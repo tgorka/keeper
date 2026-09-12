@@ -407,6 +407,16 @@ impl TransferTally {
     }
 }
 
+/// Local history relative to the last known remote tracking tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteRelation {
+    Same,
+    Ahead,
+    Behind,
+    Diverged,
+}
+
 /// The polled snapshot the tray and any late-subscribing view read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -415,6 +425,8 @@ pub struct SyncStatus {
     pub profile_name: String,
     pub state: ProfileState,
     pub phase: SyncPhase,
+    /// Unknown when the last known remote cannot be reliably compared.
+    pub remote_relation: Option<RemoteRelation>,
     pub files_done: u64,
     pub files_total: Option<u64>,
     pub bytes_done: u64,
@@ -459,6 +471,7 @@ impl SyncStatus {
             profile_name: profile_name.into(),
             state: ProfileState::Idle,
             phase: SyncPhase::Idle,
+            remote_relation: None,
             files_done: 0,
             files_total: None,
             bytes_done: 0,
@@ -628,18 +641,8 @@ pub fn status_line(status: &SyncStatus) -> String {
             }
             line
         }
-        // "up to date" is only honest when nothing is waiting for ANY reason
-        // (AD-34-10). The two reasons are different facts and are worded
-        // differently: a queued unit means work has been accepted but not yet
-        // published, and a settling file means work has been *seen* and is
-        // being deliberately held until its writer stops. Reporting either as
-        // up to date is how a user comes to believe a file reached the server
-        // when it did not — and the settling case is the one that used to be
-        // invisible here, because it has no journal row to be counted by.
-        //
-        // The wording matches the Pending list's own "Waiting for writes to
-        // stop", so the tray and the window never explain the same wait two
-        // different ways.
+        // Queued and settling work are separate local facts. Neither their
+        // presence nor their absence establishes equality with the remote.
         _ if status.pending > 0 && status.settling > 0 => format!(
             "{} — {} waiting to sync, {} waiting for writes to stop",
             status.profile_name, status.pending, status.settling
@@ -654,7 +657,17 @@ pub fn status_line(status: &SyncStatus) -> String {
             "{} — {} waiting for writes to stop",
             status.profile_name, status.settling
         ),
-        _ => format!("{} — up to date", status.profile_name),
+        _ => format!(
+            "{} — {}",
+            status.profile_name,
+            match status.remote_relation {
+                Some(RemoteRelation::Same) => "local history matches the last known remote",
+                Some(RemoteRelation::Ahead) => "ahead of the last known remote",
+                Some(RemoteRelation::Behind) => "behind the last known remote",
+                Some(RemoteRelation::Diverged) => "local and last known remote histories diverged",
+                None => "remote comparison unknown",
+            }
+        ),
     }
 }
 
@@ -1172,16 +1185,47 @@ mod tests {
     }
 
     #[test]
-    fn a_profile_with_queued_work_is_never_reported_as_up_to_date() {
-        // Saying "up to date (1 queued)" is how a user comes to believe a file
-        // reached the server when it is still sitting in the journal.
+    fn quiet_history_reports_only_the_known_remote_relation() {
         let mut s = status("tgdrive");
-        s.state = ProfileState::Idle;
-        s.pending = 3;
-        assert_eq!(status_line(&s), "tgdrive — 3 waiting to sync");
+        // Empty queues and a successful earlier sync do not establish equality.
+        s.last_sync_ms = Some(1);
+        assert_eq!(status_line(&s), "tgdrive — remote comparison unknown");
+        for (relation, verdict) in [
+            (
+                RemoteRelation::Same,
+                "local history matches the last known remote",
+            ),
+            (RemoteRelation::Ahead, "ahead of the last known remote"),
+            (RemoteRelation::Behind, "behind the last known remote"),
+            (
+                RemoteRelation::Diverged,
+                "local and last known remote histories diverged",
+            ),
+        ] {
+            s.remote_relation = Some(relation);
+            assert_eq!(status_line(&s), format!("tgdrive — {verdict}"));
+        }
+        s.remote_relation = None;
+        assert_eq!(status_line(&s), "tgdrive — remote comparison unknown");
+    }
 
-        s.pending = 0;
-        assert_eq!(status_line(&s), "tgdrive — up to date");
+    #[test]
+    fn stopped_states_outrank_activity_and_remote_relation() {
+        let mut s = status("tgdrive");
+        s.remote_relation = Some(RemoteRelation::Behind);
+        s.phase = SyncPhase::Fetching;
+        s.pending = 3;
+        s.settling = 5;
+        s.error = Some("access refused".into());
+        for (state, verdict) in [
+            (ProfileState::MediaAbsent, "drive not connected"),
+            (ProfileState::Paused, "paused"),
+            (ProfileState::Offline, "offline, 3 waiting"),
+            (ProfileState::NeedsAttention, "access refused"),
+        ] {
+            s.state = state;
+            assert_eq!(status_line(&s), format!("tgdrive — {verdict}"));
+        }
     }
 
     /// The owner's report: "pending took very long; if keeper has a process
@@ -1209,15 +1253,12 @@ mod tests {
         assert_eq!(status_line(&s), "Scanning tgdrive — 41000 files");
     }
 
-    /// AD-34-10, and the single most misleading string in the app before this.
-    ///
-    /// `pending` counts journal rows. A folder where five thousand files are
-    /// mid-write has none, so the line printed "up to date" over it for as long
-    /// as the writing lasted.
+    /// Equal history does not mean local writes have been published.
     #[test]
-    fn a_folder_whose_files_are_still_being_written_is_never_up_to_date() {
+    fn pending_and_settling_work_outrank_remote_equality() {
         let mut s = status("tgdrive");
         s.state = ProfileState::Watching;
+        s.remote_relation = Some(RemoteRelation::Same);
         s.settling = 5_000;
         assert_eq!(
             status_line(&s),
@@ -1233,11 +1274,9 @@ mod tests {
             "tgdrive — 2 waiting to sync, 5000 waiting for writes to stop"
         );
 
-        // Only once BOTH are zero is the claim honest.
+        // Retiring settling work must not hide the remaining queued work.
         s.settling = 0;
         assert_eq!(status_line(&s), "tgdrive — 2 waiting to sync");
-        s.pending = 0;
-        assert_eq!(status_line(&s), "tgdrive — up to date");
     }
 
     /// An in-flight transfer already says what it is doing, and its own line is
@@ -1247,6 +1286,8 @@ mod tests {
         let mut s = status("tgdrive");
         s.state = ProfileState::Syncing;
         s.phase = SyncPhase::Committing;
+        s.remote_relation = Some(RemoteRelation::Behind);
+        s.pending = 3;
         s.settling = 7;
         assert!(
             status_line(&s).starts_with(SyncPhase::Committing.label()),

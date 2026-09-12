@@ -1498,6 +1498,52 @@ it leaves, and an offline folder does not walk its tree until a unit is due.
 Progress is reported in bytes where a total is known, because a file-counted bar
 sits at 50% for ten minutes when one of the two files is a 4 GB video.
 
+### Watching is not a claim that the server was just checked
+
+`Watching` describes the folder's operating state, not its replication proof.
+When no active phase, stopped condition or waiting work takes precedence, the
+status line compares the local history with `origin/<branch>`:
+
+- **Local history matches the last known remote** means the two commit IDs
+  match. It does not prove the server has not moved since the last fetch.
+- **Behind** means the last-known remote contains commits not yet applied here.
+- **Ahead** means this clone contains commits absent from that last-known tip.
+- **Diverged** means neither tip includes the other.
+- **Remote comparison unknown** means the references or history cannot be
+  compared reliably. Missing information is never treated as equality.
+
+This read-only comparison inspects local Git references and, on a cold pair,
+their commit graph. It neither contacts the server nor walks the folder's
+files. Ahead/behind walks advance from both tips together; proving divergence
+can require reading both complete histories. A cold walk uses the history
+reader's 4 MiB object-cache budget, and subsequent reads reuse the verdict
+while the reference pair and profile identity remain unchanged. An external
+commit or fetch invalidates that verdict. A Worktree lane compares its own
+working branch and tracking ref, not the base branch. Paused or absent-media
+profiles do not probe the repository for this optional observation.
+
+The right-hand tip is the local remote-tracking reference. If a transport has
+not refreshed it after a successful push, the comparison can still say
+**Ahead** until a later fetch updates that reference; it is not a claim that
+the push failed or that those commits are definitely missing from the server.
+`lastSyncMs` is not used
+as a remote-check timestamp: a successful local or LFS operation is not evidence
+that the remote branch was checked. Matching histories also does not verify
+materialized LFS content; use the verification tools in §8 for that.
+
+The Pending list says **No pending files reported** when it has no rows.
+That is a statement about the list, not proof that local and remote histories
+match. The fetch, watcher and scan schedules in §21 are unchanged by these
+status semantics; opening the view does not force a remote check.
+
+A Pending scan owns only its own temporary progress. While it runs, it may
+report `Scanning` and measured counts; a real sync phase or a stopped state
+(`Offline`, `Paused`, `Needs attention`, disconnected drive) takes precedence.
+Completion, failure or cancellation retires that scan's progress without
+clearing another operation. Streamed counters, paths and rates refine only an
+active matching phase, so an old completed scan cannot become a new transfer's
+100% bar.
+
 ### The Pending list runs in both directions
 
 `git status` and the completeness gate see only what this machine changed, so
@@ -3278,7 +3324,7 @@ than once an hour**, and the thorough passes run once a day.
 | **scan pass** (event-driven) | commit what settled | a walk of the paths the watcher named (`:(literal)` include pathspecs), the stability gate, LFS staging, the commit; a `Push` is queued if anything was committed or the branch is ahead | a wake, once the gate's settle window (5 s; 10 s on removable media; 60 s ceiling) has run out; at most one wake-driven walk per `min(settle, 5 s)` | `scan pass reason=wake` / `reason=settle`, then `status walk finished caller="commit" included=N` | `scan_due`, `scan_and_enqueue`, `WalkPolicy::include` |
 | **scan pass** (backstop) | an event the watcher dropped | the same pass over the **whole index** (every entry `lstat`-ed; no directory walk — a path the gate holds that git does not carry is `lstat`-ed by the pass itself, §4) | every **1 h** while the watcher is live (`LIVE_WATCH_BACKSTOP_MS`); every `pollIntervalMs` (default 15 s) when it is not — the cadence the degraded-watcher warning names | `scan pass reason=paced`, `status walk finished … included=0` | `scan_is_due`, `LIVE_WATCH_BACKSTOP_MS` |
 | **untracked sweep** | a file that appeared while nothing was watching | the walk also reads every directory (`find_untracked`), so a path git has never seen is found; a live watcher's `Create` event buys the same walk at once, so this is only for what it missed. After `untracked=N` the paths it found are held by the gate, and the gate's second look at each of them is the next commit-leg pass's own sample: the pass lists the held paths its walk did not report and the index does not carry (one probe of the index), gives each git's own exclusion (`.gitignore` and nested repositories, which a path held since before the rule was written has not had) and `lstat`s it itself, so a held path git has never seen costs two stats per pass (§4), never a directory walk — a settled one is committed, a moving one stays held, a gone or ignored one is forgotten, one the pass cannot stat stays held with a `warn`. The same sample covers a restart between the two looks, whichever leg walked first, because `file_state` carries the episode and the pass seeds the gate before it looks | every **24 h** (`UNTRACKED_SWEEP_INTERVAL`), on the first pass of a run, and on every pass with no live watcher; the watcher's own 24 h rescan event rides the same clock | `untracked sweep: this walk reads every directory`, then `status walk finished … untracked=N`; the second look logs nothing of its own — `status walk finished … untracked=0 included=N` is the narrowed walk it rode; `a held path is one git ignores …; forgetting it` / `… now lies inside a nested repository …; forgetting it` (info, `path=`) for one the exclusion drops; `a held path the walk did not report could not be stat'd; keeping it held until it can be` (warn, `path=` and `err=`, once per pass) for one it cannot judge; `the gate holds paths the walk did not report and the index cannot be read …; sampling every one of them` (warn, once per pass) when the index probe fails — which the commit leg can only reach by a race, since its walk read the same index a moment earlier and would have failed the pass first | `walk_policy`, `Engine::paths_for_the_second_look`, `watch::DEFAULT_RESCAN_INTERVAL_MS` |
-| **remote poll** | a peer's change | one fetch of `refs/heads/<branch>` (a single HTTPS request when nothing moved), then fast-forward, or §5's merge | every **5 min** (`REMOTE_POLL_MS`); at once when this pass committed something or a wake named a path; `wake_now` and *Sync now* force it | `remote poll queued reason=paced|wake|push owed`, then `remote polled: up to date` / `the remote branch moved` | `scan_and_enqueue`, `do_pull` |
+| **remote poll** | a peer's change | one fetch of `refs/heads/<branch>` (a single HTTPS request when nothing moved), then fast-forward, or §5's merge | **5 min eligibility floor** (`REMOTE_POLL_MS`), evaluated inside a scan pass, not an independent timer; a quiet live-watcher folder may wait for the **1 h** scan backstop. A commit, named wake, `wake_now` or *Sync now* can bring the pass forward | `remote poll queued reason=paced|wake|push owed`, then `remote polled: up to date` / `the remote branch moved` | `scan_and_enqueue`, `do_pull` |
 | **push** | publish what was committed | `git push` of the working branch, held while any LFS upload is outstanding | a journaled unit, drained on the tick after it is queued; retried with backoff | `committed profile=… files=N`, then `pushed branch=… commits=N` | `do_push` |
 | **LFS transfers** | the objects a commit or a pull needs | one upload/download per queued unit, verify-after-upload, resume on download | journaled units, drained as they are queued | `materialized LFS content`, the transfer's own lines | `do_lfs` |
 | **LFS prune** | the second local copy | release local objects the remote **confirmed** holding (`synced_at_ms`) whose content is in the worktree | on a successful pass that moved an LFS object, or the hourly release look (`RELEASE_LOOK_EVERY_MS`) | `lfs prune: nothing to release` / `released local LFS objects the remote is known to hold` | `mark_synced`, `prune_lfs_store` |
@@ -3298,10 +3344,12 @@ Three things the table implies, stated so nobody infers the opposite:
 - **A local change never waits for a clock.** The watcher, the settle window and
   the journal are the whole path from a saved file to a pushed commit; the hourly
   and daily rows exist for what the watcher could not see.
-- **A peer's change waits for the remote poll** — up to five minutes, less when
-  this machine is itself changing things. Forgejo does not push to clients;
-  making that faster means asking the remote more often, which is a request per
-  poll, not a walk.
+- **A peer's change waits for a pass that checks the remote.** The five-minute
+  floor is currently checked inside `scan_and_enqueue`, so it is not a
+  five-minute delivery guarantee: a quiet live-watcher folder can wait for the
+  hourly backstop. This scheduling gap was observed on hesperia/v0.8.27 and is
+  not changed by the UI truthfulness fix. Forgejo does not push to clients;
+  a status query reports the last-known tip without forcing another fetch.
 - **Every number here is a `const` or a profile field, and the log line is the
   proof it ran.** `grep 'scan pass' keeper.log | cut -c1-16 | uniq -c` is the
   walk cadence; a folder that walks oftener than this table says is a bug, and

@@ -639,7 +639,7 @@ describe("SyncPane profile header", () => {
 
   it("draws no bar without a denominator, and the streamed one once there is", async () => {
     mockStatuses.mockResolvedValue([
-      statusVm({ state: "syncing", phase: "pushing", line: RUST_TRANSFER_LINE }),
+      statusVm({ state: "syncing", phase: "uploadingLfs", line: RUST_TRANSFER_LINE }),
     ]);
     render(<SyncPane />);
     await screen.findByText(RUST_TRANSFER_LINE);
@@ -724,7 +724,7 @@ describe("SyncPane profile header", () => {
     mockStatuses.mockResolvedValue([
       statusVm({
         state: "needsAttention",
-        phase: "pushing",
+        phase: "uploadingLfs",
         pending: 0,
         error: refusal,
         needsAttention: true,
@@ -772,7 +772,13 @@ describe("SyncPane profile header", () => {
 
     act(() => {
       emitProgress?.(
-        progressVm({ fraction: 0.5, filesDone: 6, filesTotal: 12, bytesPerSecond: null }),
+        progressVm({
+          phase: "committing",
+          fraction: 0.5,
+          filesDone: 6,
+          filesTotal: 12,
+          bytesPerSecond: null,
+        }),
       );
     });
 
@@ -796,7 +802,13 @@ describe("SyncPane profile header", () => {
 
     act(() => {
       emitProgress?.(
-        progressVm({ fraction: null, filesDone: 23, filesTotal: 155_662, bytesPerSecond: null }),
+        progressVm({
+          phase: "scanning",
+          fraction: null,
+          filesDone: 23,
+          filesTotal: 155_662,
+          bytesPerSecond: null,
+        }),
       );
     });
 
@@ -807,20 +819,76 @@ describe("SyncPane profile header", () => {
     expect(counter.parentElement?.textContent).toBe("23/155662 files");
   });
 
-  it("drops a stale streamed fraction once the poll says the folder is settled", async () => {
-    await renderPane();
+  it("retires scan details across a fetching snapshot, its live frame, and idle", async () => {
+    const scanning = "Scanning tgdrive";
+    mockStatuses.mockResolvedValue([
+      statusVm({ state: "syncing", phase: "scanning", line: scanning }),
+    ]);
+    render(<SyncPane />);
+    await screen.findByText(scanning);
+    expect(emitProgress).not.toBeNull();
     act(() => {
-      emitProgress?.(progressVm({ fraction: 0.42 }));
+      emitProgress?.(
+        progressVm({
+          phase: "scanning",
+          fraction: 1,
+          filesDone: 100,
+          filesTotal: 100,
+          current: "notes/scanned.md",
+        }),
+      );
     });
-    // `watching` with pending work is active, so the bar is honest here…
-    await screen.findByRole("progressbar");
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "100");
+    expect(screen.getByText("100/100 files")).toBeInTheDocument();
+    expect(screen.getByText("notes/scanned.md")).toBeInTheDocument();
+
+    // The old scan frame is still stored when the polled phase changes.
+    act(() => {
+      syncStore
+        .getState()
+        .mergeStatuses([
+          statusVm({ state: "syncing", phase: "fetching", line: "Fetching tgdrive" }),
+        ]);
+    });
+    expect(screen.getByText("Fetching tgdrive")).toBeInTheDocument();
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+    expect(screen.queryByText("100/100 files")).not.toBeInTheDocument();
+    expect(screen.queryByText("notes/scanned.md")).not.toBeInTheDocument();
+
+    // A new phase must be accepted even though the previous stored frame differs.
+    act(() => {
+      emitProgress?.(
+        progressVm({
+          phase: "fetching",
+          fraction: 0.25,
+          filesDone: 1,
+          filesTotal: 4,
+          current: "pack/incoming.pack",
+          bytesPerSecond: 4_100_000,
+        }),
+      );
+    });
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "25");
+    expect(screen.getByText("1/4 files")).toBeInTheDocument();
+    expect(screen.getByText("pack/incoming.pack")).toBeInTheDocument();
+    expect(screen.getByText("4.1 MB/s")).toBeInTheDocument();
 
     act(() => {
-      syncStore.getState().mergeStatuses([statusVm({ state: "idle", pending: 0, phase: "idle" })]);
+      syncStore.getState().mergeStatuses([
+        statusVm({
+          state: "idle",
+          phase: "idle",
+          pending: 0,
+          line: "tgdrive — remote comparison unknown",
+        }),
+      ]);
     });
-
-    // …but the last event the engine sent must not leave a filled bar behind.
-    await waitFor(() => expect(screen.queryByRole("progressbar")).not.toBeInTheDocument());
+    expect(screen.getByText("tgdrive — remote comparison unknown")).toBeInTheDocument();
+    expect(screen.queryByText("Syncing")).not.toBeInTheDocument();
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+    expect(screen.queryByText("1/4 files")).not.toBeInTheDocument();
+    expect(screen.queryByText("pack/incoming.pack")).not.toBeInTheDocument();
+    expect(screen.queryByText(/B\/s/)).not.toBeInTheDocument();
   });
 
   it("unsubscribes from the progress stream on unmount", async () => {
@@ -1475,6 +1543,7 @@ describe("SyncPane pending", () => {
 
   /** Which of the queued rows is the one actually moving right now. */
   it("marks the row the transfer is on, and only that one", async () => {
+    mockStatuses.mockResolvedValue([statusVm({ state: "syncing", phase: "downloadingLfs" })]);
     mockPending.mockResolvedValue([
       { path: "70-comms/camera-0000.mov", reason: "incoming", sinceMs: null, sizeBytes: 9_500_000 },
       {
@@ -2168,6 +2237,17 @@ describe("sync pane projections", () => {
     expect(syncLiveFraction(busy, progressVm({ fraction: 1.4 }))).toBe(1);
     // With no event yet, the polled counters still answer.
     expect(syncLiveFraction(busy, undefined)).toBeCloseTo(0.25);
+    // A delayed frame cannot lend another phase its denominator.
+    expect(syncLiveFraction(busy, progressVm({ phase: "scanning", fraction: 1 }))).toBeCloseTo(
+      0.25,
+    );
+    // Queued work keeps polling fast but does not make an idle frame live.
+    expect(
+      syncLiveFraction(
+        statusVm({ pending: 3, filesDone: 100, filesTotal: 100 }),
+        progressVm({ phase: "idle", fraction: 1 }),
+      ),
+    ).toBeNull();
   });
 
   it("keeps a streamed rate behind the poll's verdict on whether work is happening", () => {
@@ -2181,6 +2261,15 @@ describe("sync pane projections", () => {
     // nothing to show. The poll carries no rate of its own to fall back on.
     expect(syncLiveRate(busy, undefined)).toBeNull();
     expect(syncLiveRate(busy, progressVm({ bytesPerSecond: 0 }))).toBeNull();
+    expect(
+      syncLiveRate(busy, progressVm({ phase: "fetching", bytesPerSecond: 9_000_000 })),
+    ).toBeNull();
+    expect(
+      syncLiveRate(
+        statusVm({ pending: 3 }),
+        progressVm({ phase: "idle", bytesPerSecond: 9_000_000 }),
+      ),
+    ).toBeNull();
   });
 });
 

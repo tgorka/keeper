@@ -6069,3 +6069,38 @@ status: open
   summary: `prime_moved_paths` still buys a full directory walk for a rename whose destinations the pass would now sample itself.
   evidence: A rename prime records the moved-in destinations in the gate as already settled and sets `untracked_appeared` so the next commit walk is a `full()` one (`Engine::prime_moved_paths`, Epic 70, F-GATE-7) — the flag was the only way a walk without a directory scan could come to observe a path the index does not carry. With this story the pass's own second look samples every held unindexed path (`Engine::paths_for_the_second_look`), so the primed destinations would be staged by the narrowed walk's pass without the scan; the prime's flag is now a directory walk bought for paths the pass would have looked at anyway. Left as is because the story's Never list keeps `prime_moved_paths` out of it (`priming_moved_paths_makes_the_next_walk_a_full_one` still asserts the flag); the follow-up is to drop the flag insert from the prime and let the second look stage the destinations, keeping the test's shape for the rename-in-one-commit property.
   status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-sync-ui-reports-known-state-and-live-work.md`
+  summary: A remote-object audit can leave an ownerless Verifying phase after Recheck all files.
+  evidence: `Engine::audit_remote_objects` publishes Verifying for an LFS-enabled profile, but has no scoped progress owner or Idle cleanup on its empty-object, filesystem-remote, error or success exits. `republish_missing_objects` also returns without retiring that phase; `sync_rescan` reaches this chain and logs audit failures. This producer predates the Pending fix. It can keep a history verdict hidden and suppress lower-priority Pending progress until a later primary pass retires it.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-sync-ui-reports-known-state-and-live-work.md`
+  summary: A quiet live watcher can starve the nominal five-minute remote-poll floor until the hourly scan backstop.
+  evidence: On hesperia/v0.8.27, tgdrive was clean and one commit behind its fetched tracking tip before the later paced pass fast-forwarded it. The remote-poll eligibility check lives inside scan work rather than independently of the live-watch scan gate. `docs/sync.md` §21 now distinguishes the five-minute eligibility floor from the actual delivery bound; this UI-status spec explicitly leaves scheduling unchanged.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-sync-ui-reports-known-state-and-live-work.md`
+  summary: Cancelling Pending releases its WalkClaim while its blocking scan can still be running.
+  evidence: Dropping the async Pending future drops the existing WalkClaim; a started `spawn_blocking` closure continues until its work completes. The cancellation regression holds that real worker after its scan reports and releases it separately. The new PollProgress owner retires only presentation state and deliberately does not redesign the pre-existing worker/claim lifetime.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-sync-ui-reports-known-state-and-live-work.md`
+  summary: A retained progress frame can be mistaken for a later operation that enters the same phase.
+  evidence: `SyncStatusVm` and `SyncProgressVm` contain no common operation generation. Phase matching now rejects frames from different or inactive phases, but a completed old frame can match a new operation's phase before its new frame arrives. This already existed under the old activity-only predicate; closing it requires an operation-identity contract rather than trusting whichever channel arrived last.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-sync-ui-reports-known-state-and-live-work.md`
+  summary: The in-process HTTP push path does not refresh the local remote-tracking ref after acknowledgement.
+  evidence: `Engine::push_after_commit` awaits `git::push_http::push`, logs its report and returns without recording the acknowledged tip in `refs/remotes/origin/*`; `do_push` and `mark_synced` do not record it either. The existing Gix path can therefore leave a successful publish comparing Ahead against an older tracking ref until a fetch. The UI documentation now explicitly states that this comparison is not proof a push failed. The transport bookkeeping is unchanged here.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-sync-ui-reports-known-state-and-live-work.md`
+  summary: The Gix push path ignores the Worktree lane's effective working branch.
+  evidence: `do_push` constructs a refspec using `working_branch(profile)`, but `push_once`'s Gix branch ignores that refspec and passes `profile.branch` to `push_after_commit`. A Worktree/PushOnly profile has a different effective branch. This routing predates the UI comparison and requires a focused transport test before changing publish policy.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-sync-ui-reports-known-state-and-live-work.md`
+  summary: The development shell has invalid null fixtures for non-nullable Settings IPC results.
+  evidence: Opening the full Settings view in the real browser fails in ShortcutsSection because `hotkey_get` returns null instead of HotkeyVm, then in CaptureSettingsForm because `recording_destination_profiles` returns null instead of an array. Mounting the real SyncSection independently exposes the same issue for `sync_list_settings_get` (`folded`). These are development-fixture gaps, not observed native-shell failures. The Sync status/progress renderer was verified independently; this change does not manufacture production fallbacks for invalid fixture data.
+  status: open

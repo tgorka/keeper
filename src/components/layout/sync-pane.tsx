@@ -142,7 +142,6 @@ import {
 } from "@/lib/stores/copy-job";
 import {
   ensureSyncHydrated,
-  isSyncStatusActive,
   removeSyncProfile,
   rescanSyncProfile,
   setSyncProfileEnabled,
@@ -161,6 +160,7 @@ import {
   startSyncDetailPolling,
   startSyncProgressStream,
   syncLiveFraction,
+  syncLiveProgress,
   syncLiveRate,
   useSyncDetailStore,
 } from "@/lib/stores/sync-detail";
@@ -199,7 +199,7 @@ export const SYNC_ACTIVITY_EMPTY_SENTENCE =
   "Nothing has synced yet. Files show up here as keeper carries them.";
 
 /** The Pending empty state. */
-export const SYNC_PENDING_EMPTY_SENTENCE = "Nothing is waiting to sync.";
+export const SYNC_PENDING_EMPTY_SENTENCE = "No pending files reported.";
 
 /** The reason line for a file inside its quiet window. Never a countdown. */
 export const SYNC_SETTLING_SENTENCE = "Waiting for writes to stop";
@@ -995,13 +995,11 @@ function SyncProfileCard({
     });
   };
 
-  const active = status !== undefined && isSyncStatusActive(status);
   const fraction = syncLiveFraction(status, progress);
   const percent = fraction === null ? null : Math.round(fraction * 100);
-  // The live detail comes off the stream alone, so a window that just mounted
-  // honestly has none of it until the next event — and a folder the poll calls
-  // settled has none either, however recently an event arrived.
-  const streamed = active ? progress : undefined;
+  // The snapshot owns activity and phase; a delayed frame from another phase
+  // cannot keep completed work visible.
+  const streamed = syncLiveProgress(status, progress);
   const current = streamed?.current ?? null;
   // Both figures worded the way the Rust status line words them, so this fast
   // copy and the 2 s-polled sentence above read as the same quantity rather
