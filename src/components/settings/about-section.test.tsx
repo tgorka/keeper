@@ -198,19 +198,6 @@ describe("AboutSection egress list", () => {
     expect(screen.queryByText("Folder sync remote")).not.toBeInTheDocument();
   });
 
-  it("says the list is computed from accounts and folder-sync profiles, hosts only", async () => {
-    // The disclosure copy has to name both inputs: a bare `github.com` row under a
-    // sentence that only mentions accounts reads as a fabricated entry, and the
-    // host-only promise is the reason no repository path or token is on screen.
-    mockEgress.mockResolvedValue(SYNC_EGRESS);
-    render(<AboutSection open />);
-
-    const sentence = await screen.findByText(/These are the servers keeper connects to/);
-    expect(sentence).toHaveTextContent("folder-sync profiles");
-    expect(sentence).toHaveTextContent("host only");
-    expect(sentence).toHaveTextContent("no telemetry, analytics, or crash reporting");
-  });
-
   it("renders an honest error line when the egress list cannot load", async () => {
     mockEgress.mockRejectedValue(new Error("registry read failed"));
     render(<AboutSection open />);

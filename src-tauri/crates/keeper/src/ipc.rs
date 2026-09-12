@@ -11618,7 +11618,10 @@ fn sync_remote_urls(state: &AppState) -> Result<Vec<String>, IpcError> {
 /// provider changes
 /// the disclosed set. Failures funnel through [`to_ipc_error`].
 #[tauri::command]
-pub async fn egress_list(state: State<'_, AppState>) -> Result<Vec<EgressEndpointVm>, IpcError> {
+pub async fn egress_list(
+    state: State<'_, AppState>,
+    telemetry: State<'_, Arc<keeper_core::telemetry::Telemetry>>,
+) -> Result<Vec<EgressEndpointVm>, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     let rows = keeper_core::registry::list_accounts(&data_dir).map_err(to_ipc_error)?;
     let accounts: Vec<(String, Provider)> = rows
@@ -11643,12 +11646,16 @@ pub async fn egress_list(state: State<'_, AppState>) -> Result<Vec<EgressEndpoin
     // drops it, because keeper cannot say what it would contact.
     let provider_base_urls =
         keeper_core::bots::store::provider_base_urls(&data_dir).map_err(to_ipc_error)?;
-    Ok(compute_egress(
+    let mut destinations = compute_egress(
         &accounts,
         &sync_remotes,
         &provider_base_urls,
         EGRESS_UPDATE_ENDPOINT,
-    ))
+    );
+    if let Some(destination) = telemetry.egress() {
+        destinations.push(destination);
+    }
+    Ok(destinations)
 }
 
 /// Subscribe to the merged unified inbox across every restorable account (FR-18,

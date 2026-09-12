@@ -1,0 +1,53 @@
+:root {
+  font-family: system-ui, sans-serif;
+  color-scheme: light dark;
+}
+body {
+  margin: 0;
+  background: Canvas;
+  color: CanvasText;
+}
+main {
+  max-width: 54rem;
+  margin: auto;
+  padding: 1rem;
+  overflow-wrap: anywhere;
+}
+header,
+section {
+  margin-bottom: 1.5rem;
+  padding: 1rem;
+  border: 1px solid GrayText;
+  border-radius: 0.5rem;
+}
+p {
+  line-height: 1.5;
+}
+nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 1rem 0;
+}
+button {
+  min-height: 2.75rem;
+  max-width: 100%;
+  padding: 0.5rem 0.75rem;
+  cursor: pointer;
+  font: inherit;
+}
+button:disabled {
+  cursor: default;
+}
+button:focus-visible {
+  outline: 3px solid Highlight;
+  outline-offset: 2px;
+}
+button[aria-pressed="true"] {
+  border: 2px solid Highlight;
+}
+article {
+  margin-top: 1rem;
+  border: 1px solid GrayText;
+  border-radius: 0.5rem;
+}

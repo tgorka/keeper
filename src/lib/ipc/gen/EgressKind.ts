@@ -19,4 +19,4 @@
  * pre-existing single-word variants serialize identically under either rule, so
  * this changed no existing wire value.
  */
-export type EgressKind = "homeserver" | "beeper" | "gitRemote" | "botProvider" | "update";
+export type EgressKind = "homeserver" | "beeper" | "gitRemote" | "botProvider" | "update" | "telemetry";

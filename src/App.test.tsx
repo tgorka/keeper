@@ -36,6 +36,7 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     encryptionPosture: mockEncryptionPosture,
     listenNotesOpenNote: mockListenNotesOpenNote,
     capabilities: mockCapabilities,
+    telemetryStudyStop: vi.fn(async () => {}),
   };
 });
 

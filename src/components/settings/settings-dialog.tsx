@@ -21,6 +21,7 @@ import {
 import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
 import { SyncGitRow } from "@/components/settings/sync-git-row";
 import { DeviceSection, SyncSection } from "@/components/settings/sync-section";
+import { TelemetrySection } from "@/components/settings/telemetry-section";
 import { UnsetShortcutRow } from "@/components/settings/unset-shortcut-row";
 import { Button } from "@/components/ui/button";
 import {
@@ -35,6 +36,7 @@ import { Kbd } from "@/components/ui/kbd";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Switch } from "@/components/ui/switch";
+import { useTelemetryOpening } from "@/hooks/use-telemetry";
 import { useVoiceFacts } from "@/hooks/use-voice-facts";
 import { acceleratorFromEvent, DEFAULT_GLOBAL_HOTKEY, formatAccelerator } from "@/lib/hotkey";
 import {
@@ -142,6 +144,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
  * is the same claim.
  */
 export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
+  useTelemetryOpening("settingsOpened", open);
   // The OS-global summon hotkey is a desktop-only capability; hide the whole
   // Shortcuts section wherever the platform lacks it (the phone tier).
   const globalHotkey = useCapabilitiesStore((s) => s.capabilities.globalHotkey);
@@ -221,6 +224,7 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
               claim on iOS (Story 14.2, FR-53/FR-61). Desktop (Story 10.3) unchanged. */}
       {!reducedPlatform && <BackgroundSection open={open} />}
       <PrivacySection open={open} />
+      <TelemetrySection open={open} />
       {globalHotkey && <ShortcutsSection open={open} />}
       {/* Beside Shortcuts rather than gated with it: the summon chord is a
           desktop capability, but the template a capture starts from and the tag

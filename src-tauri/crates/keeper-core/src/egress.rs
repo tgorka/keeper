@@ -765,6 +765,7 @@ mod tests {
             EgressKind::GitRemote,
             EgressKind::BotProvider,
             EgressKind::Update,
+            EgressKind::Telemetry,
         ];
 
         // Wildcard-free exhaustive match: a new `EgressKind` variant makes this
@@ -776,6 +777,7 @@ mod tests {
                 EgressKind::GitRemote => {}
                 EgressKind::BotProvider => {}
                 EgressKind::Update => {}
+                EgressKind::Telemetry => {}
             }
         }
 
@@ -784,7 +786,16 @@ mod tests {
         let accounts = vec![("https://matrix.beeper.com".to_owned(), Provider::Beeper)];
         let remotes = vec!["https://github.com/tgorka/notes.git".to_owned()];
         let providers = vec!["https://gw.example.org/v1".to_owned()];
-        let out = compute_egress(&accounts, &remotes, &providers, UPDATE);
+        let mut out = compute_egress(&accounts, &remotes, &providers, UPDATE);
+        let telemetry = crate::telemetry::Telemetry::open(
+            None,
+            crate::telemetry::PublicConfig::parse(
+                "https://us.i.posthog.com",
+                "phc_synthetic_fixture",
+            ),
+        );
+        telemetry.study_config().expect("synthetic study consent");
+        out.extend(telemetry.egress());
 
         for kind in ALL_KINDS {
             assert!(

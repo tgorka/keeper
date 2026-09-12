@@ -26,6 +26,7 @@ import {
   CommandInput,
   CommandList,
 } from "@/components/ui/command";
+import { captureTelemetry, useTelemetryOpening } from "@/hooks/use-telemetry";
 import type { PaletteChatVm, PaletteMode, PaletteResultsVm } from "@/lib/ipc/client";
 import { paletteQuery } from "@/lib/ipc/client";
 import { commandPaletteStore, useCommandPaletteStore } from "@/lib/stores/command-palette";
@@ -50,6 +51,7 @@ function parseInput(raw: string): { mode: PaletteMode; needle: string } {
 
 export function CommandPalette() {
   const isOpen = useCommandPaletteStore((s) => s.isOpen);
+  useTelemetryOpening("commandPaletteOpened", isOpen);
   const selected = useRoomsStore((s) => s.selected);
 
   const [value, setValue] = useState("");
@@ -96,6 +98,7 @@ export function CommandPalette() {
           }
         })
         .catch(() => {
+          void captureTelemetry("frontendError");
           if (seq === requestSeq.current && commandPaletteStore.getState().isOpen) {
             setResults(EMPTY_RESULTS);
             setHasResponded(true);
