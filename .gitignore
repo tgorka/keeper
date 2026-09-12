@@ -31,6 +31,8 @@ coverage
 .env.*
 !.env.example
 !.env.1p
+# Public-only PostHog build references live in deploy/posthog/client.env.1p.
+# Keep the obsolete .env.posthog.1p ignored; never whitelist local resolved env files.
 *.pem
 *.p12
 *.keychain

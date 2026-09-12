@@ -1,16 +1,17 @@
 # Egress surface
 
-keeper is a **client only** — it has no server-side components and phones home to nothing it
-does not have to. This document is the canonical, diffable record of every network destination
-keeper contacts, and it is enforced in two ways:
+keeper is a **client only** — it has no server-side components. Optional observability
+contacts PostHog only after the relevant local consent or an explicit synthetic study start.
+This document is the canonical, diffable record of every network destination keeper contacts,
+and it is enforced in two ways:
 
 1. **In the app.** Settings → About renders the *live* egress list, computed in Rust from your
-   actual signed-in accounts and your actual folder-sync profiles (`egress::compute_egress`,
-   wired through the `egress_list` command). The *set* of entries is derived from the same
-   accounts registry the session-restore path reads and the same profile set the sync engine
-   drives (never a hand-maintained list), so it can never drift from which accounts and folders
-   you actually have; the `api.beeper.com` and update-endpoint hosts are fixed constants
-   surfaced by that live state (and single-sourced — see below).
+   actual signed-in accounts, folder-sync profiles, bot providers and local observability
+   policy (`egress::compute_egress`, wired through `egress_list`). Entries derive from
+   the same accounts, profiles, providers and consent/study state that control those
+   features, rather than a hand-maintained account or folder list. The `api.beeper.com`
+   and update-endpoint hosts are fixed constants surfaced by that live state
+   (and single-sourced — see below).
 2. **In releases.** The release workflow emits a per-release "Egress diff note" that diffs this
    file against the previous tag into the job summary (NFR-11, AD-23), so any change to where
    keeper sends traffic is visible on every release.
@@ -25,6 +26,7 @@ keeper contacts, and it is enforced in two ways:
 | Each configured **AI provider's host** (e.g. `localhost`, `127.0.0.1`, `gw.example.org`) | One entry per distinct provider *host* across your Bots providers (duplicates collapse to one); absent entirely when no provider is configured, which is how keeper ships | Chat completions, model and capability discovery, and a bot probe against the Hermes or Ollama endpoint you typed. Only the **host** is shown — never the `/v1` path, a profile prefix, or a credential. See the provider chapter below, and `egress::remote_host`. |
 | **`github.com/tgorka/keeper/releases/...`** (the signed-update `latest.json` endpoint) | Always (an update check) | Signed auto-updates (NFR-12). Downloads are cryptographically verified against keeper's minisign public key before installing. |
 | **`*.githubusercontent.com`** (GitHub's release-asset CDN) | Only while downloading an update the user chose to install | GitHub serves release files (the update binary) from its content-delivery network, which the `github.com` release URL redirects to. Disclosed so the egress list is exhaustive, not just the check endpoint. |
+| **`us.i.posthog.com`** | Only when configured and a relevant local observability category is enabled, or an explicitly started synthetic study is active; all default off | Closed diagnostic/product observations, OTLP diagnostic records/traces, separately consented public remote configuration, or content-isolated synthetic study replay/heatmaps. No raw app log export. See the consent boundary below. |
 
 ### The folder-sync daemon
 
@@ -128,10 +130,10 @@ lives at an endpoint. That endpoint is the one destination in this document that
 because you typed it**: keeper ships no default endpoint, no hosted model and no proxy of its own,
 so a fresh install has no provider row here at all, and adding one in Settings → Bots is the act
 that creates the destination. Removing the provider removes the row on the next open, with no
-cache to go stale. This is the same posture the no-telemetry section below states for everything
-else — *"keeper never sends your data, usage, or diagnostics anywhere except the servers listed
-above"* — and the provider row is how a model endpoint becomes one of the servers listed above
-rather than an exception to it. The reasoning is recorded as `docs/decisions.md` D-4.
+cache to go stale. Like the consent boundary below, this makes the destination explicit:
+keeper sends only the declared feature's data to the listed server. Adding an AI
+provider does not enable observability or approve AI analysis of diagnostics or replay.
+The provider reasoning is recorded as `docs/decisions.md` D-4.
 
 The row is **derived, never hand-written**. `EgressKind::BotProvider` is computed by
 `egress::compute_egress` from `bots::store::provider_base_urls`, read from the same store the
@@ -341,12 +343,59 @@ The arithmetic that makes it a bad trade today, on a default Synapse:
 What ships instead is step-level following on the Hermes host already listed, and the
 interface says "following" rather than "streaming" (Story 63.7, AD-177).
 
-## The no-telemetry invariant
+## The observability consent boundary
 
-keeper has **no telemetry, analytics, or crash reporting** — and no opt-in scaffolding for any of
-it, because there is nothing to opt into. keeper never sends your data, usage, or diagnostics
-anywhere except the servers listed above. This is a hard invariant: any change that would add a
-new egress destination must be reflected here (and will surface in the release egress diff note).
+Epic 71 replaces the former unconditional no-telemetry claim with **no PostHog
+collection or contact without the relevant local consent**. New and existing
+installations default off. Rust owns local-only consent, schema validation and
+normal-app export; synchronized settings cannot grant consent. Settings → About
+discloses the configured ingestion host from the same live policy. The management
+host `us.posthog.com` is used only by separate maintainer tooling, not by the app.
+
+| Consent | What may leave | What it cannot enable |
+| --- | --- | --- |
+| Diagnostics | Closed readiness/interaction durations, sanitized frontend-error categories and content-free diagnostic records/operation traces | Raw exception text, stack payloads, arbitrary tracing strings or wholesale application logs |
+| Product statistics | Closed events for opening the command palette or settings | Search text, command names, setting values, person profiles or account identifiers |
+| Remote configuration | A request for the public `keeper-client-config` flag payload and a bounded support sentence | Collection, consent, security policy, destinations, grants, encryption changes or synchronized user preferences |
+| Synthetic usability study | Replay/heatmaps of a separate synthetic surface after explicit per-session start | Normal-app DOM or real account, drive, note, bot or recording content |
+
+Normal observations carry a random installation identifier, never a Matrix ID
+or email, and no implicit cross-device identity. Payloads exclude messages,
+filenames, local paths, notes, credentials, recordings, bot prompts/responses,
+normal-app URLs, arbitrary DOM attributes, console values and network bodies.
+Recording zero-egress and on-device speech guarantees are unchanged.
+
+**Transport still reveals metadata.** Direct HTTPS necessarily exposes the
+client's source IP, request timing and ordinary connection metadata to PostHog
+and its serving infrastructure. Disabling GeoIP/person enrichment does not
+hide the IP from the transport. These are minimized content-free observations,
+not a claim of anonymous networking; public project tokens are forgeable.
+
+Admission is bounded to **60 admissions per minute**, not 60 observations:
+one admission may generate multiple observations. The normal Rust exporter
+uses a lazily created pooled HTTP client, at most three concurrent collector
+requests plus one flags request, bounded deadlines/queues and no retries.
+These exporter bounds do not describe the synthetic study SDK. Offline,
+revoked and dropped observations are missing; opt-in counts are not all
+installations or all people, and app readiness is not a claim of browser web
+vitals or total Rust startup coverage.
+
+Revocation stops future collection, discards queued unsent records and cancels
+in-flight work as practicable. Bytes already transmitted cannot be recalled
+by a local switch. A study has a separate session-local opt-in: real application
+content is unmounted before study capture starts, and capture/outgoing study
+requests stop before the real application returns. Ordinary diagnostics never
+enable replay. Synthetic study observations are separate from production
+metrics and must not inflate them.
+
+No AI processing or Replay Vision is automatically approved. Metric proposals
+and any future AI-analysis scope need separate human review; authoring a proposed
+metric with an AI tool is not permission for PostHog to process user content with AI.
+The provisioning workflow neither autoapproves metrics nor enables person enrichment.
+See [the maintainer runbook](credentials.md#posthog-maintainer-runbook).
+
+Any new destination or changed collection boundary must be reflected here and
+in the live policy, and will surface in the release egress diff note.
 
 ## The update endpoint is a shared constant
 

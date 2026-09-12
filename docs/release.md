@@ -209,9 +209,15 @@ build; a value that is not a sha is ignored with a warning rather than believed.
    ```
 
 4. The `Release` workflow triggers on the tag, builds on `macos-latest`, signs and
-   notarizes the `aarch64-apple-darwin` `.dmg`, and creates a **draft** GitHub release
-   carrying the artifact.
-5. Review the draft release, then **publish it**.
+   notarizes the `aarch64-apple-darwin` `.dmg`, then checks the uncompressed
+   `.app` contents and frontend assets **before** creating/uploading the draft.
+   Companion syncd uploads require this job to succeed and each packaged daemon
+   to pass its own credential check.
+5. Review the draft, all release jobs, egress diff, artifact inventory and the
+   [credential gates](#observability-and-credential-release-gates), then **publish it**.
+   A failed gate is a publication blocker for the maintainer. Workflow ordering
+   blocks its automated uploads; it cannot stop an owner manually publishing
+   an existing draft or uploading assets through another path.
 
    > **Auto-updates require the release to be published, not left as a draft.** The
    > updater endpoint is `.../releases/latest/download/latest.json`, and GitHub's
@@ -246,6 +252,63 @@ spctl -a -t open --context context:primary-signature keeper.dmg
 # The notarization ticket is stapled to the app.
 xcrun stapler validate keeper.app
 ```
+
+## Observability and credential release gates
+
+Public build configuration uses the existing Actions variables
+`KEEPER_POSTHOG_HOST` and `KEEPER_POSTHOG_PROJECT_TOKEN`; local builds use
+the tracked `deploy/posthog/client.env.1p` public-only template. Never use
+the maintainer environment or a real PostHog personal/secure key for a build.
+The trusted manual provisioning path is documented in
+[credentials.md](credentials.md#posthog-maintainer-runbook).
+
+| Check | Scope and gate |
+| --- | --- |
+| CI `frontend`: provisioning and environment safety | `node --test scripts/posthog/*.test.mjs`, no credentials or live service; fixtures are not live API evidence |
+| CI `build`: synthetic management-env canary | `POSTHOG_PERSONAL_API_KEY=KEEPER_PRIVILEGED_KEY_MUST_NOT_SHIP_71` is supplied only as a noncredential to the real app build; scanner requires absence from `dist`, the release `keeper` executable and staged `keeper-rec` |
+| Release app pre-upload gate | `scripts/posthog/release-build.mjs` is tauri-action's build runner. It runs Tauri, requires real executable `Contents/MacOS/keeper` and `keeper-rec`, scans `dist` and all regular files in the actual uncompressed `.app`, and returns failure before tauri-action can upload assets |
+| Release companion gate | Both Linux and macOS syncd jobs require app-job success, scan `src-tauri/keeper-syncd-$TARGET` after packaging, then attach it and its checksum to the existing draft; no fallback release creation |
+| `posthog.yml` manual operations | Secret-free preflight verifies required `tgorka` reviewer and a single `main` branch policy before the protected personal-key job can start. Main-only trusted checkout and reviewed manifest hash required for apply/smoke. Not a PR status check; never runs with PR code |
+| Egress release note | Diff `docs/egress.md` against the preceding tag and review all changed destinations/consent boundaries |
+
+The scanner requires nonempty regular-file coverage **for each requested
+root**; symlinks are skipped, and unreadable/missing roots fail. It checks
+recognizable credential patterns and the synthetic canary, plus the updater
+signing key's raw/decoded value when available in the release environment.
+It does not print matched values, and it does not prove absence of unknown
+credentials or detect every encoded representation.
+
+**No compressed-bundle claim:** scanning a `.dmg` or `.tar.gz` as opaque bytes
+is not an inspection of its contents. The automated gate scans the built
+uncompressed `.app` that Tauri packages, not the compressed distribution
+containers. Before human publication, mount the downloaded DMG read-only and
+extract the downloaded updater tarball into separate temporary directories,
+then run `bun scripts/check-client-secrets.ts <mounted-app> <extracted-app>`
+and signing/version checks on those actual contents. Do not pass the archives
+themselves as substitutes. For iOS, extract the IPA and scan `Payload/keeper.app`;
+the compile-only iOS job is not a shipped-bundle credential check.
+
+Before publishing:
+
+- [ ] App and **both** syncd targets passed their artifact gates; draft contains
+  the expected signed app/updater assets and daemon/checksum pairs.
+- [ ] Downloaded distribution contents were unpacked/mounted, scanned and
+  checked for signing, version and expected sidecar contents.
+- [ ] Review the egress diff and confirm fresh-install default-off, separate
+  category behavior, revocation and synthetic-only replay using real requests
+  on each platform/surface claimed for this release.
+- [ ] For changed PostHog resources, run reviewed `plan`, explicit `apply`,
+  `verify`, repeated unchanged `apply`, and synthetic UUID/flag/all-Endpoint
+  smoke. Record the exact commit and emitted manifest hash, not an old audit's
+  digest. Metrics remain proposed; AI processing needs separate approval.
+
+The coordinator's 2026-09-12 successful live apply/verify and UUID/four-Endpoint
+smoke supersede the earlier missing-evidence audit. Later corrections still
+need their own gates and live readback; this runbook is not a claim they ran.
+Local `scripts/release-macos.sh` and owner/manual publication are separate
+paths, not mechanically guarded by this CI runner. Their maintainer must run
+the same pre-upload scans and release checks; never describe the workflow
+as preventing a repository owner from overriding publication policy.
 
 ## Perf and reliability sign-off (SM-3)
 
@@ -299,9 +362,9 @@ admin must, under **Settings → Branches → Branch protection rules** for `mai
 "Require status checks to pass before merging" and mark these CI checks as required:
 
 - **License firewall** — `cargo deny check licenses bans sources` (Rust) and the JS license gate (`bun run check:licenses`).
-- **Frontend** — biome lint, `tsc` typecheck, vitest.
+- **Frontend** — biome lint, `tsc` typecheck, vitest, and credential-free PostHog provisioning safety tests.
 - **Rust** — `rustfmt --check`, clippy `-D warnings`, cargo-nextest.
-- **Tauri build** — `tauri build --no-bundle`.
+- **Tauri build** — `tauri build --no-bundle` with a synthetic management-env canary, followed by credential exclusion over frontend assets, the app executable and staged recording sidecar.
 - **iOS (compile check)** — `cargo check --workspace --target aarch64-apple-ios` (Rust, device-free compile gate; no signing/simulator).
 - **Recording sidecar (gapless-concat, NFR-22)** — `swift test` on the `keeper-rec` package (rotation unit tests + the gapless-concat gate, fixtures generated on the runner; no capture hardware, no signing). Maps to the `recording` job in `ci.yml`.
 

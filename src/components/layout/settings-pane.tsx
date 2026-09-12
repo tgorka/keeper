@@ -32,7 +32,7 @@ export function SettingsPane() {
         <h1 className="font-heading text-title">{SETTINGS_PANE_TITLE}</h1>
         <p className="text-muted-foreground text-xs">{SETTINGS_PANE_SUBTITLE}</p>
       </header>
-      <ScrollArea className="min-h-0 flex-1">
+      <ScrollArea className="min-h-0 flex-1" fitWidth>
         <div className="flex min-w-0 flex-col gap-4 p-4">
           {/* `open` is the hydration signal every section takes, and a mounted
               pane is unambiguously open — the pane only exists while it is the

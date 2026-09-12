@@ -79,6 +79,7 @@ mod share_ios;
 // (NFR-57) — is decided in `sync`, not by absence.
 mod sync;
 mod sync_ipc;
+mod telemetry_ipc;
 #[cfg(desktop)]
 mod tray;
 // The voice port's platform implementations: iOS (Story 62.4, AD-165–AD-167)
@@ -329,6 +330,7 @@ pub fn run() {
     );
     let builder = builder
         .setup(|app| {
+            telemetry_ipc::init(app);
             // Boot-time settings layers, config import and logging init
             // (Stories 22.5/22.6, 46.6/46.7) — first among the setup steps, and
             // for a sharper reason than "it always was".
@@ -934,6 +936,13 @@ pub fn run() {
                 ipc::bridge_unsubscribe_health,
                 ipc::demo_subscribe,
                 ipc::egress_list,
+                telemetry_ipc::telemetry_status,
+                telemetry_ipc::telemetry_consent_set,
+                telemetry_ipc::telemetry_capture,
+                telemetry_ipc::telemetry_remote_config,
+                telemetry_ipc::telemetry_study_config,
+                telemetry_ipc::telemetry_study_stop,
+                telemetry_ipc::telemetry_study_preview,
                 ipc::login_password,
                 ipc::login_oidc,
                 ipc::cancel_oidc,
@@ -1392,6 +1401,11 @@ pub fn run() {
     let builder = builder.on_window_event(|window, event| {
         if window.label() == "main" {
             match event {
+                WindowEvent::Destroyed => {
+                    let _ = window
+                        .state::<std::sync::Arc<keeper_core::telemetry::Telemetry>>()
+                        .study_stop();
+                }
                 WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
                     if let Err(error) = window.hide() {
@@ -1450,6 +1464,14 @@ pub fn run() {
                     live,
                 );
             }
+        }
+    });
+    #[cfg(not(desktop))]
+    let builder = builder.on_window_event(|window, event| {
+        if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
+            let _ = window
+                .state::<std::sync::Arc<keeper_core::telemetry::Telemetry>>()
+                .study_stop();
         }
     });
     builder

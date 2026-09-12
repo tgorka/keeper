@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+chrono = { workspace = true }
 ts-rs = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -82,3 +83,10 @@ base64 = { workspace = true }
 # it drags in neither tauri nor gix, so `check:core-tauri-free` and
 # `check:core-sync-free` stay green. MIT OR Apache-2.0.
 unicode-normalization = { workspace = true }
+# OTLP protobuf wire encoding for the closed consent-gated observability schema.
+# Already resolved via Matrix; no arbitrary tracing subscriber is exported.
+prost = "0.14"
+
+[dev-dependencies]
+# The privacy lifecycle tests observe real localhost connection/cancellation.
+tokio = { workspace = true, features = ["net"] }

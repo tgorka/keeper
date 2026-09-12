@@ -18,8 +18,8 @@ import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stor
 import { useVoiceStore } from "@/lib/stores/voice";
 
 /**
- * The honest disclosure of what the egress list is and the no-telemetry invariant
- * (Story 11.2, NFR-11, UX-DR17; Story 23.7). Sentence case, no exclamation marks
+ * The honest disclosure of the live network policy
+ * (Story 11.2, NFR-11, UX-DR17; Epics 23 and 71). Sentence case, no exclamation marks
  * (project voice).
  *
  * Note the GitHub asset CDN: the update *check* hits github.com (listed), but the
@@ -33,7 +33,7 @@ import { useVoiceStore } from "@/lib/stores/voice";
  * entry. Naming the second input is what makes the row legible as a disclosure.
  */
 const EGRESS_HONESTY_SENTENCE =
-  "These are the servers keeper connects to, computed from your live accounts and folder-sync profiles — nothing else. A folder-sync entry shows the remote's host only, never the repository path or any credential. keeper has no telemetry, analytics, or crash reporting. App-update files are delivered by GitHub's release CDN (githubusercontent.com).";
+  "These are the servers keeper connects to, computed from live accounts, folder-sync profiles, model providers and local observability consent. A folder-sync entry shows only the host, never the repository path or credentials. Optional diagnostics, product statistics and remote configuration are off by default; control them in Diagnostics & studies. App-update files are delivered by GitHub's release CDN (githubusercontent.com).";
 
 /**
  * The honest copy for the signed-update control (Story 11.2, NFR-12). Explains that
@@ -270,21 +270,24 @@ export function AboutSection({ open }: { open: boolean }) {
           setLogPath(null);
         }
       });
-    void egressList()
-      .then((list) => {
-        if (!cancelled) {
-          setEndpoints(list);
-        }
-      })
-      .catch(() => {
-        // A registry read failure renders an honest error line rather than an empty
-        // (and therefore dishonest) list.
-        if (!cancelled) {
-          setEndpoints(null);
-        }
-      });
+    let egressRead = 0;
+    const refreshEgress = () => {
+      const request = ++egressRead;
+      void egressList()
+        .then((list) => {
+          if (!cancelled && request === egressRead) setEndpoints(list);
+        })
+        .catch(() => {
+          if (!cancelled && request === egressRead) setEndpoints(null);
+        });
+    };
+    refreshEgress();
+    const egressTimer = setInterval(refreshEgress, 2_000);
+    window.addEventListener("keeper-telemetry-consent-changed", refreshEgress);
     return () => {
       cancelled = true;
+      clearInterval(egressTimer);
+      window.removeEventListener("keeper-telemetry-consent-changed", refreshEgress);
     };
   }, [open]);
 

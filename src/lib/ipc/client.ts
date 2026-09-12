@@ -22,7 +22,32 @@ import type { LifecyclePhase } from "./gen/LifecyclePhase";
 import type { NavState } from "./gen/NavState";
 import type { NotificationPermission } from "./gen/NotificationPermission";
 import type { NotifyTarget } from "./gen/NotifyTarget";
+import type { TelemetryConsentVm } from "./gen/TelemetryConsentVm";
+import type { TelemetryEventReq } from "./gen/TelemetryEventReq";
+import type { TelemetryRemoteConfigVm } from "./gen/TelemetryRemoteConfigVm";
+import type { TelemetryStatusVm } from "./gen/TelemetryStatusVm";
 import type { TextFileVm } from "./gen/TextFileVm";
+
+export function telemetryStatus(): Promise<TelemetryStatusVm> {
+  return invoke("telemetry_status");
+}
+
+export function telemetryStudyStop(): Promise<void> {
+  return invoke("telemetry_study_stop");
+}
+export type { TelemetryConsentVm, TelemetryEventReq, TelemetryRemoteConfigVm, TelemetryStatusVm };
+
+export function telemetryConsentSet(consent: TelemetryConsentVm): Promise<TelemetryStatusVm> {
+  return invoke("telemetry_consent_set", { consent });
+}
+
+export function telemetryCapture(event: TelemetryEventReq): Promise<void> {
+  return invoke("telemetry_capture", { event });
+}
+
+export function telemetryRemoteConfig(): Promise<TelemetryRemoteConfigVm> {
+  return invoke("telemetry_remote_config");
+}
 
 export type { AccountVm } from "./gen/AccountVm";
 export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";

@@ -22,6 +22,8 @@ jobs:
       - run: bun run lint
       - run: bun run typecheck
       - run: bun run test
+      - name: PostHog provisioning safety (no credentials)
+        run: node --test scripts/posthog/*.test.mjs
 
   rust:
     name: Rust (fmt, clippy, test)
@@ -112,3 +114,11 @@ jobs:
           workspaces: src-tauri
       - run: bun install --frozen-lockfile
       - run: bun run tauri:build -- --no-bundle
+        env:
+          # These are public client values, not PostHog management credentials.
+          KEEPER_POSTHOG_HOST: ${{ vars.KEEPER_POSTHOG_HOST }}
+          KEEPER_POSTHOG_PROJECT_TOKEN: ${{ vars.KEEPER_POSTHOG_PROJECT_TOKEN }}
+          # Synthetic only: exercise accidental management-env embedding without a real key.
+          POSTHOG_PERSONAL_API_KEY: KEEPER_PRIVILEGED_KEY_MUST_NOT_SHIP_71
+      - name: Check public client artifacts for privileged credentials
+        run: bun scripts/check-client-secrets.ts dist src-tauri/target/release/keeper src-tauri/crates/keeper/binaries/keeper-rec-aarch64-apple-darwin

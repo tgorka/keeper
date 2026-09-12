@@ -1,9 +1,14 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { PaletteActionVm, PaletteChatVm, PaletteResultsVm } from "@/lib/ipc/client";
+import type {
+  PaletteActionVm,
+  PaletteChatVm,
+  PaletteResultsVm,
+  TelemetryEventReq,
+} from "@/lib/ipc/client";
 
-// Mock the typed IPC client so the palette never touches Tauri. `paletteQuery` is
-// the only backend call the component makes; the action commands are stubbed so
+// Mock the typed IPC client so the palette never touches Tauri. `paletteQuery`
+// drives queries; telemetry accepts only closed events; action commands are stubbed so
 // dispatch can be asserted without a live backend.
 const paletteQuery = vi.fn();
 const archiveRoom = vi.fn().mockResolvedValue(undefined);
@@ -12,8 +17,10 @@ const incognitoGetGlobal = vi.fn().mockResolvedValue(false);
 const incognitoSetGlobal = vi.fn().mockResolvedValue(undefined);
 const incognitoSetChat = vi.fn().mockResolvedValue(undefined);
 const noop = vi.fn().mockResolvedValue(undefined);
+const telemetryCapture = vi.fn().mockResolvedValue(undefined);
 
 vi.mock("@/lib/ipc/client", () => ({
+  telemetryCapture: (event: TelemetryEventReq) => telemetryCapture(event),
   paletteQuery: (query: string, mode: string, openChat: boolean) =>
     paletteQuery(query, mode, openChat),
   archiveRoom: (a: string, r: string) => archiveRoom(a, r),
@@ -93,6 +100,20 @@ function typeQuery(text: string) {
 }
 
 describe("CommandPalette", () => {
+  it("reports query failure as a fixed category, never the query or raw exception", async () => {
+    paletteQuery.mockRejectedValue(new Error("PRIVATE_EXCEPTION_SENTINEL /Users/private.txt"));
+    render(<CommandPalette />);
+    open();
+    typeQuery("PRIVATE_QUERY_SENTINEL");
+    await waitFor(() =>
+      expect(telemetryCapture).toHaveBeenCalledWith({
+        kind: "frontendError",
+        durationMs: null,
+      }),
+    );
+    expect(JSON.stringify(telemetryCapture.mock.calls)).not.toContain("PRIVATE_");
+  });
+
   it("is closed by default and opens via the store (⌘K path)", () => {
     render(<CommandPalette />);
     expect(screen.queryByRole("combobox")).not.toBeInTheDocument();

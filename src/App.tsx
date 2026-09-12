@@ -13,8 +13,9 @@ import { useNavStatePersistence } from "@/hooks/use-nav-state-persistence";
 import { useNotesOpenNote } from "@/hooks/use-notes-open-note";
 import { useNotifyNavigate } from "@/hooks/use-notify-navigate";
 import { useSessionRestore } from "@/hooks/use-session-restore";
+import { useTelemetryReadiness } from "@/hooks/use-telemetry";
 import { useWebviewGuard } from "@/hooks/use-webview-guard";
-import { encryptionPosture } from "@/lib/ipc/client";
+import { encryptionPosture, telemetryStudyStop } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useAddAccountStore } from "@/lib/stores/add-account";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
@@ -32,6 +33,13 @@ export const NO_ACCOUNT_BOTS_NOTE =
   "Bots needs no Matrix account. You can sign in later from the menu.";
 
 function App() {
+  useEffect(() => {
+    // App is a different document: any former study recorder and its transport are gone.
+    // Retry stale disclosure only here, never before the study's synchronous network fence.
+    void telemetryStudyStop().catch(() => {
+      // Safe overdisclosure if IPC is unavailable; never log an arbitrary IPC error.
+    });
+  }, []);
   // Attempt a one-shot boot session-restore before deciding what to render.
   useSessionRestore();
   // Mirror the Rust-served per-platform capability handshake once at startup
@@ -91,6 +99,7 @@ function App() {
   // Distinguishing "still loading" (undefined) from "unchosen" (null) is
   // load-bearing so the choice never flashes before the posture resolves.
   const [postureChosen, setPostureChosen] = useState<boolean | null | undefined>(undefined);
+  useTelemetryReadiness(hydrated && (hasAccount || postureChosen !== undefined));
   useEffect(() => {
     let cancelled = false;
     void encryptionPosture()

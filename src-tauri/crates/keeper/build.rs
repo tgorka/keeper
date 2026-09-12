@@ -33,6 +33,7 @@
 use std::process::Command;
 
 fn main() {
+    validate_public_observability_config();
     // A FILE beside this script, not only an environment variable: the iOS
     // build reaches `cargo` through an Xcode build phase dispatched into a GUI
     // login session, and an export that survives every hop of that is not
@@ -183,4 +184,38 @@ fn probe_git() -> Option<String> {
     let dirty =
         git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|out| !out.is_empty());
     Some(if dirty { format!("{sha}-dirty") } else { sha })
+}
+
+/// Refuse accidental privileged values BEFORE option_env! can embed them in a
+/// binary. This reads only the two designated public build inputs and never
+/// formats their values, even in errors.
+fn validate_public_observability_config() {
+    println!("cargo:rerun-if-env-changed=KEEPER_POSTHOG_HOST");
+    println!("cargo:rerun-if-env-changed=KEEPER_POSTHOG_PROJECT_TOKEN");
+    let host = std::env::var("KEEPER_POSTHOG_HOST");
+    let token = std::env::var("KEEPER_POSTHOG_PROJECT_TOKEN");
+    if matches!(&host, Err(std::env::VarError::NotPresent))
+        && matches!(&token, Err(std::env::VarError::NotPresent))
+    {
+        return;
+    }
+    let valid = host.ok().zip(token.ok()).is_some_and(|(host, token)| {
+        let Ok(url) = url::Url::parse(&host) else {
+            return false;
+        };
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.path() == "/"
+            && host.len() <= 256
+            && token.starts_with("phc_")
+            && (12..=200).contains(&token.len())
+            && token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    });
+    assert!(valid, "Observability requires an HTTPS origin and a public phc_ project token; supplied values are not shown.");
 }

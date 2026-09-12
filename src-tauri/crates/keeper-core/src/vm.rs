@@ -1506,6 +1506,8 @@ pub enum EgressKind {
     BotProvider,
     /// The signed auto-update endpoint (`plugins.updater.endpoints`).
     Update,
+    /// Opt-in diagnostics, statistics, remote config or an active synthetic study.
+    Telemetry,
 }
 
 /// One network destination keeper contacts, derived from live app state (Story

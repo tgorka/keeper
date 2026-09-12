@@ -4172,6 +4172,7 @@ dependencies = [
  "tracing-subscriber",
  "ts-rs",
  "ulid",
+ "url",
 ]
 
 [[package]]
@@ -4179,6 +4180,7 @@ name = "keeper-core"
 version = "0.8.27"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "flate2",
  "futures-util",
  "globset",
@@ -4187,6 +4189,7 @@ dependencies = [
  "mime",
  "mime_guess",
  "percent-encoding",
+ "prost",
  "qrcode",
  "quick-xml",
  "rand 0.8.6",

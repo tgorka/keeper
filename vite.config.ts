@@ -18,14 +18,17 @@ const host = process.env.TAURI_DEV_HOST;
 const mockShell = {
   name: "keeper-dev-mock-shell",
   apply: "serve" as const,
-  transformIndexHtml: () => [
-    {
-      tag: "script",
-      attrs: { type: "module" },
-      children: 'import { installMockShell } from "/dev/mock-shell.ts"; installMockShell();',
-      injectTo: "head" as const,
-    },
-  ],
+  transformIndexHtml: (_html: string, context: { path: string }) =>
+    context.path === "/study.html"
+      ? []
+      : [
+          {
+            tag: "script",
+            attrs: { type: "module" },
+            children: 'import { installMockShell } from "/dev/mock-shell.ts"; installMockShell();',
+            injectTo: "head" as const,
+          },
+        ],
 };
 
 // https://vite.dev/config/
@@ -38,7 +41,7 @@ export default defineConfig(async () => ({
     },
   },
 
-  // Four entry points, not one (AD-60, AD-185). `index.html` is the app;
+  // Five entry points, not one (AD-60, AD-185). `index.html` is the app;
   // `capture.html` is the quick-capture panel's own document, loaded by the
   // statically declared `quick-capture` window; `voice.html` is the voice
   // pill's, loaded by the window `voice_window.rs` creates when voice is a
@@ -53,6 +56,7 @@ export default defineConfig(async () => ({
         capture: path.resolve(__dirname, "capture.html"),
         print: path.resolve(__dirname, "print.html"),
         voice: path.resolve(__dirname, "voice.html"),
+        study: path.resolve(__dirname, "study.html"),
       },
     },
   },

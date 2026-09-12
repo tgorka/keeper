@@ -70,6 +70,7 @@ import type {
   FilesListingVm,
   FilesReleaseVm,
   GrantScope,
+  HotkeyVm,
   PacedWorkVm,
   SessionSpaceFilesVm,
   SessionSpaceFileVm,
@@ -1203,6 +1204,8 @@ const ANSWERS: Record<string, unknown> = {
   notes_spaces: SPACES,
   notes_tag_tree: { nodes: TAGS },
   notes_templates: [],
+  notes_capture_impact: [],
+  voice_target_speeds: [],
   notes_backlinks: [],
   notes_history: [],
   notes_gallery: { entries: [] },
@@ -2805,6 +2808,41 @@ function voiceIdle(): VoiceStateVm {
 }
 
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  // Browser development never contacts PostHog or exposes a real project token.
+  telemetry_status: () => ({
+    consent: { diagnostics: false, productAnalytics: false, remoteConfig: false },
+    configured: false,
+    host: null,
+    installationId: null,
+  }),
+  telemetry_consent_set: () => {
+    throw new Error("PostHog is not configured in the browser development shell.");
+  },
+  telemetry_capture: () => null,
+  telemetry_remote_config: () => ({ supportMessage: null }),
+  telemetry_study_config: () => null,
+  telemetry_study_preview: () => ({ configured: false, host: null }),
+  telemetry_study_stop: () => null,
+  // The Settings document also mounts these native shortcut rows. Browser
+  // preview cannot register OS shortcuts, but must still return their typed VM.
+  hotkey_get: (): HotkeyVm => ({
+    accelerator: "Control+Alt+Space",
+    isDefault: true,
+    active: false,
+    conflict: null,
+  }),
+  recording_hotkey_get: (): HotkeyVm => ({
+    accelerator: "",
+    isDefault: true,
+    active: false,
+    conflict: null,
+  }),
+  voice_hotkey_get: (): HotkeyVm => ({
+    accelerator: "",
+    isDefault: true,
+    active: false,
+    conflict: null,
+  }),
   // --- Bots (Epic 61, Story 61.4) ----------------------------------------
   //
   // Handlers rather than `ANSWERS` entries for all of them, because the two

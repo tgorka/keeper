@@ -48,6 +48,18 @@ tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 
 development_status:
+  # Epic 71: optional content-free observability; no new hosted server.
+  # Stack publication is reserved for the coordinator by this checkout's rules.
+  epic-71: in-progress
+  71-1-consent-and-destination-honesty: review
+  71-2-bounded-diagnostics-and-traces: review
+  71-3-product-statistics-errors-and-performance: review
+  71-4-maintainer-remote-configuration: review
+  71-5-restricted-usability-studies: review
+  71-6-posthog-project-tooling: review
+  71-7-marketing-and-future-server-contracts: review
+  71-8-ci-security-and-platform-evidence: in-progress
+  epic-71-retrospective: optional
   epic-1: backlog
   1-1-cargo-workspace-split-and-typed-ipc-foundation: done
   1-2-app-shell-three-pane-frame-and-keeper-theme: done
