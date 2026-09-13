@@ -124,12 +124,12 @@ codec: string,
 scalePercent: number, 
 /**
  * Acoustic echo cancellation on the microphone feed (Story 22.7): `true`
- * (the default) runs the mic through macOS's voice-processing unit, whose
- * echo reference is the OUTPUT DEVICE's mix — so what the speakers play
- * stops being re-recorded by the microphone. Costs a mono mic track and
- * non-defeatable voice-band noise suppression. Read at every
- * `recording_start`; the sidecar's `echoCancellation`, emitted only when
- * the mic is on.
+ * runs the mic through macOS's voice-processing unit, whose echo reference
+ * is the OUTPUT DEVICE's mix — so what the speakers play stops being
+ * re-recorded by the microphone. Costs a mono mic track and non-defeatable
+ * voice-band noise suppression, which is why it is OFF by default (owner
+ * decision, 2026-08-05). Read at every `recording_start`; the sidecar's
+ * `echoCancellation`, emitted only when the mic is on.
  */
 echoCancellation: boolean, 
 /**

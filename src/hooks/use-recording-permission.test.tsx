@@ -10,6 +10,10 @@ vi.mock("@/lib/ipc/client", () => ({
   requestCameraPermission: vi.fn(),
   openMicrophoneSettings: vi.fn(),
   openCameraSettings: vi.fn(),
+  // The stored capture answer the mount probe waits for, so the first probe
+  // carries the seeded flags (spec *Recording remembers which sources are on*).
+  recordingCaptureSourcesGet: vi.fn(),
+  recordingCaptureSourcesSet: vi.fn(),
 }));
 
 import {
@@ -22,11 +26,16 @@ import {
   openCameraSettings,
   openMicrophoneSettings,
   openScreenRecordingSettings,
+  recordingCaptureSourcesGet,
   recordingPermission,
   requestCameraPermission,
   requestMicrophonePermission,
   requestScreenRecordingPermission,
 } from "@/lib/ipc/client";
+import {
+  ensureCaptureSourcesHydrated,
+  resetCaptureSourcesForTest,
+} from "@/lib/stores/recording-capture-sources";
 import { resetRecordingMicForTest, setMicEnabled } from "@/lib/stores/recording-mic";
 import { resetRecordingWebcamForTest, setWebcamEnabled } from "@/lib/stores/recording-webcam";
 
@@ -37,6 +46,7 @@ const mockRequestMic = vi.mocked(requestMicrophonePermission);
 const mockRequestCamera = vi.mocked(requestCameraPermission);
 const mockOpenMicSettings = vi.mocked(openMicrophoneSettings);
 const mockOpenCameraSettings = vi.mocked(openCameraSettings);
+const mockCaptureGet = vi.mocked(recordingCaptureSourcesGet);
 
 const GRANTED: RecordingPermissionVm = {
   screenRecording: "granted",
@@ -68,7 +78,7 @@ function ipcRejection() {
   });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   mockFetch.mockReset();
   mockFetch.mockResolvedValue(GRANTED);
   mockRequest.mockReset();
@@ -83,6 +93,15 @@ beforeEach(() => {
   mockOpenMicSettings.mockResolvedValue(undefined);
   mockOpenCameraSettings.mockReset();
   mockOpenCameraSettings.mockResolvedValue(undefined);
+  // The stored answer this hook's mount probe waits for. Pre-hydrated in most
+  // cases so the probe is immediate and the arrangement below is what it reads.
+  mockCaptureGet.mockReset();
+  mockCaptureGet.mockResolvedValue({ systemAudio: true, microphone: true, camera: true });
+  resetCaptureSourcesForTest();
+  // The hook's mount probe waits for the stored capture answer so it spawns one
+  // `keeper-rec`, not two. Resolving it here leaves every case below arranging
+  // the stores directly, as it always did.
+  await ensureCaptureSourcesHydrated();
 });
 
 afterEach(() => {
@@ -104,8 +123,11 @@ describe("useRecordingPermission", () => {
 
     await waitFor(() => expect(result.current.permission).toEqual(GRANTED));
     expect(mockFetch).toHaveBeenCalledTimes(1);
-    // Both sources default off: the probe reports both legs disabled.
-    expect(mockFetch).toHaveBeenCalledWith(false, false);
+    // Both sources are ON by default since 2026-09-13 (spec *Recording
+    // remembers which sources are on*), so the mount probe carries both legs —
+    // which is what makes an ungranted mic or camera show up as a named,
+    // actionable row instead of a silent failure at Start.
+    expect(mockFetch).toHaveBeenCalledWith(true, true);
   });
 
   it("re-detects when the document becomes visible again", async () => {
@@ -178,7 +200,9 @@ describe("useRecordingPermission", () => {
     }
   });
 
-  it("re-fetches with the mic flag when the mic source is toggled on (Story 20.2)", async () => {
+  it("re-fetches with the mic flag when the mic source is toggled (Story 20.2)", async () => {
+    setMicEnabled(false);
+    setWebcamEnabled(false);
     const { result } = renderHook(() => useRecordingPermission());
     await waitFor(() => expect(result.current.permission).toEqual(GRANTED));
     expect(mockFetch).toHaveBeenLastCalledWith(false, false);
@@ -202,6 +226,8 @@ describe("useRecordingPermission", () => {
       camera: "notYetRequested",
       canStart: false,
     };
+    setMicEnabled(false);
+    setWebcamEnabled(false);
     const { result } = renderHook(() => useRecordingPermission());
     await waitFor(() => expect(result.current.permission).toEqual(GRANTED));
 
@@ -224,6 +250,7 @@ describe("useRecordingPermission", () => {
 
   it("request adopts the re-resolved outcome and threads the enabled flags", async () => {
     setMicEnabled(true);
+    setWebcamEnabled(false);
     mockFetch.mockResolvedValue({
       screenRecording: "notYetRequested",
       microphone: "granted",
@@ -324,27 +351,30 @@ describe("useRecordingPermission", () => {
   });
 
   it("a stale in-flight probe never clobbers a newer result", async () => {
-    // First probe resolves slowly to GRANTED; a second, newer probe resolves
+    // One probe resolves slowly to GRANTED; a second, newer one resolves
     // quickly to DENIED. Last-initiated wins: the late GRANTED must be dropped.
+    // Both are taken with `refresh` after the mount probe has settled — the
+    // focus path is coalesced (AD-34-6) and the mount probe waits for the
+    // stored capture answer, so neither is a reliable way to own a token.
+    const { result } = renderHook(() => useRecordingPermission());
+    await waitFor(() => expect(result.current.permission).toEqual(GRANTED));
+
     let releaseSlow!: (vm: RecordingPermissionVm) => void;
     const slow = new Promise<RecordingPermissionVm>((resolve) => {
       releaseSlow = resolve;
     });
+    mockFetch.mockReset();
     mockFetch.mockReturnValueOnce(slow).mockResolvedValue(DENIED);
-
-    const { result } = renderHook(() => useRecordingPermission());
-    // Kick a newer probe while the mount probe is still pending. The focus path is
-    // coalesced (AD-34-6), so `refresh` is the direct way to take a newer token —
-    // token ordering is what this test is about, not the focus schedule.
+    const stale = result.current.refresh();
     await act(async () => {
       await result.current.refresh();
     });
     await waitFor(() => expect(result.current.permission).toEqual(DENIED));
 
-    // The earlier (mount) probe now resolves GRANTED — it must not win.
+    // The earlier probe now resolves GRANTED — it must not win.
     await act(async () => {
       releaseSlow(GRANTED);
-      await slow;
+      await stale;
     });
     expect(result.current.permission).toEqual(DENIED);
   });

@@ -247,6 +247,8 @@ export type { Provider } from "./gen/Provider";
 export type { ProviderKind } from "./gen/ProviderKind";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
 export type { RecordingApplicationVm } from "./gen/RecordingApplicationVm";
+export type { RecordingCaptureSourcesPatchVm } from "./gen/RecordingCaptureSourcesPatchVm";
+export type { RecordingCaptureSourcesVm } from "./gen/RecordingCaptureSourcesVm";
 export type { RecordingDestinationKind } from "./gen/RecordingDestinationKind";
 export type { RecordingDisplayVm } from "./gen/RecordingDisplayVm";
 export type { RecordingDurabilityState } from "./gen/RecordingDurabilityState";
@@ -468,6 +470,8 @@ import type { PacedWorkVm } from "./gen/PacedWorkVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
+import type { RecordingCaptureSourcesPatchVm } from "./gen/RecordingCaptureSourcesPatchVm";
+import type { RecordingCaptureSourcesVm } from "./gen/RecordingCaptureSourcesVm";
 import type { RecordingFilterVm } from "./gen/RecordingFilterVm";
 import type { RecordingHitVm } from "./gen/RecordingHitVm";
 import type { RecordingNoteStubVm } from "./gen/RecordingNoteStubVm";
@@ -2645,6 +2649,34 @@ export async function recoveredSessionAcknowledge(folder: string): Promise<void>
  */
 export async function recordingSettingsGet(): Promise<RecordingSettingsVm> {
   return await invoke<RecordingSettingsVm>("recording_settings_get");
+}
+
+/**
+ * Read which sources the next Recording Session captures (spec *Recording
+ * remembers which sources are on*): system audio, the microphone and the
+ * camera, each default ON and each remembered across launches.
+ *
+ * Its own command rather than three fields on {@link recordingSettingsGet}: the
+ * settings VM is submitted whole, and a whole-VM write settles the DESTINATION
+ * and rebuilds the recordings index — neither of which a capture toggle means.
+ */
+export async function recordingCaptureSourcesGet(): Promise<RecordingCaptureSourcesVm> {
+  return await invoke<RecordingCaptureSourcesVm>("recording_capture_sources_get");
+}
+
+/**
+ * Remember the capture answers this patch carries — exactly the switch that
+ * moved, never the others, whose stored values may not have been read yet — and
+ * resolve the EFFECTIVE triple: what the next read will say. It differs from
+ * what was sent when a config-file layer pins one of the keys, and showing that
+ * answer is what keeps the switch from promising a session that will not happen.
+ *
+ * A running session is unaffected: the sidecar bound its sources at Start.
+ */
+export async function recordingCaptureSourcesSet(
+  sources: RecordingCaptureSourcesPatchVm,
+): Promise<RecordingCaptureSourcesVm> {
+  return await invoke<RecordingCaptureSourcesVm>("recording_capture_sources_set", { sources });
 }
 
 /**

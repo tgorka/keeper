@@ -1,25 +1,27 @@
 /**
- * Webcam selection store (Story 20.1, FR-70, AD-36).
+ * Webcam selection store (Story 20.1, FR-70, AD-36; spec *Recording remembers
+ * which sources are on*).
  *
  * A vanilla zustand store created at module load *outside* React (the
- * `recording-mic.ts` precedent) holding the ephemeral webcam selection for the
- * next Recording Session: whether the webcam source is enabled (default
- * **off** — off-by-default is what makes the lazy-permission contract true:
- * camera permission is requested only when the user enables the source, never
- * preemptively) and which camera to use (`null` = the system default camera,
- * the picker's default). Never persisted to `keeper.db` and never mirrored
- * into Settings → Recording (ephemeral per-session, like the mic). The header
- * Start click reads both values imperatively and threads them through
- * `recording_start` as the new `camera_enabled`/`camera_device_id` params —
- * the sidecar then records `camera-####.mp4` as its own separate file, synced
- * to the screen.
+ * `recording-mic.ts` precedent) holding the webcam selection for the next
+ * Recording Session: whether the webcam source is enabled and which camera to
+ * use (`null` = the system default camera, the picker's default).
+ *
+ * Since 2026-09-13 the ENABLED half mirrors a persisted answer
+ * (`recording.camera`, default **on**), seeded once per launch by
+ * `recording-settings.ts` and written through on every toggle; the CAMERA half
+ * stays per-session, for the same reason the mic's device does. Nothing is
+ * requested from render: a camera that is on without its grant blocks Start and
+ * names itself (Story 20.2). The header Start click reads both values
+ * imperatively and threads them through `recording_start` — the sidecar then
+ * records `camera-####.mp4` as its own separate file, synced to the screen.
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
 import type { RecordingSourcesVm } from "@/lib/ipc/client";
 
 export interface RecordingWebcamState {
-  /** Whether the next session records the webcam (default off). */
+  /** Whether the next session records the webcam (persisted, default on). */
   webcamEnabled: boolean;
   /** The selected camera's id, or `null` for the system default camera. */
   cameraDeviceId: string | null;
@@ -31,7 +33,7 @@ export interface RecordingWebcamState {
 
 /** The vanilla store instance, created once at module load and shared app-wide. */
 export const recordingWebcamStore = createStore<RecordingWebcamState>()((set) => ({
-  webcamEnabled: false,
+  webcamEnabled: true,
   cameraDeviceId: null,
   setWebcamEnabled: (enabled) => set({ webcamEnabled: enabled }),
   setCameraDeviceId: (deviceId) => set({ cameraDeviceId: deviceId }),
@@ -85,7 +87,7 @@ export function isCameraSelectionAvailable(
   return sources.cameras.some((camera) => camera.id === deviceId);
 }
 
-/** Test-only reset: restore the default-off toggle + default camera. */
+/** Test-only reset: restore the default-on toggle + default camera. */
 export function resetRecordingWebcamForTest(): void {
-  recordingWebcamStore.setState({ webcamEnabled: false, cameraDeviceId: null });
+  recordingWebcamStore.setState({ webcamEnabled: true, cameraDeviceId: null });
 }

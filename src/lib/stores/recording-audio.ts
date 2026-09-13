@@ -1,21 +1,22 @@
 /**
- * System-audio toggle store (Story 19.2, FR-69).
+ * System-audio toggle store (Story 19.2, FR-69; spec *Recording remembers which
+ * sources are on*).
  *
  * A vanilla zustand store created at module load *outside* React (the
- * `recording-source.ts` precedent) holding one piece of ephemeral UI state:
- * whether the next Recording Session captures system audio. It defaults to
- * `true` on load ("default on" — the epic's wording; never "remembered") and
- * is never persisted to `keeper.db` and never mirrored into Settings →
- * Recording — DB persistence + Settings mirroring are reserved for
- * segmentation (17.5) and folder/fps (19.5). The header Start click reads the
- * current value imperatively and threads it through `recording_start` as the
- * new `system_audio` param.
+ * `recording-source.ts` precedent) holding whether the next Recording Session
+ * captures system audio. Default **on**, as it always was — what changed on
+ * 2026-09-13 is that the answer is now persisted (`recording.system_audio`):
+ * `recording-settings.ts` seeds this store from Rust once per launch and every
+ * toggle writes through, so turning system audio off survives a relaunch
+ * instead of being forgotten by it. The compile-time default here equals the
+ * Rust default. The header Start click reads the current value imperatively and
+ * threads it through `recording_start` as the `system_audio` param.
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
 
 export interface RecordingAudioState {
-  /** Whether the next session captures system audio (default on). */
+  /** Whether the next session captures system audio (persisted, default on). */
   systemAudioEnabled: boolean;
   /** Set the system-audio toggle. */
   setSystemAudioEnabled: (enabled: boolean) => void;

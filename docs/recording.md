@@ -21,6 +21,39 @@ egress-diff gate in CI), has no telemetry, and writes only where you point it.
 - **Audio only** — pick "Audio only (no video)" as the source to record just
   system audio and/or the microphone into `audio-####.m4a` segments.
 
+## What is on when you open it
+
+All three capture sources start **on** — system audio, the microphone (system
+default input) and the camera (system default camera) — and echo cancellation
+starts **off**. Whatever you change is remembered: the answers live in this
+machine's settings table as `recording.system_audio`, `recording.microphone` and
+`recording.camera`, so a source you turn off stays off through the next launch,
+and through the relaunch an update performs. Which microphone and which camera
+is deliberately *not* remembered — a device id for hardware that is not plugged
+in today would only be reconciled back to the system default anyway.
+
+Owner decision, 2026-09-13. Before it, the microphone and the camera were off on
+every launch and nothing was written down, on the reasoning that off-by-default
+is what makes the permission story lazy (FR-67, AD-36). The half of that story
+that still holds is the one that matters: **keeper never asks the OS for the
+microphone or the camera from a rendered view.** The prompt happens when you
+enable a source by hand, or when you press the permission row's own *Request
+permission*. The cost of the new default is named where it lands: on a Mac that
+has never granted Microphone or Camera access, Start is disabled and says which
+permission is blocking it (see [Permissions](#permissions)) — grant it there, or
+turn that source off once and it will stay off.
+
+Two things to know about what "on" means:
+
+- **An audio-only recording never records the camera.** Picking "Audio only (no
+  video)" as the source drops the camera leg however the Camera switch is set —
+  the card says so, the manifest records `camera: false`, and no camera file is
+  written. The switch stays on for your next screen recording.
+- **A pinned key wins.** These three are ordinary settings keys, so a
+  `keeper.toml` / `config.json` layer can pin one (`"recording.camera" = false`).
+  When it does, the switch takes the effective answer straight back — it will
+  refuse to move rather than promise a session that will not happen.
+
 ## Audio processing
 
 **Echo cancellation** (**off by default**, under the microphone picker) stops the
@@ -346,7 +379,9 @@ Known recording keys: `recording.codec` (`h264` | `hevc`),
 (absolute path), `recording.path_template` (template string — one that does
 not parse degrades to the default on read), `recording.echo_cancellation`
 (bool, **default false** — only a stored `"1"`/`true` turns it on),
-`debug.mode` (bool).
+`recording.system_audio`, `recording.microphone`, `recording.camera` (bool,
+**default true** each — a stored `"0"`/`false` is what turns a source off, and
+anything else reads as the default), `debug.mode` (bool).
 
 ## Out of scope (honest verdicts)
 

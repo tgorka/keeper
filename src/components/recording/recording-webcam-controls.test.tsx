@@ -7,6 +7,10 @@ vi.mock("@/lib/ipc/client", () => ({
   // Imported by the recording-source store module (not called here — the
   // Webcam card never polls; the Source card owns the poll).
   listRecordingSources: vi.fn(),
+  // The toggle is remembered now (spec *Recording remembers which sources are
+  // on*): every flip writes through its own narrow command pair.
+  recordingCaptureSourcesGet: vi.fn(),
+  recordingCaptureSourcesSet: vi.fn(),
 }));
 
 import {
@@ -15,25 +19,67 @@ import {
   CAMERA_PERMISSION_DENIED_NOTE,
   CAMERA_PERMISSION_GRANTED_NOTE,
   RecordingWebcamControls,
+  WEBCAM_AUDIO_ONLY_NOTE,
   WEBCAM_CAPTION,
   WEBCAM_DISCLOSURE,
   WEBCAM_OFF_NOTE,
   WEBCAM_SWITCH_TESTID,
 } from "@/components/recording/recording-webcam-controls";
-import { requestCameraPermission } from "@/lib/ipc/client";
-import { recordingSourceStore, resetRecordingSourceForTest } from "@/lib/stores/recording-source";
+import {
+  type RecordingCaptureSourcesVm,
+  recordingCaptureSourcesGet,
+  recordingCaptureSourcesSet,
+  requestCameraPermission,
+} from "@/lib/ipc/client";
+import { resetCaptureSourcesForTest } from "@/lib/stores/recording-capture-sources";
+import {
+  recordingSourceStore,
+  resetRecordingSourceForTest,
+  selectRecordingTarget,
+} from "@/lib/stores/recording-source";
 import {
   cameraDeviceId,
   resetRecordingWebcamForTest,
   setCameraDeviceId,
+  setWebcamEnabled,
   webcamEnabled,
 } from "@/lib/stores/recording-webcam";
 
 const mockRequestCamera = vi.mocked(requestCameraPermission);
+const mockCaptureGet = vi.mocked(recordingCaptureSourcesGet);
+const mockCaptureSet = vi.mocked(recordingCaptureSourcesSet);
+
+/** What a fresh install stores: every source on. */
+const ALL_SOURCES_ON: RecordingCaptureSourcesVm = {
+  systemAudio: true,
+  microphone: true,
+  camera: true,
+};
+
+/**
+ * Render with the camera off — the arrangement every "enabling it" case needs
+ * now that the shipped default is ON (spec *Recording remembers which sources
+ * are on*). Turning it off through the store, not the switch, so the click
+ * under test is the first one the permission request can see.
+ */
+function renderWithCameraOff() {
+  act(() => setWebcamEnabled(false));
+  render(<RecordingWebcamControls />);
+  return screen.getByTestId(WEBCAM_SWITCH_TESTID);
+}
 
 beforeEach(() => {
   mockRequestCamera.mockReset();
   mockRequestCamera.mockResolvedValue("granted");
+  mockCaptureGet.mockReset();
+  mockCaptureGet.mockResolvedValue(ALL_SOURCES_ON);
+  mockCaptureSet.mockReset();
+  mockCaptureSet.mockImplementation(async (patch) => ({
+    systemAudio: patch.systemAudio ?? ALL_SOURCES_ON.systemAudio,
+    microphone: patch.microphone ?? ALL_SOURCES_ON.microphone,
+    camera: patch.camera ?? ALL_SOURCES_ON.camera,
+  }));
+  resetCaptureSourcesForTest();
 });
 
 afterEach(() => {
@@ -43,20 +89,51 @@ afterEach(() => {
 });
 
 describe("RecordingWebcamControls", () => {
-  it("renders the webcam switch OFF by default and requests no permission on render", () => {
+  it("renders the webcam switch ON by default and requests no permission on render", () => {
+    // On by default since 2026-09-13 (spec *Recording remembers which sources
+    // are on*). The half of AD-36 that survives is asserted right here: a
+    // source that is on at first paint still prompts for nothing — the OS
+    // prompt is bound to an explicit enable, and an ungranted camera is Start's
+    // problem to name (Story 20.2), not a dialog nobody asked for.
     render(<RecordingWebcamControls />);
 
     const toggle = screen.getByTestId(WEBCAM_SWITCH_TESTID);
-    expect(toggle).toHaveAttribute("aria-checked", "false");
-    expect(webcamEnabled()).toBe(false);
-    // The lazy-permission contract (FR-70, AD-36): nothing fires on render.
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(webcamEnabled()).toBe(true);
     expect(mockRequestCamera).not.toHaveBeenCalled();
     // The separate-file framing is always visible (FR-70).
     expect(screen.getByText(WEBCAM_CAPTION)).toBeInTheDocument();
   });
 
-  it("greys the camera picker with the helper caption while the webcam is off", () => {
+  it("turning the webcam off is remembered, and requests nothing", async () => {
     render(<RecordingWebcamControls />);
+
+    fireEvent.click(screen.getByTestId(WEBCAM_SWITCH_TESTID));
+
+    expect(webcamEnabled()).toBe(false);
+    expect(mockRequestCamera).not.toHaveBeenCalled();
+    // The write is what makes the next launch agree with the switch — the
+    // whole point of the change: before it, this choice died with the process.
+    await waitFor(() =>
+      expect(mockCaptureSet).toHaveBeenCalledWith(expect.objectContaining({ camera: false })),
+    );
+  });
+
+  it("says an audio-only recording records no camera", () => {
+    // The camera is ON by default now, so "Audio only" plus an untouched card
+    // is an ordinary path — and `recording_start` drops the camera leg for that
+    // target. A card still promising a separate camera file would be claiming a
+    // file nobody writes.
+    selectRecordingTarget({ kind: "audioOnly" });
+    render(<RecordingWebcamControls />);
+
+    expect(webcamEnabled()).toBe(true);
+    expect(screen.getByText(WEBCAM_AUDIO_ONLY_NOTE)).toBeInTheDocument();
+    expect(screen.queryByText(WEBCAM_DISCLOSURE)).not.toBeInTheDocument();
+  });
+
+  it("greys the camera picker with the helper caption while the webcam is off", () => {
+    renderWithCameraOff();
 
     const picker = screen.getByTestId(CAMERA_DEVICE_SELECT_TESTID);
     expect(picker).toBeDisabled();
@@ -69,7 +146,7 @@ describe("RecordingWebcamControls", () => {
   });
 
   it("enabling the webcam requests permission exactly once and shows the granted caption", async () => {
-    render(<RecordingWebcamControls />);
+    renderWithCameraOff();
 
     fireEvent.click(screen.getByTestId(WEBCAM_SWITCH_TESTID));
 
@@ -85,7 +162,7 @@ describe("RecordingWebcamControls", () => {
 
   it("a denied permission surfaces the honest denied caption (Start blocked, fix path named)", async () => {
     mockRequestCamera.mockResolvedValue("denied");
-    render(<RecordingWebcamControls />);
+    renderWithCameraOff();
 
     fireEvent.click(screen.getByTestId(WEBCAM_SWITCH_TESTID));
 
@@ -103,7 +180,7 @@ describe("RecordingWebcamControls", () => {
     mockRequestCamera
       .mockImplementationOnce(() => new Promise((resolve) => (resolveA = resolve)))
       .mockImplementationOnce(() => new Promise((resolve) => (resolveB = resolve)));
-    render(<RecordingWebcamControls />);
+    renderWithCameraOff();
 
     const toggle = screen.getByTestId(WEBCAM_SWITCH_TESTID);
     fireEvent.click(toggle); // enable → request A in flight
@@ -124,7 +201,7 @@ describe("RecordingWebcamControls", () => {
 
   it("a failed permission round-trip makes no claim either way", async () => {
     mockRequestCamera.mockRejectedValue({ message: "keeper-rec did not answer" });
-    render(<RecordingWebcamControls />);
+    renderWithCameraOff();
 
     fireEvent.click(screen.getByTestId(WEBCAM_SWITCH_TESTID));
 
@@ -134,7 +211,7 @@ describe("RecordingWebcamControls", () => {
   });
 
   it("disabling the webcam restores the off note and never re-requests", async () => {
-    render(<RecordingWebcamControls />);
+    renderWithCameraOff();
 
     const toggle = screen.getByTestId(WEBCAM_SWITCH_TESTID);
     fireEvent.click(toggle);
@@ -159,7 +236,7 @@ describe("RecordingWebcamControls", () => {
     });
     render(<RecordingWebcamControls />);
 
-    fireEvent.click(screen.getByTestId(WEBCAM_SWITCH_TESTID));
+    // The camera is on by default now, so the picker is live without a click.
     const picker = screen.getByTestId(CAMERA_DEVICE_SELECT_TESTID);
     expect(picker).toBeEnabled();
     // The default remains selected until the user picks a device; the

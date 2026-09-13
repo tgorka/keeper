@@ -21,6 +21,7 @@
  * swallowed to the safe default — Start stays disabled and no row claims a
  * grant — never a crash, never an infinite spinner.
  */
+
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RecordingPermissionVm } from "@/lib/ipc/client";
 import {
@@ -32,6 +33,7 @@ import {
   requestMicrophonePermission,
   requestScreenRecordingPermission,
 } from "@/lib/ipc/client";
+import { ensureCaptureSourcesHydrated } from "@/lib/stores/recording-capture-sources";
 import { micEnabled as isMicEnabledNow, useMicEnabled } from "@/lib/stores/recording-mic";
 import {
   webcamEnabled as isWebcamEnabledNow,
@@ -194,9 +196,16 @@ export function useRecordingPermission(): UseRecordingPermission {
     // `RETURN_PROBE_COALESCE_MS` window collapses the pair (and any
     // focus/blur burst) into a single probe that lands after the click, which is
     // imperceptible against the seconds a real System Settings round-trip takes.
-    // The mount probe stays immediate — nothing is pending to coalesce with, and
-    // the rows must not render "not requested" any longer than necessary.
-    void refresh();
+    // The mount probe waits for one thing only: the stored answer for which
+    // sources are on (spec *Recording remembers which sources are on*). It
+    // seeds the two stores this effect's sibling watches, so probing before it
+    // lands would spawn one `keeper-rec` for the shipped defaults and a second
+    // for the real answer, on every launch of a machine that turned a source
+    // off. The read never rejects and is deduped app-wide, so this costs one
+    // IPC hop and no extra process.
+    void ensureCaptureSourcesHydrated().finally(() => {
+      void refresh();
+    });
     let queued = 0;
     const probeOnReturn = (): void => {
       const token = ++queued;

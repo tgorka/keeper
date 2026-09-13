@@ -1096,6 +1096,8 @@ pub fn run() {
                 ipc::recording_status,
                 ipc::recording_acknowledge,
                 ipc::recording_settings_get,
+                ipc::recording_capture_sources_get,
+                ipc::recording_capture_sources_set,
                 ipc::recording_path_preview,
                 ipc::recording_destination_profiles,
                 ipc::sync_list_settings_get,

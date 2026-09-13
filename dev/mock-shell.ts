@@ -72,6 +72,8 @@ import type {
   GrantScope,
   HotkeyVm,
   PacedWorkVm,
+  RecordingCaptureSourcesVm,
+  RecordingSettingsVm,
   SessionSpaceFilesVm,
   SessionSpaceFileVm,
   SessionSpaceVm,
@@ -1414,16 +1416,6 @@ const ANSWERS: Record<string, unknown> = {
     virtualPaths: 118,
     problems: [],
   } satisfies SyncVerifyVm,
-  recording_settings_get: {
-    codec: "hevc",
-    fps: 60,
-    scalePercent: 100,
-    segmentMb: 250,
-    durationCapMinutes: 60,
-    destinationDir: "/Volumes/merope/tgdrive/recordings",
-    pathTemplate: "{yyyy}/{yyyy}-{mm}-{dd} {HH}{MM} {slug}",
-    echoCancellation: true,
-  },
   notes_capture_windows: [],
   // Sessions. Until now this whole feature fell through to `fallback`, which
   // answers `null` for `sessions_detail` and blanks the pane — so the one
@@ -2747,6 +2739,46 @@ let botMessageDetails = false;
 let firstRunSetupSkipped = false;
 
 /**
+ * The effective recording settings, held in a `let` so a write lands somewhere.
+ * Not a disk: a page reload starts from these values again.
+ */
+let recordingSettings: RecordingSettingsVm = {
+  codec: "hevc",
+  fps: 60,
+  scalePercent: 100,
+  segmentMb: 250,
+  durationCapMinutes: 60,
+  destinationDir: "/Volumes/merope/tgdrive/recordings",
+  destinationKind: "folder",
+  destinationProfileId: null,
+  destinationProfileName: null,
+  destinationVolume: null,
+  pathTemplate: "{yyyy}/{yyyy}-{mm}-{dd} {HH}{MM} {slug}",
+  echoCancellation: false,
+};
+
+/**
+ * Which sources the next session captures (spec *Recording remembers which
+ * sources are on*), in `sessionStorage` so the manual check the spec asks for —
+ * turn one off, reload, it is still off — actually reproduces here. All three
+ * ship ON, as the registry defaults do, so a first visit shows what a fresh
+ * install shows.
+ */
+const CAPTURE_SOURCES_KEY = "keeper.mock-shell.captureSources";
+
+function loadCaptureSources(): RecordingCaptureSourcesVm {
+  const shipped: RecordingCaptureSourcesVm = { systemAudio: true, microphone: true, camera: true };
+  try {
+    const stored = sessionStorage.getItem(CAPTURE_SOURCES_KEY);
+    return stored === null ? shipped : { ...shipped, ...JSON.parse(stored) };
+  } catch {
+    return shipped;
+  }
+}
+
+let captureSources: RecordingCaptureSourcesVm = loadCaptureSources();
+
+/**
  * Which languages the faked device can recognise on-device (Epic 63): three
  * states, chosen with `?voice=many|one|none` on the dev URL, because the
  * surface has to be looked at in each — a list to choose from, a list of one,
@@ -3174,6 +3206,33 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   first_run_setup_skipped_set: (payload) => {
     firstRunSetupSkipped = payload.skipped === true;
     return null;
+  },
+  // --- Recording settings ---------------------------------------------------
+  //
+  // Handlers over a module-level object rather than an `ANSWERS` row, so a write
+  // lands somewhere and the mirror store's confirm path is exercised: the set
+  // echoes the effective VM, exactly as the Rust command does.
+  recording_settings_get: () => recordingSettings,
+  recording_settings_set: (payload) => {
+    const next = payload.settings as Partial<typeof recordingSettings> | undefined;
+    recordingSettings = { ...recordingSettings, ...(next ?? {}) };
+    return recordingSettings;
+  },
+  // --- Capture sources (spec *Recording remembers which sources are on*) -----
+  //
+  // The whole point being looked at here is that the switches REMEMBER, so this
+  // pair survives a reload via `sessionStorage` — a handler that answered the
+  // same triple every time would show exactly the bug the spec ends.
+  recording_capture_sources_get: () => captureSources,
+  recording_capture_sources_set: (payload) => {
+    const next = payload.sources as Partial<RecordingCaptureSourcesVm> | undefined;
+    captureSources = { ...captureSources, ...(next ?? {}) };
+    try {
+      sessionStorage.setItem(CAPTURE_SOURCES_KEY, JSON.stringify(captureSources));
+    } catch {
+      // A harness that cannot write still answers honestly for this page.
+    }
+    return captureSources;
   },
   // --- Voice (Epic 62, Story 62.5) ----------------------------------------
   voice_availability: () => voiceUnavailable(),
