@@ -10,28 +10,32 @@
  * is off, an honest line replaces the "separate track" note: the recording
  * will have no content audio.
  *
- * The mic row (Story 19.3) is a `Switch` (default **off**) plus a device
- * `Select` with "System default input" always the first/default option and
- * each enumerated input device below it; the picker is disabled/greyed with a
- * helper caption while the mic is off. Enabling the Switch is the one trigger
- * for the lazy microphone permission request (`request_microphone_permission`
- * — never requested preemptively, never on render), and the outcome surfaces
+ * The mic row (Story 19.3) is a `Switch` (default **on** since 2026-09-13) plus
+ * a device `Select` with "System default input" always the first/default option
+ * and each enumerated input device below it; the picker is disabled/greyed with
+ * a helper caption while the mic is off. Enabling the Switch by hand is the one
+ * trigger for the lazy microphone permission request
+ * (`request_microphone_permission` — never requested preemptively, never on
+ * render, and never by the switch merely STARTING on), and the outcome surfaces
  * as an honest inline caption: granted → the voice records as its own track;
  * denied → Start is blocked while the mic stays enabled (Story 20.2 — the
  * pre-flight row names it), with the System Settings fix path.
  *
- * Those two rows are bound to ephemeral stores ({@link recording-audio.ts},
- * {@link recording-mic.ts}) — per-session, never persisted, never mirrored
- * into Settings → Recording. Destination/fps (19.5) stay out of scope.
+ * Whether those two rows are on is REMEMBERED (spec *Recording remembers which
+ * sources are on*): the session stores they bind to
+ * ({@link recording-audio.ts}, {@link recording-mic.ts}) are seeded once per
+ * launch from `recording_capture_sources_get` and written back on every toggle
+ * through {@link recording-capture-sources.ts}. The mic DEVICE stays
+ * per-session. Destination/fps (19.5) stay out of scope.
  *
- * The Echo cancellation row (Story 22.7) is the one exception: a PERSISTED
- * setting on the shared `recording-settings` mirror, default **on**, sitting
- * under the device picker because it is a property of the mic feed. It states
- * both costs plainly (a mono mic track, non-defeatable voice-band noise
- * suppression) and that it applies to the next Recording Session — the sidecar
- * binds the voice-processing unit once, at Start. It greys out until hydration
- * lands, while the mic is off, and while the card is not `active` (a live
- * session already bound its processor, and the setter rejects a change).
+ * The Echo cancellation row (Story 22.7) is the one row on the shared
+ * `recording-settings` mirror, default **off**, sitting under the device picker
+ * because it is a property of the mic feed. It states both costs plainly (a mono
+ * mic track, non-defeatable voice-band noise suppression) and that it applies to
+ * the next Recording Session — the sidecar binds the voice-processing unit once,
+ * at Start. It greys out until hydration lands, while the mic is off, and while
+ * the card is not `active` (a live session already bound its processor, and the
+ * setter rejects a change).
  */
 import { useEffect, useRef, useState } from "react";
 import { Label } from "@/components/ui/label";
@@ -45,6 +49,10 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { requestMicrophonePermission, type TccPermission } from "@/lib/ipc/client";
 import { setSystemAudioEnabled, useSystemAudioEnabled } from "@/lib/stores/recording-audio";
+import {
+  ensureCaptureSourcesHydrated,
+  persistCaptureSources,
+} from "@/lib/stores/recording-capture-sources";
 import {
   isMicSelectionAvailable,
   setMicDeviceId,
@@ -159,6 +167,10 @@ export function RecordingAudioControls({
   const settings = useRecordingSettings();
   useEffect(() => {
     void ensureRecordingSettingsHydrated();
+    // Which sources are on is a persisted answer too, read once per launch and
+    // seeded into the three session stores (spec *Recording remembers which
+    // sources are on*).
+    void ensureCaptureSourcesHydrated();
   }, []);
 
   // Pre-Start reconciliation (Story 19.4): a specifically-selected mic that
@@ -185,8 +197,20 @@ export function RecordingAudioControls({
   // caption for the current state (rapid on→off→on fires overlapping requests).
   const micRequestSeq = useRef(0);
 
+  /**
+   * The system-audio switch: move the session store, then remember it (spec
+   * *Recording remembers which sources are on*). The store moves first so the
+   * switch never waits on IPC; the write is best-effort and takes Rust's
+   * effective answer back, so a key a config file pins visibly refuses to move.
+   */
+  const onSystemAudioToggle = (checked: boolean) => {
+    setSystemAudioEnabled(checked);
+    void persistCaptureSources({ systemAudio: checked });
+  };
+
   const onMicToggle = (checked: boolean) => {
     setMicEnabled(checked);
+    void persistCaptureSources({ microphone: checked });
     const requestId = micRequestSeq.current + 1;
     micRequestSeq.current = requestId;
     if (checked) {
@@ -245,7 +269,7 @@ export function RecordingAudioControls({
           id="system-audio-toggle"
           data-testid={SYSTEM_AUDIO_SWITCH_TESTID}
           checked={enabled}
-          onCheckedChange={setSystemAudioEnabled}
+          onCheckedChange={onSystemAudioToggle}
         />
       </div>
       {enabled ? (
@@ -254,9 +278,10 @@ export function RecordingAudioControls({
         <p className="text-muted-foreground text-xs">{SYSTEM_AUDIO_OFF_NOTE}</p>
       )}
 
-      {/* The microphone row (Story 19.3): Switch (default off) + device picker
-          ("System default input" first). Off is the honest default — enabling
-          is what triggers the one lazy permission request. */}
+      {/* The microphone row (Story 19.3): Switch (default on since 2026-09-13,
+          and remembered) + device picker ("System default input" first).
+          Enabling by hand is still the one trigger for the permission request;
+          nothing is requested from render. */}
       <div className="flex items-center justify-between gap-4 border-border border-t pt-4">
         <div className="flex flex-col gap-0.5">
           <Label htmlFor="mic-toggle">{MIC_LABEL}</Label>

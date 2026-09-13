@@ -117,6 +117,9 @@ export async function ensureRecordingSettingsHydrated(): Promise<void> {
         lastConfirmed = vm;
         recordingSettingsStore.getState().setSettings(vm);
       }
+      // The capture switches are NOT seeded here: which sources are on is its
+      // own command and its own module (`recording-capture-sources.ts`), so a
+      // toggle never rides along on a whole-VM write.
     })
     .catch(() => {
       // Allow a later retry rather than caching the failure forever.

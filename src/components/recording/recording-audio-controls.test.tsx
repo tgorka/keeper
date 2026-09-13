@@ -11,6 +11,11 @@ vi.mock("@/lib/ipc/client", () => ({
   // from and commits through (the shared recording-settings mirror).
   recordingSettingsGet: vi.fn(),
   recordingSettingsSet: vi.fn(),
+  // Which sources are on (spec *Recording remembers which sources are on*):
+  // its own command pair, so a capture toggle never rides along on a whole-VM
+  // settings write.
+  recordingCaptureSourcesGet: vi.fn(),
+  recordingCaptureSourcesSet: vi.fn(),
 }));
 
 import {
@@ -27,6 +32,8 @@ import {
 } from "@/components/recording/recording-audio-controls";
 import {
   type RecordingSettingsVm,
+  recordingCaptureSourcesGet,
+  recordingCaptureSourcesSet,
   recordingSettingsGet,
   recordingSettingsSet,
   requestMicrophonePermission,
@@ -37,6 +44,7 @@ import {
   micEnabled,
   resetRecordingMicForTest,
   setMicDeviceId,
+  setMicEnabled,
 } from "@/lib/stores/recording-mic";
 import { resetRecordingSettingsForTest } from "@/lib/stores/recording-settings";
 import { recordingSourceStore, resetRecordingSourceForTest } from "@/lib/stores/recording-source";
@@ -44,6 +52,11 @@ import { recordingSourceStore, resetRecordingSourceForTest } from "@/lib/stores/
 const mockRequestMic = vi.mocked(requestMicrophonePermission);
 const mockSettingsGet = vi.mocked(recordingSettingsGet);
 const mockSettingsSet = vi.mocked(recordingSettingsSet);
+const mockCaptureGet = vi.mocked(recordingCaptureSourcesGet);
+const mockCaptureSet = vi.mocked(recordingCaptureSourcesSet);
+
+/** What a fresh install stores: every source on. */
+const ALL_SOURCES_ON = { systemAudio: true, microphone: true, camera: true };
 
 /** The effective VM a fresh install reads — echo cancellation ON (Story 22.7). */
 const DEFAULT_SETTINGS: RecordingSettingsVm = {
@@ -61,6 +74,17 @@ const DEFAULT_SETTINGS: RecordingSettingsVm = {
   pathTemplate: "{yyyy}/{yyyy}-{mm}-{dd} {HH}{MM} {slug}",
 };
 
+/**
+ * Render with the microphone off — the arrangement every "enabling it" case
+ * needs now that the shipped default is ON (spec *Recording remembers which
+ * sources are on*). Turned off through the store, so the click under test is the
+ * first one the permission request can see.
+ */
+function renderWithMicOff() {
+  act(() => setMicEnabled(false));
+  render(<RecordingAudioControls />);
+}
+
 beforeEach(() => {
   mockRequestMic.mockReset();
   mockRequestMic.mockResolvedValue("granted");
@@ -68,6 +92,14 @@ beforeEach(() => {
   mockSettingsGet.mockResolvedValue(DEFAULT_SETTINGS);
   mockSettingsSet.mockReset();
   mockSettingsSet.mockImplementation(async (settings) => settings);
+  mockCaptureGet.mockReset();
+  mockCaptureGet.mockResolvedValue(ALL_SOURCES_ON);
+  mockCaptureSet.mockReset();
+  mockCaptureSet.mockImplementation(async (patch) => ({
+    systemAudio: patch.systemAudio ?? ALL_SOURCES_ON.systemAudio,
+    microphone: patch.microphone ?? ALL_SOURCES_ON.microphone,
+    camera: patch.camera ?? ALL_SOURCES_ON.camera,
+  }));
 });
 
 afterEach(() => {
@@ -96,13 +128,17 @@ describe("RecordingAudioControls", () => {
     expect(screen.queryByText(/no content audio/)).not.toBeInTheDocument();
   });
 
-  it("turning the switch off updates the store and shows the honest off-state line", () => {
+  it("turning the switch off updates the store, remembers it, and shows the off-state line", async () => {
     render(<RecordingAudioControls />);
 
     const toggle = screen.getByTestId("system-audio-switch");
     fireEvent.click(toggle);
 
     expect(systemAudioEnabled()).toBe(false);
+    // Remembered, not just toggled (spec *Recording remembers which sources are on*).
+    await waitFor(() =>
+      expect(mockCaptureSet).toHaveBeenCalledWith(expect.objectContaining({ systemAudio: false })),
+    );
     expect(
       screen.getByText("System audio is off. The recording will have no content audio."),
     ).toBeInTheDocument();
@@ -124,18 +160,33 @@ describe("RecordingAudioControls", () => {
 
   // --- The microphone row (Story 19.3) ------------------------------------
 
-  it("renders the mic switch OFF by default and requests no permission on render", () => {
+  it("renders the mic switch ON by default and requests no permission on render", () => {
+    // On by default since 2026-09-13 (spec *Recording remembers which sources
+    // are on*). The surviving half of AD-36 is asserted here: a source that is
+    // on at first paint still prompts for nothing — the OS prompt is bound to
+    // an explicit enable, and an ungranted mic is Start's to name (Story 20.2).
     render(<RecordingAudioControls />);
 
     const toggle = screen.getByTestId(MIC_SWITCH_TESTID);
-    expect(toggle).toHaveAttribute("aria-checked", "false");
-    expect(micEnabled()).toBe(false);
-    // The lazy-permission contract (FR-69, AD-36): nothing fires on render.
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(micEnabled()).toBe(true);
     expect(mockRequestMic).not.toHaveBeenCalled();
   });
 
-  it("greys the device picker with the helper caption while the mic is off", () => {
+  it("turning the mic off is remembered, and requests nothing", async () => {
     render(<RecordingAudioControls />);
+
+    fireEvent.click(screen.getByTestId(MIC_SWITCH_TESTID));
+
+    expect(micEnabled()).toBe(false);
+    expect(mockRequestMic).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(mockCaptureSet).toHaveBeenCalledWith(expect.objectContaining({ microphone: false })),
+    );
+  });
+
+  it("greys the device picker with the helper caption while the mic is off", () => {
+    renderWithMicOff();
 
     const picker = screen.getByTestId(MIC_DEVICE_SELECT_TESTID);
     expect(picker).toBeDisabled();
@@ -146,7 +197,7 @@ describe("RecordingAudioControls", () => {
   });
 
   it("enabling the mic requests permission exactly once and shows the granted caption", async () => {
-    render(<RecordingAudioControls />);
+    renderWithMicOff();
 
     fireEvent.click(screen.getByTestId(MIC_SWITCH_TESTID));
 
@@ -160,7 +211,7 @@ describe("RecordingAudioControls", () => {
 
   it("a denied permission surfaces the honest denied caption (Start blocked, fix path named)", async () => {
     mockRequestMic.mockResolvedValue("denied");
-    render(<RecordingAudioControls />);
+    renderWithMicOff();
 
     fireEvent.click(screen.getByTestId(MIC_SWITCH_TESTID));
 
@@ -178,7 +229,7 @@ describe("RecordingAudioControls", () => {
     mockRequestMic
       .mockImplementationOnce(() => new Promise((resolve) => (resolveA = resolve)))
       .mockImplementationOnce(() => new Promise((resolve) => (resolveB = resolve)));
-    render(<RecordingAudioControls />);
+    renderWithMicOff();
 
     const toggle = screen.getByTestId(MIC_SWITCH_TESTID);
     fireEvent.click(toggle); // enable → request A in flight
@@ -199,7 +250,7 @@ describe("RecordingAudioControls", () => {
 
   it("a failed permission round-trip makes no claim either way", async () => {
     mockRequestMic.mockRejectedValue({ message: "keeper-rec did not answer" });
-    render(<RecordingAudioControls />);
+    renderWithMicOff();
 
     fireEvent.click(screen.getByTestId(MIC_SWITCH_TESTID));
 
@@ -209,7 +260,7 @@ describe("RecordingAudioControls", () => {
   });
 
   it("disabling the mic restores the off note and never re-requests", async () => {
-    render(<RecordingAudioControls />);
+    renderWithMicOff();
 
     const toggle = screen.getByTestId(MIC_SWITCH_TESTID);
     fireEvent.click(toggle);
@@ -233,7 +284,7 @@ describe("RecordingAudioControls", () => {
     });
     render(<RecordingAudioControls />);
 
-    fireEvent.click(screen.getByTestId(MIC_SWITCH_TESTID));
+    // The mic is on by default now, so the picker is live without a click.
     const picker = screen.getByTestId(MIC_DEVICE_SELECT_TESTID);
     expect(picker).toBeEnabled();
     // The default remains selected until the user picks a device; the
@@ -254,7 +305,7 @@ describe("RecordingAudioControls", () => {
       cameras: [],
     });
     setMicDeviceId("X");
-    render(<RecordingAudioControls />);
+    renderWithMicOff();
     // While the device is still enumerated the selection stays.
     expect(micDeviceId()).toBe("X");
 
@@ -289,8 +340,9 @@ describe("RecordingAudioControls", () => {
   /** Render with the mic enabled and the persisted settings hydrated — the
    * only state in which the echo-cancellation switch is interactive. */
   async function renderWithLiveMic(active = true) {
+    // The mic is on by default now, so no click is needed to make the
+    // echo-cancellation switch interactive.
     render(<RecordingAudioControls active={active} />);
-    fireEvent.click(screen.getByTestId(MIC_SWITCH_TESTID));
     await waitFor(() => expect(mockSettingsGet).toHaveBeenCalled());
     const toggle = screen.getByTestId(ECHO_CANCELLATION_SWITCH_TESTID);
     return toggle;

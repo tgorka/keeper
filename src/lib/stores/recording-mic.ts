@@ -1,25 +1,35 @@
 /**
- * Microphone selection store (Story 19.3, FR-69, AD-36).
+ * Microphone selection store (Story 19.3, FR-69, AD-36; spec *Recording
+ * remembers which sources are on*).
  *
  * A vanilla zustand store created at module load *outside* React (the
- * `recording-audio.ts` precedent) holding the ephemeral mic selection for the
- * next Recording Session: whether the mic source is enabled (default **off** —
- * off-by-default is what makes the lazy-permission contract true: microphone
- * permission is requested only when the user enables the source, never
- * preemptively) and which input device to use (`null` = the system default
- * input, the picker's default). Never persisted to `keeper.db` and never
- * mirrored into Settings → Recording — DB persistence + Settings mirroring are
- * reserved for segmentation (17.5) and folder/fps (19.5). The header Start
- * click reads both values imperatively and threads them through
- * `recording_start` as the new `microphone_enabled`/`microphone_device_id`
- * params.
+ * `recording-audio.ts` precedent) holding the mic selection for the next
+ * Recording Session: whether the mic source is enabled and which input device
+ * to use (`null` = the system default input, the picker's default).
+ *
+ * Since 2026-09-13 the ENABLED half is a mirror of a persisted answer
+ * (`recording.microphone`, default **on**): `recording-settings.ts` seeds it
+ * from Rust once per launch and every toggle writes through, because a choice
+ * thrown away by the next relaunch is the report this changed. The compile-time
+ * default here equals the Rust default, so a start that happens before the
+ * first read lands still captures what the shipped default promises.
+ *
+ * The DEVICE half stays per-session and is never persisted: a remembered id for
+ * hardware that is not plugged in today is reconciled away at the next
+ * enumeration anyway (see {@link isMicSelectionAvailable}).
+ *
+ * Off no longer guards the permission request — the half of AD-36 that still
+ * holds is that nothing is ever requested from render: the request is bound to
+ * an explicit enable, and a mic that is on without its grant blocks Start and
+ * names itself (Story 20.2). The header Start click reads both values
+ * imperatively and threads them through `recording_start`.
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
 import type { RecordingSourcesVm } from "@/lib/ipc/client";
 
 export interface RecordingMicState {
-  /** Whether the next session captures the microphone (default off). */
+  /** Whether the next session captures the microphone (persisted, default on). */
   micEnabled: boolean;
   /** The selected input device's id, or `null` for the system default input. */
   micDeviceId: string | null;
@@ -31,7 +41,7 @@ export interface RecordingMicState {
 
 /** The vanilla store instance, created once at module load and shared app-wide. */
 export const recordingMicStore = createStore<RecordingMicState>()((set) => ({
-  micEnabled: false,
+  micEnabled: true,
   micDeviceId: null,
   setMicEnabled: (enabled) => set({ micEnabled: enabled }),
   setMicDeviceId: (deviceId) => set({ micDeviceId: deviceId }),
@@ -85,7 +95,7 @@ export function isMicSelectionAvailable(
   return sources.microphones.some((mic) => mic.id === deviceId);
 }
 
-/** Test-only reset: restore the default-off toggle + default input. */
+/** Test-only reset: restore the default-on toggle + default input. */
 export function resetRecordingMicForTest(): void {
-  recordingMicStore.setState({ micEnabled: false, micDeviceId: null });
+  recordingMicStore.setState({ micEnabled: true, micDeviceId: null });
 }

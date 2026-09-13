@@ -1947,6 +1947,100 @@ pub fn set_recording_echo_cancellation(data_dir: &Path, enabled: bool) -> Result
     )
 }
 
+/// The `settings` keys holding which capture sources the next Recording Session
+/// starts with (spec *Recording remembers which sources are on*). Stored with
+/// the registry's `"1"`/`"0"` convention; absent or unrecognized ⇒ the default
+/// of **ON** for all three.
+///
+/// On by default on the owner's decision (2026-09-13). Until then the
+/// microphone and the camera were off on every launch and the choice was never
+/// written anywhere, because off-by-default was what made AD-36's lazy
+/// permission contract true. The half of that contract that survives is the
+/// load-bearing half — nothing is ever requested from render — and the cost is
+/// named where it lands: a source that is on without its TCC grant blocks Start
+/// and names itself (Story 20.2), and turning it off now sticks.
+const RECORDING_SYSTEM_AUDIO_KEY: &str = "recording.system_audio";
+const RECORDING_MICROPHONE_KEY: &str = "recording.microphone";
+const RECORDING_CAMERA_KEY: &str = "recording.camera";
+
+/// The default capture state of each source: ON (owner decision, 2026-09-13).
+pub const RECORDING_SYSTEM_AUDIO_DEFAULT: bool = true;
+pub const RECORDING_MICROPHONE_DEFAULT: bool = true;
+pub const RECORDING_CAMERA_DEFAULT: bool = true;
+
+/// How a default-ON capture flag reads: `"1"` ⇒ on, `"0"` ⇒ off, absent or
+/// anything else ⇒ the default. Unlike the default-OFF flags (where only `"1"`
+/// counts), a default-ON flag has to read its OFF value explicitly — otherwise a
+/// person who turned a source off would have it turned back on by the next
+/// launch, which is the bug this whole spec exists to end.
+///
+/// Written out at each of the three call sites rather than behind a helper
+/// taking a `&str`, because `config::keys`' scanner resolves the key of every
+/// `get_setting` call statically: a helper makes all three keys invisible to it
+/// and the classification guard then has nothing to check.
+fn capture_flag(stored: Option<&str>, default: bool) -> bool {
+    match stored {
+        Some("1") => true,
+        Some("0") => false,
+        _ => default,
+    }
+}
+
+/// Read whether the next session captures system audio (default ON).
+pub fn get_recording_system_audio(data_dir: &Path) -> Result<bool, CoreError> {
+    let stored = get_setting(data_dir, RECORDING_SYSTEM_AUDIO_KEY)?;
+    Ok(capture_flag(
+        stored.as_deref(),
+        RECORDING_SYSTEM_AUDIO_DEFAULT,
+    ))
+}
+
+/// Write whether the next session captures system audio.
+pub fn set_recording_system_audio(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        RECORDING_SYSTEM_AUDIO_KEY,
+        if enabled { "1" } else { "0" },
+    )
+}
+
+/// Read whether the next session captures the microphone (default ON). The
+/// device itself stays an in-session choice — absent means the system default
+/// input, never a remembered id that may no longer be plugged in.
+pub fn get_recording_microphone(data_dir: &Path) -> Result<bool, CoreError> {
+    let stored = get_setting(data_dir, RECORDING_MICROPHONE_KEY)?;
+    Ok(capture_flag(
+        stored.as_deref(),
+        RECORDING_MICROPHONE_DEFAULT,
+    ))
+}
+
+/// Write whether the next session captures the microphone.
+pub fn set_recording_microphone(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        RECORDING_MICROPHONE_KEY,
+        if enabled { "1" } else { "0" },
+    )
+}
+
+/// Read whether the next session records the camera (default ON). Like the
+/// microphone, the camera *device* is an in-session choice defaulting to the
+/// system default camera.
+pub fn get_recording_camera(data_dir: &Path) -> Result<bool, CoreError> {
+    let stored = get_setting(data_dir, RECORDING_CAMERA_KEY)?;
+    Ok(capture_flag(stored.as_deref(), RECORDING_CAMERA_DEFAULT))
+}
+
+/// Write whether the next session records the camera.
+pub fn set_recording_camera(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        RECORDING_CAMERA_KEY,
+        if enabled { "1" } else { "0" },
+    )
+}
+
 /// The `settings` key holding an explicit path to the `git` binary folder sync
 /// drives (Story 34.14). Stored as the raw absolute path string; absent / empty
 /// ⇒ automatic resolution, which is the default and what almost every install
@@ -3794,6 +3888,41 @@ mod tests {
             get_recording_echo_cancellation(&dir).expect("read raw 1"),
             "only a literal \"1\" turns echo cancellation on"
         );
+    }
+
+    #[test]
+    fn recording_capture_sources_default_on_and_remember_being_turned_off() {
+        // Owner decision 2026-09-13: a fresh install records the screen with
+        // system audio, the microphone and the camera on.
+        let dir = temp_dir();
+        assert!(get_recording_system_audio(&dir).expect("fresh system audio"));
+        assert!(get_recording_microphone(&dir).expect("fresh microphone"));
+        assert!(get_recording_camera(&dir).expect("fresh camera"));
+
+        // The half that matters for the report this came from: OFF is written,
+        // read back, and survives — a default-ON flag that only recognized "1"
+        // would turn the source back on at the next launch.
+        set_recording_system_audio(&dir, false).expect("turn system audio off");
+        set_recording_microphone(&dir, false).expect("turn the mic off");
+        set_recording_camera(&dir, false).expect("turn the camera off");
+        assert!(!get_recording_system_audio(&dir).expect("read system audio off"));
+        assert!(!get_recording_microphone(&dir).expect("read mic off"));
+        assert!(!get_recording_camera(&dir).expect("read camera off"));
+
+        set_recording_camera(&dir, true).expect("turn the camera back on");
+        assert!(get_recording_camera(&dir).expect("read camera on"));
+
+        // Read-side normalization, like every other recording setting: a
+        // hand-edited `config.json` value that is neither "1" nor "0" degrades
+        // to the documented default instead of erroring.
+        for garbage in ["", "maybe", "true", "false", "2", "on"] {
+            set_setting(&dir, "recording.microphone", garbage).expect("store garbage");
+            assert!(
+                get_recording_microphone(&dir).expect("read garbage"),
+                "stored {garbage:?} must read as the default (on)"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

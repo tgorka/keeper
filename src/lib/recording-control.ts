@@ -7,7 +7,9 @@
  * capture stores the Recording view's Start button and the banner's Restart
  * read imperatively (source target, system audio, mic, webcam) — the stores
  * outlive view remounts, so a palette/hotkey start can never silently revert a
- * chosen app/mic/webcam/display to the defaults.
+ * chosen app/mic/webcam/display to the defaults. A capture source nobody has
+ * answered yet this launch is left to Rust, which reads what this device last
+ * chose (spec *Recording remembers which sources are on*).
  *
  * Error-safe by design: a failed start surfaces through the existing Story 18.4
  * loud-failure pipeline (Rust marks the session failed → tray error + native
@@ -17,10 +19,10 @@
  */
 import { isLiveRecording } from "@/hooks/use-recording-session";
 import { recordingStart, recordingStatus, recordingStop } from "@/lib/ipc/client";
-import { systemAudioEnabled } from "@/lib/stores/recording-audio";
-import { micDeviceId, micEnabled } from "@/lib/stores/recording-mic";
+import { captureSourcesForStart } from "@/lib/stores/recording-capture-sources";
+import { micDeviceId } from "@/lib/stores/recording-mic";
 import { selectedRecordingTarget } from "@/lib/stores/recording-source";
-import { cameraDeviceId, webcamEnabled } from "@/lib/stores/recording-webcam";
+import { cameraDeviceId } from "@/lib/stores/recording-webcam";
 
 /**
  * Start a recording session with the CURRENT capture selections, read
@@ -31,12 +33,19 @@ import { cameraDeviceId, webcamEnabled } from "@/lib/stores/recording-webcam";
  */
 export async function startRecordingWithCurrentSelections(): Promise<void> {
   try {
+    // Which sources are on is a persisted answer since 2026-09-13 (spec
+    // *Recording remembers which sources are on*). A palette verb or the global
+    // hotkey can be the first thing that ever touches recording in a launch, so
+    // a source nobody has answered yet is sent as `undefined` and decided in
+    // Rust from what this device last chose — rather than blocking the start on
+    // a read that may be slow or may never answer.
+    const capture = captureSourcesForStart();
     await recordingStart(
       selectedRecordingTarget(),
-      systemAudioEnabled(),
-      micEnabled(),
+      capture.systemAudio,
+      capture.microphone,
       micDeviceId(),
-      webcamEnabled(),
+      capture.camera,
       cameraDeviceId(),
     );
   } catch (error) {

@@ -56,14 +56,15 @@ use keeper_core::vm::{
     EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch,
     IncognitoVm, IpcError, IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot,
     NewChatResolutionVm, NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch,
-    PaletteMode, PaletteResultsVm, PingVm, Provider, RecordingDestinationKind,
-    RecordingDurabilityState, RecordingDurabilityVm, RecordingFilterVm, RecordingNoteStubVm,
-    RecordingNoteTargetVm, RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm,
-    RecordingSearchVm, RecordingSessionMetaVm, RecordingSettingsVm, RecordingSourcesVm,
-    RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm, RecordingUiState,
-    RecordingVolumeState, RecordingVolumeVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
-    ScreenRecordingAccess, SearchFilterVm, SearchHitVm, SpacesSnapshot, SyncListSettingsVm,
-    TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
+    PaletteMode, PaletteResultsVm, PingVm, Provider, RecordingCaptureSourcesPatchVm,
+    RecordingCaptureSourcesVm, RecordingDestinationKind, RecordingDurabilityState,
+    RecordingDurabilityVm, RecordingFilterVm, RecordingNoteStubVm, RecordingNoteTargetVm,
+    RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm, RecordingSearchVm,
+    RecordingSessionMetaVm, RecordingSettingsVm, RecordingSourcesVm, RecordingStatusVm,
+    RecordingSummaryVm, RecordingTargetVm, RecordingUiState, RecordingVolumeState,
+    RecordingVolumeVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch, ScreenRecordingAccess,
+    SearchFilterVm, SearchHitVm, SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch,
+    TypingBatch, VerificationFlowVm,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -6461,33 +6462,10 @@ pub async fn recording_start(
     meta_tags: Option<String>,
     meta_custom: Option<Vec<keeper_core::recording::SessionMetaField>>,
 ) -> Result<RecordingStatusVm, IpcError> {
-    // Story 19.2: the Audio card's ephemeral per-session toggle. `None` (no
-    // explicit choice reached the command) preserves the 16.6 default-on path.
-    let system_audio = system_audio.unwrap_or(true);
-    // Story 19.3: the Audio card's ephemeral mic selection — off unless
-    // explicitly enabled (`None` → `false`, the lazy-permission default), the
-    // device id `None` → the system default input. The one resolved flag feeds
-    // BOTH the sidecar wire (`SessionParams.microphone`) and the manifest
-    // (`SessionDevices.microphone`), so an off session honestly records
-    // `devices.microphone = false` and no mic track.
-    let mic_on = microphone_enabled.unwrap_or(false);
-    let microphone = mic_on.then_some(MicSelection {
-        device_id: microphone_device_id,
-        // Story 22.7: filled from the registry below, once the data dir is
-        // resolved — the ephemeral card carries the device pick, the persisted
-        // setting carries the processing.
-        echo_cancellation: keeper_core::registry::RECORDING_ECHO_CANCELLATION_DEFAULT,
-    });
-    // Story 20.1: the Webcam card's ephemeral camera selection, resolved by
-    // the identical rule — off unless explicitly enabled, device id `None` →
-    // the system default camera. The one resolved flag feeds BOTH the sidecar
-    // wire (`SessionParams.camera`) and the manifest (`SessionDevices.camera`),
-    // so an off session honestly records `devices.camera = false`, writes no
-    // `camera-####` file, and touches no Camera-TCC.
-    let camera_on = camera_enabled.unwrap_or(false);
-    let camera = camera_on.then_some(CameraSelection {
-        device_id: camera_device_id,
-    });
+    // Story 19.2/19.3/20.1 + the spec *Recording remembers which sources are on*:
+    // which sources this session captures is resolved further down, beside the
+    // other persisted settings — `None` (no explicit choice reached the command)
+    // now means "whatever this device last chose", which needs `data_dir`.
     // Story 19.1: map the picker's selected target into the manifest capture
     // target + the sidecar's video-target params. `None` (no picker selection)
     // preserves the 16.6 main-display default. A vanished application fails
@@ -6617,6 +6595,38 @@ pub async fn recording_start(
     let codec = keeper_core::registry::get_recording_codec(&data_dir).map_err(to_ipc_error)?;
     let scale_percent =
         keeper_core::registry::get_recording_scale_percent(&data_dir).map_err(to_ipc_error)?;
+    // Which sources this session captures (Story 19.2/19.3/20.1 + the spec
+    // *Recording remembers which sources are on*). An explicit argument wins —
+    // it is what the person is looking at on the cards — and `None` falls back
+    // to the stored preference rather than a constant, so a start that reached
+    // this command without the cards ever rendering (the palette verb, the
+    // global hotkey, a restart of a finished session) captures what this device
+    // last chose. All three default to ON when nothing is stored.
+    let system_audio = match system_audio {
+        Some(explicit) => explicit,
+        None => {
+            keeper_core::registry::get_recording_system_audio(&data_dir).map_err(to_ipc_error)?
+        }
+    };
+    let mic_on = match microphone_enabled {
+        Some(explicit) => explicit,
+        None => keeper_core::registry::get_recording_microphone(&data_dir).map_err(to_ipc_error)?,
+    };
+    let camera_on = match camera_enabled {
+        Some(explicit) => explicit,
+        None => keeper_core::registry::get_recording_camera(&data_dir).map_err(to_ipc_error)?,
+    };
+    // Story 21.3 meets a camera that is now ON by default: an audio-only target
+    // records no camera, whatever the switch says. Without this the two
+    // audio-only sub-modes disagree — with system audio the sidecar takes the
+    // SCStream path and DOES write `camera-####.mov` beside the audio for a
+    // session the person asked to be audio only; without it
+    // (`beginAudioOnlyMicSession`) there is no camera leg at all, so the
+    // manifest's `devices.camera = true` would be a claim about a file that was
+    // never written. The pre-flight gate already drops the camera leg for this
+    // target, so this is also what makes Start's arithmetic and the session
+    // agree.
+    let camera_on = camera_on && !audio_only;
     // Story 22.7: the persisted echo-cancellation switch, read HERE like every
     // other setting — the sidecar binds the voice-processing unit once at Start,
     // so a later edit applies to the next session only. Folded into the mic
@@ -6624,9 +6634,17 @@ pub async fn recording_start(
     // mic block itself is emitted.
     let echo_cancellation =
         keeper_core::registry::get_recording_echo_cancellation(&data_dir).map_err(to_ipc_error)?;
-    let microphone = microphone.map(|mic| MicSelection {
+    // The one resolved flag per source feeds BOTH the sidecar wire
+    // (`SessionParams`) and the manifest (`SessionDevices`), so an off session
+    // honestly records `devices.microphone = false` / `camera = false`, writes
+    // no track or `camera-####` file, and touches no Microphone/Camera TCC. The
+    // device ids stay the cards' per-session pick; `None` is the system default.
+    let microphone = mic_on.then_some(MicSelection {
+        device_id: microphone_device_id,
         echo_cancellation,
-        ..mic
+    });
+    let camera = camera_on.then_some(CameraSelection {
+        device_id: camera_device_id,
     });
     // Story 40.3: the template names the session, and the EFFECTIVE template is
     // always concrete — absent, blank and unparseable all degrade to
@@ -10209,6 +10227,78 @@ fn read_recording_settings(
     })
 }
 
+/// Read which sources the next Recording Session captures (spec *Recording
+/// remembers which sources are on*). Absent or unrecognized keys read as ON.
+fn read_capture_sources(data_dir: &Path) -> Result<RecordingCaptureSourcesVm, IpcError> {
+    Ok(RecordingCaptureSourcesVm {
+        system_audio: keeper_core::registry::get_recording_system_audio(data_dir)
+            .map_err(to_ipc_error)?,
+        microphone: keeper_core::registry::get_recording_microphone(data_dir)
+            .map_err(to_ipc_error)?,
+        camera: keeper_core::registry::get_recording_camera(data_dir).map_err(to_ipc_error)?,
+    })
+}
+
+/// Which sources the next Recording Session captures (spec *Recording remembers
+/// which sources are on*) — the answer the three pre-record switches show.
+#[tauri::command]
+pub async fn recording_capture_sources_get(
+    state: State<'_, AppState>,
+) -> Result<RecordingCaptureSourcesVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    off_async_runtime(move || read_capture_sources(&data_dir)).await?
+}
+
+/// Remember which sources the next Recording Session captures, and answer with
+/// what the next read will say (spec *Recording remembers which sources are on*).
+///
+/// Three keys, nothing else. Deliberately NOT folded into
+/// [`recording_settings_set`]: that command settles the DESTINATION (writing one
+/// key and clearing the other, after a refusal check) and rebuilds the
+/// recordings index, neither of which a capture toggle means — and the VM it
+/// takes is a lossy READ, so a toggle made while a profile was paused or its
+/// drive was out would persist the degraded folder answer over the person's
+/// synced destination and never give it back.
+///
+/// A PATCH, so exactly the switch that moved is written: the other two answers
+/// are read once per launch, and a toggle made before that read landed would
+/// otherwise persist the shipped defaults over what this device chose.
+///
+/// No liveness guard, unlike echo cancellation: these decide what the NEXT
+/// session captures, the running sidecar bound its sources at Start, so a change
+/// mid-session changes nothing about it and lies to nobody.
+///
+/// The answer is the EFFECTIVE triple, re-read after the write, so a key a
+/// config file pins (`Settable::AnyLayer`) visibly refuses to move instead of
+/// leaving the switch showing a value the next launch will not honour.
+#[tauri::command]
+pub async fn recording_capture_sources_set(
+    state: State<'_, AppState>,
+    sources: RecordingCaptureSourcesPatchVm,
+) -> Result<RecordingCaptureSourcesVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    off_async_runtime(move || write_capture_sources(&data_dir, sources)).await?
+}
+
+/// The blocking body of [`recording_capture_sources_set`]: write every answer
+/// the patch carries, then re-read the effective triple.
+fn write_capture_sources(
+    data_dir: &Path,
+    patch: RecordingCaptureSourcesPatchVm,
+) -> Result<RecordingCaptureSourcesVm, IpcError> {
+    if let Some(enabled) = patch.system_audio {
+        keeper_core::registry::set_recording_system_audio(data_dir, enabled)
+            .map_err(to_ipc_error)?;
+    }
+    if let Some(enabled) = patch.microphone {
+        keeper_core::registry::set_recording_microphone(data_dir, enabled).map_err(to_ipc_error)?;
+    }
+    if let Some(enabled) = patch.camera {
+        keeper_core::registry::set_recording_camera(data_dir, enabled).map_err(to_ipc_error)?;
+    }
+    read_capture_sources(data_dir)
+}
+
 /// Why a submitted recordings destination is refused, in the words the surface
 /// prints (Story 41.2, UX-DR47).
 ///
@@ -12797,6 +12887,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Spec *Recording remembers which sources are on*: the three capture flags
+    /// read ON on a fresh install and round-trip, so a source turned off is
+    /// still off after the relaunch that used to forget it.
+    #[test]
+    fn capture_sources_read_on_by_default_and_remember_being_turned_off() {
+        let dir = settings_temp_dir();
+        let fresh = read_capture_sources(&dir).expect("fresh read");
+        assert!(fresh.system_audio, "a fresh install captures system audio");
+        assert!(fresh.microphone, "a fresh install captures the microphone");
+        assert!(fresh.camera, "a fresh install records the camera");
+
+        keeper_core::registry::set_recording_microphone(&dir, false).expect("turn the mic off");
+        let after_camera = write_capture_sources(
+            &dir,
+            RecordingCaptureSourcesPatchVm {
+                camera: Some(false),
+                ..Default::default()
+            },
+        )
+        .expect("turn the camera off");
+        assert!(!after_camera.camera);
+        assert!(
+            !after_camera.microphone,
+            "a patch carrying one answer must not overwrite the stored others — \
+             a toggle made before the launch's read landed would otherwise \
+             persist the shipped defaults over what this device chose"
+        );
+        let reread = read_capture_sources(&dir).expect("re-read");
+        assert!(
+            !reread.microphone,
+            "off survives the read that starts a session"
+        );
+        assert!(!reread.camera);
+        assert!(reread.system_audio, "the untouched flag is untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The capture sources are NOT part of the settings VM, and a settings write
+    /// therefore cannot move them. That separation is the whole reason the
+    /// narrow command exists: `write_recording_settings` settles the destination
+    /// (naming one key and clearing the other) from a VM that is a lossy READ,
+    /// so a camera toggle riding along could persist a degraded folder answer
+    /// over a synced destination and never give it back.
+    #[test]
+    fn a_settings_write_leaves_the_capture_sources_alone() {
+        let dir = settings_temp_dir();
+        keeper_core::registry::set_recording_camera(&dir, false).expect("turn the camera off");
+        let settings = read_recording_settings(&dir, &no_profiles).expect("read the settings");
+        write_recording_settings(&dir, &settings, false, &no_profiles).expect("write them back");
+        assert!(
+            !read_capture_sources(&dir).expect("re-read").camera,
+            "a settings write must not resurrect a source the person turned off"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Story 22.7: while a session is LIVE, a request that CHANGES echo
     /// cancellation is rejected before any write — not one row moves, not even
     /// the unrelated ones in the same request.
@@ -12886,19 +13032,14 @@ mod tests {
                 keeper_core::registry::get_recording_echo_cancellation(&dir).expect("read back");
             assert_eq!(echo_cancellation, stored);
 
-            // The exact composition `recording_start` performs.
-            let microphone = Some(MicSelection {
+            // The composition `recording_start` performs: one step, the stored
+            // value folded in where the mic block is built. The assertion that
+            // matters is the WIRE below — a local re-check of a value this test
+            // just wrote into a local would pass with `recording_start` deleted.
+            let microphone = true.then_some(MicSelection {
                 device_id: None,
-                echo_cancellation: keeper_core::registry::RECORDING_ECHO_CANCELLATION_DEFAULT,
-            })
-            .map(|mic| MicSelection {
                 echo_cancellation,
-                ..mic
             });
-            assert_eq!(
-                microphone.as_ref().map(|mic| mic.echo_cancellation),
-                Some(stored)
-            );
 
             let wire: serde_json::Value =
                 serde_json::from_str(&keeper_core::recording::start_recording_request(

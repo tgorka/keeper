@@ -18,20 +18,22 @@ afterEach(() => {
 });
 
 describe("recording-webcam store", () => {
-  it("defaults the webcam to off with the system default camera", () => {
-    // Off-by-default is the lazy-permission hinge (FR-70, AD-36): no camera
-    // permission is ever requested — and no camera-#### file is ever written
-    // — until the user enables the source.
-    expect(webcamEnabled()).toBe(false);
+  it("defaults the webcam to on with the system default camera", () => {
+    // On by default since 2026-09-13 (spec *Recording remembers which sources
+    // are on*); this compile-time value is what a start that happens before the
+    // persisted answer is read uses, so it has to equal the Rust default. No
+    // permission is requested on render — that half of AD-36 is asserted in the
+    // card's own suite.
+    expect(webcamEnabled()).toBe(true);
     expect(cameraDeviceId()).toBeNull();
-    expect(recordingWebcamStore.getState().webcamEnabled).toBe(false);
+    expect(recordingWebcamStore.getState().webcamEnabled).toBe(true);
   });
 
   it("setWebcamEnabled flips the toggle, read back imperatively", () => {
-    setWebcamEnabled(true);
-    expect(webcamEnabled()).toBe(true);
     setWebcamEnabled(false);
     expect(webcamEnabled()).toBe(false);
+    setWebcamEnabled(true);
+    expect(webcamEnabled()).toBe(true);
   });
 
   it("setCameraDeviceId selects a device and null restores the system default", () => {
@@ -46,21 +48,21 @@ describe("recording-webcam store", () => {
       enabled: useWebcamEnabled(),
       deviceId: useCameraDeviceId(),
     }));
-    expect(result.current.enabled).toBe(false);
+    expect(result.current.enabled).toBe(true);
     expect(result.current.deviceId).toBeNull();
     act(() => {
-      setWebcamEnabled(true);
+      setWebcamEnabled(false);
       setCameraDeviceId("X");
     });
-    expect(result.current.enabled).toBe(true);
+    expect(result.current.enabled).toBe(false);
     expect(result.current.deviceId).toBe("X");
   });
 
-  it("reset restores the default-off toggle and default camera", () => {
-    setWebcamEnabled(true);
+  it("reset restores the default-on toggle and default camera", () => {
+    setWebcamEnabled(false);
     setCameraDeviceId("X");
     resetRecordingWebcamForTest();
-    expect(webcamEnabled()).toBe(false);
+    expect(webcamEnabled()).toBe(true);
     expect(cameraDeviceId()).toBeNull();
   });
 });

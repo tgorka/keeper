@@ -1,7 +1,8 @@
 /**
  * The live Webcam card (Story 20.1, FR-70, AD-36/AD-37, UX-DR34).
  *
- * A `Switch` (default **off**) plus a flat camera `Select` with "System
+ * A `Switch` (default **on** since 2026-09-13, and remembered — spec *Recording
+ * remembers which sources are on*) plus a flat camera `Select` with "System
  * default camera" always the first/default option and each enumerated camera
  * below it (built-in / external / Continuity Camera — the `localizedName`
  * already distinguishes them, so no device-class grouping); the picker is
@@ -18,9 +19,11 @@
  * no burn-in (macOS 14+ can composite the camera via the system presenter
  * overlay — an OS behavior, not a keeper feature; UX-DR34).
  *
- * Bound to the ephemeral {@link recording-webcam.ts} store — per-session,
- * never persisted, never mirrored into Settings → Recording (the mic
- * precedent, Story 19.3).
+ * Bound to the {@link recording-webcam.ts} store, whose enabled half mirrors
+ * the persisted `recording.camera` answer (seeded once per launch, written
+ * through on every toggle) while the camera device stays per-session — a
+ * remembered id for hardware that is not plugged in today would only be
+ * reconciled away again.
  */
 import { useEffect, useRef, useState } from "react";
 import { Label } from "@/components/ui/label";
@@ -33,7 +36,11 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { requestCameraPermission, type TccPermission } from "@/lib/ipc/client";
-import { useRecordingSources } from "@/lib/stores/recording-source";
+import {
+  ensureCaptureSourcesHydrated,
+  persistCaptureSources,
+} from "@/lib/stores/recording-capture-sources";
+import { useRecordingSources, useSelectedRecordingTarget } from "@/lib/stores/recording-source";
 import {
   isCameraSelectionAvailable,
   setCameraDeviceId,
@@ -57,6 +64,16 @@ export const WEBCAM_DISCLOSURE =
   "The camera is never burned into the screen video — no picture-in-picture. " +
   "On macOS 14 and later, the system presenter overlay can composite your camera; " +
   "that is a macOS behavior, not part of the recording.";
+
+/**
+ * What an audio-only target means for the camera: nothing is recorded, whatever
+ * this switch says (`recording_start` drops the camera leg for that target). The
+ * switch stays live because it is a preference for the next screen recording —
+ * but a card that showed the camera "on" beside an audio-only Start would be
+ * claiming a file that is never written.
+ */
+export const WEBCAM_AUDIO_ONLY_NOTE =
+  "An audio-only recording does not record the camera. This stays on for your next screen recording.";
 
 /** The camera picker's always-first default option. */
 export const CAMERA_DEFAULT_DEVICE_LABEL = "System default camera";
@@ -104,6 +121,17 @@ export function RecordingWebcamControls({
   const deviceId = useCameraDeviceId();
   const sources = useRecordingSources();
   const cameras = sources?.cameras ?? [];
+  // Story 21.3: an audio-only target records no camera, so the card says so
+  // rather than showing a switch that promises a file nobody will write.
+  const audioOnly = useSelectedRecordingTarget().kind === "audioOnly";
+
+  // The switch's value is a persisted answer (spec *Recording remembers which
+  // sources are on*), read once per launch and seeded into the session store.
+  // Hydrated here as well as from the Audio card: this card can be the only one
+  // mounted, and the read is deduped app-wide.
+  useEffect(() => {
+    void ensureCaptureSourcesHydrated();
+  }, []);
 
   // Pre-Start reconciliation (the 19.4 mic pattern): a specifically-selected
   // camera that vanished from the live enumeration falls back to "System
@@ -129,6 +157,9 @@ export function RecordingWebcamControls({
 
   const onWebcamToggle = (checked: boolean) => {
     setWebcamEnabled(checked);
+    // Remember it, so the next launch agrees with the switch (the store moves
+    // first; the write is best-effort and takes Rust's effective answer back).
+    void persistCaptureSources({ camera: checked });
     const requestId = cameraRequestSeq.current + 1;
     cameraRequestSeq.current = requestId;
     if (checked) {
@@ -201,7 +232,12 @@ export function RecordingWebcamControls({
         </SelectContent>
       </Select>
       {!webcamOn && <p className="text-muted-foreground text-xs">{WEBCAM_OFF_NOTE}</p>}
-      {webcamOn && <p className="text-muted-foreground text-xs">{WEBCAM_DISCLOSURE}</p>}
+      {webcamOn && audioOnly && (
+        <p className="text-muted-foreground text-xs">{WEBCAM_AUDIO_ONLY_NOTE}</p>
+      )}
+      {webcamOn && !audioOnly && (
+        <p className="text-muted-foreground text-xs">{WEBCAM_DISCLOSURE}</p>
+      )}
       {webcamOn && cameraPermission === "granted" && (
         <p className="text-muted-foreground text-xs" role="status">
           {CAMERA_PERMISSION_GRANTED_NOTE}

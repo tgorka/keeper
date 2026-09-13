@@ -47,6 +47,12 @@ vi.mock("@/lib/ipc/client", () => ({
   // mount. No flagged profile is this suite's world — today's card.
   recordingDestinationProfiles: vi.fn(() => Promise.resolve([])),
   recordingSettingsSet: vi.fn((vm: unknown) => Promise.resolve(vm)),
+  // The Audio and Webcam cards read which sources are on (spec *Recording
+  // remembers which sources are on*) and write a toggle back through this pair.
+  recordingCaptureSourcesGet: vi.fn(() =>
+    Promise.resolve({ systemAudio: true, microphone: true, camera: true }),
+  ),
+  recordingCaptureSourcesSet: vi.fn((sources: unknown) => Promise.resolve(sources)),
   // The completion / recovery cards (Story 20.3): the summary fetch, the
   // cross-restart recovery scan, the acknowledgement latch, and Reveal.
   recordingSessionSummary: vi.fn(() =>
@@ -168,6 +174,10 @@ import { ALL_NOTES_SCOPE, notesFiltersStore } from "@/lib/stores/notes-filters";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { resetRecordingAudioForTest } from "@/lib/stores/recording-audio";
+import {
+  ensureCaptureSourcesHydrated,
+  resetCaptureSourcesForTest,
+} from "@/lib/stores/recording-capture-sources";
 import { recordingMetaStore } from "@/lib/stores/recording-meta";
 import { resetRecordingMicForTest, setMicEnabled } from "@/lib/stores/recording-mic";
 import { resetRecordingSourceForTest, selectRecordingTarget } from "@/lib/stores/recording-source";
@@ -255,7 +265,12 @@ const DENIED: RecordingPermissionVm = {
   canStart: false,
 };
 
-beforeEach(() => {
+beforeEach(async () => {
+  // Which sources are on is read once per launch and seeded into the three
+  // stores. Resolving it here — with what a fresh install stores — leaves every
+  // case below arranging those stores directly, as they always did.
+  resetCaptureSourcesForTest();
+  await ensureCaptureSourcesHydrated();
   mockFetch.mockReset();
   mockFetch.mockResolvedValue(NOT_YET);
   mockRequest.mockReset();
@@ -435,6 +450,10 @@ describe("RecordingPane", () => {
   // --- Microphone / Camera pre-flight rows (Story 20.2) --------------------
 
   it("renders no Microphone or Camera permission row while both sources are off", async () => {
+    // Both sources are ON by default since 2026-09-13, so "off" is now an
+    // arrangement rather than the starting state.
+    setMicEnabled(false);
+    setWebcamEnabled(false);
     render(<RecordingPane />);
 
     await waitFor(() => expect(mockFetch).toHaveBeenCalled());
@@ -449,8 +468,31 @@ describe("RecordingPane", () => {
     expect(mockFetch).toHaveBeenLastCalledWith(false, false);
   });
 
+  it("renders both source rows on the shipped defaults, and Start names the blocker", async () => {
+    // The cost of default-on, stated: a machine that never granted Microphone
+    // or Camera meets a blocked Start naming one of them, with the row's own
+    // request action beside it — nothing is prompted from render, and turning
+    // the source off (which now sticks) is the other way through.
+    mockFetch.mockResolvedValue({
+      screenRecording: "granted",
+      microphone: "notYetRequested",
+      camera: "notYetRequested",
+      canStart: false,
+    });
+    render(<RecordingPane />);
+
+    expect(
+      await screen.findByTestId(permissionRowTestId(MICROPHONE_PERMISSION_NAME)),
+    ).toBeVisible();
+    expect(screen.getByTestId(permissionRowTestId(CAMERA_PERMISSION_NAME))).toBeVisible();
+    expect(mockFetch).toHaveBeenLastCalledWith(true, true);
+    expect(screen.getByRole("button", { name: START_RECORDING_LABEL })).toBeDisabled();
+    expect(screen.getByText(startBlockedNote(MICROPHONE_PERMISSION_NAME))).toBeInTheDocument();
+  });
+
   it("an enabled+denied mic renders its row, blocks Start, and names Microphone", async () => {
     setMicEnabled(true);
+    setWebcamEnabled(false);
     mockFetch.mockResolvedValue({
       screenRecording: "granted",
       microphone: "denied",
@@ -475,6 +517,7 @@ describe("RecordingPane", () => {
   });
 
   it("an enabled+denied camera deep-links to the Camera pane (Story 20.2)", async () => {
+    setMicEnabled(false);
     setWebcamEnabled(true);
     mockFetch.mockResolvedValue({
       screenRecording: "granted",
@@ -490,6 +533,7 @@ describe("RecordingPane", () => {
   });
 
   it("an enabled+not-requested camera renders its row with the request action and names Camera", async () => {
+    setMicEnabled(false);
     setWebcamEnabled(true);
     mockFetch.mockResolvedValue({
       screenRecording: "granted",
@@ -518,6 +562,7 @@ describe("RecordingPane", () => {
 
   it("the Microphone row's request action fires the mic request then re-probes (Story 20.2)", async () => {
     setMicEnabled(true);
+    setWebcamEnabled(false);
     mockFetch.mockResolvedValue({
       screenRecording: "granted",
       microphone: "notYetRequested",
@@ -540,6 +585,7 @@ describe("RecordingPane", () => {
     // Screen denied while the enabled mic is granted: the note must name the
     // highest-priority blocker — Screen Recording, never the mic.
     setMicEnabled(true);
+    setWebcamEnabled(false);
     mockFetch.mockResolvedValue({
       screenRecording: "denied",
       microphone: "granted",
@@ -558,6 +604,8 @@ describe("RecordingPane", () => {
   });
 
   it("toggling the mic on re-probes and mounts the Microphone row live (Story 20.2)", async () => {
+    setMicEnabled(false);
+    setWebcamEnabled(false);
     render(<RecordingPane />);
     await waitFor(() => expect(mockFetch).toHaveBeenCalled());
     expect(
@@ -577,6 +625,8 @@ describe("RecordingPane", () => {
   });
 
   it("re-probes after the OS prompt resolves so Start reflects the grant with no focus event (Story 20.2)", async () => {
+    setMicEnabled(false);
+    setWebcamEnabled(false);
     render(<RecordingPane />);
     await waitFor(() => expect(mockFetch).toHaveBeenCalled());
     // Wait for the mount probe to RESOLVE, not merely to have been called: the row
@@ -639,14 +689,13 @@ describe("RecordingPane", () => {
     mockFetch.mockResolvedValue(GRANTED);
     render(<RecordingPane />);
 
-    // Default on: the first arg is the default target, the second `true`; the
-    // mic defaults off (Story 19.3): `false` + `null` (system default input);
-    // the webcam defaults off too (Story 20.1): `false` + `null`.
+    // The shipped defaults since 2026-09-13: all three sources on, both
+    // devices the system default (`null`).
     const startButton = await screen.findByRole("button", { name: START_RECORDING_LABEL });
     await waitFor(() => expect(startButton).toBeEnabled());
     fireEvent.click(startButton);
     await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
-    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, false, null, false, null, {
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, true, null, true, null, {
       title: undefined,
       participants: undefined,
       note: undefined,
@@ -665,50 +714,47 @@ describe("RecordingPane", () => {
     await waitFor(() => expect(startButton).toBeEnabled());
     fireEvent.click(startButton);
     await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
-    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), false, false, null, false, null, {
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), false, true, null, true, null, {
       title: undefined,
       participants: undefined,
       note: undefined,
     });
   });
 
-  it("Start threads an enabled mic through to recording_start (Story 19.3)", async () => {
+  it("Start threads a mic turned off on the card through to recording_start (Story 19.3)", async () => {
     mockFetch.mockResolvedValue(GRANTED);
     render(<RecordingPane />);
 
-    // Enable the mic on the Audio card (this also fires the lazy permission
-    // request — mocked granted); the device stays the system default (null).
+    // Turning the mic OFF is the interesting direction now that on is the
+    // default; the device selection is untouched (system default, null).
     const micToggle = await screen.findByTestId(MIC_SWITCH_TESTID);
     fireEvent.click(micToggle);
-    expect(micToggle).toHaveAttribute("aria-checked", "true");
-
-    const startButton = screen.getByRole("button", { name: START_RECORDING_LABEL });
-    await waitFor(() => expect(startButton).toBeEnabled());
-    fireEvent.click(startButton);
-    await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
-    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, true, null, false, null, {
-      title: undefined,
-      participants: undefined,
-      note: undefined,
-    });
-  });
-
-  it("Start threads an enabled webcam through to recording_start (Story 20.1)", async () => {
-    mockFetch.mockResolvedValue(GRANTED);
-    render(<RecordingPane />);
-
-    // Enable the webcam on the Webcam card (this also fires the lazy camera
-    // permission request — mocked granted); the device stays the system
-    // default camera (null).
-    const webcamToggle = await screen.findByTestId(WEBCAM_SWITCH_TESTID);
-    fireEvent.click(webcamToggle);
-    expect(webcamToggle).toHaveAttribute("aria-checked", "true");
+    expect(micToggle).toHaveAttribute("aria-checked", "false");
 
     const startButton = screen.getByRole("button", { name: START_RECORDING_LABEL });
     await waitFor(() => expect(startButton).toBeEnabled());
     fireEvent.click(startButton);
     await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
     expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, false, null, true, null, {
+      title: undefined,
+      participants: undefined,
+      note: undefined,
+    });
+  });
+
+  it("Start threads a webcam turned off on the card through to recording_start (Story 20.1)", async () => {
+    mockFetch.mockResolvedValue(GRANTED);
+    render(<RecordingPane />);
+
+    const webcamToggle = await screen.findByTestId(WEBCAM_SWITCH_TESTID);
+    fireEvent.click(webcamToggle);
+    expect(webcamToggle).toHaveAttribute("aria-checked", "false");
+
+    const startButton = screen.getByRole("button", { name: START_RECORDING_LABEL });
+    await waitFor(() => expect(startButton).toBeEnabled());
+    fireEvent.click(startButton);
+    await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
+    expect(mockStart).toHaveBeenLastCalledWith(expect.anything(), true, true, null, false, null, {
       title: undefined,
       participants: undefined,
       note: undefined,

@@ -3459,12 +3459,12 @@ pub struct RecordingSettingsVm {
     /// `scalePercent` (dimensions rounded to even pixels Swift-side).
     pub scale_percent: u32,
     /// Acoustic echo cancellation on the microphone feed (Story 22.7): `true`
-    /// (the default) runs the mic through macOS's voice-processing unit, whose
-    /// echo reference is the OUTPUT DEVICE's mix — so what the speakers play
-    /// stops being re-recorded by the microphone. Costs a mono mic track and
-    /// non-defeatable voice-band noise suppression. Read at every
-    /// `recording_start`; the sidecar's `echoCancellation`, emitted only when
-    /// the mic is on.
+    /// runs the mic through macOS's voice-processing unit, whose echo reference
+    /// is the OUTPUT DEVICE's mix — so what the speakers play stops being
+    /// re-recorded by the microphone. Costs a mono mic track and non-defeatable
+    /// voice-band noise suppression, which is why it is OFF by default (owner
+    /// decision, 2026-08-05). Read at every `recording_start`; the sidecar's
+    /// `echoCancellation`, emitted only when the mic is on.
     pub echo_cancellation: bool,
     /// The EFFECTIVE recording path template (Story 40.2, AD-65): the persisted
     /// user choice when one exists and still parses, otherwise
@@ -3477,6 +3477,62 @@ pub struct RecordingSettingsVm {
     /// nothing; submitting a blank one clears the key, which reads back as the
     /// default.
     pub path_template: String,
+}
+
+/// Which sources the next Recording Session captures (spec *Recording remembers
+/// which sources are on*).
+///
+/// All three default to **on** (owner decision, 2026-09-13) and are remembered:
+/// before this they were session-scoped frontend state, so every relaunch threw
+/// away what the person had chosen — the report this exists to end was "every
+/// restart of the app these settings are coming back to different defaults".
+///
+/// Its own VM, and its own command pair, rather than three more fields on
+/// [`RecordingSettingsVm`]: that VM is submitted whole, and a whole-VM write is
+/// a DESTINATION decision (`destination_choice` names one key and clears the
+/// other) plus a recordings-index rebuild. Riding along with those is defensible
+/// for a settings FORM; it is not defensible for the two switches at the top of
+/// the pre-record card, where a camera toggle would rewrite the destination the
+/// read had degraded and walk every recordings root per click.
+///
+/// Which microphone and which camera is NOT carried here: the device stays an
+/// in-session choice defaulting to the system default, because a remembered
+/// device id for hardware that is not plugged in today buys a stale value and a
+/// second failure mode.
+///
+/// A source that is on without its TCC grant does not prompt from render — it
+/// blocks Start and names itself (Story 20.2), and turning it off sticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingCaptureSourcesVm {
+    /// Whether the next session captures the audio the recorded content plays.
+    pub system_audio: bool,
+    /// Whether the next session records a microphone track.
+    pub microphone: bool,
+    /// Whether the next session writes the separate `camera-####` files. An
+    /// audio-only target never does, whatever this says (`recording_start`).
+    pub camera: bool,
+}
+
+/// One capture switch moving (spec *Recording remembers which sources are on*):
+/// the sources this request has an answer for, and no others.
+///
+/// A patch rather than the whole triple because the surface that writes it is a
+/// single switch, and the other two may have no answer yet — the stored ones are
+/// read once per launch, so a toggle made before that read landed would
+/// otherwise persist the shipped defaults over what this device actually chose,
+/// which is the bug the spec exists to end, re-entered through its own fix.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct RecordingCaptureSourcesPatchVm {
+    /// The new system-audio answer, or `None` to leave the stored one alone.
+    pub system_audio: Option<bool>,
+    /// The new microphone answer, or `None` to leave the stored one alone.
+    pub microphone: Option<bool>,
+    /// The new camera answer, or `None` to leave the stored one alone.
+    pub camera: Option<bool>,
 }
 
 /// What a path template would name the next recording — or why it would not

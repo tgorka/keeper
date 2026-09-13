@@ -236,13 +236,12 @@ export function RecordingPane() {
               onClick={() => {
                 // Story 19.1: start the session for the picker's selected target
                 // (a display or an application; the main display by default).
-                // Story 19.2: thread the Audio card's system-audio toggle
-                // (default on) read imperatively at click time.
-                // Story 19.3: thread the Audio card's mic selection (default
-                // off; device null = system default input) the same way.
-                // Story 20.1: thread the Webcam card's camera selection
-                // (default off; device null = system default camera) the
-                // same way — off ships no camera fields at all.
+                // Story 19.2/19.3/20.1: thread the three capture switches, read
+                // imperatively at click time. All three are ON by default and
+                // REMEMBERED since 2026-09-13 (spec *Recording remembers which
+                // sources are on*); the device ids stay per-session, `null`
+                // meaning the system default. A source that is off ships no
+                // fields for it at all.
                 void start(
                   selectedRecordingTarget(),
                   systemAudioEnabled(),
@@ -458,9 +457,10 @@ export function RecordingPane() {
               </Card>
             ) : title === "Webcam" ? (
               // The live Webcam card (Story 20.1, FR-70): the separate-file
-              // camera Switch (default off) + the flat camera picker; the
-              // lazy Camera-TCC request fires only on enable. `active`
-              // freezes pre-Start reconciliation while a session is live.
+              // camera Switch (default on and remembered) + the flat camera
+              // picker; the lazy Camera-TCC request fires only on an explicit
+              // enable. `active` freezes pre-Start reconciliation while a
+              // session is live.
               <Card key={title} size="sm">
                 <CardHeader>
                   <CardTitle>{title}</CardTitle>

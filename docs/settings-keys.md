@@ -84,6 +84,12 @@ file-controlled instead, and says which file.
 | | | | | Fallback cap on a single segment's duration, in minutes. |
 | `recording.echo_cancellation` | user-global | boolean (`1`/`0`) | `0` | `"recording.echo_cancellation" = true` |
 | | | | | Acoustic echo cancellation on the microphone track; costs a mono track and voice-band noise suppression. |
+| `recording.system_audio` | user-global | boolean (`1`/`0`) | `1` | `"recording.system_audio" = false` |
+| | | | | Whether the next Recording Session captures system audio. |
+| `recording.microphone` | user-global | boolean (`1`/`0`) | `1` | `"recording.microphone" = false` |
+| | | | | Whether the next Recording Session captures the microphone; the device itself is chosen per session. |
+| `recording.camera` | user-global | boolean (`1`/`0`) | `1` | `"recording.camera" = false` |
+| | | | | Whether the next Recording Session records the camera; the camera itself is chosen per session. |
 | `sessions.spaces_folded` | user-global | boolean (`1`/`0`) | `0` | `"sessions.spaces_folded" = true` |
 | | | | | Whether a session's spaces arrive folded; a space folded or unfolded by hand keeps that answer. |
 | `sync.list_folded` | user-global | integer 1..=50 | `10` | `"sync.list_folded" = 10` |
