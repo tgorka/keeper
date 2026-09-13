@@ -139,6 +139,7 @@ Not preferences. keeper writes these and reads them back, so a file entry would 
 | `notes.capture_draft.<…>` | JSON | Per capture window: the note it holds and the body creation gave it. | it points at the note one live capture window is holding, and is cleared the moment that thought is filed |
 | `notes.capture_placement.<…>` | text | Per capture window: its remembered position and whether the position is locked. | it is where a person last dragged one capture window, rewritten on every dismissal |
 | `notes.read.<…>` | text | Per note: the revision this device has acknowledged. | it is this device's record of which revision of a note it has already shown you, and it must never travel — that is what makes an edit from the other machine unread |
+| `ui.first_run_setup_skipped` | boolean (`1`/`0`) | Whether the person asked keeper not to open first-run setup at startup. | it is the answer somebody gave in the skip dialog, and pre-setting it in a file would hide setup from a person who was never offered it |
 | `ui.ios_sync_disclosure_shown` | boolean (`1`/`0`) | Whether the one-time iOS no-background-sync disclosure has been shown. | it is a one-time latch keeper sets after showing a disclosure, and pre-setting it in a file would suppress a card the person never saw |
 | `ui.recovered_sessions_acknowledged` | JSON | Recovered recording sessions the person has acknowledged. | it is the set of recovered recording sessions somebody has already dismissed, rewritten on every dismissal |
 

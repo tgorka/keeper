@@ -2736,6 +2736,17 @@ const BOT_AUDIT: BotAuditRowVm[] = [
 let botMessageDetails = false;
 
 /**
+ * The persisted "don't open setup when keeper starts" answer (spec *Skipping
+ * setup can stick*). A module-level `let` rather than an `ANSWERS` entry for the
+ * reason the toggle above gives: the write needs somewhere to land, so ticking
+ * the box in the skip-confirm and reading it back answers what was just said
+ * instead of a constant. A page reload re-runs this module and starts at
+ * `false` — this harness has no disk, and a fresh install is the state it
+ * therefore always boots in.
+ */
+let firstRunSetupSkipped = false;
+
+/**
  * Which languages the faked device can recognise on-device (Epic 63): three
  * states, chosen with `?voice=many|one|none` on the dev URL, because the
  * surface has to be looked at in each — a list to choose from, a list of one,
@@ -3152,6 +3163,16 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   bots_message_details_get: () => botMessageDetails,
   bots_message_details_set: (payload) => {
     botMessageDetails = payload.shown === true;
+    return null;
+  },
+  // --- First-run setup (spec *Skipping setup can stick*) ------------------
+  //
+  // The round trip within one session: the checkbox writes here and the boot
+  // read answers it. Persistence across launches is the Rust `settings` table's
+  // job and cannot be looked at here.
+  first_run_setup_skipped_get: () => firstRunSetupSkipped,
+  first_run_setup_skipped_set: (payload) => {
+    firstRunSetupSkipped = payload.skipped === true;
     return null;
   },
   // --- Voice (Epic 62, Story 62.5) ----------------------------------------

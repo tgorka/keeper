@@ -8,10 +8,14 @@
  * {@link import("./new-chat").newChatStore}).
  *
  * The state is session-scoped and intentionally throwaway — it is NEVER persisted.
- * `dismissed` is set only by this store's own {@link WizardState.finish} when the
- * user skips the whole flow with zero accounts, so it can never regress a
- * sign-out-of-last-account back-to-login path (only the wizard sets it). No token,
- * session, or homeserver material is ever held here — Rust is the source of truth.
+ * `dismissed` is set only by this store's own {@link WizardState.finish}, so it can
+ * never regress a sign-out-of-last-account back-to-login path (only the wizard
+ * sets it). Since the spec *Skipping setup can stick*, `App`'s boot also calls
+ * `finish()` when this device's stored answer says startup must not open setup —
+ * a persisted skip standing in for a skip this session — which is why that answer
+ * lives in the Rust `settings` table (`ui.first_run_setup_skipped`) and not here.
+ * No token, session, or homeserver material is ever held here — Rust is the
+ * source of truth.
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";

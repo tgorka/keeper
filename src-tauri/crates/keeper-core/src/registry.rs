@@ -626,6 +626,35 @@ pub fn set_ios_sync_disclosure_shown(data_dir: &Path) -> Result<(), CoreError> {
     set_setting(data_dir, UI_IOS_SYNC_DISCLOSURE_SHOWN_KEY, "1")
 }
 
+/// The `settings` key holding the answer to "don't open first-run setup at
+/// startup" (spec *Skipping setup can stick*). Stored as `"1"` when the person
+/// ticked the box in the wizard's skip-confirm, `"0"` when they cleared it;
+/// absent = never asked, so setup is still offered.
+const UI_FIRST_RUN_SETUP_SKIPPED_KEY: &str = "ui.first_run_setup_skipped";
+
+/// Read whether the person asked keeper not to open first-run setup at startup
+/// (spec *Skipping setup can stick*). `"1"` ⇒ `true`; `"0"` or absent ⇒ `false`.
+/// Device-global — it is an answer about this install's startup, not about an
+/// Account. Before this key existed the wizard's dismissal lived only in the
+/// webview's memory, so every relaunch of an install with no Account — and an
+/// update is a relaunch — re-opened onboarding somebody had already skipped.
+pub fn get_first_run_setup_skipped(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, UI_FIRST_RUN_SETUP_SKIPPED_KEY)?.as_deref() == Some("1"))
+}
+
+/// Record the answer given in the wizard's skip-confirm (spec *Skipping setup can
+/// stick*). Two-way, unlike the one-way [`set_ios_sync_disclosure_shown`] latch:
+/// the same checkbox is how the wizard comes back, so clearing it has to be
+/// expressible. Written only from that dialog — nothing else in the app decides
+/// this for the person.
+pub fn set_first_run_setup_skipped(data_dir: &Path, skipped: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        UI_FIRST_RUN_SETUP_SKIPPED_KEY,
+        if skipped { "1" } else { "0" },
+    )
+}
+
 /// The `settings` key holding the recovered-session acknowledgement seen-set
 /// (Story 20.3, FR-73). A JSON array of opaque session **keys** — every
 /// crash-recovered session the user has already been shown-and-dismissed. The
@@ -3901,6 +3930,35 @@ mod tests {
         assert!(get_ios_sync_disclosure_shown(&dir).expect("read back"));
         set_ios_sync_disclosure_shown(&dir).expect("re-latch");
         assert!(get_ios_sync_disclosure_shown(&dir).expect("read after re-latch"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_run_setup_skipped_defaults_false_and_round_trips_both_ways() {
+        let dir = temp_dir();
+        // Never asked ⇒ setup is still offered.
+        assert!(!get_first_run_setup_skipped(&dir).expect("read default"));
+        set_first_run_setup_skipped(&dir, true).expect("persist the answer");
+        assert!(get_first_run_setup_skipped(&dir).expect("read back"));
+        // The stored bytes, not just the round trip: `docs/settings-keys.md`
+        // publishes this key as `Flag01`, and a reader with a config file in
+        // hand is entitled to the value the table names.
+        assert_eq!(
+            get_setting(&dir, UI_FIRST_RUN_SETUP_SKIPPED_KEY).expect("read raw"),
+            Some("1".to_owned())
+        );
+        // Clearing the box is the half a one-way latch could not express: after
+        // it, startup offers setup again.
+        set_first_run_setup_skipped(&dir, false).expect("clear the answer");
+        assert!(!get_first_run_setup_skipped(&dir).expect("read after clearing"));
+        assert_eq!(
+            get_setting(&dir, UI_FIRST_RUN_SETUP_SKIPPED_KEY).expect("read raw"),
+            Some("0".to_owned())
+        );
+        // Anything else is not an answer: offering setup is the safe reading, and
+        // it is the one a hand-edited or truncated row gets.
+        set_setting(&dir, UI_FIRST_RUN_SETUP_SKIPPED_KEY, "yes").expect("write a stray value");
+        assert!(!get_first_run_setup_skipped(&dir).expect("read a stray value"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

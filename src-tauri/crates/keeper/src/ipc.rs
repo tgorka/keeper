@@ -10852,6 +10852,29 @@ pub fn ios_sync_disclosure_shown_set(state: State<'_, AppState>) -> Result<(), I
     keeper_core::registry::set_ios_sync_disclosure_shown(&data_dir).map_err(to_ipc_error)
 }
 
+/// Read whether the person asked keeper not to open first-run setup at startup
+/// (spec *Skipping setup can stick*). Absent ⇒ `false` (setup is still offered).
+/// Device-global; lives in the `settings` k/v table under
+/// `ui.first_run_setup_skipped`. Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn first_run_setup_skipped_get(state: State<'_, AppState>) -> Result<bool, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::get_first_run_setup_skipped(&data_dir).map_err(to_ipc_error)
+}
+
+/// Record the answer given in the first-run wizard's skip-confirm (spec *Skipping
+/// setup can stick*). Two-way, unlike the iOS disclosure latch above: the same
+/// checkbox is how setup comes back at startup, so `false` has to be writable.
+/// Failures funnel through [`to_ipc_error`].
+#[tauri::command]
+pub fn first_run_setup_skipped_set(
+    state: State<'_, AppState>,
+    skipped: bool,
+) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::set_first_run_setup_skipped(&data_dir, skipped).map_err(to_ipc_error)
+}
+
 /// Read whether launch-at-login is enabled (Story 10.3, FR-53, AD-25). The autostart
 /// plugin is the single source of truth (its LaunchAgent state), so this reads
 /// `autolaunch().is_enabled()` rather than a shadow setting. Default off on a fresh

@@ -1070,6 +1070,8 @@ pub fn run() {
                 ipc::ios_open_app_settings,
                 ipc::ios_sync_disclosure_shown_get,
                 ipc::ios_sync_disclosure_shown_set,
+                ipc::first_run_setup_skipped_get,
+                ipc::first_run_setup_skipped_set,
                 ipc::launch_at_login_get,
                 ipc::launch_at_login_set,
                 ipc::menu_bar_presence_get,

@@ -11,6 +11,7 @@
  * or reimplements login/discovery/QR/ack — Rust and the reused components own that.
  */
 import { useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 import { LoginScreen } from "@/components/auth/login-screen";
 import { BridgeCard } from "@/components/bridges/bridge-card";
 import {
@@ -24,10 +25,16 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
 import { useBridgeCatalog } from "@/hooks/use-bridge-catalog";
 import { useBridgeDiscovery } from "@/hooks/use-bridge-discovery";
 import { COMPANION_STACK_DOCS_URL } from "@/lib/bridges";
-import type { BridgeNetworkVm } from "@/lib/ipc/client";
+import {
+  type BridgeNetworkVm,
+  firstRunSetupSkippedGet,
+  firstRunSetupSkippedSet,
+} from "@/lib/ipc/client";
 import { accountsStore, useAccountsStore } from "@/lib/stores/accounts";
 import { useWizardStore, type WizardStep } from "@/lib/stores/wizard";
 
@@ -43,6 +50,14 @@ const STEP_LABEL: Record<WizardStep, string> = {
 };
 
 /**
+ * The skip-confirm's checkbox label (spec *Skipping setup can stick*). It names
+ * startup rather than "again", because Settings → "Run setup again" still opens
+ * the wizard afterwards — which the dialog's own description says. Sentence case,
+ * no exclamation mark (UX-DR10).
+ */
+export const SKIP_AT_STARTUP_LABEL = "Don't open setup when keeper starts";
+
+/**
  * The full-frame first-run wizard. Renders the current `step` from
  * {@link wizardStore}; a single Esc-confirm {@link AlertDialog} guards leaving.
  */
@@ -52,6 +67,49 @@ export function FirstRunWizard() {
   // Whether the "Skip setup?" confirm is open. Esc opens it (asks once) rather
   // than exiting the wizard immediately.
   const [confirmOpen, setConfirmOpen] = useState(false);
+  // The persisted answer to "don't open setup when keeper starts" (spec
+  // *Skipping setup can stick*), mirrored so the box opens showing what this
+  // device already answered. Three facts, because a confirm can land before the
+  // read does and each of them decides something different:
+  //   `skipAtStartup` — what the box shows now;
+  //   `storedRef`     — the last answer known to be on disk, which closing the
+  //                     dialog without confirming restores (the box is an input
+  //                     for the pending skip, never a claim about disk it did
+  //                     not write);
+  //   `answeredRef` / `touchedRef` — whether anybody, the read or the person,
+  //                     has actually answered. With neither, a confirm writes
+  //                     NOTHING: an unreadable settings table must not let the
+  //                     default `false` overwrite a `true` somebody set months
+  //                     ago and re-open onboarding at every launch — the exact
+  //                     bug this change exists to fix.
+  const [skipAtStartup, setSkipAtStartup] = useState(false);
+  const storedRef = useRef(false);
+  const answeredRef = useRef(false);
+  const touchedRef = useRef(false);
+  useEffect(() => {
+    let cancelled = false;
+    void firstRunSetupSkippedGet()
+      .then((value) => {
+        if (cancelled) {
+          return;
+        }
+        answeredRef.current = true;
+        storedRef.current = value;
+        // A person who has already ticked or cleared the box while the read was
+        // in flight has answered the question themselves; the late answer must
+        // not move the control under them.
+        if (!touchedRef.current) {
+          setSkipAtStartup(value);
+        }
+      })
+      .catch(() => {
+        // Unreadable ⇒ the box stays unchecked and a confirm writes nothing
+        // unless the person touches it (the honest default; skipping still works).
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Esc opens the confirm rather than leaving. Once the confirm is open, its own
   // AlertDialog owns Escape (closing the confirm), so this handler only fires for
@@ -77,6 +135,23 @@ export function FirstRunWizard() {
   }, [confirmOpen]);
 
   const skip = () => setConfirmOpen(true);
+
+  /**
+   * Confirming the skip: persist the box's answer, then leave. The write is
+   * best-effort and never blocks the exit — a settings table that cannot be
+   * written must not trap somebody in onboarding — but it says so out loud
+   * rather than silently reproducing the bug the answer was meant to fix. Both
+   * values are written when they are known, including `false`: clearing the box
+   * is how setup comes back at startup.
+   */
+  const confirmSkip = () => {
+    if (answeredRef.current || touchedRef.current) {
+      void firstRunSetupSkippedSet(skipAtStartup).catch(() => {
+        toast.error("Couldn't remember that. Setup may open again next time keeper starts.");
+      });
+    }
+    finish();
+  };
 
   return (
     <section
@@ -104,15 +179,41 @@ export function FirstRunWizard() {
         </footer>
       )}
 
-      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+      <AlertDialog
+        open={confirmOpen}
+        onOpenChange={(open) => {
+          setConfirmOpen(open);
+          if (!open) {
+            // Closing without confirming ("Keep setting up", Esc, the overlay)
+            // writes nothing, so the box must not keep showing an answer this
+            // device does not hold: it reopens on the stored one.
+            touchedRef.current = false;
+            setSkipAtStartup(storedRef.current);
+          }
+        }}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Skip setup?</AlertDialogTitle>
             <AlertDialogDescription>You can run it again from Settings.</AlertDialogDescription>
           </AlertDialogHeader>
+          {/* The one control over whether startup opens this again (spec
+              *Skipping setup can stick*). Pre-filled from the persisted answer,
+              so the same box that silenced onboarding is the box that brings it
+              back — and only confirming the skip writes it. */}
+          <Label className="flex items-center gap-2 text-sm">
+            <Checkbox
+              checked={skipAtStartup}
+              onCheckedChange={(next) => {
+                touchedRef.current = true;
+                setSkipAtStartup(next === true);
+              }}
+            />
+            {SKIP_AT_STARTUP_LABEL}
+          </Label>
           <AlertDialogFooter>
             <AlertDialogCancel>Keep setting up</AlertDialogCancel>
-            <AlertDialogAction onClick={finish}>Skip setup</AlertDialogAction>
+            <AlertDialogAction onClick={confirmSkip}>Skip setup</AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

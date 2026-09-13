@@ -2762,6 +2762,26 @@ export async function iosSyncDisclosureShownSet(): Promise<void> {
 }
 
 /**
+ * Read whether the person asked keeper not to open first-run setup at startup
+ * (spec *Skipping setup can stick*). Absent = `false` — setup is still offered.
+ * Device-global and persisted in the Rust `settings` k/v table, never
+ * `localStorage`: which install has been through onboarding is a fact about this
+ * machine, and it has to survive the relaunch an update performs.
+ */
+export async function firstRunSetupSkippedGet(): Promise<boolean> {
+  return await invoke<boolean>("first_run_setup_skipped_get");
+}
+
+/**
+ * Record the answer given in the first-run wizard's skip-confirm (spec *Skipping
+ * setup can stick*). Two-way, unlike {@link iosSyncDisclosureShownSet}: clearing
+ * the checkbox is how startup offers setup again. Written from that dialog only.
+ */
+export async function firstRunSetupSkippedSet(skipped: boolean): Promise<void> {
+  await invoke<void>("first_run_setup_skipped_set", { skipped });
+}
+
+/**
  * Read whether launch-at-login is enabled (Story 10.3, FR-53, AD-25). The autostart
  * plugin's LaunchAgent state is authoritative; off by default on a fresh install.
  * Rejects with the {@link IpcError} envelope on a plugin failure.
