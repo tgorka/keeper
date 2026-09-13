@@ -15,7 +15,7 @@ import { useNotifyNavigate } from "@/hooks/use-notify-navigate";
 import { useSessionRestore } from "@/hooks/use-session-restore";
 import { useTelemetryReadiness } from "@/hooks/use-telemetry";
 import { useWebviewGuard } from "@/hooks/use-webview-guard";
-import { encryptionPosture, telemetryStudyStop } from "@/lib/ipc/client";
+import { encryptionPosture, firstRunSetupSkippedGet, telemetryStudyStop } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useAddAccountStore } from "@/lib/stores/add-account";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
@@ -31,6 +31,15 @@ import { useWizardStore, wizardStore } from "@/lib/stores/wizard";
 export const NO_ACCOUNT_BOTS_LABEL = "Continue without an account";
 export const NO_ACCOUNT_BOTS_NOTE =
   "Bots needs no Matrix account. You can sign in later from the menu.";
+
+/**
+ * How long the boot waits for the stored "don't open setup when keeper starts"
+ * answer before treating it as unanswered (spec *Skipping setup can stick*). It
+ * is one read of one row, so this is not a budget — it is a bound, so that a
+ * `settings` table which never answers (a lock held by another process, a wedged
+ * sqlite open) costs one needless wizard rather than an app that never opens.
+ */
+const SETUP_ANSWER_DEADLINE_MS = 3_000;
 
 function App() {
   useEffect(() => {
@@ -93,13 +102,52 @@ function App() {
   // means "the login screen was", and each is set by the surface it names.
   const [signInSkipped, setSignInSkipped] = useState(false);
 
+  // The persisted answer to "don't open setup when keeper starts" (spec *Skipping
+  // setup can stick*). Tri-state: `undefined` = still reading (hold the splash),
+  // `true`/`false` = answered. Before this read the wizard's dismissal lived only
+  // in this webview's memory, so an install with no Account met onboarding on
+  // every relaunch — and an update is a relaunch, which is how the field report
+  // arrived. A read that fails OR does not answer within
+  // `SETUP_ANSWER_DEADLINE_MS` means *not skipped*: a genuine first run keeps its
+  // wizard, skipping it again costs one click, and no unanswerable settings table
+  // can hold the whole app on a splash forever.
+  const [setupSkipped, setSetupSkipped] = useState<boolean | undefined>(undefined);
+  useEffect(() => {
+    let cancelled = false;
+    const deadline = window.setTimeout(() => {
+      if (!cancelled) {
+        setSetupSkipped((current) => current ?? false);
+      }
+    }, SETUP_ANSWER_DEADLINE_MS);
+    void firstRunSetupSkippedGet()
+      .then((value) => {
+        if (!cancelled) {
+          setSetupSkipped(value);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSetupSkipped(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+      window.clearTimeout(deadline);
+    };
+  }, []);
+
   // First-run at-rest-encryption gate (Story 2.6). Loaded once for a fresh
   // install (`!hasAccount`). `undefined` = still loading (hold the splash);
   // `null` = unchosen (show the choice); `true`/`false` = chosen (show login).
   // Distinguishing "still loading" (undefined) from "unchosen" (null) is
   // load-bearing so the choice never flashes before the posture resolves.
   const [postureChosen, setPostureChosen] = useState<boolean | null | undefined>(undefined);
-  useTelemetryReadiness(hydrated && (hasAccount || postureChosen !== undefined));
+  // `appReady` means the first painted non-splash UI, so every gate that can
+  // still be holding the splash belongs in this condition — including the
+  // first-run skip answer above, which holds it on a zero-account boot.
+  useTelemetryReadiness(
+    hydrated && (hasAccount || (postureChosen !== undefined && setupSkipped !== undefined)),
+  );
   useEffect(() => {
     let cancelled = false;
     void encryptionPosture()
@@ -120,32 +168,56 @@ function App() {
     };
   }, []);
 
-  // One-shot first-run auto-start of the wizard (Story 6.8). Fires at most once
-  // (guarded by a ref) when the app has finished restoring, there are no accounts,
-  // and the at-rest-encryption posture has resolved (not still loading / unchosen).
-  // Deliberately NOT triggered by a later sign-out-of-last-account: the ref keeps
-  // it a genuine first-run boot event only.
-  const bootDecidedRef = useRef(false);
+  // The one-shot first-run boot decision (Story 6.8), in two halves.
+  //
+  // The first half latches WHAT THE BOOT WAS the moment the boot state resolves
+  // (hydrated + a resolved, chosen posture): a fresh install with zero Accounts,
+  // or not. It is frozen into state rather than re-read later, because the second
+  // half waits on another IPC answer and `hasAccount` can change under it — a
+  // sign-out of the last Account inside that window must not read as a first run
+  // and throw somebody into full-frame onboarding.
+  const bootLatchedRef = useRef(false);
+  const [firstRunAtBoot, setFirstRunAtBoot] = useState<boolean | undefined>(undefined);
   useEffect(() => {
-    // Only evaluate the first-run decision once the boot state is fully resolved
-    // (hydrated + a resolved posture). This is a one-shot boot decision: the first
-    // time we reach a resolved boot state we either auto-start (fresh install with
-    // zero accounts) or lock the decision out forever. A later sign-out-of-last-
-    // account therefore never auto-starts the wizard — the decision was already made
-    // at boot, when an account was present.
     if (
-      bootDecidedRef.current ||
+      bootLatchedRef.current ||
       !hydrated ||
       postureChosen === undefined ||
       postureChosen === null
     ) {
       return;
     }
-    bootDecidedRef.current = true;
-    if (!hasAccount) {
+    bootLatchedRef.current = true;
+    setFirstRunAtBoot(!hasAccount);
+  }, [hydrated, hasAccount, postureChosen]);
+
+  // The second half acts on that frozen fact once the stored skip answer is in,
+  // exactly once. A later sign-out-of-last-account therefore never auto-starts
+  // the wizard: the decision was made at boot, when an Account was present.
+  const bootActedRef = useRef(false);
+  useEffect(() => {
+    if (bootActedRef.current || firstRunAtBoot === undefined || setupSkipped === undefined) {
+      return;
+    }
+    bootActedRef.current = true;
+    if (!firstRunAtBoot) {
+      return;
+    }
+    if (setupSkipped) {
+      // A persisted skip stands in for a skip this session: `finish()` already
+      // closes the wizard and sets `dismissed` iff there are zero accounts,
+      // which lands this boot in the shell's empty inbox — exactly where the
+      // skip that wrote the answer landed — instead of the bare login screen.
+      // Reusing it rather than adding a store action keeps `dismissed` with
+      // exactly one writer (`src/lib/stores/wizard.ts`). The landing does not
+      // depend on this effect having run, though: `renderContent` reads
+      // `setupSkipped` directly, so no frame can paint the login screen while
+      // this is still pending.
+      wizardStore.getState().finish();
+    } else {
       wizardStore.getState().start();
     }
-  }, [hydrated, hasAccount, postureChosen]);
+  }, [firstRunAtBoot, setupSkipped]);
 
   // Decide the shell/login/splash content, then render it alongside a single
   // always-mounted <Toaster />. The Toaster lives ABOVE the hasAccount gate so a
@@ -193,9 +265,13 @@ function App() {
     // add-account login overlay on top when the footer requests it (subsequent adds
     // are never gated — the addMode path below is unchanged).
     if (!hasAccount) {
-      // Still loading the posture: keep holding the splash rather than flashing the
-      // choice or the login form.
-      if (postureChosen === undefined) {
+      // Still loading the posture, or still reading the stored skip answer on a
+      // boot that could be a first run: keep holding the splash rather than
+      // flashing the choice, the login form, or a wizard the answer is about to
+      // suppress. A boot that already had an Account never waits on that answer —
+      // `firstRunAtBoot === false` says so — so signing out of the last Account
+      // lands on the login screen without a detour through the splash.
+      if (postureChosen === undefined || (firstRunAtBoot !== false && setupSkipped === undefined)) {
         return (
           <div
             role="status"
@@ -209,17 +285,20 @@ function App() {
       if (postureChosen === null) {
         return <AtRestEncryptionChoice onResolved={() => setPostureChosen(false)} />;
       }
-      // A resolved posture with the wizard dismissed (skipped/finished with zero
-      // accounts) lands the user in an empty inbox — the shell (with its "Add an
-      // account" footer) rather than the bare login screen. `dismissed` is set only
-      // by the wizard's own finish(), so a sign-out-of-last-account still shows the
-      // login screen here (it never sets `dismissed`). All other zero-account states
-      // render the login screen — with, where this build has Bots, the one
-      // explicit way past it (Story 63.1, AD-180): a conversation with a model
-      // needs no account, and the phone that opens keeper for one must not
-      // meet a wall. Signing in stays the form above it; the way past is a
-      // control that says what it opens and that sign-in is still there.
-      if (!wizardDismissed && !signInSkipped) {
+      // A resolved posture with the wizard dismissed — or with this device's
+      // stored answer saying startup must not open setup — lands the user in an
+      // empty inbox: the shell (with its "Add an account" footer) rather than the
+      // bare login screen. Both are read here, in render, rather than left to the
+      // boot effect that sets `dismissed`: an effect commits after a paint, and
+      // the frame in between would be the login screen the stored answer exists
+      // to avoid. A sign-out-of-last-account on a device with no stored answer
+      // still shows the login screen (nothing set `dismissed`). All other
+      // zero-account states render the login screen — with, where this build has
+      // Bots, the one explicit way past it (Story 63.1, AD-180): a conversation
+      // with a model needs no account, and the phone that opens keeper for one
+      // must not meet a wall. Signing in stays the form above it; the way past is
+      // a control that says what it opens and that sign-in is still there.
+      if (!wizardDismissed && !signInSkipped && setupSkipped !== true) {
         return (
           <>
             <LoginScreen />

@@ -18,6 +18,10 @@ const mockListenNotesOpenNote = vi.hoisted(() => vi.fn(async () => () => {}));
 // The executor form, not `Promise.withResolvers`: the project compiles
 // against `lib: ES2020`, where that constructor method does not exist.
 const mockCapabilities = vi.hoisted(() => vi.fn(() => new Promise(() => {})));
+// The persisted "don't open setup when keeper starts" answer (spec *Skipping
+// setup can stick*). Pending is never the default here: every test above the
+// first-run path needs a resolved answer, since the boot decision waits for it.
+const mockFirstRunSetupSkipped = vi.hoisted(() => vi.fn<() => Promise<boolean>>());
 
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
@@ -37,6 +41,8 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     listenNotesOpenNote: mockListenNotesOpenNote,
     capabilities: mockCapabilities,
     telemetryStudyStop: vi.fn(async () => {}),
+    firstRunSetupSkippedGet: mockFirstRunSetupSkipped,
+    firstRunSetupSkippedSet: vi.fn(async () => {}),
   };
 });
 
@@ -90,6 +96,9 @@ describe("App", () => {
     mockListenNotesOpenNote.mockClear();
     mockCapabilities.mockReset();
     mockCapabilities.mockImplementation(() => new Promise(() => {}));
+    mockFirstRunSetupSkipped.mockReset();
+    // Default: nobody has silenced setup, so first run still opens the wizard.
+    mockFirstRunSetupSkipped.mockResolvedValue(false);
     capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
     primaryViewStore.getState().setView("inbox");
     leadingDrawerStore.getState().close();
@@ -185,6 +194,131 @@ describe("App", () => {
     expect(wizardStore.getState().dismissed).toBe(true);
     expect(await screen.findByRole("main")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Sign in" })).not.toBeInTheDocument();
+  });
+
+  /**
+   * Spec *Skipping setup can stick*: the dismissal used to live only in this
+   * webview's memory, so an install with no Account met onboarding on every
+   * relaunch — and an update is a relaunch, which is how the field report came
+   * in. A stored answer now decides the boot, and it has to land where the skip
+   * that wrote it landed: the shell, not the bare login screen.
+   */
+  it("does NOT open setup at startup once the device answered that it should not", async () => {
+    mockEncryptionPosture.mockResolvedValue(false);
+    mockFirstRunSetupSkipped.mockResolvedValue(true);
+    accountsStore.getState().markHydrated();
+    render(<App />);
+
+    expect(await screen.findByRole("main")).toBeInTheDocument();
+    expect(wizardStore.getState().active).toBe(false);
+    expect(screen.queryByRole("region", { name: "First-run setup" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sign in" })).not.toBeInTheDocument();
+  });
+
+  it("renders the shell on a suppressed boot even if nothing records the dismissal", async () => {
+    // The landing must be decided in render, not by the effect that calls
+    // `finish()`: an effect commits after a paint, and the frame in between
+    // would be the login screen the stored answer exists to avoid. Neutering
+    // `finish` is how this test can tell the two apart.
+    mockEncryptionPosture.mockResolvedValue(false);
+    mockFirstRunSetupSkipped.mockResolvedValue(true);
+    const realFinish = wizardStore.getState().finish;
+    wizardStore.setState({ finish: () => {} });
+    try {
+      accountsStore.getState().markHydrated();
+      render(<App />);
+
+      expect(await screen.findByRole("main")).toBeInTheDocument();
+      expect(wizardStore.getState().dismissed).toBe(false);
+      expect(screen.queryByRole("button", { name: "Sign in" })).not.toBeInTheDocument();
+    } finally {
+      wizardStore.setState({ finish: realFinish });
+    }
+  });
+
+  it("treats an unreadable answer as an answer, without waiting out the deadline", async () => {
+    // A refusal is information: onboarding must open at once, not after the
+    // deadline that exists for reads which never answer at all. Fake timers that
+    // are never advanced are what tells those two apart.
+    vi.useFakeTimers();
+    try {
+      mockEncryptionPosture.mockResolvedValue(false);
+      mockFirstRunSetupSkipped.mockRejectedValue(new Error("settings unreadable"));
+      accountsStore.getState().markHydrated();
+      render(<App />);
+      await act(async () => {});
+
+      expect(wizardStore.getState().active).toBe(true);
+      expect(screen.getByRole("region", { name: "First-run setup" })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a sign-out while the stored answer is still in flight does not open setup", async () => {
+    // The boot decision now waits on a second IPC answer, and `hasAccount` can
+    // change inside that window. What the boot WAS is latched when the boot
+    // state resolves, so a sign-out of the last Account cannot be mistaken for a
+    // first run and throw somebody into full-frame onboarding.
+    let answer: (value: boolean) => void = () => {};
+    mockEncryptionPosture.mockResolvedValue(false);
+    mockFirstRunSetupSkipped.mockReturnValue(
+      new Promise<boolean>((resolve) => {
+        answer = resolve;
+      }),
+    );
+    accountsStore.getState().addAccount(account);
+    accountsStore.getState().markHydrated();
+    const { rerender } = render(<App />);
+    expect(await screen.findByRole("main")).toBeInTheDocument();
+
+    accountsStore.getState().removeAccount(account.accountId);
+    rerender(<App />);
+    await act(async () => {
+      answer(false);
+    });
+
+    expect(wizardStore.getState().active).toBe(false);
+    expect(screen.queryByRole("region", { name: "First-run setup" })).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+  });
+
+  it("gives up on an answer that never arrives and opens setup rather than the splash", async () => {
+    // A `settings` read that hangs (a lock another process holds) used to leave
+    // the whole app on an unlabelled splash with no way forward.
+    vi.useFakeTimers();
+    try {
+      mockEncryptionPosture.mockResolvedValue(false);
+      mockFirstRunSetupSkipped.mockReturnValue(new Promise(() => {}));
+      accountsStore.getState().markHydrated();
+      render(<App />);
+      await act(async () => {});
+      expect(screen.getByRole("status", { name: "Loading keeper" })).toBeInTheDocument();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3_000);
+      });
+      expect(wizardStore.getState().active).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds the splash while the stored answer is still unread (no wizard, no login screen)", async () => {
+    mockEncryptionPosture.mockResolvedValue(false);
+    // Never resolves: the boot decision must wait rather than open a wizard the
+    // answer is about to suppress.
+    mockFirstRunSetupSkipped.mockReturnValue(new Promise(() => {}));
+    accountsStore.getState().markHydrated();
+    render(<App />);
+    // Flush the resolved posture and every effect it wakes, so this asserts the
+    // state after the boot decision had its chance — not merely before it.
+    await act(async () => {});
+
+    expect(screen.getByRole("status", { name: "Loading keeper" })).toBeInTheDocument();
+    expect(wizardStore.getState().active).toBe(false);
+    expect(screen.queryByRole("button", { name: "Sign in" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("main")).not.toBeInTheDocument();
   });
 
   it("still renders the login screen after a sign-out of the last account (wizard does NOT auto-start)", async () => {

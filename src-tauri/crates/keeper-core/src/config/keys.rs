@@ -742,6 +742,19 @@ pub const KEYS: &[KeySpec] = &[
     },
     // ---- ui --------------------------------------------------------------
     KeySpec {
+        key: "ui.first_run_setup_skipped",
+        family: false,
+        scope: Scope::SessionState,
+        settable: Settable::Never(
+            "it is the answer somebody gave in the skip dialog, and pre-setting it in a file \
+             would hide setup from a person who was never offered it",
+        ),
+        shape: Shape::Flag01,
+        default: "0",
+        summary: "Whether the person asked keeper not to open first-run setup at startup.",
+        example: "",
+    },
+    KeySpec {
         key: "ui.ios_sync_disclosure_shown",
         family: false,
         scope: Scope::SessionState,
@@ -1426,6 +1439,7 @@ mod tests {
     fn state_is_refused_from_every_file_including_this_machines() {
         for key in [
             "sdk_encryption",
+            "ui.first_run_setup_skipped",
             "ui.ios_sync_disclosure_shown",
             "ui.recovered_sessions_acknowledged",
             "notes.capture_draft.draft",

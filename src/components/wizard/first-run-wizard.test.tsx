@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BridgeCatalogState } from "@/hooks/use-bridge-catalog";
 import type { BridgeDiscoveryState } from "@/hooks/use-bridge-discovery";
@@ -53,15 +53,25 @@ vi.mock("@/hooks/use-bridge-discovery", () => ({
 
 // BridgeCard (rendered by the discovery step) opens a login Sheet that calls the
 // streaming IPC client on proceed; stub the client so the card never touches a
-// real Tauri channel.
+// real Tauri channel. The two first-run-skip functions are the wizard's own
+// (spec *Skipping setup can stick*) and each test sets what the device answered.
+const mockSkippedGet = vi.hoisted(() => vi.fn<() => Promise<boolean>>());
+const mockSkippedSet = vi.hoisted(() => vi.fn<(skipped: boolean) => Promise<void>>());
 vi.mock("@/lib/ipc/client", () => ({
   startBridgeLogin: vi.fn(() => new Promise<number>(() => {})),
   submitBridgeLogin: vi.fn(() => Promise.resolve()),
   cancelBridgeLogin: vi.fn(() => Promise.resolve()),
   bridgeBotRoom: vi.fn(() => Promise.resolve("!bot:example.org")),
+  firstRunSetupSkippedGet: () => mockSkippedGet(),
+  firstRunSetupSkippedSet: (skipped: boolean) => mockSkippedSet(skipped),
 }));
 
-import { FirstRunWizard } from "@/components/wizard/first-run-wizard";
+// The wizard names a failed write rather than swallowing it; the toast is the
+// only observable difference between "keeper remembered" and "it did not".
+const mockToastError = vi.hoisted(() => vi.fn());
+vi.mock("sonner", () => ({ toast: { error: mockToastError } }));
+
+import { FirstRunWizard, SKIP_AT_STARTUP_LABEL } from "@/components/wizard/first-run-wizard";
 
 const matrixNetwork: BridgeNetworkVm = {
   networkId: "whatsapp",
@@ -111,6 +121,12 @@ describe("FirstRunWizard", () => {
     mockDiscovery.mockReturnValue(
       discoveryReady([{ networkId: "whatsapp", status: "configured" }]),
     );
+    mockSkippedGet.mockReset();
+    mockSkippedSet.mockReset();
+    // Nothing answered yet: the box is unticked, as on a fresh install.
+    mockSkippedGet.mockResolvedValue(false);
+    mockSkippedSet.mockResolvedValue(undefined);
+    mockToastError.mockClear();
   });
 
   afterEach(() => {
@@ -191,6 +207,131 @@ describe("FirstRunWizard", () => {
     expect(wizardStore.getState().active).toBe(false);
     // Zero accounts ⇒ dismissed so App lands in the empty inbox, not login.
     expect(wizardStore.getState().dismissed).toBe(true);
+  });
+
+  it("the startup box shows the answer this device already gave", async () => {
+    // Somebody silenced onboarding on an earlier launch; re-running setup from
+    // Settings must show that, or clearing it would be impossible to find.
+    mockSkippedGet.mockResolvedValue(true);
+    render(<FirstRunWizard />);
+    fireEvent.click(screen.getByRole("button", { name: "Skip setup" }));
+
+    const dialog = await screen.findByRole("alertdialog");
+    await waitFor(() =>
+      expect(within(dialog).getByRole("checkbox", { name: SKIP_AT_STARTUP_LABEL })).toBeChecked(),
+    );
+  });
+
+  it("skipping with the startup box ticked persists it", async () => {
+    render(<FirstRunWizard />);
+    fireEvent.click(screen.getByRole("button", { name: "Skip setup" }));
+
+    const dialog = await screen.findByRole("alertdialog");
+    const box = within(dialog).getByRole("checkbox", { name: SKIP_AT_STARTUP_LABEL });
+    expect(box).not.toBeChecked();
+    fireEvent.click(box);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Skip setup" }));
+
+    // The next launch reads this and lands in the shell instead of onboarding.
+    expect(mockSkippedSet).toHaveBeenCalledWith(true);
+    expect(wizardStore.getState().active).toBe(false);
+  });
+
+  it("skipping with the startup box cleared brings setup back at startup", async () => {
+    mockSkippedGet.mockResolvedValue(true);
+    render(<FirstRunWizard />);
+    fireEvent.click(screen.getByRole("button", { name: "Skip setup" }));
+
+    const dialog = await screen.findByRole("alertdialog");
+    const box = within(dialog).getByRole("checkbox", { name: SKIP_AT_STARTUP_LABEL });
+    await waitFor(() => expect(box).toBeChecked());
+    fireEvent.click(box);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Skip setup" }));
+
+    // `false`, not "left alone": the box is the only control over the answer, so
+    // clearing it has to be written.
+    expect(mockSkippedSet).toHaveBeenCalledWith(false);
+  });
+
+  it("a late-arriving stored answer does not move the box under the person", async () => {
+    // The read is async and the Skip control is live from first paint, so an
+    // answer can land after somebody has already ticked the box. Theirs wins —
+    // otherwise the tick is silently undone and setup keeps reopening.
+    let answer: (value: boolean) => void = () => {};
+    mockSkippedGet.mockReturnValue(
+      new Promise<boolean>((resolve) => {
+        answer = resolve;
+      }),
+    );
+    render(<FirstRunWizard />);
+    fireEvent.click(screen.getByRole("button", { name: "Skip setup" }));
+
+    const dialog = await screen.findByRole("alertdialog");
+    const box = within(dialog).getByRole("checkbox", { name: SKIP_AT_STARTUP_LABEL });
+    fireEvent.click(box);
+    expect(box).toBeChecked();
+
+    await act(async () => {
+      answer(false);
+    });
+    expect(within(dialog).getByRole("checkbox", { name: SKIP_AT_STARTUP_LABEL })).toBeChecked();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Skip setup" }));
+    expect(mockSkippedSet).toHaveBeenCalledWith(true);
+  });
+
+  it("writes nothing when the stored answer could not be read and the box was not touched", async () => {
+    // The destructive case: a read failure leaves the box unchecked, and writing
+    // that `false` would wipe a `true` set months ago and re-open onboarding at
+    // every launch — the very bug this control exists to end.
+    mockSkippedGet.mockRejectedValue(new Error("settings unreadable"));
+    render(<FirstRunWizard />);
+    fireEvent.click(screen.getByRole("button", { name: "Skip setup" }));
+
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Skip setup" }));
+
+    expect(mockSkippedSet).not.toHaveBeenCalled();
+    // Still leaves: an unreadable answer must never trap anybody in onboarding.
+    expect(wizardStore.getState().active).toBe(false);
+  });
+
+  it("still leaves when the answer cannot be written, and says so", async () => {
+    mockSkippedSet.mockRejectedValue(new Error("settings unwritable"));
+    render(<FirstRunWizard />);
+    fireEvent.click(screen.getByRole("button", { name: "Skip setup" }));
+
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(within(dialog).getByRole("checkbox", { name: SKIP_AT_STARTUP_LABEL }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Skip setup" }));
+
+    expect(wizardStore.getState().active).toBe(false);
+    // The failure is named rather than swallowed: onboarding coming back next
+    // launch would otherwise be inexplicable.
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith(
+        expect.stringMatching(/^Couldn't remember that\./),
+      ),
+    );
+  });
+
+  it("keeping setup re-opens the box on the stored answer, not on the abandoned tick", async () => {
+    // The box is an input for the pending skip. Closing without confirming
+    // writes nothing, so it must not keep showing an answer this device does not
+    // hold.
+    render(<FirstRunWizard />);
+    fireEvent.click(screen.getByRole("button", { name: "Skip setup" }));
+
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(within(dialog).getByRole("checkbox", { name: SKIP_AT_STARTUP_LABEL }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Keep setting up" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Skip setup" }));
+    const reopened = await screen.findByRole("alertdialog");
+    expect(
+      within(reopened).getByRole("checkbox", { name: SKIP_AT_STARTUP_LABEL }),
+    ).not.toBeChecked();
+    expect(mockSkippedSet).not.toHaveBeenCalled();
   });
 
   it("Esc opens the confirm (does not exit immediately); confirming calls finish()", async () => {
