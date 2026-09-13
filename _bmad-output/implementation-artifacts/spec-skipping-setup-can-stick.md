@@ -2,11 +2,12 @@
 title: 'Skipping setup can stick'
 type: 'feature'
 created: '2026-09-13'
-status: 'in-review'
-review_loop_iteration: 0
-followup_review_recommended: false
+status: 'done'
+review_loop_iteration: 1
+followup_review_recommended: true
 context: []
 baseline_revision: '53e859eedcfbe51b112c5ddf575a2c49503c2f18'
+final_revision: '3b6a0d6'
 warnings: []
 ---
 
@@ -122,3 +123,31 @@ The box is an input for the pending skip, not a mirror of disk: only confirming 
 - Real engine, not jsdom: the dev harness (`bun run dev`) driven through Chrome on the macOS host over tunnelled CDP. The wizard auto-starts on a zero-Account boot; the confirm renders the box unchecked; ticking it and confirming closes the wizard, lands on the shell, and `first_run_setup_skipped_get` answers `true` over the real IPC wire. With the harness seeded `true`, boot renders the shell (empty chat list, "Add account" footer) with no wizard and no login screen.
 - Note what the harness cannot show: its answer is a module-level `let`, so a page reload starts at `false`. Persistence across launches is the `settings` table's, covered by the registry test.
 - `src-tauri/crates/keeper/src/{ipc,lib}.rs` cannot be compiled on the Linux dev host (AGENTS.md); the command pair is written by inspection here and gated by CI's macOS `Rust (fmt, clippy, test)` job.
+
+## Auto Run Result
+
+Status: done. Blocking condition: none.
+
+**Implemented.** A skipped first-run setup now stays skipped across launches. One checkbox in
+the wizard's skip-confirm ("Don't open setup when keeper starts") writes a device-global
+two-way answer into the Rust `settings` table (`ui.first_run_setup_skipped`); the boot honours
+it and lands where a skip lands — the shell's empty Inbox — and Settings → "Run setup again"
+still opens the wizard, where clearing the same box brings startup setup back.
+
+**Files changed**
+- `src-tauri/crates/keeper-core/src/registry.rs` — the key plus `get_/set_first_run_setup_skipped`, and a round-trip test that also pins the stored `1`/`0` and a stray value.
+- `src-tauri/crates/keeper-core/src/config/keys.rs` — the `KeySpec` (`SessionState`, `Settable::Never`, `Flag01`) and the never-from-a-file refusal list.
+- `docs/settings-keys.md` — regenerated row.
+- `src-tauri/crates/keeper/src/ipc.rs`, `lib.rs` — the command pair, registered in the shared handler literal (both targets).
+- `src/lib/ipc/client.ts` — the two wrappers.
+- `src/components/wizard/first-run-wizard.tsx` — the label const, the checkbox, the read/write rules, the cancel reset, the named write failure.
+- `src/App.tsx` — the bounded read, the two-half boot decision, the render-side landing, the telemetry gate.
+- `src/lib/stores/wizard.ts` — module doc names the persisted answer.
+- `dev/mock-shell.ts` — a round-tripping harness answer.
+- `src/App.test.tsx`, `src/components/wizard/first-run-wizard.test.tsx` — 12 new cases.
+
+**Review** — 2 passes in parallel (adversarial, edge-case): 11 findings patched (4 high), 6 rejected with reasons, 0 deferred, 0 spec loopbacks. See the triage log above.
+
+**Verification** — every command in Verification above ran green; each of the seven guards was mutation-checked (removed, suite red, restored); the behaviour was driven in Chrome on the macOS host against the dev harness over tunnelled CDP.
+
+**Residual risk** — `crates/keeper/src/{ipc,lib}.rs` were written by inspection (the shell crate does not compile on this Linux host) and are gated by CI's macOS `Rust (fmt, clippy, test)` job. A follow-up review is recommended: the review pass changed boot ordering and the render-time landing decision, which is the kind of change worth a second pair of eyes.
