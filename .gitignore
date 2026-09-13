@@ -54,3 +54,7 @@ src-tauri/bindings/
 
 # The commit an install states for the build it is about to make (build.rs).
 src-tauri/crates/keeper/build-sha.txt
+
+# Linked to the shared fleet overrides (~/bmad-custom); the link target is
+# an absolute path, so it is not portable and is not committed.
+_bmad/custom
