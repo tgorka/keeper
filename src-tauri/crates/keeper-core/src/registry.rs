@@ -1022,6 +1022,29 @@ pub fn set_debug_mode(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
     set_setting(data_dir, DEBUG_MODE_KEY, if enabled { "1" } else { "0" })
 }
 
+/// The background-update toggle's settings key.
+const AUTO_UPDATE_KEY: &str = "update.auto";
+
+/// Read the background-update toggle. **Absent ⇒ on**
+/// ([`crate::update::DEFAULT_ENABLED`]): an install that has never answered
+/// gets the behaviour every other app of this shape has, and only an explicit
+/// `"0"` turns it off. That asymmetry is deliberate — `debug.mode` defaults off
+/// because it writes files nobody asked for, and this defaults on because the
+/// endpoint it contacts is the one already disclosed in About and the artifact
+/// is signature-verified before it installs.
+pub fn get_auto_update(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(match get_setting(data_dir, AUTO_UPDATE_KEY)?.as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => crate::update::DEFAULT_ENABLED,
+    })
+}
+
+/// Write the background-update toggle.
+pub fn set_auto_update(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+    set_setting(data_dir, AUTO_UPDATE_KEY, if enabled { "1" } else { "0" })
+}
+
 /// List every muted Network label (Story 10.2, FR-52). Returns the `network_id`
 /// (display-label) of each present row; an empty vector means no Network is muted.
 /// Sorted ascending for determinism. Keeper-local — Matrix has no Network concept.
@@ -4188,6 +4211,25 @@ mod tests {
         assert!(get_debug_mode(&dir).expect("read back on"));
         set_debug_mode(&dir, false).expect("disable");
         assert!(!get_debug_mode(&dir).expect("read back off"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The one setting in this table that defaults **on**, and the reason it
+    /// needs its own test: a reader that fell back to `== Some("1")` like its
+    /// neighbours would leave every existing install — none of which has this
+    /// row — with background updates off, which is exactly the behaviour the
+    /// feature replaces. An explicit `"0"` must be the only way to get there.
+    #[test]
+    fn auto_update_defaults_on_and_round_trips() {
+        let dir = temp_dir();
+        assert!(
+            get_auto_update(&dir).expect("read default"),
+            "an install that never answered updates in the background"
+        );
+        set_auto_update(&dir, false).expect("disable");
+        assert!(!get_auto_update(&dir).expect("read back off"));
+        set_auto_update(&dir, true).expect("enable");
+        assert!(get_auto_update(&dir).expect("read back on"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

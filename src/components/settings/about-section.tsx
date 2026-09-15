@@ -1,13 +1,16 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { check, type Update } from "@tauri-apps/plugin-updater";
+import { check } from "@tauri-apps/plugin-updater";
 import { type MouseEvent, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { useVoiceFacts } from "@/hooks/use-voice-facts";
 import {
+  type AutoUpdateVm,
+  autoUpdateGet,
+  autoUpdateSet,
   debugLogPath,
   debugModeGet,
   debugModeSet,
@@ -15,7 +18,9 @@ import {
   egressList,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
+import { isUpdateBusy, type UpdatePhase, updateStore, useUpdateStore } from "@/lib/stores/update";
 import { useVoiceStore } from "@/lib/stores/voice";
+import { updateErrorMessage } from "@/lib/update-error";
 
 /**
  * The honest disclosure of the live network policy
@@ -126,37 +131,16 @@ function openExternal(event: MouseEvent<HTMLAnchorElement>, url: string) {
 }
 
 /**
- * The states of the in-app update flow (Story 11.2, NFR-12). Every path — including a
- * failed check, a failed install, or a failed relaunch — resolves to one of these
- * rendered states; an error is never thrown to the console only. Installing and
- * relaunching happen only after an explicit second click (consent), so merely checking
- * never restarts the app out from under an in-progress compose.
+ * The honest copy for the background-update switch. Says what turning it on
+ * does, names the cadence Rust chose rather than a literal, and says plainly
+ * that keeper does not restart itself — the one thing a person needs to know to
+ * predict when the new build starts being used.
  */
-type UpdateState =
-  | { kind: "idle" }
-  | { kind: "checking" }
-  | { kind: "upToDate" }
-  | { kind: "available"; version: string }
-  | { kind: "downloading"; version: string }
-  | { kind: "installedNeedsRestart" }
-  | { kind: "error"; message: string };
-
-/**
- * Extract a human-readable message from an unknown thrown value (never throws). Falls
- * back to a generic line for a non-string / empty / object-valued `message` so the
- * error surface never renders "[object Object]", "undefined", or a dangling colon.
- */
-function errorMessage(raw: unknown): string {
-  if (typeof raw === "string" && raw.trim() !== "") {
-    return raw;
-  }
-  if (typeof raw === "object" && raw !== null && "message" in raw) {
-    const message = (raw as { message: unknown }).message;
-    if (typeof message === "string" && message.trim() !== "") {
-      return message;
-    }
-  }
-  return "Something went wrong.";
+export function autoUpdateSentence(plan: AutoUpdateVm | undefined): string {
+  const hours = plan === undefined ? 0 : Math.round(plan.checkIntervalMs / 3_600_000);
+  const cadence =
+    hours >= 1 ? `about every ${hours} hour${hours === 1 ? "" : "s"}` : "on a cadence";
+  return `keeper looks for a new version ${cadence} and installs it in the background. It starts using the new version the next time you restart keeper — keeper never restarts itself.`;
 }
 
 /**
@@ -199,16 +183,21 @@ export function AboutSection({ open }: { open: boolean }) {
   // with). `undefined` = still loading; `null` = read failed (render "unknown"
   // rather than guessing).
   const [appVersion, setAppVersion] = useState<string | null | undefined>(undefined);
-  const [update, setUpdate] = useState<UpdateState>({ kind: "idle" });
+  // The update flow's state, shared with the background loop
+  // (`use-auto-update`): an update it installed while Settings was closed is
+  // still here to be reported, and a check it started is not raced by a click.
+  const update = useUpdateStore((s) => s.phase);
+  // The background-update plan: `undefined` until Rust answers. Carries the
+  // effective `enabled` (a layer file may pin it) and the cadence the sentence
+  // names.
+  const [autoPlan, setAutoPlan] = useState<AutoUpdateVm | undefined>(undefined);
+  const autoWriteId = useRef(0);
   // Debug-mode toggle (Story 22.5): `undefined` = still loading.
   const [debugMode, setDebugMode] = useState<boolean | undefined>(undefined);
   const debugWriteId = useRef(0);
   // Where this device's app log is, as Rust answers it (Story 65.3): `null`
   // until it has, or when it could not.
   const [logPath, setLogPath] = useState<string | null>(null);
-  // The detected-but-not-yet-installed update, held between the two clicks. Not state:
-  // it is not rendered, only consumed by the install step.
-  const pendingUpdate = useRef<Update | null>(null);
   // Guards every async resolution below so it never sets state after unmount.
   const mounted = useRef(true);
   useEffect(() => {
@@ -217,9 +206,9 @@ export function AboutSection({ open }: { open: boolean }) {
       mounted.current = false;
     };
   }, []);
-  const setUpdateSafe = (next: UpdateState) => {
+  const setUpdateSafe = (next: UpdatePhase) => {
     if (mounted.current) {
-      setUpdate(next);
+      updateStore.getState().setPhase(next);
     }
   };
 
@@ -227,11 +216,15 @@ export function AboutSection({ open }: { open: boolean }) {
     if (!open) {
       return;
     }
-    // Reset to the loading state (and a fresh update flow) on every (re)open so a
-    // stale prior list never lingers while the fresh read is in flight.
+    // Reset to the loading state on every (re)open so a stale prior list never
+    // lingers while the fresh read is in flight. The update flow is reset with
+    // it — except where resetting would discard something that is still true:
+    // an installed build waiting for a restart, or a check/download in flight.
     setEndpoints(undefined);
-    setUpdate({ kind: "idle" });
-    pendingUpdate.current = null;
+    const flow = updateStore.getState();
+    if (flow.phase.kind !== "installedNeedsRestart" && !isUpdateBusy(flow.phase)) {
+      flow.reset();
+    }
     let cancelled = false;
     void getVersion()
       .then((version) => {
@@ -257,6 +250,20 @@ export function AboutSection({ open }: { open: boolean }) {
           setDebugMode(false);
         }
       });
+    if (inAppUpdater) {
+      // Only where an in-app updater exists: the switch is inside that block,
+      // so reading it on a phone would be a dead round-trip per open.
+      void autoUpdateGet()
+        .then((plan) => {
+          if (!cancelled) {
+            setAutoPlan(plan);
+          }
+        })
+        .catch(() => {
+          // Unanswered: the switch stays disabled rather than claiming an
+          // answer. The manual control below is unaffected.
+        });
+    }
     void debugLogPath()
       .then((path) => {
         if (!cancelled) {
@@ -289,23 +296,23 @@ export function AboutSection({ open }: { open: boolean }) {
       clearInterval(egressTimer);
       window.removeEventListener("keeper-telemetry-consent-changed", refreshEgress);
     };
-  }, [open]);
+  }, [open, inAppUpdater]);
 
   // Step 1 — detect only. Never installs or relaunches; a mere check must not restart
   // the app. On an available update we stash it and surface "available" for consent.
   const onCheckForUpdates = () => {
-    setUpdate({ kind: "checking" });
+    updateStore.getState().setPhase({ kind: "checking" });
     void check()
       .then((result) => {
         if (result === null) {
           setUpdateSafe({ kind: "upToDate" });
           return;
         }
-        pendingUpdate.current = result;
+        updateStore.getState().setPending(result);
         setUpdateSafe({ kind: "available", version: result.version });
       })
       .catch((raw: unknown) => {
-        setUpdateSafe({ kind: "error", message: errorMessage(raw) });
+        setUpdateSafe({ kind: "error", message: updateErrorMessage(raw) });
       });
   };
 
@@ -313,15 +320,16 @@ export function AboutSection({ open }: { open: boolean }) {
   // failure is reported distinctly (the update is already on disk) rather than as a
   // generic failure that would imply the install itself failed.
   const onDownloadAndInstall = () => {
-    const target = pendingUpdate.current;
+    const flow = updateStore.getState();
+    const target = flow.pending;
     if (target === null) {
       return;
     }
     // Consume the pending update so a rapid double-click can't launch a second
     // concurrent downloadAndInstall() on the same handle. To retry after a
     // failure the user re-checks, which re-detects and re-arms the update.
-    pendingUpdate.current = null;
-    setUpdate({ kind: "downloading", version: target.version });
+    flow.setPending(null);
+    flow.setPhase({ kind: "downloading", version: target.version });
     void target
       .downloadAndInstall()
       .then(async () => {
@@ -330,18 +338,51 @@ export function AboutSection({ open }: { open: boolean }) {
           // A real relaunch exits the process, so this never renders. If relaunch
           // resolves without actually restarting, never leave the flow stuck on
           // "downloading" — the update is already on disk, so ask for a restart.
-          setUpdateSafe({ kind: "installedNeedsRestart" });
+          setUpdateSafe({ kind: "installedNeedsRestart", version: null });
         } catch {
           // Install succeeded but the relaunch failed; the update is on disk.
-          setUpdateSafe({ kind: "installedNeedsRestart" });
+          setUpdateSafe({ kind: "installedNeedsRestart", version: null });
         }
       })
       .catch((raw: unknown) => {
-        setUpdateSafe({ kind: "error", message: errorMessage(raw) });
+        setUpdateSafe({ kind: "error", message: updateErrorMessage(raw) });
       });
   };
 
-  const busy = update.kind === "checking" || update.kind === "downloading";
+  // The restart the background path asks for: the new build is already on disk,
+  // so this only exchanges the running process for it. A failed relaunch says
+  // so and leaves the "restart to finish" sentence standing — the install is
+  // not undone by a relaunch that did not happen.
+  const onRestart = () => {
+    void relaunch().catch((raw: unknown) => {
+      setUpdateSafe({ kind: "error", message: updateErrorMessage(raw) });
+    });
+  };
+
+  const busy = isUpdateBusy(update);
+
+  // Optimistic toggle with revert-on-failure, and the *effective* plan applied
+  // when it differs: a `update.auto` pinned by a layer file makes the switch
+  // visibly refuse to move rather than promising a cadence that never runs.
+  const onAutoUpdateChange = (next: boolean) => {
+    autoWriteId.current += 1;
+    const id = autoWriteId.current;
+    const prev = autoPlan;
+    if (prev !== undefined) {
+      setAutoPlan({ ...prev, enabled: next });
+    }
+    void autoUpdateSet(next)
+      .then((effective) => {
+        if (id === autoWriteId.current && mounted.current) {
+          setAutoPlan(effective);
+        }
+      })
+      .catch(() => {
+        if (id === autoWriteId.current && mounted.current) {
+          setAutoPlan(prev);
+        }
+      });
+  };
 
   // Optimistic toggle with revert-on-failure (the settings-pane pattern): never
   // display a state that was not actually saved.
@@ -431,9 +472,16 @@ export function AboutSection({ open }: { open: boolean }) {
             </p>
           )}
           {update.kind === "installedNeedsRestart" && (
-            <p className="text-muted-foreground text-xs" role="status">
-              Update installed. Restart keeper to finish.
-            </p>
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-muted-foreground text-xs" role="status">
+                {update.version === null
+                  ? "Update installed. Restart keeper to finish."
+                  : `Update ${update.version} installed. Restart keeper to finish.`}
+              </p>
+              <Button type="button" variant="outline" size="sm" onClick={onRestart}>
+                Restart now
+              </Button>
+            </div>
           )}
           {update.kind === "error" && (
             <p className="text-held text-xs" role="alert">
@@ -441,6 +489,20 @@ export function AboutSection({ open }: { open: boolean }) {
             </p>
           )}
           <p className="text-muted-foreground text-xs">{UPDATE_HONESTY_SENTENCE}</p>
+          {autoPlan?.supported === true && (
+            <>
+              <div className="mt-0.5 flex items-center justify-between gap-2">
+                <Label htmlFor="auto-update">Update automatically</Label>
+                <Switch
+                  id="auto-update"
+                  checked={autoPlan?.enabled ?? false}
+                  disabled={autoPlan === undefined}
+                  onCheckedChange={onAutoUpdateChange}
+                />
+              </div>
+              <p className="text-muted-foreground text-xs">{autoUpdateSentence(autoPlan)}</p>
+            </>
+          )}
         </div>
       )}
 

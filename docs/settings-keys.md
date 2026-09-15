@@ -100,6 +100,8 @@ file-controlled instead, and says which file.
 | | | | | Whether keeper keeps a menu-bar (tray) presence. |
 | `undo_send.window` | user-global | integer 0..=60 | `10` | `"undo_send.window" = 10` |
 | | | | | How long a sent message is held before it dispatches, in seconds. |
+| `update.auto` | user-global | boolean (`1`/`0`) | `1` | `"update.auto" = false` |
+| | | | | Whether keeper checks for its own update on a cadence and installs it in the background. The new build starts being used at the next restart; keeper never restarts itself. Off means the update endpoint is contacted only when somebody clicks Check for updates. |
 
 ## Keys only `keeper.<host>.toml` may set
 

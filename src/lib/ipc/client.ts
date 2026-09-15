@@ -9,6 +9,7 @@
 import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { AutoUpdateVm } from "./gen/AutoUpdateVm";
 import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 import type { DockBadgeMode } from "./gen/DockBadgeMode";
 import type { DocumentVm } from "./gen/DocumentVm";
@@ -53,6 +54,7 @@ export type { AccountVm } from "./gen/AccountVm";
 export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 export type { AuditOutcome } from "./gen/AuditOutcome";
 export type { AuditVerdict } from "./gen/AuditVerdict";
+export type { AutoUpdateVm } from "./gen/AutoUpdateVm";
 export type { BackupStatus } from "./gen/BackupStatus";
 export type { BadgeStyle } from "./gen/BadgeStyle";
 export type { BbctlAvailabilityVm } from "./gen/BbctlAvailabilityVm";
@@ -2849,6 +2851,25 @@ export async function debugModeGet(): Promise<boolean> {
  */
 export async function debugModeSet(enabled: boolean): Promise<void> {
   await invoke("debug_mode_set", { enabled });
+}
+
+/**
+ * The background-update plan: whether keeper checks for its own update on a
+ * cadence and installs it unasked, plus the cadence (first delay, interval,
+ * retry backoff) it does that on. Rust owns every number here — the loop in
+ * `use-auto-update` schedules them and invents none.
+ */
+export async function autoUpdateGet(): Promise<AutoUpdateVm> {
+  return invoke<AutoUpdateVm>("auto_update_get");
+}
+
+/**
+ * Turn background updates on or off, resolving with the **effective** plan: a
+ * `update.auto` pinned by a layer file comes back unchanged, so the switch
+ * shows what will happen rather than what was asked for.
+ */
+export async function autoUpdateSet(enabled: boolean): Promise<AutoUpdateVm> {
+  return invoke<AutoUpdateVm>("auto_update_set", { enabled });
 }
 
 /**
