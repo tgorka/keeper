@@ -8,6 +8,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { FirstRunWizard } from "@/components/wizard/first-run-wizard";
 import { useActiveChatReporter } from "@/hooks/use-active-chat-reporter";
 import { useAppLifecycle } from "@/hooks/use-app-lifecycle";
+import { useAutoUpdate } from "@/hooks/use-auto-update";
 import { useCapabilitiesHydrate } from "@/hooks/use-capabilities-hydrate";
 import { useNavStatePersistence } from "@/hooks/use-nav-state-persistence";
 import { useNotesOpenNote } from "@/hooks/use-notes-open-note";
@@ -83,6 +84,10 @@ function App() {
   // animation-frame liveness probe, on the reduced-capability (iOS) tier only
   // (Story 14.4, tauri#14371). Never reloads a healthy webview. Inert on desktop.
   useWebviewGuard();
+  // Check for a new keeper on the cadence Rust chose, install it in the
+  // background, and ask for a restart rather than performing one. Desktop only
+  // (the phone tier has no in-app updater) and off if `update.auto` says so.
+  useAutoUpdate();
   const hydrated = useAccountsStore((s) => s.hydrated);
   const hasAccount = useAccountsStore((s) => s.accounts.length > 0);
   const addAccountOpen = useAddAccountStore((s) => s.open);

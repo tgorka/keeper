@@ -62,6 +62,38 @@ pub struct HotkeyVm {
     pub conflict: Option<String>,
 }
 
+/// The background-update plan (Epic 11 follow-on): whether keeper installs its
+/// own updates unasked, and the cadence it does that on.
+///
+/// Built by [`crate::update::plan`] from the stored `update.auto` answer and the
+/// shipped constants — the webview never invents a cadence, and the two
+/// surfaces that read this (the background loop and the About switch) cannot
+/// disagree about what is on. `enabled` is the *effective* answer after the
+/// layer files have had their say, so a key pinned by a `keeper.toml` makes the
+/// switch visibly refuse to move rather than promising a session that will
+/// never happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AutoUpdateVm {
+    /// Whether a background install can happen on this build at all — the
+    /// shell's answer, per-platform. `false` renders the switch away (absent,
+    /// not disabled) and leaves the two-click manual control as the only path.
+    pub supported: bool,
+    /// Whether background checking and installing is on. Never `true` where
+    /// `supported` is `false`.
+    pub enabled: bool,
+    /// Milliseconds from app start to the first background check.
+    #[ts(type = "number")]
+    pub first_check_delay_ms: i64,
+    /// Milliseconds between background checks thereafter.
+    #[ts(type = "number")]
+    pub check_interval_ms: i64,
+    /// Milliseconds to wait after a failed check or download before retrying.
+    #[ts(type = "number")]
+    pub retry_delay_ms: i64,
+}
+
 /// Response of the `app_ping` liveness command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

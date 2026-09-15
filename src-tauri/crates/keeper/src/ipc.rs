@@ -49,7 +49,7 @@ use keeper_core::recording::{
     RECOVERY_MAX_VISITS,
 };
 use keeper_core::vm::{
-    AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
+    AccountVm, ApprovalDraftVm, AutoUpdateVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
     CapabilitiesVm, ChatNotifyMode, ConfigLayersVm, ConnectionStatusBatch, CouplingCaveatVm,
     DemoBatch, DockBadgeMode, DraftMirrorBatch, EditVersionVm, EgressEndpointVm,
@@ -11038,6 +11038,56 @@ pub fn debug_mode_set(state: State<'_, AppState>, enabled: bool) -> Result<(), I
     keeper_core::registry::set_debug_mode(&data_dir, enabled).map_err(to_ipc_error)?;
     crate::debug_log::set_enabled(enabled);
     Ok(())
+}
+
+/// Whether a background install is something this build may do behind the
+/// person's back.
+///
+/// macOS only, and not as a placeholder: installing there replaces the `.app`
+/// bundle and leaves the running process alone, so the new build simply becomes
+/// what the next launch runs. Windows' updater hands off to an installer that
+/// requires the app to exit — acceptable after somebody clicked *Download and
+/// install*, never acceptable unasked — and Linux has no bundle keeper ships.
+/// Both keep the two-click manual control; neither gets a background one until
+/// its install is known to be non-disruptive.
+const BACKGROUND_UPDATE_SUPPORTED: bool = cfg!(target_os = "macos");
+
+/// Read the background-update plan: whether keeper may install its own updates
+/// on a cadence here, whether it is switched on, plus the cadence itself.
+///
+/// The cadence is [`keeper_core::update`]'s, never the webview's, and `enabled`
+/// is the **effective** answer — read back through the layer engine, so a
+/// `update.auto` pinned by a `keeper.toml` shows up as a switch that will not
+/// move rather than as a promise that never takes. Errors funnel through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub fn auto_update_get(state: State<'_, AppState>) -> Result<AutoUpdateVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let enabled = keeper_core::registry::get_auto_update(&data_dir).map_err(to_ipc_error)?;
+    Ok(keeper_core::update::plan(
+        enabled,
+        BACKGROUND_UPDATE_SUPPORTED,
+    ))
+}
+
+/// Set the background-update toggle, and answer with the effective plan.
+///
+/// Persist, then re-read: the returned `enabled` is what the next launch (and
+/// the background loop, which re-reads this before every cycle) will actually
+/// do, which is the only value the switch may render. Errors funnel through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub fn auto_update_set(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<AutoUpdateVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::set_auto_update(&data_dir, enabled).map_err(to_ipc_error)?;
+    let effective = keeper_core::registry::get_auto_update(&data_dir).map_err(to_ipc_error)?;
+    Ok(keeper_core::update::plan(
+        effective,
+        BACKGROUND_UPDATE_SUPPORTED,
+    ))
 }
 
 /// The tail of the app log, for the in-app diagnostics surface.

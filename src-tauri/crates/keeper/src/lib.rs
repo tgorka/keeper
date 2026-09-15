@@ -1080,6 +1080,8 @@ pub fn run() {
                 ipc::sessions_spaces_folded_set,
                 ipc::debug_mode_get,
                 ipc::debug_mode_set,
+                ipc::auto_update_get,
+                ipc::auto_update_set,
                 ipc::debug_log_tail,
                 ipc::debug_log_path,
                 ipc::titlebar_drag_report,

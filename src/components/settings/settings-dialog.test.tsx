@@ -2,6 +2,25 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
+  // The About sub-block's background-update plan and its writer.
+  autoUpdateGet: vi.fn(() =>
+    Promise.resolve({
+      supported: true,
+      enabled: true,
+      firstCheckDelayMs: 120_000,
+      checkIntervalMs: 21_600_000,
+      retryDelayMs: 1_800_000,
+    }),
+  ),
+  autoUpdateSet: vi.fn((enabled: boolean) =>
+    Promise.resolve({
+      supported: true,
+      enabled,
+      firstCheckDelayMs: 120_000,
+      checkIntervalMs: 21_600_000,
+      retryDelayMs: 1_800_000,
+    }),
+  ),
   encryptionPosture: vi.fn(() => Promise.resolve(null)),
   honorRemoteDeletions: vi.fn(() => Promise.resolve(false)),
   setHonorRemoteDeletions: vi.fn(() => Promise.resolve()),
