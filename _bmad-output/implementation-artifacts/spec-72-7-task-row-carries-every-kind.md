@@ -1,7 +1,7 @@
 ---
-status: review
+status: done
 baseline_revision: a8eb9c2
-final_revision: ''
+final_revision: 'c162a1a12a86'
 ---
 
 # Story 72.7 — The task row carries every kind

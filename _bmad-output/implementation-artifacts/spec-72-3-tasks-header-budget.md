@@ -1,8 +1,8 @@
 ---
 title: 'The Tasks header has a budget, and its prose moves into a hint'
-status: review
+status: done
 baseline_revision: a8eb9c2
-final_revision: ''
+final_revision: 'c162a1a12a86'
 ---
 
 <intent-contract>

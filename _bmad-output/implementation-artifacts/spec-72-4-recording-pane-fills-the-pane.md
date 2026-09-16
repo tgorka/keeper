@@ -2,9 +2,9 @@
 title: 'The Recording pane fills the pane'
 type: 'bugfix'
 created: '2026-09-16'
-status: review
+status: done
 baseline_revision: a8eb9c2
-final_revision: ''
+final_revision: 'c162a1a12a86'
 ---
 
 <intent-contract>
