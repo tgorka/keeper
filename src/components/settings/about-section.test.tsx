@@ -5,6 +5,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
   egressList: vi.fn(() => Promise.resolve([])),
+  // The background-update plan (`update.auto` + the cadence): on by default,
+  // exactly as an install that has never answered reads it.
+  autoUpdateGet: vi.fn(() =>
+    Promise.resolve({
+      supported: true,
+      enabled: true,
+      firstCheckDelayMs: 120_000,
+      checkIntervalMs: 21_600_000,
+      retryDelayMs: 1_800_000,
+      restartCheckIntervalMs: 60_000,
+    }),
+  ),
+  autoUpdateSet: vi.fn((enabled: boolean) =>
+    Promise.resolve({
+      supported: true,
+      enabled,
+      firstCheckDelayMs: 120_000,
+      checkIntervalMs: 21_600_000,
+      retryDelayMs: 1_800_000,
+      restartCheckIntervalMs: 60_000,
+    }),
+  ),
   debugModeGet: vi.fn(() => Promise.resolve(false)),
   debugModeSet: vi.fn(() => Promise.resolve()),
   // Where this device's log is (Story 65.3): the default is the Mac's answer,
@@ -37,17 +59,22 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import {
   AboutSection,
+  autoUpdateSentence,
   debugModeSentence,
   IOS_DISCLOSURE_LINES,
   MACOS_DISCLOSURE_LINES,
+  selfRestartNote,
 } from "@/components/settings/about-section";
 import {
+  autoUpdateGet,
+  autoUpdateSet,
   debugLogPath,
   type EgressEndpointVm,
   egressList,
   voiceAvailability,
 } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { updateStore } from "@/lib/stores/update";
 import { voiceStore } from "@/lib/stores/voice";
 
 const mockEgress = vi.mocked(egressList);
@@ -57,6 +84,8 @@ const mockOpenUrl = vi.mocked(openUrl);
 const mockGetVersion = vi.mocked(getVersion);
 const mockVoiceAvailability = vi.mocked(voiceAvailability);
 const mockDebugLogPath = vi.mocked(debugLogPath);
+const mockAutoUpdateGet = vi.mocked(autoUpdateGet);
+const mockAutoUpdateSet = vi.mocked(autoUpdateSet);
 
 /** All seven capabilities present = the desktop tier (updater block renders). */
 const DESKTOP_CAPABILITIES = {
@@ -124,6 +153,12 @@ beforeEach(() => {
   mockDebugLogPath.mockReset();
   mockDebugLogPath.mockResolvedValue("/Users/alice/Library/Logs/keeper/keeper.log");
   voiceStore.setState({ state: null, unavailable: undefined, wake: null });
+  // The update flow lives in a module-level store now (it is shared with the
+  // background loop), so a case that left a build "waiting for a restart" must
+  // not hand that state to the next one.
+  updateStore.getState().reset();
+  mockAutoUpdateGet.mockClear();
+  mockAutoUpdateSet.mockClear();
   // Default the mirror to the desktop tier so the software-update block renders for
   // the egress/update-flow assertions; the reduced-platform cases opt in explicitly.
   capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
@@ -346,6 +381,101 @@ describe("AboutSection update flow", () => {
       expect(screen.getByText("Update failed: signature verification failed")).toBeInTheDocument();
     });
     expect(mockRelaunch).not.toHaveBeenCalled();
+  });
+
+  it("reports a build the background loop already installed, and restarts on request", async () => {
+    // What `use-auto-update` leaves behind while Settings was closed: installed,
+    // named, waiting for a restart nobody has been forced into.
+    updateStore
+      .getState()
+      .setPhase({ kind: "installedNeedsRestart", version: "0.9.0", atMs: Date.now() });
+    render(<AboutSection open />);
+    await waitFor(() => expect(mockEgress).toHaveBeenCalled());
+
+    expect(
+      screen.getByText("Update 0.9.0 installed. Restart keeper to finish."),
+    ).toBeInTheDocument();
+    // Opening About must not discard that state the way it resets a stale check.
+    expect(mockRelaunch).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Restart now" }));
+    await waitFor(() => expect(mockRelaunch).toHaveBeenCalledTimes(1));
+  });
+
+  it("says what the self-restart is waiting for, and names the recording case", async () => {
+    const flow = updateStore.getState();
+    flow.setPhase({ kind: "installedNeedsRestart", version: "0.9.0", atMs: Date.now() });
+    flow.setRestartHold("recording");
+    render(<AboutSection open />);
+    await waitFor(() => expect(mockEgress).toHaveBeenCalled());
+
+    // The hold that can stand for hours on a machine nobody is touching is the
+    // one a person must be able to read off the surface.
+    expect(screen.getByText(selfRestartNote("recording"))).toBeInTheDocument();
+    expect(selfRestartNote("recording")).toContain("will not restart while a recording is running");
+    expect(selfRestartNote("inUse")).toContain("once you are away from keeper");
+  });
+
+  it("persists the background-update switch and shows the effective answer a file pinned", async () => {
+    render(<AboutSection open />);
+    const auto = await screen.findByLabelText("Update automatically");
+    // The stored answer, not a compile-time default: on.
+    await waitFor(() => expect(auto).toBeChecked());
+
+    // A layer file pins `update.auto`, so the write is echoed back unchanged and
+    // the switch refuses to move rather than promising a session that never runs.
+    mockAutoUpdateSet.mockResolvedValueOnce({
+      supported: true,
+      enabled: true,
+      firstCheckDelayMs: 120_000,
+      checkIntervalMs: 21_600_000,
+      retryDelayMs: 1_800_000,
+      restartCheckIntervalMs: 60_000,
+    });
+    fireEvent.click(auto);
+    expect(mockAutoUpdateSet).toHaveBeenCalledWith(false);
+    await waitFor(() => expect(auto).toBeChecked());
+
+    // With nothing pinning it, the same click sticks.
+    fireEvent.click(auto);
+    await waitFor(() => expect(auto).not.toBeChecked());
+  });
+
+  it("omits the switch where a background install would exit the app, keeping the manual control", async () => {
+    mockAutoUpdateGet.mockResolvedValueOnce({
+      supported: false,
+      enabled: false,
+      firstCheckDelayMs: 120_000,
+      checkIntervalMs: 21_600_000,
+      retryDelayMs: 1_800_000,
+      restartCheckIntervalMs: 60_000,
+    });
+    render(<AboutSection open />);
+    await waitFor(() => expect(mockEgress).toHaveBeenCalled());
+
+    // Absent, not disabled — the project's rule for a surface the platform
+    // refuses. The two-click path is unaffected.
+    expect(screen.queryByLabelText("Update automatically")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Check for updates" })).toBeInTheDocument();
+  });
+
+  it("names the cadence Rust chose in the switch's sentence", () => {
+    const plan = {
+      supported: true,
+      enabled: true,
+      firstCheckDelayMs: 120_000,
+      checkIntervalMs: 21_600_000,
+      retryDelayMs: 1_800_000,
+      restartCheckIntervalMs: 60_000,
+    };
+    expect(autoUpdateSentence(plan)).toContain("about every 6 hours");
+    // And the two things a person needs to predict what happens to their
+    // session: that keeper will restart itself, and the one thing that always
+    // stops it.
+    expect(autoUpdateSentence(plan)).toContain("keeper restarts itself");
+    expect(autoUpdateSentence(plan)).toContain("never while a recording is running");
+    // Unanswered: no invented number.
+    expect(autoUpdateSentence(undefined)).toContain("on a cadence");
   });
 });
 

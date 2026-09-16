@@ -821,6 +821,17 @@ pub const KEYS: &[KeySpec] = &[
         summary: "How long a sent message is held before it dispatches, in seconds.",
         example: "10",
     },
+    // ---- update ----------------------------------------------------------
+    KeySpec {
+        key: "update.auto",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Flag01,
+        default: "1",
+        summary: "Whether keeper checks for its own update on a cadence, installs it in the background, and then restarts itself into it once nobody is using keeper — overnight, or after hours away, and never while a recording is live. Off means the update endpoint is contacted only when somebody clicks Check for updates, and only a person restarts.",
+        example: "false",
+    },
 ];
 
 /// Shared reason for the three OS-global accelerators.

@@ -47,6 +47,8 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
   AccountVm,
+  AutoUpdateRestartVm,
+  AutoUpdateVm,
   BotAttachmentVm,
   BotAuditRowVm,
   BotCommandPreviewVm,
@@ -2850,7 +2852,38 @@ function voiceIdle(): VoiceStateVm {
   };
 }
 
+/**
+ * The background-update plan, as `keeper_core::update::plan` builds it for an
+ * install that has never answered: supported, on, with the shipped cadence.
+ *
+ * A module-level `let` with a round-tripping setter rather than an `ANSWERS`
+ * row, for this file's usual reason: the switch's whole behaviour is that the
+ * write is echoed back and applied, and a read-only answer would show a switch
+ * that snaps back and teach the reviewer the toggle is broken. The loop's own
+ * `plugin:updater|check` is not answered here, so nothing in the dev rig ever
+ * downloads anything.
+ */
+let autoUpdate: AutoUpdateVm = {
+  supported: true,
+  enabled: true,
+  firstCheckDelayMs: 120_000,
+  checkIntervalMs: 21_600_000,
+  retryDelayMs: 1_800_000,
+  restartCheckIntervalMs: 60_000,
+};
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  auto_update_get: () => autoUpdate,
+  // Always a hold, never a verdict to restart: a harness that answered
+  // `restart: true` would relaunch the dev page out from under whoever is
+  // looking at it. The real answer is Rust's, from the recording state and the
+  // local hour, and cannot be looked at here.
+  auto_update_restart_check: () =>
+    ({ restart: false, hold: "inUse" }) satisfies AutoUpdateRestartVm,
+  auto_update_set: (payload) => {
+    autoUpdate = { ...autoUpdate, enabled: payload.enabled === true };
+    return autoUpdate;
+  },
   // Browser development never contacts PostHog or exposes a real project token.
   telemetry_status: () => ({
     consent: { diagnostics: false, productAnalytics: false, remoteConfig: false },

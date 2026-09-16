@@ -62,6 +62,71 @@ pub struct HotkeyVm {
     pub conflict: Option<String>,
 }
 
+/// The background-update plan (Epic 11 follow-on): whether keeper installs its
+/// own updates unasked, and the cadence it does that on.
+///
+/// Built by [`crate::update::plan`] from the stored `update.auto` answer and the
+/// shipped constants — the webview never invents a cadence, and the two
+/// surfaces that read this (the background loop and the About switch) cannot
+/// disagree about what is on. `enabled` is the *effective* answer after the
+/// layer files have had their say, so a key pinned by a `keeper.toml` makes the
+/// switch visibly refuse to move rather than promising a session that will
+/// never happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AutoUpdateVm {
+    /// Whether a background install can happen on this build at all — the
+    /// shell's answer, per-platform. `false` renders the switch away (absent,
+    /// not disabled) and leaves the two-click manual control as the only path.
+    pub supported: bool,
+    /// Whether background checking and installing is on. Never `true` where
+    /// `supported` is `false`.
+    pub enabled: bool,
+    /// Milliseconds from app start to the first background check.
+    #[ts(type = "number")]
+    pub first_check_delay_ms: i64,
+    /// Milliseconds between background checks thereafter.
+    #[ts(type = "number")]
+    pub check_interval_ms: i64,
+    /// Milliseconds to wait after a failed check or download before retrying.
+    #[ts(type = "number")]
+    pub retry_delay_ms: i64,
+    /// Milliseconds between "is this a good moment to restart?" questions once
+    /// a build is installed and waiting.
+    #[ts(type = "number")]
+    pub restart_check_interval_ms: i64,
+}
+
+/// The answer to "may keeper restart itself into the installed build now?"
+/// ([`crate::update::decide_restart`]).
+///
+/// `hold` is why not, so a surface can say what it is waiting for instead of
+/// leaving "restart to finish" standing for a week with no explanation. Exactly
+/// one of the two is meaningful: `restart` true carries no hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AutoUpdateRestartVm {
+    /// Whether to restart now.
+    pub restart: bool,
+    /// Why not, when `restart` is false.
+    pub hold: Option<AutoUpdateHold>,
+}
+
+/// Why keeper is not restarting itself into an installed build yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum AutoUpdateHold {
+    /// A recording is live — the one refusal that ignores hour and idleness.
+    Recording,
+    /// The person still has first refusal on the restart.
+    Grace,
+    /// Somebody is using keeper.
+    InUse,
+}
+
 /// Response of the `app_ping` liveness command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

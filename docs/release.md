@@ -223,9 +223,20 @@ build; a value that is not a sha is ignored with a warning rather than believed.
    > updater endpoint is `.../releases/latest/download/latest.json`, and GitHub's
    > `/releases/latest/` only resolves to the newest **published**, non-prerelease
    > release — a draft is never "latest" and its `latest.json` is not reachable at that
-   > URL. Until you publish, installed apps' "Check for updates" will not see the new
-   > release (it reports up to date or, transiently, an error). Publish to make the
-   > update live.
+   > URL. Until you publish, neither an installed app's "Check for updates" nor its
+   > background updater (on by default, `update.auto`; it checks about every 6 hours)
+   > will see the new release — it reports up to date or, transiently, an error.
+   > Publish to make the update live.
+
+   > **A published release reaches running apps by itself, and runs there by
+   > itself.** With **Update automatically** on, installed apps download and
+   > verify the new build in the background within about six hours, and then
+   > restart themselves into it at the first moment nothing is lost: not while a
+   > recording is live, not within half an hour of the install, and then only
+   > overnight after a quiet spell or after several hours away. So a bad release
+   > is not merely downloaded onto other people's machines — it is what they are
+   > running by the next morning, with nobody having clicked anything. Publish
+   > only what you would install.
 
 ## Egress diff note
 

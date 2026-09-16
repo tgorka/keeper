@@ -100,6 +100,8 @@ file-controlled instead, and says which file.
 | | | | | Whether keeper keeps a menu-bar (tray) presence. |
 | `undo_send.window` | user-global | integer 0..=60 | `10` | `"undo_send.window" = 10` |
 | | | | | How long a sent message is held before it dispatches, in seconds. |
+| `update.auto` | user-global | boolean (`1`/`0`) | `1` | `"update.auto" = false` |
+| | | | | Whether keeper checks for its own update on a cadence, installs it in the background, and then restarts itself into it once nobody is using keeper — overnight, or after hours away, and never while a recording is live. Off means the update endpoint is contacted only when somebody clicks Check for updates, and only a person restarts. |
 
 ## Keys only `keeper.<host>.toml` may set
 
