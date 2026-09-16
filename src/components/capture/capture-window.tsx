@@ -35,6 +35,7 @@ import { Lock, LockOpen, Pin, PinOff, X } from "lucide-react";
 import { useCallback, useEffect } from "react";
 import { CaptureDocument } from "@/components/capture/capture-document";
 import { Button } from "@/components/ui/button";
+import { IconHint } from "@/components/ui/tooltip";
 import { saveNote } from "@/hooks/use-notes-body";
 import { captureKey } from "@/lib/capture-target";
 import { type CaptureTargetVm, listenNotesCaptureWindows } from "@/lib/ipc/client";
@@ -194,31 +195,37 @@ export function CaptureWindowChrome({ captureKey, onClose }: CaptureWindowChrome
        * measured is unchanged by adding a third button on the far side.
        * `justify-end gap-1` needs no layout work for it.
        */}
-      <Button
-        variant="ghost"
-        size="icon"
-        aria-label={alwaysOnTop ? CAPTURE_UNPIN_LABEL : CAPTURE_PIN_LABEL}
-        aria-pressed={alwaysOnTop}
-        onClick={() => {
-          void setCaptureWindowAlwaysOnTop(captureKey, !alwaysOnTop);
-        }}
-      >
-        {alwaysOnTop ? <Pin aria-hidden="true" /> : <PinOff aria-hidden="true" />}
-      </Button>
-      <Button
-        variant="ghost"
-        size="icon"
-        aria-label={locked ? CAPTURE_UNLOCK_LABEL : CAPTURE_LOCK_LABEL}
-        aria-pressed={!locked}
-        onClick={() => {
-          void setCaptureWindowLocked(captureKey, !locked);
-        }}
-      >
-        {locked ? <Lock aria-hidden="true" /> : <LockOpen aria-hidden="true" />}
-      </Button>
-      <Button variant="ghost" size="icon" aria-label={CAPTURE_CLOSE_LABEL} onClick={onClose}>
-        <X aria-hidden="true" />
-      </Button>
+      <IconHint label={alwaysOnTop ? CAPTURE_UNPIN_LABEL : CAPTURE_PIN_LABEL}>
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label={alwaysOnTop ? CAPTURE_UNPIN_LABEL : CAPTURE_PIN_LABEL}
+          aria-pressed={alwaysOnTop}
+          onClick={() => {
+            void setCaptureWindowAlwaysOnTop(captureKey, !alwaysOnTop);
+          }}
+        >
+          {alwaysOnTop ? <Pin aria-hidden="true" /> : <PinOff aria-hidden="true" />}
+        </Button>
+      </IconHint>
+      <IconHint label={locked ? CAPTURE_UNLOCK_LABEL : CAPTURE_LOCK_LABEL}>
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label={locked ? CAPTURE_UNLOCK_LABEL : CAPTURE_LOCK_LABEL}
+          aria-pressed={!locked}
+          onClick={() => {
+            void setCaptureWindowLocked(captureKey, !locked);
+          }}
+        >
+          {locked ? <Lock aria-hidden="true" /> : <LockOpen aria-hidden="true" />}
+        </Button>
+      </IconHint>
+      <IconHint label={CAPTURE_CLOSE_LABEL}>
+        <Button variant="ghost" size="icon" aria-label={CAPTURE_CLOSE_LABEL} onClick={onClose}>
+          <X aria-hidden="true" />
+        </Button>
+      </IconHint>
     </div>
   );
 }

@@ -73,6 +73,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { IconHint } from "@/components/ui/tooltip";
 import type { SyncProfileVm } from "@/lib/ipc/client";
 // The credential calls are made straight from the form rather than through the
 // mirror store: none of them change anything the store mirrors, and the read
@@ -2312,17 +2313,19 @@ export function AddFolderForm({
               {/* A button, not an adornment with a click handler: it changes
                   what is on screen, so it has to be reachable by keyboard, carry
                   its state, and say which way it will flip. */}
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                aria-pressed={tokenVisible}
-                aria-label={tokenVisible ? SYNC_TOKEN_HIDE_LABEL : SYNC_TOKEN_SHOW_LABEL}
-                disabled={disabled || saving}
-                onClick={() => setTokenVisible((shown) => !shown)}
-              >
-                {tokenVisible ? <EyeOff /> : <Eye />}
-              </Button>
+              <IconHint label={tokenVisible ? SYNC_TOKEN_HIDE_LABEL : SYNC_TOKEN_SHOW_LABEL}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-pressed={tokenVisible}
+                  aria-label={tokenVisible ? SYNC_TOKEN_HIDE_LABEL : SYNC_TOKEN_SHOW_LABEL}
+                  disabled={disabled || saving}
+                  onClick={() => setTokenVisible((shown) => !shown)}
+                >
+                  {tokenVisible ? <EyeOff /> : <Eye />}
+                </Button>
+              </IconHint>
             </div>
           </div>
           <p className="text-muted-foreground text-xs">

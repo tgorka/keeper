@@ -21,10 +21,10 @@
  * already draws it, and this trigger's label was worded after that one.
  *
  * {@link NOTE_ACTIONS_TEXT} is therefore no longer rendered as text — it is the
- * `title` a pointer gets, and the prefix of the accessible name, which still
- * carries the note's title after it. A control whose spoken name does not
- * contain the word its tooltip shows cannot be operated by anyone saying what
- * they see (WCAG 2.5.3).
+ * hint the pointer and a keyboard focus both get, and the prefix of the
+ * accessible name, which still carries the note's title after it. A control
+ * whose spoken name does not contain the word its hint shows cannot be operated
+ * by anyone saying what they see (WCAG 2.5.3).
  *
  * Destructive last, and behind a separator: nothing has to reason about
  * position, the item under the cursor when the menu opens is never the one that
@@ -34,6 +34,7 @@
  * reader walking a workspace with several note panels open would otherwise hear
  * the same control in each of them.
  */
+
 import { MoreHorizontal } from "lucide-react";
 import { type ReactNode, useState } from "react";
 import { NoteDeleteDialog } from "@/components/notes/note-delete-dialog";
@@ -45,6 +46,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { IconHint } from "@/components/ui/tooltip";
 
 /**
  * The trigger's accessible name, suffixed with the note's title. Worded like
@@ -93,21 +95,22 @@ export function NoteActions({
   return (
     <>
       <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            size="icon-sm"
-            variant="ghost"
-            // The name carries the note's title so a workspace with several
-            // note panels open does not announce the same control in each of
-            // them; the tooltip carries only the word, because the title is
-            // already on screen an inch to the left.
-            aria-label={`${NOTE_ACTIONS_LABEL} ${title}`}
-            title={NOTE_ACTIONS_TEXT}
-          >
-            <MoreHorizontal aria-hidden="true" />
-          </Button>
-        </DropdownMenuTrigger>
+        <IconHint label={`${NOTE_ACTIONS_LABEL} ${title}`}>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              // The name carries the note's title so a workspace with several
+              // note panels open does not announce the same control in each of
+              // them; the hint carries the same sentence, and no `title=` — a
+              // keyboard or a touch screen never saw one (AD-239).
+              aria-label={`${NOTE_ACTIONS_LABEL} ${title}`}
+            >
+              <MoreHorizontal aria-hidden="true" />
+            </Button>
+          </DropdownMenuTrigger>
+        </IconHint>
         <DropdownMenuContent align="end">
           {children}
           {/* The destructive verb gets a break above it as well as last place.

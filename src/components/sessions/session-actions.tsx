@@ -27,6 +27,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { IconHint } from "@/components/ui/tooltip";
 import type { SessionRowVm } from "@/lib/ipc/client";
 import {
   revealPath,
@@ -80,17 +81,19 @@ export function SessionActions({ rootId, rootPath, row }: SessionActionsProps) {
   return (
     <>
       <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            aria-label={SESSION_ACTIONS_LABEL}
-            className="size-7"
-          >
-            <MoreHorizontal aria-hidden className="size-4" />
-          </Button>
-        </DropdownMenuTrigger>
+        <IconHint label={SESSION_ACTIONS_LABEL}>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label={SESSION_ACTIONS_LABEL}
+              className="size-7"
+            >
+              <MoreHorizontal aria-hidden className="size-4" />
+            </Button>
+          </DropdownMenuTrigger>
+        </IconHint>
         <DropdownMenuContent align="end">
           <DropdownMenuItem onSelect={() => void sessionsSetPinned(rootId, row.id, !row.pinned)}>
             {row.pinned ? SESSION_UNPIN_LABEL : SESSION_PIN_LABEL}

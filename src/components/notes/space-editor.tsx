@@ -54,6 +54,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { IconHint } from "@/components/ui/tooltip";
 import { spaceQueryText } from "@/hooks/use-notes-actions";
 import type { NoteSpaceFieldVm, NoteSpaceVm, NoteTemplateVm } from "@/lib/ipc/client";
 import { notesSpaceSave, notesSpaceTerms, notesTagTree, notesTemplates } from "@/lib/ipc/client";
@@ -895,19 +896,21 @@ export function IconChoice({
 }) {
   const Glyph = spaceIcon(name);
   return (
-    <button
-      type="button"
-      aria-pressed={selected}
-      aria-label={label}
-      data-space-icon={name ?? "none"}
-      onClick={onSelect}
-      className={cn(
-        "rounded-md border p-2 outline-none focus-visible:ring-2 focus-visible:ring-ring",
-        selected ? "border-ring bg-accent text-accent-foreground" : "border-input",
-      )}
-    >
-      <Glyph aria-hidden="true" className="size-4" />
-    </button>
+    <IconHint label={label}>
+      <button
+        type="button"
+        aria-pressed={selected}
+        aria-label={label}
+        data-space-icon={name ?? "none"}
+        onClick={onSelect}
+        className={cn(
+          "flex size-8 items-center justify-center rounded-md border",
+          selected ? "border-ring bg-accent" : "border-border hover:bg-accent/50",
+        )}
+      >
+        <Glyph aria-hidden="true" className="size-4" />
+      </button>
+    </IconHint>
   );
 }
 

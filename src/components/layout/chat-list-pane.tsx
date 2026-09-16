@@ -22,6 +22,7 @@ import { type SurfaceRail, useSurfaceColumn } from "@/components/layout/surface-
 import { Kbd } from "@/components/ui/kbd";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
+import { IconHint } from "@/components/ui/tooltip";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import type { InboxBatch, InboxRoomVm, NetworksSnapshot, SpacesSnapshot } from "@/lib/ipc/client";
 import {
@@ -693,27 +694,31 @@ export function ChatListPane() {
             {spaceFilterActive && (
               <span className="inline-flex items-center gap-1 rounded-full bg-accent px-2 py-0.5 text-accent-foreground text-xs">
                 {activeSpaceName ?? "Space"}
-                <button
-                  type="button"
-                  onClick={clearSpaceFilter}
-                  aria-label={`Clear ${activeSpaceName ?? "Space"} filter`}
-                  className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  <X aria-hidden="true" className="size-3" />
-                </button>
+                <IconHint label={`Clear ${activeSpaceName ?? "Space"} filter`}>
+                  <button
+                    type="button"
+                    onClick={clearSpaceFilter}
+                    aria-label={`Clear ${activeSpaceName ?? "Space"} filter`}
+                    className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <X aria-hidden="true" className="size-3" />
+                  </button>
+                </IconHint>
               </span>
             )}
             {networkFilterActive && activeNetwork !== null && (
               <span className="inline-flex items-center gap-1 rounded-full bg-accent px-2 py-0.5 text-accent-foreground text-xs">
                 {activeNetwork}
-                <button
-                  type="button"
-                  onClick={clearNetworkFilter}
-                  aria-label={`Clear ${activeNetwork} filter`}
-                  className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  <X aria-hidden="true" className="size-3" />
-                </button>
+                <IconHint label={`Clear ${activeNetwork} filter`}>
+                  <button
+                    type="button"
+                    onClick={clearNetworkFilter}
+                    aria-label={`Clear ${activeNetwork} filter`}
+                    className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <X aria-hidden="true" className="size-3" />
+                  </button>
+                </IconHint>
               </span>
             )}
           </div>

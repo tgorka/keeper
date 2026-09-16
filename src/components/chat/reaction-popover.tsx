@@ -11,6 +11,7 @@ import { Smile } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { IconHint } from "@/components/ui/tooltip";
 
 /**
  * The curated reaction set. Arbitrary Matrix reaction strings pass through
@@ -30,32 +31,35 @@ export function ReactionPopover({ onPick }: ReactionPopoverProps) {
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button type="button" variant="ghost" size="icon-xs" aria-label="Add reaction">
-          <Smile aria-hidden="true" />
-        </Button>
-      </PopoverTrigger>
+      <IconHint label="Add reaction">
+        <PopoverTrigger asChild>
+          <Button type="button" variant="ghost" size="icon-xs" aria-label="Add reaction">
+            <Smile aria-hidden="true" />
+          </Button>
+        </PopoverTrigger>
+      </IconHint>
       <PopoverContent
         align="start"
         className="w-auto flex-row gap-0.5 p-1"
         aria-label="Pick a reaction"
       >
         {CURATED_EMOJI.map((emoji) => (
-          <Button
-            key={emoji}
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            aria-label={`React with ${emoji}`}
-            onClick={() => {
-              onPick(emoji);
-              setOpen(false);
-            }}
-          >
-            <span aria-hidden="true" className="text-base leading-none">
-              {emoji}
-            </span>
-          </Button>
+          <IconHint key={emoji} label={`React with ${emoji}`}>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label={`React with ${emoji}`}
+              onClick={() => {
+                onPick(emoji);
+                setOpen(false);
+              }}
+            >
+              <span aria-hidden="true" className="text-base leading-none">
+                {emoji}
+              </span>
+            </Button>
+          </IconHint>
         ))}
       </PopoverContent>
     </Popover>

@@ -48,4 +48,46 @@ function TooltipContent({
   );
 }
 
+export const HOVER_HINT_DELAY_MS = 500;
+
+export function HoverHint({
+  label,
+  detail,
+  side = "top",
+  children,
+}: {
+  label: string;
+  detail?: string;
+  side?: "top" | "right" | "bottom" | "left";
+  children: React.ReactNode;
+}): React.JSX.Element {
+  return (
+    <TooltipProvider delayDuration={HOVER_HINT_DELAY_MS} skipDelayDuration={0}>
+      <Tooltip delayDuration={HOVER_HINT_DELAY_MS}>
+        <TooltipTrigger asChild>{children}</TooltipTrigger>
+        <TooltipContent side={side} className="max-w-xs flex-col items-start whitespace-normal">
+          <span className="w-full break-words [overflow-wrap:anywhere]">{label}</span>
+          {detail && <span className="line-clamp-3 w-full break-words">{detail}</span>}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
+export function IconHint({
+  label,
+  side = "top",
+  children,
+}: {
+  label: string;
+  side?: "top" | "right" | "bottom" | "left";
+  children: React.ReactNode;
+}): React.JSX.Element {
+  return (
+    <HoverHint label={label} side={side}>
+      {children}
+    </HoverHint>
+  );
+}
+
 export { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger };

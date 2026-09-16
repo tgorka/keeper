@@ -151,6 +151,7 @@ function space(
     folder: null,
     warnings: [],
     order: 0,
+    updatedMs: null,
     error: null,
   };
 }

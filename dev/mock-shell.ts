@@ -202,20 +202,33 @@ const noteRows = NOTES.map(([id, title, body, tags, modified, pinned], index) =>
 
 /** The five defaults 44.3 seeds, plus the shapes a real vault grows. */
 const SPACES = [
+  ["keeper:all", "All notes", "", "notebook", null],
   ["s-inbox", "Inbox", "is:untagged", "inbox", "inbox"],
   ["s-journal", "Journal", "is:journal", "calendar-days", "journal"],
   ["s-pinned", "Pinned", "is:pinned", "pin", "pinned"],
   ["s-rec", "Recordings", "is:recording", "video", "recordings"],
   ["s-tpl", "Templates", "is:template", "layout-template", "templates"],
   ["s-work", "Active work", "tag:epic22", "layers", null],
+  [
+    "keeper:uncategorized",
+    "Uncategorized",
+    "-is:untagged -is:journal -is:pinned -is:recording -is:template -tag:epic22",
+    "shapes",
+    null,
+  ],
 ].map(([id, name, query, icon, defaultKey]) => ({
   id,
   name,
+  updatedMs: null,
   query,
   icon,
   defaultKey,
   order: 0,
-  sort: null,
+  sort: "",
+  sortEffective: "modified desc",
+  limit: 0,
+  template: null,
+  folder: null,
   error: null,
   warnings: [],
 }));

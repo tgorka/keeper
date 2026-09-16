@@ -64,7 +64,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Lamp } from "@/components/ui/lamp";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { IconHint, Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSignOut } from "@/hooks/use-sign-out";
 import { accountHueVar } from "@/lib/account-hue";
 import { initials } from "@/lib/account-initials";
@@ -786,20 +786,18 @@ export function AccountFooter({ collapsed }: AccountFooterProps) {
       ))}
 
       {collapsed ? (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              aria-label="Add account"
-              onClick={openAddAccount}
-            >
-              <Plus aria-hidden="true" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="right">Add account</TooltipContent>
-        </Tooltip>
+        // A narrow left rail when folded, so the hint opens to the right of it.
+        <IconHint side="right" label="Add account">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            aria-label="Add account"
+            onClick={openAddAccount}
+          >
+            <Plus aria-hidden="true" />
+          </Button>
+        </IconHint>
       ) : (
         <Button
           type="button"

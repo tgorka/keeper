@@ -13,6 +13,7 @@
 import { X } from "lucide-react";
 import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { IconHint } from "@/components/ui/tooltip";
 import { encryptionStatusStore, useShowVerifyBanner } from "@/lib/stores/encryption-status";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 
@@ -45,15 +46,17 @@ export function VerifyBanner() {
           >
             Verify
           </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            aria-label="Dismiss"
-            onClick={() => encryptionStatusStore.getState().dismissBanner()}
-          >
-            <X aria-hidden="true" />
-          </Button>
+          <IconHint label="Dismiss">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Dismiss"
+              onClick={() => encryptionStatusStore.getState().dismissBanner()}
+            >
+              <X aria-hidden="true" />
+            </Button>
+          </IconHint>
         </AlertAction>
       </Alert>
     </div>

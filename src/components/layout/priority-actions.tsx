@@ -73,6 +73,7 @@
 import type { LucideIcon } from "lucide-react";
 import { type ReactNode, useLayoutEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { IconHint } from "@/components/ui/tooltip";
 import { PANE_HEADER_GAP_PX } from "./pane-header";
 
 /** Marks the group, so a test can find it without knowing the caller. */
@@ -103,6 +104,8 @@ export interface PriorityAction {
   readonly icon: LucideIcon;
   /** What the control and the menu item both do. One handler, so they cannot drift. */
   readonly onSelect: () => void;
+  /** A pending write must not be submitted twice, even while promoted. */
+  readonly disabled?: boolean;
   /**
    * For a candidate that DISCLOSES something rather than doing something:
    * whether the region it names is open right now. Rendered as
@@ -289,39 +292,36 @@ export function PriorityActions({
         </div>
       )}
       {items.slice(0, promoted).map(({ icon: Icon, ...item }) => (
-        <Button
-          key={item.id}
-          ref={(node) => {
-            if (node === null) {
-              controls.delete(item.id);
-            } else {
-              controls.set(item.id, node);
-            }
-          }}
-          {...{ [PRIORITY_ACTION_ATTR]: item.id }}
-          type="button"
-          size="icon-sm"
-          variant="ghost"
-          // The word is gone from the surface and from nowhere else. `title`
-          // is what a pointer gets on a hover; `aria-label` is the whole
-          // visible word rather than a description of it, so speech input can
-          // say what an eye reads even though the eye reads a picture
-          // (WCAG 2.5.3). An icon with no name is a control nobody can ask for.
-          aria-label={item.label}
-          title={item.label}
-          // Undefined on a plain verb, so the attribute is absent rather than
-          // false: a control that discloses nothing must not report a closed
-          // region. The `ghost` variant already paints `aria-expanded:bg-muted`,
-          // so the open panel is visible here without a class of our own — and
-          // without a pixel of width, which is what keeps promotion a function
-          // of the window rather than of what is open.
-          aria-expanded={item.expanded}
-          aria-controls={item.controls}
-          className="shrink-0"
-          onClick={item.onSelect}
-        >
-          <Icon aria-hidden="true" />
-        </Button>
+        <IconHint key={item.id} label={item.label}>
+          <Button
+            ref={(node) => {
+              if (node === null) {
+                controls.delete(item.id);
+              } else {
+                controls.set(item.id, node);
+              }
+            }}
+            {...{ [PRIORITY_ACTION_ATTR]: item.id }}
+            type="button"
+            size="icon-sm"
+            variant="ghost"
+            // The hint and the accessible name carry the same word as the menu.
+            aria-label={item.label}
+            disabled={item.disabled}
+            // Undefined on a plain verb, so the attribute is absent rather than
+            // false: a control that discloses nothing must not report a closed
+            // region. The `ghost` variant already paints `aria-expanded:bg-muted`,
+            // so the open panel is visible here without a class of our own — and
+            // without a pixel of width, which is what keeps promotion a function
+            // of the window rather than of what is open.
+            aria-expanded={item.expanded}
+            aria-controls={item.controls}
+            className="shrink-0"
+            onClick={item.onSelect}
+          >
+            <Icon aria-hidden="true" />
+          </Button>
+        </IconHint>
       ))}
       <div ref={menuRef} className="flex shrink-0 items-center">
         {menu(inMenu)}

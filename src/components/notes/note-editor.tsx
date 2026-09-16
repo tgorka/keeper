@@ -25,7 +25,15 @@
  * the editor stays alive behind them so Escape returns to the caret it left,
  * which is a promise a remount could not keep.
  */
-import { Files, FolderSearch, History, SlidersHorizontal } from "lucide-react";
+import {
+  ArrowLeft,
+  ArrowRight,
+  Files,
+  FolderSearch,
+  History,
+  List,
+  SlidersHorizontal,
+} from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { CaptureNoteItem } from "@/components/capture/capture-note-item";
 import { ExportNoteItem } from "@/components/export/export-note-item";
@@ -33,17 +41,30 @@ import { PaneHeader } from "@/components/layout/pane-header";
 import { type PriorityAction, PriorityActions } from "@/components/layout/priority-actions";
 import { Button } from "@/components/ui/button";
 import {
+  DropdownMenu,
   DropdownMenuCheckboxItem,
+  DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { IconHint } from "@/components/ui/tooltip";
 import { useNotesBody } from "@/hooks/use-notes-body";
-import { type NoteWriteVm, notesGallery, notesRename, notesTagTree } from "@/lib/ipc/client";
+import {
+  type NoteWriteVm,
+  notesBodyRead,
+  notesGallery,
+  notesRename,
+  notesTagTree,
+  type PanelTargetVm,
+} from "@/lib/ipc/client";
 import { followExternalUrl, resolveWikilink } from "@/lib/notes/follow-link";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { markSaved, readNoteDocument, useNoteDocument } from "@/lib/stores/notes-editor";
 import { ensureNotesVaultsHydrated, useNotesVaultsStore } from "@/lib/stores/notes-vaults";
+import { panelsStore, usePanelsStore } from "@/lib/stores/panels";
 import { filePathForNote, SHOW_IN_FILES_LABEL, showNoteInFiles } from "@/lib/vault-link";
 import { AttachFileButton } from "./attach-file-button";
 import { ATTACHMENTS_LABEL, AttachmentsPanel } from "./attachments-panel";
@@ -316,6 +337,7 @@ export interface NoteEditorProps {
   noteId: string | null;
   /** Open another note — a backlink row, or a wikilink that resolved. */
   onOpenNote?: (noteId: string) => void;
+  panelId?: string;
   /**
    * The controls of the surface that HOLDS this editor — a panel's fold and
    * close — handed straight to the header's fourth group (Story 50.1).
@@ -352,7 +374,7 @@ export interface NoteEditorProps {
  */
 export const NOTE_COLUMN_CLASS = "flex h-full min-h-0 min-w-0 flex-col";
 
-export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorProps) {
+export function NoteEditor({ vaultId, noteId, onOpenNote, frame, panelId }: NoteEditorProps) {
   const body = useNotesBody(vaultId, noteId);
   // Story 46.12: every one of these names the note THIS editor is showing.
   // Two editors are two subscriptions to two documents in one store, and the
@@ -1013,18 +1035,19 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
                     nothing on screen left to say the region exists. The verbs
                     below still demote, because a verb in a menu is still a verb
                     you can reach by name. */}
-                <Button
-                  type="button"
-                  size="icon-sm"
-                  variant="ghost"
-                  aria-label={PROPERTIES_LABEL}
-                  title={PROPERTIES_LABEL}
-                  aria-expanded={showProperties}
-                  aria-controls={showProperties ? propertiesRegionId : undefined}
-                  onClick={toggleProperties}
-                >
-                  <SlidersHorizontal aria-hidden="true" className="size-4" />
-                </Button>
+                <IconHint label={PROPERTIES_LABEL}>
+                  <Button
+                    type="button"
+                    size="icon-sm"
+                    variant="ghost"
+                    aria-label={PROPERTIES_LABEL}
+                    aria-expanded={showProperties}
+                    aria-controls={showProperties ? propertiesRegionId : undefined}
+                    onClick={toggleProperties}
+                  >
+                    <SlidersHorizontal aria-hidden="true" className="size-4" />
+                  </Button>
+                </IconHint>
               </>
             }
             // The menu is the row's overflow in the row's own order, and then
@@ -1113,11 +1136,18 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
             )}
           />
         )}
-        // Group 4 — the panel's own controls, when a panel is what is holding
-        // this editor (Story 50.1). Placed and never composed here; undefined
-        // in the three hosts that are not frames, and the row then has three
-        // groups exactly as it did.
-        frame={frame}
+        // The host supplies panel identity, never a second navigation stack.
+        // Capture and prewarmed editors have no panel and no navigation controls.
+        frame={
+          panelId ? (
+            <>
+              <NoteNavigation panelId={panelId} />
+              {frame}
+            </>
+          ) : (
+            frame
+          )
+        }
       />
 
       <NoteDiffBar
@@ -1290,5 +1320,94 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         </div>
       ) : null}
     </div>
+  );
+}
+
+function NavigationEntry({ target, onSelect }: { target: PanelTargetVm; onSelect: () => void }) {
+  const [title, setTitle] = useState<string | null>(null);
+  useEffect(() => {
+    if (target.kind !== "note") return;
+    let alive = true;
+    void notesBodyRead(target.vaultId, target.noteId).then(
+      (body) => {
+        if (alive) setTitle(deriveTitle(body.text));
+      },
+      () => {},
+    );
+    return () => {
+      alive = false;
+    };
+  }, [target]);
+  const fallback =
+    target.kind === "note"
+      ? target.noteId
+      : target.kind === "file"
+        ? target.relativePath
+        : target.kind === "task"
+          ? target.taskId
+          : target.sessionId;
+  return <DropdownMenuItem onSelect={onSelect}>{title ?? fallback}</DropdownMenuItem>;
+}
+
+export function NoteNavigation({ panelId }: { panelId: string }) {
+  const panel = usePanelsStore((state) => state.panels.find((entry) => entry.id === panelId));
+  if (!panel) return null;
+  return (
+    <>
+      <IconHint label="Back">
+        <Button
+          size="icon-sm"
+          variant="ghost"
+          aria-label="Back"
+          disabled={panel.back.length === 0}
+          onClick={() => panelsStore.getState().back(panelId)}
+        >
+          <ArrowLeft aria-hidden="true" />
+        </Button>
+      </IconHint>
+      <IconHint label="Forward">
+        <Button
+          size="icon-sm"
+          variant="ghost"
+          aria-label="Forward"
+          disabled={panel.forward.length === 0}
+          onClick={() => panelsStore.getState().forward(panelId)}
+        >
+          <ArrowRight aria-hidden="true" />
+        </Button>
+      </IconHint>
+      <DropdownMenu>
+        <IconHint label="Navigation history">
+          <DropdownMenuTrigger asChild>
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              aria-label="Navigation history"
+              disabled={panel.back.length + panel.forward.length === 0}
+            >
+              <List aria-hidden="true" />
+            </Button>
+          </DropdownMenuTrigger>
+        </IconHint>
+        <DropdownMenuContent className="max-h-80 overflow-y-auto">
+          {(["back", "forward"] as const).map((direction) => (
+            <div key={direction}>
+              <DropdownMenuLabel>{direction === "back" ? "Back" : "Forward"}</DropdownMenuLabel>
+              {panel[direction]
+                .slice()
+                .reverse()
+                .map((target, index) => (
+                  <NavigationEntry
+                    // biome-ignore lint/suspicious/noArrayIndexKey: the position in the stack IS the identity here — the same note can sit in a history twice, and how many steps back it is is the only thing that tells the two entries apart (it is also the argument `back` and `forward` take).
+                    key={`${direction}-${index}`}
+                    target={target}
+                    onSelect={() => panelsStore.getState()[direction](panelId, index + 1)}
+                  />
+                ))}
+            </div>
+          ))}
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </>
   );
 }

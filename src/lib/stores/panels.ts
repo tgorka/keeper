@@ -32,8 +32,8 @@
  * lens the viewer arranged rather than a fact Rust has any use for. What travels
  * is what the viewer arranged and nothing derived: the targets, which one had
  * focus, and — since Story 46.13 — which of them are folded. An id is
- * regenerated on load, and {@link Panel.replaced} is deliberately transient
- * because it is the state of a gesture rather than of an arrangement.
+ * regenerated on load. Preview restoration and the back/forward stacks are
+ * deliberately transient: gestures, not an arrangement (AD-241).
  *
  * The cookie is versioned, and {@link PANELS_VERSION} carries the one ruling in
  * this module that could not be derived: what a cookie written before folding
@@ -46,6 +46,8 @@ import type { PanelTargetVm } from "@/lib/ipc/client";
 
 /** The cookie the panel list is remembered in. One cookie for the whole list. */
 export const PANELS_COOKIE = "keeper_panels";
+
+export const PANEL_HISTORY_CAP = 50;
 
 /** A year, matching {@link "@/lib/column-widths"}: a workspace that resets on
  *  the user who opens keeper on Mondays is a workspace nobody arranges. */
@@ -90,6 +92,8 @@ export interface Panel {
   readonly id: string;
   /** What it shows, or `null` for the one panel a fresh keeper starts with. */
   readonly target: PanelTargetVm | null;
+  readonly back: PanelTargetVm[];
+  readonly forward: PanelTargetVm[];
   /**
    * What this panel showed before the single click that set {@link target} —
    * `null` when {@link target} was not set by a single click.
@@ -109,7 +113,11 @@ export interface Panel {
    * for. A run of previews keeps the first `was`, so previewing three files in
    * a row and pinning the third still puts the original document back.
    */
-  readonly replaced: { readonly was: PanelTargetVm | null } | null;
+  readonly replaced: {
+    readonly was: PanelTargetVm | null;
+    readonly back: PanelTargetVm[];
+    readonly forward: PanelTargetVm[];
+  } | null;
   /**
    * Whether this panel is folded away: its header only, no body, and no share
    * of the strip's width (Story 46.13, FR-217).
@@ -153,6 +161,8 @@ export interface PanelsState {
    * rule belongs, not the four surfaces that call this.
    */
   setActiveTarget: (target: PanelTargetVm) => void;
+  back: (panelId?: string, steps?: number) => void;
+  forward: (panelId?: string, steps?: number) => void;
   /**
    * A rename landed: every panel showing `from` now shows `to` (Story 52.2,
    * FR-302).
@@ -238,7 +248,14 @@ export interface PanelsState {
 let nextPanelId = 1;
 
 function makePanel(target: PanelTargetVm | null, folded = false): Panel {
-  const panel: Panel = { id: `panel-${nextPanelId}`, target, replaced: null, folded };
+  const panel: Panel = {
+    id: `panel-${nextPanelId}`,
+    target,
+    replaced: null,
+    folded,
+    back: [],
+    forward: [],
+  };
   nextPanelId += 1;
   return panel;
 }
@@ -559,9 +576,39 @@ function withPanel(panels: readonly Panel[], id: string, next: (panel: Panel) =>
   return panels.map((panel) => (panel.id === id ? next(panel) : panel));
 }
 
+function navigate(panelId: string | undefined, direction: "back" | "forward", steps = 1): void {
+  const { panels, activeId } = panelsStore.getState();
+  const id = panelId ?? activeId;
+  const panel = panels.find((entry) => entry.id === id);
+  if (!panel || !Number.isInteger(steps) || steps < 1 || steps > panel[direction].length) {
+    return;
+  }
+  const source = panel[direction];
+  const index = source.length - steps;
+  const target = source[index];
+  if (!target) return;
+  const opposite = direction === "back" ? "forward" : "back";
+  const moved = panel.target === null ? [] : [panel.target];
+  const next = withPanel(panels, id, (current) =>
+    shown({
+      ...current,
+      target,
+      replaced: null,
+      [direction]: source.slice(0, index),
+      [opposite]: [...current[opposite], ...moved, ...source.slice(index + 1).reverse()].slice(
+        -PANEL_HISTORY_CAP,
+      ),
+    }),
+  );
+  panelsStore.setState({ panels: next, activeId: id });
+  persist(next, id);
+}
+
 export const panelsStore = createStore<PanelsState>()((set, get) => ({
   ...initialPanels(),
 
+  back: (panelId, steps) => navigate(panelId, "back", steps),
+  forward: (panelId, steps) => navigate(panelId, "forward", steps),
   setActiveTarget: (target) => {
     const { panels, activeId } = get();
     const active = panels.find((panel) => panel.id === activeId);
@@ -574,10 +621,15 @@ export const panelsStore = createStore<PanelsState>()((set, get) => ({
       shown({
         ...panel,
         target,
+        back:
+          panel.target === null
+            ? panel.back
+            : [...panel.back, panel.target].slice(-PANEL_HISTORY_CAP),
+        forward: [],
         // The first preview in a run records what the panel really held; the
         // ones after it keep pointing at that, so pinning the fourth preview
         // still puts the original document back.
-        replaced: panel.replaced ?? { was: panel.target },
+        replaced: panel.replaced ?? { was: panel.target, back: panel.back, forward: panel.forward },
       }),
     );
     set({ panels: next });
@@ -644,6 +696,8 @@ export const panelsStore = createStore<PanelsState>()((set, get) => ({
       const restored = withPanel(panels, activeId, (panel) => ({
         ...panel,
         target: active.replaced === null ? panel.target : active.replaced.was,
+        back: active.replaced?.back ?? panel.back,
+        forward: active.replaced?.forward ?? panel.forward,
         replaced: null,
       }));
       appendBeside(set, restored, activeId, target);

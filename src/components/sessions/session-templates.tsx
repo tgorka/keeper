@@ -57,6 +57,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { InputGroup, InputGroupInput } from "@/components/ui/input-group";
+import { IconHint } from "@/components/ui/tooltip";
 import { formatDraftAge } from "@/lib/format-time";
 import type { SessionPatternVm, SessionTemplateEntryVm } from "@/lib/ipc/client";
 import {
@@ -1042,17 +1043,18 @@ function TemplateSection({
           {SESSION_TEMPLATE_NEW_FOLDER}
         </Button>
         {renameable && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            aria-label={`${SESSION_TEMPLATE_RENAME} ${template.label}`}
-            title={`${SESSION_TEMPLATE_RENAME} ${template.label}`}
-            onClick={onEdit}
-            className="h-7 px-2"
-          >
-            <Pencil aria-hidden="true" className="size-3.5" />
-          </Button>
+          <IconHint label={`${SESSION_TEMPLATE_RENAME} ${template.label}`}>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              aria-label={`${SESSION_TEMPLATE_RENAME} ${template.label}`}
+              onClick={onEdit}
+              className="h-7 px-2"
+            >
+              <Pencil aria-hidden="true" className="size-3.5" />
+            </Button>
+          </IconHint>
         )}
       </div>
 
@@ -1262,38 +1264,40 @@ function TemplateSection({
                     on folders as well as files, because a template's shape is its
                     folders and the trash makes taking one back cheap. */}
                 <span className="flex shrink-0 items-center gap-0.5 opacity-0 focus-within:opacity-100 group-hover:opacity-100">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    tabIndex={active === node.relPath ? 0 : -1}
-                    aria-label={`${SESSION_TEMPLATE_ENTRY_RENAME} ${node.relPath}`}
-                    title={SESSION_TEMPLATE_ENTRY_RENAME}
-                    className="size-6"
-                    onClick={() => {
-                      onNotice(null);
-                      // Seeded with the name it has: most renames are a small edit
-                      // to it, and the extension is part of what may be edited.
-                      setRenamingEntry({ relPath: node.relPath, draft: node.name });
-                    }}
-                  >
-                    <Pencil aria-hidden="true" className="size-3.5" />
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    tabIndex={active === node.relPath ? 0 : -1}
-                    aria-label={`${SESSION_TEMPLATE_ENTRY_DELETE} ${node.relPath}`}
-                    title={SESSION_TEMPLATE_ENTRY_DELETE}
-                    className="size-6 text-muted-foreground hover:text-destructive"
-                    onClick={() => {
-                      onNotice(null);
-                      setDeleting(node);
-                    }}
-                  >
-                    <Trash2 aria-hidden="true" className="size-3.5" />
-                  </Button>
+                  <IconHint side="right" label={`${SESSION_TEMPLATE_ENTRY_RENAME} ${node.relPath}`}>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      tabIndex={active === node.relPath ? 0 : -1}
+                      aria-label={`${SESSION_TEMPLATE_ENTRY_RENAME} ${node.relPath}`}
+                      className="size-6"
+                      onClick={() => {
+                        onNotice(null);
+                        // Seeded with the name it has: most renames are a small edit
+                        // to it, and the extension is part of what may be edited.
+                        setRenamingEntry({ relPath: node.relPath, draft: node.name });
+                      }}
+                    >
+                      <Pencil aria-hidden="true" className="size-3.5" />
+                    </Button>
+                  </IconHint>
+                  <IconHint side="right" label={`${SESSION_TEMPLATE_ENTRY_DELETE} ${node.relPath}`}>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      tabIndex={active === node.relPath ? 0 : -1}
+                      aria-label={`${SESSION_TEMPLATE_ENTRY_DELETE} ${node.relPath}`}
+                      className="size-6 text-muted-foreground hover:text-destructive"
+                      onClick={() => {
+                        onNotice(null);
+                        setDeleting(node);
+                      }}
+                    >
+                      <Trash2 aria-hidden="true" className="size-3.5" />
+                    </Button>
+                  </IconHint>
                 </span>
               </div>
             );

@@ -49,6 +49,7 @@ import { PaneHeader } from "@/components/layout/pane-header";
 import { TASKS_CLOCK_TICK_MS, TaskDetail } from "@/components/layout/tasks-pane";
 import { deriveTitle, NoteEditor } from "@/components/notes/note-editor";
 import { Button } from "@/components/ui/button";
+import { IconHint } from "@/components/ui/tooltip";
 import {
   type FilesEntryVm,
   type FilesListingVm,
@@ -484,26 +485,38 @@ export function noteVaultReason(
  *  `reason` is {@link noteVaultReason}'s answer, decided by the frame above so
  *  that the frame knows whether this is going to draw the panel's header. */
 function NotePanelBody({
+  panelId,
   vaultId,
   noteId,
   reason,
   frame,
 }: {
+  panelId: string;
   vaultId: string;
   noteId: string;
   reason: string | null;
   frame: ReactNode;
 }) {
   const onOpenNote = useCallback(
-    (next: string) =>
-      panelsStore.getState().setActiveTarget({ kind: "note", vaultId, noteId: next }),
-    [vaultId],
+    (next: string) => {
+      panelsStore.getState().focusPanel(panelId);
+      panelsStore.getState().setActiveTarget({ kind: "note", vaultId, noteId: next });
+    },
+    [vaultId, panelId],
   );
 
   if (reason !== null) {
     return <PanelReason reason={reason} />;
   }
-  return <NoteEditor vaultId={vaultId} noteId={noteId} onOpenNote={onOpenNote} frame={frame} />;
+  return (
+    <NoteEditor
+      panelId={panelId}
+      vaultId={vaultId}
+      noteId={noteId}
+      onOpenNote={onOpenNote}
+      frame={frame}
+    />
+  );
 }
 
 /**
@@ -643,6 +656,7 @@ function TaskPanelBody({ resolution }: { resolution: TaskResolution | null }) {
  *  panel's header row. `frame` is non-null for exactly one of them at a time —
  *  see {@link PanelFrame} — and whichever body is not drawing the row ignores it. */
 function PanelBody({
+  panelId,
   target,
   emptySentence,
   noteReason,
@@ -650,6 +664,7 @@ function PanelBody({
   taskResolution,
   frame,
 }: {
+  panelId: string;
   target: PanelTargetVm | null;
   emptySentence: string;
   noteReason: string | null;
@@ -675,6 +690,7 @@ function PanelBody({
     case "note":
       return (
         <NotePanelBody
+          panelId={panelId}
           vaultId={target.vaultId}
           noteId={target.noteId}
           reason={noteReason}
@@ -877,38 +893,40 @@ function PanelFrame({
   // pointer that hovered a bare chevron would learn only that the strip folds,
   // not which of four files this one is. Open, the panel names itself an inch
   // to the left, so the control only has to say what it does. Whichever it is,
-  // `title` and `aria-label` are the same words — a control whose tooltip and
+  // the hint and `aria-label` are the same words — a control whose tooltip and
   // whose spoken name disagree cannot be operated by anyone saying what they
   // see (WCAG 2.5.3), and with the text gone the tooltip IS the visible label.
   const foldName = panel.folded ? `${PANEL_UNFOLD_LABEL}: ${name}` : PANEL_FOLD_LABEL;
   const fold = (
-    <Button
-      type="button"
-      variant="ghost"
-      size={FOLD_STRIP.headControlSize}
-      // The name says which way the control goes; `aria-expanded` says where it
-      // is now.
-      aria-expanded={!panel.folded}
-      aria-label={foldName}
-      title={foldName}
-      className="shrink-0"
-      onClick={() => panelsStore.getState().toggleFold(panel.id)}
-    >
-      <FoldGlyph aria-hidden="true" />
-    </Button>
+    <IconHint label={foldName}>
+      <Button
+        type="button"
+        variant="ghost"
+        size={FOLD_STRIP.headControlSize}
+        // The name says which way the control goes; `aria-expanded` says where it
+        // is now.
+        aria-expanded={!panel.folded}
+        aria-label={foldName}
+        className="shrink-0"
+        onClick={() => panelsStore.getState().toggleFold(panel.id)}
+      >
+        <FoldGlyph aria-hidden="true" />
+      </Button>
+    </IconHint>
   );
   const close = closable ? (
-    <Button
-      type="button"
-      variant="ghost"
-      size="icon-sm"
-      aria-label={PANEL_CLOSE_LABEL}
-      title={PANEL_CLOSE_LABEL}
-      className="shrink-0"
-      onClick={() => panelsStore.getState().closePanel(panel.id)}
-    >
-      <X aria-hidden="true" />
-    </Button>
+    <IconHint label={PANEL_CLOSE_LABEL}>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-sm"
+        aria-label={PANEL_CLOSE_LABEL}
+        className="shrink-0"
+        onClick={() => panelsStore.getState().closePanel(panel.id)}
+      >
+        <X aria-hidden="true" />
+      </Button>
+    </IconHint>
   ) : null;
   // Story 45.21. A file only: a note panel's Export is in the editor's own
   // Actions menu, which is the surface that can flush the buffer before the
@@ -1017,6 +1035,7 @@ function PanelFrame({
       {panel.folded ? null : (
         <div className="min-h-0 flex-1 overflow-auto">
           <PanelBody
+            panelId={panel.id}
             target={panel.target}
             emptySentence={emptySentence}
             noteReason={noteReason}

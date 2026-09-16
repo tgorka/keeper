@@ -55,6 +55,7 @@ import { exportStore } from "@/lib/stores/export";
 import { newChatStore } from "@/lib/stores/new-chat";
 import { notesFiltersStore } from "@/lib/stores/notes-filters";
 import { notesVaultsStore } from "@/lib/stores/notes-vaults";
+import { panelsStore } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import type { RoomSelection } from "@/lib/stores/rooms";
 import { searchStore } from "@/lib/stores/search";
@@ -135,6 +136,8 @@ export const paletteActionHandlers: Record<string, PaletteActionHandler> = {
     primaryViewStore.getState().setView("notes");
     await openJournalToday();
   },
+  "notes-back": () => panelsStore.getState().back(),
+  "notes-forward": () => panelsStore.getState().forward(),
   // Open Note… and Search Notes both land on the vault's one find surface. There
   // is exactly one search field, and two entries pretending to be two surfaces
   // would be the drift UX-DR42 exists to prevent.

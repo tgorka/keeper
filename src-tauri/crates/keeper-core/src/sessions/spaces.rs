@@ -570,9 +570,9 @@ fn read_create_dir(value: &FieldValue) -> (String, Option<String>) {
 
 /// Read a whole `_spaces/` directory, in rail order.
 ///
-/// Position then name, through [`crate::notes::sort::rail_order`] — the rail's
-/// one comparison, so a session's spaces and a vault's cannot disagree about
-/// what "above" means.
+/// Position then name, through [`crate::notes::sort::rail_order`]. Sessions
+/// supply no modification date, so the notes rail's AD-237 date tie-break does
+/// not reorder session spaces.
 #[must_use]
 pub fn read_all(files: &[(&str, &str)]) -> Vec<SessionSpace> {
     let mut spaces: Vec<SessionSpace> = files
@@ -580,7 +580,7 @@ pub fn read_all(files: &[(&str, &str)]) -> Vec<SessionSpace> {
         .filter(|(rel, _)| rel.ends_with(".md"))
         .map(|(rel, text)| read_one(rel, text))
         .collect();
-    spaces.sort_by(|a, b| sort::rail_order((a.order, &a.name), (b.order, &b.name)));
+    spaces.sort_by(|a, b| sort::rail_order((a.order, None, &a.name), (b.order, None, &b.name)));
     spaces
 }
 
@@ -1796,6 +1796,18 @@ mod tests {
     /// References, Tasks) is a plausible-looking accident: it is what the rail
     /// falls back to the moment every `order` becomes zero, and nothing else
     /// would fail if that happened.
+    #[test]
+    fn undated_session_spaces_keep_their_name_tie_break() {
+        let rows = read_all(&[
+            ("z.md", "---\nkeeper:\n  space: 'is:task'\n---\n# Zulu\n"),
+            ("a.md", "---\nkeeper:\n  space: 'is:task'\n---\n# Alpha\n"),
+        ]);
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            ["Alpha", "Zulu"]
+        );
+    }
+
     #[test]
     fn the_rail_reads_in_reading_order_and_not_alphabetically() {
         let files: Vec<(String, String)> = DEFAULT_SESSION_SPACES

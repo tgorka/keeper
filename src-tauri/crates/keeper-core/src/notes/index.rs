@@ -44,14 +44,10 @@ use crate::notes::tags::{normalise, TagNode};
 /// mismatch is discard-and-cold-scan, so a bump is always safe and never a
 /// migration.
 ///
-/// 3 → 4 for the real predicate syntax: `{ :depends_on }`, `{ cites }` and a
-/// colon-keyed pair are edges now where an earlier build of this branch saw
-/// nothing. That is a change of MEANING with no change of shape, and it is
-/// invisible to every other staleness check — the note is byte-identical, so
-/// `size`/`mtime_ns`/`ino` all match and the cached entry is adopted with its
-/// predicates missing. Without the bump the feature stays dark on exactly the
-/// vaults that have been indexed before.
-pub const INDEX_SCHEMA: u32 = 4;
+/// 4 → 5 for prose snippets (AD-238). An unchanged note's cached raw-markdown
+/// excerpt would otherwise survive every stat check and hide the new preview
+/// until the note was edited. Discarding the advisory cache rebuilds it once.
+pub const INDEX_SCHEMA: u32 = 5;
 
 /// The `IndexEntry.fields` key carrying the note's provenance class, written by
 /// the reconciler from the trailers of the last commit touching the file
@@ -182,8 +178,8 @@ pub struct IndexEntry {
     /// `space`, `capture`, `recording`, `orphan`, `unstable_identity`,
     /// `unparsed`. Backs the `is:` predicate.
     pub flags: Vec<String>,
-    /// A short body excerpt for the list row, so rendering a window of rows never
-    /// touches the filesystem.
+    /// A short prose excerpt with markdown markup removed, so rendering a
+    /// window of rows never touches the filesystem.
     pub snippet: String,
     /// The note's own position in a list (Story 44.5, AD-81), parsed from
     /// frontmatter once here rather than re-read from `fields["order"]` on every

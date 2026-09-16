@@ -51,6 +51,7 @@ function space(p: Partial<NoteSpaceVm> = {}): NoteSpaceVm {
   return {
     id: p.id ?? "s1",
     name: p.name ?? "Active work",
+    updatedMs: p.updatedMs ?? null,
     query: p.query ?? "tag:client/acme -tag:draft",
     sort: p.sort ?? "modified desc",
     sortEffective: p.sortEffective ?? "modified desc",

@@ -366,6 +366,19 @@ describe("the header row at several widths", () => {
     picked.length = 0;
   });
 
+  it("prevents a pending promoted action from running until it is enabled again", () => {
+    restoreWidths = withActionWidths(WIDTH);
+    const item = ITEMS[0];
+    const { rerender } = render(
+      <PriorityActions budget={1400} items={[{ ...item, disabled: true }]} menu={() => null} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: item.label }));
+    expect(picked).toEqual([]);
+    rerender(<PriorityActions budget={1400} items={[item]} menu={() => null} />);
+    fireEvent.click(screen.getByRole("button", { name: item.label }));
+    expect(picked).toEqual([item.id]);
+  });
+
   it("shows every verb as a word when the row is wide", () => {
     const resize = mount();
     resize(1400);

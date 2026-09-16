@@ -1,10 +1,10 @@
 /**
- * The one space in the rail with no note behind it.
+ * The synthetic complement space, beside All notes (`./all-spaces.ts`).
  *
- * Every other space is a markdown file somebody wrote, so it can be renamed,
- * re-queried and deleted. This one is composed on demand from all the others —
- * the negation of every space's query — which means there is nothing on disk to
- * open, and the rail draws no pencil and no bin beside it.
+ * File-backed spaces are markdown notes somebody wrote. This row is composed
+ * on demand from their queries — their negation — so it has nothing on disk
+ * to open, and the rail draws no pencil or bin beside it. All notes is the
+ * other synthetic row: it selects the existing unscoped list.
  *
  * The value is Rust's. `UNCATEGORIZED_SPACE_ID` in
  * `src-tauri/crates/keeper/src/notes_ipc.rs` is what the wire actually carries,

@@ -55,6 +55,7 @@ import { NEW_NOTE_LABEL, NOTES_COUNT_SLOT } from "@/components/notes/notes-pane"
 import { VaultSwitcher } from "@/components/notes/vault-switcher";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { IconHint } from "@/components/ui/tooltip";
 import { createNote, showCapture, useNotesActions } from "@/hooks/use-notes-actions";
 import { useNotesChanges } from "@/hooks/use-notes-changes";
 import { countLabel, NOTES } from "@/lib/count-label";
@@ -249,27 +250,31 @@ export function NotesPhoneList({
         {/* Two verbs, both ≥44pt: a new note in the active vault, and quick
             capture — the sheet, which needs no vault chosen here because Rust
             resolves the page against the active vault. */}
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          aria-label={NOTES_PHONE_CAPTURE_LABEL}
-          onClick={() => void showCapture()}
-          className="size-11 shrink-0"
-        >
-          <NotebookPen aria-hidden="true" />
-        </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          aria-label={NEW_NOTE_LABEL}
-          disabled={activeVaultId === null}
-          onClick={onCreate}
-          className="size-11 shrink-0"
-        >
-          <FilePlus aria-hidden="true" />
-        </Button>
+        <IconHint label={NOTES_PHONE_CAPTURE_LABEL}>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            aria-label={NOTES_PHONE_CAPTURE_LABEL}
+            onClick={() => void showCapture()}
+            className="size-11 shrink-0"
+          >
+            <NotebookPen aria-hidden="true" />
+          </Button>
+        </IconHint>
+        <IconHint label={NEW_NOTE_LABEL}>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            aria-label={NEW_NOTE_LABEL}
+            disabled={activeVaultId === null}
+            onClick={onCreate}
+            className="size-11 shrink-0"
+          >
+            <FilePlus aria-hidden="true" />
+          </Button>
+        </IconHint>
       </PhoneBackBar>
       {!noVault && (
         <div className="flex shrink-0 flex-col gap-2 border-border border-b px-3 py-2">

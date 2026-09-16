@@ -1548,14 +1548,9 @@ fn note_title(fm: &Frontmatter, body: &str, rel: &str) -> String {
     naming::note_title(fm.as_string("title"), body, stem(rel))
 }
 
-/// The first [`SNIPPET_CHARS`] characters of body, whitespace folded.
+/// The first [`SNIPPET_CHARS`] characters of the body's prose.
 fn snippet(body: &str) -> String {
-    body.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(SNIPPET_CHARS)
-        .collect()
+    keeper_core::notes::snippet::prose(body, SNIPPET_CHARS)
 }
 
 /// The filename stem of a vault-relative path.
@@ -3428,6 +3423,23 @@ mod tests {
         );
         // The right type with a missing field.
         assert!(adopt_cache(br#"{"schema":1}"#, "01VAULT").is_none());
+    }
+
+    #[test]
+    fn raw_markdown_snippet_caches_are_rebuilt_on_upgrade() {
+        let mut old_entry = entry("note.md", stat(1, 1, 1));
+        old_entry.snippet = "**raw markdown**".to_owned();
+        let old_cache = serde_json::to_vec(&IndexCache {
+            schema: 4,
+            vault_id: "01VAULT".to_owned(),
+            built_ms: 1,
+            entries: vec![old_entry],
+        })
+        .expect("old cache serializes");
+        assert!(
+            adopt_cache(&old_cache, "01VAULT").is_none(),
+            "unchanged notes must not retain raw markdown previews after upgrade"
+        );
     }
 
     #[test]

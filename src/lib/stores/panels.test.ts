@@ -4,6 +4,7 @@ import {
   activePanel,
   hydratePanels,
   isRestorableTarget,
+  PANEL_HISTORY_CAP,
   PANELS_COOKIE,
   PANELS_COOKIE_BUDGET,
   panelsCookie,
@@ -47,6 +48,80 @@ beforeEach(() => {
   resetPanelsStoreForTest();
 });
 
+describe("per-panel navigation", () => {
+  it("restores the original history when a preview is opened beside it", () => {
+    store().openPanel(A);
+    store().setActiveTarget(B);
+    store().openPanel(B);
+    const first = store().panels[0];
+    expect(first?.back).toEqual([]);
+    expect(first?.forward).toEqual([]);
+    store().back(first?.id);
+    expect(shown()).toEqual([A, B]);
+  });
+  const notes = ["A", "B", "C", "D"].map(
+    (noteId): PanelTargetVm => ({
+      kind: "note",
+      vaultId: "v",
+      noteId,
+    }),
+  );
+
+  it("walks four notes in both directions and truncates a fork", () => {
+    for (const note of notes) store().setActiveTarget(note);
+    for (const note of notes.slice(0, -1).reverse()) {
+      store().back();
+      expect(activePanel(store()).target).toEqual(note);
+    }
+    store().back();
+    expect(activePanel(store()).target).toEqual(notes[0]);
+    for (const note of notes.slice(1)) {
+      store().forward();
+      expect(activePanel(store()).target).toEqual(note);
+    }
+    store().back();
+    store().setActiveTarget(A);
+    store().forward();
+    expect(activePanel(store()).target).toEqual(A);
+    expect(activePanel(store()).forward).toEqual([]);
+  });
+
+  it("drops the oldest entry and never persists the stacks", () => {
+    for (let i = 0; i <= PANEL_HISTORY_CAP + 1; i++) {
+      store().setActiveTarget({ kind: "note", vaultId: "v", noteId: String(i) });
+    }
+    expect(activePanel(store()).back).toHaveLength(PANEL_HISTORY_CAP);
+    store().back(undefined, PANEL_HISTORY_CAP);
+    expect(activePanel(store()).target).toEqual({ kind: "note", vaultId: "v", noteId: "1" });
+    const cookie = panelsCookie(store().panels, store().activeId);
+    expect(decodeURIComponent(cookie)).not.toContain('"back"');
+    expect(decodeURIComponent(cookie)).not.toContain('"forward"');
+  });
+
+  it("keeps two panels independent and returns through non-note targets", () => {
+    store().openPanel(A);
+    const first = store().activeId;
+    store().setActiveTarget(NOTE_ONE);
+    store().openPanel(NOTE_TWO);
+    const second = store().activeId;
+    expect(activePanel(store()).back).toEqual([]);
+    store().setActiveTarget(notes[3]);
+    store().back(first);
+    expect(shown()).toEqual([A, notes[3]]);
+    store().back(second);
+    expect(shown()).toEqual([A, NOTE_TWO]);
+  });
+
+  it("jumps directly and retains intermediate forward entries", () => {
+    for (const note of notes) store().setActiveTarget(note);
+    store().back(undefined, 3);
+    expect(activePanel(store()).target).toEqual(notes[0]);
+    store().forward(undefined, 2);
+    expect(activePanel(store()).target).toEqual(notes[2]);
+    store().forward();
+    expect(activePanel(store()).target).toEqual(notes[3]);
+  });
+});
 describe("the panel list", () => {
   it("starts as one empty panel, because a workspace with none has no way back", () => {
     expect(store().panels).toHaveLength(1);
@@ -257,7 +332,6 @@ describe("a file that was renamed under the panels showing it", () => {
 
     store().retargetPanels(B, B);
 
-    expect(store().panels[0]?.replaced).toEqual({ was: A });
     store().openPanel(B);
     expect(shown()).toEqual([A, B]);
   });
@@ -414,7 +488,10 @@ describe("surviving a restart", () => {
     // The drive being out is exactly when the arrangement matters most: the
     // panel has to come back when the drive does, and it cannot come back if the
     // restore quietly filtered it out for being unreachable.
-    const cookie = panelsCookie([{ id: "p", target: A, replaced: null, folded: false }], "p");
+    const cookie = panelsCookie(
+      [{ id: "p", target: A, replaced: null, folded: false, back: [], forward: [] }],
+      "p",
+    );
     resetPanelsStoreForTest();
     hydratePanels(cookie);
 
@@ -422,7 +499,10 @@ describe("surviving a restart", () => {
   });
 
   it("hydrates once, so a double-invoked effect does not re-restore over a click", () => {
-    const cookie = panelsCookie([{ id: "p", target: A, replaced: null, folded: false }], "p");
+    const cookie = panelsCookie(
+      [{ id: "p", target: A, replaced: null, folded: false, back: [], forward: [] }],
+      "p",
+    );
     resetPanelsStoreForTest();
     hydratePanels(cookie);
     store().setActiveTarget(B);
@@ -458,9 +538,12 @@ describe("surviving a restart", () => {
   });
 
   it("forgets the arrangement when nothing is open", () => {
-    expect(panelsCookie([{ id: "p", target: null, replaced: null, folded: false }], "p")).toContain(
-      "max-age=0",
-    );
+    expect(
+      panelsCookie(
+        [{ id: "p", target: null, replaced: null, folded: false, back: [], forward: [] }],
+        "p",
+      ),
+    ).toContain("max-age=0");
   });
 
   it("remembers what fits and says how many it could not", () => {
@@ -474,6 +557,8 @@ describe("surviving a restart", () => {
       target: { kind: "file", profileId: "p1", relativePath: `${long}/${index}.md` } as const,
       replaced: null,
       folded: false,
+      back: [],
+      forward: [],
     }));
 
     const cookie = panelsCookie(panels, "p0");
@@ -776,6 +861,8 @@ describe("a fold that survives a restart", () => {
       target: { kind: "file", profileId: "p1", relativePath: `${long}/${index}.md` } as const,
       replaced: null,
       folded: true,
+      back: [],
+      forward: [],
     }));
 
     const value = cookieValue(panelsCookie(panels, "p0"));
@@ -800,9 +887,9 @@ describe("a fold that survives a restart", () => {
     const value = cookieValue(
       panelsCookie(
         [
-          { id: "p0", target: null, replaced: null, folded: true },
-          { id: "p1", target: A, replaced: null, folded: false },
-          { id: "p2", target: B, replaced: null, folded: true },
+          { id: "p0", target: null, replaced: null, folded: true, back: [], forward: [] },
+          { id: "p1", target: A, replaced: null, folded: false, back: [], forward: [] },
+          { id: "p2", target: B, replaced: null, folded: true, back: [], forward: [] },
         ],
         "p1",
       ),

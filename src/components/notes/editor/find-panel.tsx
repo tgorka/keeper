@@ -72,6 +72,7 @@ import {
 import { createRoot } from "react-dom/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { IconHint } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
 /** The three flags, as the query carries them. */
@@ -213,22 +214,23 @@ function FindBar({ view, onExternalQuery }: FindBarProps): React.ReactElement {
             usable controls beat one row of unusable ones. */}
         <div className="flex flex-wrap items-center gap-1.5">
           {readOnly ? null : (
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label={replacing ? "Hide replace" : "Show replace"}
-              title={replacing ? "Hide replace" : "Show replace"}
-              aria-expanded={replacing}
-              className="shrink-0 text-muted-foreground"
-              onMouseDown={keepFocus}
-              onClick={() => setReplacing((open) => !open)}
-            >
-              <ChevronRight
-                aria-hidden="true"
-                className={cn("size-3 transition-transform", replacing && "rotate-90")}
-              />
-            </Button>
+            <IconHint label={replacing ? "Hide replace" : "Show replace"}>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label={replacing ? "Hide replace" : "Show replace"}
+                aria-expanded={replacing}
+                className="shrink-0 text-muted-foreground"
+                onMouseDown={keepFocus}
+                onClick={() => setReplacing((open) => !open)}
+              >
+                <ChevronRight
+                  aria-hidden="true"
+                  className={cn("size-3 transition-transform", replacing && "rotate-90")}
+                />
+              </Button>
+            </IconHint>
           )}
           <div className="flex min-w-[9rem] flex-1 items-center gap-1.5">
             <Search aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
@@ -246,96 +248,103 @@ function FindBar({ view, onExternalQuery }: FindBarProps): React.ReactElement {
             />
           </div>
           <div className="flex shrink-0 items-center gap-0.5">
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label="Match case"
-              title="Match case"
-              aria-pressed={flags.caseSensitive}
-              className={MODE_CLASS}
-              onMouseDown={keepFocus}
-              onClick={toggle("caseSensitive")}
-            >
-              <CaseSensitive aria-hidden="true" className="size-3" />
-            </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label="Regular expression"
-              title="Regular expression"
-              aria-pressed={flags.regexp}
-              className={MODE_CLASS}
-              onMouseDown={keepFocus}
-              onClick={toggle("regexp")}
-            >
-              <Regex aria-hidden="true" className="size-3" />
-            </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label="Whole word"
-              title="Whole word"
-              aria-pressed={flags.wholeWord}
-              className={MODE_CLASS}
-              onMouseDown={keepFocus}
-              onClick={toggle("wholeWord")}
-            >
-              <WholeWord aria-hidden="true" className="size-3" />
-            </Button>
+            <IconHint label="Match case">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Match case"
+                aria-pressed={flags.caseSensitive}
+                className={MODE_CLASS}
+                onMouseDown={keepFocus}
+                onClick={toggle("caseSensitive")}
+              >
+                <CaseSensitive aria-hidden="true" className="size-3" />
+              </Button>
+            </IconHint>
+            <IconHint label="Regular expression">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Regular expression"
+                aria-pressed={flags.regexp}
+                className={MODE_CLASS}
+                onMouseDown={keepFocus}
+                onClick={toggle("regexp")}
+              >
+                <Regex aria-hidden="true" className="size-3" />
+              </Button>
+            </IconHint>
+            <IconHint label="Whole word">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Whole word"
+                aria-pressed={flags.wholeWord}
+                className={MODE_CLASS}
+                onMouseDown={keepFocus}
+                onClick={toggle("wholeWord")}
+              >
+                <WholeWord aria-hidden="true" className="size-3" />
+              </Button>
+            </IconHint>
           </div>
           <div className="flex shrink-0 items-center gap-0.5">
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label="Previous match"
-              title="Previous match"
-              className="shrink-0 text-muted-foreground"
-              onMouseDown={keepFocus}
-              onClick={() => findPrevious(view)}
-            >
-              <ArrowUp aria-hidden="true" className="size-3" />
-            </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label="Next match"
-              title="Next match"
-              className="shrink-0 text-muted-foreground"
-              onMouseDown={keepFocus}
-              onClick={() => findNext(view)}
-            >
-              <ArrowDown aria-hidden="true" className="size-3" />
-            </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label="Select all matches"
-              title="Select all matches"
-              className="shrink-0 text-muted-foreground"
-              onMouseDown={keepFocus}
-              onClick={() => selectMatches(view)}
-            >
-              <TextSelect aria-hidden="true" className="size-3" />
-            </Button>
+            <IconHint label="Previous match">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Previous match"
+                className="shrink-0 text-muted-foreground"
+                onMouseDown={keepFocus}
+                onClick={() => findPrevious(view)}
+              >
+                <ArrowUp aria-hidden="true" className="size-3" />
+              </Button>
+            </IconHint>
+            <IconHint label="Next match">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Next match"
+                className="shrink-0 text-muted-foreground"
+                onMouseDown={keepFocus}
+                onClick={() => findNext(view)}
+              >
+                <ArrowDown aria-hidden="true" className="size-3" />
+              </Button>
+            </IconHint>
+            <IconHint label="Select all matches">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Select all matches"
+                className="shrink-0 text-muted-foreground"
+                onMouseDown={keepFocus}
+                onClick={() => selectMatches(view)}
+              >
+                <TextSelect aria-hidden="true" className="size-3" />
+              </Button>
+            </IconHint>
           </div>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            aria-label="Close find"
-            title="Close find"
-            className="ml-auto shrink-0 text-muted-foreground"
-            onMouseDown={keepFocus}
-            onClick={() => closeSearchPanel(view)}
-          >
-            <X aria-hidden="true" className="size-3" />
-          </Button>
+          <IconHint label="Close find">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Close find"
+              className="ml-auto shrink-0 text-muted-foreground"
+              onMouseDown={keepFocus}
+              onClick={() => closeSearchPanel(view)}
+            >
+              <X aria-hidden="true" className="size-3" />
+            </Button>
+          </IconHint>
         </div>
 
         {replacing && !readOnly ? (
