@@ -1,6 +1,6 @@
 ---
 title: 'The Tasks header has a budget, and its prose moves into a hint'
-status: in-progress
+status: review
 baseline_revision: a8eb9c2
 final_revision: ''
 ---
@@ -95,3 +95,7 @@ Prerequisites identified and handed to Main: the existing probe locates Add by b
 Required output at both widths: selected task and panel strip mounted; pane ≥ `TASKS_PANE_MIN_WIDTH_PX`, list ≥ `columnMinWidth(\"tasks-list\")`, detail ≥ `TASKS_DETAIL_MIN_WIDTH_PX`, panel ≥ its declared floor; header identity ≥ `PANE_HEADER_IDENTITY_MIN_PX`; action group within its computed budget, overflow trigger in view, no clipped element; Add opens the exclusive detail-region form without violating those floors. Focus/hover the info icon and open the overflow menu to check both explanatory sentences and bulk action reachability on the actual surface.
 
 This real-browser measurement is **owed by the coordinator and was not run here**. jsdom performs no layout. No repository-wide gate, formatter, Rust build, package operation, or git operation was run by this slice.
+
+## Shipped in
+
+PR #363 of stack #364 (epic 72), branch `epic72/tasks`. The macOS gate (`bun run check:rust:macos`) passed on hesperia over the stack tip, which is where the `keeper` shell crate compiles at all.

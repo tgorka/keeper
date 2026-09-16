@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: review
 baseline_revision: a8eb9c2
 final_revision: ''
 ---
@@ -54,3 +54,7 @@ Keep the existing 224px control measure and wrapping rows. New kind-specific con
 
 ## Verification
 Pending targeted component suites and manual-seed mutation proof. The dev/probe pass over a created task of each offered kind is the coordinator's: run the repository Vite probe with `bunx vite --host 0.0.0.0` and open `/dev/probe/` in the coordinator's real-browser/CDP harness; extend/drive its task-create scenario for sync, release, verify, gc, bot and copy. Exact coordinator invocation to be confirmed against dev/probe entry before handoff. No whole-repository gates or formatters run by this slice.
+
+## Shipped in
+
+PR #363 of stack #364 (epic 72), branch `epic72/tasks`. The macOS gate (`bun run check:rust:macos`) passed on hesperia over the stack tip, which is where the `keeper` shell crate compiles at all.

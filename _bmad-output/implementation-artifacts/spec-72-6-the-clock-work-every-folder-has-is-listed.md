@@ -126,3 +126,7 @@ The requested triage file was read in full via decoded `.text`; it summarizes th
 Reachability is exercised through real `Engine::open` and its public task listing; scheduler tests advance the injected clock past eight days and observe no armed window or history for disabled proposals. The cadence test parses the stored Sync schedule and compares its next window to LIVE_WATCH_BACKSTOP_MS. Db tests close and reopen the actual SQLite file, preserving deletion and edits. No projection code changed; scan, scratch sweep and optional notes still come from `paced_work`.
 
 No shell crate or bindings were changed. No git commands, repo-wide gates, or formatters were run. The coordinator owns final formatting and the nextest rerun where installed. Existing Gc assertions were scoped to Gc rather than assuming it was the only kind; release integration now asserts the actual contract (no Release row invented) rather than an incidental exact list of all kinds. No wording-only test was added or re-pinned. No throwaway script remains.
+
+## Shipped in
+
+PR #363 of stack #364 (epic 72), branch `epic72/tasks`. The macOS gate (`bun run check:rust:macos`) passed on hesperia over the stack tip, which is where the `keeper` shell crate compiles at all.

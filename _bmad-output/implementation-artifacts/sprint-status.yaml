@@ -51,15 +51,15 @@ development_status:
   # Epic 72: the owner's 0.8.29 field report, triaged claim-by-claim before planning.
   # Stack publication is reserved for the coordinator by this checkout's rules.
   epic-72: in-progress
-  72-1-the-rail-opens-on-everything-and-leads-with-the-newest: in-progress
-  72-2-a-hint-you-can-read-on-every-row-and-every-icon: in-progress
-  72-3-the-tasks-header-has-a-budget: in-progress
-  72-4-the-recording-pane-fills-the-pane: in-progress
-  72-5-back-and-forward-through-the-notes-you-followed: in-progress
-  72-6-the-clock-work-every-folder-has-is-listed: in-progress
-  72-7-the-task-row-carries-every-kind: backlog
-  72-8-the-bot-a-task-runs-on-the-host-that-can-run-it: backlog
-  72-9-a-form-that-creates-every-kind: backlog
+  72-1-the-rail-opens-on-everything-and-leads-with-the-newest: review
+  72-2-a-hint-you-can-read-on-every-row-and-every-icon: review
+  72-3-the-tasks-header-has-a-budget: review
+  72-4-the-recording-pane-fills-the-pane: review
+  72-5-back-and-forward-through-the-notes-you-followed: review
+  72-6-the-clock-work-every-folder-has-is-listed: review
+  72-7-the-task-row-carries-every-kind: review
+  72-8-the-bot-a-task-runs-on-the-host-that-can-run-it: review
+  72-9-a-form-that-creates-every-kind: review
   # Epic 71: optional content-free observability; no new hosted server.
   # Stack publication is reserved for the coordinator by this checkout's rules.
   epic-71: in-progress

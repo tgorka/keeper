@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: review
 baseline_revision: a8eb9c2
 final_revision: ''
 ---
@@ -60,3 +60,7 @@ The first Rust run exposed a real regression: alphabetic empty-query ranking put
 - `RUSTUP_TOOLCHAIN=stable-x86_64-unknown-linux-gnu cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core palette`: first attempt timed out at 180 seconds during cold compilation; retry produced **46 passed, 1 failed** (default-list displacement). A 47-pass intermediate run after removing that assertion was rejected by Main; it is not the acceptance result. Ranking fixed and stronger default-list regression added; final rerun: **48 passed, 0 failed**. Main explicitly authorized cargo test because nextest is absent here.
 - Production reachability: NoteEditor mounts NoteNavigation for the panel ID passed by PanelStrip and NotesPhoneNote; palette handlers call the same store verbs. Real Radix menu + store interaction exercised by the new component test; browser pixels and physical-phone interaction were not verified here.
 - No shell-crate changes or Rust view-model type changes in this slice. Formatting and full gates belong to Main, per shared-worktree contract.
+
+## Shipped in
+
+PR #362 of stack #364 (epic 72), branch `epic72/surfaces`. The macOS gate (`bun run check:rust:macos`) passed on hesperia over the stack tip, which is where the `keeper` shell crate compiles at all.

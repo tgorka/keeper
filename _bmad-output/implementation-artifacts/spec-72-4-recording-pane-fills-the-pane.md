@@ -2,7 +2,7 @@
 title: 'The Recording pane fills the pane'
 type: 'bugfix'
 created: '2026-09-16'
-status: in-progress
+status: review
 baseline_revision: a8eb9c2
 final_revision: ''
 ---
@@ -85,3 +85,7 @@ One new test guards the rendered body/card/header class contract and the four me
 The Recording header and the comparison Settings/Files files were read and left unchanged. No Rust changed; no Rust build or binding regeneration was needed. No repo-wide gates, formatters, or git operations were run by this slice.
 
 **Still owed by the coordinator:** a **1500px Mac screenshot**, with computed body/card/field widths if available. It must show the Recording cards spanning the available pane inside the unchanged 24px body padding, the Next session form card spanning that same width, metadata inputs left-aligned at no more than 640px rather than stretched across the window, the custom name/value row fitting that measure, and the unchanged full-width header. Inspect the completed-session details editor as well because it uses the same measured fields. At a narrower desktop width the fields must shrink without horizontal clipping. The class guard and passing jsdom suite do not establish pixel geometry, so this spec remains in progress until the coordinator records that visual acceptance.
+
+## Shipped in
+
+PR #362 of stack #364 (epic 72), branch `epic72/surfaces`. The macOS gate (`bun run check:rust:macos`) passed on hesperia over the stack tip, which is where the `keeper` shell crate compiles at all.

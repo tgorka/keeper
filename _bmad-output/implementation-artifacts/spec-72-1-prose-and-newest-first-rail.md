@@ -1,6 +1,6 @@
 ---
 title: 'The rail opens on everything, leads with the newest, and its preview reads like prose'
-status: in-progress
+status: review
 baseline_revision: a8eb9c2
 final_revision: ''
 ---
@@ -72,3 +72,7 @@ No filesystem walk for dates, frontend markdown renderer, synthetic edit/delete 
 - Generated `src/lib/ipc/gen/NoteSpaceVm.ts` carries `updatedMs: number | null`; generated `NoteRowVm.ts` carries the prose field documentation. No hand edits to generated bindings.
 - Additional shell regression `raw_markdown_snippet_caches_are_rebuilt_on_upgrade` supplies a real schema-4 IndexCache containing raw markdown to the cache adopter; it must refuse it. Like the composition test, it awaits macOS execution.
 - Rust mutation command: `RUSTUP_TOOLCHAIN=stable-x86_64-unknown-linux-gnu cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core notes::`. Reversing the modified-date comparison and bypassing inline prose extraction produced **639 passed, four failed**. The two rail tests observed oldest/absent-first order; the prose tests observed raw `**bold**`, backticks, destinations and escaped punctuation. Both files were restored exactly (snapshot hashes A7EF / A346), and the final identical scoped command passed **643 tests**, 2370 filtered. No mutations or throwaway artifacts remain.
+
+## Shipped in
+
+PR #362 of stack #364 (epic 72), branch `epic72/surfaces`. The macOS gate (`bun run check:rust:macos`) passed on hesperia over the stack tip, which is where the `keeper` shell crate compiles at all.

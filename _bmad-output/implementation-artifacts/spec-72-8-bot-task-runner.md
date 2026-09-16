@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: review
 baseline_revision: a8eb9c2
 final_revision: ''
 ---
@@ -84,3 +84,7 @@ The attended `bots_ipc.rs` and its tests were not edited. Their passing status i
 - `CopyOutcome`: one shell exhaustive match in copy_ipc.rs plus its existing fixtures; Skipped arm added with the reason preserved.
 - `run_tool_loop_reporting`: existing bots_ipc call and new task call; signature unchanged. ToolCallReporter uses chat::ToolCall, ToolHost is Send + Sync, and disjoint record fields are captured by the sink/reporter.
 - Reference-only symbols checked: `Endpoint` (exported by bots, not http), `CoreError` (error module, not crate root), `Platform` required methods, `default_profile_id` (Option<String>), `ContextBundle::system_prompt` (Option<String>), `store::insert_provider`/`insert_bot`/`save_grant` and audit listing/result types. No reference signature was changed.
+
+## Shipped in
+
+PR #363 of stack #364 (epic 72), branch `epic72/tasks`. The macOS gate (`bun run check:rust:macos`) passed on hesperia over the stack tip, which is where the `keeper` shell crate compiles at all.

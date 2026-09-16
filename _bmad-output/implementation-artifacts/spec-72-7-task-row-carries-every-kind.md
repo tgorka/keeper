@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: review
 baseline_revision: a8eb9c2
 final_revision: ''
 ---
@@ -49,3 +49,7 @@ AD-233: copy uses the engine's existing `Engine::blocking` fence. On the product
 
 ## Verification
 Pending targeted task, copy, core tasks and CLI vocabulary tests. Bot-column regression runs before persistence edits. Date-window mutation must fail, then exact source restoration must pass. No formatters, git operations, or repository-wide gates in this lane.
+
+## Shipped in
+
+PR #363 of stack #364 (epic 72), branch `epic72/tasks`. The macOS gate (`bun run check:rust:macos`) passed on hesperia over the stack tip, which is where the `keeper` shell crate compiles at all.

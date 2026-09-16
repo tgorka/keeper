@@ -90,3 +90,7 @@ final_revision: ''
 No Rust files changed. No browser was launched and no visual rendering was performed by this slice. jsdom proves focus/hover timing, escaping, classes, context-menu preservation, full-value popover operation and action behavior, not pixel geometry.
 
 Main owns the epic-wide `dev/probe` pass. It must show: a pointer hint remains absent until 500ms; keyboard focus opens it; a truncated row's complete label wraps without ellipsis, detail occupies at most three rendered lines, and the hint does not overflow the viewport/pane; the Files full-value control remains operable; folded avatar rails remain unhinted. Formatting and repo-wide gates are also the coordinator's work.
+
+## Shipped in
+
+PR #362 of stack #364 (epic 72), branch `epic72/surfaces`. The macOS gate (`bun run check:rust:macos`) passed on hesperia over the stack tip, which is where the `keeper` shell crate compiles at all.
