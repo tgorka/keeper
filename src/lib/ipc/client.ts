@@ -9,6 +9,7 @@
 import { Channel, invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { AutoUpdateRestartVm } from "./gen/AutoUpdateRestartVm";
 import type { AutoUpdateVm } from "./gen/AutoUpdateVm";
 import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 import type { DockBadgeMode } from "./gen/DockBadgeMode";
@@ -54,6 +55,8 @@ export type { AccountVm } from "./gen/AccountVm";
 export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 export type { AuditOutcome } from "./gen/AuditOutcome";
 export type { AuditVerdict } from "./gen/AuditVerdict";
+export type { AutoUpdateHold } from "./gen/AutoUpdateHold";
+export type { AutoUpdateRestartVm } from "./gen/AutoUpdateRestartVm";
 export type { AutoUpdateVm } from "./gen/AutoUpdateVm";
 export type { BackupStatus } from "./gen/BackupStatus";
 export type { BadgeStyle } from "./gen/BadgeStyle";
@@ -2870,6 +2873,22 @@ export async function autoUpdateGet(): Promise<AutoUpdateVm> {
  */
 export async function autoUpdateSet(enabled: boolean): Promise<AutoUpdateVm> {
   return invoke<AutoUpdateVm>("auto_update_set", { enabled });
+}
+
+/**
+ * Whether keeper may restart itself into a build that is installed and waiting.
+ * Rust weighs the recording state and the local hour against the two numbers
+ * passed here; a `hold` says what it is waiting for. Read-only — the caller
+ * relaunches.
+ */
+export async function autoUpdateRestartCheck(
+  installedForMs: number,
+  idleMs: number,
+): Promise<AutoUpdateRestartVm> {
+  return invoke<AutoUpdateRestartVm>("auto_update_restart_check", {
+    installedForMs,
+    idleMs,
+  });
 }
 
 /**

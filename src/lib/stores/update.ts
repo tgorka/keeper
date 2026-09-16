@@ -17,6 +17,7 @@
 import type { Update } from "@tauri-apps/plugin-updater";
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import type { AutoUpdateHold } from "@/lib/ipc/client";
 
 /**
  * The states of the update flow. Every path — including a failed check, a
@@ -26,7 +27,9 @@ import { createStore } from "zustand/vanilla";
  * `installedNeedsRestart` carries the version when the background loop
  * installed it (nobody watched that happen, so the sentence names the build)
  * and `null` after the manual two-step flow, whose sentence already followed a
- * click on the version it names.
+ * click on the version it names. `atMs` is when the install landed: the
+ * self-restart policy's grace window is measured from it, so a person who sees
+ * "restart to finish" is never beaten to the restart by keeper.
  */
 export type UpdatePhase =
   | { kind: "idle" }
@@ -34,7 +37,7 @@ export type UpdatePhase =
   | { kind: "upToDate" }
   | { kind: "available"; version: string }
   | { kind: "downloading"; version: string }
-  | { kind: "installedNeedsRestart"; version: string | null }
+  | { kind: "installedNeedsRestart"; version: string | null; atMs: number }
   | { kind: "error"; message: string };
 
 export interface UpdateState {
@@ -46,10 +49,18 @@ export interface UpdateState {
    * consumed so a double-click cannot start two downloads of one handle.
    */
   pending: Update | null;
+  /**
+   * Why keeper has not restarted itself into the waiting build yet, as Rust
+   * last answered — or `null` before it has been asked. Rendered, so "restart
+   * to finish" standing for a day is explained rather than mysterious.
+   */
+  restartHold: AutoUpdateHold | null;
   /** Move the flow to `phase`. */
   setPhase: (phase: UpdatePhase) => void;
   /** Record (or clear) the update awaiting an explicit install click. */
   setPending: (pending: Update | null) => void;
+  /** Record the latest reason the self-restart is holding. */
+  setRestartHold: (hold: AutoUpdateHold | null) => void;
   /** Back to the start: a fresh Settings open, with no stale prior result. */
   reset: () => void;
 }
@@ -61,9 +72,11 @@ export interface UpdateState {
 export const updateStore = createStore<UpdateState>()((set) => ({
   phase: { kind: "idle" },
   pending: null,
+  restartHold: null,
   setPhase: (phase) => set({ phase }),
   setPending: (pending) => set({ pending }),
-  reset: () => set({ phase: { kind: "idle" }, pending: null }),
+  setRestartHold: (restartHold) => set({ restartHold }),
+  reset: () => set({ phase: { kind: "idle" }, pending: null, restartHold: null }),
 }));
 
 /**

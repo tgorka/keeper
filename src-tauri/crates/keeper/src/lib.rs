@@ -1082,6 +1082,7 @@ pub fn run() {
                 ipc::debug_mode_set,
                 ipc::auto_update_get,
                 ipc::auto_update_set,
+                ipc::auto_update_restart_check,
                 ipc::debug_log_tail,
                 ipc::debug_log_path,
                 ipc::titlebar_drag_report,

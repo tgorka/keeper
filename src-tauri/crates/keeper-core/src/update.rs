@@ -15,10 +15,15 @@
 //! 1. **Never on boot.** The first check waits [`FIRST_CHECK_DELAY_MS`], so a
 //!    cold launch spends its first seconds on sync and the room list, not on a
 //!    release manifest.
-//! 2. **Never a relaunch.** A background install replaces the bundle on disk;
-//!    the running process keeps the old code until the person restarts it. The
-//!    update flow may say "restart to finish"; it may never restart *for* them,
-//!    because the thing it would discard is an unsent message.
+//! 2. **Never a relaunch somebody would notice.** A background install replaces
+//!    the bundle on disk; the running process keeps the old code until it is
+//!    restarted. keeper will do that restart itself — an update nobody restarts
+//!    into is an update nobody got — but only at a moment where nothing is lost:
+//!    never while a recording is live, not for [`RESTART_GRACE_MS`] after the
+//!    install (so a person about to restart is never beaten to it), and then only
+//!    in the small hours after a short quiet spell, or after a long one at any
+//!    hour. [`decide_restart`] is that judgement, and it is the only place it is
+//!    made.
 //! 3. **A failure is not a retry storm.** A check or download that fails backs
 //!    off to [`RETRY_DELAY_MS`] rather than the full interval (a transient
 //!    offline moment should not cost six hours) and never faster than that.
@@ -83,6 +88,135 @@ pub fn plan(enabled: bool, supported: bool) -> AutoUpdateVm {
         first_check_delay_ms: FIRST_CHECK_DELAY_MS,
         check_interval_ms: CHECK_INTERVAL_MS,
         retry_delay_ms: RETRY_DELAY_MS,
+        restart_check_interval_ms: RESTART_CHECK_INTERVAL_MS,
+    }
+}
+
+/// How often the loop asks whether this is a good moment to restart, once a
+/// build is installed and waiting.
+///
+/// A minute: the question is cheap (one recording-state read and a clock), and
+/// the windows below are measured in minutes, so a coarser poll would sit out
+/// the night window it is watching for.
+pub const RESTART_CHECK_INTERVAL_MS: i64 = 60_000;
+
+/// How long an installed build waits for a person to restart into it before
+/// keeper considers doing it itself.
+///
+/// Half an hour. Somebody who sees "restart to finish" and reaches for ⌘Q must
+/// win that race; this is the margin that lets them.
+pub const RESTART_GRACE_MS: i64 = 30 * 60 * 1_000;
+
+/// Start of the night window, in minutes after local midnight (02:00).
+pub const NIGHT_START_MINUTE: i64 = 2 * 60;
+
+/// End of the night window, in minutes after local midnight (05:00).
+///
+/// 02:00–05:00 rather than "after midnight": the hours somebody is most likely
+/// to still be working are the ones just after midnight, and a machine woken at
+/// 05:00 for the day should already be on the new build.
+pub const NIGHT_END_MINUTE: i64 = 5 * 60;
+
+/// Quiet spell required inside the night window.
+///
+/// Fifteen minutes. In the middle of the night this is enough to tell "asleep"
+/// from "reading one message"; requiring hours would mean a laptop shut at
+/// 02:30 never gets its restart.
+pub const NIGHT_IDLE_MS: i64 = 15 * 60 * 1_000;
+
+/// Quiet spell required at any other hour.
+///
+/// Four hours with no interaction at all — a lunch, a meeting, a machine left
+/// on overnight in a different timezone than the one this code guessed. Long
+/// enough that it is never "while someone is working on it".
+pub const AWAY_IDLE_MS: i64 = 4 * 60 * 60 * 1_000;
+
+/// What keeper knows when it asks whether to restart into an installed build.
+///
+/// Every field is measured by a caller — the shell reads the recording state and
+/// the local clock, the webview measures its own idleness — and none of it is
+/// decided here. `idle_ms` is time since the last interaction *with keeper*,
+/// which is the only idleness a webview can honestly report; it is not a
+/// system-wide idle timer, and the thresholds are chosen so that the difference
+/// does not matter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestartFacts {
+    /// How long the installed build has been waiting for a restart.
+    pub installed_for_ms: i64,
+    /// Time since the last interaction with keeper.
+    pub idle_ms: i64,
+    /// Minutes after local midnight, right now.
+    pub minute_of_day: i64,
+    /// Whether a recording session is live (capture running or winding down).
+    pub recording_live: bool,
+}
+
+/// Why keeper is not restarting itself yet. Each variant is a sentence the
+/// About surface can render, so "waiting" is never unexplained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartHold {
+    /// A recording is live. The one absolute refusal: a restart mid-capture
+    /// costs a file somebody cannot re-record.
+    Recording,
+    /// Inside the grace window — the person gets first refusal.
+    Grace,
+    /// Somebody is using keeper.
+    InUse,
+}
+
+/// The answer: restart now, or hold for a named reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartVerdict {
+    /// Restart into the installed build now.
+    Restart,
+    /// Not yet, because of this.
+    Hold(RestartHold),
+}
+
+/// Whether now is a moment keeper may restart itself into an installed build.
+///
+/// Order matters and is the policy: a live recording refuses regardless of hour
+/// or idleness; the grace window refuses next, so the person who just read
+/// "restart to finish" is never beaten to it; then the night window with a short
+/// quiet spell, or any hour with a long one.
+#[must_use]
+pub fn decide_restart(facts: RestartFacts) -> RestartVerdict {
+    if facts.recording_live {
+        return RestartVerdict::Hold(RestartHold::Recording);
+    }
+    if facts.installed_for_ms < RESTART_GRACE_MS {
+        return RestartVerdict::Hold(RestartHold::Grace);
+    }
+    let night = facts.minute_of_day >= NIGHT_START_MINUTE && facts.minute_of_day < NIGHT_END_MINUTE;
+    if night && facts.idle_ms >= NIGHT_IDLE_MS {
+        return RestartVerdict::Restart;
+    }
+    if facts.idle_ms >= AWAY_IDLE_MS {
+        return RestartVerdict::Restart;
+    }
+    RestartVerdict::Hold(RestartHold::InUse)
+}
+
+impl From<RestartVerdict> for crate::vm::AutoUpdateRestartVm {
+    /// The verdict as the webview receives it. Here rather than in the shell so
+    /// the wire shape of a hold cannot drift from the decision that produced it.
+    fn from(verdict: RestartVerdict) -> Self {
+        use crate::vm::AutoUpdateHold;
+
+        match verdict {
+            RestartVerdict::Restart => Self {
+                restart: true,
+                hold: None,
+            },
+            RestartVerdict::Hold(hold) => Self {
+                restart: false,
+                hold: Some(match hold {
+                    RestartHold::Recording => AutoUpdateHold::Recording,
+                    RestartHold::Grace => AutoUpdateHold::Grace,
+                    RestartHold::InUse => AutoUpdateHold::InUse,
+                }),
+            },
+        }
     }
 }
 
@@ -108,6 +242,18 @@ const _: () = assert!(
     CHECK_INTERVAL_MS <= 24 * 60 * 60 * 1_000,
     "a machine left open must be checked at least daily"
 );
+const _: () = assert!(
+    NIGHT_START_MINUTE < NIGHT_END_MINUTE && NIGHT_END_MINUTE <= 24 * 60,
+    "the night window is a window, inside one day"
+);
+const _: () = assert!(
+    NIGHT_IDLE_MS < AWAY_IDLE_MS,
+    "the night is what buys the shorter quiet spell; equal thresholds would make it pointless"
+);
+const _: () = assert!(
+    NIGHT_IDLE_MS > RESTART_CHECK_INTERVAL_MS,
+    "the poll must be able to observe the quiet spell it waits for"
+);
 
 #[cfg(test)]
 mod tests {
@@ -125,6 +271,7 @@ mod tests {
             assert_eq!(plan.first_check_delay_ms, FIRST_CHECK_DELAY_MS);
             assert_eq!(plan.check_interval_ms, CHECK_INTERVAL_MS);
             assert_eq!(plan.retry_delay_ms, RETRY_DELAY_MS);
+            assert_eq!(plan.restart_check_interval_ms, RESTART_CHECK_INTERVAL_MS);
         }
     }
 
@@ -137,5 +284,95 @@ mod tests {
         let plan = plan(true, false);
         assert!(!plan.supported);
         assert!(!plan.enabled);
+    }
+
+    /// The facts of a machine nobody is touching in the middle of the night —
+    /// the case the whole self-restart exists for.
+    fn asleep() -> RestartFacts {
+        RestartFacts {
+            installed_for_ms: RESTART_GRACE_MS + 1,
+            idle_ms: NIGHT_IDLE_MS + 1,
+            minute_of_day: NIGHT_START_MINUTE + 30,
+            recording_live: false,
+        }
+    }
+
+    /// A live recording refuses the restart at every hour and at every degree
+    /// of idleness, because a capture cut in half is the one loss here that
+    /// cannot be undone — and an idle machine is exactly what a long unattended
+    /// recording looks like, which is why this is checked before anything else.
+    #[test]
+    fn a_live_recording_refuses_however_quiet_and_late_it_is() {
+        let facts = RestartFacts {
+            recording_live: true,
+            idle_ms: AWAY_IDLE_MS * 10,
+            ..asleep()
+        };
+        assert_eq!(
+            decide_restart(facts),
+            RestartVerdict::Hold(RestartHold::Recording)
+        );
+    }
+
+    /// The person who just read "restart to finish" wins the race.
+    #[test]
+    fn the_grace_window_holds_even_when_everything_else_says_go() {
+        let facts = RestartFacts {
+            installed_for_ms: RESTART_GRACE_MS - 1,
+            ..asleep()
+        };
+        assert_eq!(
+            decide_restart(facts),
+            RestartVerdict::Hold(RestartHold::Grace)
+        );
+        assert_eq!(decide_restart(asleep()), RestartVerdict::Restart);
+    }
+
+    /// Outside the night window a quarter of an hour is not "nobody is working
+    /// on it" — a coffee is not an absence — and four hours is.
+    #[test]
+    fn daytime_needs_a_real_absence_and_the_night_needs_only_a_quiet_spell() {
+        let noon = RestartFacts {
+            minute_of_day: 12 * 60,
+            ..asleep()
+        };
+        assert_eq!(
+            decide_restart(noon),
+            RestartVerdict::Hold(RestartHold::InUse)
+        );
+        assert_eq!(
+            decide_restart(RestartFacts {
+                idle_ms: AWAY_IDLE_MS,
+                ..noon
+            }),
+            RestartVerdict::Restart
+        );
+    }
+
+    /// The window's edges, because "after midnight" is the version of this that
+    /// restarts under somebody still working at 00:30, and 05:00 is the hour a
+    /// machine should already be on the new build rather than about to restart.
+    #[test]
+    fn the_night_window_excludes_late_evening_and_the_morning() {
+        for minute in [0, NIGHT_START_MINUTE - 1, NIGHT_END_MINUTE, 23 * 60 + 59] {
+            assert_eq!(
+                decide_restart(RestartFacts {
+                    minute_of_day: minute,
+                    ..asleep()
+                }),
+                RestartVerdict::Hold(RestartHold::InUse),
+                "minute {minute} is not the night window"
+            );
+        }
+        for minute in [NIGHT_START_MINUTE, NIGHT_END_MINUTE - 1] {
+            assert_eq!(
+                decide_restart(RestartFacts {
+                    minute_of_day: minute,
+                    ..asleep()
+                }),
+                RestartVerdict::Restart,
+                "minute {minute} is inside it"
+            );
+        }
     }
 }

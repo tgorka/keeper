@@ -11090,6 +11090,58 @@ pub fn auto_update_set(
     ))
 }
 
+/// Whether keeper may restart itself into a build that is installed and waiting
+/// (Story: background updates restart themselves).
+///
+/// The webview asks on a cadence and supplies the one fact only it can measure —
+/// how long since somebody last interacted with keeper. This side supplies the
+/// two it owns: whether a recording is live (read from the live session slot,
+/// never from a frontend mirror, because this is the refusal that must not be
+/// spoofable by a stale store) and the local wall-clock minute. The judgement
+/// itself is [`keeper_core::update::decide_restart`]'s.
+///
+/// Read-only: it restarts nothing. The caller relaunches, because the caller is
+/// what holds the webview that would be discarded.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn auto_update_restart_check(
+    state: State<'_, AppState>,
+    installed_for_ms: i64,
+    idle_ms: i64,
+) -> Result<keeper_core::vm::AutoUpdateRestartVm, IpcError> {
+    use chrono::Timelike as _;
+
+    let recording_live = recording_snapshot_off_runtime(&state)
+        .await?
+        .state
+        .is_live();
+    let now = chrono::Local::now();
+    let minute_of_day = i64::from(now.hour() * 60 + now.minute());
+    let facts = keeper_core::update::RestartFacts {
+        installed_for_ms,
+        idle_ms,
+        minute_of_day,
+        recording_live,
+    };
+    Ok(keeper_core::update::decide_restart(facts).into())
+}
+
+/// Mobile stub for [`auto_update_restart_check`]: there is no in-app updater on
+/// the phone tier, so there is never an installed build waiting for a restart —
+/// an honest `Unsupported` rather than a verdict about a thing that cannot
+/// happen. The `inAppUpdater` capability is `false`, so nothing calls it.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn auto_update_restart_check(
+    installed_for_ms: i64,
+    idle_ms: i64,
+) -> Result<keeper_core::vm::AutoUpdateRestartVm, IpcError> {
+    let _ = (installed_for_ms, idle_ms);
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the in-app updater is desktop-only".to_owned(),
+    )))
+}
+
 /// The tail of the app log, for the in-app diagnostics surface.
 ///
 /// Reads a file the app already writes rather than starting a second stream:

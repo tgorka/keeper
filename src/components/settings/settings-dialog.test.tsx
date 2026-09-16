@@ -10,6 +10,7 @@ vi.mock("@/lib/ipc/client", () => ({
       firstCheckDelayMs: 120_000,
       checkIntervalMs: 21_600_000,
       retryDelayMs: 1_800_000,
+      restartCheckIntervalMs: 60_000,
     }),
   ),
   autoUpdateSet: vi.fn((enabled: boolean) =>
@@ -19,6 +20,7 @@ vi.mock("@/lib/ipc/client", () => ({
       firstCheckDelayMs: 120_000,
       checkIntervalMs: 21_600_000,
       retryDelayMs: 1_800_000,
+      restartCheckIntervalMs: 60_000,
     }),
   ),
   encryptionPosture: vi.fn(() => Promise.resolve(null)),

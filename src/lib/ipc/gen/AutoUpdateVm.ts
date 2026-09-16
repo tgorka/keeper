@@ -35,4 +35,9 @@ checkIntervalMs: number,
 /**
  * Milliseconds to wait after a failed check or download before retrying.
  */
-retryDelayMs: number, };
+retryDelayMs: number, 
+/**
+ * Milliseconds between "is this a good moment to restart?" questions once
+ * a build is installed and waiting.
+ */
+restartCheckIntervalMs: number, };

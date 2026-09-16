@@ -14,6 +14,7 @@ vi.mock("@/lib/ipc/client", () => ({
       firstCheckDelayMs: 120_000,
       checkIntervalMs: 21_600_000,
       retryDelayMs: 1_800_000,
+      restartCheckIntervalMs: 60_000,
     }),
   ),
   autoUpdateSet: vi.fn((enabled: boolean) =>
@@ -23,6 +24,7 @@ vi.mock("@/lib/ipc/client", () => ({
       firstCheckDelayMs: 120_000,
       checkIntervalMs: 21_600_000,
       retryDelayMs: 1_800_000,
+      restartCheckIntervalMs: 60_000,
     }),
   ),
   debugModeGet: vi.fn(() => Promise.resolve(false)),
@@ -61,6 +63,7 @@ import {
   debugModeSentence,
   IOS_DISCLOSURE_LINES,
   MACOS_DISCLOSURE_LINES,
+  selfRestartNote,
 } from "@/components/settings/about-section";
 import {
   autoUpdateGet,
@@ -383,7 +386,9 @@ describe("AboutSection update flow", () => {
   it("reports a build the background loop already installed, and restarts on request", async () => {
     // What `use-auto-update` leaves behind while Settings was closed: installed,
     // named, waiting for a restart nobody has been forced into.
-    updateStore.getState().setPhase({ kind: "installedNeedsRestart", version: "0.9.0" });
+    updateStore
+      .getState()
+      .setPhase({ kind: "installedNeedsRestart", version: "0.9.0", atMs: Date.now() });
     render(<AboutSection open />);
     await waitFor(() => expect(mockEgress).toHaveBeenCalled());
 
@@ -395,6 +400,20 @@ describe("AboutSection update flow", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Restart now" }));
     await waitFor(() => expect(mockRelaunch).toHaveBeenCalledTimes(1));
+  });
+
+  it("says what the self-restart is waiting for, and names the recording case", async () => {
+    const flow = updateStore.getState();
+    flow.setPhase({ kind: "installedNeedsRestart", version: "0.9.0", atMs: Date.now() });
+    flow.setRestartHold("recording");
+    render(<AboutSection open />);
+    await waitFor(() => expect(mockEgress).toHaveBeenCalled());
+
+    // The hold that can stand for hours on a machine nobody is touching is the
+    // one a person must be able to read off the surface.
+    expect(screen.getByText(selfRestartNote("recording"))).toBeInTheDocument();
+    expect(selfRestartNote("recording")).toContain("will not restart while a recording is running");
+    expect(selfRestartNote("inUse")).toContain("once you are away from keeper");
   });
 
   it("persists the background-update switch and shows the effective answer a file pinned", async () => {
@@ -411,6 +430,7 @@ describe("AboutSection update flow", () => {
       firstCheckDelayMs: 120_000,
       checkIntervalMs: 21_600_000,
       retryDelayMs: 1_800_000,
+      restartCheckIntervalMs: 60_000,
     });
     fireEvent.click(auto);
     expect(mockAutoUpdateSet).toHaveBeenCalledWith(false);
@@ -428,6 +448,7 @@ describe("AboutSection update flow", () => {
       firstCheckDelayMs: 120_000,
       checkIntervalMs: 21_600_000,
       retryDelayMs: 1_800_000,
+      restartCheckIntervalMs: 60_000,
     });
     render(<AboutSection open />);
     await waitFor(() => expect(mockEgress).toHaveBeenCalled());
@@ -445,10 +466,14 @@ describe("AboutSection update flow", () => {
       firstCheckDelayMs: 120_000,
       checkIntervalMs: 21_600_000,
       retryDelayMs: 1_800_000,
+      restartCheckIntervalMs: 60_000,
     };
     expect(autoUpdateSentence(plan)).toContain("about every 6 hours");
-    // And says the thing a person needs to predict when the new build runs.
-    expect(autoUpdateSentence(plan)).toContain("keeper never restarts itself");
+    // And the two things a person needs to predict what happens to their
+    // session: that keeper will restart itself, and the one thing that always
+    // stops it.
+    expect(autoUpdateSentence(plan)).toContain("keeper restarts itself");
+    expect(autoUpdateSentence(plan)).toContain("never while a recording is running");
     // Unanswered: no invented number.
     expect(autoUpdateSentence(undefined)).toContain("on a cadence");
   });

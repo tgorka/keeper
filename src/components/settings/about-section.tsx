@@ -8,6 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { useVoiceFacts } from "@/hooks/use-voice-facts";
 import {
+  type AutoUpdateHold,
   type AutoUpdateVm,
   autoUpdateGet,
   autoUpdateSet,
@@ -131,16 +132,29 @@ function openExternal(event: MouseEvent<HTMLAnchorElement>, url: string) {
 }
 
 /**
- * The honest copy for the background-update switch. Says what turning it on
- * does, names the cadence Rust chose rather than a literal, and says plainly
- * that keeper does not restart itself — the one thing a person needs to know to
- * predict when the new build starts being used.
+ * The honest copy for the background-update switch. Names the cadence Rust
+ * chose rather than a literal, and then the two things a person needs in order
+ * to predict what keeper will do to their session: it *will* restart itself,
+ * and it will not do it while they are using it or while a recording runs.
  */
 export function autoUpdateSentence(plan: AutoUpdateVm | undefined): string {
   const hours = plan === undefined ? 0 : Math.round(plan.checkIntervalMs / 3_600_000);
   const cadence =
     hours >= 1 ? `about every ${hours} hour${hours === 1 ? "" : "s"}` : "on a cadence";
-  return `keeper looks for a new version ${cadence} and installs it in the background. It starts using the new version the next time you restart keeper — keeper never restarts itself.`;
+  return `keeper looks for a new version ${cadence} and installs it in the background. If you have not restarted into it, keeper restarts itself once you have stopped using it — overnight, or after a few hours away — and never while a recording is running.`;
+}
+
+/**
+ * What the waiting build is waiting for, as Rust last answered it. A "restart
+ * to finish" line that stands for a day is otherwise unexplained — and the
+ * recording case in particular is a refusal somebody should be able to read,
+ * since it is the one that can hold for hours on a machine nobody is touching.
+ */
+export function selfRestartNote(hold: AutoUpdateHold | null): string {
+  if (hold === "recording") {
+    return "keeper will not restart while a recording is running. It restarts itself once the recording has finished and you are away from keeper.";
+  }
+  return "You can restart now, or leave it: keeper restarts itself once you are away from keeper, and never while a recording is running.";
 }
 
 /**
@@ -187,6 +201,8 @@ export function AboutSection({ open }: { open: boolean }) {
   // (`use-auto-update`): an update it installed while Settings was closed is
   // still here to be reported, and a check it started is not raced by a click.
   const update = useUpdateStore((s) => s.phase);
+  // Why the self-restart is holding, as the background loop last heard it.
+  const restartHold = useUpdateStore((s) => s.restartHold);
   // The background-update plan: `undefined` until Rust answers. Carries the
   // effective `enabled` (a layer file may pin it) and the cadence the sentence
   // names.
@@ -338,10 +354,10 @@ export function AboutSection({ open }: { open: boolean }) {
           // A real relaunch exits the process, so this never renders. If relaunch
           // resolves without actually restarting, never leave the flow stuck on
           // "downloading" — the update is already on disk, so ask for a restart.
-          setUpdateSafe({ kind: "installedNeedsRestart", version: null });
+          setUpdateSafe({ kind: "installedNeedsRestart", version: null, atMs: Date.now() });
         } catch {
           // Install succeeded but the relaunch failed; the update is on disk.
-          setUpdateSafe({ kind: "installedNeedsRestart", version: null });
+          setUpdateSafe({ kind: "installedNeedsRestart", version: null, atMs: Date.now() });
         }
       })
       .catch((raw: unknown) => {
@@ -482,6 +498,9 @@ export function AboutSection({ open }: { open: boolean }) {
                 Restart now
               </Button>
             </div>
+          )}
+          {update.kind === "installedNeedsRestart" && autoPlan?.enabled === true && (
+            <p className="text-muted-foreground text-xs">{selfRestartNote(restartHold)}</p>
           )}
           {update.kind === "error" && (
             <p className="text-held text-xs" role="alert">

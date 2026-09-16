@@ -228,11 +228,15 @@ build; a value that is not a sha is ignored with a warning rather than believed.
    > will see the new release — it reports up to date or, transiently, an error.
    > Publish to make the update live.
 
-   > **A published release reaches running apps by itself.** With **Update
-   > automatically** on, installed apps download and verify the new build in the
-   > background within about six hours and start using it at their next restart;
-   > nothing relaunches anybody's app. So a bad release is live on other people's
-   > machines without anyone clicking: publish only what you would install.
+   > **A published release reaches running apps by itself, and runs there by
+   > itself.** With **Update automatically** on, installed apps download and
+   > verify the new build in the background within about six hours, and then
+   > restart themselves into it at the first moment nothing is lost: not while a
+   > recording is live, not within half an hour of the install, and then only
+   > overnight after a quiet spell or after several hours away. So a bad release
+   > is not merely downloaded onto other people's machines — it is what they are
+   > running by the next morning, with nobody having clicked anything. Publish
+   > only what you would install.
 
 ## Egress diff note
 
