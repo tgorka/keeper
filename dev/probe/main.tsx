@@ -141,6 +141,19 @@ function q(selector: string): Element | null {
   return document.querySelector(selector);
 }
 
+/**
+ * The Tasks header's verbs are icon-only since Epic 72 (AD-240's budget), so a
+ * control is found by the accessible name it carries rather than by its text —
+ * which for `Add a task` is now the empty string.
+ */
+function byName(selector: string, name: string): HTMLElement | null {
+  return (
+    (Array.from(document.querySelectorAll(selector)) as HTMLElement[]).find(
+      (el) => el.getAttribute("aria-label") === name,
+    ) ?? null
+  );
+}
+
 function byText(selector: string, text: string): HTMLElement | null {
   return (
     (Array.from(document.querySelectorAll(selector)) as HTMLElement[]).find(
@@ -279,7 +292,7 @@ async function drive(): Promise<void> {
     await sleep(700);
     measure("beside");
     if (act === "beside-add") {
-      const trigger = byText("button", TASK_FORM_ADD_TITLE);
+      const trigger = byName("button", TASK_FORM_ADD_TITLE);
       trigger?.click();
       await waitFor("beside-form", () => q(`section[aria-label="${TASKS_DETAIL_LABEL}"] form`));
       await sleep(400);
@@ -288,7 +301,7 @@ async function drive(): Promise<void> {
   }
 
   if (act === "add" || act === "create") {
-    const trigger = byText("button", TASK_FORM_ADD_TITLE);
+    const trigger = byName("button", TASK_FORM_ADD_TITLE);
     if (trigger === null) {
       emit("missing.add_trigger", "true");
       return;
