@@ -307,9 +307,8 @@ export function RecordingPane() {
       />
 
       <ScrollArea className="min-h-0 flex-1">
-        {/* Centered single column at content-max-width (UX-DR29), not a full-bleed
-            body — unlike the Bridges pane. */}
-        <div className="mx-auto flex w-full max-w-[720px] flex-col gap-6 p-6">
+        {/* UX-DR93: cards fill the pane; metadata fields keep their own measure. */}
+        <div className="flex w-full flex-col gap-6 p-6">
           {/* The completion / in-app-recovery card (Story 20.3, FR-71/FR-73):
               a finalized session renders the plain completion card; the in-app
               `recovered` terminal renders the same shape with a warning edge.

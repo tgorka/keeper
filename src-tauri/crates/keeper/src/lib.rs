@@ -21,6 +21,13 @@ mod bots_ipc;
 // absence rather than a refusing twin (AD-27).
 #[cfg(desktop)]
 mod bots_drive_ipc;
+// The unattended turn a scheduled `bot` task runs (Story 72.8, AD-244).
+// Desktop-only: it needs the drive, so it links where `keeper-sync` does, and
+// a phone lists the task row while the Mac runs it (AD-226). It builds the
+// turn `bots_ipc` builds minus the session, the channel and the voice, with no
+// approver, so every `Ask` a grant produces is a refusal it records.
+#[cfg(desktop)]
+mod bot_task;
 // The drive-as-tools host (Story 61.11). Desktop-only: it composes
 // `keeper_sync::bots_fs`, and `keeper-sync` is not a dependency on iOS or
 // Android. Every decision it sequences lives in `keeper-core` or

@@ -32,7 +32,7 @@ enabled: boolean,
 /**
  * The profile this task is scoped to, `null` for host-wide work.
  */
-profileId: string | null, 
+profileId: string | null, botId: string | null, promptSubpath: string | null, model: string | null, copySource: string | null, copyDestination: string | null, replaceExisting: boolean, modifiedAfterMs: number | null, modifiedBeforeMs: number | null, 
 /**
  * That profile's human name, `null` when the id names no current profile —
  * which is exactly the "folder is gone" fact [`task_host`] acts on.

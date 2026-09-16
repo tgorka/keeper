@@ -59,11 +59,30 @@ describe("copy job lifecycle", () => {
   it("starts a job and lands its first snapshot without waiting for a poll", async () => {
     await startCopyJob("/Users/alice/Pictures", "/Volumes/backup", true);
 
-    expect(mockStart).toHaveBeenCalledWith("/Users/alice/Pictures", "/Volumes/backup", true);
+    // The store is a forwarder, not a minter: what the caller chose reaches
+    // the shell verbatim, and the two modified-window bounds an unset caller
+    // did not choose reach it as `null` — the wire's spelling of "no bound" —
+    // rather than as `0`, which would copy nothing older than the epoch.
+    expect(mockStart).toHaveBeenCalledWith(
+      "/Users/alice/Pictures",
+      "/Volumes/backup",
+      true,
+      null,
+      null,
+    );
     const state = copyJobStore.getState();
     expect(state.id).toBe("job-1");
     expect(state.job).toEqual(jobVm());
     expect(state.error).toBeNull();
+  });
+
+  it("sends the modified-window bounds to the shell as epoch milliseconds", async () => {
+    // Bounds are numbers on the wire and the shell stores them as epoch ms;
+    // a store that reformatted them into a string or a Date would still type
+    // check and still break `keeper-syncd copy`.
+    await startCopyJob("/a", "/b", false, 1_700_000_000_000, 1_700_000_060_000);
+
+    expect(mockStart).toHaveBeenCalledWith("/a", "/b", false, 1_700_000_000_000, 1_700_000_060_000);
   });
 
   it("records a refused start as an IPC failure with no job behind it", async () => {

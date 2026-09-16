@@ -31,6 +31,7 @@ import { NOTES_PHONE_CAPTURE_LABEL } from "@/components/notes/notes-phone-pane";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { Lamp } from "@/components/ui/lamp";
+import { IconHint } from "@/components/ui/tooltip";
 import { showCapture } from "@/hooks/use-notes-actions";
 import { accountHueVar } from "@/lib/account-hue";
 import { initials } from "@/lib/account-initials";
@@ -136,54 +137,62 @@ export function PhoneInboxHeader({ drawerButtonRef, magnifierRef }: PhoneInboxHe
           </button>
         )}
         {bots && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            aria-label={BOTS_PANE_TITLE}
-            onClick={() => primaryViewStore.getState().setView("bots")}
-            className="size-11 shrink-0"
-          >
-            <Bot aria-hidden="true" />
-          </Button>
+          <IconHint label={BOTS_PANE_TITLE}>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label={BOTS_PANE_TITLE}
+              onClick={() => primaryViewStore.getState().setView("bots")}
+              className="size-11 shrink-0"
+            >
+              <Bot aria-hidden="true" />
+            </Button>
+          </IconHint>
         )}
         {/* Quick capture (Epic 66, Story 66.4, AD-200): the phone's twin of the
             desktop's hotkey, one tap from the Inbox because a thought arrives
             while reading messages more often than while reading notes. The
             sheet, not a window; present exactly where a vault can exist. */}
         {notes && (
+          <IconHint label={NOTES_PHONE_CAPTURE_LABEL}>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label={NOTES_PHONE_CAPTURE_LABEL}
+              onClick={() => void showCapture()}
+              className="size-11 shrink-0"
+            >
+              <NotebookPen aria-hidden="true" />
+            </Button>
+          </IconHint>
+        )}
+        <IconHint label="Search">
+          <Button
+            ref={magnifierRef}
+            type="button"
+            variant="ghost"
+            size="icon"
+            aria-label="Search"
+            onClick={() => searchSurfaceStore.getState().open()}
+            className="size-11 shrink-0"
+          >
+            <Search aria-hidden="true" />
+          </Button>
+        </IconHint>
+        <IconHint label="New chat">
           <Button
             type="button"
             variant="ghost"
             size="icon"
-            aria-label={NOTES_PHONE_CAPTURE_LABEL}
-            onClick={() => void showCapture()}
+            aria-label="New chat"
+            onClick={() => newChatStore.getState().open()}
             className="size-11 shrink-0"
           >
-            <NotebookPen aria-hidden="true" />
+            <Pencil aria-hidden="true" />
           </Button>
-        )}
-        <Button
-          ref={magnifierRef}
-          type="button"
-          variant="ghost"
-          size="icon"
-          aria-label="Search"
-          onClick={() => searchSurfaceStore.getState().open()}
-          className="size-11 shrink-0"
-        >
-          <Search aria-hidden="true" />
-        </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          aria-label="New chat"
-          onClick={() => newChatStore.getState().open()}
-          className="size-11 shrink-0"
-        >
-          <Pencil aria-hidden="true" />
-        </Button>
+        </IconHint>
       </div>
     </header>
   );

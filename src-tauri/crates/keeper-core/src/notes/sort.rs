@@ -54,11 +54,8 @@ const MAX_ECHOED_VALUE: usize = 48;
 
 /// Where a space sits in the rail when its file does not say (FR-157).
 ///
-/// Zero, and every space that existed before Story 44.4 is one — so an
-/// un-ordered rail is still the alphabetical rail it has always been, and the
-/// four seeded defaults still render Inbox, Journal, Pinned, Recordings in the
-/// order the deleted fixed rows did. Negative is how a space floats above that
-/// block without renumbering everything below it.
+/// Zero for an unpositioned space. Negative positions float above that block;
+/// equal positions lead with the newest modification (AD-237).
 pub const DEFAULT_SPACE_ORDER: f64 = 0.0;
 
 /// A space's stored rail position, read.
@@ -110,15 +107,17 @@ pub fn read_order(raw: &str) -> StoredOrder {
     }
 }
 
-/// The rail comparison: position first, then name (FR-157).
+/// The rail comparison: position, newest modification, then name (AD-237).
 ///
-/// `total_cmp` rather than `partial_cmp`, so the comparator is total whatever
-/// arrives — the same reason Story 44.5 gives for a note's order. The name
-/// tie-break is what the rail sorted by before this story, so a vault nobody
-/// has positioned does not move.
+/// AD-237 amends 44.4 on the owner's word: unordered spaces should lead with
+/// the newest, not the alphabet. Explicit positions remain primary; absent
+/// dates follow known ones. `total_cmp` keeps the position comparison total.
+/// Callers without dates retain the name tie-break by passing `None`.
 #[must_use]
-pub fn rail_order(a: (f64, &str), b: (f64, &str)) -> Ordering {
-    a.0.total_cmp(&b.0).then_with(|| a.1.cmp(b.1))
+pub fn rail_order(a: (f64, Option<i64>, &str), b: (f64, Option<i64>, &str)) -> Ordering {
+    a.0.total_cmp(&b.0)
+        .then_with(|| b.1.cmp(&a.1))
+        .then_with(|| a.2.cmp(b.2))
 }
 
 /// Which fact a space orders the notes it lists by (FR-158).
@@ -878,36 +877,34 @@ mod tests {
     }
 
     #[test]
-    fn a_rail_nobody_positioned_is_the_alphabetical_rail_it_always_was() {
-        // The four seeded defaults carry no `keeper.order`, and this is the
-        // assertion that says installing Story 44.4 does not move them.
+    fn an_unpositioned_rail_leads_with_the_newest_then_names_equal_or_absent_dates() {
         let mut rail = [
-            (read_order("").order, "Recordings"),
-            (read_order("").order, "Inbox"),
-            (read_order("").order, "Pinned"),
-            (read_order("").order, "Journal"),
+            (0.0, None, "Zulu"),
+            (0.0, Some(10), "Apple"),
+            (0.0, Some(20), "Newest"),
+            (0.0, Some(10), "Banana"),
+            (0.0, None, "Absent"),
         ];
-        rail.sort_by(|a, b| rail_order((a.0, a.1), (b.0, b.1)));
+        rail.sort_by(|a, b| rail_order(*a, *b));
         assert_eq!(
-            rail.iter().map(|row| row.1).collect::<Vec<_>>(),
-            vec!["Inbox", "Journal", "Pinned", "Recordings"]
+            rail.iter().map(|row| row.2).collect::<Vec<_>>(),
+            vec!["Newest", "Apple", "Banana", "Absent", "Zulu"]
         );
     }
 
     #[test]
-    fn a_position_lifts_a_space_out_of_the_alphabet_and_a_negative_one_above_it() {
+    fn a_position_still_outranks_newest_first_and_preserves_fractional_positions() {
         let mut rail = [
-            (read_order("2").order, "Inbox"),
-            (read_order("").order, "Journal"),
-            (read_order("-1").order, "Recordings"),
-            (read_order("1.5").order, "Pinned"),
+            (read_order("2").order, Some(100), "Inbox"),
+            (read_order("").order, Some(20), "Journal"),
+            (read_order("-1").order, Some(1), "Recordings"),
+            (read_order("1.5").order, Some(200), "Pinned"),
+            (read_order("").order, Some(10), "Older"),
         ];
-        rail.sort_by(|a, b| rail_order((a.0, a.1), (b.0, b.1)));
+        rail.sort_by(|a, b| rail_order(*a, *b));
         assert_eq!(
-            rail.iter().map(|row| row.1).collect::<Vec<_>>(),
-            vec!["Recordings", "Journal", "Pinned", "Inbox"],
-            "-1 floats above the unpositioned 0, and 1.5 slots between 0 and 2 \
-             rather than truncating onto 1"
+            rail.iter().map(|row| row.2).collect::<Vec<_>>(),
+            vec!["Recordings", "Journal", "Older", "Pinned", "Inbox"]
         );
     }
 

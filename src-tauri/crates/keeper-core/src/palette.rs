@@ -417,7 +417,15 @@ fn query_actions(
             continue;
         }
         let score = if needle.is_empty() {
-            Some(0)
+            // History is primarily a panel control. Keep existing default verbs
+            // ahead of it; searching still uses the ordinary matching score.
+            Some(
+                if matches!(action.id.as_str(), "notes-back" | "notes-forward") {
+                    -1
+                } else {
+                    0
+                },
+            )
         } else {
             action_score(needle, &action)
         };
@@ -693,6 +701,22 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             NOTES_CATEGORY,
             &["note", "vault", "folder", "change vault"],
             Some("⌘⌥V"),
+            false,
+        ),
+        action(
+            "notes-back",
+            "Back",
+            NOTES_CATEGORY,
+            &["note", "back", "navigation", "previous"],
+            None,
+            false,
+        ),
+        action(
+            "notes-forward",
+            "Forward",
+            NOTES_CATEGORY,
+            &["note", "forward", "navigation", "next"],
+            None,
             false,
         ),
         // --- Sessions (Phase 7, FR-251): gated by category exactly as Notes
@@ -1779,15 +1803,56 @@ mod tests {
         assert!(ids.contains(&"open-recordings"), "searchable: {ids:?}");
     }
 
-    /// The six notes actions the registry ships (Phase 5, build contract §1).
-    const NOTES_ACTION_IDS: [&str; 6] = [
+    /// The notes actions the registry ships.
+    const NOTES_ACTION_IDS: [&str; 8] = [
         "notes-new",
         "notes-capture",
         "notes-journal-today",
         "notes-open",
         "notes-search",
         "notes-switch-vault",
+        "notes-back",
+        "notes-forward",
     ];
+
+    #[test]
+    fn panel_history_does_not_evict_existing_default_actions() {
+        let mut expected = [
+            "open-inbox",
+            "open-archive",
+            "open-approval",
+            "open-bridges",
+            "notes-new",
+            "notes-capture",
+            "notes-journal-today",
+            "notes-open",
+            "notes-search",
+            "notes-switch-vault",
+            "sessions-view",
+            "sessions-new",
+            "sessions-log-today",
+            "tasks-view",
+            "new-chat",
+            "open-search",
+            "start-export",
+            "add-account",
+            "toggle-incognito-global",
+            "sync-now",
+        ];
+        expected.sort_unstable();
+        let actions = query_actions("", false, false, true, false, false);
+        let mut actual: Vec<&str> = actions.iter().map(|action| action.id.as_str()).collect();
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "navigation must not evict a default verb");
+        for (needle, id) in [("back", "notes-back"), ("forward", "notes-forward")] {
+            assert!(
+                query_actions(needle, false, false, true, false, false)
+                    .iter()
+                    .any(|action| action.id == id),
+                "{id} remains searchable"
+            );
+        }
+    }
 
     #[test]
     fn the_notes_section_is_present_iff_the_notes_capability_is_on() {
@@ -1797,20 +1862,22 @@ mod tests {
         let index = sample_index();
 
         let on = index.query("", PaletteMode::Action, false, false, true, false, false);
+        for id in &NOTES_ACTION_IDS[..6] {
+            assert!(
+                on.actions.iter().any(|a| a.id == *id),
+                "{id} remains present in the default list when notes is on"
+            );
+        }
         let off = index.query("", PaletteMode::Action, false, false, false, false, false);
         for id in NOTES_ACTION_IDS {
-            assert!(
-                on.actions.iter().any(|a| a.id == id),
-                "{id} present when notes is on"
-            );
             assert!(
                 !off.actions.iter().any(|a| a.id == id),
                 "{id} absent when notes is off"
             );
         }
 
-        // A direct query honors the same gate ("note" matches every title or
-        // keyword in the section).
+        // Search the category rather than assuming every note action fits in the
+        // capped empty-query results ("note" matches each title or keyword).
         let queried_on = index.query(
             "note",
             PaletteMode::Action,
@@ -1852,6 +1919,12 @@ mod tests {
             NOTES_ACTION_IDS.len(),
             "the whole section projects, and nothing else joins it"
         );
+        for id in NOTES_ACTION_IDS {
+            assert!(
+                notes_section.items.iter().any(|item| item.id == id),
+                "{id} appears in the cheat sheet's Notes section"
+            );
+        }
         assert!(
             !sections_on.iter().any(|s| s.category == "Recording"),
             "notes on does not drag the recording section in with it"
@@ -2746,7 +2819,13 @@ mod tests {
             NOTES_ACTION_IDS.len(),
             "the section is the whole registry's; the tray takes three of it"
         );
-        for absent in ["notes-open", "notes-search", "notes-switch-vault"] {
+        for absent in [
+            "notes-open",
+            "notes-search",
+            "notes-switch-vault",
+            "notes-back",
+            "notes-forward",
+        ] {
             assert!(
                 section.iter().any(|id| id == absent),
                 "{absent} is registered — this test would be vacuous otherwise"
@@ -2757,7 +2836,13 @@ mod tests {
             .iter()
             .map(|(_, label)| *label)
             .collect();
-        for absent in ["Open Note", "Search Notes", "Switch Vault"] {
+        for absent in [
+            "Open Note",
+            "Search Notes",
+            "Switch Vault",
+            "Back",
+            "Forward",
+        ] {
             assert!(
                 !shown.contains(&absent),
                 "{absent} reached the tray: {shown:?}"

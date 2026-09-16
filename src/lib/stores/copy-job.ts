@@ -50,7 +50,13 @@ export const COPY_UNKNOWN_ERROR = "The copy failed for an unknown reason.";
  * is derived from the same grouping, so the two can never disagree about what
  * happened.
  */
-export const COPY_OUTCOME_ORDER: readonly string[] = ["failed", "collision", "copied", "identical"];
+export const COPY_OUTCOME_ORDER: readonly string[] = [
+  "failed",
+  "collision",
+  "copied",
+  "identical",
+  "skipped",
+];
 
 /** One outcome's entries, in the order Rust reported them. */
 export interface CopyGroup {
@@ -206,13 +212,19 @@ export async function startCopyJob(
   source: string,
   destination: string,
   replaceExisting: boolean,
+  modifiedAfterMs: number | null = null,
+  modifiedBeforeMs: number | null = null,
 ): Promise<void> {
   if (isCopyRunning(copyJobStore.getState())) {
     return;
   }
   copyJobStore.getState().begin();
   try {
-    copyJobStore.getState().started(await copyStart(source, destination, replaceExisting));
+    copyJobStore
+      .getState()
+      .started(
+        await copyStart(source, destination, replaceExisting, modifiedAfterMs, modifiedBeforeMs),
+      );
   } catch (raw) {
     copyJobStore.getState().fail(syncErrorMessage(raw, COPY_UNKNOWN_ERROR));
     return;

@@ -1,4 +1,4 @@
-import { createEvent, fireEvent, render, screen } from "@testing-library/react";
+import { act, createEvent, fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { NOTE_DELETE_LABEL } from "@/components/notes/note-actions";
 import {
@@ -162,6 +162,17 @@ function renderNoteRow(overrides: Partial<NoteRowVm> = {}): HTMLElement {
   }
   return found;
 }
+
+it("reveals the complete truncated title and prose on focus, even when unread provenance is shown", () => {
+  const title = "A very long note title whose ending matters after the list has truncated it";
+  const snippet = "Body prose from Rust, including literal <b>text</b>.";
+  const button = renderNoteRow({ title, snippet, unread: true, origin: "changed by agent" });
+  act(() => button.focus());
+  const hint = screen.getByRole("tooltip");
+  expect(hint).toHaveTextContent(title);
+  expect(within(hint).getByText(snippet)).toHaveClass("line-clamp-3");
+  expect(hint.querySelector("b")).toBeNull();
+});
 
 function unreadDot(rowElement: HTMLElement): HTMLElement {
   const found = rowElement.querySelector<HTMLElement>('[data-slot="unread-dot"]');

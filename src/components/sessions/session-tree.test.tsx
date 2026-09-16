@@ -417,11 +417,10 @@ describe("SessionTree", () => {
     mount();
     const row = screen.getByRole("treeitem", { name: "about.md" });
     // Labelled by the refusal itself, so the reason is what a screen reader
-    // reads and what the tooltip shows — a disabled button with no sentence
+    // reads and what the hint shows — a disabled button with no sentence
     // teaches nothing about why this one file is different.
     const button = within(row).getByLabelText(UNDELETABLE_SENTENCE);
     expect(button).toBeDisabled();
-    expect(button).toHaveAttribute("title", UNDELETABLE_SENTENCE);
   });
 
   it("offers no Delete at all on a scratch row, which already says why", () => {

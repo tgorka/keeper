@@ -93,6 +93,7 @@ import {
   useResizableColumn,
 } from "@/components/ui/resizable-columns";
 import { Switch } from "@/components/ui/switch";
+import { IconHint } from "@/components/ui/tooltip";
 import {
   type NoteWriteVm,
   notesFieldVocabulary,
@@ -2008,17 +2009,19 @@ function RecordingPath({ relativePath, target, canReveal }: RecordingPathProps) 
         <OverflowValue name={fileName(relativePath)} value={relativePath} monospace />
       </div>
       <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            className="size-6 shrink-0"
-            aria-label={`${NOTE_PATH_ACTIONS_LABEL} ${relativePath}`}
-          >
-            <MoreHorizontal aria-hidden="true" />
-          </Button>
-        </DropdownMenuTrigger>
+        <IconHint label={`${NOTE_PATH_ACTIONS_LABEL} ${relativePath}`}>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="size-6 shrink-0"
+              aria-label={`${NOTE_PATH_ACTIONS_LABEL} ${relativePath}`}
+            >
+              <MoreHorizontal aria-hidden="true" />
+            </Button>
+          </DropdownMenuTrigger>
+        </IconHint>
         <DropdownMenuContent align="end">
           {canReveal && target !== undefined && (
             <DropdownMenuItem

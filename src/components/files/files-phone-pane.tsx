@@ -67,6 +67,7 @@ import {
 import { OFFLINE_PILL_TEXT } from "@/components/layout/sidebar-pane";
 import { FILES_SYNC_MARK_LABEL, SyncStatusMark } from "@/components/layout/sync-status-mark";
 import { Button } from "@/components/ui/button";
+import { IconHint } from "@/components/ui/tooltip";
 import type { FilesEntryVm, FilesListingVm, SyncProfileVm } from "@/lib/ipc/client";
 import {
   revealPath,
@@ -597,21 +598,22 @@ export function FilesPhonePane() {
           </Button>
         )}
         {place.kind === "folder" && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="size-11"
-            aria-label={FILES_REFRESH_LABEL}
-            title={FILES_REFRESH_LABEL}
-            disabled={refreshing}
-            onClick={() => void refresh()}
-          >
-            <RefreshCw
-              aria-hidden="true"
-              className={cn(refreshing && "motion-safe:animate-spin")}
-            />
-          </Button>
+          <IconHint label={FILES_REFRESH_LABEL}>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="size-11"
+              aria-label={FILES_REFRESH_LABEL}
+              disabled={refreshing}
+              onClick={() => void refresh()}
+            >
+              <RefreshCw
+                aria-hidden="true"
+                className={cn(refreshing && "motion-safe:animate-spin")}
+              />
+            </Button>
+          </IconHint>
         )}
       </header>
       {reduced && offline && (

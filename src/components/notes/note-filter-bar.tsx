@@ -44,6 +44,7 @@ import { type KeyboardEvent, type Ref, useEffect, useId, useRef, useState } from
 import { TagCombobox } from "@/components/notes/tag-combobox";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { IconHint } from "@/components/ui/tooltip";
 import { tagsVocabulary } from "@/lib/ipc/client";
 import {
   notesFiltersStore,
@@ -78,14 +79,16 @@ function FilterChip({
       className="inline-flex shrink-0 items-center gap-1 rounded-full bg-accent px-2 py-0.5 text-accent-foreground text-xs"
     >
       {label}
-      <button
-        type="button"
-        aria-label={clearLabel}
-        onClick={onClear}
-        className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
-      >
-        <X aria-hidden="true" className="size-3" />
-      </button>
+      <IconHint label={clearLabel}>
+        <button
+          type="button"
+          aria-label={clearLabel}
+          onClick={onClear}
+          className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <X aria-hidden="true" className="size-3" />
+        </button>
+      </IconHint>
     </span>
   );
 }
@@ -148,14 +151,16 @@ export function TagFilterChip({
         <Sign aria-hidden="true" className="size-3" />
         {chip.tag}
       </button>
-      <button
-        type="button"
-        aria-label={`Clear tag ${chip.tag} filter`}
-        onClick={() => onRemove(chip.tag)}
-        className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
-      >
-        <X aria-hidden="true" className="size-3" />
-      </button>
+      <IconHint label={`Clear tag ${chip.tag} filter`}>
+        <button
+          type="button"
+          aria-label={`Clear tag ${chip.tag} filter`}
+          onClick={() => onRemove(chip.tag)}
+          className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <X aria-hidden="true" className="size-3" />
+        </button>
+      </IconHint>
     </span>
   );
 }

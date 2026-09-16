@@ -175,33 +175,51 @@ function App() {
 
   // The one-shot first-run boot decision (Story 6.8), in two halves.
   //
-  // The first half latches WHAT THE BOOT WAS the moment the boot state resolves
-  // (hydrated + a resolved, chosen posture): a fresh install with zero Accounts,
-  // or not. It is frozen into state rather than re-read later, because the second
-  // half waits on another IPC answer and `hasAccount` can change under it — a
-  // sign-out of the last Account inside that window must not read as a first run
-  // and throw somebody into full-frame onboarding.
+  // The first half latches WHAT THE BOOT WAS the moment the accounts store says
+  // it has finished loading — a fresh install with zero Accounts, or not. It is
+  // frozen into state rather than re-read later, because the second half waits
+  // on another IPC answer and `hasAccount` can change under it — a sign-out of
+  // the last Account inside that window must not read as a first run and throw
+  // somebody into full-frame onboarding.
+  //
+  // `hydrated` alone, and NOT hydrated-plus-a-resolved-posture, which is what
+  // this waited for until Epic 72 measured it: hydration is the instant the
+  // stored Accounts are known, so `hasAccount` at that instant IS the boot's
+  // fact, while the posture read resolves some unbounded time later. Latching on
+  // the later of the two read `hasAccount` at whatever moment the slower IPC
+  // answered — so a sign-out inside the posture window latched `firstRunAtBoot`
+  // as true and started the wizard, which is the very thing the second half's
+  // comment promises cannot happen. It reproduced as a 2-in-8 flake in
+  // `App.test.tsx` as soon as an unrelated import shifted the interleaving.
   const bootLatchedRef = useRef(false);
   const [firstRunAtBoot, setFirstRunAtBoot] = useState<boolean | undefined>(undefined);
   useEffect(() => {
-    if (
-      bootLatchedRef.current ||
-      !hydrated ||
-      postureChosen === undefined ||
-      postureChosen === null
-    ) {
+    if (bootLatchedRef.current || !hydrated) {
       return;
     }
     bootLatchedRef.current = true;
     setFirstRunAtBoot(!hasAccount);
-  }, [hydrated, hasAccount, postureChosen]);
+  }, [hydrated, hasAccount]);
 
-  // The second half acts on that frozen fact once the stored skip answer is in,
-  // exactly once. A later sign-out-of-last-account therefore never auto-starts
-  // the wizard: the decision was made at boot, when an Account was present.
+  // The second half acts on that frozen fact once the stored skip answer is in
+  // and the posture has been chosen, exactly once. A later sign-out-of-last-
+  // account therefore never auto-starts the wizard: the decision was made at
+  // boot, when an Account was present.
+  //
+  // The posture gate lives HERE and not on the latch above (Epic 72): an
+  // unchosen posture (`null`) is the first-run encryption choice's own screen,
+  // which must not be pre-empted by the wizard, and waiting for it to become
+  // non-null is therefore about when to ACT. Reading `hasAccount` that late is
+  // what made a sign-out inside the posture window look like a first run.
   const bootActedRef = useRef(false);
   useEffect(() => {
-    if (bootActedRef.current || firstRunAtBoot === undefined || setupSkipped === undefined) {
+    if (
+      bootActedRef.current ||
+      firstRunAtBoot === undefined ||
+      setupSkipped === undefined ||
+      postureChosen === undefined ||
+      postureChosen === null
+    ) {
       return;
     }
     bootActedRef.current = true;
@@ -222,7 +240,7 @@ function App() {
     } else {
       wizardStore.getState().start();
     }
-  }, [firstRunAtBoot, setupSkipped]);
+  }, [firstRunAtBoot, setupSkipped, postureChosen]);
 
   // Decide the shell/login/splash content, then render it alongside a single
   // always-mounted <Toaster />. The Toaster lives ABOVE the hasAccount gate so a

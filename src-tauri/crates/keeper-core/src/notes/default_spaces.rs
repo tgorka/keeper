@@ -103,10 +103,9 @@ pub struct DefaultSpace {
 
 /// The five, in the order the rail used to fix.
 ///
-/// The order is also alphabetical by name, which is what `notes_spaces` sorts
-/// by today — so a freshly seeded vault renders the rail the deleted rows
-/// rendered, glyph for glyph, before Story 44.4 gives a space an explicit
-/// `order`.
+/// Equal dates still settle alphabetically; AD-237 now orders unpositioned
+/// spaces by newest modification before that name tie-break. The seed order
+/// does not assign an explicit `keeper.order`.
 ///
 /// **Templates is the fifth, and it is not one of the deleted rows** (Story
 /// 45.20). 44.7 made a template an ordinary note carrying an ordinary tag

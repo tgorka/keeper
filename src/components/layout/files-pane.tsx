@@ -130,6 +130,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { FullValueButton, useOverflowing } from "@/components/ui/overflow-value";
+import { HoverHint, IconHint } from "@/components/ui/tooltip";
 import { useWindowedRows } from "@/components/ui/window-list";
 import { useLongPress } from "@/hooks/use-long-press";
 import { SURFACE_COLUMNS } from "@/lib/column-widths";
@@ -1070,7 +1071,7 @@ interface FilesRowActionOption {
  * The name fits the tree, truncates when it cannot, and then — and only then —
  * grows a trigger that opens the whole thing. A deeply nested path in a shallow
  * pane is the ordinary case here, and until now the tail of such a name was
- * simply unreadable: the tree has no tooltip and the row does not scroll.
+ * simply unreadable. The hint adds a pointer preview; the full-value route stays.
  *
  * A render prop, because the two halves cannot live in one element. The
  * truncating span belongs INSIDE a folder's toggle button — clicking a folder's
@@ -1091,7 +1092,7 @@ function RowName({
   const { ref, overflowing } = useOverflowing();
   return (
     <>
-      {children(ref)}
+      <HoverHint label={name}>{children(ref)}</HoverHint>
       {overflowing && <FullValueButton name={FILES_NAME_LABEL} value={name} tabIndex={tabIndex} />}
     </>
   );
@@ -2934,21 +2935,21 @@ export function FilesPane() {
         {actions.length > 0 && promoted > 0 && (
           <span className="flex shrink-0 items-center gap-1">
             {actions.slice(0, promoted).map(({ id, label, icon: Icon, onSelect }) => (
-              <Button
-                key={id}
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                tabIndex={actionTabIndex}
-                // The whole visible word as the name rather than a description of
-                // it, so speech input can ask for what the menu spells even
-                // though the eye reads a picture (WCAG 2.5.3).
-                aria-label={label}
-                title={label}
-                onClick={onSelect}
-              >
-                <Icon aria-hidden="true" />
-              </Button>
+              <IconHint key={id} label={label}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  tabIndex={actionTabIndex}
+                  // The whole visible word as the name rather than a description of
+                  // it, so speech input can ask for what the menu spells even
+                  // though the eye reads a picture (WCAG 2.5.3).
+                  aria-label={label}
+                  onClick={onSelect}
+                >
+                  <Icon aria-hidden="true" />
+                </Button>
+              </IconHint>
             ))}
           </span>
         )}
@@ -3187,17 +3188,18 @@ export function FilesPane() {
                   label and a red hairline rather than a tint — so the one verb
                   in this row that cannot be undone still reads as itself with
                   its word taken off. */}
-                <Button
-                  type="button"
-                  variant="destructive"
-                  size="icon-sm"
-                  aria-label={FILES_DELETE_LABEL}
-                  title={FILES_DELETE_LABEL}
-                  className="shrink-0"
-                  onClick={() => requestDelete(deletable)}
-                >
-                  <Trash2 aria-hidden="true" />
-                </Button>
+                <IconHint label={FILES_DELETE_LABEL}>
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    size="icon-sm"
+                    aria-label={FILES_DELETE_LABEL}
+                    className="shrink-0"
+                    onClick={() => requestDelete(deletable)}
+                  >
+                    <Trash2 aria-hidden="true" />
+                  </Button>
+                </IconHint>
               </>
             )}
             {/* Story 45.13's entry point, on the SAME selection Delete acts on
@@ -3217,32 +3219,34 @@ export function FilesPane() {
               A mark that means "vault" in the body cannot also mean "attach" in
               the header. */}
             {attachablePaths.length > 0 && activeVaultId !== null && (
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label={ATTACH_TO_NOTE_LABEL}
-                title={ATTACH_TO_NOTE_LABEL}
-                className="shrink-0"
-                onClick={() => setAttaching(true)}
-              >
-                <Paperclip aria-hidden="true" />
-              </Button>
+              <IconHint label={ATTACH_TO_NOTE_LABEL}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={ATTACH_TO_NOTE_LABEL}
+                  className="shrink-0"
+                  onClick={() => setAttaching(true)}
+                >
+                  <Paperclip aria-hidden="true" />
+                </Button>
+              </IconHint>
             )}
             {/* `RefreshCw` is the glyph the folded rail already spends on this
               same verb (see `tree`'s rail above). One control, one mark,
               whichever side of the fold it is drawn on. */}
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              aria-label={FILES_REFRESH_LABEL}
-              title={FILES_REFRESH_LABEL}
-              className="shrink-0"
-              onClick={refresh}
-            >
-              <RefreshCw aria-hidden="true" />
-            </Button>
+            <IconHint label={FILES_REFRESH_LABEL}>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label={FILES_REFRESH_LABEL}
+                className="shrink-0"
+                onClick={refresh}
+              >
+                <RefreshCw aria-hidden="true" />
+              </Button>
+            </IconHint>
           </div>
           <p className="text-muted-foreground text-sm">{FILES_PANE_SUBTITLE}</p>
         </header>

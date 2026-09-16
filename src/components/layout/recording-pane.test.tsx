@@ -333,6 +333,44 @@ describe("RecordingPane", () => {
     await waitFor(() => expect(mockFetch).toHaveBeenCalled());
   });
 
+  it("fills the pane while keeping the header and metadata field measures local (UX-DR93)", async () => {
+    render(<RecordingPane />);
+    await waitFor(() => expect(mockFetch).toHaveBeenCalled());
+
+    // A class-drift guard, not a jsdom pixel measurement. The 1500px Mac
+    // screenshot owns actual geometry; these assertions stop re-centering
+    // every card just to keep the text inputs readable.
+    const pane = screen.getByRole("region", { name: "Recording" });
+    const header = within(pane).getByRole("heading", { name: "Recording" }).closest("header");
+    expect(header).toHaveClass(
+      "flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4",
+      { exact: true },
+    );
+
+    const card = within(pane).getByText("Next session").closest('[data-slot="card"]');
+    const body = card?.parentElement;
+    expect(body).toHaveClass("flex", "w-full", "flex-col", "gap-6", "p-6");
+    expect(body?.className).not.toMatch(/(?:^|\s)(?:mx-auto|max-w-\S+)(?:\s|$)/);
+    expect(card?.className).not.toMatch(/(?:^|\s)(?:mx-auto|max-w-\S+)(?:\s|$)/);
+
+    for (const label of [
+      META_TITLE_LABEL,
+      META_PARTICIPANTS_LABEL,
+      META_NOTE_LABEL,
+      META_TAGS_LABEL,
+    ]) {
+      expect(within(pane).getByLabelText(label).parentElement).toHaveClass(
+        "w-full",
+        "max-w-[640px]",
+      );
+    }
+    fireEvent.click(within(pane).getByRole("button", { name: "Add field" }));
+    expect(
+      within(pane).getByLabelText(META_CUSTOM_NAME_LABEL).parentElement?.parentElement,
+    ).toHaveClass("w-full", "max-w-[640px]");
+    fireEvent.click(within(pane).getByRole("button", { name: "Remove field 1" }));
+  });
+
   it("hosts the Permissions section above the setup cards", async () => {
     render(<RecordingPane />);
 

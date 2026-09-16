@@ -31,6 +31,7 @@ import { roomInitials } from "@/components/chat/RoomAvatar";
 import { FOLD_STRIP } from "@/components/layout/fold-strip";
 import { FoldableGroup } from "@/components/layout/sidebar-group";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { HoverHint } from "@/components/ui/tooltip";
 import type { SpaceVm } from "@/lib/ipc/client";
 import { setSpaceFilter } from "@/lib/ipc/client";
 import { spacesStore, useSpacesStore } from "@/lib/stores/spaces";
@@ -66,37 +67,47 @@ export function SpacesGroup({ collapsed = false }: { collapsed?: boolean }) {
           activeSpace?.accountId === space.accountId && activeSpace?.spaceId === space.spaceId;
         const httpAvatar =
           space.avatarUrl && /^https?:\/\//.test(space.avatarUrl) ? space.avatarUrl : null;
+        const row = (
+          // icon-hint-exempt: folded avatars keep their name without a long-press-competing hint (45.20).
+          <button
+            type="button"
+            onClick={() => onRowClick(space)}
+            aria-current={isActive ? "true" : undefined}
+            aria-pressed={isActive}
+            // The name is the Space's own in BOTH renderings. On the rail it
+            // is the only carrier of the name, which is the whole difference
+            // between a folded menu and a strip of glyphs; unfolded it is
+            // identical to the visible text, so the two cannot come apart.
+            aria-label={space.name}
+            className={cn(
+              "flex items-center rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+              // On the rail this row is one item on the strip, at the strip's
+              // item size. It used to be `p-1.5` around a 24px avatar with a
+              // paragraph explaining that 24+6+6 is 36 — a sum that stops
+              // being 36 the day the avatar changes, and a hover pill 4px
+              // narrower than its neighbour's when it did.
+              collapsed
+                ? cn("justify-center", FOLD_STRIP.controlClass)
+                : "w-full gap-2 px-2 py-1.5",
+              isActive ? "bg-accent text-accent-foreground" : "hover:bg-accent",
+            )}
+          >
+            <Avatar size="sm">
+              {httpAvatar !== null && <AvatarImage src={httpAvatar} alt="" />}
+              <AvatarFallback>{roomInitials(space.name)}</AvatarFallback>
+            </Avatar>
+            {!collapsed && <span className="truncate text-sm">{space.name}</span>}
+          </button>
+        );
         return (
           <li key={`${space.accountId}:${space.spaceId}`}>
-            <button
-              type="button"
-              onClick={() => onRowClick(space)}
-              aria-current={isActive ? "true" : undefined}
-              aria-pressed={isActive}
-              // The name is the Space's own in BOTH renderings. On the rail it
-              // is the only carrier of the name, which is the whole difference
-              // between a folded menu and a strip of glyphs; unfolded it is
-              // identical to the visible text, so the two cannot come apart.
-              aria-label={space.name}
-              className={cn(
-                "flex items-center rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-                // On the rail this row is one item on the strip, at the strip's
-                // item size. It used to be `p-1.5` around a 24px avatar with a
-                // paragraph explaining that 24+6+6 is 36 — a sum that stops
-                // being 36 the day the avatar changes, and a hover pill 4px
-                // narrower than its neighbour's when it did.
-                collapsed
-                  ? cn("justify-center", FOLD_STRIP.controlClass)
-                  : "w-full gap-2 px-2 py-1.5",
-                isActive ? "bg-accent text-accent-foreground" : "hover:bg-accent",
-              )}
-            >
-              <Avatar size="sm">
-                {httpAvatar !== null && <AvatarImage src={httpAvatar} alt="" />}
-                <AvatarFallback>{roomInitials(space.name)}</AvatarFallback>
-              </Avatar>
-              {!collapsed && <span className="truncate text-sm">{space.name}</span>}
-            </button>
+            {collapsed ? (
+              row
+            ) : (
+              <HoverHint label={space.name} side="right">
+                {row}
+              </HoverHint>
+            )}
           </li>
         );
       })}

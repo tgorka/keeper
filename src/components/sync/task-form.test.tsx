@@ -17,8 +17,11 @@
  */
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { clearMocks } from "@tauri-apps/api/mocks";
+import { open as openFolder } from "@tauri-apps/plugin-dialog";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { installMockShell } from "../../../dev/mock-shell";
 
 vi.mock("@/lib/ipc/client", () => ({
   syncTaskSave: vi.fn(),
@@ -31,7 +34,11 @@ vi.mock("@/lib/ipc/client", () => ({
   // it undefined would be exercising the effect's `catch` in every test that
   // touches the field.
   syncTaskSchedulePreview: vi.fn(),
+  botsBotsList: vi.fn(),
+  botsModelsList: vi.fn(),
+  syncBrowse: vi.fn(),
 }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 
 import {
   TASK_SCHEDULE_CEILING_DAYS,
@@ -82,8 +89,24 @@ import {
   taskFormScheduleOfferText,
   taskFormUnlistedProfileText,
 } from "@/components/sync/task-form";
-import type { SyncProfileVm, TaskSchedulePreviewVm, TaskVm } from "@/lib/ipc/client";
-import { syncProfiles, syncTaskSave, syncTaskSchedulePreview } from "@/lib/ipc/client";
+import type * as IpcClient from "@/lib/ipc/client";
+import type {
+  BotVm,
+  FilesEntryVm,
+  FilesListingVm,
+  SyncProfileVm,
+  TaskSchedulePreviewVm,
+  TaskVm,
+} from "@/lib/ipc/client";
+import {
+  botsBotsList,
+  botsModelsList,
+  syncBrowse,
+  syncProfiles,
+  syncTaskSave,
+  syncTaskSchedulePreview,
+} from "@/lib/ipc/client";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { TASK_KINDS } from "@/lib/stores/sync";
 
 const mockSave = vi.mocked(syncTaskSave);
@@ -113,6 +136,14 @@ function taskVm(over: Partial<TaskVm> = {}): TaskVm {
     updatedMs: NOW - 60_000,
     onMissed: "run_now",
     missedDelayMs: null,
+    botId: null,
+    promptSubpath: null,
+    model: null,
+    copySource: null,
+    copyDestination: null,
+    replaceExisting: false,
+    modifiedAfterMs: null,
+    modifiedBeforeMs: null,
     lastRun: null,
     host: {
       kind: "app",
@@ -164,6 +195,9 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
 }
 
 beforeEach(() => {
+  capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, botTools: true });
+  vi.mocked(botsBotsList).mockResolvedValue([]);
+  vi.mocked(botsModelsList).mockResolvedValue([]);
   mockProfiles.mockResolvedValue([]);
   // Echoing and empty by default: the echo keeps the staleness guard satisfied
   // for every test that is not about staleness, and no instants means no preview
@@ -173,7 +207,316 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+  clearMocks();
   vi.clearAllMocks();
+});
+
+/** Exercise the same refusing IPC mock as dev/probe, not an always-yes spy. */
+async function useDevSave() {
+  clearMocks();
+  Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+  installMockShell();
+  const client = await vi.importActual<typeof IpcClient>("@/lib/ipc/client");
+  mockSave.mockImplementation(client.syncTaskSave);
+}
+
+function promptEntry(
+  name: string,
+  relativePath: string,
+  kind: FilesEntryVm["kind"] = "file",
+): FilesEntryVm {
+  return {
+    name,
+    relativePath,
+    kind,
+    absolutePath: `/held/${relativePath}`,
+    sync: { status: "synced", detail: null },
+    size: null,
+    lfsOid: null,
+    mtimeMs: null,
+    release: null,
+    folderRole: null,
+    virtualChildren: 0,
+    virtualBytes: 0,
+    write: { writable: true, reason: null, caveat: null, caveatShort: null },
+  };
+}
+
+function promptListing(subpath: string, entries: FilesEntryVm[]): FilesListingVm {
+  return {
+    profileId: "01FOLDER",
+    subpath,
+    entries,
+    state: "listed",
+    detail: null,
+    truncated: false,
+    stale: false,
+    write: { writable: true, reason: null, caveat: null, caveatShort: null },
+  };
+}
+
+const BOT: BotVm = {
+  id: "bot-one",
+  providerId: "provider-one",
+  target: "assistant",
+  name: "Field assistant",
+  pinOrder: 0,
+  shape: null,
+  colour: null,
+  mark: null,
+  createdMs: NOW,
+};
+
+describe("TaskForm creation and new kinds", () => {
+  it("accepts an untouched add form through the refusing dev shell", async () => {
+    await useDevSave();
+    const saved = vi.fn();
+    render(<TaskForm onSaved={saved} />);
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(saved).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "sync",
+          mode: "manual",
+          schedule: null,
+        }),
+      ),
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("shows the scheduled-empty refusal above controls and scrolls to it", async () => {
+    await useDevSave();
+    const saved = vi.fn();
+    render(<TaskForm onSaved={saved} />);
+    fireEvent.change(screen.getByLabelText("Id"), { target: { value: "empty-schedule" } });
+    fireEvent.change(screen.getByLabelText("Mode"), { target: { value: "scheduled" } });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "task 'empty-schedule' is scheduled with no schedule: it would report itself enabled and never run",
+    );
+    expect(
+      alert.compareDocumentPosition(screen.getByLabelText("Id")) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
+    expect(saved).not.toHaveBeenCalled();
+  });
+
+  it("omits bot kind and fields when this build cannot reach the drive", async () => {
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    render(
+      <TaskForm
+        task={taskVm({
+          kind: "bot",
+          botId: BOT.id,
+          model: "model-one",
+          promptSubpath: "prompt.md",
+        })}
+      />,
+    );
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+    expect(screen.queryByRole("option", { name: "bot" })).toBeNull();
+    expect(screen.queryByLabelText("Bot")).toBeNull();
+    expect(screen.queryByLabelText("Model")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Prompt file" })).toBeNull();
+    expect(botsBotsList).not.toHaveBeenCalled();
+    expect(botsModelsList).not.toHaveBeenCalled();
+    expect(syncBrowse).not.toHaveBeenCalled();
+  });
+
+  it("browses returned folder paths and saves the chosen prompt, bot and model", async () => {
+    await useDevSave();
+    mockProfiles.mockResolvedValue([profileVm()]);
+    vi.mocked(botsBotsList).mockResolvedValue([BOT]);
+    vi.mocked(botsModelsList).mockResolvedValue([
+      {
+        id: "model-one",
+        family: null,
+        parameterSize: null,
+        quantization: null,
+        sizeBytes: null,
+        contextWindow: null,
+        maxOutputTokens: null,
+        vision: null,
+        tools: null,
+        reasoning: null,
+        capabilities: [],
+      },
+    ]);
+    vi.mocked(syncBrowse).mockImplementation(async (_id, subpath) =>
+      subpath === ""
+        ? promptListing("", [
+            promptEntry("Prompts", "rust-returned-folder", "folder"),
+            promptEntry("ignore.txt", "ignore.txt"),
+          ])
+        : promptListing(subpath, [
+            promptEntry("Review.md", "rust-returned-folder/exact prompt.md"),
+          ]),
+    );
+    const saved = vi.fn();
+    render(<TaskForm onSaved={saved} />);
+    fireEvent.change(screen.getByLabelText("Kind"), { target: { value: "bot" } });
+    fireEvent.change(screen.getByLabelText("Bot"), {
+      target: {
+        value: (await screen.findByRole("option", { name: BOT.name })).getAttribute("value"),
+      },
+    });
+    await screen.findByRole("option", { name: "model-one" });
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "model-one" } });
+    await screen.findByRole("option", { name: "field notes" });
+    fireEvent.change(screen.getByLabelText("Folder"), { target: { value: "01FOLDER" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Open folder: Prompts" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Review.md" }));
+    expect(screen.queryByRole("button", { name: "ignore.txt" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(saved).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "bot",
+          botId: BOT.id,
+          model: "model-one",
+          profileId: "01FOLDER",
+          promptSubpath: "rust-returned-folder/exact prompt.md",
+        }),
+      ),
+    );
+  });
+
+  it("keeps stored bot/model choices while reads fail and distinguishes an unavailable folder from an empty one", async () => {
+    const stored = taskVm({
+      kind: "bot",
+      botId: BOT.id,
+      model: "stored-model",
+      profileId: "01FOLDER",
+      promptSubpath: "kept.md",
+    });
+    vi.mocked(botsBotsList).mockResolvedValue([BOT]);
+    vi.mocked(botsModelsList).mockRejectedValue({ message: "Model endpoint is offline" });
+    vi.mocked(syncBrowse).mockResolvedValue({
+      ...promptListing("", []),
+      state: "missing",
+      entries: null,
+      detail: "This folder is not mounted",
+    });
+    mockSave.mockResolvedValue(stored);
+    render(<TaskForm task={stored} />);
+    expect(screen.getByText("Reading bots…")).toBeInTheDocument();
+    expect(screen.getByLabelText("Bot")).toHaveValue(BOT.id);
+    expect(screen.getByLabelText("Model")).toHaveValue("stored-model");
+    await screen.findByText("Model endpoint is offline");
+    await screen.findByText("This folder is not mounted");
+    expect(screen.queryByText("No folders or .md files here.")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          botId: BOT.id,
+          model: "stored-model",
+          promptSubpath: "kept.md",
+        }),
+      ),
+    );
+  });
+
+  it("discards a late prompt listing after the chosen profile changes", async () => {
+    let finishOld: (listing: FilesListingVm) => void = () => {};
+    vi.mocked(syncBrowse)
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          finishOld = resolve;
+        }),
+      )
+      .mockResolvedValue(promptListing("", []));
+    mockProfiles.mockResolvedValue([
+      profileVm(),
+      profileVm({ id: "second", name: "Other folder" }),
+    ]);
+    render(
+      <TaskForm task={taskVm({ kind: "bot", profileId: "01FOLDER", promptSubpath: "old.md" })} />,
+    );
+    await screen.findByRole("option", { name: "Other folder" });
+    fireEvent.change(screen.getByLabelText("Folder"), { target: { value: "second" } });
+    await screen.findByText("No folders or .md files here.");
+    await act(async () => finishOld(promptListing("", [promptEntry("wrong.md", "wrong.md")])));
+    await waitFor(() => expect(screen.getByText("No prompt chosen")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "wrong.md" })).toBeNull();
+  });
+
+  it("lets the backend refuse missing copy paths, then saves native paths and UTC bounds", async () => {
+    await useDevSave();
+    mockProfiles.mockResolvedValue([profileVm()]);
+    const saved = vi.fn();
+    render(<TaskForm onSaved={saved} />);
+    await screen.findByRole("option", { name: "field notes" });
+    fireEvent.change(screen.getByLabelText("Folder"), { target: { value: "01FOLDER" } });
+    fireEvent.change(screen.getByLabelText("Kind"), { target: { value: "copy" } });
+    expect(screen.queryByLabelText("Folder")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("needs a source path");
+    expect(saved).not.toHaveBeenCalled();
+    vi.mocked(openFolder).mockResolvedValueOnce("/Volumes/source with spaces");
+    fireEvent.click(screen.getByRole("button", { name: "Choose a source folder" }));
+    await screen.findByText("/Volumes/source with spaces");
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("needs a destination path");
+    expect(saved).not.toHaveBeenCalled();
+    vi.mocked(openFolder).mockResolvedValueOnce("/Volumes/backup");
+    fireEvent.click(screen.getByRole("button", { name: "Choose a destination folder" }));
+    await screen.findByText("/Volumes/backup");
+    vi.mocked(openFolder).mockResolvedValueOnce(null);
+    fireEvent.click(screen.getByRole("button", { name: "Choose a source folder" }));
+    fireEvent.change(screen.getByLabelText("Modified from"), { target: { value: "2026-09-14" } });
+    fireEvent.change(screen.getByLabelText("Modified before"), { target: { value: "2026-09-17" } });
+    fireEvent.click(screen.getByRole("switch", { name: "Replace files that already exist" }));
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(saved).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "copy",
+          profileId: null,
+          copySource: "/Volumes/source with spaces",
+          copyDestination: "/Volumes/backup",
+          replaceExisting: true,
+          modifiedAfterMs: Date.UTC(2026, 8, 14),
+          modifiedBeforeMs: Date.UTC(2026, 8, 17),
+        }),
+      ),
+    );
+  });
+
+  it("preserves precise stored bounds on edit and clears an explicitly emptied date", async () => {
+    const stored = taskVm({
+      kind: "copy",
+      modifiedAfterMs: NOW + 123,
+      modifiedBeforeMs: NOW + 456_789,
+    });
+    mockSave.mockResolvedValue(stored);
+    render(<TaskForm task={stored} />);
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          modifiedAfterMs: NOW + 123,
+          modifiedBeforeMs: NOW + 456_789,
+        }),
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL })).toBeEnabled(),
+    );
+    fireEvent.change(screen.getByLabelText("Modified from"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          modifiedAfterMs: null,
+          modifiedBeforeMs: NOW + 456_789,
+        }),
+      ),
+    );
+  });
 });
 
 describe("TaskForm, adding a task", () => {
@@ -201,8 +544,12 @@ describe("TaskForm, adding a task", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
 
-    // Exactly these ten keys, and `id: ""` above all: an id invented here
+    // Exactly these eighteen keys, and `id: ""` above all: an id invented here
     // would be a second minter, and `sync_ipc.rs` already has the only one.
+    // This is the file's one exact save assertion — the default `sync` kind is
+    // where every key is pinned, including the eight per-kind keys the kinds
+    // this form grew since sent as `null`/`false` on a plain sync row; the
+    // per-kind tests below may relax to `objectContaining`.
     await waitFor(() =>
       expect(mockSave).toHaveBeenCalledWith({
         id: "",
@@ -222,6 +569,16 @@ describe("TaskForm, adding a task", () => {
         // No reading to be stale: a create has no baseline, and passing one
         // would make the store refuse a row it is about to insert.
         baselineUpdatedMs: null,
+        // The other kinds' keys, absent on a sync row. Each is the one key of
+        // its kind, so nothing can enumerate a second target per row (AD-139).
+        botId: null,
+        promptSubpath: null,
+        model: null,
+        copySource: null,
+        copyDestination: null,
+        replaceExisting: false,
+        modifiedAfterMs: null,
+        modifiedBeforeMs: null,
       }),
     );
     await waitFor(() => expect(onSaved).toHaveBeenCalledWith(taskVm()));
@@ -241,6 +598,9 @@ describe("TaskForm, adding a task", () => {
     });
     render(<TaskForm />);
     await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText(TASK_FORM_MODE_LABEL), {
+      target: { value: "scheduled" },
+    });
 
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
 
@@ -478,21 +838,23 @@ describe("TaskForm, editing a task", () => {
     // this row. A blank or a different id here would be a second task, and the
     // first one's run history would be orphaned rather than moved.
     await waitFor(() =>
-      expect(mockSave).toHaveBeenCalledWith({
-        id: "01SCHED",
-        kind: "release",
-        mode: "manual",
-        enabled: false,
-        profileId: "01FOLDER",
-        schedule: "@weekly",
-        description: null,
-        onMissed: "run_now",
-        // Absent on the stored row, and this edit touched nothing about it.
-        missedDelayMs: null,
-        // The reading this form opened on, which is what makes the store's
-        // refusal possible at all.
-        baselineUpdatedMs: NOW - 60_000,
-      }),
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "01SCHED",
+          kind: "release",
+          mode: "manual",
+          enabled: false,
+          profileId: "01FOLDER",
+          schedule: "@weekly",
+          description: null,
+          onMissed: "run_now",
+          // Absent on the stored row, and this edit touched nothing about it.
+          missedDelayMs: null,
+          // The reading this form opened on, which is what makes the store's
+          // refusal possible at all.
+          baselineUpdatedMs: NOW - 60_000,
+        }),
+      ),
     );
   });
 
@@ -639,18 +1001,19 @@ describe("TaskForm, which kind of task this is", () => {
     // rather than moves bytes. `verify` takes no reservation and asks no
     // network, but that is `run_task`'s business and not this form's.
     await waitFor(() =>
-      expect(mockSave).toHaveBeenCalledWith({
-        id: "",
-        kind: "verify",
-        mode: "scheduled",
-        enabled: true,
-        profileId: null,
-        schedule: "@daily",
-        description: null,
-        onMissed: "run_now",
-        missedDelayMs: null,
-        baselineUpdatedMs: null,
-      }),
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "",
+          kind: "verify",
+          enabled: true,
+          profileId: null,
+          schedule: "@daily",
+          description: null,
+          onMissed: "run_now",
+          missedDelayMs: null,
+          baselineUpdatedMs: null,
+        }),
+      ),
     );
   });
 
@@ -670,18 +1033,19 @@ describe("TaskForm, which kind of task this is", () => {
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
 
     await waitFor(() =>
-      expect(mockSave).toHaveBeenCalledWith({
-        id: "",
-        kind: "release",
-        mode: "scheduled",
-        enabled: true,
-        profileId: null,
-        schedule: "@daily",
-        description: null,
-        onMissed: "run_now",
-        missedDelayMs: null,
-        baselineUpdatedMs: null,
-      }),
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "",
+          kind: "release",
+          enabled: true,
+          profileId: null,
+          schedule: "@daily",
+          description: null,
+          onMissed: "run_now",
+          missedDelayMs: null,
+          baselineUpdatedMs: null,
+        }),
+      ),
     );
   });
 
@@ -708,12 +1072,11 @@ describe("TaskForm, which kind of task this is", () => {
     // what it should. The claim is that every offered kind has a sentence of
     // its own, and the loop above is the whole of that claim.
 
-    // And rendered: the constant could name all three while no control showed
+    // And rendered: the constant could name all six while no control showed
     // it, which is the same trap the schedule bounds note's own guard closes.
     render(<TaskForm />);
     expect(await screen.findByText(TASK_FORM_KIND_NOTE)).toBeInTheDocument();
   });
-
   it("arrives holding a stored verify rather than the add form's default", async () => {
     // The state this story newly makes reachable, seen from the other end. An
     // edit form that opened on the add default would silently rewrite a check

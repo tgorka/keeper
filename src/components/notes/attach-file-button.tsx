@@ -69,6 +69,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { IconHint } from "@/components/ui/tooltip";
 import { notesAttachSources } from "@/lib/ipc/client";
 import { planAttachments } from "@/lib/notes/attach";
 import { ATTACH_FROM_VAULT_LABEL, AttachFromVaultDialog } from "./attach-from-vault-dialog";
@@ -193,25 +194,26 @@ export function AttachFileButton({ vaultId, body, onInsert, onOutcome }: AttachF
   return (
     <>
       <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          {/* Still one `<button>`, so the header's action group is still the
-              two controls AD-104 leaves it at — but a paperclip now, not the
-              sentence (Story 48.9). `ATTACH_FILE_LABEL` moves from the
-              control's text to its `aria-label` and its `title`, unchanged, so
-              a screen reader and speech input still hear and say the same words
-              (WCAG 2.5.3) and a pointer can still ask what the picture means.
-              The paperclip is the one glyph nothing else in this app spends. */}
-          <Button
-            type="button"
-            size="icon-sm"
-            variant="ghost"
-            aria-label={ATTACH_FILE_LABEL}
-            title={ATTACH_FILE_LABEL}
-            disabled={busy}
-          >
-            <Paperclip aria-hidden="true" />
-          </Button>
-        </DropdownMenuTrigger>
+        <IconHint label={ATTACH_FILE_LABEL}>
+          <DropdownMenuTrigger asChild>
+            {/* Still one `<button>`, so the header's action group is still the
+                two controls AD-104 leaves it at — but a paperclip now, not the
+                sentence (Story 48.9). `ATTACH_FILE_LABEL` moves from the
+                control's text to its `aria-label`, unchanged, so a screen reader
+                and speech input still hear and say the same words (WCAG 2.5.3)
+                and the hint says it to a pointer and a keyboard alike. The
+                paperclip is the one glyph nothing else in this app spends. */}
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              aria-label={ATTACH_FILE_LABEL}
+              disabled={busy}
+            >
+              <Paperclip aria-hidden="true" />
+            </Button>
+          </DropdownMenuTrigger>
+        </IconHint>
         <DropdownMenuContent align="end">
           {/* The OS picker first: it is what this control has always done, and
               the item a hand travelling down the list reaches first should be

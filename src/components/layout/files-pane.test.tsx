@@ -974,6 +974,13 @@ describe("FilesPane — a name too long for the tree", () => {
       }),
     ).toBeNull();
 
+    const name = within(long).getByText(LONG);
+    fireEvent.pointerMove(name, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(LONG);
+    fireEvent.pointerLeave(name);
+    // The delayed hint adds a route; it must not replace the keyboard/touch one.
+    expect(trigger).toBeInTheDocument();
+
     await click(trigger);
     expect(screen.getByLabelText(`${OVERFLOW_PANEL_LABEL}: ${FILES_NAME_LABEL}`)).toHaveTextContent(
       LONG,
@@ -2497,7 +2504,6 @@ describe("FilesPane — the row's context menu", () => {
     // and the pointer gets it as a tooltip. An icon with no name is a control
     // nobody can ask for (WCAG 2.5.3).
     const button = within(row).getByRole("button", { name: FILES_OPEN_LABEL });
-    expect(button).toHaveAttribute("title", FILES_OPEN_LABEL);
     expect(button).toHaveTextContent("");
   });
 
@@ -3610,7 +3616,6 @@ describe("FilesPane — the header the prose has to fit in", () => {
       // By role and name, which is the whole promise of taking the word off:
       // speech input can still ask for what the eye reads as a picture.
       const control = within(header).getByRole("button", { name: word });
-      expect(control).toHaveAttribute("title", word);
       // Nothing written on it, and one silent glyph inside it.
       expect(control.textContent).toBe("");
       const glyph = control.querySelector("svg");

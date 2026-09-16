@@ -35,6 +35,7 @@ import { useEffect, useRef, useState } from "react";
 import type { BotPasteContext, BotPasteDecision } from "@/components/bots/bot-paste";
 import { botHumanBytes } from "@/components/bots/bot-paste";
 import { Button } from "@/components/ui/button";
+import { IconHint } from "@/components/ui/tooltip";
 import type { BotDeliverableVm } from "@/lib/ipc/client";
 import {
   botsDeliverablePaths,
@@ -115,16 +116,18 @@ export function BotAttachmentStrip({
                   alt={image.filename}
                   className="h-20 w-full rounded-sm object-cover"
                 />
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  aria-label={`${BOT_ATTACHMENT_REMOVE}: ${image.filename}`}
-                  className="absolute top-0 right-0 size-6 bg-background/80"
-                  onClick={() => onRemove(index)}
-                >
-                  <X className="size-3" aria-hidden="true" />
-                </Button>
+                <IconHint label={`${BOT_ATTACHMENT_REMOVE}: ${image.filename}`}>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-label={`${BOT_ATTACHMENT_REMOVE}: ${image.filename}`}
+                    className="absolute top-0 right-0 size-6 bg-background/80"
+                    onClick={() => onRemove(index)}
+                  >
+                    <X className="size-3" aria-hidden="true" />
+                  </Button>
+                </IconHint>
               </div>
               <p className="truncate text-xs" title={image.filename}>
                 {image.filename}

@@ -236,10 +236,10 @@ describe("finding the destructive verb", () => {
     });
     // 46.5's report was that an icon among five WORDS reads as decoration. The
     // row is icons now, so the trigger is one too (48.9) — and the word it used
-    // to render is still the word it answers to. The eye reads the tooltip, a
-    // screen reader reads the name, speech input says either: all three are the
-    // same words (WCAG 2.5.3).
-    expect(trigger).toHaveAttribute("title", NOTE_ACTIONS_TEXT);
+    // to render is still the word it answers to. The eye reads the hint, a
+    // screen reader reads the name, speech input says the name: no `title=`
+    // survives AD-239, so the name is the claim here.
+    expect(trigger).not.toHaveAttribute("title");
     const spoken = trigger.getAttribute("aria-label") ?? "";
     expect(spoken.startsWith(NOTE_ACTIONS_TEXT)).toBe(true);
     // The name carries the note as well as the act, so a workspace with two

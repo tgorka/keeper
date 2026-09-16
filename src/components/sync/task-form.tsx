@@ -57,7 +57,8 @@
  * fails with `no such folder`. So the folder is *picked* from `syncProfiles()`
  * and never typed — that picker is the only defence there is.
  */
-import { type FormEvent, useEffect, useId, useState } from "react";
+import { open as openFolder } from "@tauri-apps/plugin-dialog";
+import { type FormEvent, useEffect, useId, useRef, useState } from "react";
 import {
   TASK_SCHEDULE_BOUNDS_NOTE,
   TASK_SCHEDULE_OFFERS,
@@ -67,8 +68,23 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import type { SyncProfileVm, TaskSchedulePreviewVm, TaskVm } from "@/lib/ipc/client";
-import { syncProfiles, syncTaskSave, syncTaskSchedulePreview } from "@/lib/ipc/client";
+import type {
+  BotModelVm,
+  BotVm,
+  FilesListingVm,
+  SyncProfileVm,
+  TaskSchedulePreviewVm,
+  TaskVm,
+} from "@/lib/ipc/client";
+import {
+  botsBotsList,
+  botsModelsList,
+  syncBrowse,
+  syncProfiles,
+  syncTaskSave,
+  syncTaskSchedulePreview,
+} from "@/lib/ipc/client";
+import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { syncErrorMessage, TASK_KINDS, TASK_MISSED_POLICIES, TASK_MODES } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
@@ -152,7 +168,7 @@ export const TASK_FORM_KIND_LABEL = "Kind";
  * author would introduce here is the same drift AD-C7 forbids in the spellings.
  */
 export const TASK_FORM_KIND_NOTE =
-  "sync runs one sync pass over the folder, or over every enabled folder. release runs one release sweep, with every refusal dehydrate has. verify re-checks stored content against its recorded digests: it reads only, asks no network, and takes no per-folder reservation. gc repacks the folder's git objects in a quiet window, so a long-lived folder's store stays bounded; keeper seeds one per folder, weekly.";
+  "sync runs one sync pass over the folder, or over every enabled folder. release runs one release sweep, with every refusal dehydrate has. verify re-checks stored content against its recorded digests: it reads only, asks no network, and takes no per-folder reservation. gc repacks the folder's git objects in a quiet window, so a long-lived folder's store stays bounded; keeper seeds one per folder, weekly. bot runs a saved prompt with the chosen bot and model, under existing grants only. copy copies between two local folders once per run, without a sync relationship.";
 
 export const TASK_FORM_MODE_LABEL = "Mode";
 /** The three modes, accurate to `tasks::decide` and no longer than that. */
@@ -212,7 +228,7 @@ export const TASK_FORM_SCHEDULE_LABEL = "Schedule";
  * and quotes it — and that sentence is the one the person needs.
  */
 export const TASK_FORM_SCHEDULE_NOTE =
-  "Five-field cron, or @hourly / @daily / @weekly, or every <n><unit> such as every 90m. Leave it empty to store no schedule. keeper refuses an expression it cannot read, and quotes what you typed.";
+  "Five-field cron, or @hourly / @daily / @weekly, or every <n><unit> such as every 90m. A scheduled task needs a schedule. Leave it empty only for manual or off mode. keeper refuses an expression it cannot read, and quotes what you typed.";
 /**
  * What the box refuses at either end, mirrored from Rust's two constants
  * (Story 59.7).
@@ -470,6 +486,14 @@ type TaskFormValues = {
    * `"120"` is not silently a two-minute delay the form then refuses.
    */
   missedDelayMinutes: string;
+  botId: string;
+  promptSubpath: string;
+  model: string;
+  copySource: string;
+  copyDestination: string;
+  replaceExisting: boolean;
+  modifiedAfterMs: number | null;
+  modifiedBeforeMs: number | null;
 };
 
 /**
@@ -508,13 +532,14 @@ export function TaskForm({
   onSavingChange?: (saving: boolean) => void;
 }) {
   const editing = task !== undefined;
+  const botTools = useCapabilitiesStore((state) => state.capabilities.botTools);
   // Seeded once, deliberately (see `task` above).
   const [form, setForm] = useState<TaskFormValues>(() =>
     task === undefined
       ? {
           id: "",
           kind: "sync",
-          mode: "scheduled",
+          mode: "manual",
           enabled: true,
           profileId: "",
           schedule: "",
@@ -526,6 +551,14 @@ export function TaskForm({
           // otherwise, which is the same compatibility argument the policy above
           // makes.
           missedDelayMinutes: "",
+          botId: "",
+          promptSubpath: "",
+          model: "",
+          copySource: "",
+          copyDestination: "",
+          replaceExisting: false,
+          modifiedAfterMs: null,
+          modifiedBeforeMs: null,
         }
       : {
           id: task.id,
@@ -554,6 +587,14 @@ export function TaskForm({
           // build could not have written.
           missedDelayMinutes:
             task.missedDelayMs === null ? "" : String(Math.round(task.missedDelayMs / 60_000)),
+          botId: task.botId ?? "",
+          promptSubpath: task.promptSubpath ?? "",
+          model: task.model ?? "",
+          copySource: task.copySource ?? "",
+          copyDestination: task.copyDestination ?? "",
+          replaceExisting: task.replaceExisting,
+          modifiedAfterMs: task.modifiedAfterMs,
+          modifiedBeforeMs: task.modifiedBeforeMs,
         },
   );
   /**
@@ -567,6 +608,10 @@ export function TaskForm({
   const [baselineUpdatedMs] = useState<number | null>(() => task?.updatedMs ?? null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const errorRef = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (error !== null) errorRef.current?.scrollIntoView({ block: "nearest" });
+  }, [error]);
   /** `null` until the folder read lands — an unknown list, not an empty one. */
   const [profiles, setProfiles] = useState<SyncProfileVm[] | null>(null);
   const [profilesError, setProfilesError] = useState<string | null>(null);
@@ -773,7 +818,16 @@ export function TaskForm({
         kind: form.kind,
         mode: form.mode,
         enabled: form.enabled,
-        profileId: form.profileId === "" ? null : form.profileId,
+        // Copy names native paths, not a sync relationship.
+        profileId: form.kind === "copy" || form.profileId === "" ? null : form.profileId,
+        botId: form.botId === "" ? null : form.botId,
+        promptSubpath: form.promptSubpath === "" ? null : form.promptSubpath,
+        model: form.model === "" ? null : form.model,
+        copySource: form.copySource === "" ? null : form.copySource,
+        copyDestination: form.copyDestination === "" ? null : form.copyDestination,
+        replaceExisting: form.replaceExisting,
+        modifiedAfterMs: form.modifiedAfterMs,
+        modifiedBeforeMs: form.modifiedBeforeMs,
         // The only normalisation this form performs, and it is not tidying: an
         // empty box means "store nothing", and the wire type spells the absent
         // value `null` — the empty string is a different thing. Both fields below
@@ -820,6 +874,16 @@ export function TaskForm({
         void submit(event);
       }}
     >
+      {error !== null && (
+        <p
+          ref={errorRef}
+          role="alert"
+          data-testid={TASK_FORM_ERROR_TESTID}
+          className="break-words text-destructive text-xs"
+        >
+          {error}
+        </p>
+      )}
       <div className={TASK_FORM_ROW_CLASS}>
         <Label htmlFor={`${fieldId}-id`}>{TASK_FORM_ID_LABEL}</Label>
         <Input
@@ -863,18 +927,25 @@ export function TaskForm({
         <select
           id={`${fieldId}-kind`}
           className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
-          value={form.kind}
+          value={form.kind === "bot" && !botTools ? "" : form.kind}
           disabled={saving}
           onChange={(event) => setForm((live) => ({ ...live, kind: event.target.value }))}
         >
-          {TASK_KINDS.map((kind) => (
+          {form.kind === "bot" && !botTools && (
+            <option value="" disabled>
+              Unavailable on this build
+            </option>
+          )}
+          {TASK_KINDS.filter((kind) => kind !== "bot" || botTools).map((kind) => (
             <option key={kind} value={kind}>
               {kind}
             </option>
           ))}
         </select>
       </div>
-      <p className="text-muted-foreground text-xs">{TASK_FORM_KIND_NOTE}</p>
+      <p className="text-muted-foreground text-xs">
+        {botTools ? TASK_FORM_KIND_NOTE : TASK_FORM_KIND_NOTE.replace(/bot [^.]+\. /, "")}
+      </p>
 
       <div className={TASK_FORM_ROW_CLASS}>
         <Label htmlFor={`${fieldId}-mode`}>{TASK_FORM_MODE_LABEL}</Label>
@@ -916,35 +987,61 @@ export function TaskForm({
           for `profileId: null`. A `"__wide__"` sentinel translated back to `null`
           on the way out would be the same thing wearing a disguise. All three
           menus here are native so the form is one idiom rather than two. */}
-      <div className={TASK_FORM_ROW_CLASS}>
-        <Label htmlFor={`${fieldId}-profile`}>{TASK_FORM_PROFILE_LABEL}</Label>
-        <select
-          id={`${fieldId}-profile`}
-          className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
-          value={form.profileId}
-          disabled={saving}
-          onChange={(event) => setForm((live) => ({ ...live, profileId: event.target.value }))}
-        >
-          <option value="">{TASK_HOST_WIDE_TEXT}</option>
-          {listedProfiles.map((profile) => (
-            <option key={profile.id} value={profile.id}>
-              {profile.name}
-            </option>
-          ))}
-          {unlistedProfile && <option value={storedProfileId}>{unlistedProfileText}</option>}
-        </select>
-      </div>
-      {/* Before the read lands the list is unknown, not empty — the Tasks pane's
+      {form.kind !== "copy" && (
+        <>
+          <div className={TASK_FORM_ROW_CLASS}>
+            <Label htmlFor={`${fieldId}-profile`}>{TASK_FORM_PROFILE_LABEL}</Label>
+            <select
+              id={`${fieldId}-profile`}
+              className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
+              value={form.profileId}
+              disabled={saving}
+              onChange={(event) =>
+                setForm((live) => ({
+                  ...live,
+                  profileId: event.target.value,
+                  promptSubpath: "",
+                }))
+              }
+            >
+              <option value="">{TASK_HOST_WIDE_TEXT}</option>
+              {listedProfiles.map((profile) => (
+                <option key={profile.id} value={profile.id}>
+                  {profile.name}
+                </option>
+              ))}
+              {unlistedProfile && <option value={storedProfileId}>{unlistedProfileText}</option>}
+            </select>
+          </div>
+          {/* Before the read lands the list is unknown, not empty — the Tasks pane's
           own rule, and without saying so the picker was indistinguishable from a
           machine that syncs no folders. */}
-      {profiles === null && (
-        <p className="text-muted-foreground text-xs">{TASK_FORM_PROFILE_READING_NOTE}</p>
+          {profiles === null && (
+            <p className="text-muted-foreground text-xs">{TASK_FORM_PROFILE_READING_NOTE}</p>
+          )}
+          {profilesError !== null && (
+            <p className="text-destructive text-xs">
+              {TASK_FORM_PROFILE_READ_FAILED_PREFIX}
+              {profilesError}
+            </p>
+          )}
+        </>
       )}
-      {profilesError !== null && (
-        <p className="text-destructive text-xs">
-          {TASK_FORM_PROFILE_READ_FAILED_PREFIX}
-          {profilesError}
-        </p>
+      {form.kind === "bot" && botTools && (
+        <BotTaskFields
+          form={form}
+          fieldId={fieldId}
+          saving={saving}
+          onChange={(values) => setForm((live) => ({ ...live, ...values }))}
+        />
+      )}
+      {form.kind === "copy" && (
+        <CopyTaskFields
+          form={form}
+          fieldId={fieldId}
+          saving={saving}
+          onChange={(values) => setForm((live) => ({ ...live, ...values }))}
+        />
       )}
 
       <div className={TASK_FORM_ROW_CLASS}>
@@ -964,7 +1061,7 @@ export function TaskForm({
           box asks. Both spellings are `text-muted-foreground` and neither is a
           `role="alert"`: this is help about text somebody is still writing, and
           the one paragraph in this form that reports a *failure* is the refusal
-          at the bottom, which arrives from a save that actually happened. A
+          at the top, which arrives from a save that actually happened. A
           refusal here is louder than nothing and quieter than an error, which is
           exactly its standing.
 
@@ -1071,12 +1168,6 @@ export function TaskForm({
         </>
       )}
 
-      {/* Rust's sentence, corrected in no way, in the form that asked for it. */}
-      {error !== null && (
-        <p role="alert" data-testid={TASK_FORM_ERROR_TESTID} className="text-destructive text-xs">
-          {error}
-        </p>
-      )}
       <div className="flex items-center gap-2">
         <Button type="submit" variant="outline" size="sm" className="w-fit" disabled={saving}>
           {editing ? TASK_FORM_EDIT_SUBMIT_LABEL : TASK_FORM_ADD_SUBMIT_LABEL}
@@ -1088,5 +1179,320 @@ export function TaskForm({
         )}
       </div>
     </form>
+  );
+}
+
+type KindFieldsProps = {
+  form: TaskFormValues;
+  fieldId: string;
+  saving: boolean;
+  onChange: (values: Partial<TaskFormValues>) => void;
+};
+
+function BotTaskFields({ form, fieldId, saving, onChange }: KindFieldsProps) {
+  const [bots, setBots] = useState<BotVm[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    void botsBotsList().then(
+      (rows) => {
+        if (live) setBots(rows);
+      },
+      (raw) => {
+        if (live) setError(syncErrorMessage(raw));
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, []);
+  const selected = bots?.find((bot) => bot.id === form.botId);
+  return (
+    <fieldset className="flex min-w-0 flex-col gap-2 rounded-md border p-3" disabled={saving}>
+      <legend className="px-1 text-sm font-medium">Bot task</legend>
+      <div className={TASK_FORM_ROW_CLASS}>
+        <Label htmlFor={`${fieldId}-bot`}>Bot</Label>
+        <select
+          id={`${fieldId}-bot`}
+          className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
+          value={form.botId}
+          onChange={(event) => onChange({ botId: event.target.value, model: "" })}
+        >
+          <option value="">Choose a bot…</option>
+          {bots?.map((bot) => (
+            <option key={bot.id} value={bot.id}>
+              {bot.name}
+            </option>
+          ))}
+          {form.botId !== "" && !selected && (
+            <option value={form.botId}>{form.botId} — not listed</option>
+          )}
+        </select>
+      </div>
+      {error !== null ? (
+        <p role="status" className="text-destructive text-xs">
+          {error}
+        </p>
+      ) : bots === null ? (
+        <p className="text-muted-foreground text-xs">Reading bots…</p>
+      ) : (
+        bots.length === 0 && (
+          <p className="text-muted-foreground text-xs">
+            No bots are pinned. Add one in Bots first.
+          </p>
+        )
+      )}
+      <TaskModelPicker
+        key={`model:${form.botId}`}
+        bot={selected}
+        value={form.model}
+        fieldId={fieldId}
+        onChange={(model) => onChange({ model })}
+      />
+      <TaskPromptPicker
+        key={`prompt:${form.profileId}`}
+        profileId={form.profileId}
+        value={form.promptSubpath}
+        onChange={(promptSubpath) => onChange({ promptSubpath })}
+      />
+      <p className="text-muted-foreground text-xs">
+        The runner reads the chosen .md under this folder, without its frontmatter or first heading.
+        Existing grants apply; a write that needs approval is refused when nobody is there.
+      </p>
+    </fieldset>
+  );
+}
+
+function TaskModelPicker({
+  bot,
+  value,
+  fieldId,
+  onChange,
+}: {
+  bot: BotVm | undefined;
+  value: string;
+  fieldId: string;
+  onChange: (model: string) => void;
+}) {
+  const [models, setModels] = useState<BotModelVm[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!bot) return;
+    let live = true;
+    void botsModelsList(bot.providerId, bot.target).then(
+      (rows) => {
+        if (live) setModels(rows);
+      },
+      (raw) => {
+        if (live) setError(syncErrorMessage(raw));
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [bot]);
+  return (
+    <>
+      <div className={TASK_FORM_ROW_CLASS}>
+        <Label htmlFor={`${fieldId}-model`}>Model</Label>
+        <select
+          id={`${fieldId}-model`}
+          className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+        >
+          <option value="">Choose a model…</option>
+          {models?.map((model) => (
+            <option key={model.id} value={model.id}>
+              {model.id}
+            </option>
+          ))}
+          {value !== "" && !models?.some((model) => model.id === value) && (
+            <option value={value}>{value} — not listed</option>
+          )}
+        </select>
+      </div>
+      {error !== null ? (
+        <p role="status" className="text-destructive text-xs">
+          {error}
+        </p>
+      ) : !bot ? (
+        <p className="text-muted-foreground text-xs">Choose a bot to read its models.</p>
+      ) : models === null ? (
+        <p className="text-muted-foreground text-xs">Reading models…</p>
+      ) : (
+        models.length === 0 && (
+          <p className="text-muted-foreground text-xs">This bot offers no models.</p>
+        )
+      )}
+    </>
+  );
+}
+
+function TaskPromptPicker({
+  profileId,
+  value,
+  onChange,
+}: {
+  profileId: string;
+  value: string;
+  onChange: (subpath: string) => void;
+}) {
+  const [subpath, setSubpath] = useState("");
+  const [listing, setListing] = useState<FilesListingVm | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [readVersion, setReadVersion] = useState(0);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `readVersion` is a deliberate re-run trigger, not a read — Retry bumps it so the same folder and subpath are browsed again after a refusal.
+  useEffect(() => {
+    if (profileId === "") return;
+    let live = true;
+    setListing(null);
+    setError(null);
+    void syncBrowse(profileId, subpath).then(
+      (read) => {
+        if (live) setListing(read);
+      },
+      (raw) => {
+        if (live) setError(syncErrorMessage(raw));
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [profileId, subpath, readVersion]);
+  const entries =
+    listing?.state === "listed"
+      ? (listing.entries?.filter(
+          (entry) => entry.kind === "folder" || entry.name.toLowerCase().endsWith(".md"),
+        ) ?? [])
+      : [];
+  return (
+    <section aria-label="Prompt file" className="flex min-w-0 flex-col gap-2">
+      <span className="text-sm font-medium">Prompt file</span>
+      <p className="break-all font-mono text-xs">{value || "No prompt chosen"}</p>
+      {profileId === "" ? (
+        <p className="text-muted-foreground text-xs">
+          Choose a folder above to browse its .md files.
+        </p>
+      ) : (
+        <>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="button" size="sm" variant="outline" onClick={() => setSubpath("")}>
+              Folder root
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              onClick={() => setReadVersion((n) => n + 1)}
+            >
+              Refresh files
+            </Button>
+            <span className="break-all text-muted-foreground text-xs">{subpath || "/"}</span>
+          </div>
+          {error !== null ? (
+            <p role="status" className="text-destructive text-xs">
+              {error}
+            </p>
+          ) : listing === null ? (
+            <p className="text-muted-foreground text-xs">Reading files…</p>
+          ) : (
+            <p className="text-muted-foreground text-xs">
+              {listing.detail ??
+                (listing.state !== "listed"
+                  ? "This folder cannot be read."
+                  : entries.length === 0
+                    ? "No folders or .md files here."
+                    : null)}
+            </p>
+          )}
+          {entries.length > 0 && (
+            <ul className="max-h-48 overflow-y-auto rounded-md border">
+              {entries.map((entry) => (
+                <li key={entry.relativePath}>
+                  <button
+                    type="button"
+                    className="w-full break-all px-3 py-2 text-left text-sm hover:bg-accent focus-visible:bg-accent"
+                    aria-pressed={
+                      entry.kind === "folder" ? undefined : value === entry.relativePath
+                    }
+                    onClick={() =>
+                      entry.kind === "folder"
+                        ? setSubpath(entry.relativePath)
+                        : onChange(entry.relativePath)
+                    }
+                  >
+                    {entry.kind === "folder" ? `Open folder: ${entry.name}` : entry.name}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function CopyTaskFields({ form, fieldId, saving, onChange }: KindFieldsProps) {
+  const pick = async (key: "copySource" | "copyDestination") => {
+    try {
+      const selection = await openFolder({ directory: true });
+      if (typeof selection === "string") onChange({ [key]: selection });
+    } catch {
+      // The native copy card's rule: cancellation/failure keeps the prior choice.
+    }
+  };
+  return (
+    <fieldset className="flex min-w-0 flex-col gap-2 rounded-md border p-3" disabled={saving}>
+      <legend className="px-1 text-sm font-medium">Copy task</legend>
+      {(["copySource", "copyDestination"] as const).map((key) => (
+        <div key={key} className="flex min-w-0 flex-col gap-1">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="w-fit"
+            onClick={() => {
+              void pick(key);
+            }}
+          >
+            {key === "copySource" ? "Choose a source folder" : "Choose a destination folder"}
+          </Button>
+          <p className="break-all font-mono text-xs">{form[key] || "Nothing chosen"}</p>
+        </div>
+      ))}
+      <div className={TASK_FORM_ROW_CLASS}>
+        <Label htmlFor={`${fieldId}-replace`}>Replace files that already exist</Label>
+        <Switch
+          id={`${fieldId}-replace`}
+          checked={form.replaceExisting}
+          onCheckedChange={(replaceExisting) => onChange({ replaceExisting })}
+        />
+      </div>
+      <p className="text-muted-foreground text-xs">
+        Left off, identical files are skipped and differing files are left alone and reported.
+      </p>
+      {(["modifiedAfterMs", "modifiedBeforeMs"] as const).map((key) => (
+        <div key={key} className={TASK_FORM_ROW_CLASS}>
+          <Label htmlFor={`${fieldId}-${key}`}>
+            {key === "modifiedAfterMs" ? "Modified from" : "Modified before"}
+          </Label>
+          <Input
+            id={`${fieldId}-${key}`}
+            type="date"
+            className={TASK_FORM_CONTROL_CLASS}
+            value={form[key] == null ? "" : new Date(form[key]).toISOString().slice(0, 10)}
+            onChange={(event) =>
+              onChange({ [key]: event.target.value === "" ? null : event.target.valueAsNumber })
+            }
+          />
+        </div>
+      ))}
+      <p className="text-muted-foreground text-xs">
+        Optional source modification dates, at midnight UTC: from is inclusive; before is exclusive.
+        Leave either empty for no bound. Files outside the window are reported as skipped.
+      </p>
+    </fieldset>
   );
 }

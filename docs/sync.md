@@ -2144,8 +2144,9 @@ A task's `kind` is one of keeper's own verbs, never a shell string:
 | `sync` | one full sync pass over the named folder, or over every enabled folder when the task is host-wide — the same `sync --once` body, taking the same per-folder reservation |
 | `release` | one release sweep over the named folder, or over every enabled folder — the same body §9 describes, with every one of its refusals |
 | `verify` | one verification pass over the named folder, or over every enabled folder — the same body `keeper-syncd verify` runs, reading only: no worktree file is written, no object is added to the store, and no network is asked |
-| `bot` | one question, asked of one bot: the prompt is the text of a markdown file under the named folder — `<zone>/<session>/prompts/NN-slug.md`, resolved through the same containment every other path in the crate goes through — and the answer's opening, its tool calls, its tokens and its duration are the run's detail. Reads one file, writes none, and reaches exactly the provider that bot names (already disclosed under Settings → Bots). |
+| `bot` | one question, asked of one bot: the prompt is any markdown file under the named folder, resolved through the same containment every other path uses. Frontmatter and one leading heading are omitted; the remaining text reaches the model verbatim. Existing grants govern every tool call; unattended asks are refused, never approved by the schedule. |
 | `gc` | one `git gc --quiet` over the named folder's repository, or over every enabled folder — the shim verb AD-41 admitted and nothing then called. Runs in a quiet window: it takes the folder's reservation (no sync pass) and its walk claim (no status walk), and answers `busy` when either is held. Keeper seeds one per desktop folder (`gc-<id>`, `every 7d`, `run_now`) once; a deleted row stays deleted. A phone seeds none and refuses a hand-written one with its own sentence. The run's detail carries the loose-object count before and after. |
+| `copy` | one verified local copy job between two absolute paths, optionally bounded by source modification time; no profile, journal entry, relationship, or deletion propagation |
 
 `sync`, `release` and `verify` reuse the existing implementation rather than gaining a second one,
 which is what makes "a task is not a privileged caller" true rather than
@@ -2154,15 +2155,67 @@ actual bytes the same way, asks the server the same per-object question at the
 moment of the deletion, and honours the pin, the per-file deadline and both
 budgets.
 
+A copy task stores native-picker paths verbatim and runs the same verified job
+as **Copy files once**. `replace_existing` defaults to false. The optional
+`modified_after_ms` bound is inclusive and `modified_before_ms` is exclusive,
+both in epoch milliseconds. Files outside the window are named **skipped** in
+the report and remain in its file total; directories are always recreated.
+With bounds active, an unreadable modification time is explicitly skipped,
+never silently admitted. Each run leaves its per-file copy log in the
+destination and stores bytes and file counts in task history. This is a
+schedule over independent jobs, not date-filtered git sync.
+
+The CLI accepts `tasks set <id> --kind copy --copy-source <absolute-path>
+--copy-destination <absolute-path>`, with optional `--replace-existing true`,
+`--modified-after-ms <epoch-ms>` and `--modified-before-ms <epoch-ms>`.
+
+### The schedules offered on a desktop host
+
+Keeper offers one host-wide Sync and Verify row, with a persisted marker per kind.
+Deleting a proposal keeps it deleted across restarts; editing it keeps the
+chosen schedule. A row already using the proposed id is never overwritten.
+
+| row | proposed schedule | initially enabled | meaning |
+| --- | --- | --- | --- |
+| `sync-host` | `every 1h` | no | all enabled folders, at the live-watcher scan backstop (`LIVE_WATCH_BACKSTOP_MS`), not the remote poll's 5-minute eligibility floor |
+| `verify-host` | `every 7d` | no | proposed weekly read-only verification of all enabled folders; verification has no existing paced rhythm |
+| `gc-<id>` | `every 7d` | yes | the existing weekly repack, once per desktop folder |
+
+The proposals are host-wide so they cannot shadow a user's host-wide schedule
+through folder-tier precedence. For Sync,
+within one tier the **most capable** mode wins (`scheduled`, then `manual`,
+then `off`); a disabled row counts as `off`, so it cannot veto an enabled
+scheduled sibling. Folder-specific rows still take precedence over host-wide
+rows outright: a folder with only an off row keeps its poll even under a
+host-wide scheduled task. Release keeps its separate least-permissive rule,
+because disagreeing instructions about deletion must choose less deletion.
+
+Disabled proposals do not run or arm a first window. Verification is not a
+replacement for the scratch sweep: enabling it requests a separate read-only
+verification body, not another driver for cleanup. The scratch/footprint sweep
+stays daily (**24 hours**, `SWEEP_EVERY_MS`); the release/helper look remains
+hourly. The read-only “Also paced by this host” rows remain scan, scratch sweep,
+and optional notes cadence: nothing is migrated out of that projection.
+
 `bot` reuses the app's own chat path for the same reason, through a port: this
 crate is `keeper-core`-free, so the engine asks the shell to run the turn and
 records what came back. A host with no bot runner — `keeper-syncd` today —
 lists the task, refuses the run with "this host cannot run a bot task; the
 keeper app on the Mac runs it", and leaves the window for the host that has
-one. The app's own task form does not offer the kind yet: it needs a bot, a
-prompt file and a model, and a kind offered without controls for them would
-create rows that can only fail. Until it grows them, a bot task is created
-here:
+one. The app's own task form offers the kind with controls for all three facts
+a row of it carries — a bot, a prompt file and a model — so it is created there
+like every other kind; the CLI can set one too:
+
+```
+keeper-syncd tasks set nightly-digest --kind bot --profile drive \
+  --bot 01M1HDCJBAWFGF19X2ZB0H90VK \
+  --prompt 60-sessions/active/2026-09-05-digest/prompts/10-summarise.md \
+  --schedule '0 7 * * *'
+```
+
+The prompt need not live in a session's `prompts/` folder: AD-244 allows any
+markdown file under the profile, and the path above is one example rather than
+the shape.
 
 ```
 keeper-syncd tasks set nightly-digest --kind bot --profile drive \
@@ -2694,6 +2747,12 @@ task's run line took the credit for work the ordinary poll would have done
 anyway. `off` and `manual` take nothing away — a `manual` task adds a button,
 and a folder is paused by pausing the folder, never by a task row somebody
 forgot to delete.
+
+Only an **enabled** scheduled row drives this. Among Sync rows in the same
+tier, one such row is enough to stand the paced poll down even if a sibling is
+manual or disabled. This fixes a pre-existing trap in hand-authored task lists,
+not just keeper's proposals. Switching the only scheduled row off restores
+the poll; folder-specific rows still outrank host-wide rows.
 
 Two things are deliberately **not** stood down with it, and both are things you
 would miss:
@@ -3309,9 +3368,9 @@ fsmonitor; it feeds the walk directly.
 One table, so the question *"why did keeper just do that, and how often will it"*
 has one answer. Every row is a **cadence** (the ordinary case is event-driven and
 listed first), every row logs **one line** when it runs — grep the log for the
-quoted text — and none of them is a task: §14's tasks are records a person
-creates; this is the engine's own pacing, and the read-only *Paced* rows in ⌘8
-show the ones that concern a folder.
+quoted text. Most rows are engine pacing, not tasks; the exceptions are labelled
+as §14 tasks, including keeper's host-wide proposals and per-folder gc. The read-only
+*Paced* rows in ⌘8 still show the projected work that concerns a folder.
 
 The rule behind the numbers (the owner's, 2026-09-09, after Epic 70): a change
 of ours is committed seconds after the watcher sees it and a peer's change
@@ -3334,6 +3393,8 @@ than once an hour**, and the thorough passes run once a day.
 | **helper look** | a `filter.lfs.process` helper another git left waiting | one `read_dir` of `.git/lfs/helpers/` and one `try_lock` per marker: an unlocked marker is a dead helper's leftover and is removed; a locked one idle ≥ 30 min (`STUCK_HELPER_IDLE`) is a stuck helper — counted, and the oldest named with its idle time, its git and the process that ran that git (a `ps` walk up the parent chain, only then, bounded to 10 s); a marker whose lock cannot be tried is placed by `ps -p` instead and reported as skipped; one sticky warning per onset, retired when none remain; **never killed** — it belongs to a git keeper did not start | every **1 h** (`HELPER_LOOK_EVERY_MS`), and the first tick of a run | `helper look alive=N stuck=N removed=N skipped=N`, and the `anomaly:` line when stuck > 0 or skipped > 0 | `look_at_helpers_if_due`, `LfsStore::look_at_helpers` |
 | **footprint sweep** | say what history carries as plain blobs above today's threshold, and whether a control file is pointer text | one `lstat` per tracked path — or, when HEAD and the threshold have not moved since the last one, the remembered numbers with no walk | rides the scratch sweep, every **24 h** | `footprint sweep files=N bytes=N measured=true|false`, and the `anomaly:` line when files > 0 | `report_blobs_over_threshold` |
 | **`gc`** (a §14 task) | the object store stays packed | `git gc --quiet` in a quiet window (the folder's reservation and its walk claim) | seeded **`every 7d`** per desktop folder (`gc-<id>`); editable and deletable like any task | the task's run line (`task … outcome=…`) and `loose_before=… loose_after=…` | `perform_gc_task`, `db::seed_gc_task` |
+| **`sync` proposal** (a §14 task) | make the host's scan schedule visible and editable | full sync passes over enabled folders when enabled; governs the paced scan through §14's rule | one host-wide row offered disabled at **`every 1h`** | the task's run line | `perform_sync_task`, `db::seed_clock_tasks` |
+| **`verify` proposal** (a §14 task) | offer a remembered verification schedule | read-only verification of enabled folders when enabled, distinct from cleanup | one host-wide row offered disabled at **`every 7d`**, a proposal rather than a pre-existing engine cadence | the task's run line | `perform_verify_task`, `db::seed_clock_tasks` |
 | **notes cadence** | a note is committed soon after you stop typing and pushed soon after | `commit` asks the engine to look now (`wake_now`); `push` is one `sync_once` | commit **2 s** after the last edit (`commitIdleMs`); push **30 s** after the commit (`pushIntervalMs`), or at once on blur where `pushOnBlur` is set | `notes cadence: commit — …` / `notes cadence: push — …` | `notes_vault::dispatch_cadence` |
 | **recordings push** | a finished recording reaches the remote | one push pass, on the policy the folder carries | `sessionEnd` (or the policy's other triggers) | `published this folder's recordings` | `push_recordings_if_due` |
 | **Pending list poll** (UI) | the Sync pane's *waiting* rows | an index-only walk, never the directories | at most once a **minute** while the pane is open (`POLL_WALK_MIN_INTERVAL`) | `status walk finished caller="poll"` | `Engine::pending` |

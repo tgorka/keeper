@@ -15,7 +15,7 @@
  * `onInsert` proves nothing about it. The third writes to a note nobody has
  * open, so its result is read off the write command.
  */
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   NoteAttachSourceVm,
@@ -463,15 +463,18 @@ describe("one insertion path", () => {
    */
   it("puts the same file into the note as the same bytes from all four entry points", async () => {
     const fromPanel = await throughThePanel();
-    document.body.innerHTML = "";
+    // `cleanup()` and not `document.body.innerHTML = ""`: a hint renders into a
+    // portal (Epic 72's IconHint on the attach control), and tearing the DOM
+    // out from under React leaves it removing a node that is no longer there.
+    cleanup();
     resetNotesEditorStoreForTest();
 
     const fromPicker = await throughThePicker();
-    document.body.innerHTML = "";
+    cleanup();
     resetNotesEditorStoreForTest();
 
     const fromVault = await throughTheVaultChooser();
-    document.body.innerHTML = "";
+    cleanup();
     resetNotesEditorStoreForTest();
 
     const fromChooser = await throughTheChooser();

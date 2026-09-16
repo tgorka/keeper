@@ -27,6 +27,7 @@ import { TagVocabularyInput } from "@/components/tags/tag-vocabulary-input";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { IconHint } from "@/components/ui/tooltip";
 import type { RecordingMetaFields } from "@/lib/stores/recording-meta";
 
 /** Field labels (recording voice). */
@@ -69,7 +70,9 @@ export function RecordingMetaFieldSet({
 }: RecordingMetaFieldSetProps) {
   return (
     <>
-      <div className="flex flex-col gap-1.5">
+      {/* Preserve the old field measure (720px body minus its 48px padding
+          and the card's 32px padding), not a cap on the full-width cards. */}
+      <div className="flex w-full max-w-[640px] flex-col gap-1.5">
         <Label htmlFor={`${idPrefix}-title`}>{META_TITLE_LABEL}</Label>
         <Input
           id={`${idPrefix}-title`}
@@ -79,7 +82,7 @@ export function RecordingMetaFieldSet({
           onChange={(event) => onChange({ title: event.target.value })}
         />
       </div>
-      <div className="flex flex-col gap-1.5">
+      <div className="flex w-full max-w-[640px] flex-col gap-1.5">
         <Label htmlFor={`${idPrefix}-participants`}>{META_PARTICIPANTS_LABEL}</Label>
         <Input
           id={`${idPrefix}-participants`}
@@ -89,7 +92,7 @@ export function RecordingMetaFieldSet({
           onChange={(event) => onChange({ participants: event.target.value })}
         />
       </div>
-      <div className="flex flex-col gap-1.5">
+      <div className="flex w-full max-w-[640px] flex-col gap-1.5">
         <Label htmlFor={`${idPrefix}-note`}>{META_NOTE_LABEL}</Label>
         <Input
           id={`${idPrefix}-note`}
@@ -99,7 +102,7 @@ export function RecordingMetaFieldSet({
           onChange={(event) => onChange({ note: event.target.value })}
         />
       </div>
-      <div className="flex flex-col gap-1.5">
+      <div className="flex w-full max-w-[640px] flex-col gap-1.5">
         <Label htmlFor={`${idPrefix}-tags`}>{META_TAGS_LABEL}</Label>
         {/* Story 42.5: completion over the ONE tag vocabulary — the same
             paths the notes tag tree is built from, so a tag that exists only
@@ -123,7 +126,7 @@ export function RecordingMetaFieldSet({
           // reordered.
           // biome-ignore lint/suspicious/noArrayIndexKey: positional slots
           key={index}
-          className="flex items-end gap-2"
+          className="flex w-full max-w-[640px] items-end gap-2"
         >
           <div className="flex min-w-0 flex-1 flex-col gap-1.5">
             <Label htmlFor={`${idPrefix}-custom-name-${index}`}>{META_CUSTOM_NAME_LABEL}</Label>
@@ -155,18 +158,20 @@ export function RecordingMetaFieldSet({
               }}
             />
           </div>
-          <Button
-            type="button"
-            size="icon"
-            variant="ghost"
-            disabled={disabled}
-            aria-label={`Remove field ${index + 1}`}
-            onClick={() => {
-              onChange({ custom: fields.custom.filter((_, i) => i !== index) });
-            }}
-          >
-            <X className="size-4" aria-hidden="true" />
-          </Button>
+          <IconHint label={`Remove field ${index + 1}`}>
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              disabled={disabled}
+              aria-label={`Remove field ${index + 1}`}
+              onClick={() => {
+                onChange({ custom: fields.custom.filter((_, i) => i !== index) });
+              }}
+            >
+              <X className="size-4" aria-hidden="true" />
+            </Button>
+          </IconHint>
         </div>
       ))}
       <Button

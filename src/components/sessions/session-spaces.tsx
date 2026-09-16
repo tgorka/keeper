@@ -116,6 +116,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Lamp } from "@/components/ui/lamp";
+import { IconHint } from "@/components/ui/tooltip";
 import { formatDraftAge } from "@/lib/format-time";
 import type { SessionSpaceFilesVm, SessionSpaceVm } from "@/lib/ipc/client";
 import {
@@ -924,30 +925,34 @@ function SpaceSection({
               <FilePlus aria-hidden="true" className="size-3.5" />
             </button>
           )}
-          <button
-            type="button"
-            aria-label={`${SESSION_SPACE_EDIT} ${space.name}`}
-            onClick={onEdit}
-            className={cn(
-              "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
-              "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
-              "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
-            )}
-          >
-            <Pencil aria-hidden="true" className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            aria-label={`${SESSION_SPACE_DELETE} ${space.name}`}
-            onClick={onDelete}
-            className={cn(
-              "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
-              "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
-              "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
-            )}
-          >
-            <Trash2 aria-hidden="true" className="size-3.5" />
-          </button>
+          <IconHint label={`${SESSION_SPACE_EDIT} ${space.name}`}>
+            <button
+              type="button"
+              aria-label={`${SESSION_SPACE_EDIT} ${space.name}`}
+              onClick={onEdit}
+              className={cn(
+                "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
+                "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
+                "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+              )}
+            >
+              <Pencil aria-hidden="true" className="size-3.5" />
+            </button>
+          </IconHint>
+          <IconHint label={`${SESSION_SPACE_DELETE} ${space.name}`}>
+            <button
+              type="button"
+              aria-label={`${SESSION_SPACE_DELETE} ${space.name}`}
+              onClick={onDelete}
+              className={cn(
+                "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
+                "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
+                "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+              )}
+            >
+              <Trash2 aria-hidden="true" className="size-3.5" />
+            </button>
+          </IconHint>
         </>
       }
       // Outside the folded region, with the header controls it belongs to: a

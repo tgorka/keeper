@@ -58,6 +58,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { IconHint } from "@/components/ui/tooltip";
 import { useLongPress } from "@/hooks/use-long-press";
 import { formatDraftAge } from "@/lib/format-time";
 import type { SessionEntryVm } from "@/lib/ipc/client";
@@ -452,35 +453,37 @@ export function SessionTree({
                   only while their row is the focused one. */}
               {!entry.isDir && (
                 <span className="flex shrink-0 items-center gap-0.5 opacity-0 focus-within:opacity-100 group-hover:opacity-100">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    tabIndex={active === entry.relPath ? 0 : -1}
-                    aria-label={SESSION_TREE_OPEN_EXTERNAL_LABEL}
-                    title={SESSION_TREE_OPEN_EXTERNAL_LABEL}
-                    className="size-6"
-                    onClick={() => {
-                      void syncOpenEntry(rootId, entry.subpath).catch(() => undefined);
-                    }}
-                  >
-                    <ExternalLink aria-hidden="true" className="size-3.5" />
-                  </Button>
-                  {canReveal && (
+                  <IconHint side="right" label={SESSION_TREE_OPEN_EXTERNAL_LABEL}>
                     <Button
                       type="button"
                       variant="ghost"
                       size="icon"
                       tabIndex={active === entry.relPath ? 0 : -1}
-                      aria-label={SESSION_TREE_REVEAL_LABEL}
-                      title={SESSION_TREE_REVEAL_LABEL}
+                      aria-label={SESSION_TREE_OPEN_EXTERNAL_LABEL}
                       className="size-6"
                       onClick={() => {
-                        void revealPath(entry.absolutePath).catch(() => undefined);
+                        void syncOpenEntry(rootId, entry.subpath).catch(() => undefined);
                       }}
                     >
-                      <SquareArrowOutUpRight aria-hidden="true" className="size-3.5" />
+                      <ExternalLink aria-hidden="true" className="size-3.5" />
                     </Button>
+                  </IconHint>
+                  {canReveal && (
+                    <IconHint side="right" label={SESSION_TREE_REVEAL_LABEL}>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        tabIndex={active === entry.relPath ? 0 : -1}
+                        aria-label={SESSION_TREE_REVEAL_LABEL}
+                        className="size-6"
+                        onClick={() => {
+                          void revealPath(entry.absolutePath).catch(() => undefined);
+                        }}
+                      >
+                        <SquareArrowOutUpRight aria-hidden="true" className="size-3.5" />
+                      </Button>
+                    </IconHint>
                   )}
                   {/* Live exactly when Rust says the file is deletable, and
                       DISABLED-with-the-reason when it is not (FR-262). Neither
@@ -503,22 +506,28 @@ export function SessionTree({
                       choice about which of two identical sentences to show —
                       not a rule re-derived here. */}
                   {entry.locked === null && (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      disabled={entry.undeletable !== null}
-                      tabIndex={active === entry.relPath ? 0 : -1}
-                      aria-label={entry.undeletable ?? `${SESSION_TREE_DELETE_LABEL} ${entry.name}`}
-                      title={entry.undeletable ?? SESSION_TREE_DELETE_LABEL}
-                      className="size-6 text-muted-foreground hover:text-destructive"
-                      onClick={() => {
-                        setNotice(null);
-                        setDeleting(entry);
-                      }}
+                    <IconHint
+                      side="right"
+                      label={entry.undeletable ?? `${SESSION_TREE_DELETE_LABEL} ${entry.name}`}
                     >
-                      <Trash2 aria-hidden="true" className="size-3.5" />
-                    </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        disabled={entry.undeletable !== null}
+                        tabIndex={active === entry.relPath ? 0 : -1}
+                        aria-label={
+                          entry.undeletable ?? `${SESSION_TREE_DELETE_LABEL} ${entry.name}`
+                        }
+                        className="size-6 text-muted-foreground hover:text-destructive"
+                        onClick={() => {
+                          setNotice(null);
+                          setDeleting(entry);
+                        }}
+                      >
+                        <Trash2 aria-hidden="true" className="size-3.5" />
+                      </Button>
+                    </IconHint>
                   )}
                 </span>
               )}

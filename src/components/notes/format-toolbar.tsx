@@ -44,13 +44,14 @@ import {
 import { type MouseEvent, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { IconHint } from "@/components/ui/tooltip";
 import { type EmojiMatch, emojiFor, matchEmoji } from "@/lib/emoji/match";
 import { EMOJI_TABLE } from "@/lib/emoji/table";
 import { cn } from "@/lib/utils";
 import type { FormatAction } from "./editor/format-commands";
 
 // Every emoji choice wears the same classes, so they are computed once here
-// rather than 1855 times inside the grid. `<Button>` runs `cn(buttonVariants())`
+// rather than 1855 times inside the grid. A `Button` element runs `cn(buttonVariants())`
 // per instance — tailwind-merge, not string concatenation — and at this count
 // that dominates opening the picker. The markup below reproduces what `Button`
 // emits, `data-` attributes included, so the DOM is unchanged.
@@ -253,58 +254,60 @@ export function FormatToolbar({ onAction }: FormatToolbarProps) {
   return (
     <div ref={rootRef} className="relative flex flex-wrap items-center gap-0.5 border-b px-2 py-1">
       {DIRECT.map(({ action, label, Icon }) => (
+        <IconHint key={label} label={label}>
+          <Button
+            type="button"
+            size="icon-sm"
+            variant="ghost"
+            aria-label={label}
+            onMouseDown={keepCaret}
+            onClick={() => run(action)}
+          >
+            <Icon aria-hidden="true" />
+          </Button>
+        </IconHint>
+      ))}
+      <IconHint label="Heading">
         <Button
-          key={label}
           type="button"
           size="icon-sm"
           variant="ghost"
-          aria-label={label}
-          title={label}
+          aria-label="Heading"
+          aria-expanded={panel === "heading"}
           onMouseDown={keepCaret}
-          onClick={() => run(action)}
+          onClick={() => openPanel("heading")}
         >
-          <Icon aria-hidden="true" />
+          <Heading aria-hidden="true" />
         </Button>
-      ))}
+      </IconHint>
 
-      <Button
-        type="button"
-        size="icon-sm"
-        variant="ghost"
-        aria-label="Heading"
-        title="Heading"
-        aria-expanded={panel === "heading"}
-        onMouseDown={keepCaret}
-        onClick={() => openPanel("heading")}
-      >
-        <Heading aria-hidden="true" />
-      </Button>
+      <IconHint label="Table">
+        <Button
+          type="button"
+          size="icon-sm"
+          variant="ghost"
+          aria-label="Table"
+          aria-expanded={panel === "table"}
+          onMouseDown={keepCaret}
+          onClick={() => openPanel("table")}
+        >
+          <Table aria-hidden="true" />
+        </Button>
+      </IconHint>
 
-      <Button
-        type="button"
-        size="icon-sm"
-        variant="ghost"
-        aria-label="Table"
-        title="Table"
-        aria-expanded={panel === "table"}
-        onMouseDown={keepCaret}
-        onClick={() => openPanel("table")}
-      >
-        <Table aria-hidden="true" />
-      </Button>
-
-      <Button
-        type="button"
-        size="icon-sm"
-        variant="ghost"
-        aria-label="Emoji"
-        title="Emoji"
-        aria-expanded={panel === "emoji"}
-        onMouseDown={keepCaret}
-        onClick={() => openPanel("emoji")}
-      >
-        <Smile aria-hidden="true" />
-      </Button>
+      <IconHint label="Emoji">
+        <Button
+          type="button"
+          size="icon-sm"
+          variant="ghost"
+          aria-label="Emoji"
+          aria-expanded={panel === "emoji"}
+          onMouseDown={keepCaret}
+          onClick={() => openPanel("emoji")}
+        >
+          <Smile aria-hidden="true" />
+        </Button>
+      </IconHint>
 
       {panel === "emoji" ? (
         <fieldset
@@ -333,24 +336,24 @@ export function FormatToolbar({ onAction }: FormatToolbarProps) {
           ) : (
             <div className="grid max-h-48 grid-cols-8 gap-0.5 overflow-y-auto">
               {emoji.map(({ shortcode, emoji: character }) => (
-                <button
-                  key={shortcode}
-                  type="button"
-                  data-slot="button"
-                  data-variant="ghost"
-                  data-size="icon-sm"
-                  className={EMOJI_CHOICE_CLASS}
-                  // The shortcode is the name, because the character alone is
-                  // what a screen reader would otherwise have to describe.
-                  aria-label={shortcode}
-                  title={`:${shortcode}:`}
-                  onMouseDown={keepCaret}
-                  onClick={() => run({ kind: "emoji", text: character })}
-                >
-                  <span aria-hidden="true" className="text-title leading-none">
-                    {character}
-                  </span>
-                </button>
+                <IconHint key={shortcode} label={shortcode}>
+                  <button
+                    type="button"
+                    data-slot="button"
+                    data-variant="ghost"
+                    data-size="icon-sm"
+                    className={EMOJI_CHOICE_CLASS}
+                    // The shortcode is the name, because the character alone is
+                    // what a screen reader would otherwise have to describe.
+                    aria-label={shortcode}
+                    onMouseDown={keepCaret}
+                    onClick={() => run({ kind: "emoji", text: character })}
+                  >
+                    <span aria-hidden="true" className="text-title leading-none">
+                      {character}
+                    </span>
+                  </button>
+                </IconHint>
               ))}
             </div>
           )}
@@ -366,17 +369,18 @@ export function FormatToolbar({ onAction }: FormatToolbarProps) {
           className="absolute top-full left-2 z-20 mt-1 flex gap-0.5 rounded-md border bg-popover p-1 shadow-md"
         >
           {HEADING_LEVELS.map((level) => (
-            <Button
-              key={level}
-              type="button"
-              size="icon-sm"
-              variant="ghost"
-              aria-label={`Heading ${level}`}
-              onMouseDown={keepCaret}
-              onClick={() => run({ kind: "heading", level })}
-            >
-              H{level}
-            </Button>
+            <IconHint key={level} label={`Heading ${level}`}>
+              <Button
+                type="button"
+                size="icon-sm"
+                variant="ghost"
+                aria-label={`Heading ${level}`}
+                onMouseDown={keepCaret}
+                onClick={() => run({ kind: "heading", level })}
+              >
+                H{level}
+              </Button>
+            </IconHint>
           ))}
         </fieldset>
       ) : null}

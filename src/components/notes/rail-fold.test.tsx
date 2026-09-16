@@ -44,6 +44,7 @@ const SPACES: NoteSpaceVm[] = [
   {
     id: "s-inbox",
     name: "Inbox",
+    updatedMs: null,
     query: "is:untagged",
     sort: "modified desc",
     sortEffective: "modified desc",

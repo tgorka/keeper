@@ -783,13 +783,16 @@ struct SpaceLens {
     name: String,
 }
 
-/// The reserved id of the one space that has no note behind it.
+/// The reserved id of the synthetic complement space, beside `All notes`.
 ///
-/// Every other space in the rail is a markdown file somebody wrote. This one is
-/// composed on demand from all the others, so it has no path, no frontmatter and
-/// nothing to edit or delete — the rail hides those controls for exactly this id.
+/// File-backed spaces are markdown notes somebody wrote. This row is composed
+/// from their queries, so it has no path, no frontmatter and nothing to edit
+/// or delete — the rail hides those controls for both synthetic identities.
 /// The colon keeps it out of the id space a note can occupy.
 pub const UNCATEGORIZED_SPACE_ID: &str = "keeper:uncategorized";
+
+/// The unscoped rail row, with no file or independently evaluated lens.
+pub const ALL_SPACE_ID: &str = "keeper:all";
 
 /// The query that selects the notes no space claims.
 ///
@@ -1487,7 +1490,7 @@ pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError
     let vault = vault_of(&vault_id)?;
     let snapshot = notes_vault::snapshot(&vault_id)
         .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id)))?;
-    let mut spaces: Vec<NoteSpaceVm> = snapshot
+    let spaces: Vec<NoteSpaceVm> = snapshot
         .entries()
         .iter()
         .filter(|entry| has_flag(entry, "space"))
@@ -1500,6 +1503,7 @@ pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError
             NoteSpaceVm {
                 id: def.id,
                 name: def.name,
+                updated_ms: Some(query::resolve_date(query::DateField::Modified, entry)),
                 query: def.query,
                 sort_effective: sort::read(&def.sort).sort.canonical(),
                 sort: def.sort,
@@ -1517,22 +1521,45 @@ pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError
             }
         })
         .collect();
-    // The rail is ordered by what each space says, then by name — which is what
-    // it sorted by before Story 44.4, so a vault nobody has positioned does not
-    // move (FR-157).
-    spaces.sort_by(|a, b| sort::rail_order((a.order, a.name.as_str()), (b.order, b.name.as_str())));
-    // Composed, not read: the one row in this list with no file behind it.
-    //
-    // It goes last rather than into the sort, and that is deliberate. Its order
-    // is not a position somebody chose and it must not compete with the ones
-    // that are — a person who floats a space to the top of the rail has said
-    // something, and a synthetic row outranking them would be keeper arguing.
-    // The foot of the list is also where it reads best: everything above is a
-    // place notes were put, and this is what is left.
+    Ok(compose_space_rows(
+        spaces,
+        uncategorized_query(&vault, &snapshot),
+    ))
+}
+
+fn compose_space_rows(mut spaces: Vec<NoteSpaceVm>, uncategorized: String) -> Vec<NoteSpaceVm> {
+    // Synthetic rows do not compete with positions chosen by the owner.
+    spaces.sort_by(|a, b| {
+        sort::rail_order(
+            (a.order, a.updated_ms, a.name.as_str()),
+            (b.order, b.updated_ms, b.name.as_str()),
+        )
+    });
+    spaces.insert(
+        0,
+        NoteSpaceVm {
+            id: ALL_SPACE_ID.to_owned(),
+            name: "All notes".to_owned(),
+            updated_ms: None,
+            // The empty query is the existing unscoped path, not a new matcher.
+            query: String::new(),
+            sort_effective: sort::read("").sort.canonical(),
+            sort: String::new(),
+            limit: 0,
+            icon: Some("notebook".to_owned()),
+            default_key: None,
+            template: None,
+            folder: None,
+            warnings: Vec::new(),
+            order: 0.0,
+            error: None,
+        },
+    );
     spaces.push(NoteSpaceVm {
         id: UNCATEGORIZED_SPACE_ID.to_owned(),
         name: "Uncategorized".to_owned(),
-        query: uncategorized_query(&vault, &snapshot),
+        updated_ms: None,
+        query: uncategorized,
         sort_effective: sort::read("").sort.canonical(),
         sort: String::new(),
         limit: 0,
@@ -1544,7 +1571,7 @@ pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError
         order: 0.0,
         error: None,
     });
-    Ok(spaces)
+    spaces
 }
 
 // ---------------------------------------------------------------------------
@@ -6540,5 +6567,52 @@ mod attach_and_table_tests {
         );
 
         std::fs::remove_dir_all(&vault.local_path).ok();
+    }
+}
+
+#[cfg(test)]
+mod rail_rows_tests {
+    use super::*;
+
+    #[test]
+    fn notes_spaces_pins_synthetic_rows_around_the_owners_order() {
+        let empty = compose_space_rows(Vec::new(), String::new());
+        let mut older = empty[0].clone();
+        older.id = "older".to_owned();
+        older.name = "Older".to_owned();
+        older.updated_ms = Some(10);
+        let mut newer = older.clone();
+        newer.id = "newer".to_owned();
+        newer.name = "Newer".to_owned();
+        newer.updated_ms = Some(20);
+        let mut positioned = older.clone();
+        positioned.id = "positioned".to_owned();
+        positioned.name = "Positioned".to_owned();
+        positioned.order = -1.0;
+        let rows = compose_space_rows(vec![older, positioned, newer], "-tag:claimed".to_owned());
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            [
+                ALL_SPACE_ID,
+                "positioned",
+                "newer",
+                "older",
+                UNCATEGORIZED_SPACE_ID
+            ]
+        );
+        // The `All notes` row carries no query on purpose, and an empty string is
+        // not a query this language has (`query::parse("")` is `empty query`):
+        // the row is chosen by its id and filters through the viewer's existing
+        // unscoped path, so nothing ever parses this field. It therefore also
+        // carries no `error`, which is what keeps a warning chip off a row that
+        // has nothing wrong with it.
+        assert!(rows[0].query.is_empty());
+        assert!(rows[0].error.is_none());
+        assert!(
+            query::parse(&rows[0].query).is_err(),
+            "if the empty query ever became parseable, this row would need a real one"
+        );
+        assert_eq!(rows[4].query, "-tag:claimed");
+        assert_eq!(empty.len(), 2);
     }
 }

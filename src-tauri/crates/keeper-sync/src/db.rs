@@ -520,9 +520,8 @@ fn ensure_task_columns(conn: &Connection) -> Result<()> {
     // model, and the row is the one place those facts may live — three columns
     // rather than one JSON blob, by AD-139, so nothing can ever enumerate more
     // than one target per row. `prompt_subpath` is **profile-relative**, the
-    // same spelling every other path this crate stores; the session check —
-    // inside a session of the folder, under `prompts/`, tagged `prompt` — is
-    // the shell's at save, because only the shell can see the sessions folder.
+    // same spelling every other path this crate stores. AD-244 allows any
+    // markdown prompt under the profile, not just a session's prompts folder.
     if !existing.iter().any(|c| c == "bot_id") {
         conn.execute("ALTER TABLE tasks ADD COLUMN bot_id TEXT", [])?;
     }
@@ -531,6 +530,20 @@ fn ensure_task_columns(conn: &Connection) -> Result<()> {
     }
     if !existing.iter().any(|c| c == "model") {
         conn.execute("ALTER TABLE tasks ADD COLUMN model TEXT", [])?;
+    }
+    for (name, declaration) in [
+        ("copy_source", "TEXT"),
+        ("copy_destination", "TEXT"),
+        ("replace_existing", "INTEGER NOT NULL DEFAULT 0"),
+        ("modified_after_ms", "INTEGER"),
+        ("modified_before_ms", "INTEGER"),
+    ] {
+        if !existing.iter().any(|column| column == name) {
+            conn.execute(
+                &format!("ALTER TABLE tasks ADD COLUMN {name} {declaration}"),
+                [],
+            )?;
+        }
     }
     Ok(())
 }
@@ -3075,7 +3088,8 @@ pub const TASK_RUNS_CAP: usize = 50;
 const TASK_COLUMNS: &str = "id, profile_id, kind, schedule, mode, next_due_ms, \
                             enabled, updated_ms, running_host, lease_until_ms, \
                             on_missed, description, missed_delay_ms, \
-                            bot_id, prompt_subpath, model";
+                            bot_id, prompt_subpath, model, copy_source, copy_destination, \
+                            replace_existing, modified_after_ms, modified_before_ms";
 
 /// One stored task.
 ///
@@ -3142,13 +3156,17 @@ pub struct TaskRow {
     ///
     /// The same spelling every path this crate stores has, and resolved at run
     /// through `browse::resolve` — the one join a root and a subpath are
-    /// allowed (AD-65). That the path is inside a session of the folder, under
-    /// `prompts/` and tagged `prompt` is the shell's rule at save; this crate
-    /// stores what it was handed and refuses only what leaves the folder.
+    /// allowed (AD-65). Any markdown file under the profile may be a prompt
+    /// (AD-244); the shell checks that shape at save.
     pub prompt_subpath: Option<String>,
-    /// The model a `bot` task sends as, or `None` to let the runner choose by
-    /// its own default rule (Story 69.4, AD-224). `None` on every other kind.
+    /// The model a `bot` task sends as. A runner refuses an absent model.
     pub model: Option<String>,
+    /// Absolute native-picker paths, stored verbatim (AD-C1).
+    pub copy_source: Option<String>,
+    pub copy_destination: Option<String>,
+    pub replace_existing: bool,
+    pub modified_after_ms: Option<i64>,
+    pub modified_before_ms: Option<i64>,
 }
 
 impl TaskRow {
@@ -3240,6 +3258,11 @@ type StoredTask = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+    Option<i64>,
+    Option<i64>,
 );
 
 /// Read one `tasks` row, tolerating every column but the primary key.
@@ -3290,6 +3313,11 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
         row.get(13).unwrap_or_default(),
         row.get(14).unwrap_or_default(),
         row.get(15).unwrap_or_default(),
+        row.get(16).unwrap_or_default(),
+        row.get(17).unwrap_or_default(),
+        row.get(18).unwrap_or_default(),
+        row.get(19).unwrap_or_default(),
+        row.get(20).unwrap_or_default(),
     ))
 }
 
@@ -3319,6 +3347,11 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         bot_id,
         prompt_subpath,
         model,
+        copy_source,
+        copy_destination,
+        replace_existing,
+        modified_after_ms,
+        modified_before_ms,
     ) = stored;
     let unknown = |reason: String| UnknownTask {
         id: id.clone(),
@@ -3352,6 +3385,11 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         bot_id,
         prompt_subpath,
         model,
+        copy_source,
+        copy_destination,
+        replace_existing,
+        modified_after_ms,
+        modified_before_ms,
     };
     if let Err(err) = row.parsed_schedule() {
         return Err(unknown(format!("unreadable schedule: {err}")));
@@ -3447,6 +3485,33 @@ pub fn upsert_task(
     baseline_updated_ms: Option<i64>,
 ) -> Result<TaskSave> {
     crate::tasks::validate_id(&task.id)?;
+    let required: &[(Option<&str>, &str)] = match task.kind {
+        // A bot task's prompt is a subpath, so a row with no folder names a
+        // file under nothing: `perform_bot_task` refuses it on every run
+        // ("a bot task names one folder; this row names none"). A row that can
+        // only ever fail is what the write door exists to prevent, so the
+        // folder is required here beside the other two rather than discovered
+        // a window later.
+        TaskKind::Bot => &[
+            (task.bot_id.as_deref(), "a bot"),
+            (task.prompt_subpath.as_deref(), "a prompt file"),
+            (task.profile_id.as_deref(), "a folder"),
+        ],
+        TaskKind::Copy => &[
+            (task.copy_source.as_deref(), "a source path"),
+            (task.copy_destination.as_deref(), "a destination path"),
+        ],
+        _ => &[],
+    };
+    for (value, name) in required {
+        if value.is_none_or(str::is_empty) {
+            return Err(SyncError::Config(format!(
+                "task '{}' is a {} task, so it needs {name}: choose one before saving",
+                task.id,
+                task.kind.as_str()
+            )));
+        }
+    }
     // The parser's own refusal, propagated unchanged: it already names the
     // rule and quotes the expression, and a second layer of prose around it
     // would bury the one line that says what is wrong.
@@ -3549,8 +3614,11 @@ pub fn upsert_task(
     tx.execute(
         "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
                             updated_ms, running_host, lease_until_ms, on_missed,
-                            description, missed_delay_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL, ?9, ?10, ?11)
+                            description, missed_delay_ms, bot_id, prompt_subpath, model,
+                            copy_source, copy_destination, replace_existing,
+                            modified_after_ms, modified_before_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL, ?9, ?10, ?11,
+                 ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
          ON CONFLICT(id) DO UPDATE SET
              profile_id      = excluded.profile_id,
              kind            = excluded.kind,
@@ -3561,8 +3629,16 @@ pub fn upsert_task(
              updated_ms      = excluded.updated_ms,
              on_missed       = excluded.on_missed,
              description     = excluded.description,
-             missed_delay_ms = excluded.missed_delay_ms",
-        (
+             missed_delay_ms = excluded.missed_delay_ms,
+             bot_id = excluded.bot_id,
+             prompt_subpath = excluded.prompt_subpath,
+             model = excluded.model,
+             copy_source = excluded.copy_source,
+             copy_destination = excluded.copy_destination,
+             replace_existing = excluded.replace_existing,
+             modified_after_ms = excluded.modified_after_ms,
+             modified_before_ms = excluded.modified_before_ms",
+        rusqlite::params![
             &task.id,
             &task.profile_id,
             task.kind.as_str(),
@@ -3574,7 +3650,15 @@ pub fn upsert_task(
             task.on_missed.as_str(),
             &task.description,
             task.missed_delay_ms,
-        ),
+            &task.bot_id,
+            &task.prompt_subpath,
+            &task.model,
+            &task.copy_source,
+            &task.copy_destination,
+            task.replace_existing,
+            task.modified_after_ms,
+            task.modified_before_ms,
+        ],
     )?;
     tx.commit()?;
     Ok(effect)
@@ -4396,6 +4480,11 @@ pub fn seed_gc_task(conn: &Connection, profile_id: &str, now_ms: i64) -> Result<
             bot_id: None,
             prompt_subpath: None,
             model: None,
+            copy_source: None,
+            copy_destination: None,
+            replace_existing: false,
+            modified_after_ms: None,
+            modified_before_ms: None,
         };
         upsert_task(conn, &row, None)?;
         true
@@ -4409,6 +4498,83 @@ pub fn seed_gc_task(conn: &Connection, profile_id: &str, now_ms: i64) -> Result<
     Ok(created)
 }
 
+/// Proposed defaults, not extra drivers (AD-242). Sync mirrors the live-watch
+/// backstop; verification has no paced driver and is offered weekly beside gc.
+pub const SYNC_TASK_SCHEDULE: &str = "every 1h";
+pub const VERIFY_TASK_SCHEDULE: &str = "every 7d";
+
+pub const SYNC_TASK_ID: &str = "sync-host";
+pub const VERIFY_TASK_ID: &str = "verify-host";
+
+/// Offer host-wide disabled schedules once. A local proposal would shadow a
+/// person's host-wide schedule through folder-tier precedence.
+/// As with gc, write the marker after the row, and never replace an existing id.
+pub fn seed_clock_tasks(conn: &Connection, now_ms: i64) -> Result<()> {
+    for (kind, id, schedule, description) in [
+        (
+            TaskKind::Sync,
+            SYNC_TASK_ID,
+            SYNC_TASK_SCHEDULE,
+            "proposed sync schedule at the live-watcher backstop cadence",
+        ),
+        (
+            TaskKind::Verify,
+            VERIFY_TASK_ID,
+            VERIFY_TASK_SCHEDULE,
+            "proposed weekly verification; not an existing paced check",
+        ),
+    ] {
+        let marker = format!("{}_task_seeded:host", kind.as_str());
+        let seeded: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key = ?1)",
+            [&marker],
+            |row| row.get(0),
+        )?;
+        if seeded {
+            continue;
+        }
+        let taken: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
+            [&id],
+            |row| row.get(0),
+        )?;
+        if !taken {
+            upsert_task(
+                conn,
+                &TaskRow {
+                    id: id.to_owned(),
+                    profile_id: None,
+                    kind,
+                    schedule: Some(schedule.to_owned()),
+                    mode: TaskMode::Scheduled,
+                    next_due_ms: None,
+                    enabled: false,
+                    updated_ms: now_ms,
+                    running_host: None,
+                    lease_until_ms: None,
+                    on_missed: crate::tasks::TaskMissedPolicy::RunNow,
+                    description: Some(description.to_owned()),
+                    missed_delay_ms: None,
+                    bot_id: None,
+                    prompt_subpath: None,
+                    model: None,
+                    copy_source: None,
+                    copy_destination: None,
+                    replace_existing: false,
+                    modified_after_ms: None,
+                    modified_before_ms: None,
+                },
+                None,
+            )?;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)",
+            (&marker, now_ms.to_string()),
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4420,6 +4586,65 @@ mod tests {
 
     fn profile(id: &str) -> SyncProfile {
         SyncProfile::new(id, "n", "/tmp/x", "https://git.example/r.git")
+    }
+
+    #[test]
+    fn clock_task_seeds_survive_two_opens_without_undoing_decisions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let c = open(dir.path()).expect("first open");
+            for id in ["a", "b"] {
+                upsert_profile(&c, &profile(id), 1).expect("profile");
+            }
+            seed_clock_tasks(&c, 1).expect("seed");
+            seed_clock_tasks(&c, 2).expect("seed twice");
+            let rows = list_tasks(&c).expect("tasks").tasks;
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|row| !row.enabled
+                && row.mode == TaskMode::Scheduled
+                && row.profile_id.is_none()));
+            assert_eq!(rows[0].kind, TaskKind::Sync);
+            assert_eq!(rows[1].kind, TaskKind::Verify);
+            delete_task(&c, SYNC_TASK_ID).expect("delete");
+            let mut chosen = rows
+                .into_iter()
+                .find(|row| row.id == VERIFY_TASK_ID)
+                .expect("verify");
+            chosen.schedule = Some("every 3d".to_owned());
+            chosen.enabled = true;
+            upsert_task(&c, &chosen, None).expect("edit");
+        }
+        let c = open(dir.path()).expect("second open");
+        seed_clock_tasks(&c, 3).expect("seed again");
+        let rows = list_tasks(&c).expect("tasks").tasks;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, VERIFY_TASK_ID);
+        assert!(rows[0].enabled);
+        assert_eq!(rows[0].schedule.as_deref(), Some("every 3d"));
+    }
+
+    #[test]
+    fn clock_task_seed_keeps_a_preexisting_row_at_its_id() {
+        let c = conn();
+        let mut chosen = task(SYNC_TASK_ID, Some("every 2h"), TaskMode::Manual);
+        chosen.profile_id = None;
+        upsert_task(&c, &chosen, None).expect("chosen row");
+        seed_clock_tasks(&c, 2).expect("seed");
+        let rows = list_tasks(&c).expect("tasks").tasks;
+        let row = rows
+            .iter()
+            .find(|row| row.id == SYNC_TASK_ID)
+            .expect("chosen row");
+        assert_eq!(row.mode, TaskMode::Manual);
+        assert_eq!(row.schedule.as_deref(), Some("every 2h"));
+        assert!(row.enabled);
+        delete_task(&c, SYNC_TASK_ID).expect("forget");
+        seed_clock_tasks(&c, 3).expect("marked offered");
+        assert!(list_tasks(&c)
+            .expect("tasks")
+            .tasks
+            .iter()
+            .all(|row| row.kind != TaskKind::Sync));
     }
 
     /// The three runtime columns come back together, stamped by whichever
@@ -6690,6 +6915,11 @@ mod tests {
             bot_id: None,
             prompt_subpath: None,
             model: None,
+            copy_source: None,
+            copy_destination: None,
+            replace_existing: false,
+            modified_after_ms: None,
+            modified_before_ms: None,
             schedule: schedule.map(str::to_owned),
             mode,
             next_due_ms: None,
@@ -6700,6 +6930,80 @@ mod tests {
             on_missed: crate::tasks::TaskMissedPolicy::RunNow,
             description: None,
             missed_delay_ms: None,
+        }
+    }
+
+    #[test]
+    fn bot_task_columns_survive_insert_and_update() {
+        let c = conn();
+        let mut row = task("bot-columns", None, TaskMode::Manual);
+        row.kind = TaskKind::Bot;
+        for suffix in ["first", "edited"] {
+            row.bot_id = Some(format!("bot-{suffix}"));
+            row.prompt_subpath = Some(format!("prompts/{suffix}.md"));
+            row.model = Some(format!("model-{suffix}"));
+            upsert_task(&c, &row, None).expect("save bot task");
+            let stored = get_task(&c, &row.id).expect("read").expect("task");
+            assert_eq!(stored.bot_id, row.bot_id, "bot id survives the write door");
+            assert_eq!(stored.prompt_subpath, row.prompt_subpath);
+            assert_eq!(stored.model, row.model);
+        }
+    }
+
+    #[test]
+    fn task_write_door_refuses_missing_kind_targets() {
+        let c = conn();
+        for (kind, missing) in [
+            (TaskKind::Bot, "a bot"),
+            (TaskKind::Bot, "a prompt file"),
+            (TaskKind::Bot, "a folder"),
+            (TaskKind::Copy, "a source path"),
+            (TaskKind::Copy, "a destination path"),
+        ] {
+            let mut row = task("missing-target", None, TaskMode::Manual);
+            row.kind = kind;
+            if missing == "a prompt file" {
+                row.bot_id = Some("bot".into());
+            }
+            if missing == "a folder" {
+                // Everything a bot task needs except the folder its prompt path
+                // is relative to: a row the engine could only ever refuse.
+                row.bot_id = Some("bot".into());
+                row.prompt_subpath = Some("prompts/10-summarise.md".into());
+                row.profile_id = None;
+            }
+            if missing == "a destination path" {
+                row.copy_source = Some("/source".into());
+            }
+            let err = upsert_task(&c, &row, None).expect_err("missing target");
+            assert!(matches!(err, SyncError::Config(_)));
+            assert!(err.to_string().contains(missing), "{err}");
+            assert!(get_task(&c, &row.id).expect("read").is_none());
+        }
+    }
+
+    #[test]
+    fn copy_task_columns_survive_insert_and_update() {
+        let c = conn();
+        let mut row = task("copy-columns", None, TaskMode::Manual);
+        row.kind = TaskKind::Copy;
+        for (source, destination, replace, after, before) in [
+            (
+                "/source one",
+                "/destination one",
+                true,
+                Some(1000),
+                Some(2000),
+            ),
+            ("/source two", "/destination two", false, None, None),
+        ] {
+            row.copy_source = Some(source.into());
+            row.copy_destination = Some(destination.into());
+            row.replace_existing = replace;
+            row.modified_after_ms = after;
+            row.modified_before_ms = before;
+            upsert_task(&c, &row, None).expect("save");
+            assert_eq!(get_task(&c, &row.id).expect("read"), Some(row.clone()));
         }
     }
 
@@ -6795,6 +7099,13 @@ mod tests {
                 "bot_id",
                 "prompt_subpath",
                 "model",
+                // Story 72.7's five, the same additive path: a `copy` task's two
+                // absolute paths, its replace choice and its date window.
+                "copy_source",
+                "copy_destination",
+                "replace_existing",
+                "modified_after_ms",
+                "modified_before_ms",
             ]
         );
         assert_eq!(

@@ -75,7 +75,13 @@ import {
 } from "@/components/layout/fold-strip";
 import { Button } from "@/components/ui/button";
 import { ColumnResizer, useResizableColumn } from "@/components/ui/resizable-columns";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  IconHint,
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { columnStyle, SURFACE_COLUMNS, type SurfaceColumnId } from "@/lib/column-widths";
 import { columnFoldStore, useColumnFold } from "@/lib/stores/column-fold";
 import { cn } from "@/lib/utils";
@@ -150,32 +156,29 @@ function RailControl({ control }: { control: SurfaceRailControl }) {
   const badge =
     count === null || count === undefined || count <= 0 ? null : count > 99 ? "99+" : String(count);
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size={FOLD_STRIP.controlSize}
-          aria-label={name}
-          data-slot={COLUMN_RAIL_CONTROL_SLOT}
-          data-rail-control={control.id}
-          disabled={disabled}
-          className="relative shrink-0"
-          onClick={onSelect}
-        >
-          <Icon aria-hidden="true" />
-          {badge !== null && (
-            <span
-              aria-hidden="true"
-              className="absolute -top-0.5 -right-0.5 min-w-4 rounded-full bg-secondary px-1 text-meta text-secondary-foreground leading-none tabular-nums"
-            >
-              {badge}
-            </span>
-          )}
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent side="right">{name}</TooltipContent>
-    </Tooltip>
+    <IconHint side="right" label={name}>
+      <Button
+        type="button"
+        variant="ghost"
+        size={FOLD_STRIP.controlSize}
+        aria-label={name}
+        data-slot={COLUMN_RAIL_CONTROL_SLOT}
+        data-rail-control={control.id}
+        disabled={disabled}
+        className="relative shrink-0"
+        onClick={onSelect}
+      >
+        <Icon aria-hidden="true" />
+        {badge !== null && (
+          <span
+            aria-hidden="true"
+            className="absolute -top-0.5 -right-0.5 min-w-4 rounded-full bg-secondary px-1 text-meta text-secondary-foreground leading-none tabular-nums"
+          >
+            {badge}
+          </span>
+        )}
+      </Button>
+    </IconHint>
   );
 }
 
@@ -275,29 +278,31 @@ export function useSurfaceColumn(
   const titleId = `column-${id}-title`;
   const FoldGlyph = folded ? FOLD_STRIP.unfoldIcon : FOLD_STRIP.foldIcon;
   const foldControl = (
-    <Button
-      type="button"
-      variant="ghost"
-      // A head control, not a strip item: it lives in the 40px pane-header band
-      // every foldable surface's head now is, at the size every other control
-      // in every other pane header is. `fold-strip.tsx` states why the panel's
-      // band won over this file's old 44px sum.
-      size={FOLD_STRIP.headControlSize}
-      // Contains the visible title, so the control can be operated by anyone
-      // saying the word they can see (WCAG 2.5.3), and leads with the verb,
-      // which is the half a folded strip has no other way to state.
-      aria-label={foldName}
-      // The button sits inside the region it controls, which is how the
-      // sidebar's does it: while folded the strip IS the column, and a
-      // control parked in a neighbour would belong to the wrong surface.
-      aria-expanded={!folded}
-      aria-controls={`column-${id}`}
-      data-slot="column-fold"
-      className="shrink-0"
-      onClick={() => columnFoldStore.getState().toggleColumn(id)}
-    >
-      <FoldGlyph aria-hidden="true" />
-    </Button>
+    <IconHint side="right" label={foldName}>
+      <Button
+        type="button"
+        variant="ghost"
+        // A head control, not a strip item: it lives in the 40px pane-header band
+        // every foldable surface's head now is, at the size every other control
+        // in every other pane header is. `fold-strip.tsx` states why the panel's
+        // band won over this file's old 44px sum.
+        size={FOLD_STRIP.headControlSize}
+        // Contains the visible title, so the control can be operated by anyone
+        // saying the word they can see (WCAG 2.5.3), and leads with the verb,
+        // which is the half a folded strip has no other way to state.
+        aria-label={foldName}
+        // The button sits inside the region it controls, which is how the
+        // sidebar's does it: while folded the strip IS the column, and a
+        // control parked in a neighbour would belong to the wrong surface.
+        aria-expanded={!folded}
+        aria-controls={`column-${id}`}
+        data-slot="column-fold"
+        className="shrink-0"
+        onClick={() => columnFoldStore.getState().toggleColumn(id)}
+      >
+        <FoldGlyph aria-hidden="true" />
+      </Button>
+    </IconHint>
   );
 
   const chrome = !enabled ? null : folded ? (

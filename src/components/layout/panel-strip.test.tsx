@@ -669,9 +669,6 @@ describe("the panel strip's fold control", () => {
     const unfold = within(folded).getByRole("button", { name: `${PANEL_UNFOLD_LABEL}: a.md` });
     // The name says which way the control goes; `aria-expanded` says where it is.
     expect(unfold).toHaveAttribute("aria-expanded", "false");
-    // The tooltip and the name are the same words, so speech input can say what
-    // a pointer reads (WCAG 2.5.3).
-    expect(unfold).toHaveAttribute("title", `${PANEL_UNFOLD_LABEL}: a.md`);
     // Nothing else is on screen for this panel — no Close, no Export, no name.
     expect(within(folded).getAllByRole("button")).toHaveLength(1);
 

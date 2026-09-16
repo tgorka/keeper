@@ -42,6 +42,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Skeleton } from "@/components/ui/skeleton";
+import { IconHint } from "@/components/ui/tooltip";
 import { useCouplingCaveats } from "@/hooks/use-coupling-caveats";
 import { useSelectedRoomVm } from "@/hooks/use-selected-room-vm";
 import { useShellLayout } from "@/hooks/use-shell-layout";
@@ -1498,35 +1499,39 @@ export function ConversationPane({
           </div>
           <div className="flex shrink-0 items-center gap-1">
             {accountId !== null && selectedRoomId !== null && (
+              <IconHint label="Export this chat">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Export this chat"
+                  onClick={() =>
+                    exportStore.getState().open({
+                      scope: "chat",
+                      accountId,
+                      roomId: selectedRoomId,
+                    })
+                  }
+                  className=""
+                >
+                  <Download aria-hidden="true" />
+                </Button>
+              </IconHint>
+            )}
+            <IconHint label="Toggle detail panel">
               <Button
+                ref={toggleRef}
                 type="button"
                 variant="ghost"
                 size="icon"
-                aria-label="Export this chat"
-                onClick={() =>
-                  exportStore.getState().open({
-                    scope: "chat",
-                    accountId,
-                    roomId: selectedRoomId,
-                  })
-                }
-                className=""
+                aria-label="Toggle detail panel"
+                aria-pressed={detailOpen}
+                onClick={onToggleDetail}
+                className="shrink-0"
               >
-                <Download aria-hidden="true" />
+                <PanelRight aria-hidden="true" />
               </Button>
-            )}
-            <Button
-              ref={toggleRef}
-              type="button"
-              variant="ghost"
-              size="icon"
-              aria-label="Toggle detail panel"
-              aria-pressed={detailOpen}
-              onClick={onToggleDetail}
-              className="shrink-0"
-            >
-              <PanelRight aria-hidden="true" />
-            </Button>
+            </IconHint>
           </div>
         </div>
       )}

@@ -580,15 +580,17 @@ describe("every foldable surface says which one it is", () => {
     expect(root).not.toHaveAttribute("aria-labelledby");
   });
 
-  it.each(SURFACE_COLUMN_IDS)("hangs a tooltip on the %s strip's way back", (id) => {
-    // The strip's only answer to "which menu is this". Asserted structurally:
-    // the control is a tooltip trigger while folded and a bare button while
-    // open, where the title beside it has already said the word.
+  it.each(SURFACE_COLUMN_IDS)("hangs a tooltip on the %s strip both ways", (id) => {
+    // Both directions carry one since Epic 72 (AD-239, the owner's "same
+    // tooltip on all the icons"). Before it, only the folded control had a
+    // hint, on the reasoning that the title beside the open one had already
+    // said the word — but the title says the REGION and the control is the
+    // VERB, so an icon-only button that collapses a pane now names itself too.
     render(<Column id={id} />);
     const open = screen.getByRole("button", {
       name: `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS[id].label}`,
     });
-    expect(open).not.toHaveAttribute("data-state");
+    expect(open).toHaveAttribute("data-state");
 
     fireEvent.click(open);
     const folded = screen.getByRole("button", {

@@ -2,14 +2,27 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { FOLD_STRIP } from "@/components/layout/fold-strip";
+import {
+  PANE_HEADER_GAP_PX,
+  PANE_HEADER_IDENTITY_MIN_PX,
+  paneHeaderActionsBudget,
+} from "@/components/layout/pane-header";
 import { PANEL_MIN_WIDTH_CLASS } from "@/components/layout/panel-strip";
+import { planPriorityActions } from "@/components/layout/priority-actions";
 import { SIDEBAR_WIDTH_CLASS } from "@/components/layout/sidebar-pane";
-import { TASKS_DETAIL_MIN_WIDTH_PX, TASKS_PANE_MIN_WIDTH_PX } from "@/components/layout/tasks-pane";
+import {
+  TASKS_DETAIL_MIN_WIDTH_PX,
+  TASKS_HEADER_CONTROL_PX,
+  TASKS_HEADER_FIXED_WIDTH_PX,
+  TASKS_HEADER_PADDING_CLASS,
+  TASKS_PANE_MIN_WIDTH_PX,
+} from "@/components/layout/tasks-pane";
 import { SIDEBAR_COLLAPSE_BREAKPOINT } from "@/hooks/use-shell-layout";
 import { columnMinWidth } from "@/lib/column-widths";
 
 /**
  * The main window may not be resizable to a width a surface cannot fit.
+ * jsdom performs no layout: these are arithmetic contracts, not measured widths.
  *
  * These are two numbers in two languages — a Tauri config and a pile of CSS —
  * and nothing but this test connects them. `minWidth` was 940 from the first
@@ -84,5 +97,27 @@ describe("the window cannot be narrower than the layout's floor", () => {
     // is made of: a hand-written 600 here would go stale the first time either
     // the list's floor or the detail's moved.
     expect(TASKS_PANE_MIN_WIDTH_PX).toBe(columnMinWidth("tasks-list") + TASKS_DETAIL_MIN_WIDTH_PX);
+  });
+
+  it("fits the Tasks header's unsqueezable controls beside its identity floor", () => {
+    const padding = 2 * px(TASKS_HEADER_PADDING_CLASS);
+    const content = TASKS_PANE_MIN_WIDTH_PX - padding;
+    const budget = paneHeaderActionsBudget({ header: content, status: null });
+    expect(TASKS_HEADER_FIXED_WIDTH_PX).toBeLessThanOrEqual(budget);
+    expect(padding + TASKS_HEADER_FIXED_WIDTH_PX + PANE_HEADER_GAP_PX).toBeLessThanOrEqual(
+      TASKS_PANE_MIN_WIDTH_PX - PANE_HEADER_IDENTITY_MIN_PX,
+    );
+
+    const widths = Array.from({ length: 3 }, () => TASKS_HEADER_CONTROL_PX);
+    const promoted = planPriorityActions({
+      available: budget,
+      reserved: TASKS_HEADER_FIXED_WIDTH_PX,
+      widths,
+      gap: PANE_HEADER_GAP_PX,
+    });
+    const spent =
+      TASKS_HEADER_FIXED_WIDTH_PX +
+      widths.slice(0, promoted).reduce((sum, width) => sum + width + PANE_HEADER_GAP_PX, 0);
+    expect(spent).toBeLessThanOrEqual(budget);
   });
 });

@@ -27,7 +27,7 @@ import { SpacesGroup } from "@/components/layout/spaces-group";
 import { Button } from "@/components/ui/button";
 import { Lamp } from "@/components/ui/lamp";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { IconHint } from "@/components/ui/tooltip";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { BRIDGE_HEALTH_LABEL, BRIDGE_HEALTH_LAMP } from "@/lib/bridges";
 import type { CapabilitiesVm } from "@/lib/ipc/client";
@@ -320,23 +320,25 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
   const foldName = `${collapsed ? "Expand" : "Collapse"} ${SIDEBAR_TITLE.toLowerCase()}`;
   const FoldGlyph = collapsed ? FOLD_STRIP.unfoldIcon : FOLD_STRIP.foldIcon;
   const foldControl = (
-    <Button
-      type="button"
-      variant="ghost"
-      // A head control: the drawer's head is the same 40px pane-header band as
-      // every other foldable surface's, and this is the size a control in one
-      // is. See `fold-strip.tsx` — the drawer used to spend 36px here and stand
-      // 4px taller than the panel header beside it.
-      size={FOLD_STRIP.headControlSize}
-      aria-label={foldName}
-      aria-expanded={!collapsed}
-      aria-controls={VIEWS_LIST_ID}
-      data-slot="sidebar-fold"
-      className="shrink-0"
-      onClick={onToggleFold ?? undefined}
-    >
-      <FoldGlyph aria-hidden="true" />
-    </Button>
+    <IconHint label={foldName} side="right">
+      <Button
+        type="button"
+        variant="ghost"
+        // A head control: the drawer's head is the same 40px pane-header band as
+        // every other foldable surface's, and this is the size a control in one
+        // is. See `fold-strip.tsx` — the drawer used to spend 36px here and stand
+        // 4px taller than the panel header beside it.
+        size={FOLD_STRIP.headControlSize}
+        aria-label={foldName}
+        aria-expanded={!collapsed}
+        aria-controls={VIEWS_LIST_ID}
+        data-slot="sidebar-fold"
+        className="shrink-0"
+        onClick={onToggleFold ?? undefined}
+      >
+        <FoldGlyph aria-hidden="true" />
+      </Button>
+    </IconHint>
   );
 
   return (
@@ -372,15 +374,7 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
               {SIDEBAR_TITLE}
             </h2>
           )}
-          {onToggleFold !== null &&
-            (collapsed ? (
-              <Tooltip>
-                <TooltipTrigger asChild>{foldControl}</TooltipTrigger>
-                <TooltipContent side="right">{foldName}</TooltipContent>
-              </Tooltip>
-            ) : (
-              foldControl
-            ))}
+          {onToggleFold !== null && foldControl}
         </FoldStripHead>
       )}
       {/* `shrink` and not `flex-1` while folded: the views take the height they
@@ -470,43 +464,34 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
               if (collapsed) {
                 return (
                   <li key={view.label}>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size={FOLD_STRIP.controlSize}
-                          aria-label={rowName}
-                          aria-current={active ? "page" : undefined}
-                          className={cn("relative", active && "bg-accent text-accent-foreground")}
-                          onClick={onClick}
-                        >
-                          <Icon aria-hidden="true" />
-                          {showHealthLamp && bridgeHealth !== null && (
-                            <Lamp
-                              state={BRIDGE_HEALTH_LAMP[bridgeHealth]}
-                              label={null}
-                              data-slot="bridge-health-rollup"
-                              className={RAIL_INDICATOR}
-                            />
-                          )}
-                          {showApprovalBadge && (
-                            <span
-                              aria-hidden="true"
-                              data-slot="approval-count"
-                              className={cn(RAIL_INDICATOR, "size-1.5 rounded-full bg-held")}
-                            />
-                          )}
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent side="right">
-                        {showApprovalBadge
-                          ? `${view.label} (${pendingDraftCount})`
-                          : showHealthLamp && healthWord !== null
-                            ? `${view.label} — ${healthWord}`
-                            : view.label}
-                      </TooltipContent>
-                    </Tooltip>
+                    <IconHint label={rowName} side="right">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size={FOLD_STRIP.controlSize}
+                        aria-label={rowName}
+                        aria-current={active ? "page" : undefined}
+                        className={cn("relative", active && "bg-accent text-accent-foreground")}
+                        onClick={onClick}
+                      >
+                        <Icon aria-hidden="true" />
+                        {showHealthLamp && bridgeHealth !== null && (
+                          <Lamp
+                            state={BRIDGE_HEALTH_LAMP[bridgeHealth]}
+                            label={null}
+                            data-slot="bridge-health-rollup"
+                            className={RAIL_INDICATOR}
+                          />
+                        )}
+                        {showApprovalBadge && (
+                          <span
+                            aria-hidden="true"
+                            data-slot="approval-count"
+                            className={cn(RAIL_INDICATOR, "size-1.5 rounded-full bg-held")}
+                          />
+                        )}
+                      </Button>
+                    </IconHint>
                   </li>
                 );
               }

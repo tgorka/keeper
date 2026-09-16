@@ -13,6 +13,10 @@ id: string,
  */
 name: string, 
 /**
+ * Last modification of the space note; synthetic rows have no date.
+ */
+updatedMs: number | null, 
+/**
  * The query source text, exactly as stored.
  */
 query: string, 
@@ -111,14 +115,11 @@ folder: string | null,
  */
 warnings: Array<string>, 
 /**
- * Where this space sits in the rail: lower first, ties by name
- * (FR-157, AD-81).
+ * Where this space sits in the rail: lower first, ties by newest
+ * modification, then name (FR-157, AD-237).
  *
- * Zero for a space nobody has positioned, which is every space that exists
- * before this story — so a rail nobody has ordered is still the
- * alphabetical rail it was, and the seeded defaults still render Inbox,
- * Journal, Pinned, Recordings in the order the deleted fixed rows did.
- * Negative is allowed and is how a space floats above that block.
+ * Zero for a space nobody has positioned; negative positions float above
+ * that block. AD-237 deliberately replaces 44.4's alphabetical default.
  *
  * `f64` for the reason a note's own order is one (Story 44.5): `1.5` is how
  * a person slots a row between 1 and 2 without renumbering everything under

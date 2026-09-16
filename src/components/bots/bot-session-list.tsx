@@ -65,6 +65,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { InputGroup, InputGroupInput } from "@/components/ui/input-group";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { IconHint } from "@/components/ui/tooltip";
 import { type CountNoun, countLabel } from "@/lib/count-label";
 import { formatDraftAge } from "@/lib/format-time";
 import type { BotSessionRowVm, BotSessionScope, BotSessionVm } from "@/lib/ipc/client";
@@ -466,16 +467,18 @@ export function BotSessionList({
                       )}
                     </Button>
                     <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="ghost"
-                          aria-label={`${BOT_SESSION_ACTIONS_LABEL} ${row.session.title}`}
-                        >
-                          <MoreHorizontal aria-hidden="true" className="size-4" />
-                        </Button>
-                      </DropdownMenuTrigger>
+                      <IconHint label={`${BOT_SESSION_ACTIONS_LABEL} ${row.session.title}`}>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            aria-label={`${BOT_SESSION_ACTIONS_LABEL} ${row.session.title}`}
+                          >
+                            <MoreHorizontal aria-hidden="true" className="size-4" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                      </IconHint>
                       <DropdownMenuContent align="end">
                         <DropdownMenuItem
                           onSelect={() =>

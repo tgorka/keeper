@@ -7,6 +7,8 @@
  * a task no present host can run reads **Unhosted** with its reason; a row this
  * build cannot read is shown rather than dropped; and a Run now the engine
  * refuses shows the refusal without any row claiming the task ran.
+ * jsdom performs no layout. Header class and arithmetic guards do not measure
+ * real widths; the coordinator runs dev/probe at the acceptance widths.
  */
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -31,6 +33,7 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 import { LIST_FOLD_MORE_LABEL } from "@/components/layout/list-fold";
+import { PANE_HEADER_IDENTITY_SLOT } from "@/components/layout/pane-header";
 import { COLUMN_COLLAPSE_PREFIX } from "@/components/layout/surface-column";
 import {
   formatTaskAgo,
@@ -92,12 +95,14 @@ import {
   TASKS_HISTORY_TESTID,
   TASKS_LIST_EMPTY_TEXT,
   TASKS_LIST_LABEL,
+  TASKS_MORE_ACTIONS_LABEL,
   TASKS_OPEN_BESIDE_HINT,
   TASKS_ORPHAN_REFUSAL_TESTID,
   TASKS_PANE_EMPTY_AFTER,
   TASKS_PANE_EMPTY_COMMAND,
   TASKS_PANE_EMPTY_SENTENCE,
   TASKS_PANE_MIN_WIDTH_PX,
+  TASKS_PANE_SUBTITLE,
   TASKS_PANE_TITLE,
   TASKS_RAIL_LIST_LABEL,
   TASKS_REFUSAL_TESTID,
@@ -220,6 +225,17 @@ function task(over: Partial<TaskVm> = {}): TaskVm {
     nextDueMs: NOW + 3_600_000,
     runningHost: null,
     leaseUntilMs: null,
+    // The eight per-kind fields (Story 72.7). A `sync` row carries every key
+    // and fills none of them: the wire has no conditional keys, so a fixture
+    // that left them out would be a shape no build sends.
+    botId: null,
+    promptSubpath: null,
+    model: null,
+    copySource: null,
+    copyDestination: null,
+    replaceExisting: false,
+    modifiedAfterMs: null,
+    modifiedBeforeMs: null,
     lastRun: run(),
     host: { kind: "app", sentence: SENTENCE_APP, reason: null },
     ...over,
@@ -2411,21 +2427,65 @@ describe("the row says enough to act on", () => {
     expect(within(row).queryByText("Scheduled")).toBeNull();
   });
 
-  it("says what Run now does, once, and only when there is a row to do it to", async () => {
+  it("keeps both explanations reachable in the info hint, not the header flow", async () => {
     answer(listing({ tasks: [] }));
     render(<TasksPane />);
     await screen.findByText(TASKS_PANE_EMPTY_SENTENCE);
-    // A sentence about a button nobody can see yet is noise.
-    expect(screen.queryByText(TASKS_RUN_NOW_SENTENCE)).toBeNull();
+    expect(screen.queryByText(TASKS_PANE_SUBTITLE)).toBeNull();
+    fireEvent.focus(screen.getByRole("button", { name: TASKS_PANE_SUBTITLE }));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(TASKS_PANE_SUBTITLE);
+    expect(screen.getByRole("tooltip")).not.toHaveTextContent(TASKS_RUN_NOW_SENTENCE);
+    fireEvent.blur(screen.getByRole("button", { name: TASKS_PANE_SUBTITLE }));
 
     answer(listing());
     fireEvent.click(screen.getByRole("button", { name: TASK_REFRESH_TEXT }));
+    const info = await screen.findByRole("button", {
+      name: `${TASKS_PANE_SUBTITLE} ${TASKS_RUN_NOW_SENTENCE}`,
+    });
+    expect(screen.queryByText(TASKS_RUN_NOW_SENTENCE)).toBeNull();
+    fireEvent.focus(info);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(TASKS_PANE_SUBTITLE);
+    expect(screen.getByRole("tooltip")).toHaveTextContent(TASKS_RUN_NOW_SENTENCE);
+    // Preserve the two meaningful wording promises as the sentence moves.
+    expect(screen.getByRole("tooltip")).toHaveTextContent(/whether or not a window is open/);
+    expect(screen.getByRole("tooltip")).toHaveTextContent(/does not move the schedule/);
+  });
 
-    expect(await screen.findByText(TASKS_RUN_NOW_SENTENCE)).toBeVisible();
-    // The two halves that are worth stating, and both are in it: the window is
-    // not consulted, and the schedule does not move.
-    expect(TASKS_RUN_NOW_SENTENCE).toMatch(/whether or not a window is open/);
-    expect(TASKS_RUN_NOW_SENTENCE).toMatch(/does not move the schedule/);
+  it("distinguishes a future first window from a task with no window or an actual run", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(NOW);
+    try {
+      answer(
+        listing({
+          tasks: [
+            task({ id: "FUTURE", lastRun: null, nextDueMs: NOW + 7 * 86_400_000 }),
+            task({ id: "NO-WINDOW", lastRun: null, nextDueMs: null }),
+            task({ id: "DUE", lastRun: null, nextDueMs: NOW }),
+            task({ id: "RAN", lastRun: run(), nextDueMs: NOW + 86_400_000 }),
+          ],
+        }),
+      );
+      render(<TasksPane />);
+      await screen.findByTestId(TASKS_DETAIL_TESTID);
+      selectRow("FUTURE");
+      expect(
+        within(screen.getByTestId(TASKS_DETAIL_TESTID)).getAllByText(
+          "not yet — first window in 7 days",
+        ),
+      ).toHaveLength(2);
+      for (const id of ["NO-WINDOW", "DUE"]) {
+        selectRow(id);
+        expect(
+          within(screen.getByTestId(TASKS_DETAIL_TESTID)).getAllByText(TASK_NEVER_RAN_TEXT),
+        ).toHaveLength(2);
+      }
+      selectRow("RAN");
+      const detail = within(screen.getByTestId(TASKS_DETAIL_TESTID));
+      expect(detail.getByText("5 min ago")).toBeInTheDocument();
+      expect(detail.getByText("Succeeded")).toBeInTheDocument();
+      expect(detail.queryByText(/not yet/)).toBeNull();
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("shows a task's own words when it has any, and nothing at all when it does not", async () => {
@@ -2847,8 +2907,19 @@ describe("several tasks at once", () => {
     await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(3));
   }
 
+  async function bulkControl(name: string): Promise<HTMLElement> {
+    const promoted = screen.queryByRole("button", { name });
+    if (promoted) return promoted;
+    if (!screen.queryByRole("menu")) {
+      fireEvent.keyDown(screen.getByRole("button", { name: TASKS_MORE_ACTIONS_LABEL }), {
+        key: "ArrowDown",
+      });
+    }
+    return screen.findByRole("menuitem", { name });
+  }
+
   async function pressBulk(name: string): Promise<void> {
-    const control = screen.getByRole("button", { name });
+    const control = await bulkControl(name);
     await act(async () => {
       fireEvent.click(control);
       await Promise.resolve();
@@ -3218,7 +3289,7 @@ describe("several tasks at once", () => {
 
     // The control is disabled rather than merely inert, so the person can see
     // that the first press is still going.
-    expect(screen.getByRole("button", { name: TASKS_BULK_DISABLE_TEXT })).toBeDisabled();
+    expect(await bulkControl(TASKS_BULK_DISABLE_TEXT)).toHaveAttribute("aria-disabled", "true");
     await pressBulk(TASKS_BULK_DISABLE_TEXT);
     expect(syncTasksSetEnabled).toHaveBeenCalledTimes(1);
 
@@ -3226,9 +3297,7 @@ describe("several tasks at once", () => {
       settle({ entries: [] });
       await Promise.resolve();
     });
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: TASKS_BULK_DISABLE_TEXT })).toBeEnabled(),
-    );
+    expect(await bulkControl(TASKS_BULK_DISABLE_TEXT)).not.toHaveAttribute("aria-disabled");
   });
 
   it("keeps exactly one tab stop when the anchor row leaves the listing", async () => {
@@ -3441,6 +3510,25 @@ describe("a task you can open beside the list", () => {
  * reverted, and none of them can tell you the view is readable.
  */
 describe("the Tasks pane's layout floors", () => {
+  it("keeps the identity's width classes unchanged when a selection adds bulk verbs", async () => {
+    answer(listing());
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+    const identity = document.querySelector(`[data-slot="${PANE_HEADER_IDENTITY_SLOT}"]`);
+    expect(identity).not.toBeNull();
+    const classes = identity?.className;
+    selectRow("01SCHED");
+    expect(screen.getByTestId(TASKS_SELECTED_TESTID)).toHaveTextContent("1");
+    expect(identity?.className).toBe(classes);
+    // With no measured budget, verbs demote rather than disappearing.
+    fireEvent.keyDown(screen.getByRole("button", { name: TASKS_MORE_ACTIONS_LABEL }), {
+      key: "ArrowDown",
+    });
+    for (const name of [TASKS_BULK_ENABLE_TEXT, TASKS_BULK_DISABLE_TEXT, TASKS_BULK_FORGET_TEXT]) {
+      expect(await screen.findByRole("menuitem", { name })).toBeInTheDocument();
+    }
+  });
+
   it("gives the detail region a floor, because it is the box that held the form", () => {
     // 28px, measured, in a 1024px window — with the add form inside it at 0px
     // and that form's controls at 22px. The region had no `min-width` at all, so

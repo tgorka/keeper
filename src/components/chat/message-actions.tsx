@@ -11,6 +11,7 @@
 import { Pencil, Reply, Trash2 } from "lucide-react";
 import { ReactionPopover } from "@/components/chat/reaction-popover";
 import { Button } from "@/components/ui/button";
+import { IconHint } from "@/components/ui/tooltip";
 
 interface MessageActionsProps {
   /** The target message's opaque render key. */
@@ -41,36 +42,42 @@ export function MessageActions({
   return (
     <div className="flex items-center gap-0.5 rounded-md border border-border bg-background p-0.5 shadow-xs">
       <ReactionPopover onPick={(emoji) => onReact(messageKey, emoji)} />
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon-xs"
-        aria-label="Reply"
-        onClick={() => onReply(messageKey)}
-      >
-        <Reply aria-hidden="true" />
-      </Button>
-      {canEdit && (
+      <IconHint label="Reply">
         <Button
           type="button"
           variant="ghost"
           size="icon-xs"
-          aria-label="Edit"
-          onClick={() => onEdit(messageKey)}
+          aria-label="Reply"
+          onClick={() => onReply(messageKey)}
         >
-          <Pencil aria-hidden="true" />
+          <Reply aria-hidden="true" />
         </Button>
+      </IconHint>
+      {canEdit && (
+        <IconHint label="Edit">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Edit"
+            onClick={() => onEdit(messageKey)}
+          >
+            <Pencil aria-hidden="true" />
+          </Button>
+        </IconHint>
       )}
       {canDelete && (
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          aria-label="Delete"
-          onClick={() => onDelete(messageKey)}
-        >
-          <Trash2 aria-hidden="true" />
-        </Button>
+        <IconHint label="Delete">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Delete"
+            onClick={() => onDelete(messageKey)}
+          >
+            <Trash2 aria-hidden="true" />
+          </Button>
+        </IconHint>
       )}
     </div>
   );

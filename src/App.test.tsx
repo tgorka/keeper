@@ -255,6 +255,38 @@ describe("App", () => {
     }
   });
 
+  it("a sign-out while the POSTURE answer is still in flight does not open setup", async () => {
+    // The same claim as the test below, over the other of the two boot reads —
+    // and the one that was broken until Epic 72. The latch used to wait for
+    // hydration AND a chosen posture, then read `hasAccount`; a sign-out inside
+    // the posture window therefore latched "this was a first run" and started
+    // full-frame onboarding over somebody who had just signed out. It flaked at
+    // 2-in-8 in the test above, depending on whether the posture promise
+    // happened to resolve before the removal; here the ordering is the fixture,
+    // so the assertion is a fact rather than a coin toss.
+    let posture: (value: boolean | null) => void = () => {};
+    mockEncryptionPosture.mockReturnValue(
+      new Promise<boolean | null>((resolve) => {
+        posture = resolve;
+      }),
+    );
+    mockFirstRunSetupSkipped.mockResolvedValue(false);
+    accountsStore.getState().addAccount(account);
+    accountsStore.getState().markHydrated();
+    const { rerender } = render(<App />);
+    expect(await screen.findByRole("main")).toBeInTheDocument();
+
+    accountsStore.getState().removeAccount(account.accountId);
+    rerender(<App />);
+    await act(async () => {
+      posture(false);
+    });
+
+    expect(wizardStore.getState().active).toBe(false);
+    expect(screen.queryByRole("region", { name: "First-run setup" })).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+  });
+
   it("a sign-out while the stored answer is still in flight does not open setup", async () => {
     // The boot decision now waits on a second IPC answer, and `hasAccount` can
     // change inside that window. What the boot WAS is latched when the boot

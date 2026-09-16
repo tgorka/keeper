@@ -77,6 +77,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { HoverHint } from "@/components/ui/tooltip";
 import { useLongPress } from "@/hooks/use-long-press";
 import { formatDraftAge } from "@/lib/format-time";
 import type { NoteOrder, NoteRowVm } from "@/lib/ipc/client";
@@ -386,7 +387,9 @@ export function NoteRow({
   // never the one that removes the note.
   return (
     <ContextMenu>
-      <ContextMenuTrigger asChild>{rowButton}</ContextMenuTrigger>
+      <HoverHint label={row.title} detail={row.snippet}>
+        <ContextMenuTrigger asChild>{rowButton}</ContextMenuTrigger>
+      </HoverHint>
       <ContextMenuContent>
         <ContextMenuItem onSelect={() => onSelect(row)}>{NOTE_ROW_OPEN_HERE_LABEL}</ContextMenuItem>
         <ContextMenuItem onSelect={() => onSelectBeside(row)}>

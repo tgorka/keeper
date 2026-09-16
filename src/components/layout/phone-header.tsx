@@ -28,6 +28,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { IconHint } from "@/components/ui/tooltip";
 import { useSelectedRoomVm } from "@/hooks/use-selected-room-vm";
 import { detailStore } from "@/lib/stores/detail-ui";
 import { exportStore } from "@/lib/stores/export";
@@ -113,14 +114,16 @@ export function PhoneHeader({ level, onBack, backRef }: PhoneHeaderProps) {
     >
       {level === 1 && (
         <>
-          <button
-            type="button"
-            aria-label="Open details"
-            onClick={() => detailStore.getState().openDetail()}
-            className="flex h-11 min-w-0 flex-1 items-center justify-start text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <ConversationHeaderIdentity accountId={accountId} />
-          </button>
+          <IconHint label="Open details">
+            <button
+              type="button"
+              aria-label="Open details"
+              onClick={() => detailStore.getState().openDetail()}
+              className="flex h-11 min-w-0 flex-1 items-center justify-start text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <ConversationHeaderIdentity accountId={accountId} />
+            </button>
+          </IconHint>
           <ConversationIncognitoChip
             // Key by roomId so a room switch remounts the chip (same guard as the
             // desktop header): it can never leave a Popover bound to the previous chat.
@@ -130,17 +133,19 @@ export function PhoneHeader({ level, onBack, backRef }: PhoneHeaderProps) {
             networkId={networkId}
           />
           <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                aria-label="More"
-                className="size-11 shrink-0"
-              >
-                <Ellipsis aria-hidden="true" />
-              </Button>
-            </DropdownMenuTrigger>
+            <IconHint label="More">
+              <DropdownMenuTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label="More"
+                  className="size-11 shrink-0"
+                >
+                  <Ellipsis aria-hidden="true" />
+                </Button>
+              </DropdownMenuTrigger>
+            </IconHint>
             <DropdownMenuContent align="end">
               {accountId !== null && roomId !== null && (
                 <>

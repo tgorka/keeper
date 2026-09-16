@@ -1,6 +1,8 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteSpaceVm } from "@/lib/ipc/client";
+import { ALL_SPACE_ID } from "@/lib/notes/all-spaces";
+import { ALL_NOTES_SCOPE } from "@/lib/stores/notes-filters";
 
 // Mock the typed IPC client so the list never touches Tauri. The editor this
 // list opens reaches for four more commands, and the delete confirmation for
@@ -54,6 +56,7 @@ function space(p: Partial<NoteSpaceVm> & Pick<NoteSpaceVm, "id" | "name">): Note
   return {
     id: p.id,
     name: p.name,
+    updatedMs: p.updatedMs ?? null,
     query: p.query ?? "tag:client/acme",
     sort: p.sort ?? "modified desc",
     sortEffective: p.sortEffective ?? "modified desc",
@@ -98,6 +101,42 @@ afterEach(() => {
 });
 
 describe("SpaceList rows", () => {
+  it("selects All notes from another scope without offering synthetic file actions", async () => {
+    notesFiltersStore.getState().setScope({ kind: "folder", path: "projects" });
+    mockSpaces.mockResolvedValue([
+      space({ id: ALL_SPACE_ID, name: "All notes", query: "" }),
+      space({ id: "s1", name: "Work" }),
+    ]);
+    render(<SpaceList vaultId="vault-1" onNewNote={vi.fn()} />);
+    const all = await screen.findByRole("button", { name: "All notes" });
+    fireEvent.click(all);
+    expect(notesFiltersStore.getState().scope).toEqual(ALL_NOTES_SCOPE);
+    expect(all).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByRole("button", { name: "Edit space All notes" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete space All notes" })).toBeNull();
+    fireEvent.click(all);
+    expect(notesFiltersStore.getState().scope).toEqual(ALL_NOTES_SCOPE);
+  });
+
+  it("shades the whole row including actions without making actions select it", async () => {
+    const onNewNote = vi.fn();
+    mockSpaces.mockResolvedValue([space({ id: "s1", name: "Work" })]);
+    render(<SpaceList vaultId="vault-1" onNewNote={onNewNote} />);
+    const select = await screen.findByRole("button", { name: "Work" });
+    const row = select.closest("li");
+    expect(row).toHaveClass("hover:bg-accent/50");
+    for (const name of ["New note in Work", "Edit space Work", "Delete space Work"]) {
+      expect(row).toContainElement(screen.getByRole("button", { name }));
+    }
+    fireEvent.click(screen.getByRole("button", { name: "New note in Work" }));
+    expect(onNewNote).toHaveBeenCalledOnce();
+    expect(notesFiltersStore.getState().scope).toEqual(ALL_NOTES_SCOPE);
+    fireEvent.click(select);
+    expect(row).toHaveClass("bg-accent");
+    expect(select).not.toHaveClass("bg-accent", "hover:bg-accent/50");
+    expect(select).toHaveClass("focus-visible:ring-2");
+  });
+
   it("selects a space as a scope without navigating away from the open note", async () => {
     mockSpaces.mockResolvedValue([space({ id: "s1", name: "Active work" })]);
     render(<SpaceList vaultId="vault-1" />);
@@ -165,7 +204,8 @@ describe("SpaceList rows", () => {
     const row = await screen.findByRole("button", {
       name: `Odd, ${SPACE_SETTINGS_SUBTITLE}`,
     });
-    expect(row).toHaveAttribute("title", said);
+    fireEvent.focus(row);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(said);
     expect(screen.getByText(SPACE_SETTINGS_SUBTITLE)).toBeInTheDocument();
   });
 
@@ -202,7 +242,7 @@ describe("SpaceList rows", () => {
 
   /**
    * The rail's order is Rust's (FR-157): `notes_spaces` sorts by each space's
-   * `keeper.order` and then by name. This asserts the list renders that answer
+   * `keeper.order` and then newest modification. This asserts the list renders that answer
    * as given — a component that re-sorted by name here would throw the
    * positions away and the whole feature would be invisible.
    */

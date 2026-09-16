@@ -33,8 +33,10 @@ import { NoteDeleteDialog } from "@/components/notes/note-delete-dialog";
 import { SpaceEditor } from "@/components/notes/space-editor";
 import { spaceIcon } from "@/components/notes/space-icons";
 import { Lamp } from "@/components/ui/lamp";
+import { HoverHint, IconHint } from "@/components/ui/tooltip";
 import type { NoteSpaceVm } from "@/lib/ipc/client";
 import { notesSpaces, notesSpacesRestoreDefaults } from "@/lib/ipc/client";
+import { ALL_SPACE_ID } from "@/lib/notes/all-spaces";
 import { UNCATEGORIZED_SPACE_ID } from "@/lib/notes/uncategorized";
 import {
   ALL_NOTES_SCOPE,
@@ -54,8 +56,8 @@ export const SPACE_BROKEN_SUBTITLE = "This space's query can't be read";
  *
  * Short and generic on purpose: the row is a sidebar entry and the sentences
  * Rust composed name a value and a fallback, which does not fit here. This is
- * the marker that something is wrong; the whole of it is on the row's `title`
- * and, for a keyboard, in the editor the pencil opens. What it must not be is
+ * the marker that something is wrong; the whole of it is in the row's hint
+ * and in the editor the pencil opens. What it must not be is
  * absent — a space quietly ignoring a line of its own file is the failure this
  * replaces.
  */
@@ -101,7 +103,9 @@ export function SpaceList({
   const [deleting, setDeleting] = useState<string | null>(null);
   const [restoring, setRestoring] = useState(false);
   const [restoreResult, setRestoreResult] = useState<string | null>(null);
-  const activeSpaceId = useNotesFiltersStore((s) => (s.scope.kind === "space" ? s.scope.id : null));
+  const activeSpaceId = useNotesFiltersStore((s) =>
+    s.scope.kind === "space" ? s.scope.id : s.scope.kind === "all" ? ALL_SPACE_ID : null,
+  );
   const folded = useNotesRailFold((state) => state.groups.spaces);
 
   const reload = useCallback(() => {
@@ -182,20 +186,21 @@ export function SpaceList({
         as="ul"
         bodyClassName="flex flex-col gap-0.5"
         actions={
-          <button
-            type="button"
-            aria-label={RESTORE_DEFAULTS}
-            title={RESTORE_DEFAULTS}
-            disabled={vaultId === null || restoring}
-            onClick={restore}
-            className={cn(
-              "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
-              "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
-              "disabled:pointer-events-none disabled:opacity-50",
-            )}
-          >
-            <RotateCcw aria-hidden="true" className="size-3.5" />
-          </button>
+          <IconHint label={RESTORE_DEFAULTS}>
+            <button
+              type="button"
+              aria-label={RESTORE_DEFAULTS}
+              disabled={vaultId === null || restoring}
+              onClick={restore}
+              className={cn(
+                "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
+                "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+                "disabled:pointer-events-none disabled:opacity-50",
+              )}
+            >
+              <RotateCcw aria-hidden="true" className="size-3.5" />
+            </button>
+          </IconHint>
         }
         notice={
           restoreResult !== null && (
@@ -221,122 +226,134 @@ export function SpaceList({
           const active = space.id === activeSpaceId;
           const Glyph = spaceIcon(space.icon);
           return (
-            <li key={space.id} className="group flex items-start">
-              <button
-                type="button"
-                aria-current={active ? "true" : undefined}
-                aria-pressed={active}
-                // The failure belongs in the accessible name too: a dot is not a
-                // carrier on its own (UX-DR43).
-                aria-label={subtitle === null ? space.name : `${space.name}, ${subtitle}`}
-                // The whole sentence, for a pointer. The keyboard path to it is
-                // the pencil beside this row, which lists every warning in full
-                // — a row in a sidebar this narrow cannot hold one of them, and
-                // the editor is where the value gets fixed anyway.
-                title={misread ? space.warnings.join(" ") : undefined}
-                className={cn(
-                  "flex min-w-0 flex-1 items-start gap-2 rounded-md px-2 py-1.5 text-left outline-none",
-                  "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-                  active ? "bg-accent text-accent-foreground" : "hover:bg-accent/50",
-                )}
-                onClick={() =>
-                  notesFiltersStore.getState().setScope({
-                    kind: "space",
-                    id: space.id,
-                    name: space.name,
-                    defaultKey: space.defaultKey,
-                  })
-                }
+            <li
+              key={space.id}
+              className={cn(
+                "group flex items-start rounded-md",
+                active ? "bg-accent text-accent-foreground" : "hover:bg-accent/50",
+              )}
+            >
+              <HoverHint
+                label={space.name}
+                detail={space.error ?? (misread ? space.warnings.join(" ") : space.query)}
+                side="right"
               >
-                {/* A Space whose query keeper cannot read is a fault, and it
+                <button
+                  type="button"
+                  aria-current={active ? "true" : undefined}
+                  aria-pressed={active}
+                  // The failure belongs in the accessible name too: a dot is not a
+                  // carrier on its own (UX-DR43).
+                  aria-label={subtitle === null ? space.name : `${space.name}, ${subtitle}`}
+                  className={cn(
+                    "flex min-w-0 flex-1 items-start gap-2 rounded-md px-2 py-1.5 text-left outline-none",
+                    "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+                  )}
+                  onClick={() =>
+                    notesFiltersStore.getState().setScope(
+                      space.id === ALL_SPACE_ID
+                        ? ALL_NOTES_SCOPE
+                        : {
+                            kind: "space",
+                            id: space.id,
+                            name: space.name,
+                            defaultKey: space.defaultKey,
+                          },
+                    )
+                  }
+                >
+                  {/* A Space whose query keeper cannot read is a fault, and it
                     gets the fault lamp; a healthy one gets a spacer of the same
                     width so the glyph column below does not shuffle sideways.
                     The failure is already in the row's accessible name
                     (UX-DR43), so the lamp stays silent rather than saying it
                     twice. It used to be an amber dot and nothing else, which is
                     the colour-only status this vocabulary exists to end. */}
-                {broken ? (
-                  <Lamp state="fault" label={null} data-slot="space-dot" className="mt-1.5" />
-                ) : (
-                  <span
-                    aria-hidden="true"
-                    data-slot="space-dot"
-                    className="mt-1.5 size-1.5 shrink-0"
-                  />
-                )}
-                <Glyph
-                  aria-hidden="true"
-                  data-slot="space-icon"
-                  data-space-icon={space.icon ?? "none"}
-                  className="mt-0.5 size-4 shrink-0 text-muted-foreground"
-                />
-                <span className="flex min-w-0 flex-col">
-                  <span className="truncate text-sm">{space.name}</span>
-                  {subtitle !== null && (
+                  {broken ? (
+                    <Lamp state="fault" label={null} data-slot="space-dot" className="mt-1.5" />
+                  ) : (
                     <span
-                      data-slot="space-subtitle"
-                      className="truncate text-muted-foreground text-xs"
-                    >
-                      {subtitle}
-                    </span>
+                      aria-hidden="true"
+                      data-slot="space-dot"
+                      className="mt-1.5 size-1.5 shrink-0"
+                    />
                   )}
-                </span>
-              </button>
+                  <Glyph
+                    aria-hidden="true"
+                    data-slot="space-icon"
+                    data-space-icon={space.icon ?? "none"}
+                    className="mt-0.5 size-4 shrink-0 text-muted-foreground"
+                  />
+                  <span className="flex min-w-0 flex-col">
+                    <span className="truncate text-sm">{space.name}</span>
+                    {subtitle !== null && (
+                      <span
+                        data-slot="space-subtitle"
+                        className="truncate text-muted-foreground text-xs"
+                      >
+                        {subtitle}
+                      </span>
+                    )}
+                  </span>
+                </button>
+              </HoverHint>
               {/* Always in the DOM, revealed on hover or focus, for the pencil's
                   reason. The accessible name carries the space, because a
                   column of eight rows would otherwise offer eight controls all
                   called "New note". */}
-              {onNewNote !== undefined && (
-                <button
-                  type="button"
-                  aria-label={`New note in ${space.name}`}
-                  onClick={() => onNewNote(space)}
-                  className={cn(
-                    "mt-1 shrink-0 rounded-md p-1.5 text-muted-foreground outline-none",
-                    "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
-                    "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
-                  )}
-                >
-                  <FilePlus aria-hidden="true" className="size-3.5" />
-                </button>
+              {onNewNote !== undefined && space.id !== ALL_SPACE_ID && (
+                <IconHint label={`New note in ${space.name}`}>
+                  <button
+                    type="button"
+                    aria-label={`New note in ${space.name}`}
+                    onClick={() => onNewNote(space)}
+                    className={cn(
+                      "mt-1 shrink-0 rounded-md p-1.5 text-muted-foreground outline-none",
+                      "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
+                      "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+                    )}
+                  >
+                    <FilePlus aria-hidden="true" className="size-3.5" />
+                  </button>
+                </IconHint>
               )}
-              {/* The composed row has no file, so it has nothing to edit and
-                  nothing to delete. Both controls are absent rather than
-                  disabled: a disabled pencil says "you may not do this here",
-                  and the truth is that there is no `this` — the row is the
-                  complement of the rows above it and changes when they do. */}
-              {space.id === UNCATEGORIZED_SPACE_ID ? null : (
+              {/* Synthetic rows have no file to edit or delete. */}
+              {space.id === UNCATEGORIZED_SPACE_ID || space.id === ALL_SPACE_ID ? null : (
                 <>
                   {/* Always in the DOM, revealed on hover or focus: an affordance
                   that only exists under a pointer is one a keyboard cannot
                   reach. */}
-                  <button
-                    type="button"
-                    aria-label={`Edit space ${space.name}`}
-                    onClick={() => setEditing(space.id)}
-                    className={cn(
-                      "mt-1 shrink-0 rounded-md p-1.5 text-muted-foreground outline-none",
-                      "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
-                      "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
-                    )}
-                  >
-                    <Pencil aria-hidden="true" className="size-3.5" />
-                  </button>
+                  <IconHint label={`Edit space ${space.name}`}>
+                    <button
+                      type="button"
+                      aria-label={`Edit space ${space.name}`}
+                      onClick={() => setEditing(space.id)}
+                      className={cn(
+                        "mt-1 shrink-0 rounded-md p-1.5 text-muted-foreground outline-none",
+                        "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
+                        "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+                      )}
+                    >
+                      <Pencil aria-hidden="true" className="size-3.5" />
+                    </button>
+                  </IconHint>
                   {/* Same reveal rule as the pencil, and after it: the destructive
                   control is last, so a hand travelling along the row reaches
                   edit before delete. */}
-                  <button
-                    type="button"
-                    aria-label={`${DELETE_SPACE} ${space.name}`}
-                    onClick={() => setDeleting(space.id)}
-                    className={cn(
-                      "mt-1 shrink-0 rounded-md p-1.5 text-muted-foreground outline-none",
-                      "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
-                      "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
-                    )}
-                  >
-                    <Trash2 aria-hidden="true" className="size-3.5" />
-                  </button>
+                  <IconHint label={`${DELETE_SPACE} ${space.name}`}>
+                    <button
+                      type="button"
+                      aria-label={`${DELETE_SPACE} ${space.name}`}
+                      onClick={() => setDeleting(space.id)}
+                      className={cn(
+                        "mt-1 shrink-0 rounded-md p-1.5 text-muted-foreground outline-none",
+                        "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
+                        "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+                      )}
+                    >
+                      <Trash2 aria-hidden="true" className="size-3.5" />
+                    </button>
+                  </IconHint>
                 </>
               )}
             </li>

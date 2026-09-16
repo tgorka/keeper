@@ -37,6 +37,7 @@ import {
 } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { IconHint } from "@/components/ui/tooltip";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { formatFileSize } from "@/lib/file-size";
 import {
@@ -787,15 +788,17 @@ export function Composer({
               </span>
             )}
           </div>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            aria-label="Cancel"
-            onClick={cancelPending}
-          >
-            ×
-          </Button>
+          <IconHint label="Cancel">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Cancel"
+              onClick={cancelPending}
+            >
+              ×
+            </Button>
+          </IconHint>
         </div>
       )}
       {/* Local-wins conflict chip (Story 7.2, AD-15): a differing remote draft is
@@ -830,34 +833,38 @@ export function Composer({
                   {formatFileSize(attachment.size)}
                 </span>
               )}
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                aria-label={`Remove ${chipLabel(attachment)}`}
-                onClick={() => removeAttachment(attachment.id)}
-              >
-                <X aria-hidden="true" className="size-3" />
-              </Button>
+              <IconHint label={`Remove ${chipLabel(attachment)}`}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={`Remove ${chipLabel(attachment)}`}
+                  onClick={() => removeAttachment(attachment.id)}
+                >
+                  <X aria-hidden="true" className="size-3" />
+                </Button>
+              </IconHint>
             </li>
           ))}
         </ul>
       )}
       <div className="flex items-end gap-2">
         {attachEnabled && pending?.mode !== "edit" && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            aria-label="Attach file"
-            disabled={disabled}
-            onClick={() => void pickFiles()}
-            // Phone (Story 13.5): the attach affordance is a ≥44pt `+`
-            // presenting the same native picker; desktop keeps the 36px paperclip.
-            className={cn(phone && "size-11")}
-          >
-            {phone ? <Plus aria-hidden="true" /> : <Paperclip aria-hidden="true" />}
-          </Button>
+          <IconHint label="Attach file">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label="Attach file"
+              disabled={disabled}
+              onClick={() => void pickFiles()}
+              // Phone (Story 13.5): the attach affordance is a ≥44pt `+`
+              // presenting the same native picker; desktop keeps the 36px paperclip.
+              className={cn(phone && "size-11")}
+            >
+              {phone ? <Plus aria-hidden="true" /> : <Paperclip aria-hidden="true" />}
+            </Button>
+          </IconHint>
         )}
         <Textarea
           ref={textareaRef}

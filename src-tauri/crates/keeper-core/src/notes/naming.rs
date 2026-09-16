@@ -171,21 +171,24 @@ pub fn title_from_body(body: &str) -> String {
             continue;
         }
 
-        // Only strip `#` when it actually opens a heading. `#project/keeper` on
-        // its own line is a tag, and its text is not the note's title.
-        let hashes = line.len() - line.trim_start_matches('#').len();
-        let rest = &line[hashes..];
-        let title = if hashes > 0 && (rest.is_empty() || rest.starts_with(' ')) {
-            rest.trim().trim_end_matches('#').trim()
-        } else {
-            line
-        };
+        let title = strip_atx_heading(line);
 
         if !title.is_empty() {
             return title.to_owned();
         }
     }
     String::new()
+}
+
+/// Strip heading markers without mistaking an inline tag for a heading.
+pub(crate) fn strip_atx_heading(line: &str) -> &str {
+    let hashes = line.len() - line.trim_start_matches('#').len();
+    let rest = &line[hashes..];
+    if hashes > 0 && (rest.is_empty() || rest.starts_with(' ')) {
+        rest.trim().trim_end_matches('#').trim()
+    } else {
+        line
+    }
 }
 
 /// A note's title as every surface shows it: an explicit frontmatter `title`,

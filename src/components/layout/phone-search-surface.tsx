@@ -31,6 +31,7 @@ import { PaletteActionRow, PaletteChatRow } from "@/components/command-palette/p
 import { SearchPanel } from "@/components/search/search-panel";
 import { Command, CommandEmpty, CommandGroup, CommandList } from "@/components/ui/command";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
+import { IconHint } from "@/components/ui/tooltip";
 import type { PaletteChatVm, PaletteMode, PaletteResultsVm } from "@/lib/ipc/client";
 import { paletteQuery } from "@/lib/ipc/client";
 import { primaryViewStore } from "@/lib/stores/primary-view";
@@ -204,17 +205,19 @@ export function PhoneSearchSurface() {
 
           {/* Header: back/close affordance + segmented scope control. */}
           <div className="flex h-[var(--phone-header)] shrink-0 items-center gap-1 border-border border-b px-1">
-            <DialogPrimitive.Close asChild>
-              <button
-                type="button"
-                aria-label="Close search"
-                className="flex size-11 shrink-0 items-center justify-center rounded-full text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-              >
-                {/* The phone shell's own back glyph, not a `←` character at a
-                    size the type scale does not have: an icon is an icon. */}
-                <ChevronLeft className="size-5" aria-hidden="true" />
-              </button>
-            </DialogPrimitive.Close>
+            <IconHint label="Close search">
+              <DialogPrimitive.Close asChild>
+                <button
+                  type="button"
+                  aria-label="Close search"
+                  className="flex size-11 shrink-0 items-center justify-center rounded-full text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                >
+                  {/* The phone shell's own back glyph, not a `←` character at a
+                      size the type scale does not have: an icon is an icon. */}
+                  <ChevronLeft className="size-5" aria-hidden="true" />
+                </button>
+              </DialogPrimitive.Close>
+            </IconHint>
             <div
               role="tablist"
               aria-label="Search scope"

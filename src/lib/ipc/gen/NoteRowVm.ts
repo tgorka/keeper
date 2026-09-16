@@ -22,7 +22,7 @@ path: string,
  */
 title: string, 
 /**
- * Short body excerpt for the row.
+ * Short whitespace-folded prose excerpt with markdown markup removed.
  */
 snippet: string, 
 /**

@@ -132,6 +132,7 @@ import { PaneHeader } from "@/components/layout/pane-header";
 import type { CsvTableOptions } from "@/components/notes/editor/csv-table";
 import { FileProperties, PROPERTIES_LABEL } from "@/components/notes/properties-panel";
 import { Button } from "@/components/ui/button";
+import { IconHint } from "@/components/ui/tooltip";
 import { syncExportPdf } from "@/lib/ipc/client";
 import {
   fileFrameFoldStore,
@@ -954,23 +955,24 @@ export function TextFileFrame({
             {caveatOpen ? writeCaveat : writeCaveatShort}
           </p>
           {caveatFoldable ? (
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              aria-label={TEXT_FILE_CAVEAT_LABEL}
-              title={TEXT_FILE_CAVEAT_LABEL}
-              aria-expanded={caveatOpen}
-              aria-controls={caveatRegionId}
-              className="-my-0.5 shrink-0"
-              onClick={() => fileFrameFoldStore.getState().toggleBand("caveat")}
-            >
-              {caveatOpen ? (
-                <ChevronDown aria-hidden="true" />
-              ) : (
-                <ChevronRight aria-hidden="true" />
-              )}
-            </Button>
+            <IconHint label={TEXT_FILE_CAVEAT_LABEL}>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label={TEXT_FILE_CAVEAT_LABEL}
+                aria-expanded={caveatOpen}
+                aria-controls={caveatRegionId}
+                className="-my-0.5 shrink-0"
+                onClick={() => fileFrameFoldStore.getState().toggleBand("caveat")}
+              >
+                {caveatOpen ? (
+                  <ChevronDown aria-hidden="true" />
+                ) : (
+                  <ChevronRight aria-hidden="true" />
+                )}
+              </Button>
+            </IconHint>
           ) : null}
         </div>
       )}

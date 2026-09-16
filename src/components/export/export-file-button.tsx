@@ -19,6 +19,7 @@
 import { Download } from "lucide-react";
 import { announceExport } from "@/components/export/export-announce";
 import { Button } from "@/components/ui/button";
+import { IconHint } from "@/components/ui/tooltip";
 import { exportTarget } from "@/lib/export/export-target";
 
 /** The button's label. Matches the note menu item exactly: one act, one word,
@@ -32,31 +33,32 @@ export interface ExportFileButtonProps {
 
 export function ExportFileButton({ profileId, relativePath }: ExportFileButtonProps) {
   return (
-    <Button
-      type="button"
-      variant="ghost"
-      size="icon-sm"
-      // The ellipsis survives the loss of the text (Story 48.9). "Export…"
-      // promises that a dialog follows, and a glyph cannot make that promise —
-      // so the three dots stay in the accessible name and in the tooltip, where
-      // a keyboard user and a pointer both still get the warning that this
-      // opens something rather than exporting on the spot.
-      //
-      // `Download` because this app already draws an export that way:
-      // `conversation-pane.tsx` exports a chat with the same glyph, and
-      // `phone-header.tsx`'s Export menu item carries it too. Nothing in the
-      // sync family spends it on transfer direction — those say "Large file
-      // download" in words.
-      aria-label={EXPORT_FILE_LABEL}
-      title={EXPORT_FILE_LABEL}
-      className="shrink-0"
-      onClick={() => {
-        // Every rejection is handled inside `exportTarget`, so this can produce
-        // no unhandled one.
-        void exportTarget({ kind: "file", profileId, relativePath }).then(announceExport);
-      }}
-    >
-      <Download aria-hidden="true" />
-    </Button>
+    <IconHint label={EXPORT_FILE_LABEL}>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-sm"
+        // The ellipsis survives the loss of the text (Story 48.9). "Export…"
+        // promises that a dialog follows, and a glyph cannot make that promise —
+        // so the three dots stay in the accessible name and in the hint, where
+        // a keyboard user and a pointer both still get the warning that this
+        // opens something rather than exporting on the spot.
+        //
+        // `Download` because this app already draws an export that way:
+        // `conversation-pane.tsx` exports a chat with the same glyph, and
+        // `phone-header.tsx`'s Export menu item carries it too. Nothing in the
+        // sync family spends it on transfer direction — those say "Large file
+        // download" in words.
+        aria-label={EXPORT_FILE_LABEL}
+        className="shrink-0"
+        onClick={() => {
+          // Every rejection is handled inside `exportTarget`, so this can produce
+          // no unhandled one.
+          void exportTarget({ kind: "file", profileId, relativePath }).then(announceExport);
+        }}
+      >
+        <Download aria-hidden="true" />
+      </Button>
+    </IconHint>
   );
 }
