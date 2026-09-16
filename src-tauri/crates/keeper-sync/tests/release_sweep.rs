@@ -549,6 +549,11 @@ impl Fixture {
                     bot_id: None,
                     prompt_subpath: None,
                     model: None,
+                    copy_source: None,
+                    copy_destination: None,
+                    replace_existing: false,
+                    modified_after_ms: None,
+                    modified_before_ms: None,
                     schedule: Some("@daily".to_owned()),
                     mode,
                     next_due_ms: None,
@@ -2246,20 +2251,16 @@ async fn with_no_task_rows_at_all_a_successful_sync_releases_what_it_always_did(
         "the ledger no longer claims this machine holds the content"
     );
 
-    // The only row on the host is the weekly `gc` task every desktop folder
-    // is seeded with (Epic 70, AD-234) — a repack, which governs nothing about
-    // release. No release row was invented anywhere to make the release
-    // above happen: Story 57.4 adds a governor, not a default.
+    // Default proposals govern no release: Story 57.4 adds a governor,
+    // not a default. No release row was invented to make this happen.
     let listing = db::list_tasks(&ledger_conn(&f.platform)).expect("list the host's tasks");
     assert_eq!(listing.unknown.len(), 0);
-    assert_eq!(
+    assert!(
         listing
             .tasks
             .iter()
-            .map(|task| (task.kind, task.id.as_str()))
-            .collect::<Vec<_>>(),
-        vec![(TaskKind::Gc, db::gc_task_id(PROFILE_ID).as_str())],
-        "the seeded gc row, and no release row invented to make that happen"
+            .all(|task| task.kind != TaskKind::Release),
+        "no release row was invented to make that happen"
     );
 }
 

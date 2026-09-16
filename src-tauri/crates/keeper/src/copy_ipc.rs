@@ -207,6 +207,7 @@ fn entry_vm(entry: &keeper_sync::copy::CopyEntry) -> CopyEntryVm {
         CopyOutcome::Copied => ("copied", None),
         CopyOutcome::Identical => ("identical", None),
         CopyOutcome::Collision => ("collision", None),
+        CopyOutcome::Skipped { reason } => ("skipped", Some(reason.clone())),
         CopyOutcome::Failed { reason } => ("failed", Some(reason.clone())),
     };
     CopyEntryVm {
@@ -244,6 +245,8 @@ pub async fn copy_start(
     source: String,
     destination: String,
     replace_existing: Option<bool>,
+    modified_after_ms: Option<i64>,
+    modified_before_ms: Option<i64>,
 ) -> Result<String, IpcError> {
     let source = PathBuf::from(&source);
     let destination = PathBuf::from(&destination);
@@ -290,6 +293,8 @@ pub async fn copy_start(
     let (id, cancel) = registry.register(source.clone(), destination.clone());
     let options = CopyOptions {
         replace_existing: replace_existing.unwrap_or(false),
+        modified_after_ms,
+        modified_before_ms,
     };
 
     let job_id = id.clone();

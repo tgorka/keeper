@@ -502,6 +502,12 @@ pub enum LfsDirection {
 /// claims to describe. So each of these was written against the function it
 /// dispatches to, and the test `tasks_run_help_names_the_exit_codes_it_can_produce`
 /// holds the one that a wrapper script cannot afford to have go stale.
+// `Set` carries every column of a task the CLI can write — which since Story
+// 72.7 includes a `copy` task's two absolute paths and its date window — so it
+// is necessarily far larger than `Run { task, timer }`. The reason `Command`
+// above carries the same allow applies unchanged: boxing would move an
+// allocation into a type clap constructs anyway, exactly once per process.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum TaskCommand {
     /// List every stored task, with its target, schedule and last run.
@@ -694,16 +700,28 @@ pub struct TaskSetArgs {
     /// editing a bot task's window must not forget which bot it asks.
     #[arg(long, value_name = "ID")]
     pub bot: Option<String>,
-    /// The prompt file a `bot` task sends, relative to the folder's root —
-    /// `<zone>/<session>/prompts/NN-slug.md`. Its whole text after the
-    /// frontmatter is the prompt.
+    /// Any markdown prompt under the folder's root, relative to that root.
+    /// Frontmatter and one leading heading are omitted from the prompt.
     #[arg(long, value_name = "SUBPATH")]
     pub prompt: Option<String>,
-    /// The model to ask as. Absent leaves the choice to the runner's rule: the
-    /// conversation's last model, then the provider's own default, then the
-    /// first offered model that can chat.
+    /// The model to ask as. A bot runner refuses a task without a model.
     #[arg(long, value_name = "MODEL")]
     pub model: Option<String>,
+    /// Absolute source path for a verified copy job.
+    #[arg(long)]
+    pub copy_source: Option<String>,
+    /// Absolute destination directory for a verified copy job.
+    #[arg(long)]
+    pub copy_destination: Option<String>,
+    /// Replace differing destination files only after verification.
+    #[arg(long)]
+    pub replace_existing: Option<bool>,
+    /// Inclusive source modification-time lower bound, in epoch milliseconds.
+    #[arg(long)]
+    pub modified_after_ms: Option<i64>,
+    /// Exclusive source modification-time upper bound, in epoch milliseconds.
+    #[arg(long)]
+    pub modified_before_ms: Option<i64>,
     /// What to do about a window that fell due while nobody was home:
     /// `run-now`, `delay` or `skip`.
     ///
@@ -897,10 +915,12 @@ pub enum TaskKindArg {
     /// Re-check stored content against its recorded digests. Reads only, asks
     /// no network, and takes no per-folder reservation.
     Verify,
-    /// Ask a bot the prompt in one markdown file under the folder's sessions,
+    /// Ask a bot the prompt in one markdown file under a folder,
     /// and record what it answered. Needs `--bot` and `--prompt`; runs only on
     /// a host with a bot runner, which today is the keeper app.
     Bot,
+    /// One verified local copy job, optionally bounded by source modification time.
+    Copy,
     /// Repack the folder's git objects (`git gc --quiet`) in a quiet window:
     /// no sync pass and no status walk in flight. Keeper seeds one per folder,
     /// weekly; a phone refuses it.
@@ -981,6 +1001,7 @@ impl From<TaskKindArg> for TaskKind {
             TaskKindArg::Release => Self::Release,
             TaskKindArg::Verify => Self::Verify,
             TaskKindArg::Bot => Self::Bot,
+            TaskKindArg::Copy => Self::Copy,
             TaskKindArg::Gc => Self::Gc,
         }
     }
@@ -4155,19 +4176,24 @@ fn cmd_task_set(
             .model
             .clone()
             .or_else(|| existing.and_then(|row| row.model.clone())),
+        copy_source: args
+            .copy_source
+            .clone()
+            .or_else(|| existing.and_then(|row| row.copy_source.clone())),
+        copy_destination: args
+            .copy_destination
+            .clone()
+            .or_else(|| existing.and_then(|row| row.copy_destination.clone())),
+        replace_existing: args
+            .replace_existing
+            .unwrap_or_else(|| existing.is_some_and(|row| row.replace_existing)),
+        modified_after_ms: args
+            .modified_after_ms
+            .or_else(|| existing.and_then(|row| row.modified_after_ms)),
+        modified_before_ms: args
+            .modified_before_ms
+            .or_else(|| existing.and_then(|row| row.modified_before_ms)),
     };
-    if row.kind == keeper_sync::tasks::TaskKind::Bot
-        && (row.bot_id.is_none() || row.prompt_subpath.is_none())
-    {
-        // Refused here rather than at the first run, where the answer would be
-        // a failed run in a history instead of a sentence at the keyboard.
-        return Err(SyncError::Config(format!(
-            "task `{}` is a bot task, so it needs a bot and a prompt file: \
-             pass --bot <id> --prompt <subpath>",
-            args.task
-        ))
-        .into());
-    }
     engine.save_task(&row, None)?;
     report_task(printer, engine, now_ms, &row.id)
 }
@@ -6183,6 +6209,11 @@ mod tests {
             bot_id: None,
             prompt_subpath: None,
             model: None,
+            copy_source: None,
+            copy_destination: None,
+            replace_existing: false,
+            modified_after_ms: None,
+            modified_before_ms: None,
         }
     }
 
@@ -6217,6 +6248,11 @@ mod tests {
             bot: None,
             prompt: None,
             model: None,
+            copy_source: None,
+            copy_destination: None,
+            replace_existing: None,
+            modified_after_ms: None,
+            modified_before_ms: None,
             description: None,
             no_description: false,
         }

@@ -49,6 +49,13 @@ impl ShellSyncPlatform {
 }
 
 impl SyncPlatform for ShellSyncPlatform {
+    #[cfg(desktop)]
+    fn bot_task_runner(&self) -> Option<Arc<dyn keeper_sync::platform::BotTaskRunner>> {
+        Some(Arc::new(crate::bot_task::ShellBotTaskRunner::new(
+            Arc::clone(&self.platform),
+        )))
+    }
+
     fn data_dir(&self) -> SyncResult<PathBuf> {
         self.platform
             .data_dir()

@@ -287,6 +287,16 @@ pub struct TaskVm {
     pub enabled: bool,
     /// The profile this task is scoped to, `null` for host-wide work.
     pub profile_id: Option<String>,
+    pub bot_id: Option<String>,
+    pub prompt_subpath: Option<String>,
+    pub model: Option<String>,
+    pub copy_source: Option<String>,
+    pub copy_destination: Option<String>,
+    pub replace_existing: bool,
+    #[ts(type = "number | null")]
+    pub modified_after_ms: Option<i64>,
+    #[ts(type = "number | null")]
+    pub modified_before_ms: Option<i64>,
     /// That profile's human name, `null` when the id names no current profile —
     /// which is exactly the "folder is gone" fact [`task_host`] acts on.
     pub profile: Option<String>,
@@ -401,6 +411,16 @@ pub struct TaskSaveReq {
     pub enabled: bool,
     /// The profile to scope it to, `null` for host-wide.
     pub profile_id: Option<String>,
+    pub bot_id: Option<String>,
+    pub prompt_subpath: Option<String>,
+    pub model: Option<String>,
+    pub copy_source: Option<String>,
+    pub copy_destination: Option<String>,
+    pub replace_existing: bool,
+    #[ts(type = "number | null")]
+    pub modified_after_ms: Option<i64>,
+    #[ts(type = "number | null")]
+    pub modified_before_ms: Option<i64>,
     /// The schedule expression, `null` to store none.
     pub schedule: Option<String>,
     /// What to call this task, `null` to store no description.
@@ -1019,7 +1039,7 @@ fn paced_scan_row(folder: &PacedFolderFacts<'_>) -> PacedWorkVm {
 }
 
 /// The scratch sweep row. Governance cannot reach it: a scheduled Sync task
-/// takes the scan's backstop, and the sweep keeps its own hour.
+/// takes the scan's backstop, and the sweep keeps its own 24 hours.
 fn paced_sweep_row(folder: &PacedFolderFacts<'_>) -> PacedWorkVm {
     let (standing, cadence, mut sentence) = if folder.enabled {
         (

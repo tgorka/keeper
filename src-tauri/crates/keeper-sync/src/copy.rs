@@ -140,6 +140,8 @@ pub enum CopyOutcome {
     /// The destination held *different* content and was left exactly as it was.
     /// Only [`CopyOptions::replace_existing`] turns this into a replacement.
     Collision,
+    /// Outside the requested date window, or its modification time is unreadable.
+    Skipped { reason: String },
     /// Nothing was published. `reason` names the file's own problem — a refused
     /// symlink, a source that changed mid-read, a digest that did not match, an
     /// unreadable file — because a count of failures without reasons is not a
@@ -182,7 +184,7 @@ pub struct CopyReport {
     pub bytes_copied: u64,
 }
 
-/// The one choice a job offers.
+/// Choices for one verified copy job.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopyOptions {
@@ -190,6 +192,9 @@ pub struct CopyOptions {
     /// bytes have passed verification (AD-C4). Defaults to `false`: the classic
     /// tool that eats the newer file is the failure mode this guards.
     pub replace_existing: bool,
+    /// Inclusive lower and exclusive upper source mtime bounds, in epoch ms.
+    pub modified_after_ms: Option<i64>,
+    pub modified_before_ms: Option<i64>,
 }
 
 /// One progress update for a job.
@@ -270,7 +275,7 @@ fn copy_verified_hooked(
     content: Option<&dyn ContentSource>,
     hook: ChunkHook<'_>,
 ) -> Result<CopyReport> {
-    let plan = plan_copy(source, content)?;
+    let plan = plan_copy(source, content, options)?;
     std::fs::create_dir_all(destination)
         .map_err(|err| SyncError::io("create copy destination", destination, err))?;
 
@@ -296,6 +301,17 @@ fn copy_verified_hooked(
                 let dir = destination.join(rel);
                 std::fs::create_dir_all(&dir)
                     .map_err(|err| SyncError::io("create copy directory", dir, err))?;
+            }
+            PlanItem::Skipped { rel, reason } => {
+                report.entries.push(CopyEntry {
+                    path: display(rel),
+                    bytes: 0,
+                    outcome: CopyOutcome::Skipped {
+                        reason: reason.clone(),
+                    },
+                    sha256: None,
+                });
+                reporter.finish(0);
             }
             PlanItem::Refused { rel, reason } => {
                 report.entries.push(CopyEntry {
@@ -866,6 +882,10 @@ enum PlanItem {
         rel: PathBuf,
         reason: String,
     },
+    Skipped {
+        rel: PathBuf,
+        reason: String,
+    },
 }
 
 /// Walk the source and decide, up front, what the job consists of.
@@ -873,7 +893,11 @@ enum PlanItem {
 /// The pre-walk exists so `files_total` and `bytes_total` are facts rather than
 /// guesses (AC 5): a surface must never claim a total it does not have. It is
 /// also what makes the job's order deterministic — see [`children_of`].
-fn plan_copy(source: &Path, content: Option<&dyn ContentSource>) -> Result<Plan> {
+fn plan_copy(
+    source: &Path,
+    content: Option<&dyn ContentSource>,
+    options: &CopyOptions,
+) -> Result<Plan> {
     let root_meta = std::fs::symlink_metadata(source)
         .map_err(|err| SyncError::io("stat copy source", source, err))?;
 
@@ -888,7 +912,7 @@ fn plan_copy(source: &Path, content: Option<&dyn ContentSource>) -> Result<Plan>
             )));
         };
         let rel = PathBuf::from(name);
-        let item = classify(source, rel, content)?;
+        let item = classify(source, rel, content, options)?;
         let bytes_total = match &item {
             PlanItem::File { bytes, .. } => *bytes,
             _ => 0,
@@ -940,7 +964,7 @@ fn plan_copy(source: &Path, content: Option<&dyn ContentSource>) -> Result<Plan>
             }
             continue;
         }
-        items.push(classify(&absolute, rel, content)?);
+        items.push(classify(&absolute, rel, content, options)?);
     }
 
     let files_total = items
@@ -968,6 +992,7 @@ fn classify(
     absolute: &Path,
     rel: PathBuf,
     content: Option<&dyn ContentSource>,
+    options: &CopyOptions,
 ) -> Result<PlanItem> {
     let meta = std::fs::symlink_metadata(absolute)
         .map_err(|err| SyncError::io("stat copy source", absolute, err))?;
@@ -986,6 +1011,30 @@ fn classify(
             rel,
             reason: format!("{}, which cannot be copied", describe_kind(&meta)),
         });
+    }
+    if options.modified_after_ms.is_some() || options.modified_before_ms.is_some() {
+        let modified = match meta.modified() {
+            Ok(time) => match time.duration_since(std::time::UNIX_EPOCH) {
+                Ok(duration) => i128::try_from(duration.as_millis()).unwrap_or(i128::MAX),
+                Err(error) => -i128::try_from(error.duration().as_millis()).unwrap_or(i128::MAX),
+            },
+            Err(err) => return Ok(PlanItem::Skipped {
+                rel,
+                reason: format!("modification time could not be read, so the date window cannot be checked: {err}"),
+            }),
+        };
+        if options
+            .modified_after_ms
+            .is_some_and(|bound| modified < i128::from(bound))
+            || options
+                .modified_before_ms
+                .is_some_and(|bound| modified >= i128::from(bound))
+        {
+            return Ok(PlanItem::Skipped {
+                rel,
+                reason: "outside the requested modification-time window".into(),
+            });
+        }
     }
     if is_dataless(absolute)? {
         return Ok(PlanItem::Refused {
@@ -1217,17 +1266,19 @@ pub fn render_copy_log(
     let mut identical = 0usize;
     let mut collision = 0usize;
     let mut failed = 0usize;
+    let mut skipped = 0usize;
     for entry in &report.entries {
         match entry.outcome {
             CopyOutcome::Copied => copied += 1,
             CopyOutcome::Identical => identical += 1,
             CopyOutcome::Collision => collision += 1,
+            CopyOutcome::Skipped { .. } => skipped += 1,
             CopyOutcome::Failed { .. } => failed += 1,
         }
     }
     let _ = writeln!(
         out,
-        "files:       {} ({copied} copied, {identical} identical, {collision} left alone, {failed} failed)",
+        "files:       {} ({copied} copied, {identical} identical, {collision} left alone, {skipped} skipped, {failed} failed)",
         report.entries.len()
     );
     let _ = writeln!(out, "bytes:       {}", report.bytes_copied);
@@ -1239,6 +1290,7 @@ pub fn render_copy_log(
             CopyOutcome::Copied => "copied",
             CopyOutcome::Identical => "identical",
             CopyOutcome::Collision => "left-alone",
+            CopyOutcome::Skipped { .. } => "skipped",
             CopyOutcome::Failed { .. } => "FAILED",
         };
         // `-` rather than an empty column: a reader must be able to tell "no
@@ -1252,7 +1304,7 @@ pub fn render_copy_log(
             // provenance trailers guard against.
             entry.path.replace(['\n', '\r'], " ")
         );
-        if let CopyOutcome::Failed { reason } = &entry.outcome {
+        if let CopyOutcome::Failed { reason } | CopyOutcome::Skipped { reason } = &entry.outcome {
             let _ = writeln!(out, "    reason: {}", reason.replace(['\n', '\r'], " "));
         }
     }
@@ -1263,6 +1315,61 @@ pub fn render_copy_log(
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn copy_date_window_counts_skips_and_keeps_half_open_boundaries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        for (name, ms) in [("old", 999), ("lower", 1000), ("upper", 2000)] {
+            let path = source.join(name);
+            write_file(&path, b"bytes");
+            File::options()
+                .write(true)
+                .open(path)
+                .expect("open")
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)),
+                )
+                .expect("mtime");
+        }
+        std::fs::create_dir_all(source.join("empty")).expect("directory");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        let sink: CopySink = Box::new(move |progress| {
+            captured.lock().expect("progress").push(progress);
+            true
+        });
+        let report = copy_verified(
+            &source,
+            &destination,
+            &CopyOptions {
+                modified_after_ms: Some(1000),
+                modified_before_ms: Some(2000),
+                ..CopyOptions::default()
+            },
+            Some(&sink),
+            &off(),
+            None,
+        )
+        .expect("copy");
+        assert_eq!(report.bytes_copied, 5);
+        assert_eq!(read_file(&destination.join("lower")), b"bytes");
+        assert!(!destination.join("old").exists());
+        assert!(!destination.join("upper").exists());
+        assert!(destination.join("empty").is_dir());
+        for name in ["old", "upper"] {
+            assert!(report
+                .entries
+                .iter()
+                .any(|entry| entry.path == name
+                    && matches!(entry.outcome, CopyOutcome::Skipped { .. })));
+        }
+        let progress = seen.lock().expect("progress");
+        let last = progress.last().expect("final progress");
+        assert_eq!((last.files_done, last.files_total), (3, 3));
+    }
 
     fn off() -> AtomicBool {
         AtomicBool::new(false)
@@ -1501,6 +1608,7 @@ mod tests {
 
         let options = CopyOptions {
             replace_existing: true,
+            ..CopyOptions::default()
         };
         let report =
             copy_verified(&source, &destination, &options, None, &off(), None).expect("copy");
@@ -1539,6 +1647,7 @@ mod tests {
         };
         let options = CopyOptions {
             replace_existing: true,
+            ..CopyOptions::default()
         };
         let report = copy_verified_hooked(
             &source,
@@ -1989,9 +2098,11 @@ mod tests {
         assert!(log.contains("source:      /src"), "{log}");
         assert!(log.contains("destination: /dst"), "{log}");
         assert!(log.contains("2026-07-30T12:00:00+02:00"), "{log}");
-        // The counts are the summary a person reads first.
+        // The summary line, the one a person reads first in every copy log:
+        // asserted in full, skipped column included, so a column gained or
+        // renamed out from under the reader is red rather than silent.
         assert!(
-            log.contains("4 (1 copied, 1 identical, 1 left alone, 1 failed)"),
+            log.contains("4 (1 copied, 1 identical, 1 left alone, 0 skipped, 1 failed)"),
             "{log}"
         );
         assert!(log.contains("copied  4  aa11  a.txt"), "{log}");

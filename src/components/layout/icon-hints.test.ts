@@ -29,6 +29,7 @@ const SWEPT_FILES = [
   "layout/fold-strip.tsx",
   "layout/spaces-group.tsx",
   "layout/sidebar-pane.tsx",
+  "layout/sync-pane.tsx",
   "layout/account-footer.tsx",
   "layout/chat-list-pane.tsx",
   "layout/conversation-pane.tsx",

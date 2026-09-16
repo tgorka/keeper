@@ -28,7 +28,7 @@ enabled: boolean,
 /**
  * The profile to scope it to, `null` for host-wide.
  */
-profileId: string | null, 
+profileId: string | null, botId: string | null, promptSubpath: string | null, model: string | null, copySource: string | null, copyDestination: string | null, replaceExisting: boolean, modifiedAfterMs: number | null, modifiedBeforeMs: number | null, 
 /**
  * The schedule expression, `null` to store none.
  */

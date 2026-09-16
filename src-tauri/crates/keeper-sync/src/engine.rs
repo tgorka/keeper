@@ -653,7 +653,7 @@ pub const RELEASE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// How often a folder's release candidates are looked at.
 ///
-/// An hour, matching [`SWEEP_EVERY_MS`] and for the same shape of reason: the
+/// An hour, independently of the daily [`SWEEP_EVERY_MS`]: the
 /// TTL this gate serves is measured in days, so asking every successful sync —
 /// which on a busy folder is every few seconds — would read the whole ledger
 /// over and over to learn nothing. It is a *look* interval and not a schedule:
@@ -1977,12 +1977,12 @@ impl Engine {
             scan_reasons: Mutex::new(HashMap::new()),
             untracked_appeared: Mutex::new(HashSet::new()),
         };
-        engine.seed_gc_tasks()?;
+        engine.seed_folder_tasks()?;
         engine.seed_status()?;
         Ok(engine)
     }
 
-    /// Offer every folder its weekly `gc` task, once (Epic 70, AD-234).
+    /// Offer per-folder gc and host-wide disabled clock tasks (AD-234, AD-242).
     ///
     /// Only where the verb can run: a phone's [`GitCli`] refuses `gc` before
     /// any spawn, so seeding there would write a row whose every run answers
@@ -1992,20 +1992,21 @@ impl Engine {
     /// the folders already stored and from [`Self::upsert_profile`] for the
     /// ones that arrive later, which is what makes "every desktop folder has
     /// one" an invariant rather than a migration.
-    fn seed_gc_tasks(&self) -> Result<()> {
+    fn seed_folder_tasks(&self) -> Result<()> {
         if self.git.engine() != GitEngine::Binary {
             return Ok(());
         }
         let now = self.platform.now_ms();
+        self.with_db(|conn| db::seed_clock_tasks(conn, now))?;
         let profiles = self.with_db(db::list_profiles)?;
         for profile in &profiles {
-            self.seed_gc_task(&profile.id, now)?;
+            self.seed_folder_task_rows(&profile.id, now)?;
         }
         Ok(())
     }
 
-    /// [`Self::seed_gc_tasks`] for one folder.
-    fn seed_gc_task(&self, profile_id: &str, now_ms: i64) -> Result<()> {
+    /// [`Self::seed_folder_tasks`] for one folder.
+    fn seed_folder_task_rows(&self, profile_id: &str, now_ms: i64) -> Result<()> {
         if self.git.engine() != GitEngine::Binary {
             return Ok(());
         }
@@ -2626,7 +2627,7 @@ impl Engine {
         // here, once by marker, so the invariant does not wait for a restart
         // (Epic 70). `keeper-syncd` writes its `config.toml` folders through
         // this door too.
-        self.seed_gc_task(&profile.id, now)?;
+        self.seed_folder_task_rows(&profile.id, now)?;
         Self::lock(&self.remote_relations).insert(profile.id.clone(), Arc::new(Mutex::new(None)));
         Self::lock(&self.poll_progress).remove(&profile.id);
         let mut status = Self::lock(&self.status);
@@ -4047,12 +4048,116 @@ impl Engine {
             // one kind whose work happens outside this crate (AD-224), so the
             // arm is a resolve, a read and one call through the port.
             tasks::TaskKind::Bot => self.perform_bot_task(task, profiles).await,
+            tasks::TaskKind::Copy => self.perform_copy_task(task, profiles).await,
             // No `source` here either: a repack rewrites how objects are
             // stored and not one of them, so there is no commit and no
             // provenance. The one kind that runs the shim's `gc` verb
             // (AD-41, AD-234).
             tasks::TaskKind::Gc => self.perform_gc_task(task, profiles).await,
         }
+    }
+
+    /// A remembered schedule over a copy job, not a profile or journal entry.
+    async fn perform_copy_task(
+        &self,
+        task: &db::TaskRow,
+        profiles: &[SyncProfile],
+    ) -> (tasks::TaskOutcome, String) {
+        use crate::copy::{CopyOptions, CopyOutcome};
+        let (Some(source), Some(destination)) = (&task.copy_source, &task.copy_destination) else {
+            return (
+                tasks::TaskOutcome::Failed,
+                "this copy task needs a source and a destination path".into(),
+            );
+        };
+        let source = Path::new(source);
+        let destination = Path::new(destination);
+        let options = CopyOptions {
+            replace_existing: task.replace_existing,
+            modified_after_ms: task.modified_after_ms,
+            modified_before_ms: task.modified_before_ms,
+        };
+        // The existing blocking fence preserves the borrowed engine needed for
+        // hydration while handing the runtime's work to another worker.
+        Self::blocking(|| {
+            if !source.exists() {
+                return (
+                    tasks::TaskOutcome::Failed,
+                    format!("{} does not exist", source.display()),
+                );
+            }
+            if destination.starts_with(source) {
+                return (
+                    tasks::TaskOutcome::Failed,
+                    "the destination is inside the source, which would copy the tree into itself"
+                        .into(),
+                );
+            }
+            let target = source
+                .canonicalize()
+                .unwrap_or_else(|_| source.to_path_buf());
+            let content = profiles
+                .iter()
+                .any(|profile| {
+                    let root = profile
+                        .local_path
+                        .canonicalize()
+                        .unwrap_or_else(|_| profile.local_path.clone());
+                    target.starts_with(root)
+                })
+                .then_some(self as &dyn crate::copy::ContentSource);
+            let report = match crate::copy::copy_verified(
+                source,
+                destination,
+                &options,
+                None,
+                &AtomicBool::new(false),
+                content,
+            ) {
+                Ok(report) => report,
+                Err(err) => return (tasks::TaskOutcome::Failed, err.to_string()),
+            };
+            let mut copied = 0;
+            let mut identical = 0;
+            let mut skipped = 0;
+            let mut collisions = 0;
+            let mut failed = 0;
+            for entry in &report.entries {
+                match entry.outcome {
+                    CopyOutcome::Copied => copied += 1,
+                    CopyOutcome::Identical => identical += 1,
+                    CopyOutcome::Skipped { .. } => skipped += 1,
+                    CopyOutcome::Collision => collisions += 1,
+                    CopyOutcome::Failed { .. } => failed += 1,
+                }
+            }
+            static NEXT_COPY_LOG: AtomicU64 = AtomicU64::new(0);
+            let stamp = format!(
+                "{}-{}-{}",
+                self.platform.now_ms(),
+                std::process::id(),
+                NEXT_COPY_LOG.fetch_add(1, Ordering::Relaxed)
+            );
+            let log = destination.join(crate::copy::copy_log_filename(&stamp));
+            let body = crate::copy::render_copy_log(
+                &report,
+                source,
+                destination,
+                &self.platform.now_ms().to_string(),
+            );
+            let log_error = std::fs::write(&log, body).err();
+            let mut detail = format!("{} bytes; {} files: {copied} copied, {identical} identical, {skipped} skipped, {collisions} left alone, {failed} failed",
+                report.bytes_copied, report.entries.len());
+            if let Some(err) = &log_error {
+                detail.push_str(&format!("; could not write the copy log: {err}"));
+            }
+            let outcome = if failed > 0 || log_error.is_some() {
+                tasks::TaskOutcome::Failed
+            } else {
+                tasks::TaskOutcome::Ok
+            };
+            (outcome, detail)
+        })
     }
 
     /// One sync pass over the named folder, or over every enabled folder when
@@ -4602,6 +4707,15 @@ impl Engine {
     /// leads; the counts follow. An error record has no answer, so its
     /// sentences are the line — the first two, because a detail is one line
     /// and a stream that broke usually says the same thing twice.
+    ///
+    /// A refused tool call is named here and not left to the audit log. A
+    /// scheduled run has no approver, so `grant::decide`'s every `Ask` becomes
+    /// a refusal (AD-244) and the model carries on — which is right, and which
+    /// means a run that wrote nothing at all still ends `Ok`. The outcome stays
+    /// `Ok` because the turn did finish; what must not happen is the Tasks pane
+    /// reading "Succeeded" with no hint that the one thing the prompt asked for
+    /// was declined. So the count leads the counts, and the first refusal's own
+    /// words follow it, bounded like the answer is.
     fn bot_run_detail(record: &crate::platform::BotRunRecord) -> String {
         if !record.errors.is_empty() {
             return record
@@ -4632,6 +4746,21 @@ impl Engine {
         }
         if let Some(tokens) = record.completion_tokens {
             parts.push(format!("{tokens} tokens"));
+        }
+        let (refused, remarked): (Vec<&String>, Vec<&String>) = record
+            .warnings
+            .iter()
+            .partition(|warning| warning.contains(crate::platform::TOOL_REFUSED_MARK));
+        if let Some(first) = refused.first() {
+            let mut head = first.split_whitespace().collect::<Vec<_>>().join(" ");
+            if head.chars().count() > 60 {
+                head = head.chars().take(60).collect::<String>();
+                head.push('…');
+            }
+            parts.push(format!("{} refused ({head})", refused.len()));
+        }
+        if !remarked.is_empty() {
+            parts.push(format!("{} warnings", remarked.len()));
         }
         format!("{head} — {}", parts.join(", "))
     }
@@ -12141,6 +12270,11 @@ impl Engine {
     /// [`tasks::TaskMode::Off`] rather than as absent, and about a row this build
     /// cannot read governing nothing applies here word for word.
     ///
+    /// Within a Sync tier the most capable row wins: any enabled scheduled
+    /// sibling already drives this folder, so an off/manual row must not leave
+    /// the paced driver running underneath it. Release keeps the opposite
+    /// fold because conflicting deletion instructions must delete less.
+    ///
     /// One thing does **not** transpose, and it is the `Err` arm.
     /// [`Self::release_permits`] declines on a table it could not read, because
     /// the question there is *may I delete content*. The question here is *may I
@@ -12156,12 +12290,9 @@ impl Engine {
 
     /// Which stored task row of `kind` governs this folder, if any.
     ///
-    /// One fold for both kinds, deliberately: the tier rule (*the narrower
-    /// statement wins*), the least-permissive rule and the rank they are measured
-    /// on are the same claim about both records, and a second copy would be a
-    /// second place for them to disagree. What each kind then *does* with the
-    /// answer differs, and that lives in [`Self::release_permits`] and
-    /// [`Self::sync_poll_permits`] where the claim being made is visible.
+    /// Both kinds share the rank and folder-over-host precedence. Within a
+    /// tier Sync asks whether any row drives the folder (maximum rank), while
+    /// Release asks whether deletion is permitted (minimum rank).
     ///
     /// The `kind` filter is load-bearing in both directions: a sync task says
     /// nothing about whether content may be deleted, and a release task says
@@ -12172,7 +12303,7 @@ impl Engine {
         kind: tasks::TaskKind,
     ) -> Result<Option<tasks::TaskMode>> {
         let listing = self.with_db(db::list_tasks)?;
-        // Least permissive wins, so the fold is a `min` over an order
+        // The kind chooses min or max over an order that
         // [`tasks::TaskMode`] deliberately does not derive: its three variants
         // are three answers rather than a scale, and an `Ord` on the type would
         // invite some other caller to read a ranking into them. The rank is
@@ -12203,7 +12334,15 @@ impl Engine {
                 None => &mut host_wide,
             };
             *tier = Some(match *tier {
-                Some(existing) if rank(existing) <= rank(mode) => existing,
+                Some(existing)
+                    if if kind == tasks::TaskKind::Sync {
+                        rank(existing) >= rank(mode)
+                    } else {
+                        rank(existing) <= rank(mode)
+                    } =>
+                {
+                    existing
+                }
                 _ => mode,
             });
         }
@@ -18037,6 +18176,11 @@ mod tests {
             bot_id: None,
             prompt_subpath: None,
             model: None,
+            copy_source: None,
+            copy_destination: None,
+            replace_existing: false,
+            modified_after_ms: None,
+            modified_before_ms: None,
             schedule: Some(schedule.to_owned()),
             mode: tasks::TaskMode::Scheduled,
             next_due_ms: None,
@@ -18069,6 +18213,94 @@ mod tests {
             kind: tasks::TaskKind::Verify,
             ..task(id, profile_id, schedule)
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copy_task_runs_verified_job_and_records_window_summary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let engine = Engine::open(platform.clone()).expect("engine");
+        let source = dir.path().join("copy-source");
+        std::fs::create_dir_all(&source).expect("source");
+        for (name, ms, bytes) in [
+            ("old", 1000, b"old".as_slice()),
+            ("new", 3000, b"newer".as_slice()),
+        ] {
+            let path = source.join(name);
+            std::fs::write(&path, bytes).expect("fixture");
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .expect("open")
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(ms)),
+                )
+                .expect("mtime");
+        }
+        let mut row = task("copy-fixtures", None, "every 5m");
+        row.kind = tasks::TaskKind::Copy;
+        row.copy_source = Some(source.to_string_lossy().into_owned());
+        for (name, bound, bytes) in [("all", None, 8), ("bounded", Some(2000), 5)] {
+            let destination = dir.path().join(name);
+            row.copy_destination = Some(destination.to_string_lossy().into_owned());
+            row.modified_after_ms = bound;
+            engine.save_task(&row, None).expect("save");
+            engine
+                .run_task_now(&row.id, tasks::TaskRunDriver::Person)
+                .await
+                .expect("run");
+            let runs = engine.task_history(&row.id, 1).expect("history");
+            assert_eq!(runs[0].outcome, Some(tasks::TaskOutcome::Ok));
+            assert!(runs[0]
+                .detail
+                .as_deref()
+                .expect("detail")
+                .starts_with(&format!("{bytes} bytes; 2 files:")));
+            assert_eq!(
+                std::fs::read(destination.join("new")).expect("new"),
+                b"newer"
+            );
+            assert_eq!(destination.join("old").exists(), bound.is_none());
+            let log = std::fs::read_dir(&destination)
+                .expect("destination")
+                .map(|entry| entry.expect("entry").path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "log"))
+                .expect("log");
+            let log = std::fs::read_to_string(log).expect("read log");
+            if bound.is_some() {
+                assert!(log.contains("skipped  0  -  old"), "{log}");
+            }
+            platform.advance_ms(1);
+        }
+        assert!(engine.list_profiles().expect("profiles").is_empty());
+        let queued: i64 = engine
+            .with_db(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM journal", [], |row| row.get(0))?)
+            })
+            .expect("journal");
+        assert_eq!(queued, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn copy_task_blocking_fence_does_not_starve_another_engine_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = Engine::open(Arc::new(TestPlatform::new(dir.path()))).expect("engine");
+        tokio::spawn(async move {
+            let (send, receive) = std::sync::mpsc::channel();
+            let other = tokio::spawn(async move {
+                Arc::new(engine).tick().await.expect("other engine tick");
+                send.send(()).expect("completion");
+            });
+            Engine::blocking(|| {
+                receive
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("replacement runtime worker must run the pending tick");
+            });
+            other.await.expect("join");
+        })
+        .await
+        .expect("copy worker");
     }
 
     /// AD-136's central claim, asserted the only way it honestly can be: by
@@ -18305,8 +18537,14 @@ mod tests {
         }
 
         let listing = engine.tasks().expect("tasks");
+        // Not "the listing is empty" any more: since Story 72.6 every machine
+        // carries the two host-wide clock proposals, so the question is whether
+        // any of *these three* rows was read as something this build runs.
         assert!(
-            listing.tasks.is_empty(),
+            !listing
+                .tasks
+                .iter()
+                .any(|row| ["01UPD", "01TEL", "01EXEC"].contains(&row.id.as_str())),
             "neither row is one this build could honestly run"
         );
         assert_eq!(
@@ -18395,7 +18633,12 @@ mod tests {
             );
         }
         assert!(
-            engine.tasks().expect("tasks").tasks.is_empty(),
+            !engine
+                .tasks()
+                .expect("tasks")
+                .tasks
+                .iter()
+                .any(|row| row.id == "01BAD"),
             "a refused schedule stores nothing at all"
         );
     }
@@ -20288,7 +20531,7 @@ mod tests {
     /// often a folder is walked, exactly as a sync task says nothing about
     /// whether content may be deleted.
     #[test]
-    fn a_folders_sync_governance_is_the_narrowest_row_and_the_least_permissive_mode() {
+    fn a_folders_sync_governance_is_the_narrowest_tier_and_the_most_capable_mode() {
         let dir = tempfile::tempdir().expect("tempdir");
         let Some(engine) = engine(dir.path()) else {
             return;
@@ -20300,9 +20543,8 @@ mod tests {
             engine
                 .sync_governance(&p.id)
                 .expect("the tasks table reads"),
-            None,
-            "no rows at all is the un-migrated database, and it has to read as \
-             `the folder polls exactly as it did` rather than as anything new"
+            Some(tasks::TaskMode::Off),
+            "the disabled host proposal keeps the folder's ordinary pacing"
         );
 
         // The mirror of the release test's first case, and the half that was
@@ -20314,7 +20556,7 @@ mod tests {
             engine
                 .sync_governance(&p.id)
                 .expect("the tasks table reads"),
-            None,
+            Some(tasks::TaskMode::Off),
             "a release task says nothing about how often a folder is walked"
         );
 
@@ -20327,7 +20569,7 @@ mod tests {
             engine
                 .sync_governance(&p.id)
                 .expect("the tasks table reads"),
-            None,
+            Some(tasks::TaskMode::Off),
             "another folder's row governs another folder"
         );
 
@@ -20364,8 +20606,8 @@ mod tests {
             engine
                 .sync_governance(&p.id)
                 .expect("the tasks table reads"),
-            Some(tasks::TaskMode::Manual),
-            "the least permissive of two rows in one tier is what the fold answers"
+            Some(tasks::TaskMode::Scheduled),
+            "an enabled scheduled sibling is the tier's driver"
         );
 
         // `enabled = 0` is a knob set to off, not a knob that is absent.
@@ -20375,8 +20617,8 @@ mod tests {
             engine
                 .sync_governance(&p.id)
                 .expect("the tasks table reads"),
-            Some(tasks::TaskMode::Off),
-            "a row that is not live must not leave a knob that does nothing"
+            Some(tasks::TaskMode::Scheduled),
+            "switching one sibling off cannot veto the other scheduled driver"
         );
 
         // A row a newer keeper wrote governs nothing, and the fallback is
@@ -20404,7 +20646,7 @@ mod tests {
             engine
                 .sync_governance(&p.id)
                 .expect("the tasks table reads"),
-            None,
+            Some(tasks::TaskMode::Off),
             "one row this build cannot read must not be able to stop a folder polling"
         );
     }
@@ -21105,6 +21347,200 @@ mod tests {
         }
     }
 
+    #[test]
+    fn clock_task_disabled_authored_sync_cannot_veto_an_enabled_sibling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = Engine::open(Arc::new(TestPlatform::new(dir.path()))).expect("engine");
+        let p = profile(dir.path());
+        engine
+            .with_db(|conn| db::upsert_profile(conn, &p, 1))
+            .expect("unseeded profile");
+        let mut disabled = task("disabled", Some(&p.id), "every 1h");
+        disabled.enabled = false;
+        engine
+            .save_task(&disabled, None)
+            .expect("disabled authored row");
+        assert!(
+            engine.sync_poll_permits(&p),
+            "a lone authored row switched off restores pacing"
+        );
+        engine
+            .save_task(&task("enabled", Some(&p.id), "every 2h"), None)
+            .expect("enabled authored row");
+        assert_eq!(
+            engine.sync_governance_mode(&p.id),
+            Some(tasks::TaskMode::Scheduled)
+        );
+        assert!(
+            !engine.sync_poll_permits(&p),
+            "a disabled sibling cannot leave a second driver"
+        );
+    }
+
+    #[tokio::test]
+    async fn clock_task_proposals_do_not_arm_or_run_while_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let engine = Engine::open(platform.clone()).expect("engine");
+        let p = profile(dir.path());
+        engine
+            .with_db(|conn| db::upsert_profile(conn, &p, 1))
+            .expect("profile");
+        engine.run_due_tasks(std::slice::from_ref(&p)).await;
+        platform.advance_ms(8 * 24 * 60 * 60 * 1_000);
+        engine.run_due_tasks(std::slice::from_ref(&p)).await;
+        for row in engine.tasks().expect("tasks").tasks {
+            assert_eq!(row.next_due_ms, None);
+            assert!(engine
+                .task_history(&row.id, 50)
+                .expect("history")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn clock_task_seed_governs_only_when_enabled_and_keeps_real_cadence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let engine = Engine::open(platform.clone()).expect("engine");
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("profile");
+        let mut row = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .into_iter()
+            .find(|row| row.id == db::SYNC_TASK_ID)
+            .expect("sync seed");
+        let schedule = row.parsed_schedule().expect("schedule").expect("scheduled");
+        assert_eq!(
+            schedule.next_due_after(0, 0).expect("next"),
+            LIVE_WATCH_BACKSTOP_MS
+        );
+        assert!(
+            engine.scan_due(&p),
+            "disabled seed preserves the first paced poll"
+        );
+        platform.advance_ms(p.effective_poll_interval_ms() as i64);
+        assert!(
+            engine.scan_due(&p),
+            "disabled seed preserves the next paced poll"
+        );
+        row.enabled = true;
+        engine.save_task(&row, None).expect("enable");
+        platform.advance_ms(p.effective_poll_interval_ms() as i64);
+        assert!(
+            !engine.scan_due(&p),
+            "enabled seed surrenders the paced driver"
+        );
+    }
+
+    /// A scheduled bot run has no approver, so a write outside an approved
+    /// subtree is refused and the turn carries on (AD-244). The outcome is
+    /// therefore `Ok` — and the line the Tasks pane shows must still say that
+    /// something was declined, or a run that did nothing reads as one that did.
+    #[test]
+    fn a_bot_run_that_was_refused_says_so_in_its_one_line() {
+        let record = crate::platform::BotRunRecord {
+            outcome: crate::tasks::TaskOutcome::Ok,
+            answer: "I could not write the summary.".to_owned(),
+            tool_calls: 2,
+            warnings: vec![
+                "write refused: no grant covers 40-media/summaries/2026-09.md".to_owned(),
+            ],
+            errors: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: Some(41),
+            ms: 2_500,
+            finish_reason: None,
+            model: None,
+        };
+        let detail = Engine::bot_run_detail(&record);
+        assert!(
+            detail.contains("1 refused"),
+            "the count of declined calls is the fact a person acts on, got {detail}"
+        );
+        assert!(
+            detail.contains("40-media/summaries/2026-09.md"),
+            "and the first refusal's own words say which write it was, got {detail}"
+        );
+        // A warning is not a refusal: the runner writes remarks into the same
+        // vector (a model that answered under another name, a truncated
+        // answer), and counting one of those as a declined write would tell a
+        // person to go looking for something that never happened. The mark is
+        // what tells them apart.
+        let remarked = crate::platform::BotRunRecord {
+            warnings: vec!["requested model llama; llama:8b answered".to_owned()],
+            ..record.clone()
+        };
+        let detail = Engine::bot_run_detail(&remarked);
+        assert!(
+            !detail.contains("refused"),
+            "a remark is not a refusal, got {detail}"
+        );
+        assert!(
+            detail.contains("1 warnings"),
+            "but it is still worth the one line saying there was one, got {detail}"
+        );
+        let clean = crate::platform::BotRunRecord {
+            warnings: Vec::new(),
+            ..record
+        };
+        let detail = Engine::bot_run_detail(&clean);
+        assert!(
+            !detail.contains("refused") && !detail.contains("warnings"),
+            "and a run with neither says nothing about either, got {detail}"
+        );
+    }
+
+    #[test]
+    fn clock_task_proposal_does_not_veto_a_host_schedule_or_change_folder_precedence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = Engine::open(Arc::new(TestPlatform::new(dir.path()))).expect("engine");
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("profile");
+        assert_eq!(
+            engine.sync_governance_mode(&p.id),
+            Some(tasks::TaskMode::Off)
+        );
+        assert!(engine.sync_poll_permits(&p));
+        engine
+            .save_task(&task("host", None, "every 2h"), None)
+            .expect("host schedule");
+        assert_eq!(
+            engine.sync_governance_mode(&p.id),
+            Some(tasks::TaskMode::Scheduled)
+        );
+        assert!(
+            !engine.sync_poll_permits(&p),
+            "proposal cannot veto a scheduled sibling"
+        );
+        let mut local = task("local", Some(&p.id), "every 3h");
+        local.enabled = false;
+        engine.save_task(&local, None).expect("local off");
+        assert_eq!(
+            engine.sync_governance_mode(&p.id),
+            Some(tasks::TaskMode::Off)
+        );
+        assert!(
+            engine.sync_poll_permits(&p),
+            "folder tier still outranks host tier"
+        );
+        let other = SyncProfile::new("other", "other", dir.path().join("other"), "x");
+        engine.upsert_profile(&other).expect("other folder");
+        assert!(
+            !engine.sync_poll_permits(&other),
+            "host schedule still governs other folders"
+        );
+        assert!(engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .iter()
+            .filter(|row| row.kind == tasks::TaskKind::Sync && row.id != "local")
+            .all(|row| row.profile_id.is_none()));
+    }
+
     // -- Epic 70, Story 70.7: the gc task (AD-234) --------------------------
 
     /// Every desktop folder is offered its weekly `gc` task — the ones stored
@@ -21144,6 +21580,7 @@ mod tests {
         let seeded: Vec<Seeded> = listing
             .tasks
             .iter()
+            .filter(|t| t.kind == tasks::TaskKind::Gc)
             .map(|t| {
                 (
                     t.id.clone(),
@@ -21178,6 +21615,7 @@ mod tests {
             listing
                 .tasks
                 .iter()
+                .filter(|t| t.kind == tasks::TaskKind::Gc)
                 .all(|t| t.enabled && t.on_missed == tasks::TaskMissedPolicy::RunNow),
             "enabled, and a missed week runs when the machine is next awake"
         );
@@ -21195,6 +21633,7 @@ mod tests {
             .expect("tasks")
             .tasks
             .into_iter()
+            .filter(|t| t.kind == tasks::TaskKind::Gc)
             .map(|t| t.id)
             .collect();
         assert_eq!(

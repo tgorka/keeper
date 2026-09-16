@@ -220,14 +220,14 @@ pub enum TaskKind {
     /// went fine: *"1000 paths checked, 0 bad, 1000 virtual in 1 folders"* is
     /// the answer to a question `sync` and `release` cannot be asked.
     Verify,
-    /// One turn of a bot over a prompt file kept in a session's `prompts/`
-    /// folder (Epic 69, Story 69.4, AD-224, FR-506…FR-509).
+    /// One turn of a bot over a prompt file under the profile — any markdown
+    /// file qualifies (AD-244), not just one in a session's `prompts/` folder
+    /// (Epic 69, Story 69.4, AD-224, FR-506…FR-509).
     ///
-    /// **The fourth kind, and the first that names a target.** The row carries
-    /// three nullable columns for it — `bot_id`, `prompt_subpath` (profile-
-    /// relative, `<zone>/<session>/prompts/NN-slug.md`) and `model` — saved
-    /// through the same doors, listed and run by the same tick, leased and
-    /// capped like the other three. A bot task is always folder-scoped, because
+    /// The row carries `bot_id`, `prompt_subpath` (any markdown file relative
+    /// to the profile root) and `model`, saved through the same doors, listed
+    /// and run by the same tick, leased and capped like the other kinds.
+    /// A bot task is always folder-scoped, because
     /// the prompt is a file in that folder; a host-wide row of this kind is a
     /// misconfiguration the arm reports.
     ///
@@ -246,10 +246,12 @@ pub enum TaskKind {
     /// `keeper-core`-free, so the engine reaches the bot through
     /// [`crate::platform::SyncPlatform::bot_task_runner`], a port that defaults
     /// to `None`. A host with no runner — `keeper-syncd`, the phone — lists the
-    /// row, never claims it on its tick, and answers a requested run with the
+    /// row and records a deferred run with the
     /// host sentence (NFR-43's shape, one rung up: the kind is *known* here,
     /// and still not this host's to run).
     Bot,
+    /// One verified local copy job, never a sync relationship (AD-C1).
+    Copy,
     /// One `git gc --quiet` over the named folder's repository, or over every
     /// enabled folder when the task is host-wide (Epic 70, Story 70.7,
     /// AD-234, FR-527).
@@ -283,6 +285,7 @@ impl TaskKind {
             Self::Release => "release",
             Self::Verify => "verify",
             Self::Bot => "bot",
+            Self::Copy => "copy",
             Self::Gc => "gc",
         }
     }
@@ -295,6 +298,7 @@ impl TaskKind {
             "release" => Some(Self::Release),
             "verify" => Some(Self::Verify),
             "bot" => Some(Self::Bot),
+            "copy" => Some(Self::Copy),
             "gc" => Some(Self::Gc),
             _ => None,
         }
@@ -1836,6 +1840,7 @@ mod tests {
             TaskKind::Release,
             TaskKind::Verify,
             TaskKind::Bot,
+            TaskKind::Copy,
             TaskKind::Gc,
         ] {
             assert_eq!(TaskKind::from_stored(kind.as_str()), Some(kind));
@@ -2191,15 +2196,7 @@ mod tests {
         /// `from_stored` refuses it, so it never enters this comparison in the
         /// first place.
         ///
-        /// `bot` (Story 69.4, AD-224) is here for a reason with a date on it:
-        /// the engine runs it, `keeper-syncd` can schedule it, and the form
-        /// cannot offer it yet because a bot task needs three fields the form
-        /// has no controls for — the bot, the prompt file and the model — and a
-        /// kind offered without them would create rows that always fail. It
-        /// leaves this list the moment the form grows them; until then a person
-        /// creates one with `keeper-syncd tasks set --kind bot`, and the row is
-        /// listed and run everywhere like any other.
-        const NEVER_OFFERED: [&str; 1] = ["bot"];
+        const NEVER_OFFERED: [&str; 0] = [];
 
         // An exemption for a spelling nothing accepts is an exemption that
         // exempts nothing, and the day somebody misspells one here the kind it

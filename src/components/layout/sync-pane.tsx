@@ -54,6 +54,7 @@
  * the app-shell / sidebar level: a machine with no usable `git` gets no sync UI
  * at all, never a disabled one.
  */
+
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import {
   ArrowDownToLine,
@@ -102,6 +103,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   Popover,
@@ -114,6 +116,7 @@ import {
 import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
+import { IconHint } from "@/components/ui/tooltip";
 import { formatDraftAge } from "@/lib/format-time";
 import type {
   CopyJobState,
@@ -664,6 +667,7 @@ const COPY_OUTCOME_TITLES: Record<string, string> = {
   collision: "Already there, and different",
   copied: "Copied and verified",
   identical: "Already identical",
+  skipped: "Outside the date window",
 };
 
 const COPY_OUTCOME_COUNTS: Record<string, string> = {
@@ -671,6 +675,7 @@ const COPY_OUTCOME_COUNTS: Record<string, string> = {
   collision: "left untouched",
   copied: "copied and verified",
   identical: "already identical",
+  skipped: "skipped",
 };
 
 /**
@@ -681,6 +686,7 @@ const COPY_OUTCOME_COUNTS: Record<string, string> = {
 const COPY_OUTCOME_NOTES: Record<string, string> = {
   collision: `A file of the same name is already at the destination and its contents differ. keeper left it exactly as it was; turn on ${COPY_REPLACE_LABEL} to overwrite it on the next copy.`,
   identical: "The destination already held these bytes, so nothing was written.",
+  skipped: "The source modification time is outside the chosen date window; nothing was copied.",
 };
 
 /** Decimal size units, counted the way a file manager counts them. */
@@ -1417,19 +1423,21 @@ function SyncDeliveryMark({
 
   return (
     <Popover>
-      <PopoverTrigger asChild>
-        {/* Named the way the folder-path button is named: what the glyph shows
+      <IconHint label={`${SYNC_DELIVERY_DETAIL_LABEL}: ${row.path}`}>
+        <PopoverTrigger asChild>
+          {/* Named the way the folder-path button is named: what the glyph shows
             is a state, which does not say that activating it explains the
             state — so the accessible name carries that, and the path, because
             a card holds as many of these as it holds rows. */}
-        <button
-          type="button"
-          aria-label={`${SYNC_DELIVERY_DETAIL_LABEL}: ${row.path}`}
-          className="flex shrink-0 items-center rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          {glyph}
-        </button>
-      </PopoverTrigger>
+          <button
+            type="button"
+            aria-label={`${SYNC_DELIVERY_DETAIL_LABEL}: ${row.path}`}
+            className="flex shrink-0 items-center rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {glyph}
+          </button>
+        </PopoverTrigger>
+      </IconHint>
       <PopoverContent align="end" className="gap-2">
         <PopoverHeader>
           {/* The row truncates the path to fit beside the figures; this is the
@@ -1756,6 +1764,8 @@ function CopyCard() {
   const [source, setSource] = useState("");
   const [destination, setDestination] = useState("");
   const [replaceExisting, setReplaceExisting] = useState(false);
+  const [modifiedAfterMs, setModifiedAfterMs] = useState<number | null>(null);
+  const [modifiedBeforeMs, setModifiedBeforeMs] = useState<number | null>(null);
   const fieldId = useId();
 
   const job = useCopyJobStore((state) => state.job);
@@ -1892,6 +1902,45 @@ function CopyCard() {
           </p>
         </div>
         <div className="flex flex-col gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-modified-from`}>Modified from</Label>
+            <Input
+              id={`${fieldId}-modified-from`}
+              type="date"
+              className="w-56 shrink-0"
+              disabled={running}
+              value={
+                modifiedAfterMs === null ? "" : new Date(modifiedAfterMs).toISOString().slice(0, 10)
+              }
+              onChange={(event) =>
+                setModifiedAfterMs(event.target.value === "" ? null : event.target.valueAsNumber)
+              }
+            />
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-modified-before`}>Modified before</Label>
+            <Input
+              id={`${fieldId}-modified-before`}
+              type="date"
+              className="w-56 shrink-0"
+              disabled={running}
+              value={
+                modifiedBeforeMs === null
+                  ? ""
+                  : new Date(modifiedBeforeMs).toISOString().slice(0, 10)
+              }
+              onChange={(event) =>
+                setModifiedBeforeMs(event.target.value === "" ? null : event.target.valueAsNumber)
+              }
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">
+            Optional source modification dates, at midnight UTC: from is inclusive; before is
+            exclusive. Leave either empty for no bound. Files outside the window are reported as
+            skipped.
+          </p>
+        </div>
+        <div className="flex flex-col gap-2">
           {/* The claim first, in the card's own voice, then the limit on it —
               two stacked muted lines would read as one grey block with neither
               of them landing. */}
@@ -1911,7 +1960,13 @@ function CopyCard() {
               size="sm"
               disabled={running || source === "" || destination === ""}
               onClick={() => {
-                void startCopyJob(source, destination, replaceExisting);
+                void startCopyJob(
+                  source,
+                  destination,
+                  replaceExisting,
+                  modifiedAfterMs,
+                  modifiedBeforeMs,
+                );
               }}
             >
               {COPY_SUBMIT_LABEL}

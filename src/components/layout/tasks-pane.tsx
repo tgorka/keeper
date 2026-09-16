@@ -105,10 +105,22 @@
  * {@link TaskDetail}, this file's own component, with its write half switched
  * off; see that component's header for why the pane stays the only writer.
  */
-import { ChevronRight, ListChecks } from "lucide-react";
+import {
+  ChevronRight,
+  Info,
+  ListChecks,
+  MoreHorizontal,
+  Pause,
+  Play,
+  Plus,
+  RefreshCw,
+  Trash2,
+} from "lucide-react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { FoldToggle, useFold } from "@/components/layout/list-fold";
+import { PANE_HEADER_GAP_PX, PaneHeader } from "@/components/layout/pane-header";
+import { type PriorityAction, PriorityActions } from "@/components/layout/priority-actions";
 import { useSurfaceColumn } from "@/components/layout/surface-column";
 // `TASK_HOST_WIDE_TEXT` is the form's rather than this file's: the picker's
 // first option and this pane's folder column are one fact, and the dependency
@@ -128,7 +140,14 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { IconHint } from "@/components/ui/tooltip";
 import { columnMinWidth } from "@/lib/column-widths";
 import { type CountNoun, countLabel, RUNS } from "@/lib/count-label";
 import type {
@@ -176,10 +195,8 @@ export const TASKS_PANE_SUBTITLE =
  * - It does **not move the schedule**. Somebody asking for a run now is not
  *   asking to skip tonight's.
  *
- * Sited on the pane rather than as a per-row tooltip: this is one fact about the
- * verb, not per-row state, and `PACED_SUBTITLE` set the precedent that a fact
- * worth knowing is said in words rather than left to be inferred from an
- * absence.
+ * Sited in the header's info hint alongside the pane description (AD-240).
+ * The explanation stays reachable without claiming pixels from the identity.
  */
 export const TASKS_RUN_NOW_SENTENCE =
   "Run now performs the work immediately, whether or not a window is open — and it does not move the schedule.";
@@ -458,6 +475,12 @@ export const TASKS_DETAIL_MIN_WIDTH_PX = 360;
  * sidebar is collapsed, and 48 + 240 + 360 + 280 = 928.
  */
 export const TASKS_PANE_MIN_WIDTH_PX = columnMinWidth("tasks-list") + TASKS_DETAIL_MIN_WIDTH_PX;
+
+/** Fixed icon squares and padding, shared by the rendered header and its floor guard. */
+export const TASKS_HEADER_CONTROL_PX = 32;
+export const TASKS_HEADER_PADDING_CLASS = "px-[24px]";
+export const TASKS_HEADER_FIXED_WIDTH_PX = 3 * TASKS_HEADER_CONTROL_PX + 2 * PANE_HEADER_GAP_PX;
+export const TASKS_MORE_ACTIONS_LABEL = "More task actions";
 
 /**
  * How many projected paced rows rest on screen (Story 59.13).
@@ -1519,6 +1542,10 @@ export function TaskDetail({
   const busy = verbs !== null && (verbs.writing || verbs.deleting);
   const unhosted = task.host.kind === "unhosted";
   const report = taskReportText(task.lastRun);
+  const neverRanText =
+    task.lastRun === null && task.nextDueMs !== null && task.nextDueMs > now
+      ? `not yet — first window ${formatTaskDue(task.nextDueMs, now)}`
+      : TASK_NEVER_RAN_TEXT;
   // Names the region the disclosure genuinely opens, which this project treats
   // as a requirement rather than a nicety (`sidebar-pane.tsx`, `note-editor.tsx`
   // and two guard tests): `aria-expanded` alone announces "collapsed" and gives
@@ -1621,14 +1648,15 @@ export function TaskDetail({
         <Field label={TASK_SCHEDULE_LABEL}>{task.schedule ?? TASK_NO_SCHEDULE_TEXT}</Field>
         <Field label={TASK_NEXT_DUE_LABEL}>{formatTaskDue(task.nextDueMs, now)}</Field>
         <Field label={TASK_LAST_RUN_LABEL}>
-          {task.lastRun === null ? TASK_NEVER_RAN_TEXT : formatTaskAgo(task.lastRun.startedMs, now)}
+          {task.lastRun === null ? neverRanText : formatTaskAgo(task.lastRun.startedMs, now)}
         </Field>
-        <Field label={TASK_LAST_OUTCOME_LABEL}>{taskOutcomeText(task.lastRun)}</Field>
+        <Field label={TASK_LAST_OUTCOME_LABEL}>
+          {task.lastRun === null ? neverRanText : taskOutcomeText(task.lastRun)}
+        </Field>
         {/* Absence, never an empty cell and never a sentence this file invented.
             The states that arrive with no report are all already named by a cell
-            beside this one: `lastRun === null` — never ran, and a third copy of
-            that one fact is exactly what the refusal test's *never run appears
-            twice* count protects; an in-flight run, whose row `claim_task` opens
+            beside this one: `lastRun === null` — no run yet; an in-flight run,
+            whose row `claim_task` opens
             with `detail` unset, so it has reported nothing yet; and a reclaimed
             lease, which both `claim_task` and `release_host_leases` write as
             `abandoned` without touching `detail` — so nothing here is a failed
@@ -2860,6 +2888,40 @@ export function TasksPane() {
     ],
   });
 
+  const headerHint = [
+    TASKS_PANE_SUBTITLE,
+    ...(listing !== null && listing.tasks.length > 0 ? [TASKS_RUN_NOW_SENTENCE] : []),
+  ].join(" ");
+  const bulkActions: PriorityAction[] =
+    selection.length === 0
+      ? []
+      : [
+          {
+            id: "enable",
+            label: TASKS_BULK_ENABLE_TEXT,
+            icon: Play,
+            disabled: bulkWriting,
+            onSelect: () => void setSelectionEnabled(true),
+          },
+          {
+            id: "disable",
+            label: TASKS_BULK_DISABLE_TEXT,
+            icon: Pause,
+            disabled: bulkWriting,
+            onSelect: () => void setSelectionEnabled(false),
+          },
+          {
+            id: "forget",
+            label: TASKS_BULK_FORGET_TEXT,
+            icon: Trash2,
+            disabled: bulkWriting,
+            onSelect: () => {
+              setForgetSubject({ kind: "several", ids: selection.map((row) => row.id) });
+              setForgetAsking(true);
+            },
+          },
+        ];
+
   return (
     <section
       aria-label={TASKS_PANE_TITLE}
@@ -2885,108 +2947,107 @@ export function TasksPane() {
       style={{ flexBasis: TASKS_PANE_MIN_WIDTH_PX, minWidth: TASKS_PANE_MIN_WIDTH_PX }}
       className="flex shrink grow flex-col border-border border-r bg-background last:border-r-0"
     >
-      <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
-        <div className="min-w-0">
-          <h1 className="font-heading text-title">{TASKS_PANE_TITLE}</h1>
-          <p className="text-muted-foreground text-sm">{TASKS_PANE_SUBTITLE}</p>
-          {/* Rendered only when there is a row it could apply to: a sentence
-              about a button nobody can see yet is noise, and the empty state
-              already carries its own three-part explanation. */}
-          {listing !== null && listing.tasks.length > 0 && (
-            <p className="text-muted-foreground text-xs">{TASKS_RUN_NOW_SENTENCE}</p>
-          )}
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          {/* The bulk verbs, and they exist only when there is a selection to
-              act on (Story 59.4). Absent rather than disabled, which is
-              `files-pane.tsx:2989`'s gate: a disabled control says *not now*,
-              and with nothing selected the truth is *there is nothing to do
-              this to*.
-
-              Sited in the header because the header sits above BOTH columns and
-              does not fold — and because 45.3's rule is that *a per-row Delete
-              button cannot answer "and the other four"*. That is also what keeps
-              Story 59.1's no-control-on-the-row invariant intact. */}
-          {selection.length > 0 && (
-            <>
-              {/* A COUNT, not a sentence beside buttons — the app's own chip,
-                  `files-pane.tsx:3003`'s treatment: the figure is what is drawn
-                  and the words are what is announced. `role="status"` earns its
-                  live region here, because the number changes under the
-                  reader's own clicks; it is also what makes the name reachable
-                  at all, since an `aria-label` on a role-less `span` reaches a
-                  screen reader not at all. */}
+      <PaneHeader
+        className={TASKS_HEADER_PADDING_CLASS}
+        identity={
+          <>
+            <h1 className="truncate font-heading text-title">{TASKS_PANE_TITLE}</h1>
+            <IconHint label={headerHint}>
+              <Button type="button" variant="ghost" size="icon-sm" aria-label={headerHint}>
+                <Info aria-hidden="true" />
+              </Button>
+            </IconHint>
+            {selection.length > 0 && (
               <Badge
                 variant="secondary"
                 role="status"
                 data-testid={TASKS_SELECTED_TESTID}
                 aria-label={tasksSelectionSentence(selection.length)}
-                title={tasksSelectionSentence(selection.length)}
                 className="figures"
               >
                 {selection.length}
               </Badge>
-              {/* All three disabled while a batched call is outstanding — see
-                  `bulkWriting`. Two rapid clicks would otherwise carry the same
-                  pre-bump baselines and the second would be refused `changed
-                  elsewhere` for every id, by the first's own write. */}
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={bulkWriting}
-                onClick={() => void setSelectionEnabled(true)}
-              >
-                {TASKS_BULK_ENABLE_TEXT}
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={bulkWriting}
-                onClick={() => void setSelectionEnabled(false)}
-              >
-                {TASKS_BULK_DISABLE_TEXT}
-              </Button>
-              {/* Asked before anything goes, exactly as the row's own Forget is:
-                  a destructive verb over a set with no confirmation is worse
-                  than the single-id one it stands in for, not better. The
-                  question names the COUNT — see `tasksForgetConfirmTitle`. */}
-              <Button
-                type="button"
-                variant="destructive"
-                size="sm"
-                disabled={bulkWriting}
-                onClick={() => {
-                  setForgetSubject({ kind: "several", ids: selection.map((row) => row.id) });
-                  setForgetAsking(true);
-                }}
-              >
-                {TASKS_BULK_FORGET_TEXT}
-              </Button>
-            </>
-          )}
-          {/* The action and the thing it reveals are worded identically
-              (`add-folder-form.tsx`'s rule): a button called something else
-              would be a second name for one form. Disabled while a save is in
-              flight, because pressing it then unmounts the form Rust's answer
-              has to land in — see `formSaving`. */}
-          <Button
-            ref={addTriggerRef}
-            type="button"
-            variant="outline"
-            size="sm"
-            aria-expanded={adding}
-            disabled={formSaving}
-            onClick={() => setAdding((open) => !open)}
-          >
-            {TASK_FORM_ADD_TITLE}
-          </Button>
-          <Button type="button" variant="outline" size="sm" onClick={() => void refresh()}>
-            {TASK_REFRESH_TEXT}
-          </Button>
-        </div>
-      </header>
+            )}
+          </>
+        }
+        actions={(budget) => (
+          <PriorityActions
+            budget={budget}
+            items={bulkActions}
+            leading={
+              <div className="flex items-center" style={{ gap: PANE_HEADER_GAP_PX }}>
+                <IconHint label={TASK_FORM_ADD_TITLE}>
+                  <Button
+                    ref={addTriggerRef}
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    style={{ width: TASKS_HEADER_CONTROL_PX }}
+                    aria-label={TASK_FORM_ADD_TITLE}
+                    aria-expanded={adding}
+                    disabled={formSaving}
+                    onClick={() => setAdding((open) => !open)}
+                  >
+                    <Plus aria-hidden="true" />
+                  </Button>
+                </IconHint>
+                <IconHint label={TASK_REFRESH_TEXT}>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    style={{ width: TASKS_HEADER_CONTROL_PX }}
+                    aria-label={TASK_REFRESH_TEXT}
+                    onClick={() => void refresh()}
+                  >
+                    <RefreshCw aria-hidden="true" />
+                  </Button>
+                </IconHint>
+              </div>
+            }
+            menu={(inMenu) => (
+              <DropdownMenu>
+                <IconHint label={TASKS_MORE_ACTIONS_LABEL}>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      style={{ width: TASKS_HEADER_CONTROL_PX }}
+                      aria-label={TASKS_MORE_ACTIONS_LABEL}
+                    >
+                      <MoreHorizontal aria-hidden="true" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                </IconHint>
+                <DropdownMenuContent align="end">
+                  {bulkActions.map((action) =>
+                    inMenu(action.id) ? (
+                      <DropdownMenuItem
+                        key={action.id}
+                        disabled={action.disabled}
+                        variant={action.id === "forget" ? "destructive" : "default"}
+                        onSelect={action.onSelect}
+                      >
+                        {action.label}
+                      </DropdownMenuItem>
+                    ) : null,
+                  )}
+                  <DropdownMenuItem
+                    disabled={formSaving}
+                    onSelect={() => setAdding((open) => !open)}
+                  >
+                    {TASK_FORM_ADD_TITLE}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => void refresh()}>
+                    {TASK_REFRESH_TEXT}
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+          />
+        )}
+      />
 
       {/* Pane-level facts, above both levels and spanning them: a listing that
           would not read and a refusal with nowhere to be drawn are about the

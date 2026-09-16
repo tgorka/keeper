@@ -298,14 +298,25 @@ pub struct BotTaskSpec {
     pub profile_id: String,
     /// The bot to ask, as stored on the row.
     pub bot_id: String,
-    /// The model to send as, or `None` for the runner's own default rule (the
-    /// conversation's, then the provider's, then the first offered).
+    /// The model to send as. There is no fallback rule: an absent model is
+    /// refused with "this bot task names no model; set the task's model before
+    /// running it" rather than sent with a provider-chosen one (AD-244).
     pub model: Option<String>,
     /// The prompt file, profile-relative, as stored on the row.
     pub prompt_subpath: String,
     /// The prompt file's text, frontmatter included.
     pub prompt_text: String,
 }
+
+/// The mark a [`BotRunRecord::warnings`] entry carries when a tool call was
+/// declined rather than merely remarked on.
+///
+/// Both sides of the port agree on it: the runner writes it into the sentence
+/// it composes for a refusal, and the engine counts it when it folds the
+/// record into one line. A separate field would be cleaner and is what Story
+/// 69.5's log should take when it arrives; until then this keeps the count
+/// honest with one string instead of a second vector.
+pub const TOOL_REFUSED_MARK: &str = " refused: ";
 
 /// What one bot run produced (Epic 69, Story 69.4; written into the session
 /// by Story 69.5).
@@ -332,6 +343,12 @@ pub struct BotRunRecord {
     /// Things worth a person's eye that did not stop the run: a model that
     /// answered under a different name, a refused tool call, a truncated
     /// answer.
+    ///
+    /// A warning about a **declined tool call** contains
+    /// [`TOOL_REFUSED_MARK`], and that is a contract rather than a convention:
+    /// an unattended run has no approver, so every `Ask` becomes a refusal
+    /// (AD-244) and the one line a person reads has to be able to say how many
+    /// of these there were without mistaking a model's rename for one.
     pub warnings: Vec<String>,
     /// Why it failed, when it did — the stream's own credential-free
     /// sentences, in order.

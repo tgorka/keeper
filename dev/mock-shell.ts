@@ -65,6 +65,7 @@ import type {
   BotStreamEvent,
   BotVm,
   CapabilitiesVm,
+  CopyJobVm,
   DocumentVm,
   FileSizeVm,
   FilesEntrySyncVm,
@@ -1791,9 +1792,29 @@ const TASK_RUNS: Record<string, TaskRunVm[]> = {
   ],
 };
 
+/**
+ * The eight per-kind fields a `sync`, `release`, `verify` or `gc` row leaves
+ * empty (Story 72.7).
+ *
+ * Every key exists on every kind on the wire, so a fixture that omitted them
+ * would be a shape the shell never sends — and the point of this harness is to
+ * answer exactly what the shell answers.
+ */
+const NO_KIND_PAYLOAD = {
+  botId: null,
+  promptSubpath: null,
+  model: null,
+  copySource: null,
+  copyDestination: null,
+  replaceExisting: false,
+  modifiedAfterMs: null,
+  modifiedBeforeMs: null,
+} satisfies Partial<TaskVm>;
+
 const TASKS: TaskVm[] = [
   {
     id: "01JNIGHTLYSYNCAAAAAAAAAAAA",
+    ...NO_KIND_PAYLOAD,
     kind: "sync",
     mode: "scheduled",
     enabled: true,
@@ -1812,6 +1833,7 @@ const TASKS: TaskVm[] = [
   },
   {
     id: "01JRELEASESWEEPBBBBBBBBBBB",
+    ...NO_KIND_PAYLOAD,
     kind: "release",
     mode: "scheduled",
     enabled: true,
@@ -1841,6 +1863,7 @@ const TASKS: TaskVm[] = [
   },
   {
     id: "01JLOGROTATEFFFFFFFFFFFFFF",
+    ...NO_KIND_PAYLOAD,
     kind: "release",
     mode: "scheduled",
     enabled: true,
@@ -1870,6 +1893,7 @@ const TASKS: TaskVm[] = [
   },
   {
     id: "01JVAULTPUSHCCCCCCCCCCCCCC",
+    ...NO_KIND_PAYLOAD,
     kind: "sync",
     mode: "scheduled",
     enabled: true,
@@ -1891,6 +1915,7 @@ const TASKS: TaskVm[] = [
   },
   {
     id: "01JARCHIVETRIMDDDDDDDDDDDD",
+    ...NO_KIND_PAYLOAD,
     kind: "release",
     mode: "manual",
     enabled: true,
@@ -1911,6 +1936,7 @@ const TASKS: TaskVm[] = [
   },
   {
     id: "01JORPHANEDTASKEEEEEEEEEEE",
+    ...NO_KIND_PAYLOAD,
     kind: "sync",
     mode: "scheduled",
     enabled: true,
@@ -1939,6 +1965,7 @@ const TASKS: TaskVm[] = [
   },
   {
     id: "01JPAUSEDSWEEPFFFFFFFFFFFF",
+    ...NO_KIND_PAYLOAD,
     kind: "release",
     mode: "off",
     enabled: true,
@@ -2885,7 +2912,61 @@ let autoUpdate: AutoUpdateVm = {
   restartCheckIntervalMs: 60_000,
 };
 
+// A browser has no filesystem. These are explicitly fixture files, dated on
+// either side of a day boundary so the date controls can be exercised honestly.
+const COPY_FIXTURES = [
+  { path: "mock-old.txt", bytes: 32, mtimeMs: Date.UTC(2026, 8, 14) },
+  { path: "mock-new.txt", bytes: 64, mtimeMs: Date.UTC(2026, 8, 16) },
+];
+const copyJobs = new Map<string, CopyJobVm>();
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  copy_start: (payload) => {
+    const source = String(payload.source ?? "");
+    const destination = String(payload.destination ?? "");
+    if (source === "" || destination === "") {
+      throw {
+        code: "internal",
+        message: "Choose a source and a destination.",
+        accountId: null,
+        retriable: false,
+      };
+    }
+    const after = typeof payload.modifiedAfterMs === "number" ? payload.modifiedAfterMs : null;
+    const before = typeof payload.modifiedBeforeMs === "number" ? payload.modifiedBeforeMs : null;
+    const entries = COPY_FIXTURES.map((file) => {
+      const skipped =
+        (after !== null && file.mtimeMs < after) || (before !== null && file.mtimeMs >= before);
+      return {
+        path: file.path,
+        bytes: skipped ? 0 : file.bytes,
+        outcome: skipped ? "skipped" : "copied",
+        reason: skipped ? "Source modification time is outside the chosen date window." : null,
+      };
+    });
+    const id = `mock-copy-${copyJobs.size + 1}`;
+    const bytes = entries.reduce((sum, entry) => sum + entry.bytes, 0);
+    copyJobs.set(id, {
+      id,
+      source,
+      destination,
+      state: "done",
+      filesDone: entries.length,
+      filesTotal: entries.length,
+      bytesDone: bytes,
+      bytesTotal: bytes,
+      current: null,
+      entries,
+      error: null,
+    });
+    return id;
+  },
+  copy_status: (payload) => {
+    const job = copyJobs.get(String(payload.id));
+    if (!job)
+      throw { code: "not_found", message: "No such copy job.", accountId: null, retriable: false };
+    return job;
+  },
   auto_update_get: () => autoUpdate,
   // Always a hold, never a verdict to restart: a harness that answered
   // `restart: true` would relaunch the dev page out from under whoever is
@@ -3428,6 +3509,37 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   },
   sync_task_save: (payload) => {
     const req = payload.req as TaskSaveReq;
+    const id = req.id === "" ? `01JMOCKSAVED${TASKS.length}` : req.id;
+    if (req.mode === "scheduled" && req.schedule === null) {
+      throw {
+        code: "internal",
+        message: `task '${id}' is scheduled with no schedule: it would report itself enabled and never run`,
+        accountId: null,
+        retriable: false,
+      };
+    }
+    const missing =
+      req.kind === "bot"
+        ? !req.botId
+          ? "a bot"
+          : !req.promptSubpath
+            ? "a prompt file"
+            : null
+        : req.kind === "copy"
+          ? !req.copySource
+            ? "a source path"
+            : !req.copyDestination
+              ? "a destination path"
+              : null
+          : null;
+    if (missing !== null) {
+      throw {
+        code: "internal",
+        message: `task '${id}' is a ${req.kind} task, so it needs ${missing}: choose one before saving`,
+        accountId: null,
+        retriable: false,
+      };
+    }
     const existing = TASKS.find((candidate) => candidate.id === req.id);
     // The lost-update refusal, mirrored so the flow worth looking at is
     // reachable in the dev shell: a form that seeded from a reading somebody
@@ -3470,12 +3582,20 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     const prior = existing ?? TASKS[0];
     const saved: TaskVm = {
       ...prior,
-      id: req.id === "" ? `01JMOCKSAVED${TASKS.length}` : req.id,
+      id,
       kind: req.kind,
       mode: req.mode,
       enabled: req.enabled,
       profileId: req.profileId,
       schedule: req.schedule,
+      botId: req.botId,
+      promptSubpath: req.promptSubpath,
+      model: req.model,
+      copySource: req.copySource,
+      copyDestination: req.copyDestination,
+      replaceExisting: req.replaceExisting,
+      modifiedAfterMs: req.modifiedAfterMs,
+      modifiedBeforeMs: req.modifiedBeforeMs,
       // Echoed verbatim, `""` included: the real store keeps a blank a person
       // typed apart from a description that was never there, so a mock that
       // collapsed them would hide the one case the view has to render as absence.
