@@ -6249,6 +6249,27 @@ reason: the session `40-media/recordings/2026/2026-09-15 14.29 mounica-sync` car
 status: fixed
 resolution: story 73.6 / AD-250 — `folder_holds_pointer_segments` makes recovery skip a session this machine does not hold (`recording.rs`), the discard arm refuses a pointer `.partial`, and `reconcile_from_dir` reads the pointer's own `size` line so a manifest stays truthful on a clone that holds no bytes. Four tests, each proved by mutation. Field repair on hesperia the same day: the truthful manifest restored from the conflict copy after gating it against the four files on disk, both conflict copies dropped, keeper committed (`71f07ccb2` 2 deleted, `1e513304b` 1 modified) and pushed, both clones converged on `1e513304b` with zero conflict copies and clean status, and the archive index rebuilt on the next app start so `ended_ts` and the four segment sizes are right in `archive.db` too.
 
+### DW-257: The copy kind's add form still overflows a 650 px region at 1024 px wide.
+
+origin: story 74.1's own real-browser measurement, 2026-09-17
+location: `src/components/sync/task-form.tsx` (the copy fieldset), measured through `dev/probe` over tunnelled CDP
+reason: story 74.1 took the nine standing note paragraphs out of the form's flow and deleted the two date inputs, which took the default kind from 1042 px to 456 px at 1568 px and from 1356 px to 576 px at 1024 px — every kind now fits a 900 px-tall window at both widths. The copy kind is still the tallest by 161 px: 617 px at 1568 (fits a 650 px region) and 737 px at 1024 (does not), because its fieldset carries four more rows than any other kind and each row costs ~44 px once it wraps at 1024. Removing the date pair already took 389 px out of it. The remedies are a density pass over the source/destination rows or a collapsed section, and both are decisions story 74.1's Approach deliberately does not carry — guessing at one would have put a second scroll or a fold into a surface the epic protects.
+status: open
+
+### DW-258: The task ledger folder has no picker and no machine-local selector.
+
+origin: story 74.3, 2026-09-17
+location: `crates/keeper/src/sync_ipc.rs` (the folder-edit request's per-feature fields, ~1115-1171), `src/components/settings/**`, `keeper-core/src/config/keys.rs`
+reason: AD-251 says the ledger is chosen "the same way the notes vault is", and the *mechanism* half shipped: `[folder.tasks] subfolder` on the profile, validated like `NotesConfig`, travelling in the folder file, and read by the engine. What did not ship is the discoverability half — the `notes`/`recordings`/`sessions` trio in the folder-edit IPC has no `tasks` sibling, so today the flag is reachable only by editing `.keeper/keeper.toml` by hand, and the machine-local `tasks.ledger_vault` key (the twin of `notes.active_vault`) does not exist. Until then a copy task on a machine whose folder file was never edited keeps no mark and walks its whole source every pass, which is exactly the behaviour epic 74 set out to end. The shell half is macOS-CI-gated.
+status: open
+
+### DW-259: Story 74.6 — a run is still not a list you can open, and paced work still shows no configuration.
+
+origin: epic 74's plan, 2026-09-17
+location: `src/components/layout/tasks-pane.tsx:1178-1316` (the runs disclosure), `src/lib/stores/panels.ts:270-295` (the panel target kinds), `crates/keeper/src/sync_ipc.rs:2234-2282` (`syncPacedWork`)
+reason: the epic's sixth story is specified (`spec-74-6-runs-are-a-list-you-can-open.md`) with its acceptance list, and deliberately not built in this pass. Runs now carry why-and-how-late and render it (74.5), but a run row is still not clickable, `sameTarget` still knows only `note|file|recording|task`, no run-detail surface exists, and a paced row still shows a cadence sentence rather than its configuration. The measured constraint the story must respect is in its spec: Tasks already spends four columns and ~1 470 px of the owner's 1 568, so the drill-down belongs in the panel strip and not in a fifth fixed column.
+status: open
+
 ## Triage of 2026-09-17
 
 Six read-only lanes verified every open entry of this ledger against the tree on 2026-09-17 (epic 73, story 73.5). This section is the triage's result; the next planning session reads this, not the six agent reports.
