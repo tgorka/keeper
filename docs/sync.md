@@ -2146,7 +2146,7 @@ A task's `kind` is one of keeper's own verbs, never a shell string:
 | `verify` | one verification pass over the named folder, or over every enabled folder — the same body `keeper-syncd verify` runs, reading only: no worktree file is written, no object is added to the store, and no network is asked |
 | `bot` | one question, asked of one bot: the prompt is any markdown file under the named folder, resolved through the same containment every other path uses. Frontmatter and one leading heading are omitted; the remaining text reaches the model verbatim. Existing grants govern every tool call; unattended asks are refused, never approved by the schedule. |
 | `gc` | one `git gc --quiet` over the named folder's repository, or over every enabled folder — the shim verb AD-41 admitted and nothing then called. Runs in a quiet window: it takes the folder's reservation (no sync pass) and its walk claim (no status walk), and answers `busy` when either is held. Keeper seeds one per desktop folder (`gc-<id>`, `every 7d`, `run_now`) once; a deleted row stays deleted. A phone seeds none and refuses a hand-written one with its own sentence. The run's detail carries the loose-object count before and after. |
-| `copy` | one verified local copy job between two absolute paths, optionally bounded by source modification time; no profile, journal entry, relationship, or deletion propagation |
+| `copy` | one verified local copy job between two absolute paths, bounded below by the **mark** the last successful run left — so a repeated copy carries what changed and nothing else; no profile, journal entry, relationship, or deletion propagation |
 
 `sync`, `release` and `verify` reuse the existing implementation rather than gaining a second one,
 which is what makes "a task is not a privileged caller" true rather than
@@ -2156,18 +2156,42 @@ moment of the deletion, and honours the pin, the per-file deadline and both
 budgets.
 
 A copy task stores native-picker paths verbatim and runs the same verified job
-as **Copy files once**. `replace_existing` defaults to false. The optional
-`modified_after_ms` bound is inclusive and `modified_before_ms` is exclusive,
-both in epoch milliseconds. Files outside the window are named **skipped** in
-the report and remain in its file total; directories are always recreated.
-With bounds active, an unreadable modification time is explicitly skipped,
-never silently admitted. Each run leaves its per-file copy log in the
-destination and stores bytes and file counts in task history. This is a
-schedule over independent jobs, not date-filtered git sync.
+as **Copy files once**. `replace_existing` defaults to false.
+
+**What a repeated copy copies: everything newer than its mark.** Each
+successful run leaves a file in the task's ledger folder whose *name* carries
+the newest source modification time that run covered (§21). The next run reads
+that name and copies only sources modified strictly after it — exclusive,
+because the instant in the name was already covered. Three rules make the line
+trustworthy:
+
+* a run that failed or only partly succeeded leaves a name that **does not**
+  advance the mark, so the next run looks again at everything it did;
+* the mark is the newest mtime the run *covered*, never the clock at the end of
+  it — a file written while the walk was running is older than that clock, and a
+  clock mark would put it behind the line and skip it forever;
+* the name also carries a fingerprint of the task's configuration, so
+  re-pointing a copy task at another source or destination makes every earlier
+  mark inapplicable and the next pass a full one.
+
+A file behind the mark is **absent from the report** rather than listed as
+skipped: an incremental pass over a large tree is mostly such files, and one
+line each would bury the handful that matter — the run that did copy it holds
+its line, in its own ledger file. Directories are always recreated. A file
+whose modification time cannot be read is copied rather than skipped (the
+verified copy is idempotent, and a file keeper cannot date is not a file it may
+silently drop). Each run still leaves its per-file copy log in the destination,
+and the same text is the body of the ledger entry. This is a schedule over
+independent jobs, not date-filtered git sync.
+
+There is no typed date window. `modified_after_ms`/`modified_before_ms` and the
+`--modified-after-ms`/`--modified-before-ms` flags were removed in epic 74
+(AD-256 rescinding AD-245): a date a person maintains answers "what did I ask
+for", while the question a repeated copy actually has is "what has not been
+copied yet", and only keeper can answer that.
 
 The CLI accepts `tasks set <id> --kind copy --copy-source <absolute-path>
---copy-destination <absolute-path>`, with optional `--replace-existing true`,
-`--modified-after-ms <epoch-ms>` and `--modified-before-ms <epoch-ms>`.
+--copy-destination <absolute-path>`, with optional `--replace-existing true`.
 
 ### The schedules offered on a desktop host
 

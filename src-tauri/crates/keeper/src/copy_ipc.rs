@@ -207,7 +207,6 @@ fn entry_vm(entry: &keeper_sync::copy::CopyEntry) -> CopyEntryVm {
         CopyOutcome::Copied => ("copied", None),
         CopyOutcome::Identical => ("identical", None),
         CopyOutcome::Collision => ("collision", None),
-        CopyOutcome::Skipped { reason } => ("skipped", Some(reason.clone())),
         CopyOutcome::Failed { reason } => ("failed", Some(reason.clone())),
     };
     CopyEntryVm {
@@ -245,8 +244,6 @@ pub async fn copy_start(
     source: String,
     destination: String,
     replace_existing: Option<bool>,
-    modified_after_ms: Option<i64>,
-    modified_before_ms: Option<i64>,
 ) -> Result<String, IpcError> {
     let source = PathBuf::from(&source);
     let destination = PathBuf::from(&destination);
@@ -293,8 +290,10 @@ pub async fn copy_start(
     let (id, cancel) = registry.register(source.clone(), destination.clone());
     let options = CopyOptions {
         replace_existing: replace_existing.unwrap_or(false),
-        modified_after_ms,
-        modified_before_ms,
+        // A one-shot copy has no previous run to inherit a mark from, and a
+        // typed date window is what AD-256 removed: a person pressing "Copy
+        // files once" is asking for this tree, now.
+        modified_since_ms: None,
     };
 
     let job_id = id.clone();

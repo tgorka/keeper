@@ -32,7 +32,17 @@ enabled: boolean,
 /**
  * The profile this task is scoped to, `null` for host-wide work.
  */
-profileId: string | null, botId: string | null, promptSubpath: string | null, model: string | null, copySource: string | null, copyDestination: string | null, replaceExisting: boolean, modifiedAfterMs: number | null, modifiedBeforeMs: number | null, 
+profileId: string | null, botId: string | null, promptSubpath: string | null, model: string | null, copySource: string | null, copyDestination: string | null, replaceExisting: boolean, 
+/**
+ * The mark the last successful run left, epoch ms, `null` when this task
+ * has no ledger entry yet (Story 74.4, AD-252).
+ *
+ * Read from the run ledger's file **names**, never typed by a person: a
+ * date window the operator had to maintain was AD-245, rescinded by
+ * AD-256. The copy's lower bound is what keeper measured, not what
+ * somebody remembered.
+ */
+markMs: number | null, 
 /**
  * That profile's human name, `null` when the id names no current profile —
  * which is exactly the "folder is gone" fact [`task_host`] acts on.

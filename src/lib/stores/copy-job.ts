@@ -212,19 +212,13 @@ export async function startCopyJob(
   source: string,
   destination: string,
   replaceExisting: boolean,
-  modifiedAfterMs: number | null = null,
-  modifiedBeforeMs: number | null = null,
 ): Promise<void> {
   if (isCopyRunning(copyJobStore.getState())) {
     return;
   }
   copyJobStore.getState().begin();
   try {
-    copyJobStore
-      .getState()
-      .started(
-        await copyStart(source, destination, replaceExisting, modifiedAfterMs, modifiedBeforeMs),
-      );
+    copyJobStore.getState().started(await copyStart(source, destination, replaceExisting));
   } catch (raw) {
     copyJobStore.getState().fail(syncErrorMessage(raw, COPY_UNKNOWN_ERROR));
     return;

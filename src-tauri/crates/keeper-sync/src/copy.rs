@@ -140,8 +140,6 @@ pub enum CopyOutcome {
     /// The destination held *different* content and was left exactly as it was.
     /// Only [`CopyOptions::replace_existing`] turns this into a replacement.
     Collision,
-    /// Outside the requested date window, or its modification time is unreadable.
-    Skipped { reason: String },
     /// Nothing was published. `reason` names the file's own problem — a refused
     /// symlink, a source that changed mid-read, a digest that did not match, an
     /// unreadable file — because a count of failures without reasons is not a
@@ -182,6 +180,16 @@ pub struct CopyReport {
     /// the job rather than counted alongside them (AD-C6), so the summary
     /// cannot disagree with the lines it summarizes.
     pub bytes_copied: u64,
+    /// The newest source modification time this job actually covered, epoch
+    /// ms, or `None` when it covered nothing whose mtime could be read
+    /// (Story 74.4, AD-252).
+    ///
+    /// This is the next run's lower bound, and it is deliberately **not** the
+    /// clock at the end of the job: a file written while the walk was running
+    /// is older than that clock, so a clock mark would put it behind the line
+    /// and it would never be copied. A covered-mtime mark can only be too
+    /// small, which costs one extra comparison next time and loses nothing.
+    pub mark_ms: Option<i64>,
 }
 
 /// Choices for one verified copy job.
@@ -192,9 +200,18 @@ pub struct CopyOptions {
     /// bytes have passed verification (AD-C4). Defaults to `false`: the classic
     /// tool that eats the newer file is the failure mode this guards.
     pub replace_existing: bool,
-    /// Inclusive lower and exclusive upper source mtime bounds, in epoch ms.
-    pub modified_after_ms: Option<i64>,
-    pub modified_before_ms: Option<i64>,
+    /// Copy only sources modified **strictly after** this instant, epoch ms
+    /// (Story 74.4, AD-252).
+    ///
+    /// Exclusive, and that is the whole point: the value is a *mark* left by a
+    /// previous run, naming an instant that run already covered. Including it
+    /// would re-copy the newest file of every pass forever.
+    ///
+    /// This replaced the typed `modified_after_ms`/`modified_before_ms` window
+    /// (AD-245, rescinded by AD-256). A date a person maintains answers "what
+    /// did I ask for"; a mark keeper wrote answers "what has not been copied
+    /// yet", which is the question a repeated copy actually has.
+    pub modified_since_ms: Option<i64>,
 }
 
 /// One progress update for a job.
@@ -283,6 +300,7 @@ fn copy_verified_hooked(
     let mut report = CopyReport {
         entries: Vec::with_capacity(plan.files_total as usize),
         bytes_copied: 0,
+        mark_ms: None,
     };
 
     // Publish the totals before any byte moves, so a surface never has to
@@ -302,17 +320,9 @@ fn copy_verified_hooked(
                 std::fs::create_dir_all(&dir)
                     .map_err(|err| SyncError::io("create copy directory", dir, err))?;
             }
-            PlanItem::Skipped { rel, reason } => {
-                report.entries.push(CopyEntry {
-                    path: display(rel),
-                    bytes: 0,
-                    outcome: CopyOutcome::Skipped {
-                        reason: reason.clone(),
-                    },
-                    sha256: None,
-                });
-                reporter.finish(0);
-            }
+            // A file behind the mark is not work and not a line: an earlier
+            // run covered it and its own ledger file says so (Story 74.4).
+            PlanItem::Behind => {}
             PlanItem::Refused { rel, reason } => {
                 report.entries.push(CopyEntry {
                     path: display(rel),
@@ -324,7 +334,11 @@ fn copy_verified_hooked(
                 });
                 reporter.finish(0);
             }
-            PlanItem::File { rel, bytes } => {
+            PlanItem::File {
+                rel,
+                bytes,
+                modified_ms,
+            } => {
                 reporter.begin(display(rel));
                 let src = plan.root.join(rel);
                 let dst = destination.join(rel);
@@ -342,6 +356,18 @@ fn copy_verified_hooked(
                 match step {
                     Step::Cancelled => break,
                     Step::Done(outcome, sha256) => {
+                        // The mark advances only for a file this run really
+                        // accounted for. `Identical` counts — the pass looked
+                        // at it and the destination already held it, which is
+                        // exactly "covered". A failure does not: leaving the
+                        // mark behind it is what makes the next run try again.
+                        if matches!(outcome, CopyOutcome::Copied | CopyOutcome::Identical) {
+                            if let Some(modified) = *modified_ms {
+                                report.mark_ms = Some(
+                                    report.mark_ms.map_or(modified, |mark| mark.max(modified)),
+                                );
+                            }
+                        }
                         report.entries.push(CopyEntry {
                             path: display(rel),
                             bytes: *bytes,
@@ -869,23 +895,31 @@ struct Plan {
 enum PlanItem {
     /// A directory to recreate at the destination. Always precedes everything
     /// inside it, which is what lets the copy skip a `create_dir_all` per file.
-    Dir {
-        rel: PathBuf,
-    },
+    Dir { rel: PathBuf },
     File {
         rel: PathBuf,
         bytes: u64,
+        /// The source's modification time, epoch ms, when the filesystem would
+        /// say. Folded into the run's mark for the files this pass covers
+        /// (Story 74.4), and `None` where the mtime could not be read — which
+        /// is why the mark is an `Option` all the way out: a tree whose times
+        /// cannot be read has no honest high-water line.
+        modified_ms: Option<i64>,
     },
     /// Something this module refuses to copy, carried into the plan so it is
     /// counted in the totals and reported by name instead of vanishing.
-    Refused {
-        rel: PathBuf,
-        reason: String,
-    },
-    Skipped {
-        rel: PathBuf,
-        reason: String,
-    },
+    Refused { rel: PathBuf, reason: String },
+    /// A file an earlier run already covered: older than the mark this run was
+    /// given (Story 74.4, AD-252).
+    ///
+    /// It is not in the totals and not in the report. An incremental pass over
+    /// a large tree is mostly this, and a report with one line per file the run
+    /// deliberately did not look at buries the handful of lines that matter.
+    /// The run that *did* copy it holds its line, in its own ledger file.
+    /// No path: nothing downstream may name it, and that is the invariant
+    /// rather than an omission — a `Behind` item must not be able to leak into
+    /// the report, the progress totals or a log line.
+    Behind,
 }
 
 /// Walk the source and decide, up front, what the job consists of.
@@ -967,9 +1001,13 @@ fn plan_copy(
         items.push(classify(&absolute, rel, content, options)?);
     }
 
+    // Neither a directory (recreated, not copied) nor a file behind the mark
+    // (already accounted for by the run that copied it, Story 74.4) is work
+    // this job will do — and a progress bar whose denominator counts files it
+    // will never touch is a bar that lies from its first frame.
     let files_total = items
         .iter()
-        .filter(|item| !matches!(item, PlanItem::Dir { .. }))
+        .filter(|item| !matches!(item, PlanItem::Dir { .. } | PlanItem::Behind))
         .count() as u64;
     let bytes_total = items
         .iter()
@@ -1012,28 +1050,29 @@ fn classify(
             reason: format!("{}, which cannot be copied", describe_kind(&meta)),
         });
     }
-    if options.modified_after_ms.is_some() || options.modified_before_ms.is_some() {
-        let modified = match meta.modified() {
-            Ok(time) => match time.duration_since(std::time::UNIX_EPOCH) {
-                Ok(duration) => i128::try_from(duration.as_millis()).unwrap_or(i128::MAX),
-                Err(error) => -i128::try_from(error.duration().as_millis()).unwrap_or(i128::MAX),
-            },
-            Err(err) => return Ok(PlanItem::Skipped {
-                rel,
-                reason: format!("modification time could not be read, so the date window cannot be checked: {err}"),
-            }),
-        };
-        if options
-            .modified_after_ms
-            .is_some_and(|bound| modified < i128::from(bound))
-            || options
-                .modified_before_ms
-                .is_some_and(|bound| modified >= i128::from(bound))
-        {
-            return Ok(PlanItem::Skipped {
-                rel,
-                reason: "outside the requested modification-time window".into(),
-            });
+    // The source's modification time, read once and carried into the plan: it
+    // is both the lower-bound test below and — for the files this run does
+    // cover — the next run's mark (Story 74.4, AD-252).
+    let modified_ms = match meta.modified() {
+        Ok(time) => match time.duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => i64::try_from(duration.as_millis()).ok(),
+            Err(error) => i64::try_from(error.duration().as_millis())
+                .ok()
+                .map(|ms| -ms),
+        },
+        // A filesystem that will not say when a file changed (some network
+        // mounts, some archives) cannot be filtered or marked. Both halves
+        // below treat that as "no information", never as "old".
+        Err(_) => None,
+    };
+    if let (Some(bound), Some(modified)) = (options.modified_since_ms, modified_ms) {
+        if modified <= bound {
+            // Not a skip and not a refusal: this file was covered by an earlier
+            // run, whose own record says so. Reporting a line per unchanged
+            // file would make the report of an incremental pass over a large
+            // tree longer than the pass itself is interesting.
+            drop(rel);
+            return Ok(PlanItem::Behind);
         }
     }
     if is_dataless(absolute)? {
@@ -1077,11 +1116,13 @@ fn classify(
         return Ok(PlanItem::File {
             rel,
             bytes: pointer.size,
+            modified_ms,
         });
     }
     Ok(PlanItem::File {
         rel,
         bytes: meta.len(),
+        modified_ms,
     })
 }
 
@@ -1266,19 +1307,17 @@ pub fn render_copy_log(
     let mut identical = 0usize;
     let mut collision = 0usize;
     let mut failed = 0usize;
-    let mut skipped = 0usize;
     for entry in &report.entries {
         match entry.outcome {
             CopyOutcome::Copied => copied += 1,
             CopyOutcome::Identical => identical += 1,
             CopyOutcome::Collision => collision += 1,
-            CopyOutcome::Skipped { .. } => skipped += 1,
             CopyOutcome::Failed { .. } => failed += 1,
         }
     }
     let _ = writeln!(
         out,
-        "files:       {} ({copied} copied, {identical} identical, {collision} left alone, {skipped} skipped, {failed} failed)",
+        "files:       {} ({copied} copied, {identical} identical, {collision} left alone, {failed} failed)",
         report.entries.len()
     );
     let _ = writeln!(out, "bytes:       {}", report.bytes_copied);
@@ -1290,7 +1329,6 @@ pub fn render_copy_log(
             CopyOutcome::Copied => "copied",
             CopyOutcome::Identical => "identical",
             CopyOutcome::Collision => "left-alone",
-            CopyOutcome::Skipped { .. } => "skipped",
             CopyOutcome::Failed { .. } => "FAILED",
         };
         // `-` rather than an empty column: a reader must be able to tell "no
@@ -1304,7 +1342,7 @@ pub fn render_copy_log(
             // provenance trailers guard against.
             entry.path.replace(['\n', '\r'], " ")
         );
-        if let CopyOutcome::Failed { reason } | CopyOutcome::Skipped { reason } = &entry.outcome {
+        if let CopyOutcome::Failed { reason } = &entry.outcome {
             let _ = writeln!(out, "    reason: {}", reason.replace(['\n', '\r'], " "));
         }
     }
@@ -1316,12 +1354,15 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    /// The mark is a lower bound on work AND the thing the next run inherits,
+    /// so one fixture has to prove both halves: what a bound leaves alone, and
+    /// what the report says the next bound should be.
     #[test]
-    fn copy_date_window_counts_skips_and_keeps_half_open_boundaries() {
+    fn a_mark_bounds_the_work_and_the_report_names_the_next_one() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("source");
         let destination = dir.path().join("destination");
-        for (name, ms) in [("old", 999), ("lower", 1000), ("upper", 2000)] {
+        for (name, ms) in [("older", 999), ("at-the-mark", 1000), ("newer", 2000)] {
             let path = source.join(name);
             write_file(&path, b"bytes");
             File::options()
@@ -1345,8 +1386,7 @@ mod tests {
             &source,
             &destination,
             &CopyOptions {
-                modified_after_ms: Some(1000),
-                modified_before_ms: Some(2000),
+                modified_since_ms: Some(1000),
                 ..CopyOptions::default()
             },
             Some(&sink),
@@ -1354,21 +1394,81 @@ mod tests {
             None,
         )
         .expect("copy");
+
         assert_eq!(report.bytes_copied, 5);
-        assert_eq!(read_file(&destination.join("lower")), b"bytes");
-        assert!(!destination.join("old").exists());
-        assert!(!destination.join("upper").exists());
+        assert_eq!(read_file(&destination.join("newer")), b"bytes");
+        // Exclusive: the file whose mtime IS the mark was covered by the run
+        // that left it, and copying it again every pass forever is exactly what
+        // the exclusivity is for.
+        assert!(!destination.join("at-the-mark").exists());
+        assert!(!destination.join("older").exists());
+        // Directories are still recreated: the bound is about file content, and
+        // a destination missing a folder the source has is a different tree.
         assert!(destination.join("empty").is_dir());
-        for name in ["old", "upper"] {
-            assert!(report
+        // A file behind the mark is not a line in the report. An incremental
+        // pass over a large tree is mostly those, and one line each would bury
+        // the handful that matter.
+        assert_eq!(
+            report
                 .entries
                 .iter()
-                .any(|entry| entry.path == name
-                    && matches!(entry.outcome, CopyOutcome::Skipped { .. })));
-        }
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newer"],
+        );
+        assert_eq!(
+            report.mark_ms,
+            Some(2000),
+            "the next run's bound is the newest mtime this one covered"
+        );
         let progress = seen.lock().expect("progress");
         let last = progress.last().expect("final progress");
-        assert_eq!((last.files_done, last.files_total), (3, 3));
+        assert_eq!((last.files_done, last.files_total), (1, 1));
+    }
+
+    /// `Identical` counts toward the mark and a failure does not — the rule
+    /// that decides whether the next run looks at a file again.
+    #[test]
+    fn an_identical_file_advances_the_mark_and_nothing_else_does() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        for (name, ms) in [("same", 3000), ("fresh", 1000)] {
+            let path = source.join(name);
+            write_file(&path, b"bytes");
+            File::options()
+                .write(true)
+                .open(path)
+                .expect("open")
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)),
+                )
+                .expect("mtime");
+        }
+        // Already there, byte for byte: the pass will read it, hash it and
+        // report `Identical` — which is "covered", so it moves the line.
+        write_file(&destination.join("same"), b"bytes");
+
+        let report = copy_verified(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            None,
+        )
+        .expect("copy");
+
+        assert!(report
+            .entries
+            .iter()
+            .any(|entry| entry.path == "same" && entry.outcome == CopyOutcome::Identical));
+        assert_eq!(
+            report.mark_ms,
+            Some(3000),
+            "a file the pass found already present was still accounted for"
+        );
     }
 
     fn off() -> AtomicBool {
@@ -2087,6 +2187,7 @@ mod tests {
                 },
             ],
             bytes_copied: 4,
+            mark_ms: None,
         };
         let log = render_copy_log(
             &report,
@@ -2099,10 +2200,12 @@ mod tests {
         assert!(log.contains("destination: /dst"), "{log}");
         assert!(log.contains("2026-07-30T12:00:00+02:00"), "{log}");
         // The summary line, the one a person reads first in every copy log:
-        // asserted in full, skipped column included, so a column gained or
-        // renamed out from under the reader is red rather than silent.
+        // asserted in full, so a column gained or renamed out from under the
+        // reader is red rather than silent. The `skipped` column left with the
+        // date window it counted (AD-256): a file behind the mark is not in
+        // the report at all, so a zero there would be a count of nothing.
         assert!(
-            log.contains("4 (1 copied, 1 identical, 1 left alone, 0 skipped, 1 failed)"),
+            log.contains("4 (1 copied, 1 identical, 1 left alone, 1 failed)"),
             "{log}"
         );
         assert!(log.contains("copied  4  aa11  a.txt"), "{log}");
@@ -2126,6 +2229,7 @@ mod tests {
                 sha256: Some("cc33".into()),
             }],
             bytes_copied: 1,
+            mark_ms: None,
         };
         let log = render_copy_log(&report, Path::new("/s"), Path::new("/d"), "now");
         let planted = log

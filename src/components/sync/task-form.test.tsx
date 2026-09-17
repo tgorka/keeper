@@ -56,6 +56,7 @@ import {
   TASK_FORM_EDIT_SUBMIT_LABEL,
   TASK_FORM_EDIT_TITLE,
   TASK_FORM_ENABLED_LABEL,
+  TASK_FORM_ENABLED_NOTE,
   TASK_FORM_ERROR_TESTID,
   TASK_FORM_ID_ADD_NOTE,
   TASK_FORM_ID_EDIT_NOTE,
@@ -66,13 +67,16 @@ import {
   TASK_FORM_MISSED_DELAY_NOT_A_NUMBER,
   TASK_FORM_MISSED_DELAY_NOTE,
   TASK_FORM_MODE_LABEL,
+  TASK_FORM_MODE_NOTE,
   TASK_FORM_ON_MISSED_LABEL,
   TASK_FORM_ON_MISSED_NOTE,
   TASK_FORM_PROFILE_LABEL,
   TASK_FORM_PROFILE_READ_FAILED_PREFIX,
   TASK_FORM_PROFILE_READING_NOTE,
   TASK_FORM_ROW_CLASS,
+  TASK_FORM_SCHEDULE_HINT,
   TASK_FORM_SCHEDULE_LABEL,
+  TASK_FORM_SCHEDULE_NOTE,
   TASK_FORM_SCHEDULE_OFFER_LABEL,
   TASK_FORM_SCHEDULE_OFFER_NOTE,
   TASK_FORM_SCHEDULE_OFFER_PLACEHOLDER,
@@ -142,8 +146,7 @@ function taskVm(over: Partial<TaskVm> = {}): TaskVm {
     copySource: null,
     copyDestination: null,
     replaceExisting: false,
-    modifiedAfterMs: null,
-    modifiedBeforeMs: null,
+    markMs: null,
     lastRun: null,
     host: {
       kind: "app",
@@ -444,7 +447,7 @@ describe("TaskForm creation and new kinds", () => {
     expect(screen.queryByRole("button", { name: "wrong.md" })).toBeNull();
   });
 
-  it("lets the backend refuse missing copy paths, then saves native paths and UTC bounds", async () => {
+  it("lets the backend refuse missing copy paths, then saves native paths", async () => {
     await useDevSave();
     mockProfiles.mockResolvedValue([profileVm()]);
     const saved = vi.fn();
@@ -467,8 +470,6 @@ describe("TaskForm creation and new kinds", () => {
     await screen.findByText("/Volumes/backup");
     vi.mocked(openFolder).mockResolvedValueOnce(null);
     fireEvent.click(screen.getByRole("button", { name: "Choose a source folder" }));
-    fireEvent.change(screen.getByLabelText("Modified from"), { target: { value: "2026-09-14" } });
-    fireEvent.change(screen.getByLabelText("Modified before"), { target: { value: "2026-09-17" } });
     fireEvent.click(screen.getByRole("switch", { name: "Replace files that already exist" }));
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
     await waitFor(() =>
@@ -479,43 +480,46 @@ describe("TaskForm creation and new kinds", () => {
           copySource: "/Volumes/source with spaces",
           copyDestination: "/Volumes/backup",
           replaceExisting: true,
-          modifiedAfterMs: Date.UTC(2026, 8, 14),
-          modifiedBeforeMs: Date.UTC(2026, 8, 17),
         }),
       ),
     );
   });
 
-  it("preserves precise stored bounds on edit and clears an explicitly emptied date", async () => {
-    const stored = taskVm({
-      kind: "copy",
-      modifiedAfterMs: NOW + 123,
-      modifiedBeforeMs: NOW + 456_789,
-    });
-    mockSave.mockResolvedValue(stored);
-    render(<TaskForm task={stored} />);
-    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
-    await waitFor(() =>
-      expect(mockSave).toHaveBeenCalledWith(
-        expect.objectContaining({
-          modifiedAfterMs: NOW + 123,
-          modifiedBeforeMs: NOW + 456_789,
-        }),
-      ),
+  /**
+   * AD-256, from the wire rather than from the screen.
+   *
+   * Asserting that no date input renders would pass just as well over a form
+   * that still carried the two values in its state and posted them — which is
+   * exactly the half-removal the decision forbids, and the one a sibling lane's
+   * bindings will start rejecting. So the claim is made about the payload keys:
+   * a copy task's save carries no date window at all, in either mode.
+   */
+  it("sends no date window from a copy task, in either mode", async () => {
+    mockSave.mockResolvedValue(taskVm({ kind: "copy" }));
+    const edit = render(
+      <TaskForm task={taskVm({ kind: "copy", copySource: "/a", copyDestination: "/b" })} />,
     );
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL })).toBeEnabled(),
-    );
-    fireEvent.change(screen.getByLabelText("Modified from"), { target: { value: "" } });
-    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
-    await waitFor(() =>
-      expect(mockSave).toHaveBeenLastCalledWith(
-        expect.objectContaining({
-          modifiedAfterMs: null,
-          modifiedBeforeMs: NOW + 456_789,
-        }),
-      ),
-    );
+    fireEvent.click(edit.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+    await waitFor(() => expect(mockSave).toHaveBeenCalled());
+    const [edited] = mockSave.mock.calls[0] ?? [];
+    expect(Object.keys(edited ?? {}).filter((key) => key.startsWith("modified"))).toStrictEqual([]);
+    // The fieldset the dates lived in is still here and still decides what a
+    // copy overwrites — nothing was removed but the window.
+    expect(
+      edit.getByRole("switch", { name: "Replace files that already exist" }),
+    ).toBeInTheDocument();
+    edit.unmount();
+
+    // And on an add form, where the fieldset is reached through the kind menu
+    // rather than seeded from a row — the two paths build the payload from the
+    // same state, and a leftover seed would only show on one of them.
+    mockSave.mockClear();
+    const add = render(<TaskForm />);
+    fireEvent.change(add.getByLabelText(TASK_FORM_KIND_LABEL), { target: { value: "copy" } });
+    fireEvent.click(add.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
+    await waitFor(() => expect(mockSave).toHaveBeenCalled());
+    const [added] = mockSave.mock.calls[0] ?? [];
+    expect(Object.keys(added ?? {}).filter((key) => key.startsWith("modified"))).toStrictEqual([]);
   });
 });
 
@@ -544,7 +548,7 @@ describe("TaskForm, adding a task", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
 
-    // Exactly these eighteen keys, and `id: ""` above all: an id invented here
+    // Exactly these sixteen keys, and `id: ""` above all: an id invented here
     // would be a second minter, and `sync_ipc.rs` already has the only one.
     // This is the file's one exact save assertion — the default `sync` kind is
     // where every key is pinned, including the eight per-kind keys the kinds
@@ -577,8 +581,9 @@ describe("TaskForm, adding a task", () => {
         copySource: null,
         copyDestination: null,
         replaceExisting: false,
-        modifiedAfterMs: null,
-        modifiedBeforeMs: null,
+        // No `modifiedAfterMs`/`modifiedBeforeMs`: AD-256 removed the date
+        // window, and this exact-key assertion is what fails if either ever
+        // comes back through a seed or a spread.
       }),
     );
     await waitFor(() => expect(onSaved).toHaveBeenCalledWith(taskVm()));
@@ -662,7 +667,7 @@ describe("TaskForm, adding a task", () => {
     render(<TaskForm />);
     await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
 
-    expect(screen.getByText(TASK_FORM_ID_ADD_NOTE)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: TASK_FORM_ID_ADD_NOTE })).toBeInTheDocument();
     expect(TASK_FORM_ID_ADD_NOTE).toMatch(/replaces that task/);
   });
 
@@ -1072,10 +1077,13 @@ describe("TaskForm, which kind of task this is", () => {
     // what it should. The claim is that every offered kind has a sentence of
     // its own, and the loop above is the whole of that claim.
 
-    // And rendered: the constant could name all six while no control showed
+    // And reachable: the constant could name all six while no control carried
     // it, which is the same trap the schedule bounds note's own guard closes.
+    // The hint's accessible name, because the tooltip body is not rendered
+    // until a pointer arrives (74.1) — the name is what a screen reader reads
+    // and what keeps the sentence from becoming an unreferenced string.
     render(<TaskForm />);
-    expect(await screen.findByText(TASK_FORM_KIND_NOTE)).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: TASK_FORM_KIND_NOTE })).toBeInTheDocument();
   });
   it("arrives holding a stored verify rather than the add form's default", async () => {
     // The state this story newly makes reachable, seen from the other end. An
@@ -1195,7 +1203,7 @@ describe("TaskForm, how long the delay is", () => {
     });
     const box = screen.getByLabelText(TASK_FORM_MISSED_DELAY_LABEL);
     expect(box).toHaveValue("");
-    expect(screen.getByText(TASK_FORM_MISSED_DELAY_NOTE)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: TASK_FORM_MISSED_DELAY_NOTE })).toBeInTheDocument();
 
     // And the other half, which is not symmetry for its own sake: the store
     // keeps a stored delay across a policy change and the write door refuses an
@@ -1408,7 +1416,7 @@ describe("TaskForm, the task's description", () => {
     render(<TaskForm />);
     await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
 
-    expect(screen.getByText(TASK_FORM_DESCRIPTION_NOTE)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: TASK_FORM_DESCRIPTION_NOTE })).toBeInTheDocument();
     expect(TASK_FORM_DESCRIPTION_NOTE).toContain("the only name of this task you can ever change");
     expect(TASK_FORM_DESCRIPTION_NOTE).toContain("sent exactly as typed");
     // The two rules it is quoting, each stated where it is actually enforced.
@@ -1459,7 +1467,7 @@ describe("TaskForm, help for writing a schedule", () => {
     expect(offered.some((expression) => expression.startsWith("@"))).toBe(true);
     expect(offered.some((expression) => expression.startsWith("every "))).toBe(true);
     expect(offered.some((expression) => expression.split(" ").length === 5)).toBe(true);
-    expect(screen.getByText(TASK_FORM_SCHEDULE_OFFER_NOTE)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: TASK_FORM_SCHEDULE_OFFER_NOTE })).toBeInTheDocument();
   });
 
   it("types the chosen form into the box and keeps claiming nothing itself", async () => {
@@ -1849,7 +1857,7 @@ wording needs rewriting rather than this regex widening`,
     // second one is new.
     mockProfiles.mockResolvedValue([]);
     render(<TaskForm onSaved={vi.fn()} />);
-    expect(screen.getByText(TASK_FORM_ON_MISSED_NOTE)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: TASK_FORM_ON_MISSED_NOTE })).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText(TASK_FORM_ON_MISSED_LABEL), {
       target: { value: "delay" },
@@ -1857,8 +1865,11 @@ wording needs rewriting rather than this regex widening`,
     fireEvent.change(screen.getByLabelText(TASK_FORM_MISSED_DELAY_LABEL), {
       target: { value: "240" },
     });
-    expect(screen.getByText(taskFormOnMissedNote(240))).toBeInTheDocument();
-    expect(screen.queryByText(TASK_FORM_ON_MISSED_NOTE)).toBeNull();
+    // The hint recomposes with the box, which is the whole of 59.6 reaching
+    // this file: a sentence stating the default beside a task that chose 240
+    // would be the untruth the note exists to prevent — hover or not.
+    expect(screen.getByRole("button", { name: taskFormOnMissedNote(240) })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: TASK_FORM_ON_MISSED_NOTE })).toBeNull();
   });
 
   it("converts minutes to the wire's milliseconds, and keeps absence apart from zero", () => {
@@ -1969,7 +1980,13 @@ wording needs rewriting rather than this regex widening`,
 
   it("is the sentence the form actually renders", async () => {
     render(<TaskForm />);
-    expect(await screen.findByText(TASK_SCHEDULE_BOUNDS_NOTE)).toBeInTheDocument();
+    // Reachable through the schedule box's hint, which carries the dialect and
+    // its bounds as one sentence: what may be typed and what is refused at
+    // either end are one question, and two hovers would make somebody find the
+    // second to learn the first has limits.
+    const hint = await screen.findByRole("button", { name: TASK_FORM_SCHEDULE_HINT });
+    expect(hint).toHaveAccessibleName(expect.stringContaining(TASK_SCHEDULE_BOUNDS_NOTE));
+    expect(hint).toHaveAccessibleName(expect.stringContaining(TASK_FORM_SCHEDULE_NOTE));
   });
 
   it("names a singular period without a bare 1 in front of it", () => {
@@ -1977,6 +1994,74 @@ wording needs rewriting rather than this regex widening`,
     // than assumed: "once a minute" at one, "once every N minutes" above one.
     expect(taskSchedulePeriodPhrase(1, "minute")).toBe("once a minute");
     expect(taskSchedulePeriodPhrase(366, "day")).toBe("once every 366 days");
+  });
+});
+
+/**
+ * THE PROPERTY OF STORY 74.1: the form has to fit the region it opens in.
+ *
+ * Nine standing note paragraphs rendered unconditionally in flow — the kind note
+ * alone is ~90 words — which put 1 100–1 500px of form in a ~650px region, held
+ * only by a 10px overlay scrollbar. The owner photographed a card cut
+ * mid-sentence; the screenshot is just where it happened to be cut.
+ *
+ * Two claims, and they are opposite halves of one rule. The prose must be OUT of
+ * the flow (a hint that also left a paragraph behind saves nothing), and it must
+ * still be REACHABLE (prose deleted is not prose moved). Neither assertion alone
+ * is worth anything: the first passes over a deletion and the second passes over
+ * a form that renders each sentence twice.
+ */
+describe("TaskForm, the standing prose is beside its label rather than under it", () => {
+  const MOVED = [
+    ["the id's minting and replacing rule", TASK_FORM_ID_ADD_NOTE],
+    ["what a description is for", TASK_FORM_DESCRIPTION_NOTE],
+    ["what each kind does", TASK_FORM_KIND_NOTE],
+    ["what each mode does", TASK_FORM_MODE_NOTE],
+    ["why enabled is not the mode", TASK_FORM_ENABLED_NOTE],
+    ["the schedule dialect and its bounds", TASK_FORM_SCHEDULE_HINT],
+    ["what the offer menu does", TASK_FORM_SCHEDULE_OFFER_NOTE],
+    ["what a missed window means", TASK_FORM_ON_MISSED_NOTE],
+  ] as const;
+
+  it.each(MOVED)("keeps %s reachable without standing in the flow", async (_what, prose) => {
+    render(<TaskForm />);
+    // Reachable: the hint's accessible name, because the tooltip body is not in
+    // the tree until a pointer arrives — the name is what a screen reader reads
+    // and the only thing a test can hold the sentence by.
+    expect(await screen.findByRole("button", { name: prose })).toBeInTheDocument();
+    // And out of the flow: no element whose own text IS the prose. `getByText`
+    // matches text content, and the trigger's copy of it lives in an attribute,
+    // so this is exactly the paragraph-or-not question.
+    expect(screen.queryByText(prose)).toBeNull();
+  });
+
+  it("leaves in the flow only what names a refusal somebody is hitting now", async () => {
+    // The line this story draws. Help moved; a sentence saying *you cannot do
+    // the thing you are trying to do* did not, because a refusal behind a hover
+    // is a refusal somebody hits before they read it. The id note is the case
+    // where the same field has one of each, so it is the one worth asserting:
+    // the add form's rule is a hint, the edit form's frozen-id warning is not.
+    render(<TaskForm task={taskVm()} />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+    expect(screen.getByText(TASK_FORM_ID_EDIT_NOTE)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: TASK_FORM_ID_ADD_NOTE })).toBeNull();
+  });
+
+  it("stands no paragraph of prose at all on a resting add form", async () => {
+    // A count, because the rule is about HEIGHT and one sentence at a time is
+    // how nine of them accumulated — a per-note test cannot see the tenth
+    // arrive. Twelve words is the line between a sentence that explains and the
+    // short status lines that stay ("Reading the folder list…", "No prompt
+    // chosen"): those report the state of a read rather than teaching a field,
+    // and they are transient. Listed rather than counted so a failure names the
+    // paragraph that came back instead of printing 1 ≠ 0.
+    render(<TaskForm />);
+    const form = await screen.findByRole("form", { name: TASK_FORM_ADD_TITLE });
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+    const standing = Array.from(form.querySelectorAll("p"))
+      .map((paragraph) => paragraph.textContent ?? "")
+      .filter((text) => text.split(" ").length > 12);
+    expect(standing).toStrictEqual([]);
   });
 });
 
@@ -2011,6 +2096,20 @@ describe("the form's rows wrap rather than squeezing their controls", () => {
     for (const control of controls) {
       expect(control).toHaveClass("shrink-0");
     }
+  });
+
+  it("keeps a hint beside a label out of the rows' way", async () => {
+    // The hint triggers are `<button>`s inside a row, and the guard above walks
+    // `label.parentElement` — so a hint dropped straight into a row would have
+    // made the label's parent the row's own `flex-wrap` box and passed while
+    // pushing the glyph into the middle of a `justify-between` row. The label
+    // and its hint are therefore one box, and this asserts that box exists
+    // rather than trusting the class string.
+    render(<TaskForm />);
+    const hint = await screen.findByRole("button", { name: TASK_FORM_ENABLED_NOTE });
+    const label = screen.getByText(TASK_FORM_ENABLED_LABEL);
+    expect(hint.parentElement).toBe(label.parentElement);
+    expect(label.parentElement).toHaveClass("items-center");
   });
 
   it("keeps the row and the control classes in one place each", () => {

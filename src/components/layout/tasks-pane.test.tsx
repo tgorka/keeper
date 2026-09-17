@@ -195,6 +195,8 @@ function run(over: Partial<TaskRunVm> = {}): TaskRunVm {
     outcome: "ok",
     unknownOutcome: null,
     detail: "no folders to sync",
+    trigger: "scheduled",
+    lateByMs: 0,
     host: "dev#1",
     ...over,
   };
@@ -234,8 +236,7 @@ function task(over: Partial<TaskVm> = {}): TaskVm {
     copySource: null,
     copyDestination: null,
     replaceExisting: false,
-    modifiedAfterMs: null,
-    modifiedBeforeMs: null,
+    markMs: null,
     lastRun: run(),
     host: { kind: "app", sentence: SENTENCE_APP, reason: null },
     ...over,
@@ -1978,12 +1979,43 @@ describe("a task's runs open on the row, and are read only when asked for", () =
     const [blank, named] = screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID);
 
     expect(within(blank).getByText(TASK_HISTORY_NO_HOST_TEXT)).toBeInTheDocument();
-    // The blank report draws no cell at all: the row ends at its host, so its
-    // whole text is the outcome, the time and the stand-in for the host.
-    expect(blank.textContent).toBe(`Succeeded5 min ago${TASK_HISTORY_NO_HOST_TEXT}`);
+    // The blank report draws no cell at all: the row ends at its host and the
+    // one word saying why it ran, which every run recorded since AD-253
+    // carries. Asserted as the whole text so a cell appearing between them is
+    // red rather than silent.
+    expect(blank.textContent).toBe(`Succeeded5 min ago${TASK_HISTORY_NO_HOST_TEXT}on its schedule`);
     // And the row beside it is unaffected.
     expect(within(named).getByText("dev#1")).toBeInTheDocument();
     expect(within(named).getByText("3 synced")).toBeInTheDocument();
+  });
+
+  it("says why a run happened, and how late, only when the run knows", async () => {
+    // AD-253's whole point: three runs that were indistinguishable before this
+    // story. A row from before it says nothing rather than claiming a schedule,
+    // and an on-time run says nothing about lateness — otherwise the one row
+    // that was 41 minutes late would be buried under rows boasting punctuality.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    const started = Date.now() - 5 * 60_000;
+    vi.mocked(syncTaskHistory).mockResolvedValue([
+      run({ id: 3, startedMs: started, trigger: "timer", lateByMs: 41 * 60_000 }),
+      run({ id: 2, startedMs: started, trigger: "requested", lateByMs: null }),
+      run({ id: 1, startedMs: started, trigger: null, lateByMs: null }),
+    ]);
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(3));
+    const [late, asked, unrecorded] = screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID);
+
+    expect(within(late).getByText("the host's timer")).toBeInTheDocument();
+    expect(within(late).getByText("late by 41 min")).toBeInTheDocument();
+    expect(within(asked).getByText("you asked")).toBeInTheDocument();
+    expect(within(asked).queryByText(/late by/)).toBeNull();
+    // Nothing invented for a run recorded before the columns existed.
+    expect(within(unrecorded).queryByText("on its schedule")).toBeNull();
+    expect(within(unrecorded).queryByText("you asked")).toBeNull();
+    expect(within(unrecorded).queryByText(/late by/)).toBeNull();
   });
 
   it("names an outcome whose stored spelling is blank rather than rendering nothing", async () => {

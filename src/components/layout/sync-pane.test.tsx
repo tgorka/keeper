@@ -1931,7 +1931,7 @@ describe("SyncPane copy files once", () => {
 
     // Replace defaults off (AD-C4), and the choice is sent rather than assumed.
     await waitFor(() =>
-      expect(mockCopyStart).toHaveBeenCalledWith(COPY_SOURCE, COPY_DESTINATION, false, null, null),
+      expect(mockCopyStart).toHaveBeenCalledWith(COPY_SOURCE, COPY_DESTINATION, false),
     );
   });
 
@@ -1950,46 +1950,8 @@ describe("SyncPane copy files once", () => {
     fireEvent.click(screen.getByRole("button", { name: COPY_SUBMIT_LABEL }));
 
     await waitFor(() =>
-      expect(mockCopyStart).toHaveBeenCalledWith(COPY_SOURCE, COPY_DESTINATION, true, null, null),
+      expect(mockCopyStart).toHaveBeenCalledWith(COPY_SOURCE, COPY_DESTINATION, true),
     );
-  });
-
-  it("sends the copy card's optional UTC date window to the copy job", async () => {
-    await renderPane();
-    await chooseCopyPaths();
-    fireEvent.change(screen.getByLabelText("Modified from"), { target: { value: "2026-09-14" } });
-    fireEvent.change(screen.getByLabelText("Modified before"), { target: { value: "2026-09-17" } });
-    fireEvent.click(screen.getByRole("button", { name: COPY_SUBMIT_LABEL }));
-    await waitFor(() =>
-      expect(mockCopyStart).toHaveBeenCalledWith(
-        COPY_SOURCE,
-        COPY_DESTINATION,
-        false,
-        Date.UTC(2026, 8, 14),
-        Date.UTC(2026, 8, 17),
-      ),
-    );
-  });
-
-  it("keeps bounded-out files named in the settled report", async () => {
-    seedCopyJob(
-      copyJobVm({
-        state: "done",
-        current: null,
-        entries: [
-          {
-            path: "old/photo.jpg",
-            bytes: 0,
-            outcome: "skipped",
-            reason: "Modified before the inclusive start.",
-          },
-        ],
-      }),
-    );
-    await renderPane();
-    const report = within(screen.getByTestId(COPY_REPORT_TESTID));
-    expect(report.getByText("old/photo.jpg")).toBeInTheDocument();
-    expect(report.getByText("Modified before the inclusive start.")).toBeInTheDocument();
   });
 
   it("shows the state, the bar, the file in flight and Stop, then stops polling once settled", async () => {

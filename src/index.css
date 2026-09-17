@@ -116,10 +116,22 @@
     --radius-sm: 5px;
     --radius-md: 7px;
     --radius-lg: var(--radius);
-    --radius-xl: calc(var(--radius) * 1.4);
-    --radius-2xl: calc(var(--radius) * 1.8);
-    --radius-3xl: calc(var(--radius) * 2.2);
-    --radius-4xl: calc(var(--radius) * 2.6);
+    /* The container step (AD-255). At 1.4 this was 7px — the same corner as
+       `--radius-md`, so a 500px card and the 224px inputs inside it were cut
+       identically and the card read as neither square nor round. 2× the 5px key
+       gives containers 10px while fields keep 7px and chips 3px.
+
+       REDEFINED rather than added, because the five `rounded-xl` consumers in
+       `src/` are exactly the container-scale set this decision is about — card,
+       dialog, alert-dialog and command (its shell and its input row) — so a new
+       token would have meant editing all five to say the same thing. The upper
+       steps move by the scale's own 0.4 increment to keep the ramp monotonic:
+       2xl and 3xl have no consumer at all, and 4xl's only one is the `h-5` count
+       badge, whose radius is clamped by its own height long before 16px. */
+    --radius-xl: calc(var(--radius) * 2);
+    --radius-2xl: calc(var(--radius) * 2.4);
+    --radius-3xl: calc(var(--radius) * 2.8);
+    --radius-4xl: calc(var(--radius) * 3.2);
 }
 
 :root {

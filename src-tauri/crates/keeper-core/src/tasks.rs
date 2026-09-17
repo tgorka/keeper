@@ -261,6 +261,23 @@ pub struct TaskRunVm {
     pub unknown_outcome: Option<String>,
     /// The run's detail line — an error message, a summary — `null` when none.
     pub detail: Option<String>,
+    /// Why the run happened: `"scheduled"`, `"requested"`, `"timer"` — or
+    /// `null` for a run recorded before AD-253 gave the engine somewhere to
+    /// write it (Story 74.5).
+    ///
+    /// The spelling and not a variant, for [`Self::outcome`]'s reason: the
+    /// frontend renders it, `keeper-sync` owns the vocabulary, and a word this
+    /// build does not know is shown rather than swallowed.
+    pub trigger: Option<String>,
+    /// How far past its own window the run was claimed, in milliseconds.
+    ///
+    /// `0` is an on-time run; `null` means the question was never asked — a run
+    /// from before this story, or one with no window to be late for, because a
+    /// person pressing Run now is not late. Kept distinct from `0` on purpose:
+    /// a surface that rendered them the same way would be inventing
+    /// punctuality.
+    #[ts(type = "number | null")]
+    pub late_by_ms: Option<i64>,
     /// Which host recorded the run, as stored (e.g. `"app"`, `"daemon"`).
     pub host: String,
 }
@@ -293,10 +310,15 @@ pub struct TaskVm {
     pub copy_source: Option<String>,
     pub copy_destination: Option<String>,
     pub replace_existing: bool,
+    /// The mark the last successful run left, epoch ms, `null` when this task
+    /// has no ledger entry yet (Story 74.4, AD-252).
+    ///
+    /// Read from the run ledger's file **names**, never typed by a person: a
+    /// date window the operator had to maintain was AD-245, rescinded by
+    /// AD-256. The copy's lower bound is what keeper measured, not what
+    /// somebody remembered.
     #[ts(type = "number | null")]
-    pub modified_after_ms: Option<i64>,
-    #[ts(type = "number | null")]
-    pub modified_before_ms: Option<i64>,
+    pub mark_ms: Option<i64>,
     /// That profile's human name, `null` when the id names no current profile —
     /// which is exactly the "folder is gone" fact [`task_host`] acts on.
     pub profile: Option<String>,
@@ -417,10 +439,6 @@ pub struct TaskSaveReq {
     pub copy_source: Option<String>,
     pub copy_destination: Option<String>,
     pub replace_existing: bool,
-    #[ts(type = "number | null")]
-    pub modified_after_ms: Option<i64>,
-    #[ts(type = "number | null")]
-    pub modified_before_ms: Option<i64>,
     /// The schedule expression, `null` to store none.
     pub schedule: Option<String>,
     /// What to call this task, `null` to store no description.

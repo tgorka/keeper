@@ -51,6 +51,7 @@ pub mod files_write;
 pub mod footprint;
 pub mod git;
 pub mod http;
+pub mod ledger;
 pub mod lfs;
 pub mod logfile;
 pub mod names;

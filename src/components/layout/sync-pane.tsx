@@ -103,7 +103,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   Popover,
@@ -667,7 +666,6 @@ const COPY_OUTCOME_TITLES: Record<string, string> = {
   collision: "Already there, and different",
   copied: "Copied and verified",
   identical: "Already identical",
-  skipped: "Outside the date window",
 };
 
 const COPY_OUTCOME_COUNTS: Record<string, string> = {
@@ -675,7 +673,6 @@ const COPY_OUTCOME_COUNTS: Record<string, string> = {
   collision: "left untouched",
   copied: "copied and verified",
   identical: "already identical",
-  skipped: "skipped",
 };
 
 /**
@@ -1764,8 +1761,6 @@ function CopyCard() {
   const [source, setSource] = useState("");
   const [destination, setDestination] = useState("");
   const [replaceExisting, setReplaceExisting] = useState(false);
-  const [modifiedAfterMs, setModifiedAfterMs] = useState<number | null>(null);
-  const [modifiedBeforeMs, setModifiedBeforeMs] = useState<number | null>(null);
   const fieldId = useId();
 
   const job = useCopyJobStore((state) => state.job);
@@ -1902,45 +1897,6 @@ function CopyCard() {
           </p>
         </div>
         <div className="flex flex-col gap-2">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <Label htmlFor={`${fieldId}-modified-from`}>Modified from</Label>
-            <Input
-              id={`${fieldId}-modified-from`}
-              type="date"
-              className="w-56 shrink-0"
-              disabled={running}
-              value={
-                modifiedAfterMs === null ? "" : new Date(modifiedAfterMs).toISOString().slice(0, 10)
-              }
-              onChange={(event) =>
-                setModifiedAfterMs(event.target.value === "" ? null : event.target.valueAsNumber)
-              }
-            />
-          </div>
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <Label htmlFor={`${fieldId}-modified-before`}>Modified before</Label>
-            <Input
-              id={`${fieldId}-modified-before`}
-              type="date"
-              className="w-56 shrink-0"
-              disabled={running}
-              value={
-                modifiedBeforeMs === null
-                  ? ""
-                  : new Date(modifiedBeforeMs).toISOString().slice(0, 10)
-              }
-              onChange={(event) =>
-                setModifiedBeforeMs(event.target.value === "" ? null : event.target.valueAsNumber)
-              }
-            />
-          </div>
-          <p className="text-muted-foreground text-xs">
-            Optional source modification dates, at midnight UTC: from is inclusive; before is
-            exclusive. Leave either empty for no bound. Files outside the window are reported as
-            skipped.
-          </p>
-        </div>
-        <div className="flex flex-col gap-2">
           {/* The claim first, in the card's own voice, then the limit on it —
               two stacked muted lines would read as one grey block with neither
               of them landing. */}
@@ -1960,13 +1916,7 @@ function CopyCard() {
               size="sm"
               disabled={running || source === "" || destination === ""}
               onClick={() => {
-                void startCopyJob(
-                  source,
-                  destination,
-                  replaceExisting,
-                  modifiedAfterMs,
-                  modifiedBeforeMs,
-                );
+                void startCopyJob(source, destination, replaceExisting);
               }}
             >
               {COPY_SUBMIT_LABEL}

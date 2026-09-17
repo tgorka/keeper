@@ -723,12 +723,6 @@ pub struct TaskSetArgs {
     /// Replace differing destination files only after verification.
     #[arg(long)]
     pub replace_existing: Option<bool>,
-    /// Inclusive source modification-time lower bound, in epoch milliseconds.
-    #[arg(long)]
-    pub modified_after_ms: Option<i64>,
-    /// Exclusive source modification-time upper bound, in epoch milliseconds.
-    #[arg(long)]
-    pub modified_before_ms: Option<i64>,
     /// What to do about a window that fell due while nobody was home:
     /// `run-now`, `delay` or `skip`.
     ///
@@ -4194,12 +4188,6 @@ fn cmd_task_set(
         replace_existing: args
             .replace_existing
             .unwrap_or_else(|| existing.is_some_and(|row| row.replace_existing)),
-        modified_after_ms: args
-            .modified_after_ms
-            .or_else(|| existing.and_then(|row| row.modified_after_ms)),
-        modified_before_ms: args
-            .modified_before_ms
-            .or_else(|| existing.and_then(|row| row.modified_before_ms)),
     };
     engine.save_task(&row, None)?;
     report_task(printer, engine, now_ms, &row.id)
@@ -6219,8 +6207,6 @@ mod tests {
             copy_source: None,
             copy_destination: None,
             replace_existing: false,
-            modified_after_ms: None,
-            modified_before_ms: None,
         }
     }
 
@@ -6234,6 +6220,10 @@ mod tests {
             outcome: Some(outcome),
             unknown_outcome: None,
             detail: Some("1 synced, 0 already syncing, 0 waiting, 0 failed".to_owned()),
+            // A scheduled run served on time: the pair AD-253 records at claim
+            // time, and the shape every `--json` assertion below reads.
+            trigger: Some(keeper_sync::ledger::RunTrigger::Scheduled),
+            late_by_ms: Some(0),
             host: "server-a".to_owned(),
         }
     }
@@ -6258,8 +6248,6 @@ mod tests {
             copy_source: None,
             copy_destination: None,
             replace_existing: None,
-            modified_after_ms: None,
-            modified_before_ms: None,
             description: None,
             no_description: false,
         }
