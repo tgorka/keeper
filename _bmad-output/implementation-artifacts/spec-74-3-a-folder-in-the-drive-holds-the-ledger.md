@@ -50,3 +50,25 @@ Acceptance, verbatim from the epic: *a folder-file fixture carrying `[folder.tas
 - `keeper-sync` is `keeper-core`-free, and that bit: the grammar was first written in `keeper-core` and had to move, because `keeper-sync/Cargo.toml:10` forbids the edge and `keeper-syncd` must not link matrix-sdk. It now lives in `keeper-sync/src/ledger.rs`, and the three trigger words reach the frontend as strings the way `TaskVm.mode` already does.
 
 **Owed:** the settings UI and the `tasks.ledger_vault` machine-local key are not in this change. The ledger is reachable today through the profile flag (the `[folder.tasks]` table in the folder file, which travels), so the mechanism is complete and testable; what is missing is the picker that makes it discoverable, and the folder-edit IPC field beside `notes`/`recordings`/`sessions` in the shell crate. DW-258.
+
+## What the macOS job caught that no local gate could
+
+The shell crate does not build on the Linux dev host, so `crates/keeper` is
+verified only by CI — and it found four real defects in this epic's shell-side
+edits, each on its own round trip:
+
+1. `entry_vm` still matched `CopyOutcome::Skipped`, whose only producer was the
+   date window. (The local sweep was a grep, and mine filtered comment lines in
+   a way that hid this call site.)
+2. Four lines of `///` on a function parameter, which `rustc` rejects outright.
+   Nothing local parses that file, so nothing local could say so.
+3. `SyncProfile` gained `tasks` and the shell's own guard demanded it be named
+   in `EXPRESSED` or `PRESERVED` — the guard doing exactly its job. `PRESERVED`,
+   truthfully: no form shows the flag, so no request may express it.
+4. The same guard's second half: for every preserved field the fixture's `prior`
+   must differ from a fresh profile, or the preservation assertion is vacuous.
+   `tasks` was `None` in both, and the guard said so by name.
+
+Recorded because it is the argument for those guards, and because the pattern
+generalises: on this host a shell-crate change is verified by inspection, and
+inspection misses a match arm, a doc comment and two halves of a guard.

@@ -58,3 +58,25 @@ Acceptance, verbatim from the epic: *no occurrence of either field name anywhere
 - The stored `tasks` columns stay inert per the crate's additive-only rule, with the comment at `ensure_task_columns` saying so — no drop migration.
 - Tests that asserted the window were **deleted**, not re-pointed: `copy_date_window_counts_skips_and_keeps_half_open_boundaries`, the store's "sends the modified-window bounds" test, the pane's "sends the copy card's optional UTC date window" and "keeps bounded-out files named in the settled report", and the CLI's flag rows.
 - `cargo clippy -p keeper-core -p keeper-sync -p keeper-syncd --all-targets -- -D warnings` clean; `cargo test` over the three crates green; `bunx tsc --noEmit` and the full vitest suite (5912 tests) green.
+
+## What the macOS job caught that no local gate could
+
+The shell crate does not build on the Linux dev host, so `crates/keeper` is
+verified only by CI — and it found four real defects in this epic's shell-side
+edits, each on its own round trip:
+
+1. `entry_vm` still matched `CopyOutcome::Skipped`, whose only producer was the
+   date window. (The local sweep was a grep, and mine filtered comment lines in
+   a way that hid this call site.)
+2. Four lines of `///` on a function parameter, which `rustc` rejects outright.
+   Nothing local parses that file, so nothing local could say so.
+3. `SyncProfile` gained `tasks` and the shell's own guard demanded it be named
+   in `EXPRESSED` or `PRESERVED` — the guard doing exactly its job. `PRESERVED`,
+   truthfully: no form shows the flag, so no request may express it.
+4. The same guard's second half: for every preserved field the fixture's `prior`
+   must differ from a fresh profile, or the preservation assertion is vacuous.
+   `tasks` was `None` in both, and the guard said so by name.
+
+Recorded because it is the argument for those guards, and because the pattern
+generalises: on this host a shell-crate change is verified by inspection, and
+inspection misses a match arm, a doc comment and two halves of a guard.
