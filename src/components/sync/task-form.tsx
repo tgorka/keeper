@@ -58,6 +58,7 @@
  * and never typed — that picker is the only defence there is.
  */
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
+import { Info } from "lucide-react";
 import { type FormEvent, useEffect, useId, useRef, useState } from "react";
 import {
   TASK_SCHEDULE_BOUNDS_NOTE,
@@ -68,6 +69,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { IconHint } from "@/components/ui/tooltip";
 import type {
   BotModelVm,
   BotVm,
@@ -454,6 +456,64 @@ export const TASK_FORM_ROW_CLASS = "flex flex-wrap items-center justify-between 
  *  `w-56` is 224px, and 224 is what the region's floor is built from. */
 export const TASK_FORM_CONTROL_CLASS = "w-56 shrink-0";
 
+/**
+ * The label and its hint, which travel together (Story 74.1).
+ *
+ * Its own flex box rather than two loose children of the row, because the row is
+ * `justify-between` and a third item would be pushed into the middle of it —
+ * the hint belongs to the label, not to the gap between the label and the field.
+ * `flex-wrap` for the same reason the row has it: at the 360px floor the glyph
+ * takes a line of its own rather than shrinking the word beside it.
+ */
+export const TASK_FORM_LABEL_CLASS = "flex flex-wrap items-center gap-1";
+
+/**
+ * The prose that used to stand under a field, moved beside its label
+ * (Story 74.1, AD-240's precedent in `tasks-pane.tsx`).
+ *
+ * Nine of these paragraphs rendered unconditionally in flow — the kind note
+ * alone is ~90 words — which made the form 1 100–1 500px tall in a ~650px
+ * region: the card was cut in every window anybody has, and the only thing
+ * holding it was a 10px overlay scrollbar. What it cost to fix is stated here
+ * rather than hidden: an explanation behind a hover is an explanation somebody
+ * has to go and get, so only text that *explains* moved. Text naming a refusal
+ * the person is hitting right now — a failed save, a box that does not hold a
+ * number, an id that cannot change — stays in the flow where they cannot miss
+ * it.
+ *
+ * The label is duplicated onto the trigger's `aria-label` because the tooltip
+ * itself is not rendered until a pointer arrives: the accessible name is what
+ * makes the sentence reachable to a screen reader and to a test, and it is why
+ * every caller passes prose rather than a word like "help".
+ */
+function FieldHint({ label }: { label: string }) {
+  return (
+    <IconHint label={label}>
+      <Button type="button" variant="ghost" size="icon-sm" aria-label={label}>
+        <Info aria-hidden="true" />
+      </Button>
+    </IconHint>
+  );
+}
+
+/**
+ * What the schedule box accepts and what it refuses at either end, as one hint.
+ *
+ * Two sentences that were two paragraphs: the dialect and the bounds are one
+ * question — *what may I type here* — and splitting them across two hovers would
+ * make a person find the second one to learn that the first has limits. The
+ * pane's header hint joins its sentences the same way (`tasks-pane.tsx`).
+ */
+export const TASK_FORM_SCHEDULE_HINT = `${TASK_FORM_SCHEDULE_NOTE} ${TASK_SCHEDULE_BOUNDS_NOTE}`;
+
+/** What the replace-existing switch decides when it is off. */
+export const TASK_FORM_REPLACE_EXISTING_NOTE =
+  "Left off, identical files are skipped and differing files are left alone and reported.";
+
+/** What running a saved prompt reads, and what it is still not allowed to do. */
+export const TASK_FORM_PROMPT_NOTE =
+  "The runner reads the chosen .md under this folder, without its frontmatter or first heading. Existing grants apply; a write that needs approval is refused when nobody is there.";
+
 /** Matches the two native `<select>`s in `session-space-editor.tsx`. */
 const SELECT_CLASS =
   "h-9 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
@@ -492,8 +552,6 @@ type TaskFormValues = {
   copySource: string;
   copyDestination: string;
   replaceExisting: boolean;
-  modifiedAfterMs: number | null;
-  modifiedBeforeMs: number | null;
 };
 
 /**
@@ -557,8 +615,6 @@ export function TaskForm({
           copySource: "",
           copyDestination: "",
           replaceExisting: false,
-          modifiedAfterMs: null,
-          modifiedBeforeMs: null,
         }
       : {
           id: task.id,
@@ -593,8 +649,6 @@ export function TaskForm({
           copySource: task.copySource ?? "",
           copyDestination: task.copyDestination ?? "",
           replaceExisting: task.replaceExisting,
-          modifiedAfterMs: task.modifiedAfterMs,
-          modifiedBeforeMs: task.modifiedBeforeMs,
         },
   );
   /**
@@ -826,8 +880,6 @@ export function TaskForm({
         copySource: form.copySource === "" ? null : form.copySource,
         copyDestination: form.copyDestination === "" ? null : form.copyDestination,
         replaceExisting: form.replaceExisting,
-        modifiedAfterMs: form.modifiedAfterMs,
-        modifiedBeforeMs: form.modifiedBeforeMs,
         // The only normalisation this form performs, and it is not tidying: an
         // empty box means "store nothing", and the wire type spells the absent
         // value `null` — the empty string is a different thing. Both fields below
@@ -885,7 +937,10 @@ export function TaskForm({
         </p>
       )}
       <div className={TASK_FORM_ROW_CLASS}>
-        <Label htmlFor={`${fieldId}-id`}>{TASK_FORM_ID_LABEL}</Label>
+        <div className={TASK_FORM_LABEL_CLASS}>
+          <Label htmlFor={`${fieldId}-id`}>{TASK_FORM_ID_LABEL}</Label>
+          {!editing && <FieldHint label={TASK_FORM_ID_ADD_NOTE} />}
+        </div>
         <Input
           id={`${fieldId}-id`}
           className={TASK_FORM_CONTROL_CLASS}
@@ -896,9 +951,11 @@ export function TaskForm({
           onChange={(event) => setForm((live) => ({ ...live, id: event.target.value }))}
         />
       </div>
-      <p className="text-muted-foreground text-xs">
-        {editing ? TASK_FORM_ID_EDIT_NOTE : TASK_FORM_ID_ADD_NOTE}
-      </p>
+      {/* The one note that does NOT move into a hint, and the asymmetry is the
+          point: on an edit form this box is read-only and the sentence says why
+          a person cannot do the thing they are at that moment trying to do. A
+          refusal behind a hover is a refusal somebody hits before they read. */}
+      {editing && <p className="text-muted-foreground text-xs">{TASK_FORM_ID_EDIT_NOTE}</p>}
 
       {/* Directly under the id, because it is the same question answered the
           other way: the box above is a key that is frozen or minted, and this one
@@ -907,7 +964,10 @@ export function TaskForm({
           line for it, and a box that invites paragraphs would be promising a
           surface that does not exist. */}
       <div className={TASK_FORM_ROW_CLASS}>
-        <Label htmlFor={`${fieldId}-description`}>{TASK_FORM_DESCRIPTION_LABEL}</Label>
+        <div className={TASK_FORM_LABEL_CLASS}>
+          <Label htmlFor={`${fieldId}-description`}>{TASK_FORM_DESCRIPTION_LABEL}</Label>
+          <FieldHint label={TASK_FORM_DESCRIPTION_NOTE} />
+        </div>
         <Input
           id={`${fieldId}-description`}
           className={TASK_FORM_CONTROL_CLASS}
@@ -917,13 +977,20 @@ export function TaskForm({
           onChange={(event) => setForm((live) => ({ ...live, description: event.target.value }))}
         />
       </div>
-      <p className="text-muted-foreground text-xs">{TASK_FORM_DESCRIPTION_NOTE}</p>
 
       {/* The option text is the stored spelling itself: the row's badge already
           shows `task.kind` verbatim, and two words for one stored value is
           exactly the drift AD-C7 forbids. */}
       <div className={TASK_FORM_ROW_CLASS}>
-        <Label htmlFor={`${fieldId}-kind`}>{TASK_FORM_KIND_LABEL}</Label>
+        <div className={TASK_FORM_LABEL_CLASS}>
+          <Label htmlFor={`${fieldId}-kind`}>{TASK_FORM_KIND_LABEL}</Label>
+          {/* The bot sentence is dropped on a build without bot tools for the
+              reason it always was: a menu that cannot offer `bot` must not
+              explain it. */}
+          <FieldHint
+            label={botTools ? TASK_FORM_KIND_NOTE : TASK_FORM_KIND_NOTE.replace(/bot [^.]+\. /, "")}
+          />
+        </div>
         <select
           id={`${fieldId}-kind`}
           className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
@@ -943,12 +1010,12 @@ export function TaskForm({
           ))}
         </select>
       </div>
-      <p className="text-muted-foreground text-xs">
-        {botTools ? TASK_FORM_KIND_NOTE : TASK_FORM_KIND_NOTE.replace(/bot [^.]+\. /, "")}
-      </p>
 
       <div className={TASK_FORM_ROW_CLASS}>
-        <Label htmlFor={`${fieldId}-mode`}>{TASK_FORM_MODE_LABEL}</Label>
+        <div className={TASK_FORM_LABEL_CLASS}>
+          <Label htmlFor={`${fieldId}-mode`}>{TASK_FORM_MODE_LABEL}</Label>
+          <FieldHint label={TASK_FORM_MODE_NOTE} />
+        </div>
         <select
           id={`${fieldId}-mode`}
           className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
@@ -963,10 +1030,12 @@ export function TaskForm({
           ))}
         </select>
       </div>
-      <p className="text-muted-foreground text-xs">{TASK_FORM_MODE_NOTE}</p>
 
       <div className={TASK_FORM_ROW_CLASS}>
-        <Label htmlFor={`${fieldId}-enabled`}>{TASK_FORM_ENABLED_LABEL}</Label>
+        <div className={TASK_FORM_LABEL_CLASS}>
+          <Label htmlFor={`${fieldId}-enabled`}>{TASK_FORM_ENABLED_LABEL}</Label>
+          <FieldHint label={TASK_FORM_ENABLED_NOTE} />
+        </div>
         <Switch
           id={`${fieldId}-enabled`}
           // `shrink-0` and not {@link TASK_FORM_CONTROL_CLASS}: a switch is not
@@ -979,7 +1048,6 @@ export function TaskForm({
           onCheckedChange={(checked) => setForm((live) => ({ ...live, enabled: checked }))}
         />
       </div>
-      <p className="text-muted-foreground text-xs">{TASK_FORM_ENABLED_NOTE}</p>
 
       {/* A native `<select>`, not the Radix one, and the reason is recorded in
           `session-file-actions.tsx`: Radix's `Select` throws on an empty-string
@@ -1045,7 +1113,10 @@ export function TaskForm({
       )}
 
       <div className={TASK_FORM_ROW_CLASS}>
-        <Label htmlFor={`${fieldId}-schedule`}>{TASK_FORM_SCHEDULE_LABEL}</Label>
+        <div className={TASK_FORM_LABEL_CLASS}>
+          <Label htmlFor={`${fieldId}-schedule`}>{TASK_FORM_SCHEDULE_LABEL}</Label>
+          <FieldHint label={TASK_FORM_SCHEDULE_HINT} />
+        </div>
         <Input
           id={`${fieldId}-schedule`}
           className={TASK_FORM_CONTROL_CLASS}
@@ -1055,7 +1126,6 @@ export function TaskForm({
           onChange={(event) => setForm((live) => ({ ...live, schedule: event.target.value }))}
         />
       </div>
-      <p className="text-muted-foreground text-xs">{TASK_FORM_SCHEDULE_NOTE}</p>
 
       {/* Directly under the box, because it is the answer to the question the
           box asks. Both spellings are `text-muted-foreground` and neither is a
@@ -1088,14 +1158,16 @@ export function TaskForm({
             </p>
           )
         ))}
-      <p className="text-muted-foreground text-xs">{TASK_SCHEDULE_BOUNDS_NOTE}</p>
 
       {/* An action, not a value — see {@link TASK_FORM_SCHEDULE_OFFER_NOTE}. The
           `value` is pinned to `""` so the control always reads as its own
           placeholder rather than pretending to mirror the box, and native for the
           reason the other four menus are. */}
       <div className={TASK_FORM_ROW_CLASS}>
-        <Label htmlFor={`${fieldId}-schedule-offer`}>{TASK_FORM_SCHEDULE_OFFER_LABEL}</Label>
+        <div className={TASK_FORM_LABEL_CLASS}>
+          <Label htmlFor={`${fieldId}-schedule-offer`}>{TASK_FORM_SCHEDULE_OFFER_LABEL}</Label>
+          <FieldHint label={TASK_FORM_SCHEDULE_OFFER_NOTE} />
+        </div>
         <select
           id={`${fieldId}-schedule-offer`}
           className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
@@ -1117,7 +1189,6 @@ export function TaskForm({
           ))}
         </select>
       </div>
-      <p className="text-muted-foreground text-xs">{TASK_FORM_SCHEDULE_OFFER_NOTE}</p>
 
       {/* Beside the schedule because it is a question about the schedule, and
           native for the reason the other three menus are. The option text is
@@ -1125,7 +1196,15 @@ export function TaskForm({
           words for one stored value is the drift AD-C7 forbids, and this is the
           vocabulary `tasks list --json` prints. */}
       <div className={TASK_FORM_ROW_CLASS}>
-        <Label htmlFor={`${fieldId}-on-missed`}>{TASK_FORM_ON_MISSED_LABEL}</Label>
+        <div className={TASK_FORM_LABEL_CLASS}>
+          <Label htmlFor={`${fieldId}-on-missed`}>{TASK_FORM_ON_MISSED_LABEL}</Label>
+          {/* Composed, not written: the sentence has to describe the wait THIS
+              task will actually do, and a literal `30` in it would be false for
+              every task that chose otherwise. An unparseable box falls back to
+              the default's number rather than saying nothing, because the hint
+              explains the setting and the refusal at the top explains the box. */}
+          <FieldHint label={taskFormOnMissedNote(effectiveDelayMinutes)} />
+        </div>
         <select
           id={`${fieldId}-on-missed`}
           className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
@@ -1140,32 +1219,25 @@ export function TaskForm({
           ))}
         </select>
       </div>
-      {/* Composed, not written: the sentence has to describe the wait THIS task
-          will actually do, and a literal `30` in it would be false for every
-          task that chose otherwise — the same defect as the wrong number this
-          note shipped with, arrived at from the other side. An unparseable box
-          falls back to the default's number rather than saying nothing, because
-          the note explains the setting and the refusal below explains the box. */}
-      <p className="text-muted-foreground text-xs">{taskFormOnMissedNote(effectiveDelayMinutes)}</p>
 
       {showMissedDelay && (
-        <>
-          <div className={TASK_FORM_ROW_CLASS}>
+        <div className={TASK_FORM_ROW_CLASS}>
+          <div className={TASK_FORM_LABEL_CLASS}>
             <Label htmlFor={`${fieldId}-missed-delay`}>{TASK_FORM_MISSED_DELAY_LABEL}</Label>
-            <Input
-              id={`${fieldId}-missed-delay`}
-              className={TASK_FORM_CONTROL_CLASS}
-              value={form.missedDelayMinutes}
-              disabled={saving}
-              inputMode="numeric"
-              placeholder={String(TASK_MISSED_DELAY_MINUTES)}
-              onChange={(event) =>
-                setForm((live) => ({ ...live, missedDelayMinutes: event.target.value }))
-              }
-            />
+            <FieldHint label={TASK_FORM_MISSED_DELAY_NOTE} />
           </div>
-          <p className="text-muted-foreground text-xs">{TASK_FORM_MISSED_DELAY_NOTE}</p>
-        </>
+          <Input
+            id={`${fieldId}-missed-delay`}
+            className={TASK_FORM_CONTROL_CLASS}
+            value={form.missedDelayMinutes}
+            disabled={saving}
+            inputMode="numeric"
+            placeholder={String(TASK_MISSED_DELAY_MINUTES)}
+            onChange={(event) =>
+              setForm((live) => ({ ...live, missedDelayMinutes: event.target.value }))
+            }
+          />
+        </div>
       )}
 
       <div className="flex items-center gap-2">
@@ -1253,12 +1325,9 @@ function BotTaskFields({ form, fieldId, saving, onChange }: KindFieldsProps) {
         key={`prompt:${form.profileId}`}
         profileId={form.profileId}
         value={form.promptSubpath}
+        hint={TASK_FORM_PROMPT_NOTE}
         onChange={(promptSubpath) => onChange({ promptSubpath })}
       />
-      <p className="text-muted-foreground text-xs">
-        The runner reads the chosen .md under this folder, without its frontmatter or first heading.
-        Existing grants apply; a write that needs approval is refused when nobody is there.
-      </p>
     </fieldset>
   );
 }
@@ -1332,10 +1401,14 @@ function TaskModelPicker({
 function TaskPromptPicker({
   profileId,
   value,
+  hint,
   onChange,
 }: {
   profileId: string;
   value: string;
+  /** What the runner will do with the chosen file — the fieldset's standing
+   *  prose, now beside the heading it was under rather than below the list. */
+  hint: string;
   onChange: (subpath: string) => void;
 }) {
   const [subpath, setSubpath] = useState("");
@@ -1368,7 +1441,10 @@ function TaskPromptPicker({
       : [];
   return (
     <section aria-label="Prompt file" className="flex min-w-0 flex-col gap-2">
-      <span className="text-sm font-medium">Prompt file</span>
+      <div className={TASK_FORM_LABEL_CLASS}>
+        <span className="text-sm font-medium">Prompt file</span>
+        <FieldHint label={hint} />
+      </div>
       <p className="break-all font-mono text-xs">{value || "No prompt chosen"}</p>
       {profileId === "" ? (
         <p className="text-muted-foreground text-xs">
@@ -1462,37 +1538,20 @@ function CopyTaskFields({ form, fieldId, saving, onChange }: KindFieldsProps) {
           <p className="break-all font-mono text-xs">{form[key] || "Nothing chosen"}</p>
         </div>
       ))}
+      {/* The date window that used to stand here is gone end to end (AD-256,
+          rescinding AD-245): a copy's lower bound is a mark keeper writes for
+          itself, not two dates a person has to remember to move. */}
       <div className={TASK_FORM_ROW_CLASS}>
-        <Label htmlFor={`${fieldId}-replace`}>Replace files that already exist</Label>
+        <div className={TASK_FORM_LABEL_CLASS}>
+          <Label htmlFor={`${fieldId}-replace`}>Replace files that already exist</Label>
+          <FieldHint label={TASK_FORM_REPLACE_EXISTING_NOTE} />
+        </div>
         <Switch
           id={`${fieldId}-replace`}
           checked={form.replaceExisting}
           onCheckedChange={(replaceExisting) => onChange({ replaceExisting })}
         />
       </div>
-      <p className="text-muted-foreground text-xs">
-        Left off, identical files are skipped and differing files are left alone and reported.
-      </p>
-      {(["modifiedAfterMs", "modifiedBeforeMs"] as const).map((key) => (
-        <div key={key} className={TASK_FORM_ROW_CLASS}>
-          <Label htmlFor={`${fieldId}-${key}`}>
-            {key === "modifiedAfterMs" ? "Modified from" : "Modified before"}
-          </Label>
-          <Input
-            id={`${fieldId}-${key}`}
-            type="date"
-            className={TASK_FORM_CONTROL_CLASS}
-            value={form[key] == null ? "" : new Date(form[key]).toISOString().slice(0, 10)}
-            onChange={(event) =>
-              onChange({ [key]: event.target.value === "" ? null : event.target.valueAsNumber })
-            }
-          />
-        </div>
-      ))}
-      <p className="text-muted-foreground text-xs">
-        Optional source modification dates, at midnight UTC: from is inclusive; before is exclusive.
-        Leave either empty for no bound. Files outside the window are reported as skipped.
-      </p>
     </fieldset>
   );
 }

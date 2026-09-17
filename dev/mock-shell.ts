@@ -1725,6 +1725,9 @@ const TASK_RUNS: Record<string, TaskRunVm[]> = {
     outcome: "ok",
     unknownOutcome: null,
     detail: "3 synced, 0 already syncing, 0 waiting, 0 failed",
+    // Its schedule came due and this host served it on time (Story 74.5).
+    trigger: "scheduled",
+    lateByMs: 0,
     host: "01DEVICE#4188",
   })),
   // Mid-run: the newest attempt has no `finishedMs` and no outcome, which is
@@ -1738,6 +1741,8 @@ const TASK_RUNS: Record<string, TaskRunVm[]> = {
       outcome: null,
       unknownOutcome: null,
       detail: null,
+      trigger: "requested",
+      lateByMs: null,
       host: "01DEVICE#912",
     },
     {
@@ -1748,6 +1753,10 @@ const TASK_RUNS: Record<string, TaskRunVm[]> = {
       outcome: "ok",
       unknownOutcome: null,
       detail: "looked at 1 284 objects, released 96, reclaimed 74 GB",
+      // The host timer woke and ran it, 41 minutes past the window — the
+      // shape that was invisible before AD-253.
+      trigger: "timer",
+      lateByMs: 41 * 60_000,
       host: "01DEVICE#912",
     },
   ],
@@ -1763,6 +1772,8 @@ const TASK_RUNS: Record<string, TaskRunVm[]> = {
       unknownOutcome: null,
       detail:
         "0 synced, 0 already syncing, 0 waiting, 1 failed: could not resolve host git.tgorka.dev",
+      trigger: "scheduled",
+      lateByMs: 0,
       host: "01DEVICE#4188",
     },
     {
@@ -1773,6 +1784,8 @@ const TASK_RUNS: Record<string, TaskRunVm[]> = {
       outcome: "deferred",
       unknownOutcome: null,
       detail: "0 synced, 0 already syncing, 1 waiting, 0 failed",
+      trigger: "scheduled",
+      lateByMs: 0,
       host: "01DEVICE#4188",
     },
   ],
@@ -1787,6 +1800,10 @@ const TASK_RUNS: Record<string, TaskRunVm[]> = {
       outcome: null,
       unknownOutcome: "sublimated",
       detail: "recorded by keeper 0.9.0",
+      // Recorded before AD-253: the row says nothing about why it ran,
+      // rather than claiming a schedule it cannot vouch for.
+      trigger: null,
+      lateByMs: null,
       host: "01DEVICE#77",
     },
   ],
@@ -1807,8 +1824,8 @@ const NO_KIND_PAYLOAD = {
   copySource: null,
   copyDestination: null,
   replaceExisting: false,
-  modifiedAfterMs: null,
-  modifiedBeforeMs: null,
+  // No ledger folder in the harness's fixtures, so no mark (Story 74.4).
+  markMs: null,
 } satisfies Partial<TaskVm>;
 
 const TASKS: TaskVm[] = [
@@ -2932,18 +2949,19 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
         retriable: false,
       };
     }
-    const after = typeof payload.modifiedAfterMs === "number" ? payload.modifiedAfterMs : null;
-    const before = typeof payload.modifiedBeforeMs === "number" ? payload.modifiedBeforeMs : null;
-    const entries = COPY_FIXTURES.map((file) => {
-      const skipped =
-        (after !== null && file.mtimeMs < after) || (before !== null && file.mtimeMs >= before);
-      return {
+    // The mark, not a typed window (AD-256): a run the shell reports covers
+    // everything newer than the last successful one's high-water mtime, and the
+    // harness answers exactly what the engine answers — a file behind the mark
+    // is absent from the report rather than listed as skipped.
+    const since = typeof payload.modifiedSinceMs === "number" ? payload.modifiedSinceMs : null;
+    const entries = COPY_FIXTURES.filter((file) => since === null || file.mtimeMs > since).map(
+      (file) => ({
         path: file.path,
-        bytes: skipped ? 0 : file.bytes,
-        outcome: skipped ? "skipped" : "copied",
-        reason: skipped ? "Source modification time is outside the chosen date window." : null,
-      };
-    });
+        bytes: file.bytes,
+        outcome: "copied",
+        reason: null,
+      }),
+    );
     const id = `mock-copy-${copyJobs.size + 1}`;
     const bytes = entries.reduce((sum, entry) => sum + entry.bytes, 0);
     copyJobs.set(id, {
@@ -3499,6 +3517,10 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       outcome: "ok",
       unknownOutcome: null,
       detail: "no folders to sync",
+      // A person pressed Run now, and a request has no window to be late for
+      // (Story 74.5).
+      trigger: "requested",
+      lateByMs: null,
       host: "01DEVICE#4188",
     };
     // Recorded, so the next read shows the run rather than the pane appearing
@@ -3594,8 +3616,6 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       copySource: req.copySource,
       copyDestination: req.copyDestination,
       replaceExisting: req.replaceExisting,
-      modifiedAfterMs: req.modifiedAfterMs,
-      modifiedBeforeMs: req.modifiedBeforeMs,
       // Echoed verbatim, `""` included: the real store keeps a blank a person
       // typed apart from a description that was never there, so a mock that
       // collapsed them would hide the one case the view has to render as absence.

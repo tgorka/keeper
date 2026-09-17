@@ -1869,6 +1869,10 @@ fn task_run_vm(run: &keeper_sync::db::TaskRunRow) -> TaskRunVm {
         // (NFR-43).
         unknown_outcome: run.unknown_outcome.clone(),
         detail: run.detail.clone(),
+        // The three words the engine knew at claim time and used to throw away
+        // (Story 74.5, AD-253). A spelling for `outcome`'s reason.
+        trigger: run.trigger.map(|trigger| trigger.as_str().to_owned()),
+        late_by_ms: run.late_by_ms,
         host: run.host.clone(),
     }
 }
@@ -1898,6 +1902,11 @@ fn task_vm(
     profiles: &[SyncProfile],
     unreadable_profiles: &[String],
     last_run: Option<TaskRunVm>,
+    /// The mark the task's ledger folder holds, when one is configured and a
+    /// run of this configuration has succeeded (Story 74.4). Resolved by the
+    /// caller, which already has the engine and the profile list in hand —
+    /// this function reads a row and decides nothing about the filesystem.
+    mark_ms: Option<i64>,
     daemon: DaemonPresence,
 ) -> TaskVm {
     let profile = row
@@ -1936,8 +1945,12 @@ fn task_vm(
         copy_source: row.copy_source.clone(),
         copy_destination: row.copy_destination.clone(),
         replace_existing: row.replace_existing,
-        modified_after_ms: row.modified_after_ms,
-        modified_before_ms: row.modified_before_ms,
+        // Read from the ledger folder's file names, not from a column: the
+        // mark lives in the drive so it survives this machine's database
+        // (Story 74.4, AD-252). `None` here means either "no ledger folder is
+        // configured" or "no successful run of this configuration yet", and
+        // the surface says which by whether a ledger path exists at all.
+        mark_ms,
         next_due_ms: row.next_due_ms,
         running_host: row.running_host.clone(),
         lease_until_ms: row.lease_until_ms,
@@ -2216,7 +2229,17 @@ pub async fn sync_tasks(state: tauri::State<'_, AppState>) -> Result<TaskListing
             .map_err(|err| sync_ipc_error(&err))?
             .first()
             .map(task_run_vm);
-        tasks.push(task_vm(row, &profiles, &unreadable, last_run, daemon));
+        // Names in the ledger folder, not a column: cheap enough per row that
+        // the list can show how far each copy has got (Story 74.4).
+        let mark_ms = engine.task_mark(row);
+        tasks.push(task_vm(
+            row,
+            &profiles,
+            &unreadable,
+            last_run,
+            mark_ms,
+            daemon,
+        ));
     }
     Ok(TaskListingVm {
         tasks,
@@ -2495,8 +2518,6 @@ pub async fn sync_task_save(
         copy_source: req.copy_source.clone(),
         copy_destination: req.copy_destination.clone(),
         replace_existing: req.replace_existing,
-        modified_after_ms: req.modified_after_ms,
-        modified_before_ms: req.modified_before_ms,
     };
     // The one caller that passes a baseline, and the reason the parameter
     // exists: this form seeded its six values once, so every field it is about
@@ -2531,11 +2552,13 @@ pub async fn sync_task_save(
         .map_err(|err| sync_ipc_error(&err))?
         .first()
         .map(task_run_vm);
+    let mark_ms = engine.task_mark(stored);
     Ok(task_vm(
         stored,
         &profiles,
         &unreadable,
         last_run,
+        mark_ms,
         daemon_presence_probe(app_dir).await,
     ))
 }

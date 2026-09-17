@@ -811,6 +811,25 @@ impl TaskTrigger {
             Self::Timer => SyncSource::Cli,
         }
     }
+
+    /// The same fact in the vocabulary that gets **written down** — the
+    /// `task_runs.trigger` column and the run ledger's file names (Story 74.5,
+    /// AD-253).
+    ///
+    /// One mapping, in one place, because the two vocabularies exist for
+    /// different reasons and must not be merged: this enum is the engine's
+    /// internal control flow (it decides claim semantics and the next window),
+    /// while [`crate::ledger::RunTrigger`] is a persisted spelling that a
+    /// database row, a file name in somebody's drive and a frontend all have
+    /// to agree on. The words happen to coincide today; the mapping is what
+    /// makes a future divergence a compile error rather than a silent one.
+    fn run_trigger(self) -> crate::ledger::RunTrigger {
+        match self {
+            Self::Scheduled => crate::ledger::RunTrigger::Scheduled,
+            Self::Requested => crate::ledger::RunTrigger::Requested,
+            Self::Timer => crate::ledger::RunTrigger::Timer,
+        }
+    }
 }
 
 /// Why the release sweep is running: because a sync just succeeded, or because
@@ -3929,7 +3948,21 @@ impl Engine {
             TaskTrigger::Timer => None,
         };
         let Some(run_id) = self.with_db(|conn| {
-            db::claim_task(conn, &task.id, &host, now_ms, TASK_LEASE_MS, due_at_most)
+            db::claim_task(
+                conn,
+                &task.id,
+                &host,
+                now_ms,
+                TASK_LEASE_MS,
+                due_at_most,
+                trigger.run_trigger(),
+                // The window this row carried when it was claimed. It is the
+                // only moment the lateness is knowable: `finish_task_run`
+                // overwrites `next_due_ms` with the NEXT window, so a run
+                // served forty minutes after its own left no trace of it
+                // before AD-253 (Story 74.5).
+                task.next_due_ms,
+            )
         })?
         else {
             return Ok(None);
@@ -3941,7 +3974,9 @@ impl Engine {
         // a panic inside the work cannot leave the id behind and wedge every
         // later quit into holding a lease for a run that ended.
         let _in_flight = self.mark_task_run_in_flight(&task.id);
-        let (outcome, detail) = self.perform_task(task, profiles, trigger.source()).await;
+        let (outcome, detail) = self
+            .perform_task(task, profiles, trigger.source(), trigger.run_trigger())
+            .await;
         // The clock is read again rather than reused: a sync pass takes as long
         // as it takes, and a window computed from the instant the task became
         // due would come due again the moment a run that overran it finished.
@@ -4037,6 +4072,11 @@ impl Engine {
         task: &db::TaskRow,
         profiles: &[SyncProfile],
         source: SyncSource,
+        // Why this run happened, in the spelling that gets written down. Every
+        // kind is handed it — a run's provenance is not a property of what the
+        // run does (Story 74.5, AD-253) — and the arms that have a ledger
+        // entry to write use it.
+        run_trigger: crate::ledger::RunTrigger,
     ) -> (tasks::TaskOutcome, String) {
         match task.kind {
             tasks::TaskKind::Sync => self.perform_sync_task(task, profiles, source).await,
@@ -4054,7 +4094,7 @@ impl Engine {
             // one kind whose work happens outside this crate (AD-224), so the
             // arm is a resolve, a read and one call through the port.
             tasks::TaskKind::Bot => self.perform_bot_task(task, profiles).await,
-            tasks::TaskKind::Copy => self.perform_copy_task(task, profiles).await,
+            tasks::TaskKind::Copy => self.perform_copy_task(task, profiles, run_trigger).await,
             // No `source` here either: a repack rewrites how objects are
             // stored and not one of them, so there is no commit and no
             // provenance. The one kind that runs the shim's `gc` verb
@@ -4063,11 +4103,106 @@ impl Engine {
         }
     }
 
+    /// What this task IS, fingerprinted — the eight hex characters every one of
+    /// its run files carries (Story 74.4, AD-252).
+    ///
+    /// A mark left by a run whose source, destination or replace rule differed
+    /// describes *different work*, so honouring it would silently never copy
+    /// the new source's history. Composed from the stored fields in a fixed
+    /// order rather than from a derived `Debug`, because a field reordering
+    /// must not invalidate every mark in every ledger on every machine.
+    ///
+    /// Kinds with no configuration of their own fingerprint their kind and
+    /// their folder: that is the whole of what decides what such a run does,
+    /// and it still distinguishes two tasks of the same kind over two folders.
+    fn task_fingerprint(task: &db::TaskRow) -> String {
+        crate::ledger::config_fingerprint(&[
+            task.kind.as_str(),
+            task.profile_id.as_deref().unwrap_or(""),
+            task.copy_source.as_deref().unwrap_or(""),
+            task.copy_destination.as_deref().unwrap_or(""),
+            if task.replace_existing {
+                "replace"
+            } else {
+                "keep"
+            },
+            task.bot_id.as_deref().unwrap_or(""),
+            task.prompt_subpath.as_deref().unwrap_or(""),
+            task.model.as_deref().unwrap_or(""),
+        ])
+    }
+
+    /// The mark this task's ledger holds, for a surface that wants to say how
+    /// far it has got, and `None` when no ledger is configured or no run of
+    /// this configuration has finished.
+    ///
+    /// Reads directory names only — see [`crate::ledger::TaskLedger::latest_mark`]
+    /// — so a list of tasks can ask it per row without a per-row file read.
+    pub fn task_mark(&self, task: &db::TaskRow) -> Option<i64> {
+        let profiles = self.list_profiles().ok()?;
+        let fingerprint = Self::task_fingerprint(task);
+        self.task_ledger(task, &profiles, &fingerprint)?
+            .latest_mark(&fingerprint)
+    }
+
+    /// Where this task's runs are written down, or `None` when nothing is
+    /// configured to hold them (Story 74.3, AD-251).
+    ///
+    /// The ledger is a folder inside a synced profile, flagged the way a notes
+    /// vault is flagged — so the search is over the profiles this engine is
+    /// already holding, and there is no second path to validate. Two rules
+    /// decide which one:
+    ///
+    /// * a task scoped to a profile uses **that** profile's ledger, or none;
+    /// * a host-wide task uses the first profile that carries one, in the
+    ///   profile order the caller handed over (stable, because the engine's
+    ///   profile list is sorted before it reaches here).
+    ///
+    /// `None` is a first-class answer, not a degradation: with no ledger a
+    /// copy simply has no mark, so it walks everything and reports to
+    /// `task_runs` exactly as it did before this epic. Nothing is invented,
+    /// and nothing is written outside the database — which is what makes the
+    /// feature opt-in by configuring a folder rather than by a migration.
+    fn task_ledger(
+        &self,
+        task: &db::TaskRow,
+        profiles: &[SyncProfile],
+        fingerprint: &str,
+    ) -> Option<crate::ledger::TaskLedger> {
+        let candidate = profiles.iter().find(|profile| {
+            profile.tasks.is_some()
+                && task
+                    .profile_id
+                    .as_ref()
+                    .is_none_or(|scoped| scoped == &profile.id)
+        })?;
+        let config = candidate.tasks.as_ref()?;
+        match crate::ledger::TaskLedger::resolve(&candidate.local_path, &config.subfolder, &task.id)
+        {
+            Ok(ledger) => Some(ledger),
+            // A subfolder the path rules refuse is a configuration fault, and
+            // the profile's own validator should have caught it before it was
+            // stored. Logged rather than propagated: it must not turn a copy
+            // that would otherwise work into a failure, and the next run of
+            // the folder-file loader will say the same thing again.
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    task = task.id,
+                    fingerprint,
+                    "task ledger folder is unusable; this run records no mark"
+                );
+                None
+            }
+        }
+    }
+
     /// A remembered schedule over a copy job, not a profile or journal entry.
     async fn perform_copy_task(
         &self,
         task: &db::TaskRow,
         profiles: &[SyncProfile],
+        trigger: crate::ledger::RunTrigger,
     ) -> (tasks::TaskOutcome, String) {
         use crate::copy::{CopyOptions, CopyOutcome};
         let (Some(source), Some(destination)) = (&task.copy_source, &task.copy_destination) else {
@@ -4078,10 +4213,16 @@ impl Engine {
         };
         let source = Path::new(source);
         let destination = Path::new(destination);
+        let fingerprint = Self::task_fingerprint(task);
+        let ledger = self.task_ledger(task, profiles, &fingerprint);
         let options = CopyOptions {
             replace_existing: task.replace_existing,
-            modified_after_ms: task.modified_after_ms,
-            modified_before_ms: task.modified_before_ms,
+            // The lower bound is what keeper measured last time, not a date
+            // somebody typed (AD-256 rescinded that). No ledger, no mark, full
+            // pass — an unreadable history costs a walk, never a skipped file.
+            modified_since_ms: ledger
+                .as_ref()
+                .and_then(|ledger| ledger.latest_mark(&fingerprint)),
         };
         // The existing blocking fence preserves the borrowed engine needed for
         // hydration while handing the runtime's work to another worker.
@@ -4125,14 +4266,12 @@ impl Engine {
             };
             let mut copied = 0;
             let mut identical = 0;
-            let mut skipped = 0;
             let mut collisions = 0;
             let mut failed = 0;
             for entry in &report.entries {
                 match entry.outcome {
                     CopyOutcome::Copied => copied += 1,
                     CopyOutcome::Identical => identical += 1,
-                    CopyOutcome::Skipped { .. } => skipped += 1,
                     CopyOutcome::Collision => collisions += 1,
                     CopyOutcome::Failed { .. } => failed += 1,
                 }
@@ -4151,11 +4290,40 @@ impl Engine {
                 destination,
                 &self.platform.now_ms().to_string(),
             );
-            let log_error = std::fs::write(&log, body).err();
-            let mut detail = format!("{} bytes; {} files: {copied} copied, {identical} identical, {skipped} skipped, {collisions} left alone, {failed} failed",
+            let log_error = std::fs::write(&log, &body).err();
+            let mut detail = format!("{} bytes; {} files: {copied} copied, {identical} identical, {collisions} left alone, {failed} failed",
                 report.bytes_copied, report.entries.len());
             if let Some(err) = &log_error {
                 detail.push_str(&format!("; could not write the copy log: {err}"));
+            }
+            let verdict = if failed > 0 {
+                crate::ledger::RunVerdict::Partial
+            } else {
+                crate::ledger::RunVerdict::Ok
+            };
+            // The ledger entry, whose NAME is the next run's lower bound. The
+            // mark is the newest mtime this pass covered — `None` when it
+            // covered nothing, in which case the run is still written down
+            // (the person asked, and it happened) but marked with the instant
+            // it finished, which advances nothing a file could hide behind.
+            if let Some(ledger) = &ledger {
+                let name = crate::ledger::RunFileName {
+                    mark_ms: report.mark_ms.unwrap_or_else(|| self.platform.now_ms()),
+                    trigger,
+                    verdict,
+                    fingerprint: fingerprint.clone(),
+                };
+                let header =
+                    crate::ledger::render_run_header("copy", trigger, verdict, &name, &detail);
+                if let Err(err) = ledger.write_run(&name, &format!("{header}{body}")) {
+                    // A ledger that cannot be written is a real failure: the
+                    // next run would re-walk the whole tree and, worse, nothing
+                    // in the drive would record that this one happened. Said
+                    // out loud rather than swallowed — but after the copy,
+                    // whose bytes are already verified and safe.
+                    detail.push_str(&format!("; could not write the run ledger entry: {err}"));
+                    return (tasks::TaskOutcome::Failed, detail);
+                }
             }
             let outcome = if failed > 0 || log_error.is_some() {
                 tasks::TaskOutcome::Failed
@@ -18300,8 +18468,6 @@ mod tests {
             copy_source: None,
             copy_destination: None,
             replace_existing: false,
-            modified_after_ms: None,
-            modified_before_ms: None,
             schedule: Some(schedule.to_owned()),
             mode: tasks::TaskMode::Scheduled,
             next_due_ms: None,
@@ -18336,71 +18502,174 @@ mod tests {
         }
     }
 
+    /// The whole of story 74.4 in one fixture: a copy task whose profile holds
+    /// a ledger folder runs twice, and the second run copies only what changed
+    /// since the first one's mark — which it learns from a file NAME, with no
+    /// database column and no file opened.
     #[tokio::test(flavor = "multi_thread")]
-    async fn copy_task_runs_verified_job_and_records_window_summary() {
+    async fn a_second_copy_carries_only_what_changed_since_the_mark() {
         let dir = tempfile::tempdir().expect("tempdir");
         let platform = Arc::new(TestPlatform::new(dir.path()));
         let engine = Engine::open(platform.clone()).expect("engine");
+
+        // A profile whose folder holds the ledger, flagged the way a notes
+        // vault is flagged (Story 74.3).
+        let mut profile = profile(dir.path());
+        profile.tasks = Some(crate::profile::TasksConfig::default());
+        std::fs::create_dir_all(&profile.local_path).expect("profile root");
+        engine.upsert_profile(&profile).expect("save profile");
+
         let source = dir.path().join("copy-source");
         std::fs::create_dir_all(&source).expect("source");
-        for (name, ms, bytes) in [
-            ("old", 1000, b"old".as_slice()),
-            ("new", 3000, b"newer".as_slice()),
-        ] {
+        let touch = |name: &str, bytes: &[u8], ms: u64| {
             let path = source.join(name);
             std::fs::write(&path, bytes).expect("fixture");
             std::fs::File::options()
                 .write(true)
-                .open(path)
+                .open(&path)
                 .expect("open")
                 .set_times(
                     std::fs::FileTimes::new()
                         .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(ms)),
                 )
                 .expect("mtime");
-        }
-        let mut row = task("copy-fixtures", None, "every 5m");
+        };
+        touch("old", b"old", 1_000);
+        touch("new", b"newer", 3_000);
+
+        let destination = dir.path().join("destination");
+        let mut row = task("copy-fixtures", Some(&profile.id), "every 5m");
         row.kind = tasks::TaskKind::Copy;
         row.copy_source = Some(source.to_string_lossy().into_owned());
-        for (name, bound, bytes) in [("all", None, 8), ("bounded", Some(2000), 5)] {
-            let destination = dir.path().join(name);
-            row.copy_destination = Some(destination.to_string_lossy().into_owned());
-            row.modified_after_ms = bound;
-            engine.save_task(&row, None).expect("save");
-            engine
-                .run_task_now(&row.id, tasks::TaskRunDriver::Person)
-                .await
-                .expect("run");
-            let runs = engine.task_history(&row.id, 1).expect("history");
-            assert_eq!(runs[0].outcome, Some(tasks::TaskOutcome::Ok));
-            assert!(runs[0]
+        row.copy_destination = Some(destination.to_string_lossy().into_owned());
+        engine.save_task(&row, None).expect("save");
+
+        // First pass: no mark exists, so everything is carried.
+        engine
+            .run_task_now(&row.id, tasks::TaskRunDriver::Person)
+            .await
+            .expect("first run");
+        let first = engine.task_history(&row.id, 1).expect("history");
+        assert_eq!(first[0].outcome, Some(tasks::TaskOutcome::Ok));
+        assert!(first[0]
+            .detail
+            .as_deref()
+            .expect("detail")
+            .starts_with("8 bytes; 2 files:"));
+        assert_eq!(
+            std::fs::read(destination.join("old")).expect("old"),
+            b"old",
+            "a first pass has no mark and therefore no lower bound"
+        );
+
+        // The mark is the newest mtime that pass covered — 3000 — and it is in
+        // a file name, in the ledger folder, under the year that instant falls
+        // in. Read here the way a person would: by listing the directory.
+        let ledger_year = profile
+            .local_path
+            .join(crate::profile::DEFAULT_TASKS_SUBFOLDER)
+            .join(&row.id)
+            .join("1970");
+        let names: Vec<String> = std::fs::read_dir(&ledger_year)
+            .expect("ledger year folder")
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        assert_eq!(names.len(), 1, "one run, one file: {names:?}");
+        let parsed = crate::ledger::RunFileName::parse(&names[0]).expect("a run file name");
+        assert_eq!(parsed.mark_ms, 3_000);
+        assert_eq!(parsed.trigger, crate::ledger::RunTrigger::Requested);
+        assert_eq!(parsed.verdict, crate::ledger::RunVerdict::Ok);
+        assert_eq!(
+            engine.task_mark(&row).expect("mark"),
+            3_000,
+            "and the surface reads the same number back out of the names"
+        );
+        // The body is the copy report a person can read without keeper.
+        let body = std::fs::read_to_string(ledger_year.join(&names[0])).expect("body");
+        assert!(body.contains("why:         requested"), "{body}");
+        assert!(body.contains("copied  5  "), "{body}");
+
+        // Now one file changes and one does not. The second pass must carry the
+        // changed one and not even look at the other.
+        std::fs::remove_dir_all(&destination).expect("clear the destination");
+        touch("new", b"newest", 5_000);
+        platform.advance_ms(1);
+        engine
+            .run_task_now(&row.id, tasks::TaskRunDriver::Person)
+            .await
+            .expect("second run");
+        let second = engine.task_history(&row.id, 1).expect("history");
+        assert!(
+            second[0]
                 .detail
                 .as_deref()
                 .expect("detail")
-                .starts_with(&format!("{bytes} bytes; 2 files:")));
-            assert_eq!(
-                std::fs::read(destination.join("new")).expect("new"),
-                b"newer"
-            );
-            assert_eq!(destination.join("old").exists(), bound.is_none());
-            let log = std::fs::read_dir(&destination)
-                .expect("destination")
-                .map(|entry| entry.expect("entry").path())
-                .find(|path| path.extension().is_some_and(|ext| ext == "log"))
-                .expect("log");
-            let log = std::fs::read_to_string(log).expect("read log");
-            if bound.is_some() {
-                assert!(log.contains("skipped  0  -  old"), "{log}");
-            }
-            platform.advance_ms(1);
-        }
-        assert!(engine.list_profiles().expect("profiles").is_empty());
-        let queued: i64 = engine
-            .with_db(|conn| {
-                Ok(conn.query_row("SELECT COUNT(*) FROM journal", [], |row| row.get(0))?)
-            })
-            .expect("journal");
-        assert_eq!(queued, 0);
+                .starts_with("6 bytes; 1 files:"),
+            "only the file modified after the mark: {:?}",
+            second[0].detail
+        );
+        assert!(
+            !destination.join("old").exists(),
+            "a file behind the mark is not copied again — that is the whole point"
+        );
+        assert_eq!(engine.task_mark(&row).expect("mark"), 5_000);
+
+        // A configuration change invalidates the mark: the same task pointed at
+        // a new destination has never copied anything there, and inheriting the
+        // old line would leave that destination permanently missing history.
+        let elsewhere = dir.path().join("elsewhere");
+        row.copy_destination = Some(elsewhere.to_string_lossy().into_owned());
+        engine.save_task(&row, None).expect("save");
+        assert_eq!(
+            engine.task_mark(&row),
+            None,
+            "a different destination is different work"
+        );
+        platform.advance_ms(1);
+        engine
+            .run_task_now(&row.id, tasks::TaskRunDriver::Person)
+            .await
+            .expect("third run");
+        assert_eq!(
+            std::fs::read(elsewhere.join("old")).expect("old"),
+            b"old",
+            "so the pass is a full one"
+        );
+    }
+
+    /// With no ledger folder configured nothing is invented: the run is
+    /// recorded in `task_runs` exactly as it was before this epic, and not one
+    /// byte is written outside the database and the destination.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_copy_without_a_ledger_folder_still_runs_and_writes_nothing_extra() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let engine = Engine::open(platform.clone()).expect("engine");
+        let source = dir.path().join("copy-source");
+        std::fs::create_dir_all(&source).expect("source");
+        std::fs::write(source.join("one"), b"bytes").expect("fixture");
+        let destination = dir.path().join("destination");
+        let mut row = task("copy-no-ledger", None, "every 5m");
+        row.kind = tasks::TaskKind::Copy;
+        row.copy_source = Some(source.to_string_lossy().into_owned());
+        row.copy_destination = Some(destination.to_string_lossy().into_owned());
+        engine.save_task(&row, None).expect("save");
+
+        engine
+            .run_task_now(&row.id, tasks::TaskRunDriver::Person)
+            .await
+            .expect("run");
+
+        let runs = engine.task_history(&row.id, 1).expect("history");
+        assert_eq!(runs[0].outcome, Some(tasks::TaskOutcome::Ok));
+        assert_eq!(engine.task_mark(&row), None);
+        // Every pass is a full pass without a mark, which is the honest cost of
+        // not configuring a ledger — never a skipped file.
+        assert_eq!(
+            std::fs::read(destination.join("one")).expect("one"),
+            b"bytes"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -19781,7 +20050,18 @@ mod tests {
         let host = engine.task_host();
         let now = platform.now_ms();
         engine
-            .with_db(|conn| db::claim_task(conn, "01TERM", &host, now, TASK_LEASE_MS, None))
+            .with_db(|conn| {
+                db::claim_task(
+                    conn,
+                    "01TERM",
+                    &host,
+                    now,
+                    TASK_LEASE_MS,
+                    None,
+                    crate::ledger::RunTrigger::Requested,
+                    None,
+                )
+            })
             .expect("claim")
             .expect("claimed");
 
@@ -20223,7 +20503,18 @@ mod tests {
         let host = engine.task_host();
         let now = platform.now_ms();
         engine
-            .with_db(|conn| db::claim_task(conn, "01QUIT", &host, now, TASK_LEASE_MS, None))
+            .with_db(|conn| {
+                db::claim_task(
+                    conn,
+                    "01QUIT",
+                    &host,
+                    now,
+                    TASK_LEASE_MS,
+                    None,
+                    crate::ledger::RunTrigger::Requested,
+                    None,
+                )
+            })
             .expect("claim")
             .expect("claimed");
 
@@ -20232,7 +20523,16 @@ mod tests {
         let other = format!("{}#{}", engine.device().id, std::process::id() + 1);
         assert!(
             engine
-                .with_db(|conn| db::claim_task(conn, "01QUIT", &other, now, TASK_LEASE_MS, None))
+                .with_db(|conn| db::claim_task(
+                    conn,
+                    "01QUIT",
+                    &other,
+                    now,
+                    TASK_LEASE_MS,
+                    None,
+                    crate::ledger::RunTrigger::Requested,
+                    None,
+                ))
                 .expect("the claim statement runs")
                 .is_none(),
             "a held lease is what stops two hosts running one window"
@@ -20251,7 +20551,16 @@ mod tests {
 
         assert!(
             engine
-                .with_db(|conn| db::claim_task(conn, "01QUIT", &other, now, TASK_LEASE_MS, None))
+                .with_db(|conn| db::claim_task(
+                    conn,
+                    "01QUIT",
+                    &other,
+                    now,
+                    TASK_LEASE_MS,
+                    None,
+                    crate::ledger::RunTrigger::Requested,
+                    None,
+                ))
                 .expect("the claim statement runs")
                 .is_some(),
             "and handing it back is what stops the next host waiting out TASK_LEASE_MS \
@@ -20321,7 +20630,18 @@ mod tests {
         let now = inner.now_ms();
         let claim_by_other = || {
             engine
-                .with_db(|conn| db::claim_task(conn, "01MIDRUN", &other, now, TASK_LEASE_MS, None))
+                .with_db(|conn| {
+                    db::claim_task(
+                        conn,
+                        "01MIDRUN",
+                        &other,
+                        now,
+                        TASK_LEASE_MS,
+                        None,
+                        crate::ledger::RunTrigger::Requested,
+                        None,
+                    )
+                })
                 .expect("the claim statement runs")
         };
         assert!(
@@ -20446,7 +20766,9 @@ mod tests {
                     &other,
                     inner.now_ms(),
                     TASK_LEASE_MS,
-                    None
+                    None,
+                    crate::ledger::RunTrigger::Requested,
+                    None,
                 ))
                 .expect("the claim statement runs")
                 .is_some(),
@@ -20870,6 +21192,8 @@ mod tests {
                                         HOST,
                                         now,
                                         TASK_LEASE_MS,
+                                        Some(now),
+                                        crate::ledger::RunTrigger::Scheduled,
                                         Some(now),
                                     )
                                 })

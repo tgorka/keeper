@@ -249,8 +249,14 @@ says six times that something ended and never says what began.
 
 ## Shapes
 
-Small radii — 5px default, 3px on inline chips. A workroom's fittings are square-ish; a 12px radius
-reads consumer. `full` is for shapes whose ROUNDNESS IS THEIR MEANING: avatars, lamps, and count
+Small radii — 5px default, 7px on fields, 3px on inline chips, and **10px on containers**: a card,
+a dialog or a command palette is cut one step deeper than the inputs standing inside it. A workroom's
+fittings are square-ish; a 12px radius reads consumer, and that ceiling is unchanged — the container
+step buys separation, not softness. It exists because a 500px card and its 224px inputs used to carry
+the identical 7px corner, which is how a card stops reading as a container at all: with nothing to
+tell the edge of the region from the edge of the thing inside it, the eye reads a sheet of same-sized
+tiles. A container must always out-round its own fields by a visible step, and never by more than one.
+`full` is for shapes whose ROUNDNESS IS THEIR MEANING: avatars, lamps, and count
 badges. A count badge is a pill because a pill reads as a token dropped onto the row rather than a
 region of it — and there must be exactly ONE count badge component, because two implementations of
 one idea is how a UI starts looking slightly wrong without anyone being able to say why.

@@ -20,6 +20,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SyncError};
+use crate::ledger::RunTrigger;
 use crate::profile::{self, ProfileState, SyncProfile};
 use crate::stability::{FileSample, PersistedEntry};
 use crate::tasks::{TaskKind, TaskMode, TaskOutcome, TaskSchedule, TaskState};
@@ -245,6 +246,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     ensure_journal_columns(conn)?;
     ensure_materialized_columns(conn)?;
     ensure_task_columns(conn)?;
+    ensure_task_run_columns(conn)?;
     ensure_prune_default(conn)?;
     Ok(())
 }
@@ -531,16 +533,69 @@ fn ensure_task_columns(conn: &Connection) -> Result<()> {
     if !existing.iter().any(|c| c == "model") {
         conn.execute("ALTER TABLE tasks ADD COLUMN model TEXT", [])?;
     }
+    // `modified_after_ms` and `modified_before_ms` were story 72.9's copy date
+    // window (AD-245). AD-256 rescinded it: a date somebody has to type is a
+    // worse answer to "copy what changed" than the mark keeper now writes for
+    // itself (AD-252). They are gone from `TaskRow` and from every statement
+    // this file issues — nothing reads them and nothing writes them.
+    //
+    // They are deliberately NOT dropped, and are deliberately not in this list
+    // either. Not dropped, because this crate's schema rule is additive-only
+    // (NFR-43): SQLite's `DROP COLUMN` rewrites the table, and a rewrite that
+    // fails halfway through on a database a daemon has open is a folder that
+    // stops syncing — a far worse outcome than two unread integers per row. Not
+    // re-added here, because a fresh database has no reason to carry a column
+    // no code names; the two spellings therefore exist in databases created
+    // before this change and in no others, which is exactly what the
+    // skip-and-list reader tolerance is for.
     for (name, declaration) in [
         ("copy_source", "TEXT"),
         ("copy_destination", "TEXT"),
         ("replace_existing", "INTEGER NOT NULL DEFAULT 0"),
-        ("modified_after_ms", "INTEGER"),
-        ("modified_before_ms", "INTEGER"),
     ] {
         if !existing.iter().any(|column| column == name) {
             conn.execute(
                 &format!("ALTER TABLE tasks ADD COLUMN {name} {declaration}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Carry a `task_runs` table written before a run could say why it ran
+/// (Story 74.5, AD-253).
+///
+/// Two columns, both nullable, both written once by [`claim_task`] and never
+/// updated afterwards:
+///
+/// * `trigger` — `scheduled | requested | timer`, the word
+///   `crate::ledger::RunTrigger::as_str` produces. The **word** rather than a
+///   small integer because the run files in the drive's ledger carry the same
+///   three words in their names (AD-252), and a column that stored `1` where a
+///   file name says `requested` would make the two histories disagree the first
+///   time anybody compared them — which is the drift epic 73 spent a day
+///   untangling for recording manifests.
+/// * `late_by_ms` — how far past the window this row actually carried the claim
+///   happened, in milliseconds, never negative. Written at claim time and not
+///   derived later, because `finish_task_run` overwrites `next_due_ms` with the
+///   *next* window: by the time a reader sees the row, the window it was late
+///   for is gone.
+///
+/// `NULL` in either is *unknown*, and that is the honest reading for the runs a
+/// database already holds: a keeper that predates this change recorded runs it
+/// could not say the reason for, and a default of `scheduled` or `0` would put
+/// a confident lie on every one of them.
+fn ensure_task_run_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(task_runs)")?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (name, declaration) in [("trigger", "TEXT"), ("late_by_ms", "INTEGER")] {
+        if !existing.iter().any(|column| column == name) {
+            conn.execute(
+                &format!("ALTER TABLE task_runs ADD COLUMN {name} {declaration}"),
                 [],
             )?;
         }
@@ -3089,7 +3144,7 @@ const TASK_COLUMNS: &str = "id, profile_id, kind, schedule, mode, next_due_ms, \
                             enabled, updated_ms, running_host, lease_until_ms, \
                             on_missed, description, missed_delay_ms, \
                             bot_id, prompt_subpath, model, copy_source, copy_destination, \
-                            replace_existing, modified_after_ms, modified_before_ms";
+                            replace_existing";
 
 /// One stored task.
 ///
@@ -3165,8 +3220,6 @@ pub struct TaskRow {
     pub copy_source: Option<String>,
     pub copy_destination: Option<String>,
     pub replace_existing: bool,
-    pub modified_after_ms: Option<i64>,
-    pub modified_before_ms: Option<i64>,
 }
 
 impl TaskRow {
@@ -3238,6 +3291,22 @@ pub struct TaskRunRow {
     pub unknown_outcome: Option<String>,
     pub detail: Option<String>,
     pub host: String,
+    /// Why this run happened, as [`claim_task`] was told (AD-253).
+    ///
+    /// `None` on a run recorded before Story 74.5, and on one whose stored word
+    /// this build has no variant for — the same skip-and-list tolerance
+    /// [`Self::unknown_outcome`] gets, minus the second field, because unlike an
+    /// outcome an unreadable trigger costs a reader nothing they could act on.
+    pub trigger: Option<RunTrigger>,
+    /// How far past its window this run was claimed, in milliseconds; `0` for an
+    /// on-time run.
+    ///
+    /// `None` is *not measured* — a run recorded before Story 74.5, or one with
+    /// no window to be late for (a person pressing Run now is not late). It is
+    /// deliberately not folded into `0`: "on time" and "nobody asked the
+    /// question" are different facts and a surface that showed them the same way
+    /// would be inventing punctuality.
+    pub late_by_ms: Option<i64>,
 }
 
 /// The `tasks` row as SQLite hands it over, before the vocabulary is applied.
@@ -3261,8 +3330,6 @@ type StoredTask = (
     Option<String>,
     Option<String>,
     bool,
-    Option<i64>,
-    Option<i64>,
 );
 
 /// Read one `tasks` row, tolerating every column but the primary key.
@@ -3316,8 +3383,6 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
         row.get(16).unwrap_or_default(),
         row.get(17).unwrap_or_default(),
         row.get(18).unwrap_or_default(),
-        row.get(19).unwrap_or_default(),
-        row.get(20).unwrap_or_default(),
     ))
 }
 
@@ -3350,8 +3415,6 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         copy_source,
         copy_destination,
         replace_existing,
-        modified_after_ms,
-        modified_before_ms,
     ) = stored;
     let unknown = |reason: String| UnknownTask {
         id: id.clone(),
@@ -3388,8 +3451,6 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         copy_source,
         copy_destination,
         replace_existing,
-        modified_after_ms,
-        modified_before_ms,
     };
     if let Err(err) = row.parsed_schedule() {
         return Err(unknown(format!("unreadable schedule: {err}")));
@@ -3615,10 +3676,9 @@ pub fn upsert_task(
         "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
                             updated_ms, running_host, lease_until_ms, on_missed,
                             description, missed_delay_ms, bot_id, prompt_subpath, model,
-                            copy_source, copy_destination, replace_existing,
-                            modified_after_ms, modified_before_ms)
+                            copy_source, copy_destination, replace_existing)
          VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL, ?9, ?10, ?11,
-                 ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                 ?12, ?13, ?14, ?15, ?16, ?17)
          ON CONFLICT(id) DO UPDATE SET
              profile_id      = excluded.profile_id,
              kind            = excluded.kind,
@@ -3635,9 +3695,7 @@ pub fn upsert_task(
              model = excluded.model,
              copy_source = excluded.copy_source,
              copy_destination = excluded.copy_destination,
-             replace_existing = excluded.replace_existing,
-             modified_after_ms = excluded.modified_after_ms,
-             modified_before_ms = excluded.modified_before_ms",
+             replace_existing = excluded.replace_existing",
         rusqlite::params![
             &task.id,
             &task.profile_id,
@@ -3656,8 +3714,6 @@ pub fn upsert_task(
             &task.copy_source,
             &task.copy_destination,
             task.replace_existing,
-            task.modified_after_ms,
-            task.modified_before_ms,
         ],
     )?;
     tx.commit()?;
@@ -4023,6 +4079,11 @@ pub fn move_task_window(conn: &Connection, moved: TaskWindowMove<'_>) -> Result<
     if affected != 1 {
         return Ok(false);
     }
+    // No `trigger` and no `late_by_ms`, deliberately (AD-253): nothing ran, so
+    // there is no reason a run happened, and a window that was declined or
+    // postponed was never *served* late — it was not served at all. Writing
+    // `scheduled` and `0` here would put two of this table's most load-bearing
+    // facts on a row that has neither.
     tx.execute(
         "INSERT INTO task_runs (task_id, started_ms, finished_ms, outcome, detail, host)
          VALUES (?1, ?2, ?2, ?3, ?4, ?5)",
@@ -4097,6 +4158,20 @@ pub struct TaskWindowMove<'a> {
 /// Claim, abandonment and the run row share one transaction. A crash between
 /// them would otherwise leave a lease with no run (a task that looks busy
 /// forever) or a run with no lease (two hosts doing the same work).
+///
+/// `trigger` and `served_window_ms` are the two facts AD-253 stops throwing
+/// away, and this is the only moment either is knowable. `trigger` is the
+/// caller's own reason for claiming — never inferred here from the shape of
+/// the arguments, because `due_at_most: None` means "a person asked" *and*
+/// "a timer unit woke", which are different facts to a reader. `served_window_ms`
+/// is the window the row carried when it was claimed, which
+/// [`finish_task_run`] then overwrites with the *next* one: the lateness has to
+/// be measured here or it cannot be measured at all.
+// Eight arguments, one over clippy's line. A struct would buy nothing here:
+// every one of them is a distinct primitive the caller already has in hand at
+// the claim, and wrapping them would only move the same eight assignments to
+// the call site while hiding which ones the SQL actually gates on.
+#[allow(clippy::too_many_arguments)]
 pub fn claim_task(
     conn: &Connection,
     id: &str,
@@ -4104,6 +4179,8 @@ pub fn claim_task(
     now_ms: i64,
     lease_ms: i64,
     due_at_most: Option<i64>,
+    trigger: RunTrigger,
+    served_window_ms: Option<i64>,
 ) -> Result<Option<i64>> {
     // `unchecked_transaction` for [`record_activity`]'s reason: the engine
     // holds this connection behind a `Mutex` and hands out `&Connection`.
@@ -4137,9 +4214,17 @@ pub fn claim_task(
          WHERE task_id = ?1 AND finished_ms IS NULL",
         (id, now_ms, TaskOutcome::Abandoned.as_str()),
     )?;
+    // Zero, not `NULL`, for a run claimed at or before its window: "on time" is
+    // a measurement this row made, and it has to be distinguishable from the
+    // "nobody recorded this" that every pre-74.5 row carries. `saturating_sub`
+    // and the clamp together mean a clock that stepped backwards between the
+    // arming and the claim reads as on time rather than as negative lateness —
+    // a number no reader has a meaning for.
+    let late_by_ms = served_window_ms.map(|window| now_ms.saturating_sub(window).max(0));
     tx.execute(
-        "INSERT INTO task_runs (task_id, started_ms, host) VALUES (?1, ?2, ?3)",
-        (id, now_ms, host),
+        "INSERT INTO task_runs (task_id, started_ms, host, trigger, late_by_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        (id, now_ms, host, trigger.as_str(), late_by_ms),
     )?;
     let run_id = tx.last_insert_rowid();
     trim_task_runs(&tx, id)?;
@@ -4339,7 +4424,7 @@ pub fn finish_task_run(conn: &Connection, close: TaskRunClose<'_>) -> Result<()>
 /// *newest* run and made a surface report an older attempt as the current one.
 pub fn task_runs(conn: &Connection, task_id: &str, limit: usize) -> Result<Vec<TaskRunRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, task_id, started_ms, finished_ms, outcome, detail, host
+        "SELECT id, task_id, started_ms, finished_ms, outcome, detail, host, trigger, late_by_ms
          FROM task_runs WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2",
     )?;
     // A negative `LIMIT` means "every row" to SQLite, which is what
@@ -4354,11 +4439,25 @@ pub fn task_runs(conn: &Connection, task_id: &str, limit: usize) -> Result<Vec<T
             r.get::<_, Option<String>>(4)?,
             r.get::<_, Option<String>>(5)?,
             r.get::<_, String>(6)?,
+            r.get::<_, Option<String>>(7)?,
+            r.get::<_, Option<i64>>(8)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, task_id, started_ms, finished_ms, stored, detail, host) = row?;
+        let (id, task_id, started_ms, finished_ms, stored, detail, host, trigger, late_by_ms) =
+            row?;
+        // Skip-and-list, the same tolerance the outcome gets and for the same
+        // reason (NFR-43): a run a newer keeper recorded with a fourth trigger
+        // word is still a run that happened, and dropping the row — or guessing
+        // `Scheduled` — would be worse than saying nothing about why it ran.
+        let trigger = trigger.and_then(|stored| match RunTrigger::parse(&stored) {
+            Some(known) => Some(known),
+            None => {
+                tracing::debug!(run = id, trigger = stored, "an unreadable run trigger");
+                None
+            }
+        });
         let mut outcome = None;
         let mut unknown_outcome = None;
         if let Some(stored) = stored {
@@ -4379,6 +4478,8 @@ pub fn task_runs(conn: &Connection, task_id: &str, limit: usize) -> Result<Vec<T
             unknown_outcome,
             detail,
             host,
+            trigger,
+            late_by_ms,
         });
     }
     Ok(out)
@@ -4483,8 +4584,6 @@ pub fn seed_gc_task(conn: &Connection, profile_id: &str, now_ms: i64) -> Result<
             copy_source: None,
             copy_destination: None,
             replace_existing: false,
-            modified_after_ms: None,
-            modified_before_ms: None,
         };
         upsert_task(conn, &row, None)?;
         true
@@ -4561,8 +4660,6 @@ pub fn seed_clock_tasks(conn: &Connection, now_ms: i64) -> Result<()> {
                     copy_source: None,
                     copy_destination: None,
                     replace_existing: false,
-                    modified_after_ms: None,
-                    modified_before_ms: None,
                 },
                 None,
             )?;
@@ -6918,8 +7015,6 @@ mod tests {
             copy_source: None,
             copy_destination: None,
             replace_existing: false,
-            modified_after_ms: None,
-            modified_before_ms: None,
             schedule: schedule.map(str::to_owned),
             mode,
             next_due_ms: None,
@@ -6987,21 +7082,13 @@ mod tests {
         let c = conn();
         let mut row = task("copy-columns", None, TaskMode::Manual);
         row.kind = TaskKind::Copy;
-        for (source, destination, replace, after, before) in [
-            (
-                "/source one",
-                "/destination one",
-                true,
-                Some(1000),
-                Some(2000),
-            ),
-            ("/source two", "/destination two", false, None, None),
+        for (source, destination, replace) in [
+            ("/source one", "/destination one", true),
+            ("/source two", "/destination two", false),
         ] {
             row.copy_source = Some(source.into());
             row.copy_destination = Some(destination.into());
             row.replace_existing = replace;
-            row.modified_after_ms = after;
-            row.modified_before_ms = before;
             upsert_task(&c, &row, None).expect("save");
             assert_eq!(get_task(&c, &row.id).expect("read"), Some(row.clone()));
         }
@@ -7099,13 +7186,16 @@ mod tests {
                 "bot_id",
                 "prompt_subpath",
                 "model",
-                // Story 72.7's five, the same additive path: a `copy` task's two
-                // absolute paths, its replace choice and its date window.
+                // Story 72.7's three, the same additive path: a `copy` task's
+                // two absolute paths and its replace choice. Its date window
+                // was two more columns here until AD-256 rescinded it — a
+                // database created before this change still carries
+                // `modified_after_ms` and `modified_before_ms` and is right to,
+                // but `ensure_task_columns` no longer adds them, so a fresh one
+                // ends here.
                 "copy_source",
                 "copy_destination",
                 "replace_existing",
-                "modified_after_ms",
-                "modified_before_ms",
             ]
         );
         assert_eq!(
@@ -7118,6 +7208,12 @@ mod tests {
                 "outcome",
                 "detail",
                 "host",
+                // Story 74.5's two, added by `ensure_task_run_columns` rather
+                // than by the batch, which is why they come last in the order it
+                // adds them: why the run ran, and how far past its window it was
+                // claimed (AD-253).
+                "trigger",
+                "late_by_ms",
             ]
         );
         let tasks_after_first = columns_of(&c, "tasks");
@@ -7187,9 +7283,18 @@ mod tests {
             None,
         )
         .expect("save");
-        claim_task(&c, "01U", "hostA", 0, 60_000, None)
-            .expect("claim")
-            .expect("the first claim wins");
+        claim_task(
+            &c,
+            "01U",
+            "hostA",
+            0,
+            60_000,
+            None,
+            RunTrigger::Scheduled,
+            None,
+        )
+        .expect("claim")
+        .expect("the first claim wins");
 
         let mut edited = task("01U", Some("every 10m"), TaskMode::Scheduled);
         edited.updated_ms = 42;
@@ -7329,7 +7434,17 @@ mod tests {
                 c.busy_timeout(std::time::Duration::from_secs(5))
                     .expect("busy timeout");
                 gate.wait();
-                claim_task(&c, "01R", host, 1_000, 60_000, None).expect("claim")
+                claim_task(
+                    &c,
+                    "01R",
+                    host,
+                    1_000,
+                    60_000,
+                    None,
+                    RunTrigger::Scheduled,
+                    None,
+                )
+                .expect("claim")
             }));
         }
         let claims: Vec<Option<i64>> = racers
@@ -7362,19 +7477,47 @@ mod tests {
             None,
         )
         .expect("save");
-        let abandoned = claim_task(&c, "01L", "hostA", 0, 1_000, None)
-            .expect("claim")
-            .expect("hostA claims a free task");
+        let abandoned = claim_task(
+            &c,
+            "01L",
+            "hostA",
+            0,
+            1_000,
+            None,
+            RunTrigger::Scheduled,
+            None,
+        )
+        .expect("claim")
+        .expect("hostA claims a free task");
 
         // The expiry instant is a boundary, so it is asserted exactly.
         assert_eq!(
-            claim_task(&c, "01L", "hostB", 999, 1_000, None).expect("claim"),
+            claim_task(
+                &c,
+                "01L",
+                "hostB",
+                999,
+                1_000,
+                None,
+                RunTrigger::Scheduled,
+                None
+            )
+            .expect("claim"),
             None,
             "one millisecond before it expires the lease is still hostA's"
         );
-        let taken = claim_task(&c, "01L", "hostB", 1_000, 1_000, None)
-            .expect("claim")
-            .expect("at the instant it expires the lease is reclaimable");
+        let taken = claim_task(
+            &c,
+            "01L",
+            "hostB",
+            1_000,
+            1_000,
+            None,
+            RunTrigger::Scheduled,
+            None,
+        )
+        .expect("claim")
+        .expect("at the instant it expires the lease is reclaimable");
 
         let runs = task_runs(&c, "01L", 10).expect("runs");
         assert_eq!(runs.len(), 2);
@@ -7401,7 +7544,17 @@ mod tests {
         upsert_task(&c, &off, None).expect("save");
 
         assert_eq!(
-            claim_task(&c, "01D", "hostA", 0, 60_000, None).expect("claim"),
+            claim_task(
+                &c,
+                "01D",
+                "hostA",
+                0,
+                60_000,
+                None,
+                RunTrigger::Scheduled,
+                None
+            )
+            .expect("claim"),
             None,
             "`enabled` decides whether the row is live, and a dead row runs for nobody"
         );
@@ -7420,9 +7573,18 @@ mod tests {
             None,
         )
         .expect("save");
-        let run = claim_task(&c, "01F", "hostA", 0, 60_000, None)
-            .expect("claim")
-            .expect("claimed");
+        let run = claim_task(
+            &c,
+            "01F",
+            "hostA",
+            0,
+            60_000,
+            None,
+            RunTrigger::Scheduled,
+            None,
+        )
+        .expect("claim")
+        .expect("claimed");
 
         finish_task_run(
             &c,
@@ -7450,9 +7612,18 @@ mod tests {
         assert_eq!(runs[0].detail.as_deref(), Some("remote hung up"));
         assert_eq!(runs[0].host, "hostA");
         assert!(
-            claim_task(&c, "01F", "hostB", 6_000, 60_000, None)
-                .expect("claim")
-                .is_some(),
+            claim_task(
+                &c,
+                "01F",
+                "hostB",
+                6_000,
+                60_000,
+                None,
+                RunTrigger::Scheduled,
+                None
+            )
+            .expect("claim")
+            .is_some(),
             "releasing the lease and recording the result is one fact, so nothing is half-written"
         );
     }
@@ -7470,9 +7641,18 @@ mod tests {
             None,
         )
         .expect("save");
-        let in_flight = claim_task(&c, "01O", "hostA", 0, 60_000, None)
-            .expect("claim")
-            .expect("claimed");
+        let in_flight = claim_task(
+            &c,
+            "01O",
+            "hostA",
+            0,
+            60_000,
+            None,
+            RunTrigger::Scheduled,
+            None,
+        )
+        .expect("claim")
+        .expect("claimed");
         c.execute(
             "INSERT INTO task_runs (task_id, started_ms, finished_ms, outcome, host)
              VALUES ('01O', 1, 2, 'teleported', 'hostZ')",
@@ -7508,9 +7688,18 @@ mod tests {
         let mut ids = Vec::new();
         for n in 0..TASK_RUNS_CAP + 5 {
             let now = 1_000 * (n as i64 + 1);
-            let run = claim_task(&c, "01C", "hostA", now, 60_000, None)
-                .expect("claim")
-                .expect("claimed");
+            let run = claim_task(
+                &c,
+                "01C",
+                "hostA",
+                now,
+                60_000,
+                None,
+                RunTrigger::Scheduled,
+                None,
+            )
+            .expect("claim")
+            .expect("claimed");
             finish_task_run(
                 &c,
                 TaskRunClose {
@@ -7541,6 +7730,219 @@ mod tests {
         );
     }
 
+    /// AD-253's three runs: one the scheduler claimed, one a person asked for,
+    /// one served after its window. They have to be three distinguishable rows
+    /// afterwards, because in memory the engine already knows which is which
+    /// and — before this story — dropped it on the floor at the claim.
+    ///
+    /// The lateness is the sharp half. `finish_task_run` writes the *next*
+    /// window over `next_due_ms`, so this test closes each run before reading:
+    /// a `late_by_ms` derived at read time would be measured against a window
+    /// that no longer exists, and would read zero for the run that was forty
+    /// minutes late.
+    #[test]
+    fn a_run_records_why_it_ran_and_how_late_it_was_claimed() {
+        let c = conn();
+        let window = 10_000_i64;
+        let late_window = 20_000_i64;
+        for (id, trigger, served, claimed_at) in [
+            ("01TS", RunTrigger::Scheduled, Some(window), window),
+            ("01TR", RunTrigger::Requested, None, window + 5),
+            (
+                "01TL",
+                RunTrigger::Timer,
+                Some(late_window),
+                late_window + 2_400_000,
+            ),
+        ] {
+            upsert_task(&c, &task(id, Some("every 5m"), TaskMode::Scheduled), None).expect("save");
+            let run = claim_task(&c, id, "hostA", claimed_at, 60_000, None, trigger, served)
+                .expect("claim")
+                .expect("claimed");
+            // The overwrite AD-253 is about: after this, the row's own window is
+            // the NEXT one and the served window is unrecoverable.
+            finish_task_run(
+                &c,
+                TaskRunClose {
+                    run_id: run,
+                    task_id: id,
+                    host: "hostA",
+                    finished_ms: claimed_at + 1,
+                    outcome: TaskOutcome::Ok,
+                    detail: None,
+                    next_due_ms: Some(claimed_at + 300_000),
+                },
+            )
+            .expect("finish");
+        }
+
+        let scheduled = &task_runs(&c, "01TS", 10).expect("runs")[0];
+        assert_eq!(scheduled.trigger, Some(RunTrigger::Scheduled));
+        assert_eq!(
+            scheduled.late_by_ms,
+            Some(0),
+            "a run claimed at its own window is on time, and says so with a \
+             number rather than by staying silent"
+        );
+
+        let requested = &task_runs(&c, "01TR", 10).expect("runs")[0];
+        assert_eq!(
+            requested.trigger,
+            Some(RunTrigger::Requested),
+            "a person asking must not be indistinguishable from the clock asking"
+        );
+        assert_eq!(
+            requested.late_by_ms, None,
+            "a person pressing Run now is not late for anything: there was no \
+             window, and 0 would claim it was measured"
+        );
+
+        let late = &task_runs(&c, "01TL", 10).expect("runs")[0];
+        assert_eq!(late.trigger, Some(RunTrigger::Timer));
+        assert_eq!(
+            late.late_by_ms,
+            Some(2_400_000),
+            "forty minutes past the window it actually carried, measured at the \
+             claim because nothing afterwards can still see that window"
+        );
+        assert_ne!(
+            late.late_by_ms,
+            Some(0),
+            "and not folded into on-time by the finish that moved the window"
+        );
+    }
+
+    /// Every kind goes through the one claim, so none of them can grow a
+    /// branch that forgets to record this (AD-253: "no kind-specific branch").
+    #[test]
+    fn every_task_kind_records_its_trigger_through_the_same_claim() {
+        let c = conn();
+        for (n, kind) in [
+            TaskKind::Sync,
+            TaskKind::Release,
+            TaskKind::Verify,
+            TaskKind::Bot,
+            TaskKind::Copy,
+            TaskKind::Gc,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("01K{n}");
+            let mut row = task(&id, Some("every 5m"), TaskMode::Scheduled);
+            row.kind = kind;
+            // The two kinds whose write door demands a target; everything else
+            // about this row is identical, which is the point.
+            if kind == TaskKind::Bot {
+                row.bot_id = Some("bot".into());
+                row.prompt_subpath = Some("prompts/10.md".into());
+            }
+            if kind == TaskKind::Copy {
+                row.copy_source = Some("/source".into());
+                row.copy_destination = Some("/destination".into());
+            }
+            upsert_task(&c, &row, None).expect("save");
+            claim_task(
+                &c,
+                &id,
+                "hostA",
+                5_000,
+                60_000,
+                None,
+                RunTrigger::Requested,
+                Some(1_000),
+            )
+            .expect("claim")
+            .expect("claimed");
+            let run = &task_runs(&c, &id, 10).expect("runs")[0];
+            assert_eq!(
+                (run.trigger, run.late_by_ms),
+                (Some(RunTrigger::Requested), Some(4_000)),
+                "{} must record the same two facts as every other kind",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// A run recorded by a keeper that had never heard of either column is still
+    /// a run that happened, and it must read as *not measured* rather than as a
+    /// confident default — which is the whole reason both columns are nullable
+    /// (NFR-43). An unreadable trigger word takes the same path for the same
+    /// reason: a fourth word from a newer keeper costs the reason, never the row.
+    #[test]
+    fn a_run_from_before_the_columns_existed_says_nothing_rather_than_guessing() {
+        let c = conn();
+        upsert_task(
+            &c,
+            &task("01OLD", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
+        c.execute(
+            "INSERT INTO task_runs (task_id, started_ms, finished_ms, outcome, host)
+             VALUES ('01OLD', 1, 2, 'ok', 'hostZ')",
+            [],
+        )
+        .expect("a pre-74.5 row");
+        c.execute(
+            "INSERT INTO task_runs (task_id, started_ms, finished_ms, outcome, host, trigger)
+             VALUES ('01OLD', 3, 4, 'ok', 'hostZ', 'teleported')",
+            [],
+        )
+        .expect("a row from a newer keeper");
+
+        let runs = task_runs(&c, "01OLD", 10).expect("runs");
+        assert_eq!(runs.len(), 2, "neither row is dropped and nothing is fatal");
+        assert_eq!(
+            (runs[0].trigger, runs[0].late_by_ms),
+            (None, None),
+            "an unreadable trigger word is skipped, never guessed at"
+        );
+        assert_eq!(
+            (runs[1].trigger, runs[1].late_by_ms),
+            (None, None),
+            "and a row written before the columns existed reads as not measured, \
+             never as an on-time scheduled run"
+        );
+    }
+
+    /// A declined or postponed window is a decision, not a run: nothing was
+    /// served, so there is no trigger and nothing was late. Writing either here
+    /// would put a run's facts on a row that records the absence of one.
+    #[test]
+    fn a_moved_window_records_no_trigger_and_no_lateness() {
+        let c = conn();
+        upsert_task(
+            &c,
+            &task("01MV", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
+        arm_task(&c, "01MV", Some(1_000), 0).expect("arm");
+        assert!(move_task_window(
+            &c,
+            TaskWindowMove {
+                task_id: "01MV",
+                host: "hostA",
+                observed_due_ms: 1_000,
+                next_due_ms: 301_000,
+                now_ms: 2_000,
+                outcome: TaskOutcome::Declined,
+                detail: "the window was skipped",
+            },
+        )
+        .expect("move"));
+
+        let run = &task_runs(&c, "01MV", 10).expect("runs")[0];
+        assert_eq!(run.outcome, Some(TaskOutcome::Declined));
+        assert_eq!(
+            (run.trigger, run.late_by_ms),
+            (None, None),
+            "a window nobody served has no reason for running and no lateness; \
+             1000 ms of 'lateness' here would describe a run that never happened"
+        );
+    }
+
     #[test]
     fn deleting_a_task_takes_its_runs_with_it() {
         let c = conn();
@@ -7550,9 +7952,18 @@ mod tests {
             None,
         )
         .expect("save");
-        claim_task(&c, "01G", "hostA", 0, 60_000, None)
-            .expect("claim")
-            .expect("claimed");
+        claim_task(
+            &c,
+            "01G",
+            "hostA",
+            0,
+            60_000,
+            None,
+            RunTrigger::Scheduled,
+            None,
+        )
+        .expect("claim")
+        .expect("claimed");
 
         delete_task(&c, "01G").expect("delete");
         assert!(get_task(&c, "01G").expect("get").is_none());
@@ -7578,14 +7989,33 @@ mod tests {
         arm_task(&c, "01W", Some(10_000), 0).expect("arm");
 
         assert_eq!(
-            claim_task(&c, "01W", "hostA", 9_999, 60_000, Some(9_999)).expect("claim"),
+            claim_task(
+                &c,
+                "01W",
+                "hostA",
+                9_999,
+                60_000,
+                Some(9_999),
+                RunTrigger::Scheduled,
+                None
+            )
+            .expect("claim"),
             None,
             "one millisecond before the window opens there is nothing to claim"
         );
         assert!(
-            claim_task(&c, "01W", "hostA", 10_000, 60_000, Some(10_000))
-                .expect("claim")
-                .is_some(),
+            claim_task(
+                &c,
+                "01W",
+                "hostA",
+                10_000,
+                60_000,
+                Some(10_000),
+                RunTrigger::Scheduled,
+                None
+            )
+            .expect("claim")
+            .is_some(),
             "and at the instant it opens the claim succeeds"
         );
         // The requested door passes `None` and does not care about the window,
@@ -7604,9 +8034,18 @@ mod tests {
         )
         .expect("finish");
         assert!(
-            claim_task(&c, "01W", "hostB", 12_000, 60_000, None)
-                .expect("claim")
-                .is_some(),
+            claim_task(
+                &c,
+                "01W",
+                "hostB",
+                12_000,
+                60_000,
+                None,
+                RunTrigger::Scheduled,
+                None
+            )
+            .expect("claim")
+            .is_some(),
             "a request is not a window, so it claims a task that is not due"
         );
     }
@@ -7626,12 +8065,30 @@ mod tests {
         )
         .expect("save");
         arm_task(&c, "01X", Some(0), 0).expect("arm");
-        let slow = claim_task(&c, "01X", "hostA", 0, 1_000, Some(0))
-            .expect("claim")
-            .expect("hostA claims it");
-        let taken = claim_task(&c, "01X", "hostB", 2_000, 60_000, None)
-            .expect("claim")
-            .expect("hostB reclaims the expired lease");
+        let slow = claim_task(
+            &c,
+            "01X",
+            "hostA",
+            0,
+            1_000,
+            Some(0),
+            RunTrigger::Scheduled,
+            None,
+        )
+        .expect("claim")
+        .expect("hostA claims it");
+        let taken = claim_task(
+            &c,
+            "01X",
+            "hostB",
+            2_000,
+            60_000,
+            None,
+            RunTrigger::Scheduled,
+            None,
+        )
+        .expect("claim")
+        .expect("hostB reclaims the expired lease");
 
         // hostA finally returns, long after it lost the row.
         finish_task_run(
@@ -7684,7 +8141,17 @@ mod tests {
         arm_task(&c, "01Z", Some(0), 0).expect("arm");
 
         assert_eq!(
-            claim_task(&c, "01Z", "hostA", 1_000, 60_000, None).expect("claim"),
+            claim_task(
+                &c,
+                "01Z",
+                "hostA",
+                1_000,
+                60_000,
+                None,
+                RunTrigger::Scheduled,
+                None
+            )
+            .expect("claim"),
             None,
             "an `off` that still runs when asked is not off"
         );
@@ -8996,9 +9463,18 @@ mod tests {
         )
         .expect("save");
         for n in 0..TASK_RUNS_CAP as i64 {
-            let run = claim_task(&c, "01I", "hostA", n * 10, 1, None)
-                .expect("claim")
-                .expect("claimed");
+            let run = claim_task(
+                &c,
+                "01I",
+                "hostA",
+                n * 10,
+                1,
+                None,
+                RunTrigger::Scheduled,
+                None,
+            )
+            .expect("claim")
+            .expect("claimed");
             finish_task_run(
                 &c,
                 TaskRunClose {
@@ -9019,9 +9495,18 @@ mod tests {
             "the cap is full before the run under test is opened"
         );
 
-        let opened = claim_task(&c, "01I", "hostB", 999_000, 60_000, None)
-            .expect("claim")
-            .expect("claimed");
+        let opened = claim_task(
+            &c,
+            "01I",
+            "hostB",
+            999_000,
+            60_000,
+            None,
+            RunTrigger::Scheduled,
+            None,
+        )
+        .expect("claim")
+        .expect("claimed");
         let runs = task_runs(&c, "01I", TASK_RUNS_CAP * 2).expect("runs");
         assert_eq!(runs.len(), TASK_RUNS_CAP, "and it still holds afterwards");
         assert_eq!(
@@ -9059,9 +9544,18 @@ mod tests {
         let c = conn();
         for id in ["01P", "01Q"] {
             upsert_task(&c, &task(id, Some("every 5m"), TaskMode::Scheduled), None).expect("save");
-            claim_task(&c, id, "dying", 0, 3_600_000, None)
-                .expect("claim")
-                .expect("claimed");
+            claim_task(
+                &c,
+                id,
+                "dying",
+                0,
+                3_600_000,
+                None,
+                RunTrigger::Scheduled,
+                None,
+            )
+            .expect("claim")
+            .expect("claimed");
         }
         upsert_task(
             &c,
@@ -9069,9 +9563,18 @@ mod tests {
             None,
         )
         .expect("save");
-        claim_task(&c, "01R2", "other", 0, 3_600_000, None)
-            .expect("claim")
-            .expect("claimed");
+        claim_task(
+            &c,
+            "01R2",
+            "other",
+            0,
+            3_600_000,
+            None,
+            RunTrigger::Scheduled,
+            None,
+        )
+        .expect("claim")
+        .expect("claimed");
 
         assert_eq!(
             release_host_leases(&c, "dying", 9_000, &HashSet::new()).expect("release"),
@@ -9113,9 +9616,18 @@ mod tests {
         let c = conn();
         for id in ["01RUNNING", "01IDLE"] {
             upsert_task(&c, &task(id, Some("every 5m"), TaskMode::Scheduled), None).expect("save");
-            claim_task(&c, id, "quitting", 0, 3_600_000, None)
-                .expect("claim")
-                .expect("claimed");
+            claim_task(
+                &c,
+                id,
+                "quitting",
+                0,
+                3_600_000,
+                None,
+                RunTrigger::Scheduled,
+                None,
+            )
+            .expect("claim")
+            .expect("claimed");
         }
 
         let hold = HashSet::from(["01RUNNING".to_owned()]);
@@ -9137,9 +9649,18 @@ mod tests {
             "and it expires the ordinary TASK_LEASE_MS way rather than never"
         );
         assert!(
-            claim_task(&c, "01RUNNING", "other", 9_001, 3_600_000, None)
-                .expect("the claim statement runs")
-                .is_none(),
+            claim_task(
+                &c,
+                "01RUNNING",
+                "other",
+                9_001,
+                3_600_000,
+                None,
+                RunTrigger::Scheduled,
+                None
+            )
+            .expect("the claim statement runs")
+            .is_none(),
             "which is the property: the other host cannot start a second run"
         );
 
@@ -9173,9 +9694,18 @@ mod tests {
             None,
         )
         .expect("save");
-        claim_task(&c, "01ONLY", "quitting", 0, 3_600_000, None)
-            .expect("claim")
-            .expect("claimed");
+        claim_task(
+            &c,
+            "01ONLY",
+            "quitting",
+            0,
+            3_600_000,
+            None,
+            RunTrigger::Scheduled,
+            None,
+        )
+        .expect("claim")
+        .expect("claimed");
 
         let hold = HashSet::from(["01ONLY".to_owned()]);
         assert_eq!(
@@ -9205,18 +9735,36 @@ mod tests {
             None,
         )
         .expect("save");
-        claim_task(&c, "01MINE", "quitting", 0, 3_600_000, None)
-            .expect("claim")
-            .expect("claimed");
+        claim_task(
+            &c,
+            "01MINE",
+            "quitting",
+            0,
+            3_600_000,
+            None,
+            RunTrigger::Scheduled,
+            None,
+        )
+        .expect("claim")
+        .expect("claimed");
         upsert_task(
             &c,
             &task("01THEIRS", Some("every 5m"), TaskMode::Scheduled),
             None,
         )
         .expect("save");
-        claim_task(&c, "01THEIRS", "other", 0, 3_600_000, None)
-            .expect("claim")
-            .expect("claimed");
+        claim_task(
+            &c,
+            "01THEIRS",
+            "other",
+            0,
+            3_600_000,
+            None,
+            RunTrigger::Scheduled,
+            None,
+        )
+        .expect("claim")
+        .expect("claimed");
 
         let hold = HashSet::from(["01THEIRS".to_owned(), "01GONE".to_owned()]);
         assert_eq!(
@@ -9262,8 +9810,17 @@ mod tests {
             .busy_timeout(std::time::Duration::from_millis(0))
             .expect("no timeout");
         assert_eq!(
-            claim_task(&contender, "01B2", "hostB", 0, 60_000, None)
-                .expect("contention is an answer about the lease, not a fault to propagate"),
+            claim_task(
+                &contender,
+                "01B2",
+                "hostB",
+                0,
+                60_000,
+                None,
+                RunTrigger::Scheduled,
+                None
+            )
+            .expect("contention is an answer about the lease, not a fault to propagate"),
             None
         );
 
@@ -9283,9 +9840,18 @@ mod tests {
         let mut owned = task("01Y", Some("every 5m"), TaskMode::Scheduled);
         owned.profile_id = Some("p".to_owned());
         upsert_task(&c, &owned, None).expect("save");
-        claim_task(&c, "01Y", "hostA", 0, 60_000, None)
-            .expect("claim")
-            .expect("claimed");
+        claim_task(
+            &c,
+            "01Y",
+            "hostA",
+            0,
+            60_000,
+            None,
+            RunTrigger::Scheduled,
+            None,
+        )
+        .expect("claim")
+        .expect("claimed");
         let host_wide = TaskRow {
             profile_id: None,
             ..task("01HW", Some("every 5m"), TaskMode::Scheduled)

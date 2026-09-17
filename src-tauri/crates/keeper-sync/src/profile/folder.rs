@@ -151,6 +151,15 @@ const FOLDER_FIELD_RULES: &[(&str, FolderFieldRule)] = &[
     // vault is: every clone holds the same `60-sessions/` tree, so a folder
     // file may say so and every machine that syncs it agrees (AD-107).
     ("sessions", FolderFieldRule::Allowed),
+    // Where the task ledger lives is a fact about the repository's layout for
+    // the same reason a vault is, and more sharply: the ledger exists so a run
+    // recorded on one machine is readable on the other, which only works if
+    // both machines agree on the folder. A machine-local answer would put the
+    // two halves of one history in two different directories of the same drive
+    // (AD-251). The *selector* — which drive holds the ledger — stays
+    // machine-local in `tasks.ledger_vault`, because a profile id is minted
+    // per machine.
+    ("tasks", FolderFieldRule::Allowed),
 ];
 
 /// What a folder file may do with one canonical profile key.
@@ -1094,6 +1103,9 @@ subfolder = "40-media/recordings"
 
 [folder.sessions]
 subfolder = "60-sessions"
+
+[folder.tasks]
+subfolder = "70-tasks"
 "#,
             &tier(),
         );
@@ -1120,6 +1132,11 @@ subfolder = "60-sessions"
             "a folder may declare that it holds a sessions zone"
         );
         assert_eq!(
+            p.tasks.as_ref().expect("tasks").subfolder,
+            "70-tasks",
+            "a folder may declare where its task ledger lives (AD-251)"
+        );
+        assert_eq!(
             outcome.owned.iter().map(String::as_str).collect::<Vec<_>>(),
             vec![
                 "branch",
@@ -1131,6 +1148,7 @@ subfolder = "60-sessions"
                 "recordings",
                 "sessions",
                 "tags",
+                "tasks",
             ]
         );
     }
@@ -1200,6 +1218,61 @@ subfolder = "60-sessions"
         assert!(
             outcome.profile.notes.is_none(),
             "an invalid layer is dropped whole"
+        );
+    }
+
+    /// The ledger folder travels between clones, which is exactly why a bad one
+    /// is refused and **not stored** (AD-251): an absolute subfolder would have
+    /// `Path::join` discard `local_path` on every machine that read the file,
+    /// and an overlapping one would hand one tree to two writers. The overlap
+    /// case is checked against the *stored* profile's vault, because that is
+    /// how the pair arrives in practice — a file that names only the ledger,
+    /// read on a machine whose profile already holds a vault.
+    #[test]
+    fn a_bad_tasks_subfolder_is_refused_and_not_stored() {
+        for bad in ["/Volumes/elsewhere", "", "../outside"] {
+            let (_dir, outcome) =
+                applied(&format!("[folder.tasks]\nsubfolder = \"{bad}\"\n"), &tier());
+            let fault = only_fault(&outcome);
+            assert!(
+                fault.message.contains("tasks subfolder"),
+                "the validator's own sentence must survive: {}",
+                fault.message
+            );
+            assert!(
+                outcome.profile.tasks.is_none(),
+                "{bad:?} must not be stored: an invalid layer is dropped whole"
+            );
+            assert!(
+                !outcome.owned.contains("tasks"),
+                "and the surface must not show it as owned by the file: {:?}",
+                outcome.owned
+            );
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(FOLDER_CONFIG_DIR)).expect("create .keeper");
+        std::fs::write(
+            root.join(FOLDER_CONFIG_DIR).join(SHARED_FILE),
+            "[folder.tasks]\nsubfolder = \"40-notes/runs\"\n",
+        )
+        .expect("write");
+        let mut stored = profile(&root);
+        stored.notes = Some(crate::profile::NotesConfig {
+            subfolder: "40-notes".to_owned(),
+            ..Default::default()
+        });
+        let outcome = tier().apply(&stored);
+        let fault = only_fault(&outcome);
+        assert!(
+            fault.message.contains("40-notes"),
+            "the refusal must name the vault it collides with: {}",
+            fault.message
+        );
+        assert!(
+            outcome.profile.tasks.is_none(),
+            "a ledger inside the vault must not be stored"
         );
     }
 

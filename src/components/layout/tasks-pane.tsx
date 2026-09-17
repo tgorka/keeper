@@ -754,6 +754,48 @@ export const TASK_HISTORY_RETRY_NOTE = "Close Runs and open it again to ask once
 export const TASK_HISTORY_NO_HOST_TEXT = "no host recorded";
 
 /**
+ * Why a run happened, in one word beside it (Story 74.5, AD-253).
+ *
+ * Three stored spellings, and a fourth case that is not a spelling: a run
+ * recorded before the engine had anywhere to write this. That one says nothing
+ * rather than guessing — the alternative is a list where every old run claims
+ * to have been scheduled.
+ *
+ * The words are the engine's own (`keeper_sync::ledger::RunTrigger`), rendered
+ * and never branched on: an unrecognised one is shown verbatim, which is
+ * NFR-43's rule and the reason this is a lookup with a fallback rather than a
+ * switch.
+ */
+export const TASK_TRIGGER_TEXT: Record<string, string> = {
+  scheduled: "on its schedule",
+  requested: "you asked",
+  timer: "the host's timer",
+};
+
+/**
+ * How late a run was served, when it was late at all.
+ *
+ * `null` is "the question was never asked" — no window to be late for, or a run
+ * from before this story — and `0` is an on-time run: both render nothing,
+ * because a list that said "on time" on every row would bury the one row that
+ * says forty minutes. Only lateness earns pixels.
+ */
+export function taskLatenessText(lateByMs: number | null): string | null {
+  if (lateByMs === null || lateByMs <= 0) {
+    return null;
+  }
+  const minutes = Math.round(lateByMs / 60_000);
+  if (minutes < 1) {
+    return "late by under a minute";
+  }
+  if (minutes < 60) {
+    return `late by ${minutes} min`;
+  }
+  const hours = Math.round(minutes / 60);
+  return hours < 24 ? `late by ${hours} h` : `late by ${Math.round(hours / 24)} d`;
+}
+
+/**
  * How many recorded runs the unfolded list still does not show.
  *
  * The fold's unfolded size is a global preference with a floor of ten, while a
@@ -1259,6 +1301,20 @@ function TaskRunList({
                 <span className="font-mono text-muted-foreground [overflow-wrap:anywhere]">
                   {entry.host.trim() === "" ? TASK_HISTORY_NO_HOST_TEXT : entry.host}
                 </span>
+                {/* Why it ran, and only when the run knows: a row written
+                    before AD-253 says nothing rather than claiming a schedule
+                    it cannot vouch for (Story 74.5). */}
+                {entry.trigger !== null && (
+                  <span className="shrink-0 text-muted-foreground">
+                    {TASK_TRIGGER_TEXT[entry.trigger] ?? entry.trigger}
+                  </span>
+                )}
+                {/* Lateness earns pixels; punctuality does not. */}
+                {taskLatenessText(entry.lateByMs) !== null && (
+                  <span className="shrink-0 text-amber-700 dark:text-amber-500">
+                    {taskLatenessText(entry.lateByMs)}
+                  </span>
+                )}
                 {/* Absent or blank is silence, `taskReportText`'s rule. The
                     wrapping is the pair Story 58.2 established for engine prose,
                     because this is the same unbounded string in a narrower

@@ -40,6 +40,26 @@ unknownOutcome: string | null,
  */
 detail: string | null, 
 /**
+ * Why the run happened: `"scheduled"`, `"requested"`, `"timer"` — or
+ * `null` for a run recorded before AD-253 gave the engine somewhere to
+ * write it (Story 74.5).
+ *
+ * The spelling and not a variant, for [`Self::outcome`]'s reason: the
+ * frontend renders it, `keeper-sync` owns the vocabulary, and a word this
+ * build does not know is shown rather than swallowed.
+ */
+trigger: string | null, 
+/**
+ * How far past its own window the run was claimed, in milliseconds.
+ *
+ * `0` is an on-time run; `null` means the question was never asked — a run
+ * from before this story, or one with no window to be late for, because a
+ * person pressing Run now is not late. Kept distinct from `0` on purpose:
+ * a surface that rendered them the same way would be inventing
+ * punctuality.
+ */
+lateByMs: number | null, 
+/**
  * Which host recorded the run, as stored (e.g. `"app"`, `"daemon"`).
  */
 host: string, };

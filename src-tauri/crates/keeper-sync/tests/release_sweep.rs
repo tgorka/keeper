@@ -552,8 +552,6 @@ impl Fixture {
                     copy_source: None,
                     copy_destination: None,
                     replace_existing: false,
-                    modified_after_ms: None,
-                    modified_before_ms: None,
                     schedule: Some("@daily".to_owned()),
                     mode,
                     next_due_ms: None,

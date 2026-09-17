@@ -4126,15 +4126,11 @@ export async function copyStart(
   source: string,
   destination: string,
   replaceExisting?: boolean,
-  modifiedAfterMs: number | null = null,
-  modifiedBeforeMs: number | null = null,
 ): Promise<string> {
   return await invoke<string>("copy_start", {
     source,
     destination,
     replaceExisting,
-    modifiedAfterMs,
-    modifiedBeforeMs,
   });
 }
 
