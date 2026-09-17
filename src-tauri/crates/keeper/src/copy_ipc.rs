@@ -207,7 +207,6 @@ fn entry_vm(entry: &keeper_sync::copy::CopyEntry) -> CopyEntryVm {
         CopyOutcome::Copied => ("copied", None),
         CopyOutcome::Identical => ("identical", None),
         CopyOutcome::Collision => ("collision", None),
-        CopyOutcome::Skipped { reason } => ("skipped", Some(reason.clone())),
         CopyOutcome::Failed { reason } => ("failed", Some(reason.clone())),
     };
     CopyEntryVm {
