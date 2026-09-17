@@ -1130,6 +1130,59 @@ fn split_partial_suffix(file: &str) -> (&str, bool) {
     }
 }
 
+/// The first line of a git-LFS pointer file, byte for byte. A segment file
+/// that begins with this is **not media** — it is a 130-odd-byte stand-in for
+/// media that lives somewhere else.
+///
+/// This module owns no LFS logic and gains none: the sync crate decides what
+/// is stored as a pointer, when it is hydrated and when it is released.
+/// Recording only has to be able to tell a stand-in apart from a recording,
+/// because on a clone that keeps pointers every question this module asks of
+/// the filesystem — how big is this segment, does it hold a playable `moov` —
+/// gets an answer about the stand-in and none about the media.
+const LFS_POINTER_FIRST_LINE: &[u8] = b"version https://git-lfs.github.com/spec/v1";
+
+/// How much of a candidate is read to classify it. A pointer is three short
+/// lines (version, `oid sha256:…`, `size …`); 512 bytes covers every legal one
+/// with room to spare, and reading a fixed small head costs the same whether
+/// the file is 130 bytes or two gigabytes.
+const LFS_POINTER_PROBE_BYTES: usize = 512;
+
+/// The size of the media a git-LFS pointer stands in for, or `None` when the
+/// file is not a pointer (the ordinary case: real media, and every file on the
+/// machine that recorded it).
+///
+/// **Why the pointer's own `size` line is the right answer.** A pointer is a
+/// complete description of the media it replaces — oid and length — so on a
+/// clone that stores pointers the true byte count is *present*, just not in
+/// `metadata().len()`. Reading it is what lets a manifest stay truthful about
+/// a recording whose bytes this machine does not hold, instead of recording
+/// the stand-in's 134 bytes as the size of a 799 MB capture (the field defect
+/// this closes: DW-256).
+///
+/// Total and cheap: an unreadable file, a short read, a missing or unparseable
+/// `size` line all yield `None`, which lands the caller on the ordinary
+/// filesystem answer. No allocation beyond the fixed probe buffer.
+fn lfs_pointer_media_size(path: &Path) -> Option<u64> {
+    use std::io::Read as _;
+
+    let mut head = [0u8; LFS_POINTER_PROBE_BYTES];
+    let mut file = std::fs::File::open(path).ok()?;
+    let read = file.read(&mut head).ok()?;
+    let head = head.get(..read)?;
+    if !head.starts_with(LFS_POINTER_FIRST_LINE) {
+        return None;
+    }
+    // `size <decimal>` on its own line. Parsed from the probe only, so a
+    // pointer whose (illegally long) key list pushed `size` past the probe
+    // reads as "not a pointer" rather than as a wrong number.
+    std::str::from_utf8(head)
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("size "))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 /// The persisted `status` of a session manifest (Story 17.2). Lowercase on the
 /// wire: `"recording" | "finalized" | "recovered" | "failed"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1826,10 +1879,18 @@ impl SessionManifest {
                 .get(&(track.to_owned(), index))
                 .copied()
                 .unwrap_or((None, None));
+            // Disk is authoritative about size — but on a clone that stores
+            // this segment as a git-LFS pointer, `metadata().len()` is the
+            // stand-in's length, not the capture's. The pointer carries the
+            // real number, so prefer it and leave the manifest true on every
+            // machine the folder reaches. Measured field damage without this:
+            // a synced session whose four segments (799 MB … 1.9 GB) were
+            // rewritten to 134 and 135 bytes, then committed (DW-256).
+            let bytes = lfs_pointer_media_size(&path).unwrap_or(metadata.len());
             segments.push(SegmentEntry {
                 index,
                 file: file.to_owned(),
-                bytes: metadata.len(),
+                bytes,
                 track: track.to_owned(),
                 pts_start,
                 pts_end,
@@ -2093,6 +2154,37 @@ fn recover_orphaned_sessions_within(
     recovered
 }
 
+/// Whether any segment-shaped file in this session folder is a git-LFS
+/// pointer rather than media — i.e. whether the recording arrived here by
+/// sync instead of being captured here (DW-256).
+///
+/// **Any** pointer is enough: a session whose bytes are partly elsewhere was
+/// not made on this machine, and every judgement recovery makes about such a
+/// folder is a judgement about stand-ins. Only names this module already
+/// treats as segments are considered, so an unrelated pointer sitting in the
+/// folder (a sidecar PDF, an attachment) does not freeze the recovery of a
+/// session that really did crash here.
+///
+/// Unreadable directory → `false`: the caller's next step reads the folder
+/// too and fails there with a message, and refusing to salvage every session
+/// because one `read_dir` blinked would be worse than the thing this guards.
+fn folder_holds_pointer_segments(folder: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        // The finished name decides identity, `.partial` or not — the suffix
+        // is exactly the case that must be caught before it is deleted.
+        let (finished, _) = split_partial_suffix(name);
+        session_segment_identity(Path::new(finished)).is_some()
+            && lfs_pointer_media_size(&path).is_some()
+    })
+}
+
 /// Salvage one already-loaded session for [`recover_orphaned_sessions`],
 /// returning its folder when (and only when) the manifest was rewritten to
 /// [`ManifestStatus::Recovered`]. Every refusal is a silent-or-logged `None` —
@@ -2126,6 +2218,25 @@ fn salvage_session_folder(
     // A genuinely-crashed orphan is never reserved and still salvages.
     if is_active(&manifest.folder) {
         tracing::debug!("recovery: skipping reserved live session folder");
+        return None;
+    }
+    // **A recording this machine does not hold is not this machine's to
+    // salvage (DW-256).** A synced recordings folder arrives on every clone,
+    // including one that stores its media as git-LFS pointers — and on that
+    // clone every filesystem answer below is about a 130-byte stand-in: the
+    // `.partial` probe finds no `moov` in a pointer and would DELETE it, and
+    // the rebuild would write the stand-in's length as the capture's size.
+    // Both then commit and travel back to the machine that owns the bytes.
+    //
+    // So the presence of any pointer among the segment files is the answer to
+    // a question this module could not otherwise ask: *was this recorded
+    // here?* If it was not, leave the folder exactly as it is — the machine
+    // that made it will finish it, and its `recording` status is the honest
+    // description of a session whose end this clone has not seen yet.
+    if folder_holds_pointer_segments(&manifest.folder) {
+        tracing::debug!(
+            "recovery: skipping a synced session whose media is not on this machine (LFS pointers)"
+        );
         return None;
     }
     // The crash left the segment it was writing under its `.partial` name
@@ -2252,6 +2363,21 @@ pub fn resolve_partial_segments(folder: &Path) -> Vec<PartialSegmentRecovery> {
                 index,
                 track,
                 "recovery: leaving a partial segment whose finished name already exists"
+            );
+            continue;
+        }
+        // A pointer is not media, and "no playable `moov`" is the only thing
+        // the probe below can conclude about one — so without this the
+        // discard arm would delete a synced clone's stand-in for a segment
+        // whose bytes exist on another machine, and commit the deletion
+        // (DW-256). Recovery already refuses such a folder wholesale; this is
+        // the same rule at the one irreversible call in the module, because
+        // this function is public and a future caller will not know.
+        if lfs_pointer_media_size(&path).is_some() {
+            tracing::warn!(
+                index,
+                track,
+                "recovery: leaving a partial segment that is a pointer, not media"
             );
             continue;
         }
@@ -5812,6 +5938,126 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A git-LFS pointer for `bytes` of media, in the exact three-line shape
+    /// git-lfs writes (and the shape the field defect arrived in: 134 and 135
+    /// bytes standing in for 799 MB and 1.9 GB).
+    fn lfs_pointer(bytes: u64) -> Vec<u8> {
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {bytes}\n",
+            "86ac462dcaf4a8b55e4e594b4707a83c360552cf88a4454227e0cc1433be6540"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_pointer_segment_keeps_the_medias_real_size_in_the_ledger() {
+        // The measured field case (DW-256): a session synced to a clone that
+        // stores media as pointers. `metadata().len()` is ~130; the capture is
+        // 837_784_110 bytes, and the pointer says so.
+        let base = fresh_temp_dir("reconcile-pointer");
+        let folder = base.join("keeper-rec pointer");
+        std::fs::create_dir_all(&folder).expect("session folder");
+        let pointer = lfs_pointer(837_784_110);
+        std::fs::write(folder.join("screen-0000.mov"), &pointer).expect("pointer segment");
+        std::fs::write(folder.join("screen-0001.mov"), vec![7u8; 42]).expect("real segment");
+        let mut manifest = SessionManifest {
+            version: MANIFEST_VERSION,
+            session: "keeper-rec pointer".to_owned(),
+            status: ManifestStatus::Finalized,
+            capture_target: CaptureTarget::display(None),
+            devices: test_devices(),
+            segments: Vec::new(),
+            meta: None,
+            started_at: None,
+            ended_at: None,
+            folder: folder.clone(),
+        };
+
+        manifest.reconcile_from_dir().expect("reconcile");
+
+        assert_eq!(
+            manifest.segments,
+            vec![
+                screen_entry(0, "screen-0000.mov", 837_784_110),
+                screen_entry(1, "screen-0001.mov", 42),
+            ],
+            "a pointer contributes the media's size, real media its own"
+        );
+        assert!(
+            pointer.len() < 200,
+            "the stand-in really is the small file whose length must not be recorded"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recovery_leaves_a_synced_session_whose_media_is_not_on_this_machine() {
+        // The generator of the two conflict copies measured on 2026-09-17: a
+        // still-`recording` folder arrives by sync on a pointer-only clone,
+        // which salvaged it, wrote its own `recovered` manifest, committed it,
+        // and diverged from the machine that was recording. The clone must do
+        // nothing at all.
+        let base = fresh_temp_dir("recover-synced-pointers");
+        let folder = stale_session(&base, "keeper-rec synced", ManifestStatus::Recording, 2);
+        std::fs::write(folder.join("screen-0000.mov"), lfs_pointer(837_784_110))
+            .expect("pointer segment");
+        std::fs::write(folder.join("screen-0001.mov"), lfs_pointer(2_007_949_579))
+            .expect("pointer segment");
+        // The other machine is mid-rotation, so its in-progress segment is
+        // here as a pointer too. The probe finds no `moov` in a pointer, and
+        // deleting it would destroy this clone's only reference to the media.
+        std::fs::write(
+            folder.join("screen-0002.mov.partial"),
+            lfs_pointer(889_657_113),
+        )
+        .expect("partial pointer");
+        let before = std::fs::read(folder.join("manifest.json")).expect("manifest before");
+
+        assert_eq!(
+            recover_orphaned_sessions(&base, &no_folder_is_active),
+            Vec::<std::path::PathBuf>::new(),
+            "a recording this machine does not hold is not this machine's to salvage"
+        );
+
+        assert!(
+            folder.join("screen-0002.mov.partial").exists(),
+            "a pointer must never be deleted as an unusable partial"
+        );
+        assert_eq!(
+            std::fs::read(folder.join("manifest.json")).expect("manifest after"),
+            before,
+            "not one byte of the other machine's manifest may be rewritten"
+        );
+        let reloaded = SessionManifest::load(&folder).expect("reload");
+        assert_eq!(
+            reloaded.status,
+            ManifestStatus::Recording,
+            "the honest state is `recording`: this clone has not seen the end"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_crash_orphan_recorded_here_still_recovers_beside_an_unrelated_pointer() {
+        // The guard must key on SEGMENT files only: a pointer that is not a
+        // segment (an attachment, a sidecar) must not freeze the recovery of a
+        // session that genuinely crashed on this machine.
+        let base = fresh_temp_dir("recover-unrelated-pointer");
+        let folder = stale_session(&base, "keeper-rec local", ManifestStatus::Recording, 2);
+        std::fs::write(folder.join("attachment.pdf"), lfs_pointer(4_000_000)).expect("pointer");
+
+        assert_eq!(
+            recover_orphaned_sessions(&base, &no_folder_is_active),
+            vec![folder.clone()],
+            "an unrelated pointer is not evidence about where this was recorded"
+        );
+        assert_eq!(
+            SessionManifest::load(&folder).expect("reload").status,
+            ManifestStatus::Recovered
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The log line has to say WHICH of the two happened, and it is written
     /// from this report — so asserting the report is asserting the log without
     /// installing a subscriber.
@@ -5886,6 +6132,34 @@ mod tests {
                 "{name} is not ours to resolve"
             );
         }
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The one irreversible call in this module, guarded on its own account:
+    /// a `.partial` that is a git-LFS pointer names media held on another
+    /// machine, and the `moov` probe can only ever conclude "unusable" about
+    /// a pointer — so the discard arm would delete the sole reference to a
+    /// segment that is perfectly intact somewhere else (DW-256).
+    #[test]
+    fn resolving_partials_never_deletes_a_pointer() {
+        let folder = fresh_temp_dir("resolve-partials-pointer");
+        std::fs::create_dir_all(&folder).expect("folder");
+        let pointer = lfs_pointer(889_657_113);
+        std::fs::write(folder.join("camera-0003.mov.partial"), &pointer).expect("partial pointer");
+
+        assert!(
+            resolve_partial_segments(&folder).is_empty(),
+            "neither finalised nor discarded: this machine cannot judge it"
+        );
+        assert_eq!(
+            std::fs::read(folder.join("camera-0003.mov.partial")).expect("still there"),
+            pointer,
+            "the stand-in for another machine's segment stays, byte for byte"
+        );
+        assert!(
+            !folder.join("camera-0003.mov").exists(),
+            "and it is never published under a finished name either"
+        );
         let _ = std::fs::remove_dir_all(&folder);
     }
 

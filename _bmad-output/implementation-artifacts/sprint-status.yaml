@@ -57,6 +57,7 @@ development_status:
   73-3-nothing-is-published-without-its-bytes: backlog
   73-4-routing-settings-can-change-after-a-folder-exists: backlog
   73-5-the-ledger-says-what-is-true: review
+  73-6-a-recording-this-machine-does-not-hold: review
   # Epic 72: the owner's 0.8.29 field report, triaged claim-by-claim before planning.
   # Stack publication is reserved for the coordinator by this checkout's rules.
   epic-72: done
