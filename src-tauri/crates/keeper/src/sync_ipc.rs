@@ -1902,10 +1902,10 @@ fn task_vm(
     profiles: &[SyncProfile],
     unreadable_profiles: &[String],
     last_run: Option<TaskRunVm>,
-    /// The mark the task's ledger folder holds, when one is configured and a
-    /// run of this configuration has succeeded (Story 74.4). Resolved by the
-    /// caller, which already has the engine and the profile list in hand —
-    /// this function reads a row and decides nothing about the filesystem.
+    // The mark the task's ledger folder holds, when one is configured and a run
+    // of this configuration has succeeded (Story 74.4). Resolved by the caller,
+    // which already has the engine and the profile list in hand — this function
+    // reads a row and decides nothing about the filesystem.
     mark_ms: Option<i64>,
     daemon: DaemonPresence,
 ) -> TaskVm {
