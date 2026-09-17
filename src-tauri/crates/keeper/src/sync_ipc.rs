@@ -5269,13 +5269,24 @@ mod tests {
     /// configured where the repository can say it — `.keeper/keeper.toml`, which
     /// travels with the folder — rather than clicked per machine. A save from a
     /// form that has never shown the list must not be able to empty it.
-    const PRESERVED: [&str; 6] = [
+    const PRESERVED: [&str; 7] = [
         "id",
         "volumeId",
         "enabled",
         "lfsNever",
         "lfsPruneLocal",
         "regenerable",
+        // The task ledger's flag (Story 74.3, AD-251), preserved for exactly
+        // the reason `lfsNever` is: no form shows it yet, so no request may
+        // express it, and `parse_req` keeps it because it starts from
+        // `prior.clone()`. It is set today by editing the folder's own
+        // `.keeper/keeper.toml`, which is also where it travels from — and the
+        // rule this list encodes is what stops a save from a form that has
+        // never shown the flag from silently clearing it, which would make
+        // every copy task on that folder stop marking how far it got. It moves
+        // to EXPRESSED in the same change that adds the control (DW-258), the
+        // way `recordings` did in Story 41.7.
+        "tasks",
     ];
 
     fn json_fields(profile: &SyncProfile) -> serde_json::Map<String, serde_json::Value> {
