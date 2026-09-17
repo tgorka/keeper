@@ -241,6 +241,30 @@ pub enum SyncError {
     #[error("{}: this folder's first copy never finished. {detail}", .path.display())]
     CheckoutUnfinished { path: PathBuf, detail: String },
 
+    /// A fast-forward `git` refused **before it started**: the working tree
+    /// holds changes to paths the merge would overwrite.
+    ///
+    /// Its own variant because the two things a caller must know are not in
+    /// `GitCommand`: *which paths* hold the merge (git names them, one per
+    /// line, in its own output) and that **a retry cannot change the answer**.
+    /// Measured on the owner's machine, 2026-09-17: a folder spent 75 minutes
+    /// in `remote polled: the remote branch moved` → `sync retrying … merge
+    /// --ff-only failed` → `sync has failed 3 times in a row`, every few
+    /// minutes, because the blocking path was one keeper excludes from sync —
+    /// so keeper could neither commit it (the exclusion) nor merge past it
+    /// (git's refusal), and the folder could never converge again by itself.
+    ///
+    /// `Permanent`, therefore, and it names the paths: either keeper owns
+    /// those bytes and discards them itself
+    /// ([`crate::engine::Engine`]'s fast-forward arm), or a person has to
+    /// decide, and then the one useful thing keeper can do is say which files
+    /// they are (AD-247).
+    #[error(
+        "the folder cannot take the remote's history while these files hold local changes: {}",
+        .paths.join(", ")
+    )]
+    MergeBlocked { paths: Vec<String> },
+
     /// The operation was cancelled — by the user, by shutdown, or by a volume
     /// disappearing mid-flight. Never surfaced as a failure.
     #[error("operation cancelled")]
@@ -296,6 +320,10 @@ impl SyncError {
             // gets the same answer. A retry could only succeed by overwriting
             // the very thing the refusal protects.
             Self::Refused(_) => Retriability::Permanent,
+            // Nothing about a retry can change git's answer: the precondition
+            // is the working tree, and nothing between two ticks touches it.
+            // Retrying it is the loop AD-247 exists to end.
+            Self::MergeBlocked { .. } => Retriability::Permanent,
             // Transient, and the classification IS the retry: the repair —
             // writing the `HEAD` paths the interrupted checkout never wrote —
             // is mechanical, owned by keeper, and needs nobody. Parking it
@@ -327,6 +355,10 @@ impl SyncError {
                 | Self::InvalidPathForRemote { .. }
                 | Self::Quota { .. }
                 | Self::Diverged { .. }
+                // The blocking paths are the person's own edits, and keeper
+                // has already tried the only thing it may do on its own
+                // (discard the paths it owns). What is left is a decision.
+                | Self::MergeBlocked { .. }
         )
     }
 
@@ -353,6 +385,7 @@ impl SyncError {
             Self::Config(_) => "config",
             Self::Busy(_) => "busy",
             Self::Refused(_) => "refused",
+            Self::MergeBlocked { .. } => "mergeBlocked",
             Self::CheckoutUnfinished { .. } => "checkoutUnfinished",
             Self::Cancelled => "cancelled",
         }

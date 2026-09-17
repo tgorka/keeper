@@ -177,6 +177,13 @@ pub fn sync_exit_code(err: &SyncError) -> u8 {
         // `EXIT_CONFIG` — nothing about the configuration is wrong when keeper
         // declines to overwrite a file the user edited.
         SyncError::Refused(_) => EXIT_FAILURE,
+        // A fast-forward git refused because the working tree holds changes it
+        // would overwrite (AD-247). `EXIT_CONFIG`, not `EXIT_FAILURE`: retrying
+        // changes nothing at all — the precondition is somebody's own edits, and
+        // a `Restart=on-failure` loop against it is the shape this whole
+        // classification exists to prevent. The error's own sentence names the
+        // files, which is what the person running this needs.
+        SyncError::MergeBlocked { .. } => EXIT_CONFIG,
         // A one-shot run against a folder whose working copy was never made
         // did nothing it was asked to do, so `$?` has to say so — and
         // `Restart=on-failure` is exactly right here: the repair is mechanical

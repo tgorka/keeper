@@ -41,13 +41,23 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-03
-last_updated: 2026-09-16
+last_updated: 2026-09-17
 project: keeper
 project_key: NOKEY
 tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 
 development_status:
+  # Epic 73: the field investigation of 2026-09-17 plus the first full triage of
+  # the deferred-work ledger (274 open entries verified against the tree).
+  # Stack publication is reserved for the coordinator by this checkout's rules.
+  epic-73: in-progress
+  73-1-an-excluded-path-is-not-counted: review
+  73-2-a-fast-forward-that-cannot-start-says-so: review
+  73-3-nothing-is-published-without-its-bytes: backlog
+  73-4-routing-settings-can-change-after-a-folder-exists: backlog
+  73-5-the-ledger-says-what-is-true: review
+  73-6-a-recording-this-machine-does-not-hold: review
   # Epic 72: the owner's 0.8.29 field report, triaged claim-by-claim before planning.
   # Stack publication is reserved for the coordinator by this checkout's rules.
   epic-72: done
