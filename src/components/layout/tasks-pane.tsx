@@ -3326,27 +3326,51 @@ export function TasksPane() {
                 form's rows wrap rather than letting a field give, so the host is
                 wide enough by construction instead of by assumption. */}
             {adding ? (
-              <Card size="sm" className="m-6 w-full max-w-[720px]">
-                <CardContent>
-                  <TaskForm
-                    onSaved={(saved) => {
-                      setAdding(false);
-                      // Show what was just made rather than leaving the region
-                      // on whatever was selected before it existed. The id is
-                      // Rust's — a create sends `id: ""` and gets a minted ULID
-                      // back — so this is the only moment the pane learns it.
-                      // A replace and not an addition: a new task is what the
-                      // person is now looking at, not a fifth member of a set
-                      // they assembled before it existed.
-                      setSelected(new Set([saved.id]));
-                      setAnchorKey(saved.id);
-                      void refresh();
-                    }}
-                    onCancel={() => setAdding(false)}
-                    onSavingChange={setFormSaving}
-                  />
-                </CardContent>
-              </Card>
+              // Flush with the region and inside it, which is two corrections
+              // of one line (`<Card size="sm" className="m-6 w-full ...">`,
+              // Story 74.1) the owner reported on 2026-09-17 and the probe then
+              // measured:
+              //
+              // * **`m-6` plus `w-full` always overflows by the margin.**
+              //   `w-full` is 100% of the region, and the 24px left margin
+              //   pushed the whole card that far past its right edge: region
+              //   `476..1021`, card `500..1045`, every control ending at 1029 —
+              //   i.e. under the panel strip that starts at 1022. The scroll
+              //   area's `scrollWidth 569 > clientWidth 545` is the same 24px,
+              //   and it is hidden rather than scrollable, so the right end of
+              //   nine fields was unreachable. Padding cannot do that: it is
+              //   inside the width.
+              // * **A framed, rounded card in a square flush pane reads as a
+              //   loose tile.** Every other column root here carries no radius
+              //   and no border on purpose (DESIGN.md's workroom rule), and the
+              //   region is already a bordered surface — a second frame 24px
+              //   inside the first is the "not level with the edges" the report
+              //   names. The form is the region's content now, not an object
+              //   sitting on it.
+              //
+              // `max-w` and `min-w-0` both stay: the cap is Story 59.13's (a
+              // form 1,000px wide is unreadable), and `min-w-0` is what lets
+              // the rows wrap at the 360px floor instead of forcing a second
+              // overflow.
+              <div className="min-w-0 max-w-[720px] p-4">
+                <TaskForm
+                  onSaved={(saved) => {
+                    setAdding(false);
+                    // Show what was just made rather than leaving the region
+                    // on whatever was selected before it existed. The id is
+                    // Rust's — a create sends `id: ""` and gets a minted ULID
+                    // back — so this is the only moment the pane learns it.
+                    // A replace and not an addition: a new task is what the
+                    // person is now looking at, not a fifth member of a set
+                    // they assembled before it existed.
+                    setSelected(new Set([saved.id]));
+                    setAnchorKey(saved.id);
+                    void refresh();
+                  }}
+                  onCancel={() => setAdding(false)}
+                  onSavingChange={setFormSaving}
+                />
+              </div>
             ) : listing !== null && tasks.length === 0 && listing.unknown.length === 0 ? (
               // The empty state is drawn in the wide region rather than in the
               // 320px column: it is three paragraphs and a shell command, and a
