@@ -5405,6 +5405,14 @@ mod tests {
         prior.volume_id = Some("01VOLUME".into());
         prior.lfs_never = vec!["*.psd".into()];
         prior.regenerable = vec!["index.md".into()];
+        // The task ledger's flag, which no form expresses yet (Story 74.3): a
+        // fresh profile holds no ledger, so `Some(..)` here is a value a fresh
+        // one never has — which is what gives the preservation assertion teeth
+        // rather than letting it pass for both a save that kept the flag and a
+        // save that dropped it.
+        prior.tasks = Some(keeper_sync::profile::TasksConfig {
+            subfolder: "70-tasks".into(),
+        });
         // The opt-out, because a fresh profile now releases the redundant copy.
         prior.lfs_prune_local = false;
         // Story 56.1's virtualization policy. A fresh profile virtualizes
