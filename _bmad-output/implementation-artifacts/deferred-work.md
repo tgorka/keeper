@@ -44,6 +44,7 @@ origin: migrated from legacy ledger (spec-1-6-send-text-with-local-echo-and-visi
 location: keeper-core/src/send.rs
 reason: AD-13's stated invariant is crate-wide ("the only function in the whole crate that feeds the SDK send queue"), but the guard only reads its own file and matches one literal call form. A future `Timeline::send` introduced in `account.rs` (or anywhere outside `send.rs`) would pass the guard untouched, and a refactor renaming the local `content` binding or inlining the argument would break the scan into a false "one gate" pass or a spurious failure. It currently correctly enforces the present code, so no live defect — deferred rather than patched because a robust crate-wide, refactor-resilient enforcement (e.g. scanning all `keeper-core/src` sources, or a build-time architectural lint) is non-trivial and risks false positives, and the spec's AC scoped the assertion to "the send module." Fix: broaden the guard to scan every `keeper-core/src/*.rs` for `Timeline::send`/`send_queue().send` call sites and assert the sole one is inside `send::submit`, resilient to formatting.
 status: open
+triage 2026-09-17: partially strengthened since filing — account.rs:454-535 adds a caller gate (whitespace-normalized send::submit(/send::dispatch( counts), but the guard itself is still single-file/literal and a raw Timeline::send in any third file still passes
 
 ### DW-6: The shell-wide connection/offline pill (`src/hooks/use-connection-status.ts`) is driven by `accounts[0]` only, so with ≥2 accounts it reflects an arbitrary (restore/add-order-dependent) single account's connectivity — account 2..N being offline is invisible, and which account "owns" the pill changes when `accounts[0]` is signed out.
 
@@ -127,14 +128,18 @@ origin: migrated from legacy ledger (spec-3-2-device-verification-emoji-sas-and-
 location: src-tauri/crates/keeper-core/src/account.rs (subscribe_verification)
 reason: In `AccountManager::subscribe_verification` (`account.rs`), `activate` inserts the handle under the first lock; a concurrent `remove_account` between spawn and the second lock hits the `None` branch, which aborts the task and clears the flow sender but does not remove/tear-down the just-activated `Client`+`SyncService`. This mirrors the exact shape flagged and deferred for `subscribe_connection_status`/`subscribe_encryption_status`; the race requires a concurrent account removal during a subscribe (not a normal path). Fix all subscribe lifecycles together (AD-21 teardown-on-early-failure) rather than diverging one copy. See [[DW-14]], [[DW-20]], [[DW-23]].
 status: open
+triage 2026-09-17: the abort path now also flow_tx_slot.release() (the DW-20 fix), but the spawn→register teardown gap itself is unchanged
 
 ### DW-17: An incoming self-verification request that arrived before the producer's `add_event_handler` registered (e.g. the peer started verification during the sync gap at app start) is never surfaced — the handler only fires on future to-device events.
 
 origin: migrated from legacy ledger (spec-3-2-device-verification-emoji-sas-and-qr.md), 2026-07-06
 location: keeper-core verification::run_producer
 reason: `verification::run_producer` registers a `ToDeviceKeyVerificationRequestEvent` handler and only forwards flow ids from events observed after registration; it does not poll `client.encryption()` for already-pending verification requests on startup. In practice the always-on `useVerification` subscriber (mounted in `app-shell`) is live for the whole session, so a request that arrives while keeper is running is caught; the gap is only a request landing in the narrow window before the handler attaches, and verification requests self-expire (~10 min). Fix later by enumerating existing pending requests when the producer starts and seeding them into the flow channel.
-status: open
-blocked: 2026-07-25 — NOT IMPLEMENTABLE as prescribed. matrix-sdk 0.18 `Encryption` exposes only flow-id-keyed `get_verification_request(user_id, flow_id)`; there is no API to enumerate pending verification requests, so the startup-enumeration fix cannot be written. Needs either an upstream API or a different design.### DW-18: Signing out the account that owns an open verification modal tears down its subscription but never resets the verification store, so the modal is stranded open on a now-removed account and a subsequent `close()` fires `verificationCancel` against a dead account.
+status: blocked 2026-09-17
+blocker: upstream matrix-sdk API or a redesigned startup sweep; no in-repo story named
+blocked: 2026-07-25 — NOT IMPLEMENTABLE as prescribed. matrix-sdk 0.18 `Encryption` exposes only flow-id-keyed `get_verification_request(user_id, flow_id)`; there is no API to enumerate pending verification requests, so the startup-enumeration fix cannot be written. Needs either an upstream API or a different design.
+
+### DW-18: Signing out the account that owns an open verification modal tears down its subscription but never resets the verification store, so the modal is stranded open on a now-removed account and a subsequent `close()` fires `verificationCancel` against a dead account.
 
 origin: migrated from legacy ledger (spec-3-2-device-verification-emoji-sas-and-qr.md), 2026-07-06
 location: src/hooks/use-verification.ts
@@ -184,6 +189,7 @@ origin: migrated from legacy ledger (spec-3-4-replies-and-edits.md), 2026-07-06
 location: src-tauri/crates/keeper-core/src/send.rs
 reason: `src-tauri/crates/keeper-core/src/send.rs` `submit_is_the_sole_send_dispatch_gate` does `include_str!("send.rs")` and `match_indices` over that one file only. This is a pre-existing limitation of the guard mechanism (the original `.send(content)` guard was already single-file); Story 3.4 faithfully extended the same intra-file pattern for reply/edit. The invariant still holds today by convention (all dispatch is in `send.rs`). A robust fix needs a crate-wide scan (build-script/`walkdir` over `src/`, or a clippy-style lint) rather than `include_str!` of one file, so it was not a trivial in-diff patch. See [[DW-5]].
 status: open
+triage 2026-09-17: account.rs's caller gate counts send::submit(/send::dispatch( but not raw SDK call forms — the crate-wide invariant still rests on convention for direct SDK call sites
 
 ### DW-25: The composer surfaces the generic retry-implying error copy ("Couldn't send. Check your connection and try again.") for *non-retriable* reply/edit failures (`TargetNotFound`/`NotEditable`, `retriable: false`), so a user who edits a message that is no longer editable/present is told to check their connection and retry — which won't help — undercutting the honesty the non-retriable `IpcErrorCode` distinction was added for.
 
@@ -205,8 +211,11 @@ status: open
 origin: migrated from legacy ledger (spec-3-5-reactions.md), 2026-07-06
 location: src-tauri/crates/keeper-core/src/send.rs + account.rs (toggle_reaction)
 reason: `src-tauri/crates/keeper-core/src/send.rs` `toggle_reaction` and `src-tauri/crates/keeper-core/src/account.rs` `toggle_reaction` — the Rust tests added by Story 3.5 cover the pure `aggregate_reactions` helper and the FR-41 source-scan guard, but no test constructs the resolve/dispatch failure. This mirrors the pre-existing coverage shape of `submit_reply`/`submit_edit`/`retry` (also lacking behavioral error tests) because a `matrix_sdk_ui::Timeline` has no lightweight constructor for unit tests; closing it needs shared timeline test-harness infrastructure (a fixture room/timeline) rather than an in-diff patch, and the same fixture would retro-cover the sibling send methods.
-status: open
-blocked: 2026-07-25 — no test harness exists. keeper-core has NO [dev-dependencies] section at all (no wiremock, no matrix-sdk-test, no mock-sync), so the behavioural test this entry asks for has nothing to run against. Unblocking is a harness decision, not a bug fix.### DW-28: Received audio in an unsupported codec (e.g. Ogg/Opus voice notes, which WKWebView on macOS does not decode natively) renders empty `<audio controls>` forever — the element fires neither `onLoadedMetadata` nor `onError` on a codec-unsupported stall, so no retry/fallback surfaces and AC3 ("received audio plays back inline") silently fails for those clips.
+status: blocked 2026-09-17
+blocker: test-harness decision — no named story yet (keeper-core has no mock Matrix sync harness)
+blocked: 2026-07-25 — no test harness exists. keeper-core has NO [dev-dependencies] section at all (no wiremock, no matrix-sdk-test, no mock-sync), so the behavioural test this entry asks for has nothing to run against. Unblocking is a harness decision, not a bug fix.
+
+### DW-28: Received audio in an unsupported codec (e.g. Ogg/Opus voice notes, which WKWebView on macOS does not decode natively) renders empty `<audio controls>` forever — the element fires neither `onLoadedMetadata` nor `onError` on a codec-unsupported stall, so no retry/fallback surfaces and AC3 ("received audio plays back inline") silently fails for those clips.
 
 origin: migrated from legacy ledger (spec-3-6-receive-media-thumbnails-protocol-streaming-preview.md), 2026-07-06
 location: src/components/chat/media-attachment.tsx
@@ -222,6 +231,7 @@ reason: `src-tauri/crates/keeper/src/media_protocol.rs` (`partial_or_full`) + `s
 status: open
 decision: 2026-07-06 Cap honoring 25 MB bar — Enforce a max-size guard at or above the epic's 25 MB video bar, rejecting oversized media (413) before the whole-file load, coordinated with the send-side cap in DW-31.
 note: 2026-07-11 (Story 12.4) The Range seek-amplification leg is now bounded — iOS caps each Range slice at MAX_MEDIA_RANGE_CHUNK (8 MiB) in media_protocol.rs, so repeated seeks no longer re-materialize the full buffer. The base whole-file in-RAM load remains; disk-backed streaming (avoiding it) stays deferred here per Epic 12.
+triage 2026-09-17: the range-seek leg is bounded on iOS by Story 12.4 (MAX_MEDIA_RANGE_CHUNK 8 MiB, media_protocol.rs:123-126); the whole-file in-RAM load and desktop slices remain
 
 ### DW-30: The `keeper-media://` handle is unauthenticated/forgeable — its three path segments (`account_id`, `room_id`, item `unique_id`) are all data the webview already holds, so a compromised webview (e.g. via a future XSS foothold) could name coordinates to fetch decrypted bytes for any currently-open room on the same account; the handle is not HMAC-signed and the trust boundary is undocumented.
 
@@ -258,7 +268,8 @@ resolution: resolved by sweep wave 1. `RedactedStub` and `UtdStub` now render `r
 origin: migrated from legacy ledger (spec-4-1-unread-management.md), 2026-07-06
 location: src-tauri/crates/keeper-core/src/account.rs (mark_room_read / mark_room_unread)
 reason: `src-tauri/crates/keeper-core/src/account.rs` `mark_room_read`/`mark_room_unread` call live matrix-sdk `Room`/`Timeline` APIs (`TimelineBuilder::build`, `mark_as_read`, `set_unread_flag`) that need a live homeserver or a mock-sync harness to exercise; the `keeper-core` crate currently has no mock Matrix server / integration-test scaffolding (all tests are pure or capture-sink based), so covering these paths is a test-infrastructure investment beyond this story. Not a code defect — the paths pass fmt/clippy and mirror the existing best-effort signals pattern (Story 3.9); flagged so the closed-timeline mark-read (whose receipt advance depends on the room event cache being populated for never-opened rooms) gets real-homeserver verification when a sync test harness exists.
-status: open
+status: blocked 2026-09-17
+blocker: test-harness decision (no mock sync harness; keeper-core's [dev-dependencies] is tokio-only)
 
 ### DW-35: A pinned room that is not currently present in any account's live SlidingSync room-list window is silently excluded from the Pins strip (and undercounts the window `total`) until it reappears.
 
@@ -397,6 +408,7 @@ note: 2026-08-17 (story 53.1, review) — one correction to the note above and o
   `use-pointer-drag` already supports — and it is a UX decision about what a press on
   a card should mean on a phone (a hold, with the scroll it costs), not a defect fix,
   so 53.1's review did not make it.
+triage 2026-09-17: after stories 52.7/53.1 the pointer path works (pointer-capture hook); what remains is exactly this entry's subject — the desktop keyboard path is still absent
 
 ### DW-38: A favourited chat has no unread/mention affordance anywhere in the inbox view — the Favorites section renders compact rows as avatar + name only, and favourited rooms are removed from the Inbox window, so an unread favourited conversation shows no bold-name/dot/mention badge on any surface.
 
@@ -425,7 +437,8 @@ status: open
 origin: migrated from legacy ledger (spec-4-5-spaces-as-room-group-views.md), 2026-07-06
 location: keeper-core account.rs (run_spaces_producer)
 reason: The merger's Space filtering/exclusion/membership/removal paths are well covered by direct `InboxMerger` tests, but the concurrency-sensitive producer (`account.rs::run_spaces_producer`, which owns the `Client`, the `subscribe_to_all_room_updates()` receiver, and the recompute loop) is untested because `keeper-core` has no mock Matrix sync harness — the same crate-wide limitation already deferred for `mark_room_read`/`mark_room_unread` (spec-4-1) and the timeline send-error paths (spec-3-5). Closing it needs a shared mock-homeserver/sync fixture rather than a story-local test; deferred to that test-infrastructure investment. See [[DW-34]], [[DW-27]].
-status: open
+status: blocked 2026-09-17
+blocker: test-harness decision (no mock sync harness; producer lifecycle untestable)
 
 ### DW-42: `room_item_to_vm` now resolves each room's bridged-Network label via `bridge::room_bridge_network` for every room of every room-list batch (Reset + incremental), where previously it was an on-demand single-room call used only for the delete confirmation.
 
@@ -528,6 +541,7 @@ origin: migrated from legacy ledger (spec-5-7-archive-survives-sign-out-and-dele
 location: src/hooks/use-sign-out.ts (no Settings → Archive-management surface)
 reason: Story 5.7's only archive-delete entry point is the sign-out `SignOutDialog`; once `sign_out` completes and the account is removed from the switcher, the account is no longer listed, so the "…and delete this Account's archive" path is unreachable. The delete path is fire-once (`use-sign-out.ts`): sign-out → removeAccount → `deleteAccountArchive`, and on a purge rejection (or an app kill between the two IPC calls) the archive rows persist with no way to re-trigger the purge. The Rust `delete_account_archive` is keyed by `account_id` only and does not require a live session, so a future Settings → Archive-management surface could list accounts with residual `archive.db` rows and offer a re-delete — deferred as out of scope for the sign-out-time delete this story owns.
 status: open
+triage 2026-09-17: narrowed, not resolved — a later story added a toast with actionable Retry re-purging after account removal (covers purge-rejection); the app-kill-between-sign_out-and-purge orphaning and the Settings/archive-management surface remain
 
 ### DW-56: Bridge discovery source (c) bot-DM detection is gated behind `room.is_direct() == Ok(true)`, but self-hosted mautrix/Beeper bot management rooms are frequently NOT flagged `m.direct`, so the `not logged in` status can silently fail to trigger on exactly the homeservers this feature targets.
 
@@ -587,6 +601,7 @@ origin: migrated from legacy ledger (spec-6-5-bridge-session-health-and-re-login
 location: keeper-core bridges/health.rs (HealthAggregator)
 reason: `scripted_observation_sequence_yields_expected_emissions` (bridges/health.rs) drives `HealthState::apply` directly and never constructs a `HealthAggregator` or a sink; the "emit only on change" cadence contract the frontend relies on for the pulse/roll-up is verified only at the pure-diff layer, not at the aggregator that wires diff→sink. The shell is documented residual risk, but a focused test with a mock sink asserting (a) no emit on an idempotent recompute, (b) emit on a real per-session change, and (c) graceful handling of a closed sink channel would convert the diff-gate contract from "reasoned" to "verified."
 status: open
+triage 2026-09-17: aggregator-level tests now exist (health.rs:824-925), but notify_aggregator wires a `Box::new(|_| true)` sink stub — the diff-gate emit contract is still untested at the HealthAggregator boundary
 
 ### DW-64: A `bbctl run` that emits no recognized started/error prose marker (or is genuinely slow to start) leaves the run stepper with no terminal state and no timeout — only a user cancel escapes; add a bounded run-start timeout / unrecognized-daemon handling when the provisional prose markers are tuned against a real `bbctl` binary.
 
@@ -630,7 +645,8 @@ resolution: resolved by sweep wave 1. `composer.tsx` `send()` on the edit path n
 origin: migrated from legacy ledger (spec-7-1-persistent-per-chat-drafts.md), 2026-07-06
 location: keeper-core registry.rs (temp_dir test helper)
 reason: `registry.rs` `temp_dir()` (shared by all registry tests incl. the pre-existing `pins` tests) builds `keeper-registry-test-{pid}-{nanos}`; `cargo test` runs tests multithreaded within one process, so two tests entering `temp_dir()` within the same nanosecond get the same path and interfere. Pre-existing helper (not introduced by this story). A per-call atomic counter or `tempfile`-style guaranteed-unique dir would eliminate the flake.
-status: open
+status: done 2026-09-17
+resolution: verified by the 2026-09-17 ledger triage: keeper-core/src/registry.rs:2429-2431 — `temp_dir()` now uses a `static COUNTER: AtomicU64` instead of pid+nanos
 
 ### DW-70: A debounced `saveDraft` that has already fired (IPC in flight) when the user sends can commit *after* the post-send `clearDraft`, resurrecting an orphan draft row + amber marker on an already-sent chat that survives relaunch; the prior mitigation only cancels the still-*queued* debounce timer, not an in-flight save.
 
@@ -808,6 +824,7 @@ location: keeper-core/src/notify.rs (register_notify_handler / dispatch)
 reason: `keeper-core/src/notify.rs` `register_notify_handler`/`dispatch` have no window-focus or active-room check; a user typing in a Chat gets an OS notification for the message that just appeared on screen. Not required by Story 10.1's ACs (which only require posting sender/Chat/preview, honoring the previews toggle, and no push egress), so it was not in scope, but it is standard notification behavior worth an explicit later decision alongside the mute/mention-only/DND rules (Story 10.2) or background/foreground semantics (Story 10.3).
 status: open
 decision: 2026-07-06 Add focus/active-room suppression — Wire a shell window-focus + active-room signal into dispatch and suppress notifications for the room the user is actively viewing while the app is focused.
+triage 2026-09-17: half-resolved by Story 14.3 — should_notify gained an is_active_room gate, but the signal is set only on the reduced tier, so desktop behaves exactly as before
 
 ### DW-93: Muting/unmuting a whole Network does not live-refresh the inbox row mute glyph — an idle room's glyph flips only when that room next produces a VectorDiff, so the bell-off glyph can lag the actual (immediately-applied) notification suppression for an arbitrary time.
 
@@ -910,7 +927,9 @@ origin: spec-12-1-ios-project-init-and-repo-integration.md, 2026-07-11
 location: rust-toolchain.toml (targets) + src-tauri/crates/keeper/gen/apple/project.yml (x86_64 Externals / EXCLUDED_ARCHS references)
 reason: The generated `project.yml` references `x86_64` Externals paths and `EXCLUDED_ARCHS[sdk=iphoneos*] = x86_64`, but the pinned Rust targets are Apple-Silicon-only. On an Apple-Silicon dev box (the current environment) this is a non-issue; on an Intel Mac the Simulator core build would need `x86_64-apple-ios`. Out of scope for 12.1 (Simulator boot is 12.2's exit criterion, and CI runs on Apple-Silicon macos-latest), surfaced incidentally by adversarial review. Revisit alongside the 12.2 Simulator seam or 12.5 iOS CI if Intel-host support is required.
 status: closed 2026-07-25
-resolution: Won't fix. The premise holds (x86_64-apple-ios is unpinned) but acting on it contradicts the project's recorded Apple-Silicon-only posture; pinning an Intel Simulator target would advertise support that is deliberately not offered.### DW-107: The generated `ExportOptions.plist` hard-codes `method = debugging` (a development/debug export, not distribution) with no `teamID`/`signingStyle`.
+resolution: Won't fix. The premise holds (x86_64-apple-ios is unpinned) but acting on it contradicts the project's recorded Apple-Silicon-only posture; pinning an Intel Simulator target would advertise support that is deliberately not offered.
+
+### DW-107: The generated `ExportOptions.plist` hard-codes `method = debugging` (a development/debug export, not distribution) with no `teamID`/`signingStyle`.
 
 origin: spec-12-1-ios-project-init-and-repo-integration.md, 2026-07-11
 location: src-tauri/crates/keeper/gen/apple/ExportOptions.plist
@@ -931,7 +950,9 @@ origin: spec-13-1-phone-layout-tier-and-navigation-stack.md, 2026-07-11
 location: src/components/layout/phone-shell.tsx:47 (level = detailOpen && selected ? 2 : ...) + src/lib/stores/rooms.ts (selectRoom/requestFocus never touch detailStore)
 reason: The lifted `detailStore.open` is a global flag not scoped to the selected room (this mirrors the pre-existing desktop behavior, where detail-open also persisted across room switches). Through the 13.1 phone surface the bad state is not reachable: in-stack navigation changes rooms only via the back control (level 2 → closeDetail closes detail; level 1 → selectRoom(null) runs with detail already closed), and the deep-link primitive (`requestFocus`) is not yet wired to any phone trigger (notifications deferred; phone Search is Story 13.4). The only way to observe it today is a desktop→phone resize with the detail panel open, which lands on Detail showing the current room — acceptable. Deferred rather than patched because a correct reset needs a product decision on per-room detail semantics that Story 13.2 (which builds the identity-tap "push Detail" affordance, the phone's replacement for ⌘I) is the natural owner of; a phone-scoped effect that closes detail on `selected` change is the likely fix. Revisit with Story 13.2.
 status: done 2026-07-25
-resolution: Verified already fixed by Story 13.2 — phone-shell.tsx's header comment names this entry, and the selection path now resets detail. Closed by sweep triage, no code written.### DW-110: The phone navigation stack has no keyboard/assistive-tech focus management — pushing/popping a level moves no focus, the covered lower levels stay in the tab order and accessibility tree (not `inert`/`aria-hidden`), and the back control provides no focus-return or Escape-key handler.
+resolution: Verified already fixed by Story 13.2 — phone-shell.tsx's header comment names this entry, and the selection path now resets detail. Closed by sweep triage, no code written.
+
+### DW-110: The phone navigation stack has no keyboard/assistive-tech focus management — pushing/popping a level moves no focus, the covered lower levels stay in the tab order and accessibility tree (not `inert`/`aria-hidden`), and the back control provides no focus-return or Escape-key handler.
 
 origin: spec-13-1-phone-layout-tier-and-navigation-stack.md, 2026-07-11
 location: src/components/layout/phone-shell.tsx (opaque absolute overlays without inert/aria-hidden; BackControl with no focus-return; no Escape handler)
@@ -981,7 +1002,9 @@ resolution: Story 66.1 (DW-112). `SearchPanel` names the device by the tier: `SE
 - source_spec: `_bmad-output/implementation-artifacts/spec-14-2-honest-no-background-sync-disclosure.md`
   summary: Gating the "Background & dock" Settings section off the reduced (iOS) tier removed the only badge-mode control (all / mentions-only / off) reachable on iOS, yet Story 14.2's new `BADGE_NOT_LIVE_SENTENCE` advertises the app-icon badge — so iOS users are told a badge exists with no way to set it to mentions-only or off.
   evidence: `settings-dialog.tsx` now renders `<BackgroundSection>` behind `!reducedPlatform`; that section held the `Dock badge` `DockBadgeMode` radio, whose value is the shared config the iOS app-icon badge (`keeper-core/src/badge.rs`, `ipc.rs` `dock_badge_mode_*`) will consume in Story 14.3. Today the iOS `set_badge_count` is a stub no-op so the control did nothing on iOS (no current functional regression), but Story 14.3 should re-surface an iOS-appropriate badge-mode control when it builds the badge so the disclosure copy and the available settings stay honest and consistent.
+  status: done
 
+  resolution: verified by the 2026-09-17 ledger triage: settings-dialog.tsx NotificationsSection now renders an "App icon badge" RadioGroup (`DOCK_BADGE_OPTIONS`, dockBadgeModeGet/set) under `reducedPlatform` (:510-513) — Story 14.3 did exactly what this entry asked
 - source_spec: `_bmad-output/implementation-artifacts/spec-14-4-resume-integrity-blank-webview-guard-and-stale-resume-pill.md`
   summary: Nav-state restore does not validate that the stored room/account still exists (signed-out or room left/forgotten during suspension) before re-selecting it, so a reload can land on an empty/error Room pane instead of falling back to the Inbox.
   evidence: `use-nav-state-persistence.ts` calls `selectRoom({accountId, roomId})` from the restored `NavState` with no existence check; a correct fix must reconcile after the snapshot-then-diff mirror hydrates (the rooms store is empty at mount, so a naive check would defeat restore entirely). Real but needs focused design.
@@ -994,40 +1017,48 @@ resolution: Story 66.1 (DW-112). `SearchPanel` names the device by the tier: `SE
 - source_spec: `_bmad-output/implementation-artifacts/spec-14-4-resume-integrity-blank-webview-guard-and-stale-resume-pill.md`
   summary: The stale-resume "Connecting…" pill's `!offline` honesty gate interacts with the stale-resume `pause_all()` prelude (which drives every account to Offline), so on the exact overnight/stale-resume scenario the pill exists for it is hidden while offline and then cleared by the subsequent offline→online transition — the pill may essentially never render on its primary path. The code does not distinguish "offline because mid-restart-reconnect" (should show "Connecting…") from "offline and staying offline" (14.6's persistent pill, should not).
   evidence: `phone-shell.tsx` gates the pill `connecting && !refreshing && !offline && pullDy === null`; the stale-resume path in `lifecycle.rs` calls `pause_all()` → per-account `SyncService::stop()` → accounts transition to `ConnectionStatus::Offline` → `useShellOffline()` true → `!offline` false, and `use-stale-resume-pill.ts` settles (clears) on the offline→online transition back. Correct resolution needs the SM-8 on-device observation named in the spec's residual-risk #1 (does `pause_all()` emit an offline batch, and for how long), so a code fix cannot be derived blind — reversing the pass-2 `!offline` gate would reintroduce the dishonesty it was added to prevent (a "Connecting…" claim on a resume that stays offline). Also test-architecturally invisible: `phone-shell.test.tsx` mocks `useStaleResumePill` as a static boolean stub, so no test exercises the hook↔component interaction against a real `pause_all`-driven offline resume — the headline behavioral question falls in the seam between the two mocked-apart suites. Flagged by two independent adversarial reviewers as the top open concern; verify at SM-8 and reconcile the offline-but-reconnecting vs offline-and-staying distinction.
-  status: open
+  status: needs-field-check 2026-09-17
+  settles-with: run keeper on the iPhone/Simulator, background >120 s (STALE_RESUME_THRESHOLD, lifecycle.rs:41), resume, and observe the offline transition window
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-14-5-memory-hygiene-under-jetsam.md`
   summary: SM-8 dogfooding bar — Instruments-on-Simulator confirmation that memory returns near baseline after backgrounding keeper with media loaded. The automated portion of Story 14.5 asserts only that the image-shed drop hook fires (image `src` dropped on background, restored on foreground) and that the 12.4 per-request Range cap holds; whether dropping the image `src` actually releases the WKWebView's decoded-image memory (and how close to baseline) is only observable on the Simulator with Instruments.
   evidence: The shed lives in the frontend (`src/lib/stores/lifecycle.ts` + `media-attachment.tsx`/`media-preview-overlay.tsx` drop the image `src` on `phase === "background"`), because the droppable decoded-image memory lives in the WKWebView renderer, which Rust cannot free. jsdom does not decode bitmaps or run WKWebView memory management, so the memory-return-to-baseline effect is not unit-testable; it is an SM-8 dogfooding item per Epic 14 (verification is Simulator-first, on-device soaks folded into SM-8, not story-blocking). Record findings. Disk-backed streaming (avoiding the whole-file in-RAM media load) stays deferred — see DW-29 (do not duplicate).
-  status: open
+  status: needs-field-check 2026-09-17
+  settles-with: Instruments Allocations on the Simulator: background with media loaded, record return-to-baseline
 - source_spec: `_bmad-output/implementation-artifacts/spec-14-5-memory-hygiene-under-jetsam.md`
   summary: SM-8 dogfooding bar — a 24 h suspended soak with a large account must survive without a jetsam kill. This is the phase's memory-hygiene reliability bar and cannot be a story-blocking automated gate; it is an on-device/Simulator dogfooding step with findings ledgered.
   evidence: Story 14.5 sheds the frontend image memory on background (see the sibling SM-8 entry) and preserves the Story 12.4 request-scoped Range cap, but whether a suspended session with a large account survives 24 h without iOS jetsam-killing it is a device-time behavioral bar, not a unit test. Per Epic 14 the overnight/24 h soak folds into SM-8 dogfooding rather than blocking the story. Run on-device with a large account, record survival/kill and any findings. Related deferred capacity work: DW-29 (disk-backed streaming) — cross-referenced, not duplicated.
-  status: open
+  status: needs-field-check 2026-09-17
+  settles-with: on-device 24 h suspended soak with a large account; record survival/kill
 - source_spec: `_bmad-output/implementation-artifacts/spec-14-5-memory-hygiene-under-jetsam.md`
   summary: The Story 14.5 image-shed deliberately exempts `<audio>`/`<video>` playback surfaces (dropping their `src` would reset playback position, force a large re-download, and restart `autoPlay`), so a backgrounded open Quick-Look overlay showing an autoplaying `<video>` leaves its decoded media buffer un-shed — the single largest decoded-media holder is not released while that overlay is open in the background.
   evidence: `media-preview-overlay.tsx` gates only the `kind === "image"` full-res `src` on `useMediaShed()`; the video (`<video src={src} autoPlay>`) and audio branches keep their `src` across a shed cycle by design (playback-continuity), and `media-attachment.tsx` likewise never sheds the inline `<audio>`/video poster. In practice iOS suspends webview media playback on background (no background-audio entitlement), so the exempted buffer is a bounded, paused decode rather than a growing one, and the exemption is the correct trade-off for the common case (a background round-trip should not reset a voice note or video). But the residual is real and un-acknowledged elsewhere: quantify it during the SM-8 Instruments pass (background with a preview overlay open on a large video) and decide whether a "shed on true memory-warning even mid-playback" path (the deferred native `didReceiveMemoryWarning` seam, AD-30) is warranted. See the sibling SM-8 entries and DW-29.
-  status: open
+  status: needs-field-check 2026-09-17
+  settles-with: quantify the un-shed video overlay buffer during the SM-8 Instruments pass (background with a preview overlay open)
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-14-6-flaky-network-resilience.md`
   summary: SM-8 dogfooding bar — an airplane-mode toggle with keeper foreground must recover unaided: the persistent offline pill appears while disconnected and clears on reconnect, sync resumes with no app restart and no blank webview, and a message composed while disconnected sends on reconnect (no lost message).
   evidence: The automated suite covers the pill (phone-shell.test.tsx offline-pill precedence/clear-on-reconnect), the tier-gated queued caption (message-bubble.test.tsx), and outbox durability across an elapsed window (account.rs `outbox_row_elapsed_while_suspended_is_durable_and_due`), but real radio state transitions are Simulator-unverifiable — airplane mode is device-only behavior. Recovery rides the existing matrix-sdk offline mode + SDK-native backoff (Story 1.7) and the single 14.1 sync kick; no new machinery to verify, only the on-device end-to-end. Record findings.
-  status: open
+  status: needs-field-check 2026-09-17
+  settles-with: on-device airplane-mode toggle with keeper foreground; record recovery
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-14-6-flaky-network-resilience.md`
   summary: SM-8 dogfooding bar — a real Wi-Fi↔cellular handover with keeper foreground must recover unaided (no restart, no lost message): sync re-establishes across the interface switch, any transient offline pill clears by itself, and a message composed mid-handover sends once the new path is up.
   evidence: An interface handover (different local addresses, momentary double-NAT/drop) is not reproducible in the Simulator or jsdom; the automated 14.6 suite proves the pill/caption/durability pieces but the radio-level reconnect is on-device only. Same recovery spine as the airplane-mode bar (matrix-sdk offline mode + reconnect supervisor, 14.1 sync kick, ~250 ms outbox scheduler tick). Record findings alongside the sibling 14.6 SM-8 entry.
-  status: open
+  status: needs-field-check 2026-09-17
+  settles-with: on-device Wi-Fi↔cellular handover soak; record recovery alongside 14-6a
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-14-7-backup-exclusion-and-file-protection.md`
   summary: SM-8 device bars for Story 14.7 — on Simulator/device, read `NSURLIsExcludedFromBackupKey` back == true on the `data_dir` root and each `accounts/<ulid>/sdk` directory after login + archive creation; confirm `keeper.db`/`archive.db` and their `-wal`/`-shm` sidecars are backup-excluded via the directory-level flag; and confirm all stores stay accessible after first unlock under `NSFileProtectionCompleteUntilFirstUserAuthentication` (lock the device mid-sync — the resumed sync loop must keep working, never an inaccessible store).
   evidence: The host suite proves everything except the FFI syscall — the spy-`Platform` tests in `keeper-core/src/account.rs` pin the invocations (root at `AccountManager::new`, each sdk dir at every `activate`, idempotent re-flag, non-fatal on failure), and `crates/keeper/tests/entitlements_protection.rs` pins the protection class in both `project.yml` and the regenerated `keeper_iOS.entitlements`. But `IosPlatform::exclude_from_backup` is `#[cfg(target_os = "ios")]` (host tests never execute it; it compiles under the Story 12.5 iOS gate), and the actual subtree-covers-sidecars xattr behavior plus lock-screen store accessibility are only observable on device/Simulator. Read the key back with a scratch NSURL resource-values probe during SM-8 dogfooding and record findings.
-  status: open
+  status: needs-field-check 2026-09-17
+  settles-with: scratch NSURL resource-values probe on Simulator/device reading `NSURLIsExcludedFromBackupKey` on data_dir + each sdk dir, plus lock-screen store access
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-14-7-backup-exclusion-and-file-protection.md`
   summary: Pre-existing Story 14.3 iOS badge break — `IosPlatform::set_badge_count` calls `WebviewWindow::set_badge_count`, which is `#[cfg(desktop)]`-only in tauri 2.11.5, so `cargo check -p keeper --target aarch64-apple-ios` fails (E0599 at `crates/keeper/src/ipc.rs` `set_badge_count`) and the Story 12.5 iOS CI gate has been red on `main` since 14.3. Not Story 14.7's fix — flagged for the coordinator.
   evidence: Reproduced 2026-07-11 while iOS-compile-checking the 14.7 FFI — `cargo check -p keeper --target aarch64-apple-ios` errors with "no method named `set_badge_count` found for struct `tauri::WebviewWindow<R>`" at the iOS `set_badge_count` body; that error is the SOLE iOS-target failure (the new `exclude_from_backup` objc2 FFI compiles clean). tauri 2.11.5 gates `WebviewWindow::set_badge_count` behind `#[cfg(desktop)]`; on iOS the badge needs a different seam (e.g. `UIApplication.applicationIconBadgeNumber` / a mobile-capable plugin API). Fix belongs to a 14.3 follow-up: restore an iOS-buildable `set_badge_count` (honest no-op or a real mobile badge call) so the 12.5 gate goes green again.
-  status: open
+  status: done
+  resolution: verified by the 2026-09-17 ledger triage: keeper/src/ipc.rs:919-923 — `IosPlatform::set_badge_count` now uses `UNUserNotificationCenter::setBadgeCount` via objc2-user-notifications, with a comment naming the 14.3/15.4 fix
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-15-4-required-ios-ci-gate-and-release-hygiene.md`
   summary: Pre-existing required-check label drift in `docs/release.md` — four of the five "Required status checks (branch protection)" bullets ("License firewall", "Frontend", "Rust", "Tauri build") do NOT verbatim match their CI job `name:` values (`License firewall (cargo-deny, JS)`, `Frontend (lint, typecheck, test)`, `Rust (fmt, clippy, test)`, `Tauri build (macOS)`), so a repo admin copy-pasting the bolded labels into GitHub branch-protection settings could fail to bind those four required checks. Not caused by Story 15.4 (whose added `iOS (compile check)` row matches its job `name:` exactly); surfaced incidentally by 15.4's review.
@@ -1037,7 +1068,8 @@ resolution: Story 66.1 (DW-112). `SearchPanel` names the device by the tier: `SE
 - source_spec: `_bmad-output/implementation-artifacts/spec-16-1-keeper-rec-swiftpm-scaffold-codesign-and-externalbin-wiring.md`
   summary: Validate on a real signed/notarized release that keeper-rec's hardened-runtime signature and entitlements survive tauri-action's bundle re-sign inside the notarized .app, and that the empty entitlements file suffices once real ScreenCaptureKit + system-audio capture lands (Story 16.6).
   evidence: The signed release path pre-signs keeper-rec (hardened runtime + entitlements) before tauri-action bundles/notarizes (tauri#11992 workaround); whether tauri's deep bundle-sign preserves that signature/entitlements can only be confirmed with real Developer ID secrets + hardware, which are outside this unattended loop. The empty <dict/> entitlements is correct for the getCapabilities stub but may need audio/capture entitlements under hardened runtime when 16.6 exercises live capture. The signed-path verify (codesign -dv) currently checks the standalone binary, not the copy inside the .app.
-  status: open
+  status: needs-field-check 2026-09-17
+  settles-with: only a signed/notarized release on real hardware can confirm entitlements survive tauri-action's bundle re-sign
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
   summary: `DesktopRecorder::run_session` treats a mid-stream stdout read error identically to a clean EOF, so a truncated/failed recording is reported as a clean end. Surface a `SidecarFailed` when the reader hits an I/O error (16.6 real-capture hardening).
@@ -1057,12 +1089,14 @@ resolution: Story 66.1 (DW-112). `SearchPanel` names the device by the tier: `SE
 - source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
   summary: Crash-recovery entry — `RecordingSession::apply` only accepts `Recovered` from `Stopping`, but a realistic self-salvage arrives from `Recording`/`Rotating`; model the crash-recovery transitions in Epic 17.
   evidence: `parse_event` maps `"state":"recovered"` to `RecordingEvent::Recovered`, yet `apply` rejects it outside `Stopping` (an `IllegalTransition` would fail a salvaged recording). The epic explicitly defers full crash-recovery entry semantics to Epic 17; 16.2 keeps `Recovered` as a reachable terminal only via a graceful stop.
-  status: open
+  status: skip 2026-09-17
+  resolution: superseded — Epic 17 delivered crash recovery as a manifest-level salvage, so the illegal-transition hazard can't fire
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
   summary: `SegmentClosed { index }` — the reported index is parsed but never validated against the internal counter (no gap/dup/monotonicity check), so `segments_closed()` can silently drift; enforce with Epic 17 segmentation.
   evidence: `apply` does `saturating_add(1)` on a counter and ignores the parsed `index`. A sidecar reporting out-of-order/duplicate indices would desync the count from reality — harmless in the 16.2 skeleton (no consumer) but load-bearing once a consumer enumerates segment files. Real segment-index semantics land with Epic 17.
-  status: open
+  status: skip 2026-09-17
+  resolution: superseded — every terminal rebuilds segments from disk, so counter drift self-corrects
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
   summary: The sidecar-provided `Failed` message is copied verbatim into the error taxonomy with no length cap or path scrub, so the module's secret-free invariant depends entirely on keeper-rec; add a `cap_message`-style bound when real capture errors land (16.6).
@@ -1072,12 +1106,14 @@ resolution: Story 66.1 (DW-112). `SearchPanel` names the device by the tier: `SE
 - source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
   summary: `drive_session`'s `on_state` is a batched, post-resolution replay rather than a live feed; wire a channel-based live progress feed when a real consumer (progress UI) needs one (16.3+).
   evidence: The `Recorder::run_session` sink is `Box<dyn FnMut + Send>` (`'static`) and cannot borrow the non-`'static` `on_state`, so transitions are buffered and flushed when the run resolves. The live per-event feed is the sink itself; a live `on_state` needs a channel bridge, best added against a real progress-UI requirement in a later story.
-  status: open
+  status: skip 2026-09-17
+  resolution: moot — the real progress consumer is fed live via on_event; on_state stays a convenience replay
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
   summary: No single-session guard — two concurrent `run_session` calls on a `DesktopRecorder` would spawn two competing `keeper-rec` captures; enforce the "one capture target per session" invariant at the command/registry layer in 16.3+.
   evidence: The port is reentrant with no dedupe; the epic invariant "only one capture target per session" must be enforced where sessions are owned (a registry like `BbctlRunRegistry`), which does not exist until an IPC/command surface lands (16.3+).
-  status: open
+  status: done
+  resolution: verified by the 2026-09-17 ledger triage: keeper/src/ipc.rs:6532-6535 (recording_start refuses when the slot holds a live run) + :5856-5858 ("single-child start-guard" comment)
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md`
   summary: A non-zero `keeper-rec` exit that follows an already-reported terminal (`finalized`/`recovered`/`error`) masks that terminal — `drive_session` returns the generic `SidecarFailed` exit-status error instead of the honest finalized/failed outcome the session already reached. Reconcile once keeper-rec's exit-code contract is defined (16.4/16.6).
@@ -1092,7 +1128,8 @@ resolution: Story 66.1 (DW-112). `SearchPanel` names the device by the tier: `SE
 - source_spec: `_bmad-output/implementation-artifacts/spec-16-4-ndjson-rpc-handshake-getcapabilities-and-listsources.md`
   summary: The new `DesktopRecorder::request_response` round-trip has no read/round-trip timeout — a `keeper-rec` that spawns, reads the request line, then hangs (deadlock, wedged CoreGraphics, waiting on a dialog) leaves `get_capabilities()`/`list_sources()` pending forever, and with them 16.5's pre-flight. `kill_on_drop` only fires if the future is dropped, and nothing drops it.
   evidence: `request_response` loops on `reader.read_until(...).await` and then `child.wait().await` with no `tokio::time::timeout` anywhere. A bounded request/response call especially warrants a timeout (unlike the streaming `run_session`). This extends the 16.2-deferred `wait()`-timeout concern to the new request path; 16.6 owns the capture-session lifecycle timeout policy (start/stop/round-trip). Both review reviewers flagged it independently.
-  status: open
+  status: done
+  resolution: verified by the 2026-09-17 ledger triage: recorder.rs:100-109,127-142 (PREFLIGHT_TIMEOUT + `bounded()`, doc: "closes the deferred unbounded-request_response spinner risk") + tests :790-824
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-16-4-ndjson-rpc-handshake-getcapabilities-and-listsources.md`
   summary: `request_response` reads response lines with `read_until(b'\n', &mut buf)` and no per-line length cap, so a buggy/replaced sidecar emitting a huge line before the correlated response accumulates it unbounded in memory.
@@ -1107,37 +1144,44 @@ resolution: Story 66.1 (DW-112). `SearchPanel` names the device by the tier: `SE
 - source_spec: `_bmad-output/implementation-artifacts/spec-16-4-ndjson-rpc-handshake-getcapabilities-and-listsources.md`
   summary: id-correlation uses fixed per-method ids (`1` for getCapabilities, `2` for listSources) with no method-echo verification; correct only because each call spawns a fresh process and issues exactly one request. 16.6's persistent multi-request capture session (start/stop/events over one long-lived process) will collide on fixed ids.
   evidence: `request_response` correlates purely on `response_id == id` with a constant id per method and never verifies the response answers the method asked. For 16.6's persistent session this needs monotonically-increasing request ids and response/method validation (defense-in-depth) to avoid mismatching a reply to the wrong outstanding request.
-  status: open
+  status: skip 2026-09-17
+  resolution: the triggering design (persistent multi-request session) never landed; every call is a fresh spawn
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-16-5-screen-recording-permission-pre-flight.md`
   summary: The request/grant/relaunch UX rides `CGRequestScreenCaptureAccess`'s synchronous bool, which on a real first grant returns false while the OS prompt is still on screen (grant often not visible until relaunch on macOS 15+), so the row briefly reads "Denied — open System Settings" and the `requested+notDetermined → Denied` mapping labels an "awaiting/needs-relaunch" state with a hard "Denied" pill. Real grant/relaunch behavior and the final labeling need validation on a dev-signed Mac with a real grant.
   evidence: `request_screen_recording_permission` (ipc.rs) maps a not-granted request outcome straight to Denied via the pure resolver; `main.swift` calls `CGRequestScreenCaptureAccess()` whose sync return can't distinguish "prompt live/awaiting" from "denied". The relaunch note-line already discloses the quirk and re-detect on focus partly rescues it, but the epic explicitly defers real-grant validation to Story 16.6 (physical Mac + real grant + dev-signed build) — the honest awaiting-vs-denied labeling should be finalized there.
-  status: open
+  status: needs-field-check 2026-09-17
+  settles-with: settle on a dev-signed Mac with a real first grant (observe awaiting-vs-denied labelling through the relaunch)
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-17-1-dual-writer-gapless-size-based-rotation-in-keeper-rec.md`
   summary: A `stop` that lands during an in-flight segment rotation can suppress the just-closed middle segment's `segmentClosed` event, so Story 17.2's event-fed ledger would miss that (fully-written, on-disk, playable) segment. No consequence in 17.1 (no ledger yet).
   evidence: In keeper-rec `Capture.swift`, the retired writer's async `finishWriting` completion emits `segmentClosed` only `if !stopping`; suppression is required because `segmentClosed` is an illegal host transition once the machine is `Stopping`. If `stop()` sets `stopping` during writer A's finalize window, segment A gets no event. Story 17.2 should reconcile the ledger from a session-folder scan (the segment file exists), or drain any in-flight rotation before emitting `stopping`, so no closed segment is lost.
-  status: open
+  status: done
+  resolution: verified by the 2026-09-17 ledger triage: recording.rs:1717-1718 (reconcile_from_dir "backfills a segment whose event a mid-rotation stop suppressed (DW-992)") + test :5179-5182
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-17-2-session-folder-manifest-json-and-segment-ledger.md`
   summary: Story 17.3 startup recovery must run `SessionManifest::reconcile_from_dir` (rebuild the segment ledger from the on-disk `.mp4` files), not merely flip a stale `recording` manifest to `recovered` — a session that ended via a sidecar spawn fault / non-zero exit / crash never executed 17.2's terminal reconcile, so its manifest's `segments` list is incomplete or event-fed (possibly `bytes:0` / synthesized names).
   evidence: In `keeper/src/ipc.rs` `recording_start`, the terminal reconcile+write runs only inside the event sink on an applied terminal event (`Finalized`/`Recovered`/`Failed`); when `run_session` returns `Err` without a terminal event, the outer branch flips only the in-memory snapshot to `Failed` and never touches the manifest (it was moved into the sink closure). This is correct-by-design for 17.2 (crash recovery is explicitly 17.3's scope, and a stale `recording` manifest is the interrupted-session signal), but 17.3 must reconcile from disk when salvaging, since `reconcile_from_dir` already exists and produces the authoritative list.
-  status: open
+  status: done
+  resolution: verified by the 2026-09-17 ledger triage: recording.rs:2154-2158 (salvage_session_folder runs reconcile_from_dir before marking recovered)
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-17-3-startup-recovery-of-orphaned-segments.md`
   summary: `recording_base_dir` (extracted in 17.3) eagerly evaluates its `platform.data_dir()?` fallback via `unwrap_or`, so a machine where `data_dir()` errors but `dirs::video_dir()` succeeds fails the base-dir derivation needlessly (affecting both `recording_start` and the startup recovery pass); switch to `unwrap_or_else`/lazy so the fallback is only hit when `video_dir()` is `None`.
   evidence: `Ok(dirs::video_dir().unwrap_or(platform.data_dir()?).join("keeper"))` — `unwrap_or` takes its argument by value, so `platform.data_dir()?` is always evaluated and can propagate an error even when `video_dir()` is `Some`. This is a faithful copy of the pre-existing inline shape in `recording_start` (not a 17.3 regression), but 17.3 promotes it to the single source of truth for the recordings base dir. Near-impossible on desktop (`data_dir()` rarely errors); low value, non-blocking.
-  status: open
+  status: done
+  resolution: verified by the 2026-09-17 ledger triage: keeper/src/ipc.rs:7970-7972 (`dirs::video_dir().unwrap_or_else(|| data_dir.to_path_buf())` — lazy, no error propagation)
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-17-3-startup-recovery-of-orphaned-segments.md`
   summary: The pre-record recovery pass runs `recover_orphaned_sessions` synchronously on the record hot path, so record-start latency grows O(number of accumulated session folders) — a `~/Movies/keeper` with thousands of old sessions on a slow/network volume adds a `read_dir` + per-folder `stat`/manifest read to every Start; consider bounding the scan or moving it off the start path once dogfooding shows accumulation.
   evidence: In `recording_start`, `recover_orphaned_sessions(&base)` walks every immediate subdirectory of the base dir before the sidecar spawns. For N finalized sessions that is N `stat`/`read_to_string` calls on the interactive path (orphans are usually 0–1, so writes are rare). Acceptable today (sidecar spawn dominates; folders accumulate slowly), but the cost scales with lifetime session count on the one path where latency is user-visible.
-  status: open
+  status: done
+  resolution: verified by the 2026-09-17 ledger triage: recording.rs:1883-1900 (RECOVERY_MAX_DEPTH=8, RECOVERY_MAX_VISITS=4096) + :2048-2053 (budget truncates the walk) + ipc.rs:9897-9899
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-17-4-automated-gapless-concat-test-nfr-22.md`
   summary: On a REAL (non-fixture) capture session the final segment closes via `finalized` (which carries no bounds), so its `ptsStart`/`ptsEnd` are null and the NFR-22 concat gate reports `missingBounds` for that segment — the session's last boundary is unverifiable. Accepted for 17.4 (the CI gate runs on generated fixtures with complete bounds), but a future story that gates real signed-runner output must supply final-segment bounds.
   evidence: `keeper-rec/Capture.swift` emits `ptsStart`/`ptsEnd` only on `segmentClosed` (rotation), never on the clean-stop `finalized` path (Option B, coordinator-authorized; the 17.1 state machine was deliberately left untouched — `finalized` carrying segment fields would be a new illegal-transition surface). `gaplessConcatViolations` (`ConcatAssert.swift`) treats any null-bounds segment as a `missingBounds` violation. To gate real captures, either have the sidecar report the final segment's bounds at stop, or reconstruct them (they cannot be recovered from the rebased `.mp4`).
-  status: open
+  status: blocked 2026-09-17
+  blocker: Story 20.6 (real-hardware capture acceptance) — no spec-20-6 exists yet
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-17-4-automated-gapless-concat-test-nfr-22.md`
   summary: The Swift concat harness hand-maintains its own `manifest.json` decoder (`ManifestDocument` in `ConcatAssert.swift`) and fixture writer (`FixtureSegments.swift`) that must stay shape-compatible with the Rust `SessionManifest`/`SegmentEntry` serde, with no cross-language round-trip guard — a second unguarded language seam alongside `PROTOCOL_VERSION`. A future manifest-schema change in Rust could silently break the gate reading real signed-runner output.
@@ -1165,17 +1209,20 @@ resolution: Story 66.1 (DW-112). `SearchPanel` names the device by the tier: `SE
 - source_spec: `_bmad-output/implementation-artifacts/spec-19-3-microphone-picker-and-separate-track.md`
   summary: The macOS 13–14 parallel AVCaptureSession microphone path (new in Story 19.3) has robustness gaps that only manifest on 13–14 hardware — clock never reconciled with the video/SCStream anchor (A/V-sync drift), appendMicSample has no lower-bound PTS trim so a mic sample preceding a rotated segment's session start could fail writer B, an AVCaptureSessionRuntimeError after startRunning is not observed (silent mic track, no event), and startRunning/stopRunning race on unsynchronized global-queue tasks with micSession never nil'd.
   evidence: tools/keeper-rec/Sources/keeper-rec/Capture.swift startMicCaptureSession (~454-483), appendMicSample (~491-496, guards only sessionStarted + isReadyForMoreMediaData — no per-segment lower-bound PTS check), and stop() (~632-639). On the 15+ in-stream captureMicrophone path (dev host is macOS 26) the mic rides the shared SCStream clock so none of these apply; the whole 13–14 branch is compile-verified only and unreachable by the automated gates. Real, caused by this story, but graceful mic degradation + the loud warning surface is Story 19.4's chartered scope (Microphone Hot-Unplug Resilience, depends on 19.3 + Epic 18); on-hardware A/V-sync + rotation-with-mic verification is Story 20.6, consistent with every real-capture leg deferred since 16.6.
-  status: open
+  status: needs-field-check 2026-09-17
+  settles-with: needs macOS 13-14 hardware (A/V drift, PTS trim, runtime error observation, start/stop race)
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-19-3-microphone-picker-and-separate-track.md`
   summary: On the setup surface, when the selected mic device disappears from the enumerated microphones list before Start (a pre-Start unplug), the device Select renders a stale/empty value (no matching SelectItem) and Start still ships the dead device id to the sidecar.
   evidence: src/components/recording/recording-audio-controls.tsx renders `value={deviceId ?? MIC_DEFAULT_DEVICE_VALUE}` (~157) against `useRecordingSources()?.microphones` with no validity check, and the header Start reads `micDeviceId()` from the store unreconciled; on 15+ the sidecar silently falls back to default for a vanished microphoneCaptureDeviceID, on 13–14 AVCaptureDevice(uniqueID:) returns nil and the recording fails cleanly with an honest error. No leak or hang, but the picker shows a stale selection and the wire carries a dead id. Device churn / re-enumeration + selection reconciliation is Story 19.4's scope (Microphone Hot-Unplug Resilience).
-  status: open
+  status: done
+  resolution: verified by the 2026-09-17 ledger triage: src/components/recording/recording-audio-controls.tsx:176-189 (pre-Start reconciliation via isMicSelectionAvailable) + test :300-329
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-19-4-microphone-hot-unplug-resilience.md`
   summary: The macOS 15+ mic hot-unplug seam (Story 19.4) — in-stream `.microphone` + a parallel fallback `AVCaptureSession` both feeding one `micInput`, guarded only by the PTS-lower-bound trim — plus the silence-fill's clock/format assumptions are correct-by-construction but exercised only by the simulated signal, never by real overlapping hardware audio.
   evidence: Concrete on-hardware risks the automated gates (pure `MicHealth.decide`, Rust state-machine/parse tests, no-session smoke) cannot reach, all in `tools/keeper-rec/Sources/keeper-rec/Capture.swift`: (1) `activeMicDeviceId = micDeviceId ?? AVCaptureDevice.default(for:.audio)?.uniqueID` (~990) is a guess on 15+ where SCStream never reports its bound default — a wrong non-nil guess makes `MicHealth.decide` return `ignore` on a real unplug (silent gap, no warning) for the picked-default case; (2) `attemptMicFallback` (~632) double-feeds the mic track on 15+ (in-stream output stays attached), correctness resting entirely on the untested-against-real-streams trim (~1031); (3) `makeSilenceBuffer` hardcodes mono/16-bit/48 kHz LPCM (~1171) which may mismatch the mic input's stereo AAC config and fail the append (reintroducing the gap it prevents); (4) `appendSilenceChunk`'s host-clock-vs-sample-PTS assumption (~1150) and the `maxFill` clamp that drops a multi-second span down to one 250 ms tick (~1154) can each leave a real gap under clock skew or a stalled queue; (5) `micLost` clears on any single passing sample (~558) so a straggler can flap the silence-fill. All are the real-capture/A-V-sync leg the spec explicitly routes to Story 20.6 (SM-10 induced-failure matrix), consistent with every real-capture deferral since 16.6 — the dev host is macOS 26 so the 13–14 branch is compile-verified only.
-  status: open
+  status: needs-field-check 2026-09-17
+  settles-with: the three on-hardware risks need real overlapping mic audio; automated gates can't reach them
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-18-5-disk-space-guard-warn-and-graceful-stop-and-finalize.md`
   summary: RecordingStatusVm.warning is a single Option<String>, so a 19.4 mic-unplug warning and the Story 18.5 low-disk warning overwrite each other last-write-wins when they co-occur, silently hiding one persistent warning the 19.4 model promised would stay until resolved.
@@ -1198,19 +1245,22 @@ resolution: Story 66.1 (DW-112). `SearchPanel` names the device by the tier: `SE
 - source_spec: `_bmad-output/implementation-artifacts/spec-17-1-dual-writer-gapless-size-based-rotation-in-keeper-rec.md`
   summary: Display sleep during capture suspends SCStream sample delivery; on wake the first frame fires the duration-cap rotation and the RETIRING writer's `finishWriting` fails with AVFoundationErrorDomain -11800, killing the whole session (observed live in the 20.5 soak, manifest `failed`, segment-0 left without its final moov). The engine should either pause/stop gracefully on display sleep (SCStreamDelegate / NSWorkspace sleep notifications) or tolerate a wake-side rotation after a long sample gap.
   evidence: Soak session `keeper-rec 2026-07-20 09.28.41`: screen-0000.mp4 mtime frozen at start, 2 moofs for a nominal 30 min, rotation fired at wake (t=30:00 cap), banner "segment finalize failed: ... -11800". Standalone 1-min-cap rotation with the display awake rotates cleanly (verified twice).
-  status: open
+  status: done
+  resolution: verified by the 2026-09-17 ledger triage: Capture.swift:1858-1867 (Story 20.5 soak fix: `retiring.writer.endSession(atSourceTime:)` before finishWriting, comment naming -11800/-16341) + idle heartbeat (:2020 area, "Story 20.5")
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-17-1-dual-writer-gapless-size-based-rotation-in-keeper-rec.md`
   summary: A Stop landing during/just after an in-flight rotation reports a false "no frames were captured before stop" failure (the finalize guard reads rotation-freshened per-segment state), even though prior segments captured fine — a clean session gets a failed outcome and no completion card.
   evidence: Live repro 2026-07-20 ~10:05: 1-min-cap session, Stop clicked ~4 s after the segment-3 rotation began; banner showed "Recording failed — no frames were captured before stop" despite segments 1-2 on disk. The stop path should wait out `rotationInFlight` (or treat sessionStarted/segment state as session-scoped, not segment-scoped) before judging emptiness.
   status: open
+  triage 2026-09-17: Story 20.5's stopCapture quiescing may have narrowed the window, but the requested fix (wait out rotationInFlight / session-scoped emptiness) was never made
 
 ### DW-113: Every published macOS release is silently unsigned, so an installed build is Gatekeeper-rejected and cannot read keychain items written by a signed predecessor.
 
 origin: found live while shipping v0.4.2, 2026-07-26
 location: .github/workflows/release.yml (Detect Apple signing secrets) + repository Actions secrets
 reason: The workflow treats Apple signing as optional and falls back to an ad-hoc build with only a `::notice::`, which nobody reads on a green run. The repository holds only `TAURI_SIGNING_PRIVATE_KEY`/`_PASSWORD` — every `APPLE_*` secret is absent — so v0.4.0/v0.4.1/v0.4.2 all published "(unsigned build)" artifacts while the release looked entirely successful. `spctl -a` rejects the result, so a fresh install needs the right-click→Open ceremony. The keychain leg is real but latent: macOS binds keychain ACLs to the signing identity, and an ad-hoc signature has no certificate — its identity is a cdhash that changes with every build — so an ad-hoc build cannot read credentials written by a signed one, and in that steady state every update would force a re-login. Fix: provision the `APPLE_*` secrets so the signed path runs, and make the unsigned fallback loud (fail a tagged release by default, opt in explicitly for a local/test build). The identity must then stay stable across releases — changing certificate costs one forced re-login.
-status: open
+status: blocked 2026-09-17
+blocker: provisioning of the seven APPLE_*/KEYCHAIN_PASSWORD Actions secrets (owner action)
 correction: 2026-07-27 — this entry originally blamed the signing change for the accounts vanishing after installing v0.4.2 on hesperia. That diagnosis was WRONG and the evidence for it was circumstantial (a rollback to the signed 0.3.0 restored the accounts, which both explanations predict). The actual cause was a code regression, since fixed: `lib.rs` called Tauri's `invoke_handler` twice, and that method ASSIGNS (`self.invoke_handler = Box::new(handler)`), so the second registration — folder sync's desktop-only commands — discarded all 164 commands from the first. The desktop build had nine reachable commands and answered "Command <name> not found" to everything else, which is why the account never restored, the recording surface never appeared, and the Bridges pane showed a raw IPC error. What falsified the keychain story: `bridge_catalog` failed too, and it touches no credential. The keychain hazard above stands on its own and stays open; it simply was not what broke that install.
 note: 2026-07-29 — the workflow half is fixed; the entry stays open because its `location` also
   names the repository's Actions secrets, and those are still absent. `release.yml` no longer has
@@ -1448,6 +1498,7 @@ note: 2026-07-29 — the recurrence cost is already bounded, and that guard is n
   search perf gate at 24.98 s and this sweep at 12.05-21.54 s, the next slowest test in the
   workspace is 4.4 s, and all 1469 together take 43 s. So a recurrence costs four minutes and a
   named failing test instead of ninety-six minutes and a cancelled run.
+triage 2026-09-17: keeper-side trigger removed (repo.rs:79 stale-lock recovery); the pinned fork's prepare.rs fixup loop itself is untouched — the deadline or fork patch is still owed
 
 ### DW-121: The desktop app registers itself as the git LFS clean/smudge filter, but the app binary has no `lfs` subcommand — so the filter fails on every invocation.
 
@@ -1914,6 +1965,7 @@ reason: the guard decides whether a path git reports as modified is a real edit 
   recorded is the whole reason a single-platform version of this test would mislead. Filed so that the
   guard's REACHABILITY is not mistaken for its logic, which is well covered.
 status: open
+triage 2026-09-17: the blocker is gone — DW-121 was closed by story 34.19 (the app binary learned the lfs subcommand), so the end-to-end racily-clean test this entry asks for is buildable today; the test doc's DW-121 citation (lfs_roundtrip.rs:558-565) is now stale
 
 ### DW-140: Whoever fixes DW-124 must not do it by re-staging — `is_false_modification` is designed to suppress exactly the signal a re-stage-based reconciler would look for.
 
@@ -1934,7 +1986,8 @@ reason: story 34-15's promise — a pointer is never published ahead of its obje
   that fix. A reconciler built on "re-stage and see what git reports" cannot work, because this guard
   is specifically built to keep git's report quiet. Note that this batch narrowed the guard to paths
   genuinely routed through LFS, which shrinks the exposure to real LFS paths and does not remove it.
-status: open
+status: blocked 2026-09-17
+blocker: DW-124 (remote LFS-pointer reconciliation, still open)
 
 ### DW-141: `last_sync_ms` lives only in the engine's in-memory status map, so a relaunch — or any `keeper-syncd status` invocation, which is a different process — reports "never synced" for a folder that has synced correctly for a week.
 
@@ -2107,6 +2160,7 @@ reason: story 34-7's load-bearing claim — remove a folder and its secret goes 
   daemon's environment fallback the resolution is documentation: say plainly that an operator-injected
   secret is the operator's to withdraw.
 status: open
+triage 2026-09-17: the env half gained a warning line (keeper-syncd/src/platform.rs:398-401 warns that the env var still supplies the secret); the enumeration pass never happened
 
 ### DW-150: `titlebar_drag_report` is a non-async `#[tauri::command]`, so the diagnostic for a titlebar drag performs two main-thread filesystem writes inside the very mouse-down the story exists to keep free.
 
@@ -2254,7 +2308,8 @@ reason: the acceptance names a 600 px window height and a visible account footer
   from DW-118's overhang. So the two belong to one check: whoever resolves DW-118 should re-measure
   the footer's position at a small window height and record the number here, and if it lands on
   screen, close this by citing the measurement rather than by writing a test that cannot see it.
-status: open
+status: needs-field-check 2026-09-17
+settles-with: the AX re-measure on a real macOS window at small height — the same measurement DW-118 needs
 
 ### DW-158: The drag band's collapsed-rail width is untested, so a hard-coded width would restore the seam AD-34-3 exists to prevent, with a green suite.
 
@@ -2488,7 +2543,8 @@ reason: `livePreview` provides its decorations from a `ViewPlugin`
 
   **The test it needs is the reproduction above**, and nothing in the suite currently does it: build
   an `EditorView` with the markdown language AND `livePreview` over a document containing a fence.
-status: open
+status: done 2026-09-17
+resolution: verified by the 2026-09-17 ledger triage: src/components/notes/editor/mermaid-widget.ts:230-247 (`mermaidLayer()` — a StateField emitting `Decoration.replace({ widget: MermaidWidget, block: true })`), wired at live-preview.ts:1799; live-preview.ts:1101-1102 names the fix ("45.10 moved the mermaid fence out to `mermaidLayer`"); live-preview-marks.test.ts:367-371 ("constructs, and replaces the fence with the diagram widget")
 
 ### DW-166: `is:journal` is spelled twice — the index derives the flag from a literal `"journal/"` prefix and story 44.6's creation seed inverts it from its own constant.
 
@@ -2643,7 +2699,8 @@ what closes this: `cargo check --manifest-path src-tauri/Cargo.toml -p keeper` o
   file already there is byte-identical afterwards. That last one is the only item about data rather
   than display, and byte equality is the check: a note replaced with a blank one looks exactly like
   a note that was created.
-status: open
+status: needs-field-check 2026-09-17
+settles-with: `cargo check --manifest-path src-tauri/Cargo.toml -p keeper` on the macOS host + spec-44-6 §11's six-step smoke
 
 ### DW-171: Story 44.16's shell wiring has never been through a compiler either — and unlike 44.6's it writes over a file the user already has.
 
@@ -2692,7 +2749,8 @@ what closes this: `cargo check --manifest-path src-tauri/Cargo.toml -p keeper` o
      — `mark_dirty` reaching the commit cadence is the one claim in this story that no test on any
      platform covers.
   5. Confirm a file over 4 MiB refuses with the sentence naming both sizes rather than hanging.
-status: open
+status: needs-field-check 2026-09-17
+settles-with: the same command as DW-170 plus the byte-for-byte CSV smoke
 
 ## DW-N1 — the editor caret opens in front of the frontmatter block
 
@@ -2766,7 +2824,8 @@ character closes this.
 
 ## DW-N2 — `recorder::tests::fetch_request_screen_recording_round_trips_the_fake_sidecar` is flaky under parallel test threads
 
-**Status:** open. **Found:** 2026-08-04, running `cargo test -p keeper --lib` on Linux.
+**Status:** needs-field-check 2026-09-17. **Found:** 2026-08-04, running `cargo test -p keeper --lib` on Linux.
+**Settles-with:** `cargo test -p keeper --lib fetch_request_screen_recording` (default threads, repeated) on Linux.
 **Severity:** a false red in CI and in the pre-push hook. No product defect.
 
 **What happens.** The test writes a `#!/bin/sh` fake sidecar with `FakeSidecar::write` and executes
@@ -2802,7 +2861,8 @@ and bytes. Not done here because it is host-side accounting in `recorder.rs`/`ip
 
 ## DW-N4 — the in-app updater is broken for every install, and publishing v0.6.5 is what broke it
 
-**Status:** open, needs an owner decision (key placement or release policy). **Found:** 2026-08-05,
+**Status:** done 2026-09-17. **Found:** 2026-08-05,
+**Resolution:** verified by the 2026-09-17 ledger triage: GitHub release v0.8.30 (latest, non-prerelease, published 2026-09-16) ships `latest.json` (738 B) beside `keeper_0.8.30_aarch64.app.tar.gz` + `.sig` + `.dmg` — verified via GitHub API.
 owner clicked Update and got `Update failed: Could not fetch a valid release JSON from the remote`.
 **Severity:** every installed copy of keeper, on every version. The update button cannot succeed.
 
@@ -2976,6 +3036,7 @@ the testing lesson, which is the reusable part: a hook suite that does `renderHo
   `App.tsx` fails it. `use-notify-navigate.test.ts` has the same hook-only shape and is the reason
   nobody noticed the notes trio; worth the same treatment when someone is next in that file.
 status: open
+triage 2026-09-17: half-fixed — listenNotesCaptureShown is now mounted (use-capture-draft.ts:135-145); listenNotesShowUnread still has zero subscribers repo-wide
 
 ### DW-190: Comments anchored to parts of a PDF need a PDF renderer keeper does not have.
 
@@ -3060,7 +3121,8 @@ reason: these compile and their handler registration is now pinned by
   Each story's spec carries its own ordered gate checks; this entry exists so the set is
   findable from one place rather than five, and so it is not mistaken for covered because the
   Rust compiles.
-status: open
+status: needs-field-check 2026-09-17
+settles-with: the stories' ordered gate checks on the macOS host (nothing here can drive a webview)
 
 ### DW-193: The `.gitattributes` lines already broken by the unquoted writer are left exactly as they are, and every one of them is a rule covering nothing.
 
@@ -3483,7 +3545,8 @@ reason: The epic's scope is Hermes because that is what was asked for, and the w
   genuinely untested is the shape of that reachability from a phone — a loopback Ollama does not
   exist on iOS, so it means a LAN or tailnet address, which is the `is_private` disclosure path.
   Revisit if a phone-side provider list needs to rank or explain the two kinds differently.
-status: open
+status: skip 2026-09-17
+resolution: deliberate product hold: a refusal gate "would be code whose only effect is to make the app less honest about what it can do"; ProviderKind stays exactly Hermes | Ollama (bots/mod.rs:68-76)
 
 ### DW-222: The listening indicator lives inside keeper, not on the lock screen.
 
@@ -3497,7 +3560,8 @@ reason: Armed listening keeps running with another app in front, which is the wh
   needs an ActivityKit widget extension in the generated Apple project, a second bundle id, and
   its own signing story on a free Personal Team, where every extension is another target to
   re-sign every seven days.
-status: open
+status: needs-field-check 2026-09-17
+settles-with: `bun run install:ios` on hesperia + Apple ID in its Xcode to mint the extension profile, then the .appex proof + a photograph from kalypso
 note: 2026-09-05, epic 65, story 65.5 (built), story 65.6 (recorded) — the Live Activity is
   written: a `@_cdecl` bridge in the app target (`gen/apple/Sources/keeper/KeeperIsland.swift`),
   the `KeeperIsland` widget-extension target with the shared `ActivityAttributes` and the four
@@ -3582,7 +3646,8 @@ reason: The owner asked to watch a conversation held on the other device grow wo
   five cold minutes, with a caption that says "following". Revisit if Hermes serves a fan-out or
   replayable per-run stream, or if the owner decides the Matrix-bot product question (DW-226),
   which would move transcripts to the homeserver on purpose rather than as a side effect.
-status: open
+status: blocked 2026-09-17
+blocker: DW-226 (Hermes-as-Matrix-bot product decision)
 
 ### DW-225: An `NSTouchBar` item inside keeper's own window.
 
@@ -3600,7 +3665,8 @@ reason: Supported by Apple: an app may place its own items in the Touch Bar's ap
   (`github.com/pock/pock/issues/655`). The supported Touch Bar reach — a Shortcut opening
   `keeper://voice/talk` from the Quick Actions button — ships. A nicety for a 2016–2021 hardware
   line; take it only if somebody with a Touch Bar Mac asks for it while keeper is in front.
-status: open
+status: skip 2026-09-17
+resolution: unbuilt, and the entry excludes it ("take it only if somebody with a Touch Bar Mac asks for it while keeper is in front"); the supported Shortcut reach ships
 
 ### DW-226: Making Hermes the Matrix bot is a product decision, not a story.
 
@@ -3631,7 +3697,8 @@ reason: The port holds an `NSProcessInfo` activity (`UserInitiatedAllowingIdleSy
   external USB microphone in clamshell mode is the one arrangement that could work and is
   untested (DW-228 comes first). Not a defect; recorded so nobody files it as one or writes a
   `PreventUserIdleSystemSleep` assertion that would keep a laptop hot for nothing.
-status: open
+status: skip 2026-09-17
+resolution: physically impossible (lid disconnects the mic); recorded so nobody files it as a defect — the exclusion is the entry's own point
 
 ### DW-228: The macOS voice port has never been compiled or run.
 
@@ -3670,7 +3737,8 @@ reason: The port was authored on the Linux dev host, where the shell crate canno
      45 s rather than the recogniser ending the session.
   5. Record the answers in `docs/constraints-and-limitations.md` (replace "not yet compiled where
      it was written") and close this row.
-status: open
+status: needs-field-check 2026-09-17
+settles-with: `bun run check:rust:macos` from the Linux box, then install:macos on hesperia
 note: 2026-09-05, epic 65 — this row has an **iOS half** the title does not name, and epic 65
   collects it: the iOS port's background listening has never been run on hardware either.
   Epic 62 designed it (a `.playAndRecord` session with `mixWithOthers`, `UIBackgroundModes:
@@ -3745,7 +3813,8 @@ reason: The pill is a plain Tauri window — `always_on_top`, `visible_on_all_wo
   lane, §2). Take the in-house subclass over the git dependency if this is ever taken at all;
   take neither until someone reports the pill missing over a full-screen app they actually
   talk into.
-status: open
+status: skip 2026-09-17
+resolution: explicitly parked ("take neither until someone reports the pill missing over a full-screen app they actually talk into"); both routes cost macos-private-api or blind unsafe code
 
 ### DW-230: A waveform in the pill, rather than a level.
 
@@ -3763,7 +3832,8 @@ reason: The owner named superwhisper, whose recording window draws a live wavefo
   2.14.0, `https://superwhisper.com/changelog`, read 2026-09-04), which is the cost stated by the
   people who pay it. Not built. Revisit only if the level proves unreadable on the real Mac —
   the epic's screenshot is the evidence either way.
-status: open
+status: skip 2026-09-17
+resolution: refused as decoration at the price AD-186 forbids (audio data leaving the tap); revisit only if the level proves unreadable on the real Mac
 
 ### DW-231: Speech streamed token by token; synthesis waits for the whole answer.
 
@@ -3780,7 +3850,8 @@ reason: A turn now passes through `Sending` while tokens arrive (story 64.3), so
   every segment. The latency it would save is the model's generation time, which a
   "thinking" state now shows instead of hiding. Not built; revisit if the owner's answers are
   routinely long enough that waiting reads as a stall even with the state visible.
-status: open
+status: skip 2026-09-17
+resolution: deliberate deferral with a stated revisit condition (long answers reading as a stall even with "thinking" visible)
 
 ### DW-232: Choosing a named voice rather than a language.
 
@@ -3816,7 +3887,8 @@ reason: Apple's guidance is to tell VoiceOver when visible content changes and t
   which already renders the same `VoiceStateVm` and is where a VoiceOver user is. Verify on
   hesperia with VoiceOver on and a voice turn started from the hotkey while another app is in
   front; record the answer here and, if it is "no", move the live region rather than duplicate it.
-status: open
+status: needs-field-check 2026-09-17
+settles-with: VoiceOver on hesperia: hotkey turn with another app in front
 
 ### DW-234: A tablet tier — an iPad now gets the phone tier at every width.
 
@@ -3853,7 +3925,8 @@ reason: The island is updated from the app process only. A push-updated activity
   through a homeserver operator's gateway or a user-run relay — never keeper's. Nothing about
   an indicator of *listening* needs it: while keeper listens, the app process is alive to
   update the card, and when it is not, the card ending is the truth.
-status: open
+status: skip 2026-09-17
+resolution: refused for the same reason D-1 defers the paid program (free team lacks push capability; NFR-11 forbids push on project infra); reopens only under D-1's trigger
 
 ### DW-236: Recognition through an accepted phone call, in the background.
 
@@ -3874,7 +3947,8 @@ reason: Accepting a call suspends the app (Apple, *Audio Session Programming Gui
   Live Activity button (App Intents) that re-arms from the Lock Screen without opening keeper —
   which still runs in the app process and may hit the same rule. Take either only with a
   kalypso measurement of the post-call reactivation first; the ring (AD-192) is the instrument.
-status: open
+status: needs-field-check 2026-09-17
+settles-with: on kalypso: accept a call while armed, read the ring
 
 ### DW-237: The sessions board on the phone.
 
@@ -3944,7 +4018,8 @@ reason: Screen recording is the Mac's: ScreenCaptureKit, a sidecar process, a de
   interruption handling a memo needs (DW-236's rules apply to it unchanged). Refused in this
   epic so the Mac's recording model is not bent around a phone; take it, if at all, as its own
   story with its own sentence.
-status: open
+status: skip 2026-09-17
+resolution: refused in epic 66 so the Mac's recording model is not bent around a phone; "take it, if at all, as its own story with its own sentence"
 
 ### DW-240: A share-in extension.
 
@@ -3967,7 +4042,8 @@ reason: Sharing *out* of keeper is a `UIActivityViewController` from the app pro
   links (`tauri-plugin-deep-link`), which takes a URL, not a file. Take this after DW-222
   closes, with the same install-script proofs (`.appex` in the bundle, the profile minted or
   the exact refusal).
-status: open
+status: blocked 2026-09-17
+blocker: DW-222 (a third bundle id is not a cost to take before the second is proven)
 
 ### DW-241: An `ssh://` remote on a phone profile is not refused at the sheet.
 
@@ -4040,7 +4116,8 @@ reason: The session mode was written as `.default` and was never the mode in for
   capture side (the voice-processing tap, `setVoiceProcessingEnabled`, or a second gate that
   ignores transcripts while `isSpeaking`), which is its own row. What closes this one is the
   reading, written here with the ring rows verbatim.
-status: open
+status: needs-field-check 2026-09-17
+settles-with: on kalypso: locked screen, phrase, question, multi-sentence answer; read Settings → Bots ring
 
 ### DW-244: With several bots pinned and none chosen, a spoken question goes to whichever was talked to last — and with none ever talked to, a locked phone stops listening.
 
@@ -4161,6 +4238,7 @@ origin: review 2026-09-08 (F-GATE-5, -9, -10, -11, -12), left out of Epic 70 by 
 location: `watch.rs` (the `Err` batch is one `warn!`; `EventKind::Other` never reaches `classify`), `engine.rs` (`ensure_watcher` returns on `Live`; `strip_prefix` against the configured root; `report_collapsed` logs only)
 reason: silent downgrades to the paced backstop, not data loss. Record `last_event_ms` per watcher and demote on a rescan tick that found changes the watcher never reported; canonicalise `local_path` once; route the nested-repo sighting through `self.warn`. FSEvents' persistent journal (`sinceWhen`) is the larger win and needs a `notify` change or a macOS-only watcher of keeper's own.
 status: open
+triage 2026-09-17: one of the five findings landed (watch.rs:993 classify(EventKind::Other) now returns Touch, so overflow is handled) and the arm-failure memory/re-arm/UI warning shipped (engine.rs:5795-5890); a live watcher going deaf, symlinked anchored excludes, and the nested-repo user-visible warning are unchanged
 
 ### DW-250: Durable-state edges — the app/daemon migration race, a `file://` remote's deferred push loop, per-path ledger writes without `prepare_cached`, `materialized_rows` on the runtime, and a `.keepervirtual` that HEAD carries but the worktree lacks.
 
@@ -4174,7 +4252,8 @@ status: open
 origin: review 2026-09-08 (F-BMAD-4, F-BMAD-9, F-BMAD-12b), recorded by Epic 70 story 70.8
 location: `sprint-status.yaml` (31-4 `in-progress`, 31-6 `done`), `tests/lfs_roundtrip.rs:10` ("No network"), `_bmad-output/implementation-artifacts/` (zero `spec-2[3-9]-*.md`, zero `spec-3[01]-*.md`)
 reason: §18's earlier claim of verification "against real git remotes … and the review-lane airlock" had no artefact behind it; 70.8 downgraded the sentence rather than build the harness. The NFR-26 whole-log scan test the Phase 4 summary credits was never written either — `docs/performance.md` says so. Epics 23–31 are spec-less by construction; `docs/sync.md` plus AD-40…AD-53 is their reviewable contract, which is why §18 is load-bearing.
-status: open
+status: blocked 2026-09-17
+blocker: makistack Forgejo access token (out of band, per sprint-status note)
 
 - source_spec: none
   summary: Restyle the note editor's Find/Replace bar so it matches the app's UI instead of rendering as unstyled inputs and buttons.
@@ -4226,18 +4305,21 @@ status: open
 - source_spec: spec-note-embeds-media
   summary: `.docx`, `.pptx` and `.xlsx` embedded in a note are still links.
   evidence: They are `documentRow`s with no inline renderer — `document-viewer.tsx` shows a PDF through the webview's own renderer and offers the other three as a download. What a spreadsheet should look like inside a paragraph is a design question, not a wiring one, so `drawableFor` returns null for them and the link stays.
-  status: open
+  status: skip 2026-09-17
+  resolution: excluded by the entry itself — "What a spreadsheet should look like inside a paragraph is a design question, not a wiring one"
 
 - source_spec: spec-note-embeds-media
   summary: `![[note.md]]` is still a link rather than a transclusion.
   evidence: Deliberate and stated in `file-embed.ts`: showing one note inside another is a different feature with a different meaning, and mounting a raw editor over a note would be a second way to write one without `notes_save`'s base revision or its conflict copy. Rust refuses that write too, so both halves agree. Listed here because "every file type renders inline except this one" is the kind of gap a reader will otherwise report as a bug.
 
-  status: open
+  status: skip 2026-09-17
+  resolution: deliberate on both halves (the frontend states the transclusion refusal; Rust refuses the write too); listed only so readers don't report it as a bug
 
 - source_spec: spec-note-embeds-media
   summary: A PDF embed cannot report a failed load.
   evidence: `<embed>` fires no `error` event, so the degrade-to-a-link path every other kind has does not exist for PDF. Safe today because the path came back from a resolver that stats the file, so "the vault holds it" is established before the element is built — but a file deleted between the resolve and the paint shows an empty box rather than the link. Fixing it means probing the bytes or watching for a zero-size box, neither of which is obviously worth it.
-  status: open
+  status: skip 2026-09-17
+  resolution: the entry itself judges the fix "not obviously worth it" (resolver stats the file first)
 
 - source_spec: spec-html-rendered-and-editable
   summary: The JSON structure view is still read-only, so "editable rendered text" is true of HTML and CSV and not of JSON.
@@ -4252,7 +4334,8 @@ status: open
 - source_spec: spec-html-rendered-and-editable
   summary: A `<style>` block is dropped, so a page renders in keeper's typography rather than its own.
   evidence: Deliberate and stated in `html-view.ts`: applying a file's CSS would be styling this application's own DOM from a document somebody was handed. A scoped or sanitised subset is possible and is a separate question with its own answer.
-  status: open
+  status: done
+  resolution: verified by the 2026-09-17 ledger triage: src/components/viewers/html-view.ts:268-286 `safeCss` (request-filtered stylesheets), :415/:499-500 `<style>` blocks collected, src/components/viewers/raw-rendered-view.tsx:339-343 sheets mounted into a shadow root ("a file that says `div { position: fixed }` styles itself and not this application")
 
 - source_spec: none
   summary: `files-pane.test.tsx` "re-reads a remembered folder once when Refresh rescues a failed first list" times out under parallel load.
@@ -4263,6 +4346,7 @@ status: open
   summary: The filter-protocol deadlock itself is guarded against but not root-caused.
   evidence: Observed precisely — content fully delivered (every open file at EOF), `keeper lfs filter-process` blocked in `pktline::read` on stdin, parent blocked in `Client::invoke`. `Request::fill` handles the flush packet correctly, so the missing packet is on the client side or in how a conversion is handed between gix's pool and ours. This change makes the deadlock survivable (bounded concurrency, abandonable walk, self-terminating filter) without explaining it. Reproducing it on a synthetic repo of large filtered files is its own story.
   status: open
+  triage 2026-09-17: the survivability guard ships, but no root-cause story exists — the deadlock is contained, not explained; the reproduction story is buildable
 
 - source_spec: spec-no-sync-unit-stalls-in-silence
   summary: `.git/lfs/tmp` accumulates leaked scratch — 100 GB in 863 files over four days on one machine.
@@ -4272,7 +4356,8 @@ status: open
 - source_spec: spec-no-sync-unit-stalls-in-silence
   summary: A profile can sit in `offline` indefinitely with no path back.
   evidence: `Offline` is set on a transient network error with the comment "the queue drains when connectivity returns (AD-49)", but the state is only refreshed by a sync that completes. When the only queued unit cannot complete, the profile reports `offline` forever while the server is reachable — observed for three days with `curl` answering the remote in 30 ms. The state needs a way to be re-evaluated that does not depend on the thing it is blocking.
-  status: open
+  status: done
+  resolution: verified by the 2026-09-17 ledger triage: engine.rs:5205-5235 `remote_within_reach` — doc states "the row that made the profile offline is the row that will clear it" (transient failure re-queues its own unit via reschedule_after; gate keyed on the sticky set, not the word); OFFLINE_SEED_MAX_AGE_MS freshness window engine.rs:2569-2597
 
 - source_spec: spec-repair-the-lfs-stat-invariant
   summary: Nothing detects a broken pointer-stat invariant on its own; the repair runs only when a person presses "Recheck all files".
@@ -4328,7 +4413,8 @@ status: open
 - source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
   summary: A host cannot decline the repository's virtualization policy: an empty `virtualPatterns` is silence, so a machine can replace the committed list but never withdraw from it.
   evidence: `VirtualPolicy::compile` treats a profile list that says nothing as "this tier is silent", which is the right reading of an unset key and the wrong one for a key deliberately set to `[]`. The operator case that arises is a laptop that is often offline and wants everything materialized; today the only spellings are a pattern that matches nothing or a negation-only list, both accidental. Distinguishing key-absent from key-empty needs the `Option<Vec<String>>` shape on the profile field, which is entangled with the `SyncProfileReq` `Option` rule (DW-116) that 56.1 declared a non-goal. Settle it in the story that renders the control (56.7/56.9), together with the tier surface AD-132 asks for.
-  status: open
+  status: blocked 2026-09-17
+  blocker: the keeper Tauri shell crate does not link on the Linux dev host (a story that can build `keeper` — macOS host, or keeper linking on Linux)
   keep: |
     Reviewed and kept, and story 56.14 makes it slightly SHARPER rather than moot. This
     entry noted that the only spellings of "this machine withdraws from the committed
@@ -4685,7 +4771,8 @@ status: open
 - source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
   summary: `lfs::stage::dehydrate`'s post-create cleanup paths are structurally verified but not exercised, because none of them can be forced from a fixture without stubbing the filesystem.
   evidence: All three post-create failures (`write_all`, `File::set_permissions` on an owned handle, `rename` onto a file the identity re-check just proved regular) funnel through one `if published.is_err()` cleanup, so there is a single path to audit rather than three — but on Linux none of them can be provoked from a temp directory, and this tree does not stub the filesystem here. The pre-create refusal is covered (`a_target_whose_length_moved_is_refused_and_leaves_no_staging_file`), and a leaked `.keeper.*.tmp` is tier-0 excluded so it can never be committed; the residual risk is litter nobody sweeps, which is the same gap `.git/lfs/tmp` already has its own ledger entry for.
-  status: open
+  status: skip 2026-09-17
+  resolution: the three dehydrate failure arms still cannot be provoked on Linux; the tree deliberately refuses a filesystem stub layer for three lines sharing one exit — reintroduce only if a seam lands for another reason
   keep: |
     Reviewed and kept, with one thing now different in its favour: story 56.14 made
     `materialize` follow the same shape — its failure paths funnel through one `if
@@ -4808,6 +4895,7 @@ status: open
     sweep gains a single per-pass capability probe — one call, saving the whole byte budget
     per pass on that host. The 56.11 entry that annotated this one is recorded stale,
     because its argument now lives here.
+  triage 2026-09-17: premise narrowed — Linux answers for real since 56.11, so the cost stands on macOS/Windows only; becomes moot if a second platform probe ships
 
 - source_spec: spec-56-5-it-lets-go-a-day-after-it-landed
   summary: A folder config layer that fails validation is discarded whole, so any `Allowed` field's committed value silently reverts to the profile's default rather than to the value the file asked for.
@@ -5074,7 +5162,8 @@ status: open
 - source_spec: spec-56-7-the-row-says-what-it-is-and-what-a-delete-will-do
   summary: `Engine::materialized_paths` reads a profile's whole `materialized` table on every folder expansion, unfiltered by the cone being listed.
   evidence: `db::materialized_paths` is `SELECT path FROM materialized WHERE profile_id = ?1` with no prefix filter and no cap, so its cost grows with everything the profile has ever hydrated and not released rather than with the folder on screen — while `list_resolved` caps itself at `LISTING_CAP` and `browse_marks_for` exists precisely because per-listing engine work was too expensive on this hardware. Narrowed rather than removed in this story: the read is skipped entirely when the pending view is unavailable, it is the same statement and the same table `Engine::pending` already reads once per marks walk, and it is taken exactly where `list_profiles` is taken two statements above it. A cone-scoped reader (`AND (path = ?2 OR path LIKE ?2 || '/%')`) is a new `db.rs` accessor beside `materialized_paths` rather than a change to it, because `Engine::pending`'s `replacing` flag needs the whole set.
-  status: open
+  status: blocked 2026-09-17
+  blocker: the keeper Tauri shell crate does not link on the Linux dev host (a story that can build `keeper` — macOS host, or keeper linking on Linux)
   keep: |
     Reviewed and kept, and the reason is the same one that keeps the story-56.9 double-scan
     entry open: every caller is in `keeper/src/sync_ipc.rs` — `:2197`, `:3674` and
@@ -5162,7 +5251,8 @@ status: open
 - source_spec: spec-56-9-the-button-and-the-time-you-have-left
   summary: `sync_browse` now scans the profile's whole `materialized` table twice for one directory listing — once for the marks and once for the deadlines.
   evidence: `sync_ipc::sync_browse` reads `engine.materialized_paths(&id)` for `browse::MaterializedView` and then `engine.release_schedules(&id)` for the countdown; both are unfiltered scans of the same table for the same profile (`db::materialized_paths`, `db::materialized_rows`), and the first read's own comment already calls itself "an unfiltered scan of everything this profile has ever hydrated, paid on every folder expansion". The keys `release_schedules` returns are exactly the keys `materialized_paths` returns, so one read could feed both views. Not folded in this story because it changes the failure coupling deliberately established by 56.7: a schedules read that fails currently costs the rows their countdown only, while a shared read would also cost them their `Materialized` mark, and the fix lands in the one crate that cannot be compiled on this host. It should be taken together with the cone-scoped reader already deferred by 56.7, which would make both reads cheap rather than making one of them disappear.
-  status: open
+  status: blocked 2026-09-17
+  blocker: the keeper Tauri shell crate does not link on the Linux dev host (a story that can build `keeper` — macOS host, or keeper linking on Linux)
   keep: |
     Kept, and blocked rather than merely deferred (story 56.14). The double scan is real and
     the fix the entry proposes is the right one, but the caller is `sync_ipc::sync_browse` in
@@ -5346,7 +5436,8 @@ status: open
 - source_spec: spec-56-11-is-this-file-open-answered-for-real
   summary: The Linux open-file answer carries one stated narrowing — a process owned by another uid, root included, has a descriptor table keeper cannot read — so `Closed` means "no process whose descriptor table this process may read holds this inode open" rather than "nothing holds it".
   evidence: `/proc/<pid>/fd` is mode `0500`, so `open_file_state_under_proc`'s `PermissionDenied` arm continues the scan for a process whose `/proc/<pid>/stat` is still readable (an ordinary other-uid process) instead of refusing. Requiring total completeness was considered and rejected: pid 1 alone guarantees an unreadable descriptor table on every Linux box that has ever booted, so the strict rule answers `Unknown` — i.e. refuses every release — on every host, which is the exact failure mode the story exists to end. What is NOT narrowed, and does refuse, is a process keeper cannot even identify: an unenterable `/proc/<pid>` where the world-readable `stat` file is `EACCES` too (`hidepid=1`), a procfs in which keeper's own process does not appear (a masked container `/proc`, or a root with no resolvable `/proc/self`), an unreadable `/proc`, an unenumerable dirent, a descriptor table that stopped enumerating part-way, a descriptor whose `stat` failed for any reason but "it is gone", and a target that cannot be stat'ed. NOT `hidepid=2`: an adversarial review caught an earlier draft of this entry and of the code's own docs asserting that it refuses. It does not — it makes other users' `<pid>` directories invisible rather than unreadable, so an unprivileged keeper enumerates only its own user's processes and reads all of them, answers `Closed`, and that answer is inside the narrowed claim rather than a breach of it. Why it is not fixed here rather than merely not fixed: this refusal does not carry NFR-40 — refusal 1 (content identity) and refusal 3 (the per-object remote proof at the moment of the deletion) do — and a release is a `rename(2)` with truncation forbidden by AD-125, so an existing reader keeps its inode intact and the harm from a missed opener is that its NEXT open reads ~130 bytes of pointer text, recoverable by asking for the path again, which materializes it from the remote whose ability to serve that exact object refusal 3 had just proved. NOT from the local store: `lfsPruneLocal` defaults to on and releases the store copy precisely when the worktree holds the content, so a materialized path is exactly the state in which no local copy may be left — the same review caught that claim too. Shape if it ever needs closing: a privileged helper process that can read every descriptor table, or `F_SETLEASE` on the target before the rename — both of which need `libc`/`unsafe` in `keeper-sync` (which denies both) plus a capability the daemon does not currently ask for. Stated in `probe_open_file_state`'s doc, in `LinuxPlatform::open_file_state`'s doc and in `docs/sync.md` §"What a release refuses to do" rather than left to be discovered.
-  status: open
+  status: skip 2026-09-17
+  resolution: deliberate, correct trade-off recorded for future readers; only a privileged helper would revisit it
   keep: |
     Reviewed and kept as a deliberate and correct trade-off, not a defect. Requiring total
     completeness was considered and rejected for a reason that is arithmetic rather than
@@ -5396,7 +5487,8 @@ status: open
 - source_spec: spec-56-11-is-this-file-open-answered-for-real
   summary: `sync_release_entry`'s doc comment in the shell crate still tells the reader that no platform can answer the open-file question, "which is every host today" — false since story 56.11 for Linux, and it is the doc on the command the Files pane's Release action calls.
   evidence: `src-tauri/crates/keeper/src/sync_ipc.rs:2518-2519` reads "On a host whose platform cannot answer \"is this file open\" race-free — which is every host today — the honest answer is `ContentRefusal::OpenUnknown`". `ShellSyncPlatform::open_file_state` now delegates to `keeper_sync::platform::probe_open_file_state`, so on Linux the command reaches the rename and that sentence is true only of macOS and Windows. Not fixed in story 56.11 because `sync_ipc.rs` is owned by a concurrent story in the same worktree and a drive-by doc edit there would collide; the coordinator confirmed it is being carried into that story's brief. Doc comment only, no behaviour.
-  status: open
+  status: done
+  resolution: verified by the 2026-09-17 ledger triage: grep "every host today" in keeper/src/sync_ipc.rs → no match; sync_ipc.rs:3855-3857 now carries the per-host wording ("On those two hosts that is 56.4's recorded and deliberate consequence")
   keep: |
     Kept, and the blocker is unchanged and now permanent for this branch (story 56.14). The
     file is `src-tauri/crates/keeper/src/sync_ipc.rs`, the Tauri shell crate, which cannot be
@@ -5415,7 +5507,8 @@ status: open
 - source_spec: spec-56-11-is-this-file-open-answered-for-real
   summary: Two of the ten fail-closed guards in the `/proc` walk cannot be reached by any test this repository can write — the `Err` dirent arms of the two `read_dir` iterators — and are therefore present but unproven.
   evidence: A mutation sweep over every guard in `open_file_state_under_proc` (each replaced with a `Closed`-or-continue mutant, the single test run, the file restored and verified byte-for-byte by SHA-256) caught eight of ten. The two survivors are the `let Ok(entry) = entry else { return Unknown }` in the `/proc` enumeration and the `let Ok(fd) = fd else { return Unknown }` inside `<pid>/fd`: producing an `Err` from a `ReadDir` iterator needs `getdents` to fail part-way through, which no chmod, symlink, `ENOTDIR` fixture or unprivileged mount can arrange. The `dev` half of the `ino == ino && dev == dev` match is unprovable for the same class of reason — it needs two files on two different devices sharing an inode number. All three stay because removing them is a real defect; recorded so a future reviewer does not read their absence from the sweep as an oversight. Shape: a `fuse`-backed or `errno`-injecting test filesystem, which the permissive-only licence firewall and the no-new-dependency rule both argue against for this alone.
-  status: open
+  status: skip 2026-09-17
+  resolution: needs a failing ReadDir mid-iteration / two devices sharing an inode; untestable by any fixture this repo can write, and removing the guards is the wrong direction
   keep: |
     Reviewed and kept. The two `Err` dirent arms need `getdents` to fail part-way through an
     open directory, and the `dev` half of the inode match needs two files on two different
@@ -5431,7 +5524,8 @@ status: open
 - source_spec: spec-56-12-drive-settings-for-virtual-files
   summary: On the ADD path the folder-owned key set is always empty, so a folder that already ships a `.keeper/keeper.toml` gets every Advanced control rendered as editable and its first save silently discarded — which is the canonical AD-132 scenario, not an edge case.
   evidence: `add-folder-form.tsx` derives `folderOwned` from `profile?.folderOwned ?? []`, and an add form has no profile. By the time Save is pressed the form DOES have a chosen `localPath`, so the answer is knowable — but `SyncProfileVm.folderOwned` is minted by `SyncProfileVm::from`, which needs a stored profile. `profile::as_stored(incoming, None)` then restores the TYPE DEFAULT rather than the file's value, and the add branch blanks the form afterwards, so the person cannot even see what was dropped. The fix is a per-path question the form can ask before its first save — a `sync_folder_owned_fields(localPath)` command over `keeper_sync::profile::folder::owned_fields` against a synthetic profile — which is a new IPC command and outside a story that added none.
-  status: open
+  status: blocked 2026-09-17
+  blocker: the keeper Tauri shell crate does not link on the Linux dev host (a story that can build `keeper` — macOS host, or keeper linking on Linux)
   keep: |
     Kept, and blocked on the shell crate (story 56.14). The entry is right that this is the
     canonical AD-132 scenario rather than an edge case, and right about the fix: a
@@ -5497,7 +5591,8 @@ status: open
 - source_spec: spec-56-12-drive-settings-for-virtual-files
   summary: `SyncProfileVm.folder_owned` re-derives the folder overlay that `db::list_profiles` computed and threw away one line earlier, so the value and its ownership flag are read at two different instants and can disagree.
   evidence: `db::list_profiles` calls `profile::in_force`, which runs `FolderTier::apply` and discards `FolderOutcome::owned`; `SyncProfileVm::from` then calls `profile::owned_fields`, running `apply` a second time. Besides the duplicated TOML parse and `validate` per layer, the two reads can straddle an edit of the file: if the key vanishes between them the VM carries the FILE's value with `folderOwned` not naming it, so the control renders editable holding a value the person never chose, and the next save writes it into the table as a deliberate choice. `owned_fields`' own doc calls that "the wrong direction to be wrong in". The fix is to thread `FolderOutcome` (or just `owned`) out of `in_force` and `db::list_profiles` instead of asking twice.
-  status: open
+  status: blocked 2026-09-17
+  blocker: the keeper Tauri shell crate does not link on the Linux dev host (a story that can build `keeper` — macOS host, or keeper linking on Linux)
   keep: |
     Kept, and blocked in a way worth stating precisely, because the obvious fix is a dead end
     (story 56.14). Threading `FolderOutcome` out of `profile::in_force` and `db::list_profiles`
@@ -5613,7 +5708,8 @@ status: open
 - source_spec: `spec-56-14-the-engine-side-deferred-sweep.md`
   summary: Nothing prunes a released `materialized` row, so the ledger grows with every path a profile has ever hydrated rather than with the paths its cone holds.
   evidence: Story 56.14 made `db::forget_materialized` retain the row and stamp `released_at_ms` instead of deleting it, so the recency history the release clocks reason with survives a release. There is no `DELETE FROM materialized` anywhere in the crate (grep), so a path deleted or renamed upstream leaves its released row behind forever: the bound is paths-ever-hydrated, which for a folder with renames, dated exports or a rolling archive grows with time and not with the folder. Both filtered readers (`materialized_paths`, `materialized_rows`) stay correct and index-ranged, and `is_pinned` is a single-row lookup, so the cost is disk rather than time. Found by story 56.14's own review pass, which caught the `keep`'s original claim that the growth was "bounded by the folder, not by time" — that sentence has been corrected to state the real bound.
-  status: open
+  status: done
+  resolution: verified by the 2026-09-17 ledger triage: db.rs:1484-1494 `age_out_materialized` (DELETE … released_at_ms < horizon); called from the sweep at engine.rs:8274; MATERIALIZED_RETENTION_MS test at db.rs:5344
   keep: |
     Not fixed here because the rule is a decision rather than an edit: a released row is
     worth keeping precisely so that a re-materialization inherits its clocks, so a prune has
@@ -6069,6 +6165,7 @@ status: open
   summary: `prime_moved_paths` still buys a full directory walk for a rename whose destinations the pass would now sample itself.
   evidence: A rename prime records the moved-in destinations in the gate as already settled and sets `untracked_appeared` so the next commit walk is a `full()` one (`Engine::prime_moved_paths`, Epic 70, F-GATE-7) — the flag was the only way a walk without a directory scan could come to observe a path the index does not carry. With this story the pass's own second look samples every held unindexed path (`Engine::paths_for_the_second_look`), so the primed destinations would be staged by the narrowed walk's pass without the scan; the prime's flag is now a directory walk bought for paths the pass would have looked at anyway. Left as is because the story's Never list keeps `prime_moved_paths` out of it (`priming_moved_paths_makes_the_next_walk_a_full_one` still asserts the flag); the follow-up is to drop the flag insert from the prime and let the second look stage the destinations, keeping the test's shape for the rename-in-one-commit property.
   status: open
+  triage 2026-09-17: paths_for_the_second_look now exists and would cover the destinations; the flag is kept out of the second-look story by its Never list and remains a redundant directory walk
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-sync-ui-reports-known-state-and-live-work.md`
   summary: A remote-object audit can leave an ownerless Verifying phase after Recheck all files.
@@ -6103,7 +6200,8 @@ status: open
 - source_spec: `_bmad-output/implementation-artifacts/spec-sync-ui-reports-known-state-and-live-work.md`
   summary: The development shell has invalid null fixtures for non-nullable Settings IPC results.
   evidence: Opening the full Settings view in the real browser fails in ShortcutsSection because `hotkey_get` returns null instead of HotkeyVm, then in CaptureSettingsForm because `recording_destination_profiles` returns null instead of an array. Mounting the real SyncSection independently exposes the same issue for `sync_list_settings_get` (`folded`). These are development-fixture gaps, not observed native-shell failures. The Sync status/progress renderer was verified independently; this change does not manufacture production fallbacks for invalid fixture data.
-  status: open
+  status: done
+  resolution: verified by the 2026-09-17 ledger triage: dev/mock-shell.ts:2998 `hotkey_get` now returns a real HotkeyVm; the two other named null fixtures (recording_destination_profiles, sync_list_settings_get) no longer exist in the mock shell at all
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-72-7-task-row-carries-every-kind.md`
   summary: A scheduled `copy` task holds the serial task pre-pass for the whole copy, so no folder on the host syncs while it runs.
@@ -6114,3 +6212,76 @@ status: open
   summary: Nothing renews a task lease during a run, so a copy longer than an hour can be reclaimed by a second host while the first is still writing.
   evidence: `claim_task` takes a lease for `TASK_LEASE_MS` (1 h, `engine.rs:718-725`) and nothing extends it; a copy of a large tree can exceed that, after which a second host sharing `sync.db` — the app and `keeper-syncd` both run `perform_copy_task` — may claim the same row and record the first run `abandoned`. The destination does not corrupt (`copy_verified` writes to a temp file and renames, and refuses to replace an existing file unless the task says to), so the visible damage is a confusing report and a duplicated walk rather than a damaged file. The honest fix is a lease renewal driven from the copy's own progress sink, which every long-running kind would then share; it is not a copy-specific change and no other kind has hit the ceiling yet.
   status: open
+
+### DW-252: A commit carrying an LFS pointer reached the remote while its object never did, so every other clone parks that object's download for good.
+
+origin: field measurement on hesperia, 2026-09-17 (keeper 0.8.29/0.8.30, three live profiles)
+location: `keeper-sync/src/engine.rs` (the push leg and its LFS upload), `keeper-sync/src/lfs/*`, `journal` kind `lfsDownload`
+reason: Measured, not inferred. `tgdrive` committed `3bc392792` at 07:59:39Z with `lfs=1`; the commit reached the server (the second clone had it), but the object `86ac462dcaf4a8b55e4e594b4707a83c360552cf88a4454227e0cc1433be6540` (1089 B) never did — it sat only in `/Volumes/merope/tgdrive/.git/lfs/objects/86/ac/`, and the server answered `unknown host does not have LFS object …` to every fetch. The second clone (`tgdrive-light`) therefore parked 15 `lfsDownload` rows and retried them for ~14 hours (16 failures in one hour of log alone), with the working file left as a 129-byte pointer nobody could read. `lfs prune: nothing to release` proves prune did not delete it; the upload leg simply never ran or never reported. Two consequences to fix separately: (1) a push must not report success while an object the pushed commits reference is absent from the remote — the completeness gate AD-231 applies to prune should apply to publish; (2) `lfsDownload` should distinguish "the remote does not have it" from a transport failure and say so where a person can see it, instead of retrying forever at WARN. Repaired by hand on 2026-09-17 by copying the object into the second clone's store and `git lfs push --object-id`; the file hydrated on the next pass (`materialized LFS content … materialized=1`).
+status: open
+
+### DW-253: `ensure_attributes` never retires a managed `.gitattributes` rule whose pattern the profile's own `lfsNever` excludes.
+
+origin: field measurement on hesperia, 2026-09-17
+location: `keeper-sync/src/lfs/stage.rs` (`ensure_attributes`, `already_routed`), AD-230's retirement clause
+reason: `tgdrive`'s profile carries an 18-glob `lfsNever` that includes `*.json`, yet line 179 of its `.gitattributes` — inside keeper's own managed block, whose line 1 reads `# keeper-sync: managed LFS rules — edit above this line` — was `*.json filter=lfs diff=lfs merge=lfs -text`. keeper wrote that rule itself when one oversized JSON converted the whole extension, and nothing has retired it since `lfsNever` gained the glob. That rule is what routed a 1 KB recording manifest conflict copy into LFS and so caused DW-252. AD-230 says a keeper-written managed-block rule whose pattern the profile's `lfsNever` excludes must be retired; measurement says it is not. Removed by hand in that folder on 2026-09-17 (`f0a9caa9e`), which is a repair of one repository and not of the code. 746 JSON files already stored as objects were deliberately left alone.
+status: open
+
+### DW-254: A fast-forward blocked by a dirty working file retries forever, and when that file lives in a sync-excluded directory there is no way out at all.
+
+origin: field measurement on hesperia, 2026-09-17
+location: `keeper-sync/src/engine.rs` (the merge leg, `sync retrying` / `sync has failed N times in a row`), `git/cli.rs` `merge_ff_only`
+reason: `tgdrive-light` sat for 75 minutes in this loop: `remote polled: the remote branch moved fast_forward=true received_pack=true` → `sync retrying … git merge --ff-only failed (exit 1): error: Your local changes to the following files would be overwritten by merge: 10-notes/.keeper/index.json` → `sync warning … sync has failed 3 times in a row`, repeating every few minutes with no resolution and no state a person could act on beyond a WARN in a log that is off by default. The deadlock is total when the blocking path is one keeper excludes from sync: keeper cannot commit it (the exclusion) and cannot merge past it (git refuses), so the folder can never converge again. The engine needs a verdict for this case — classify the refusal, name the paths, and either stash-and-restore them, commit them, or stop and say the folder needs a person, rather than retrying an operation whose precondition it never re-establishes. Unstuck by hand on 2026-09-17 (`git checkout --` the cache file, then `merge --ff-only`); both clones then converged to `f0a9caa9e`.
+status: open
+
+### DW-255: A tracked file inside a sync-excluded directory is counted as modified forever, which AD-45 says an exclusion must never do.
+
+origin: field measurement on hesperia, 2026-09-17
+location: `keeper-sync/src/engine.rs` (`commit_local`'s exclusion filter vs the walk's counters), `exclude.rs` (AD-45)
+reason: `10-notes/.keeper/index.json` — keeper's own notes index cache, written on the same drive it syncs — was tracked in git in both `tgdrive` clones. keeper excludes `.keeper/` from sync, so the commit leg skipped it, but git kept reporting it: every status walk read `entries=1 scanned=156941 modified=1` and 15 consecutive paced passes after 07:59Z committed nothing while the folder read as dirty in the UI. Its untracked neighbour `.keeper/trash/` was correctly invisible (`untracked=0`), which is what proves the exclusion works until git carries the path. AD-45 requires an exclusion to be invisible — "not staged, not queued, not counted, never reported as pending" — so either the walk must subtract excluded tracked paths from its counters and the pane's pending figure, or keeper must refuse to leave such a path tracked and say so once. This also caused DW-254: the permanently dirty file is what blocked the fast-forward. Worked around per repository on 2026-09-17 by untracking the cache and gitignoring it (`d8fe2668e`); the same walk then read `entries=0 modified=0`.
+status: open
+## Triage of 2026-09-17
+
+Six read-only lanes verified every open entry of this ledger against the tree on 2026-09-17 (epic 73, story 73.5). This section is the triage's result; the next planning session reads this, not the six agent reports.
+
+### Arithmetic
+
+- Open before the triage: **274** per the epic's planning count. The file's own census was **277** open entries: the epic count missed three — DW-18 and DW-28 (whose `###` headers were glued onto the previous entry's last line and are now split out onto their own lines) and DW-220 (an `open (re-scoped)` status).
+- Closed out by this triage: **done 18, skip 18, blocked 15, needs-field-check 21 = 72 entries**.
+- Of those 72, 69 carried a literal open status line that was replaced; the other three had none to replace — spec-14-2 (no status line at all) and DW-N2/DW-N4 (ledger notes whose status was prose).
+- **Open after: 208** (207 open entries plus DW-220, whose status reads `open (re-scoped)`). Both frames agree: the epic's 274 − 69 (the 72 minus the three that had no literal open status line) = 205, + the 3 entries the epic count missed = 208; and the file's 277 − 69 = 208.
+- The 208 that remain open are: **186 real and buildable** (or, for a handful, blocked on a named upstream/credential fact — those carry a blocked status and are not in the 208) and **22 human decisions**. Every `real` entry was left `open`; where a lane's note corrected an entry's premise, a `triage 2026-09-17:` line records the correction without rewriting the original reason.
+
+### The six proposed bundles
+
+1. **`dw-subscribe-lifecycles-and-verification-store`** — DW-13, DW-14, DW-15, DW-16, DW-18, DW-21, DW-22, DW-23. One shared gap-safe subscribe helper for the account.rs spawn→register lifecycle, plus the verification store/hook on top of it.
+2. **`drafts-outbox-persistence`** — DW-62, DW-67, DW-70, DW-74, DW-75, DW-80, DW-81, DW-82. One cohesive sweep over keeper-core's registry/connection lifecycle and the composer↔draft/outbox write paths.
+3. **`recorder-sidecar-stream-hardening`** — spec-16-2/16-4 blocks at ledger lines ~1042–1102 (read-error distinction, unbounded channel/line caps, `child.wait()` timeout, `Recovered`-transition, `SegmentClosed` index, Failed-message cap, single-session guard, exit-masks-terminal, run_session test harness, request-line cap, Protocol interpolation). All eight live in `keeper/src/recorder.rs` + `keeper-core/src/recording.rs`.
+4. **`tray-write-discipline`** — DW-151, DW-152, DW-153, DW-154, DW-155, DW-156. The write-early-return seam, the unreachable arm, the dwell decay under recording, the per-tick `set_text`, the two spec-34-1 corrections, and the capability/async assertion test.
+5. **`sync-engine-review-leftovers`** — DW-247, DW-248, DW-249, DW-250, L4262, L4267. Epic-70-review findings in keeper-sync's engine/git/lfs: the batch-do_lfs unit claim, the streaming push client, watcher health and the nested-repo warning, the db/virtual-policy edges, and the `lfs/tmp` sweep.
+6. **`sync-engine-publish-and-merge`** — DW-252, DW-253, DW-254, DW-255, L5296, L6048, L6093, L6098. Publish/merge/stat correctness in keeper-sync (engine.rs push/pull/upload legs + lfs/stage.rs + git/repo.rs), causally chained in the field measurements (DW-255 → DW-254; DW-253 → DW-252). DW-252…DW-255 are owned by epic 73's stories 73.1–73.4 and stay `open` here.
+
+### Decisions a human must take (22)
+
+- **DW-19** — leave the honest-but-mislabeled QR waiting screen as-is until a live QR validation session exists (recorded 2026-07-06).
+- **DW-45** — scope the m.room.message archive handler later per-concern (reactions / UTD-redecrypt / paginated history each belong to their owning story) (recorded 2026-07-06).
+- **DW-54** — measure real event-cache disk growth before committing to a retention policy (recorded 2026-07-06).
+- **DW-118** — authorize a function-level unsafe exception for the WKWebView content-inset SPI call, after logging the runtime discriminator.
+- **DW-130** — mint a real `Forbidden` IPC code (regenerate TS) and decide whether a wait deserves a code, vs accept the documented nearest-fit.
+- **DW-137** — defaults/documentation question that would revisit DW-119's recorded closed-wont-fix decision.
+- **DW-138** — delete the EchoSuppressor or record the wiring condition under which it returns.
+- **DW-142** — ruling on the `@device` provenance qualifier bytes: amend the planning artifacts or revert the bytes.
+- **DW-143** — settle the volume-label origin hazard with DW-142's ruling.
+- **DW-226** — the Bots-on-Matrix product fork: "No code until that decision is written down."
+- **DW-232** — write the named-voice-vs-language rule (the confusion D-9 exists to end).
+- **DW-234** — iPad support as a platform-tier product decision, not a breakpoint.
+- **DW-242** — pick the phone `TrashTarget` (a `SyncPlatform` fact; two remedies named in the entry).
+- **DW-244** — voice target: resolve-at-speak vs refuse-at-arm, and the hands-free re-arm policy.
+- **L4196** — what a resizer announces under layout override (deliberate per the spec; needs a considered answer, not a mechanical fix).
+- **L4216** — where emoji recents state lives (per vault / per device / synced).
+- **L4382** — teaching `add_pattern` the leading-slash rule changes the meaning of every stored excludes/lfsNever list on next load — needs a migration of stored user data.
+- **L4397** — the wire field "was a server contacted" is a published `--json` contract addition; deliberately parked for the next version bump alongside the size/size_bytes rename.
+- **L5332** — bindgen-on-every-host vs a hand-written FFI shim with its own soundness argument (testable only on a real Mac).
+- **L5379** — the fix must accept leaking one thread per hung mount per pass (uninterruptible syscall, uncancellable) — a design decision, not an edit.
+- **L5450** — widening `branch`/`excludes`/`tags` to `Option` moves three fields across the EXPRESSED/PRESERVED classification — an API decision, and the shell crate cannot build here.
+- **L5593** — `size` vs `size_bytes` is a published-contract break (docs/sync.md §13); do it at the next deliberate `--json` version bump together with L4397's discriminator.
