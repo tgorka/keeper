@@ -722,6 +722,12 @@ pub fn host_platform_name() -> &'static str {
 /// Nothing renews it, deliberately: a run that outlives its lease is reclaimed
 /// and its attempt recorded as `abandoned`, which is a fact a reader can act on
 /// rather than a lease that quietly follows a process that may already be dead.
+/// How many tracked-but-excluded paths one anomaly names.
+///
+/// Enough to act on, few enough that a folder with thousands of them (a whole
+/// excluded subtree somebody committed once) writes a line rather than a page.
+const EXCLUDED_TRACKED_NAMED: usize = 5;
+
 const TASK_LEASE_MS: i64 = 3_600_000;
 
 /// How soon a task retries after a run that did not happen.
@@ -8871,9 +8877,57 @@ impl Engine {
         if outcome.fast_forward {
             let reference = tracking.clone();
             let path = repo_path.clone();
-            tokio::task::spawn_blocking(move || git.merge_ff_only(&path, &reference))
-                .await
-                .map_err(|err| SyncError::Journal(format!("merge task failed: {err}")))??;
+            let attempt = {
+                let git = git.clone();
+                let reference = reference.clone();
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || git.merge_ff_only(&path, &reference))
+                    .await
+                    .map_err(|err| SyncError::Journal(format!("merge task failed: {err}")))?
+            };
+            match attempt {
+                Ok(()) => {}
+                // git refused before it started: the working tree holds
+                // changes the fast-forward would overwrite (AD-247). Exactly
+                // one arm of this is keeper's to resolve — every blocking path
+                // being one the profile excludes from sync, which means the
+                // bytes are keeper's own or the machine's and the folder can
+                // never converge while they stand. Anything else is a person's
+                // edit, and the honest move is to stop and name it rather than
+                // retry an operation whose precondition nothing between two
+                // ticks will change.
+                Err(SyncError::MergeBlocked { paths }) => {
+                    let excludes = ExcludeSet::new(&profile.excludes)?;
+                    let mine: Vec<String> = paths
+                        .iter()
+                        .filter(|path| excludes.is_excluded(Path::new(path.as_str())))
+                        .cloned()
+                        .collect();
+                    if mine.len() != paths.len() {
+                        return Err(SyncError::MergeBlocked { paths });
+                    }
+                    tracing::info!(
+                        profile = profile.name,
+                        paths = mine.join(", "),
+                        "the fast-forward was held by excluded paths; discarding keeper's own copies"
+                    );
+                    {
+                        let git = git.clone();
+                        let path = path.clone();
+                        let discard = mine.clone();
+                        tokio::task::spawn_blocking(move || git.discard_paths(&path, &discard))
+                            .await
+                            .map_err(|err| {
+                                SyncError::Journal(format!("discard task failed: {err}"))
+                            })??;
+                    }
+                    let git = git.clone();
+                    tokio::task::spawn_blocking(move || git.merge_ff_only(&path, &reference))
+                        .await
+                        .map_err(|err| SyncError::Journal(format!("merge task failed: {err}")))??;
+                }
+                Err(err) => return Err(err),
+            }
             // A fast-forward takes the remote's history wholesale: nothing was
             // contested, so nothing was copied aside.
             return Ok(Converged::default());
@@ -9987,6 +10041,71 @@ impl Engine {
     /// cannot have its own line. It is counted rather than dropped: "and 3
     /// more" is the difference between a user who knows to keep looking and one
     /// who fixes a single file and assumes they are done.
+    /// Take the paths the profile excludes out of a walk's answer, and name
+    /// the tracked ones once.
+    ///
+    /// AD-45 has said since Epic 23 that an exclusion is **invisible** — "not
+    /// staged, not queued, not counted, never reported as pending" — and the
+    /// commit leg has always honoured the first two. The walk's answer did
+    /// not: git reports a path it tracks whatever keeper thinks of it, so a
+    /// tracked file inside an excluded directory was counted on every walk and
+    /// reported as pending forever. Measured on the owner's drive, 2026-09-17:
+    /// `10-notes/.keeper/index.json` — keeper's own notes index cache, tracked
+    /// in git — left `tgdrive` reading `entries=1 scanned=156941 modified=1`
+    /// on every poll for 22 hours across 15 paced passes that committed
+    /// nothing, while its untracked neighbour `.keeper/trash/` was correctly
+    /// invisible. The untracked half proves the exclusion works right up to
+    /// the moment git carries the path.
+    ///
+    /// Silence alone would be wrong, though: such a path can never be
+    /// committed *and* it blocks a fast-forward (AD-247, which is how the same
+    /// file deadlocked the second clone), so it gets one anomaly per pass — a
+    /// standing fact reported once, never an event per walk, which is the
+    /// distinction that kept Epic 70's log from reaching 1.2 GB again. The
+    /// remedy named is the only one that works: untrack them.
+    fn drop_excluded(
+        &self,
+        profile: &SyncProfile,
+        status: &mut git::repo::RepoStatus,
+    ) -> Result<()> {
+        let excludes = ExcludeSet::new(&profile.excludes)?;
+        let mut tracked: Vec<PathBuf> = Vec::new();
+        for list in [&mut status.added, &mut status.modified, &mut status.deleted] {
+            list.retain(|path| {
+                if excludes.is_excluded(path) {
+                    tracked.push(path.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        // Untracked paths are left alone: the pending list and the stager
+        // already filter them, and the commit walk is also where a nested
+        // repository inside an excluded directory gets explained. Only the
+        // tracked buckets are corrected here, because only a tracked path can
+        // be counted, refuse to be committed, and hold a fast-forward.
+        if tracked.is_empty() {
+            return Ok(());
+        }
+        tracked.sort();
+        let named: Vec<String> = tracked
+            .iter()
+            .take(EXCLUDED_TRACKED_NAMED)
+            .map(|path| path.display().to_string())
+            .collect();
+        crate::anomaly::Anomaly {
+            what: "files git tracks inside a folder keeper excludes from sync",
+            measured: format!("files={} first={}", tracked.len(), named.join(", ")),
+            expected: "none; an exclusion keeps a path out of git as well as out of a pass",
+            consequence: "keeper can never commit them and git will not fast-forward past a \
+                          change to one, so the folder reads dirty for good — untrack them \
+                          (`git rm --cached <path>`) and let the exclusion hide them",
+        }
+        .report(&profile.name);
+        Ok(())
+    }
+
     fn report_unreadable(&self, profile: &SyncProfile, unreadable: &[git::repo::UnreadablePath]) {
         let Some(first) = unreadable.first() else {
             return;
@@ -10093,6 +10212,8 @@ impl Engine {
                 "commit",
             )?
         };
+        let mut status = status;
+        self.drop_excluded(profile, &mut status)?;
         #[cfg(test)]
         after_walk::fire(&profile.local_path);
         // The volume gate at the top of the tick answered "is the drive here"
@@ -21433,6 +21554,60 @@ mod tests {
             !engine.scan_due(&p),
             "enabled seed surrenders the paced driver"
         );
+    }
+
+    /// AD-45's first clause, on the walk's answer: a path the profile excludes
+    /// is not counted, whether or not git tracks it.
+    ///
+    /// The untracked half was always right; the tracked half is what left
+    /// `tgdrive` reading `modified=1` for 22 hours over a cache keeper itself
+    /// writes, refusing to commit it (correctly) and refusing to stop
+    /// mentioning it. An ordinary path in the same walk must survive — this is
+    /// a filter, not a mute button.
+    #[test]
+    fn an_excluded_tracked_path_leaves_the_walks_answer_and_an_ordinary_one_stays() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.excludes = vec!["scratch/**".to_owned()];
+        let mut status = git::repo::RepoStatus {
+            added: vec![
+                PathBuf::from("scratch/new.bin"),
+                PathBuf::from("notes/new.md"),
+            ],
+            modified: vec![
+                // keeper's own notes index cache: excluded by the built-in
+                // corpus, and tracked in git on the owner's drive.
+                PathBuf::from("10-notes/.keeper/index.json"),
+                PathBuf::from("scratch/one.bin"),
+                PathBuf::from("notes/one.md"),
+            ],
+            deleted: vec![PathBuf::from("scratch/gone.bin")],
+            untracked: vec![PathBuf::from("scratch/untracked.bin")],
+            ..Default::default()
+        };
+        engine
+            .drop_excluded(&p, &mut status)
+            .expect("the filter reads the profile's own patterns");
+        assert_eq!(status.modified, [PathBuf::from("notes/one.md")]);
+        assert_eq!(status.added, [PathBuf::from("notes/new.md")]);
+        assert!(status.deleted.is_empty(), "{:?}", status.deleted);
+        assert_eq!(
+            status.untracked,
+            [PathBuf::from("scratch/untracked.bin")],
+            "untracked paths are already invisible downstream and are left alone"
+        );
+
+        // A walk with nothing excluded in it is returned untouched — the
+        // filter must not be a pass that rewrites every answer.
+        let mut ordinary = git::repo::RepoStatus {
+            modified: vec![PathBuf::from("notes/one.md")],
+            ..Default::default()
+        };
+        engine.drop_excluded(&p, &mut ordinary).expect("no-op");
+        assert_eq!(ordinary.modified, [PathBuf::from("notes/one.md")]);
     }
 
     /// A scheduled bot run has no approver, so a write outside an approved

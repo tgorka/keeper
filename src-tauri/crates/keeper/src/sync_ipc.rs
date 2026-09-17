@@ -920,6 +920,12 @@ pub fn sync_ipc_error(err: &SyncError) -> IpcError {
         // `false` on its own account — the wait is on the uploads, not on a
         // clock, and pressing "Sync now" again cannot shorten it.
         SyncError::LfsUploadPending { .. } => IpcErrorCode::SyncUnavailable,
+        // A fast-forward the working tree holds back (AD-247). `syncUnavailable`
+        // for `LfsUploadPending`'s reason — sync cannot continue right now —
+        // and the sentence names the files, which is the only thing that can
+        // move it. Not `internal`: nothing about this is a defect, and not
+        // `invalidCredentials`/`serverUnreachable`: the remote answered fine.
+        SyncError::MergeBlocked { .. } => IpcErrorCode::SyncUnavailable,
         // The same shape one line up: a wait rather than a fault. Another
         // machine reached the shared branch first, so this pass published
         // nothing and the reconcile it queued is what makes the next one land

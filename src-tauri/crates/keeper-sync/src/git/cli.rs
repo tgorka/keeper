@@ -394,7 +394,25 @@ impl GitCli {
         self.refuse_on_phone(Verb::Checkout)?;
         self.run("merge --ff-only", repo, &merge_ff_only_args(reference)?)
             .map(drop)
-            .map_err(|err| self.undo_failed_merge(repo, err))
+            .map_err(|err| self.undo_failed_merge(repo, blocked_or(err)))
+    }
+
+    /// Throw away the working-tree changes to `paths`, restoring them to
+    /// `HEAD`.
+    ///
+    /// Narrow on purpose: the one caller is the fast-forward arm resolving a
+    /// [`SyncError::MergeBlocked`] whose every path is one the profile
+    /// excludes from sync (AD-247), so the bytes discarded here are keeper's
+    /// own or the machine's — a cache, a lock, a trash tree — and never
+    /// content a person put in the folder. `--` separates the paths from any
+    /// revision, so a file called `main` is a file.
+    pub fn discard_paths(&self, repo: &Path, paths: &[String]) -> Result<()> {
+        self.refuse_on_phone(Verb::Checkout)?;
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.run("checkout -- <paths>", repo, &discard_paths_args(paths))
+            .map(drop)
     }
 
     /// Merge `reference` with the remote winning every content conflict, and
@@ -1200,6 +1218,66 @@ fn merge_ff_only_args(reference: &str) -> Result<Vec<String>> {
         "--quiet".to_owned(),
         safe_ref(reference)?,
     ])
+}
+
+/// `git checkout -q -- <paths>` argument vector.
+fn discard_paths_args(paths: &[String]) -> Vec<String> {
+    let mut args = vec!["checkout".to_owned(), "-q".to_owned(), "--".to_owned()];
+    args.extend(paths.iter().cloned());
+    args
+}
+
+/// Re-read a failed `merge --ff-only` as [`SyncError::MergeBlocked`] when git
+/// refused it for local changes, naming the paths git named.
+///
+/// git's own words are the parser's input, in both shapes it uses:
+///
+/// ```text
+/// error: Your local changes to the following files would be overwritten by merge:
+///     notes/one.md
+/// Please commit your changes or stash them before you merge.
+/// ```
+///
+/// and the untracked variant (`error: The following untracked working tree
+/// files would be overwritten by merge:`). Anything else keeps the
+/// classification it arrived with — a diverged history, a missing ref and a
+/// broken index are all still `GitCommand`, and the caller's conflict-copy
+/// path depends on that.
+fn blocked_or(err: SyncError) -> SyncError {
+    let SyncError::GitCommand { stderr, .. } = &err else {
+        return err;
+    };
+    let paths = blocked_paths(stderr);
+    if paths.is_empty() {
+        return err;
+    }
+    SyncError::MergeBlocked { paths }
+}
+
+/// The paths git listed under its "would be overwritten by merge" heading.
+///
+/// One per line, tab-indented, terminated by the first line that is not —
+/// which is git's own "Please commit your changes…" or "Aborting". Paths are
+/// taken verbatim: git prints them repository-relative, which is the spelling
+/// every other path in this crate uses, and re-quoting one would only invent a
+/// name no filesystem has.
+fn blocked_paths(stderr: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut listing = false;
+    for line in stderr.lines() {
+        if line.contains("would be overwritten by merge") {
+            listing = true;
+            continue;
+        }
+        if !listing {
+            continue;
+        }
+        match line.strip_prefix('\t') {
+            Some(path) if !path.trim().is_empty() => paths.push(path.to_owned()),
+            _ => listing = false,
+        }
+    }
+    paths
 }
 
 /// `git merge -X theirs -X no-renames <ref>` argument vector.
@@ -2024,6 +2102,129 @@ mod tests {
         // Nothing in progress: the abort is a no-op, not a fault.
         cli.merge_abort(root)
             .expect("there is no merge to abort, and that is success");
+    }
+
+    /// The shape that deadlocked a folder for 75 minutes in the field: a
+    /// fast-forward git refuses because the working tree holds a change it
+    /// would overwrite. It must arrive as [`SyncError::MergeBlocked`] naming
+    /// the path — a `GitCommand` is `Transient`, and retrying it is the loop
+    /// AD-247 exists to end.
+    #[test]
+    fn a_fast_forward_blocked_by_a_local_change_names_the_paths_and_is_not_transient() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("cache.json"), b"base").expect("write");
+        std::fs::write(root.join("keep.md"), b"base").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        // The remote moves both files on.
+        git(&["checkout", "-q", "-b", "remote"]);
+        std::fs::write(root.join("cache.json"), b"theirs").expect("write");
+        std::fs::write(root.join("keep.md"), b"theirs").expect("write");
+        git(&["commit", "-qam", "ahead"]);
+        git(&["checkout", "-q", "main"]);
+        // ...and locally one of them is dirty, which is what git refuses.
+        std::fs::write(root.join("cache.json"), b"mine").expect("write");
+
+        let cli = GitCli::new(PathBuf::from("git"));
+        let err = cli
+            .merge_ff_only(root, "refs/heads/remote")
+            .expect_err("git refuses a fast-forward over a dirty file");
+        let SyncError::MergeBlocked { paths } = &err else {
+            panic!(
+                "classified as {} instead of mergeBlocked: {err}",
+                err.code()
+            );
+        };
+        assert_eq!(paths, &["cache.json".to_owned()]);
+        assert_eq!(err.retriability(), crate::error::Retriability::Permanent);
+        assert!(err.needs_user_action(), "only a person can decide about it");
+        assert!(
+            err.to_string().contains("cache.json"),
+            "the sentence names the file: {err}"
+        );
+
+        // Discarding keeper's own copy is what the engine does when every
+        // blocking path is one it excludes — and then the fast-forward lands.
+        cli.discard_paths(root, &["cache.json".to_owned()])
+            .expect("the cache goes back to HEAD");
+        cli.merge_ff_only(root, "refs/heads/remote")
+            .expect("and the fast-forward applies");
+        assert_eq!(
+            std::fs::read(root.join("keep.md")).expect("read"),
+            b"theirs",
+            "the remote's history is in the worktree"
+        );
+    }
+
+    /// A fast-forward git refuses for any OTHER reason keeps its
+    /// classification: the conflict-copy path depends on a diverged history
+    /// reading as `GitCommand`, not as a blocked working tree.
+    #[test]
+    fn a_diverged_fast_forward_is_not_read_as_a_blocked_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("f.txt"), b"base").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["checkout", "-q", "-b", "remote"]);
+        std::fs::write(root.join("f.txt"), b"theirs").expect("write");
+        git(&["commit", "-qam", "theirs"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(root.join("f.txt"), b"ours").expect("write");
+        git(&["commit", "-qam", "ours"]);
+
+        let err = GitCli::new(PathBuf::from("git"))
+            .merge_ff_only(root, "refs/heads/remote")
+            .expect_err("diverged histories cannot fast-forward");
+        assert_eq!(err.code(), "gitCommand", "got {err}");
+    }
+
+    /// git's own two headings, parsed from its own words.
+    #[test]
+    fn the_blocked_listing_stops_at_gits_next_sentence() {
+        let tracked = "error: Your local changes to the following files would be overwritten by merge:\n\t10-notes/.keeper/index.json\n\tnotes/two.md\nPlease commit your changes or stash them before you merge.\nAborting\n";
+        assert_eq!(
+            blocked_paths(tracked),
+            ["10-notes/.keeper/index.json", "notes/two.md"]
+        );
+        let untracked = "error: The following untracked working tree files would be overwritten by merge:\n\tnew.md\nPlease move or remove them before you merge.\n";
+        assert_eq!(blocked_paths(untracked), ["new.md"]);
+        assert!(blocked_paths("fatal: not something we can merge").is_empty());
     }
 
     /// A merge that dies *after* writing `MERGE_HEAD` — a child killed at its
