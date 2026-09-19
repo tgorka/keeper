@@ -1,7 +1,7 @@
 ---
-status: in-progress
+status: done
 baseline_revision: 16f7912
-final_revision: ''
+final_revision: '6b20d86a6aeffc2866721c53367d1a54640bdc9f'
 ---
 
 # Story 75.2 — The lock is off when it opens, and nothing floats until asked

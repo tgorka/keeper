@@ -1,7 +1,7 @@
 ---
-status: in-progress
+status: done
 baseline_revision: 16f7912
-final_revision: ''
+final_revision: '6745464f6bd9b423e991215fed39acd65bbc32e0'
 ---
 
 # Story 75.1 — A lock freezes the size you chose

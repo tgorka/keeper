@@ -50,10 +50,10 @@ story_location: _bmad-output/implementation-artifacts
 development_status:
   # Epic 75: the owner's four notes on the quick-capture floating window.
   # Stack publication is reserved for the coordinator by this checkout's rules.
-  epic-75: in-progress
-  75-1-a-lock-freezes-the-size-you-chose: in-progress
-  75-2-the-lock-is-off-when-it-opens: in-progress
-  75-3-one-header-row: in-progress
+  epic-75: done
+  75-1-a-lock-freezes-the-size-you-chose: done
+  75-2-the-lock-is-off-when-it-opens: done
+  75-3-one-header-row: done
   # Epic 74: the owner's five notes on the Tasks surface, triaged before planning.
   # Stack publication is reserved for the coordinator by this checkout's rules.
   epic-74: in-progress

@@ -1,7 +1,7 @@
 ---
-status: in-progress
+status: done
 baseline_revision: 16f7912
-final_revision: ''
+final_revision: '20e07d1a608e11e693de45daf2fb048cb3ff3ed3'
 ---
 
 # Story 75.3 — One header row
