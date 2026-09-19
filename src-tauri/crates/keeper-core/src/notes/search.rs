@@ -42,32 +42,36 @@ pub struct Hit {
 /// An empty needle matches nothing — an empty query should show the unfiltered
 /// list, not every byte of every note.
 pub fn find(haystack: &str, needle: &str, max_hits: usize) -> Vec<Hit> {
+    let mut line = 1;
+    let mut counted = 0;
+    find_spans(haystack, needle, max_hits)
+        .into_iter()
+        .map(|(start, end)| {
+            line += haystack[counted..start]
+                .bytes()
+                .filter(|b| *b == b'\n')
+                .count() as u32;
+            counted = start;
+            Hit {
+                line,
+                span: (start, end),
+                snippet: snippet(haystack, start, end),
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn find_spans(haystack: &str, needle: &str, max_hits: usize) -> Vec<(usize, usize)> {
     let pattern: Vec<char> = fold_str(needle).chars().collect();
     if pattern.is_empty() || max_hits == 0 {
         return Vec::new();
     }
-
-    let mut hits = Vec::new();
-    let mut line: u32 = 1;
-    // Newlines up to `counted` are already reflected in `line`; the counter only
-    // ever moves forward, so line numbering stays O(n) over the whole haystack.
-    let mut counted = 0usize;
-    let mut at = 0usize;
-
+    let mut spans = Vec::new();
+    let mut at = 0;
     while at < haystack.len() {
-        line += haystack[counted..at]
-            .bytes()
-            .filter(|b| *b == b'\n')
-            .count() as u32;
-        counted = at;
-
         if let Some(end) = match_at(haystack, at, &pattern) {
-            hits.push(Hit {
-                line,
-                span: (at, end),
-                snippet: snippet(haystack, at, end),
-            });
-            if hits.len() >= max_hits {
+            spans.push((at, end));
+            if spans.len() == max_hits {
                 break;
             }
             at = end;
@@ -75,8 +79,7 @@ pub fn find(haystack: &str, needle: &str, max_hits: usize) -> Vec<Hit> {
             at = next_boundary(haystack, at);
         }
     }
-
-    hits
+    spans
 }
 
 /// Byte offset of the character after the one starting at `at`.

@@ -28,6 +28,7 @@ pub mod commands;
 pub mod context_files;
 pub mod deliverable;
 pub mod discover;
+pub mod embed;
 pub mod error;
 pub mod follow;
 pub mod grant;

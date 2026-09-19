@@ -10,6 +10,7 @@ function row(id: string, title = id): NoteRowVm {
     unresolvedTarget: "",
     predicates: [],
     title,
+    hit: null,
     snippet: "",
     tags: [],
     updatedMs: 1,
@@ -37,6 +38,7 @@ function batch(
     ops,
     total: counts.total,
     matched: counts.matched ?? counts.total,
+    hidden: 0,
   };
 }
 

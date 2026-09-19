@@ -44,6 +44,7 @@ function row(overrides: Partial<NoteRowVm> & { id: string; title: string }): Not
     // target nobody has written yet (owner item 2).
     unresolvedTarget: "",
     snippet: "the body excerpt",
+    hit: null,
     predicates: [],
     tags: [],
     updatedMs: Date.now() - 3_600_000,

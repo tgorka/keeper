@@ -3,13 +3,20 @@
 //! Everything here is a *rule* rather than an *effect*: what a frontmatter block
 //! means, what filename a title produces, what a tag tree looks like, what a
 //! wikilink resolves to, what a template expands to, what a space query matches,
-//! what the index is. It takes bytes and returns values. It never opens a file,
+//! what the index is. It takes bytes and returns values. It never opens a note,
 //! never spawns a task, and never learns that a profile id means anything to git
 //! — the vault IO lives in the `keeper` shell on `keeper-sync`'s watcher
 //! (AD-56). That split is the reason this phase is testable at all: every rule
 //! below is exercised over `&str` inputs, with no vault, no tokio and no Tauri.
+//!
+//! One module holds a file of its own: [`search_index`] owns `<vault>/.keeper/
+//! search.db` (Epic 76, AD-261) — a derived, disposable SQLite index the shell
+//! hands a path to and feeds note text it has already read. It is still a rule
+//! over bytes it is given: it reads no note, and everything in it can be
+//! rebuilt from the files.
 
 pub mod attach;
+pub mod chunk;
 pub mod counts;
 pub mod csv;
 pub mod default_spaces;
@@ -25,7 +32,9 @@ pub mod prompt;
 pub mod query;
 pub mod recording_note;
 pub mod search;
+pub mod search_index;
 pub mod seed;
+pub mod service_files;
 pub mod snippet;
 pub mod sort;
 pub mod tags;

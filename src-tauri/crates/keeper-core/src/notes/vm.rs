@@ -99,6 +99,55 @@ pub struct NoteCadenceVm {
     pub push_on_blur: bool,
 }
 
+/// The passage that answered a list query (AD-266).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteHitVm {
+    pub snippet: String,
+    /// Half-open UTF-16 ranges into `snippet`, not byte offsets into the note.
+    pub marks: Vec<[u32; 2]>,
+    /// `words`, `meaning` or `both`; meaning alone never fabricates marks.
+    pub why: String,
+    pub score: f32,
+}
+
+/// Body marks stamped with the revision whose bytes were matched.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteMarksVm {
+    pub rev: String,
+    /// Half-open UTF-16 positions in the post-frontmatter body.
+    pub ranges: Vec<[u32; 2]>,
+}
+
+/// The effective search posture, not merely the existence of a chosen model.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteSearchStateVm {
+    pub vault_id: String,
+    /// `indexing`, `words`, `meaning` or `refused`.
+    pub phase: String,
+    pub indexed: u32,
+    pub total: u32,
+    pub embedded: u32,
+    pub embeddable: u32,
+    pub model: String,
+    /// A refusal or setup sentence; empty when there is nothing to say.
+    pub sentence: String,
+}
+
+/// The configured provider and its model chosen for meaning search (AD-264).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct EmbeddingModelVm {
+    pub provider: String,
+    pub model: String,
+}
+
 /// One row of the note list (FR-103).
 ///
 /// Everything the row paints, so rendering a window of a ten-thousand-note vault
@@ -116,6 +165,8 @@ pub struct NoteRowVm {
     pub title: String,
     /// Short whitespace-folded prose excerpt with markdown markup removed.
     pub snippet: String,
+    /// Match evidence while a list query stands; absent in ordinary browsing.
+    pub hit: Option<NoteHitVm>,
     /// Normalised tag paths.
     pub tags: Vec<String>,
     /// Last modification, ms since the Unix epoch.
@@ -219,6 +270,9 @@ pub struct NoteListVm {
     /// larger, the surface says both numbers — a cap that quietly shrank a
     /// count is the same defect as a count of the rendered window.
     pub matched: u32,
+    /// Matching notes withheld by service-file hiding, before paging or a cap.
+    /// Zero when the toggle is off; never a count of hidden chunks.
+    pub hidden: u32,
     /// Offset of `rows[0]` within `total`.
     pub offset: u32,
 }
@@ -677,6 +731,8 @@ pub struct NoteChangeBatch {
     pub total: u32,
     /// How many the lens matched before `keeper.limit` declined any.
     pub matched: u32,
+    /// Service files withheld by the current filter, before paging.
+    pub hidden: u32,
 }
 
 /// One index-based note-list operation.
@@ -1106,6 +1162,9 @@ pub struct NoteIndexProgressVm {
 pub struct NoteQueryReq {
     /// Free text; `None` for no text filter.
     pub text: Option<String>,
+    /// Hide configured service basenames from this list only (AD-267).
+    #[serde(default)]
+    pub hide_service_files: bool,
     /// The tag chips, keyed by tag and ANDed together (FR-148, UX-DR54).
     ///
     /// A map rather than an include list beside an exclude list, because the
@@ -1287,6 +1346,7 @@ mod tests {
     #[test]
     fn a_row_serialises_camel_case_including_the_two_absent_by_empty_string_fields() {
         let row = NoteRowVm {
+            hit: None,
             predicates: Vec::new(),
             id: "n1".to_owned(),
             path: "notes/a.md".to_owned(),
@@ -1333,6 +1393,7 @@ mod tests {
         // order the reader sees: `{dcterms:source, schema:about}` is a sentence
         // about provenance first. Sorting here would be keeper re-wording it.
         let row = NoteRowVm {
+            hit: None,
             predicates: vec!["dcterms:source".to_owned(), "schema:about".to_owned()],
             id: "n2".to_owned(),
             path: "notes/b.md".to_owned(),

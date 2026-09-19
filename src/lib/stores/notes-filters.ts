@@ -359,6 +359,9 @@ export function noteQueryFor(
     // `bot`. There is one chip because there is one question people ask of it.
     origin: state.agentOnly ? "agent" : null,
     flags,
+    // The eye toggle arrives with the surface (Story 76.4); until then nothing
+    // is hidden, so a list without the control cannot hide what it cannot show.
+    hideServiceFiles: false,
     offset,
     limit,
   };

@@ -4152,6 +4152,7 @@ dependencies = [
  "objc2-user-notifications",
  "objc2-web-kit",
  "percent-encoding",
+ "reqwest",
  "security-framework 3.7.0",
  "serde",
  "serde_json",
@@ -4180,6 +4181,7 @@ name = "keeper-core"
 version = "0.8.30"
 dependencies = [
  "base64 0.22.1",
+ "blake3",
  "chrono",
  "flate2",
  "futures-util",

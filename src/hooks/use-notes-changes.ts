@@ -67,6 +67,7 @@ async function readWindow(vaultId: string): Promise<NoteListVm> {
       total: folder.notes.length,
       matched: folder.notes.length,
       offset: 0,
+      hidden: 0,
     };
   }
   const { limit } = notesListStore.getState();

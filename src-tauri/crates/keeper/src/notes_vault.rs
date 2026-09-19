@@ -54,6 +54,8 @@ use keeper_core::notes::index::{
     FIELD_DEVICE, FIELD_ORIGIN, INDEX_SCHEMA,
 };
 use keeper_core::notes::order;
+use keeper_core::notes::search_index::{NoteDoc, SearchIndex, SEARCH_DB_FILE};
+use keeper_core::notes::vm::NoteSearchStateVm;
 use keeper_core::notes::vm::{
     NoteAttachmentVm, NoteCadenceVm, NoteDiffVm, NoteHunkVm, NoteIndexProgressVm, NoteRevisionVm,
     NoteVaultVm,
@@ -149,7 +151,7 @@ impl Vault {
     /// `<vault>/.keeper` — created lazily, never at flag time, because an empty
     /// scaffold in someone's existing vault is the "keeper moved my stuff"
     /// failure FR-121 forbids.
-    fn keeper_dir(&self) -> PathBuf {
+    pub(crate) fn keeper_dir(&self) -> PathBuf {
         self.root.join(KEEPER_DIR)
     }
 }
@@ -162,6 +164,7 @@ struct Slot {
     index: watch::Receiver<Arc<IndexSnapshot>>,
     /// Cold-scan / rescan progress, for `notes_subscribe_index`.
     progress: watch::Receiver<NoteIndexProgressVm>,
+    search: watch::Receiver<NoteSearchStateVm>,
     /// Head provenance per vault-relative path, refreshed on every publish.
     /// Beside the snapshot rather than inside the pure index, because it is read
     /// from git and the core may not know git exists (AD-40).
@@ -180,6 +183,14 @@ enum Work {
     /// watcher tap, where a burst that outran the channel degrades to a slower
     /// correct answer rather than a lost update.
     Rescan,
+    Rebuild,
+    EmbeddingModelChanged,
+    EmbedTick,
+    Embedded {
+        generation: u64,
+        model: String,
+        rows: Result<Vec<(i64, String, Vec<f32>)>, keeper_core::bots::embed::EmbedError>,
+    },
     /// The provenance projection came back. Origin is a *git* fact the pure
     /// index cannot know, so it arrives as a second pass over the entry set:
     /// the reconciler stamps `keeper.origin` and `keeper.device` onto each
@@ -448,6 +459,20 @@ pub fn progress(id: &str) -> Option<NoteIndexProgressVm> {
         .map(|slot| slot.progress.borrow().clone())
 }
 
+pub fn subscribe_search(id: &str) -> Option<watch::Receiver<NoteSearchStateVm>> {
+    registry().get(id).map(|slot| slot.search.clone())
+}
+
+pub fn search_state(id: &str) -> Option<NoteSearchStateVm> {
+    registry().get(id).map(|slot| slot.search.borrow().clone())
+}
+
+pub fn embedding_model_changed() {
+    for slot in registry().values() {
+        let _ = slot.work.send(Work::EmbeddingModelChanged);
+    }
+}
+
 /// Head provenance per vault-relative path, for the row projection.
 pub fn heads(id: &str) -> Option<Arc<HashMap<String, HeadRevision>>> {
     registry().get(id).map(|slot| Arc::clone(&slot.heads))
@@ -504,7 +529,7 @@ pub fn set_recording_tags(session_id: &str, tags: &[String]) {
 /// repair and was documented as one. AD-100 put the folder's own configuration
 /// in there — `keeper.toml` and `keeper.<host>.toml`, which sync — so the whole
 /// directory is no longer safe to delete and this must never grow into a
-/// `remove_dir_all`. It removes `index.json` and nothing else: the trash is the
+/// `remove_dir_all`. It removes the model and search caches only: the trash is the
 /// user's recoverable deletions (NFR-30) and the `*.toml` files are their
 /// settings, and neither is a cache a rescan can regenerate.
 pub fn rebuild(id: &str) -> Result<(), NotesError> {
@@ -512,13 +537,7 @@ pub fn rebuild(id: &str) -> Result<(), NotesError> {
     let slot = guard
         .get(id)
         .ok_or_else(|| NotesError::VaultUnknown(id.to_owned()))?;
-    let cache = slot.vault.keeper_dir().join("index.json");
-    if let Err(error) = std::fs::remove_file(&cache) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(%error, "notes: could not drop the index cache; rescanning anyway");
-        }
-    }
-    let _ = slot.work.send(Work::Rescan);
+    let _ = slot.work.send(Work::Rebuild);
     Ok(())
 }
 
@@ -701,17 +720,38 @@ fn spawn_reconciler(app: &AppHandle, vault: Vault) -> Slot {
         total_estimate: 0,
         phase: PHASE_SCANNING.to_owned(),
     });
+    let (search_tx, search_rx) = watch::channel(NoteSearchStateVm {
+        vault_id: vault.id.clone(),
+        phase: "indexing".to_owned(),
+        indexed: 0,
+        total: 0,
+        embedded: 0,
+        embeddable: 0,
+        model: String::new(),
+        sentence: String::new(),
+    });
+    let sender = work_tx.downgrade();
     let slot = Slot {
         vault: vault.clone(),
         index: index_rx,
         progress: progress_rx,
+        search: search_rx,
         heads: Arc::new(HashMap::new()),
         work: work_tx,
         cadence: Cadence::default(),
     };
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        reconcile(handle, vault, work_rx, index_tx, progress_tx).await;
+        reconcile(
+            handle,
+            vault,
+            work_rx,
+            sender,
+            index_tx,
+            progress_tx,
+            search_tx,
+        )
+        .await;
     });
     slot
 }
@@ -721,11 +761,24 @@ async fn reconcile(
     app: AppHandle,
     vault: Vault,
     mut work: mpsc::UnboundedReceiver<Work>,
+    sender: mpsc::WeakUnboundedSender<Work>,
     index: watch::Sender<Arc<IndexSnapshot>>,
     progress: watch::Sender<NoteIndexProgressVm>,
+    search_progress: watch::Sender<NoteSearchStateVm>,
 ) {
     let mut state = ReconcilerState::default();
+    let search = Arc::new(Mutex::new(None));
+    let mut embedding = EmbeddingBackfill::default();
     cold_start(&app, &vault, &mut state, &index, &progress).await;
+    embedding.lexical_refused = !sync_search(
+        &vault,
+        &state,
+        &search,
+        &search_progress,
+        None,
+        embedding.lexical_refused,
+    )
+    .await;
 
     let mut coalescer = Coalescer::default();
     loop {
@@ -746,13 +799,169 @@ async fn reconcile(
                 }
                 if coalescer.is_due(Instant::now()) {
                     let batch = coalescer.take();
-                    apply_batch(&app, &vault, &mut state, &batch, &index).await;
+                    let changes = apply_batch(&app, &vault, &mut state, &batch, &index).await;
+                    if !changes.is_empty() {
+                        embedding.generation = embedding.generation.wrapping_add(1);
+                        embedding.complete = false;
+                        embedding.lexical_refused = !sync_search(
+                            &vault,
+                            &state,
+                            &search,
+                            &search_progress,
+                            Some(changes),
+                            embedding.lexical_refused,
+                        )
+                        .await;
+                    }
                 }
             }
-            Some(Work::Rescan) => {
+            Some(Work::Rescan | Work::Rebuild) => {
+                let rebuild = matches!(received, Some(Work::Rebuild));
+                if rebuild {
+                    embedding.refused = false;
+                    embedding.retry_at = None;
+                    let writer = Arc::clone(&search);
+                    let dir = vault.keeper_dir();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        *writer.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                        for name in [
+                            "index.json".to_owned(),
+                            SEARCH_DB_FILE.to_owned(),
+                            format!("{SEARCH_DB_FILE}-wal"),
+                            format!("{SEARCH_DB_FILE}-shm"),
+                        ] {
+                            let _ = std::fs::remove_file(dir.join(name));
+                        }
+                    })
+                    .await;
+                }
+                embedding.generation = embedding.generation.wrapping_add(1);
+                embedding.complete = false;
+                search_progress.send_modify(|vm| {
+                    vm.phase = "indexing".to_owned();
+                    vm.indexed = 0;
+                    vm.embedded = 0;
+                    vm.embeddable = 0;
+                });
                 coalescer.take();
                 state = ReconcilerState::default();
                 cold_start(&app, &vault, &mut state, &index, &progress).await;
+                embedding.lexical_refused = !sync_search(
+                    &vault,
+                    &state,
+                    &search,
+                    &search_progress,
+                    None,
+                    embedding.lexical_refused,
+                )
+                .await;
+            }
+            Some(Work::EmbeddingModelChanged) => {
+                // Keep the old request in flight marked running until it returns;
+                // its generation will be rejected, and no second batch overlaps it.
+                embedding = EmbeddingBackfill {
+                    generation: embedding.generation.wrapping_add(1),
+                    running: embedding.running,
+                    lexical_refused: embedding.lexical_refused,
+                    ..EmbeddingBackfill::default()
+                };
+                let writer = Arc::clone(&search);
+                let cleared = tokio::task::spawn_blocking(move || {
+                    writer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_mut()
+                        .is_none_or(|index| index.clear_vectors().is_ok())
+                })
+                .await
+                .unwrap_or(false);
+                if !cleared {
+                    tracing::warn!(vault = %vault.id, "notes: vector reset failed");
+                    embedding.refused = true;
+                }
+                search_progress.send_modify(|vm| {
+                    if embedding.lexical_refused {
+                        return;
+                    }
+                    vm.phase = if cleared { "words" } else { "refused" }.to_owned();
+                    if cleared {
+                        vm.embedded = 0;
+                    }
+                    vm.model.clear();
+                    vm.sentence = if cleared {
+                        String::new()
+                    } else {
+                        "Could not reset meaning search — rebuild the index.".to_owned()
+                    };
+                });
+            }
+            Some(Work::EmbedTick) => {
+                if coalescer.wait(Instant::now()).is_none() {
+                    embed_tick(&app, &search, &search_progress, &sender, &mut embedding).await;
+                }
+            }
+            Some(Work::Embedded {
+                generation,
+                model,
+                rows,
+            }) => {
+                embedding.running = false;
+                if generation != embedding.generation {
+                    continue;
+                }
+                match rows {
+                    Ok(rows) => {
+                        let writer = Arc::clone(&search);
+                        let progress = search_progress.clone();
+                        let stored = tokio::task::spawn_blocking(move || {
+                            let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.as_mut().map(|index| {
+                                let stored = index.put_vectors(&model, &rows);
+                                if stored.is_ok() {
+                                    publish_search_stats(index, &progress);
+                                }
+                                stored
+                            })
+                        })
+                        .await;
+                        match stored {
+                            Ok(Some(Ok(stored))) if stored > 0 => embedding.retry_at = None,
+                            Ok(Some(Ok(_))) => {
+                                embedding.retry_at = Some(Instant::now() + Duration::from_secs(30));
+                            }
+                            _ => {
+                                embedding.refused = true;
+                                search_progress.send_modify(|vm| {
+                                    if embedding.lexical_refused {
+                                        return;
+                                    }
+                                    vm.phase = "refused".to_owned();
+                                    vm.sentence =
+                                        "Could not store meaning search — rebuild the index."
+                                            .to_owned();
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        embedding.refused = !error.is_retryable();
+                        embedding.retry_at = error
+                            .is_retryable()
+                            .then(|| Instant::now() + Duration::from_secs(30));
+                        search_progress.send_modify(|vm| {
+                            if embedding.lexical_refused {
+                                return;
+                            }
+                            vm.phase = if error.is_retryable() {
+                                "words"
+                            } else {
+                                "refused"
+                            }
+                            .to_owned();
+                            vm.sentence = error.to_string();
+                        });
+                    }
+                }
             }
             Some(Work::Heads(heads)) => stamp_heads(&vault, &mut state, heads, &index),
             Some(Work::RecordingTags { session_id, tags }) => {
@@ -772,6 +981,331 @@ async fn reconcile(
             None => return,
         }
     }
+}
+
+type SearchWriter = Arc<Mutex<Option<SearchIndex>>>;
+
+enum SearchChange {
+    Replace(Box<IndexEntry>, String),
+    Remove(String),
+}
+
+#[derive(Default)]
+struct EmbeddingBackfill {
+    generation: u64,
+    running: bool,
+    refused: bool,
+    complete: bool,
+    lexical_refused: bool,
+    retry_at: Option<Instant>,
+    provider_revision: Option<keeper_core::bots::store::ProviderRow>,
+}
+
+fn publish_search_stats(index: &SearchIndex, progress: &watch::Sender<NoteSearchStateVm>) {
+    if let Ok(stats) = index.stats() {
+        progress.send_modify(|vm| {
+            vm.indexed = stats.notes;
+            vm.embedded = stats.vectors;
+            vm.embeddable = stats.chunks;
+            if vm.phase != "refused" {
+                vm.phase =
+                    if stats.vectors > 0 && stats.vectors == stats.chunks && !vm.model.is_empty() {
+                        "meaning"
+                    } else {
+                        "words"
+                    }
+                    .to_owned();
+            }
+        });
+    }
+}
+
+async fn sync_search(
+    vault: &Vault,
+    state: &ReconcilerState,
+    writer: &SearchWriter,
+    progress: &watch::Sender<NoteSearchStateVm>,
+    mut changes: Option<Vec<SearchChange>>,
+    lexical_refused: bool,
+) -> bool {
+    let cold = changes.is_none();
+    if let Some(changes) = changes.as_mut() {
+        let live: HashSet<&str> = state
+            .entries
+            .values()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        changes.retain(|change| match change {
+            SearchChange::Remove(id) => !live.contains(id.as_str()),
+            SearchChange::Replace(_, _) => true,
+        });
+    }
+    let entries = if cold {
+        state.entries.values().cloned().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let vault = vault.clone();
+    let writer = Arc::clone(writer);
+    let progress = progress.clone();
+    progress.send_modify(|vm| vm.total = u32::try_from(state.entries.len()).unwrap_or(u32::MAX));
+    tokio::task::spawn_blocking(move || {
+        let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            match SearchIndex::open(&vault.keeper_dir().join(SEARCH_DB_FILE), &vault.id) {
+                Ok(index) => *guard = Some(index),
+                Err(_) => {
+                    tracing::warn!(vault = %vault.id, "notes: search index open failed");
+                    progress.send_modify(|vm| {
+                        vm.phase = "refused".to_owned();
+                        vm.sentence = "Search index unavailable — rebuild the index.".to_owned();
+                    });
+                    return false;
+                }
+            }
+        }
+        let Some(index) = guard.as_mut() else { return false };
+        let stats = if cold { index.note_stats().unwrap_or_default() } else { HashMap::new() };
+        let mut failed = false;
+        let mut apply = |change| {
+            let result = match change {
+                SearchChange::Replace(entry, text) => {
+                    let (_, offset) = Frontmatter::parse(&text);
+                    let stat = format!("{}:{}:{}:{}", entry.size, entry.mtime_ns, entry.ino, entry.path);
+                    index.replace_note(&NoteDoc {
+                        id: &entry.id, path: &entry.path, title: &entry.title,
+                        tags: &entry.tags, fields: &entry.fields, body: &text[offset..],
+                        stat: Some(&stat),
+                    }).map(|_| ())
+                }
+                SearchChange::Remove(id) => index.remove_note(&id),
+            };
+            if result.is_err() {
+                tracing::warn!(vault = %vault.id, "notes: search index update failed");
+            }
+            result.is_ok()
+        };
+        if cold {
+            for (ordinal, entry) in entries.iter().enumerate() {
+                let stat = format!("{}:{}:{}:{}", entry.size, entry.mtime_ns, entry.ino, entry.path);
+                if stats.get(&entry.id) != Some(&stat) {
+                    if let Some(text) = read_bounded(&vault.join(&entry.path)) {
+                        failed |= !apply(SearchChange::Replace(Box::new(entry.clone()), text));
+                    } else {
+                        failed = true;
+                        tracing::warn!(vault = %vault.id, note = %entry.id, "notes: search source read failed");
+                    }
+                }
+                if ordinal % 32 == 0 {
+                    progress.send_modify(|vm| vm.indexed = u32::try_from(ordinal + 1).unwrap_or(u32::MAX));
+                }
+            }
+        } else {
+            for change in changes.unwrap_or_default() { failed |= !apply(change); }
+        }
+        if cold {
+            let ids = entries.into_iter().map(|entry| entry.id).collect();
+            if index.retain_notes(&ids).is_err() {
+                failed = true;
+                tracing::warn!(vault = %vault.id, "notes: search index pruning failed");
+            }
+        }
+        progress.send_modify(|vm| {
+            if !failed && !lexical_refused && vm.phase == "refused" { return; }
+            vm.phase = if failed { "refused" } else { "words" }.to_owned();
+            vm.sentence = if failed { "Search index update failed — rebuild the index.".to_owned() } else { String::new() };
+        });
+        publish_search_stats(index, &progress);
+        !failed
+    }).await.unwrap_or(false)
+}
+
+pub(crate) fn embedding_endpoint(
+    platform: &dyn Platform,
+    provider: &str,
+) -> Result<keeper_core::bots::Endpoint, String> {
+    use keeper_core::bots::{store, Endpoint};
+    let dir = platform
+        .data_dir()
+        .map_err(|_| "Could not read embedding settings.")?;
+    let row = store::get_provider(&dir, provider)
+        .map_err(|_| "Could not read the embedding provider.")?
+        .ok_or("Embedding provider is missing — choose one in Settings.")?;
+    let token = keeper_core::bots::resolve_token(platform, provider, None)
+        .map_err(|_| "Could not read the embedding provider credential.")?;
+    Ok(Endpoint::new(&row.provider, None, token))
+}
+
+pub(crate) fn embedding_client() -> Result<&'static reqwest::Client, &'static str> {
+    static CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
+        keeper_core::bots::http::client(keeper_core::bots::http::READ_TIMEOUT)
+            .map_err(|error| error.to_string())
+    });
+    CLIENT
+        .as_ref()
+        .map_err(|_| "Could not connect to the embedding provider.")
+}
+
+async fn embed_tick(
+    app: &AppHandle,
+    writer: &SearchWriter,
+    progress: &watch::Sender<NoteSearchStateVm>,
+    sender: &mpsc::WeakUnboundedSender<Work>,
+    backfill: &mut EmbeddingBackfill,
+) {
+    use keeper_core::bots::{embed, store};
+    if backfill.running
+        || backfill.complete
+        || backfill.lexical_refused
+        || backfill
+            .retry_at
+            .is_some_and(|deadline| Instant::now() < deadline)
+    {
+        return;
+    }
+    let state = app.state::<crate::ipc::AppState>();
+    let Ok(dir) = state.platform.data_dir() else {
+        return;
+    };
+    let Ok(Some(model)) = keeper_core::registry::get_embedding_model(&dir) else {
+        return;
+    };
+    // Re-read the configured row so editing/removing its endpoint retries a refusal.
+    let revision = store::get_provider(&dir, &model.provider).ok().flatten();
+    if revision != backfill.provider_revision {
+        backfill.generation = backfill.generation.wrapping_add(1);
+        backfill.provider_revision = revision;
+        backfill.refused = false;
+        backfill.complete = false;
+        backfill.retry_at = None;
+    }
+    if backfill.running || backfill.refused || backfill.complete {
+        return;
+    }
+    if backfill.provider_revision.is_none() {
+        backfill.refused = true;
+        progress.send_modify(|vm| {
+            vm.phase = "refused".to_owned();
+            vm.model = model.model.clone();
+            vm.sentence = "Embedding provider is missing — choose one in Settings.".to_owned();
+        });
+        return;
+    }
+    let writer = Arc::clone(writer);
+    let tag = model.model.clone();
+    let batch_progress = progress.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
+        let index = guard.as_mut()?;
+        let stats = index.stats().ok()?;
+        if stats.model.as_ref().is_some_and(|stored| stored != &tag) {
+            index.clear_vectors().ok()?;
+        }
+        publish_search_stats(index, &batch_progress);
+        index
+            .chunks_without_vectors(&tag, embed::EMBED_BATCH_MAX)
+            .ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(rows) = rows else {
+        progress.send_modify(|vm| {
+            vm.phase = "refused".to_owned();
+            vm.sentence = "Search index unavailable — rebuild the index.".to_owned();
+        });
+        backfill.refused = true;
+        return;
+    };
+    progress.send_modify(|vm| {
+        vm.model = model.model.clone();
+        vm.sentence.clear();
+        vm.phase = if vm.embedded > 0 && vm.embedded == vm.embeddable {
+            "meaning"
+        } else {
+            "words"
+        }
+        .to_owned();
+    });
+    if rows.is_empty() {
+        backfill.complete = true;
+        return;
+    }
+    let endpoint = match embedding_endpoint(state.platform.as_ref(), &model.provider) {
+        Ok(endpoint) => endpoint,
+        Err(sentence) => {
+            backfill.refused = true;
+            progress.send_modify(|vm| {
+                vm.phase = "refused".to_owned();
+                vm.sentence = sentence;
+            });
+            return;
+        }
+    };
+    let timeout = backfill
+        .provider_revision
+        .as_ref()
+        .and_then(|row| row.read_timeout_ms)
+        .filter(|ms| *ms > 0)
+        .map_or(keeper_core::bots::http::READ_TIMEOUT, |ms| {
+            Duration::from_millis(ms.unsigned_abs())
+        });
+    let client = match embedding_client() {
+        Ok(client) => client,
+        Err(_) => {
+            backfill.refused = true;
+            progress.send_modify(|vm| {
+                vm.phase = "refused".to_owned();
+                vm.sentence = "Could not connect to the embedding provider.".to_owned();
+            });
+            return;
+        }
+    };
+    let Some(sender) = sender.upgrade() else {
+        return;
+    };
+    let generation = backfill.generation;
+    backfill.running = true;
+    tauri::async_runtime::spawn(async move {
+        let inputs = rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "{}{}",
+                    embed::passage_prefix(&model.model),
+                    row.embedding_text
+                )
+            })
+            .collect();
+        let result = tokio::time::timeout(
+            timeout,
+            embed::embed(
+                client,
+                &endpoint,
+                embed::EmbedRequest {
+                    model: &model.model,
+                    inputs,
+                },
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(embed::EmbedError::Transport(
+                "Embedding request timed out.".to_owned(),
+            ))
+        })
+        .map(|vectors| {
+            rows.into_iter()
+                .zip(vectors)
+                .map(|(row, vector)| (row.rowid, row.text_hash, vector))
+                .collect()
+        });
+        let _ = sender.send(Work::Embedded {
+            generation,
+            model: model.model,
+            rows: result,
+        });
+    });
 }
 
 /// Everything the single mutator owns.
@@ -919,12 +1453,13 @@ async fn apply_batch(
     state: &mut ReconcilerState,
     batch: &[String],
     index: &watch::Sender<Arc<IndexSnapshot>>,
-) {
+) -> Vec<SearchChange> {
     if batch.is_empty() {
-        return;
+        return Vec::new();
     }
     let now = now_ms();
     let mut changed = false;
+    let mut changes = Vec::new();
     for rel in batch {
         // Attachments and other vault files are not notes. They still sync; they
         // are simply not index entries.
@@ -947,20 +1482,31 @@ async fn apply_batch(
                 let Some(text) = read_bounded(&absolute) else {
                     continue;
                 };
-                upsert(state, parse_note(rel, &stat, &text, now));
+                let entry = parse_note(rel, &stat, &text, now);
+                if let Some(old) = state.entries.get(rel).filter(|old| old.id != entry.id) {
+                    changes.push(SearchChange::Remove(old.id.clone()));
+                }
+                changes.push(SearchChange::Replace(Box::new(entry.clone()), text));
+                upsert(state, entry);
                 changed = true;
             }
             // Gone, or replaced by something that is not a regular file.
-            _ => changed |= remove(state, rel),
+            _ => {
+                if let Some(entry) = state.entries.get(rel) {
+                    changes.push(SearchChange::Remove(entry.id.clone()));
+                }
+                changed |= remove(state, rel);
+            }
         }
     }
     if !changed {
-        return;
+        return changes;
     }
     let moved = apply_orphan_flags(state);
     reapply(state, &moved);
     publish(app, vault, index, state.builder.snapshot());
     write_cache(vault, state);
+    changes
 }
 
 /// Absorb one changed note, keeping the inbound-link map true.
@@ -2737,6 +3283,9 @@ pub fn mark_dirty(vault_id: &str) {
 /// two schedulers over one git repository is how you get concurrent index locks.
 pub fn cadence_tick() {
     dispatch_cadence(false);
+    for slot in registry().values() {
+        let _ = slot.work.send(Work::EmbedTick);
+    }
 }
 
 /// Force every vault's outstanding work forward: the main window hiding, the
@@ -3152,6 +3701,70 @@ mod tests {
             snippet: String::new(),
             order: keeper_core::notes::order::NoteOrder::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn search_keeps_a_renamed_id_when_the_old_path_removal_arrives_last() {
+        let vault = test_vault("search-rename");
+        let text = "Taxes belong in the body, far from the note title.";
+        let mut original = entry("z.md", stat(text.len() as u64, 1, 1));
+        original.id = "stable-note".to_owned();
+        std::fs::write(vault.join("z.md"), text).expect("write source");
+        let mut state = ReconcilerState::default();
+        state
+            .entries
+            .insert(original.path.clone(), original.clone());
+        let writer = Arc::new(Mutex::new(None));
+        let (progress, _receiver) = watch::channel(NoteSearchStateVm {
+            vault_id: vault.id.clone(),
+            phase: "indexing".to_owned(),
+            indexed: 0,
+            total: 0,
+            embedded: 0,
+            embeddable: 0,
+            model: String::new(),
+            sentence: String::new(),
+        });
+        sync_search(&vault, &state, &writer, &progress, None, false).await;
+        let query = || {
+            SearchIndex::open_read_only(&vault.keeper_dir().join(SEARCH_DB_FILE))
+                .expect("read search")
+                .query("taxes", 10)
+                .expect("query")
+        };
+        assert_eq!(query()[0].note_id, "stable-note");
+
+        let mut renamed = original.clone();
+        renamed.path = "a.md".to_owned();
+        state.entries.clear();
+        state.entries.insert(renamed.path.clone(), renamed.clone());
+        sync_search(
+            &vault,
+            &state,
+            &writer,
+            &progress,
+            Some(vec![
+                SearchChange::Replace(Box::new(renamed), text.to_owned()),
+                SearchChange::Remove(original.id.clone()),
+            ]),
+            false,
+        )
+        .await;
+        assert_eq!(query()[0].note_id, "stable-note");
+
+        state.entries.clear();
+        sync_search(
+            &vault,
+            &state,
+            &writer,
+            &progress,
+            Some(vec![SearchChange::Remove(original.id)]),
+            false,
+        )
+        .await;
+        assert!(query().is_empty());
+        drop(writer);
+        std::fs::remove_dir_all(&vault.root).expect("remove vault");
     }
 
     /// Every predicate spelling reaches the panel, and each reaches it under

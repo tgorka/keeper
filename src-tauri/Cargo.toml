@@ -18,6 +18,7 @@ all = { level = "warn", priority = -1 }
 unwrap_used = "warn"
 
 [workspace.dependencies]
+blake3 = "1.8.5"
 # Tauri shell. The `tray-icon` feature backs the opt-in menu-bar presence (Story 10.3,
 # FR-53); the dock-badge port uses the in-core `set_badge_count` API (no extra feature).
 # The feature is desktop-only and is added by the `keeper` crate through a

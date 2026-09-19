@@ -41,6 +41,11 @@ serde_json = { workspace = true }
 # VM export step. Bindings dir is set by the workspace `TS_RS_EXPORT_DIR` env.
 ts-rs = { workspace = true }
 tokio = { workspace = true }
+# The one shared HTTP client the notes search uses to ask a provider for
+# embeddings (Epic 76, AD-264): a `LazyLock<reqwest::Client>` names the type
+# directly, so the crate needs the dependency by name; the version is the
+# workspace's and no new package enters the lock.
+reqwest = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
