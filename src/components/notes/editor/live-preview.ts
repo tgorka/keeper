@@ -25,6 +25,7 @@ import {
   Decoration,
   type DecorationSet,
   EditorView,
+  keymap,
   ViewPlugin,
   type ViewUpdate,
   WidgetType,
@@ -1181,6 +1182,58 @@ export const flashExternalEffect = StateEffect.define<{ from: number; to: number
 
 /** Drop every external highlight. */
 export const clearExternalFlashEffect = StateEffect.define<null>();
+
+export const setSearchMarks = StateEffect.define<ReadonlyArray<readonly [number, number]>>();
+export const clearSearchMarks = StateEffect.define<null>();
+
+export const searchMarksField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(value, transaction) {
+    let next = value.map(transaction.changes);
+    for (const effect of transaction.effects) {
+      if (effect.is(clearSearchMarks)) next = Decoration.none;
+      if (effect.is(setSearchMarks)) {
+        const ranges: Range<Decoration>[] = [];
+        for (const [from, to] of effect.value) {
+          if (
+            Number.isInteger(from) &&
+            Number.isInteger(to) &&
+            from >= 0 &&
+            from < to &&
+            to <= transaction.state.doc.length
+          ) {
+            ranges.push(Decoration.mark({ class: "cm-search-mark" }).range(from, to));
+          }
+        }
+        next = Decoration.set(ranges, true);
+      }
+    }
+    return next;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
+
+export function searchMarks(): Extension {
+  return [
+    searchMarksField,
+    keymap.of([
+      {
+        key: "Escape",
+        run: (view) => {
+          if (view.state.field(searchMarksField).size === 0) return false;
+          view.dispatch({ effects: clearSearchMarks.of(null) });
+          return true;
+        },
+      },
+    ]),
+    EditorView.baseTheme({
+      ".cm-search-mark": {
+        backgroundColor: "var(--search-highlight)",
+        color: "var(--search-highlight-foreground)",
+      },
+    }),
+  ];
+}
 
 const externalFlashField = StateField.define<DecorationSet>({
   create: () => Decoration.none,

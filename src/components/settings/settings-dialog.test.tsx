@@ -30,6 +30,16 @@ vi.mock("@/lib/ipc/client", () => ({
   incognitoSetGlobal: vi.fn(() => Promise.resolve()),
   notifyGetPreviewEnabled: vi.fn(() => Promise.resolve(true)),
   notifySetPreviewEnabled: vi.fn(() => Promise.resolve()),
+  // The Notes search section (Story 76.4 / 76.6): a name list and a model
+  // picker, both read on open.
+  notesServiceFileNamesGet: vi.fn(() =>
+    Promise.resolve(["index.md", "agents.md", "claude.md", "log.md"]),
+  ),
+  notesServiceFileNamesSet: vi.fn((names: string[]) => Promise.resolve(names)),
+  notesEmbeddingModelGet: vi.fn(() => Promise.resolve(null)),
+  notesEmbeddingModelSet: vi.fn(() => Promise.resolve()),
+  botsProvidersList: vi.fn(() => Promise.resolve([])),
+  botsModelsList: vi.fn(() => Promise.resolve([])),
   dockBadgeModeGet: vi.fn(() => Promise.resolve("all")),
   dockBadgeModeSet: vi.fn(() => Promise.resolve()),
   notificationPermissionState: vi.fn(() => Promise.resolve("granted")),

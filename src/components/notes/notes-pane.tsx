@@ -66,12 +66,15 @@ import { createNote, saveFilterAsSpace, useNotesActions } from "@/hooks/use-note
 import { useNotesChanges } from "@/hooks/use-notes-changes";
 import { countLabel, NOTES } from "@/lib/count-label";
 import type { NoteRowVm } from "@/lib/ipc/client";
+import { notesSubscribeSearch, notesUnsubscribeChanges } from "@/lib/ipc/client";
 import { columnFoldStore } from "@/lib/stores/column-fold";
 import {
   emptyFilterReason,
+  hydrateHideServiceFiles,
   isFiltered,
   isScopeOnly,
   notesFiltersStore,
+  persistHideServiceFiles,
   scopeLabel,
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
@@ -82,6 +85,7 @@ import {
   notesRailFoldStore,
   useNotesRailFold,
 } from "@/lib/stores/notes-rail-fold";
+import { notesSearchStateStore } from "@/lib/stores/notes-search-state";
 import {
   ensureNotesVaultsHydrated,
   useActiveVault,
@@ -150,7 +154,10 @@ export function NotesPane() {
   const rows = useNotesListStore((s) => s.rows);
   const total = useNotesListStore((s) => s.total);
   const matched = useNotesListStore((s) => s.matched);
+  const hidden = useNotesListStore((s) => s.hidden);
+  const count = `${countLabel(total, NOTES, { of: matched })}${hidden > 0 ? ` · ${hidden.toLocaleString()} hidden` : ""}`;
   const loaded = useNotesListStore((s) => s.loaded);
+  const searchError = useNotesListStore((s) => s.searchError);
   // Which rail sections are folded (Story 47.3). Read here so the folded
   // COLUMN's rail can open the section it names: unfolding the column into a
   // section the user left folded would be a control that lands you nowhere.
@@ -165,6 +172,7 @@ export function NotesPane() {
   // A verb's failure belongs to the surface that asked for it, so it is shown
   // here rather than swallowed or pushed into the read mirror.
   const [actionError, setActionError] = useState<string | null>(null);
+  const [visibilityReady, setVisibilityReady] = useState(false);
   // What Rust had to say about a create that succeeded and still did not do
   // what was asked — a note in a space whose query no new note can satisfy.
   // Separate from `actionError` because it is not a failure: the note exists,
@@ -191,7 +199,42 @@ export function NotesPane() {
 
   // The list mirror follows the active vault and the chip set; this is the only
   // thing in the view that reads or subscribes.
-  useNotesChanges(activeVaultId);
+  useNotesChanges(activeVaultId, visibilityReady);
+
+  useEffect(() => {
+    let cancelled = false;
+    void hydrateHideServiceFiles()
+      .catch((error: unknown) => {
+        if (!cancelled)
+          setActionError(syncErrorMessage(error, "Could not restore service-file visibility."));
+      })
+      .finally(() => {
+        if (!cancelled) setVisibilityReady(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (activeVaultId === null) return;
+    let cancelled = false;
+    let subscriptionId: string | null = null;
+    void notesSubscribeSearch(activeVaultId, (vm) => {
+      if (!cancelled && vm.vaultId === activeVaultId) notesSearchStateStore.getState().apply(vm);
+    })
+      .then((id) => {
+        if (cancelled) void notesUnsubscribeChanges(id);
+        else subscriptionId = id;
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setActionError(syncErrorMessage(error, "Search status is unavailable."));
+      });
+    return () => {
+      cancelled = true;
+      if (subscriptionId !== null) void notesUnsubscribeChanges(subscriptionId);
+    };
+  }, [activeVaultId]);
 
   // The palette's Open Note… and Search Notes both land here: the vault's one
   // find surface is the field, and routing both to it beats two entries that
@@ -205,6 +248,14 @@ export function NotesPane() {
   const report = useCallback((raw: unknown) => {
     setActionError(syncErrorMessage(raw, NOTES_ACTION_FAILED));
   }, []);
+
+  const onHideServiceFilesChange = useCallback(
+    (hidden: boolean) => {
+      setActionError(null);
+      void persistHideServiceFiles(hidden).catch(report);
+    },
+    [report],
+  );
 
   /**
    * Make a note and open it (FR-160, Story 44.6).
@@ -360,7 +411,7 @@ export function NotesPane() {
   let emptyKind: NotesEmptyKind | null = null;
   if (noVault) {
     emptyKind = "no-vault";
-  } else if (loaded && rows.length === 0 && !scanning) {
+  } else if (loaded && rows.length === 0 && !scanning && !searchError) {
     // "Nothing here" and "nothing matches" are different facts and get different
     // sentences; a search that matched nothing gets a third, because the way out
     // of it is the field rather than the chips, and an empty lens a fourth,
@@ -480,7 +531,7 @@ export function NotesPane() {
       id: "notes",
       icon: NotebookText,
       label: NOTES_RAIL_LIST_LABEL,
-      detail: loaded && !noVault ? countLabel(total, NOTES, { of: matched }) : null,
+      detail: loaded && !noVault && !searchError ? count : null,
       count: total,
       onSelect: () => columnFoldStore.getState().toggleColumn("notes-list"),
     },
@@ -585,21 +636,12 @@ export function NotesPane() {
         {list.chrome}
         {!list.folded && (
           <>
-            {!noVault && <NoteFilterBar onSaveAsSpace={onSaveAsSpace} searchRef={searchRef} />}
-            {/* A cold scan in flight, under the chip bar (FR-96, AD-57). The list
-                stays interactive throughout — you can open the first note before the
-                last one is found — so this is a thin bar and not a blocking state.
-                A corrupt cache takes the same branch as an absent one: a rescan,
-                never an error message. */}
-            {scanning && (
-              <div
-                role="status"
-                aria-label="Reading this vault"
-                data-slot="notes-index-progress"
-                className="h-0.5 w-full shrink-0 overflow-hidden bg-muted"
-              >
-                <div className="h-full w-1/3 bg-primary/60 motion-safe:animate-pulse" />
-              </div>
+            {!noVault && (
+              <NoteFilterBar
+                onSaveAsSpace={onSaveAsSpace}
+                searchRef={searchRef}
+                onHideServiceFilesChange={onHideServiceFilesChange}
+              />
             )}
             {actionError !== null && (
               <p role="alert" className="shrink-0 px-3 py-2 text-destructive text-xs">
@@ -632,16 +674,32 @@ export function NotesPane() {
 
                 `total` and never `rows.length`: the list is windowed and the page
                 is 200, so the array on screen is a screenful of a vault. */}
-            {!noVault && loaded && (
+            {!noVault && loaded && !searchError && (
               <p
                 role="status"
                 data-slot={NOTES_COUNT_SLOT}
                 className="shrink-0 border-border border-b px-3 py-1 text-muted-foreground text-xs"
               >
-                {countLabel(total, NOTES, { of: matched })}
+                <span className="whitespace-nowrap">
+                  {countLabel(total, NOTES, { of: matched })}
+                </span>
+                {hidden > 0 && (
+                  <span className="whitespace-nowrap">{` · ${hidden.toLocaleString()} hidden`}</span>
+                )}
               </p>
             )}
-            {emptyKind !== null ? (
+            {loaded && total === 0 && hidden > 0 ? (
+              <div className="flex flex-col items-center gap-2 p-4 text-sm">
+                <p>Matching notes are hidden by the service-file preference.</p>
+                <button
+                  type="button"
+                  className="underline"
+                  onClick={() => onHideServiceFilesChange(false)}
+                >
+                  Show service files
+                </button>
+              </div>
+            ) : emptyKind !== null ? (
               <NotesEmptyState kind={emptyKind} detail={emptyDetail} onAction={onEmptyAction} />
             ) : (
               <NoteList

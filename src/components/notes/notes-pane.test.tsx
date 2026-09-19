@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   NoteCreateReq,
@@ -58,12 +58,12 @@ function row(id: string, title: string, tags: string[]): NoteRowVm {
     id,
     path: `${id}.md`,
     // Empty on a row that IS a note; carried only by an outbound edge to a
-    hit: null,
     // target nobody has written yet (owner item 2).
     unresolvedTarget: "",
     predicates: [],
     title,
     snippet: `${title} body`,
+    hit: null,
     tags,
     updatedMs: 1_754_000_000_000,
     pinned: false,
@@ -285,6 +285,9 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     notesVaultSetActive: vi.fn(async (vaultId: string) => {
       activeVault = vaultId;
     }),
+    notesHideServiceFilesGet: vi.fn(async () => true),
+    notesHideServiceFilesSet: vi.fn(async () => {}),
+    notesSubscribeSearch: vi.fn(async () => "search-1"),
     notesList: vi.fn(async (vaultId: string, query: NoteQueryReq) => evaluate(vaultId, query)),
     notesTree: vi.fn(async () => ({ relDir: "", dirs: [], notes: [] })),
     notesTagTree: vi.fn(async () => ({ nodes: [] })),
@@ -337,10 +340,16 @@ import { COLUMN_RESIZER_LABEL } from "@/components/ui/resizable-columns";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { WINDOW_ROW_ATTR } from "@/components/ui/window-list";
 import { COLUMN_WIDTH_COOKIE, SURFACE_COLUMNS } from "@/lib/column-widths";
-import { notesCreate, notesDelete, notesDeletePlan } from "@/lib/ipc/client";
+import {
+  notesCreate,
+  notesDelete,
+  notesDeletePlan,
+  notesHideServiceFilesGet,
+  notesHideServiceFilesSet,
+} from "@/lib/ipc/client";
 import { COLUMN_FOLD_COOKIE, resetColumnFoldForTest } from "@/lib/stores/column-fold";
 import { notesFiltersStore, resetNotesFiltersStoreForTest } from "@/lib/stores/notes-filters";
-import { resetNotesListStoreForTest } from "@/lib/stores/notes-list";
+import { notesListStore, resetNotesListStoreForTest } from "@/lib/stores/notes-list";
 import {
   NOTES_RAIL_FOLD_COOKIE,
   notesRailFoldCookie,
@@ -1246,5 +1255,69 @@ describe("NotesPane — deleting from the list", () => {
     fireEvent.click(await screen.findByRole("button", { name: NOTE_DELETE_CONFIRM }));
 
     await waitFor(() => expect(notesDelete).toHaveBeenCalledWith("vault-a", "a1"));
+  });
+});
+
+describe("service visibility in the mounted pane", () => {
+  it("does not claim a complete count before visibility has been restored", async () => {
+    // ES2022 lacks Promise.withResolvers.
+    let release: (hidden: boolean) => void = () => {};
+    vi.mocked(notesHideServiceFilesGet).mockReturnValueOnce(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+    const { container } = renderPane();
+    expect(container.querySelector(`[data-slot="${NOTES_COUNT_SLOT}"]`)).toBeNull();
+    await act(async () => release(false));
+    await waitForRows("Pricing");
+    expect(
+      screen.getByRole("button", { name: "Hide service files", pressed: false }),
+    ).toBeVisible();
+    expect(container.querySelector(`[data-slot="${NOTES_COUNT_SLOT}"]`)).toHaveTextContent(
+      "4 notes",
+    );
+  });
+
+  it("restores the last eye choice and reports a refused change without pretending it saved", async () => {
+    vi.mocked(notesHideServiceFilesGet).mockResolvedValueOnce(false);
+    renderPane();
+    await waitForRows("Pricing");
+    const eye = await screen.findByRole("button", { name: "Hide service files", pressed: false });
+    vi.mocked(notesHideServiceFilesSet).mockRejectedValueOnce(new Error("disk full"));
+    fireEvent.click(eye);
+    await waitFor(() => expect(eye).toHaveAttribute("aria-pressed", "false"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("disk full");
+  });
+
+  it("uses Rust counts with singular, plural, cap and hidden clauses, never the mounted row count", async () => {
+    const { container } = renderPane();
+    await waitForRows("Pricing");
+    for (const [total, matched, hidden, expected] of [
+      [1, 1, 1, "1 note · 1 hidden"],
+      [0, 0, 2, "0 notes · 2 hidden"],
+      [1, 4, 2, "1 of 4 notes · 2 hidden"],
+      [2, 2, 0, "2 notes"],
+    ] as const) {
+      act(() => notesListStore.getState().reset({ rows: [], total, matched, hidden, offset: 0 }));
+      expect(container.querySelector(`[data-slot="${NOTES_COUNT_SLOT}"]`)?.textContent).toBe(
+        expected,
+      );
+    }
+  });
+
+  it("offers an escape from all-hidden results without clearing the search", async () => {
+    renderPane();
+    await waitForRows("Pricing");
+    fireEvent.change(screen.getByRole("searchbox", { name: NOTES_SEARCH_PLACEHOLDER }), {
+      target: { value: "Pricing" },
+    });
+    await waitForRows("Pricing");
+    act(() =>
+      notesListStore.getState().reset({ rows: [], total: 0, matched: 0, hidden: 2, offset: 0 }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Show service files" }));
+    expect(notesFiltersStore.getState().hideServiceFiles).toBe(false);
+    expect(notesFiltersStore.getState().text).toBe("Pricing");
   });
 });

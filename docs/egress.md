@@ -175,6 +175,15 @@ local notification posted by the app process with no trigger and no push
 (`crates/keeper/src/voice_notify.rs:175-193`, `UNUserNotificationCenter` in-process; no APNs,
 no token), so the row above is unchanged and no row is added.
 
+Since Epic 76 (AD-264, NFR-67) the notes search index can ask this same endpoint for
+**embeddings** — `POST /v1/embeddings` on the provider a person chose in Settings → Notes
+search, sent from `keeper-core::bots::embed` on the same client with the same host — and it is
+the *only* place a note's text ever leaves the process: one chunk of a note per input, in
+batches of at most 32, and never while no embedding model is chosen. keeper ships no model,
+downloads no weights, and adds no destination (huggingface.co and its kin are refused by D-4 and
+recorded as rejected in `research-notes-search-2026-09-19.md` §5); with no provider row there is
+no embedding, and search is words only. The row above is unchanged and no row is added.
+
 ## Screen recording adds no egress
 
 Screen recording (the macOS recording phase, Epics 16–20) is fully local: the `keeper-rec`

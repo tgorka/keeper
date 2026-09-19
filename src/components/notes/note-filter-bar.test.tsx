@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { createRef } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The bar reads the tag vocabulary when its chooser opens (Story 44.13); the
@@ -16,6 +17,10 @@ import {
   notesFiltersStore,
   resetNotesFiltersStoreForTest,
 } from "@/lib/stores/notes-filters";
+import { notesListStore, resetNotesListStoreForTest } from "@/lib/stores/notes-list";
+import { notesSearchStateStore } from "@/lib/stores/notes-search-state";
+import { notesVaultsStore } from "@/lib/stores/notes-vaults";
+import { settingsUiStore } from "@/lib/stores/settings-ui";
 
 const mockVocabulary = vi.mocked(tagsVocabulary);
 
@@ -31,6 +36,10 @@ const mockVocabulary = vi.mocked(tagsVocabulary);
  */
 beforeEach(() => {
   resetNotesFiltersStoreForTest();
+  resetNotesListStoreForTest();
+  settingsUiStore.getState().setSettingsOpen(false);
+  notesSearchStateStore.setState({ byVault: {} });
+  notesVaultsStore.setState({ activeVaultId: "v1" });
   mockVocabulary.mockReset();
   mockVocabulary.mockResolvedValue({
     entries: [
@@ -106,11 +115,11 @@ describe("the tag chip's three states", () => {
 
   it("offers Save as space once a chip is set, so an exclusion can be kept", () => {
     const { rerender } = render(bar());
-    expect(screen.queryByText("Save as space")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save as space" })).toBeNull();
 
     notesFiltersStore.getState().setTagTerm("draft", "exclude");
     rerender(bar());
-    expect(screen.getByText("Save as space")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save as space" })).toBeInTheDocument();
   });
 });
 
@@ -319,4 +328,152 @@ describe("adding a tag filter from the bar", () => {
 
     expect(mockVocabulary).not.toHaveBeenCalled();
   });
+});
+
+describe("icon bar search and visibility", () => {
+  it("keeps the eye out of Save and the Escape walk", () => {
+    render(bar());
+    const eye = screen.getByRole("button", { name: "Hide service files", pressed: true });
+    fireEvent.click(eye);
+    expect(screen.getByRole("button", { name: "Hide service files", pressed: false })).toBe(eye);
+    expect(screen.queryByRole("button", { name: "Save as space" })).toBeNull();
+    act(() => {
+      const state = notesFiltersStore.getState();
+      state.setScope({ kind: "folder", path: "projects" });
+      state.setTagTerm("work", "include");
+      state.setAgentOnly(true);
+      state.setPinnedOnly(true);
+      state.setText("budget");
+    });
+    const field = screen.getByRole("searchbox", { name: "Search this vault" });
+    for (const check of [
+      () => expect(notesFiltersStore.getState().text).toBe(""),
+      () => expect(notesFiltersStore.getState().pinnedOnly).toBe(false),
+      () => expect(notesFiltersStore.getState().agentOnly).toBe(false),
+      () => expect(notesFiltersStore.getState().tagTerms).toEqual([]),
+      () => expect(notesFiltersStore.getState().scope.kind).toBe("all"),
+    ]) {
+      fireEvent.keyDown(field, { key: "Escape" });
+      check();
+      expect(eye).toHaveAttribute("aria-pressed", "false");
+    }
+  });
+
+  it("keeps all six icon actions named and repeats each name in its tooltip", async () => {
+    notesFiltersStore.getState().setText("budget");
+    render(bar());
+    for (const name of [
+      "Add a tag filter",
+      "Changed by agent",
+      "Pinned only",
+      "Hide service files",
+      "Save as space",
+      "Clear search",
+    ]) {
+      const button = screen.getByRole("button", { name });
+      expect(button.textContent).toBe("");
+      act(() => button.focus());
+      expect((await screen.findByRole("tooltip")).textContent).toBe(name);
+      act(() => button.blur());
+      await waitFor(() => expect(screen.queryByRole("tooltip")).toBeNull());
+    }
+  });
+
+  it("focuses through searchRef and clears without leaving the field", () => {
+    notesFiltersStore.getState().setText("budget");
+    const searchRef = createRef<HTMLInputElement>();
+    render(<NoteFilterBar onSaveAsSpace={vi.fn()} searchRef={searchRef} />);
+    act(() => searchRef.current?.focus());
+    const field = screen.getByRole("searchbox", { name: "Search this vault" });
+    expect(field).toHaveFocus();
+    fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+    expect(field).toHaveValue("");
+    expect(field).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "Clear search" })).toBeNull();
+  });
+
+  it("announces indexing, then words, then meaning without a ready caption", () => {
+    const { container } = render(bar());
+    const state = {
+      vaultId: "v1",
+      phase: "indexing",
+      indexed: 2,
+      total: 5,
+      embedded: 0,
+      embeddable: 8,
+      model: "",
+      sentence: "",
+    };
+    act(() => notesSearchStateStore.getState().apply(state));
+    const field = screen.getByRole("searchbox", { name: "Search this vault" });
+    expect(field).toHaveAccessibleDescription("Indexing. Indexing 2/5 notes");
+    expect(screen.getByRole("status")).toHaveTextContent("Indexing 2/5");
+    act(() =>
+      notesSearchStateStore
+        .getState()
+        .apply({ ...state, phase: "words", indexed: 5, embeddable: 0 }),
+    );
+    expect(field).toHaveAccessibleDescription(/Words.*Meaning is off/);
+    expect(
+      screen.getByRole("button", {
+        name: "Meaning is off — choose an embedding model in Settings",
+      }),
+    ).toBeVisible();
+    act(() =>
+      notesSearchStateStore
+        .getState()
+        .apply({ ...state, phase: "meaning", model: "embed", embedded: 8 }),
+    );
+    expect(field).toHaveAccessibleDescription("Words + meaning");
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(container.querySelector('[data-slot="search-state-glyph"]')).toHaveAttribute(
+      "data-phase",
+      "Words + meaning",
+    );
+  });
+
+  it("renders no caption before search state arrives", () => {
+    render(bar());
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+});
+
+it("links a refused status to Settings and gives read failure precedence over progress", () => {
+  notesSearchStateStore.getState().apply({
+    vaultId: "v1",
+    phase: "refused",
+    indexed: 1,
+    total: 1,
+    embedded: 0,
+    embeddable: 2,
+    model: "embed",
+    sentence: "Provider cannot embed notes.",
+  });
+  render(bar());
+  fireEvent.click(screen.getByRole("button", { name: "Provider cannot embed notes. Settings" }));
+  expect(settingsUiStore.getState().settingsOpen).toBe(true);
+  act(() => {
+    notesFiltersStore.getState().setText("budget");
+    notesListStore.getState().failSearch("Search failed. Try again.");
+  });
+  expect(screen.getByRole("status")).toHaveTextContent("Search failed. Try again.");
+  expect(
+    screen.queryByRole("button", { name: "Provider cannot embed notes. Settings" }),
+  ).not.toBeInTheDocument();
+});
+
+it("shows full meaning backfill progress while the search mode remains words", () => {
+  notesSearchStateStore.getState().apply({
+    vaultId: "v1",
+    phase: "words",
+    indexed: 1,
+    total: 1,
+    embedded: 15,
+    embeddable: 500,
+    model: "embed",
+    sentence: "",
+  });
+  render(bar());
+  expect(screen.getByRole("status")).toHaveTextContent("Indexing meaning 15/500 chunks");
+  expect(screen.getByRole("searchbox")).toHaveAccessibleDescription(/Words/);
 });

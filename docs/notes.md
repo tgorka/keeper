@@ -32,6 +32,7 @@ because the sync engine already stamps every commit with its origin.
     attachments/                       # pasted and dropped files
     .keeper/                           # keeper's own cache. NEVER synced.
       index.json                       # the index cache — safe to delete
+      search.db                        # the search index (Epic 76) — derived, safe to delete
       trash/<id>/<original path>       # deleted notes, recoverable
     .obsidian/                         # yours. keeper never reads or writes it.
 ```
@@ -174,9 +175,29 @@ contracts, and neither surface borrowed the other's.
 `⌘F` finds inside the note you have open — the editor's own find, so it reaches text below
 the fold that the rendered view has not drawn yet, and `Enter`/`⇧Enter` walk the hits.
 
+**The list's search field searches the bodies** (Epic 76). Type a word and the list is
+re-ordered by relevance — FTS5 `bm25` over every note chunked heading by heading — with the
+matching words marked in each row's excerpt, and marked again in the note when you open it
+from that list. The marks go when the query goes, when you switch notes, or on `Esc` in the
+editor. Folding is keeper's own, so `łódź` finds `Łódź` and `notatke` finds `notatkę`; the
+last word you typed matches as a prefix, so the list narrows as you type.
+
+**Meaning, if you have a model.** Settings → Notes search lets you pick an embedding model
+from a provider you already configured (Ollama today; a model that advertises `embedding`).
+With one chosen, every chunk is embedded through that provider's `/v1/embeddings` — paced in
+the background, never blocking the list — and a query is answered by words and by meaning
+together: a note that says *taxes* can answer `podatki`. Such a row says *matched by meaning*
+and carries no marks, because there is no word to mark. With no model chosen search is words
+only and the bar says so. keeper ships no model and downloads none (D-4, D-21).
+
+**Service files.** The eye toggle in the bar hides `index.md`, `agents.md`, `claude.md` and
+`log.md` from the list — on by default, remembered across launches; the count line says how
+many it hid. The names are a setting (`notes.service_file_names`). A hidden note still opens
+from a link, still matches `⌘⇧F`, and is still in the Files tree.
+
 `⌘⇧F` searches everything at once: messages, notes and session files. It was the chat
 search shortcut and is now the search shortcut; a person who wants to find a sentence
-rarely remembers which surface they wrote it on.
+rarely remembers which surface they wrote it on. It reads the files, not the index.
 
 ## Capture
 
@@ -226,9 +247,10 @@ cannot complete becomes a journal row and is retried, so nothing here can block 
 a notes vault*.
 
 **The list is missing a note that is on disk.** The index is a cache and is allowed to be
-wrong. Delete `<vault>/.keeper/` and restart, or use *Rebuild index*. A cold scan of 10 000
-notes takes under five seconds; nothing is lost, because everything in the cache is derived
-from the files.
+wrong. Delete `<vault>/.keeper/` and restart, or use *Rebuild index* — which also deletes
+`search.db`, so search results and marks come back as the index is rebuilt. A cold scan of
+10 000 notes takes under five seconds; nothing is lost, because everything in the cache is
+derived from the files.
 
 **A note cannot be opened by its id.** Its frontmatter `id` is not a ULID — written by another
 tool, or hand-edited. keeper will not overwrite an id it did not write, so the note is indexed
@@ -252,6 +274,7 @@ and carries on. The tray item and the command palette still work.
 Table and board lenses over frontmatter fields, and torn-off sticky note windows. Both are
 specified (FR-123, FR-124) and scheduled; neither is implemented.
 
-Also deliberately out of scope this phase: vault encryption, a full-text search engine (the
-bounded parallel scan is never stale and is fast enough well past ten thousand notes), a
-plugin API, notes on the phone, and publishing a note into a Matrix room.
+Also deliberately out of scope this phase: vault encryption, a plugin API, notes on the phone,
+and publishing a note into a Matrix room. Full-text search, once listed here as out of scope,
+arrived with Epic 76 — see *Finding text* and D-21 in `docs/decisions.md` for what changed
+and what did not (the in-memory index is still the model; `search.db` is derived).

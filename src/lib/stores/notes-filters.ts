@@ -34,6 +34,7 @@
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
 import type { NoteQueryReq, NoteTagTerm } from "@/lib/ipc/client";
+import { notesHideServiceFilesGet, notesHideServiceFilesSet } from "@/lib/ipc/client";
 
 /**
  * What the list is scoped to — the sidebar row that is selected, or `all` when
@@ -190,12 +191,14 @@ export interface NotesFiltersState {
    * `include` and none of the `exclude`.
    */
   tagTerms: readonly TagChip[];
-  /** The search field's text — a content scan, not a name match (FR-118). */
+  /** The list's ranked full-text query. */
   text: string;
   /** The "Changed by agent" chip. */
   agentOnly: boolean;
   /** The "Pinned only" chip, independent of the Pinned scope row. */
   pinnedOnly: boolean;
+  /** Global viewing preference, deliberately not a chip or space predicate. */
+  hideServiceFiles: boolean;
   /**
    * A monotonic nonce bumped by the palette's Open Note… / Search Notes actions.
    * The search field's DOM node belongs to the pane that renders it, so rather
@@ -233,6 +236,7 @@ export interface NotesFiltersState {
   setAgentOnly: (on: boolean) => void;
   /** Set the "Pinned only" chip. */
   setPinnedOnly: (on: boolean) => void;
+  setHideServiceFiles: (hidden: boolean) => void;
   /**
    * Drop the trailing chip, walking the bar down one press at a time (the Esc
    * contract). Resolves in reverse bar order — pinned, then origin, then the
@@ -248,6 +252,45 @@ export interface NotesFiltersState {
   requestSearchFocus: () => void;
 }
 
+let visibilityRevision = 0;
+let acknowledgedVisibility = true;
+let visibilityWrites: Promise<void> = Promise.resolve();
+let visibilityHydration: Promise<void> | null = null;
+
+/** A read started before a click must not undo the person's newer choice. */
+export function hydrateHideServiceFiles(): Promise<void> {
+  visibilityHydration ??= (async () => {
+    const revision = visibilityRevision;
+    await visibilityWrites;
+    const value = await notesHideServiceFilesGet();
+    const hidden = typeof value === "boolean" ? value : true;
+    if (revision === visibilityRevision) {
+      acknowledgedVisibility = hidden;
+      notesFiltersStore.getState().setHideServiceFiles(hidden);
+    }
+  })();
+  return visibilityHydration;
+}
+
+/** Serialize dedicated preference writes; only the latest failure rolls back. */
+export function persistHideServiceFiles(hidden: boolean): Promise<void> {
+  notesFiltersStore.getState().setHideServiceFiles(hidden);
+  const revision = visibilityRevision;
+  const write = visibilityWrites.then(async () => {
+    try {
+      await notesHideServiceFilesSet(hidden);
+      acknowledgedVisibility = hidden;
+    } catch (error) {
+      if (revision === visibilityRevision) {
+        notesFiltersStore.getState().setHideServiceFiles(acknowledgedVisibility);
+      }
+      throw error;
+    }
+  });
+  visibilityWrites = write.catch(() => {});
+  return write;
+}
+
 /** The vanilla store instance, created once at module load and shared app-wide. */
 export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
   scope: ALL_NOTES_SCOPE,
@@ -255,6 +298,7 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
   text: "",
   agentOnly: false,
   pinnedOnly: false,
+  hideServiceFiles: true,
   searchNonce: 0,
   setScope: (scope) =>
     set((state) => ({
@@ -273,6 +317,10 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
   setText: (text) => set({ text }),
   setAgentOnly: (agentOnly) => set({ agentOnly }),
   setPinnedOnly: (pinnedOnly) => set({ pinnedOnly }),
+  setHideServiceFiles: (hideServiceFiles) => {
+    visibilityRevision += 1;
+    set({ hideServiceFiles });
+  },
   dropLastChip: () =>
     set((state) => {
       if (state.pinnedOnly) {
@@ -358,10 +406,8 @@ export function noteQueryFor(
     // The DSL's origin vocabulary: `agent` is a commit whose `Keeper-Source` is
     // `bot`. There is one chip because there is one question people ask of it.
     origin: state.agentOnly ? "agent" : null,
+    hideServiceFiles: state.hideServiceFiles,
     flags,
-    // The eye toggle arrives with the surface (Story 76.4); until then nothing
-    // is hidden, so a list without the control cannot hide what it cannot show.
-    hideServiceFiles: false,
     offset,
     limit,
   };
@@ -429,4 +475,8 @@ export function useNotesFiltersStore<T>(selector: (state: NotesFiltersState) => 
 /** Test-only reset: clear every chip and the search text. */
 export function resetNotesFiltersStoreForTest(): void {
   notesFiltersStore.getState().clearAll();
+  notesFiltersStore.getState().setHideServiceFiles(true);
+  acknowledgedVisibility = true;
+  visibilityWrites = Promise.resolve();
+  visibilityHydration = null;
 }

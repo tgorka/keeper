@@ -25,7 +25,7 @@ import { captureSheetStore } from "@/lib/stores/capture-sheet";
 import { detailStore } from "@/lib/stores/detail-ui";
 import { leadingDrawerStore } from "@/lib/stores/leading-drawer";
 import { resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
-import { resetNotesFiltersStoreForTest } from "@/lib/stores/notes-filters";
+import { notesFiltersStore, resetNotesFiltersStoreForTest } from "@/lib/stores/notes-filters";
 import { resetNotesListStoreForTest } from "@/lib/stores/notes-list";
 import { resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { resetPanelsStoreForTest } from "@/lib/stores/panels";
@@ -108,6 +108,9 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     voiceWakeGet: vi.fn(() => new Promise<never>(() => {})),
     // The notes reads.
     notesVaults: vi.fn(async () => [VAULT]),
+    notesHideServiceFilesGet: vi.fn(async () => true),
+    notesHideServiceFilesSet: vi.fn(async () => {}),
+    notesSubscribeSearch: vi.fn(async () => "search-1"),
     notesVaultActive: vi.fn(async () => VAULT.id),
     notesVaultSetActive: vi.fn(async () => {}),
     notesList: (vaultId: string, query: NoteQueryReq) => notesList(vaultId, query),
@@ -163,13 +166,13 @@ import {
 import { EXPORT_NOTE_LABEL } from "@/components/export/export-note-item";
 import { PhoneShell } from "@/components/layout/phone-shell";
 import { NOTE_ACTIONS_LABEL } from "@/components/notes/note-actions";
+import { NOTES_SEARCH_PLACEHOLDER } from "@/components/notes/note-filter-bar";
 import { NOTE_HISTORY_LABEL } from "@/components/notes/note-history-panel";
 import { NEW_NOTE_LABEL, NOTES_COUNT_SLOT } from "@/components/notes/notes-pane";
 import {
   NOTES_PHONE_BACK_TO_LIST,
   NOTES_PHONE_CAPTURE_LABEL,
   NOTES_PHONE_NOTE_SLOT,
-  NOTES_PHONE_SEARCH_LABEL,
 } from "@/components/notes/notes-phone-pane";
 import { NOTE_AUTOSAVE_IDLE_MS } from "@/hooks/use-notes-body";
 import { phoneRoutesView } from "@/lib/phone-surfaces";
@@ -275,7 +278,7 @@ beforeEach(() => {
     const rows = [DENTIST, GROCERIES].filter((candidate) =>
       candidate.title.toLowerCase().includes(needle),
     );
-    return { rows, total: rows.length, matched: rows.length, offset: 0, hidden: 0 };
+    return { rows, total: rows.length, matched: rows.length, hidden: 0, offset: 0 };
   });
   notesOpen.mockImplementation(async (_vault, noteId, onBatch) => {
     onBatch({
@@ -333,7 +336,7 @@ describe("the Notes view on the phone stack", () => {
     const notes = within(level as HTMLElement);
     expect(notes.getByRole("button", { name: "Back to Inbox" })).toBeVisible();
     expect(notes.getByRole("button", { name: `Vault ${VAULT.name}` })).toBeInTheDocument();
-    expect(notes.getByRole("searchbox", { name: NOTES_PHONE_SEARCH_LABEL })).toBeInTheDocument();
+    expect(notes.getByRole("searchbox", { name: NOTES_SEARCH_PLACEHOLDER })).toBeInTheDocument();
     expect(
       (level as HTMLElement).querySelector(`[data-slot="${NOTES_COUNT_SLOT}"]`),
     ).toHaveTextContent("2");
@@ -360,7 +363,7 @@ describe("the Notes view on the phone stack", () => {
   it("searches through Rust's own list query, never a client-side filter", async () => {
     render(<PhoneShell />);
     await openNotes();
-    const field = screen.getByRole("searchbox", { name: NOTES_PHONE_SEARCH_LABEL });
+    const field = screen.getByRole("searchbox", { name: NOTES_SEARCH_PLACEHOLDER });
     fireEvent.change(field, { target: { value: "dentist" } });
 
     await waitFor(() => {
@@ -373,6 +376,18 @@ describe("the Notes view on the phone stack", () => {
       expect(screen.queryByRole("button", { name: /Groceries/ })).toBeNull();
     });
     expect(screen.getByRole("button", { name: /Ring the dentist/ })).toBeInTheDocument();
+    act(() => notesFiltersStore.getState().requestSearchFocus());
+    expect(field).toHaveFocus();
+    for (const name of [
+      "Add a tag filter",
+      "Changed by agent",
+      "Pinned only",
+      "Hide service files",
+      "Save as space",
+      "Clear search",
+    ]) {
+      expect(screen.getByRole("button", { name })).toBeVisible();
+    }
   });
 
   it("opens a note rendered in the real editor at level 2, and back pops to the list", async () => {

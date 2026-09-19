@@ -39,8 +39,28 @@
  * clicked once — and a filter you can build but not keep trains people not to
  * build filters.
  */
-import { Minus, Plus, Search, X } from "lucide-react";
-import { type KeyboardEvent, type Ref, useEffect, useId, useRef, useState } from "react";
+import {
+  Bookmark,
+  Bot,
+  Eye,
+  EyeOff,
+  Loader,
+  Minus,
+  Pin,
+  Plus,
+  Search,
+  Sparkles,
+  X,
+} from "lucide-react";
+import {
+  type KeyboardEvent,
+  type Ref,
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
 import { TagCombobox } from "@/components/notes/tag-combobox";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -52,13 +72,14 @@ import {
   type TagChip,
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
+import { useNotesListStore } from "@/lib/stores/notes-list";
+import { useNotesSearchState } from "@/lib/stores/notes-search-state";
+import { useNotesVaultsStore } from "@/lib/stores/notes-vaults";
+import { settingsUiStore } from "@/lib/stores/settings-ui";
 import { cn } from "@/lib/utils";
 
 /** The chip bar's own tag chooser (Story 44.13). */
 export const ADD_TAG_FILTER = "Add a tag filter";
-
-/** The header caption under the search field, kept verbatim. */
-export const NOTES_SEARCH_POSTURE = "Searching the files, not an index";
 
 /** The search field's placeholder. */
 export const NOTES_SEARCH_PLACEHOLDER = "Search this vault";
@@ -168,21 +189,88 @@ export function TagFilterChip({
 export function NoteFilterBar({
   onSaveAsSpace,
   searchRef,
+  phone = false,
+  onHideServiceFilesChange,
 }: {
   /** Promote the current chip set to a space note (`⌘⇧S`, FR-105). */
   onSaveAsSpace: () => void;
   /** So `⌘F` and the palette's Search Notes can put the caret in the field. */
   searchRef?: Ref<HTMLInputElement>;
+  phone?: boolean;
+  onHideServiceFilesChange?: (hidden: boolean) => void;
 }) {
   const scope = useNotesFiltersStore((s) => s.scope);
   const tagTerms = useNotesFiltersStore((s) => s.tagTerms);
   const text = useNotesFiltersStore((s) => s.text);
   const agentOnly = useNotesFiltersStore((s) => s.agentOnly);
   const pinnedOnly = useNotesFiltersStore((s) => s.pinnedOnly);
+  const hideServiceFiles = useNotesFiltersStore((s) => s.hideServiceFiles);
+  const vaultId = useNotesVaultsStore((s) => s.activeVaultId);
+  const searchState = useNotesSearchState((s) => (vaultId ? s.byVault[vaultId] : undefined));
+  const searchError = useNotesListStore((s) => s.searchError);
   const fieldId = useId();
   const [adding, setAdding] = useState(false);
   const [vocabulary, setVocabulary] = useState<readonly string[]>([]);
   const addRef = useRef<HTMLButtonElement>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const settingsObserver = useRef<MutationObserver | null>(null);
+  useEffect(() => {
+    const unsubscribe = settingsUiStore.subscribe((state) => {
+      if (!state.settingsOpen) settingsObserver.current?.disconnect();
+    });
+    return () => {
+      unsubscribe();
+      settingsObserver.current?.disconnect();
+    };
+  }, []);
+  const attachSearchRef = useCallback(
+    (node: HTMLInputElement | null) => {
+      inputRef.current = node;
+      if (typeof searchRef === "function") searchRef(node);
+      else if (searchRef) searchRef.current = node;
+    },
+    [searchRef],
+  );
+
+  const indexing = searchState?.phase === "indexing";
+  const meaning = searchState?.phase === "meaning";
+  const Glyph = indexing ? Loader : meaning ? Sparkles : Search;
+  const mode = indexing ? "Indexing" : meaning ? "Words + meaning" : "Words";
+  const settingsLabel = "Meaning is off — choose an embedding model in Settings";
+  const meaningOff =
+    searchState?.phase === "words" &&
+    searchState.model === "" &&
+    (searchState.sentence === "" || searchState.sentence === settingsLabel);
+  const progress = indexing
+    ? `Indexing ${searchState.indexed.toLocaleString()}${searchState.total > 0 ? `/${searchState.total.toLocaleString()}` : ""} notes`
+    : searchState?.phase === "words" && searchState.embeddable > searchState.embedded
+      ? `Indexing meaning ${searchState.embedded.toLocaleString()}/${searchState.embeddable.toLocaleString()} chunks`
+      : "";
+  const failure = text.trim() ? searchError : null;
+  const status = failure || searchState?.sentence || progress || (meaningOff ? settingsLabel : "");
+  const target = phone ? "size-11" : "size-6";
+  const iconClass = cn(
+    target,
+    "shrink-0 p-0 text-muted-foreground aria-pressed:bg-accent aria-pressed:text-accent-foreground",
+  );
+
+  function openSearchSettings(): void {
+    settingsObserver.current?.disconnect();
+    const focus = () => {
+      const target = document.getElementById("notes-embedding-model");
+      if (!target) return false;
+      target.scrollIntoView({ block: "center" });
+      target.focus();
+      return true;
+    };
+    settingsUiStore.getState().setSettingsOpen(true);
+    if (!focus()) {
+      settingsObserver.current = new MutationObserver(() => {
+        if (focus()) settingsObserver.current?.disconnect();
+      });
+      settingsObserver.current.observe(document.body, { childList: true, subtree: true });
+    }
+  }
 
   // Read when the chooser opens rather than when the bar mounts: the bar is on
   // screen for the whole session and the vocabulary is only wanted for the few
@@ -237,90 +325,155 @@ export function NoteFilterBar({
   };
 
   return (
-    <div className="flex shrink-0 flex-col gap-2 border-border border-b px-3 py-2">
-      <div data-slot="filter-chip-bar" className="flex flex-wrap items-center gap-1">
-        {scope.kind !== "all" && (
-          <FilterChip
-            label={scopeLabel(scope)}
-            clearLabel={`Clear ${scopeLabel(scope)} scope`}
-            onClear={() => notesFiltersStore.getState().setScope(scope)}
-          />
-        )}
-        {tagTerms.map((chip) => (
-          <TagFilterChip
-            key={chip.tag}
-            chip={chip}
-            onCycle={(tag) => notesFiltersStore.getState().cycleTag(tag)}
-            onRemove={(tag) => notesFiltersStore.getState().removeTag(tag)}
-          />
-        ))}
-        {/* Sits with the tag chips, because it makes one. The bar's order —
-            scope, tags, origin, pinned — is what makes removing a chip a
-            muscle movement, and a chooser filed anywhere else would be a
-            second place to look for the tags. */}
-        <Button
-          ref={addRef}
-          type="button"
-          variant="ghost"
-          size="xs"
-          className="shrink-0 text-muted-foreground"
-          aria-expanded={adding}
-          onClick={() => (adding ? closeChooser() : setAdding(true))}
+    <div
+      data-slot="note-filter-bar"
+      data-tier={phone ? "phone" : "desktop"}
+      className={cn(
+        "flex min-w-0 shrink-0 flex-col gap-2 border-border border-b py-2",
+        phone ? "px-2" : "px-3",
+      )}
+    >
+      <div
+        data-slot="filter-chip-bar"
+        className={
+          phone
+            ? "grid min-w-0 grid-cols-[minmax(44px,1fr)_176px]"
+            : "flex min-w-0 items-start gap-1"
+        }
+        style={
+          phone ? { gridTemplateAreas: "'scope scope' 'chooser actions' 'tags tags'" } : undefined
+        }
+      >
+        <div
+          data-slot="filter-tag-lane"
+          className={
+            phone
+              ? "contents"
+              : "flex max-h-40 min-w-0 flex-1 flex-wrap items-start gap-1 overflow-y-auto"
+          }
         >
-          <Plus aria-hidden="true" className="size-3" />
-          {ADD_TAG_FILTER}
-        </Button>
-        {/* Story 49: two real toggles, drawn as two.
-
-            These were one-way controls. The button rendered only while the
-            filter was OFF and could only turn it on; turning it off happened on
-            a different control — a chip that took its place, with its own `✕`,
-            named something else. So the bar had two ways to say one fact, the
-            control moved on every press, and the only way back was to find the
-            thing that had replaced the thing you pressed. A toggle whose
-            off-switch is somewhere else is not a toggle.
-
-            One persistent control each, in one place, with one name in both
-            states — `aria-pressed` says which state it is in, and the pressed
-            paint is the chip's own `bg-accent`, so on it looks exactly like the
-            chip it replaces and off it looks like the control that makes one.
-            The name does not change with the state: a control renamed by its own
-            press is one that speech input cannot ask for twice (WCAG 2.5.3), and
-            `aria-pressed` already carries the difference exactly.
-
-            The Esc walk (`dropLastChip`) still clears them in the same order —
-            it reads the store, not the chips, and the store did not change. */}
-        <Button
-          type="button"
-          variant="ghost"
-          size="xs"
-          aria-pressed={agentOnly}
-          className="shrink-0 text-muted-foreground aria-pressed:bg-accent aria-pressed:text-accent-foreground"
-          onClick={() => notesFiltersStore.getState().setAgentOnly(!agentOnly)}
-        >
-          Changed by agent
-        </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="xs"
-          aria-pressed={pinnedOnly}
-          className="shrink-0 text-muted-foreground aria-pressed:bg-accent aria-pressed:text-accent-foreground"
-          onClick={() => notesFiltersStore.getState().setPinnedOnly(!pinnedOnly)}
-        >
-          Pinned only
-        </Button>
-        {savable && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="xs"
-            className="ml-auto shrink-0"
-            onClick={onSaveAsSpace}
+          {scope.kind !== "all" && (
+            <div
+              style={phone ? { gridArea: "scope" } : undefined}
+              className={cn(
+                "min-w-0 max-w-full [&>[data-slot=filter-chip]]:relative [&>[data-slot=filter-chip]]:block [&>[data-slot=filter-chip]]:truncate [&>[data-slot=filter-chip]>button]:absolute [&>[data-slot=filter-chip]>button]:top-0 [&>[data-slot=filter-chip]>button]:right-0 [&_svg]:mx-auto",
+                phone
+                  ? "mb-1 [&>[data-slot=filter-chip]]:h-11 [&>[data-slot=filter-chip]]:pr-12 [&>[data-slot=filter-chip]]:leading-10 [&_button]:size-11"
+                  : "[&>[data-slot=filter-chip]]:h-6 [&>[data-slot=filter-chip]]:pr-7 [&_button]:size-6",
+              )}
+            >
+              <FilterChip
+                label={scopeLabel(scope)}
+                clearLabel={`Clear ${scopeLabel(scope)} scope`}
+                onClear={() => notesFiltersStore.getState().setScope(scope)}
+              />
+            </div>
+          )}
+          <IconHint label={ADD_TAG_FILTER}>
+            <Button
+              ref={addRef}
+              type="button"
+              variant="ghost"
+              size={phone ? "icon" : "icon-xs"}
+              style={phone ? { gridArea: "chooser" } : undefined}
+              className={iconClass}
+              aria-label={ADD_TAG_FILTER}
+              aria-expanded={adding}
+              onClick={() => (adding ? closeChooser() : setAdding(true))}
+            >
+              <Plus aria-hidden="true" className="size-4" />
+            </Button>
+          </IconHint>
+          <div
+            data-slot="filter-tags"
+            style={phone ? { gridArea: "tags" } : undefined}
+            className={cn(
+              phone ? "flex max-h-40 min-w-0 flex-wrap gap-1 overflow-y-auto" : "contents",
+              "[&>[data-slot=filter-chip]]:min-w-0 [&>[data-slot=filter-chip]]:max-w-full [&>[data-slot=filter-chip]]:gap-0 [&>[data-slot=filter-chip]]:px-0 [&>[data-slot=filter-chip]]:py-0 [&_button:first-child]:block [&_button:first-child]:min-w-0 [&_button:first-child]:truncate [&_button:first-child]:px-1 [&_button:last-child]:shrink-0 [&_svg]:inline-block",
+              phone
+                ? "[&_button]:h-11 [&_button:first-child]:min-w-11 [&_button:last-child]:w-11"
+                : "[&_button]:h-6 [&_button:first-child]:min-w-6 [&_button:last-child]:w-6",
+            )}
           >
-            Save as space
-          </Button>
-        )}
+            {tagTerms.map((chip) => (
+              <TagFilterChip
+                key={chip.tag}
+                chip={chip}
+                onCycle={(tag) => notesFiltersStore.getState().cycleTag(tag)}
+                onRemove={(tag) => notesFiltersStore.getState().removeTag(tag)}
+              />
+            ))}
+          </div>
+        </div>
+        <div
+          data-slot="filter-actions"
+          style={phone ? { gridArea: "actions" } : undefined}
+          className={cn("flex shrink-0 flex-nowrap items-start", phone ? "gap-0" : "gap-1")}
+        >
+          <IconHint label="Changed by agent">
+            <Button
+              type="button"
+              variant="ghost"
+              size={phone ? "icon" : "icon-xs"}
+              className={iconClass}
+              aria-label="Changed by agent"
+              aria-pressed={agentOnly}
+              onClick={() => notesFiltersStore.getState().setAgentOnly(!agentOnly)}
+            >
+              <Bot aria-hidden="true" className="size-4" />
+            </Button>
+          </IconHint>
+          <IconHint label="Pinned only">
+            <Button
+              type="button"
+              variant="ghost"
+              size={phone ? "icon" : "icon-xs"}
+              className={iconClass}
+              aria-label="Pinned only"
+              aria-pressed={pinnedOnly}
+              onClick={() => notesFiltersStore.getState().setPinnedOnly(!pinnedOnly)}
+            >
+              <Pin aria-hidden="true" className="size-4" />
+            </Button>
+          </IconHint>
+          <IconHint label="Hide service files">
+            <Button
+              type="button"
+              variant="ghost"
+              size={phone ? "icon" : "icon-xs"}
+              className={iconClass}
+              aria-label="Hide service files"
+              aria-pressed={hideServiceFiles}
+              onClick={() =>
+                (onHideServiceFilesChange ?? notesFiltersStore.getState().setHideServiceFiles)(
+                  !hideServiceFiles,
+                )
+              }
+            >
+              {hideServiceFiles ? (
+                <EyeOff aria-hidden="true" className="size-4" />
+              ) : (
+                <Eye aria-hidden="true" className="size-4" />
+              )}
+            </Button>
+          </IconHint>
+          <span className={cn(target, "shrink-0")}>
+            {savable && (
+              <IconHint label="Save as space">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size={phone ? "icon" : "icon-xs"}
+                  className={iconClass}
+                  aria-label="Save as space"
+                  onClick={onSaveAsSpace}
+                >
+                  <Bookmark aria-hidden="true" className="size-4" />
+                </Button>
+              </IconHint>
+            )}
+          </span>
+        </div>
       </div>
       {adding && (
         <TagCombobox
@@ -337,23 +490,73 @@ export function NoteFilterBar({
           onDismiss={closeChooser}
         />
       )}
-      <div className="flex items-center gap-1.5">
-        <Search aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+      <div className="relative min-w-0">
+        <Glyph
+          aria-hidden="true"
+          data-slot="search-state-glyph"
+          data-phase={mode}
+          className="pointer-events-none absolute top-1/2 left-2 size-4 -translate-y-1/2 text-muted-foreground"
+        />
         <Input
-          ref={searchRef}
+          ref={attachSearchRef}
           id={fieldId}
           type="search"
           aria-label={NOTES_SEARCH_PLACEHOLDER}
+          aria-describedby={`${fieldId}-description`}
           placeholder={NOTES_SEARCH_PLACEHOLDER}
-          className="h-8"
+          className={cn(
+            "min-w-0 pl-8 [&::-webkit-search-cancel-button]:appearance-none",
+            phone ? "h-11 pr-12" : "h-8 pr-8",
+          )}
           value={text}
           onChange={(event) => notesFiltersStore.getState().setText(event.target.value)}
           onKeyDown={onSearchKeyDown}
         />
+        {text !== "" && (
+          <IconHint label="Clear search">
+            <Button
+              type="button"
+              variant="ghost"
+              size={phone ? "icon" : "icon-xs"}
+              aria-label="Clear search"
+              className={cn(iconClass, "absolute top-1/2 right-0 -translate-y-1/2")}
+              onClick={() => {
+                notesFiltersStore.getState().setText("");
+                inputRef.current?.focus();
+              }}
+            >
+              <X aria-hidden="true" className="size-4" />
+            </Button>
+          </IconHint>
+        )}
       </div>
-      {/* The same posture the archive search takes, and true in the same way:
-          there is no index to be stale, because the scan reads the files. */}
-      <p className="text-muted-foreground text-xs">{NOTES_SEARCH_POSTURE}</p>
+      <span id={`${fieldId}-description`} className="sr-only">
+        {mode}
+        {status ? `. ${status}` : ""}
+      </span>
+      {status !== "" && (
+        <div
+          role="status"
+          data-slot="notes-search-status"
+          className="min-w-0 text-muted-foreground text-xs"
+        >
+          {!failure && (meaningOff || searchState?.phase === "refused") ? (
+            <button
+              type="button"
+              aria-label={meaningOff ? settingsLabel : `${status} Settings`}
+              className="flex w-full min-w-0 items-center gap-1 text-left underline-offset-2 hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+              onClick={openSearchSettings}
+            >
+              <span className="truncate">
+                {meaningOff ? "Meaning is off — choose an embedding model in" : status}
+              </span>
+              <span className="shrink-0">Settings</span>
+            </button>
+          ) : (
+            <span className="block truncate">{status}</span>
+          )}
+        </div>
+      )}
     </div>
   );
 }
