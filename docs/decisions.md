@@ -1093,3 +1093,46 @@ volume, with one person and at most three clients on one Forgejo — and this is
   a second owner whose folder is not a git host's tenant.
 - **Status / owner:** decided. Owner is the architect; Epic 70 implements the cost model the
   decision assumes; NFR-23 (re-authored), NFR-61 and NFR-62 are the bars.
+
+## D-21 — A search index is derived and disposable; the model is still the files
+
+keeper's notes surface gains a per-vault search index — SQLite with FTS5 and f32 vectors, in
+`<vault>/.keeper/search.db` — and the in-memory index of the vault stays what it has been since
+epic 35: the only model, published over a `watch` channel, cached only advisorily. This is
+recorded here because it overturns a written position: AD-57 and `index.rs:1-10` rejected "a
+SQLite table beside `sync.db`" as "a cache-invalidation bug forever", and `docs/notes.md`
+listed "a full-text search engine" as deliberately out of scope because "the bounded parallel
+scan is never stale". Epic 76's triage of the owner's ask — rank by body, mark the words, find
+by meaning — found that none of the three can be computed by a bounded scan of ten thousand
+files inside the hundred milliseconds a keystroke allows, and this is the answer.
+
+- **What the index buys, for this owner:** a rank (FTS5 `bm25`), a match position (keeper's
+  own matcher over the raw text, so `ł` is `l` everywhere), a vector per chunk from the
+  provider the owner already runs, and a hybrid of the two with a floor under the semantic
+  half — none of which the scan can give and all of which the list needs to say *why* a note
+  is in it. (AD-261…AD-266; FR-563…FR-569; research §2, §3, §7, §8)
+- **What it costs, stated so nobody re-discovers it:** one more file the reconciler must keep
+  consistent with the files; a chunk table that is re-derived for every changed note; a vector
+  per chunk that is a provider round trip to re-derive after a model change; and the standing
+  rule that anything it says which the files do not is a bug in the reconciler, never a fact.
+  (`notes_vault.rs`; NFR-63, NFR-66, NFR-70)
+- **Why the staleness argument does not apply:** the index is fed by the same `Touched` and
+  `Rescan` deltas as the model, through the same `(size, mtime_ns, ino)` revalidation, so it
+  cannot be more stale than the list; it holds nothing a user did, so discarding it loses
+  nothing; and a schema or vault mismatch, or a rebuild, deletes it — a mismatch is a rescan,
+  never an error, which is AD-57's own rule applied to one more file. (AD-261)
+- **What stays where it was:** ⌘⇧F keeps reading the files; a space's `text:` keeps its
+  title-then-body read; the sessions surface keeps the shared matcher; `.keeper/` keeps its
+  Tier-0 exclusion so the index never reaches a commit. (AD-20, FR-121; DW-261)
+- **The assumptions this rests on, each falsifiable:** a personal vault stays under ~10⁵
+  chunks, so brute-force cosine is milliseconds (DW-262 names the threshold); the owner's
+  provider answers `/v1/embeddings` on a loopback host, so no egress row is added (D-4,
+  NFR-67); the reconciler remains the single writer per vault; the chunker's offsets are into
+  the editor's body, so a mark and a cursor share one coordinate system.
+- **Revisit triggers — any one reopens the store question, none reopens it otherwise:** a
+  vault past 10⁵ chunks with NFR-65 failing; a second writer to `search.db`; a provider kind
+  whose embeddings route is not OpenAI-shaped; a measured need for stemming (DW-260) that the
+  fold cannot meet; the owner asking for the search index to become the model (it must not,
+  and this entry says why).
+- **Status / owner:** decided. Owner is the architect; Epic 76 implements it; NFR-63…NFR-70
+  are the bars, measured on hesperia before any story closes.

@@ -6270,6 +6270,62 @@ location: `src/components/layout/tasks-pane.tsx:1178-1316` (the runs disclosure)
 reason: the epic's sixth story is specified (`spec-74-6-runs-are-a-list-you-can-open.md`) with its acceptance list, and deliberately not built in this pass. Runs now carry why-and-how-late and render it (74.5), but a run row is still not clickable, `sameTarget` still knows only `note|file|recording|task`, no run-detail surface exists, and a paced row still shows a cadence sentence rather than its configuration. The measured constraint the story must respect is in its spec: Tasks already spends four columns and ~1 470 px of the owner's 1 568, so the drill-down belongs in the panel strip and not in a fifth fixed column.
 status: open
 
+### DW-260: Polish stemming (Snowball `polish` via `frostem`) once its quality is measured.
+
+origin: epic 76's plan, 2026-09-19 (AD-263)
+location: `src-tauri/crates/keeper-core/src/notes/search_index.rs` (the fold step before FTS insert and before query build), `src-tauri/deny.toml` (frostem is BSD-3-Clause, on the allow-list)
+reason: FTS5's `porter` is English-only; Snowball upstream now ships `polish.sbl` and `frostem` exposes it as a pure-Rust feature, but no published evaluation of the stemmer exists (research §4, §12). Applying it to both sides of the fold is a one-line change once a measurement on the owner's vault says it helps more than it hurts (inflected forms of `notatka` are the test case). Prefix matching on the last word covers the type-ahead case today.
+status: open
+
+### DW-261: Serve ⌘⇧F search-everywhere from the search index.
+
+origin: epic 76's plan, 2026-09-19
+location: `src-tauri/crates/keeper/src/notes_ipc.rs:3390-3440` (`run_search`), `src/hooks/use-notes-search.ts`, `src/components/search/document-search-panel.tsx`
+reason: ⌘⇧F re-reads every file per query and streams unranked, index-ordered hits; once `search.db` exists it could answer the same panel ranked and in milliseconds. Kept out because the panel's contract — every line hit, streamed, "never stale (there is nothing to invalidate)" — is a different promise from the list's, and the sessions surface shares its matcher. Decide after 76.2 has been in the owner's hands.
+status: open
+
+### DW-262: An approximate-nearest-neighbour index when a vault passes 100 000 chunks.
+
+origin: epic 76's plan, 2026-09-19 (AD-265)
+location: `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`cosine_top_k`)
+reason: brute-force cosine over 50 000 vectors is single-digit milliseconds (research §7); the crossover where HNSW (`hnsw_rs`, pure Rust, MIT/Apache-2.0) pays for its build cost and its recall trade is well past any personal vault measured so far. The trigger is NFR-65's number failing on a real vault, not a feeling.
+status: open
+
+### DW-263: A reranker over the fused top-k.
+
+origin: epic 76's plan, 2026-09-19 (AD-265)
+location: `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`fuse`)
+reason: pi-knowledge's deep mode sends the top 30 to a cross-encoder; bge-m3's card recommends "hybrid retrieval + re-ranking". A reranker is a second model call per query on the provider's wire (the same D-4 route) and a second latency budget. Not before the floor and the weights have been measured on the owner's vault and found wanting.
+status: open
+
+### DW-264: Measure chunk overlap on the owner's vault before keeping AD-262's no-overlap rule for good.
+
+origin: epic 76's plan, 2026-09-19 (research §9.4)
+location: `src-tauri/crates/keeper-core/src/notes/chunk.rs`
+reason: Chroma's chunking evaluation found that zero overlap cost about five points of recall with a small embedding model, while pi-knowledge's dogfood found overlap produced near-duplicate retrieval units. AD-262 pins no overlap for the offset-integrity and de-duplication reasons; the recall side is a measurement nobody has taken on this vault. One constant and one test change if it turns out to matter.
+status: open
+
+### DW-265: A per-model query/passage prefix table for embeddings.
+
+origin: epic 76's plan, 2026-09-19 (research §6.3)
+location: `src-tauri/crates/keeper-core/src/bots/embed.rs`
+reason: E5 models want `query: ` / `passage: `, nomic wants `search_query: ` / `search_document: `, bge-m3 wants none, and keeper cannot read which convention a user's model follows. Story 76.6 ships a name-substring table for the three families the research names; every other model gets no prefix. A model whose family keeper does not recognise loses some recall silently — the table is the place a fourth family is added, and a settings-side override is the fuller answer.
+status: open
+
+### DW-266: A folder-scoped note list does not hide service files.
+
+origin: story 76.4, 2026-09-19
+location: `src/hooks/use-notes-changes.ts` (the folder-scope branch reads `notesTree`), `src-tauri/crates/keeper/src/notes_ipc.rs` (`notes_list`), `keeper-core/src/notes/vm.rs` (`NoteQueryReq`)
+reason: the hide toggle is applied in `notes_list`, but a list scoped to a folder is read through `notesTree`, which lists a directory and takes no `NoteQueryReq`; that branch shows service files and reports `hidden: 0`. Waived for the epic rather than re-matching file names in the frontend (Rust owns the predicate, AD-267). The fix is an optional `folder_path` on `NoteQueryReq` and the scope filter in `notes_list`, so the one path answers both scopes.
+status: open
+
+### DW-267: The fusion thresholds and the lexical pool are constants nobody has measured.
+
+origin: epic 76 review, 2026-09-19 (AD-265; review-core item 1, review-shell item 2)
+location: `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`MIN_MEANING_COSINE`, `MIN_HYBRID_SCORE`, `LEX_WEIGHT`/`VEC_WEIGHT`, `LEXICAL_POOL`)
+reason: the review found that min-max normalising the vector pool makes the best meaning-only chunk score 1.0 whatever its cosine, so the epic's "below any note that says the word" could not hold; the fix ranks by tier (both › words › meaning) and gates a meaning-only hit on a raw cosine floor of 0.5 — a number chosen without a measurement, on a scale that is model-dependent (e5 compresses everything into 0.7–0.9; nomic and bge-m3 spread wider). The lexical pool is 1 000 notes, so a word in more notes than that gives a count line that caps. Both are to be measured on the owner's vault with the model actually chosen, and the constants (or a per-model table) set from the measurement.
+status: open
+
 ## Triage of 2026-09-17
 
 Six read-only lanes verified every open entry of this ledger against the tree on 2026-09-17 (epic 73, story 73.5). This section is the triage's result; the next planning session reads this, not the six agent reports.
