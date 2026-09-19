@@ -36,6 +36,7 @@ import { settleNoteEditorBoot } from "@/test/note-editor-boot";
 const notesOpen =
   vi.fn<(v: string, n: string, on: (b: NoteBodyBatch) => void) => Promise<string>>();
 const notesRename = vi.fn<(v: string, n: string, title: string) => Promise<unknown>>();
+const notesNoteMarks = vi.fn(async () => ({ rev: "r0", ranges: [[2, 9]] as [number, number][] }));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn(async () => {}),
@@ -43,6 +44,7 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 
 vi.mock("@/lib/ipc/client", () => ({
   notesOpen: (v: string, n: string, on: (b: NoteBodyBatch) => void) => notesOpen(v, n, on),
+  notesNoteMarks: () => notesNoteMarks(),
   notesClose: vi.fn(async () => {}),
   notesSave: vi.fn(async () => ({ frontmatter: "", rev: "r1", path: "n.md", conflictCopy: null })),
   notesBufferReport: vi.fn(async () => {}),
@@ -77,6 +79,7 @@ import {
   markSaveFailed,
   resetNotesEditorStoreForTest,
 } from "@/lib/stores/notes-editor";
+import { notesFiltersStore } from "@/lib/stores/notes-filters";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
@@ -1204,5 +1207,83 @@ describe("a note's title, changed in the properties panel", () => {
     // would move a file because somebody corrected a typo in `owner:`.
     await waitFor(() => expect(field).toHaveValue("grace"));
     expect(notesRename).not.toHaveBeenCalled();
+  });
+});
+
+describe("persistent list marks", () => {
+  afterEach(() => {
+    notesFiltersStore.getState().setText("");
+  });
+  it("paints a current reply and clears when the query clears", async () => {
+    notesNoteMarks.mockResolvedValue({ rev: "r0", ranges: [[2, 9]] });
+    notesFiltersStore.getState().setText("Meeting");
+    await openEditor();
+    await settleNoteEditorBoot();
+    await waitFor(() =>
+      expect(document.querySelector(".cm-search-mark")).toHaveTextContent("Meeting"),
+    );
+    act(() => notesFiltersStore.getState().setText(""));
+    expect(document.querySelector(".cm-search-mark")).toBeNull();
+  });
+  it("does not paint a stale revision", async () => {
+    notesNoteMarks.mockResolvedValue({ rev: "older", ranges: [[2, 9]] });
+    notesFiltersStore.getState().setText("Meeting");
+    await openEditor();
+    await settleNoteEditorBoot();
+    await waitFor(() => expect(notesNoteMarks).toHaveBeenCalled());
+    expect(document.querySelector(".cm-search-mark")).toBeNull();
+  });
+  it("clears the first note and paints only the second note's ranges", async () => {
+    notesFiltersStore.getState().setText("word");
+    notesNoteMarks.mockResolvedValue({ rev: "r0", ranges: [[0, 3]] });
+    notesOpen.mockImplementation(async (_vault, note, onBatch) => {
+      onBatch({
+        kind: "reset",
+        text: note === "n1" ? "one word" : "two word",
+        frontmatter: "",
+        rev: "r0",
+        cursor: null,
+        path: `${note}.md`,
+      });
+      return `sub-${note}`;
+    });
+    const { rerender } = render(<NoteEditor vaultId="v1" noteId="n1" />);
+    await settleNoteEditorBoot();
+    await waitFor(() => expect(document.querySelector(".cm-search-mark")).toHaveTextContent("one"));
+    rerender(<NoteEditor vaultId="v1" noteId="n2" />);
+    await waitFor(() => expect(document.querySelector(".cm-search-mark")).toHaveTextContent("two"));
+    expect(document.querySelector(".cm-content")).not.toHaveTextContent("one");
+  });
+  it("keeps Escape-dismissed marks hidden through a refreshed body and trailing whitespace", async () => {
+    notesNoteMarks.mockResolvedValue({ rev: "r0", ranges: [[2, 9]] });
+    notesFiltersStore.getState().setText("Meeting");
+    await openEditor();
+    await settleNoteEditorBoot();
+    await waitFor(() =>
+      expect(document.querySelector(".cm-search-mark")).toHaveTextContent("Meeting"),
+    );
+    const content = document.querySelector(".cm-content");
+    if (!content) throw new Error("Editor missing");
+    fireEvent.keyDown(content, { key: "Escape" });
+    expect(document.querySelector(".cm-search-mark")).toBeNull();
+    const calls = notesNoteMarks.mock.calls.length;
+    await act(async () => {
+      notesFiltersStore.getState().setText("Meeting ");
+      notesOpen.mock.calls[notesOpen.mock.calls.length - 1]?.[2]({
+        kind: "reset",
+        text: `${BODY}\nAnother line`,
+        frontmatter: "",
+        rev: "r1",
+        cursor: null,
+        path: "n.md",
+      });
+    });
+    expect(notesNoteMarks).toHaveBeenCalledTimes(calls);
+    expect(document.querySelector(".cm-search-mark")).toBeNull();
+    notesNoteMarks.mockResolvedValue({ rev: "r1", ranges: [[2, 9]] });
+    act(() => notesFiltersStore.getState().setText("Meet"));
+    await waitFor(() =>
+      expect(document.querySelector(".cm-search-mark")).toHaveTextContent("Meeting"),
+    );
   });
 });

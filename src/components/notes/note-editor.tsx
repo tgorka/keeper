@@ -56,13 +56,20 @@ import {
   type NoteWriteVm,
   notesBodyRead,
   notesGallery,
+  notesNoteMarks,
   notesRename,
   notesTagTree,
   type PanelTargetVm,
 } from "@/lib/ipc/client";
 import { followExternalUrl, resolveWikilink } from "@/lib/notes/follow-link";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
-import { markSaved, readNoteDocument, useNoteDocument } from "@/lib/stores/notes-editor";
+import {
+  markSaved,
+  notesEditorStore,
+  readNoteDocument,
+  useNoteDocument,
+} from "@/lib/stores/notes-editor";
+import { notesFiltersStore } from "@/lib/stores/notes-filters";
 import { ensureNotesVaultsHydrated, useNotesVaultsStore } from "@/lib/stores/notes-vaults";
 import { panelsStore, usePanelsStore } from "@/lib/stores/panels";
 import { filePathForNote, SHOW_IN_FILES_LABEL, showNoteInFiles } from "@/lib/vault-link";
@@ -557,6 +564,8 @@ export function NoteEditor({
       // when this chunk happened to land — which, with a second editor beside
       // this one, is not necessarily this one.
       const opened = readNoteDocument(vaultId, noteId);
+      let marksGeneration = 0;
+      let dismissedQuery: string | null = null;
       const editorView = new view.EditorView({
         parent: host,
         state: state.EditorState.create({
@@ -644,6 +653,9 @@ export function NoteEditor({
                 return cachedTags;
               }),
             ]),
+            // Escape first closes Find, then simplifies a selection via the
+            // default keymap; with neither present, it dismisses list marks.
+            preview.searchMarks(),
             preview.livePreview({
               vaultId,
               assetUrl: (rel) =>
@@ -660,6 +672,16 @@ export function NoteEditor({
               listFolder: (folder) => notesGallery(vaultId, folder),
             }),
             view.EditorView.updateListener.of((update) => {
+              if (
+                update.transactions.some(
+                  (transaction) =>
+                    transaction.annotation(state.Transaction.remote) !== true &&
+                    transaction.effects.some((effect) => effect.is(preview.clearSearchMarks)),
+                )
+              ) {
+                marksGeneration += 1;
+                dismissedQuery = notesFiltersStore.getState().text.trim();
+              }
               if (!update.docChanged) {
                 return;
               }
@@ -703,6 +725,59 @@ export function NoteEditor({
               editorView.requestMeasure();
             });
       resizes?.observe(host);
+
+      const refreshMarks = () => {
+        const generation = ++marksGeneration;
+        editorView.dispatch({
+          effects: preview.clearSearchMarks.of(null),
+          annotations: state.Transaction.remote.of(true),
+        });
+        const query = notesFiltersStore.getState().text.trim();
+        const document = readNoteDocument(vaultId, noteId);
+        if (
+          !query.trim() ||
+          query === dismissedQuery ||
+          !document.rev ||
+          document.text !== document.base
+        )
+          return;
+        void notesNoteMarks(vaultId, noteId, query)
+          .then((reply) => {
+            const current = readNoteDocument(vaultId, noteId);
+            if (
+              disposed ||
+              generation !== marksGeneration ||
+              notesFiltersStore.getState().text.trim() !== query ||
+              reply.rev !== current.rev ||
+              current.text !== current.base ||
+              editorView.state.doc.toString() !== current.base
+            )
+              return;
+            editorView.dispatch({ effects: preview.setSearchMarks.of(reply.ranges) });
+          })
+          .catch(() => {});
+      };
+      const stopFilters = notesFiltersStore.subscribe((next, previous) => {
+        if (next.text.trim() !== previous.text.trim()) {
+          dismissedQuery = null;
+          refreshMarks();
+        }
+      });
+      let previousDocument = readNoteDocument(vaultId, noteId);
+      const stopDocument = notesEditorStore.subscribe(() => {
+        const current = readNoteDocument(vaultId, noteId);
+        if (current === previousDocument) return;
+        const changed =
+          current.rev !== previousDocument.rev ||
+          current.base !== previousDocument.base ||
+          current.text !== previousDocument.text;
+        previousDocument = current;
+        if (changed)
+          queueMicrotask(() => {
+            if (!disposed) refreshMarks();
+          });
+      });
+      refreshMarks();
 
       runtimeRef.current = {
         applyExternal: (text: string) => {
@@ -749,6 +824,9 @@ export function NoteEditor({
         },
         focus: () => editorView.focus(),
         destroy: () => {
+          marksGeneration += 1;
+          stopFilters();
+          stopDocument();
           resizes?.disconnect();
           editorView.destroy();
         },

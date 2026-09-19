@@ -1,15 +1,26 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { notesHideServiceFilesGet, notesHideServiceFilesSet } from "@/lib/ipc/client";
 import {
   emptyFilterReason,
+  hydrateHideServiceFiles,
   isFiltered,
+  isScopeOnly,
   noteQueryFor,
   notesFiltersStore,
+  persistHideServiceFiles,
   resetNotesFiltersStoreForTest,
   tagChipState,
 } from "@/lib/stores/notes-filters";
 
+vi.mock("@/lib/ipc/client", () => ({
+  notesHideServiceFilesGet: vi.fn(async () => true),
+  notesHideServiceFilesSet: vi.fn(async () => {}),
+}));
+
 beforeEach(() => {
   resetNotesFiltersStoreForTest();
+  vi.mocked(notesHideServiceFilesGet).mockReset().mockResolvedValue(true);
+  vi.mocked(notesHideServiceFilesSet).mockReset().mockResolvedValue();
 });
 
 /** The current chip states, which is what every assertion here is about. */
@@ -275,5 +286,59 @@ describe("emptyFilterReason", () => {
 
   it("says nothing when nothing is narrowing", () => {
     expect(emptyFilterReason(notesFiltersStore.getState())).toBeNull();
+  });
+});
+
+describe("service visibility is a preference, not a chip", () => {
+  it("sends the eye state without treating it as a savable filter", () => {
+    for (const hidden of [true, false]) {
+      notesFiltersStore.getState().setHideServiceFiles(hidden);
+      expect(noteQueryFor(notesFiltersStore.getState(), 0, 200).hideServiceFiles).toBe(hidden);
+      expect(isFiltered(notesFiltersStore.getState())).toBe(false);
+      expect(isScopeOnly(notesFiltersStore.getState())).toBe(true);
+      notesFiltersStore.getState().dropLastChip();
+      notesFiltersStore.getState().clearAll();
+      expect(notesFiltersStore.getState().hideServiceFiles).toBe(hidden);
+    }
+  });
+
+  it("ignores a hydrate started before the user's choice", async () => {
+    let resolve: (hidden: boolean) => void = () => {};
+    vi.mocked(notesHideServiceFilesGet).mockReturnValue(
+      new Promise((done) => {
+        resolve = done;
+      }),
+    );
+    const hydrate = hydrateHideServiceFiles();
+    await persistHideServiceFiles(false);
+    resolve(true);
+    await hydrate;
+    expect(notesFiltersStore.getState().hideServiceFiles).toBe(false);
+  });
+
+  it("restores the acknowledged choice when the latest write fails", async () => {
+    vi.mocked(notesHideServiceFilesGet).mockResolvedValue(false);
+    await hydrateHideServiceFiles();
+    vi.mocked(notesHideServiceFilesSet).mockRejectedValue(new Error("disk full"));
+    await expect(persistHideServiceFiles(true)).rejects.toThrow("disk full");
+    expect(notesFiltersStore.getState().hideServiceFiles).toBe(false);
+  });
+
+  it("serializes fast presses so the final acknowledged choice wins", async () => {
+    let release: () => void = () => {};
+    vi.mocked(notesHideServiceFilesSet).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    const first = persistHideServiceFiles(false);
+    const second = persistHideServiceFiles(true);
+    await Promise.resolve();
+    expect(notesHideServiceFilesSet).toHaveBeenCalledTimes(1);
+    release();
+    await Promise.all([first, second]);
+    expect(vi.mocked(notesHideServiceFilesSet).mock.calls).toEqual([[false], [true]]);
+    expect(notesFiltersStore.getState().hideServiceFiles).toBe(true);
   });
 });

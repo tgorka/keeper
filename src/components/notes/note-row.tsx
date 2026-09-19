@@ -67,7 +67,7 @@
  * accessibility regression.
  */
 import { AlertTriangle, Pin } from "lucide-react";
-import type { Ref } from "react";
+import type { ReactNode, Ref } from "react";
 import { NOTE_DELETE_LABEL } from "@/components/notes/note-actions";
 import {
   ContextMenu,
@@ -81,10 +81,35 @@ import { HoverHint } from "@/components/ui/tooltip";
 import { useLongPress } from "@/hooks/use-long-press";
 import { formatDraftAge } from "@/lib/format-time";
 import type { NoteOrder, NoteRowVm } from "@/lib/ipc/client";
+import { markRuns } from "@/lib/mark-runs";
 import { cn } from "@/lib/utils";
 
 /** How many tag chips a row shows before it collapses the rest into `+n`. */
 const VISIBLE_TAGS = 3;
+
+/**
+ * The search excerpt as text runs, matched runs wrapped in `<mark>`. Keyed by
+ * the run's offset into the excerpt: runs never reorder, so the offset is the
+ * identity an index only pretends to be. A hit matched by meaning alone has no
+ * runs to mark (AD-265).
+ */
+function markedRuns(hit: NonNullable<NoteRowVm["hit"]>): ReactNode[] {
+  let offset = 0;
+  return markRuns(hit.snippet, hit.why === "meaning" ? [] : hit.marks).map((run) => {
+    const at = offset;
+    offset += run.text.length;
+    return run.marked ? (
+      <mark
+        key={at}
+        className="bg-[var(--search-highlight)] text-[var(--search-highlight-foreground)]"
+      >
+        {run.text}
+      </mark>
+    ) : (
+      run.text
+    );
+  });
+}
 
 /** The accessible name of the `+n` chip, suffixed with the count. Named so a
  * test and a screen reader agree on what the affordance is. */
@@ -196,8 +221,9 @@ export function NoteRow({
   // dispatches the synthetic `contextmenu` the Radix trigger is already
   // listening for. Off the phone tier every handler is a no-op.
   const longPress = useLongPress();
-  const shownTags = row.tags.slice(0, VISIBLE_TAGS);
-  const hiddenTags = row.tags.slice(VISIBLE_TAGS);
+  const visibleTags = row.hit ? 0 : VISIBLE_TAGS;
+  const shownTags = row.tags.slice(0, visibleTags);
+  const hiddenTags = row.tags.slice(visibleTags);
   const overflow = hiddenTags.length;
   // The accessible name puts state before content, but only where state changes
   // what the row MEANS — which for an unread, agent-touched note it does.
@@ -209,7 +235,8 @@ export function NoteRow({
     row.conflict ? "conflicted" : null,
     row.pinned ? "pinned" : null,
     row.tags.length > 0 ? `${row.tags.length} tags` : null,
-    noteOrderLabel(row.order),
+    row.hit ? row.hit.snippet : noteOrderLabel(row.order),
+    row.hit?.why === "meaning" ? "matched by meaning" : null,
   ]
     .filter((part) => part !== null)
     .join(", ");
@@ -290,31 +317,40 @@ export function NoteRow({
               Set in the register's mono face: this is a column of figures read
               down rather than across, and it only reads as a column if the
               digits are the same width in every row. */}
-          <span
-            data-slot="note-order"
-            data-order-source={row.order.source}
-            className={cn(
-              "ml-auto shrink-0 font-mono text-xs",
-              row.order.source === "own" && "text-foreground",
-              // A note that never stated a position is quieter than one that
-              // did: a column of identical defaults should read as "nobody
-              // ordered these", not as data. Quieter is a step down the text
-              // ramp, not a step through it — this number is still the fact the
-              // sort used, so it stays at the 4.5:1 metadata tone rather than
-              // being faded below it.
-              row.order.source === "default" && "text-muted-foreground",
-              row.order.source === "unreadable" && "text-destructive",
-            )}
-          >
-            {formatNoteOrder(row.order)}
-          </span>
+          {!row.hit && (
+            <span
+              data-slot="note-order"
+              data-order-source={row.order.source}
+              className={cn(
+                "ml-auto shrink-0 font-mono text-xs",
+                row.order.source === "own" && "text-foreground",
+                // A note that never stated a position is quieter than one that
+                // did: a column of identical defaults should read as "nobody
+                // ordered these", not as data. Quieter is a step down the text
+                // ramp, not a step through it — this number is still the fact the
+                // sort used, so it stays at the 4.5:1 metadata tone rather than
+                // being faded below it.
+                row.order.source === "default" && "text-muted-foreground",
+                row.order.source === "unreadable" && "text-destructive",
+              )}
+            >
+              {formatNoteOrder(row.order)}
+            </span>
+          )}
           <span className="figures shrink-0 text-muted-foreground text-xs">
             {formatDraftAge(row.updatedMs)}
           </span>
         </span>
         <span className="flex min-w-0 items-center gap-1.5">
+          {row.hit?.why === "meaning" && (
+            <span className="shrink-0 text-muted-foreground text-xs">matched by meaning</span>
+          )}
           <span className="min-w-0 flex-1 truncate text-muted-foreground text-xs">
-            {row.unread && row.origin !== "" ? row.origin : row.snippet}
+            {row.hit
+              ? markedRuns(row.hit)
+              : row.unread && row.origin !== ""
+                ? row.origin
+                : row.snippet}
           </span>
           {shownTags.map((tag) => (
             // A real button, not a styled span: it changes what the list shows,
@@ -387,7 +423,7 @@ export function NoteRow({
   // never the one that removes the note.
   return (
     <ContextMenu>
-      <HoverHint label={row.title} detail={row.snippet}>
+      <HoverHint label={row.title} detail={row.hit?.snippet ?? row.snippet}>
         <ContextMenuTrigger asChild>{rowButton}</ContextMenuTrigger>
       </HoverHint>
       <ContextMenuContent>

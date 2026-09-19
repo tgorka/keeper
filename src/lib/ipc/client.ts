@@ -138,6 +138,7 @@ export type { EditVersionVm } from "./gen/EditVersionVm";
 export type { Effect } from "./gen/Effect";
 export type { EgressEndpointVm } from "./gen/EgressEndpointVm";
 export type { EgressKind } from "./gen/EgressKind";
+export type { EmbeddingModelVm } from "./gen/EmbeddingModelVm";
 export type { EncryptionStatus } from "./gen/EncryptionStatus";
 export type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 export type { ExportPhase } from "./gen/ExportPhase";
@@ -201,11 +202,13 @@ export type { NoteFolderVm } from "./gen/NoteFolderVm";
 export type { NoteGalleryItemVm } from "./gen/NoteGalleryItemVm";
 export type { NoteGalleryScope } from "./gen/NoteGalleryScope";
 export type { NoteGalleryVm } from "./gen/NoteGalleryVm";
+export type { NoteHitVm } from "./gen/NoteHitVm";
 export type { NoteHunkVm } from "./gen/NoteHunkVm";
 export type { NoteIndexProgressVm } from "./gen/NoteIndexProgressVm";
 export type { NoteLinkTargetVm } from "./gen/NoteLinkTargetVm";
 export type { NoteListOp } from "./gen/NoteListOp";
 export type { NoteListVm } from "./gen/NoteListVm";
+export type { NoteMarksVm } from "./gen/NoteMarksVm";
 export type { NoteOrder } from "./gen/NoteOrder";
 export type { NoteOrderSource } from "./gen/NoteOrderSource";
 export type { NoteQueryCheckVm } from "./gen/NoteQueryCheckVm";
@@ -216,6 +219,7 @@ export type { NoteRowVm } from "./gen/NoteRowVm";
 export type { NoteSearchBatch } from "./gen/NoteSearchBatch";
 export type { NoteSearchHitVm } from "./gen/NoteSearchHitVm";
 export type { NoteSearchReq } from "./gen/NoteSearchReq";
+export type { NoteSearchStateVm } from "./gen/NoteSearchStateVm";
 export type { NoteSpaceFieldVm } from "./gen/NoteSpaceFieldVm";
 export type { NoteSpaceReq } from "./gen/NoteSpaceReq";
 export type { NoteSpaceTagVm } from "./gen/NoteSpaceTagVm";
@@ -424,6 +428,7 @@ import type { CopyJobVm } from "./gen/CopyJobVm";
 import type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
 import type { DraftMirrorBatch } from "./gen/DraftMirrorBatch";
 import type { EditVersionVm } from "./gen/EditVersionVm";
+import type { EmbeddingModelVm } from "./gen/EmbeddingModelVm";
 import type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 import type { ExportProgressVm } from "./gen/ExportProgressVm";
 import type { ExportRequestVm } from "./gen/ExportRequestVm";
@@ -455,6 +460,7 @@ import type { NoteGalleryVm } from "./gen/NoteGalleryVm";
 import type { NoteIndexProgressVm } from "./gen/NoteIndexProgressVm";
 import type { NoteLinkTargetVm } from "./gen/NoteLinkTargetVm";
 import type { NoteListVm } from "./gen/NoteListVm";
+import type { NoteMarksVm } from "./gen/NoteMarksVm";
 import type { NoteQueryCheckVm } from "./gen/NoteQueryCheckVm";
 import type { NoteQueryReq } from "./gen/NoteQueryReq";
 import type { NoteRefVm } from "./gen/NoteRefVm";
@@ -462,6 +468,7 @@ import type { NoteRevisionVm } from "./gen/NoteRevisionVm";
 import type { NoteRowVm } from "./gen/NoteRowVm";
 import type { NoteSearchBatch } from "./gen/NoteSearchBatch";
 import type { NoteSearchReq } from "./gen/NoteSearchReq";
+import type { NoteSearchStateVm } from "./gen/NoteSearchStateVm";
 import type { NoteSpaceReq } from "./gen/NoteSpaceReq";
 import type { NoteSpaceTermsVm } from "./gen/NoteSpaceTermsVm";
 import type { NoteSpaceVm } from "./gen/NoteSpaceVm";
@@ -5279,6 +5286,47 @@ export async function notesSubscribeIndex(
   onProgress: (progress: NoteIndexProgressVm) => void,
 ): Promise<string> {
   return await subscribeWithStringId<NoteIndexProgressVm>("notes_subscribe_index", onProgress, {
+    vaultId,
+  });
+}
+
+export async function notesNoteMarks(
+  vaultId: string,
+  noteId: string,
+  query: string,
+): Promise<NoteMarksVm> {
+  return await invoke<NoteMarksVm>("notes_note_marks", { vaultId, noteId, query });
+}
+
+export async function notesServiceFileNamesGet(): Promise<string[]> {
+  return await invoke<string[]>("notes_service_file_names_get");
+}
+
+export async function notesServiceFileNamesSet(names: string[]): Promise<void> {
+  return await invoke<void>("notes_service_file_names_set", { names });
+}
+
+export async function notesHideServiceFilesGet(): Promise<boolean> {
+  return await invoke<boolean>("notes_hide_service_files_get");
+}
+
+export async function notesHideServiceFilesSet(hidden: boolean): Promise<void> {
+  return await invoke<void>("notes_hide_service_files_set", { hidden });
+}
+
+export async function notesEmbeddingModelGet(): Promise<EmbeddingModelVm | null> {
+  return await invoke<EmbeddingModelVm | null>("notes_embedding_model_get");
+}
+
+export async function notesEmbeddingModelSet(model: EmbeddingModelVm | null): Promise<void> {
+  return await invoke<void>("notes_embedding_model_set", { model });
+}
+
+export async function notesSubscribeSearch(
+  vaultId: string,
+  onState: (state: NoteSearchStateVm) => void,
+): Promise<string> {
+  return await subscribeWithStringId<NoteSearchStateVm>("notes_subscribe_search", onState, {
     vaultId,
   });
 }

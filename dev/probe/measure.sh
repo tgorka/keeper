@@ -11,6 +11,7 @@
 # CHROME defaults to the macOS install path; override it anywhere else.
 # `--use-mock-keychain` because Chrome otherwise blocks on a login-keychain
 # prompt that no headless run can answer.
+# PROBE_ENTRY selects a different real-component page (e.g. notes-filter.html).
 set -eu
 
 CHROME="${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
@@ -25,7 +26,7 @@ for w in $WIDTHS; do
   rm -f "$file"
   "$CHROME" --headless=new --window-size="$w",900 --user-data-dir="/tmp/probe-ud-$w" \
     --no-first-run --disable-gpu --use-mock-keychain --disable-extensions \
-    "http://127.0.0.1:8133/dev/probe/index.html?label=$LABEL-$w&$QUERY" \
+    "http://127.0.0.1:8133/dev/probe/${PROBE_ENTRY:-index.html}?label=$LABEL-$w&width=$w&$QUERY" \
     >/dev/null 2>&1 &
   pid=$!
   waited=0
