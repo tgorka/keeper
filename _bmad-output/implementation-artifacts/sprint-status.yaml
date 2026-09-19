@@ -50,6 +50,9 @@ story_location: _bmad-output/implementation-artifacts
 development_status:
   # Epic 76: the owner's four-paragraph note on note-list search — words, marks, meaning, service files, icons — triaged before planning.
   # Stack publication is reserved for the coordinator by this checkout's rules.
+  # Stack (bottom → top): #371 epic76/plan (docs only) → #372 epic76/search-index (keeper-core + shell wire, the rung the
+  # macOS CI job actually compiles) → #373 epic76/search-surface (React). #372 is what unblocks the rest; the shell crate
+  # in it was written by inspection on Linux. final_revision stamps land in a chore(bmad) PR after the merge.
   epic-76: in-progress
   76-1-a-search-index-beside-the-model: review
   76-2-a-list-that-ranks-and-marks-what-matched: review
