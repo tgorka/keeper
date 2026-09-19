@@ -1322,6 +1322,102 @@ pub fn set_active_vault(data_dir: &Path, vault_id: &str) -> Result<(), CoreError
     set_setting(data_dir, NOTES_ACTIVE_VAULT_KEY, vault_id)
 }
 
+const NOTES_SERVICE_FILE_NAMES_KEY: &str = "notes.service_file_names";
+const NOTES_HIDE_SERVICE_FILES_KEY: &str = "notes.hide_service_files";
+const NOTES_EMBEDDING_MODEL_KEY: &str = "notes.embedding_model";
+
+fn normalized_service_file_names(names: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    for name in names {
+        let name = name.trim();
+        if name.is_empty() || name.contains(['/', '\\']) {
+            continue;
+        }
+        let name = name.to_lowercase();
+        if !result.contains(&name) {
+            result.push(name);
+        }
+    }
+    result
+}
+
+/// Service-file basenames (AD-267). Absent or corrupt ⇒ the documented defaults;
+/// an explicitly empty array remains empty, so hiding can match nothing.
+pub fn get_service_file_names(data_dir: &Path) -> Result<Vec<String>, CoreError> {
+    if let Some(raw) = get_setting(data_dir, NOTES_SERVICE_FILE_NAMES_KEY)? {
+        match serde_json::from_str::<Vec<String>>(&raw) {
+            Ok(names) => return Ok(normalized_service_file_names(&names)),
+            Err(error) => {
+                tracing::warn!(%error, "service-file names are malformed; using defaults")
+            }
+        }
+    }
+    Ok(crate::notes::service_files::DEFAULT_SERVICE_FILE_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect())
+}
+
+/// Store names, not paths: trim, lowercase and keep each basename once.
+pub fn set_service_file_names(data_dir: &Path, names: &[String]) -> Result<(), CoreError> {
+    let raw = serde_json::to_string(&normalized_service_file_names(names))
+        .map_err(|error| CoreError::Internal(error.to_string()))?;
+    set_setting(data_dir, NOTES_SERVICE_FILE_NAMES_KEY, &raw)
+}
+
+/// The last visibility choice, initially hiding service files.
+pub fn get_hide_service_files(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, NOTES_HIDE_SERVICE_FILES_KEY)?.as_deref() != Some("0"))
+}
+
+pub fn set_hide_service_files(data_dir: &Path, hidden: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        NOTES_HIDE_SERVICE_FILES_KEY,
+        if hidden { "1" } else { "0" },
+    )
+}
+
+/// A configured provider's model, never a model downloaded by keeper (AD-264).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EmbeddingModel {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Blank or corrupt means words only; the provider is resolved by the caller.
+pub fn get_embedding_model(data_dir: &Path) -> Result<Option<EmbeddingModel>, CoreError> {
+    let Some(raw) =
+        get_setting(data_dir, NOTES_EMBEDDING_MODEL_KEY)?.filter(|raw| !raw.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    match serde_json::from_str::<EmbeddingModel>(&raw) {
+        Ok(model) => Ok(Some(model).filter(valid_embedding_model)),
+        Err(error) => {
+            tracing::warn!(%error, "embedding model is malformed; using words only");
+            Ok(None)
+        }
+    }
+}
+
+pub fn set_embedding_model(
+    data_dir: &Path,
+    model: Option<EmbeddingModel>,
+) -> Result<(), CoreError> {
+    let raw = match model.filter(valid_embedding_model) {
+        Some(model) => {
+            serde_json::to_string(&model).map_err(|error| CoreError::Internal(error.to_string()))?
+        }
+        None => String::new(),
+    };
+    set_setting(data_dir, NOTES_EMBEDDING_MODEL_KEY, &raw)
+}
+
+fn valid_embedding_model(model: &EmbeddingModel) -> bool {
+    !model.provider.trim().is_empty() && !model.model.trim().is_empty()
+}
+
 /// The `settings` key prefix recording which note one quick-capture window is
 /// holding (Phase 5, FR-101; Story 45.14): `notes.capture_draft.<key>`.
 ///
@@ -2416,6 +2512,78 @@ pub fn get_account(data_dir: &Path, account_id: &str) -> Result<Option<AccountRo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_file_names_default_corrupt_and_normalized_round_trip() {
+        let dir = temp_dir();
+        let defaults = crate::notes::service_files::DEFAULT_SERVICE_FILE_NAMES.map(str::to_owned);
+        assert_eq!(get_service_file_names(&dir).expect("default"), defaults);
+        for raw in ["{not-json", "[1]", "null"] {
+            set_setting(&dir, NOTES_SERVICE_FILE_NAMES_KEY, raw).expect("seed corrupt");
+            assert_eq!(get_service_file_names(&dir).expect("fallback"), defaults);
+        }
+        let names = [
+            " Log.MD ",
+            "log.md",
+            "",
+            "   ",
+            "docs/log.md",
+            "docs\\log.md",
+            "Agents.md",
+        ]
+        .map(str::to_owned);
+        set_service_file_names(&dir, &names).expect("set names");
+        assert_eq!(
+            get_service_file_names(&dir).expect("read names"),
+            ["log.md", "agents.md"]
+        );
+        set_service_file_names(&dir, &[]).expect("empty names");
+        assert!(get_service_file_names(&dir).expect("read empty").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hide_service_files_defaults_on_and_remembers_both_choices() {
+        let dir = temp_dir();
+        assert!(get_hide_service_files(&dir).expect("default"));
+        set_hide_service_files(&dir, false).expect("show");
+        assert!(!get_hide_service_files(&dir).expect("reopen hidden setting"));
+        set_hide_service_files(&dir, true).expect("hide");
+        assert!(get_hide_service_files(&dir).expect("reopen hidden setting"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn embedding_model_round_trips_and_clears_to_words_only() {
+        let dir = temp_dir();
+        assert_eq!(get_embedding_model(&dir).expect("default"), None);
+        let model = EmbeddingModel {
+            provider: "local".into(),
+            model: "bge-m3".into(),
+        };
+        set_embedding_model(&dir, Some(model.clone())).expect("choose");
+        assert_eq!(get_embedding_model(&dir).expect("read"), Some(model));
+        set_embedding_model(&dir, None).expect("clear");
+        assert_eq!(get_embedding_model(&dir).expect("cleared"), None);
+        set_setting(&dir, NOTES_EMBEDDING_MODEL_KEY, "{bad").expect("corrupt");
+        assert_eq!(get_embedding_model(&dir).expect("corrupt fallback"), None);
+        for (provider, model) in [("", "m"), ("p", " \n"), (" ", "")] {
+            let blank = EmbeddingModel {
+                provider: provider.into(),
+                model: model.into(),
+            };
+            set_setting(
+                &dir,
+                NOTES_EMBEDDING_MODEL_KEY,
+                &serde_json::to_string(&blank).expect("json"),
+            )
+            .expect("raw blank");
+            assert_eq!(get_embedding_model(&dir).expect("blank read"), None);
+            set_embedding_model(&dir, Some(blank)).expect("blank write");
+            assert_eq!(get_embedding_model(&dir).expect("blank roundtrip"), None);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A scratch directory no other test can land in.
     ///

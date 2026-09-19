@@ -209,6 +209,7 @@ const MODEL: BotModelVm = {
   vision: false,
   tools: true,
   reasoning: false,
+  embedding: null,
   capabilities: ["completion", "tools"],
 };
 

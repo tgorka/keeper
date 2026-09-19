@@ -64,6 +64,8 @@ file-controlled instead, and says which file.
 | | | | | On-disk event and error logging. Read before anything else at boot, so a file can turn it on for the boot that goes wrong. |
 | `incognito.global` | user-global | boolean (`1`/`0`) | `0` | `"incognito.global" = true` |
 | | | | | Suppress read receipts and typing notifications everywhere. |
+| `notes.service_file_names` | user-global | JSON | `["index.md","agents.md","claude.md","log.md"]` | `"notes.service_file_names" = '["index.md","agents.md","claude.md","log.md"]'` |
+| | | | | File names the notes list treats as service files, in every folder and regardless of case. |
 | `notify.previews_enabled` | user-global | boolean (`1`/`0`) | `1` | `"notify.previews_enabled" = false` |
 | | | | | Whether native notifications include the message body. |
 | `notify.dnd_global` | user-global | boolean (`1`/`0`) | `0` | `"notify.dnd_global" = true` |
@@ -144,6 +146,8 @@ Not preferences. keeper writes these and reads them back, so a file entry would 
 | Key | Shape | What it holds | Why no file sets it |
 | --- | --- | --- | --- |
 | `sdk_encryption` | boolean (`on`/`off`) | At-rest encryption posture for the local matrix-sdk store; absent means unchosen, which is what gates the first-run question. | the posture is keyed to a per-account passphrase in this machine's Keychain, so flipping it is a re-key of the local store, not a toggle |
+| `notes.hide_service_files` | boolean (`1`/`0`) | Whether the notes list is hiding service files. | it remembers the person's last choice in the notes list |
+| `notes.embedding_model` | JSON | The provider and model chosen for meaning search; blank keeps search words-only. | the model is chosen from the configured providers in Settings |
 | `notes.capture_draft.<…>` | JSON | Per capture window: the note it holds and the body creation gave it. | it points at the note one live capture window is holding, and is cleared the moment that thought is filed |
 | `notes.capture_placement.<…>` | text | Per capture window: its remembered position and size, whether it floats above other applications, and whether the lock is on. | it is what a person last did to one capture window — dragged it, resized it, pinned it above other applications or locked it — rewritten on every dismissal |
 | `notes.read.<…>` | text | Per note: the revision this device has acknowledged. | it is this device's record of which revision of a note it has already shown you, and it must never travel — that is what makes an edit from the other machine unread |

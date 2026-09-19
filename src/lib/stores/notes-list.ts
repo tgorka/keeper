@@ -57,10 +57,14 @@ export interface NotesListState {
    * Equal to `total` unless a cap bit.
    */
   matched: number;
+  /** Matching notes withheld by service visibility, before paging/caps. */
+  hidden: number;
   /** Where this window starts in the filtered set. */
   offset: number;
   /** Whether a first list read has landed. */
   loaded: boolean;
+  searchError: string | null;
+  failSearch: (sentence: string) => void;
   /**
    * How many rows the window currently asks Rust for. It GROWS rather than
    * paging, and the whole window is re-read at the new size: appending pages
@@ -84,16 +88,21 @@ export const notesListStore = createStore<NotesListState>()((set) => ({
   rows: [],
   total: 0,
   matched: 0,
+  hidden: 0,
   offset: 0,
   loaded: false,
+  searchError: null,
+  failSearch: (searchError) => set({ rows: [], total: 0, matched: 0, hidden: 0, searchError }),
   limit: NOTES_PAGE_SIZE,
   reset: (vm) =>
     set({
       rows: vm.rows,
       total: vm.total,
       matched: vm.matched,
+      hidden: vm.hidden,
       offset: vm.offset,
       loaded: true,
+      searchError: null,
     }),
   applyBatch: (batch) =>
     set((state) => {
@@ -142,7 +151,14 @@ export const notesListStore = createStore<NotesListState>()((set) => ({
       // is open is the panel list's business now (Story 45.1), not this
       // mirror's, and the row simply stops being listed (UX-DR41) — a list that
       // closed the editor would move the user's place on every agent write.
-      return { rows, total: batch.total, matched: batch.matched, loaded: true };
+      return {
+        rows,
+        total: batch.total,
+        matched: batch.matched,
+        hidden: batch.hidden,
+        loaded: true,
+        searchError: null,
+      };
     }),
   growWindow: () => set((state) => ({ limit: state.limit + NOTES_PAGE_SIZE })),
   clear: () =>
@@ -150,8 +166,10 @@ export const notesListStore = createStore<NotesListState>()((set) => ({
       rows: [],
       total: 0,
       matched: 0,
+      hidden: 0,
       offset: 0,
       loaded: false,
+      searchError: null,
       limit: NOTES_PAGE_SIZE,
     }),
 }));
@@ -170,8 +188,10 @@ export function resetNotesListStoreForTest(): void {
     rows: [],
     total: 0,
     matched: 0,
+    hidden: 0,
     offset: 0,
     loaded: false,
+    searchError: null,
     limit: NOTES_PAGE_SIZE,
   });
 }

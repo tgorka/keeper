@@ -28,11 +28,10 @@
  * one per 250 ms per subscription, and the filter is a predicate sweep over an
  * in-memory index (NFR-28).
  *
- * A failed read leaves the previous rows on screen: the list is a projection,
- * and blanking a working list because one poll faulted is worse than showing a
- * list that is a second stale.
+ * A failed search clears its rows and reports the failure: stale matches under
+ * a new query would misrepresent the result. Non-search polls retain the list.
  */
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import type { NoteChangeBatch, NoteListVm } from "@/lib/ipc/client";
 import {
   notesList,
@@ -48,6 +47,7 @@ import {
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
 import { notesListStore, useNotesListStore } from "@/lib/stores/notes-list";
+import { syncErrorMessage } from "@/lib/stores/sync";
 
 /**
  * Read the window Rust composes for the current chip set.
@@ -66,6 +66,7 @@ async function readWindow(vaultId: string): Promise<NoteListVm> {
       rows: folder.notes,
       total: folder.notes.length,
       matched: folder.notes.length,
+      hidden: 0,
       offset: 0,
     };
   }
@@ -77,13 +78,21 @@ async function readWindow(vaultId: string): Promise<NoteListVm> {
  * Keep the note-list mirror in step with one vault. Pass `null` when no vault is
  * active — the mirror is cleared and nothing is subscribed.
  */
-export function useNotesChanges(vaultId: string | null): void {
+export function useNotesChanges(vaultId: string | null, ready = true): void {
   // The chip set as one string, so the query effect re-runs on a real change
   // rather than on every render that rebuilds an equal array.
   const filterKey = useNotesFiltersStore((s) =>
-    JSON.stringify([s.scope, s.tagTerms, s.text.trim(), s.agentOnly, s.pinnedOnly]),
+    JSON.stringify([
+      s.scope,
+      s.tagTerms,
+      s.text.trim(),
+      s.agentOnly,
+      s.pinnedOnly,
+      s.hideServiceFiles,
+    ]),
   );
   const limit = useNotesListStore((s) => s.limit);
+  const requestEpoch = useRef(0);
 
   // `filterKey` and `limit` are dependencies rather than reads: `readWindow` pulls
   // both out of their stores imperatively, so the effect body carries no store
@@ -91,30 +100,41 @@ export function useNotesChanges(vaultId: string | null): void {
   // re-run it. Dropping them freezes the list on the first chip set it ever had.
   // biome-ignore lint/correctness/useExhaustiveDependencies: re-run triggers, not reads
   useEffect(() => {
+    if (!ready) return;
     if (vaultId === null) {
       notesListStore.getState().clear();
       return;
     }
     let cancelled = false;
+    const epoch = ++requestEpoch.current;
     void (async () => {
       try {
         const vm = await readWindow(vaultId);
         // A read for the vault or filter we have since left must not paint: it
         // would put the previous scope's rows under the current bar.
-        if (!cancelled) {
+        if (!cancelled && epoch === requestEpoch.current) {
           notesListStore.getState().reset(vm);
         }
-      } catch {
-        // Keep whatever is on screen.
+      } catch (error) {
+        if (
+          !cancelled &&
+          epoch === requestEpoch.current &&
+          notesFiltersStore.getState().text.trim()
+        ) {
+          notesListStore
+            .getState()
+            .failSearch(syncErrorMessage(error, "Search could not be read. Try again."));
+        }
       }
     })();
     return () => {
       cancelled = true;
+      requestEpoch.current += 1;
     };
-  }, [vaultId, filterKey, limit]);
+  }, [vaultId, filterKey, limit, ready]);
 
   useEffect(() => {
-    if (vaultId === null) {
+    if (!ready || vaultId === null) {
       return;
     }
     let cancelled = false;
@@ -126,15 +146,25 @@ export function useNotesChanges(vaultId: string | null): void {
       if (cancelled || batch.vaultId !== vaultId) {
         return;
       }
-      if (isFiltered(notesFiltersStore.getState())) {
+      const filters = notesFiltersStore.getState();
+      if (isFiltered(filters) || filters.hideServiceFiles) {
+        const epoch = ++requestEpoch.current;
         void (async () => {
           try {
             const vm = await readWindow(vaultId);
-            if (!cancelled) {
+            if (!cancelled && epoch === requestEpoch.current) {
               notesListStore.getState().reset(vm);
             }
-          } catch {
-            // Keep whatever is on screen.
+          } catch (error) {
+            if (
+              !cancelled &&
+              epoch === requestEpoch.current &&
+              notesFiltersStore.getState().text.trim()
+            ) {
+              notesListStore
+                .getState()
+                .failSearch(syncErrorMessage(error, "Search could not be read. Try again."));
+            }
           }
         })();
         return;
@@ -161,5 +191,5 @@ export function useNotesChanges(vaultId: string | null): void {
         void notesUnsubscribeChanges(subscriptionId);
       }
     };
-  }, [vaultId]);
+  }, [vaultId, ready]);
 }

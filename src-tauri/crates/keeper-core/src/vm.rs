@@ -5450,13 +5450,15 @@ pub struct BotModelVm {
     pub tools: Option<bool>,
     /// Whether the model reasons/thinks. `None` = the endpoint did not say.
     pub reasoning: Option<bool>,
+    /// Whether the model embeds text. `None` = the endpoint did not say.
+    pub embedding: Option<bool>,
     /// Every capability string the endpoint served, verbatim and unfiltered.
     ///
     /// Ollama's vocabulary is open-ended (`completion`, `tools`, `insert`,
     /// `vision`, `embedding`, `thinking`, `image`, `audio` today), so keeper
-    /// keeps the words it was given instead of narrowing them to the three it
-    /// currently understands. Empty means the endpoint served no list at all,
-    /// which is exactly the case the three flags report as `None`.
+    /// keeps the words it was given instead of narrowing them to known flags.
+    /// Empty means the endpoint served no list at all, which is exactly the
+    /// case the flags report as `None`.
     pub capabilities: Vec<String>,
 }
 

@@ -30,6 +30,11 @@ total: number,
  */
 matched: number, 
 /**
+ * Matching notes withheld by service-file hiding, before paging or a cap.
+ * Zero when the toggle is off; never a count of hidden chunks.
+ */
+hidden: number, 
+/**
  * Offset of `rows[0]` within `total`.
  */
 offset: number, };

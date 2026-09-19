@@ -11,6 +11,7 @@ function row(id: string, title = id): NoteRowVm {
     predicates: [],
     title,
     snippet: "",
+    hit: null,
     tags: [],
     updatedMs: 1,
     pinned: false,
@@ -37,6 +38,7 @@ function batch(
     ops,
     total: counts.total,
     matched: counts.matched ?? counts.total,
+    hidden: 0,
   };
 }
 

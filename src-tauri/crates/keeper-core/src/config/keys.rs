@@ -517,6 +517,36 @@ pub const KEYS: &[KeySpec] = &[
         example: "\"01J8Z5R0Q9WQ4C3S0PNK7T2A1B\"",
     },
     KeySpec {
+        key: "notes.service_file_names",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Json,
+        default: "[\"index.md\",\"agents.md\",\"claude.md\",\"log.md\"]",
+        summary: "File names the notes list treats as service files, in every folder and regardless of case.",
+        example: "'[\"index.md\",\"agents.md\",\"claude.md\",\"log.md\"]'",
+    },
+    KeySpec {
+        key: "notes.hide_service_files",
+        family: false,
+        scope: Scope::SessionState,
+        settable: Settable::Never("it remembers the person's last choice in the notes list"),
+        shape: Shape::Flag01,
+        default: "1",
+        summary: "Whether the notes list is hiding service files.",
+        example: "",
+    },
+    KeySpec {
+        key: "notes.embedding_model",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::Never("the model is chosen from the configured providers in Settings"),
+        shape: Shape::Json,
+        default: "",
+        summary: "The provider and model chosen for meaning search; blank keeps search words-only.",
+        example: "",
+    },
+    KeySpec {
         key: "notes.capture_draft.",
         family: true,
         scope: Scope::SessionState,
@@ -1041,6 +1071,17 @@ is worth a sentence back.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_file_default_matches_registry_fallback() {
+        let names: Vec<String> =
+            serde_json::from_str(spec("notes.service_file_names").expect("key").default)
+                .expect("names");
+        assert_eq!(
+            names,
+            crate::notes::service_files::DEFAULT_SERVICE_FILE_NAMES
+        );
+    }
 
     /// Coverage: every settings key the crates actually use is classified here.
     ///

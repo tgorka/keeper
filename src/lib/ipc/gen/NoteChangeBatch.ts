@@ -30,4 +30,8 @@ total: number,
 /**
  * How many the lens matched before `keeper.limit` declined any.
  */
-matched: number, };
+matched: number, 
+/**
+ * Service files withheld by the current filter, before paging.
+ */
+hidden: number, };

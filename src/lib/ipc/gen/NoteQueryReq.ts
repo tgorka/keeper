@@ -14,6 +14,10 @@ export type NoteQueryReq = {
  */
 text: string | null, 
 /**
+ * Hide configured service basenames from this list only (AD-267).
+ */
+hideServiceFiles: boolean, 
+/**
  * The tag chips, keyed by tag and ANDed together (FR-148, UX-DR54).
  *
  * A map rather than an include list beside an exclude list, because the

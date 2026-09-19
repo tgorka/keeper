@@ -286,7 +286,13 @@ pub async fn ollama_model_capabilities(
     let response = request.send().await.map_err(BotsError::transport)?;
     let response = require_success(response, label).await?;
     let shown: ShowBody = json_body(response, label).await?;
-    let (vision, tools, reasoning, capabilities) = capability_flags(shown.capabilities.as_deref());
+    let CapabilityFlags {
+        vision,
+        tools,
+        reasoning,
+        embedding,
+        capabilities,
+    } = capability_flags(shown.capabilities.as_deref());
     Ok(BotModelVm {
         id: model.to_owned(),
         family: shown.details.as_ref().and_then(|d| d.family.clone()),
@@ -304,6 +310,7 @@ pub async fn ollama_model_capabilities(
         vision,
         tools,
         reasoning,
+        embedding,
         capabilities,
     })
 }
@@ -348,7 +355,13 @@ fn tag_to_vm(row: TagRow) -> Option<BotModelVm> {
     if id.is_empty() {
         return None;
     }
-    let (vision, tools, reasoning, capabilities) = capability_flags(row.capabilities.as_deref());
+    let CapabilityFlags {
+        vision,
+        tools,
+        reasoning,
+        embedding,
+        capabilities,
+    } = capability_flags(row.capabilities.as_deref());
     Some(BotModelVm {
         id,
         family: row.details.as_ref().and_then(|d| d.family.clone()),
@@ -369,8 +382,18 @@ fn tag_to_vm(row: TagRow) -> Option<BotModelVm> {
         vision,
         tools,
         reasoning,
+        embedding,
         capabilities,
     })
+}
+
+#[derive(Default)]
+struct CapabilityFlags {
+    vision: Option<bool>,
+    tools: Option<bool>,
+    reasoning: Option<bool>,
+    embedding: Option<bool>,
+    capabilities: Vec<String>,
 }
 
 /// The whole tri-state rule, in one place.
@@ -384,19 +407,18 @@ fn tag_to_vm(row: TagRow) -> Option<BotModelVm> {
 /// The vocabulary is open-ended by design — `completion`, `tools`, `insert`,
 /// `vision`, `embedding`, `thinking`, `image`, `audio` today (R2 §4.3) — so
 /// unknown strings are kept verbatim in the returned list and never dropped.
-fn capability_flags(
-    capabilities: Option<&[String]>,
-) -> (Option<bool>, Option<bool>, Option<bool>, Vec<String>) {
+fn capability_flags(capabilities: Option<&[String]>) -> CapabilityFlags {
     let Some(list) = capabilities.filter(|list| !list.is_empty()) else {
-        return (None, None, None, Vec::new());
+        return CapabilityFlags::default();
     };
-    let has = |name: &str| list.iter().any(|item| item == name);
-    (
-        Some(has("vision")),
-        Some(has("tools")),
-        Some(has("thinking")),
-        list.to_vec(),
-    )
+    let has = |name: &str| Some(list.iter().any(|item| item == name));
+    CapabilityFlags {
+        vision: has("vision"),
+        tools: has("tools"),
+        reasoning: has("thinking"),
+        embedding: has("embedding"),
+        capabilities: list.to_vec(),
+    }
 }
 
 /// The probe for an Ollama "bot", which is a model tag.
@@ -512,6 +534,7 @@ fn hermes_vm(id: String, hint: Option<&HermesHint>) -> BotModelVm {
         vision: hint.and_then(|h| h.vision),
         tools: hint.and_then(|h| h.tools),
         reasoning: hint.and_then(|h| h.reasoning),
+        embedding: None,
         capabilities: Vec::new(),
     }
 }
@@ -941,10 +964,17 @@ mod tests {
     /// no capability list means unknown, and unknown is never `false`.
     #[test]
     fn an_absent_capability_list_is_unknown_not_false() {
-        let (vision, tools, reasoning, list) = capability_flags(None);
+        let CapabilityFlags {
+            vision,
+            tools,
+            reasoning,
+            embedding,
+            capabilities: list,
+        } = capability_flags(None);
         assert_eq!(vision, None, "absent list must not answer vision");
         assert_eq!(tools, None, "absent list must not answer tools");
         assert_eq!(reasoning, None, "absent list must not answer reasoning");
+        assert_eq!(embedding, None, "absent list must not answer embedding");
         assert!(list.is_empty());
     }
 
@@ -952,18 +982,36 @@ mod tests {
     /// empty array is the same silence as an absent key.
     #[test]
     fn an_empty_capability_list_is_also_unknown() {
-        assert_eq!(capability_flags(Some(&[])).0, None);
+        let flags = capability_flags(Some(&[]));
+        assert_eq!(
+            (flags.vision, flags.tools, flags.reasoning, flags.embedding),
+            (None, None, None, None)
+        );
     }
 
     /// A list that is present speaks for every flag, including the negatives.
     #[test]
-    fn a_present_capability_list_answers_all_three() {
+    fn a_present_capability_list_answers_every_flag() {
         let list = vec!["completion".to_owned(), "vision".to_owned()];
-        let (vision, tools, reasoning, kept) = capability_flags(Some(&list));
+        let CapabilityFlags {
+            vision,
+            tools,
+            reasoning,
+            embedding,
+            capabilities: kept,
+        } = capability_flags(Some(&list));
         assert_eq!(vision, Some(true));
         assert_eq!(tools, Some(false), "stated absence is false, not unknown");
         assert_eq!(reasoning, Some(false));
+        assert_eq!(embedding, Some(false));
         assert_eq!(kept, list, "unknown vocabulary is kept verbatim");
+    }
+
+    #[test]
+    fn embedding_is_advertised_but_hermes_silence_is_unknown() {
+        let list = vec!["embedding".to_owned()];
+        assert_eq!(capability_flags(Some(&list)).embedding, Some(true));
+        assert_eq!(hermes_vm("model".into(), None).embedding, None);
     }
 
     #[test]

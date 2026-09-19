@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
 import { CaptureSettingsSection } from "@/components/notes/capture-settings";
+import { SearchSettingsSection } from "@/components/notes/search-settings";
 import { RecordingAdvancedControls } from "@/components/recording/recording-advanced-controls";
 import { RecordingDestinationControls } from "@/components/recording/recording-destination-controls";
 import { SessionsSettingsSection } from "@/components/sessions/sessions-settings";
@@ -232,6 +233,7 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
           platform that has a vault. The section renders itself away when there
           is no vault to configure (Story 45.16, FR-193). */}
       <CaptureSettingsSection open={open} />
+      <SearchSettingsSection open={open} />
       {/* The Recording section is desktop-macOS-≥13 only (Story 16.3): absent on
               every platform that cannot record, never a dead affordance. */}
       {recording && <RecordingSection open={open} />}

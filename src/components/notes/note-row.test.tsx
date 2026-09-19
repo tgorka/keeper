@@ -38,6 +38,7 @@ function row(order: NoteOrder, overrides: Partial<NoteRowVm> = {}): NoteRowVm {
     unresolvedTarget: "",
     title: "A note",
     snippet: "the body excerpt",
+    hit: null,
     predicates: [],
     tags: [],
     updatedMs: Date.now() - 3_600_000,
@@ -391,5 +392,54 @@ describe("NoteRow — right-click gives the note's menu, not the WebView's", () 
     // A right-click is not a click: the row must not also swap the panel out
     // from under the menu that just opened.
     expect(onSelect).not.toHaveBeenCalled();
+  });
+});
+
+describe("search evidence", () => {
+  it("marks UTF-16 runs and restores the ordinary row when the hit disappears", () => {
+    const props = {
+      selected: false,
+      tabIndex: 0,
+      canReveal: true,
+      onSelect: vi.fn(),
+      onSelectBeside: vi.fn(),
+      onToggleTag: vi.fn(),
+      onVerb: vi.fn(),
+    };
+    const note = row(
+      { value: 0, source: "default" },
+      {
+        hit: { snippet: "ał😀tax end", marks: [[1, 7]], why: "words", score: 1 },
+      },
+    );
+    const { container, rerender } = render(<NoteRow {...props} row={note} />);
+    expect(container.querySelector("mark")).toHaveTextContent("ł😀tax");
+    rerender(<NoteRow {...props} row={{ ...note, hit: null }} />);
+    expect(container.querySelector("mark")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Note, A note, order 0, the default" }),
+    ).toHaveTextContent("the body excerpt");
+  });
+
+  it("labels meaning without inventing lexical evidence", () => {
+    const { container } = render(
+      <NoteRow
+        row={row(
+          { value: 0, source: "default" },
+          {
+            hit: { snippet: "financial outlook", marks: [], why: "meaning", score: 1 },
+          },
+        )}
+        selected={false}
+        tabIndex={0}
+        canReveal={true}
+        onSelect={vi.fn()}
+        onSelectBeside={vi.fn()}
+        onToggleTag={vi.fn()}
+        onVerb={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("matched by meaning")).toBeInTheDocument();
+    expect(container.querySelector("mark")).toBeNull();
   });
 });

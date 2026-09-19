@@ -7,10 +7,9 @@
  * 390px viewport has room for one. So the surface is two stack levels in
  * `PhoneShell`, the Bots shape (Story 62.2): {@link NotesPhoneList} is level 1
  * over the Inbox and {@link NotesPhoneNote} is level 2 over the list, and the
- * shell's own back button, edge-swipe and Escape pop them — this file adds no
- * navigation of its own. The scope column collapses to the vault switcher at
- * the head of the list and one search field: spaces, tags and the physical
- * tree are the desktop's lenses and stay there for now.
+ * shell's own back button, edge-swipe and Escape pop them. The scope column
+ * collapses to the vault switcher and shared filter bar; tags, search and the
+ * visibility controls retain the desktop semantics with phone-sized targets.
  *
  * # Reuse, and what is forked
  *
@@ -40,7 +39,7 @@
  * scroll-into-view keeps the caret in sight. jsdom lays nothing out, so the
  * test is structural.
  */
-import { FilePlus, NotebookPen, Search } from "lucide-react";
+import { FilePlus, NotebookPen } from "lucide-react";
 import { type Ref, useCallback, useEffect, useRef, useState } from "react";
 import {
   PHONE_BACK_TO_INBOX,
@@ -49,24 +48,34 @@ import {
 } from "@/components/layout/phone-header";
 import { NoteDeleteDialog } from "@/components/notes/note-delete-dialog";
 import { NoteEditor } from "@/components/notes/note-editor";
+import { NoteFilterBar } from "@/components/notes/note-filter-bar";
 import { NoteList } from "@/components/notes/note-list";
 import { type NotesEmptyKind, NotesEmptyState } from "@/components/notes/notes-empty-state";
 import { NEW_NOTE_LABEL, NOTES_COUNT_SLOT } from "@/components/notes/notes-pane";
 import { VaultSwitcher } from "@/components/notes/vault-switcher";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { IconHint } from "@/components/ui/tooltip";
-import { createNote, showCapture, useNotesActions } from "@/hooks/use-notes-actions";
+import {
+  createNote,
+  saveFilterAsSpace,
+  showCapture,
+  useNotesActions,
+} from "@/hooks/use-notes-actions";
 import { useNotesChanges } from "@/hooks/use-notes-changes";
 import { countLabel, NOTES } from "@/lib/count-label";
 import type { NoteRowVm } from "@/lib/ipc/client";
+import { notesSubscribeSearch, notesUnsubscribeChanges } from "@/lib/ipc/client";
 import {
   emptyFilterReason,
+  hydrateHideServiceFiles,
   isFiltered,
   notesFiltersStore,
+  persistHideServiceFiles,
+  scopeLabel,
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
 import { notesListStore, useNotesListStore } from "@/lib/stores/notes-list";
+import { notesSearchStateStore } from "@/lib/stores/notes-search-state";
 import {
   ensureNotesVaultsHydrated,
   useActiveVault,
@@ -81,9 +90,6 @@ export const NOTES_PHONE_TITLE = "Notes";
 
 /** The note level's back control: the level beneath it is the list. */
 export const NOTES_PHONE_BACK_TO_LIST = `Back to ${NOTES_PHONE_TITLE}`;
-
-/** The search field's accessible name. */
-export const NOTES_PHONE_SEARCH_LABEL = "Search notes";
 
 /** The header's way into quick capture: the sheet, not a window (AD-200). */
 export const NOTES_PHONE_CAPTURE_LABEL = "Quick capture";
@@ -129,11 +135,14 @@ export function NotesPhoneList({
   const rows = useNotesListStore((s) => s.rows);
   const total = useNotesListStore((s) => s.total);
   const matched = useNotesListStore((s) => s.matched);
+  const hidden = useNotesListStore((s) => s.hidden);
   const loaded = useNotesListStore((s) => s.loaded);
+  const searchError = useNotesListStore((s) => s.searchError);
   const activeNote = useActiveNote();
   const actions = useNotesActions(activeVaultId);
   const searchRef = useRef<HTMLInputElement | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [visibilityReady, setVisibilityReady] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -141,7 +150,42 @@ export function NotesPhoneList({
   }, []);
 
   // The list mirror follows the active vault and the search text.
-  useNotesChanges(activeVaultId);
+  useNotesChanges(activeVaultId, visibilityReady);
+
+  useEffect(() => {
+    let cancelled = false;
+    void hydrateHideServiceFiles()
+      .catch((error: unknown) => {
+        if (!cancelled)
+          setActionError(syncErrorMessage(error, "Could not restore service-file visibility."));
+      })
+      .finally(() => {
+        if (!cancelled) setVisibilityReady(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (activeVaultId === null) return;
+    let cancelled = false;
+    let subscriptionId: string | null = null;
+    void notesSubscribeSearch(activeVaultId, (vm) => {
+      if (!cancelled && vm.vaultId === activeVaultId) notesSearchStateStore.getState().apply(vm);
+    })
+      .then((id) => {
+        if (cancelled) void notesUnsubscribeChanges(id);
+        else subscriptionId = id;
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setActionError(syncErrorMessage(error, "Search status is unavailable."));
+      });
+    return () => {
+      cancelled = true;
+      if (subscriptionId !== null) void notesUnsubscribeChanges(subscriptionId);
+    };
+  }, [activeVaultId]);
 
   // The palette's Open Note… / Search Notes land on this field, as they land on
   // the desktop pane's (UX-DR42): one find surface per tier.
@@ -169,6 +213,25 @@ export function NotesPhoneList({
   const report = useCallback((raw: unknown) => {
     setActionError(syncErrorMessage(raw, NOTES_ACTION_FAILED));
   }, []);
+
+  const onHideServiceFilesChange = useCallback(
+    (hidden: boolean) => {
+      setActionError(null);
+      void persistHideServiceFiles(hidden).catch(report);
+    },
+    [report],
+  );
+
+  const onSaveAsSpace = useCallback(() => {
+    const { scope, tagTerms, agentOnly, text } = notesFiltersStore.getState();
+    const parts = [
+      scope.kind === "all" ? null : scopeLabel(scope),
+      ...tagTerms.map((chip) => (chip.term === "exclude" ? `not ${chip.tag}` : chip.tag)),
+      agentOnly ? "Changed by agent" : null,
+      text.trim() === "" ? null : `"${text.trim()}"`,
+    ].filter((part): part is string => part !== null && part !== "");
+    void saveFilterAsSpace(parts.length === 0 ? "Saved filter" : parts.join(" · ")).catch(report);
+  }, [report]);
 
   const onCreate = useCallback(() => {
     setActionError(null);
@@ -213,7 +276,7 @@ export function NotesPhoneList({
   let emptyKind: NotesEmptyKind | null = null;
   if (noVault) {
     emptyKind = "no-vault";
-  } else if (loaded && rows.length === 0 && !scanning) {
+  } else if (loaded && rows.length === 0 && !scanning && !searchError) {
     emptyKind =
       searchText.trim() !== "" ? "no-search-matches" : filtered ? "no-matches" : "empty-vault";
   }
@@ -277,52 +340,47 @@ export function NotesPhoneList({
         </IconHint>
       </PhoneBackBar>
       {!noVault && (
-        <div className="flex shrink-0 flex-col gap-2 border-border border-b px-3 py-2">
-          <VaultSwitcher />
-          <div className="relative">
-            <Search
-              aria-hidden="true"
-              className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground"
-            />
-            <Input
-              ref={searchRef}
-              type="search"
-              aria-label={NOTES_PHONE_SEARCH_LABEL}
-              placeholder={NOTES_PHONE_SEARCH_LABEL}
-              value={searchText}
-              onChange={(event) => notesFiltersStore.getState().setText(event.target.value)}
-              // 44pt: the phone's minimum target, and the same row the header
-              // buttons stand at.
-              className="h-11 pl-9"
-            />
+        <>
+          <div className="shrink-0 px-2 pt-2">
+            <VaultSwitcher />
           </div>
-        </div>
-      )}
-      {scanning && (
-        <div
-          role="status"
-          aria-label="Reading this vault"
-          data-slot="notes-index-progress"
-          className="h-0.5 w-full shrink-0 overflow-hidden bg-muted"
-        >
-          <div className="h-full w-1/3 bg-primary/60 motion-safe:animate-pulse" />
-        </div>
+          <NoteFilterBar
+            phone
+            onSaveAsSpace={onSaveAsSpace}
+            searchRef={searchRef}
+            onHideServiceFilesChange={onHideServiceFilesChange}
+          />
+        </>
       )}
       {actionError !== null && (
         <p role="alert" className="shrink-0 px-3 py-2 text-destructive text-xs">
           {actionError}
         </p>
       )}
-      {!noVault && loaded && (
+      {!noVault && loaded && !searchError && (
         <p
           role="status"
           data-slot={NOTES_COUNT_SLOT}
           className="shrink-0 border-border border-b px-3 py-1 text-muted-foreground text-xs"
         >
-          {countLabel(total, NOTES, { of: matched })}
+          <span className="whitespace-nowrap">{countLabel(total, NOTES, { of: matched })}</span>
+          {hidden > 0 && (
+            <span className="whitespace-nowrap">{` · ${hidden.toLocaleString()} hidden`}</span>
+          )}
         </p>
       )}
-      {emptyKind !== null ? (
+      {loaded && total === 0 && hidden > 0 ? (
+        <div className="flex flex-col items-center gap-2 p-4 text-sm">
+          <p>Matching notes are hidden by the service-file preference.</p>
+          <button
+            type="button"
+            className="min-h-11 underline"
+            onClick={() => onHideServiceFilesChange(false)}
+          >
+            Show service files
+          </button>
+        </div>
+      ) : emptyKind !== null ? (
         <NotesEmptyState kind={emptyKind} detail={emptyDetail} onAction={onEmptyAction} />
       ) : (
         <NoteList
