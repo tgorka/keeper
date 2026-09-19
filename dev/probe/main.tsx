@@ -195,6 +195,27 @@ function measure(phase: string): void {
       );
       emit(`${phase}.form_fields`, fields.length);
     }
+    // **Whether anything in the form is outside the region, and by how much.**
+    // Widths alone cannot answer that, and a widths-only probe is exactly how
+    // the defect the owner reported on 2026-09-17 shipped: the add form's card
+    // carried `m-6` AND `w-full`, so it was the region's full width *plus* a
+    // 24px margin — region `476..1021`, card `500..1045`, nine controls ending
+    // at 1029, under the panel strip that starts at 1022. `form_card` reported
+    // 545 and looked right. Both numbers below were 0 before the card went and
+    // are the shape of the regression: a hidden horizontal overflow, and
+    // controls whose right edge is past the region's own.
+    if (detail !== null) {
+      const viewport = form?.closest('[data-slot="scroll-area-viewport"]') ?? null;
+      emit(
+        `${phase}.form_h_overflow`,
+        viewport === null ? -1 : viewport.scrollWidth - viewport.clientWidth,
+      );
+      const regionRight = Math.round(detail.getBoundingClientRect().right);
+      const outside = (
+        Array.from(form?.querySelectorAll("input,select,textarea,button") ?? []) as HTMLElement[]
+      ).filter((el) => Math.round(el.getBoundingClientRect().right) > regionRight);
+      emit(`${phase}.form_outside_region`, outside.length);
+    }
     // Which of the two classes the eye meets first, as a number rather than as
     // a reading of the JSX: story 58.7's projected rows sit inside the SAME
     // scroller as the task rows, so "the projection is above the tasks" is a

@@ -3638,6 +3638,31 @@ describe("the Tasks pane's layout floors", () => {
     expect(screen.queryByText(TASKS_OPEN_BESIDE_HINT)).not.toBeInTheDocument();
   });
 
+  it("hosts the add form flush in the region, not on a card inside it", async () => {
+    // The reported defect, as the one thing jsdom can hold: the form sat on a
+    // `Card` whose `m-6 w-full` made it the region's full width PLUS 24px, so
+    // nine controls ended under the panel strip beside it — measured in Chrome
+    // as region `476..1021` against card `500..1045`. A margin cannot be inside
+    // a full width; padding can, and a card in a square flush pane is a loose
+    // tile besides. jsdom lays nothing out, so this asserts the STRUCTURE the
+    // measurement now depends on; `dev/probe`'s `form_h_overflow` and
+    // `form_outside_region` assert the pixels.
+    answer(listing());
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_DETAIL_TESTID);
+
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_TITLE }));
+    const form = await screen.findByRole("form", { name: TASK_FORM_ADD_TITLE });
+
+    expect(form.closest('[data-slot="card"]')).toBeNull();
+    const host = form.parentElement;
+    expect(host).not.toBeNull();
+    // The two classes that cannot coexist, named so a re-introduction is red
+    // rather than merely ugly.
+    expect(host?.className).not.toMatch(/\bm-\d/);
+    expect(host?.className).not.toMatch(/\bw-full\b/);
+  });
+
   it("names an empty task list in the column, above the projection", async () => {
     // With no tasks the column held nothing but Story 58.7's projected rows, so
     // the only thing under the heading *Task list* was work that is explicitly
