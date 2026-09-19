@@ -5382,29 +5382,43 @@ pub async fn notes_capture_close(
 /// Lock or unlock the capture window `key` (Story 45.15, FR-192, UX-DR77;
 /// Story 46.15).
 ///
-/// Locked is keeper's geometry and a window the user can neither move nor
-/// resize; unlocked is the user's, and a window they can do both to. The
-/// current position and size are snapshotted on **either** transition rather
-/// than only on a gesture, because a person who unlocks a window and never
-/// touches it has still said "this is where it goes", and a person who locks
-/// one after moving and resizing it has said "keep it *there*" — locking is not
-/// a discard button.
+/// Locked is a window the user can neither move nor resize; unlocked is one
+/// they can do both to. The current position and size are snapshotted on
+/// **either** transition rather than only on a gesture, because a person who
+/// unlocks a window and never touches it has still said "this is where it
+/// goes", and a person who locks one after moving and resizing it has said
+/// "keep it *there*" — locking is not a discard button.
 ///
 /// The live window is updated after the write, so the toggle takes effect
-/// without a reopen. That is visible on lock: the window snaps back to keeper's
-/// own 560×340 while keeping its position, which is deliberate. A locked window
-/// IS keeper's size, and the alternative is a window that looks one size now
-/// and jumps to another the next time it opens — the same surprise, delivered
-/// later and unattached to the click that caused it. The remembered size is
-/// kept, so unlocking restores it.
+/// without a reopen. **Since Story 75.1 that is invisible on lock**, and the
+/// change is the whole of AD-257: the lock used to snap the window back to
+/// keeper's own 560×340 while keeping its position, on the argument that a
+/// locked window IS keeper's size. It is not the argument the person pressing
+/// the padlock is making — they mean *stay exactly as you are* — and it made
+/// the single most reported thing about this window a decision rather than a
+/// bug. `Placement::window_size` now answers with the remembered size for a
+/// locked placement too, so the snapshot two lines below is what the window
+/// keeps rather than what it can be restored to later.
 ///
-/// **Story 48.2 made that last sentence true.** This command used to build the
-/// placement inline, merging `live.size.or(stored.size)` on both transitions —
-/// so on the *unlock* click, where the live window is the 560×340 the *lock*
-/// just normalised it to, it wrote keeper's own size over the user's a moment
-/// before anything could restore it. There is no geometry logic left here:
+/// A window that was never resized still gets keeper's size when it is locked:
+/// there is nothing else to honour. That arm did not move.
+///
+/// **Story 48.2 made the remembered size survive at all.** This command used to
+/// build the placement inline, merging `live.size.or(stored.size)` on both
+/// transitions — so on the *unlock* click, where the live window was the
+/// 560×340 the *lock* had just normalised it to, it wrote keeper's own size
+/// over the user's a moment before anything could restore it. 75.1 removed the
+/// normalisation that made that reading wrong; the guard stays, because a
+/// window keeper placed still reports a geometry that is keeper's. There is no
+/// geometry logic left here:
 /// [`keeper_core::capture::Placement::relocked`] decides what is written, in
 /// the crate that compiles everywhere, and this reads, calls, writes, applies.
+///
+/// It does **not** route through
+/// [`keeper_core::capture::Placement::opened`] (Story 75.2): this is the one
+/// moment the lock is the user's live answer rather than a flag inherited from
+/// a session they have forgotten, so unlocking it here would make the padlock
+/// a button that does nothing.
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn notes_capture_set_locked(
@@ -5460,10 +5474,16 @@ pub async fn notes_capture_windows(
 /// **And since Story 48.2 a locked window writes nothing at all.** This is the
 /// path that made the lock a discard button without anybody pressing the
 /// padlock twice: blur fires when a person clicks another app, and a locked
-/// window's live geometry is keeper's own — the normalised 560×340, at whatever
-/// coordinate the last hotkey press placed it (Story 47.5, DW-198). Merging
-/// that over the row wiped both halves of what the user had chosen, so one
-/// click elsewhere after locking was enough to lose them for good.
+/// window's live geometry is keeper's own — before Story 75.1 the normalised
+/// 560×340, and in every era whatever coordinate keeper last placed it at
+/// (Story 47.5, DW-198). Merging that over the row wiped both halves of what
+/// the user had chosen, so one click elsewhere after locking was enough to lose
+/// them for good.
+///
+/// 75.1 and 75.2 narrow how often that arises — a lock no longer resizes, and
+/// nothing opens locked — without repealing it: a window locked during this
+/// session still reports a size and position keeper chose for it, and this is
+/// still the path that must not write them down.
 /// [`keeper_core::capture::Placement::observing`] holds the rule, so this path
 /// and the lock toggle cannot come to different conclusions about it.
 #[cfg(desktop)]
@@ -5505,10 +5525,10 @@ fn capture_data_dir(
 
 /// Pin or un-pin the capture window `key` (Story 48.4).
 ///
-/// The third button on the chrome strip, beside the lock, and deliberately the
-/// same shape of command: read the stored placement, write the one field back,
-/// then apply it to the live window so the toggle takes effect without a
-/// reopen.
+/// The third button in the header's frame group, beside the lock (its own strip
+/// until Story 75.3 merged the two rows), and deliberately the same shape of
+/// command: read the stored placement, write the one field back, then apply it
+/// to the live window so the toggle takes effect without a reopen.
 ///
 /// # Why this is a Rust command and not `getCurrentWindow().setAlwaysOnTop()`
 ///
@@ -5526,7 +5546,7 @@ fn capture_data_dir(
 /// so it must not snapshot or re-assert either. Reading the live geometry here
 /// would re-introduce Story 48.2's defect on a new path: the live window's size
 /// is whatever it is at this instant, and merging it over the stored one is how
-/// a remembered size gets overwritten by a normalised one.
+/// a remembered size gets overwritten by one keeper chose.
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn notes_capture_set_always_on_top(

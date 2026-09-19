@@ -503,14 +503,14 @@ pub fn run() {
             voice_window::install(app.handle());
 
             // Give the prewarmed capture window the resizability and size its
-            // remembered placement asks for (Story 46.15, FR-192).
+            // remembered placement asks for (Story 46.15, FR-192), unlocked
+            // (Story 75.2, AD-258).
             //
             // The window is declared `resizable: false` in `tauri.conf.json`
             // and created before anything has read a setting, so it boots
-            // locked whatever the person last chose. Without this, someone who
-            // unlocked and resized it yesterday finds it today showing an open
-            // padlock, at the size they left it, with edges that do not answer
-            // — the lock reduced to a label.
+            // locked whatever the person last chose. Without this it would show
+            // an open padlock, at the size they left it, over edges that do not
+            // answer — the lock reduced to a label.
             //
             // Here rather than inside `notes_window::show`, deliberately: the
             // hotkey path is `set_position` → `show` → `set_focus` and NFR-27's
@@ -532,10 +532,23 @@ pub fn run() {
                     .unwrap_or_else(|error| {
                         tracing::debug!(
                             %error,
-                            "notes: no remembered capture placement; the panel boots locked"
+                            "notes: no remembered capture placement; keeper places the panel"
                         );
                         keeper_core::capture::Placement::default()
-                    });
+                    })
+                    // Story 75.2, AD-258: the lock is off at every open, and
+                    // this is the prewarmed window's open — it is created
+                    // hidden before this line and revealed by a hotkey press
+                    // that deliberately reads no settings, so this is the only
+                    // moment the stored row and this window meet.
+                    //
+                    // The reset is one field. `opened` keeps the position, the
+                    // size and the pin, which all ride in the same row, and
+                    // both calls below depend on that: `adopt_placement` sizes
+                    // the window from `placement.size`, and `adopt_position`
+                    // only runs at all because clearing the lock is what makes
+                    // `adopted_position` answer.
+                    .opened();
                 notes_window::adopt_placement(
                     app.handle(),
                     keeper_core::capture::DRAFT_CAPTURE_KEY,
@@ -549,6 +562,21 @@ pub fn run() {
                     app.handle(),
                     keeper_core::capture::DRAFT_CAPTURE_KEY,
                     placement,
+                );
+                // …and whether it floats above other applications (Story 75.2,
+                // AD-259). The prewarmed window is born `alwaysOnTop: false` in
+                // `tauri.conf.json`, and the only other site that applies the
+                // stored flag is `notes_window::open`, which this window never
+                // reaches: `notes_capture_open` is called with note targets
+                // only, and the hotkey and tray paths read no settings by
+                // design. Without this line a pin the owner set survives every
+                // dismissal — `hide` does not touch the attribute — and is lost
+                // at every relaunch, which is the one case a persisted flag
+                // exists for at all.
+                notes_window::set_always_on_top(
+                    app.handle(),
+                    keeper_core::capture::DRAFT_CAPTURE_KEY,
+                    placement.always_on_top,
                 );
             }
 

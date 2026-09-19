@@ -169,8 +169,10 @@ pub fn install_recording<R: Runtime>(app: &AppHandle<R>) {
 ///
 /// It raises the window **from Rust** rather than emitting an event for the
 /// webview to act on, which is the whole of NFR-27: the path is
-/// `set_position` → `show` → `set_focus`, three synchronous calls under 5 ms, with
-/// no IPC round trip in front of them. `notes_window::show` emits
+/// `is_resizable` → `set_resizable` → `show` → `set_focus` — plus a
+/// `set_position` for a window whose backend will not say whether it is
+/// resizable — a handful of synchronous window calls under 5 ms, with no IPC
+/// round trip and no settings read in front of them. `notes_window::show` emits
 /// `keeper://notes-capture-shown` afterwards so the panel can re-assert focus if
 /// a Linux compositor took it away.
 ///

@@ -4,10 +4,11 @@
 //!
 //! The **draft** window is declared statically in `tauri.conf.json`, created
 //! hidden at startup and never destroyed. That is the whole of NFR-27: the
-//! hotkey path is `is_resizable` → `set_position` → `show` → `set_focus` — at
-//! most four synchronous calls plus one compositor frame, and no settings read
-//! — with no webview construction, no bundle load, no React mount and no IPC
-//! round trip before the panel is visible.
+//! hotkey path is `is_resizable` → `set_resizable` → `show` → `set_focus`,
+//! plus a `set_position` for a window whose backend will not say whether it is
+//! resizable — at most five synchronous calls plus one compositor frame, and
+//! no settings read — with no webview construction, no bundle load, no React
+//! mount and no IPC round trip before the panel is visible.
 //! Because the window never unmounts, its editor stays focused while hidden, so
 //! `show()` reveals an already-focused live DOM node rather than racing an
 //! effect, and a keystroke typed 50 ms after the hotkey has nowhere to go but
@@ -54,14 +55,32 @@
 //! answer a drag. Both work everywhere including Wayland, and for the same
 //! reason — neither is a request to put a surface at a coordinate.
 //!
+//! **Since Story 75.2 the lock does not survive an open** (AD-258). It is a
+//! gesture about the capture in front of you, so every path that shows a
+//! capture window routes its placement through
+//! [`keeper_core::capture::Placement::opened`] first: boot adoption in
+//! `lib.rs`, [`open`] for a window the frontend asks for, and [`reveal`]'s
+//! no-placement arm for the hotkey and the tray. The rule is one function in
+//! the crate that compiles everywhere; these are three call sites of it, which
+//! is what stops the answer depending on which one the person used.
+//!
+//! **That ends the panel following the pointer between monitors, and the cost
+//! is deliberate.** Pointer-following was the compensation for a window nobody
+//! could move (Story 47.5) — keeper placed it because the user was not allowed
+//! to. With no window arriving locked there is nothing left to compensate for,
+//! and a panel that jumps to the pointer's monitor on every press is exactly
+//! the "keeps its own preferences and discards yours" the epic is named after.
+//! The [`ShowPosition::Place`] arm below is still reachable, and is still the
+//! answer for a window that will not say whether it is resizable.
+//!
 //! The **size** survives a restart: adopted once at boot by [`adopt_placement`]
 //! and never re-asserted on the hot path, so nothing undoes it.
 //!
 //! Since Story 47.5 the **position** survives one the same way (DW-198), and
-//! the two halves are both needed: [`adopt_position`] puts an unlocked window
-//! back at boot, and [`reveal`] stops re-centring it on every later hotkey
-//! press. Before that, keeper remembered how big you made the panel and threw
-//! away where you put it.
+//! the two halves are both needed: [`adopt_position`] puts a window back at
+//! boot, and [`reveal`] does not re-centre it on any later hotkey press. Before
+//! that, keeper remembered how big you made the panel and threw away where you
+//! put it.
 //!
 //! **The restore is attempted and still not promised, and that gap is
 //! deliberate.** Applying a stored position is `set_position`, which is exactly
@@ -194,8 +213,8 @@ pub fn is_visible<R: Runtime>(app: &AppHandle<R>) -> bool {
 /// calls with one read from the settings table.
 ///
 /// Since Story 47.5 it places the panel only when the panel is keeper's to
-/// place — see [`reveal`] for the whole of that decision and why it costs the
-/// hot path no settings read.
+/// place, and since Story 75.2 it also unlocks it — see [`reveal`] for the
+/// whole of both decisions and why neither costs the hot path a settings read.
 pub fn show<R: Runtime>(app: &AppHandle<R>) {
     let Some(window) = window(app, DRAFT_CAPTURE_KEY) else {
         return;
@@ -226,6 +245,16 @@ pub fn hide<R: Runtime>(app: &AppHandle<R>) {
 /// storage, because the shell does not compile on every machine and a placement
 /// rule nobody can build is a placement rule nobody can check (AD-55/AD-56).
 pub fn open(app: &AppHandle, target: &CaptureTargetVm, placement: Placement) {
+    // Story 75.2, AD-258: the lock is off at every open. Applied once, here, so
+    // that the builder below, the always-on-top re-assert and `reveal` all see
+    // the same placement — a window built `resizable(false)` and unlocked three
+    // lines later would spend a frame with edges that do not answer, which is
+    // the exact defect the builder's own comments below exist to avoid.
+    //
+    // `opened` clears `locked` and nothing else: the position, the size and the
+    // pin all ride in the same stored row and all survive (AD-259 for the pin,
+    // deliberately asymmetric with the lock).
+    let placement = placement.opened();
     let key = keeper_core::capture::capture_key(target);
     let label = capture_label(&key);
     remember_target(&label, target);
@@ -280,19 +309,24 @@ pub fn open(app: &AppHandle, target: &CaptureTargetVm, placement: Placement) {
         }
     };
     // The prewarmed draft arrives here as an EXISTING window, built from
-    // `tauri.conf.json`'s static `alwaysOnTop: true`, so the builder line above
-    // never runs for it. Re-asserting on every open is what gives that one
-    // window the stored flag at all — and it is free for the others, which are
-    // already at this value.
+    // `tauri.conf.json`'s static `alwaysOnTop` (`false` since Story 75.2,
+    // AD-259), so the builder line above never runs for it. Re-asserting on
+    // every open is what gives that one window the stored flag at all — for
+    // the opens that come through here. The draft window's own opens do not:
+    // `notes_capture_open` is called with note targets only, and the hotkey and
+    // tray read no settings by design, so what makes a pin the owner set
+    // survive a restart is the boot block in `lib.rs`, not this line.
     set_always_on_top(app, &key, placement.always_on_top);
     // The size is NOT re-asserted unconditionally here any more (Story 46.15).
-    // A locked window is still normalised — a compositor may have resized it,
-    // and every locked capture window is the same window — but an unlocked one
-    // is left at the size the user gave it, which is the whole of the feature.
-    // Which of those two this is, is `Placement::window_size`'s decision, made
-    // in `keeper_core` where it is tested.
+    // A window with a remembered size gets it back and a window with none is
+    // left exactly as it is; since Story 75.1 the lock no longer changes that
+    // answer, it only decides who may change it afterwards. Which case this is
+    // is `Placement::window_size`'s decision, made in `keeper_core` where it is
+    // tested.
+    // `reveal` announces, because the lock it clears is a fact the chrome
+    // renders. A second emit here would only make the webview re-read the same
+    // list twice per open.
     reveal(app, &window, &key, Some(placement));
-    announce(app);
 }
 
 /// Close the capture window for `key` (FR-191).
@@ -399,7 +433,25 @@ pub fn list(app: &AppHandle, placement: &dyn Fn(&str) -> Placement) -> Vec<Captu
             let key = keeper_core::capture::capture_key(&target);
             let stored = placement(&key);
             Some(CaptureWindowVm {
-                locked: stored.locked,
+                // The LIVE window's answer, falling back to the stored one —
+                // and it became live in Story 75.2 (AD-258).
+                //
+                // It used to report `stored.locked`, on the argument that the
+                // lock is keeper's own policy and no compositor has a view on
+                // it. That argument survives; what stopped being true is that
+                // the stored row describes the window in front of you. The lock
+                // is now cleared at every open and deliberately NOT written
+                // back — an open is not a gesture worth a sqlite transaction —
+                // so a row that still says `locked` is the memory of a padlock
+                // press from a session that has ended. Reporting it would draw
+                // a closed padlock over a window the person can drag, which is
+                // the chrome lying about the only thing it exists to show.
+                //
+                // `is_resizable()` is the same attribute `apply_resizability`
+                // writes at boot, on every toggle and on every reveal, and the
+                // same one `geometry` reads to decide whether a geometry is the
+                // user's. One source of truth, and no second copy of the lock.
+                locked: !window.is_resizable().unwrap_or(!stored.locked),
                 // The LIVE window's answer, falling back to the stored one.
                 //
                 // `set_always_on_top` is a request the window manager may
@@ -409,8 +461,7 @@ pub fn list(app: &AppHandle, placement: &dyn Fn(&str) -> Placement) -> Vec<Captu
                 // pressed above a window that is plainly not on top, which is
                 // the button lying rather than the compositor refusing.
                 // `is_visible` and `chrome_inset` beside it read the live
-                // window for the same reason; `locked` is stored because it is
-                // keeper's own policy and no compositor has a view on it.
+                // window for the same reason.
                 always_on_top: window.is_always_on_top().unwrap_or(stored.always_on_top),
                 key,
                 target,
@@ -490,8 +541,12 @@ fn edge_inset<R: Runtime>(window: &WebviewWindow<R>) -> u32 {
     })
 }
 
-/// Tell every window that the set of capture windows changed.
-pub fn announce(app: &AppHandle) {
+/// Tell every window that the set of capture windows — or the state of one of
+/// them — changed.
+///
+/// Generic over the runtime because [`reveal`] calls it, and that is the hotkey
+/// and tray path, which is generic so its tests can drive a mock runtime.
+pub fn announce<R: Runtime>(app: &AppHandle<R>) {
     if let Err(error) = app.emit(CAPTURE_WINDOWS_EVENT, ()) {
         tracing::warn!(%error, "notes: could not emit the capture-windows event");
     }
@@ -557,8 +612,44 @@ fn other_windows_visible(app: &AppHandle, key: &str) -> bool {
 /// question — locked follows the pointer, unlocked stays put — and it is read
 /// off `is_resizable()`, the very attribute [`apply_resizability`] writes at
 /// boot and on every toggle. One window-attribute read, no sqlite, so the hot
-/// path is still three synchronous calls (NFR-27). A window that will not say
-/// is placed, which is exactly what it did before this change.
+/// path is four synchronous calls at most — five since Story 75.2 added the
+/// unlock below, all of them window-attribute writes and none of them a query
+/// (NFR-27). A window that will not say is placed, which is exactly what it did
+/// before this change.
+///
+/// # Every path through here unlocks (Story 75.2, AD-258)
+///
+/// Both arms apply [`keeper_core::capture::Placement::opened`], so no caller
+/// can reveal a locked capture window however it reached this function. The
+/// `Some` arm re-applies what [`open`] already applied, deliberately: `opened`
+/// is idempotent (`opening_the_window_clears_the_lock_and_keeps_everything_else`
+/// asserts it) and the cost of one struct update is worth not having the rule
+/// hold only for callers that remembered it.
+///
+/// The `None` arm has no stored row and must not read one — this is the hotkey
+/// and the tray, and NFR-27 has no room for sqlite in front of them. That costs
+/// nothing here, because `opened` clears exactly one field and reads no other:
+/// the answer for a row this path has never seen is the answer it would give if
+/// it had.
+///
+/// **The consequence for the `None` arm's position decision is that it now
+/// answers `Leave` for every window that answers at all**, because every window
+/// that reached here is unlocked. That is AD-258 arriving rather than a defect:
+/// the panel followed the pointer between monitors because a locked window
+/// could not be moved by hand, and nothing arrives locked any more. The
+/// `Place` branch stays because a window that will not say whether it is
+/// resizable must still be placed, exactly as it always was.
+///
+/// # The chrome is told (Story 75.2, AD-258)
+///
+/// [`announce`] runs at the end, because this function changes a fact the
+/// webview renders: the padlock's state, and with it whether the header is a
+/// drag region at all. The chrome's mirror is hydrated on mount and on
+/// `CAPTURE_WINDOWS_EVENT`, and `CAPTURE_SHOWN_EVENT` above re-reads the draft
+/// page and nothing else — so without this a window locked earlier in the
+/// session came back showing a closed padlock over edges that resize, and the
+/// first press of that padlock "unlocked" a window that was already unlocked.
+/// It is an emit and not a query: NFR-27 is intact.
 fn reveal<R: Runtime>(
     app: &AppHandle<R>,
     window: &WebviewWindow<R>,
@@ -566,12 +657,30 @@ fn reveal<R: Runtime>(
     placement: Option<Placement>,
 ) {
     match placement {
-        Some(placement) => apply_placement(window, placement),
+        Some(placement) => apply_placement(window, placement.opened()),
         None => {
-            let unlocked = window.is_resizable().unwrap_or(false);
-            if plan_show_position(unlocked) == ShowPosition::Place {
+            // `is_ok`, not the value it carries. Since Story 75.2 every window
+            // revealed here is unlocked three lines later, so the lock cannot
+            // be the question any more — what is left is whether the window
+            // ANSWERS, which is the whole of `plan_show_position`'s doc.
+            //
+            // Reading the value was a real defect: a window the person locked
+            // earlier in this session reports `false`, so revealing it placed
+            // the panel on the pointer's monitor and then unlocked it, and the
+            // next blur wrote that coordinate over the position the padlock
+            // had been pressed to keep — the position gone for good, by the
+            // gesture meant to preserve it.
+            let answers = window.is_resizable().is_ok();
+            if plan_show_position(answers) == ShowPosition::Place {
                 position(window);
             }
+            // Story 75.2, AD-258. Spelled through `opened()` rather than as a
+            // literal `set_resizable(true)` so the rule has exactly one
+            // definition: if `opened` ever stops clearing the lock, this line
+            // stops unlocking, instead of quietly disagreeing with the two
+            // paths that do go through a stored placement. The default is a
+            // carrier for the one field — nothing else in it is read.
+            apply_resizability(window, Placement::default().opened());
         }
     }
     if let Err(error) = window.show() {
@@ -586,6 +695,10 @@ fn reveal<R: Runtime>(
     if let Err(error) = app.emit_to(window.label(), CAPTURE_SHOWN_EVENT, ()) {
         tracing::warn!(%error, %key, "notes: could not emit the capture-shown event");
     }
+    // Last, and after the `show`/`set_focus` bail-outs above on purpose: a
+    // window that could not be shown has no chrome to correct, and one that
+    // was shown has a padlock whose state this function may just have changed.
+    announce(app);
 }
 
 /// Give the capture window for `key` the resizability and size its stored
@@ -594,21 +707,32 @@ fn reveal<R: Runtime>(
 ///
 /// Two callers, one act. **At boot**, for the prewarmed window: it is declared
 /// `resizable: false` in `tauri.conf.json` and created before anything has read
-/// the settings, so without this a person who unlocked it yesterday finds it
-/// unlocked-looking and unresizable today — the lock reduced to a label, which
-/// is the exact failure Story 46.15 exists to fix. Done here, once, rather than
-/// in [`show`]: the hotkey path is three synchronous calls and a settings read
-/// does not belong in front of it (NFR-27).
+/// the settings, so without this it would show an open padlock over edges that
+/// do not answer — the lock reduced to a label, which is the exact failure
+/// Story 46.15 exists to fix. Since Story 75.2 the caller hands in a placement
+/// already through [`keeper_core::capture::Placement::opened`], so what this
+/// applies at boot is always "unlocked" and the size the row remembers. Done
+/// here, once, rather than in [`show`]: the hotkey path is a handful of
+/// synchronous window calls and a settings read does not belong in front of it
+/// (NFR-27).
 ///
-/// **On the lock toggle**, against the live window, so unlocking takes effect
-/// without a reopen.
+/// **On the lock toggle**, against the live window, so locking and unlocking
+/// take effect without a reopen. That caller does NOT go through `opened` — a
+/// padlock press is the one moment the lock is the user's live answer rather
+/// than something inherited from a previous session.
 ///
 /// It still adopts no *stored* position — see [`adopt_position`] for why a
 /// padlock click must not teleport a window. [`keep_on_screen`] is not that: it
-/// is the correction for a move this function itself caused, because locking a
-/// small window grows it to [`CAPTURE_DEFAULT_SIZE`] from the same top-left and
-/// nothing else on this path would notice the far corner leaving the monitor
-/// (Story 48.2). It moves nothing that already fits.
+/// is the correction for a move this function itself may cause, because a
+/// window whose stored size is larger than the one on screen grows from the
+/// same top-left and nothing else on this path would notice the far corner
+/// leaving the monitor (Story 48.2). It moves nothing that already fits.
+///
+/// Story 75.1 narrowed but did not close that route: locking no longer grows a
+/// window to [`CAPTURE_DEFAULT_SIZE`], so the corner case the clamp was written
+/// for now needs a window that was never resized, or a row restored onto a
+/// smaller display. Both still happen, and the correction still costs nothing
+/// when it is not needed.
 pub fn adopt_placement<R: Runtime>(app: &AppHandle<R>, key: &str, placement: Placement) {
     let Some(window) = window(app, key) else {
         return;
@@ -623,10 +747,17 @@ pub fn adopt_placement<R: Runtime>(app: &AppHandle<R>, key: &str, placement: Pla
 ///
 /// **Separate from [`adopt_placement`] because it has one caller and that is the
 /// point.** `adopt_placement` also runs on every lock toggle, and applying a
-/// stored position there would make *unlocking* teleport a window the person is
-/// looking at: the panel is wherever the last hotkey press put it, the row
-/// holds wherever they dragged it to before they locked it, and a click on a
-/// padlock is not a request to move a window.
+/// stored position there would make *locking* teleport a window the person is
+/// looking at: the panel is wherever they last left it, the row holds wherever
+/// they dragged it to before, and a click on a padlock is not a request to move
+/// a window.
+///
+/// Since Story 75.2 its caller hands in a placement through
+/// [`keeper_core::capture::Placement::opened`], which is what makes this run at
+/// all for a window whose stored row says locked:
+/// [`Placement::adopted_position`] answers `None` for a locked placement, so
+/// before 75.2 a person who locked the panel and quit came back to a window
+/// keeper re-placed rather than one where they had left it.
 ///
 /// Best-effort exactly as [`apply_placement`]'s position arm is: `set_position`
 /// is the one call UX-DR43 says a compositor may refuse, so a refusal is logged
@@ -690,10 +821,12 @@ fn apply_resizability<R: Runtime>(window: &WebviewWindow<R>, placement: Placemen
 
 /// Size a window from its placement, or leave it exactly as it is.
 ///
-/// Every part of that decision — normalise a locked window, restore an unlocked
-/// one, touch neither when nothing is remembered, and never restore a size the
-/// screen cannot show — belongs to [`Placement::window_size`], which lives in
-/// `keeper_core` and is tested there. This function converts units and calls it.
+/// Every part of that decision — restore a remembered size whether or not the
+/// window is locked (Story 75.1, AD-257), touch nothing when an unlocked window
+/// remembers none, fall back to keeper's own size for a locked window that
+/// remembers none, and never restore a size the screen cannot show — belongs to
+/// [`Placement::window_size`], which lives in `keeper_core` and is tested there.
+/// This function converts units and calls it.
 fn apply_size<R: Runtime>(window: &WebviewWindow<R>, placement: Placement) {
     let Some(size) = placement.window_size(logical_work_area(window)) else {
         return;
