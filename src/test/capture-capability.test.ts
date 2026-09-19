@@ -46,6 +46,7 @@ const conf = JSON.parse(readFileSync(TAURI_CONF, "utf8")) as {
       minWidth?: number;
       minHeight?: number;
       resizable?: boolean;
+      alwaysOnTop?: boolean;
     }[];
   };
 };
@@ -77,6 +78,28 @@ const NOTES_WINDOW_RS = readFileSync(
   "utf8",
 );
 
+const LIB_RS = readFileSync(
+  resolve(import.meta.dirname, "../../src-tauri/crates/keeper/src/lib.rs"),
+  "utf8",
+);
+
+/**
+ * One Rust function's body out of a shell-crate source, so an assertion about
+ * WHERE a call sits cannot be satisfied by the same call somewhere else.
+ *
+ * Crude on purpose: from the signature to the first closing brace in column
+ * zero, which is what `rustfmt` guarantees for a free function. A signature
+ * that no longer exists fails loudly rather than returning the whole file and
+ * quietly passing every `toContain` below.
+ */
+function rustBody(source: string, signature: string): string {
+  const start = source.indexOf(signature);
+  expect(start, `${signature} is no longer declared`).toBeGreaterThan(-1);
+  const end = source.indexOf("\n}\n", start);
+  expect(end, `${signature} has no closing brace in column zero`).toBeGreaterThan(start);
+  return source.slice(start, end);
+}
+
 describe("the capture window's document", () => {
   it("is spelled the same by the static declaration and by the code that creates one", () => {
     // W3Recording's shape: *does this thing name something, and does anything
@@ -103,10 +126,12 @@ describe("the capture window's size", () => {
    * Story 46.15 made a capture window resizable, which made its size a value
    * with **three** namers: `tauri.conf.json` for the prewarmed window,
    * `CAPTURE_DEFAULT_SIZE` for every window `notes_window::open` builds, and
-   * `Placement::window_size`, which normalises a locked window back to it. If
-   * they drift, a locked prewarmed window is silently re-sized to a number
-   * nobody chose on its first open — the window is *fine*, which is what makes
-   * it survive review. `keeper-core` is the namer; the other two follow it.
+   * `Placement::window_size`, which answers it for a locked window that
+   * remembers no size of its own (since Story 75.1 that is the only window it
+   * answers it for — a lock no longer normalises a size the person chose). If
+   * they drift, such a window is silently re-sized to a number nobody chose on
+   * its first open — the window is *fine*, which is what makes it survive
+   * review. `keeper-core` is the namer; the other two follow it.
    */
   it("is the same number in tauri.conf.json and in keeper-core", () => {
     const [width, height] = coreSize("CAPTURE_DEFAULT_SIZE");
@@ -263,5 +288,66 @@ describe("the quick-capture capability", () => {
         expect(capability.description).not.toMatch(new RegExp(`no ${word}`, "i"));
       }
     }
+  });
+});
+
+/**
+ * Epic 75's two rules live in `keeper-core` and are applied by the shell crate,
+ * which does not compile on the machine most of this epic was written on. Every
+ * `keeper-core` test can stay green while a call site that applies its answer is
+ * deleted — so the call sites are read here, from the suite that runs
+ * everywhere, exactly as this file already reads the event names and the sizes.
+ *
+ * A string match is a weak proof of behaviour and a strong proof of presence,
+ * which is the failure mode these guard against: not a wrong rule, a rule
+ * nobody applies.
+ */
+describe("the lock is off at every open and the pin is not", () => {
+  it("is born unpinned, at the value keeper-core calls the default", () => {
+    // Two namers again (Story 75.2, AD-259): `tauri.conf.json` for the
+    // prewarmed window and `Placement::default()` for a row nothing was ever
+    // stored under. A `true` here would float a panel over everything on a
+    // fresh machine — the owner's second complaint — and would do it one frame
+    // before any re-assert could correct it.
+    const declared = conf.app.windows.find((entry) => entry.url?.startsWith("capture."));
+    expect(declared, "tauri.conf.json no longer declares a capture window").toBeDefined();
+    expect(declared?.alwaysOnTop).toBe(false);
+    expect(CAPTURE_RS).toContain("always_on_top: false,");
+  });
+
+  it("routes every path that shows a capture window through opened()", () => {
+    // Three call sites, one rule (AD-258). `Placement::opened` clearing the
+    // lock is tested in `keeper-core`; that it is CALLED is only true here.
+    expect(rustBody(LIB_RS, "pub fn run() {")).toContain(".opened();");
+    expect(rustBody(NOTES_WINDOW_RS, "pub fn open(app: &AppHandle")).toContain(
+      "placement.opened()",
+    );
+    const reveal = rustBody(NOTES_WINDOW_RS, "fn reveal<R: Runtime>(");
+    expect(reveal).toContain("placement.opened()");
+    expect(reveal).toContain("Placement::default().opened()");
+  });
+
+  it("decides the hotkey's placement from whether the window answers, not from the lock", () => {
+    // The defect this replaced: reading the VALUE of `is_resizable()` meant a
+    // window the person locked this session was placed on the pointer's
+    // monitor and then unlocked, and the next blur wrote that coordinate over
+    // the position the padlock was pressed to keep.
+    const reveal = rustBody(NOTES_WINDOW_RS, "fn reveal<R: Runtime>(");
+    expect(reveal).toContain("window.is_resizable().is_ok()");
+    expect(reveal).not.toContain("is_resizable().unwrap_or");
+    // And the chrome is told, because the padlock it draws and the drag region
+    // it depends on are both this function's effect.
+    expect(reveal).toContain("announce(app);");
+  });
+
+  it("applies the remembered pin to the prewarmed window at boot", () => {
+    // The one path the draft window actually takes. `notes_window::open`
+    // re-asserts the flag too, but the draft never reaches it: the hotkey and
+    // the tray read no settings by design, so without this line a pin the
+    // owner set is lost at every relaunch — the only case a persisted flag
+    // exists for.
+    const boot = rustBody(LIB_RS, "pub fn run() {");
+    expect(boot).toContain("notes_window::set_always_on_top(");
+    expect(boot).toContain("placement.always_on_top,");
   });
 });

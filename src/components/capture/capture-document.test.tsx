@@ -17,14 +17,21 @@
  *
  * | Door | What it is | Tests |
  * |---|---|---|
- * | `CaptureDraftDocument` | the hotkey window — the door a real user comes through | 11 |
- * | `CaptureDocument` | a window opened on an existing note (Story 45.15) | 2 |
- * | `CapturePanel` | the webview root, which is what `capture.html` actually boots | 2 |
+ * | `CaptureDraftDocument` | the hotkey window — the door a real user comes through | 21 |
+ * | `CaptureDocument` | a window opened on an existing note (Story 45.15) | 3 |
+ * | `CapturePanel` | the webview root, which is what `capture.html` actually boots | 3 |
  *
  * The third row is the DW-172 row. Rendering `CaptureDraftDocument` in a test
  * can never observe that `capture-main.tsx` does not mount it, and "the tray
  * listener was declared and never mounted" is a defect this project has already
- * shipped twice.
+ * shipped twice. It is also where Story 75.3's structural claim is made, for
+ * the same reason: only the root assembles a window out of a document and the
+ * window's own controls, so only the root can be asked how many header rows
+ * that comes to.
+ *
+ * The counts had drifted (they read 11 / 2 / 2 against 20 / 3 / 2) and are
+ * re-counted here rather than incremented, because a door count nobody trusts
+ * is worse than none.
  */
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -83,11 +90,19 @@ vi.mock("@/lib/ipc/client", () => ({
   recordingOpenPath: vi.fn(async () => {}),
   revealPath: vi.fn(async () => {}),
   // Story 45.15's chrome mounts inside `CapturePanel`, so this file's boot
-  // path reaches these three the moment the root is rendered. Added here
-  // rather than by mocking the chrome away, because the root's job IS to
-  // assemble a window out of a document and a strip of buttons.
+  // path reaches these the moment the root is rendered. Added here rather than
+  // by mocking the chrome away, because the root's job IS to assemble a window
+  // out of a document and three buttons.
+  //
+  // The whole family, not the three the chrome happens to call: the capture
+  // windows STORE imports all five, and an ES module that names a missing
+  // export of a mocked module throws at import time — which surfaces as every
+  // test in the file failing for a reason none of them is about.
   notesCaptureWindows: vi.fn(async () => []),
+  notesCaptureOpen: vi.fn(async () => {}),
+  notesCaptureClose: vi.fn(async () => {}),
   notesCaptureSetLocked: vi.fn(async () => {}),
+  notesCaptureSetAlwaysOnTop: vi.fn(async () => {}),
   listenNotesCaptureWindows: vi.fn(async () => () => {}),
   // Reached only on a SLOW run, and therefore easy to mistake for unreached:
   // `NoteEditor` mounts `TemplateUpdateOffer`, which calls this after four
@@ -99,6 +114,12 @@ vi.mock("@/lib/ipc/client", () => ({
 
 import { EditorView } from "@codemirror/view";
 import { CapturePanel } from "@/capture-main";
+import {
+  CAPTURE_CLOSE_LABEL,
+  CAPTURE_LOCK_LABEL,
+  CAPTURE_PIN_LABEL,
+} from "@/components/capture/capture-window";
+import { PANE_HEADER_ACTIONS_SLOT, PANE_HEADER_FRAME_SLOT } from "@/components/layout/pane-header";
 import {
   ATTACH_FILE_LABEL,
   ATTACH_FROM_COMPUTER_LABEL,
@@ -578,11 +599,17 @@ describe("the quick-capture draft window", () => {
     });
   });
 
-  it("hands the window's chrome the same dismissal Escape performs", async () => {
+  it("hands the window's chrome the same dismissal Escape performs, from inside the one header", async () => {
     // Story 45.15's close button. A slot that arranged its own hide would be a
     // second spelling of one sentence — it would skip the force-flush that
     // makes Rust see the page as written on, so the next summon would land the
     // next thought underneath this one.
+    //
+    // Story 75.3 moved WHERE the slot is rendered and left that contract
+    // untouched, so this test keeps its assertions and adds one: the button is
+    // inside the editor header's frame group. Without that line the same test
+    // passes against a chrome row drawn above the editor, which is exactly the
+    // shape the story removed.
     render(
       <CaptureDraftDocument
         captureKey={DRAFT_KEY}
@@ -595,6 +622,12 @@ describe("the quick-capture draft window", () => {
     );
     const editor = await liveEditor();
     editor.dispatch({ changes: { from: 0, insert: "filed by the close button" } });
+
+    const headers = document.querySelectorAll("header");
+    expect(headers).toHaveLength(1);
+    const frame = headers[0]?.querySelector(`[data-slot="${PANE_HEADER_FRAME_SLOT}"]`);
+    expect(frame).not.toBeNull();
+    expect(within(frame as HTMLElement).getByRole("button", { name: "Close" })).toBeInTheDocument();
 
     notesCaptureDraft.mockResolvedValue(page("01FRESHPAGE"));
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
@@ -610,6 +643,50 @@ describe("the quick-capture draft window", () => {
     expect(notesCaptureHide.mock.invocationCallOrder[0]).toBeLessThan(
       notesCaptureDraft.mock.invocationCallOrder[1],
     );
+  });
+
+  it("keeps the way out on screen while there is no page to put a header on", async () => {
+    // The one state where the window's controls are NOT in the editor's
+    // header, because there is no editor: `useCaptureDraft` has not resolved,
+    // or there is no vault and never will be. A window showing one sentence
+    // and no close button is a window whose only exit is a keystroke nobody
+    // can see — which is the defect the close button was added for.
+    //
+    // Still not a second `header` element: this row is a `div`, it holds
+    // nothing but the controls, and it goes away the instant the editor
+    // arrives to carry them. Both halves asserted, because "the fallback
+    // exists" and "the fallback is temporary" are different claims and a
+    // fallback that outstayed the editor would be the old two-row window.
+    const handOver: { settle?: (resolved: NoteCreateVm) => void } = {};
+    notesCaptureDraft.mockImplementation(
+      () =>
+        new Promise<NoteCreateVm>((settle) => {
+          handOver.settle = settle;
+        }),
+    );
+    render(
+      <CaptureDraftDocument
+        captureKey={DRAFT_KEY}
+        chrome={(dismiss) => (
+          <button type="button" onClick={dismiss}>
+            Close
+          </button>
+        )}
+      />,
+    );
+
+    expect(await screen.findByText(CAPTURE_OPENING_LABEL)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close" })).toBeInTheDocument();
+    expect(document.querySelectorAll("header")).toHaveLength(0);
+
+    handOver.settle?.(page("01CAPTUREPAGE"));
+    await liveEditor();
+    // One row now, and the button is in it.
+    const headers = document.querySelectorAll("header");
+    expect(headers).toHaveLength(1);
+    expect(
+      within(headers[0] as HTMLElement).getByRole("button", { name: "Close" }),
+    ).toBeInTheDocument();
   });
 
   it("says it is opening a page, and stops saying it once there is one", async () => {
@@ -774,6 +851,57 @@ describe("the capture webview's root", () => {
     // The surface this story replaced, asserted absent: a textarea left mounted
     // beside the editor would be two editors again, which is the whole defect.
     expect(document.querySelector("textarea")).toBeNull();
+  });
+
+  it("draws ONE header holding the window's three controls and the note's three actions", async () => {
+    // Story 75.3's acceptance, in the realm that can state the structure. The
+    // window used to draw a 32px strip of pin/lock/close above a 40px
+    // `PaneHeader` — 72px of chrome over a 340px window — and the merge puts
+    // the three window controls in that header's frame group.
+    //
+    // Through `CapturePanel` with the REAL chrome, because that is the only
+    // door that assembles the two halves: rendering `CaptureDraftDocument`
+    // with a stub chrome could never see a root that still wrapped it in a row
+    // of its own.
+    render(<CapturePanel search="" />);
+    await liveEditor();
+
+    // One `header` element in the document. Not "the strip is gone" — that
+    // would pass against a strip renamed — but the positive claim the story
+    // makes: there is one row.
+    const headers = document.querySelectorAll("header");
+    expect(headers).toHaveLength(1);
+    const header = headers[0] as HTMLElement;
+
+    // The window's three, in the frame group, in the order DW-199 needs: close
+    // last, so the inset still protects the corner it sits in.
+    const frame = header.querySelector(`[data-slot="${PANE_HEADER_FRAME_SLOT}"]`) as HTMLElement;
+    expect(frame).not.toBeNull();
+    expect(
+      within(frame)
+        .getAllByRole("button")
+        .map((button) => button.getAttribute("aria-label")),
+    ).toEqual([CAPTURE_PIN_LABEL, CAPTURE_LOCK_LABEL, CAPTURE_CLOSE_LABEL]);
+
+    // …and the note's own, in the actions group beside them. Attach and
+    // Properties are the two `PriorityActions` never demotes, and the `…`
+    // trigger is the third: at the capture window's width the verbs behind it
+    // may move into it, but these three are the row's constants.
+    const actions = header.querySelector(
+      `[data-slot="${PANE_HEADER_ACTIONS_SLOT}"]`,
+    ) as HTMLElement;
+    expect(actions).not.toBeNull();
+    expect(within(actions).getByRole("button", { name: ATTACH_FILE_LABEL })).toBeInTheDocument();
+    expect(within(actions).getByRole("button", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+    expect(
+      within(actions).getByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_LABEL}`) }),
+    ).toBeInTheDocument();
+
+    // And nothing of the window's leaked into the note's group, which is the
+    // half of AD-260 that matters at a narrow width: `PriorityActions` may
+    // demote anything in group 3 into the `…` menu, and the way to shut a
+    // window may never be in there.
+    expect(within(actions).queryByRole("button", { name: CAPTURE_CLOSE_LABEL })).toBeNull();
   });
 
   it("asks for the same window key the draft document does", async () => {

@@ -88,9 +88,19 @@ describe("CapturePanel", () => {
     expect(dismiss).toHaveBeenCalledTimes(1);
   });
 
-  it("renders the note the window was opened on", () => {
+  it("renders the note the window was opened on, inside its own window chrome", () => {
     render(<CapturePanel search="?vault=vault-a&note=note-1" />);
-    expect(documentProps).toHaveBeenCalledWith({ vaultId: "vault-a", noteId: "note-1" });
+    // The target AND the chrome, since Story 75.3 merged the window controls
+    // into the document's own header: a note window that received the right
+    // note but no frame would render with no close button at all, which is the
+    // failure this pins. `titleBar` travels with it because whether the row may
+    // be dragged is a fact about this window, not about the note.
+    expect(documentProps).toHaveBeenCalledWith(
+      expect.objectContaining({ vaultId: "vault-a", noteId: "note-1" }),
+    );
+    const props = documentProps.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(props.frame).not.toBeUndefined();
+    expect(props.titleBar).toEqual({ draggable: true });
     expect(draftProps).not.toHaveBeenCalled();
   });
 
@@ -100,10 +110,12 @@ describe("CapturePanel", () => {
     // resolves to nothing and renders "not found" on a note the person just
     // asked keeper to open.
     render(<CapturePanel search="?vault=my%20notes&note=sub%2Fdir%2Fn3.md" />);
-    expect(documentProps).toHaveBeenCalledWith({
-      vaultId: "my notes",
-      noteId: "sub/dir/n3.md",
-    });
+    expect(documentProps).toHaveBeenCalledWith(
+      expect.objectContaining({
+        vaultId: "my notes",
+        noteId: "sub/dir/n3.md",
+      }),
+    );
   });
 
   it("falls back to the prewarmed page rather than guessing half a target", () => {

@@ -31,6 +31,7 @@
  * fresh page in front of you. Nothing anywhere on this window discards text.
  */
 import { type ReactNode, useEffect } from "react";
+import type { PaneHeaderTitleBar } from "@/components/layout/pane-header";
 import { NoteEditor } from "@/components/notes/note-editor";
 import { useCaptureDraft } from "@/hooks/use-capture-draft";
 
@@ -51,16 +52,38 @@ export interface CaptureDocumentProps {
    * standing in for one.
    */
   notices?: readonly string[];
+  /**
+   * The window's own controls — close, lock, pin — for the editor's header to
+   * carry as its frame group (Story 75.3, AD-260).
+   *
+   * Passed straight through and never rendered here. This file's whole job is
+   * the seam between a window and a document (see the module doc); a second
+   * header drawn at this level is precisely the 72px of chrome the story
+   * removed, so the controls travel to the one header there is.
+   */
+  frame?: ReactNode;
+  /**
+   * Present when nothing is drawn above that header — when it IS the window's
+   * title bar. Forwarded verbatim to `PaneHeader`, which is where the one
+   * concept and its three consequences are documented.
+   */
+  titleBar?: PaneHeaderTitleBar | null;
 }
 
 /**
  * One capture window's note, in the real editor.
  *
  * Fills its parent (`h-full`), so the host decides how tall a capture window's
- * document is — the draft window gives it the whole viewport, and Story 45.15's
- * chrome gives it what is left under the title bar.
+ * document is — and since Story 75.3 both hosts give it the whole viewport,
+ * because there is no longer a strip above it taking 32 of them.
  */
-export function CaptureDocument({ vaultId, noteId, notices = NO_NOTICES }: CaptureDocumentProps) {
+export function CaptureDocument({
+  vaultId,
+  noteId,
+  notices = NO_NOTICES,
+  frame,
+  titleBar = null,
+}: CaptureDocumentProps) {
   return (
     <div className="flex h-full min-h-0 flex-col bg-background text-foreground">
       {notices.map((notice) => (
@@ -71,7 +94,7 @@ export function CaptureDocument({ vaultId, noteId, notices = NO_NOTICES }: Captu
         </p>
       ))}
       <div className="min-h-0 flex-1">
-        <NoteEditor vaultId={vaultId} noteId={noteId} />
+        <NoteEditor vaultId={vaultId} noteId={noteId} frame={frame} titleBar={titleBar} />
       </div>
     </div>
   );
@@ -87,8 +110,8 @@ export interface CaptureDraftDocumentProps {
    */
   captureKey: string;
   /**
-   * Story 45.15's window chrome — close button, lock, drag handle — rendered
-   * above the editor and **handed the dismissal act**.
+   * Story 45.15's window chrome — close button, lock, pin — **handed the
+   * dismissal act**.
    *
    * A slot rather than a fixed element, and it receives `dismiss` rather than
    * arranging its own, because a close button that hid the window itself would
@@ -96,8 +119,26 @@ export interface CaptureDraftDocumentProps {
    * makes Rust see the page as written on, and it would skip the immediate
    * re-arm, so the next summon would pay for a resolve the hotkey path never
    * pays for. One act, one implementation, two affordances.
+   *
+   * **Where it is rendered changed in Story 75.3 and the contract did not.** It
+   * used to be a row of its own above the editor; it is now the editor's header
+   * frame group (AD-260), so the window's controls and the document's sit in
+   * one 40px row. The one exception is the state where there is no editor to
+   * put a header on — see the fallback below, which exists so the way out does
+   * not vanish in the one state where nothing else is on screen.
    */
   chrome?: (dismiss: () => void) => ReactNode;
+  /**
+   * Present when nothing is drawn above the editor's header — when it IS this
+   * window's title bar. Forwarded to {@link CaptureDocument} and on to
+   * `PaneHeader`, where the concept is documented.
+   *
+   * A prop rather than a hook called here, deliberately: the hook lives beside
+   * the chrome in `capture-window.tsx`, which already imports this file, and a
+   * capture host that reached back for it would close the cycle. The host owns
+   * both halves of the pair and passes both.
+   */
+  titleBar?: PaneHeaderTitleBar | null;
 }
 
 /**
@@ -109,7 +150,11 @@ export interface CaptureDraftDocumentProps {
  * first keystroke and has been autosaving, so dismissal flushes, hides, and
  * arms a fresh page for next time.
  */
-export function CaptureDraftDocument({ captureKey, chrome }: CaptureDraftDocumentProps) {
+export function CaptureDraftDocument({
+  captureKey,
+  chrome,
+  titleBar = null,
+}: CaptureDraftDocumentProps) {
   const { note, notices, error, windowError, dismiss } = useCaptureDraft(captureKey);
 
   useEffect(() => {
@@ -157,14 +202,36 @@ export function CaptureDraftDocument({ captureKey, chrome }: CaptureDraftDocumen
           {windowError}
         </p>
       )}
-      {chrome?.(dismiss)}
       {note === null ? (
-        error === null ? (
-          <p className="p-4 text-muted-foreground text-sm">{CAPTURE_OPENING_LABEL}</p>
-        ) : null
+        <>
+          {/* No page means no editor, and no editor means no header for the
+              window's controls to live in. This is the ONE state where they are
+              drawn on a row of their own, and it is not a leftover of the old
+              strip: it is the state where the window is showing a sentence and
+              nothing else, so the close button disappearing here would leave a
+              stuck window whose only exit is a keystroke nobody can see.
+
+              A `div` and not a `header`: there is no identity, no status and no
+              document in it, and a second `header` element is exactly the thing
+              Story 75.3 exists to refuse. `h-10 justify-end px-3` so the
+              controls sit where the merged header puts them, and the row
+              vanishes the instant the editor arrives to carry them. */}
+          <div className="flex h-10 shrink-0 items-center justify-end gap-2 border-border border-b px-3">
+            {chrome?.(dismiss)}
+          </div>
+          {error === null ? (
+            <p className="p-4 text-muted-foreground text-sm">{CAPTURE_OPENING_LABEL}</p>
+          ) : null}
+        </>
       ) : (
         <div className="min-h-0 flex-1">
-          <CaptureDocument vaultId={note.vaultId} noteId={note.id} notices={notices} />
+          <CaptureDocument
+            vaultId={note.vaultId}
+            noteId={note.id}
+            notices={notices}
+            titleBar={titleBar}
+            frame={chrome?.(dismiss)}
+          />
         </div>
       )}
     </div>

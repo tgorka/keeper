@@ -245,9 +245,11 @@ describe("the status is a box before it is a word", () => {
     expect(box(group(PANE_HEADER_STATUS_SLOT))).toBe(before);
     expect(reserved()).toEqual(reservationBefore);
     // Ellipsised on screen is not thrown away: the whole sentence stays in the
-    // DOM for a screen reader and on `title` for a pointer.
+    // DOM for a screen reader, and on the SLOT's `title` for a pointer. The
+    // slot and not the word, because a title bar makes the word inert so a
+    // press can drag the window — and a hover has to reach the same box.
     expect(shownElement()).toHaveClass("truncate");
-    expect(shownElement()).toHaveAttribute("title", REFUSED);
+    expect(group(PANE_HEADER_STATUS_SLOT)).toHaveAttribute("title", REFUSED);
   });
 
   it("hangs no title on an empty caption", () => {
@@ -260,8 +262,9 @@ describe("the status is a box before it is a word", () => {
     );
 
     // An empty tooltip is a tooltip that flickers over a blank box on every
-    // hover, which is noise for a state that is deliberately quiet.
-    expect(shownElement()).not.toHaveAttribute("title");
+    // hover, which is noise for a state that is deliberately quiet. Asserted
+    // on the slot, which is where the tooltip lives.
+    expect(group(PANE_HEADER_STATUS_SLOT)).not.toHaveAttribute("title");
   });
 });
 

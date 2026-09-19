@@ -38,8 +38,9 @@ alwaysOnTop: boolean,
 visible: boolean, 
 /**
  * The gap, in **logical CSS pixels**, the window's own resize border needs
- * on the chrome strip's top and right edges right now (Story 47.5,
- * DW-199) — `0` on every platform and in every state but one.
+ * on the chrome's top and right edges right now (Story 47.5, DW-199; the
+ * chrome is the header's frame group since Story 75.3) — `0` on every
+ * platform and in every state but one.
  *
  * Decided in Rust and carried, because the frontend cannot decide it: this
  * app reads the platform nowhere (`src/test/no-user-agent-gating.test.ts`

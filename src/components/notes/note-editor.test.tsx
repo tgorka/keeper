@@ -68,6 +68,7 @@ import {
   PANE_HEADER_FRAME_SLOT,
   PANE_HEADER_IDENTITY_SLOT,
   PANE_HEADER_STATUS_SLOT,
+  type PaneHeaderTitleBar,
 } from "@/components/layout/pane-header";
 import {
   beginSave,
@@ -138,9 +139,18 @@ function seedVault(): void {
   notesVaultsStore.getState().setVaults([vault]);
 }
 
-/** Mount the editor on a note, and let its opening `Reset` land. `frame` is
- *  the holding surface's own controls, which only a panel has. */
-async function openEditor(frame?: ReactNode, frontmatter = ""): Promise<void> {
+/** Mount the editor on a note, and let its opening `Reset` land.
+ *
+ *  `frame` is the holding surface's own controls — a panel's fold and close
+ *  since Story 50.1, a capture window's pin, lock and close since 75.3.
+ *  `titleBar` is the second half of that second host: the claim that this row
+ *  is not a band inside somebody else's window but the window's own title bar.
+ *  Both default to the shape the notes pane passes, which is nothing. */
+async function openEditor(
+  frame?: ReactNode,
+  frontmatter = "",
+  titleBar: PaneHeaderTitleBar | null = null,
+): Promise<void> {
   notesOpen.mockImplementation(async (_vault, _note, onBatch) => {
     onBatch({
       kind: "reset",
@@ -152,7 +162,7 @@ async function openEditor(frame?: ReactNode, frontmatter = ""): Promise<void> {
     });
     return "sub-1";
   });
-  render(<NoteEditor vaultId="v1" noteId="n1" frame={frame} />);
+  render(<NoteEditor vaultId="v1" noteId="n1" frame={frame} titleBar={titleBar} />);
   await act(async () => {
     await Promise.resolve();
   });
@@ -392,8 +402,12 @@ describe("the save caption is a box before it is a word", () => {
     expect(reserved()).toEqual(reservationBefore);
 
     // Ellipsised on screen is not the same as thrown away: the whole sentence
-    // stays in the DOM for a screen reader and on `title` for a pointer.
-    expect(shownElement()).toHaveAttribute("title", REFUSED);
+    // stays in the DOM for a screen reader, and on the SLOT's `title` for a
+    // pointer. It rides on the slot rather than on the word because in a
+    // capture window's title bar the word is inert — the press has to reach
+    // the box so it can drag the window — and a hover has to reach the same
+    // box so the sentence is still readable when it does not fit.
+    expect(captionSlot()).toHaveAttribute("title", REFUSED);
   });
 });
 
@@ -774,6 +788,302 @@ describe("a note in a panel: one row, carrying the panel's own controls", () => 
 
     // And the row is still a row that grows: the frame group is a constant
     // subtraction, not a cap.
+    resize(1400);
+    expect(names()).toEqual([ATTACHMENTS_LABEL, NOTE_HISTORY_LABEL, SHOW_IN_FILES_LABEL]);
+  });
+});
+
+/**
+ * A note in the quick-capture window: the row IS the window (Story 75.3).
+ *
+ * The suite above is the same merge for a panel, and stops where the panel
+ * does: a panel is a band inside a window somebody else draws, so its header
+ * can be a header and nothing more. The capture window has nothing above this
+ * row. It is the title bar — the thing you grab to move the window, the only
+ * place the platform's close button can be, and the row that has to hold six
+ * controls inside 560px and then inside the minimum.
+ *
+ * `PaneHeader` learns that as ONE prop (`titleBar`), because it is one fact
+ * about the host with three consequences, and a reviewer's first question
+ * about a shared component gaining a prop is what it did to the hosts that do
+ * not pass it. The first two tests here answer exactly that and nothing else.
+ *
+ * What these cannot prove, for the usual reason: jsdom performs no layout, so
+ * no test here measures a pixel. The widths come from `withActionWidths`, the
+ * arithmetic is keeper's own, and whether the row FITS at 560 and at the
+ * minimum is a browser fact checked on the gate.
+ */
+describe("a note in the quick-capture window: the row is the window's title bar", () => {
+  /** What the capture window hands down — pin, lock and close. Plain buttons
+   *  with this file's own strings, for the same reason `PANEL_CONTROLS` is:
+   *  what these controls ARE is `capture-window.tsx`'s decision and is
+   *  asserted there. The claim here is only about where the row puts them and
+   *  what it refuses to do to them. */
+  const PIN_LABEL = "Float above other windows";
+  const LOCK_LABEL = "Lock this window's position and size";
+  const WINDOW_CLOSE_LABEL = "Close this capture window";
+  const WINDOW_CONTROLS = (
+    <>
+      <button type="button">{PIN_LABEL}</button>
+      <button type="button">{LOCK_LABEL}</button>
+      <button type="button">{WINDOW_CLOSE_LABEL}</button>
+    </>
+  );
+
+  /** The same geometry as the suites above, plus a frame group of three
+   *  `icon-xs` window controls: 3 × 24 + 2 × 8 = 88. Sixteen more than the
+   *  panel's 72 for one more control, because the window's controls are
+   *  24px where a panel's are 32 — the whole reason 88 fits where 104 would
+   *  not have. */
+  const CAPTURE_WIDTHS: Record<string, number> = { ...WIDTHS, frame: 88 };
+
+  /** Every element the drag shim would match, in DOM order. Tauri's
+   *  `data-tauri-drag-region` is a document-level `mousedown` listener that
+   *  compares against the EXACT element the pointer went down on and never
+   *  walks up to an ancestor, so "which elements carry it" is the whole of
+   *  "where can this window be dragged from". */
+  function dragRegions(): string[] {
+    return Array.from(document.querySelectorAll("[data-tauri-drag-region]")).map(
+      (element) => element.getAttribute("data-slot") ?? element.tagName.toLowerCase(),
+    );
+  }
+
+  function identitySlot(): HTMLElement {
+    const found = document.querySelector<HTMLElement>(`[data-slot="${PANE_HEADER_IDENTITY_SLOT}"]`);
+    if (found === null) {
+      throw new Error("the header drew no identity group");
+    }
+    return found;
+  }
+
+  function actionsSlot(): HTMLElement {
+    const found = document.querySelector<HTMLElement>(`[data-slot="${PANE_HEADER_ACTIONS_SLOT}"]`);
+    if (found === null) {
+      throw new Error("the header drew no actions group");
+    }
+    return found;
+  }
+
+  let restoreWidths: (() => void) | null = null;
+  let observer: { resize: (width: number) => void; undo: () => void } | null = null;
+
+  afterEach(() => {
+    restoreWidths?.();
+    restoreWidths = null;
+    observer?.undo();
+    observer = null;
+  });
+
+  /** Mount the editor as the capture window mounts it: the three window
+   *  controls as the frame group, and the claim that this row is the title
+   *  bar. `draggable` is the live lock — a locked window does not move, so its
+   *  title bar is not a drag handle. */
+  async function openTitleBar(draggable = true): Promise<(width: number) => void> {
+    seedVault();
+    restoreWidths = withActionWidths(CAPTURE_WIDTHS);
+    observer = withHandFiredResize();
+    await openEditor(WINDOW_CONTROLS, "", { draggable });
+    const { resize } = observer;
+    return (width) => {
+      act(() => resize(width));
+    };
+  }
+
+  it("changes nothing for the notes pane, which is not in a window of its own", async () => {
+    seedVault();
+    await openEditor();
+
+    // The blast radius, asserted rather than asserted-about. Three claims,
+    // one per consequence the prop carries: a pane that passes no `titleBar`
+    // marks nothing draggable, puts no CSS floor under its title, and keeps
+    // the caption slot unsqueezable — which is 46.4's contract and is what the
+    // first suite in this file exists to protect.
+    expect(dragRegions()).toEqual([]);
+    expect(identitySlot()).not.toHaveClass("min-w-40");
+    expect(captionSlot()).toHaveClass("shrink-0");
+  });
+
+  it("changes nothing for a note in a panel, which has a frame but not a window", async () => {
+    seedVault();
+    restoreWidths = withActionWidths({ ...WIDTHS, frame: 72 });
+    await openEditor(
+      <>
+        <button type="button">Fold panel</button>
+        <button type="button">Close panel</button>
+      </>,
+    );
+
+    // The harder half of the same question: this host DOES pass a frame
+    // group, so it exercises every line the new prop touches except the prop
+    // itself. A panel's header must not become draggable because a window's
+    // did, and dragging it would move the whole application window.
+    expect(dragRegions()).toEqual([]);
+    expect(identitySlot()).not.toHaveClass("min-w-40");
+    expect(captionSlot()).toHaveClass("shrink-0");
+  });
+
+  it("marks the row, the title and the window's controls as the drag handle", async () => {
+    await openTitleBar();
+
+    // The 32px strip this replaces was marked as one box across the window's
+    // full width. The merged row is marked in four: the header itself (its
+    // padding and the gaps between the groups), the identity group (the
+    // title, and every pixel of slack in the row, which is most of it), the
+    // status slot (the save caption's own box, which sits in the middle of the
+    // row and would otherwise be a dead zone the width of `Saved · 12:34`),
+    // and the frame wrapper (the seams around pin, lock and close).
+    // Contiguous, 40px tall rather than 32, and larger than what it replaces.
+    expect(dragRegions()).toEqual([
+      "header",
+      PANE_HEADER_IDENTITY_SLOT,
+      PANE_HEADER_STATUS_SLOT,
+      PANE_HEADER_FRAME_SLOT,
+    ]);
+
+    // And NOT the actions group: a press that missed Attach by two pixels
+    // must not move the window instead of opening the panel.
+    expect(actionsSlot()).not.toHaveAttribute("data-tauri-drag-region");
+    // The title, the path and the caption are inside their marked boxes rather
+    // than being them, and the shim does not walk up — so they are made inert,
+    // which turns a press on the title or on the caption into a press on the
+    // box that holds it.
+    expect(identitySlot()).toHaveClass("[&>*]:pointer-events-none");
+    expect(captionSlot()).toHaveClass("[&>*]:pointer-events-none");
+  });
+
+  it("marks nothing when the window is locked, because a locked window does not move", async () => {
+    await openTitleBar(false);
+
+    // The lock's whole point. This is the old `capture-window.test.tsx`
+    // assertion — the drag region is conditional — moved to where the
+    // attribute now lives: the strip that used to carry it is gone, and the
+    // condition survived the move.
+    expect(dragRegions()).toEqual([]);
+    // The controls are still there and still findable: locking freezes the
+    // geometry, it does not take the way out away.
+    expect(screen.getByRole("button", { name: WINDOW_CLOSE_LABEL })).toBeVisible();
+  });
+
+  it("makes the caption the one thing that gives, and the title the one thing that truncates", async () => {
+    await openTitleBar();
+
+    const row = headerRow();
+    // AD-260's order, read off the row. Every member but the caption refuses
+    // to shrink — identity because a title bar's drag handle may not collapse
+    // (`flex-1` off a zero basis has a scaled shrink factor of zero, so
+    // without a floor it surrenders all 160px), actions and frame because
+    // neither may clip a control. So the caption is the only box a deficit
+    // can come out of, which is precisely AD-260's "the status caption gives
+    // first".
+    const squeezable = Array.from(row.children).filter(
+      (child) => !child.classList.contains("shrink-0"),
+    );
+    expect(squeezable.map((child) => child.getAttribute("data-slot"))).toEqual([
+      PANE_HEADER_IDENTITY_SLOT,
+      PANE_HEADER_STATUS_SLOT,
+    ]);
+    expect(captionSlot()).toHaveClass("min-w-0", "overflow-hidden");
+
+    // Identity is in that list only because `flex-1` implies `shrink`; what
+    // stops it is the floor, and the floor is 160px twice — once in the
+    // arithmetic as PANE_HEADER_IDENTITY_MIN_PX, once in CSS as `min-w-40`,
+    // because the arithmetic decides how many verbs promote and only the CSS
+    // decides what a real browser does with negative free space.
+    expect(identitySlot()).toHaveClass("min-w-40", "flex-1");
+    // Second, and only second: once the caption is gone the title is what
+    // gives, and it gives by truncating rather than by pushing anything out.
+    expect(within(identitySlot()).getByRole("heading")).toHaveClass("truncate");
+  });
+
+  it("stops squeezing the caption when it is the reason a write was refused", async () => {
+    await openTitleBar();
+
+    const REFUSED = "the vault is read-only and the write was refused";
+    act(() => {
+      markSaveFailed("v1", "n1", REFUSED);
+    });
+    await waitFor(() => {
+      expect(shownWord()).toBe(REFUSED);
+    });
+
+    // AD-260's order reverses for this one caption, because in a capture
+    // window it is the ONLY place a refused write says why (UX-DR35) — and
+    // the window does not close while it is refused, so a person told nothing
+    // is a person pressing Escape at a window that ignores them. The caption
+    // keeps its box and identity gives up its floor instead: at the 400px
+    // minimum the row then asks for 330px rather than 400, so the sentence is
+    // on screen instead of clipped to nothing.
+    expect(captionSlot()).toHaveClass("shrink-0");
+    expect(captionSlot()).not.toHaveClass("overflow-hidden");
+    expect(identitySlot()).not.toHaveClass("min-w-40");
+
+    // What gives instead is the note's name, and it gives the way it always
+    // does — by truncating, never by pushing a control out of the row. The
+    // whole sentence stays readable on the slot's tooltip.
+    expect(within(identitySlot()).getByRole("heading")).toHaveClass("truncate");
+    expect(captionSlot()).toHaveAttribute("title", REFUSED);
+  });
+
+  it("keeps the way out of the WINDOW on screen at every width, including the minimum", async () => {
+    const resize = await openTitleBar();
+
+    // Content widths, because that is what a `ResizeObserver` reports: 1400
+    // is a window nobody has, 800 a stretched one, 536 the default 560 less
+    // its gutters, 376 the 400px floor this story derives less the same, and 0
+    // a row no observer has answered for yet. AD-260 forbids dropping an
+    // action to make room at any of them: a control that disappears at a width
+    // is a control nobody can rely on, and these three are the pin, the lock
+    // and the way to shut the window.
+    for (const width of [1400, 800, 536, 376, 0]) {
+      resize(width);
+      for (const label of [PIN_LABEL, LOCK_LABEL, WINDOW_CLOSE_LABEL]) {
+        expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
+        expect(names()).not.toContain(label);
+      }
+      // Nor are they hiding in the note's menu — a verb that acts on the
+      // window must never be reachable only by opening the document's `…`.
+      const inMenu = menuItems();
+      for (const label of [PIN_LABEL, LOCK_LABEL, WINDOW_CLOSE_LABEL]) {
+        expect(inMenu).not.toContain(label);
+      }
+      fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    }
+  });
+
+  it("charges the row for them, and demotes two verbs at the default 560px width", async () => {
+    const resize = await openTitleBar();
+
+    // 800px, framed by a panel, promotes two (the suite above asserts it at
+    // exactly this width). A window costs 16px more than a panel — 88 for
+    // three controls against 72 for two — and 16px is not a verb, so the
+    // shape at 800 is the same: 800 - 160 - 8 - 90 - 8 - 88 - 8 = 438, less
+    // the 198 the leading control and the trigger reserve, buys the 108 and
+    // the 100 but not the 74.
+    resize(800);
+    expect(names()).toEqual([ATTACHMENTS_LABEL, NOTE_HISTORY_LABEL]);
+
+    // 536 is `CAPTURE_DEFAULT_SIZE`'s 560 less the row's own 12px gutters —
+    // a `ResizeObserver` reports CONTENT width, which is what this helper
+    // delivers and what the budget is computed from. 536 - 160 - 8 - 90 - 8 -
+    // 88 - 8 = 174, and the leading Properties control plus the `…` trigger
+    // reserve 198 before a single candidate is considered.
+    //
+    // So nothing promotes, and that is the behaviour change AD-260 accepts
+    // rather than the defect it fixes: at the default width two verbs that
+    // used to be glyphs in the row are now words in the menu. The price of the
+    // alternative is dropping a control, which AD-260 forbids, or a fourth
+    // overflow mechanism, which nobody asked for. Attach and Properties are
+    // the group's own always-out controls and are unaffected.
+    resize(536);
+    expect(names()).toEqual([]);
+    const demoted = menuItems();
+    expect(demoted).toContain(ATTACHMENTS_LABEL);
+    expect(demoted).toContain(NOTE_HISTORY_LABEL);
+    expect(demoted).toContain(SHOW_IN_FILES_LABEL);
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+    // And the row still grows: the frame group is a constant subtraction, not
+    // a cap, so a window someone stretched gets its verbs back.
     resize(1400);
     expect(names()).toEqual([ATTACHMENTS_LABEL, NOTE_HISTORY_LABEL, SHOW_IN_FILES_LABEL]);
   });

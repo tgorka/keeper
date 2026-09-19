@@ -124,7 +124,7 @@ or a compositor that will not name a monitor.
 | `free` | `{free, -, -}` | `None` | resizable; **size untouched** |
 | `free 120 -40` | `{free, (120,-40), -}` | `None` | resizable, positioned; size untouched |
 | `free size 900 600` | `{free, -, (900,600)}` | `Some((900,600))` | resizable, sized, auto-placed |
-| `locked 10 10 size 900 600` | `{locked, (10,10), (900,600)}` | `Some((560,340))` | **normalised to 560×340**, kept at (10,10) |
+| `locked 10 10 size 900 600` | `{locked, (10,10), (900,600)}` | ~~`Some((560,340))`~~ → `Some((900,600))`, kept at (10,10) | **Rescinded by AD-257 (epic 75).** This row recorded the normalisation the owner later reported as the defect: he resized the window, locked it, and it snapped back to 560×340. A locked window now freezes the size it was given rather than being normalised to keeper's default. Left struck through rather than deleted, matching M9 in the mutation table below: a table that quietly loses a row reads as if the case was never considered. |
 | `free size 3000 2000` on a 1440×900 screen | `{free, -, (3000,2000)}` | `Some((1440,900))` | clamped to the display |
 | `free size 1 1` | `{free, -, (1,1)}` | `Some((320,240))` | raised to the floor |
 | `free size 0 340` | `{free, -, **-**}` | `None` | size refused; window untouched |
@@ -190,8 +190,8 @@ after every single mutant** — not from memory. **9 applied, 9 caught, 0 surviv
 | M5 | `clamp_size`: no floor | `a_remembered_size_is_never_smaller_than_the_window_can_hold`, `an_unknown_display_…` |
 | M6 | `clamp_size`: floor applied **after** the ceiling, so the floor beats the screen | `a_display_smaller_than_the_floor_still_gets_a_window_it_can_show` |
 | M7 | `clamp_size`: a `0` work area treated as a measurement | `an_unknown_display_clamps_what_it_can_and_invents_nothing` |
-| M8 | `window_size`: unlocked + never resized returns the default instead of `None` | `a_locked_window_is_normalised_and_an_unsized_one_is_left_alone`, `an_unreadable_size_…` |
-| M9 | `window_size`: a locked window keeps the remembered size | `a_locked_window_is_normalised_and_an_unsized_one_is_left_alone` |
+| M8 | `window_size`: unlocked + never resized returns the default instead of `None` | `a_lock_freezes_the_size_it_finds_and_an_unsized_window_is_left_alone` (renamed by epic 75), `an_unreadable_size_…` |
+| M9 | ~~`window_size`: a locked window keeps the remembered size~~ | **Rescinded by AD-257 (epic 75).** This mutation killed the behaviour the owner later reported as the defect: he resized the window, locked it, and it snapped back to 560×340. Keeping the remembered size *is* the rule now, and its mutation is the inverse — reverting the locked arm to `CAPTURE_DEFAULT_SIZE` reds `a_lock_freezes_the_size_it_finds_and_an_unsized_window_is_left_alone`. Left here struck through rather than deleted: a mutation table that quietly loses a row reads as if the case was never considered. |
 
 M4/M5/M6 together are the clamp proof the story asked for: the ceiling, the floor, and the order
 between them are each independently defended. M1/M2/M3 are the decode-degradation proof.
