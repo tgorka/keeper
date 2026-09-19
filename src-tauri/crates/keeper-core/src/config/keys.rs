@@ -534,11 +534,13 @@ pub const KEYS: &[KeySpec] = &[
         family: true,
         scope: Scope::SessionState,
         settable: Settable::Never(
-            "it is where a person last dragged one capture window, rewritten on every dismissal",
+            "it is what a person last did to one capture window — dragged it, resized it, \
+             pinned it above other applications or locked it — rewritten on every dismissal",
         ),
         shape: Shape::Text,
         default: "",
-        summary: "Per capture window: its remembered position and whether the position is locked.",
+        summary: "Per capture window: its remembered position and size, whether it floats above \
+                  other applications, and whether the lock is on.",
         example: "",
     },
     KeySpec {

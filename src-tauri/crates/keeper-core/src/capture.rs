@@ -120,8 +120,9 @@ pub struct CaptureWindowVm {
     /// Whether it is on screen. A hidden draft window is still a window.
     pub visible: bool,
     /// The gap, in **logical CSS pixels**, the window's own resize border needs
-    /// on the chrome strip's top and right edges right now (Story 47.5,
-    /// DW-199) — `0` on every platform and in every state but one.
+    /// on the chrome's top and right edges right now (Story 47.5, DW-199; the
+    /// chrome is the header's frame group since Story 75.3) — `0` on every
+    /// platform and in every state but one.
     ///
     /// Decided in Rust and carried, because the frontend cannot decide it: this
     /// app reads the platform nowhere (`src/test/no-user-agent-gating.test.ts`
@@ -274,20 +275,56 @@ pub const CAPTURE_DEFAULT_SIZE: (u32, u32) = (560, 340);
 /// The smallest a capture window may be, in logical pixels.
 ///
 /// Not a taste judgement — a floor derived from what the window still has to
-/// hold. The note editor's header is three groups (AD-104): the identity group
-/// collapses to nothing by design, but the status group reserves a measured box
-/// for `Saved · HH:MM` (~100 px in a 12-hour locale) and the actions group
-/// carries an icon button plus a word-labelled menu (~112 px), on top of the
-/// row's padding and gaps (~30 px). Below roughly 250 px the actions start
-/// leaving the right-hand edge, which is exactly the defect story 46.5 fixed.
-/// 320 keeps a usable margin over that and still leaves the title something to
-/// truncate into; 240 keeps the chrome strip, the header and more than one line
-/// of text.
+/// hold, and re-derived by Story 75.3 when the two header rows became one
+/// (AD-260). The old derivation described a 32 px window-chrome strip above a
+/// 40 px editor header; that strip no longer exists, and the three window
+/// controls it carried now sit in the header's frame group, where they cost
+/// width instead of height.
+///
+/// The row, left to right, at its floor:
+///
+/// ```text
+///   12  left gutter (px-3)
+/// + 160  identity, at PANE_HEADER_IDENTITY_MIN_PX — the title's own floor
+/// +   8  gap
+/// +   0  status caption, squeezed to nothing: AD-260 says it gives first
+/// +   8  gap — the slot is IN the row, so it costs its seam even at width 0
+/// + 104  actions: attach 32 + properties 32, adjacent, + 8 + overflow 32
+/// +   8  gap
+/// +  88  frame: three 24 px window controls + two 8 px gaps
+/// +  12  right gutter
+/// = 400
+/// ```
+///
+/// Three numbers in there are decisions rather than measurements. The leading
+/// pair of actions is 64 and not 72: `PriorityActions` renders its `leading`
+/// box with no gap between the two, measured in Chromium over the real
+/// component, so the group is 104. The window controls are 24 px and not 32:
+/// three 32 px controls would put the floor at 424, and a control smaller than
+/// a document action is also the distinction a person wants — window chrome is
+/// not the note's own verbs. And the DW-199 edge inset no longer adds width:
+/// the merged chrome pads only itself, by `max(0, inset − gutter)`, and the
+/// row's own 12 px gutter already covers the inset at 1× and 2×. The 3 px that
+/// remains at 3× is not folded in here: a 3× display is 400 logical pixels
+/// wide only in a thought experiment, and paying it on every machine to
+/// protect one that cannot exist is the wrong trade.
+///
+/// The `0` for the caption is the row at its tightest and not the row always:
+/// a caption that is a *refused write* keeps its box and the identity floor is
+/// released instead, because that sentence is the only place a capture window
+/// says why it will not close. Measured in Chromium over the real component at
+/// this floor, that row is 12 + 0 + 8 + 125 + 8 + 104 + 8 + 88 + 12 = 365 of
+/// demands — the caption's box is the width of its widest sizer, 125 in this
+/// machine's locale — so the identity keeps the remaining 35 and nothing
+/// overflows. The floor does not move for it.
+///
+/// 240 of height is unchanged and is now more generous than it was: the merge
+/// gave the body back 32 px that used to be chrome.
 ///
 /// Enforced twice on purpose: here, so a remembered row can never restore a
 /// window smaller than this, and as `minWidth`/`minHeight` on the window itself,
 /// so the compositor refuses the drag before the user gets there.
-pub const CAPTURE_MIN_SIZE: (u32, u32) = (320, 240);
+pub const CAPTURE_MIN_SIZE: (u32, u32) = (400, 240);
 
 /// The word that introduces a size in a persisted placement.
 ///
@@ -306,9 +343,14 @@ const SIZE_TAG: &str = "size";
 /// seventh bare trailing token could not say which of the optional groups it
 /// belonged to.
 ///
-/// Written **only when the flag is off** (see [`Placement::encode`]), so every
-/// row keeper has ever written keeps its exact current spelling and the
-/// two-token `free 120 -40` still round-trips to itself.
+/// Written **only when the flag is on** since Story 75.2, which is the inverse
+/// of 48.4's rule and inverted with the default it encodes: the tag is the
+/// exception, and the exception is now "this window floats". Both spellings
+/// are still *read* — `top 0` is the row 48.4 wrote for an un-pinned window and
+/// still means un-pinned — so no row changes meaning, but a row written before
+/// this story that carries no tag now answers `false` instead of `true`. That
+/// is the upgrade AD-259 asks for, and [`Placement`]'s own doc argues why the
+/// old spelling had nothing better to say.
 const TOP_TAG: &str = "top";
 
 /// Whether `word` introduces one of the optional tagged groups.
@@ -356,19 +398,41 @@ fn is_tag(word: &str) -> bool {
 /// a window twice the size they left. The shell converts once, at the window it
 /// is reading or writing, and both directions use the same quantity.
 ///
-/// # Why `always_on_top` defaults to *true*
+/// # Why `always_on_top` defaults to *false* (Story 75.2, AD-259)
 ///
-/// Because that is what every capture window already is. Always-on-top was
-/// hard-coded in both birth sites — `tauri.conf.json`'s prewarmed draft and
-/// `notes_window::open`'s builder — so the absent tag has to keep meaning
-/// "on top", exactly as the absent row keeps meaning `locked`. Defaulting to
-/// `false` would read as a tidier default and would silently un-pin every
-/// capture window on every machine at upgrade, which is a behaviour change
-/// nobody asked for delivered by a story about adding a *toggle*.
+/// Story 48.4 defaulted it to `true` because that is what every capture window
+/// already was, and said in as many words that flipping it "would silently
+/// un-pin every capture window on every machine at upgrade, which is a
+/// behaviour change nobody asked for". The owner has now asked for it: a panel
+/// that decides for itself to float over every other application is the second
+/// of the four complaints this epic answers. So the un-pinning that paragraph
+/// refused is this story's deliverable, and it is deliberate rather than a
+/// regression of it.
+///
+/// **The persisted spelling had to invert with the default**, and that is the
+/// part worth reading twice. 48.4 wrote the `top` tag only when the flag was
+/// OFF, precisely so that every row written before it stayed byte-identical —
+/// which means "on" is *unrepresentable* in an old row, and there is no way to
+/// tell a window the owner pinned from one that was pinned because keeper
+/// pinned everything. Leaving [`Placement::decode`]'s absent-tag fallback at
+/// `true` would therefore have shipped a new default that no existing machine
+/// — including the one the complaint came from — ever sees. The tag is now
+/// written when the flag is ON, an absent tag means OFF, and `top 0` still
+/// reads as OFF so the rows 48.4 did write keep their meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
-    /// `true` — keeper places and sizes the window and the user can do neither.
-    /// `false` — the user moves and resizes it and keeper remembers both.
+    /// `true` — keeper places the window and the user may neither move nor
+    /// resize it. `false` — the user moves and resizes it and keeper remembers
+    /// both.
+    ///
+    /// Since Story 75.1 a lock no longer imposes a *size*: it freezes whatever
+    /// is there (see [`Placement::window_size`]). It still owns the position,
+    /// which is what lets a locked panel follow the pointer between monitors.
+    ///
+    /// Still stored, and still read by the chrome, but **no longer survives an
+    /// open**: [`Placement::opened`] clears it, because a lock is a gesture
+    /// about the capture in front of you rather than a preference about the
+    /// window (Story 75.2, AD-258).
     pub locked: bool,
     /// The remembered top-left in physical pixels, or `None` for "keeper's
     /// automatic placement", which is where a window that has never been moved
@@ -388,6 +452,14 @@ pub struct Placement {
     /// window in the same sense the size is: two capture windows are two
     /// placements, and a person who pins a note beside what they are reading
     /// has said nothing about the next window they open.
+    ///
+    /// **A pin survives an open and a lock does not, and that asymmetry is the
+    /// decision rather than an oversight** (Story 75.2, AD-258/AD-259): a lock
+    /// is a gesture about the capture in front of you, a pin is a preference
+    /// about how this window behaves, so discarding one on every open is
+    /// respect and discarding the other is the same disrespect in the opposite
+    /// direction. [`Placement::opened`] therefore clears exactly one of these
+    /// two flags.
     pub always_on_top: bool,
 }
 
@@ -397,7 +469,10 @@ impl Default for Placement {
             locked: true,
             position: None,
             size: None,
-            always_on_top: true,
+            // Story 75.2, AD-259. See the struct doc: the flip takes the
+            // persisted spelling with it, because 48.4's encoding cannot
+            // express an explicit `on`.
+            always_on_top: false,
         }
     }
 }
@@ -422,14 +497,16 @@ impl Placement {
             encoded.push_str(SIZE_TAG);
             encoded.push_str(&format!(" {width} {height}"));
         }
-        // Written only when the flag is OFF. The tag is pure cost on the
-        // overwhelmingly common row, and omitting it is what keeps every
-        // previously-written spelling — including `locked` and `free 120 -40` —
-        // byte-identical to what this function produced before Story 48.4.
-        if !self.always_on_top {
+        // Written only when the flag is ON (Story 75.2). The tag still costs
+        // nothing on the common row — it is just that the common row is now the
+        // un-pinned one — and writing the *on* case explicitly is what makes an
+        // asked-for pin distinguishable from a pin nobody asked for. Under
+        // 48.4's spelling it was not: "on" was the absence of a tag, so an
+        // upgrade could not tell the owner's pin from keeper's own default.
+        if self.always_on_top {
             encoded.push(' ');
             encoded.push_str(TOP_TAG);
-            encoded.push_str(" 0");
+            encoded.push_str(" 1");
         }
         encoded
     }
@@ -490,13 +567,17 @@ impl Placement {
         } else {
             None
         };
-        // Absent tag, absent value and unreadable value all answer `true`: the
-        // flag's default is the behaviour every existing window already has, so
-        // a row keeper cannot read costs the user nothing at all here.
+        // Absent tag, absent value and unreadable value all answer `false`
+        // (Story 75.2, AD-259): the fallback follows the default, as it did
+        // before, and the default is now an ordinary window. Only the exact
+        // word `1` floats one — so `top 0`, the only spelling 48.4 ever wrote,
+        // keeps meaning exactly what it meant, and a row keeper half-understands
+        // costs the user a pin they can restore with one click rather than a
+        // panel sitting over everything they do.
         let always_on_top = if parts.next_if(|word| *word == TOP_TAG).is_some() {
-            !matches!(parts.next(), Some("0"))
+            matches!(parts.next(), Some("1"))
         } else {
-            true
+            false
         };
         Self {
             locked,
@@ -509,12 +590,28 @@ impl Placement {
     /// The size to give this window right now, in logical pixels, or `None` for
     /// "leave it exactly as it is".
     ///
-    /// Three answers, and the third is the one that matters:
+    /// # A lock freezes what is there (Story 75.1, AD-257)
     ///
-    /// - **Locked → keeper's own size, always.** A locked window is keeper's to
-    ///   place and keeper's to size; normalising it on every open is what makes
-    ///   the lock mean something, and it is the escape hatch from a size the
-    ///   person no longer wants.
+    /// The locked arm used to answer [`CAPTURE_DEFAULT_SIZE`] for *every*
+    /// locked window, whatever the row remembered, under the rule "a locked
+    /// window is keeper's to place and keeper's to size". That is a defensible
+    /// reading of the word and it is not the one a person pressing a padlock
+    /// has: they mean *stay exactly as you are*. It made the single most
+    /// reported thing about this window — resize it, lock it, watch it jump
+    /// back to 560×340 — a decision rather than a bug, and it was not even a
+    /// lossy one: the lock command persists the live size first, so the size
+    /// the person chose was in the row the whole time and was simply not asked
+    /// for. The rule is rescinded for the size and kept for nothing else; a
+    /// locked window still cannot be *moved*, which is [`Self::adopted_position`].
+    ///
+    /// Four answers now, and the last is still the one that matters:
+    ///
+    /// - **Locked with a remembered size → that size**, clamped. The freeze.
+    /// - **Locked with nothing remembered → keeper's own size.** Not `None`:
+    ///   there is nothing to honour, and unlike the unlocked case below there
+    ///   is no gesture in flight to undo — a locked window's live extent is
+    ///   keeper's own, because that is what being locked has meant for every
+    ///   frame up to this one.
     /// - **Unlocked with a remembered size → that size**, clamped.
     /// - **Unlocked with no remembered size → `None`.** Not the default: the
     ///   caller must not touch the window. This is the difference between
@@ -523,17 +620,72 @@ impl Placement {
     ///   whose blur has not yet written it down, and re-asserting a size on the
     ///   next open would undo the gesture in front of them.
     ///
+    /// The clamp applies to every arm that answers, and applies to the freeze
+    /// for a reason the freeze creates: a size remembered on a larger monitor
+    /// is now replayed onto a *locked* window too, and a locked capture window
+    /// is undecorated and in no task switcher, so an unclamped restore would
+    /// put its controls past an edge with nothing left to click.
+    ///
     /// `work_area` is the usable area of the monitor the window will appear on,
     /// in logical pixels, or `None` when the platform will not say (a headless
     /// session, or a compositor that does not answer).
     #[must_use]
     pub fn window_size(&self, work_area: Option<(u32, u32)>) -> Option<(u32, u32)> {
         let wanted = match (self.locked, self.size) {
-            (true, _) => CAPTURE_DEFAULT_SIZE,
+            (true, Some(size)) => size,
+            (true, None) => CAPTURE_DEFAULT_SIZE,
             (false, Some(size)) => size,
             (false, None) => return None,
         };
         Some(clamp_size(wanted, work_area))
+    }
+
+    /// This placement as it must be applied when the window is **opened**
+    /// (Story 75.2, AD-258).
+    ///
+    /// # One field, and the wipe hazard that makes it a function
+    ///
+    /// `locked` is forced `false`. Nothing else moves: `position`, `size` and
+    /// `always_on_top` ride in the same stored row
+    /// (`notes.capture_placement.<key>`), so the obvious spelling of "open it
+    /// unlocked" — assigning a fresh [`Placement`] with `locked: false` — would
+    /// throw away the geometry this whole module exists to keep, and would do
+    /// it silently, on the path every window takes. That is why this is a named
+    /// function returning a struct update rather than a literal at a call site:
+    /// [`Self::relocked`]'s doc records the identical mistake being made once
+    /// already, inline, in the crate that does not compile on every machine.
+    ///
+    /// # Why the lock is discarded and the pin is not
+    ///
+    /// A lock is a gesture about the capture in front of you — it freezes the
+    /// geometry of *this* thought while you write it down, and until Story 75.1
+    /// it also resized the window out from under you. A pin is a preference
+    /// about how this window behaves. So a lock that outlived its window is a
+    /// window that no longer answers a drag for a reason nobody remembers,
+    /// while a pin discarded on every open would be keeper overruling an
+    /// explicit answer — the same disrespect in the other direction. The
+    /// asymmetry is AD-258 against AD-259 and it is deliberate: do not "fix" it
+    /// by clearing both.
+    ///
+    /// # Why it is here rather than at the two call sites
+    ///
+    /// Two paths open a capture window and neither builds it: boot adopts the
+    /// stored row for the prewarmed panel, and the hotkey **reveals** a window
+    /// that has been alive and hidden since startup (NFR-27). Which of the two
+    /// a person happened to use cannot be allowed to change whether their
+    /// window is locked, and the way to guarantee that is one rule in the crate
+    /// that compiles everywhere rather than two copies in the crate that
+    /// compiles nowhere but CI (AD-55/AD-56).
+    ///
+    /// Nothing here is written back to the settings table. The stored row keeps
+    /// saying what it said; this is what the *window* gets, and an open is not
+    /// a gesture worth a sqlite transaction.
+    #[must_use]
+    pub fn opened(self) -> Self {
+        Self {
+            locked: false,
+            ..self
+        }
     }
 
     /// The position to give this window at boot, in physical pixels, or `None`
@@ -676,6 +828,13 @@ impl Placement {
 /// a remembered geometry and can never overwrite one, and it matches
 /// [`chrome_edge_inset`]'s caller, which treats an unanswering window as
 /// locked for the same reason.
+///
+/// Since Story 75.2 a window is unlocked at every open ([`Placement::opened`]),
+/// so `false` here has become the narrow case it always described and no longer
+/// the common one: it means the person pressed the padlock during *this*
+/// session. The consequence is deliberate and worth knowing — keeper's own
+/// opening geometry is now remembered on the first blur of a window nobody has
+/// touched, because that window genuinely is theirs to move.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Observed {
     /// The top-left in physical pixels, or `None` when the platform will not
@@ -694,29 +853,44 @@ pub struct Observed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShowPosition {
     /// Place the panel on the monitor under the pointer, as keeper always has.
+    /// Since Story 75.2 this is the answer for a window that will not say
+    /// whether it is resizable, and for no other window.
     Place,
     /// Touch the position not at all — leave the window where the person put
-    /// it.
+    /// it, which since Story 75.2 is every window that answers.
     Leave,
 }
 
 /// Whether the hotkey and tray path re-places the draft panel, given only
-/// whether that window is unlocked right now (Story 47.5, DW-198).
+/// whether that window **answered** when asked about itself (Story 47.5,
+/// DW-198; narrowed by Story 75.2, AD-258).
 ///
-/// **Takes the live window attribute, not a stored placement, and that is what
+/// **Takes one live window attribute, not a stored placement, and that is what
 /// keeps NFR-27 intact.** `show` is the hotkey path: `set_position` → `show` →
-/// `set_focus`, three synchronous calls with no settings read in front of them.
-/// `unlocked` is the shell's `is_resizable()` — the same attribute
-/// `apply_resizability` writes at boot and on every lock toggle, read back off
-/// the window rather than out of sqlite. One source of truth, no query, no
-/// second copy of the lock to drift.
+/// `set_focus`, a handful of synchronous window calls with no settings read in
+/// front of them. The shell reads `is_resizable()` and hands in whether the
+/// call succeeded — not what it said. One question, no query, no second copy of
+/// anything to drift.
 ///
-/// [`Placement::adopted_position`] is the other half: it puts an unlocked
-/// window back at boot, and this stops every later hotkey press from undoing
-/// it. Without both, either half alone changes nothing a person would notice.
+/// **Why the answer is no longer the lock's.** Until Story 75.2 a locked window
+/// was keeper's to place, so `is_resizable() == false` meant "place it", and
+/// [`Placement::adopted_position`] was the other half that put an unlocked one
+/// back at boot. Since [`Placement::opened`] unlocks every window at every
+/// open, a window that reports itself locked here is one that is about to be
+/// unlocked a line later — it is a window the person locked earlier in this
+/// session, sitting exactly where they locked it. Placing it would move the
+/// window a padlock press asked to keep still, and the next blur would write
+/// that coordinate over the row: the position lost for good, by the gesture
+/// that was meant to preserve it.
+///
+/// So the only window keeper still places is one that will not say — a backend
+/// whose `is_resizable()` errors gets a placed window rather than one left
+/// wherever it happens to be. The panel no longer following the pointer between
+/// monitors is AD-258 arriving, not a regression: the following was the
+/// compensation for a window nobody could drag.
 #[must_use]
-pub fn plan_show_position(unlocked: bool) -> ShowPosition {
-    if unlocked {
+pub fn plan_show_position(answers: bool) -> ShowPosition {
+    if answers {
         ShowPosition::Leave
     } else {
         ShowPosition::Place
@@ -766,8 +940,10 @@ pub struct EdgeResize {
     pub scale: u32,
 }
 
-/// How much of the chrome strip's top and right edges the window's own resize
-/// border is sitting on, in logical CSS pixels (Story 47.5, DW-199).
+/// How much of the chrome's top and right edges the window's own resize border
+/// is sitting on, in logical CSS pixels (Story 47.5, DW-199). Since Story 75.3
+/// that chrome is the header's frame group rather than a strip above it, and
+/// the inset pads only itself: see `CAPTURE_MIN_SIZE`'s ledger.
 ///
 /// **The geometry, not the symptom.** The capture chrome's close button is
 /// flush against the top-right corner, which is where two of tao's edge strips
@@ -874,7 +1050,10 @@ pub struct WorkArea {
 /// - **The lock grows a window from the same top-left.** A 320×240 window
 ///   parked against the bottom-right corner becomes [`CAPTURE_DEFAULT_SIZE`]
 ///   the instant it is locked, and nothing used to move it, so 240 px of it
-///   went past the edge — including the corner the close button is in.
+///   went past the edge — including the corner the close button is in. Story
+///   75.1 closed that route for a window whose size is remembered — a lock now
+///   freezes it rather than growing it — and left this clamp exactly where it
+///   was, because the second route below never went through the lock at all.
 /// - **A remembered coordinate outlives its monitor.** A position stored on the
 ///   second display is replayed verbatim on a machine that has since been
 ///   undocked, putting the window on a rectangle of desktop that no longer has
@@ -1143,14 +1322,41 @@ mod tests {
     #[test]
     fn a_placement_nobody_has_touched_is_keepers_own_placement() {
         let default = Placement::default();
+        // Still locked, and this is the *stored* default rather than the one a
+        // window opens with: `locked` is what makes an unreadable or absent row
+        // fall back to "keeper places this", and [`Placement::opened`] is what
+        // hands the window to the user a moment later (Story 75.2, AD-258).
         assert!(default.locked);
         assert_eq!(default.position, None);
         assert_eq!(default.size, None);
-        // Story 48.4: the flag every capture window has always had. If this
-        // line ever reads `false`, every existing window silently stops
-        // floating on upgrade.
-        assert!(default.always_on_top);
+        // Story 75.2, AD-259: nothing floats until it is asked to. If this line
+        // ever reads `true` again, every machine that has never touched the pin
+        // gets a panel sitting over every other application.
+        assert!(!default.always_on_top);
         assert_eq!(Placement::decode(""), default);
+    }
+
+    /// The fresh-machine row of Story 75.2's matrix, end to end: no stored row
+    /// at all, which is the state every install starts in.
+    ///
+    /// Asserted through `decode("")` rather than through `Placement::default()`
+    /// because that is literally what the registry hands the shell when the
+    /// settings table has never heard of this window, and the two are allowed
+    /// to drift only over this test's dead body.
+    #[test]
+    fn a_machine_that_has_never_seen_this_window_opens_unlocked_and_unpinned() {
+        let fresh = Placement::decode("").opened();
+        assert!(!fresh.locked, "a fresh window opened locked");
+        assert!(
+            !fresh.always_on_top,
+            "a fresh window floated over everything"
+        );
+        // And keeper still places and sizes it, because nothing is remembered:
+        // `opened` unlocks, it does not invent a geometry.
+        assert_eq!(fresh.position, None);
+        assert_eq!(fresh.size, None);
+        assert_eq!(fresh.adopted_position(), None);
+        assert_eq!(fresh.window_size(Some((1_920, 1_080))), None);
     }
 
     #[test]
@@ -1160,19 +1366,19 @@ mod tests {
                 locked: true,
                 position: None,
                 size: None,
-                always_on_top: true,
+                always_on_top: false,
             },
             Placement {
                 locked: false,
                 position: None,
                 size: None,
-                always_on_top: true,
+                always_on_top: false,
             },
             Placement {
                 locked: false,
                 position: Some((120, -40)),
                 size: None,
-                always_on_top: true,
+                always_on_top: false,
             },
             // Unlock, drag, lock again: the position is kept, because locking
             // means "keep it there" and not "forget where I put it".
@@ -1180,7 +1386,7 @@ mod tests {
                 locked: true,
                 position: Some((0, 0)),
                 size: None,
-                always_on_top: true,
+                always_on_top: false,
             },
             // Resized but never moved — the reason the size is tagged rather
             // than a third and fourth trailing integer.
@@ -1188,13 +1394,13 @@ mod tests {
                 locked: false,
                 position: None,
                 size: Some((900, 600)),
-                always_on_top: true,
+                always_on_top: false,
             },
             Placement {
                 locked: false,
                 position: Some((120, -40)),
                 size: Some((900, 600)),
-                always_on_top: true,
+                always_on_top: false,
             },
             // Resize, then lock: the size is kept for the same reason the
             // position is. Locking is not a discard button.
@@ -1202,6 +1408,15 @@ mod tests {
                 locked: true,
                 position: Some((-15, 900)),
                 size: Some((1_280, 800)),
+                always_on_top: false,
+            },
+            // …and the same seven shapes are not worth writing twice, but the
+            // pinned one is: since Story 75.2 the flag is spelled only when it
+            // is ON, so `true` is the case that now adds bytes.
+            Placement {
+                locked: false,
+                position: Some((120, -40)),
+                size: Some((900, 600)),
                 always_on_top: true,
             },
         ] {
@@ -1212,7 +1427,7 @@ mod tests {
                 locked: false,
                 position: Some((120, -40)),
                 size: None,
-                always_on_top: true,
+                always_on_top: false,
             }
             .encode(),
             "free 120 -40"
@@ -1222,7 +1437,7 @@ mod tests {
                 locked: false,
                 position: Some((120, -40)),
                 size: Some((900, 600)),
-                always_on_top: true,
+                always_on_top: false,
             }
             .encode(),
             "free 120 -40 size 900 600"
@@ -1232,7 +1447,7 @@ mod tests {
                 locked: false,
                 position: None,
                 size: Some((900, 600)),
-                always_on_top: true,
+                always_on_top: false,
             }
             .encode(),
             "free size 900 600"
@@ -1253,7 +1468,11 @@ mod tests {
                 locked: false,
                 position: Some((120, -40)),
                 size: None,
-                always_on_top: true,
+                // The flag is the one fact such a row does NOT carry forward
+                // unchanged — see
+                // `a_row_from_before_the_toggle_no_longer_floats_unasked`,
+                // which is where that cost is argued rather than restated.
+                always_on_top: false,
             }
         );
         assert_eq!(Placement::decode("locked"), Placement::default());
@@ -1337,23 +1556,35 @@ mod tests {
                 locked: false,
                 position: None,
                 size: Some((560, 340)),
-                always_on_top: true,
+                always_on_top: false,
             }
         );
     }
 
-    /// Story 48.4's default, asserted from the outside: what a row written by
-    /// **every build before this one** decodes to.
+    /// Story 75.2's default, asserted from the outside: what a row written by
+    /// **every build before this one** decodes to now.
     ///
-    /// This is the whole backward-compatibility claim, and it is deliberately
-    /// spelled against literal rows rather than against `Placement::default()`
-    /// — comparing decode to the default would keep passing if someone flipped
-    /// both at once, which is exactly the change this test exists to stop.
-    /// Always-on-top was hard-coded `true` in both birth sites before Story
-    /// 48.4, so an untagged row means "on top" and can never mean anything
-    /// else.
+    /// This inverts Story 48.4's test of the same shape, and the inversion is
+    /// the story. 48.4 wrote the `top` tag only when the flag was OFF, so an
+    /// untagged row was "on top" and a pinned window was indistinguishable from
+    /// a window nobody had ever pinned. AD-259 says nothing floats until it is
+    /// asked to, and under the old spelling no existing row could express
+    /// having been asked — so the spelling inverted with the default: the tag
+    /// is written when the flag is ON, `top 0` still reads off, and every row
+    /// on every machine today comes back unpinned.
+    ///
+    /// The cost is stated plainly because it is real and it is one-way: a
+    /// person who pinned the window before this build loses that pin once, on
+    /// upgrade, and pins it again. The alternative — keeping the absent tag
+    /// meaning "on" — is a default that changes nothing for anybody who already
+    /// has a row, which is everybody the owner was speaking for.
+    ///
+    /// Spelled against literal rows rather than against `Placement::default()`,
+    /// for 48.4's reason and unchanged by the flip: comparing decode to the
+    /// default keeps passing if someone moves both at once, which is exactly
+    /// the change this test exists to catch.
     #[test]
-    fn a_row_from_before_the_toggle_still_means_on_top() {
+    fn a_row_from_before_the_toggle_no_longer_floats_unasked() {
         for raw in [
             "",
             "locked",
@@ -1362,18 +1593,32 @@ mod tests {
             "locked 0 0",
             "free size 900 600",
             "free 120 -40 size 900 600",
-            // Unreadable rows too: the flag's fallback is the behaviour the
-            // window already has, so a row keeper cannot parse costs the user
-            // their geometry and never their pinning.
+            // The spelling 48.4 actually wrote for "off". It meant off then and
+            // it means off now — the flip cost this row nothing.
+            "free 120 -40 top 0",
+            // Unreadable rows too: a row keeper cannot parse costs the user
+            // their geometry, and the flag it cannot read is the flag nobody
+            // asked for.
             "banana",
             "written by a later build",
             "free 1 2 dimensions 560 340",
         ] {
             assert!(
-                Placement::decode(raw).always_on_top,
-                "{raw} un-pinned a window nobody un-pinned"
+                !Placement::decode(raw).always_on_top,
+                "{raw} floated a window nobody asked to float"
             );
         }
+
+        // And the one row that does float: the spelling this build writes. A
+        // pin the owner set is a preference and survives every open (AD-259) —
+        // the asymmetry with the lock, in one assertion.
+        assert!(Placement::decode("free 120 -40 top 1").always_on_top);
+        assert!(
+            Placement::decode("free 120 -40 top 1")
+                .opened()
+                .always_on_top,
+            "opening the window threw away a pin the owner asked for"
+        );
     }
 
     /// The flag survives the trip through the settings table, in every
@@ -1429,37 +1674,38 @@ mod tests {
             );
         }
 
-        // The exact persisted spelling, pinned. The tag is written ONLY when
-        // the flag is off, which is what keeps every pre-48.4 row byte-identical
-        // — the four assertions below this one are the proof of that claim.
-        assert_eq!(
-            Placement {
-                locked: false,
-                position: Some((120, -40)),
-                size: None,
-                always_on_top: false,
-            }
-            .encode(),
-            "free 120 -40 top 0"
-        );
-        assert_eq!(
-            Placement {
-                locked: false,
-                position: Some((120, -40)),
-                size: Some((900, 600)),
-                always_on_top: false,
-            }
-            .encode(),
-            "free 120 -40 size 900 600 top 0"
-        );
-        // On top: no tag at all, so these are the same bytes 46.15 wrote.
-        assert_eq!(Placement::default().encode(), "locked");
+        // The exact persisted spelling, pinned. Since Story 75.2 the tag is
+        // written ONLY when the flag is ON, because that is the case a row has
+        // to be able to state — off is what every row that says nothing means.
         assert_eq!(
             Placement {
                 locked: false,
                 position: Some((120, -40)),
                 size: None,
                 always_on_top: true,
+            }
+            .encode(),
+            "free 120 -40 top 1"
+        );
+        assert_eq!(
+            Placement {
+                locked: false,
+                position: Some((120, -40)),
+                size: Some((900, 600)),
+                always_on_top: true,
+            }
+            .encode(),
+            "free 120 -40 size 900 600 top 1"
+        );
+        // Not on top: no tag at all, and therefore the same bytes 46.15 wrote
+        // for a window that had no flag to write.
+        assert_eq!(Placement::default().encode(), "locked");
+        assert_eq!(
+            Placement {
+                locked: false,
+                position: Some((120, -40)),
+                size: None,
+                always_on_top: false,
             }
             .encode(),
             "free 120 -40"
@@ -1472,47 +1718,61 @@ mod tests {
     /// size branch consumed the flag's two words looking for a size.
     #[test]
     fn reading_the_flag_costs_the_row_none_of_its_other_facts() {
-        let moved_and_unpinned = Placement::decode("free 120 -40 top 0");
-        assert!(!moved_and_unpinned.always_on_top);
-        assert_eq!(moved_and_unpinned.position, Some((120, -40)));
-        assert_eq!(moved_and_unpinned.size, None);
-        assert!(!moved_and_unpinned.locked);
+        let moved_and_pinned = Placement::decode("free 120 -40 top 1");
+        assert!(moved_and_pinned.always_on_top);
+        assert_eq!(moved_and_pinned.position, Some((120, -40)));
+        assert_eq!(moved_and_pinned.size, None);
+        assert!(!moved_and_pinned.locked);
 
-        let resized_and_unpinned = Placement::decode("free size 900 600 top 0");
-        assert!(!resized_and_unpinned.always_on_top);
-        assert_eq!(resized_and_unpinned.position, None);
-        assert_eq!(resized_and_unpinned.size, Some((900, 600)));
+        let resized_and_pinned = Placement::decode("free size 900 600 top 1");
+        assert!(resized_and_pinned.always_on_top);
+        assert_eq!(resized_and_pinned.position, None);
+        assert_eq!(resized_and_pinned.size, Some((900, 600)));
 
-        let everything = Placement::decode("locked -15 900 size 1280 800 top 0");
-        assert!(!everything.always_on_top);
+        let everything = Placement::decode("locked -15 900 size 1280 800 top 1");
+        assert!(everything.always_on_top);
         assert!(everything.locked);
         assert_eq!(everything.position, Some((-15, 900)));
         assert_eq!(everything.size, Some((1_280, 800)));
 
         // …and the flag does not disturb an unreadable size in the same row.
-        let bad_size = Placement::decode("free 1 2 size 0 340 top 0");
-        assert!(!bad_size.always_on_top);
+        let bad_size = Placement::decode("free 1 2 size 0 340 top 1");
+        assert!(bad_size.always_on_top);
         assert_eq!(bad_size.size, None);
         assert_eq!(bad_size.position, Some((1, 2)));
+
+        // The off spelling 48.4 wrote is still read for everything else in its
+        // row too — the flip changed what an ABSENT tag means, not how a
+        // present one is consumed, and a row that still carries `top 0` must
+        // not lose its position to the words `top` and `0`.
+        let pre_flip = Placement::decode("free 120 -40 top 0");
+        assert!(!pre_flip.always_on_top);
+        assert_eq!(pre_flip.position, Some((120, -40)));
     }
 
-    /// Every unreadable spelling of the flag answers `true`, because `true` is
-    /// what the window already is. Only the exact word `0` turns it off — a
-    /// row keeper half-understands must not un-pin a window.
+    /// Every unreadable spelling of the flag answers `false`, because floating
+    /// over every other application is a thing keeper does only when it is
+    /// asked, and a row keeper half-understands is not an ask (Story 75.2,
+    /// AD-259). Only the exact word `1` floats a window.
+    ///
+    /// The direction reversed with the default, and that is the point: under
+    /// 48.4 an unreadable flag could not cost a pin, and now it cannot invent
+    /// one. Both readings protect the same thing — the state the user did not
+    /// choose is never the state a damaged row produces.
     #[test]
-    fn an_unreadable_flag_leaves_the_window_where_it_was() {
-        // Explicitly on, which `encode` never writes but a hand-edited or
-        // later-build row may.
-        assert!(Placement::decode("free 1 2 top 1").always_on_top);
-        // Truncated, misspelled, and a value nobody writes.
-        assert!(Placement::decode("free 1 2 top").always_on_top);
-        assert!(Placement::decode("free 1 2 top off").always_on_top);
-        assert!(Placement::decode("free 1 2 top false").always_on_top);
-        assert!(Placement::decode("free 1 2 ontop 0").always_on_top);
-        // A tag nobody writes does not eat the position, either.
-        assert_eq!(Placement::decode("free 1 2 ontop 0").position, Some((1, 2)));
-        // Only this turns it off.
+    fn an_unreadable_flag_never_floats_a_window_nobody_floated() {
+        // Explicitly off, which `encode` no longer writes but every pre-75.2
+        // row may still carry.
         assert!(!Placement::decode("free 1 2 top 0").always_on_top);
+        // Truncated, misspelled, and a value nobody writes.
+        assert!(!Placement::decode("free 1 2 top").always_on_top);
+        assert!(!Placement::decode("free 1 2 top on").always_on_top);
+        assert!(!Placement::decode("free 1 2 top true").always_on_top);
+        assert!(!Placement::decode("free 1 2 ontop 1").always_on_top);
+        // A tag nobody writes does not eat the position, either.
+        assert_eq!(Placement::decode("free 1 2 ontop 1").position, Some((1, 2)));
+        // Only this floats it.
+        assert!(Placement::decode("free 1 2 top 1").always_on_top);
     }
 
     /// The flag is a property of the window, not of the lock or the size, so
@@ -1540,37 +1800,53 @@ mod tests {
             Some((1_024, 768))
         );
 
-        // Locked: the lock normalises the SIZE and says nothing about the flag.
+        // Locked: since Story 75.1 the lock FREEZES the size rather than
+        // normalising it, and it still says nothing about the flag — which is
+        // the claim this test is actually making, and the one arm change did
+        // not touch.
         let locked = Placement {
             locked: true,
             ..unpinned
         };
-        assert_eq!(locked.window_size(None), Some(CAPTURE_DEFAULT_SIZE));
+        assert_eq!(locked.window_size(None), Some((900, 600)));
         assert!(!Placement::decode(&locked.encode()).always_on_top);
         // The remembered size is still in the row, exactly as before 48.4.
         assert_eq!(Placement::decode(&locked.encode()).size, Some((900, 600)));
     }
 
-    /// Which of the three answers each state gets, and the one that is `None`.
+    /// Which of the four answers each state gets, and the one that is `None`.
+    ///
+    /// This test used to be called
+    /// `a_locked_window_is_normalised_and_an_unsized_one_is_left_alone`, and
+    /// the first half of that name is now a lie: Story 75.1 (AD-257) rescinded
+    /// the normalisation. It is renamed rather than deleted because the second
+    /// half is still load-bearing and the arms it covers are still the arms.
     #[test]
-    fn a_locked_window_is_normalised_and_an_unsized_one_is_left_alone() {
+    fn a_lock_freezes_the_size_it_finds_and_an_unsized_window_is_left_alone() {
         let screen = Some((1_920u32, 1_080u32));
 
-        // Locked: keeper's own size, whatever the row remembers. This is the
-        // escape hatch from a size the person no longer wants.
+        // Locked with nothing remembered: keeper's own size. There is nothing
+        // else to honour, and a locked window has to have a size to be locked
+        // at — this is the arm that keeps a never-resized window from opening
+        // at whatever the webview happened to lay out.
         assert_eq!(
             Placement::default().window_size(screen),
             Some(CAPTURE_DEFAULT_SIZE)
         );
+
+        // Locked WITH a remembered size: that size. This is the whole of Story
+        // 75.1 — the owner resizes, presses the padlock, and the window stays
+        // where it was instead of snapping back to 560×340. Delete the
+        // `(true, Some(size))` arm and this is the assertion that fails.
         assert_eq!(
             Placement {
                 locked: true,
                 position: None,
                 size: Some((1_400, 900)),
-                always_on_top: true,
+                always_on_top: false,
             }
             .window_size(screen),
-            Some(CAPTURE_DEFAULT_SIZE)
+            Some((1_400, 900))
         );
 
         // Unlocked and never resized: do not touch the window. NOT the
@@ -1581,7 +1857,7 @@ mod tests {
                 locked: false,
                 position: Some((10, 10)),
                 size: None,
-                always_on_top: true,
+                always_on_top: false,
             }
             .window_size(screen),
             None
@@ -1593,11 +1869,101 @@ mod tests {
                 locked: false,
                 position: None,
                 size: Some((900, 600)),
-                always_on_top: true,
+                always_on_top: false,
             }
             .window_size(screen),
             Some((900, 600))
         );
+    }
+
+    /// The clamp did not move with the arm, and it now guards a case it never
+    /// used to see: before Story 75.1 a locked window asked for
+    /// [`CAPTURE_DEFAULT_SIZE`], which fits every display anybody works on, so
+    /// the ceiling only ever had unlocked placements to cut down. Now a locked
+    /// row can carry 3000 px from the desk monitor and be restored on the
+    /// laptop panel — with the lock making it the one window the user cannot
+    /// drag back into view.
+    #[test]
+    fn a_locked_window_restored_on_a_smaller_screen_is_still_cut_down() {
+        let from_the_big_monitor = Placement {
+            locked: true,
+            position: None,
+            size: Some((3_000, 2_000)),
+            always_on_top: false,
+        };
+        assert_eq!(
+            from_the_big_monitor.window_size(Some((1_440, 900))),
+            Some((1_440, 900))
+        );
+        // The floor applies to a locked row too: a size below what the window
+        // can hold is raised, not honoured.
+        assert_eq!(
+            Placement {
+                locked: true,
+                position: None,
+                size: Some((1, 1)),
+                always_on_top: false,
+            }
+            .window_size(Some((1_920, 1_080))),
+            Some(CAPTURE_MIN_SIZE)
+        );
+    }
+
+    /// Story 75.2, AD-258: opening the window clears the lock and **nothing
+    /// else**.
+    ///
+    /// All four fields are asserted, deliberately. A test that checked only
+    /// `locked` would pass against the obvious wrong implementation — replacing
+    /// the stored row with a fresh `Placement` — which is exactly the mistake
+    /// the story's "the reset is one field, not a wipe" sentence is about: it
+    /// would throw away the position and the size that ride in the same row,
+    /// and the pin the owner explicitly asked for.
+    #[test]
+    fn opening_the_window_clears_the_lock_and_keeps_everything_else() {
+        let stored = Placement {
+            locked: true,
+            position: Some((120, -40)),
+            size: Some((900, 600)),
+            always_on_top: true,
+        };
+        let opened = stored.opened();
+
+        assert!(!opened.locked, "the window came back locked");
+        assert_eq!(
+            opened.position,
+            Some((120, -40)),
+            "opening the window forgot where it was"
+        );
+        assert_eq!(
+            opened.size,
+            Some((900, 600)),
+            "opening the window forgot how big it was"
+        );
+        assert!(
+            opened.always_on_top,
+            "opening the window un-pinned a window the owner pinned"
+        );
+
+        // And the geometry is not merely carried — it is ANSWERED with, which
+        // is what the shell actually asks for. Unlocking changes neither
+        // answer, because both were already the user's.
+        assert_eq!(opened.adopted_position(), Some((120, -40)));
+        assert_eq!(opened.window_size(Some((1_920, 1_080))), Some((900, 600)));
+
+        // Idempotent, because both shell paths may reach it and one of them
+        // runs on a row the other already opened: boot adopts the stored row
+        // and the hotkey reveals the same window later in the same session.
+        assert_eq!(opened.opened(), opened);
+
+        // An unlocked row is untouched in every field, so routing a path that
+        // did not need the reset through it costs nothing.
+        let already_free = Placement {
+            locked: false,
+            position: Some((10, 10)),
+            size: None,
+            always_on_top: false,
+        };
+        assert_eq!(already_free.opened(), already_free);
     }
 
     /// DW-198: the position must answer the same shape of question the size
@@ -1651,12 +2017,15 @@ mod tests {
         );
     }
 
-    /// DW-198's other half. Adopting the position at boot buys nothing if the
-    /// next hotkey press re-centres the window, so `show` has to stop placing
-    /// an unlocked one — and it decides that from the live window attribute,
-    /// with no settings read in front of the hot path (NFR-27).
+    /// DW-198's other half, as Story 75.2 narrowed it. Adopting the position at
+    /// boot buys nothing if the next hotkey press re-centres the window, so
+    /// `show` leaves a window where it is — and since every window is unlocked
+    /// at every open, the only one keeper still places is one whose backend
+    /// will not say whether it is resizable. Decided from a live window
+    /// attribute either way, with no settings read in front of the hot path
+    /// (NFR-27).
     #[test]
-    fn the_hotkey_leaves_an_unlocked_window_alone_and_still_places_a_locked_one() {
+    fn the_hotkey_leaves_a_window_that_answers_and_places_only_one_that_does_not() {
         assert_eq!(plan_show_position(true), ShowPosition::Leave);
         assert_eq!(plan_show_position(false), ShowPosition::Place);
     }
@@ -1797,8 +2166,9 @@ mod tests {
             remembered(CAPTURE_MIN_SIZE).window_size(Some((1_920, 1_080))),
             Some(CAPTURE_MIN_SIZE)
         );
-        // The floor is below keeper's own size, or normalising a locked window
-        // would enlarge it.
+        // The floor is below keeper's own size, or the answer for a locked
+        // window that remembers no size would be one the clamp then has to
+        // raise — a default nobody could actually receive.
         assert!(CAPTURE_MIN_SIZE.0 < CAPTURE_DEFAULT_SIZE.0);
         assert!(CAPTURE_MIN_SIZE.1 < CAPTURE_DEFAULT_SIZE.1);
     }
@@ -1921,12 +2291,19 @@ mod tests {
         }
     }
 
-    /// What a *locked* window reports — the same three readings, and a window
-    /// whose geometry is keeper's rather than the user's.
-    fn normalised(position: (i32, i32)) -> Observed {
+    /// What a *locked* window reports — the same three readings, from a window
+    /// keeper rather than the user is placing.
+    ///
+    /// The size became a parameter in Story 75.1. It used to be
+    /// [`CAPTURE_DEFAULT_SIZE`] unconditionally, because locking normalised the
+    /// window to keeper's size; a lock now freezes whatever is there, so the
+    /// honest reading from a locked window is the size it was locked at. The
+    /// fact that makes these readings discardable was never the size anyway —
+    /// it is `user_controlled: false`.
+    fn placed(position: (i32, i32), size: (u32, u32)) -> Observed {
         Observed {
             position: Some(position),
-            size: Some(CAPTURE_DEFAULT_SIZE),
+            size: Some(size),
             user_controlled: false,
         }
     }
@@ -1961,17 +2338,19 @@ mod tests {
             Some((120, -40)),
             "'unlock, drag, lock again' is a person saying keep it THERE"
         );
-        // ...and the live window is now keeper's 560×340.
-        assert_eq!(
-            locked.window_size(Some((1_920, 1_080))),
-            Some(CAPTURE_DEFAULT_SIZE)
-        );
+        // ...and since Story 75.1 the live window is still 900×600: the whole
+        // sequence this test walks no longer changes the size at any step,
+        // which is what the owner meant by the padlock.
+        assert_eq!(locked.window_size(Some((1_920, 1_080))), Some(CHOSEN));
 
         // Click it again. THIS is where the size used to die: the live window
-        // is the normalised one, and merging its size over the stored one
+        // was the normalised one, and merging its size over the stored one
         // overwrote 900×600 with 560×340 a moment before `window_size` was
-        // asked to restore it.
-        let unlocked = locked.relocked(normalised((120, -40)), false);
+        // asked to restore it. 75.1 removed the normalisation, so the reading
+        // is no longer wrong — but the guard is still what stops a
+        // keeper-placed reading from overwriting the row, and a window locked
+        // before it was ever resized still reports keeper's size.
+        let unlocked = locked.relocked(placed((120, -40), CHOSEN), false);
         assert_eq!(
             unlocked.size,
             Some(CHOSEN),
@@ -1999,11 +2378,13 @@ mod tests {
         // The hotkey has since re-placed this locked panel a fifth of the way
         // down the pointer's monitor (Story 47.5, DW-198), so its live
         // coordinate is keeper's and its live size is keeper's.
-        let after_blur = locked.observing(normalised((680, 216)));
+        let after_blur = locked.observing(placed((680, 216), CAPTURE_DEFAULT_SIZE));
 
         assert_eq!(after_blur, locked, "a locked window has nothing to report");
         assert_eq!(
-            after_blur.relocked(normalised((680, 216)), false).size,
+            after_blur
+                .relocked(placed((680, 216), CAPTURE_DEFAULT_SIZE), false)
+                .size,
             Some(CHOSEN),
             "so the later unlock still finds the user's size"
         );
@@ -2094,7 +2475,11 @@ mod tests {
             ..Placement::default()
         };
         assert!(unlocked.relocked(dragged((1, 2), CHOSEN), true).locked);
-        assert!(!unlocked.relocked(normalised((1, 2)), false).locked);
+        assert!(
+            !unlocked
+                .relocked(placed((1, 2), CAPTURE_DEFAULT_SIZE), false)
+                .locked
+        );
         assert!(
             !Placement::default()
                 .relocked(Observed::default(), false)
@@ -2110,8 +2495,17 @@ mod tests {
     };
 
     /// The owner's second sentence — *"moze wyjsc poza monitor"* — in its first
-    /// reachable form: locking GROWS a small window from the same top-left, and
-    /// nothing used to move it afterwards.
+    /// reachable form: a window GROWS from the same top-left, and nothing used
+    /// to move it afterwards.
+    ///
+    /// Story 75.1 closed the route this test was named for — a lock freezes the
+    /// remembered size instead of growing it to keeper's — and left the test,
+    /// because the clamp is what the story was ever about and the growth still
+    /// happens: a window locked before anything was ever written down has no
+    /// remembered size, so it still gets [`CAPTURE_DEFAULT_SIZE`], and every
+    /// other caller of `clamp_position` (the hotkey's re-placement, a restore
+    /// onto a monitor that has gone) hands it a size the position was not
+    /// chosen for.
     #[test]
     fn locking_a_small_window_in_the_corner_does_not_push_it_off_the_screen() {
         // 320×240 parked hard against the bottom-right corner.
@@ -2121,9 +2515,8 @@ mod tests {
             parked,
             "where it already fits, nothing moves"
         );
-        // The lock normalises it to 560×340 without repositioning it, so 240 px
-        // of window — including the corner the close button is in — went past
-        // the edge.
+        // Grown to 560×340 without repositioning, 240 px of window — including
+        // the corner the close button is in — went past the edge.
         assert_eq!(
             clamp_position(parked, CAPTURE_DEFAULT_SIZE, Some(PRIMARY)),
             (1_360, 740),
