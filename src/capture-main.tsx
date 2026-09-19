@@ -38,7 +38,9 @@
  * Both branches get the same chrome: a close button, because Escape being the
  * only way out is a way out nobody discovers, and a lock, because an
  * undecorated window that keeper always places is a window you cannot put where
- * you need it.
+ * you need it. Since Story 75.3 both branches also put that chrome in the same
+ * PLACE — the editor's own header, as its frame group (AD-260) — so a capture
+ * window draws one 40px row where it used to draw two totalling 72.
  *
  * What is still deliberately absent, and must stay absent: a title field, a
  * folder picker, a save button, a discard affordance. Escape files the thought;
@@ -46,24 +48,40 @@
  */
 import ReactDOM from "react-dom/client";
 import { CaptureDraftDocument } from "@/components/capture/capture-document";
-import { CaptureNoteWindow, CaptureWindowChrome } from "@/components/capture/capture-window";
+import {
+  CaptureNoteWindow,
+  CaptureWindowChrome,
+  useCaptureWindowTitleBar,
+} from "@/components/capture/capture-window";
 import { captureTargetFromSearch, DRAFT_CAPTURE_KEY } from "@/lib/capture-target";
 import "./index.css";
+
+/**
+ * The prewarmed window. Its chrome is handed the document's OWN dismissal, so
+ * the close button and Escape are one act rather than two spellings of one —
+ * filing the thought, hiding, and arming a fresh page for next time.
+ *
+ * A component of its own and not a branch inside {@link CapturePanel}, because
+ * it now has to call a hook: the note branch returns early, and a hook after an
+ * early return is a hook that is called on some renders and not others.
+ */
+function CaptureDraftWindow() {
+  const titleBar = useCaptureWindowTitleBar(DRAFT_CAPTURE_KEY);
+  return (
+    <CaptureDraftDocument
+      captureKey={DRAFT_CAPTURE_KEY}
+      titleBar={titleBar}
+      chrome={(dismiss) => <CaptureWindowChrome captureKey={DRAFT_CAPTURE_KEY} onClose={dismiss} />}
+    />
+  );
+}
 
 export function CapturePanel({ search }: { search: string }) {
   const target = captureTargetFromSearch(search);
   if (target.kind === "note") {
     return <CaptureNoteWindow vaultId={target.vaultId} noteId={target.noteId} />;
   }
-  // The prewarmed window. Its chrome is handed the document's OWN dismissal, so
-  // the close button and Escape are one act rather than two spellings of one —
-  // filing the thought, hiding, and arming a fresh page for next time.
-  return (
-    <CaptureDraftDocument
-      captureKey={DRAFT_CAPTURE_KEY}
-      chrome={(dismiss) => <CaptureWindowChrome captureKey={DRAFT_CAPTURE_KEY} onClose={dismiss} />}
-    />
-  );
+  return <CaptureDraftWindow />;
 }
 
 // Guarded so the module can be imported by a test without mounting a root.

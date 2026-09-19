@@ -37,7 +37,7 @@ import {
 import { type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { CaptureNoteItem } from "@/components/capture/capture-note-item";
 import { ExportNoteItem } from "@/components/export/export-note-item";
-import { PaneHeader } from "@/components/layout/pane-header";
+import { PaneHeader, type PaneHeaderTitleBar } from "@/components/layout/pane-header";
 import { type PriorityAction, PriorityActions } from "@/components/layout/priority-actions";
 import { Button } from "@/components/ui/button";
 import {
@@ -353,8 +353,25 @@ export interface NoteEditorProps {
    * The editor never composes these, only places them: what a panel's fold
    * looks like is `panel-strip.tsx`'s business, and a second spelling of it
    * here is a second glyph to keep in step.
+   *
+   * **A capture window passes one too, since Story 75.3.** The sentence above
+   * used to say this was absent in a capture window; AD-260 makes the window's
+   * close, lock and pin the frame group here for the same reason a panel's fold
+   * and close are — they act on the window and not on the note, so they may
+   * never be demoted into the note's own `…` menu. The doc is corrected rather
+   * than extended so the next reader is not told the opposite of what the code
+   * does.
    */
   frame?: ReactNode;
+  /**
+   * Present when nothing is drawn above this editor's header — when the header
+   * IS the window's title bar, which is true only in a capture window.
+   *
+   * Forwarded verbatim to `PaneHeader` and never read here: what it means is
+   * one concept with three consequences and it is documented in the one place
+   * that implements them. The notes pane and a panel pass nothing.
+   */
+  titleBar?: PaneHeaderTitleBar | null;
 }
 
 /**
@@ -374,7 +391,14 @@ export interface NoteEditorProps {
  */
 export const NOTE_COLUMN_CLASS = "flex h-full min-h-0 min-w-0 flex-col";
 
-export function NoteEditor({ vaultId, noteId, onOpenNote, frame, panelId }: NoteEditorProps) {
+export function NoteEditor({
+  vaultId,
+  noteId,
+  onOpenNote,
+  frame,
+  panelId,
+  titleBar = null,
+}: NoteEditorProps) {
   const body = useNotesBody(vaultId, noteId);
   // Story 46.12: every one of these names the note THIS editor is showing.
   // Two editors are two subscriptions to two documents in one store, and the
@@ -967,6 +991,13 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame, panelId }: Note
           it. The capture window mounts this exact header, so one structure
           answers both hosts. */}
       <PaneHeader
+        // Passed through untouched. In a capture window there is no chrome
+        // above this row, so the row is the window's title bar: it can be
+        // dragged, the title keeps a floor so the drag handle cannot vanish,
+        // and the save caption is the member that gives first. All three are
+        // `PaneHeader`'s to implement — see its module doc — and all three are
+        // absent in every other host, which passes nothing.
+        titleBar={titleBar}
         // `PaneHeader` owns its own height (DESIGN.md's 40px pane-header) and
         // its own bottom edge. The only thing left for a host to say is the
         // horizontal gutter: a `border-b` here drew the seam twice at 2px, and
@@ -1001,7 +1032,18 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame, panelId }: Note
         }
         // Group 2 — status. One box for all three captions, reserved from the
         // strings this machine's own clock produces, so a save cannot widen it.
-        status={{ sizers: SAVE_CAPTION_SIZERS, caption: saveWord }}
+        //
+        // A failure is the one caption that is not reserved — it is composed
+        // where the write failed — and it is also the only place a capture
+        // window says why a write was refused (UX-DR35). So it is the caption
+        // that may not be squeezed away: in a title bar `PaneHeader` releases
+        // the identity floor for it instead, and the note's name gives ground
+        // rather than the reason.
+        status={{
+          sizers: SAVE_CAPTION_SIZERS,
+          caption: saveWord,
+          unsqueezable: error !== null,
+        }}
         // Group 3 — actions, and how many of them there are (Story 48.5). The
         // function form is handed the pixels this row can spare; `budget` is
         // zero until a `ResizeObserver` has answered, and zero renders exactly
@@ -1137,7 +1179,10 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame, panelId }: Note
           />
         )}
         // The host supplies panel identity, never a second navigation stack.
-        // Capture and prewarmed editors have no panel and no navigation controls.
+        // A capture window has no panel and so no navigation controls, but it
+        // does now hand down a frame of its own (Story 75.3): the `panelId`
+        // test decides whether NAVIGATION belongs here, not whether a frame
+        // does.
         frame={
           panelId ? (
             <>

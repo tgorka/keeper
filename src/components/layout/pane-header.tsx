@@ -110,6 +110,50 @@
  * only one of them has a frame; a group in front of identity would put the
  * note's title at a different x in a panel than in the notes pane, for a
  * reason the reader cannot see.
+ *
+ * # When the row is the window's own title bar (Story 75.3, AD-260)
+ *
+ * The quick-capture window used to draw a 32px strip of its own above this
+ * header to hold pin, lock and close — 72px of chrome over a panel whose
+ * default height is 340. The strip is gone: those three controls are group 4,
+ * which is what group 4 was built for.
+ *
+ * Merging them makes the header something it is nowhere else. In a panel this
+ * row is a band inside a window somebody else draws; in the capture window
+ * there is nothing above it, so it IS the title bar — the thing you grab to
+ * move the window, the thing that must keep a grabbable area at every width,
+ * and the thing whose last resort when the content will not fit is to say less
+ * rather than to lose a control.
+ *
+ * That is ONE fact about the host, so it is {@link PaneHeaderProps.titleBar}:
+ * one prop, three consequences, written down in one place.
+ *
+ * 1. **It can be dragged.** `data-tauri-drag-region` goes on the row, on the
+ *    identity group and on the frame wrapper — never on the actions group,
+ *    where a miss would move the window instead of pressing a verb. Tauri's
+ *    shim matches the EXACT element the pointer went down on and does not walk
+ *    up, so each of them carries the attribute itself and identity's children
+ *    are made inert, which turns a press on the title into a press on the
+ *    marked box that holds it.
+ * 2. **Identity keeps a floor in CSS, not only in the arithmetic.** Group 1 is
+ *    `flex: 1 1 0%`, so its scaled shrink factor is zero and under negative
+ *    free space it collapses to nothing and absorbs nothing — which in a title
+ *    bar would take the drag handle with it. `min-w-40` is
+ *    {@link PANE_HEADER_IDENTITY_MIN_PX} spelled as a class; the two are one
+ *    fact written twice and MUST change together, exactly like `gap-2` and
+ *    {@link PANE_HEADER_GAP_PX}.
+ * 3. **The status caption gives first.** With a floor under identity and
+ *    `shrink-0` on everything else, a row that is too narrow has nowhere to
+ *    take the deficit from and overflows the window. AD-260 names the order:
+ *    the caption goes (it is transient, and the save state is repeated in the
+ *    `…` menu), then the title truncates. So in a title bar — and only there —
+ *    group 2 drops `shrink-0` for `min-w-0 overflow-hidden` and is the member
+ *    that can be squeezed to nothing. Its sizers still set its natural width,
+ *    so it is full-width whenever the row can afford it.
+ *
+ * Every other host passes nothing and is untouched: no drag attribute, no
+ * floor, an unsqueezable status. That blast radius is asserted in
+ * `note-editor.test.tsx`.
  */
 import { type ReactNode, useLayoutEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
@@ -191,6 +235,22 @@ export function paneHeaderActionsBudget({
   return Math.max(0, header - owed);
 }
 
+/**
+ * What it means for this row to be the window's own title bar.
+ *
+ * An object with one field rather than a bare boolean, because "is a title
+ * bar" and "may be dragged right now" are different claims and the row needs
+ * both: a LOCKED capture window is still the title bar — it still keeps the
+ * identity floor and still lets the caption give first — but it may not be
+ * moved, so it must not be marked. A single `draggable?: boolean` prop could
+ * not tell "not a title bar" from "a title bar nobody may drag".
+ */
+export interface PaneHeaderTitleBar {
+  /** Whether a press on the row should move the window. False for a locked
+   *  capture window, whose whole point is that it does not move. */
+  readonly draggable: boolean;
+}
+
 export interface PaneHeaderStatus {
   /**
    * Every string this slot can ever show, so the browser can measure them.
@@ -208,6 +268,24 @@ export interface PaneHeaderStatus {
   /** The one string on screen right now. `""` renders an empty slot, which is
    *  the state a caption that would only be noise should be in. */
   readonly caption: string;
+  /**
+   * `true` when {@link caption} is a failure the person has to be able to read.
+   *
+   * In a title bar the status slot is normally the member that gives first
+   * (AD-260): with a floor under identity and `shrink-0` on everything else,
+   * the row needs one squeezable member or it overflows the window. A refused
+   * write is the exception, because in a capture window this caption is the
+   * ONLY place its reason appears (UX-DR35 — one write must not grow two error
+   * channels), and a window that will not close with no visible reason is
+   * worse than a note title truncated further. So for this caption the trade
+   * is reversed: the slot keeps its width and the identity group gives up its
+   * floor instead.
+   *
+   * It costs the row the slot's natural width — the width of {@link sizers} —
+   * and not the length of the message: the caption is rendered out of flow and
+   * ellipsised, so a long sentence from Rust cannot widen anything.
+   */
+  readonly unsqueezable?: boolean;
 }
 
 export interface PaneHeaderProps {
@@ -243,6 +321,17 @@ export interface PaneHeaderProps {
    * different things.
    */
   frame?: ReactNode;
+  /**
+   * Present when there is no window chrome above this row — when this row IS
+   * the window's title bar (Story 75.3, AD-260). Absent everywhere else, which
+   * is three of the four hosts.
+   *
+   * One flag carrying three consequences — the drag marking, a CSS floor under
+   * identity, and a status caption that may be squeezed away — because they are
+   * three faces of one fact and not three requests a caller gets to mix. See
+   * the module doc for each of them and why it is load-bearing.
+   */
+  titleBar?: PaneHeaderTitleBar | null;
   /** The header element's own HORIZONTAL padding, which differs per surface.
    *  Its height and its bottom edge are the component's — see the module doc. */
   className?: string;
@@ -253,6 +342,7 @@ export function PaneHeader({
   status = null,
   actions,
   frame = null,
+  titleBar = null,
   className,
 }: PaneHeaderProps): React.ReactElement {
   const rowRef = useRef<HTMLElement>(null);
@@ -265,6 +355,17 @@ export function PaneHeader({
   // fresh every render, so depending on it would tear the observer down and
   // build it again on every keystroke that changes the title.
   const framed = frame !== null;
+  // Marked on four elements and spread rather than set, because Tauri's
+  // drag-region shim is a document-level `mousedown` listener that matches the
+  // element the press LANDED on: an ancestor carrying the attribute does
+  // nothing for a child that does not. The actions group is deliberately not
+  // among them — see the module doc.
+  const dragRegion = titleBar?.draggable === true ? { "data-tauri-drag-region": true } : {};
+  // Which way the row's one squeezable member points, and it only ever points
+  // the other way in a title bar showing a failure — see
+  // `PaneHeaderStatus.unsqueezable`. Computed once so the status slot and the
+  // identity group cannot come to disagree about which of them is giving.
+  const urgent = titleBar !== null && status?.unsqueezable === true;
 
   // Zero until the row has been observed, and that is the safe direction: a
   // group with no budget renders the 560px shape, so the worst a missing
@@ -315,6 +416,7 @@ export function PaneHeader({
   return (
     <header
       ref={rowRef}
+      {...dragRegion}
       // `h-10` is DESIGN.md's `pane-header.height`, measured the way the seam
       // makes it real: 40px INCLUDING the hairline, because the hairline is the
       // header's and not the next band's. `items-center` then centres a 32px
@@ -325,7 +427,31 @@ export function PaneHeader({
       {/* Group 1 — identity. `flex-1` off a zero basis: its width is whatever
           the row has left over, and it contributes nothing to the row's own
           content width. */}
-      <div data-slot={PANE_HEADER_IDENTITY_SLOT} className="flex min-w-0 flex-1 items-center gap-2">
+      <div
+        data-slot={PANE_HEADER_IDENTITY_SLOT}
+        {...dragRegion}
+        className={cn(
+          "flex min-w-0 flex-1 items-center gap-2",
+          // A title bar's identity is also its drag handle, so it may not
+          // collapse — `flex-1` off a zero basis has a scaled shrink factor of
+          // zero and would surrender all of it — and the press has to reach
+          // THIS box rather than the `h1` inside it. `min-w-40` is
+          // PANE_HEADER_IDENTITY_MIN_PX as a class; they change together.
+          titleBar !== null && "[&>*]:pointer-events-none",
+          // …except while the status is a failure, when identity is the member
+          // that gives instead. It keeps the drag region and loses only the
+          // floor: the `<header>` itself is marked too, so the row's padding
+          // and the gaps between its groups still drag a window whose title has
+          // been squeezed. Measured in Chromium at the capture window's 400px
+          // floor: the caption's reserved box is 125 there, so the row's fixed
+          // demands are 12 + 0 + 8 + 125 + 8 + 104 + 8 + 88 + 12 = 365 and the
+          // title keeps the remaining 35 — ellipsised to two glyphs, and the
+          // reason on screen rather than clipped to nothing. Without the
+          // release the same row is 12 + 160 + 8 + 125 + … = 525 against 400,
+          // which the window has nowhere to take from.
+          titleBar !== null && !urgent && "min-w-40",
+        )}
+      >
         {identity}
       </div>
       {status === null ? null : (
@@ -335,7 +461,35 @@ export function PaneHeader({
         <span
           ref={statusRef}
           data-slot={PANE_HEADER_STATUS_SLOT}
-          className="figures relative grid shrink-0 justify-items-end text-meta text-muted-foreground"
+          // Marked for the same reason the identity box is, and separately from
+          // it: the shim matches the element pressed, so an unmarked caption in
+          // the middle of a title bar is a dead zone the width of `Saved ·
+          // 12:34`. Its children are the hidden sizers and the caption text,
+          // which have nothing to click, so making them inert costs nothing.
+          //
+          // The `title` rides on THIS element rather than on the caption for
+          // the same reason: with the caption inert the hover lands here, and a
+          // failure too long for the slot has to stay readable somewhere — it
+          // is ellipsised, not shortened.
+          {...dragRegion}
+          title={status.caption === "" ? undefined : status.caption}
+          className={cn(
+            "figures relative grid justify-items-end text-meta text-muted-foreground",
+            titleBar !== null && "[&>*]:pointer-events-none",
+            // Unsqueezable everywhere but a title bar, where AD-260 makes this
+            // the member that gives first: with a floor under identity and
+            // `shrink-0` on the rest, the row would otherwise have nowhere to
+            // take a deficit from and would overflow the window. The sizers
+            // still set its natural width, so it only shrinks once the row has
+            // genuinely run out.
+            //
+            // A failure is the exception and the identity floor is released to
+            // pay for it (`PaneHeaderStatus.unsqueezable`): in a capture window
+            // this caption is the only place a refused write says why, and a
+            // window that will not close while its reason is clipped to nothing
+            // is the defect merging the header would otherwise have introduced.
+            titleBar === null || urgent ? "shrink-0" : "min-w-0 overflow-hidden",
+          )}
         >
           {status.sizers.map((sizer) => (
             <span
@@ -346,12 +500,7 @@ export function PaneHeader({
               {sizer}
             </span>
           ))}
-          <span
-            className="absolute inset-0 truncate text-right"
-            title={status.caption === "" ? undefined : status.caption}
-          >
-            {status.caption}
-          </span>
+          <span className="absolute inset-0 truncate text-right">{status.caption}</span>
         </span>
       )}
       {/* Group 3 — actions. Squeezable when it is a node, because 46.4 ruled
@@ -373,6 +522,7 @@ export function PaneHeader({
         <div
           ref={frameRef}
           data-slot={PANE_HEADER_FRAME_SLOT}
+          {...dragRegion}
           className="flex shrink-0 items-center gap-2"
         >
           {frame}
