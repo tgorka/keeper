@@ -38,6 +38,7 @@ function row(order: NoteOrder, overrides: Partial<NoteRowVm> = {}): NoteRowVm {
     unresolvedTarget: "",
     title: "A note",
     snippet: "the body excerpt",
+    hit: null,
     predicates: [],
     tags: [],
     updatedMs: Date.now() - 3_600_000,

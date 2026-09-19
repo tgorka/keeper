@@ -58,6 +58,7 @@ function row(id: string, title: string, tags: string[]): NoteRowVm {
     id,
     path: `${id}.md`,
     // Empty on a row that IS a note; carried only by an outbound edge to a
+    hit: null,
     // target nobody has written yet (owner item 2).
     unresolvedTarget: "",
     predicates: [],
@@ -203,6 +204,7 @@ function evaluate(vaultId: string, query: NoteQueryReq): NoteListVm {
     total: selected.length,
     matched: rows.length,
     offset: query.offset,
+    hidden: 0,
   };
 }
 

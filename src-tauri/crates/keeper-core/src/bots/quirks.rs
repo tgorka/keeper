@@ -59,6 +59,16 @@ pub enum ImagePartShape {
 /// Everything [`crate::bots::chat`] needs to know about one provider kind.
 #[derive(Debug, Clone, Copy)]
 pub struct Quirks {
+    /// Whether `/v1/embeddings` is available (AD-264).
+    ///
+    /// * Ollama — **Yes**. The OpenAI compatibility matrix documents `model`
+    ///   and string-array `input` (notes-search research §6.2,
+    ///   <https://docs.ollama.com/api/openai-compatibility>).
+    /// * Hermes — **Unknown**. The researched route table names no embeddings
+    ///   route; that is not proof of absence on the configured server, so a
+    ///   probe is allowed and a 404 becomes an explicit refusal.
+    pub embeddings: Support,
+
     /// Whether `tool_choice` reaches the model.
     ///
     /// * Ollama — **No**. Its OpenAI-compatibility matrix marks `tool_choice`
@@ -198,6 +208,7 @@ pub struct Quirks {
 pub const fn quirks(kind: ProviderKind) -> Quirks {
     match kind {
         ProviderKind::Hermes => Quirks {
+            embeddings: Support::Unknown,
             tool_choice: Support::Unknown,
             remote_image_url: Support::Yes,
             image_part: ImagePartShape::Object,
@@ -210,6 +221,7 @@ pub const fn quirks(kind: ProviderKind) -> Quirks {
             server_sessions: Support::Unknown,
         },
         ProviderKind::Ollama => Quirks {
+            embeddings: Support::Yes,
             tool_choice: Support::No,
             remote_image_url: Support::No,
             image_part: ImagePartShape::BareString,
@@ -227,6 +239,12 @@ pub const fn quirks(kind: ProviderKind) -> Quirks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embeddings_follow_documented_support_without_inventing_hermes_absence() {
+        assert_eq!(quirks(ProviderKind::Ollama).embeddings, Support::Yes);
+        assert_eq!(quirks(ProviderKind::Hermes).embeddings, Support::Unknown);
+    }
 
     #[test]
     fn unknown_is_permitted_and_no_is_not() {

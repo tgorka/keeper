@@ -1218,7 +1218,17 @@ const ANSWERS: Record<string, unknown> = {
   // `matched` off the answer, and an array left the Notes surface throwing
   // `Cannot read properties of undefined (reading 'length')` on mount — which
   // is the whole screen, in the one shell that exists to let it be looked at.
-  notes_list: { rows: noteRows, total: noteRows.length, matched: noteRows.length, offset: 0 },
+  notes_list: {
+    rows: noteRows,
+    total: noteRows.length,
+    matched: noteRows.length,
+    hidden: 0,
+    offset: 0,
+  },
+  notes_hide_service_files_get: true,
+  notes_service_file_names_get: ["index.md", "agents.md", "claude.md", "log.md"],
+  notes_embedding_model_get: null,
+  notes_note_marks: { rev: "mock", ranges: [] },
   notes_spaces: SPACES,
   notes_tag_tree: { nodes: TAGS },
   notes_templates: [],
@@ -2315,6 +2325,7 @@ function ollamaModel(id: string, family: string, parameterSize: string): BotMode
     vision: false,
     tools: true,
     reasoning: false,
+    embedding: null,
     capabilities: ["completion", "tools"],
   };
 }
@@ -2335,6 +2346,7 @@ const BOT_MODELS: Record<string, BotModelVm[]> = {
       vision: false,
       tools: true,
       reasoning: false,
+      embedding: null,
       capabilities: ["completion", "tools"],
     },
     {
@@ -2348,6 +2360,7 @@ const BOT_MODELS: Record<string, BotModelVm[]> = {
       vision: true,
       tools: true,
       reasoning: true,
+      embedding: null,
       capabilities: ["completion", "tools", "vision", "thinking"],
     },
     ollamaModel("embeddinggemma:latest", "gemma", "300M"),
@@ -2372,6 +2385,7 @@ const BOT_MODELS: Record<string, BotModelVm[]> = {
       vision: null,
       tools: true,
       reasoning: null,
+      embedding: null,
       capabilities: [],
     },
   ],
@@ -2938,6 +2952,41 @@ const COPY_FIXTURES = [
 const copyJobs = new Map<string, CopyJobVm>();
 
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  notes_hide_service_files_set: (payload) => {
+    ANSWERS.notes_hide_service_files_get = Boolean(payload.hidden);
+  },
+  notes_service_file_names_set: (payload) => {
+    const names = payload.names as string[];
+    ANSWERS.notes_service_file_names_get = [
+      ...new Set(names.map((name) => name.trim().toLowerCase()).filter(Boolean)),
+    ];
+  },
+  notes_embedding_model_set: (payload) => {
+    ANSWERS.notes_embedding_model_get = payload.model;
+  },
+  notes_subscribe_search: (payload) => {
+    (payload.channel as MockChannel<unknown>).onmessage?.({
+      vaultId: payload.vaultId,
+      phase: "words",
+      indexed: noteRows.length,
+      total: noteRows.length,
+      embedded: 0,
+      embeddable: 0,
+      model: "",
+      sentence: "",
+    });
+    return "sub-mock-search";
+  },
+  notes_subscribe_changes: (payload) => {
+    (payload.channel as MockChannel<unknown>).onmessage?.({
+      vaultId: payload.vaultId,
+      ops: [{ op: "reset", rows: noteRows }],
+      total: noteRows.length,
+      matched: noteRows.length,
+      hidden: 0,
+    });
+    return "sub-mock-changes";
+  },
   copy_start: (payload) => {
     const source = String(payload.source ?? "");
     const destination = String(payload.destination ?? "");

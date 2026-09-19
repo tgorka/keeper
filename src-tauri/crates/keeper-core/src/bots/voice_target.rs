@@ -263,6 +263,7 @@ mod tests {
             vision: None,
             tools: None,
             reasoning: None,
+            embedding: None,
             capabilities: Vec::new(),
         }
     }

@@ -275,7 +275,7 @@ beforeEach(() => {
     const rows = [DENTIST, GROCERIES].filter((candidate) =>
       candidate.title.toLowerCase().includes(needle),
     );
-    return { rows, total: rows.length, matched: rows.length, offset: 0 };
+    return { rows, total: rows.length, matched: rows.length, offset: 0, hidden: 0 };
   });
   notesOpen.mockImplementation(async (_vault, noteId, onBatch) => {
     onBatch({

@@ -345,6 +345,7 @@ describe("TaskForm creation and new kinds", () => {
         vision: null,
         tools: null,
         reasoning: null,
+        embedding: null,
         capabilities: [],
       },
     ]);

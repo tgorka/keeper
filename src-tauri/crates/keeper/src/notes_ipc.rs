@@ -27,7 +27,7 @@
 //! bottom, so the `invoke_handler` list is identical on every target and
 //! `cargo check --target aarch64-apple-ios` stays green.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
@@ -37,10 +37,12 @@ use keeper_core::notes::default_spaces::{self, SPACES_DIR};
 use keeper_core::notes::embed::{self, NoteEmbedPathVm, NoteEmbedVm};
 use keeper_core::notes::frontmatter::{FieldValue, Frontmatter};
 use keeper_core::notes::index::{IndexEntry, IndexSnapshot, TagTerms};
+use keeper_core::notes::search_index::{self, MatchWhy, SearchIndex, SEARCH_DB_FILE};
 use keeper_core::notes::template_update::{
     self, TemplateUpdateAppliedVm, TemplateUpdateApplyReq, TemplateUpdateOfferVm,
     TemplateUpdateResultVm,
 };
+use keeper_core::notes::vm::{EmbeddingModelVm, NoteHitVm, NoteMarksVm, NoteSearchStateVm};
 use keeper_core::notes::vm::{
     NoteAttachSourceVm, NoteAttachTargetVm, NoteAttachmentVm, NoteBodyBatch, NoteBodyVm,
     NoteChangeBatch, NoteConflictChoiceReq, NoteConflictVm, NoteCreateReq, NoteCreateVm, NoteCsvVm,
@@ -54,6 +56,7 @@ use keeper_core::notes::{
     attach, counts, csv, naming, order, query, search, seed, sort, tags, templates, widget,
     NotesError,
 };
+use keeper_core::registry;
 #[cfg(desktop)]
 use keeper_core::vm::ExportReceiptVm;
 use keeper_core::vm::{
@@ -280,8 +283,16 @@ static SUBSCRIPTIONS: LazyLock<Mutex<HashMap<String, Subscription>>> =
 /// query has to come from somewhere, and the honest source is the last one
 /// `notes_list` was asked for. A subscription opened before any list call streams
 /// the default window until the first `notes_list` arrives, then follows it.
-static LAST_QUERY: LazyLock<Mutex<HashMap<String, NoteQueryReq>>> =
+static LAST_QUERY: LazyLock<Mutex<HashMap<String, Arc<NoteQueryReq>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct QueryEmbedding {
+    model: registry::EmbeddingModel,
+    text: String,
+    vector: Vec<f32>,
+}
+
+static LAST_EMBEDDING: LazyLock<Mutex<Option<QueryEmbedding>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Where the caret goes the first time a freshly created note is opened.
 ///
@@ -328,7 +339,7 @@ fn subscriptions() -> MutexGuard<'static, HashMap<String, Subscription>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn last_queries() -> MutexGuard<'static, HashMap<String, NoteQueryReq>> {
+fn last_queries() -> MutexGuard<'static, HashMap<String, Arc<NoteQueryReq>>> {
     LAST_QUERY
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -365,6 +376,7 @@ fn row_of(entry: &IndexEntry, head: Option<&HeadRevision>, unread: bool) -> Note
         path: entry.path.clone(),
         title: entry.title.clone(),
         snippet: entry.snippet.clone(),
+        hit: None,
         tags: entry.tags.clone(),
         updated_ms: entry.updated_ms,
         pinned: has_flag(entry, "pinned"),
@@ -424,33 +436,14 @@ fn list_order(a: &IndexEntry, b: &IndexEntry) -> std::cmp::Ordering {
         .then(a.path.cmp(&b.path))
 }
 
-/// Whether an entry satisfies the plain (non-space) filter.
-///
-/// Index-only, deliberately: the free-text axis is
-/// [`IndexEntry::matches_text`], which reads the title, the snippet, the path,
-/// the tags and the note's own frontmatter values and never opens a file — that
-/// is what keeps NFR-28's 100 ms list paint true. Full-body matching is
-/// `notes_search`, which streams because it reads files.
-///
-/// Both content axes live in `keeper-core` rather than here — free text in
-/// [`IndexEntry::matches_text`] and the tag chips in
-/// [`IndexEntry::matches_tags`] — so what a chip selects is stated once, in the
-/// crate that can be tested on any host (AD-55/AD-56). The tag terms are
-/// normalised once per query rather than once per entry, which is why they
-/// arrive already folded instead of being read out of `req`. This function keeps
-/// only the axes that need the shell's own facts — the commit head behind
-/// `origin:`.
+/// Non-text chip predicates. Ranked text candidates come from the search index.
 fn matches_filter(
     entry: &IndexEntry,
     req: &NoteQueryReq,
     tags: &TagTerms,
     head: Option<&HeadRevision>,
 ) -> bool {
-    if let Some(text) = req.text.as_ref() {
-        if !entry.matches_text(text) {
-            return false;
-        }
-    }
+    // Text is deliberately not tested against the short model snippet.
     if !entry.matches_tags(tags) {
         return false;
     }
@@ -502,7 +495,7 @@ fn fold(value: &str) -> String {
 /// - **the page** — `req.offset`/`req.limit`, how many rows this one read
 ///   carries over the wire. Never a count of anything, and after Story 44.10
 ///   never a count of what is rendered either.
-fn project_list(
+async fn project_list(
     platform: &dyn keeper_core::platform::Platform,
     vault: &Vault,
     req: &NoteQueryReq,
@@ -510,6 +503,31 @@ fn project_list(
     let snapshot = notes_vault::snapshot(&vault.id)
         .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault.id.clone())))?;
     let heads = notes_vault::heads(&vault.id).unwrap_or_default();
+    let text = req.text.as_deref().unwrap_or_default().trim();
+    let vector = if text.is_empty() {
+        None
+    } else {
+        query_embedding(platform, &vault.id, text).await
+    };
+    let search = if text.is_empty()
+        || notes_vault::search_state(&vault.id).is_none_or(|state| state.phase == "indexing")
+    {
+        None
+    } else {
+        SearchIndex::open_read_only(&vault.keeper_dir().join(SEARCH_DB_FILE)).ok()
+    };
+    let scores = search.as_ref().and_then(|index| {
+        let lexical = index.query(text, search_index::LEXICAL_POOL).ok()?;
+        let vector = vector.and_then(|(model, vector)| {
+            index
+                .cosine_top_k(&model, &vector, search_index::VECTOR_POOL)
+                .ok()
+        });
+        Some(match vector {
+            Some(vector) => search_index::fuse(&lexical, &vector),
+            None => search_index::lexical_only(&lexical),
+        })
+    });
 
     // A space is the query DSL; everything else is the chip filter. A space also
     // brings its own ordering (Story 44.4) — the value that has sat in
@@ -564,14 +582,54 @@ fn project_list(
             )
         }
     };
+    if let Some(scores) = &scores {
+        let ids: HashSet<&str> = scores.iter().map(|hit| hit.note_id.as_str()).collect();
+        matched.retain(|entry| ids.contains(entry.id.as_str()));
+    } else if !text.is_empty() {
+        matched.retain(|entry| entry.matches_text(text));
+    }
+    let before_hiding = matched.len();
+    if req.hide_service_files {
+        let names = registry::get_service_file_names(
+            &platform.data_dir().map_err(crate::ipc::to_ipc_error)?,
+        )
+        .map_err(crate::ipc::to_ipc_error)?;
+        matched.retain(|entry| {
+            !keeper_core::notes::service_files::is_service_file(&entry.path, &names)
+        });
+    }
+    let hidden = u32::try_from(before_hiding - matched.len()).unwrap_or(u32::MAX);
     // Inside a space the sort is the WHOLE ordering: pins do not float, because
     // a sort with a hidden first term is not the sort the user chose (AD-81).
     // The plain list is unchanged and still puts pinned first — that rule was
     // never a space's, and taking it away from the default lens would be a
     // different story's decision.
-    match ordering {
-        Some(ordering) => matched.sort_by(|a, b| sort::compare(ordering, a, b)),
-        None => matched.sort_by(|a, b| list_order(a, b)),
+    if let Some(scores) = &scores {
+        let ranks: HashMap<&str, (u8, f32)> = scores
+            .iter()
+            .map(|hit| {
+                let tier = match hit.why {
+                    MatchWhy::Both => 0,
+                    MatchWhy::Words => 1,
+                    MatchWhy::Meaning => 2,
+                };
+                (hit.note_id.as_str(), (tier, hit.score))
+            })
+            .collect();
+        matched.sort_by(|a, b| {
+            let left = ranks[a.id.as_str()];
+            let right = ranks[b.id.as_str()];
+            left.0
+                .cmp(&right.0)
+                .then_with(|| right.1.total_cmp(&left.1))
+                .then(b.updated_ms.cmp(&a.updated_ms))
+                .then(a.path.cmp(&b.path))
+        });
+    } else {
+        match ordering {
+            Some(ordering) => matched.sort_by(|a, b| sort::compare(ordering, a, b)),
+            None => matched.sort_by(|a, b| list_order(a, b)),
+        }
     }
 
     // The cap is applied AFTER the ordering, which is what makes "the twenty
@@ -609,12 +667,94 @@ fn project_list(
         .take(span.end)
         .skip(span.start)
         .collect();
+    let mut rows = rows_of(platform, &vault.id, &window);
+    if let (Some(index), Some(scores)) = (&search, &scores) {
+        for row in &mut rows {
+            if let Some(score) = scores.iter().find(|hit| hit.note_id == row.id) {
+                let chunk = index
+                    .chunk_text(score.chunk_rowid)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let (snippet, marks) = if score.ordinal == 0 {
+                    (row.snippet.clone(), Vec::new())
+                } else if score.why == MatchWhy::Meaning {
+                    (keeper_core::notes::snippet::prose(&chunk, 240), Vec::new())
+                } else {
+                    let marks = search_index::marks(&chunk, text);
+                    if marks.is_empty() {
+                        (keeper_core::notes::snippet::prose(&chunk, 240), Vec::new())
+                    } else {
+                        let (snippet, ranges) = search_index::excerpt(&chunk, &marks, 240);
+                        let marks = search_index::utf16_ranges(&snippet, &ranges);
+                        (snippet, marks)
+                    }
+                };
+                row.hit = Some(NoteHitVm {
+                    snippet,
+                    marks,
+                    why: score.why.as_wire().to_owned(),
+                    score: score.score,
+                });
+            }
+        }
+    }
     Ok(NoteListVm {
-        rows: rows_of(platform, &vault.id, &window),
+        rows,
         total: selection.total,
         matched: selection.matched,
         offset,
+        hidden,
     })
+}
+
+async fn query_embedding(
+    platform: &dyn keeper_core::platform::Platform,
+    vault_id: &str,
+    query: &str,
+) -> Option<(String, Vec<f32>)> {
+    use keeper_core::bots::embed;
+    if notes_vault::search_state(vault_id)?.phase != "meaning" {
+        return None;
+    }
+    let dir = platform.data_dir().ok()?;
+    let model = registry::get_embedding_model(&dir).ok()??;
+    {
+        let cached = LAST_EMBEDDING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = cached
+            .as_ref()
+            .filter(|cached| cached.model == model && cached.text == query)
+        {
+            return Some((model.model, cached.vector.clone()));
+        }
+    }
+    let endpoint = notes_vault::embedding_endpoint(platform, &model.provider).ok()?;
+    let client = notes_vault::embedding_client().ok()?;
+    let inputs = vec![format!("{}{query}", embed::query_prefix(&model.model))];
+    let vectors = tokio::time::timeout(
+        Duration::from_secs(1),
+        embed::embed(
+            client,
+            &endpoint,
+            embed::EmbedRequest {
+                model: &model.model,
+                inputs,
+            },
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if registry::get_embedding_model(&dir).ok()?.as_ref() != Some(&model) {
+        return None;
+    }
+    let vector = vectors.into_iter().next()?;
+    *LAST_EMBEDDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(QueryEmbedding {
+        model: model.clone(),
+        text: query.to_owned(),
+        vector: vector.clone(),
+    });
+    Some((model.model, vector))
 }
 
 /// A lazy body provider for the one predicate that needs bytes.
@@ -1123,6 +1263,86 @@ pub async fn notes_vault_set_active(
     notes_vault::set_active_vault(state.platform.as_ref(), &vault_id).map_err(notes_error)
 }
 
+#[tauri::command]
+pub fn notes_service_file_names_get(state: State<'_, AppState>) -> Result<Vec<String>, IpcError> {
+    let dir = state
+        .platform
+        .data_dir()
+        .map_err(crate::ipc::to_ipc_error)?;
+    registry::get_service_file_names(&dir).map_err(crate::ipc::to_ipc_error)
+}
+
+#[tauri::command]
+pub fn notes_service_file_names_set(
+    state: State<'_, AppState>,
+    names: Vec<String>,
+) -> Result<(), IpcError> {
+    let dir = state
+        .platform
+        .data_dir()
+        .map_err(crate::ipc::to_ipc_error)?;
+    registry::set_service_file_names(&dir, &names).map_err(crate::ipc::to_ipc_error)
+}
+
+#[tauri::command]
+pub fn notes_hide_service_files_get(state: State<'_, AppState>) -> Result<bool, IpcError> {
+    let dir = state
+        .platform
+        .data_dir()
+        .map_err(crate::ipc::to_ipc_error)?;
+    registry::get_hide_service_files(&dir).map_err(crate::ipc::to_ipc_error)
+}
+
+#[tauri::command]
+pub fn notes_hide_service_files_set(
+    state: State<'_, AppState>,
+    hidden: bool,
+) -> Result<(), IpcError> {
+    let dir = state
+        .platform
+        .data_dir()
+        .map_err(crate::ipc::to_ipc_error)?;
+    registry::set_hide_service_files(&dir, hidden).map_err(crate::ipc::to_ipc_error)
+}
+
+#[tauri::command]
+pub fn notes_embedding_model_get(
+    state: State<'_, AppState>,
+) -> Result<Option<EmbeddingModelVm>, IpcError> {
+    let dir = state
+        .platform
+        .data_dir()
+        .map_err(crate::ipc::to_ipc_error)?;
+    Ok(registry::get_embedding_model(&dir)
+        .map_err(crate::ipc::to_ipc_error)?
+        .map(|model| EmbeddingModelVm {
+            provider: model.provider,
+            model: model.model,
+        }))
+}
+
+#[tauri::command]
+pub fn notes_embedding_model_set(
+    state: State<'_, AppState>,
+    model: Option<EmbeddingModelVm>,
+) -> Result<(), IpcError> {
+    let dir = state
+        .platform
+        .data_dir()
+        .map_err(crate::ipc::to_ipc_error)?;
+    let previous = registry::get_embedding_model(&dir).map_err(crate::ipc::to_ipc_error)?;
+    let model = model.map(|model| registry::EmbeddingModel {
+        provider: model.provider,
+        model: model.model,
+    });
+    if previous != model {
+        registry::set_embedding_model(&dir, model).map_err(crate::ipc::to_ipc_error)?;
+        *LAST_EMBEDDING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        notes_vault::embedding_model_changed();
+    }
+    Ok(())
+}
+
 /// Drop the index cache and cold-scan; progress arrives on the index channel.
 #[tauri::command]
 pub async fn notes_index_rebuild(vault_id: String) -> Result<(), IpcError> {
@@ -1141,11 +1361,11 @@ pub async fn notes_list(
     query: NoteQueryReq,
 ) -> Result<NoteListVm, IpcError> {
     let vault = vault_of(&vault_id)?;
-    let list = project_list(state.platform.as_ref(), &vault, &query)?;
-    // Remembered so an open changes subscription streams this window rather than
-    // a default nobody is looking at.
-    last_queries().insert(vault_id, query);
-    Ok(list)
+    // Publish the request before awaiting its provider: an older slow answer
+    // must never replace the subscription's newer query.
+    let query = Arc::new(query);
+    last_queries().insert(vault_id, Arc::clone(&query));
+    project_list(state.platform.as_ref(), &vault, &query).await
 }
 
 /// The hierarchical tag tree with per-node counts (FR-104), over both producers
@@ -2354,6 +2574,7 @@ fn unwritten_row(target: &str, predicates: &[String]) -> NoteRowVm {
         path: String::new(),
         title: String::new(),
         snippet: String::new(),
+        hit: None,
         tags: Vec::new(),
         updated_ms: 0,
         pinned: false,
@@ -3127,6 +3348,24 @@ pub async fn notes_open(
         watch_body(watcher).await;
     });
     Ok(register(Some(sub), task))
+}
+
+#[tauri::command]
+pub async fn notes_note_marks(
+    vault_id: String,
+    note_id: String,
+    query: String,
+) -> Result<NoteMarksVm, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let entry = entry_of_soon(&vault_id, &note_id).await?;
+    let text = notes_vault::read_note(&vault, &entry.path).map_err(notes_error)?;
+    let rev = notes_vault::content_rev(&text);
+    let (_, body) = split_note(&text);
+    let marks = search_index::marks(body, &query);
+    Ok(NoteMarksVm {
+        rev,
+        ranges: search_index::utf16_ranges(body, &marks),
+    })
 }
 
 /// Follow one note for the life of its subscription.
@@ -4969,19 +5208,34 @@ async fn stream_changes(
     let Some(mut index) = notes_vault::subscribe_index(&vault.id) else {
         return;
     };
+    let Some(mut search_state) = notes_vault::subscribe_search(&vault.id) else {
+        return;
+    };
     let mut previous: Vec<(String, String)> = Vec::new();
     // The counts last sent, so a change that moves no row but does move the
     // count still reaches the surface. Before Story 44.11 nothing carried the
     // count after the opening `Reset`, and a note that started matching the
     // lens below the page produced no op and no message — invisible then,
     // because nothing showed the number, and a stale count on screen now.
-    let mut sent: Option<(u32, u32)> = None;
-    // The opening snapshot, then one message per change at most every
-    // CHANGE_BATCH_MS. `while let` rather than `loop`: the window read is the
-    // condition — a vault that stops answering has nothing left to stream.
-    while let Ok(rows) = current_window(platform.as_ref(), &vault) {
+    let mut sent: Option<(u32, u32, u32)> = None;
+    // A cold search database may not exist yet. Keep the subscription alive
+    // until the search publish catches up rather than ending on that read.
+    loop {
+        let search_revision = {
+            let state = search_state.borrow_and_update();
+            (state.vault_id.clone(), state.phase.clone())
+        };
+        let rows = match current_window(platform.as_ref(), &vault).await {
+            Ok(rows) => rows,
+            Err(_) => {
+                if !wait_for_list_change(&mut index, &mut search_state, &search_revision).await {
+                    return;
+                }
+                continue;
+            }
+        };
         let next = fingerprints(&rows.rows);
-        let counts = (rows.total, rows.matched);
+        let counts = (rows.total, rows.matched, rows.hidden);
         let ops = if previous.is_empty() {
             vec![NoteListOp::Reset { rows: rows.rows }]
         } else {
@@ -4995,6 +5249,7 @@ async fn stream_changes(
                     ops,
                     total: counts.0,
                     matched: counts.1,
+                    hidden: counts.2,
                 })
                 .is_err()
         {
@@ -5002,32 +5257,61 @@ async fn stream_changes(
             return;
         }
         sent = Some(counts);
-        if index.changed().await.is_err() {
+        if !wait_for_list_change(&mut index, &mut search_state, &search_revision).await {
             return;
         }
         // Coalesce the burst behind this wake-up into one message.
         tokio::time::sleep(Duration::from_millis(CHANGE_BATCH_MS)).await;
         index.mark_unchanged();
+        search_state.mark_unchanged();
+    }
+}
+
+async fn wait_for_list_change(
+    index: &mut tokio::sync::watch::Receiver<Arc<IndexSnapshot>>,
+    search: &mut tokio::sync::watch::Receiver<NoteSearchStateVm>,
+    previous: &(String, String),
+) -> bool {
+    loop {
+        tokio::select! {
+            changed = index.changed() => return changed.is_ok(),
+            changed = search.changed() => {
+                if changed.is_err() { return false; }
+                let state = search.borrow_and_update();
+                if state.vault_id != previous.0 || state.phase != previous.1 { return true; }
+            }
+        }
     }
 }
 
 /// The window a changes subscription streams: the last query `notes_list` was
 /// asked for on this vault, or the default one.
-fn current_window(
+async fn current_window(
     platform: &dyn keeper_core::platform::Platform,
     vault: &Vault,
 ) -> Result<NoteListVm, IpcError> {
-    let req = last_queries()
-        .get(&vault.id)
-        .cloned()
-        .unwrap_or_else(default_query);
-    project_list(platform, vault, &req)
+    loop {
+        let req = last_queries()
+            .entry(vault.id.clone())
+            .or_insert_with(|| Arc::new(default_query(platform.data_dir().ok().as_deref())))
+            .clone();
+        let result = project_list(platform, vault, &req).await;
+        if last_queries()
+            .get(&vault.id)
+            .is_some_and(|current| Arc::ptr_eq(current, &req))
+        {
+            return result;
+        }
+    }
 }
 
 /// The window with no filter applied.
-fn default_query() -> NoteQueryReq {
+fn default_query(data_dir: Option<&std::path::Path>) -> NoteQueryReq {
     NoteQueryReq {
         text: None,
+        hide_service_files: data_dir
+            .and_then(|dir| registry::get_hide_service_files(dir).ok())
+            .unwrap_or(true),
         tags: std::collections::BTreeMap::new(),
         space_id: None,
         origin: None,
@@ -5101,6 +5385,28 @@ pub async fn notes_subscribe_index(
         while progress.changed().await.is_ok() {
             let snapshot = progress.borrow_and_update().clone();
             if channel.send(snapshot).is_err() {
+                return;
+            }
+        }
+    });
+    Ok(register(None, task))
+}
+
+#[tauri::command]
+pub async fn notes_subscribe_search(
+    vault_id: String,
+    channel: Channel<NoteSearchStateVm>,
+) -> Result<String, IpcError> {
+    let _ = vault_of(&vault_id)?;
+    let Some(mut search) = notes_vault::subscribe_search(&vault_id) else {
+        return Err(notes_error(NotesError::VaultUnknown(vault_id)));
+    };
+    let current = search.borrow_and_update().clone();
+    let _ = channel.send(current);
+    let task = tauri::async_runtime::spawn(async move {
+        while search.changed().await.is_ok() {
+            let current = search.borrow_and_update().clone();
+            if channel.send(current).is_err() {
                 return;
             }
         }
@@ -5825,6 +6131,7 @@ mod tests {
             path: format!("{id}.md"),
             title: title.to_owned(),
             snippet: String::new(),
+            hit: None,
             tags: Vec::new(),
             updated_ms: 0,
             pinned: false,
@@ -5853,7 +6160,7 @@ mod tests {
                 .iter()
                 .map(|(tag, term)| ((*tag).to_owned(), *term))
                 .collect(),
-            ..default_query()
+            ..default_query(None)
         };
 
         let included = req(&[("Client/Acme ", NoteTagTerm::Include)]);
@@ -5875,7 +6182,7 @@ mod tests {
 
     #[test]
     fn the_default_lens_hides_conflict_copies_and_archived_notes() {
-        let req = default_query();
+        let req = default_query(None);
         let mut conflict = entry("a.sync-conflict-20260802-120000-mini.md", "a");
         conflict.flags.push("conflict".to_owned());
         assert!(!matches_filter(&conflict, &req, &TagTerms::default(), None));
@@ -5887,7 +6194,7 @@ mod tests {
         // Asked for by name, they appear.
         let asked = NoteQueryReq {
             flags: vec!["conflict".to_owned()],
-            ..default_query()
+            ..default_query(None)
         };
         assert!(matches_filter(
             &conflict,
@@ -5902,32 +6209,6 @@ mod tests {
             &TagTerms::default(),
             None
         ));
-    }
-
-    /// The list's free-text axis, exercised through this call site: the predicate
-    /// is `keeper-core`'s, and what this asserts is that the shell hands it the
-    /// whole entry — including the frontmatter, which is where a recording note
-    /// keeps every fact about itself.
-    #[test]
-    fn a_text_filter_matches_the_title_the_path_the_tags_and_the_frontmatter() {
-        let mut note = entry("journal/2026-08-02.md", "Vault as a lens");
-        note.tags.push("project/keeper".to_owned());
-        note.fields
-            .insert("participants".to_owned(), "Ala Kowalska".to_owned());
-        let filter = |text: &str| NoteQueryReq {
-            text: Some(text.to_owned()),
-            ..default_query()
-        };
-        let hit = |text: &str| matches_filter(&note, &filter(text), &TagTerms::default(), None);
-        assert!(hit("vault"));
-        assert!(hit("LENS"));
-        assert!(hit("journal/"));
-        assert!(hit("keeper"));
-        // Nowhere in the title, the path, the tags or the body.
-        assert!(hit("kowalska"));
-        assert!(!hit("nothing here"));
-        // An empty needle is not a filter.
-        assert!(hit("   "));
     }
 
     /// The editor never sees a `---`, which is what makes "the first keystroke
