@@ -4,7 +4,7 @@ import type { NoteRowVm } from "./NoteRowVm";
 /**
  * One window of the note list, with the counts behind it (FR-103, FR-166).
  */
-export type NoteListVm = { 
+export type NoteListVm = { private: number, notice: string | null, 
 /**
  * The rows in this window, in list order.
  */

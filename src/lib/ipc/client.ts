@@ -221,7 +221,9 @@ export type { NoteSearchHitVm } from "./gen/NoteSearchHitVm";
 export type { NoteSearchReq } from "./gen/NoteSearchReq";
 export type { NoteSearchStateVm } from "./gen/NoteSearchStateVm";
 export type { NoteSpaceFieldVm } from "./gen/NoteSpaceFieldVm";
+export type { NoteSpaceParkReq } from "./gen/NoteSpaceParkReq";
 export type { NoteSpaceReq } from "./gen/NoteSpaceReq";
+export type { NoteSpaceRestoreVm } from "./gen/NoteSpaceRestoreVm";
 export type { NoteSpaceTagVm } from "./gen/NoteSpaceTagVm";
 export type { NoteSpaceTermsVm } from "./gen/NoteSpaceTermsVm";
 export type { NoteSpaceVm } from "./gen/NoteSpaceVm";
@@ -469,6 +471,7 @@ import type { NoteRowVm } from "./gen/NoteRowVm";
 import type { NoteSearchBatch } from "./gen/NoteSearchBatch";
 import type { NoteSearchReq } from "./gen/NoteSearchReq";
 import type { NoteSearchStateVm } from "./gen/NoteSearchStateVm";
+import type { NoteSpaceParkReq } from "./gen/NoteSpaceParkReq";
 import type { NoteSpaceReq } from "./gen/NoteSpaceReq";
 import type { NoteSpaceTermsVm } from "./gen/NoteSpaceTermsVm";
 import type { NoteSpaceVm } from "./gen/NoteSpaceVm";
@@ -4432,8 +4435,20 @@ export async function notesSpacesRestoreDefaults(vaultId: string): Promise<numbe
  *
  * Rejects with: `invalidInput` (an unparseable query), `unsupported`, `internal`.
  */
-export async function notesSpaceSave(vaultId: string, space: NoteSpaceReq): Promise<NoteRefVm> {
-  return await invoke<NoteRefVm>("notes_space_save", { vaultId, space });
+export async function notesSpaceSave(vaultId: string, space: NoteSpaceReq): Promise<NoteSpaceVm> {
+  return await invoke<NoteSpaceVm>("notes_space_save", { vaultId, space });
+}
+
+export async function notesSpaceTouch(vaultId: string, spaceId: string): Promise<NoteSpaceVm> {
+  return await invoke<NoteSpaceVm>("notes_space_touch", { vaultId, spaceId });
+}
+
+export async function notesSpacePark(
+  vaultId: string,
+  label: string,
+  req: NoteSpaceParkReq,
+): Promise<NoteSpaceVm> {
+  return await invoke<NoteSpaceVm>("notes_space_park", { vaultId, label, req });
 }
 
 /**
@@ -5312,6 +5327,14 @@ export async function notesHideServiceFilesGet(): Promise<boolean> {
 
 export async function notesHideServiceFilesSet(hidden: boolean): Promise<void> {
   return await invoke<void>("notes_hide_service_files_set", { hidden });
+}
+
+export async function notesIncludePrivateGet(): Promise<boolean> {
+  return await invoke<boolean>("notes_include_private_get");
+}
+
+export async function notesIncludePrivateSet(value: boolean): Promise<void> {
+  return await invoke<void>("notes_include_private_set", { value });
 }
 
 export async function notesEmbeddingModelGet(): Promise<EmbeddingModelVm | null> {

@@ -21,11 +21,17 @@
  */
 
 import { useEffect, useState } from "react";
+import { toast } from "sonner";
+import { openNotesSpace } from "@/hooks/use-notes-actions";
 import type { NoteSpaceVm } from "@/lib/ipc/client";
 import { notesSpaces } from "@/lib/ipc/client";
-import { notesFiltersStore } from "@/lib/stores/notes-filters";
-import { ensureNotesVaultsHydrated, useNotesVaultsStore } from "@/lib/stores/notes-vaults";
+import {
+  ensureNotesVaultsHydrated,
+  notesVaultsStore,
+  useNotesVaultsStore,
+} from "@/lib/stores/notes-vaults";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { syncErrorMessage } from "@/lib/stores/sync";
 
 /**
  * The seeded default key the Recordings space carries in its own frontmatter
@@ -76,26 +82,12 @@ export function useRecordingsSpace(): NoteSpaceVm | null {
   return space;
 }
 
-/**
- * Show the Notes view scoped to `space`.
- *
- * **`setScope` is a TOGGLE** (`notes-filters.ts`: re-selecting the current
- * scope clears it), which is right for a sidebar row and wrong for a button
- * that says "take me there" — pressing it while the Recordings space is already
- * selected would drop the user into every note in the vault. So the scope is
- * only set when it is not already this space; the view switch always happens,
- * because that is the half the user pressed the button for.
- */
+/** Show Notes and enter its saved query through the same touch/park path as the rail. */
 export function openRecordingsSpace(space: NoteSpaceVm): void {
   primaryViewStore.getState().setView("notes");
-  const filters = notesFiltersStore.getState();
-  if (filters.scope.kind === "space" && filters.scope.id === space.id) {
-    return;
-  }
-  filters.setScope({
-    kind: "space",
-    id: space.id,
-    name: space.name,
-    defaultKey: space.defaultKey,
+  const vaultId = notesVaultsStore.getState().activeVaultId;
+  if (vaultId === null) return;
+  void openNotesSpace(vaultId, space).catch((error: unknown) => {
+    toast.error(syncErrorMessage(error, "keeper couldn't open the Recordings space."));
   });
 }

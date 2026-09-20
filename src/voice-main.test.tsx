@@ -41,6 +41,21 @@ beforeEach(() => {
 });
 
 describe("VoiceWindow", () => {
+  it("follows OS dark appearance in the secondary document", () => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const matchMedia = window.matchMedia;
+    window.matchMedia = () => ({ ...media, matches: true });
+    document.documentElement.classList.remove("dark");
+    const view = render(<VoiceWindow />);
+    try {
+      expect(document.documentElement).toHaveClass("dark");
+    } finally {
+      view.unmount();
+      window.matchMedia = matchMedia;
+      document.documentElement.classList.remove("dark");
+    }
+  });
+
   it("draws nothing until a snapshot arrives, then draws every one", async () => {
     render(<VoiceWindow />);
     expect(drawn).toHaveBeenLastCalledWith(null);

@@ -157,6 +157,7 @@ pub struct EmbeddingModelVm {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct NoteRowVm {
+    pub vault_id: String,
     /// The note's stable id, which survives renames (FR-97).
     pub id: String,
     /// Vault-relative path with `/` separators.
@@ -252,6 +253,8 @@ pub struct NoteRowVm {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct NoteListVm {
+    pub private: u32,
+    pub notice: Option<String>,
     /// The rows in this window, in list order.
     pub rows: Vec<NoteRowVm>,
     /// How many notes this lens SELECTS, so the scrollbar is honest about a
@@ -336,6 +339,18 @@ pub struct NoteFolderVm {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct NoteSpaceVm {
+    pub restore: NoteSpaceRestoreVm,
+    pub pinned: bool,
+    #[ts(type = "number | null")]
+    pub ttl_hours: Option<u32>,
+    #[ts(type = "number | null")]
+    pub expires_ms: Option<i64>,
+    pub text: Option<String>,
+    pub parent: Option<String>,
+    pub leaf_name: String,
+    pub depth: u32,
+    pub descendants: u32,
+    pub expiry_phrase: String,
     /// The id of the note that defines the space.
     pub id: String,
     /// Display name.
@@ -353,7 +368,7 @@ pub struct NoteSpaceVm {
     /// ordering, and into the sentence in `warnings` when it cannot.
     pub sort: String,
     /// The ordering the list is actually running, as the canonical
-    /// `<key> <dir>` — always one of the ten [`crate::notes::sort`] knows, even
+    /// `<key> <dir>` — always an ordering [`crate::notes::sort`] knows, even
     /// when `sort` above holds nothing, or holds `bananas`.
     ///
     /// It exists so the editor never parses `sort`. A dropdown that had to work
@@ -436,6 +451,34 @@ pub struct NoteSpaceVm {
     /// The parse failure, when the stored query does not parse. A broken space
     /// matches nothing and says so; it never falls back to matching everything.
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteSpaceRestoreVm {
+    pub tag_terms: BTreeMap<String, NoteTagTerm>,
+    pub origin: Option<String>,
+    pub flags: Vec<String>,
+    pub text: Option<String>,
+    pub sort: Option<String>,
+    pub opaque: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteSpaceParkReq {
+    pub base_space_id: Option<String>,
+    pub tag_terms: BTreeMap<String, NoteTagTerm>,
+    pub origin: Option<String>,
+    pub flags: Vec<String>,
+    pub text: Option<String>,
+    pub sort: Option<String>,
+}
+
+fn default_space_terms() -> bool {
+    true
 }
 
 /// What a deletion is about to remove, in the words the confirmation shows
@@ -713,6 +756,7 @@ pub enum NoteBodyBatch {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct NoteChangeBatch {
+    pub private: u32,
     pub vault_id: String,
     /// Ops in order; apply them in sequence.
     pub ops: Vec<NoteListOp>,
@@ -1160,6 +1204,14 @@ pub struct NoteIndexProgressVm {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct NoteQueryReq {
+    #[serde(default = "default_space_terms")]
+    pub space_terms: bool,
+    #[serde(default)]
+    pub sort: Option<String>,
+    #[serde(default)]
+    pub vault_ids: Vec<String>,
+    #[serde(default)]
+    pub include_private: bool,
     /// Free text; `None` for no text filter.
     pub text: Option<String>,
     /// Hide configured service basenames from this list only (AD-267).
@@ -1257,6 +1309,12 @@ pub struct NoteSearchReq {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct NoteSpaceReq {
+    pub base_space_id: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
+    #[ts(type = "number | null")]
+    pub ttl_hours: Option<u32>,
+    pub text: Option<String>,
     /// The space note's id when updating; `None` creates one.
     pub id: Option<String>,
     /// The space's name. On an update this retitles the note and renames its
@@ -1346,6 +1404,7 @@ mod tests {
     #[test]
     fn a_row_serialises_camel_case_including_the_two_absent_by_empty_string_fields() {
         let row = NoteRowVm {
+            vault_id: "vault".to_owned(),
             hit: None,
             predicates: Vec::new(),
             id: "n1".to_owned(),
@@ -1393,6 +1452,7 @@ mod tests {
         // order the reader sees: `{dcterms:source, schema:about}` is a sentence
         // about provenance first. Sorting here would be keeper re-wording it.
         let row = NoteRowVm {
+            vault_id: "vault".to_owned(),
             hit: None,
             predicates: vec!["dcterms:source".to_owned(), "schema:about".to_owned()],
             id: "n2".to_owned(),

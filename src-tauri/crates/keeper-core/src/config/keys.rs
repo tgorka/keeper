@@ -537,6 +537,16 @@ pub const KEYS: &[KeySpec] = &[
         example: "",
     },
     KeySpec {
+        key: "notes.include_private",
+        family: false,
+        scope: Scope::SessionState,
+        settable: Settable::Never("it remembers the person's last choice in the notes list"),
+        shape: Shape::Flag01,
+        default: "0",
+        summary: "Whether the notes list includes private notes.",
+        example: "",
+    },
+    KeySpec {
         key: "notes.embedding_model",
         family: false,
         scope: Scope::UserGlobal,

@@ -39,6 +39,7 @@ beforeAll(() => {
 
 function row(overrides: Partial<NoteRowVm> & { id: string; title: string }): NoteRowVm {
   return {
+    vaultId: "v",
     path: `${overrides.id}.md`,
     // Empty on a row that IS a note; carried only by an outbound edge to a
     // target nobody has written yet (owner item 2).
@@ -89,14 +90,42 @@ function renderList(rows: NoteRowVm[], onVerb = vi.fn()) {
 }
 
 describe("NoteList affordances", () => {
+  it("keeps selection and keyboard focus distinct for equal note ids in different vaults", () => {
+    const first = row({ id: "same", vaultId: "first", title: "First vault" });
+    const second = row({ id: "same", vaultId: "second", title: "Second vault" });
+    const onSelect = vi.fn();
+    const props = {
+      rows: [first, second],
+      total: 2,
+      selectedId: "same",
+      onSelect,
+      onSelectBeside: vi.fn(),
+      onToggleTag: vi.fn(),
+      onVerb: vi.fn(),
+      onGrow: vi.fn(),
+    };
+    const { rerender } = render(<NoteList {...props} selectedVaultId="first" />);
+    const firstButton = screen.getByRole("button", { name: /Note, First vault/ });
+    const secondButton = screen.getByRole("button", { name: /Note, Second vault/ });
+    expect(firstButton).toHaveAttribute("aria-current", "true");
+    expect(secondButton).not.toHaveAttribute("aria-current");
+    fireEvent.keyDown(firstButton, { key: "ArrowDown" });
+    fireEvent.keyDown(firstButton, { key: "ArrowDown" });
+    fireEvent.keyDown(secondButton, { key: "Enter" });
+    expect(onSelect).toHaveBeenCalledWith(second);
+    rerender(<NoteList {...props} selectedVaultId="second" />);
+    expect(firstButton).not.toHaveAttribute("aria-current");
+    expect(secondButton).toHaveAttribute("aria-current", "true");
+  });
+
   it("carries unread, pinned and conflict state from the view model", () => {
     renderList([PLAIN, UNREAD, PINNED, CONFLICTED]);
 
     // State reaches assistive technology through the accessible name, not only
     // through a glyph — colour and shape alone are not carriers.
     expect(screen.getByRole("button", { name: /Note, Touched, unread/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Note, Kept, pinned/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Note, Split, conflicted/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Note, Kept,.*pinned/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Note, Split,.*conflicted/ })).toBeInTheDocument();
     // A plain row claims none of them.
     const plain = screen.getByRole("button", { name: /Note, Plain/ });
     expect(plain).not.toHaveAttribute("data-unread");

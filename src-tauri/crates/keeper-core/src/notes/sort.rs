@@ -107,22 +107,27 @@ pub fn read_order(raw: &str) -> StoredOrder {
     }
 }
 
-/// The rail comparison: position, newest modification, then name (AD-237).
+/// The rail comparison: pinned first, then position, newest modification and name.
 ///
 /// AD-237 amends 44.4 on the owner's word: unordered spaces should lead with
-/// the newest, not the alphabet. Explicit positions remain primary; absent
+/// the newest, not the alphabet. Within each pin group, positions lead; absent
 /// dates follow known ones. `total_cmp` keeps the position comparison total.
 /// Callers without dates retain the name tie-break by passing `None`.
 #[must_use]
-pub fn rail_order(a: (f64, Option<i64>, &str), b: (f64, Option<i64>, &str)) -> Ordering {
-    a.0.total_cmp(&b.0)
-        .then_with(|| b.1.cmp(&a.1))
-        .then_with(|| a.2.cmp(b.2))
+pub fn rail_order(
+    a: (bool, f64, Option<i64>, &str),
+    b: (bool, f64, Option<i64>, &str),
+) -> Ordering {
+    b.0.cmp(&a.0)
+        .then_with(|| a.1.total_cmp(&b.1))
+        .then_with(|| b.2.cmp(&a.2))
+        .then_with(|| a.3.cmp(b.3))
 }
 
 /// Which fact a space orders the notes it lists by (FR-158).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortKey {
+    Relevance,
     /// The note's own `order` (AD-81), which is the one ordering a user sets
     /// directly rather than derives.
     Order,
@@ -181,6 +186,7 @@ impl SortKey {
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
+            Self::Relevance => "relevance",
             Self::Order => "order",
             Self::Name => "name",
             Self::Created => "created",
@@ -199,12 +205,13 @@ impl SortKey {
     pub const fn natural(self) -> SortDir {
         match self {
             Self::Order | Self::Name => SortDir::Asc,
-            Self::Created | Self::Modified | Self::Recorded => SortDir::Desc,
+            Self::Relevance | Self::Created | Self::Modified | Self::Recorded => SortDir::Desc,
         }
     }
 
     fn from_word(word: &str) -> Option<Self> {
         match word.to_ascii_lowercase().as_str() {
+            "relevance" => Some(Self::Relevance),
             "order" => Some(Self::Order),
             "name" => Some(Self::Name),
             "created" => Some(Self::Created),
@@ -242,13 +249,23 @@ impl SpaceSort {
     /// above.
     #[must_use]
     pub fn canonical(self) -> String {
-        format!("{} {}", self.key.word(), self.dir.word())
+        format!(
+            "{} {}",
+            self.key.word(),
+            if self.key == SortKey::Relevance {
+                SortDir::Desc
+            } else {
+                self.dir
+            }
+            .word()
+        )
     }
 
     /// This ordering as a phrase a sentence can contain.
     #[must_use]
     pub const fn phrase(self) -> &'static str {
         match (self.key, self.dir) {
+            (SortKey::Relevance, _) => "relevance, best first",
             (SortKey::Order, SortDir::Asc) => "order, lowest first",
             (SortKey::Order, SortDir::Desc) => "order, highest first",
             (SortKey::Name, SortDir::Asc) => "name, A to Z",
@@ -290,7 +307,14 @@ pub fn read(raw: &str) -> StoredSort {
             key,
             dir: key.natural(),
         }),
-        (Some(key), Some(dir), None) => SortDir::from_word(dir).map(|dir| SpaceSort { key, dir }),
+        (Some(key), Some(dir), None) => SortDir::from_word(dir).map(|dir| SpaceSort {
+            key,
+            dir: if key == SortKey::Relevance {
+                SortDir::Desc
+            } else {
+                dir
+            },
+        }),
         _ => None,
     };
     match read {
@@ -303,6 +327,18 @@ pub fn read(raw: &str) -> StoredSort {
             warning: Some(unreadable_sentence(trimmed)),
         },
     }
+}
+
+/// Unlike a stored presentation key, a bar override can refuse invalid input.
+pub fn read_query_sort(raw: &str) -> Result<Option<SpaceSort>, String> {
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let stored = read(raw);
+    if let Some(warning) = stored.warning {
+        return Err(warning);
+    }
+    Ok((stored.sort.key != SortKey::Relevance).then_some(stored.sort))
 }
 
 /// The sentence a space shows when its own file names a sort keeper cannot read.
@@ -371,7 +407,7 @@ pub fn compare(sort: SpaceSort, a: &IndexEntry, b: &IndexEntry) -> Ordering {
     let primary = match sort.key {
         // Unreachable: handled above, and kept out of this match so adding a
         // sixth key cannot silently acquire the wrong tie-break.
-        SortKey::Order => Ordering::Equal,
+        SortKey::Order | SortKey::Relevance => Ordering::Equal,
         SortKey::Name => title_order(a, b),
         SortKey::Created => {
             resolve_date(DateField::Created, a).cmp(&resolve_date(DateField::Created, b))
@@ -885,7 +921,7 @@ mod tests {
             (0.0, Some(10), "Banana"),
             (0.0, None, "Absent"),
         ];
-        rail.sort_by(|a, b| rail_order(*a, *b));
+        rail.sort_by(|a, b| rail_order((false, a.0, a.1, a.2), (false, b.0, b.1, b.2)));
         assert_eq!(
             rail.iter().map(|row| row.2).collect::<Vec<_>>(),
             vec!["Newest", "Apple", "Banana", "Absent", "Zulu"]
@@ -901,10 +937,32 @@ mod tests {
             (read_order("1.5").order, Some(200), "Pinned"),
             (read_order("").order, Some(10), "Older"),
         ];
-        rail.sort_by(|a, b| rail_order(*a, *b));
+        rail.sort_by(|a, b| rail_order((false, a.0, a.1, a.2), (false, b.0, b.1, b.2)));
         assert_eq!(
             rail.iter().map(|row| row.2).collect::<Vec<_>>(),
             vec!["Recordings", "Journal", "Older", "Pinned", "Inbox"]
+        );
+    }
+
+    #[test]
+    fn blank_query_sort_leaves_relevance_in_control() {
+        assert_eq!(read_query_sort(""), Ok(None));
+        assert_eq!(read_query_sort(" \n "), Ok(None));
+    }
+
+    #[test]
+    fn pinned_rail_rows_lead_even_negative_positions() {
+        assert!(rail_order(
+            (true, 100.0, None, "Pinned"),
+            (false, -100.0, Some(10), "Other")
+        )
+        .is_lt());
+        assert_eq!(read("relevance asc").sort.canonical(), "relevance desc");
+        assert_eq!(read_query_sort("relevance"), Ok(None));
+        assert_eq!(read_query_sort("modified desc"), Ok(Some(DEFAULT_SORT)));
+        assert_eq!(
+            read_query_sort("bananas"),
+            Err(read("bananas").warning.expect("warning"))
         );
     }
 

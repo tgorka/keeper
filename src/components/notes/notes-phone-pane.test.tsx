@@ -51,6 +51,7 @@ const VAULT: NoteVaultVm = {
 function row(id: string, title: string): NoteRowVm {
   return {
     id,
+    vaultId: VAULT.id,
     path: `${id}.md`,
     title,
     snippet: `${title} body`,
@@ -110,6 +111,8 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     notesVaults: vi.fn(async () => [VAULT]),
     notesHideServiceFilesGet: vi.fn(async () => true),
     notesHideServiceFilesSet: vi.fn(async () => {}),
+    notesIncludePrivateGet: vi.fn(async () => false),
+    notesIncludePrivateSet: vi.fn(async () => {}),
     notesSubscribeSearch: vi.fn(async () => "search-1"),
     notesVaultActive: vi.fn(async () => VAULT.id),
     notesVaultSetActive: vi.fn(async () => {}),
@@ -278,7 +281,15 @@ beforeEach(() => {
     const rows = [DENTIST, GROCERIES].filter((candidate) =>
       candidate.title.toLowerCase().includes(needle),
     );
-    return { rows, total: rows.length, matched: rows.length, hidden: 0, offset: 0 };
+    return {
+      rows,
+      total: rows.length,
+      matched: rows.length,
+      hidden: 0,
+      private: 0,
+      notice: null,
+      offset: 0,
+    };
   });
   notesOpen.mockImplementation(async (_vault, noteId, onBatch) => {
     onBatch({
@@ -336,7 +347,7 @@ describe("the Notes view on the phone stack", () => {
     const notes = within(level as HTMLElement);
     expect(notes.getByRole("button", { name: "Back to Inbox" })).toBeVisible();
     expect(notes.getByRole("button", { name: `Vault ${VAULT.name}` })).toBeInTheDocument();
-    expect(notes.getByRole("searchbox", { name: NOTES_SEARCH_PLACEHOLDER })).toBeInTheDocument();
+    expect(notes.getByRole("combobox", { name: NOTES_SEARCH_PLACEHOLDER })).toBeInTheDocument();
     expect(
       (level as HTMLElement).querySelector(`[data-slot="${NOTES_COUNT_SLOT}"]`),
     ).toHaveTextContent("2");
@@ -363,7 +374,7 @@ describe("the Notes view on the phone stack", () => {
   it("searches through Rust's own list query, never a client-side filter", async () => {
     render(<PhoneShell />);
     await openNotes();
-    const field = screen.getByRole("searchbox", { name: NOTES_SEARCH_PLACEHOLDER });
+    const field = screen.getByRole("combobox", { name: NOTES_SEARCH_PLACEHOLDER });
     fireEvent.change(field, { target: { value: "dentist" } });
 
     await waitFor(() => {
@@ -379,10 +390,13 @@ describe("the Notes view on the phone stack", () => {
     act(() => notesFiltersStore.getState().requestSearchFocus());
     expect(field).toHaveFocus();
     for (const name of [
-      "Add a tag filter",
       "Changed by agent",
       "Pinned only",
       "Hide service files",
+      "Sort notes",
+      "Search drives",
+      "Include private notes",
+      "New note from search",
       "Save as space",
       "Clear search",
     ]) {

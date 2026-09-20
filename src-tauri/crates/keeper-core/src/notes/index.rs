@@ -47,7 +47,7 @@ use crate::notes::tags::{normalise, TagNode};
 /// 4 → 5 for prose snippets (AD-238). An unchanged note's cached raw-markdown
 /// excerpt would otherwise survive every stat check and hide the new preview
 /// until the note was edited. Discarding the advisory cache rebuilds it once.
-pub const INDEX_SCHEMA: u32 = 5;
+pub const INDEX_SCHEMA: u32 = 6;
 
 /// The `IndexEntry.fields` key carrying the note's provenance class, written by
 /// the reconciler from the trailers of the last commit touching the file

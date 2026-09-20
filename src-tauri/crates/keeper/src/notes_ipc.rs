@@ -370,8 +370,14 @@ fn body_sub(subscription_id: &str) -> Result<Arc<BodySub>, IpcError> {
 // ---------------------------------------------------------------------------
 
 /// Project one index entry into a row.
-fn row_of(entry: &IndexEntry, head: Option<&HeadRevision>, unread: bool) -> NoteRowVm {
+fn row_of(
+    vault_id: &str,
+    entry: &IndexEntry,
+    head: Option<&HeadRevision>,
+    unread: bool,
+) -> NoteRowVm {
     NoteRowVm {
+        vault_id: vault_id.to_owned(),
         id: entry.id.clone(),
         path: entry.path.clone(),
         title: entry.title.clone(),
@@ -422,7 +428,7 @@ fn rows_of(
         .map(|entry| {
             let head = heads.get(&entry.path);
             let unread = notes_vault::is_unread(platform, head, &entry.id);
-            row_of(entry, head, unread)
+            row_of(vault_id, entry, head, unread)
         })
         .collect()
 }
@@ -462,14 +468,69 @@ fn matches_filter(
     }
     // A conflict copy is hidden from the default lens and surfaced as a conflict
     // row instead (FR-116), so it appears only when asked for by name.
-    if has_flag(entry, "conflict") && !req.flags.iter().any(|flag| flag == "conflict") {
+    let default_lens = req
+        .space_id
+        .as_deref()
+        .is_none_or(|id| id.is_empty() || id == ALL_SPACE_ID);
+    if default_lens
+        && has_flag(entry, "conflict")
+        && !req.flags.iter().any(|flag| flag == "conflict")
+    {
         return false;
     }
     // So is an archived note (FR-119).
-    if has_flag(entry, "archived") && !req.flags.iter().any(|flag| flag == "archived") {
+    if default_lens
+        && has_flag(entry, "archived")
+        && !req.flags.iter().any(|flag| flag == "archived")
+    {
+        return false;
+    }
+    if has_flag(entry, "private")
+        && !req.include_private
+        && !req.flags.iter().any(|flag| flag == "private")
+    {
         return false;
     }
     true
+}
+
+fn query_sort(req: &NoteQueryReq) -> Result<Option<sort::SpaceSort>, IpcError> {
+    req.sort
+        .as_deref()
+        .map(sort::read_query_sort)
+        .transpose()
+        .map(Option::flatten)
+        .map_err(|message| {
+            notes_error(NotesError::Query {
+                message,
+                token_index: 0,
+            })
+        })
+}
+
+fn space_matches(
+    req: &NoteQueryReq,
+    parsed: Option<&query::Query>,
+    entry: &IndexEntry,
+    body: &mut dyn FnMut() -> String,
+    now_ms: i64,
+) -> bool {
+    !req.space_terms || parsed.is_none_or(|parsed| query::eval(parsed, entry, body, now_ms))
+}
+
+fn meaning_notice(state: Option<&NoteSearchStateVm>, configured: bool) -> Option<String> {
+    match state {
+        Some(state) if state.phase == "refused" => Some(format!(
+            "Meaning is unavailable — {} Searching words only.",
+            state.sentence
+        )),
+        Some(state) if state.phase == "meaning" => None,
+        _ if configured => Some(
+            "Meaning is unavailable — meaning search is still indexing. Searching words only."
+                .to_owned(),
+        ),
+        _ => None,
+    }
 }
 
 /// Case-fold for the two note-picking searches: the wikilink completion prefix
@@ -499,15 +560,64 @@ async fn project_list(
     platform: &dyn keeper_core::platform::Platform,
     vault: &Vault,
     req: &NoteQueryReq,
+    scope_vault: &Vault,
+    whole: bool,
+    embedding: &mut Option<EmbeddingAnswer>,
 ) -> Result<NoteListVm, IpcError> {
     let snapshot = notes_vault::snapshot(&vault.id)
         .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault.id.clone())))?;
     let heads = notes_vault::heads(&vault.id).unwrap_or_default();
-    let text = req.text.as_deref().unwrap_or_default().trim();
-    let vector = if text.is_empty() {
-        None
+    let scope_snapshot = notes_vault::snapshot(&scope_vault.id)
+        .ok_or_else(|| notes_error(NotesError::VaultUnknown(scope_vault.id.clone())))?;
+    let space = match req.space_id.as_deref() {
+        Some(id) if !id.is_empty() && id != ALL_SPACE_ID => {
+            Some(space_lens(scope_vault, &scope_snapshot, id)?)
+        }
+        _ => None,
+    };
+    let prompt = if req.space_terms {
+        space.as_ref().and_then(|space| space.text.as_deref())
     } else {
-        query_embedding(platform, &vault.id, text).await
+        None
+    };
+    let text = req
+        .text
+        .as_deref()
+        .or(prompt)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let mut public_req = req.clone();
+    public_req.include_private = true;
+    let tags = TagTerms::new(&req.tags);
+    let search_state = notes_vault::search_state(&vault.id);
+    let ready = search_state
+        .as_ref()
+        .is_some_and(|state| state.phase == "meaning");
+    let (vector, mut notice) = if text.is_empty() {
+        (None, None)
+    } else if !ready {
+        let configured = platform
+            .data_dir()
+            .ok()
+            .and_then(|dir| registry::get_embedding_model(&dir).ok())
+            .flatten()
+            .is_some();
+        (None, meaning_notice(search_state.as_ref(), configured))
+    } else {
+        if embedding.is_none() {
+            *embedding = Some(query_embedding(platform, &text).await);
+        }
+        match embedding.as_ref() {
+            Some(Ok(vector)) => (vector.as_ref(), None),
+            Some(Err(reason)) => (
+                None,
+                Some(format!(
+                    "Meaning is unavailable — {reason}. Searching words only."
+                )),
+            ),
+            None => (None, None),
+        }
     };
     let search = if text.is_empty()
         || notes_vault::search_state(&vault.id).is_none_or(|state| state.phase == "indexing")
@@ -517,11 +627,15 @@ async fn project_list(
         SearchIndex::open_read_only(&vault.keeper_dir().join(SEARCH_DB_FILE)).ok()
     };
     let scores = search.as_ref().and_then(|index| {
-        let lexical = index.query(text, search_index::LEXICAL_POOL).ok()?;
+        let lexical = index.query(&text, search_index::LEXICAL_POOL).ok()?;
         let vector = vector.and_then(|(model, vector)| {
-            index
-                .cosine_top_k(&model, &vector, search_index::VECTOR_POOL)
-                .ok()
+            match index.cosine_top_k(model, vector, search_index::VECTOR_POOL) {
+                Ok(scores) => Some(scores),
+                Err(_) => {
+                    notice = Some("Meaning is unavailable — the search index could not be read. Searching words only.".to_owned());
+                    None
+                }
+            }
         });
         Some(match vector {
             Some(vector) => search_index::fuse(&lexical, &vector),
@@ -534,10 +648,6 @@ async fn project_list(
     // `keeper.sort` since Story 37.4 and that nothing read until now — and its
     // own selection cap (Story 44.11), which is the neighbouring value 44.4
     // left where it was.
-    let space = match req.space_id.as_ref() {
-        Some(space_id) if !space_id.is_empty() => Some(space_lens(vault, &snapshot, space_id)?),
-        _ => None,
-    };
     let (mut matched, ordering, cap, space_name): (
         Vec<&IndexEntry>,
         Option<sort::SpaceSort>,
@@ -548,7 +658,9 @@ async fn project_list(
             let mut parsed = lens.query;
             // Bound to this snapshot so `backlink:` and title-resolved `link:`
             // can be answered at all; the binding is per snapshot revision.
-            query::bind_index(&mut parsed, &snapshot);
+            if let Some(parsed) = &mut parsed {
+                query::bind_index(parsed, &snapshot);
+            }
             let now_ms = notes_vault::local_now_ms();
             (
                 snapshot
@@ -556,7 +668,8 @@ async fn project_list(
                     .iter()
                     .filter(|entry| {
                         let mut body = body_reader(vault, &entry.path);
-                        query::eval(&parsed, entry, &mut body, now_ms)
+                        space_matches(req, parsed.as_ref(), entry, &mut body, now_ms)
+                            && matches_filter(entry, &public_req, &tags, heads.get(&entry.path))
                     })
                     .collect(),
                 Some(lens.ordering),
@@ -571,7 +684,9 @@ async fn project_list(
                 snapshot
                     .entries()
                     .iter()
-                    .filter(|entry| matches_filter(entry, req, &tags, heads.get(&entry.path)))
+                    .filter(|entry| {
+                        matches_filter(entry, &public_req, &tags, heads.get(&entry.path))
+                    })
                     .collect(),
                 None,
                 // The plain lens has no cap and never will: `keeper.limit` is a
@@ -586,8 +701,13 @@ async fn project_list(
         let ids: HashSet<&str> = scores.iter().map(|hit| hit.note_id.as_str()).collect();
         matched.retain(|entry| ids.contains(entry.id.as_str()));
     } else if !text.is_empty() {
-        matched.retain(|entry| entry.matches_text(text));
+        matched.retain(|entry| entry.matches_text(&text));
     }
+    let before_private = matched.len();
+    if !req.include_private && !req.flags.iter().any(|flag| flag == "private") {
+        matched.retain(|entry| !has_flag(entry, "private"));
+    }
+    let private = u32::try_from(before_private - matched.len()).unwrap_or(u32::MAX);
     let before_hiding = matched.len();
     if req.hide_service_files {
         let names = registry::get_service_file_names(
@@ -604,7 +724,10 @@ async fn project_list(
     // The plain list is unchanged and still puts pinned first — that rule was
     // never a space's, and taking it away from the default lens would be a
     // different story's decision.
-    if let Some(scores) = &scores {
+    let explicit_sort = query_sort(req)?;
+    if let Some(ordering) = explicit_sort {
+        matched.sort_by(|a, b| sort::compare(ordering, a, b));
+    } else if let Some(scores) = &scores {
         let ranks: HashMap<&str, (u8, f32)> = scores
             .iter()
             .map(|hit| {
@@ -655,7 +778,9 @@ async fn project_list(
     // of JSON and undo AD-58. WHICH rows that page names is `counts::page`'s,
     // in the crate that can prove it: the cap has to bind before the offset, or
     // a second read walks straight into the notes the space declined.
-    let size = if req.limit == 0 {
+    let size = if whole {
+        u32::MAX
+    } else if req.limit == 0 {
         DEFAULT_LIMIT
     } else {
         req.limit.min(MAX_LIMIT)
@@ -681,7 +806,7 @@ async fn project_list(
                 } else if score.why == MatchWhy::Meaning {
                     (keeper_core::notes::snippet::prose(&chunk, 240), Vec::new())
                 } else {
-                    let marks = search_index::marks(&chunk, text);
+                    let marks = search_index::marks(&chunk, &text);
                     if marks.is_empty() {
                         (keeper_core::notes::snippet::prose(&chunk, 240), Vec::new())
                     } else {
@@ -700,6 +825,8 @@ async fn project_list(
         }
     }
     Ok(NoteListVm {
+        private,
+        notice,
         rows,
         total: selection.total,
         matched: selection.matched,
@@ -708,28 +835,33 @@ async fn project_list(
     })
 }
 
+type EmbeddingAnswer = Result<Option<(String, Vec<f32>)>, &'static str>;
+
 async fn query_embedding(
     platform: &dyn keeper_core::platform::Platform,
-    vault_id: &str,
     query: &str,
-) -> Option<(String, Vec<f32>)> {
+) -> EmbeddingAnswer {
     use keeper_core::bots::embed;
-    if notes_vault::search_state(vault_id)?.phase != "meaning" {
-        return None;
-    }
-    let dir = platform.data_dir().ok()?;
-    let model = registry::get_embedding_model(&dir).ok()??;
+    let dir = platform
+        .data_dir()
+        .map_err(|_| "the settings could not be read")?;
+    let Some(model) =
+        registry::get_embedding_model(&dir).map_err(|_| "the model settings could not be read")?
+    else {
+        return Ok(None);
+    };
     {
         let cached = LAST_EMBEDDING.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = cached
             .as_ref()
             .filter(|cached| cached.model == model && cached.text == query)
         {
-            return Some((model.model, cached.vector.clone()));
+            return Ok(Some((model.model, cached.vector.clone())));
         }
     }
-    let endpoint = notes_vault::embedding_endpoint(platform, &model.provider).ok()?;
-    let client = notes_vault::embedding_client().ok()?;
+    let endpoint = notes_vault::embedding_endpoint(platform, &model.provider)
+        .map_err(|_| "the provider is unavailable")?;
+    let client = notes_vault::embedding_client().map_err(|_| "the provider is unavailable")?;
     let inputs = vec![format!("{}{query}", embed::query_prefix(&model.model))];
     let vectors = tokio::time::timeout(
         Duration::from_secs(1),
@@ -743,18 +875,25 @@ async fn query_embedding(
         ),
     )
     .await
-    .ok()?
-    .ok()?;
-    if registry::get_embedding_model(&dir).ok()?.as_ref() != Some(&model) {
-        return None;
+    .map_err(|_| "the model did not answer within 1 s")?
+    .map_err(|_| "the provider refused")?;
+    if registry::get_embedding_model(&dir)
+        .map_err(|_| "the model settings could not be read")?
+        .as_ref()
+        != Some(&model)
+    {
+        return Err("the model changed");
     }
-    let vector = vectors.into_iter().next()?;
+    let vector = vectors
+        .into_iter()
+        .next()
+        .ok_or("the provider returned no embedding")?;
     *LAST_EMBEDDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(QueryEmbedding {
         model: model.clone(),
         text: query.to_owned(),
         vector: vector.clone(),
     });
-    Some((model.model, vector))
+    Ok(Some((model.model, vector)))
 }
 
 /// A lazy body provider for the one predicate that needs bytes.
@@ -778,6 +917,10 @@ fn body_reader<'a>(vault: &'a Vault, rel: &'a str) -> impl FnMut() -> String + '
 
 /// A space's definition, as read from its note.
 struct SpaceDef {
+    pinned: bool,
+    ttl_hours: Option<u32>,
+    expires_ms: Option<i64>,
+    text: Option<String>,
     id: String,
     name: String,
     query: String,
@@ -827,10 +970,18 @@ struct SpaceDef {
 /// sentence the sidebar shows about it are both somewhere they can be proved.
 /// All this does is hand over the text and collect what comes back.
 fn space_def(entry: &IndexEntry, source: &str) -> SpaceDef {
+    space_definition(&entry.id, &entry.title, source)
+}
+
+fn space_definition(id: &str, name: &str, source: &str) -> SpaceDef {
     let (fm, _) = Frontmatter::parse(source);
     let mut def = SpaceDef {
-        id: entry.id.clone(),
-        name: entry.title.clone(),
+        pinned: false,
+        ttl_hours: None,
+        expires_ms: None,
+        text: None,
+        id: id.to_owned(),
+        name: name.to_owned(),
         query: String::new(),
         sort: String::new(),
         limit: None,
@@ -846,6 +997,20 @@ fn space_def(entry: &IndexEntry, source: &str) -> SpaceDef {
     };
     for (key, value) in pairs {
         match (key.as_str(), value) {
+            ("pinned", FieldValue::Bool(pinned)) => def.pinned = *pinned,
+            ("ttl_hours", value) => match keeper_core::notes::lifetime::read_ttl_hours(value) {
+                Ok(hours) => def.ttl_hours = Some(hours),
+                Err(warning) => def.warnings.push(warning),
+            },
+            ("expires", value) => {
+                match keeper_core::notes::lifetime::read_expires(&value.index_string()) {
+                    Ok(expires) => def.expires_ms = Some(expires),
+                    Err(warning) => def.warnings.push(warning),
+                }
+            }
+            ("text", FieldValue::Str(text)) => {
+                def.text = Some(text.clone()).filter(|text| !text.trim().is_empty())
+            }
             ("space", FieldValue::Str(query)) => def.query = query.clone(),
             // No `("space", FieldValue::Map(_))` arm: `Frontmatter` models one
             // level of nesting and says so at its `lookahead` — a second level
@@ -871,6 +1036,9 @@ fn space_def(entry: &IndexEntry, source: &str) -> SpaceDef {
             }
             _ => {}
         }
+    }
+    if def.ttl_hours.is_none() {
+        def.expires_ms = None;
     }
     def.warnings.extend(sort::read(&def.sort).warning);
     // The marker is read through `keeper-core`'s one rule rather than a sixth
@@ -915,7 +1083,8 @@ fn space_icon(raw: &str) -> Option<String> {
 /// fetching the query here and either of the others somewhere else would be
 /// reads that can disagree if the note changes between them.
 struct SpaceLens {
-    query: query::Query,
+    text: Option<String>,
+    query: Option<query::Query>,
     ordering: sort::SpaceSort,
     /// The space's `keeper.limit`, or `None` for a space that sets no cap.
     limit: Option<u32>,
@@ -962,7 +1131,7 @@ fn uncategorized_query(vault: &Vault, snapshot: &IndexSnapshot) -> String {
         snapshot
             .entries()
             .iter()
-            .filter(|e| has_flag(e, "space"))
+            .filter(|e| has_flag(e, "space") && !has_flag(e, "temporary"))
             .map(|entry| {
                 let source = notes_vault::read_note(vault, &entry.path).unwrap_or_default();
                 space_def(entry, &source).query
@@ -1004,7 +1173,8 @@ fn space_lens(
             })
         })?;
         return Ok(SpaceLens {
-            query: parsed,
+            text: None,
+            query: Some(parsed),
             ordering: sort::read("").sort,
             limit: None,
             name: "Uncategorized".to_owned(),
@@ -1015,17 +1185,22 @@ fn space_lens(
         .ok_or_else(|| notes_error(NotesError::NotFound(space_id.to_owned())))?;
     let source = notes_vault::read_note(vault, &entry.path).map_err(notes_error)?;
     let def = space_def(entry, &source);
-    let parsed = query::parse(&def.query).map_err(|error| {
-        notes_error(NotesError::Query {
-            message: error.message,
-            token_index: error.token_index,
-        })
-    })?;
+    let parsed = if def.query.trim().is_empty() && def.text.is_some() {
+        None
+    } else {
+        Some(query::parse(&def.query).map_err(|error| {
+            notes_error(NotesError::Query {
+                message: error.message,
+                token_index: error.token_index,
+            })
+        })?)
+    };
     // A sort keeper cannot read never fails the list — the space still selects
     // what it selects, and the row is already saying the file and the ordering
     // disagree. Refusing here would turn one bad word in frontmatter into an
     // empty pane with an error in it.
     Ok(SpaceLens {
+        text: def.text,
         query: parsed,
         ordering: sort::read(&def.sort).sort,
         limit: def.limit,
@@ -1306,6 +1481,24 @@ pub fn notes_hide_service_files_set(
 }
 
 #[tauri::command]
+pub fn notes_include_private_get(state: State<'_, AppState>) -> Result<bool, IpcError> {
+    let dir = state
+        .platform
+        .data_dir()
+        .map_err(crate::ipc::to_ipc_error)?;
+    registry::get_include_private(&dir).map_err(crate::ipc::to_ipc_error)
+}
+
+#[tauri::command]
+pub fn notes_include_private_set(state: State<'_, AppState>, value: bool) -> Result<(), IpcError> {
+    let dir = state
+        .platform
+        .data_dir()
+        .map_err(crate::ipc::to_ipc_error)?;
+    registry::set_include_private(&dir, value).map_err(crate::ipc::to_ipc_error)
+}
+
+#[tauri::command]
 pub fn notes_embedding_model_get(
     state: State<'_, AppState>,
 ) -> Result<Option<EmbeddingModelVm>, IpcError> {
@@ -1365,7 +1558,108 @@ pub async fn notes_list(
     // must never replace the subscription's newer query.
     let query = Arc::new(query);
     last_queries().insert(vault_id, Arc::clone(&query));
-    project_list(state.platform.as_ref(), &vault, &query).await
+    project_vaults(state.platform.as_ref(), &vault, &query).await
+}
+
+pub(crate) async fn project_vaults(
+    platform: &dyn keeper_core::platform::Platform,
+    vault: &Vault,
+    req: &NoteQueryReq,
+) -> Result<NoteListVm, IpcError> {
+    let mut embedding = None;
+    if req.vault_ids.is_empty() {
+        return project_list(platform, vault, req, vault, false, &mut embedding).await;
+    }
+    let mut pages = Vec::new();
+    let mut totals = Vec::new();
+    let mut matched = 0u32;
+    let mut hidden = 0u32;
+    let mut private = 0u32;
+    let mut notice = None;
+    let mut inner = req.clone();
+    inner.offset = 0;
+    let ids: std::collections::BTreeSet<_> = req.vault_ids.iter().collect();
+    let mut snapshots = HashMap::new();
+    let explicit = query_sort(req)?;
+    let lens = match req.space_id.as_deref() {
+        Some(id) if !id.is_empty() && id != ALL_SPACE_ID => {
+            let snapshot = notes_vault::snapshot(&vault.id)
+                .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault.id.clone())))?;
+            Some(space_lens(vault, &snapshot, id)?)
+        }
+        _ => None,
+    };
+    let prompt = req.text.as_deref().or_else(|| {
+        lens.as_ref()
+            .filter(|_| req.space_terms)
+            .and_then(|lens| lens.text.as_deref())
+    });
+    let browsing = prompt.is_none_or(|text| text.trim().is_empty());
+    for id in ids {
+        let result = match vault_of(id) {
+            Ok(target) => {
+                project_list(platform, &target, &inner, vault, true, &mut embedding).await
+            }
+            Err(error) => Err(error),
+        };
+        let answer = match result {
+            Ok(answer) => answer,
+            Err(error) => {
+                let sentence = format!("Drive {id} could not be listed: {}", error.message);
+                notice = Some(match notice {
+                    Some(previous) => format!("{previous} {sentence}"),
+                    None => sentence,
+                });
+                continue;
+            }
+        };
+        totals.push(answer.total);
+        matched = matched.saturating_add(answer.matched);
+        hidden = hidden.saturating_add(answer.hidden);
+        private = private.saturating_add(answer.private);
+        notice = notice.or(answer.notice);
+        if let Some(snapshot) = notes_vault::snapshot(id) {
+            snapshots.insert(id.clone(), snapshot);
+        }
+        pages.push(answer.rows);
+    }
+    let limit = if req.limit == 0 {
+        DEFAULT_LIMIT
+    } else {
+        req.limit.min(MAX_LIMIT)
+    };
+    let (mut rows, total) = keeper_core::notes::merge::merge_rows(pages, &totals);
+    if explicit.is_some() || browsing {
+        let ordering = explicit.or_else(|| lens.as_ref().map(|lens| lens.ordering));
+        rows.sort_by(|a, b| {
+            let left = snapshots.get(&a.vault_id).and_then(|s| s.by_id(&a.id));
+            let right = snapshots.get(&b.vault_id).and_then(|s| s.by_id(&b.id));
+            match (left, right) {
+                (Some(left), Some(right)) => match ordering {
+                    Some(ordering) => sort::compare(ordering, left, right),
+                    None => list_order(left, right),
+                },
+                _ => std::cmp::Ordering::Equal,
+            }
+            .then_with(|| a.vault_id.cmp(&b.vault_id))
+            .then_with(|| a.path.cmp(&b.path))
+        });
+    }
+    let offset = req.offset.min(total);
+    let rows = rows
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    Ok(NoteListVm {
+        rows,
+        total,
+        matched,
+        hidden,
+        private,
+        notice,
+        offset,
+    })
 }
 
 /// The hierarchical tag tree with per-node counts (FR-104), over both producers
@@ -1719,26 +2013,10 @@ pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError
             let def = space_def(entry, &source);
             // A broken query is a warning chip on the row, never a failed
             // command: a space is a file a person or an agent hand-edits.
-            let error = query::parse(&def.query).err().map(|error| error.message);
-            NoteSpaceVm {
-                id: def.id,
-                name: def.name,
-                updated_ms: Some(query::resolve_date(query::DateField::Modified, entry)),
-                query: def.query,
-                sort_effective: sort::read(&def.sort).sort.canonical(),
-                sort: def.sort,
-                // Zero is the wire's "no cap" (Story 44.11) — the same value
-                // the editor sends back for a space nobody capped, so the
-                // round trip writes no `keeper.limit` key.
-                limit: def.limit.unwrap_or(0),
-                icon: def.icon,
-                default_key: def.default_key,
-                template: def.template,
-                folder: def.folder,
-                warnings: def.warnings,
-                order: def.order,
-                error,
-            }
+            space_vm(
+                def,
+                Some(query::resolve_date(query::DateField::Modified, entry)),
+            )
         })
         .collect();
     Ok(compose_space_rows(
@@ -1747,51 +2025,230 @@ pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError
     ))
 }
 
-fn compose_space_rows(mut spaces: Vec<NoteSpaceVm>, uncategorized: String) -> Vec<NoteSpaceVm> {
-    // Synthetic rows do not compete with positions chosen by the owner.
-    spaces.sort_by(|a, b| {
-        sort::rail_order(
-            (a.order, a.updated_ms, a.name.as_str()),
-            (b.order, b.updated_ms, b.name.as_str()),
-        )
-    });
-    spaces.insert(
-        0,
-        NoteSpaceVm {
-            id: ALL_SPACE_ID.to_owned(),
-            name: "All notes".to_owned(),
-            updated_ms: None,
-            // The empty query is the existing unscoped path, not a new matcher.
-            query: String::new(),
-            sort_effective: sort::read("").sort.canonical(),
-            sort: String::new(),
+fn compose_space_rows(spaces: Vec<NoteSpaceVm>, uncategorized: String) -> Vec<NoteSpaceVm> {
+    keeper_core::notes::rail::compose_rail(spaces, uncategorized)
+}
+
+fn space_restore(def: &SpaceDef) -> keeper_core::notes::vm::NoteSpaceRestoreVm {
+    use keeper_core::notes::vm::NoteSpaceRestoreVm;
+    let mut restore = NoteSpaceRestoreVm {
+        text: def.text.clone(),
+        sort: (!def.sort.trim().is_empty()).then(|| sort::read(&def.sort).sort.canonical()),
+        ..Default::default()
+    };
+    if def.query.trim().is_empty() {
+        return restore;
+    }
+    match query::decompose(&def.query) {
+        Ok(NoteSpaceTermsVm::Chips {
+            tags,
+            flags,
+            origin,
+            text,
+            fields,
+        }) if fields.is_empty() => {
+            restore.tag_terms = tags.into_iter().map(|tag| (tag.tag, tag.term)).collect();
+            restore.flags = flags;
+            restore.origin = origin;
+            if restore.text.is_none() {
+                restore.text = text;
+            }
+        }
+        _ => restore.opaque = true,
+    }
+    restore
+}
+
+fn space_vm(def: SpaceDef, updated_ms: Option<i64>) -> NoteSpaceVm {
+    let error = if def.query.trim().is_empty() && def.text.is_some() {
+        None
+    } else {
+        query::parse(&def.query).err().map(|error| error.message)
+    };
+    NoteSpaceVm {
+        restore: space_restore(&def),
+        pinned: def.pinned,
+        ttl_hours: def.ttl_hours,
+        expires_ms: def.expires_ms,
+        expiry_phrase: keeper_core::notes::lifetime::expiry_phrase(
+            notes_vault::now_ms(),
+            def.expires_ms,
+        ),
+        text: def.text,
+        parent: None,
+        leaf_name: def.name.clone(),
+        depth: 0,
+        descendants: 0,
+        id: def.id,
+        name: def.name,
+        updated_ms,
+        query: def.query,
+        sort_effective: sort::read(&def.sort).sort.canonical(),
+        sort: def.sort,
+        limit: def.limit.unwrap_or(0),
+        icon: def.icon,
+        default_key: def.default_key,
+        template: def.template,
+        folder: def.folder,
+        warnings: def.warnings,
+        order: def.order,
+        error,
+    }
+}
+
+fn saved_space_row(vault_id: &str, saved: NoteSpaceVm) -> Result<NoteSpaceVm, IpcError> {
+    let vault = vault_of(vault_id)?;
+    let snapshot = notes_vault::snapshot(vault_id)
+        .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id.to_owned())))?;
+    let id = saved.id.clone();
+    let mut rows: Vec<_> = snapshot
+        .entries()
+        .iter()
+        .filter(|entry| has_flag(entry, "space") && entry.id != id)
+        .map(|entry| {
+            let source = notes_vault::read_note(&vault, &entry.path).unwrap_or_default();
+            space_vm(space_def(entry, &source), Some(entry.updated_ms))
+        })
+        .collect();
+    rows.push(saved);
+    compose_space_rows(rows, String::new())
+        .into_iter()
+        .find(|row| row.id == id)
+        .ok_or_else(|| notes_error(NotesError::NotFound(id)))
+}
+fn space_entry_of(vault: &Vault, id: &str) -> Result<IndexEntry, IpcError> {
+    if let Ok(entry) = entry_of(&vault.id, id) {
+        return notes_vault::read_space_entry(vault, &entry.path).map_err(notes_error);
+    }
+    notes_vault::siblings(vault, SPACES_DIR)
+        .into_iter()
+        .filter_map(|name| {
+            notes_vault::read_space_entry(vault, &format!("{SPACES_DIR}/{name}")).ok()
+        })
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| notes_error(NotesError::NotFound(id.to_owned())))
+}
+
+#[tauri::command]
+pub async fn notes_space_touch(
+    vault_id: String,
+    space_id: String,
+) -> Result<NoteSpaceVm, IpcError> {
+    use keeper_core::notes::lifetime;
+    let vault = vault_of(&vault_id)?;
+    let entry = space_entry_of(&vault, &space_id)?;
+    let source = notes_vault::read_note(&vault, &entry.path).map_err(notes_error)?;
+    let mut def = space_def(&entry, &source);
+    let now = notes_vault::now_ms();
+    if let Some(hours) = def.ttl_hours {
+        if def
+            .expires_ms
+            .is_none_or(|expires| lifetime::should_touch(now, expires, hours))
+        {
+            let expires = lifetime::expires_at(now, hours);
+            let (fm, _) = Frontmatter::parse(&source);
+            if let Some(FieldValue::Map(pairs)) = fm.get("keeper") {
+                let mut pairs = pairs.clone();
+                pairs.retain(|(key, _)| key != "expires");
+                pairs.push((
+                    "expires".to_owned(),
+                    FieldValue::Str(lifetime::expiry_stamp(expires)),
+                ));
+                let updated = Frontmatter::set_in(&source, "keeper", FieldValue::Map(pairs));
+                notes_vault::write_note(&vault, &entry.path, &updated).map_err(notes_error)?;
+                def.expires_ms = Some(expires);
+            }
+        }
+    }
+    saved_space_row(&vault_id, space_vm(def, Some(entry.updated_ms)))
+}
+
+#[tauri::command]
+pub async fn notes_space_park(
+    vault_id: String,
+    label: String,
+    req: keeper_core::notes::vm::NoteSpaceParkReq,
+) -> Result<NoteSpaceVm, IpcError> {
+    static PARK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = PARK_LOCK.lock().await;
+    let vault = vault_of(&vault_id)?;
+    let name = format!(
+        "actual-{}",
+        if label.trim().is_empty() {
+            "All notes"
+        } else {
+            label.trim()
+        }
+    );
+    let quote = |value: &str| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""));
+    let mut terms = Vec::new();
+    for (tag, term) in req.tag_terms {
+        let negation = if term == keeper_core::notes::index::NoteTagTerm::Exclude {
+            "-"
+        } else {
+            ""
+        };
+        terms.push(format!("{negation}tag:{}", quote(&tag)));
+    }
+    if let Some(origin) = req.origin {
+        terms.push(format!("origin:{}", quote(&origin)));
+    }
+    terms.extend(
+        req.flags
+            .into_iter()
+            .map(|flag| format!("is:{}", quote(&flag))),
+    );
+    let existing = notes_vault::siblings(&vault, SPACES_DIR)
+        .into_iter()
+        .filter_map(|name| {
+            notes_vault::read_space_entry(&vault, &format!("{SPACES_DIR}/{name}")).ok()
+        })
+        .find(|entry| has_flag(entry, "temporary") && entry.title == name);
+    let id = existing.as_ref().map(|entry| entry.id.clone());
+    save_space(
+        vault_id.clone(),
+        NoteSpaceReq {
+            base_space_id: req.base_space_id,
+            id,
+            name,
+            query: terms.join(" "),
+            sort: req.sort.unwrap_or_default(),
             limit: 0,
-            icon: Some("notebook".to_owned()),
-            default_key: None,
+            icon: None,
+            order: 0.0,
             template: None,
             folder: None,
-            warnings: Vec::new(),
-            order: 0.0,
-            error: None,
+            pinned: false,
+            ttl_hours: Some(keeper_core::notes::lifetime::PARKED_SEARCH_TTL_HOURS),
+            text: req.text,
         },
-    );
-    spaces.push(NoteSpaceVm {
-        id: UNCATEGORIZED_SPACE_ID.to_owned(),
-        name: "Uncategorized".to_owned(),
-        updated_ms: None,
-        query: uncategorized,
-        sort_effective: sort::read("").sort.canonical(),
-        sort: String::new(),
-        limit: 0,
-        icon: Some("shapes".to_owned()),
-        default_key: None,
-        template: None,
-        folder: None,
-        warnings: Vec::new(),
-        order: 0.0,
-        error: None,
-    });
-    spaces
+        true,
+    )
+    .await
+}
+
+fn compose_space_query(
+    vault: &Vault,
+    base_id: Option<&str>,
+    own: &str,
+) -> Result<String, IpcError> {
+    let Some(id) = base_id.filter(|id| *id != ALL_SPACE_ID) else {
+        return Ok(own.to_owned());
+    };
+    let base = if id == UNCATEGORIZED_SPACE_ID {
+        let snapshot = notes_vault::snapshot(&vault.id)
+            .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault.id.clone())))?;
+        uncategorized_query(vault, &snapshot)
+    } else {
+        let entry = space_entry_of(vault, id)?;
+        let source = notes_vault::read_note(vault, &entry.path).map_err(notes_error)?;
+        space_def(&entry, &source).query
+    };
+    Ok(match (base.trim().is_empty(), own.trim().is_empty()) {
+        (true, _) => own.to_owned(),
+        (_, true) => base,
+        _ => format!("({base}) ({own})"),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1983,19 +2440,30 @@ pub async fn notes_spaces_restore_defaults(vault_id: String) -> Result<u32, IpcE
 pub async fn notes_space_save(
     vault_id: String,
     space: NoteSpaceReq,
-) -> Result<NoteRefVm, IpcError> {
+) -> Result<NoteSpaceVm, IpcError> {
+    save_space(vault_id, space, false).await
+}
+
+async fn save_space(
+    vault_id: String,
+    mut space: NoteSpaceReq,
+    refresh_clock: bool,
+) -> Result<NoteSpaceVm, IpcError> {
     let vault = vault_of(&vault_id)?;
-    // Refuse a broken query at the edge: a space is a surface people run bulk
-    // actions from, so storing one that matches nothing silently is worse than
-    // saying no. An empty query is one of those failures — `parse` rejects it
-    // rather than reading it as "everything" — which is the backstop under the
-    // editor's own refusal to save a space with no terms left in it.
-    query::parse(&space.query).map_err(|error| {
-        notes_error(NotesError::Query {
-            message: error.message,
-            token_index: error.token_index,
-        })
-    })?;
+    space.query = compose_space_query(&vault, space.base_space_id.as_deref(), &space.query)?;
+    if !space.query.trim().is_empty()
+        || space
+            .text
+            .as_deref()
+            .is_none_or(|text| text.trim().is_empty())
+    {
+        query::parse(&space.query).map_err(|error| {
+            notes_error(NotesError::Query {
+                message: error.message,
+                token_index: error.token_index,
+            })
+        })?;
+    }
     let pairs = vec![
         ("space".to_owned(), FieldValue::Str(space.query.clone())),
         // The canonical spelling of whatever the form had selected. This is the
@@ -2016,6 +2484,15 @@ pub async fn notes_space_save(
     // user never set, in a file they can read, that nothing was applying.
     // Now zero is no cap and no cap writes no key.
     let with_presentation = |mut pairs: Vec<(String, FieldValue)>| {
+        if space.pinned {
+            pairs.push(("pinned".to_owned(), FieldValue::Bool(true)));
+        }
+        if let Some(hours) = space.ttl_hours.filter(|hours| *hours > 0) {
+            pairs.push(("ttl_hours".to_owned(), FieldValue::Num(f64::from(hours))));
+        }
+        if let Some(text) = space.text.as_ref().filter(|text| !text.trim().is_empty()) {
+            pairs.push(("text".to_owned(), FieldValue::Str(text.clone())));
+        }
         if let Some(icon) = space.icon.as_deref().and_then(space_icon) {
             pairs.push(("icon".to_owned(), FieldValue::Str(icon)));
         }
@@ -2058,7 +2535,7 @@ pub async fn notes_space_save(
     // (FR-121): the definition is spliced, and the name is spliced only when it
     // actually changed.
     if let Some(id) = space.id.as_ref().filter(|id| !id.is_empty()) {
-        let entry = entry_of(&vault_id, id)?;
+        let entry = space_entry_of(&vault, id)?;
         let source = notes_vault::read_note(&vault, &entry.path).map_err(notes_error)?;
         let mut pairs = with_presentation(pairs);
         // `keeper` is spliced whole, so a key this request does not carry is a
@@ -2068,6 +2545,27 @@ pub async fn notes_space_save(
         // "Restore default spaces" would then offer a second one.
         if let Some(key) = default_spaces::default_key_of(&source) {
             pairs.push(("default".to_owned(), FieldValue::Str(key)));
+        }
+        let old = space_def(&entry, &source);
+        if let Some(hours) = space.ttl_hours.filter(|hours| *hours > 0) {
+            let (fm, _) = Frontmatter::parse(&source);
+            let stored = match fm.get("keeper") {
+                Some(FieldValue::Map(old_pairs))
+                    if !refresh_clock && old.ttl_hours == Some(hours) =>
+                {
+                    old_pairs
+                        .iter()
+                        .find(|(key, _)| key == "expires")
+                        .map(|(_, value)| value.clone())
+                }
+                _ => None,
+            };
+            let expires = stored.unwrap_or_else(|| {
+                FieldValue::Str(keeper_core::notes::lifetime::expiry_stamp(
+                    keeper_core::notes::lifetime::expires_at(notes_vault::now_ms(), hours),
+                ))
+            });
+            pairs.push(("expires".to_owned(), expires));
         }
         let mut updated = Frontmatter::set_in(&source, "keeper", FieldValue::Map(pairs));
         let renamed = space.name != entry.title;
@@ -2087,17 +2585,14 @@ pub async fn notes_space_save(
             }
         }
         notes_vault::write_note(&vault, &entry.path, &updated).map_err(notes_error)?;
-        let path = if renamed {
-            rename_in_place(&vault, &entry.path, &space.name)?
-        } else {
-            entry.path
-        };
-        return Ok(NoteRefVm {
-            vault_id,
-            id: entry.id,
-            path,
-            title: space.name,
-        });
+        let mut published_paths = vec![entry.path.clone()];
+        if renamed {
+            published_paths.push(rename_in_place(&vault, &entry.path, &space.name)?);
+        }
+        notes_vault::publish_saved_space(&vault_id, published_paths).await;
+        let mut def = space_def(&entry, &updated);
+        def.name = space.name;
+        return saved_space_row(&vault_id, space_vm(def, Some(notes_vault::now_ms())));
     }
 
     let id = crate::sync_ipc::new_ulid();
@@ -2107,23 +2602,26 @@ pub async fn notes_space_save(
         &notes_vault::siblings(&vault, SPACES_DIR),
     );
     let rel = format!("{SPACES_DIR}/{filename}");
+    let mut pairs = with_presentation(pairs);
+    if let Some(hours) = space.ttl_hours.filter(|hours| *hours > 0) {
+        let expires = keeper_core::notes::lifetime::expires_at(notes_vault::now_ms(), hours);
+        pairs.push((
+            "expires".to_owned(),
+            FieldValue::Str(keeper_core::notes::lifetime::expiry_stamp(expires)),
+        ));
+    }
     let front = Frontmatter::serialise_new(&[
         ("id".to_owned(), FieldValue::Str(id.clone())),
         ("created".to_owned(), FieldValue::Str(now_local())),
         ("updated".to_owned(), FieldValue::Str(now_local())),
-        (
-            "keeper".to_owned(),
-            FieldValue::Map(with_presentation(pairs)),
-        ),
+        ("keeper".to_owned(), FieldValue::Map(pairs)),
     ]);
     let body = format!("# {}\n", space.name);
-    notes_vault::write_note(&vault, &rel, &format!("{front}\n{body}")).map_err(notes_error)?;
-    Ok(NoteRefVm {
-        vault_id,
-        id,
-        path: rel,
-        title: space.name,
-    })
+    let source = format!("{front}\n{body}");
+    notes_vault::write_note(&vault, &rel, &source).map_err(notes_error)?;
+    notes_vault::publish_saved_space(&vault_id, vec![rel]).await;
+    let def = space_definition(&id, &space.name, &source);
+    saved_space_row(&vault_id, space_vm(def, Some(notes_vault::now_ms())))
 }
 
 /// Rename a note's file to match a new title, keeping it in its own directory.
@@ -2554,7 +3052,7 @@ pub async fn notes_forwardlinks(
     rows.extend(
         unwritten
             .into_iter()
-            .map(|(target, predicates)| unwritten_row(target, predicates)),
+            .map(|(target, predicates)| unwritten_row(&vault_id, target, predicates)),
     );
     Ok(rows)
 }
@@ -2565,8 +3063,9 @@ pub async fn notes_forwardlinks(
 /// added to [`NoteRowVm`] tomorrow fails to compile here and somebody decides
 /// what it means for an edge with no note behind it. A `..Default::default()`
 /// would silently give it whatever the derive picked.
-fn unwritten_row(target: &str, predicates: &[String]) -> NoteRowVm {
+fn unwritten_row(vault_id: &str, target: &str, predicates: &[String]) -> NoteRowVm {
     NoteRowVm {
+        vault_id: vault_id.to_owned(),
         // No id, path or title: there is no note, and a synthesised one is a
         // row the surface could try to open. The panel is told not to read
         // these on this branch, and empty is what makes that checkable.
@@ -5217,7 +5716,7 @@ async fn stream_changes(
     // count after the opening `Reset`, and a note that started matching the
     // lens below the page produced no op and no message — invisible then,
     // because nothing showed the number, and a stale count on screen now.
-    let mut sent: Option<(u32, u32, u32)> = None;
+    let mut sent: Option<(u32, u32, u32, u32)> = None;
     // A cold search database may not exist yet. Keep the subscription alive
     // until the search publish catches up rather than ending on that read.
     loop {
@@ -5225,17 +5724,35 @@ async fn stream_changes(
             let state = search_state.borrow_and_update();
             (state.vault_id.clone(), state.phase.clone())
         };
+        let mut secondary: Vec<_> = last_queries()
+            .get(&vault.id)
+            .into_iter()
+            .flat_map(|req| req.vault_ids.clone())
+            .filter(|id| id != &vault.id)
+            .filter_map(|id| notes_vault::subscribe_index(&id))
+            .map(|mut index| {
+                index.mark_unchanged();
+                index
+            })
+            .collect();
         let rows = match current_window(platform.as_ref(), &vault).await {
             Ok(rows) => rows,
             Err(_) => {
-                if !wait_for_list_change(&mut index, &mut search_state, &search_revision).await {
+                if !wait_for_list_change(
+                    &mut index,
+                    &mut search_state,
+                    &search_revision,
+                    &mut secondary,
+                )
+                .await
+                {
                     return;
                 }
                 continue;
             }
         };
         let next = fingerprints(&rows.rows);
-        let counts = (rows.total, rows.matched, rows.hidden);
+        let counts = (rows.total, rows.matched, rows.hidden, rows.private);
         let ops = if previous.is_empty() {
             vec![NoteListOp::Reset { rows: rows.rows }]
         } else {
@@ -5250,6 +5767,7 @@ async fn stream_changes(
                     total: counts.0,
                     matched: counts.1,
                     hidden: counts.2,
+                    private: counts.3,
                 })
                 .is_err()
         {
@@ -5257,7 +5775,14 @@ async fn stream_changes(
             return;
         }
         sent = Some(counts);
-        if !wait_for_list_change(&mut index, &mut search_state, &search_revision).await {
+        if !wait_for_list_change(
+            &mut index,
+            &mut search_state,
+            &search_revision,
+            &mut secondary,
+        )
+        .await
+        {
             return;
         }
         // Coalesce the burst behind this wake-up into one message.
@@ -5271,8 +5796,14 @@ async fn wait_for_list_change(
     index: &mut tokio::sync::watch::Receiver<Arc<IndexSnapshot>>,
     search: &mut tokio::sync::watch::Receiver<NoteSearchStateVm>,
     previous: &(String, String),
+    secondary: &mut [tokio::sync::watch::Receiver<Arc<IndexSnapshot>>],
 ) -> bool {
+    // Secondary revisions share this subscription's lifetime and wake it
+    // directly: no second scheduler, no idle wakeups, no overlapping projection.
     loop {
+        let multiple = last_queries()
+            .get(&previous.0)
+            .is_some_and(|req| req.vault_ids.len() > 1);
         tokio::select! {
             changed = index.changed() => return changed.is_ok(),
             changed = search.changed() => {
@@ -5280,8 +5811,38 @@ async fn wait_for_list_change(
                 let state = search.borrow_and_update();
                 if state.vault_id != previous.0 || state.phase != previous.1 { return true; }
             }
+            () = wait_for_secondary_change(secondary), if multiple && !secondary.is_empty() => {
+                return true;
+            }
         }
     }
+}
+
+async fn wait_for_secondary_change(
+    secondary: &mut [tokio::sync::watch::Receiver<Arc<IndexSnapshot>>],
+) {
+    use std::future::Future as _;
+
+    let mut changes: Vec<_> = secondary
+        .iter_mut()
+        .map(|index| Box::pin(index.changed()))
+        .collect();
+    std::future::poll_fn(|cx| {
+        let mut changed = false;
+        changes.retain_mut(|future| match future.as_mut().poll(cx) {
+            std::task::Poll::Pending => true,
+            std::task::Poll::Ready(result) => {
+                changed |= result.is_ok();
+                false
+            }
+        });
+        if changed {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
 }
 
 /// The window a changes subscription streams: the last query `notes_list` was
@@ -5295,7 +5856,7 @@ async fn current_window(
             .entry(vault.id.clone())
             .or_insert_with(|| Arc::new(default_query(platform.data_dir().ok().as_deref())))
             .clone();
-        let result = project_list(platform, vault, &req).await;
+        let result = project_vaults(platform, vault, &req).await;
         if last_queries()
             .get(&vault.id)
             .is_some_and(|current| Arc::ptr_eq(current, &req))
@@ -5308,6 +5869,12 @@ async fn current_window(
 /// The window with no filter applied.
 fn default_query(data_dir: Option<&std::path::Path>) -> NoteQueryReq {
     NoteQueryReq {
+        space_terms: true,
+        sort: None,
+        vault_ids: Vec::new(),
+        include_private: data_dir
+            .and_then(|dir| registry::get_include_private(dir).ok())
+            .unwrap_or(false),
         text: None,
         hide_service_files: data_dir
             .and_then(|dir| registry::get_hide_service_files(dir).ok())
@@ -6058,6 +6625,165 @@ mod tests {
         }
     }
 
+    #[test]
+    fn temporary_spaces_do_not_claim_uncategorized_notes() {
+        let vault = test_vault("temporary-uncategorized");
+        notes_vault::write_note(
+            &vault,
+            "spaces/parked.md",
+            "---\nkeeper:\n  space: tag:budget\n  ttl_hours: 2\n---\n# Parked\n",
+        )
+        .expect("parked space");
+        let parked = notes_vault::read_space_entry(&vault, "spaces/parked.md").expect("entry");
+        let snapshot =
+            keeper_core::notes::index::IndexBuilder::from_entries(vec![parked]).snapshot();
+        assert_eq!(uncategorized_query(&vault, &snapshot), "");
+        std::fs::remove_dir_all(vault.local_path).ok();
+    }
+
+    #[test]
+    fn refused_meaning_reports_the_provider_remedy_not_indexing() {
+        let state = NoteSearchStateVm {
+            vault_id: "v".into(),
+            phase: "refused".into(),
+            indexed: 0,
+            total: 0,
+            embedded: 0,
+            embeddable: 0,
+            model: "model".into(),
+            sentence: "Choose a reachable provider.".into(),
+        };
+        let notice = meaning_notice(Some(&state), true).expect("notice");
+        assert!(notice.contains(&state.sentence));
+        assert!(!notice.contains("still indexing"));
+    }
+
+    #[tokio::test]
+    async fn multi_drive_subscription_wakes_without_a_primary_change() {
+        let id = crate::sync_ipc::new_ulid();
+        let mut req = default_query(None);
+        req.vault_ids = vec![id.clone(), "secondary".into()];
+        last_queries().insert(id.clone(), Arc::new(req));
+        let (_index_tx, mut index) =
+            tokio::sync::watch::channel(Arc::new(IndexSnapshot::default()));
+        let (_search_tx, mut search) = tokio::sync::watch::channel(NoteSearchStateVm {
+            vault_id: id.clone(),
+            phase: "words".into(),
+            indexed: 0,
+            total: 0,
+            embedded: 0,
+            embeddable: 0,
+            model: String::new(),
+            sentence: String::new(),
+        });
+        let (secondary_tx, secondary) =
+            tokio::sync::watch::channel(Arc::new(IndexSnapshot::default()));
+        let mut secondary = [secondary];
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(1100),
+                wait_for_list_change(
+                    &mut index,
+                    &mut search,
+                    &(id.clone(), "words".into()),
+                    &mut secondary
+                )
+            )
+            .await
+            .is_err(),
+            "unchanged secondary drives must not reproject"
+        );
+        let publish = secondary_tx.clone();
+        let publisher = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            publish
+                .send(Arc::new(IndexSnapshot::default()))
+                .expect("secondary revision");
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_for_list_change(
+                &mut index,
+                &mut search,
+                &(id.clone(), "words".into()),
+                &mut secondary,
+            ),
+        )
+        .await;
+        assert!(result.expect("secondary drives must wake the aggregate subscription"));
+        publisher.await.expect("publisher");
+        let mut single = default_query(None);
+        single.vault_ids = vec![id.clone()];
+        last_queries().insert(id.clone(), Arc::new(single));
+        secondary_tx
+            .send(Arc::new(IndexSnapshot::default()))
+            .expect("secondary revision after deselection");
+        let result = tokio::time::timeout(
+            Duration::from_millis(1100),
+            wait_for_list_change(
+                &mut index,
+                &mut search,
+                &(id.clone(), "words".into()),
+                &mut secondary,
+            ),
+        )
+        .await;
+        last_queries().remove(&id);
+        assert!(
+            result.is_err(),
+            "a single-drive subscription must stop observing secondary drives"
+        );
+    }
+
+    #[test]
+    fn prompt_only_spaces_and_lifetimes_project_from_the_written_keys() {
+        let source = "---\nkeeper:\n  space: \"\"\n  text: budget\n  pinned: true\n  ttl_hours: 48\n  expires: 2026-09-22T10:00:00Z\n---\n# Budget\n";
+        let row = space_vm(space_definition("budget", "Budget", source), None);
+        assert!(row.error.is_none());
+        assert!(row.pinned);
+        assert_eq!(row.ttl_hours, Some(48));
+        assert_eq!(row.expires_ms, Some(1_790_071_200_000));
+        assert_eq!(row.restore.text.as_deref(), Some("budget"));
+        assert!(!row.restore.opaque);
+        assert_eq!(row.restore.sort, None);
+        let sorted = source.replace("  text: budget", "  text: budget\n  sort: name asc");
+        assert_eq!(
+            space_vm(space_definition("budget", "Budget", &sorted), None)
+                .restore
+                .sort
+                .as_deref(),
+            Some("name asc")
+        );
+        let broken = source
+            .replace("ttl_hours: 48", "ttl_hours: -3")
+            .replace("2026-09-22T10:00:00Z", "yesterday-ish");
+        let row = space_vm(space_definition("budget", "Budget", &broken), None);
+        assert!(row.ttl_hours.is_none());
+        assert!(row.expires_ms.is_none());
+        assert_eq!(row.warnings.len(), 2);
+    }
+
+    #[test]
+    fn opaque_base_terms_survive_the_shared_save_and_park_composer() {
+        let vault = test_vault("base-space");
+        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let source =
+            format!("---\nid: {id}\nkeeper:\n  space: \"tag:one | tag:two\"\n---\n# Base\n");
+        notes_vault::write_note(&vault, "spaces/base.md", &source).expect("base");
+        let combined = compose_space_query(&vault, Some(id), "tag:three").expect("compose");
+        let mut note = entry("three.md", "Three");
+        note.tags = vec!["three".into()];
+        let parsed = query::parse(&combined).expect("composed query");
+        assert!(!query::eval(&parsed, &note, &mut String::new, 0));
+        note.tags.push("two".into());
+        assert!(query::eval(&parsed, &note, &mut String::new, 0));
+        assert_eq!(
+            compose_space_query(&vault, Some(id), "").expect("base only"),
+            "tag:one | tag:two"
+        );
+        std::fs::remove_dir_all(vault.local_path).ok();
+    }
+
     /// The bug DW-N1 named, driven through the real create and save code against a
     /// real file: create a note, type at the very first offset the editor can
     /// produce, save.
@@ -6127,6 +6853,7 @@ mod tests {
 
     fn row(id: &str, title: &str) -> NoteRowVm {
         NoteRowVm {
+            vault_id: "vault".to_owned(),
             id: id.to_owned(),
             path: format!("{id}.md"),
             title: title.to_owned(),
@@ -6209,6 +6936,34 @@ mod tests {
             &TagTerms::default(),
             None
         ));
+    }
+
+    #[test]
+    fn private_is_withheld_until_opted_in_by_toggle_or_flag() {
+        let mut note = entry("private.md", "Private");
+        note.flags.push("private".into());
+        let mut req = default_query(None);
+        assert!(!matches_filter(&note, &req, &TagTerms::default(), None));
+        req.include_private = true;
+        assert!(matches_filter(&note, &req, &TagTerms::default(), None));
+        req.include_private = false;
+        req.flags.push("private".into());
+        assert!(matches_filter(&note, &req, &TagTerms::default(), None));
+    }
+
+    #[test]
+    fn restored_chips_can_widen_a_space_without_changing_its_identity() {
+        let parsed = query::parse("tag:one tag:two").expect("query");
+        let mut note = entry("one.md", "One");
+        note.tags.push("one".into());
+        let mut req = default_query(None);
+        req.tags.insert("one".into(), NoteTagTerm::Include);
+        req.space_terms = false;
+        let mut body = String::new;
+        assert!(space_matches(&req, Some(&parsed), &note, &mut body, 0));
+        assert!(matches_filter(&note, &req, &TagTerms::new(&req.tags), None));
+        req.space_terms = true;
+        assert!(!space_matches(&req, Some(&parsed), &note, &mut body, 0));
     }
 
     /// The editor never sees a `---`, which is what makes "the first keystroke
@@ -6808,7 +7563,7 @@ mod attach_and_table_tests {
     /// synthesised from the target would be the same string in two fields.
     #[test]
     fn an_unwritten_edge_carries_only_its_target_and_its_predicates() {
-        let row = unwritten_row("auth-service.md", &["cites".to_owned()]);
+        let row = unwritten_row("vault", "auth-service.md", &["cites".to_owned()]);
 
         assert_eq!(row.unresolved_target, "auth-service.md");
         assert_eq!(row.predicates, vec!["cites".to_owned()]);
@@ -6828,7 +7583,7 @@ mod attach_and_table_tests {
 
         // And the zero-predicate case the panel pinned: an edge written without
         // an attribute block is still a row, with an empty predicate list.
-        let bare = unwritten_row("deck.md", &[]);
+        let bare = unwritten_row("vault", "deck.md", &[]);
         assert_eq!(bare.unresolved_target, "deck.md");
         assert!(bare.predicates.is_empty());
     }
@@ -6868,52 +7623,5 @@ mod attach_and_table_tests {
         );
 
         std::fs::remove_dir_all(&vault.local_path).ok();
-    }
-}
-
-#[cfg(test)]
-mod rail_rows_tests {
-    use super::*;
-
-    #[test]
-    fn notes_spaces_pins_synthetic_rows_around_the_owners_order() {
-        let empty = compose_space_rows(Vec::new(), String::new());
-        let mut older = empty[0].clone();
-        older.id = "older".to_owned();
-        older.name = "Older".to_owned();
-        older.updated_ms = Some(10);
-        let mut newer = older.clone();
-        newer.id = "newer".to_owned();
-        newer.name = "Newer".to_owned();
-        newer.updated_ms = Some(20);
-        let mut positioned = older.clone();
-        positioned.id = "positioned".to_owned();
-        positioned.name = "Positioned".to_owned();
-        positioned.order = -1.0;
-        let rows = compose_space_rows(vec![older, positioned, newer], "-tag:claimed".to_owned());
-        assert_eq!(
-            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
-            [
-                ALL_SPACE_ID,
-                "positioned",
-                "newer",
-                "older",
-                UNCATEGORIZED_SPACE_ID
-            ]
-        );
-        // The `All notes` row carries no query on purpose, and an empty string is
-        // not a query this language has (`query::parse("")` is `empty query`):
-        // the row is chosen by its id and filters through the viewer's existing
-        // unscoped path, so nothing ever parses this field. It therefore also
-        // carries no `error`, which is what keeps a warning chip off a row that
-        // has nothing wrong with it.
-        assert!(rows[0].query.is_empty());
-        assert!(rows[0].error.is_none());
-        assert!(
-            query::parse(&rows[0].query).is_err(),
-            "if the empty query ever became parseable, this row would need a real one"
-        );
-        assert_eq!(rows[4].query, "-tag:claimed");
-        assert_eq!(empty.len(), 2);
     }
 }

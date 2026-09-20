@@ -28,8 +28,10 @@ import {
   PANE_HEADER_ACTIONS_SLOT,
   PANE_HEADER_FRAME_SLOT,
   PANE_HEADER_IDENTITY_SLOT,
+  PANE_HEADER_LEADING_SLOT,
   PANE_HEADER_STATUS_SLOT,
   PaneHeader,
+  paneHeaderActionsBudget,
 } from "@/components/layout/pane-header";
 
 /** The two captions this file measures a slot against. Two DIFFERENT widths, so
@@ -381,5 +383,33 @@ describe("the frame's own controls are a group, not two more actions", () => {
 
     expect(headerRow().children).toHaveLength(3);
     expect(headerRow().querySelector(`[data-slot="${PANE_HEADER_FRAME_SLOT}"]`)).toBeNull();
+    expect(headerRow().querySelector(`[data-slot="${PANE_HEADER_LEADING_SLOT}"]`)).toBeNull();
+  });
+
+  it("puts navigation before identity and charges its width and seam to the action budget", () => {
+    render(
+      <PaneHeader
+        leading={
+          <>
+            <button type="button">Back</button>
+            <button type="button">Forward</button>
+          </>
+        }
+        identity={<span>a note</span>}
+        status={{ sizers: [SHORT], caption: SHORT }}
+        actions={<button type="button">Attachments</button>}
+        frame={<button type="button">Close panel</button>}
+      />,
+    );
+    expect(
+      Array.from(headerRow().children).map((child) => child.getAttribute("data-slot")),
+    ).toEqual([
+      PANE_HEADER_LEADING_SLOT,
+      PANE_HEADER_IDENTITY_SLOT,
+      PANE_HEADER_STATUS_SLOT,
+      PANE_HEADER_ACTIONS_SLOT,
+      PANE_HEADER_FRAME_SLOT,
+    ]);
+    expect(paneHeaderActionsBudget({ header: 560, status: 100, frame: 32, leading: 72 })).toBe(164);
   });
 });

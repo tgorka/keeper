@@ -69,6 +69,7 @@ import {
   PANE_HEADER_ACTIONS_SLOT,
   PANE_HEADER_FRAME_SLOT,
   PANE_HEADER_IDENTITY_SLOT,
+  PANE_HEADER_LEADING_SLOT,
   PANE_HEADER_STATUS_SLOT,
   type PaneHeaderTitleBar,
 } from "@/components/layout/pane-header";
@@ -81,7 +82,7 @@ import {
 } from "@/lib/stores/notes-editor";
 import { notesFiltersStore } from "@/lib/stores/notes-filters";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
-import { resetPanelsStoreForTest } from "@/lib/stores/panels";
+import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { SHOW_IN_FILES_LABEL } from "@/lib/vault-link";
 import { withActionWidths, withHandFiredResize, withRangeRects } from "@/test/layout";
@@ -153,6 +154,7 @@ async function openEditor(
   frame?: ReactNode,
   frontmatter = "",
   titleBar: PaneHeaderTitleBar | null = null,
+  panelId?: string,
 ): Promise<void> {
   notesOpen.mockImplementation(async (_vault, _note, onBatch) => {
     onBatch({
@@ -165,7 +167,9 @@ async function openEditor(
     });
     return "sub-1";
   });
-  render(<NoteEditor vaultId="v1" noteId="n1" frame={frame} titleBar={titleBar} />);
+  render(
+    <NoteEditor vaultId="v1" noteId="n1" frame={frame} titleBar={titleBar} panelId={panelId} />,
+  );
   await act(async () => {
     await Promise.resolve();
   });
@@ -710,9 +714,8 @@ describe("a note in a panel: one row, carrying the panel's own controls", () => 
     </>
   );
 
-  /** The same geometry as the suite above, plus the frame group: two 32px
-   *  controls and the 8px between them. */
-  const FRAMED_WIDTHS: Record<string, number> = { ...WIDTHS, frame: 72 };
+  /** Frame controls and leading navigation each cost two 32px targets plus an 8px gap. */
+  const FRAMED_WIDTHS: Record<string, number> = { ...WIDTHS, frame: 72, navigation: 72 };
 
   let restoreWidths: (() => void) | null = null;
   let observer: { resize: (width: number) => void; undo: () => void } | null = null;
@@ -728,7 +731,7 @@ describe("a note in a panel: one row, carrying the panel's own controls", () => 
     seedVault();
     restoreWidths = withActionWidths(FRAMED_WIDTHS);
     observer = withHandFiredResize();
-    await openEditor(PANEL_CONTROLS);
+    await openEditor(PANEL_CONTROLS, "", null, panelsStore.getState().activeId);
     const { resize } = observer;
     return (width) => {
       act(() => resize(width));
@@ -744,6 +747,7 @@ describe("a note in a panel: one row, carrying the panel's own controls", () => 
     // in it rather than in a band above it.
     expect(document.querySelectorAll("header")).toHaveLength(1);
     expect(Array.from(row.children).map((child) => child.getAttribute("data-slot"))).toEqual([
+      PANE_HEADER_LEADING_SLOT,
       PANE_HEADER_IDENTITY_SLOT,
       PANE_HEADER_STATUS_SLOT,
       PANE_HEADER_ACTIONS_SLOT,
@@ -781,13 +785,11 @@ describe("a note in a panel: one row, carrying the panel's own controls", () => 
   it("charges the row for them, so one fewer verb promotes at the same width", async () => {
     const resize = await openFramed();
 
-    // 800px unframed promotes three — the suite above asserts exactly that at
-    // exactly this width. Framed, group 3 is owed 80px more (72 for the two
-    // controls, 8 for the seam beside them): 800 - 160 - 8 - 90 - 8 - 72 - 8 =
-    // 454, and 454 less the 198 the leading control and the trigger reserve
-    // buys the 108 and the 100 but not the 74 behind them.
+    // The panel's frame and navigation each charge 72px plus an 8px seam.
+    // 800 - 160 - 8 - 90 - 8 - 72 - 8 - 72 - 8 = 374; after the
+    // actions' 198px reservation, only the first 108px verb fits.
     resize(800);
-    expect(names()).toEqual([ATTACHMENTS_LABEL, NOTE_HISTORY_LABEL]);
+    expect(names()).toEqual([ATTACHMENTS_LABEL]);
 
     // And the row is still a row that grows: the frame group is a constant
     // subtraction, not a cap.
@@ -1056,10 +1058,9 @@ describe("a note in the quick-capture window: the row is the window's title bar"
   it("charges the row for them, and demotes two verbs at the default 560px width", async () => {
     const resize = await openTitleBar();
 
-    // 800px, framed by a panel, promotes two (the suite above asserts it at
-    // exactly this width). A window costs 16px more than a panel — 88 for
-    // three controls against 72 for two — and 16px is not a verb, so the
-    // shape at 800 is the same: 800 - 160 - 8 - 90 - 8 - 88 - 8 = 438, less
+    // Capture has window controls but no navigation stack: 88px of frame and
+    // its seam, unlike the panel's two separate 72px groups. Its budget is
+    // 800 - 160 - 8 - 90 - 8 - 88 - 8 = 438, less
     // the 198 the leading control and the trigger reserve, buys the 108 and
     // the 100 but not the 74.
     resize(800);

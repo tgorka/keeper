@@ -60,21 +60,31 @@ import { NoteList } from "@/components/notes/note-list";
 import { type NotesEmptyKind, NotesEmptyState } from "@/components/notes/notes-empty-state";
 import { PhysicalTree } from "@/components/notes/physical-tree";
 import { SpaceList } from "@/components/notes/space-list";
+import { SpaceNamePopover } from "@/components/notes/space-name-popover";
 import { TagTree } from "@/components/notes/tag-tree";
 import { VaultSwitcher } from "@/components/notes/vault-switcher";
-import { createNote, saveFilterAsSpace, useNotesActions } from "@/hooks/use-notes-actions";
+import {
+  captureSpaceDraft,
+  createNote,
+  type SpaceSaveDraft,
+  saveFilterAsSpace,
+  useNotesActions,
+} from "@/hooks/use-notes-actions";
 import { useNotesChanges } from "@/hooks/use-notes-changes";
 import { countLabel, NOTES } from "@/lib/count-label";
-import type { NoteRowVm } from "@/lib/ipc/client";
+import type { NoteRowVm, NoteSpaceVm } from "@/lib/ipc/client";
 import { notesSubscribeSearch, notesUnsubscribeChanges } from "@/lib/ipc/client";
+import { ALL_SPACE_ID } from "@/lib/notes/all-spaces";
 import { columnFoldStore } from "@/lib/stores/column-fold";
 import {
   emptyFilterReason,
   hydrateHideServiceFiles,
+  hydrateIncludePrivate,
   isFiltered,
   isScopeOnly,
   notesFiltersStore,
   persistHideServiceFiles,
+  persistIncludePrivate,
   scopeLabel,
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
@@ -107,7 +117,7 @@ const NOTES_ACTION_FAILED = "keeper could not do that to this note.";
 export const NOTES_RAIL_LIST_LABEL = "Note list";
 
 /** The name a saved space gets when it is promoted from the chip bar. */
-export const UNTITLED_SPACE_NAME = "Saved filter";
+export const UNTITLED_SPACE_NAME = "Untitled space";
 
 /** The rail's create control, kept verbatim so a test names what a user reads. */
 export const NEW_NOTE_LABEL = "New note";
@@ -155,7 +165,8 @@ export function NotesPane() {
   const total = useNotesListStore((s) => s.total);
   const matched = useNotesListStore((s) => s.matched);
   const hidden = useNotesListStore((s) => s.hidden);
-  const count = `${countLabel(total, NOTES, { of: matched })}${hidden > 0 ? ` · ${hidden.toLocaleString()} hidden` : ""}`;
+  const privateCount = useNotesListStore((s) => s.private);
+  const count = `${countLabel(total, NOTES, { of: matched })}${hidden > 0 ? ` · ${hidden.toLocaleString()} hidden` : ""}${privateCount > 0 ? ` · ${privateCount.toLocaleString()} private` : ""}`;
   const loaded = useNotesListStore((s) => s.loaded);
   const searchError = useNotesListStore((s) => s.searchError);
   // Which rail sections are folded (Story 47.3). Read here so the folded
@@ -168,7 +179,15 @@ export function NotesPane() {
     return active.target?.kind === "note" ? active.target : null;
   });
   const actions = useNotesActions(activeVaultId);
-  const searchRef = useRef<HTMLInputElement | null>(null);
+  const searchRef = useRef<HTMLTextAreaElement | null>(null);
+  const [naming, setNaming] = useState<{
+    anchor: HTMLButtonElement;
+    name: string;
+    draft: SpaceSaveDraft;
+  } | null>(null);
+  const [savedSpace, setSavedSpace] = useState<{ vaultId: string; space: NoteSpaceVm } | null>(
+    null,
+  );
   // A verb's failure belongs to the surface that asked for it, so it is shown
   // here rather than swallowed or pushed into the read mirror.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -181,7 +200,7 @@ export function NotesPane() {
   // The row a confirmation is open for. The id alone, not the row: the list
   // re-streams constantly, and a held row object would keep a stale title on
   // screen while the dialog names what it is about to delete.
-  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<{ id: string; vaultId: string } | null>(null);
 
   useEffect(() => {
     void ensureNotesVaultsHydrated();
@@ -203,7 +222,7 @@ export function NotesPane() {
 
   useEffect(() => {
     let cancelled = false;
-    void hydrateHideServiceFiles()
+    void Promise.all([hydrateHideServiceFiles(), hydrateIncludePrivate()])
       .catch((error: unknown) => {
         if (!cancelled)
           setActionError(syncErrorMessage(error, "Could not restore service-file visibility."));
@@ -278,25 +297,25 @@ export function NotesPane() {
     [report],
   );
 
-  /**
-   * Promote the chip set to a space note (`⌘⇧S`, FR-105, UX-DR37).
-   *
-   * It is named from the chips rather than from a prompt, because nothing in
-   * this phase is a dialog (UX-DR35) and a space is an ordinary note — the name
-   * is a first line the user can change like any other. Asking for it up front
-   * would put a modal in front of a one-keystroke action, which is exactly the
-   * friction that stops people saving filters at all.
-   */
-  const onSaveAsSpace = useCallback(() => {
-    const parts = [
-      scope.kind === "all" ? null : scopeLabel(scope),
-      ...tagTerms.map((chip) => (chip.term === "exclude" ? `not ${chip.tag}` : chip.tag)),
-      agentOnly ? "Changed by agent" : null,
-      searchText.trim() === "" ? null : `"${searchText.trim()}"`,
-    ].filter((part): part is string => part !== null && part !== "");
-    const name = parts.length === 0 ? UNTITLED_SPACE_NAME : parts.join(" · ");
-    void saveFilterAsSpace(name).catch(report);
-  }, [scope, tagTerms, agentOnly, searchText, report]);
+  // AD-271 narrows the no-dialog rule: a non-modal naming popover captures
+  // this query once, and the acknowledged save refreshes the mounted rail.
+  const onSaveAsSpace = useCallback(
+    (trigger?: HTMLButtonElement) => {
+      const anchor =
+        trigger ?? document.querySelector<HTMLButtonElement>('button[aria-label="Save as space"]');
+      const draft = captureSpaceDraft();
+      if (anchor === null || draft === null) return;
+      const parts = [
+        scope.kind === "all" ? null : scopeLabel(scope),
+        ...tagTerms.map((chip) => (chip.term === "exclude" ? `not ${chip.tag}` : chip.tag)),
+        agentOnly ? "Changed by agent" : null,
+        searchText.trim() === "" ? null : `"${searchText.trim()}"`,
+      ].filter((part): part is string => part !== null && part !== "");
+      const name = parts.length === 0 ? UNTITLED_SPACE_NAME : parts.join(" · ");
+      setNaming({ anchor, name, draft });
+    },
+    [scope, tagTerms, agentOnly, searchText],
+  );
 
   // Two chords are scoped to this view by being mounted with it — nothing else
   // mounts this listener, so neither can fire from another surface.
@@ -337,32 +356,22 @@ export function NotesPane() {
    * (a double click is always preceded by a real single click, and `openPanel`
    * puts back what that click displaced).
    */
-  const openRow = useCallback(
-    (row: NoteRowVm) => {
-      if (activeVaultId !== null) {
-        panelsStore.getState().setActiveTarget({
-          kind: "note",
-          vaultId: activeVaultId,
-          noteId: row.id,
-        });
-      }
-    },
-    [activeVaultId],
-  );
+  const openRow = useCallback((row: NoteRowVm) => {
+    panelsStore.getState().setActiveTarget({
+      kind: "note",
+      vaultId: row.vaultId,
+      noteId: row.id,
+    });
+  }, []);
 
   /** Double click: open this note BESIDE what is already open (Story 46.12). */
-  const openRowBeside = useCallback(
-    (row: NoteRowVm) => {
-      if (activeVaultId !== null) {
-        panelsStore.getState().openPanel({
-          kind: "note",
-          vaultId: activeVaultId,
-          noteId: row.id,
-        });
-      }
-    },
-    [activeVaultId],
-  );
+  const openRowBeside = useCallback((row: NoteRowVm) => {
+    panelsStore.getState().openPanel({
+      kind: "note",
+      vaultId: row.vaultId,
+      noteId: row.id,
+    });
+  }, []);
 
   const runVerb = useCallback(
     (row: NoteRowVm, verb: "e" | "p" | "u" | "r" | "d") => {
@@ -370,7 +379,7 @@ export function NotesPane() {
       // is what acts — so it is handled here rather than joining the chain of
       // actions below, where every other entry runs on the keystroke.
       if (verb === "d") {
-        setDeletingId(row.id);
+        setDeletingId({ id: row.id, vaultId: row.vaultId });
         return;
       }
       const run =
@@ -402,8 +411,7 @@ export function NotesPane() {
   // the whole of "a vault switch is a filter" — and it is the panel list rather
   // than a cursor of this pane's own, so the Files surface and this one cannot
   // disagree about what is open (Story 45.1).
-  const openNoteId =
-    activeNote !== null && activeNote.vaultId === activeVaultId ? activeNote.noteId : null;
+  const openNoteId = activeNote?.noteId ?? null;
 
   // A cold scan in progress is why the list can be empty and the vault not be.
   const scanning = activeVault !== null && !activeVault.indexed;
@@ -617,7 +625,11 @@ export function NotesPane() {
                 container and everything in it stays reachable at every size
                 (AD-34-4). */}
             <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pt-1">
-              <SpaceList vaultId={activeVaultId} onNewNote={(space) => onCreate(space.id)} />
+              <SpaceList
+                vaultId={activeVaultId}
+                onNewNote={(space) => onCreate(space.id === ALL_SPACE_ID ? null : space.id)}
+                savedSpace={savedSpace?.vaultId === activeVaultId ? savedSpace.space : null}
+              />
               <TagTree vaultId={activeVaultId} />
               <PhysicalTree vaultId={activeVaultId} />
             </div>
@@ -686,9 +698,23 @@ export function NotesPane() {
                 {hidden > 0 && (
                   <span className="whitespace-nowrap">{` · ${hidden.toLocaleString()} hidden`}</span>
                 )}
+                {privateCount > 0 && (
+                  <span className="whitespace-nowrap">{` · ${privateCount.toLocaleString()} private`}</span>
+                )}
               </p>
             )}
-            {loaded && total === 0 && hidden > 0 ? (
+            {loaded && total === 0 && privateCount > 0 ? (
+              <div className="flex flex-col items-center gap-2 p-4 text-sm">
+                <p>Matching private notes are excluded from this search.</p>
+                <button
+                  type="button"
+                  className="underline"
+                  onClick={() => void persistIncludePrivate(true).catch(report)}
+                >
+                  Include private notes
+                </button>
+              </div>
+            ) : loaded && total === 0 && hidden > 0 ? (
               <div className="flex flex-col items-center gap-2 p-4 text-sm">
                 <p>Matching notes are hidden by the service-file preference.</p>
                 <button
@@ -706,6 +732,7 @@ export function NotesPane() {
                 rows={rows}
                 total={total}
                 selectedId={openNoteId}
+                selectedVaultId={activeNote?.vaultId ?? null}
                 onSelect={openRow}
                 onSelectBeside={openRowBeside}
                 onToggleTag={(tag) => notesFiltersStore.getState().cycleTag(tag)}
@@ -737,17 +764,28 @@ export function NotesPane() {
           told which note; now the panel holds the note and the rail filters the
           list. `NotePanelBody` says so out loud if the vault is actually gone. */}
       <PanelStrip emptySentence={NOTES_PANEL_EMPTY_SENTENCE} />
+      {naming !== null && (
+        <SpaceNamePopover
+          anchor={naming.anchor}
+          initialName={naming.name}
+          onClose={() => setNaming(null)}
+          onSave={async (name, options) => {
+            const saved = await saveFilterAsSpace(name, options, naming.draft);
+            if (saved !== null) setSavedSpace({ vaultId: naming.draft.vaultId, space: saved });
+          }}
+        />
+      )}
 
       {/* The list's `Delete` key, confirmed. The same dialog and the same
           command the editor's actions menu and the sidebar's space rows use:
           three doors, one removal (Story 45.17). Keyed on the id so pressing
           Delete on a second row after cancelling the first asks about the
           second rather than re-rendering the first's plan. */}
-      {activeVaultId !== null && deletingId !== null && (
+      {deletingId !== null && (
         <NoteDeleteDialog
-          key={deletingId}
-          vaultId={activeVaultId}
-          noteId={deletingId}
+          key={`${deletingId.vaultId}:${deletingId.id}`}
+          vaultId={deletingId.vaultId}
+          noteId={deletingId.id}
           onClose={() => setDeletingId(null)}
           // Nothing else to do: `deleteNote` closes any panel showing it, and
           // the list mirror is driven by the index, which the trash announced.

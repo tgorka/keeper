@@ -1378,6 +1378,19 @@ pub fn set_hide_service_files(data_dir: &Path, hidden: bool) -> Result<(), CoreE
     )
 }
 
+/// Private notes are withheld until the person explicitly includes them.
+pub fn get_include_private(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, "notes.include_private")?.as_deref() == Some("1"))
+}
+
+pub fn set_include_private(data_dir: &Path, include: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        "notes.include_private",
+        if include { "1" } else { "0" },
+    )
+}
+
 /// A configured provider's model, never a model downloaded by keeper (AD-264).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EmbeddingModel {

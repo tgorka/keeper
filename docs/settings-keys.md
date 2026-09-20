@@ -147,6 +147,7 @@ Not preferences. keeper writes these and reads them back, so a file entry would 
 | --- | --- | --- | --- |
 | `sdk_encryption` | boolean (`on`/`off`) | At-rest encryption posture for the local matrix-sdk store; absent means unchosen, which is what gates the first-run question. | the posture is keyed to a per-account passphrase in this machine's Keychain, so flipping it is a re-key of the local store, not a toggle |
 | `notes.hide_service_files` | boolean (`1`/`0`) | Whether the notes list is hiding service files. | it remembers the person's last choice in the notes list |
+| `notes.include_private` | boolean (`1`/`0`) | Whether the notes list includes private notes. | it remembers the person's last choice in the notes list |
 | `notes.embedding_model` | JSON | The provider and model chosen for meaning search; blank keeps search words-only. | the model is chosen from the configured providers in Settings |
 | `notes.capture_draft.<…>` | JSON | Per capture window: the note it holds and the body creation gave it. | it points at the note one live capture window is holding, and is cleared the moment that thought is filed |
 | `notes.capture_placement.<…>` | text | Per capture window: its remembered position and size, whether it floats above other applications, and whether the lock is on. | it is what a person last did to one capture window — dragged it, resized it, pinned it above other applications or locked it — rewritten on every dismissal |

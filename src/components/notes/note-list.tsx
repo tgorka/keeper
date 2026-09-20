@@ -63,10 +63,16 @@ const OVERSCAN = 8;
  */
 const GROW_THRESHOLD = 8;
 
+/** Note ids are scoped to a vault, including in a combined search result. */
+function noteRowKey(row: NoteRowVm): string {
+  return `${row.vaultId}:${row.id}`;
+}
+
 export function NoteList({
   rows,
   total,
   selectedId,
+  selectedVaultId = null,
   onSelect,
   onSelectBeside,
   onToggleTag,
@@ -77,6 +83,7 @@ export function NoteList({
   /** How many notes the filter matches in all, which may exceed `rows.length`. */
   total: number;
   selectedId: string | null;
+  selectedVaultId?: string | null;
   onSelect: (row: NoteRowVm) => void;
   /**
    * Double click: open this note beside what is already open (Story 46.12,
@@ -106,21 +113,32 @@ export function NoteList({
 
   // The roving keyboard cursor, kept apart from the open note on purpose: `↓`
   // must move the ring, not stream a body per row. `Enter` and a click are what
-  // open. Keyed by note id, so a re-ordered stream or a filter change moves the
+  // open. Keyed by vault and note id, so a re-ordered stream or a filter change moves the
   // row and leaves the cursor pointing at the same note — or at nothing, when
   // that note is no longer listed.
   const [focusedId, setFocusedId] = useState<string | null>(null);
-  const cursor = focusedId === null ? -1 : rows.findIndex((row) => row.id === focusedId);
+  const cursor = focusedId === null ? -1 : rows.findIndex((row) => noteRowKey(row) === focusedId);
   // The list always has exactly one tab stop: the cursor's row, or the open
   // note's, or the first. It is handed to the window as the row that must stay
   // mounted: unmount the tab stop and the list has no tab stop at all, and Tab
   // walks straight past the notes.
-  const openAt = selectedId === null ? -1 : rows.findIndex((row) => row.id === selectedId);
+  const openAt =
+    selectedId === null
+      ? -1
+      : rows.findIndex(
+          (row) =>
+            row.id === selectedId && (selectedVaultId === null || row.vaultId === selectedVaultId),
+        );
   const tabStop = cursor >= 0 ? cursor : openAt >= 0 ? openAt : 0;
 
-  // Keyed by note id so a re-ordered stream carries a row's measurement with it
-  // rather than leaving the previous row's geometry at that index.
-  const getKey = useCallback((index: number) => rows[index]?.id ?? String(index), [rows]);
+  // A combined query may contain the same note id in more than one vault.
+  const getKey = useCallback(
+    (index: number) => {
+      const row = rows[index];
+      return row === undefined ? String(index) : noteRowKey(row);
+    },
+    [rows],
+  );
   const list = useWindowedRows({
     count: rows.length,
     getKey,
@@ -131,9 +149,9 @@ export function NoteList({
     // the window's business at all: `↓` from the last visible row targets a row
     // that does not exist in the DOM yet.
     onReveal: (index) => {
-      const id = rows[index]?.id;
-      if (id !== undefined) {
-        rowRefs.current.get(id)?.focus();
+      const row = rows[index];
+      if (row !== undefined) {
+        rowRefs.current.get(noteRowKey(row))?.focus();
       }
     },
   });
@@ -151,7 +169,7 @@ export function NoteList({
     if (row === undefined) {
       return;
     }
-    setFocusedId(row.id);
+    setFocusedId(noteRowKey(row));
     list.reveal(index);
   };
 
@@ -220,20 +238,21 @@ export function NoteList({
           if (row === undefined) {
             return null;
           }
+          const key = noteRowKey(row);
           return (
-            <li key={row.id} {...list.rowProps(item)}>
+            <li key={key} {...list.rowProps(item)}>
               <NoteRow
                 ref={(element) => {
                   if (element === null) {
                     return;
                   }
-                  rowRefs.current.set(row.id, element);
+                  rowRefs.current.set(key, element);
                   return () => {
-                    rowRefs.current.delete(row.id);
+                    rowRefs.current.delete(key);
                   };
                 }}
                 row={row}
-                selected={row.id === selectedId}
+                selected={item.index === openAt}
                 tabIndex={tabStop === item.index ? 0 : -1}
                 canReveal={canReveal}
                 onSelect={onSelect}
