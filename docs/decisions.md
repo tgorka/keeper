@@ -1136,3 +1136,35 @@ files inside the hundred milliseconds a keystroke allows, and this is the answer
   and this entry says why).
 - **Status / owner:** decided. Owner is the architect; Epic 76 implements it; NFR-63…NFR-70
   are the bars, measured on hesperia before any story closes.
+
+## D-22 — A copy stays a job; two named options let it delete and refill, and the default is unchanged
+
+keeper's verified copy (epic 33, AD-C1) was written as a job, never a relationship: it walks
+a source once, moves the bytes, reports each file, and changes nothing about either folder
+afterwards. Epic 78 amends that sentence in place rather than quietly contradicting it. The
+owner asked for a copy that removes what the source no longer has, and for a say over whether
+a destination file he deleted comes back; the triage found that the second already depended,
+invisibly, on whether a ledger folder was configured.
+
+- **What changes:** `CopyOptions` gains `prune_destination` (default off) and `refresh_missing`
+  (default on). Pruning runs after the copy pass over the set of paths the plan walk already
+  saw, deletes only what that walk proved absent, and reports each file as `deleted`;
+  refilling examines a behind-the-mark source only when its destination file is missing.
+  Both are per-task columns, form controls, `task.toml` lines and daemon flags. (AD-282,
+  AD-286; FR-604…FR-606)
+- **Why the default stays a job:** AD-C1 was written against the tool that deletes the newer
+  file on the wrong side — the failure a person meets without having chosen it. A person who
+  turned on `prune_destination` on a form that says what it deletes has chosen it, and the
+  copy still remembers nothing but its mark: a prune is a job's last step, not a state.
+- **What it is not:** a mirror, a two-way sync, or a watch. The source is never written; no
+  journal is kept; the sync engine's stability gate is not shared (a five-minute lookback on
+  the mark answers the in-flight-write question for one subtraction). (AD-281; What stays out)
+- **The fact this makes visible:** with a ledger, a source behind the mark is not examined;
+  without one, every pass is full. `refresh_missing` names that so the answer no longer
+  depends on a `.keeper/keeper.toml` key nobody could see, and Settings now shows where the
+  ledger is. (AD-285)
+- **Revisit triggers:** the owner asking for the source side to change (that is sync, and
+  this entry says no); a measured pass where the per-file destination stat of
+  `refresh_missing` costs more than the hashing (DW-274).
+- **Status / owner:** decided. Owner is the architect; Epic 78 implements it; NFR-77 and
+  NFR-78 are the bars.
