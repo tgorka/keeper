@@ -269,3 +269,16 @@ development_status:
   77-7-transient-surfaces-wear-the-apps-colours-and-name-their-row: backlog
   77-8-navigation-leads-the-editor-and-carries-its-own-history: backlog
 ```
+
+## Coordinator amendments after the review wave (2026-09-20)
+
+Written here because the code shipped with them and a reader of the epic alone would otherwise be told the wrong thing.
+
+- **`depth` is the rail's indentation level, not a count of separators.** All notes = 0; the Temporary group = 1 (parent `keeper:all`); a temporary space = 2; a persistent root = 0; `Journal/Bali` = 1 under a `Journal` row at 0; Uncategorized = 0. Where the story prose said persistent roots sit at depth 1, the prose was wrong.
+- **Lifetimes are UTC.** The review found `expires_at` / `should_touch` / `expiry_phrase` called with the date-DSL clock (`local_now_ms`) while the sweep compared true UTC: east of UTC a space outlived its TTL, west of it a freshly parked 2 h search was already expired and was trashed within a minute. Every lifetime call site now uses UTC; `local_now_ms` stays for the DSL.
+- **A space restores a sort only when its file names one.** `sort::read("")` answers `DEFAULT_SORT`, so restoring it made every entered space an explicit `modified desc` override that killed relevance ranking and outlived the space. `restore.sort` is `None` for a space with no `sort:` key, and leaving a space clears the override.
+- **`includePrivate` and the selected drives are not part of what a space replaces.** Entering a space replaces the query — scope, chips, text, flags, sort — and nothing else. (FR-589's session-scoped privacy wins over the implementation contract's earlier "persisted like hideServiceFiles".)
+- **A parked search does not claim notes from Uncategorized.** `uncategorized_query` excludes temporary spaces; otherwise a 2 h parked search hid its own notes from Uncategorized until it expired.
+- **Expiry does not run on the phone tier.** It rides the reconciler's tick and the phone has no supervisor (Epic 66, NFR-57), so a temporary space made on a phone is reaped the next time a desktop syncs that vault — not never, and not on the phone. Stated rather than silently true.
+- **No second clock.** The first attempt at waking a multi-drive search on a secondary vault's change added a `tokio::time::interval`; `src/test/task-host-tick.test.ts` (AD-62) refused it, and the wake is now event-driven off the index watch receivers the subscription already holds.
+

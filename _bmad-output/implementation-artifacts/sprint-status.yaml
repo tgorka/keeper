@@ -48,6 +48,12 @@ tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 
 development_status:
+  # Stack (bottom → top), opened 2026-09-20 ready for review:
+  #   #375 epic7778/plan (docs only) → #376 epic77/notes (keeper-core + shell + React, epic 77)
+  #   → #377 epic78/tasks (keeper-sync + shell + daemon + React, epic 78).
+  # Every rung was gated alone: #376 passes cargo check/clippy/test over keeper-core+keeper-sync and
+  # the whole frontend suite in a scratch worktree; the shell crate in both feature rungs was written
+  # by inspection and is gated only by CI's macOS job. final_revision stamps land after the merge.
   # Epic 78: the copy-task half of the 2026-09-20 field report (items 24–33) — the wall-clock mark, two named options, a log that lists what changed, a run you can open, a settings section, daemon parity.
   # Stack publication is reserved for the coordinator by this checkout's rules.
   epic-78: backlog
