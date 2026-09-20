@@ -121,6 +121,8 @@ These are facts about one computer. A shared file that sets one of them is a nam
 | | | | | The OS-global voice accelerator that starts a turn; empty means unset. |
 | `notes.active_vault` | machine-local | text | *(absent)* | `"notes.active_vault" = "01J8Z5R0Q9WQ4C3S0PNK7T2A1B"` |
 | | | | | Which notes vault the notes surface is showing, as a sync-profile id. |
+| `tasks.ledger_vault` | machine-local | text | *(absent)* | `"tasks.ledger_vault" = "01J8Z5R0Q9WQ4C3S0PNK7T2A1B"` |
+| | | | | Which sync profile holds task ledgers; absent lets keeper choose. |
 | `recording.destination_dir` | machine-local | absolute path | *(absent)* | `"recording.destination_dir" = "/Users/tgorka/Movies/keeper"` |
 | | | | | Where recordings are written; absent means the shell's platform default. |
 | `recording.destination_profile_id` | machine-local | text | *(absent)* | `"recording.destination_profile_id" = "01J8Z5R0Q9WQ4C3S0PNK7T2A1B"` |
@@ -135,6 +137,7 @@ Why each one is refused from a shared file:
 - `hotkey.capture` — an OS-global accelerator is registered with this machine's window server, and two machines cannot agree on one that is free on both
 - `hotkey.voice` — an OS-global accelerator is registered with this machine's window server, and two machines cannot agree on one that is free on both
 - `notes.active_vault` — it names a row in this machine's sync.db, and the same folder is a different profile id on the other machine
+- `tasks.ledger_vault` — it names a row in this machine's sync.db, and the same folder is a different profile id on the other machine
 - `recording.destination_dir` — it is an absolute path, and /Volumes/merope/… does not exist on the other machine
 - `recording.destination_profile_id` — it names a row in this machine's sync.db, and the same folder is a different profile id on the other machine
 - `sync.git_path` — it is an absolute path to a binary, and /opt/homebrew/bin/git is not where git is on the other machine
@@ -147,6 +150,7 @@ Not preferences. keeper writes these and reads them back, so a file entry would 
 | --- | --- | --- | --- |
 | `sdk_encryption` | boolean (`on`/`off`) | At-rest encryption posture for the local matrix-sdk store; absent means unchosen, which is what gates the first-run question. | the posture is keyed to a per-account passphrase in this machine's Keychain, so flipping it is a re-key of the local store, not a toggle |
 | `notes.hide_service_files` | boolean (`1`/`0`) | Whether the notes list is hiding service files. | it remembers the person's last choice in the notes list |
+| `notes.include_private` | boolean (`1`/`0`) | Whether the notes list includes private notes. | it remembers the person's last choice in the notes list |
 | `notes.embedding_model` | JSON | The provider and model chosen for meaning search; blank keeps search words-only. | the model is chosen from the configured providers in Settings |
 | `notes.capture_draft.<…>` | JSON | Per capture window: the note it holds and the body creation gave it. | it points at the note one live capture window is holding, and is cleared the moment that thought is filed |
 | `notes.capture_placement.<…>` | text | Per capture window: its remembered position and size, whether it floats above other applications, and whether the lock is on. | it is what a person last did to one capture window — dragged it, resized it, pinned it above other applications or locked it — rewritten on every dismissal |

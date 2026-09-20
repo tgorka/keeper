@@ -33,8 +33,14 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
-import type { NoteQueryReq, NoteTagTerm } from "@/lib/ipc/client";
-import { notesHideServiceFilesGet, notesHideServiceFilesSet } from "@/lib/ipc/client";
+import type { NoteQueryReq, NoteSpaceVm, NoteTagTerm } from "@/lib/ipc/client";
+import {
+  notesHideServiceFilesGet,
+  notesHideServiceFilesSet,
+  notesIncludePrivateGet,
+  notesIncludePrivateSet,
+} from "@/lib/ipc/client";
+import { ALL_SPACE_ID } from "@/lib/notes/all-spaces";
 
 /**
  * What the list is scoped to — the sidebar row that is selected, or `all` when
@@ -71,7 +77,7 @@ export type NoteScope =
   | { readonly kind: "folder"; readonly path: string };
 
 /** The unscoped list — every note in the vault, in the vault's own order. */
-export const ALL_NOTES_SCOPE: NoteScope = { kind: "all" };
+export const ALL_NOTES_SCOPE = { kind: "all" } as const satisfies NoteScope;
 
 /** The chip label for a scope, as the bar renders it. */
 export function scopeLabel(scope: NoteScope): string {
@@ -182,6 +188,18 @@ export function withTagTerm(
   return [...chips, { tag, term }];
 }
 
+export type NoteSortChoice = {
+  key: "relevance" | "order" | "name" | "created" | "modified" | "recorded";
+  dir: "asc" | "desc";
+};
+
+/** The producer supplies canonical sort strings, never arbitrary frontmatter. */
+function restoredSort(value: string | null): NoteSortChoice | null {
+  if (value === null) return null;
+  const [key, dir] = value.split(" ");
+  return { key: key as NoteSortChoice["key"], dir: dir as NoteSortChoice["dir"] };
+}
+
 export interface NotesFiltersState {
   /** The selected sidebar scope; `all` when none is. */
   scope: NoteScope;
@@ -197,8 +215,23 @@ export interface NotesFiltersState {
   agentOnly: boolean;
   /** The "Pinned only" chip, independent of the Pinned scope row. */
   pinnedOnly: boolean;
+  flags: readonly string[];
+  origin: string | null;
+  setFlags: (flags: readonly string[]) => void;
+  setOrigin: (origin: string | null) => void;
   /** Global viewing preference, deliberately not a chip or space predicate. */
   hideServiceFiles: boolean;
+  sort: NoteSortChoice | null;
+  vaultIds: readonly string[];
+  includePrivate: boolean;
+  readonly enteredSpace: NoteSpaceVm | null;
+  spacesNonce: number;
+  setSort: (sort: NoteSortChoice | null) => void;
+  setVaultIds: (ids: readonly string[]) => void;
+  setIncludePrivate: (on: boolean) => void;
+  enterSpace: (space: NoteSpaceVm) => void;
+  mergeSpace: (space: NoteSpaceVm) => void;
+  requestSpacesReload: () => void;
   /**
    * A monotonic nonce bumped by the palette's Open Note… / Search Notes actions.
    * The search field's DOM node belongs to the pane that renders it, so rather
@@ -208,7 +241,7 @@ export interface NotesFiltersState {
    */
   searchNonce: number;
   /** Select a scope. Selecting the active one again clears it back to `all`. */
-  setScope: (scope: NoteScope) => void;
+  setScope: (scope: Exclude<NoteScope, { kind: "space" }>) => void;
   /**
    * Advance one tag chip: off → include → exclude → off. A chip that reaches
    * `off` leaves the array, so the bar shows exactly the terms that are doing
@@ -291,6 +324,42 @@ export function persistHideServiceFiles(hidden: boolean): Promise<void> {
   return write;
 }
 
+let privateRevision = 0;
+let acknowledgedPrivate = false;
+let privateWrites: Promise<void> = Promise.resolve();
+let privateHydration: Promise<void> | null = null;
+
+export function hydrateIncludePrivate(): Promise<void> {
+  privateHydration ??= (async () => {
+    const revision = privateRevision;
+    await privateWrites;
+    const value = await notesIncludePrivateGet();
+    if (revision === privateRevision) {
+      acknowledgedPrivate = value;
+      notesFiltersStore.getState().setIncludePrivate(value);
+    }
+  })();
+  return privateHydration;
+}
+
+export function persistIncludePrivate(value: boolean): Promise<void> {
+  notesFiltersStore.getState().setIncludePrivate(value);
+  const revision = privateRevision;
+  const write = privateWrites.then(async () => {
+    try {
+      await notesIncludePrivateSet(value);
+      acknowledgedPrivate = value;
+    } catch (error) {
+      if (revision === privateRevision) {
+        notesFiltersStore.getState().setIncludePrivate(acknowledgedPrivate);
+      }
+      throw error;
+    }
+  });
+  privateWrites = write.catch(() => {});
+  return write;
+}
+
 /** The vanilla store instance, created once at module load and shared app-wide. */
 export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
   scope: ALL_NOTES_SCOPE,
@@ -298,11 +367,88 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
   text: "",
   agentOnly: false,
   pinnedOnly: false,
+  flags: [],
+  origin: null,
+  setFlags: (flags) => set({ flags, pinnedOnly: flags.includes("pinned") }),
+  setOrigin: (origin) => set({ origin, agentOnly: origin === "agent" }),
   hideServiceFiles: true,
+  sort: null,
+  vaultIds: [],
+  includePrivate: false,
+  enteredSpace: null,
+  spacesNonce: 0,
+  setSort: (sort) => set({ sort }),
+  setVaultIds: (vaultIds) => set({ vaultIds: [...new Set(vaultIds)] }),
+  setIncludePrivate: (includePrivate) => {
+    privateRevision += 1;
+    set({ includePrivate });
+  },
+  enterSpace: (space) => {
+    if (space.id === ALL_SPACE_ID) {
+      set({
+        enteredSpace: null,
+        scope: ALL_NOTES_SCOPE,
+        tagTerms: [],
+        flags: [],
+        origin: null,
+        text: "",
+        agentOnly: false,
+        pinnedOnly: false,
+        sort: null,
+      });
+      return;
+    }
+    const restore = space.restore;
+    set({
+      enteredSpace: space,
+      scope: { kind: "space", id: space.id, name: space.name, defaultKey: space.defaultKey },
+      tagTerms: restore.opaque
+        ? []
+        : Object.entries(restore.tagTerms).map(([tag, term]) => ({ tag, term })),
+      text: restore.opaque ? "" : (restore.text ?? ""),
+      agentOnly: !restore.opaque && restore.origin === "agent",
+      pinnedOnly: !restore.opaque && restore.flags.includes("pinned"),
+      flags: restore.opaque ? [] : restore.flags,
+      origin: restore.opaque ? null : restore.origin,
+      sort: restore.opaque ? null : restoredSort(restore.sort),
+    });
+  },
+  mergeSpace: (space) => {
+    const restore = space.restore;
+    if (restore.opaque) throw new Error("This space's search can't be combined — open it instead.");
+    set((state) => {
+      const incoming = Object.entries(restore.tagTerms);
+      if (
+        incoming.some(([tag, term]) =>
+          state.tagTerms.some((chip) => chip.tag === tag && chip.term !== term),
+        )
+      ) {
+        throw new Error(
+          "These searches use opposite filters for the same tag — open the space instead.",
+        );
+      }
+      if (state.origin && restore.origin && state.origin !== restore.origin) {
+        throw new Error("These searches use different origins — open the space instead.");
+      }
+      return {
+        tagTerms: incoming.reduce<readonly TagChip[]>(
+          (chips, [tag, term]) => withTagTerm(chips, tag, term),
+          state.tagTerms,
+        ),
+        agentOnly: state.agentOnly || restore.origin === "agent",
+        pinnedOnly: state.pinnedOnly || restore.flags.includes("pinned"),
+        flags: [...new Set([...state.flags, ...restore.flags])],
+        origin: state.origin ?? restore.origin,
+      };
+    });
+  },
+  requestSpacesReload: () => set((state) => ({ spacesNonce: state.spacesNonce + 1 })),
   searchNonce: 0,
   setScope: (scope) =>
     set((state) => ({
       scope: sameScope(state.scope, scope) ? ALL_NOTES_SCOPE : scope,
+      sort: null,
+      enteredSpace: null,
     })),
   cycleTag: (tag) =>
     set((state) => ({
@@ -315,8 +461,14 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
   setTagTerm: (tag, term) => set((state) => ({ tagTerms: withTagTerm(state.tagTerms, tag, term) })),
   removeTag: (tag) => set((state) => ({ tagTerms: withTagTerm(state.tagTerms, tag, "off") })),
   setText: (text) => set({ text }),
-  setAgentOnly: (agentOnly) => set({ agentOnly }),
-  setPinnedOnly: (pinnedOnly) => set({ pinnedOnly }),
+  setAgentOnly: (agentOnly) => set({ agentOnly, origin: agentOnly ? "agent" : null }),
+  setPinnedOnly: (pinnedOnly) =>
+    set((state) => ({
+      pinnedOnly,
+      flags: pinnedOnly
+        ? [...new Set([...state.flags, "pinned"])]
+        : state.flags.filter((flag) => flag !== "pinned"),
+    })),
   setHideServiceFiles: (hideServiceFiles) => {
     visibilityRevision += 1;
     set({ hideServiceFiles });
@@ -324,21 +476,34 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
   dropLastChip: () =>
     set((state) => {
       if (state.pinnedOnly) {
-        return { pinnedOnly: false };
+        return { pinnedOnly: false, flags: state.flags.filter((flag) => flag !== "pinned") };
       }
       if (state.agentOnly) {
-        return { agentOnly: false };
+        return { agentOnly: false, origin: null };
       }
+      if (state.origin) return { origin: null };
+      if (state.flags.length) return { flags: state.flags.slice(0, -1) };
       if (state.tagTerms.length > 0) {
         return { tagTerms: state.tagTerms.slice(0, -1) };
       }
       if (state.scope.kind !== "all") {
-        return { scope: ALL_NOTES_SCOPE };
+        return { scope: ALL_NOTES_SCOPE, sort: null, enteredSpace: null };
       }
       return {};
     }),
   clearAll: () =>
-    set({ scope: ALL_NOTES_SCOPE, tagTerms: [], text: "", agentOnly: false, pinnedOnly: false }),
+    set({
+      scope: ALL_NOTES_SCOPE,
+      tagTerms: [],
+      text: "",
+      agentOnly: false,
+      pinnedOnly: false,
+      flags: [],
+      origin: null,
+      sort: null,
+      vaultIds: [],
+      enteredSpace: null,
+    }),
   requestSearchFocus: () => set((state) => ({ searchNonce: state.searchNonce + 1 })),
 }));
 
@@ -353,7 +518,9 @@ export function isFiltered(state: NotesFiltersState): boolean {
     state.tagTerms.length > 0 ||
     state.text.trim() !== "" ||
     state.agentOnly ||
-    state.pinnedOnly
+    state.pinnedOnly ||
+    state.flags.length > 0 ||
+    state.origin !== null
   );
 }
 
@@ -368,7 +535,13 @@ export function isFiltered(state: NotesFiltersState): boolean {
  */
 export function isScopeOnly(state: NotesFiltersState): boolean {
   return (
-    state.tagTerms.length === 0 && state.text.trim() === "" && !state.agentOnly && !state.pinnedOnly
+    state.tagTerms.length === 0 &&
+    state.text.trim() === "" &&
+    !state.agentOnly &&
+    !state.pinnedOnly &&
+    state.flags.length === 0 &&
+    state.origin === null &&
+    state.vaultIds.length === 0
   );
 }
 
@@ -392,8 +565,8 @@ export function noteQueryFor(
   offset: number,
   limit: number,
 ): NoteQueryReq {
-  const flags: string[] = [];
-  if (state.pinnedOnly) {
+  const flags = [...state.flags];
+  if (state.pinnedOnly && !flags.includes("pinned")) {
     flags.push("pinned");
   }
   const text = state.text.trim();
@@ -403,10 +576,17 @@ export function noteQueryFor(
     // same thing the three-state chip guarantees at this end (FR-148).
     tags: Object.fromEntries(state.tagTerms.map((chip) => [chip.tag, chip.term])),
     spaceId: state.scope.kind === "space" ? state.scope.id : null,
+    spaceTerms:
+      state.scope.kind !== "space" ||
+      state.enteredSpace?.id !== state.scope.id ||
+      state.enteredSpace.restore.opaque,
     // The DSL's origin vocabulary: `agent` is a commit whose `Keeper-Source` is
     // `bot`. There is one chip because there is one question people ask of it.
-    origin: state.agentOnly ? "agent" : null,
+    origin: state.origin ?? (state.agentOnly ? "agent" : null),
     hideServiceFiles: state.hideServiceFiles,
+    sort: state.sort ? `${state.sort.key} ${state.sort.dir}` : null,
+    vaultIds: [...state.vaultIds],
+    includePrivate: state.includePrivate,
     flags,
     offset,
     limit,
@@ -436,6 +616,8 @@ export function emptyFilterReason(state: NotesFiltersState): string | null {
     ...state.tagTerms.map((chip) => (chip.term === "exclude" ? `not ${chip.tag}` : chip.tag)),
     state.agentOnly ? "changed by agent" : null,
     state.pinnedOnly ? "pinned only" : null,
+    ...state.flags.filter((flag) => flag !== "pinned").map((flag) => `is:${flag}`),
+    state.origin && state.origin !== "agent" ? `origin:${state.origin}` : null,
     state.text.trim() === "" ? null : `"${state.text.trim()}"`,
   ].filter((term): term is string => term !== null);
   if (terms.length === 0) {
@@ -476,6 +658,10 @@ export function useNotesFiltersStore<T>(selector: (state: NotesFiltersState) => 
 export function resetNotesFiltersStoreForTest(): void {
   notesFiltersStore.getState().clearAll();
   notesFiltersStore.getState().setHideServiceFiles(true);
+  notesFiltersStore.getState().setIncludePrivate(false);
+  acknowledgedPrivate = false;
+  privateWrites = Promise.resolve();
+  privateHydration = null;
   acknowledgedVisibility = true;
   visibilityWrites = Promise.resolve();
   visibilityHydration = null;

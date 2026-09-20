@@ -615,6 +615,14 @@ pub enum TaskCommand {
     /// afresh rather than firing a window that fell into the past while it was
     /// out of service.
     Set(TaskSetArgs),
+    /// Show or choose the machine-local folder holding task ledgers.
+    Ledger {
+        #[arg(value_name = "SEL", conflicts_with = "none")]
+        profile: Option<String>,
+        /// Clear the choice and let keeper use the first flagged folder.
+        #[arg(long)]
+        none: bool,
+    },
     /// Make one or more tasks live again, leaving their mode and schedule
     /// exactly as they are.
     ///
@@ -723,6 +731,20 @@ pub struct TaskSetArgs {
     /// Replace differing destination files only after verification.
     #[arg(long)]
     pub replace_existing: Option<bool>,
+    /// Remove destination files whose source no longer exists.
+    #[arg(long)]
+    pub prune_destination: Option<bool>,
+    /// Refill missing destination files, even behind the mark (default).
+    #[arg(long, conflicts_with = "no_refresh_missing")]
+    pub refresh_missing: bool,
+    #[arg(long)]
+    pub no_refresh_missing: bool,
+    /// Overlap behind the mark: 5m (300000 ms) by default, 1h or plain milliseconds.
+    #[arg(long, value_name = "DURATION", value_parser = parse_copy_lookback, allow_hyphen_values = true)]
+    pub copy_lookback: Option<i64>,
+    /// Restore the default five-minute overlap.
+    #[arg(long, conflicts_with = "copy_lookback")]
+    pub no_copy_lookback: bool,
     /// What to do about a window that fell due while nobody was home:
     /// `run-now`, `delay` or `skip`.
     ///
@@ -1190,6 +1212,9 @@ pub async fn run(
                     cmd_task_run(&printer, &engine, now_ms, &task, driver).await
                 }
                 TaskCommand::Set(args) => cmd_task_set(&printer, &engine, now_ms, &args),
+                TaskCommand::Ledger { profile, none } => {
+                    cmd_tasks_ledger(&printer, &engine, profile.as_deref(), none)
+                }
                 TaskCommand::Enable { task } => {
                     cmd_task_set_enabled(&printer, &engine, now_ms, &task, true)
                 }
@@ -3546,6 +3571,12 @@ fn task_lines(now_ms: i64, views: &[TaskView<'_>], unknown: &[UnknownTask]) -> V
         if let Some(description) = task_description_text(task) {
             lines.push(format!("  name: {description}"));
         }
+        if task.kind == TaskKind::Copy {
+            lines.push(format!(
+                "  Remove destination files whose source is gone: {}; Refill missing destination files: {}; Look back: {} ms",
+                task.prune_destination, task.refresh_missing, task.copy_lookback_ms,
+            ));
+        }
         lines.push(match view.last {
             Some(run) => format!(
                 "  last: {outcome}  {when}{detail}",
@@ -3660,7 +3691,7 @@ fn task_json(
     profile_name: Option<&str>,
     last: Option<&TaskRunRow>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut document = serde_json::json!({
         "id": task.id,
         "kind": task.kind.as_str(),
         "mode": task.mode.as_str(),
@@ -3675,7 +3706,16 @@ fn task_json(
         "onMissed": task.on_missed.as_str(),
         "missedDelayMs": task.missed_delay_ms,
         "lastRun": last.map(task_run_json),
-    })
+    });
+    if task.kind == TaskKind::Copy {
+        document["copySource"] = serde_json::json!(task.copy_source);
+        document["copyDestination"] = serde_json::json!(task.copy_destination);
+        document["replaceExisting"] = serde_json::json!(task.replace_existing);
+        document["pruneDestination"] = serde_json::json!(task.prune_destination);
+        document["refreshMissing"] = serde_json::json!(task.refresh_missing);
+        document["copyLookbackMs"] = serde_json::json!(task.copy_lookback_ms);
+    }
+    document
 }
 
 /// One recorded run as the `--json` document carries it.
@@ -4188,9 +4228,87 @@ fn cmd_task_set(
         replace_existing: args
             .replace_existing
             .unwrap_or_else(|| existing.is_some_and(|row| row.replace_existing)),
+        prune_destination: args
+            .prune_destination
+            .unwrap_or_else(|| existing.is_some_and(|row| row.prune_destination)),
+        refresh_missing: if args.no_refresh_missing {
+            false
+        } else if args.refresh_missing {
+            true
+        } else {
+            existing.is_none_or(|row| row.refresh_missing)
+        },
+        copy_lookback_ms: if args.no_copy_lookback {
+            keeper_sync::tasks::COPY_LOOKBACK_DEFAULT_MS
+        } else {
+            args.copy_lookback
+                .or_else(|| existing.map(|row| row.copy_lookback_ms))
+                .unwrap_or(keeper_sync::tasks::COPY_LOOKBACK_DEFAULT_MS)
+        },
     };
     engine.save_task(&row, None)?;
     report_task(printer, engine, now_ms, &row.id)
+}
+
+fn parse_copy_lookback(value: &str) -> std::result::Result<i64, String> {
+    let (number, factor) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60_000)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3_600_000)
+    } else if let Some(number) = value.strip_suffix('d') {
+        (number, 86_400_000)
+    } else {
+        (value, 1)
+    };
+    let count = number.parse::<i64>().map_err(|_| {
+        format!("Copy lookback must be a duration such as 5m, 1h or milliseconds, got {value:?}.")
+    })?;
+    let milliseconds = count.saturating_mul(factor);
+    keeper_sync::tasks::validate_copy_lookback_ms(milliseconds).map_err(|err| err.to_string())?;
+    Ok(milliseconds)
+}
+
+fn cmd_tasks_ledger(
+    printer: &Printer,
+    engine: &Engine,
+    wanted: Option<&str>,
+    clear: bool,
+) -> std::result::Result<u8, CliError> {
+    if clear {
+        engine.set_ledger_profile(None)?;
+    } else if let Some(wanted) = wanted {
+        let profiles = engine.list_profiles()?;
+        let matched = select(&profiles, Some(wanted))?;
+        let [profile] = matched[..] else {
+            return Err(SyncError::Config(format!(
+                "Choose one ledger folder by its id; {wanted:?} matches {} folders.",
+                matched.len()
+            ))
+            .into());
+        };
+        engine.set_ledger_profile(Some(profile.id.clone()))?;
+    }
+    let chosen = engine.ledger_profile()?;
+    let resolved = engine.tasks_ledger()?;
+    let root = resolved.as_ref().map(|(profile, subfolder)| {
+        profile
+            .local_path
+            .join(subfolder)
+            .to_string_lossy()
+            .into_owned()
+    });
+    printer.line(match &root {
+        Some(root) => format!("Task ledgers: {root}"),
+        None => "No folder is configured to hold task ledgers.".to_owned(),
+    });
+    printer.json(&serde_json::json!({
+        "chosenProfileId": chosen,
+        "resolvedProfileId": resolved.as_ref().map(|(profile, _)| &profile.id),
+        "root": root,
+    }));
+    Ok(EXIT_OK)
 }
 
 /// Which batched verb is speaking, so a receipt renders the words that verb has
@@ -4785,6 +4903,7 @@ mod tests {
             format!("runs it {delay_minutes} minutes after a host noticed it"),
             format!("Defaults to {delay_minutes} minutes"),
             format!("At least {grace_minutes} minutes"),
+            format!("{} ms", keeper_sync::tasks::COPY_LOOKBACK_DEFAULT_MS),
         ] {
             assert!(
                 help.contains(&expected),
@@ -6207,6 +6326,9 @@ mod tests {
             copy_source: None,
             copy_destination: None,
             replace_existing: false,
+            prune_destination: false,
+            refresh_missing: true,
+            copy_lookback_ms: keeper_sync::tasks::COPY_LOOKBACK_DEFAULT_MS,
         }
     }
 
@@ -6225,6 +6347,7 @@ mod tests {
             trigger: Some(keeper_sync::ledger::RunTrigger::Scheduled),
             late_by_ms: Some(0),
             host: "server-a".to_owned(),
+            ledger_entry: None,
         }
     }
 
@@ -6248,6 +6371,11 @@ mod tests {
             copy_source: None,
             copy_destination: None,
             replace_existing: None,
+            prune_destination: None,
+            refresh_missing: false,
+            no_refresh_missing: false,
+            copy_lookback: None,
+            no_copy_lookback: false,
             description: None,
             no_description: false,
         }
@@ -7383,6 +7511,95 @@ mod tests {
         let row = select_task(&listing, "repack-nightly").expect("stored");
         assert_eq!(row.kind, TaskKind::Gc);
         assert_eq!(row.profile_id.as_deref(), Some("01DOCS"));
+    }
+
+    #[test]
+    fn copy_flags_reach_the_store_and_cover_every_copy_option() {
+        use keeper_sync::copy::CopyOptions;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let platform = Arc::new(keeper_sync::platform::TestPlatform::new(dir.path()));
+        // A box with no usable git cannot open an engine; that is not this test's claim.
+        let Ok(engine) = Engine::open(platform as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        std::fs::create_dir(&source).expect("source");
+        let cli = parse(&[
+            "keeper-syncd",
+            "tasks",
+            "set",
+            "copy",
+            "--kind",
+            "copy",
+            "--copy-source",
+            source.to_str().expect("source path"),
+            "--copy-destination",
+            destination.to_str().expect("destination path"),
+            "--replace-existing",
+            "true",
+            "--prune-destination",
+            "true",
+            "--no-refresh-missing",
+            "--copy-lookback",
+            "1h",
+        ])
+        .expect("copy flags");
+        let Command::Tasks {
+            command: TaskCommand::Set(args),
+        } = cli.command
+        else {
+            panic!("tasks set");
+        };
+        let printer = Printer::new(false);
+        cmd_task_set(&printer, &engine, 1, &args).expect("save");
+        cmd_task_set(&printer, &engine, 2, &set_args("copy")).expect("keep omitted values");
+        let listing = engine.tasks().expect("tasks");
+        let row = select_task(&listing, "copy").expect("copy");
+        let options = CopyOptions {
+            replace_existing: row.replace_existing,
+            modified_since_ms: None,
+            prune_destination: row.prune_destination,
+            refresh_missing: row.refresh_missing,
+        };
+        // Intentionally no rest pattern: adding a CopyOptions field must fail compilation.
+        let CopyOptions {
+            replace_existing,
+            modified_since_ms,
+            prune_destination,
+            refresh_missing,
+        } = options;
+        assert!(replace_existing);
+        assert!(prune_destination);
+        assert!(!refresh_missing);
+        // No flag sets this: the engine derives it from the mark and lookback.
+        assert_eq!(modified_since_ms, None);
+        assert_eq!(row.copy_lookback_ms, 3_600_000);
+        let mut reset = set_args("copy");
+        reset.refresh_missing = true;
+        reset.prune_destination = Some(false);
+        reset.no_copy_lookback = true;
+        cmd_task_set(&printer, &engine, 3, &reset).expect("reset");
+        let listing = engine.tasks().expect("tasks");
+        let row = select_task(&listing, "copy").expect("copy");
+        assert!(row.refresh_missing);
+        assert!(!row.prune_destination);
+        assert_eq!(
+            row.copy_lookback_ms,
+            keeper_sync::tasks::COPY_LOOKBACK_DEFAULT_MS
+        );
+    }
+
+    #[test]
+    fn copy_lookback_flags_accept_units_and_refuse_out_of_range_durations() {
+        for value in ["5m", "300000", "300000ms"] {
+            assert_eq!(parse_copy_lookback(value).expect("duration"), 300_000);
+        }
+        for value in ["-1", "400d"] {
+            let error = parse_copy_lookback(value).expect_err("out of range");
+            assert!(error.contains("Copy lookback must be between"));
+            assert!(error.ends_with('.'));
+        }
     }
 
     /// `--on-missed` is writable from the CLI, keeps its stored value when

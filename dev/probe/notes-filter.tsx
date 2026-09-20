@@ -45,7 +45,7 @@ if (fixture === "long" || fixture === "many") {
 if (fixture === "many") {
   for (let index = 0; index < 30; index += 1) filters.setTagTerm(`tag-${index}`, "include");
 }
-const searchRef = createRef<HTMLInputElement>();
+const searchRef = createRef<HTMLTextAreaElement>();
 let saves = 0;
 ReactDOM.createRoot(root).render(
   <NoteFilterBar

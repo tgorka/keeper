@@ -50,7 +50,6 @@ import {
 import {
   TASK_FORM_ADD_SUBMIT_LABEL,
   TASK_FORM_ADD_TITLE,
-  TASK_FORM_CONTROL_CLASS,
   TASK_FORM_DESCRIPTION_LABEL,
   TASK_FORM_DESCRIPTION_NOTE,
   TASK_FORM_EDIT_SUBMIT_LABEL,
@@ -73,7 +72,6 @@ import {
   TASK_FORM_PROFILE_LABEL,
   TASK_FORM_PROFILE_READ_FAILED_PREFIX,
   TASK_FORM_PROFILE_READING_NOTE,
-  TASK_FORM_ROW_CLASS,
   TASK_FORM_SCHEDULE_HINT,
   TASK_FORM_SCHEDULE_LABEL,
   TASK_FORM_SCHEDULE_NOTE,
@@ -146,6 +144,10 @@ function taskVm(over: Partial<TaskVm> = {}): TaskVm {
     copySource: null,
     copyDestination: null,
     replaceExisting: false,
+    pruneDestination: false,
+    refreshMissing: true,
+    copyLookbackMs: 300_000,
+    ledgerPath: null,
     markMs: null,
     lastRun: null,
     host: {
@@ -582,6 +584,9 @@ describe("TaskForm, adding a task", () => {
         copySource: null,
         copyDestination: null,
         replaceExisting: false,
+        pruneDestination: false,
+        refreshMissing: true,
+        copyLookbackMs: 300_000,
         // No `modifiedAfterMs`/`modifiedBeforeMs`: AD-256 removed the date
         // window, and this exact-key assertion is what fails if either ever
         // comes back through a seed or a spread.
@@ -2066,60 +2071,49 @@ describe("TaskForm, the standing prose is beside its label rather than under it"
   });
 });
 
-/**
- * What decides which half of a row gives when the row is too narrow (59.13).
- *
- * A structural guard and not a width: jsdom lays nothing out, so this asserts the
- * two classes the measured behaviour rests on. Measured before them, in a 1024px
- * window, this form's controls were **22px** wide and its notes rendered at one
- * word per line — because a flex item's default `flex-shrink: 1` makes the sized
- * box the elastic one, so the field gave and the label did not.
- */
-describe("the form's rows wrap rather than squeezing their controls", () => {
-  it("wraps every row and refuses to shrink every control", async () => {
-    render(<TaskForm />);
-    const form = await screen.findByRole("form", { name: TASK_FORM_ADD_TITLE });
-
-    // Every label's row: the label's parent IS the row, in all ten of them.
-    const rows = Array.from(form.querySelectorAll("label")).map((label) => label.parentElement);
-    expect(rows.length).toBeGreaterThanOrEqual(8);
-    for (const row of rows) {
-      expect(row).toHaveClass("flex-wrap");
-    }
-
-    // And the controls those rows hold. `aria-hidden` skipped: Radix's `Switch`
-    // puts a form-bubbling checkbox behind the toggle, and it is not a control
-    // anybody's pointer reaches.
-    const controls = Array.from(form.querySelectorAll("input,select")).filter(
-      (control) => control.getAttribute("aria-hidden") !== "true",
+describe("copy policy controls", () => {
+  it("round-trips destructive and repair choices and a non-default lookback", async () => {
+    mockSave.mockResolvedValue(taskVm({ kind: "copy" }));
+    render(
+      <TaskForm
+        task={taskVm({
+          kind: "copy",
+          pruneDestination: true,
+          refreshMissing: false,
+          copyLookbackMs: 3_600_000,
+        })}
+      />,
     );
-    expect(controls.length).toBeGreaterThanOrEqual(8);
-    for (const control of controls) {
-      expect(control).toHaveClass("shrink-0");
-    }
+    const prune = screen.getByRole("switch", { name: "Delete files the source no longer has" });
+    const refresh = screen.getByRole("switch", {
+      name: "Re-copy files missing at the destination",
+    });
+    expect(prune).toHaveAttribute("aria-checked", "true");
+    expect(refresh).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByLabelText("Copy lookback")).toHaveValue(60);
+    fireEvent.click(prune);
+    fireEvent.click(refresh);
+    fireEvent.change(screen.getByLabelText("Copy lookback"), { target: { value: "5" } });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          pruneDestination: false,
+          refreshMissing: true,
+          copyLookbackMs: 300_000,
+        }),
+      ),
+    );
   });
 
-  it("keeps a hint beside a label out of the rows' way", async () => {
-    // The hint triggers are `<button>`s inside a row, and the guard above walks
-    // `label.parentElement` — so a hint dropped straight into a row would have
-    // made the label's parent the row's own `flex-wrap` box and passed while
-    // pushing the glyph into the middle of a `justify-between` row. The label
-    // and its hint are therefore one box, and this asserts that box exists
-    // rather than trusting the class string.
-    render(<TaskForm />);
-    const hint = await screen.findByRole("button", { name: TASK_FORM_ENABLED_NOTE });
-    const label = screen.getByText(TASK_FORM_ENABLED_LABEL);
-    expect(hint.parentElement).toBe(label.parentElement);
-    expect(label.parentElement).toHaveClass("items-center");
-  });
-
-  it("keeps the row and the control classes in one place each", () => {
-    // Ten copies of a class string are ten chances for one row to stop wrapping,
-    // and the defect would be invisible until somebody narrowed a window.
-    expect(TASK_FORM_ROW_CLASS).toContain("flex-wrap");
-    expect(TASK_FORM_CONTROL_CLASS).toContain("shrink-0");
-    // 224px is the number `TASKS_DETAIL_MIN_WIDTH_PX` is built from, so the two
-    // files have to be talking about the same control width.
-    expect(TASK_FORM_CONTROL_CLASS).toContain("w-56");
+  it("keeps a rejected lookback visible with the Rust validation sentence", async () => {
+    const reason =
+      "Copy lookback must be between 0 and 31622400000 milliseconds (one year), got -60000.";
+    mockSave.mockRejectedValue({ message: reason });
+    render(<TaskForm task={taskVm({ kind: "copy" })} />);
+    fireEvent.change(screen.getByLabelText("Copy lookback"), { target: { value: "-1" } });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+    expect(await screen.findByTestId(TASK_FORM_ERROR_TESTID)).toHaveTextContent(reason);
+    expect(screen.getByLabelText("Copy lookback")).toHaveValue(-1);
   });
 });

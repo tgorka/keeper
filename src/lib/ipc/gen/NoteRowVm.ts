@@ -9,7 +9,7 @@ import type { NoteOrder } from "./NoteOrder";
  * touches no filesystem: the snippet is pre-extracted and the flags are
  * index-computed.
  */
-export type NoteRowVm = { 
+export type NoteRowVm = { vaultId: string, 
 /**
  * The note's stable id, which survives renames (FR-97).
  */

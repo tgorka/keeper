@@ -76,6 +76,7 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import { MENU_TARGET_RING, useMenuTarget } from "@/components/ui/menu-target";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { HoverHint } from "@/components/ui/tooltip";
 import { useLongPress } from "@/hooks/use-long-press";
@@ -221,6 +222,7 @@ export function NoteRow({
   // dispatches the synthetic `contextmenu` the Radix trigger is already
   // listening for. Off the phone tier every handler is a no-op.
   const longPress = useLongPress();
+  const menuTarget = useMenuTarget();
   const visibleTags = row.hit ? 0 : VISIBLE_TAGS;
   const shownTags = row.tags.slice(0, visibleTags);
   const hiddenTags = row.tags.slice(visibleTags);
@@ -230,7 +232,7 @@ export function NoteRow({
   const label = [
     "Note",
     row.title,
-    row.unread ? "unread" : null,
+    row.unread ? "unread" : "read",
     row.unread && row.origin !== "" ? row.origin : null,
     row.conflict ? "conflicted" : null,
     row.pinned ? "pinned" : null,
@@ -252,6 +254,7 @@ export function NoteRow({
       data-unread={row.unread ? "true" : undefined}
       data-conflict={row.conflict ? "true" : undefined}
       {...longPress}
+      {...menuTarget.rowProps(row.id)}
       onClick={() => onSelect(row)}
       // Story 46.12: the Files tree's pair. The single click that necessarily
       // preceded this one is undone by the panel store, so the note that was
@@ -265,7 +268,8 @@ export function NoteRow({
         // nowhere in particular. Centred, the slack is equal above and below
         // and the boundary falls in the middle of a measurable gap — which is
         // how the chat list, the recordings list and the Files tree all read.
-        "flex h-16 w-full items-center gap-2 px-3 py-2 text-left outline-none",
+        "flex h-16 w-full items-center gap-2 rounded-md px-3 py-2 text-left outline-none",
+        MENU_TARGET_RING,
         "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
         selected ? "bg-accent text-accent-foreground" : "hover:bg-accent/50",
         // A conflict is loss in progress, so it gets the destructive edge; a pin
@@ -273,29 +277,6 @@ export function NoteRow({
         row.conflict && "border-destructive border-l-[3px]",
       )}
     >
-      {/* The unread dot appears at full opacity and never animates (UX-DR39):
-          information that twitches trains people to ignore it.
-
-          Filled for unread, HOLLOW for read, and never absent — it used to be
-          `bg-transparent` once read, which cost two things. It carried its one
-          state in colour alone, where DESIGN.md asks for a filled/hollow pair
-          and never a bare dot. And it left this list with no anchor: every
-          other list in the app draws no row rule and gets its rhythm from a
-          mark repeating at a constant x down the column — the chat list's
-          avatar and account bar, a recording row's card edge, a tree row's file
-          icon. A list of read notes had an empty lane and nothing to repeat,
-          which is the sense in which its row boundary went missing. The answer
-          is the app's answer, not a hairline per row: one rule here would make
-          the notes list the only ruled list in keeper, which is heavier than
-          the app rather than more legible. */}
-      <span
-        aria-hidden="true"
-        data-slot="unread-dot"
-        className={cn(
-          "size-2 shrink-0 rounded-full",
-          row.unread ? "bg-primary" : "border border-border",
-        )}
-      />
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
         <span className="flex min-w-0 items-center gap-1.5">
           <span className={cn("min-w-0 truncate text-sm", row.unread && "font-semibold")}>
@@ -422,7 +403,7 @@ export function NoteRow({
   // already gives Delete, so the item under the cursor when the menu opens is
   // never the one that removes the note.
   return (
-    <ContextMenu>
+    <ContextMenu onOpenChange={menuTarget.onOpenChange(row.id)}>
       <HoverHint label={row.title} detail={row.hit?.snippet ?? row.snippet}>
         <ContextMenuTrigger asChild>{rowButton}</ContextMenuTrigger>
       </HoverHint>

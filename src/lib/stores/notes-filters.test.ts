@@ -1,13 +1,22 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { notesHideServiceFilesGet, notesHideServiceFilesSet } from "@/lib/ipc/client";
+import type { NoteSpaceVm } from "@/lib/ipc/client";
 import {
+  notesHideServiceFilesGet,
+  notesHideServiceFilesSet,
+  notesIncludePrivateGet,
+  notesIncludePrivateSet,
+} from "@/lib/ipc/client";
+import {
+  ALL_NOTES_SCOPE,
   emptyFilterReason,
   hydrateHideServiceFiles,
+  hydrateIncludePrivate,
   isFiltered,
   isScopeOnly,
   noteQueryFor,
   notesFiltersStore,
   persistHideServiceFiles,
+  persistIncludePrivate,
   resetNotesFiltersStoreForTest,
   tagChipState,
 } from "@/lib/stores/notes-filters";
@@ -15,16 +24,37 @@ import {
 vi.mock("@/lib/ipc/client", () => ({
   notesHideServiceFilesGet: vi.fn(async () => true),
   notesHideServiceFilesSet: vi.fn(async () => {}),
+  notesIncludePrivateGet: vi.fn(async () => false),
+  notesIncludePrivateSet: vi.fn(async () => {}),
 }));
 
 beforeEach(() => {
   resetNotesFiltersStoreForTest();
   vi.mocked(notesHideServiceFilesGet).mockReset().mockResolvedValue(true);
   vi.mocked(notesHideServiceFilesSet).mockReset().mockResolvedValue();
+  vi.mocked(notesIncludePrivateGet).mockReset().mockResolvedValue(false);
+  vi.mocked(notesIncludePrivateSet).mockReset().mockResolvedValue();
 });
 
 /** The current chip states, which is what every assertion here is about. */
 const terms = () => notesFiltersStore.getState().tagTerms;
+
+function space(id: string, restore: Partial<NoteSpaceVm["restore"]> = {}): NoteSpaceVm {
+  return {
+    id,
+    name: id,
+    defaultKey: null,
+    restore: {
+      tagTerms: {},
+      origin: null,
+      flags: [],
+      text: null,
+      sort: null,
+      opaque: false,
+      ...restore,
+    },
+  } as NoteSpaceVm;
+}
 
 describe("noteQueryFor", () => {
   it("sends every active tag, so Rust intersects rather than unions them", () => {
@@ -61,7 +91,7 @@ describe("noteQueryFor", () => {
 
   it("sends the pinned chip's flag once, and it is the only flag a scope can no longer add", () => {
     const state = notesFiltersStore.getState();
-    state.setScope({ kind: "space", id: "pinned-space", name: "Pinned", defaultKey: "pinned" });
+    state.enterSpace(space("pinned-space"));
     state.setPinnedOnly(true);
 
     // The seeded Pinned space says `is:pinned` in its own frontmatter, which
@@ -76,11 +106,7 @@ describe("noteQueryFor", () => {
     // request for any of them carries no flag at all — a flag surviving here
     // would mean the store was still filtering a space a second time.
     for (const key of ["recordings", "inbox", "journal"]) {
-      notesFiltersStore.getState().clearAll();
-      notesFiltersStore
-        .getState()
-        .setScope({ kind: "space", id: `s-${key}`, name: key, defaultKey: key });
-
+      notesFiltersStore.getState().enterSpace(space(`s-${key}`));
       const query = noteQueryFor(notesFiltersStore.getState(), 0, 200);
       expect(query.flags).toEqual([]);
       expect(query.spaceId).toBe(`s-${key}`);
@@ -88,9 +114,7 @@ describe("noteQueryFor", () => {
   });
 
   it("sends a space id rather than a flag for a space scope", () => {
-    notesFiltersStore
-      .getState()
-      .setScope({ kind: "space", id: "space-1", name: "Active work", defaultKey: null });
+    notesFiltersStore.getState().enterSpace(space("space-1"));
 
     const query = noteQueryFor(notesFiltersStore.getState(), 0, 200);
     expect(query.spaceId).toBe("space-1");
@@ -103,48 +127,95 @@ describe("noteQueryFor", () => {
   });
 });
 
-describe("scope selection", () => {
-  it("clears the scope when the active row is selected again", () => {
+describe("space entry and explicit merging", () => {
+  it("replaces query terms but preserves the person's drives and session privacy", () => {
     const state = notesFiltersStore.getState();
-    const inbox = { kind: "space", id: "s-inbox", name: "Inbox", defaultKey: "inbox" } as const;
-    state.setScope(inbox);
-    state.setScope(inbox);
-
-    expect(notesFiltersStore.getState().scope.kind).toBe("all");
-  });
-
-  it("distinguishes two spaces, so picking a different one switches rather than clears", () => {
-    const state = notesFiltersStore.getState();
-    state.setScope({ kind: "space", id: "a", name: "A", defaultKey: null });
-    state.setScope({ kind: "space", id: "b", name: "B", defaultKey: null });
-
-    expect(notesFiltersStore.getState().scope).toEqual({
-      kind: "space",
-      id: "b",
-      name: "B",
-      defaultKey: null,
+    state.setText("old prompt");
+    state.setTagTerm("old", "include");
+    state.setAgentOnly(true);
+    state.setPinnedOnly(true);
+    state.setVaultIds(["other"]);
+    state.setIncludePrivate(true);
+    state.enterSpace(
+      space("B", { tagTerms: { draft: "exclude" }, flags: ["archived"], sort: "name asc" }),
+    );
+    expect(noteQueryFor(notesFiltersStore.getState(), 0, 20)).toMatchObject({
+      text: null,
+      tags: { draft: "exclude" },
+      origin: null,
+      flags: ["archived"],
+      sort: "name asc",
+      vaultIds: ["other"],
+      includePrivate: true,
+      spaceId: "B",
+      spaceTerms: false,
+    });
+    state.removeTag("draft");
+    expect(noteQueryFor(notesFiltersStore.getState(), 0, 20)).toMatchObject({
+      tags: {},
+      spaceTerms: false,
+    });
+    state.enterSpace(space("C", { text: "saved prompt" }));
+    expect(notesFiltersStore.getState().text).toBe("saved prompt");
+    state.enterSpace(space("keeper:all"));
+    expect(noteQueryFor(notesFiltersStore.getState(), 0, 20)).toMatchObject({
+      spaceId: null,
+      text: null,
+      vaultIds: ["other"],
+      includePrivate: true,
     });
   });
 
-  /**
-   * A seeded default and a space of the user's own are the same kind of thing.
-   * `defaultKey` rides along for the sentence an empty Recordings shows; it must
-   * not be a second axis of identity, or re-pressing a renamed default would
-   * fail to clear it.
-   */
-  it("tells two spaces apart by id alone, not by whether one is a seeded default", () => {
+  it("ANDs a named merge without replacing the current prompt or drive selection", () => {
     const state = notesFiltersStore.getState();
-    state.setScope({ kind: "space", id: "s1", name: "Recordings", defaultKey: "recordings" });
-    state.setScope({ kind: "space", id: "s1", name: "Sessions", defaultKey: "recordings" });
-
-    expect(notesFiltersStore.getState().scope.kind).toBe("all");
+    state.enterSpace(space("A", { tagTerms: { work: "include" }, text: "pricing" }));
+    state.setVaultIds(["v2"]);
+    state.mergeSpace(space("B", { tagTerms: { draft: "exclude" }, flags: ["archived"] }));
+    expect(noteQueryFor(notesFiltersStore.getState(), 0, 20)).toMatchObject({
+      text: "pricing",
+      tags: { work: "include", draft: "exclude" },
+      flags: ["archived"],
+      spaceId: "A",
+      vaultIds: ["v2"],
+    });
   });
+
+  it("refuses opaque or contradictory merges without silently widening a query", () => {
+    const state = notesFiltersStore.getState();
+    state.setTagTerm("draft", "include");
+    expect(() => state.mergeSpace(space("opaque", { opaque: true }))).toThrow(/open it instead/i);
+    expect(() => state.mergeSpace(space("opposite", { tagTerms: { draft: "exclude" } }))).toThrow(
+      /opposite filters/,
+    );
+    expect(terms()).toEqual([{ tag: "draft", term: "include" }]);
+    state.enterSpace(space("opaque", { opaque: true }));
+    expect(noteQueryFor(notesFiltersStore.getState(), 0, 20)).toMatchObject({
+      spaceId: "opaque",
+      spaceTerms: true,
+      tags: {},
+      text: null,
+    });
+  });
+});
+
+it.each(["scope", "escape"] as const)("forgets an explicit space sort on leaving by %s", (exit) => {
+  const state = notesFiltersStore.getState();
+  state.enterSpace(space("work", { sort: "modified desc", text: "budget" }));
+  expect(noteQueryFor(notesFiltersStore.getState(), 0, 20).sort).toBe("modified desc");
+  if (exit === "scope") state.setScope(ALL_NOTES_SCOPE);
+  else state.dropLastChip();
+  expect(noteQueryFor(notesFiltersStore.getState(), 0, 20)).toMatchObject({
+    spaceId: null,
+    sort: null,
+    text: "budget",
+  });
+  expect(notesFiltersStore.getState().enteredSpace).toBeNull();
 });
 
 describe("dropLastChip", () => {
   it("walks the bar down from its end, one press at a time", () => {
     const state = notesFiltersStore.getState();
-    state.setScope({ kind: "space", id: "s-inbox", name: "Inbox", defaultKey: "inbox" });
+    state.enterSpace(space("s-inbox"));
     state.cycleTag("work");
     state.cycleTag("urgent");
     state.setAgentOnly(true);
@@ -273,7 +344,7 @@ describe("emptyFilterReason", () => {
 
   it("names every axis of the bar, so no term can go unmentioned", () => {
     const state = notesFiltersStore.getState();
-    state.setScope({ kind: "space", id: "s-inbox", name: "Inbox", defaultKey: "inbox" });
+    state.enterSpace({ ...space("s-inbox"), name: "Inbox" });
     state.setTagTerm("work", "include");
     state.setAgentOnly(true);
     state.setPinnedOnly(true);
@@ -341,4 +412,26 @@ describe("service visibility is a preference, not a chip", () => {
     expect(vi.mocked(notesHideServiceFilesSet).mock.calls).toEqual([[false], [true]]);
     expect(notesFiltersStore.getState().hideServiceFiles).toBe(true);
   });
+});
+
+it("does not let space entry rewrite a session privacy read already in flight", async () => {
+  let release: (value: boolean) => void = () => {};
+  vi.mocked(notesIncludePrivateGet).mockReturnValue(
+    new Promise((resolve) => {
+      release = resolve;
+    }),
+  );
+  const hydration = hydrateIncludePrivate();
+  await Promise.resolve();
+  notesFiltersStore.getState().enterSpace(space("work"));
+  release(true);
+  await hydration;
+  expect(noteQueryFor(notesFiltersStore.getState(), 0, 20).includePrivate).toBe(true);
+});
+
+it("rolls private visibility back only when its current write fails", async () => {
+  await hydrateIncludePrivate();
+  vi.mocked(notesIncludePrivateSet).mockRejectedValueOnce(new Error("disk full"));
+  await expect(persistIncludePrivate(true)).rejects.toThrow("disk full");
+  expect(notesFiltersStore.getState().includePrivate).toBe(false);
 });

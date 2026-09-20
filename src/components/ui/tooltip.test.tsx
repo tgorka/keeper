@@ -1,6 +1,15 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { HOVER_HINT_DELAY_MS, HoverHint, IconHint, TooltipProvider } from "@/components/ui/tooltip";
+import { Kbd } from "@/components/ui/kbd";
+import {
+  HOVER_HINT_DELAY_MS,
+  HoverHint,
+  IconHint,
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 afterEach(() => {
   cleanup();
@@ -54,6 +63,15 @@ describe("readable hints", () => {
     const hint = screen.getByRole("tooltip");
     expect(hint).toHaveTextContent(label);
     expect(document.querySelector('[data-slot="tooltip-content"]')).toHaveClass("max-w-xs");
+    expect(document.querySelector('[data-slot="tooltip-content"]')).toHaveClass(
+      "bg-popover",
+      "text-popover-foreground",
+      "ring-1",
+      "ring-foreground/10",
+    );
+    expect(document.querySelector('[data-slot="tooltip-content"]')).not.toHaveClass(
+      "bg-foreground",
+    );
     expect(within(hint).getByText(detail)).toHaveClass("line-clamp-3");
     expect(within(hint).getByText(label)).not.toHaveClass("truncate");
     expect(hint.querySelector("b")).toBeNull();
@@ -76,4 +94,21 @@ describe("readable hints", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open" }));
     expect(select).toHaveBeenCalledOnce();
   });
+});
+
+it("keeps keyboard hints on the muted surface inside the popover tooltip", () => {
+  render(
+    <TooltipProvider>
+      <Tooltip open>
+        <TooltipTrigger>Shortcut</TooltipTrigger>
+        <TooltipContent>
+          <Kbd>Esc</Kbd>
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>,
+  );
+  const key = document.querySelector('[data-slot="tooltip-content"] [data-slot="kbd"]');
+  expect(key).toHaveClass("bg-muted", "text-muted-foreground");
+  expect(key?.className).not.toContain("bg-background/");
+  expect(key?.className).not.toContain(":text-background");
 });

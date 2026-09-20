@@ -42,6 +42,7 @@ import { useEffect, useId, useMemo, useState } from "react";
 import { tagPaths } from "@/components/notes/editor/tag-complete";
 import { TagFilterChip } from "@/components/notes/note-filter-bar";
 import { matchSpaceIcons, type SpaceIconGroup, spaceIcon } from "@/components/notes/space-icons";
+import { SPACE_TTL_ERROR, validSpaceTtl } from "@/components/notes/space-name-popover";
 import { TagCombobox } from "@/components/notes/tag-combobox";
 import { Button } from "@/components/ui/button";
 import {
@@ -64,6 +65,7 @@ import {
   tagChipState,
   withTagTerm,
 } from "@/lib/stores/notes-filters";
+import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
 /** How many icons the chooser shows before it needs its own scroll region.
@@ -120,7 +122,7 @@ export const SPACE_SORT_KEYS: readonly { key: string; label: string }[] = [
  * whether the newest is at the top, and for `name` that question has different
  * words — so the labels are per key rather than one pair reused five times.
  */
-const SORT_DIR_LABELS: Readonly<Record<string, readonly [string, string]>> = {
+export const SORT_DIR_LABELS: Readonly<Record<string, readonly [string, string]>> = {
   order: ["Lowest first", "Highest first"],
   name: ["A to Z", "Z to A"],
   created: ["Oldest first", "Newest first"],
@@ -216,15 +218,17 @@ type Terms =
 export function SpaceEditor({
   vaultId,
   space,
+  initialName = "Untitled space",
   onClose,
   onSaved,
 }: {
   vaultId: string;
-  space: NoteSpaceVm;
+  space?: NoteSpaceVm;
+  initialName?: string;
   /** Leave without writing anything. */
   onClose: () => void;
   /** The space was written; the list should re-read itself. */
-  onSaved: () => void;
+  onSaved: (space: NoteSpaceVm) => void;
 }) {
   const nameId = useId();
   const sortKeyId = useId();
@@ -232,8 +236,14 @@ export function SpaceEditor({
   const orderId = useId();
   const templateId = useId();
   const folderId = useId();
-  const [name, setName] = useState(space.name);
-  const [icon, setIcon] = useState<string | null>(space.icon);
+  const [name, setName] = useState(space?.name ?? initialName);
+  const [icon, setIcon] = useState<string | null>(space?.icon ?? null);
+  const [pinned, setPinned] = useState(space?.pinned ?? false);
+  const [temporary, setTemporary] = useState(space?.ttlHours != null);
+  const [hours, setHours] = useState(String(space?.ttlHours ?? 48));
+  const [text, setText] = useState(space?.text ?? "");
+  const ttlId = useId();
+  const textId = useId();
   // The icon search, held here rather than inside the chooser: clearing it on
   // Cancel is free, and a query that outlived the dialog would re-open it
   // filtered to whatever somebody typed last week.
@@ -248,22 +258,22 @@ export function SpaceEditor({
   // or a word keeper does not know, and working out what either resolves to is
   // a rule that exists once, in Rust. The form shows what the list is actually
   // doing, which is also what makes Save a repair rather than a rewrite.
-  const [sortKey, setSortKey] = useState(() => space.sortEffective.split(" ")[0] ?? "modified");
-  const [sortDir, setSortDir] = useState(() => space.sortEffective.split(" ")[1] ?? "desc");
+  const [sortKey, setSortKey] = useState(() => space?.sortEffective.split(" ")[0] ?? "modified");
+  const [sortDir, setSortDir] = useState(() => space?.sortEffective.split(" ")[1] ?? "desc");
   // Held as text, because a number input's value is text and `Number("")` is 0
   // — which would silently reposition a space the moment someone cleared the
   // box to retype it. An unreadable box is "unpositioned", the same thing an
   // absent key means.
-  const [order, setOrder] = useState(() => (space.order === 0 ? "" : String(space.order)));
+  const [order, setOrder] = useState(() => (space?.order ? String(space.order) : ""));
   const [terms, setTerms] = useState<Terms>({ kind: "pending" });
   const [vaultTags, setVaultTags] = useState<readonly string[]>([]);
   // The stored path, verbatim. Seeded from the file rather than resolved
   // against the list, so a template that is missing right now stays selected
   // and stays visible instead of being cleared by a render.
-  const [template, setTemplate] = useState(space.template ?? SPACE_NO_TEMPLATE);
+  const [template, setTemplate] = useState(space?.template ?? SPACE_NO_TEMPLATE);
   // Kept as typed rather than resolved: the folder may not exist yet, and a
   // space that names one keeper has to create is not a mistake to refuse.
-  const [folder, setFolder] = useState(space.folder ?? "");
+  const [folder, setFolder] = useState(space?.folder ?? "");
   const [templateChoices, setTemplateChoices] = useState<readonly NoteTemplateVm[]>([]);
   // Whether the list above is an ANSWER or merely the absence of one. A vault
   // with genuinely no templates and a read that failed both leave `choices`
@@ -275,6 +285,13 @@ export function SpaceEditor({
   const [failure, setFailure] = useState<string | null>(null);
 
   useEffect(() => {
+    if (space === undefined) {
+      setTerms({
+        kind: "chips",
+        draft: { tags: [], flags: [], origin: null, text: null, fields: [] },
+      });
+      return;
+    }
     let cancelled = false;
     void notesSpaceTerms(space.query)
       .then((read) => {
@@ -308,7 +325,7 @@ export function SpaceEditor({
     return () => {
       cancelled = true;
     };
-  }, [space.query]);
+  }, [space]);
 
   useEffect(() => {
     let cancelled = false;
@@ -359,9 +376,17 @@ export function SpaceEditor({
     terms.draft.flags.length === 0 &&
     terms.draft.origin === null &&
     terms.draft.text === null &&
-    terms.draft.fields.length === 0;
+    terms.draft.fields.length === 0 &&
+    text.trim() === "";
+  const invalidTtl = temporary && !validSpaceTtl(hours);
   const refusal =
-    trimmedName === "" ? SPACE_NO_NAME : emptyDraft ? SPACE_NO_TERMS : (failure ?? null);
+    trimmedName === ""
+      ? SPACE_NO_NAME
+      : emptyDraft
+        ? SPACE_NO_TERMS
+        : invalidTtl
+          ? SPACE_TTL_ERROR
+          : null;
   // The stored template is not one of the options the chooser can offer —
   // either because it is gone, or because the list has not arrived yet.
   const templateUnlisted =
@@ -415,17 +440,18 @@ export function SpaceEditor({
     setSaving(true);
     setFailure(null);
     try {
-      await notesSpaceSave(vaultId, {
-        id: space.id,
+      const saved = await notesSpaceSave(vaultId, {
+        id: space?.id ?? null,
+        baseSpaceId: null,
         name: trimmedName,
         // The frozen arm hands back the bytes it was given. Re-emitting from
         // chips here is the failure this whole surface is arranged to prevent.
-        query: terms.kind === "chips" ? spaceQueryText(terms.draft) : space.query,
+        query: terms.kind === "chips" ? spaceQueryText(terms.draft) : (space?.query ?? ""),
         // Always the canonical `<key> <dir>`, which is what makes saving a
         // space whose stored sort keeper could not read into a repair: the form
         // showed the fallback and said why, and this writes what was on screen.
         sort: `${sortKey} ${sortDir}`,
-        limit: space.limit,
+        limit: space?.limit ?? 500,
         icon,
         // An empty or unreadable box is "unpositioned" — the same 0 an absent
         // `keeper.order` means — rather than a reason to refuse the whole save.
@@ -436,10 +462,13 @@ export function SpaceEditor({
         // Same rule as the template: an empty box clears the key instead of
         // storing a folder that names nothing.
         folder: folder.trim() === "" ? null : folder.trim(),
+        pinned,
+        ttlHours: temporary ? Number(hours) : null,
+        text: text === "" ? null : text,
       });
-      onSaved();
-    } catch {
-      setFailure("keeper couldn't save this space. Nothing was changed.");
+      onSaved(saved);
+    } catch (error) {
+      setFailure(syncErrorMessage(error, "keeper couldn't save this space. Nothing was changed."));
       setSaving(false);
     }
   }
@@ -490,7 +519,7 @@ export function SpaceEditor({
           and carries the identical pair. */}
       <DialogContent className="flex max-h-[85vh] flex-col gap-4 overflow-hidden sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Edit space</DialogTitle>
+          <DialogTitle>{space === undefined ? "New space" : "Edit space"}</DialogTitle>
           <DialogDescription>
             A space is a saved filter. Changing it here changes what it selects.
           </DialogDescription>
@@ -506,6 +535,52 @@ export function SpaceEditor({
               autoComplete="off"
             />
           </div>
+          <p className="text-muted-foreground text-xs">Use / to group spaces</p>
+          <label className="flex min-h-8 items-center gap-2">
+            <input
+              type="checkbox"
+              checked={pinned}
+              onChange={(event) => setPinned(event.target.checked)}
+            />
+            Pinned space
+          </label>
+          <label className="flex min-h-8 items-center gap-2">
+            <input
+              type="checkbox"
+              checked={temporary}
+              onChange={(event) => setTemporary(event.target.checked)}
+            />
+            Temporary space
+          </label>
+          {temporary && (
+            <div className="flex flex-col gap-2">
+              <Label htmlFor={ttlId}>Expires after inactivity (hours)</Label>
+              <Input
+                id={ttlId}
+                type="number"
+                min={1}
+                max={4294967295}
+                step={1}
+                value={hours}
+                onChange={(event) => setHours(event.target.value)}
+              />
+              <p className="text-muted-foreground text-xs">
+                Opening this space refreshes its lifetime. Expired spaces go to Trash.
+              </p>
+              {space?.expiryPhrase && (
+                <p className="text-muted-foreground text-xs">{space.expiryPhrase}</p>
+              )}
+            </div>
+          )}
+          <div className="flex flex-col gap-2">
+            <Label htmlFor={textId}>Search prompt</Label>
+            <Input id={textId} value={text} onChange={(event) => setText(event.target.value)} />
+          </div>
+          {failure !== null && (
+            <p role="alert" className="text-destructive text-xs">
+              {failure}
+            </p>
+          )}
 
           {/* The icon chooser (Story 45.20, UX-DR82).
 
@@ -586,7 +661,7 @@ export function SpaceEditor({
           {/* Rust already worded what it could not read; the form repeats it
               rather than inventing a second sentence, so the row in the rail and
               the dialog say the same thing about the same file. */}
-          {space.warnings.length > 0 && (
+          {space !== undefined && space.warnings.length > 0 && (
             <ul aria-label="What keeper couldn't read" className="flex flex-col gap-1">
               {space.warnings.map((said) => (
                 <li key={said} data-slot="space-warning" className="text-destructive text-sm">
@@ -602,9 +677,13 @@ export function SpaceEditor({
               <select
                 id={sortKeyId}
                 value={sortKey}
-                onChange={(event) => setSortKey(event.target.value)}
+                onChange={(event) => {
+                  setSortKey(event.target.value);
+                  if (event.target.value === "relevance") setSortDir("desc");
+                }}
                 className="h-9 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
+                <option value="relevance">Relevance</option>
                 {SPACE_SORT_KEYS.map((option) => (
                   <option key={option.key} value={option.key}>
                     {option.label}
@@ -617,18 +696,25 @@ export function SpaceEditor({
               <select
                 id={sortDirId}
                 value={sortDir}
+                disabled={sortKey === "relevance"}
                 onChange={(event) => setSortDir(event.target.value)}
                 className="h-9 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 {/* Worded per key: "ascending" is a word about the machine, and
                     what a reader wants to know is whether the newest is on top
                     — a question `name` asks in different words. */}
-                <option value="asc">
-                  {(SORT_DIR_LABELS[sortKey] ?? ["Ascending", "Descending"])[0]}
-                </option>
-                <option value="desc">
-                  {(SORT_DIR_LABELS[sortKey] ?? ["Ascending", "Descending"])[1]}
-                </option>
+                {sortKey === "relevance" ? (
+                  <option value="desc">Most relevant first</option>
+                ) : (
+                  <>
+                    <option value="asc">
+                      {(SORT_DIR_LABELS[sortKey] ?? ["Ascending", "Descending"])[0]}
+                    </option>
+                    <option value="desc">
+                      {(SORT_DIR_LABELS[sortKey] ?? ["Ascending", "Descending"])[1]}
+                    </option>
+                  </>
+                )}
               </select>
             </div>
             <div className="flex w-24 flex-col gap-1.5">

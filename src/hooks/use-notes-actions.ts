@@ -29,7 +29,14 @@
  */
 import { useCallback } from "react";
 import { isPhoneTier } from "@/hooks/use-shell-layout";
-import type { NoteCreateVm, NoteRefVm, NoteRowVm, NoteSpaceFieldVm } from "@/lib/ipc/client";
+import type {
+  NoteCreateVm,
+  NoteRefVm,
+  NoteRowVm,
+  NoteSpaceFieldVm,
+  NoteSpaceReq,
+  NoteSpaceVm,
+} from "@/lib/ipc/client";
 import {
   notesCaptureShow,
   notesCreate,
@@ -38,8 +45,11 @@ import {
   notesMarkRead,
   notesReveal,
   notesSetFlag,
+  notesSpacePark,
   notesSpaceSave,
+  notesSpaceTouch,
 } from "@/lib/ipc/client";
+import { ALL_SPACE_ID } from "@/lib/notes/all-spaces";
 import { captureSheetStore } from "@/lib/stores/capture-sheet";
 import { openCaptureWindow } from "@/lib/stores/capture-windows";
 import type { TagChip } from "@/lib/stores/notes-filters";
@@ -210,43 +220,140 @@ export async function revealNote(vaultId: string, row: NoteRowVm): Promise<void>
  * function the list itself uses, so a saved space reproduces exactly the set
  * that was on screen when it was saved.
  */
-export async function saveFilterAsSpace(name: string): Promise<NoteRefVm | null> {
+/** Capture once when naming begins, not when the async save finally runs. */
+export interface SpaceSaveDraft {
+  vaultId: string;
+  request: NoteSpaceReq;
+}
+export function captureSpaceDraft(): SpaceSaveDraft | null {
   const vaultId = activeVaultId();
-  if (vaultId === null) {
-    return null;
-  }
+  if (vaultId === null) return null;
   const { limit } = notesListStore.getState();
   const filters = notesFiltersStore.getState();
   const query = noteQueryFor(filters, 0, limit);
-  return await notesSpaceSave(vaultId, {
-    id: null,
+  return {
+    vaultId,
+    request: {
+      id: null,
+      baseSpaceId: query.spaceTerms ? query.spaceId : null,
+      name: "",
+      query: spaceQueryText({
+        tags: filters.tagTerms,
+        flags: query.flags,
+        origin: query.origin,
+        text: null,
+      }),
+      sort: query.sort ?? "modified desc",
+      limit,
+      icon: null,
+      order: 0,
+      template: null,
+      folder: null,
+      pinned: false,
+      ttlHours: null,
+      text: filters.text,
+    },
+  };
+}
+
+export async function saveFilterAsSpace(
+  name: string,
+  options: { ttlHours: number | null } = { ttlHours: null },
+  draft = captureSpaceDraft(),
+): Promise<NoteSpaceVm | null> {
+  if (draft === null) return null;
+  const saved = await notesSpaceSave(draft.vaultId, {
+    ...draft.request,
     name,
-    // The space note carries the query as text, because that is what an agent or
-    // Obsidian will read and edit. Rust composes it from the same request the
-    // list ran, so the two can never drift into different result sets.
-    query: spaceQueryText({
-      tags: filters.tagTerms,
-      flags: query.flags,
-      origin: query.origin,
-      text: query.text,
-    }),
-    sort: "modified desc",
-    limit,
-    icon: null,
-    // Unpositioned, so a space made from the filter bar lands in the rail's
-    // alphabetical block rather than jumping above spaces somebody placed by
-    // hand. There is nowhere on this path to ask, and guessing a number would
-    // be keeper deciding the shape of a rail it was not asked about.
-    order: 0,
-    // No template either, and for the same reason: this path saves the filter
-    // that is on screen, and a template is not part of a filter. The space
-    // editor is where one is chosen (Story 44.7).
-    template: null,
-    // And no folder, on the same rule: a filter says which notes, never where
-    // the next one goes. Inventing a destination nobody chose is how a space
-    // starts writing somewhere its owner never looked (Story 44.13).
-    folder: null,
+    ttlHours: options.ttlHours,
   });
+  notesFiltersStore.getState().requestSpacesReload();
+  return saved;
+}
+
+// Serialize entry so two rapid clicks cannot park the same outgoing search twice.
+let spaceEntries: Promise<unknown> = Promise.resolve();
+let spaceEntryRequest = 0;
+let queryGeneration = 0;
+// Count query edits, including edit-and-undo, but not rail reload/focus notifications.
+notesFiltersStore.subscribe((state, previous) => {
+  if (
+    state.scope !== previous.scope ||
+    state.tagTerms !== previous.tagTerms ||
+    state.text !== previous.text ||
+    state.flags !== previous.flags ||
+    state.origin !== previous.origin ||
+    state.sort !== previous.sort ||
+    state.vaultIds !== previous.vaultIds ||
+    state.includePrivate !== previous.includePrivate ||
+    state.hideServiceFiles !== previous.hideServiceFiles
+  )
+    queryGeneration += 1;
+});
+export function openNotesSpace(vaultId: string, space: NoteSpaceVm): Promise<NoteSpaceVm> {
+  const request = ++spaceEntryRequest;
+  const generation = queryGeneration;
+  const activeVault = activeVaultId();
+  const current = () =>
+    request === spaceEntryRequest &&
+    generation === queryGeneration &&
+    activeVault === activeVaultId();
+  const entry = spaceEntries.then(async () => {
+    if (space.error !== null) throw new Error(space.error);
+    if (!current()) return space;
+    const filters = notesFiltersStore.getState();
+    // Re-selecting the active row is not permission to discard in-space edits.
+    if (
+      (filters.scope.kind === "space" && filters.scope.id === space.id) ||
+      (filters.scope.kind === "all" && space.id === ALL_SPACE_ID)
+    )
+      return space;
+    const baseline =
+      filters.scope.kind === "space" && filters.enteredSpace?.id === filters.scope.id
+        ? filters.enteredSpace
+        : null;
+    const query = noteQueryFor(filters, 0, notesListStore.getState().limit);
+    const restore = baseline?.restore;
+    const changed =
+      filters.text !== (restore?.opaque ? "" : (restore?.text ?? "")) ||
+      query.origin !== (restore?.opaque ? null : (restore?.origin ?? null)) ||
+      query.flags.length !== (restore?.opaque ? 0 : (restore?.flags.length ?? 0)) ||
+      query.flags.some((flag) => restore?.opaque || !restore?.flags.includes(flag)) ||
+      query.sort !== (restore?.opaque ? null : (restore?.sort ?? null)) ||
+      filters.tagTerms.length !==
+        Object.keys(restore?.opaque ? {} : (restore?.tagTerms ?? {})).length ||
+      filters.tagTerms.some(({ tag, term }) => restore?.opaque || restore?.tagTerms[tag] !== term);
+    const outgoingId = filters.scope.kind === "space" ? filters.scope.id : ALL_SPACE_ID;
+    const meaningful =
+      (query.spaceTerms && query.spaceId !== null) ||
+      query.text !== null ||
+      filters.tagTerms.length > 0 ||
+      query.flags.length > 0 ||
+      query.origin !== null;
+    if (outgoingId !== space.id && baseline?.ttlHours == null && changed && meaningful) {
+      await notesSpacePark(
+        vaultId,
+        filters.scope.kind === "space" ? filters.scope.name : "All notes",
+        {
+          baseSpaceId: query.spaceTerms ? query.spaceId : null,
+          tagTerms: query.tags,
+          origin: query.origin,
+          flags: query.flags,
+          text: query.text,
+          sort: query.sort,
+        },
+      );
+      notesFiltersStore.getState().requestSpacesReload();
+    }
+    if (!current()) return space;
+    const acknowledged = space.id.startsWith("keeper:")
+      ? space
+      : await notesSpaceTouch(vaultId, space.id);
+    if (current()) notesFiltersStore.getState().enterSpace(acknowledged);
+    return acknowledged;
+  });
+  spaceEntries = entry.catch(() => {});
+  return entry;
 }
 
 /**
@@ -326,7 +433,7 @@ export function useNotesActions(vaultId: string | null): NotesActions {
   const pin = useCallback(
     async (row: NoteRowVm) => {
       if (vaultId !== null) {
-        await togglePin(vaultId, row);
+        await togglePin(row.vaultId, row);
       }
     },
     [vaultId],
@@ -334,7 +441,7 @@ export function useNotesActions(vaultId: string | null): NotesActions {
   const archive = useCallback(
     async (row: NoteRowVm) => {
       if (vaultId !== null) {
-        await toggleArchive(vaultId, row);
+        await toggleArchive(row.vaultId, row);
       }
     },
     [vaultId],
@@ -342,7 +449,7 @@ export function useNotesActions(vaultId: string | null): NotesActions {
   const markRead = useCallback(
     async (row: NoteRowVm) => {
       if (vaultId !== null) {
-        await markNoteRead(vaultId, row);
+        await markNoteRead(row.vaultId, row);
       }
     },
     [vaultId],
@@ -356,7 +463,7 @@ export function useNotesActions(vaultId: string | null): NotesActions {
   const reveal = useCallback(
     async (row: NoteRowVm) => {
       if (vaultId !== null) {
-        await revealNote(vaultId, row);
+        await revealNote(row.vaultId, row);
       }
     },
     [vaultId],

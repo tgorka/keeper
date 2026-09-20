@@ -26,6 +26,23 @@
 //! [`crate::notes::links`] need, because "is this offset inside code?" must mean
 //! exactly the same thing to a tag as to a wikilink.
 
+/// Whether a normalised tag names the private subtree.
+#[must_use]
+pub fn is_private(tag: &str) -> bool {
+    tag == "private" || tag.starts_with("private/")
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    #[test]
+    fn private_is_a_segment_not_a_prefix() {
+        assert!(super::is_private("private"));
+        assert!(super::is_private("private/client"));
+        assert!(!super::is_private("privateer"));
+        assert!(!super::is_private("work/private"));
+    }
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::notes::frontmatter::Frontmatter;

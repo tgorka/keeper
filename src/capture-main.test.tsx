@@ -72,6 +72,21 @@ beforeEach(() => {
 afterEach(settleNoteEditorBoot);
 
 describe("CapturePanel", () => {
+  it("follows OS dark appearance in the secondary document", () => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const matchMedia = window.matchMedia;
+    window.matchMedia = () => ({ ...media, matches: true });
+    document.documentElement.classList.remove("dark");
+    const view = render(<CapturePanel search="" />);
+    try {
+      expect(document.documentElement).toHaveClass("dark");
+    } finally {
+      view.unmount();
+      window.matchMedia = matchMedia;
+      document.documentElement.classList.remove("dark");
+    }
+  });
+
   it("renders the prewarmed page when the window names no note", () => {
     render(<CapturePanel search="" />);
     expect(screen.getByTestId(`draft-${DRAFT_CAPTURE_KEY}`)).toBeInTheDocument();

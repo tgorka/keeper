@@ -1739,6 +1739,7 @@ const TASK_RUNS: Record<string, TaskRunVm[]> = {
     trigger: "scheduled",
     lateByMs: 0,
     host: "01DEVICE#4188",
+    ledgerEntry: null,
   })),
   // Mid-run: the newest attempt has no `finishedMs` and no outcome, which is
   // what "running now" is made of. The lease on the row below matches it.
@@ -1754,6 +1755,7 @@ const TASK_RUNS: Record<string, TaskRunVm[]> = {
       trigger: "requested",
       lateByMs: null,
       host: "01DEVICE#912",
+      ledgerEntry: null,
     },
     {
       id: 410,
@@ -1768,6 +1770,7 @@ const TASK_RUNS: Record<string, TaskRunVm[]> = {
       trigger: "timer",
       lateByMs: 41 * 60_000,
       host: "01DEVICE#912",
+      ledgerEntry: null,
     },
   ],
   // A failure, with the tally first and the reason after it — the shape
@@ -1785,6 +1788,7 @@ const TASK_RUNS: Record<string, TaskRunVm[]> = {
       trigger: "scheduled",
       lateByMs: 0,
       host: "01DEVICE#4188",
+      ledgerEntry: null,
     },
     {
       id: 501,
@@ -1797,6 +1801,7 @@ const TASK_RUNS: Record<string, TaskRunVm[]> = {
       trigger: "scheduled",
       lateByMs: 0,
       host: "01DEVICE#4188",
+      ledgerEntry: null,
     },
   ],
   // A run a newer keeper recorded: the spelling is carried and rendered
@@ -1815,13 +1820,13 @@ const TASK_RUNS: Record<string, TaskRunVm[]> = {
       trigger: null,
       lateByMs: null,
       host: "01DEVICE#77",
+      ledgerEntry: null,
     },
   ],
 };
 
 /**
- * The eight per-kind fields a `sync`, `release`, `verify` or `gc` row leaves
- * empty (Story 72.7).
+ * The per-kind fields a `sync`, `release`, `verify` or `gc` row leaves empty.
  *
  * Every key exists on every kind on the wire, so a fixture that omitted them
  * would be a shape the shell never sends — and the point of this harness is to
@@ -1834,6 +1839,10 @@ const NO_KIND_PAYLOAD = {
   copySource: null,
   copyDestination: null,
   replaceExisting: false,
+  pruneDestination: false,
+  refreshMissing: true,
+  copyLookbackMs: 300_000,
+  ledgerPath: null,
   // No ledger folder in the harness's fixtures, so no mark (Story 74.4).
   markMs: null,
 } satisfies Partial<TaskVm>;
@@ -3571,6 +3580,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       trigger: "requested",
       lateByMs: null,
       host: "01DEVICE#4188",
+      ledgerEntry: null,
     };
     // Recorded, so the next read shows the run rather than the pane appearing
     // to have done nothing — the same reason `sync_profile_save` is stateful.

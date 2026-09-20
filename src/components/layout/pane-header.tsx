@@ -106,10 +106,10 @@
  * becomes true the moment a second one opens, and that happens without the
  * row changing size.
  *
- * On the right, and not the left. This header is mounted in four hosts and
- * only one of them has a frame; a group in front of identity would put the
- * note's title at a different x in a panel than in the notes pane, for a
- * reason the reader cannot see.
+ * Frame controls stay on the right. Navigation is the one leading group
+ * (Story 77.8): the owner asked for Back/Forward before identity, and only a
+ * panel host has that navigation stack. Its measured width and seam are
+ * charged on the same terms as the frame; neither group enters overflow.
  *
  * # When the row is the window's own title bar (Story 75.3, AD-260)
  *
@@ -171,6 +171,9 @@ export const PANE_HEADER_ACTIONS_SLOT = "pane-header-actions";
  *  to the surface itself. Last, never squeezed, never anything's overflow. */
 export const PANE_HEADER_FRAME_SLOT = "pane-header-frame";
 
+/** Panel navigation leads identity without sharing the action overflow budget. */
+export const PANE_HEADER_LEADING_SLOT = "pane-header-leading";
+
 /**
  * The gap between two adjacent members of the row, in pixels.
  *
@@ -200,8 +203,8 @@ export const PANE_HEADER_IDENTITY_MIN_PX = 160;
  * Pure, because it is the half of the measurement with a decision in it.
  * `header` is the row's CONTENT width — its padding already gone, which is
  * what a `ResizeObserver` entry reports. `status` is the reserved slot's whole
- * box and `frame` the frame group's, each null for a row that does not have
- * that group and therefore has no gap for it either. A width that is not a
+ * box and `frame` / `leading` their groups', each null for a row that does not
+ * have that group and therefore has no gap for it either. A width that is not a
  * finite number is a measurement that has not happened, so it costs nothing at
  * all — while a group measured at exactly 0 still costs its seam, because the
  * slot IS in the row. Never negative: "no room"
@@ -215,12 +218,14 @@ export function paneHeaderActionsBudget({
   header,
   status,
   frame = null,
+  leading = null,
   identityMin = PANE_HEADER_IDENTITY_MIN_PX,
   gap = PANE_HEADER_GAP_PX,
 }: {
   header: number;
   status: number | null;
   frame?: number | null;
+  leading?: number | null;
   identityMin?: number;
   gap?: number;
 }): number {
@@ -231,7 +236,8 @@ export function paneHeaderActionsBudget({
     identityMin +
     gap +
     (status === null || !Number.isFinite(status) ? 0 : status + gap) +
-    (frame === null || !Number.isFinite(frame) ? 0 : frame + gap);
+    (frame === null || !Number.isFinite(frame) ? 0 : frame + gap) +
+    (leading === null || !Number.isFinite(leading) ? 0 : leading + gap);
   return Math.max(0, header - owed);
 }
 
@@ -292,6 +298,8 @@ export interface PaneHeaderProps {
   /** The name of the thing this pane is showing, and anything that qualifies
    *  it. The only content in the row whose width is free to change. */
   identity: ReactNode;
+  /** Navigation is the one leading group; only a panel host supplies it. */
+  leading?: ReactNode;
   /** What the pane wants to say about itself, or `null` when it has nothing to
    *  say — see the module doc for why that is not the same as `caption: ""`. */
   status?: PaneHeaderStatus | null;
@@ -342,12 +350,14 @@ export function PaneHeader({
   status = null,
   actions,
   frame = null,
+  leading = null,
   titleBar = null,
   className,
 }: PaneHeaderProps): React.ReactElement {
   const rowRef = useRef<HTMLElement>(null);
   const statusRef = useRef<HTMLSpanElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
+  const leadingRef = useRef<HTMLDivElement>(null);
   const managed = typeof actions === "function";
   const [budget, setBudget] = useState(0);
   // Whether there IS a fourth group, rather than what is in it. The effect
@@ -355,6 +365,7 @@ export function PaneHeader({
   // fresh every render, so depending on it would tear the observer down and
   // build it again on every keystroke that changes the title.
   const framed = frame !== null;
+  const hasLeading = leading !== null;
   // Marked on four elements and spread rather than set, because Tauri's
   // drag-region shim is a document-level `mousedown` listener that matches the
   // element the press LANDED on: an ancestor carrying the attribute does
@@ -402,6 +413,7 @@ export function PaneHeader({
           header,
           status: statusRef.current?.getBoundingClientRect().width ?? null,
           frame: frameRef.current?.getBoundingClientRect().width ?? null,
+          leading: leadingRef.current?.getBoundingClientRect().width ?? null,
         }),
       );
     });
@@ -410,8 +422,12 @@ export function PaneHeader({
     if (frameBox !== null) {
       observer.observe(frameBox);
     }
+    const leadingBox = hasLeading ? leadingRef.current : null;
+    if (leadingBox !== null) {
+      observer.observe(leadingBox);
+    }
     return () => observer.disconnect();
-  }, [managed, framed]);
+  }, [managed, framed, hasLeading]);
 
   return (
     <header
@@ -424,6 +440,15 @@ export function PaneHeader({
       // `py-1.5`s were each guessing at separately.
       className={cn("flex h-10 shrink-0 items-center gap-2 border-border border-b", className)}
     >
+      {hasLeading ? (
+        <div
+          ref={leadingRef}
+          data-slot={PANE_HEADER_LEADING_SLOT}
+          className="flex shrink-0 items-center gap-2"
+        >
+          {leading}
+        </div>
+      ) : null}
       {/* Group 1 — identity. `flex-1` off a zero basis: its width is whatever
           the row has left over, and it contributes nothing to the row's own
           content width. */}

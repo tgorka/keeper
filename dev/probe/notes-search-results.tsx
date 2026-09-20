@@ -36,6 +36,7 @@ root.style.width = `${Number(params.get("width") ?? 320)}px`;
 if (params.get("theme") === "dark") document.documentElement.classList.add("dark");
 const row: NoteRowVm = {
   id: "note",
+  vaultId: "vault-1",
   path: "note.md",
   title: "Annual financial outlook",
   snippet: "Ordinary excerpt",

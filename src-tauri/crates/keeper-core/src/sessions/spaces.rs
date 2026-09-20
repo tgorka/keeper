@@ -580,7 +580,14 @@ pub fn read_all(files: &[(&str, &str)]) -> Vec<SessionSpace> {
         .filter(|(rel, _)| rel.ends_with(".md"))
         .map(|(rel, text)| read_one(rel, text))
         .collect();
-    spaces.sort_by(|a, b| sort::rail_order((a.order, None, &a.name), (b.order, None, &b.name)));
+    // Session spaces cannot be pinned, so they all carry the same `false` in
+    // the notes rail's leading pin term (Epic 77, AD-269).
+    spaces.sort_by(|a, b| {
+        sort::rail_order(
+            (false, a.order, None, &a.name),
+            (false, b.order, None, &b.name),
+        )
+    });
     spaces
 }
 

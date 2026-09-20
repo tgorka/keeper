@@ -552,6 +552,9 @@ type TaskFormValues = {
   copySource: string;
   copyDestination: string;
   replaceExisting: boolean;
+  pruneDestination: boolean;
+  refreshMissing: boolean;
+  copyLookbackMinutes: string;
 };
 
 /**
@@ -615,6 +618,9 @@ export function TaskForm({
           copySource: "",
           copyDestination: "",
           replaceExisting: false,
+          pruneDestination: false,
+          refreshMissing: true,
+          copyLookbackMinutes: "5",
         }
       : {
           id: task.id,
@@ -649,6 +655,9 @@ export function TaskForm({
           copySource: task.copySource ?? "",
           copyDestination: task.copyDestination ?? "",
           replaceExisting: task.replaceExisting,
+          pruneDestination: task.pruneDestination,
+          refreshMissing: task.refreshMissing,
+          copyLookbackMinutes: String(task.copyLookbackMs / 60_000),
         },
   );
   /**
@@ -861,6 +870,11 @@ export function TaskForm({
       setError(TASK_FORM_MISSED_DELAY_NOT_A_NUMBER);
       return;
     }
+    const copyLookbackMs = Math.round(Number(form.copyLookbackMinutes) * 60_000);
+    if (form.copyLookbackMinutes.trim() === "" || !Number.isSafeInteger(copyLookbackMs)) {
+      setError("Enter a copy lookback in minutes.");
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
@@ -880,6 +894,9 @@ export function TaskForm({
         copySource: form.copySource === "" ? null : form.copySource,
         copyDestination: form.copyDestination === "" ? null : form.copyDestination,
         replaceExisting: form.replaceExisting,
+        pruneDestination: form.pruneDestination,
+        refreshMissing: form.refreshMissing,
+        copyLookbackMs,
         // The only normalisation this form performs, and it is not tidying: an
         // empty box means "store nothing", and the wire type spells the absent
         // value `null` — the empty string is a different thing. Both fields below
@@ -1552,6 +1569,60 @@ function CopyTaskFields({ form, fieldId, saving, onChange }: KindFieldsProps) {
           onCheckedChange={(replaceExisting) => onChange({ replaceExisting })}
         />
       </div>
+      <div className="flex flex-col gap-1">
+        <div className={TASK_FORM_ROW_CLASS}>
+          <Label htmlFor={`${fieldId}-prune`}>Delete files the source no longer has</Label>
+          <Switch
+            id={`${fieldId}-prune`}
+            checked={form.pruneDestination}
+            onCheckedChange={(pruneDestination) => onChange({ pruneDestination })}
+            aria-describedby={`${fieldId}-prune-note`}
+          />
+        </div>
+        <p id={`${fieldId}-prune-note`} className="text-muted-foreground text-xs leading-4">
+          When on, each run deletes ordinary destination files absent from the source, leaving
+          symlinks and keeper's logs alone; when off, it keeps all destination files.
+        </p>
+      </div>
+      <div className="flex flex-col gap-1">
+        <div className={TASK_FORM_ROW_CLASS}>
+          <Label htmlFor={`${fieldId}-refresh`}>Re-copy files missing at the destination</Label>
+          <Switch
+            id={`${fieldId}-refresh`}
+            checked={form.refreshMissing}
+            onCheckedChange={(refreshMissing) => onChange({ refreshMissing })}
+            aria-describedby={`${fieldId}-refresh-note`}
+          />
+        </div>
+        <p id={`${fieldId}-refresh-note`} className="text-muted-foreground text-xs leading-4">
+          When on, a file deleted at the destination is restored even if its source is older than
+          the mark; when off, missing files get no separate repair pass.
+        </p>
+      </div>
+      <div className="flex flex-col gap-1">
+        <div className={TASK_FORM_ROW_CLASS}>
+          <Label htmlFor={`${fieldId}-lookback`}>Copy lookback</Label>
+          <div className="flex items-center gap-1">
+            <Input
+              id={`${fieldId}-lookback`}
+              type="number"
+              step="any"
+              className="w-24"
+              value={form.copyLookbackMinutes}
+              onChange={(event) => onChange({ copyLookbackMinutes: event.target.value })}
+              aria-describedby={`${fieldId}-lookback-note`}
+            />
+            <span className="text-xs">min</span>
+          </div>
+        </div>
+        <p id={`${fieldId}-lookback-note`} className="text-muted-foreground text-xs leading-4">
+          Re-examines sources this far before the last mark so edits around a run are not missed; 0
+          uses the mark exactly.
+        </p>
+      </div>
+      <p className="text-muted-foreground text-xs leading-4">
+        Copy tasks run wherever they are hosted, including keeper-syncd on a server.
+      </p>
     </fieldset>
   );
 }

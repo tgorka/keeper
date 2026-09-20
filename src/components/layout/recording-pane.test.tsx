@@ -76,6 +76,7 @@ vi.mock("@/lib/ipc/client", () => ({
   // vault is this suite's world, so the button is absent — the linked case has
   // its own tests below.
   notesSpaces: vi.fn(() => Promise.resolve([])),
+  notesSpaceTouch: vi.fn(),
   notesVaults: vi.fn(() => Promise.resolve([])),
   revealPath: vi.fn(() => Promise.resolve()),
   // Story 42.4: the completion card resolves its note stub on mount. No stub
@@ -152,6 +153,7 @@ import type {
 } from "@/lib/ipc/client";
 import {
   notesSpaces,
+  notesSpaceTouch,
   openCameraSettings,
   openMicrophoneSettings,
   openScreenRecordingSettings,
@@ -170,7 +172,7 @@ import {
   revealPath,
 } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
-import { ALL_NOTES_SCOPE, notesFiltersStore } from "@/lib/stores/notes-filters";
+import { notesFiltersStore, resetNotesFiltersStoreForTest } from "@/lib/stores/notes-filters";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { resetRecordingAudioForTest } from "@/lib/stores/recording-audio";
@@ -1129,18 +1131,46 @@ describe("RecordingPane", () => {
 });
 
 describe("RecordingPane — the way across to Notes (Story 45.19, FR-197)", () => {
-  const RECORDINGS_SPACE = {
+  const RECORDINGS_SPACE: NoteSpaceVm = {
     id: "spaces/2026-08-09-recordings.md",
     name: "Recordings",
     defaultKey: "recordings",
-  } as unknown as NoteSpaceVm;
+    query: "is:recording",
+    sort: "modified desc",
+    sortEffective: "modified desc",
+    limit: 0,
+    icon: null,
+    order: 0,
+    folder: null,
+    template: null,
+    warnings: [],
+    error: null,
+    updatedMs: null,
+    pinned: false,
+    ttlHours: null,
+    expiresMs: null,
+    expiryPhrase: "",
+    text: null,
+    parent: null,
+    leafName: "Recordings",
+    depth: 0,
+    descendants: 0,
+    restore: {
+      tagTerms: {},
+      flags: ["recording"],
+      origin: null,
+      text: null,
+      sort: null,
+      opaque: false,
+    },
+  };
 
   /** A space the USER named "Recordings" — no `keeper.default`, so not it. */
-  const IMPOSTOR = {
+  const IMPOSTOR: NoteSpaceVm = {
+    ...RECORDINGS_SPACE,
     id: "spaces/2026-08-09-mine.md",
-    name: "Recordings",
     defaultKey: null,
-  } as unknown as NoteSpaceVm;
+  };
 
   beforeEach(() => {
     // Hydrated directly: the pane's own boot path only needs the mirror to have
@@ -1154,8 +1184,9 @@ describe("RecordingPane — the way across to Notes (Story 45.19, FR-197)", () =
     });
     vi.mocked(notesSpaces).mockReset();
     vi.mocked(notesSpaces).mockResolvedValue([]);
+    vi.mocked(notesSpaceTouch).mockReset().mockResolvedValue(RECORDINGS_SPACE);
     primaryViewStore.getState().setView("recording");
-    notesFiltersStore.setState({ scope: ALL_NOTES_SCOPE });
+    resetNotesFiltersStoreForTest();
   });
 
   afterEach(() => {
@@ -1164,7 +1195,7 @@ describe("RecordingPane — the way across to Notes (Story 45.19, FR-197)", () =
 
   it("offers the space, named as the user named it, and goes there", async () => {
     vi.mocked(notesSpaces).mockResolvedValue([
-      { ...RECORDINGS_SPACE, name: "Sessions" } as unknown as NoteSpaceVm,
+      { ...RECORDINGS_SPACE, name: "Sessions", leafName: "Sessions" },
     ]);
     render(<RecordingPane />);
 
@@ -1179,10 +1210,13 @@ describe("RecordingPane — the way across to Notes (Story 45.19, FR-197)", () =
 
     fireEvent.click(button);
     expect(primaryViewStore.getState().view).toBe("notes");
-    expect(notesFiltersStore.getState().scope).toMatchObject({
-      kind: "space",
-      id: RECORDINGS_SPACE.id,
-    });
+    await waitFor(() =>
+      expect(notesFiltersStore.getState().scope).toMatchObject({
+        kind: "space",
+        id: RECORDINGS_SPACE.id,
+      }),
+    );
+    expect(notesFiltersStore.getState().flags).toContain("recording");
   });
 
   it("offers nothing when the vault has no Recordings space, whatever its spaces are called", async () => {
@@ -1190,7 +1224,7 @@ describe("RecordingPane — the way across to Notes (Story 45.19, FR-197)", () =
     // a link decided by name would light up here and take the user to somebody
     // else's saved query. The identity is `keeper.default`.
     vi.mocked(notesSpaces).mockResolvedValue([
-      { id: "spaces/inbox.md", name: "Inbox", defaultKey: "inbox" } as unknown as NoteSpaceVm,
+      { ...RECORDINGS_SPACE, id: "spaces/inbox.md", name: "Inbox", defaultKey: "inbox" },
       IMPOSTOR,
     ]);
     render(<RecordingPane />);

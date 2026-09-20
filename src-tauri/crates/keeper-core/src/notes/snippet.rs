@@ -63,6 +63,33 @@ pub fn prose(body: &str, budget: usize) -> String {
     out.text
 }
 
+/// Row preview: omit only the leading H1 that already supplies the title.
+#[must_use]
+pub fn prose_after_title(body: &str, title: &str, budget: usize) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    let leading = body.trim_start();
+    let first = leading.lines().next().unwrap_or("");
+    if first
+        .strip_prefix('#')
+        .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+        && folded_words(strip_atx_heading(first)).eq(folded_words(title))
+    {
+        prose(leading.get(first.len()..).unwrap_or(""), budget)
+    } else {
+        prose(body, budget)
+    }
+}
+
+fn folded_words(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.split_whitespace().flat_map(|word| {
+        word.chars()
+            .flat_map(char::to_lowercase)
+            .chain(std::iter::once(' '))
+    })
+}
+
 fn list_body(line: &str) -> Option<&str> {
     for prefix in ["- ", "* ", "+ ", "-\t", "*\t", "+\t"] {
         if let Some(rest) = line.strip_prefix(prefix) {
@@ -177,6 +204,18 @@ fn inline(mut text: &str, out: &mut Preview) {
             }
         }
         let label_start = if text.starts_with("![") { 1 } else { 0 };
+        if let Some(wiki) = text[label_start..].strip_prefix("[[") {
+            if let Some(end) = wiki.find("]]") {
+                let target = &wiki[..end];
+                let label = target.split_once('|').map_or_else(
+                    || target.rsplit('/').next().unwrap_or(target),
+                    |(_, alias)| alias,
+                );
+                suffixes.push(&wiki[end + 2..]);
+                text = label;
+                continue;
+            }
+        }
         if text[label_start..].starts_with('[') {
             let label = &text[label_start..];
             if let Some(end) = closing(label, '[', ']') {
@@ -233,6 +272,36 @@ fn inline(mut text: &str, out: &mut Preview) {
 #[cfg(test)]
 mod tests {
     use super::prose;
+
+    #[test]
+    fn row_skips_only_its_own_leading_title_and_renders_wikilinks() {
+        use super::prose_after_title;
+        assert_eq!(
+            prose_after_title("# Taxes 2026\nWhat I owe", "Taxes 2026", 240),
+            "What I owe"
+        );
+        assert_eq!(
+            prose_after_title("# Overview\nWhat I owe", "Taxes 2026", 240),
+            "Overview What I owe"
+        );
+        assert_eq!(
+            prose_after_title("# Taxes 2026\n# Other\nbody", " taxes  2026 ", 240),
+            "Other body"
+        );
+        assert_eq!(
+            prose_after_title("---\nfirst\n---\nsecond", "first", 240),
+            "first second"
+        );
+        assert_eq!(prose_after_title("# Taxes 2026", "Taxes 2026", 240), "");
+        assert_eq!(prose_after_title("# Ab c\nbody", "A bc", 240), "Ab c body");
+        assert_eq!(
+            prose(
+                "See [[Vault as a lens|the lens]] and [[Journal/Bali]] and ![[img.png]]",
+                100
+            ),
+            "See the lens and Bali and img.png"
+        );
+    }
 
     #[test]
     fn markdown_becomes_prose_before_the_budget_is_applied() {

@@ -18,6 +18,7 @@
  * dismissed by fixing the thing it describes.
  */
 import { Button } from "@/components/ui/button";
+import { useNotesFiltersStore } from "@/lib/stores/notes-filters";
 
 /** Which of the five states the list is in. */
 export type NotesEmptyKind =
@@ -77,9 +78,14 @@ export function NotesEmptyState({
   onAction: () => void;
 }) {
   const { message, action } = COPY[kind];
+  const multipleDrives = useNotesFiltersStore((state) => state.vaultIds.length > 1);
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6">
-      <p className="max-w-[36ch] text-center text-muted-foreground text-sm">{message}</p>
+      <p className="max-w-[36ch] text-center text-muted-foreground text-sm">
+        {multipleDrives && (kind === "no-matches" || kind === "no-search-matches")
+          ? "No matches in the selected drives."
+          : message}
+      </p>
       {detail !== null && detail !== undefined && (
         <p className="max-w-[36ch] text-center text-muted-foreground text-xs">{detail}</p>
       )}

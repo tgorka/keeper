@@ -22,6 +22,7 @@ import {
 import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
 import { SyncGitRow } from "@/components/settings/sync-git-row";
 import { DeviceSection, SyncSection } from "@/components/settings/sync-section";
+import { TasksSection } from "@/components/settings/tasks-section";
 import { TelemetrySection } from "@/components/settings/telemetry-section";
 import { UnsetShortcutRow } from "@/components/settings/unset-shortcut-row";
 import { Button } from "@/components/ui/button";
@@ -257,6 +258,7 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
       {/* Folder sync needs a usable `git` (Epic 29): absent on every machine
               that has none, never a section whose every button would reject. */}
       {sync && <SyncSection open={open} />}
+      {sync && <TasksSection open={open} />}
       {/* Its own section, not a block inside Sync: the device name is not a sync
           setting — it rides every commit's `Keeper-Device` trailer, names this
           machine in conflict-copy filenames, and now qualifies the commit subject

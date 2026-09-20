@@ -59,6 +59,9 @@ export interface NotesListState {
   matched: number;
   /** Matching notes withheld by service visibility, before paging/caps. */
   hidden: number;
+  private: number;
+  notice: string | null;
+  searching: boolean;
   /** Where this window starts in the filtered set. */
   offset: number;
   /** Whether a first list read has landed. */
@@ -89,10 +92,23 @@ export const notesListStore = createStore<NotesListState>()((set) => ({
   total: 0,
   matched: 0,
   hidden: 0,
+  private: 0,
+  notice: null,
+  searching: false,
   offset: 0,
   loaded: false,
   searchError: null,
-  failSearch: (searchError) => set({ rows: [], total: 0, matched: 0, hidden: 0, searchError }),
+  failSearch: (searchError) =>
+    set({
+      rows: [],
+      total: 0,
+      matched: 0,
+      hidden: 0,
+      private: 0,
+      notice: null,
+      searching: false,
+      searchError,
+    }),
   limit: NOTES_PAGE_SIZE,
   reset: (vm) =>
     set({
@@ -100,6 +116,9 @@ export const notesListStore = createStore<NotesListState>()((set) => ({
       total: vm.total,
       matched: vm.matched,
       hidden: vm.hidden,
+      private: vm.private,
+      notice: vm.notice,
+      searching: false,
       offset: vm.offset,
       loaded: true,
       searchError: null,
@@ -156,6 +175,8 @@ export const notesListStore = createStore<NotesListState>()((set) => ({
         total: batch.total,
         matched: batch.matched,
         hidden: batch.hidden,
+        private: batch.private,
+        searching: false,
         loaded: true,
         searchError: null,
       };
@@ -167,6 +188,9 @@ export const notesListStore = createStore<NotesListState>()((set) => ({
       total: 0,
       matched: 0,
       hidden: 0,
+      private: 0,
+      notice: null,
+      searching: false,
       offset: 0,
       loaded: false,
       searchError: null,
@@ -189,6 +213,9 @@ export function resetNotesListStoreForTest(): void {
     total: 0,
     matched: 0,
     hidden: 0,
+    private: 0,
+    notice: null,
+    searching: false,
     offset: 0,
     loaded: false,
     searchError: null,

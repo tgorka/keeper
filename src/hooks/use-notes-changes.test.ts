@@ -14,6 +14,7 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 const service: NoteRowVm = {
   id: "service",
+  vaultId: "v1",
   path: "agents.md",
   title: "Agent instructions",
   snippet: "",
@@ -30,14 +31,31 @@ const service: NoteRowVm = {
   headRev: "",
   order: { value: 0, source: "default" },
 };
-const hidden: NoteListVm = { rows: [], total: 0, matched: 0, hidden: 1, offset: 0 };
-const visible: NoteListVm = { rows: [service], total: 1, matched: 1, hidden: 0, offset: 0 };
+const hidden: NoteListVm = {
+  rows: [],
+  total: 0,
+  matched: 0,
+  hidden: 1,
+  private: 0,
+  notice: null,
+  offset: 0,
+};
+const visible: NoteListVm = {
+  rows: [service],
+  total: 1,
+  matched: 1,
+  hidden: 0,
+  private: 0,
+  notice: null,
+  offset: 0,
+};
 const batch: NoteChangeBatch = {
   vaultId: "v1",
   ops: [{ op: "reset", rows: [service] }],
   total: 1,
   matched: 1,
   hidden: 0,
+  private: 0,
 };
 beforeEach(() => {
   vi.clearAllMocks();
@@ -88,7 +106,7 @@ it("drops a streamed refresh that finishes after the eye changed", async () => {
   expect(notesListStore.getState().hidden).toBe(0);
 });
 
-it("clears stale rows on a rejected search while retaining loaded state and recovering on refresh", async () => {
+it("clears stale rows on a rejected search and recovers on refresh", async () => {
   notesFiltersStore.getState().setHideServiceFiles(false);
   renderHook(() => useNotesChanges("v1"));
   await waitFor(() => expect(notesListStore.getState().rows).toEqual([service]));
@@ -96,7 +114,6 @@ it("clears stale rows on a rejected search while retaining loaded state and reco
   act(() => notesFiltersStore.getState().setText("budget"));
   await waitFor(() => expect(notesListStore.getState().searchError).toBe("Search failed."));
   expect(notesListStore.getState().rows).toEqual([]);
-  expect(notesListStore.getState().loaded).toBe(true);
   await act(async () => vi.mocked(notesSubscribeChanges).mock.calls[0][1](batch));
   expect(notesListStore.getState().searchError).toBeNull();
   expect(notesListStore.getState().rows).toEqual([service]);
@@ -110,4 +127,39 @@ it("preserves the window while preference hydration gates the first read", () =>
   expect(notesList).not.toHaveBeenCalled();
   expect(notesListStore.getState().rows).toEqual([service]);
   expect(notesListStore.getState().limit).toBe(limit);
+});
+
+it("re-queries the combined result when any selected drive changes", async () => {
+  notesFiltersStore.getState().setVaultIds(["v1", "v2"]);
+  renderHook(() => useNotesChanges("v1"));
+  await waitFor(() => expect(notesListStore.getState().loaded).toBe(true));
+  const second = vi.mocked(notesSubscribeChanges).mock.calls.find(([id]) => id === "v2");
+  expect(second).toBeDefined();
+  vi.mocked(notesList).mockResolvedValueOnce({
+    ...visible,
+    rows: [{ ...service, vaultId: "v2" }],
+    private: 2,
+  });
+  await act(async () => second?.[1]({ ...batch, vaultId: "v2" }));
+  expect(notesListStore.getState().rows[0]?.vaultId).toBe("v2");
+  expect(notesListStore.getState().private).toBe(2);
+});
+
+it("rejects a late answer after a drive or private toggle changed the query", async () => {
+  let release: (vm: NoteListVm) => void = () => {};
+  vi.mocked(notesList).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+  );
+  renderHook(() => useNotesChanges("v1"));
+  act(() => {
+    notesFiltersStore.getState().setVaultIds(["v2"]);
+    notesFiltersStore.getState().setIncludePrivate(true);
+  });
+  await waitFor(() => expect(notesListStore.getState().loaded).toBe(true));
+  await act(async () => release({ ...visible, notice: "Old query notice" }));
+  expect(notesListStore.getState().rows).toEqual([]);
+  expect(notesListStore.getState().notice).toBeNull();
 });

@@ -32,7 +32,11 @@ enabled: boolean,
 /**
  * The profile this task is scoped to, `null` for host-wide work.
  */
-profileId: string | null, botId: string | null, promptSubpath: string | null, model: string | null, copySource: string | null, copyDestination: string | null, replaceExisting: boolean, 
+profileId: string | null, botId: string | null, promptSubpath: string | null, model: string | null, copySource: string | null, copyDestination: string | null, replaceExisting: boolean, pruneDestination: boolean, refreshMissing: boolean, copyLookbackMs: number, 
+/**
+ * The engine's resolved ledger directory for this task.
+ */
+ledgerPath: string | null, 
 /**
  * The mark the last successful run left, epoch ms, `null` when this task
  * has no ledger entry yet (Story 74.4, AD-252).

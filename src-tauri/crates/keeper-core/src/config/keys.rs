@@ -517,6 +517,16 @@ pub const KEYS: &[KeySpec] = &[
         example: "\"01J8Z5R0Q9WQ4C3S0PNK7T2A1B\"",
     },
     KeySpec {
+        key: "tasks.ledger_vault",
+        family: false,
+        scope: Scope::MachineLocal,
+        settable: Settable::MachineFileOnly(PROFILE_ID_WHY),
+        shape: Shape::Text,
+        default: "",
+        summary: "Which sync profile holds task ledgers; absent lets keeper choose.",
+        example: "\"01J8Z5R0Q9WQ4C3S0PNK7T2A1B\"",
+    },
+    KeySpec {
         key: "notes.service_file_names",
         family: false,
         scope: Scope::UserGlobal,
@@ -534,6 +544,16 @@ pub const KEYS: &[KeySpec] = &[
         shape: Shape::Flag01,
         default: "1",
         summary: "Whether the notes list is hiding service files.",
+        example: "",
+    },
+    KeySpec {
+        key: "notes.include_private",
+        family: false,
+        scope: Scope::SessionState,
+        settable: Settable::Never("it remembers the person's last choice in the notes list"),
+        shape: Shape::Flag01,
+        default: "0",
+        summary: "Whether the notes list includes private notes.",
         example: "",
     },
     KeySpec {
@@ -1500,6 +1520,7 @@ mod tests {
             "recording.destination_profile_id",
             "sync.git_path",
             "notes.active_vault",
+            "tasks.ledger_vault",
         ] {
             let refusal = layer_may_set(key, false).expect_err("refused from a shared file");
             assert!(

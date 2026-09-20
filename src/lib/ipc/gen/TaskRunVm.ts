@@ -62,4 +62,4 @@ lateByMs: number | null,
 /**
  * Which host recorded the run, as stored (e.g. `"app"`, `"daemon"`).
  */
-host: string, };
+host: string, ledgerEntry: string | null, };

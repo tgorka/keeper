@@ -52,11 +52,14 @@ import { NoteFilterBar } from "@/components/notes/note-filter-bar";
 import { NoteList } from "@/components/notes/note-list";
 import { type NotesEmptyKind, NotesEmptyState } from "@/components/notes/notes-empty-state";
 import { NEW_NOTE_LABEL, NOTES_COUNT_SLOT } from "@/components/notes/notes-pane";
+import { SpaceNamePopover } from "@/components/notes/space-name-popover";
 import { VaultSwitcher } from "@/components/notes/vault-switcher";
 import { Button } from "@/components/ui/button";
 import { IconHint } from "@/components/ui/tooltip";
 import {
+  captureSpaceDraft,
   createNote,
+  type SpaceSaveDraft,
   saveFilterAsSpace,
   showCapture,
   useNotesActions,
@@ -68,9 +71,11 @@ import { notesSubscribeSearch, notesUnsubscribeChanges } from "@/lib/ipc/client"
 import {
   emptyFilterReason,
   hydrateHideServiceFiles,
+  hydrateIncludePrivate,
   isFiltered,
   notesFiltersStore,
   persistHideServiceFiles,
+  persistIncludePrivate,
   scopeLabel,
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
@@ -136,11 +141,18 @@ export function NotesPhoneList({
   const total = useNotesListStore((s) => s.total);
   const matched = useNotesListStore((s) => s.matched);
   const hidden = useNotesListStore((s) => s.hidden);
+  const privateCount = useNotesListStore((s) => s.private);
   const loaded = useNotesListStore((s) => s.loaded);
   const searchError = useNotesListStore((s) => s.searchError);
   const activeNote = useActiveNote();
   const actions = useNotesActions(activeVaultId);
-  const searchRef = useRef<HTMLInputElement | null>(null);
+  const searchRef = useRef<HTMLTextAreaElement | null>(null);
+  const [savingSpace, setSavingSpace] = useState<{
+    anchor: HTMLElement;
+    draft: SpaceSaveDraft;
+    name: string;
+  } | null>(null);
+  const [spaceNotice, setSpaceNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [visibilityReady, setVisibilityReady] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -154,7 +166,7 @@ export function NotesPhoneList({
 
   useEffect(() => {
     let cancelled = false;
-    void hydrateHideServiceFiles()
+    void Promise.all([hydrateHideServiceFiles(), hydrateIncludePrivate()])
       .catch((error: unknown) => {
         if (!cancelled)
           setActionError(syncErrorMessage(error, "Could not restore service-file visibility."));
@@ -222,16 +234,22 @@ export function NotesPhoneList({
     [report],
   );
 
-  const onSaveAsSpace = useCallback(() => {
-    const { scope, tagTerms, agentOnly, text } = notesFiltersStore.getState();
-    const parts = [
-      scope.kind === "all" ? null : scopeLabel(scope),
-      ...tagTerms.map((chip) => (chip.term === "exclude" ? `not ${chip.tag}` : chip.tag)),
-      agentOnly ? "Changed by agent" : null,
-      text.trim() === "" ? null : `"${text.trim()}"`,
-    ].filter((part): part is string => part !== null && part !== "");
-    void saveFilterAsSpace(parts.length === 0 ? "Saved filter" : parts.join(" · ")).catch(report);
-  }, [report]);
+  const onSaveAsSpace = useCallback((anchor: HTMLButtonElement) => {
+    const draft = captureSpaceDraft();
+    if (draft) {
+      const { scope, tagTerms, agentOnly, text } = notesFiltersStore.getState();
+      const name =
+        [
+          scope.kind === "all" ? null : scopeLabel(scope),
+          ...tagTerms.map((chip) => (chip.term === "exclude" ? `not ${chip.tag}` : chip.tag)),
+          agentOnly ? "Changed by agent" : null,
+          text.trim() ? `"${text.trim()}"` : null,
+        ]
+          .filter(Boolean)
+          .join(" · ") || "Untitled space";
+      setSavingSpace({ anchor, draft, name });
+    }
+  }, []);
 
   const onCreate = useCallback(() => {
     setActionError(null);
@@ -243,7 +261,7 @@ export function NotesPhoneList({
       if (activeVaultId !== null) {
         panelsStore.getState().setActiveTarget({
           kind: "note",
-          vaultId: activeVaultId,
+          vaultId: row.vaultId,
           noteId: row.id,
         });
         onOpen();
@@ -352,6 +370,22 @@ export function NotesPhoneList({
           />
         </>
       )}
+      {savingSpace && (
+        <SpaceNamePopover
+          anchor={savingSpace.anchor}
+          initialName={savingSpace.name}
+          onClose={() => setSavingSpace(null)}
+          onSave={async (name, options) => {
+            const saved = await saveFilterAsSpace(name, options, savingSpace.draft);
+            if (saved) setSpaceNotice(`Space saved: ${saved.name}`);
+          }}
+        />
+      )}
+      {spaceNotice && (
+        <p role="status" className="px-2 text-xs">
+          {spaceNotice}
+        </p>
+      )}
       {actionError !== null && (
         <p role="alert" className="shrink-0 px-3 py-2 text-destructive text-xs">
           {actionError}
@@ -367,9 +401,23 @@ export function NotesPhoneList({
           {hidden > 0 && (
             <span className="whitespace-nowrap">{` · ${hidden.toLocaleString()} hidden`}</span>
           )}
+          {privateCount > 0 && (
+            <span className="whitespace-nowrap">{` · ${privateCount.toLocaleString()} private`}</span>
+          )}
         </p>
       )}
-      {loaded && total === 0 && hidden > 0 ? (
+      {loaded && total === 0 && privateCount > 0 ? (
+        <div className="flex flex-col items-center gap-2 p-4 text-sm">
+          <p>Matching private notes are excluded from this search.</p>
+          <button
+            type="button"
+            className="min-h-11 underline"
+            onClick={() => void persistIncludePrivate(true).catch(report)}
+          >
+            Include private notes
+          </button>
+        </div>
+      ) : loaded && total === 0 && hidden > 0 ? (
         <div className="flex flex-col items-center gap-2 p-4 text-sm">
           <p>Matching notes are hidden by the service-file preference.</p>
           <button

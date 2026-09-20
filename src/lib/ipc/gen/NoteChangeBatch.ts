@@ -7,7 +7,7 @@ import type { NoteListOp } from "./NoteListOp";
  * Coalesced to at most one message per 250 ms per subscription, so a 500-file
  * agent run is a handful of messages per second rather than five hundred.
  */
-export type NoteChangeBatch = { vaultId: string, 
+export type NoteChangeBatch = { private: number, vaultId: string, 
 /**
  * Ops in order; apply them in sequence.
  */

@@ -221,7 +221,9 @@ export type { NoteSearchHitVm } from "./gen/NoteSearchHitVm";
 export type { NoteSearchReq } from "./gen/NoteSearchReq";
 export type { NoteSearchStateVm } from "./gen/NoteSearchStateVm";
 export type { NoteSpaceFieldVm } from "./gen/NoteSpaceFieldVm";
+export type { NoteSpaceParkReq } from "./gen/NoteSpaceParkReq";
 export type { NoteSpaceReq } from "./gen/NoteSpaceReq";
+export type { NoteSpaceRestoreVm } from "./gen/NoteSpaceRestoreVm";
 export type { NoteSpaceTagVm } from "./gen/NoteSpaceTagVm";
 export type { NoteSpaceTermsVm } from "./gen/NoteSpaceTermsVm";
 export type { NoteSpaceVm } from "./gen/NoteSpaceVm";
@@ -352,9 +354,11 @@ export type { TaskBatchReceiptVm } from "./gen/TaskBatchReceiptVm";
 export type { TaskHostKind } from "./gen/TaskHostKind";
 export type { TaskHostVm } from "./gen/TaskHostVm";
 export type { TaskListingVm } from "./gen/TaskListingVm";
+export type { TaskRunLogVm } from "./gen/TaskRunLogVm";
 export type { TaskRunVm } from "./gen/TaskRunVm";
 export type { TaskSaveReq } from "./gen/TaskSaveReq";
 export type { TaskSchedulePreviewVm } from "./gen/TaskSchedulePreviewVm";
+export type { TasksLedgerVm } from "./gen/TasksLedgerVm";
 export type { TaskVm } from "./gen/TaskVm";
 export type { TccPermission } from "./gen/TccPermission";
 export type { TemplateChangeVm } from "./gen/TemplateChangeVm";
@@ -469,6 +473,7 @@ import type { NoteRowVm } from "./gen/NoteRowVm";
 import type { NoteSearchBatch } from "./gen/NoteSearchBatch";
 import type { NoteSearchReq } from "./gen/NoteSearchReq";
 import type { NoteSearchStateVm } from "./gen/NoteSearchStateVm";
+import type { NoteSpaceParkReq } from "./gen/NoteSpaceParkReq";
 import type { NoteSpaceReq } from "./gen/NoteSpaceReq";
 import type { NoteSpaceTermsVm } from "./gen/NoteSpaceTermsVm";
 import type { NoteSpaceVm } from "./gen/NoteSpaceVm";
@@ -538,9 +543,11 @@ import type { TagVocabularyVm } from "./gen/TagVocabularyVm";
 import type { TaskBatchIdReq } from "./gen/TaskBatchIdReq";
 import type { TaskBatchReceiptVm } from "./gen/TaskBatchReceiptVm";
 import type { TaskListingVm } from "./gen/TaskListingVm";
+import type { TaskRunLogVm } from "./gen/TaskRunLogVm";
 import type { TaskRunVm } from "./gen/TaskRunVm";
 import type { TaskSaveReq } from "./gen/TaskSaveReq";
 import type { TaskSchedulePreviewVm } from "./gen/TaskSchedulePreviewVm";
+import type { TasksLedgerVm } from "./gen/TasksLedgerVm";
 import type { TaskVm } from "./gen/TaskVm";
 import type { TccPermission } from "./gen/TccPermission";
 import type { TemplateUpdateApplyReq } from "./gen/TemplateUpdateApplyReq";
@@ -4432,8 +4439,20 @@ export async function notesSpacesRestoreDefaults(vaultId: string): Promise<numbe
  *
  * Rejects with: `invalidInput` (an unparseable query), `unsupported`, `internal`.
  */
-export async function notesSpaceSave(vaultId: string, space: NoteSpaceReq): Promise<NoteRefVm> {
-  return await invoke<NoteRefVm>("notes_space_save", { vaultId, space });
+export async function notesSpaceSave(vaultId: string, space: NoteSpaceReq): Promise<NoteSpaceVm> {
+  return await invoke<NoteSpaceVm>("notes_space_save", { vaultId, space });
+}
+
+export async function notesSpaceTouch(vaultId: string, spaceId: string): Promise<NoteSpaceVm> {
+  return await invoke<NoteSpaceVm>("notes_space_touch", { vaultId, spaceId });
+}
+
+export async function notesSpacePark(
+  vaultId: string,
+  label: string,
+  req: NoteSpaceParkReq,
+): Promise<NoteSpaceVm> {
+  return await invoke<NoteSpaceVm>("notes_space_park", { vaultId, label, req });
 }
 
 /**
@@ -5312,6 +5331,14 @@ export async function notesHideServiceFilesGet(): Promise<boolean> {
 
 export async function notesHideServiceFilesSet(hidden: boolean): Promise<void> {
   return await invoke<void>("notes_hide_service_files_set", { hidden });
+}
+
+export async function notesIncludePrivateGet(): Promise<boolean> {
+  return await invoke<boolean>("notes_include_private_get");
+}
+
+export async function notesIncludePrivateSet(value: boolean): Promise<void> {
+  return await invoke<void>("notes_include_private_set", { value });
 }
 
 export async function notesEmbeddingModelGet(): Promise<EmbeddingModelVm | null> {
@@ -6671,6 +6698,23 @@ export async function syncTasks(): Promise<TaskListingVm> {
  */
 export async function syncTaskHistory(id: string, limit?: number): Promise<TaskRunVm[]> {
   return await invoke<TaskRunVm[]>("sync_task_history", { id, limit });
+}
+
+/** Read a bounded, whole-line chunk backwards from a run log's tail. */
+export async function syncTaskRunLog(
+  runId: number,
+  cursor: number | null,
+  maxBytes: number,
+): Promise<TaskRunLogVm> {
+  return await invoke<TaskRunLogVm>("sync_task_run_log", { runId, cursor, maxBytes });
+}
+
+export async function syncTasksLedger(): Promise<TasksLedgerVm> {
+  return await invoke<TasksLedgerVm>("sync_tasks_ledger");
+}
+
+export async function syncTasksLedgerSet(profileId: string | null): Promise<void> {
+  await invoke("sync_tasks_ledger_set", { profileId });
 }
 
 /**

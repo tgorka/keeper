@@ -41,6 +41,9 @@ pub const MIN_SCHEDULE_INTERVAL_MS: i64 = 60_000;
 /// (`0 0 1 1 *`), so nothing is lost by refusing here.
 const MAX_SCHEDULE_INTERVAL_MS: i64 = 366 * 24 * 60 * 60 * 1_000;
 
+/// Default overlap behind a copy task's last successful source mark.
+pub const COPY_LOOKBACK_DEFAULT_MS: i64 = 300_000;
+
 /// How long an open window may sit unserved before keeper concludes **nobody
 /// was home** (Story 58.4, FR-356, AD-139).
 ///
@@ -1269,6 +1272,34 @@ pub fn validate_missed_delay_ms(delay_ms: Option<i64>) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// A copy overlap is a duration, bounded by the schedule's one-year ceiling.
+pub fn validate_copy_lookback_ms(lookback_ms: i64) -> Result<()> {
+    if !(0..=MAX_SCHEDULE_INTERVAL_MS).contains(&lookback_ms) {
+        return Err(SyncError::Config(format!(
+            "Copy lookback must be between 0 and {MAX_SCHEDULE_INTERVAL_MS} milliseconds (one year), got {lookback_ms}."
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod copy_lookback_tests {
+    use super::*;
+
+    #[test]
+    fn lookback_accepts_the_closed_interval_and_refuses_both_outside_edges() {
+        for accepted in [0, COPY_LOOKBACK_DEFAULT_MS, MAX_SCHEDULE_INTERVAL_MS] {
+            assert!(validate_copy_lookback_ms(accepted).is_ok());
+        }
+        for refused in [-1, MAX_SCHEDULE_INTERVAL_MS + 1, i64::MIN, i64::MAX] {
+            let sentence = validate_copy_lookback_ms(refused)
+                .expect_err("outside interval")
+                .to_string();
+            assert!(sentence.ends_with('.'));
+        }
+    }
 }
 
 /// How long this task holds a missed window back: its own value, or the

@@ -32,6 +32,7 @@ import type { NoteOrder, NoteRowVm } from "@/lib/ipc/client";
 function row(order: NoteOrder, overrides: Partial<NoteRowVm> = {}): NoteRowVm {
   return {
     id: "n1",
+    vaultId: "v",
     path: "notes/n1.md",
     // Empty on a row that IS a note; carried only by an outbound edge to a
     // target nobody has written yet (owner item 2).
@@ -129,21 +130,6 @@ describe("NoteRow — the order beside the note", () => {
   });
 });
 
-/**
- * How a row boundary is drawn in this list, and — the load-bearing half — how it
- * is deliberately NOT drawn.
- *
- * The owner reported missing borders and the notes list was the candidate,
- * because it is the one list in keeper with no row rule. It is also the one list
- * with no row ANCHOR: chat rows repeat an avatar and a full-height account bar,
- * recording rows are enclosed cards, tree rows repeat a file icon, and this row's
- * only mark in that lane went `bg-transparent` the moment a note was read. So the
- * fix is the anchor, not a hairline — a rule here would make this the only ruled
- * list in the app, which is heavier than the app rather than more legible.
- *
- * The negative assertion is the point of the file: it is what stops the next
- * person reading "no separators" and adding one.
- */
 function renderNoteRow(overrides: Partial<NoteRowVm> = {}): HTMLElement {
   const { container } = render(
     <NoteRow
@@ -175,34 +161,14 @@ it("reveals the complete truncated title and prose on focus, even when unread pr
   expect(hint.querySelector("b")).toBeNull();
 });
 
-function unreadDot(rowElement: HTMLElement): HTMLElement {
-  const found = rowElement.querySelector<HTMLElement>('[data-slot="unread-dot"]');
-  if (found === null) {
-    throw new Error("the row drew no unread dot");
-  }
-  return found;
-}
-
 describe("NoteRow — where one row stops and the next begins", () => {
-  it("keeps a mark in the anchor lane after a note has been read", () => {
-    const read = unreadDot(renderNoteRow({ unread: false }));
-
-    // A dot that vanishes leaves a list of read notes — the common case — with
-    // nothing repeating down its left edge and no rhythm to read a boundary
-    // from. Hollow is still a mark.
-    expect(read.className).not.toContain("bg-transparent");
-    expect(read).toHaveClass("border");
-    expect(read).toHaveClass("rounded-full");
-  });
-
-  it("tells read from unread by fill and not by the presence of the dot", () => {
-    const unread = unreadDot(renderNoteRow({ unread: true })).className;
-    const read = unreadDot(renderNoteRow({ unread: false })).className;
-
-    // DESIGN.md's grammar: filled and hollow, never a bare dot carrying its one
-    // state in colour alone.
-    expect(unread).not.toEqual(read);
-    expect(unread).toContain("bg-primary");
+  it("announces read state without reserving a dot lane", () => {
+    const unread = renderNoteRow({ unread: true });
+    const read = renderNoteRow({ unread: false });
+    expect(unread).toHaveAccessibleName(/, unread,/);
+    expect(read).toHaveAccessibleName(/, read,/);
+    expect(unread.querySelector('[data-slot="unread-dot"]')).toBeNull();
+    expect(read.querySelector('[data-slot="unread-dot"]')).toBeNull();
   });
 
   it("centres its content so the gap above a row equals the gap below it", () => {
@@ -221,7 +187,6 @@ describe("NoteRow — where one row stops and the next begins", () => {
     // is a status mark and not a separator, which is why it is asserted apart.
     expect(rowElement.className).not.toContain("border-b");
     expect(rowElement.className).not.toContain("border-t");
-    expect(unreadDot(renderNoteRow({ conflict: true }))).toBeInTheDocument();
     expect(renderNoteRow({ conflict: true })).toHaveClass("border-l-[3px]");
   });
 });
@@ -287,6 +252,18 @@ describe("NoteRow — right-click gives the note's menu, not the WebView's", () 
     expect(screen.getByRole("menuitem", { name: NOTE_ROW_OPEN_HERE_LABEL })).toBeInTheDocument();
   });
 
+  it("marks only the menu target and clears it on dismissal without selecting", async () => {
+    const { button, onSelect } = renderForMenu();
+    await openMenu(button);
+    expect(button).toHaveAttribute("data-menu-target");
+    expect(button).toHaveAttribute("aria-expanded", "true");
+    expect(button).not.toHaveAttribute("aria-current");
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    expect(button).not.toHaveAttribute("data-menu-target");
+    expect(button).not.toHaveAttribute("aria-expanded");
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
   it("offers the Files tree's verbs, in the Files tree's order", async () => {
     const { button } = renderForMenu({ unread: true, headRev: "abc123" });
     await openMenu(button);
@@ -316,6 +293,8 @@ describe("NoteRow — right-click gives the note's menu, not the WebView's", () 
     await openMenu(beside.button);
     fireEvent.click(screen.getByRole("menuitem", { name: NOTE_ROW_OPEN_BESIDE_LABEL }));
     expect(beside.onSelectBeside).toHaveBeenCalledWith(beside.noteRow);
+    expect(beside.button).not.toHaveAttribute("data-menu-target");
+    expect(beside.button).not.toHaveAttribute("aria-expanded");
   });
 
   it("names pin and archive for the state the row is in, and dispatches the list's verbs", async () => {
@@ -416,9 +395,9 @@ describe("search evidence", () => {
     expect(container.querySelector("mark")).toHaveTextContent("ł😀tax");
     rerender(<NoteRow {...props} row={{ ...note, hit: null }} />);
     expect(container.querySelector("mark")).toBeNull();
-    expect(
-      screen.getByRole("button", { name: "Note, A note, order 0, the default" }),
-    ).toHaveTextContent("the body excerpt");
+    expect(screen.getByRole("button", { name: /^Note, A note,/ })).toHaveTextContent(
+      "the body excerpt",
+    );
   });
 
   it("labels meaning without inventing lexical evidence", () => {

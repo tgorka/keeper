@@ -46,6 +46,7 @@
  * folder picker, a save button, a discard affordance. Escape files the thought;
  * nothing anywhere on this window discards text.
  */
+import { ThemeProvider } from "next-themes";
 import ReactDOM from "react-dom/client";
 import { CaptureDraftDocument } from "@/components/capture/capture-document";
 import {
@@ -78,10 +79,15 @@ function CaptureDraftWindow() {
 
 export function CapturePanel({ search }: { search: string }) {
   const target = captureTargetFromSearch(search);
-  if (target.kind === "note") {
-    return <CaptureNoteWindow vaultId={target.vaultId} noteId={target.noteId} />;
-  }
-  return <CaptureDraftWindow />;
+  return (
+    <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
+      {target.kind === "note" ? (
+        <CaptureNoteWindow vaultId={target.vaultId} noteId={target.noteId} />
+      ) : (
+        <CaptureDraftWindow />
+      )}
+    </ThemeProvider>
+  );
 }
 
 // Guarded so the module can be imported by a test without mounting a root.

@@ -6,6 +6,7 @@ import type {
   NoteListVm,
   NoteQueryReq,
   NoteRowVm,
+  NoteSpaceReq,
   NoteSpaceVm,
   NoteVaultVm,
 } from "@/lib/ipc/client";
@@ -56,6 +57,7 @@ const VAULT_B: NoteVaultVm = {
 function row(id: string, title: string, tags: string[]): NoteRowVm {
   return {
     id,
+    vaultId: id.startsWith("b") ? "vault-b" : "vault-a",
     path: `${id}.md`,
     // Empty on a row that IS a note; carried only by an outbound edge to a
     // target nobody has written yet (owner item 2).
@@ -154,6 +156,16 @@ function space(
     order: 0,
     updatedMs: null,
     error: null,
+    pinned: false,
+    ttlHours: null,
+    expiresMs: null,
+    text: null,
+    parent: null,
+    leafName: name,
+    depth: 0,
+    descendants: 0,
+    expiryPhrase: "",
+    restore: { tagTerms: {}, flags: [], origin: null, text: null, sort: null, opaque: true },
   };
 }
 
@@ -205,6 +217,8 @@ function evaluate(vaultId: string, query: NoteQueryReq): NoteListVm {
     matched: rows.length,
     offset: query.offset,
     hidden: 0,
+    private: 0,
+    notice: null,
   };
 }
 
@@ -287,12 +301,21 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     }),
     notesHideServiceFilesGet: vi.fn(async () => true),
     notesHideServiceFilesSet: vi.fn(async () => {}),
+    notesIncludePrivateGet: vi.fn(async () => false),
+    notesIncludePrivateSet: vi.fn(async () => {}),
+    tagsVocabulary: vi.fn(async () => ({ entries: [] })),
     notesSubscribeSearch: vi.fn(async () => "search-1"),
     notesList: vi.fn(async (vaultId: string, query: NoteQueryReq) => evaluate(vaultId, query)),
     notesTree: vi.fn(async () => ({ relDir: "", dirs: [], notes: [] })),
     notesTagTree: vi.fn(async () => ({ nodes: [] })),
     notesSpaces: vi.fn(async () => spaceList),
     notesSpacesRestoreDefaults: vi.fn(async () => 0),
+    notesSpaceTouch: vi.fn(async (_vault: string, id: string) => {
+      const found = spaceList.find((entry) => entry.id === id);
+      if (!found) throw new Error("Space missing");
+      return found;
+    }),
+    notesSpacePark: vi.fn(async () => space("parked", "actual-All notes", "", "search", null)),
     notesSubscribeChanges: vi.fn(async () => "sub-1"),
     notesUnsubscribeChanges: vi.fn(async () => undefined),
     notesCreate: vi.fn(async (vaultId: string, req: NoteCreateReq) => create(vaultId, req)),
@@ -312,12 +335,16 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
       consequence: `keeper removes ${noteId}.md from this vault.`,
       recovery: "keeper moves it into the vault's trash.",
     })),
-    notesSpaceSave: vi.fn(async () => ({
-      vaultId: "vault-a",
-      id: "space-1",
-      path: "spaces/s.md",
-      title: "Saved filter",
-    })),
+    notesSpaceSave: vi.fn(async (_vault: string, req: NoteSpaceReq) => {
+      const saved = {
+        ...space("space-1", req.name, req.query, req.icon ?? "", null),
+        ...req,
+        id: "space-1",
+        leafName: req.name,
+      };
+      spaceList = [...spaceList, saved];
+      return saved;
+    }),
   };
 });
 
@@ -346,6 +373,7 @@ import {
   notesDeletePlan,
   notesHideServiceFilesGet,
   notesHideServiceFilesSet,
+  notesSubscribeChanges,
 } from "@/lib/ipc/client";
 import { COLUMN_FOLD_COOKIE, resetColumnFoldForTest } from "@/lib/stores/column-fold";
 import { notesFiltersStore, resetNotesFiltersStoreForTest } from "@/lib/stores/notes-filters";
@@ -368,6 +396,60 @@ function renderPane() {
     </TooltipProvider>,
   );
 }
+
+async function newNoteInSpace(name: string) {
+  fireEvent.contextMenu(await screen.findByRole("button", { name }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: "New note in this space" }));
+}
+
+it("saves through the pane naming flow and reveals the acknowledged row without remounting", async () => {
+  renderPane();
+  await waitForRows("Pricing");
+  act(() => {
+    notesFiltersStore.getState().setTagTerm("work", "include");
+    notesFiltersStore.getState().setText("Pricing");
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save as space" }));
+  const name = await screen.findByLabelText("Name");
+  expect(name).toHaveValue('work · "Pricing"');
+  fireEvent.change(name, { target: { value: "Quarterly budget" } });
+  fireEvent.submit(name.closest("form") as HTMLFormElement);
+  expect(await screen.findByRole("button", { name: "Quarterly budget" })).toBeVisible();
+  expect(notesFiltersStore.getState().text).toBe("Pricing");
+});
+
+it("opens a result in its owning drive even when another drive is active", async () => {
+  contents["vault-a"] = [row("a1", "Local", []), { ...row("b1", "Foreign", []), id: "a1" }];
+  renderPane();
+  await waitForRows("Local", "Foreign");
+  fireEvent.click(screen.getByRole("button", { name: /Note, Foreign/ }));
+  await waitFor(() =>
+    expect(screen.getByTestId("note-editor")).toHaveAttribute("data-vault-id", "vault-b"),
+  );
+  expect(screen.getByRole("button", { name: /Note, Foreign/ })).toHaveAttribute(
+    "aria-current",
+    "true",
+  );
+  expect(screen.getByRole("button", { name: /Note, Local/ })).not.toHaveAttribute(
+    "aria-current",
+    "true",
+  );
+});
+
+it("names the selected drives in the empty search without clearing them", async () => {
+  renderPane();
+  await waitForRows("Pricing");
+  act(() => {
+    notesFiltersStore.getState().setVaultIds(["vault-a", "vault-b"]);
+    notesFiltersStore.getState().setText("no such result");
+  });
+  const empty = await screen.findByText("No matches in the selected drives.");
+  expect(empty).toBeVisible();
+  fireEvent.click(
+    within(empty.parentElement as HTMLElement).getByRole("button", { name: "Clear search" }),
+  );
+  expect(notesFiltersStore.getState().vaultIds).toEqual(["vault-a", "vault-b"]);
+});
 
 /** Wait until the first list read has painted its rows. */
 async function waitForRows(...titles: string[]) {
@@ -639,14 +721,14 @@ describe("NotesPane columns", () => {
     // "Unfold and put me where I asked to be", in one press. The pane already
     // answered this nonce for the palette; the rail reuses it rather than
     // growing a second focus path.
-    const field = await screen.findByRole("searchbox", { name: NOTES_SEARCH_PLACEHOLDER });
+    const field = await screen.findByRole("combobox", { name: NOTES_SEARCH_PLACEHOLDER });
     expect(field).toHaveFocus();
   });
 
   it("clears a filter from the folded list rail", async () => {
     renderPane();
     await waitForRows("Pricing");
-    fireEvent.change(screen.getByRole("searchbox", { name: NOTES_SEARCH_PLACEHOLDER }), {
+    fireEvent.change(screen.getByRole("combobox", { name: NOTES_SEARCH_PLACEHOLDER }), {
       target: { value: "pricing" },
     });
     fireEvent.click(screen.getByRole("button", { name: listFold }));
@@ -830,7 +912,7 @@ describe("NotesPane empty states", () => {
 
     // Same empty list, different reason — and therefore a different sentence.
     contents["vault-a"] = ROWS_A;
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search this vault" }), {
+    fireEvent.change(screen.getByRole("combobox", { name: "Search notes" }), {
       target: { value: "nothing matches this" },
     });
     await screen.findByText("No matches in this vault.");
@@ -1030,7 +1112,7 @@ describe("NotesPane — how many notes", () => {
     await waitForRows("Pricing", "Standup", "Garden");
     expect(noteCount()).toBe("4 notes");
 
-    fireEvent.change(screen.getByLabelText("Search this vault"), {
+    fireEvent.change(screen.getByLabelText("Search notes"), {
       target: { value: "Pricing" },
     });
     await waitFor(() => expect(noteCount()).toBe("1 note"));
@@ -1040,7 +1122,7 @@ describe("NotesPane — how many notes", () => {
     renderPane();
     await waitForRows("Pricing");
 
-    fireEvent.change(screen.getByLabelText("Search this vault"), {
+    fireEvent.change(screen.getByLabelText("Search notes"), {
       target: { value: "nothing whatsoever" },
     });
     // The empty state replaces the LIST. The count is its sibling, so it is
@@ -1123,10 +1205,20 @@ describe("NotesPane — new note", () => {
     });
     expect(lastCreate()).toEqual(["vault-a", expect.objectContaining({ space: null })]);
 
-    // And it is in the default list. The re-read is a scope change, which is
-    // what the app does when the reconciler has not yet streamed the write.
-    fireEvent.click(await screen.findByRole("button", { name: "Inbox" }));
-    notesFiltersStore.getState().clearAll();
+    // The reconciler announces the write; creation must not require a scope round trip.
+    const subscriptionCalls = vi.mocked(notesSubscribeChanges).mock.calls;
+    const subscription = subscriptionCalls[subscriptionCalls.length - 1];
+    expect(subscription?.[0]).toBe("vault-a");
+    await act(async () =>
+      subscription?.[1]({
+        vaultId: "vault-a",
+        ops: [],
+        total: contents["vault-a"].length,
+        matched: contents["vault-a"].length,
+        hidden: 0,
+        private: 0,
+      }),
+    );
     await waitFor(() => {
       expect(screen.getByRole("button", { name: /Note, Untitled 1/ })).toBeInTheDocument();
     });
@@ -1139,7 +1231,7 @@ describe("NotesPane — new note", () => {
     // Pinned selects `is:pinned`, and no fixture row is pinned — so the space
     // is empty before the create and holds exactly the new note after it. A
     // create that did not inherit the flag would leave it empty.
-    fireEvent.click(screen.getByRole("button", { name: "New note in Pinned" }));
+    await newNoteInSpace("Pinned");
     await waitFor(() => {
       expect(screen.getByTestId("note-editor")).toHaveAttribute("data-note-id", "new-1");
     });
@@ -1155,7 +1247,7 @@ describe("NotesPane — new note", () => {
     renderPane();
     await waitForRows("Pricing");
 
-    fireEvent.click(screen.getByRole("button", { name: "New note in Recordings" }));
+    await newNoteInSpace("Recordings");
 
     // The sentence is Rust's, so this asserts the slot carries one and names
     // the space — never the wording, which this surface does not compose.
@@ -1182,14 +1274,14 @@ describe("NotesPane — new note", () => {
     renderPane();
     await waitForRows("Pricing");
 
-    fireEvent.click(screen.getByRole("button", { name: "New note in Recordings" }));
+    await newNoteInSpace("Recordings");
     await waitFor(() => {
       expect(document.querySelector(`[data-slot="${NOTES_NOTICE_SLOT}"]`)).not.toBeNull();
     });
 
     // A stale explanation standing over a note it is not about is worse than
     // no explanation: the second note DID land where it was asked to.
-    fireEvent.click(screen.getByRole("button", { name: "New note in Inbox" }));
+    await newNoteInSpace("Inbox");
     await waitFor(() => {
       expect(screen.getByTestId("note-editor")).toHaveAttribute("data-note-id", "new-2");
     });
@@ -1299,7 +1391,17 @@ describe("service visibility in the mounted pane", () => {
       [1, 4, 2, "1 of 4 notes · 2 hidden"],
       [2, 2, 0, "2 notes"],
     ] as const) {
-      act(() => notesListStore.getState().reset({ rows: [], total, matched, hidden, offset: 0 }));
+      act(() =>
+        notesListStore.getState().reset({
+          rows: [],
+          total,
+          matched,
+          hidden,
+          private: 0,
+          notice: null,
+          offset: 0,
+        }),
+      );
       expect(container.querySelector(`[data-slot="${NOTES_COUNT_SLOT}"]`)?.textContent).toBe(
         expected,
       );
@@ -1309,12 +1411,20 @@ describe("service visibility in the mounted pane", () => {
   it("offers an escape from all-hidden results without clearing the search", async () => {
     renderPane();
     await waitForRows("Pricing");
-    fireEvent.change(screen.getByRole("searchbox", { name: NOTES_SEARCH_PLACEHOLDER }), {
+    fireEvent.change(screen.getByRole("combobox", { name: NOTES_SEARCH_PLACEHOLDER }), {
       target: { value: "Pricing" },
     });
     await waitForRows("Pricing");
     act(() =>
-      notesListStore.getState().reset({ rows: [], total: 0, matched: 0, hidden: 2, offset: 0 }),
+      notesListStore.getState().reset({
+        rows: [],
+        total: 0,
+        matched: 0,
+        hidden: 2,
+        private: 0,
+        notice: null,
+        offset: 0,
+      }),
     );
     fireEvent.click(screen.getByRole("button", { name: "Show service files" }));
     expect(notesFiltersStore.getState().hideServiceFiles).toBe(false);

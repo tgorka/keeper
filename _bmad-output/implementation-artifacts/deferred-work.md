@@ -6326,6 +6326,62 @@ location: `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`MIN_MEANING
 reason: the review found that min-max normalising the vector pool makes the best meaning-only chunk score 1.0 whatever its cosine, so the epic's "below any note that says the word" could not hold; the fix ranks by tier (both › words › meaning) and gates a meaning-only hit on a raw cosine floor of 0.5 — a number chosen without a measurement, on a scale that is model-dependent (e5 compresses everything into 0.7–0.9; nomic and bge-m3 spread wider). The lexical pool is 1 000 notes, so a word in more notes than that gives a count line that caps. Both are to be measured on the owner's vault with the model actually chosen, and the constants (or a per-model table) set from the measurement.
 status: open
 
+### DW-268: A space remembers its drives and its privacy opt-in.
+
+origin: epic 77's plan, 2026-09-20 (AD-275, AD-276)
+location: `src-tauri/crates/keeper-core/src/notes/vm.rs` (`NoteSpaceVm`/`NoteSpaceReq`), `src-tauri/crates/keeper/src/notes_ipc.rs` (`space_def`, `notes_space_save`), `src/hooks/use-notes-actions.ts` (`saveFilterAsSpace`)
+reason: `vault_ids` and `include_private` are bar facts in this epic; a space saved from such a search re-enters with the active drive and privacy off. Two more `keeper.` keys (`vaults`, `private`) would make the round trip exact, but a space naming a drive by id is a file that stops meaning the same thing on another machine, and nobody has asked. Decide after 77.6 has been in the owner's hands.
+status: open
+
+### DW-269: Two machines touching one temporary space inside the same tenth-of-TTL window.
+
+origin: epic 77's plan, 2026-09-20 (AD-270)
+location: `src-tauri/crates/keeper/src/notes_vault.rs` (the reconciler's conflict path), `src-tauri/crates/keeper-core/src/notes/lifetime.rs`
+reason: the tenth rule makes a write per open rare, not impossible; two devices opening the same temporary space within minutes can each rewrite `keeper.expires` and produce a conflict copy of a file whose only difference is a later timestamp. The right resolution is "the later `expires` wins, no copy" — a one-key merge rule the reconciler does not have today for any key. Not before a conflict of this shape has actually been seen.
+status: open
+
+### DW-270: Render the hover hint's excerpt as markdown.
+
+origin: epic 77's plan, 2026-09-20 (AD-278)
+location: `src/components/ui/tooltip.tsx` (`HoverHint`), `src/components/notes/note-row.tsx`
+reason: the owner asked to "render markdown so there are no strange characters"; AD-278 strips the syntax instead, which fixes the row, the popup and the search excerpt from one Rust producer. A renderer in a tooltip needs a markdown stack outside CodeMirror (the only one in the tree is `@lezer/markdown` driving the editor) and a decision about what emphasis and links mean in a 3-line clamp. Revisit only if stripped prose reads wrong on the owner's vault.
+status: open
+
+### DW-271: A keyboard chord for Back and Forward.
+
+origin: epic 77's plan, 2026-09-20 (Story 77.8)
+location: `src-tauri/crates/keeper-core/src/palette.rs:706-721` (the actions carry `None` for a shortcut), `src/hooks/use-notes-shortcut.ts`
+reason: research §3 recommends binding the platform's Back/Forward keys; on macOS that is `⌘[` / `⌘]`, which CodeMirror's default keymap already binds to indent-less / indent-more inside the editor the buttons sit above. The palette's *Back* / *Forward* actions are the chord-free route today. Choose a chord (`⌘⌥←/→` is the candidate that collides with nothing in the `⌘⌥` cluster) after the two-icon header has been used for a while.
+status: open
+
+### DW-272: A bot run's panel does not list its audit rows and a sync run's does not list its activity rows.
+
+origin: epic 78's plan, 2026-09-20 (AD-284, superseding spec-74-6)
+location: `src/components/layout/panel-strip.tsx` (`RunPanelBody`), `keeper-core/src/bots/audit.rs`, `keeper-sync/src/db.rs:3998-4345` (`activity`)
+reason: spec-74-6 planned one run panel for every kind with per-kind sub-lists; the owner's ask is the copy run's log, so 78.4 built the panel over `ledger_entry` and lets other kinds say their record is the detail line. The audit and activity halves exist and are reads; wiring them is a second data source per kind and a second empty-state sentence each, not asked for yet. AD-254's paced configuration block is not a run and stays with DW-259's other half.
+status: open
+
+### DW-273: The Tasks pane does not warn when a ledger folder is flagged but the copy task's destination is inside it.
+
+origin: epic 78's plan, 2026-09-20 (AD-285)
+location: `keeper-sync/src/engine.rs` (`perform_copy_task`, the `destination.starts_with(source)` refusal at `:4236-4242`), `src/components/sync/task-form.tsx`
+reason: a copy whose destination is a synced folder that also holds the ledger commits its own `keeper-copy-*.log` per run and its run files on top; nothing refuses it and nothing says so. Named here because 78.5 makes the ledger's location visible for the first time, which is when a person can notice the overlap; a refusal or a sentence belongs in the same place as the source-inside-destination refusal.
+status: open
+
+### DW-274: `refresh_missing` costs one stat per behind-the-mark file on every pass.
+
+origin: epic 78's plan, 2026-09-20 (AD-282, NFR-78)
+location: `keeper-sync/src/copy.rs` (`classify`)
+reason: with a ledger and a large, mostly-unchanged source, every pass stats every destination counterpart to learn nothing changed. A bounded answer exists — remember the destination's `(size, mtime_ns, ino)` per path in the ledger and stat only what the last run did not prove — but it is a second file keeper must keep consistent, the exact cost AD-C1 declines. Revisit when a measured pass on hesperia spends more time in those stats than in hashing what changed.
+status: open
+
+### DW-275: The run panel does not follow a run that is still in flight.
+
+origin: epic 78's plan, 2026-09-20 (AD-284)
+location: `src/components/layout/panel-strip.tsx` (`RunPanelBody`), `crates/keeper/src/sync_ipc.rs` (`sync_task_run_log`)
+reason: the log file is written once, at the end of the run (`ledger.write_run`, `engine.rs:4318`), so an in-flight run has no entry and the panel says so; the copy engine's `CopyProgress` sink exists for the one-shot surface and could feed the panel a live bar, but a task run is claimed and closed by the engine's tick with no subscriber today. Wire it when the owner opens a running task's row and expects to watch it.
+status: open
+
 ## Triage of 2026-09-17
 
 Six read-only lanes verified every open entry of this ledger against the tree on 2026-09-17 (epic 73, story 73.5). This section is the triage's result; the next planning session reads this, not the six agent reports.

@@ -11,7 +11,7 @@
  * unchanged" would only be a way for a stale form to resurrect a term the
  * user deleted.
  */
-export type NoteSpaceReq = { 
+export type NoteSpaceReq = { baseSpaceId: string | null, pinned: boolean, ttlHours: number | null, text: string | null, 
 /**
  * The space note's id when updating; `None` creates one.
  */

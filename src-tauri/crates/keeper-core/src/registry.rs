@@ -1322,6 +1322,17 @@ pub fn set_active_vault(data_dir: &Path, vault_id: &str) -> Result<(), CoreError
     set_setting(data_dir, NOTES_ACTIVE_VAULT_KEY, vault_id)
 }
 
+const TASKS_LEDGER_VAULT_KEY: &str = "tasks.ledger_vault";
+
+/// The machine's chosen ledger profile; an empty value lets the engine decide.
+pub fn get_ledger_vault(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, TASKS_LEDGER_VAULT_KEY)?.filter(|value| !value.trim().is_empty()))
+}
+
+pub fn set_ledger_vault(data_dir: &Path, profile_id: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, TASKS_LEDGER_VAULT_KEY, profile_id)
+}
+
 const NOTES_SERVICE_FILE_NAMES_KEY: &str = "notes.service_file_names";
 const NOTES_HIDE_SERVICE_FILES_KEY: &str = "notes.hide_service_files";
 const NOTES_EMBEDDING_MODEL_KEY: &str = "notes.embedding_model";
@@ -1375,6 +1386,19 @@ pub fn set_hide_service_files(data_dir: &Path, hidden: bool) -> Result<(), CoreE
         data_dir,
         NOTES_HIDE_SERVICE_FILES_KEY,
         if hidden { "1" } else { "0" },
+    )
+}
+
+/// Private notes are withheld until the person explicitly includes them.
+pub fn get_include_private(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, "notes.include_private")?.as_deref() == Some("1"))
+}
+
+pub fn set_include_private(data_dir: &Path, include: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        "notes.include_private",
+        if include { "1" } else { "0" },
     )
 }
 
@@ -3237,6 +3261,31 @@ mod tests {
         // than render an empty surface.
         set_active_vault(&dir, "").expect("clear vault");
         assert_eq!(get_active_vault(&dir).expect("get cleared vault"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ledger_vault_selection_round_trips_and_clears() {
+        let dir = temp_dir();
+        assert_eq!(get_ledger_vault(&dir).expect("absent"), None);
+        set_ledger_vault(&dir, "ledger").expect("choose");
+        assert_eq!(
+            get_ledger_vault(&dir).expect("read").as_deref(),
+            Some("ledger")
+        );
+        set_ledger_vault(&dir, "").expect("clear");
+        assert_eq!(get_ledger_vault(&dir).expect("cleared"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn including_private_notes_is_an_explicit_persisted_choice() {
+        let dir = temp_dir();
+        assert!(!get_include_private(&dir).expect("default"));
+        set_include_private(&dir, true).expect("include");
+        assert!(get_include_private(&dir).expect("included"));
+        set_include_private(&dir, false).expect("withhold");
+        assert!(!get_include_private(&dir).expect("withheld"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

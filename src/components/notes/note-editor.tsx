@@ -31,7 +31,6 @@ import {
   Files,
   FolderSearch,
   History,
-  List,
   SlidersHorizontal,
 } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
@@ -1261,16 +1260,8 @@ export function NoteEditor({
         // does now hand down a frame of its own (Story 75.3): the `panelId`
         // test decides whether NAVIGATION belongs here, not whether a frame
         // does.
-        frame={
-          panelId ? (
-            <>
-              <NoteNavigation panelId={panelId} />
-              {frame}
-            </>
-          ) : (
-            frame
-          )
-        }
+        leading={panelId ? <NoteNavigation panelId={panelId} /> : null}
+        frame={frame}
       />
 
       <NoteDiffBar
@@ -1461,15 +1452,142 @@ function NavigationEntry({ target, onSelect }: { target: PanelTargetVm; onSelect
       alive = false;
     };
   }, [target]);
+  // Every kind the navigation stack can hold gets its own label.
   const fallback =
     target.kind === "note"
       ? target.noteId
       : target.kind === "file"
         ? target.relativePath
-        : target.kind === "task"
-          ? target.taskId
-          : target.sessionId;
+        : target.kind === "recording"
+          ? target.sessionId
+          : `${target.taskId} · Run ${target.runId}`;
   return <DropdownMenuItem onSelect={onSelect}>{title ?? fallback}</DropdownMenuItem>;
+}
+
+function NavigationButton({
+  panelId,
+  direction,
+  entries,
+}: {
+  panelId: string;
+  direction: "back" | "forward";
+  entries: readonly PanelTargetVm[];
+}) {
+  const [open, setOpen] = useState(false);
+  const [showAll, setShowAll] = useState(false);
+  const holdTimer = useRef<number | null>(null);
+  const held = useRef(false);
+  const disabled = entries.length === 0;
+  const label = direction === "back" ? "Back" : "Forward";
+  const clearHold = useCallback(() => {
+    if (holdTimer.current !== null) {
+      clearTimeout(holdTimer.current);
+      holdTimer.current = null;
+    }
+  }, []);
+  useEffect(() => clearHold, [clearHold]);
+  useEffect(() => {
+    if (disabled) {
+      clearHold();
+      setOpen(false);
+    }
+  }, [disabled, clearHold]);
+  const changeOpen = (next: boolean) => {
+    clearHold();
+    setOpen(next);
+    if (!next) setShowAll(false);
+  };
+  const visibleCount = showAll ? entries.length : Math.min(12, entries.length);
+  return (
+    <DropdownMenu open={open && !disabled} onOpenChange={changeOpen}>
+      <IconHint label={label}>
+        <DropdownMenuTrigger asChild>
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            aria-label={label}
+            aria-keyshortcuts="Alt+ArrowLeft Alt+ArrowRight"
+            disabled={disabled}
+            onPointerDown={(event) => {
+              // Radix normally opens on pointer-down; this split button instead
+              // navigates on a click and reveals its menu only after a hold.
+              event.preventDefault();
+              if (disabled || event.button !== 0 || event.ctrlKey) return;
+              event.currentTarget.focus();
+              clearHold();
+              held.current = false;
+              holdTimer.current = window.setTimeout(() => {
+                held.current = true;
+                holdTimer.current = null;
+                setOpen(true);
+              }, 500);
+            }}
+            onPointerUp={clearHold}
+            onPointerCancel={clearHold}
+            onPointerLeave={clearHold}
+            onClick={(event) => {
+              if (held.current || open) {
+                event.preventDefault();
+                held.current = false;
+                return;
+              }
+              panelsStore.getState()[direction](panelId);
+            }}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              if (!disabled) changeOpen(true);
+            }}
+            onKeyDown={(event) => {
+              if (event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+                event.preventDefault();
+                panelsStore.getState()[event.key === "ArrowLeft" ? "back" : "forward"](panelId);
+              } else if (event.key === "ArrowDown") {
+                event.preventDefault();
+                if (!disabled) changeOpen(true);
+              } else if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                if (!disabled) panelsStore.getState()[direction](panelId);
+              }
+            }}
+          >
+            {direction === "back" ? (
+              <ArrowLeft aria-hidden="true" />
+            ) : (
+              <ArrowRight aria-hidden="true" />
+            )}
+          </Button>
+        </DropdownMenuTrigger>
+      </IconHint>
+      <DropdownMenuContent
+        aria-label={`${label} navigation history`}
+        aria-labelledby={undefined}
+        className="max-h-80 w-64 max-w-[calc(100vw-16px)] overflow-y-auto"
+      >
+        <DropdownMenuLabel>{label}</DropdownMenuLabel>
+        {Array.from({ length: visibleCount }, (_, index) => (
+          <NavigationEntry
+            // biome-ignore lint/suspicious/noArrayIndexKey: stack position identifies repeated visits and is the navigation step count.
+            key={index}
+            target={entries[entries.length - 1 - index]}
+            onSelect={() => panelsStore.getState()[direction](panelId, index + 1)}
+          />
+        ))}
+        {!showAll && entries.length > 12 && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              onSelect={(event) => {
+                event.preventDefault();
+                setShowAll(true);
+              }}
+            >
+              Show all…
+            </DropdownMenuItem>
+          </>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
 }
 
 export function NoteNavigation({ panelId }: { panelId: string }) {
@@ -1477,60 +1595,8 @@ export function NoteNavigation({ panelId }: { panelId: string }) {
   if (!panel) return null;
   return (
     <>
-      <IconHint label="Back">
-        <Button
-          size="icon-sm"
-          variant="ghost"
-          aria-label="Back"
-          disabled={panel.back.length === 0}
-          onClick={() => panelsStore.getState().back(panelId)}
-        >
-          <ArrowLeft aria-hidden="true" />
-        </Button>
-      </IconHint>
-      <IconHint label="Forward">
-        <Button
-          size="icon-sm"
-          variant="ghost"
-          aria-label="Forward"
-          disabled={panel.forward.length === 0}
-          onClick={() => panelsStore.getState().forward(panelId)}
-        >
-          <ArrowRight aria-hidden="true" />
-        </Button>
-      </IconHint>
-      <DropdownMenu>
-        <IconHint label="Navigation history">
-          <DropdownMenuTrigger asChild>
-            <Button
-              size="icon-sm"
-              variant="ghost"
-              aria-label="Navigation history"
-              disabled={panel.back.length + panel.forward.length === 0}
-            >
-              <List aria-hidden="true" />
-            </Button>
-          </DropdownMenuTrigger>
-        </IconHint>
-        <DropdownMenuContent className="max-h-80 overflow-y-auto">
-          {(["back", "forward"] as const).map((direction) => (
-            <div key={direction}>
-              <DropdownMenuLabel>{direction === "back" ? "Back" : "Forward"}</DropdownMenuLabel>
-              {panel[direction]
-                .slice()
-                .reverse()
-                .map((target, index) => (
-                  <NavigationEntry
-                    // biome-ignore lint/suspicious/noArrayIndexKey: the position in the stack IS the identity here — the same note can sit in a history twice, and how many steps back it is is the only thing that tells the two entries apart (it is also the argument `back` and `forward` take).
-                    key={`${direction}-${index}`}
-                    target={target}
-                    onSelect={() => panelsStore.getState()[direction](panelId, index + 1)}
-                  />
-                ))}
-            </div>
-          ))}
-        </DropdownMenuContent>
-      </DropdownMenu>
+      <NavigationButton panelId={panelId} direction="back" entries={panel.back} />
+      <NavigationButton panelId={panelId} direction="forward" entries={panel.forward} />
     </>
   );
 }

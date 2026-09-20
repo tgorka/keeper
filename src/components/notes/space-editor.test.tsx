@@ -63,6 +63,23 @@ function space(p: Partial<NoteSpaceVm> = {}): NoteSpaceVm {
     warnings: p.warnings ?? [],
     order: p.order ?? 0,
     error: p.error ?? null,
+    pinned: p.pinned ?? false,
+    ttlHours: p.ttlHours ?? null,
+    expiresMs: p.expiresMs ?? null,
+    text: p.text ?? null,
+    parent: p.parent ?? null,
+    leafName: p.leafName ?? p.name ?? "Active work",
+    depth: p.depth ?? 0,
+    descendants: p.descendants ?? 0,
+    expiryPhrase: p.expiryPhrase ?? "",
+    restore: p.restore ?? {
+      tagTerms: {},
+      flags: [],
+      origin: null,
+      text: null,
+      sort: null,
+      opaque: false,
+    },
   };
 }
 
@@ -91,12 +108,7 @@ beforeEach(() => {
     { name: "Journal entry", path: "templates/journal-entry.md" },
     { name: "Inbox note", path: "templates/inbox-note.md" },
   ]);
-  mockSave.mockResolvedValue({
-    vaultId: "vault-1",
-    id: "s1",
-    path: "spaces/active.md",
-    title: "Active work",
-  });
+  mockSave.mockResolvedValue(space());
   mockTagTree.mockResolvedValue({
     nodes: [
       { name: "client", path: "client", count: 3, children: [] },
@@ -576,14 +588,15 @@ describe("the sort", () => {
     expect(savedRequest().sort).toBe("recorded desc");
   });
 
-  it("offers all five facts a space can order by", async () => {
-    open();
-
-    expect(
-      within(await screen.findByLabelText("Sort by"))
-        .getAllByRole("option")
-        .map((option) => option.getAttribute("value")),
-    ).toEqual(["order", "name", "created", "modified", "recorded"]);
+  it("preserves a search saved in relevance order when its name is edited", async () => {
+    open(space({ sort: "relevance desc", sortEffective: "relevance desc", text: "budget" }));
+    expect(await screen.findByLabelText("Sort by")).toHaveValue("relevance");
+    expect(screen.getByLabelText("Direction")).toHaveDisplayValue("Most relevant first");
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Budget" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().sort).toBe("relevance desc");
+    expect(savedRequest().text).toBe("budget");
   });
 
   /**

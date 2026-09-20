@@ -22,7 +22,11 @@
  * the ellipsis is applied at all, and whether the real font makes a real value
  * overflow a real pane. Those are browser facts and this is not a browser.
  */
-import { PANE_HEADER_FRAME_SLOT, PANE_HEADER_STATUS_SLOT } from "@/components/layout/pane-header";
+import {
+  PANE_HEADER_FRAME_SLOT,
+  PANE_HEADER_LEADING_SLOT,
+  PANE_HEADER_STATUS_SLOT,
+} from "@/components/layout/pane-header";
 import { PRIORITY_ACTION_ATTR, PRIORITY_ACTIONS_SLOT } from "@/components/layout/priority-actions";
 import { WINDOW_ROW_ATTR, WINDOW_VIEWPORT_ATTR } from "@/components/ui/window-list";
 
@@ -289,6 +293,12 @@ export function withActionWidths(widths: Record<string, number>): () => void {
     }
     if (this.getAttribute("data-slot") === PANE_HEADER_FRAME_SLOT && widths.frame !== undefined) {
       return box(widths.frame);
+    }
+    if (
+      this.getAttribute("data-slot") === PANE_HEADER_LEADING_SLOT &&
+      widths.navigation !== undefined
+    ) {
+      return box(widths.navigation);
     }
     const group = this.parentElement;
     if (group?.getAttribute("data-slot") === PRIORITY_ACTIONS_SLOT) {

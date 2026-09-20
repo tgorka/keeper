@@ -179,6 +179,8 @@ struct Slot {
 enum Work {
     /// These vault-relative paths may have changed on disk.
     Touched(Vec<String>),
+    /// Publish a space mutation before its command promises the rail can reload.
+    Publish(Vec<String>, tokio::sync::oneshot::Sender<()>),
     /// Discard everything and cold-scan — `notes_index_rebuild`, or a lagged
     /// watcher tap, where a burst that outran the channel degrades to a slower
     /// correct answer rather than a lost update.
@@ -496,6 +498,27 @@ pub fn touch(id: &str, paths: Vec<String>) {
     }
 }
 
+/// Space saves alone wait for publication: their next action reloads the rail.
+/// Ordinary note writes keep the existing coalescing path. A stopped or busy
+/// reconciler must not turn a successful disk save into a permanently busy UI.
+pub async fn publish_saved_space(id: &str, paths: Vec<String>) {
+    let (done, received) = tokio::sync::oneshot::channel();
+    let sent = registry()
+        .get(id)
+        .is_some_and(|slot| slot.work.send(Work::Publish(paths, done)).is_ok());
+    if !sent
+        || !matches!(
+            tokio::time::timeout(Duration::from_secs(2), received).await,
+            Ok(Ok(()))
+        )
+    {
+        tracing::warn!(
+            vault = id,
+            "Space saved; the rail publication is still pending"
+        );
+    }
+}
+
 /// Report one recording session's canonical tags to the tag tree (Story 42.5,
 /// FR-143).
 ///
@@ -781,6 +804,7 @@ async fn reconcile(
     .await;
 
     let mut coalescer = Coalescer::default();
+    let mut last_expiry_sweep = None;
     loop {
         // With a batch pending, wait only as long as its window has left; the
         // timeout expiring IS the flush.
@@ -792,12 +816,17 @@ async fn reconcile(
             None => work.recv().await,
         };
         match received {
-            Some(Work::Touched(paths)) => {
+            Some(work @ (Work::Touched(_) | Work::Publish(_, _))) => {
+                let (paths, acknowledgement) = match work {
+                    Work::Touched(paths) => (paths, None),
+                    Work::Publish(paths, done) => (paths, Some(done)),
+                    _ => unreachable!(),
+                };
                 let now = Instant::now();
                 for rel in paths {
                     coalescer.push(rel, now);
                 }
-                if coalescer.is_due(Instant::now()) {
+                if acknowledgement.is_some() || coalescer.is_due(Instant::now()) {
                     let batch = coalescer.take();
                     let changes = apply_batch(&app, &vault, &mut state, &batch, &index).await;
                     if !changes.is_empty() {
@@ -813,6 +842,9 @@ async fn reconcile(
                         )
                         .await;
                     }
+                }
+                if let Some(done) = acknowledgement {
+                    let _ = done.send(());
                 }
             }
             Some(Work::Rescan | Work::Rebuild) => {
@@ -896,6 +928,38 @@ async fn reconcile(
                 });
             }
             Some(Work::EmbedTick) => {
+                let now = now_ms();
+                if last_expiry_sweep.is_none_or(|last| now - last >= 60_000) {
+                    last_expiry_sweep = Some(now);
+                    for entry in state
+                        .entries
+                        .values()
+                        .filter(|entry| entry.flags.iter().any(|f| f == "temporary"))
+                    {
+                        let expired = read_note(&vault, &entry.path).ok().is_some_and(|source| {
+                            let (fm, _) = Frontmatter::parse(&source);
+                            match fm.get("keeper") {
+                                Some(FieldValue::Map(pairs)) => pairs.iter().any(|(key, value)| {
+                                    key == "expires"
+                                        && keeper_core::notes::lifetime::read_expires(
+                                            &value.index_string(),
+                                        )
+                                        .ok()
+                                        .is_some_and(|expires| expires <= now)
+                                }),
+                                _ => false,
+                            }
+                        });
+                        if expired {
+                            match trash_note(&vault, &entry.path) {
+                                Ok(_) => mark_dirty(&vault.id),
+                                Err(error) => {
+                                    tracing::warn!(path = %entry.path, %error, "Could not trash expired space")
+                                }
+                            }
+                        }
+                    }
+                }
                 if coalescer.wait(Instant::now()).is_none() {
                     embed_tick(&app, &search, &search_progress, &sender, &mut embedding).await;
                 }
@@ -1983,6 +2047,13 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
     // prompted this was showing. That is not a broken space; it is not a space.
     if rel.starts_with("spaces/") && !keeper_core::notes::is_okf_reserved(rel) {
         flags.push("space".to_owned());
+        if let Some(FieldValue::Map(pairs)) = fm.get("keeper") {
+            if pairs.iter().any(|(key, value)| {
+                key == "ttl_hours" && keeper_core::notes::lifetime::read_ttl_hours(value).is_ok()
+            }) {
+                flags.push("temporary".to_owned());
+            }
+        }
     }
     if keeper_core::notes::is_okf_reserved(rel) {
         flags.push("generated".to_owned());
@@ -2036,17 +2107,23 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
     // targets and once for the attributes — which parses every link in every
     // note of the vault a second time for a projection of the same result.
     let parsed = links::extract(body);
+    let tags = tags::note_tags(&fm, body);
+    if tags.iter().any(|tag| tags::is_private(tag)) {
+        flags.push("private".to_owned());
+    }
+    let title = note_title(&fm, body, rel);
+    let preview = keeper_core::notes::snippet::prose_after_title(body, &title, SNIPPET_CHARS);
 
     IndexEntry {
         id,
         path: rel.to_owned(),
-        title: note_title(&fm, body, rel),
+        title,
         size: stat.size,
         mtime_ns: stat.mtime_ns,
         ino: stat.ino,
         created_ms,
         updated_ms,
-        tags: tags::note_tags(&fm, body),
+        tags,
         fields,
         links: parsed.iter().map(|link| link.target.clone()).collect(),
         // Every predicate the author wrote on a link, per target, keyed the way
@@ -2064,7 +2141,7 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
         // `link_predicate_map` understands it.
         link_predicates: keeper_core::notes::index::link_predicate_map(&parsed),
         flags,
-        snippet: snippet(body),
+        snippet: preview,
         // Read once, here, so the list's comparator never re-parses a string
         // (Story 44.5). The raw text stays in `fields` so `field:order=…` — an
         // ordinary space predicate over the note's own frontmatter — keeps working.
@@ -2092,11 +2169,6 @@ fn is_capture(fm: &Frontmatter) -> bool {
 /// against a name only one of them can see.
 fn note_title(fm: &Frontmatter, body: &str, rel: &str) -> String {
     naming::note_title(fm.as_string("title"), body, stem(rel))
-}
-
-/// The first [`SNIPPET_CHARS`] characters of the body's prose.
-fn snippet(body: &str) -> String {
-    keeper_core::notes::snippet::prose(body, SNIPPET_CHARS)
 }
 
 /// The filename stem of a vault-relative path.
@@ -2136,7 +2208,7 @@ fn mtime_ms(stat: &FileStat, now_ms: i64) -> i64 {
 }
 
 /// Wall-clock milliseconds since the epoch, clamped rather than panicking.
-fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| {
@@ -2248,6 +2320,15 @@ fn reapply(state: &mut ReconcilerState, paths: &[String]) {
 pub fn read_note(vault: &Vault, rel: &str) -> Result<String, NotesError> {
     let path = contained(vault, rel)?;
     std::fs::read_to_string(&path).map_err(|error| NotesError::NotFound(format!("{rel}: {error}")))
+}
+
+/// Read current bytes for a space mutation before the advisory index catches up.
+pub fn read_space_entry(vault: &Vault, rel: &str) -> Result<IndexEntry, NotesError> {
+    let path = contained(vault, rel)?;
+    let meta = std::fs::symlink_metadata(&path)
+        .map_err(|error| NotesError::NotFound(format!("{rel}: {error}")))?;
+    let source = read_note(vault, rel)?;
+    Ok(parse_note(rel, &file_stat(&meta), &source, now_ms()))
 }
 
 /// Write a note atomically.
@@ -3673,6 +3754,290 @@ mod tests {
             config: NotesConfig::default(),
             excludes: Arc::new(ExcludeSet::new(&[]).expect("built-in excludes")),
         }
+    }
+
+    #[tokio::test]
+    async fn saving_and_parking_publish_their_spaces_before_the_rail_reload() {
+        // Isolate TZ in a child process: changing the parent environment would
+        // race every date test running beside this one.
+        const CHILD: &str = "KEEPER_SPACE_CLOCK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", "notes_vault::tests::saving_and_parking_publish_their_spaces_before_the_rail_reload"])
+                .env(CHILD, "1")
+                .env("TZ", "Etc/GMT+8")
+                .status()
+                .expect("negative-offset test child");
+            assert!(status.success());
+            return;
+        }
+        assert_eq!(chrono::Local::now().offset().local_minus_utc(), -8 * 3600);
+        use keeper_core::notes::index::NoteTagTerm;
+        use keeper_core::notes::vm::{NoteSpaceParkReq, NoteSpaceReq};
+        let mut vault = test_vault("space-publication");
+        vault.id = crate::sync_ipc::new_ulid();
+        let (work, mut requests) = mpsc::unbounded_channel();
+        let (index, index_rx) = watch::channel(Arc::new(IndexSnapshot::default()));
+        let (_, progress) = watch::channel(NoteIndexProgressVm {
+            vault_id: vault.id.clone(),
+            scanned: 0,
+            total_estimate: 0,
+            phase: "ready".into(),
+        });
+        let (_, search) = watch::channel(NoteSearchStateVm {
+            vault_id: vault.id.clone(),
+            phase: "words".into(),
+            indexed: 0,
+            total: 0,
+            embedded: 0,
+            embeddable: 0,
+            model: String::new(),
+            sentence: String::new(),
+        });
+        registry().insert(
+            vault.id.clone(),
+            Slot {
+                vault: vault.clone(),
+                index: index_rx,
+                progress,
+                search,
+                heads: Arc::new(HashMap::new()),
+                work,
+                cadence: Cadence::default(),
+            },
+        );
+        // Replace only the AppHandle-dependent worker at this seam. Publication
+        // consumes real files and the real index builder; ordinary Touched work
+        // is deliberately left queued so a save without the barrier fails.
+        let root = vault.clone();
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_writes = Arc::clone(&writes);
+        let worker = tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                if matches!(&request, Work::Touched(_)) {
+                    worker_writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                if let Work::Publish(_, done) = request {
+                    let entries = siblings(&root, "spaces")
+                        .into_iter()
+                        .map(|name| {
+                            read_space_entry(&root, &format!("spaces/{name}")).expect("saved file")
+                        })
+                        .collect();
+                    let builder = IndexBuilder::from_entries(entries);
+                    index.send(builder.snapshot()).expect("published");
+                    let _ = done.send(());
+                }
+            }
+        });
+        let request = |name: &str, query: &str, base_space_id| NoteSpaceReq {
+            id: None,
+            base_space_id,
+            name: name.into(),
+            query: query.into(),
+            sort: String::new(),
+            limit: 0,
+            icon: None,
+            order: 0.0,
+            template: None,
+            folder: None,
+            pinned: false,
+            ttl_hours: None,
+            text: None,
+        };
+        let base = crate::notes_ipc::notes_space_save(
+            vault.id.clone(),
+            request("Journal/Base", "tag:one | tag:two", None),
+        )
+        .await
+        .expect("save base");
+        let rows = crate::notes_ipc::notes_spaces(vault.id.clone())
+            .await
+            .expect("rail");
+        assert!(rows.iter().any(|row| row.id == base.id));
+        assert!(rows.iter().any(|row| row.id == "keeper:group:Journal"));
+        let saved = crate::notes_ipc::notes_space_save(
+            vault.id.clone(),
+            request("Combined", "tag:three", Some(base.id.clone())),
+        )
+        .await
+        .expect("save combined");
+        let parked = crate::notes_ipc::notes_space_park(
+            vault.id.clone(),
+            "All notes".into(),
+            NoteSpaceParkReq {
+                base_space_id: Some(base.id),
+                tag_terms: BTreeMap::from([("three".into(), NoteTagTerm::Include)]),
+                origin: None,
+                flags: Vec::new(),
+                text: None,
+                sort: None,
+            },
+        )
+        .await
+        .expect("park combined");
+        let rows = crate::notes_ipc::notes_spaces(vault.id.clone())
+            .await
+            .expect("reload");
+        for id in [&saved.id, &parked.id] {
+            let row = rows
+                .iter()
+                .find(|row| &row.id == id)
+                .expect("visible saved row");
+            let query = keeper_core::notes::query::parse(&row.query).expect("stored query");
+            let mut note = parse_note("note.md", &stat(0, 0, 0), "---\ntags: [three]\n---\n", 0);
+            assert!(!keeper_core::notes::query::eval(
+                &query,
+                &note,
+                &mut String::new,
+                0
+            ));
+            note.tags.push("two".into());
+            assert!(keeper_core::notes::query::eval(
+                &query,
+                &note,
+                &mut String::new,
+                0
+            ));
+        }
+        assert_eq!(parked.ttl_hours, Some(2));
+        assert!(
+            parked.expires_ms.expect("expiry") > now_ms() + 7_100_000,
+            "a parked search west of UTC must retain its two-hour lifetime"
+        );
+        let parked_entry = snapshot(&vault.id)
+            .expect("snapshot")
+            .by_id(&parked.id)
+            .expect("parked entry")
+            .clone();
+        let source = read_note(&vault, &parked_entry.path).expect("parked file");
+        let old_expiry = parked.expires_ms.expect("expiry") - 60_000;
+        let source = source.replace(
+            &keeper_core::notes::lifetime::expiry_stamp(parked.expires_ms.expect("expiry")),
+            &keeper_core::notes::lifetime::expiry_stamp(old_expiry),
+        );
+        std::fs::write(vault.root.join(&parked_entry.path), source).expect("age parked clock");
+        let before = writes.load(std::sync::atomic::Ordering::SeqCst);
+        let refreshed = crate::notes_ipc::notes_space_park(
+            vault.id.clone(),
+            "All notes".into(),
+            NoteSpaceParkReq {
+                base_space_id: None,
+                tag_terms: BTreeMap::from([("budget".into(), NoteTagTerm::Include)]),
+                origin: None,
+                flags: Vec::new(),
+                text: None,
+                sort: None,
+            },
+        )
+        .await
+        .expect("refresh parked search");
+        publish_saved_space(&vault.id, vec![parked_entry.path.clone()]).await;
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::SeqCst) - before,
+            1,
+            "refreshing a parked search must write only once"
+        );
+        assert_eq!(refreshed.id, parked.id);
+        assert!(refreshed.expires_ms.expect("fresh expiry") > old_expiry);
+        let reloaded = crate::notes_ipc::notes_spaces(vault.id.clone())
+            .await
+            .expect("rail");
+        assert_eq!(
+            reloaded
+                .iter()
+                .find(|row| row.id == parked.id)
+                .expect("parked")
+                .expires_ms,
+            refreshed.expires_ms
+        );
+        let source = read_note(&vault, &parked_entry.path).expect("refreshed file");
+        let source = source.replace(
+            &keeper_core::notes::lifetime::expiry_stamp(refreshed.expires_ms.expect("expiry")),
+            &keeper_core::notes::lifetime::expiry_stamp(now_ms() - 10_000),
+        );
+        std::fs::write(vault.root.join(&parked_entry.path), source).expect("expire for touch");
+        let touched = crate::notes_ipc::notes_space_touch(vault.id.clone(), parked.id.clone())
+            .await
+            .expect("touch expired search");
+        assert!(
+            touched.expires_ms.expect("touched expiry") > now_ms() + 7_100_000,
+            "touch must reset the same UTC horizon the sweep compares"
+        );
+        let source = read_note(&vault, &parked_entry.path).expect("touched file");
+        let source = source.replace(
+            &keeper_core::notes::lifetime::expiry_stamp(touched.expires_ms.expect("expiry")),
+            &keeper_core::notes::lifetime::expiry_stamp(now_ms() + 20 * 3_600_000),
+        );
+        std::fs::write(vault.root.join(&parked_entry.path), source).expect("caption boundary");
+        let rows = crate::notes_ipc::notes_spaces(vault.id.clone())
+            .await
+            .expect("caption");
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == parked.id)
+                .expect("parked")
+                .expiry_phrase,
+            "expires today",
+            "captions must use UTC, not the date-DSL clock"
+        );
+        #[cfg(desktop)]
+        {
+            write_note(&vault, "spaces/pinned.md",
+                "---\npinned: true\nupdated: 2000-01-01T00:00:00Z\nkeeper:\n  space: tag:any\n---\n# Z pinned\n")
+                .expect("pinned note");
+            publish_saved_space(&vault.id, vec!["spaces/pinned.md".into()]).await;
+            let pinned = read_space_entry(&vault, "spaces/pinned.md").expect("pinned entry");
+            let mut req = keeper_core::notes::vm::NoteQueryReq {
+                vault_ids: vec![vault.id.clone(), "missing-vault".into()],
+                hide_service_files: false,
+                space_terms: true,
+                include_private: false,
+                sort: None,
+                text: None,
+                tags: BTreeMap::new(),
+                space_id: None,
+                origin: None,
+                flags: Vec::new(),
+                offset: 0,
+                limit: 100,
+            };
+            let answer =
+                crate::notes_ipc::project_vaults(&crate::ipc::DesktopPlatform, &vault, &req)
+                    .await
+                    .expect("partial readable list");
+            assert_eq!(answer.rows.first().expect("rows").id, pinned.id);
+            assert!(answer
+                .notice
+                .expect("missing drive notice")
+                .contains("missing-vault"));
+            let mut space = request("Z sorting", "tag:any", None);
+            space.sort = "name asc".into();
+            let space = crate::notes_ipc::notes_space_save(vault.id.clone(), space)
+                .await
+                .expect("sort space");
+            req.space_id = Some(space.id);
+            req.space_terms = false;
+            req.vault_ids = vec![vault.id.clone()];
+            let answer =
+                crate::notes_ipc::project_vaults(&crate::ipc::DesktopPlatform, &vault, &req)
+                    .await
+                    .expect("space ordering");
+            let titles: Vec<_> = answer.rows.iter().map(|row| row.title.as_str()).collect();
+            assert_eq!(
+                titles,
+                [
+                    "actual-All notes",
+                    "Combined",
+                    "Journal/Base",
+                    "Z pinned",
+                    "Z sorting"
+                ]
+            );
+        }
+        registry().remove(&vault.id);
+        worker.abort();
+        std::fs::remove_dir_all(vault.local_path).ok();
     }
 
     fn stat(size: u64, mtime_ns: i128, ino: u64) -> FileStat {

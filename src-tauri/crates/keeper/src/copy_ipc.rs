@@ -205,6 +205,8 @@ impl CopyRegistry {
 fn entry_vm(entry: &keeper_sync::copy::CopyEntry) -> CopyEntryVm {
     let (outcome, reason) = match &entry.outcome {
         CopyOutcome::Copied => ("copied", None),
+        CopyOutcome::Overwritten => ("overwritten", None),
+        CopyOutcome::Deleted => ("deleted", None),
         CopyOutcome::Identical => ("identical", None),
         CopyOutcome::Collision => ("collision", None),
         CopyOutcome::Failed { reason } => ("failed", Some(reason.clone())),
@@ -294,6 +296,7 @@ pub async fn copy_start(
         // typed date window is what AD-256 removed: a person pressing "Copy
         // files once" is asking for this tree, now.
         modified_since_ms: None,
+        ..CopyOptions::default()
     };
 
     let job_id = id.clone();

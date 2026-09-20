@@ -22,8 +22,9 @@
 //!    place that file behind the line and skip it *forever*. A covered-mtime
 //!    mark can only ever be too small, which costs one extra comparison on the
 //!    next pass and loses nothing.
+//!    An idle run is stamped at finish time and advances nothing.
 //! 2. **A run that was not `Ok` never advances the mark** ([`latest_mark`]
-//!    ignores `Partial` and `Failed`). A pass that died halfway has no honest
+//!    ignores `Idle`, `Partial` and `Failed`). A pass that died halfway has no honest
 //!    high-water line: some of what it skipped it never looked at.
 //! 3. **A configuration change invalidates every mark before it.** The name
 //!    carries a fingerprint of the task's own configuration; a mark whose
@@ -137,6 +138,8 @@ impl RunTrigger {
 pub enum RunVerdict {
     /// Everything the run set out to do, it did. Only this advances the mark.
     Ok,
+    /// Ran successfully but covered nothing markable. Stamped at finish time.
+    Idle,
     /// It ran and some of it failed. The mark is not trustworthy: what it did
     /// not reach, it did not look at.
     Partial,
@@ -149,6 +152,7 @@ impl RunVerdict {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
+            Self::Idle => "idle",
             Self::Partial => "partial",
             Self::Failed => "failed",
         }
@@ -158,6 +162,7 @@ impl RunVerdict {
     pub fn parse(text: &str) -> Option<Self> {
         match text {
             "ok" => Some(Self::Ok),
+            "idle" => Some(Self::Idle),
             "partial" => Some(Self::Partial),
             "failed" => Some(Self::Failed),
             _ => None,
@@ -183,6 +188,7 @@ pub struct RunFileName {
     /// kind with no source to walk (a verify, a gc), the run's finish time —
     /// the same question, "up to when is this folder accounted for", asked of a
     /// job whose input is the folder itself.
+    /// Idle, partial and failed runs also carry finish time, never a new mark.
     pub mark_ms: i64,
     /// Why the run happened.
     pub trigger: RunTrigger,
@@ -216,15 +222,22 @@ impl RunFileName {
         let body = name.strip_suffix(RUN_FILE_SUFFIX)?;
         let rest = body.strip_prefix(RUN_FILE_PREFIX)?;
         let rest = rest.strip_prefix(FIELD_SEPARATOR)?;
-        // Exactly four fields: a fifth would mean a grammar this build does not
-        // know, and splitting loosely would let it pass as the one it does.
+        // Advancing names keep the original grammar. Non-advancing names may
+        // carry their database run id; old readers skip that fifth field.
         let mut parts = rest.split(FIELD_SEPARATOR);
         let stamp_text = parts.next()?;
         let trigger = RunTrigger::parse(parts.next()?)?;
         let verdict = RunVerdict::parse(parts.next()?)?;
         let fingerprint = parts.next()?;
-        if parts.next().is_some() {
-            return None;
+        if let Some(run_id) = parts.next() {
+            if verdict.advances_mark()
+                || run_id.is_empty()
+                || !run_id.bytes().all(|byte| byte.is_ascii_digit())
+                || run_id.parse::<i64>().ok().is_none_or(|id| id <= 0)
+                || parts.next().is_some()
+            {
+                return None;
+            }
         }
         if fingerprint.len() != FINGERPRINT_LEN
             || !fingerprint
@@ -239,6 +252,59 @@ impl RunFileName {
             verdict,
             fingerprint: fingerprint.to_owned(),
         })
+    }
+}
+
+/// Machine-readable first line of a run body; legacy bodies have no counts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RunCounts {
+    pub copied: u64,
+    pub overwritten: u64,
+    pub deleted: u64,
+    pub identical: u64,
+    pub collision: u64,
+    pub failed: u64,
+    pub behind: u64,
+}
+
+impl RunCounts {
+    pub fn changed(self) -> u64 {
+        self.copied
+            .saturating_add(self.overwritten)
+            .saturating_add(self.deleted)
+    }
+
+    pub fn render(self) -> String {
+        format!(
+            "keeper-run: copied={} overwritten={} deleted={} identical={} collision={} failed={} behind={}\n",
+            self.copied, self.overwritten, self.deleted, self.identical,
+            self.collision, self.failed, self.behind,
+        )
+    }
+
+    pub fn parse(body: &str) -> Option<Self> {
+        let mut fields = body
+            .lines()
+            .next()?
+            .strip_prefix("keeper-run: ")?
+            .split(' ');
+        let mut number = |key: &str| -> Option<u64> {
+            let value = fields.next()?.strip_prefix(key)?.strip_prefix('=')?;
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            value.parse().ok()
+        };
+        let counts = Self {
+            copied: number("copied")?,
+            overwritten: number("overwritten")?,
+            deleted: number("deleted")?,
+            identical: number("identical")?,
+            collision: number("collision")?,
+            failed: number("failed")?,
+            behind: number("behind")?,
+        };
+        fields.next().is_none().then_some(counts)
     }
 }
 
@@ -477,16 +543,26 @@ impl TaskLedger {
     /// own mark reader, and including a sync pass walking the folder — never
     /// sees a half-written run, and a crash leaves no torn file behind under a
     /// name that parses.
-    pub fn write_run(&self, name: &RunFileName, body: &str) -> Result<PathBuf> {
+    pub fn write_run(&self, name: &RunFileName, body: &str, run_id: i64) -> Result<PathBuf> {
         let dir = self.root.join(year_folder(name.mark_ms));
         std::fs::create_dir_all(&dir)
             .map_err(|err| SyncError::io("create task ledger folder", &dir, err))?;
-        let path = dir.join(name.render());
+        let mut filename = name.render();
+        if !name.verdict.advances_mark() {
+            if run_id <= 0 {
+                return Err(SyncError::Config(
+                    "A ledger run id must be positive.".into(),
+                ));
+            }
+            filename.truncate(filename.len() - RUN_FILE_SUFFIX.len());
+            filename.push_str(&format!("-{run_id}{RUN_FILE_SUFFIX}"));
+        }
+        let path = dir.join(&filename);
         // The temp's name deliberately does NOT parse as a run file (no `run-`
         // prefix, no `.md` suffix): if this process dies between the write and
         // the rename, what is left over must read as "not a mark" rather than
         // as a mark with a truncated body.
-        let temp = dir.join(format!(".{}.writing", name.render()));
+        let temp = dir.join(format!(".{filename}.writing"));
         std::fs::write(&temp, body)
             .map_err(|err| SyncError::io("write task ledger entry", &temp, err))?;
         if let Err(err) = std::fs::rename(&temp, &path) {
@@ -559,6 +635,79 @@ pub fn is_run_file(name: &str) -> bool {
 mod fs_tests {
     use super::*;
 
+    #[test]
+    fn machine_counts_round_trip_and_legacy_or_malformed_bodies_are_unknown() {
+        let counts = RunCounts {
+            copied: 1,
+            overwritten: 2,
+            deleted: 3,
+            identical: 82,
+            collision: 4,
+            failed: 5,
+            behind: 1204,
+        };
+        assert_eq!(
+            RunCounts::parse(&format!("{}human log\n", counts.render())),
+            Some(counts)
+        );
+        assert_eq!(counts.changed(), 6);
+        assert_eq!(RunCounts::parse("kind: copy\n"), None);
+        assert_eq!(
+            RunCounts::parse(&counts.render().replace("copied=1", "copied=-1")),
+            None
+        );
+        assert_eq!(
+            RunCounts::parse(
+                &counts
+                    .render()
+                    .replace("copied=1", "copied=18446744073709551616")
+            ),
+            None
+        );
+        assert_eq!(
+            RunCounts::parse(&counts.render().replace(" behind=1204", "")),
+            None
+        );
+        assert_eq!(
+            RunCounts::parse(&counts.render().replace('\n', " extra=1\n")),
+            None
+        );
+    }
+
+    #[test]
+    fn idle_runs_do_not_mark_and_same_second_runs_remain_distinct() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = TaskLedger::resolve(dir.path(), "tasks", "task").expect("ledger");
+        let fp = "0123abcd";
+        let success = run(3000, RunTrigger::Requested, RunVerdict::Ok, fp);
+        ledger.write_run(&success, "covered", 1).expect("write");
+        let idle = run(9000, RunTrigger::Requested, RunVerdict::Idle, fp);
+        let first = ledger.write_run(&idle, "idle one", 2).expect("write");
+        let second = ledger.write_run(&idle, "idle two", 3).expect("write");
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read_to_string(&first).expect("read"), "idle one");
+        assert_eq!(ledger.latest_mark(fp), Some(3000));
+        assert_eq!(RunVerdict::parse("idle"), Some(RunVerdict::Idle));
+        assert!(!RunVerdict::Idle.advances_mark());
+        let filename = first.file_name().expect("name").to_str().expect("utf8");
+        assert_eq!(
+            RunFileName::parse(filename).expect("parse").verdict,
+            RunVerdict::Idle
+        );
+        // The old parser demanded exactly four fields after `run-`: it skips
+        // this fifth field before considering any timestamp as a mark.
+        let old_body = filename
+            .strip_prefix("run-")
+            .expect("prefix")
+            .strip_suffix(".md")
+            .expect("suffix");
+        assert_ne!(old_body.split('-').count(), 4);
+        assert_eq!(
+            RunFileName::parse(&filename.replace("-idle-", "-ok-")),
+            None
+        );
+    }
+
     fn temp_root(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "keeper-ledger-{label}-{}-{}",
@@ -615,6 +764,7 @@ mod fs_tests {
             .write_run(
                 &run(1_767_225_599_000, RunTrigger::Scheduled, RunVerdict::Ok, fp),
                 "december",
+                1,
             )
             .expect("write december");
         ledger
@@ -626,6 +776,7 @@ mod fs_tests {
                     fp,
                 ),
                 "january",
+                2,
             )
             .expect("write january");
         assert!(root.join("tasks/01TASK/2025").is_dir());
@@ -666,7 +817,7 @@ mod fs_tests {
             RunVerdict::Ok,
             "0123abcd",
         );
-        let path = ledger.write_run(&name, "body").expect("write");
+        let path = ledger.write_run(&name, "body", 1).expect("write");
         let dir = path.parent().expect("year folder");
         let names: Vec<String> = std::fs::read_dir(dir)
             .expect("listing")

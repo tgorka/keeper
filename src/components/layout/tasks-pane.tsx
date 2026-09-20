@@ -95,15 +95,9 @@
  * {@link TaskRow} for the `aria-current` → `aria-selected` flip and `select`
  * below for the one Files branch that has no Tasks analogue.
  *
- * **Story 59.12 let a task be opened in a tab.** The owner could click a row
- * and read its detail beside the list, and could not keep one: *"nie mogle
- * kliknac na element z task list i zobaczyc szczegolow w nowym tabie."* So
- * `PanelTargetVm` grew a `task` variant and this pane answers the gesture pair
- * every other browsing surface already answers to — a plain click previews into
- * the active panel, a double click opens beside it — copied from
- * `files-pane.tsx` for the reason 59.4's selection model was. The panel draws
- * {@link TaskDetail}, this file's own component, with its write half switched
- * off; see that component's header for why the pane stays the only writer.
+ * Epic 78 gives runs the panel gesture pair: click previews one execution,
+ * double-click keeps it beside the previous panel. Task configuration stays
+ * in this pane, and choosing a task never changes a panel target.
  */
 import {
   ChevronRight,
@@ -141,34 +135,42 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { MENU_TARGET_RING, useMenuTarget } from "@/components/ui/menu-target";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { IconHint } from "@/components/ui/tooltip";
 import { columnMinWidth } from "@/lib/column-widths";
 import { type CountNoun, countLabel, RUNS } from "@/lib/count-label";
 import type {
   PacedWorkVm,
-  PanelTargetVm,
   TaskBatchReceiptVm,
   TaskListingVm,
   TaskRunVm,
   TaskVm,
 } from "@/lib/ipc/client";
 import {
+  revealPath,
   syncPacedWork,
   syncTaskForget,
   syncTaskHistory,
+  syncTaskRunLog,
   syncTaskRunNow,
   syncTasks,
   syncTasksForget,
   syncTasksSetEnabled,
 } from "@/lib/ipc/client";
 import { columnFoldStore } from "@/lib/stores/column-fold";
-import { panelsStore } from "@/lib/stores/panels";
+import { panelsStore, usePanelsStore } from "@/lib/stores/panels";
 import { hydrateSyncListSizes } from "@/lib/stores/sync-detail";
 import { cn } from "@/lib/utils";
 
@@ -396,34 +398,11 @@ export const TASK_FORGET_TESTID = "task-forget-confirm";
  */
 export const TASKS_DETAIL_LABEL = "Task detail";
 
-/**
- * What a task panel with nothing in it says (Story 59.12).
- *
- * `PanelStrip`'s own default names the gesture that fills a panel in the Files
- * surface, and "click a file to open it" is the wrong instruction beside a list
- * of task names. Sited here rather than in the strip for `notes-pane.tsx`'s
- * reason: the sentence belongs to the surface that knows what its rows are, and
- * the strip's prop exists exactly so that each host may say its own.
- */
-export const TASKS_PANEL_EMPTY_SENTENCE =
-  "Nothing is open here yet. Double-click a task to open it beside the list.";
+/** The empty run strip is an invitation, not another task configuration. */
+export const TASKS_PANEL_EMPTY_SENTENCE = "Select a run to read its log.";
 
-/**
- * Where the open-beside gesture is advertised (Story 59.13).
- *
- * {@link TASKS_PANEL_EMPTY_SENTENCE} was the only place the gesture was named,
- * and it was named inside a panel that only exists once the gesture has already
- * been performed — while an empty strip claiming 60% of the window said it. This
- * is the same fact stated where a reader can act on it: under the one task the
- * region is drawing, which is exactly where somebody might want two.
- *
- * Rendered by the pane's detail REGION rather than by {@link TaskDetail}, so a
- * task panel cannot advertise opening a task panel. That is structural — the
- * panel host renders the component and not the region — rather than a flag a
- * later change could pass the wrong way.
- */
-export const TASKS_OPEN_BESIDE_HINT =
-  "Double-click a task in the list to keep it open beside this one.";
+/** Advertised beside the history that actually owns the run gesture. */
+export const TASKS_OPEN_BESIDE_HINT = "Double-click a run to keep it open beside this one.";
 
 /**
  * What the column says when the task list is empty (Story 59.13).
@@ -1268,65 +1247,9 @@ function TaskRunList({
         // (`tag-combobox.tsx`'s rule for the same pairing). The Activity list's
         // `aria-label` is safe only because its name comes from an `<h2>`.
         <ul className="flex flex-col gap-1.5">
-          {fold.visible.map((entry) => {
-            const report = taskReportText(entry);
-            return (
-              // `task_runs.id` is an INTEGER PRIMARY KEY and `TaskRunVm` carries
-              // it, and this list is one `ORDER BY id DESC` over that column —
-              // so unlike the Activity list, whose rows have no identity of
-              // their own and are therefore keyed by timestamp, kind and path,
-              // this one needs no composite key.
-              <li
-                key={entry.id}
-                data-testid={TASKS_HISTORY_ROW_TESTID}
-                className="flex flex-wrap items-baseline gap-2 text-xs"
-              >
-                {/* The row above's own function, reused rather than re-worded:
-                    an in-flight run, a known outcome and a spelling a newer
-                    keeper wrote stay three distinct facts (NFR-43), and the
-                    history cannot word an outcome differently from the row it
-                    hangs under. */}
-                <span className="text-foreground">{taskOutcomeText(entry)}</span>
-                {/* The pane's existing display clock, threaded in — never a
-                    second one, so two times on one screen cannot disagree about
-                    what "now" is. */}
-                <span className="figures shrink-0 text-muted-foreground">
-                  {formatTaskAgo(entry.startedMs, now)}
-                </span>
-                {/* Which host ran it is most of the reason this list exists, so
-                    a blank is named rather than left as a gap, and the string is
-                    allowed to break: it is a stored id this build did not
-                    choose, so `shrink-0` on it would push the report out of the
-                    row at a narrow width. */}
-                <span className="font-mono text-muted-foreground [overflow-wrap:anywhere]">
-                  {entry.host.trim() === "" ? TASK_HISTORY_NO_HOST_TEXT : entry.host}
-                </span>
-                {/* Why it ran, and only when the run knows: a row written
-                    before AD-253 says nothing rather than claiming a schedule
-                    it cannot vouch for (Story 74.5). */}
-                {entry.trigger !== null && (
-                  <span className="shrink-0 text-muted-foreground">
-                    {TASK_TRIGGER_TEXT[entry.trigger] ?? entry.trigger}
-                  </span>
-                )}
-                {/* Lateness earns pixels; punctuality does not. */}
-                {taskLatenessText(entry.lateByMs) !== null && (
-                  <span className="shrink-0 text-amber-700 dark:text-amber-500">
-                    {taskLatenessText(entry.lateByMs)}
-                  </span>
-                )}
-                {/* Absent or blank is silence, `taskReportText`'s rule. The
-                    wrapping is the pair Story 58.2 established for engine prose,
-                    because this is the same unbounded string in a narrower
-                    place. */}
-                {report !== null && (
-                  <span className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]">
-                    {report}
-                  </span>
-                )}
-              </li>
-            );
-          })}
+          {fold.visible.map((entry) => (
+            <RunRow key={entry.id} entry={entry} now={now} />
+          ))}
         </ul>
       )}
       {runs !== null && runs.length > 0 && (
@@ -1350,6 +1273,109 @@ function TaskRunList({
         <p className="text-muted-foreground text-xs">{TASK_HISTORY_BOUND_TEXT}</p>
       )}
     </div>
+  );
+}
+
+function menuKey(event: React.KeyboardEvent<HTMLElement>) {
+  if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const rect = event.currentTarget.getBoundingClientRect();
+  event.currentTarget.dispatchEvent(
+    new MouseEvent("contextmenu", {
+      bubbles: true,
+      clientX: rect.left,
+      clientY: rect.bottom,
+    }),
+  );
+}
+
+function RunRow({ entry, now }: { entry: TaskRunVm; now: number }) {
+  const menu = useMenuTarget();
+  const trigger = useRef<HTMLButtonElement>(null);
+  const [error, setError] = useState<string | null>(null);
+  const selected = usePanelsStore((state) => {
+    const target = state.panels.find((panel) => panel.id === state.activeId)?.target;
+    return target?.kind === "run" && target.taskId === entry.taskId && target.runId === entry.id;
+  });
+  const target = { kind: "run" as const, taskId: entry.taskId, runId: entry.id };
+  const pathAction = async (reveal: boolean) => {
+    try {
+      const log = await syncTaskRunLog(entry.id, null, 0);
+      if (reveal) await revealPath(log.path);
+      else await navigator.clipboard.writeText(log.path);
+      setError(null);
+    } catch (cause) {
+      setError(messageOf(cause));
+    }
+  };
+  return (
+    <li data-testid={TASKS_HISTORY_ROW_TESTID}>
+      <ContextMenu onOpenChange={menu.onOpenChange(String(entry.id))}>
+        <ContextMenuTrigger asChild>
+          <button
+            type="button"
+            {...menu.rowProps(String(entry.id))}
+            aria-haspopup="menu"
+            ref={trigger}
+            aria-current={selected ? true : undefined}
+            aria-label={`Run ${entry.id} · ${entry.taskId} · ${taskOutcomeText(entry)}`}
+            onKeyDown={menuKey}
+            onClick={() => panelsStore.getState().setActiveTarget(target)}
+            onDoubleClick={() => panelsStore.getState().openPanel(target)}
+            className={cn(
+              "flex min-h-11 w-full min-w-0 flex-col gap-1 rounded-[7px] p-2 text-left text-[13px] leading-5 outline-none focus-visible:ring-2 focus-visible:ring-ring",
+              selected ? "bg-accent" : "hover:bg-accent",
+              MENU_TARGET_RING,
+            )}
+          >
+            <span className="flex w-full flex-wrap gap-x-2 [overflow-wrap:anywhere]">
+              <span>{taskOutcomeText(entry)}</span>
+              <span className="text-muted-foreground">{formatTaskAgo(entry.startedMs, now)}</span>
+              <span className="font-mono text-muted-foreground">
+                {entry.host.trim() || TASK_HISTORY_NO_HOST_TEXT}
+              </span>
+              {entry.trigger !== null && (
+                <span>{TASK_TRIGGER_TEXT[entry.trigger] ?? entry.trigger}</span>
+              )}
+              {taskLatenessText(entry.lateByMs) !== null && (
+                <span>{taskLatenessText(entry.lateByMs)}</span>
+              )}
+            </span>
+            <span className="block w-full whitespace-pre-wrap [overflow-wrap:anywhere]">
+              {taskReportText(entry) ?? "No run report was recorded"}
+            </span>
+          </button>
+        </ContextMenuTrigger>
+        <ContextMenuContent
+          aria-label={`Run ${entry.id} · ${entry.taskId}`}
+          className="w-60 max-w-[calc(100vw-16px)]"
+          collisionPadding={8}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            trigger.current?.focus();
+          }}
+        >
+          <ContextMenuItem
+            className="min-h-8"
+            onSelect={() => panelsStore.getState().openPanel(target)}
+          >
+            Open beside
+          </ContextMenuItem>
+          <ContextMenuItem className="min-h-8" onSelect={() => void pathAction(false)}>
+            Copy path
+          </ContextMenuItem>
+          <ContextMenuItem className="min-h-8" onSelect={() => void pathAction(true)}>
+            Reveal ledger folder
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
+      {error && (
+        <p role="alert" className="text-destructive text-xs">
+          {error}
+        </p>
+      )}
+    </li>
   );
 }
 
@@ -1415,7 +1441,7 @@ function TaskRow({
   tabIndex,
   optionRef,
   onRowClick,
-  onRowDoubleClick,
+  actions,
   onActivate,
 }: {
   task: TaskVm;
@@ -1432,58 +1458,116 @@ function TaskRow({
   optionRef: (element: HTMLDivElement | null) => void;
   /** The whole event, because the modifier is what decides the gesture. */
   onRowClick: (event: ReactMouseEvent<HTMLDivElement>, id: string) => void;
-  /** The whole event too, for the same reason: the guards a double click has to
-   *  pass are the ones a single click passes, and they are decoded in one place. */
-  onRowDoubleClick: (event: ReactMouseEvent<HTMLDivElement>, id: string) => void;
+  actions: {
+    disabled: boolean;
+    runDisabled: boolean;
+    run: () => void;
+    edit: () => void;
+    toggle: () => void;
+    forget: () => void;
+  };
   /** Enter, which a `<button>` used to answer for nothing. */
   onActivate: (id: string) => void;
 }) {
+  const menu = useMenuTarget();
+  const trigger = useRef<HTMLDivElement>(null);
+  const focusHandoff = useRef(false);
   const unhosted = task.host.kind === "unhosted";
   return (
-    <div
-      ref={optionRef}
-      role="option"
-      data-testid={TASKS_ROW_TESTID}
-      data-task-id={task.id}
-      tabIndex={tabIndex}
-      aria-selected={selected}
-      onClick={(event) => onRowClick(event, task.id)}
-      onDoubleClick={(event) => onRowDoubleClick(event, task.id)}
-      onKeyDown={(event) => {
-        // Space belongs to the list's own handler, where the modifier that
-        // makes it a toggle is decoded beside the arrows — one place for the
-        // keys this list owns. Enter is the plain activation the element lost
-        // when it stopped being a button.
-        if (event.key === "Enter") {
-          event.preventDefault();
-          onActivate(task.id);
-        }
+    <ContextMenu
+      onOpenChange={(open) => {
+        if (open) focusHandoff.current = false;
+        menu.onOpenChange(task.id)(open);
       }}
-      className={cn(
-        "flex w-full flex-col gap-1 border-border border-b px-3 py-2 text-left",
-        "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-        selected ? "bg-accent" : "hover:bg-accent",
-      )}
     >
-      <span className="flex min-w-0 items-center gap-2">
-        {/* Both stored spellings, the kind badge's rule: a kind or a mode a
+      <ContextMenuTrigger asChild>
+        <div
+          ref={(element) => {
+            trigger.current = element;
+            optionRef(element);
+          }}
+          role="option"
+          data-testid={TASKS_ROW_TESTID}
+          data-task-id={task.id}
+          tabIndex={tabIndex}
+          aria-selected={selected}
+          {...menu.rowProps(task.id)}
+          aria-haspopup="menu"
+          onClick={(event) => onRowClick(event, task.id)}
+          onKeyDown={(event) => {
+            menuKey(event);
+            // Space belongs to the list's own handler, where the modifier that
+            // makes it a toggle is decoded beside the arrows — one place for the
+            // keys this list owns. Enter is the plain activation the element lost
+            // when it stopped being a button.
+            if (event.key === "Enter") {
+              event.preventDefault();
+              onActivate(task.id);
+            }
+          }}
+          className={cn(
+            "flex w-full flex-col gap-1 border-border border-b px-3 py-2 text-left",
+            "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+            "rounded-[7px]",
+            MENU_TARGET_RING,
+            selected ? "bg-accent" : "hover:bg-accent",
+          )}
+        >
+          <span className="flex min-w-0 items-center gap-2">
+            {/* Both stored spellings, the kind badge's rule: a kind or a mode a
             newer keeper wrote is shown rather than hidden (NFR-43). */}
-        <Badge variant="secondary">{task.kind}</Badge>
-        <Badge variant="outline">{task.mode}</Badge>
-        <span className="truncate font-medium text-foreground text-sm">{task.id}</span>
-      </span>
-      <span className="flex min-w-0 items-center justify-between gap-2 text-xs">
-        {/* The host WORD only. Its sentence and its reason are Rust's and are
+            <Badge variant="secondary">{task.kind}</Badge>
+            <Badge variant="outline">{task.mode}</Badge>
+            <span className="truncate font-medium text-foreground text-sm">{task.id}</span>
+          </span>
+          <span className="flex min-w-0 items-center justify-between gap-2 text-xs">
+            {/* The host WORD only. Its sentence and its reason are Rust's and are
             rendered whole in the detail — a line this narrow would clip them,
             and a clipped host claim is the one thing AD-137 cannot tolerate.
             What the word has to carry alone is the alarm, which is why an
             unhosted row is coloured here as well as named. */}
-        <span className={unhosted ? "truncate text-destructive" : "truncate text-muted-foreground"}>
-          {HOST_KIND_LABELS[task.host.kind] ?? task.host.kind}
-        </span>
-        <span className="shrink-0 text-muted-foreground">{formatTaskDue(task.nextDueMs, now)}</span>
-      </span>
-    </div>
+            <span
+              className={unhosted ? "truncate text-destructive" : "truncate text-muted-foreground"}
+            >
+              {HOST_KIND_LABELS[task.host.kind] ?? task.host.kind}
+            </span>
+            <span className="shrink-0 text-muted-foreground">
+              {formatTaskDue(task.nextDueMs, now)}
+            </span>
+          </span>
+        </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent
+        aria-label={task.id}
+        className="w-60 max-w-[calc(100vw-16px)]"
+        collisionPadding={8}
+        onCloseAutoFocus={(event) => {
+          event.preventDefault();
+          if (!focusHandoff.current) trigger.current?.focus();
+        }}
+      >
+        <ContextMenuItem className="min-h-8" disabled={actions.runDisabled} onSelect={actions.run}>
+          Run now
+        </ContextMenuItem>
+        <ContextMenuItem className="min-h-8" disabled={actions.disabled} onSelect={actions.edit}>
+          Edit
+        </ContextMenuItem>
+        <ContextMenuItem className="min-h-8" disabled={actions.disabled} onSelect={actions.toggle}>
+          {task.enabled ? "Disable" : "Enable"}
+        </ContextMenuItem>
+        <ContextMenuItem
+          className="min-h-8"
+          disabled={actions.disabled}
+          variant="destructive"
+          onSelect={() => {
+            focusHandoff.current = true;
+            actions.forget();
+          }}
+        >
+          Forget
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
   );
 }
 
@@ -1503,34 +1587,8 @@ function TaskRow({
  * width"* — a sentence written against a region that did not exist yet. This is
  * that region; the sentence is honoured rather than amended.
  *
- * # Two hosts, one rendering (Story 59.12)
- *
- * The paragraph that stood here said *"a region and not a panel: `PanelStrip`'s
- * targets are documents opened in an editor, and a task is not one"*. The owner
- * then asked for a task he could open in a tab, and 59.12 gave `PanelTargetVm`
- * a `task` variant — so this component now has **two hosts**: the pane's own
- * detail region, and a task panel in the strip beside it. Two hosts and ONE
- * rendering, deliberately: two components over one task could word the same
- * fact differently, which is the defect shape this codebase keeps closing.
- *
- * All of the difference between the two hosts is {@link TaskDetailVerbs}, and a
- * host that does not write passes `null` rather than nine inert props. A `null`
- * cannot drift; nine no-ops can, and the first one somebody wires up by mistake
- * is a write from the host that must not write.
- *
- * **Why the panel does not write, in the words of the flag that decides it.**
- * `writing` is `formSaving`, and `formSaving` is pane-wide *because* two write
- * surfaces over one task undo each other: `upsert_task` inserts when the id is
- * absent, so a Forget confirmed mid-save deletes a row the settling save then
- * re-inserts. That rule is enforceable only by a host that can see its own
- * in-flight writes, and a second host by definition cannot see the first's. So
- * the pane writes and the panel reads, and the read-only host is expressed as
- * the absence of the verbs rather than as a disabled copy of them.
- *
- * The `Runs` disclosure stays in both, which is that same rule rather than an
- * exception to it: `sync_task_history` is a **read**, it takes the id and
- * nothing else, and a detail that could not show a task's runs would be a
- * strictly poorer copy of the region it is a copy of.
+ * Task configuration has one host. The panel strip now shows a recorded run
+ * and its log instead of a second read-only copy of this component.
  */
 export interface TaskDetailVerbs {
   running: boolean;
@@ -1554,7 +1612,6 @@ export function TaskDetail({
   historyRuns,
   historyError,
   onHistoryToggle,
-  heading = true,
   verbs,
 }: {
   task: TaskVm;
@@ -1571,31 +1628,10 @@ export function TaskDetail({
   historyRuns: TaskRunVm[] | null;
   historyError: string | null;
   onHistoryToggle: (id: string) => void;
-  /**
-   * Whether the task's id is drawn as this region's heading.
-   *
-   * True in the pane, whose region is a section about exactly one task — the id
-   * is its title rather than one cell among five. False in a panel, which is
-   * already named twice over by the frame around it: the `aria-label` on its
-   * `<section>` and the header row under it. `PanelFrame` refuses a heading for
-   * a file for the reason that applies here word for word — *a second `h2`
-   * naming the same document would put two entries in a screen reader's heading
-   * list for one document* — and under the lockstep a plain click leaves, the
-   * pane's region beside the panel is holding the very same task, so the two
-   * entries would be the same word twice.
-   *
-   * Defaulted rather than required, because the heading is what this region has
-   * always drawn: a host that says nothing gets what Story 59.1 shipped.
-   */
-  heading?: boolean;
-  /** Everything that changes the task record, or `null` in a host that reads. */
-  verbs: TaskDetailVerbs | null;
+  verbs: TaskDetailVerbs;
 }) {
-  const editing = verbs?.editing ?? false;
-  // Both flags refuse the disclosure while a write to this task is on its way,
-  // and both are false in a host with no verbs — nothing it can do could be the
-  // write they are guarding against.
-  const busy = verbs !== null && (verbs.writing || verbs.deleting);
+  const editing = verbs.editing;
+  const busy = verbs.writing || verbs.deleting;
   const unhosted = task.host.kind === "unhosted";
   const report = taskReportText(task.lastRun);
   const neverRanText =
@@ -1629,17 +1665,7 @@ export function TaskDetail({
           <div className="flex items-center gap-2">
             <Badge variant="secondary">{task.kind}</Badge>
             <Badge variant="outline">{task.mode}</Badge>
-            {/* The name, and the reason it is a heading here and a span in the
-                list: this region is about exactly one task, so the id is its
-                title rather than one cell among five. A panel draws the same
-                string with the same weight and no heading semantics — see
-                {@link heading}; the styling is one class list either way, so
-                the two hosts cannot come to look different. */}
-            {heading ? (
-              <h2 className="truncate font-medium text-foreground text-sm">{task.id}</h2>
-            ) : (
-              <span className="truncate font-medium text-foreground text-sm">{task.id}</span>
-            )}
+            <h2 className="truncate font-medium text-foreground text-sm">{task.id}</h2>
           </div>
           {/* The task's own words, when it has any (Story 59.5). Under the name
               because the name is what it describes, and absent when blank —
@@ -1654,50 +1680,45 @@ export function TaskDetail({
             {task.profile ?? (task.profileId === null ? TASK_HOST_WIDE_TEXT : task.profileId)}
           </p>
         </div>
-        {/* Absent, not disabled, in a read-only host: a disabled control says
-            *not now*, and in a task panel the truth is *not here* — see this
-            component's header for why the pane is the only writer. */}
-        {verbs !== null && (
-          <div className="flex shrink-0 items-center gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              disabled={verbs.running}
-              onClick={() => verbs.onRunNow(task.id)}
-            >
-              {TASK_RUN_NOW_TEXT}
-            </Button>
-            {/* A disclosure, not a dialog: the same component the header reveals,
+        <div className="flex shrink-0 items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={verbs.running}
+            onClick={() => verbs.onRunNow(task.id)}
+          >
+            {TASK_RUN_NOW_TEXT}
+          </Button>
+          {/* A disclosure, not a dialog: the same component the header reveals,
                 in the region it is about (AD-C7). Disabled while a save is in
                 flight for the reason the header's twin is — pressing it unmounts
                 the form Rust's answer has to land in. */}
-            <Button
-              ref={editTriggerRef}
-              type="button"
-              variant="outline"
-              size="sm"
-              aria-expanded={verbs.editing}
-              disabled={verbs.writing}
-              onClick={() => verbs.onEditToggle(task.id)}
-            >
-              {TASK_EDIT_TEXT}
-            </Button>
-            {/* Refused twice over while a write is on its way: `upsert_task`
+          <Button
+            ref={editTriggerRef}
+            type="button"
+            variant="outline"
+            size="sm"
+            aria-expanded={verbs.editing}
+            disabled={verbs.writing}
+            onClick={() => verbs.onEditToggle(task.id)}
+          >
+            {TASK_EDIT_TEXT}
+          </Button>
+          {/* Refused twice over while a write is on its way: `upsert_task`
                 inserts when the id is absent, so a deletion confirmed mid-save is
                 undone by the save settling behind it. `deleting` is the second
                 confirm of the same delete. */}
-            <Button
-              type="button"
-              variant="destructive"
-              size="sm"
-              disabled={verbs.writing || verbs.deleting}
-              onClick={() => verbs.onForget(task.id)}
-            >
-              {TASK_FORGET_TEXT}
-            </Button>
-          </div>
-        )}
+          <Button
+            type="button"
+            variant="destructive"
+            size="sm"
+            disabled={verbs.writing || verbs.deleting}
+            onClick={() => verbs.onForget(task.id)}
+          >
+            {TASK_FORGET_TEXT}
+          </Button>
+        </div>
       </div>
 
       <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -1822,11 +1843,7 @@ export function TaskDetail({
       {/* Capped where the region is not, the Sync pane's reason: a form is read
           line by line, and a label-and-field pair stretched across a wide
           window is worse than one that sits still. */}
-      {/* `editing` rather than `verbs.editing`: it is the same value — see its
-          declaration — and it keeps the guard a null check rather than a member
-          access the linter would rewrite into an optional chain that no longer
-          narrows `verbs` for the form below. */}
-      {verbs !== null && editing && (
+      {editing && (
         <Card size="sm" className="w-full max-w-[720px]">
           <CardContent>
             <TaskForm
@@ -2629,7 +2646,7 @@ export function TasksPane() {
     if (resolvedId === null) {
       return;
     }
-    setEditingId(null);
+    setEditingId((current) => (current === resolvedId ? current : null));
     if (historyRef.current !== null) {
       historyToken.current += 1;
       openHistory(null);
@@ -2662,6 +2679,11 @@ export function TasksPane() {
   );
 
   const onListKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (
+      event.defaultPrevented ||
+      (event.target instanceof Element && event.target.closest('[role="menu"]'))
+    )
+      return;
     if (tasks.length === 0) {
       return;
     }
@@ -2720,78 +2742,12 @@ export function TasksPane() {
     moveSelection(to);
   };
 
-  /**
-   * What a row's click is allowed to do to the panel beside the list (Story
-   * 59.12), `files-pane.tsx:2102-2131`'s rule, branch for branch.
-   *
-   * A modified click belongs to the selection model and never to the panel:
-   * somebody assembling a five-task selection to Forget does not want five
-   * panels, and the last Shift-click of a range is not the task they were
-   * looking at. A click that landed on a control is that control's — no row
-   * carries one today, and Story 59.1's invariant says none ever will, but this
-   * is the line that keeps the invariant's next reader honest.
-   *
-   * The target is composed here and nowhere else, so the preview and the
-   * open-beside below cannot come to disagree about which task a gesture named.
-   */
-  const clickTarget = useCallback(
-    (event: ReactMouseEvent<HTMLDivElement>, id: string): PanelTargetVm | null => {
-      if (event.metaKey || event.ctrlKey || event.shiftKey) {
-        return null;
-      }
-      if (event.target instanceof Element && event.target.closest("button") !== null) {
-        return null;
-      }
-      return { kind: "task", taskId: id };
-    },
-    [],
-  );
-
-  /**
-   * What a row's own click means (Story 59.4), `files-pane.tsx:2146-2163`'s
-   * decoding, with 59.12's panel half beside it.
-   *
-   * `metaKey || ctrlKey` is checked **before** `shiftKey`, and the two are one
-   * branch rather than two: on any given machine one of them is the wrong
-   * platform, and a browser that honoured only Cmd would leave every Linux user
-   * without a toggle.
-   *
-   * Two things at once because they are one gesture, and the split between them
-   * is {@link clickTarget}: the selection branch runs for every click including
-   * the modified ones, and the panel branch runs only for a plain click that
-   * did not land on a control. Previewing rather than opening, so a person
-   * stepping down a list of twenty is left with one panel and not twenty.
-   */
+  /** Task selection stays in the configuration column; only runs enter the strip. */
   const handleRowClick = useCallback(
     (event: ReactMouseEvent<HTMLDivElement>, id: string) => {
-      if (!(event.target instanceof Element && event.target.closest("button") !== null)) {
-        let mode: "replace" | "toggle" | "extend" = "replace";
-        if (event.metaKey || event.ctrlKey) {
-          mode = "toggle";
-        } else if (event.shiftKey) {
-          mode = "extend";
-        }
-        select(id, mode);
-      }
-      const target = clickTarget(event, id);
-      if (target !== null) {
-        panelsStore.getState().setActiveTarget(target);
-      }
+      select(id, event.metaKey || event.ctrlKey ? "toggle" : event.shiftKey ? "extend" : "replace");
     },
-    [clickTarget, select],
-  );
-
-  /** Double click: open this task BESIDE what is already open. The single click
-   *  that necessarily preceded it is undone by the store, so the task that was
-   *  showing comes back rather than being replaced by a second copy of this one. */
-  const handleRowDoubleClick = useCallback(
-    (event: ReactMouseEvent<HTMLDivElement>, id: string) => {
-      const target = clickTarget(event, id);
-      if (target !== null) {
-        panelsStore.getState().openPanel(target);
-      }
-    },
-    [clickTarget],
+    [select],
   );
 
   /**
@@ -2867,6 +2823,23 @@ export function TasksPane() {
     },
     [applyReceipt, refresh, selection],
   );
+
+  const toggleTaskEnabled = async (task: TaskVm) => {
+    setBulkWriting(true);
+    try {
+      applyReceipt(
+        await syncTasksSetEnabled(
+          [{ id: task.id, baselineUpdatedMs: task.updatedMs }],
+          !task.enabled,
+        ),
+      );
+    } catch (cause) {
+      setBulkError(messageOf(cause));
+    } finally {
+      await refresh(true);
+      setBulkWriting(false);
+    }
+  };
 
   /**
    * Forget every id the confirmation named, and empty the selection.
@@ -3202,7 +3175,26 @@ export function TasksPane() {
                           rowRefs.current[index] = element;
                         }}
                         onRowClick={handleRowClick}
-                        onRowDoubleClick={handleRowDoubleClick}
+                        actions={{
+                          disabled: formSaving || bulkWriting || deleting[task.id] === true,
+                          runDisabled:
+                            running[task.id] === true ||
+                            formSaving ||
+                            bulkWriting ||
+                            deleting[task.id] === true,
+                          run: () => void runNow(task.id),
+                          edit: () => {
+                            select(task.id, "replace");
+                            setEditingId(task.id);
+                            historyToken.current += 1;
+                            openHistory(null);
+                          },
+                          toggle: () => void toggleTaskEnabled(task),
+                          forget: () => {
+                            setForgetSubject({ kind: "one", id: task.id });
+                            setForgetAsking(true);
+                          },
+                        }}
                         // Enter, and a plain replace: re-choosing the task
                         // already open costs nothing now, because the effect
                         // that closes a form keys off the resolved id rather
@@ -3286,13 +3278,7 @@ export function TasksPane() {
         </section>
         {list.seam}
 
-        {/* Level 2 — one task at a time, and still the pane's own region rather
-            than the strip beside it (Story 59.12). The two are not rivals: this
-            region follows the selection, a panel holds the task somebody asked
-            to keep, and the only gesture that makes them differ is the double
-            click that asked for exactly that. Deleting this region in favour of
-            the strip would take Story 59.1's level 2 away from every reader who
-            never double-clicks anything. */}
+        {/* Task configuration stays here; the strip beside it owns run detail. */}
         <section
           aria-label={TASKS_DETAIL_LABEL}
           // The floor Story 59.13 added, and the reason it is inline rather than
@@ -3411,9 +3397,7 @@ export function TasksPane() {
                     task={selectedTask}
                     now={now}
                     refusal={refusals[selectedTask.id] ?? null}
-                    // The pane is the writing host, so it passes all nine — see
-                    // {@link TaskDetailVerbs} for why the panel beside it passes
-                    // `null` instead of nine inert copies of them.
+                    // Task writes stay coordinated in this one configuration host.
                     verbs={{
                       running: running[selectedTask.id] === true,
                       deleting: deleting[selectedTask.id] === true,
@@ -3447,13 +3431,7 @@ export function TasksPane() {
                     historyError={history?.id === selectedTask.id ? history.error : null}
                     onHistoryToggle={toggleHistory}
                   />
-                  {/* Where the open-beside gesture is advertised now (Story
-                      59.13). The REGION says it, not `TaskDetail`, so a task
-                      panel — which renders the component and not this — cannot
-                      offer to open a task panel. And only under a drawn task:
-                      never over the form, the empty state or a multi-selection,
-                      because in none of those is there a task to double-click at
-                      the place the sentence points. */}
+                  {/* Run navigation remains discoverable beside task history. */}
                   <p className="px-6 pb-4 text-muted-foreground text-xs">
                     {TASKS_OPEN_BESIDE_HINT}
                   </p>

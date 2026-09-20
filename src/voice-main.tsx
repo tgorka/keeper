@@ -15,6 +15,7 @@
  * grants `core:default` and nothing else, and this file is why that is
  * enough.
  */
+import { ThemeProvider } from "next-themes";
 import { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { VoicePill } from "@/components/voice/voice-pill";
@@ -43,7 +44,11 @@ export function VoiceWindow() {
       unlisten?.();
     };
   }, []);
-  return <VoicePill state={state} />;
+  return (
+    <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
+      <VoicePill state={state} />
+    </ThemeProvider>
+  );
 }
 
 // Guarded so the module can be imported by a test without mounting a root.

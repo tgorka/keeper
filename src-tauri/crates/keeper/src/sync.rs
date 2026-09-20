@@ -364,7 +364,25 @@ pub fn engine(platform: Arc<dyn Platform>) -> SyncResult<Arc<Engine>> {
     if let Some(existing) = guard.as_ref() {
         return Ok(Arc::clone(existing));
     }
+    let ledger_profile = match platform.data_dir() {
+        Ok(dir) => match keeper_core::registry::get_ledger_vault(&dir) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, "could not read the app's ledger selection");
+                None
+            }
+        },
+        Err(error) => {
+            tracing::warn!(%error, "could not resolve the app's settings directory");
+            None
+        }
+    };
     let built = Arc::new(Engine::open(Arc::new(ShellSyncPlatform::new(platform)))?);
+    if let Some(profile_id) = ledger_profile {
+        if let Err(error) = built.set_ledger_profile(Some(profile_id)) {
+            tracing::warn!(%error, "could not seed the engine's ledger selection");
+        }
+    }
     *guard = Some(Arc::clone(&built));
     Ok(built)
 }

@@ -6,6 +6,7 @@ import { activePanel, panelsStore, resetPanelsStoreForTest } from "@/lib/stores/
 function row(id: string, title = id): NoteRowVm {
   return {
     id,
+    vaultId: "vault-a",
     path: `${id}.md`,
     unresolvedTarget: "",
     predicates: [],
@@ -39,6 +40,7 @@ function batch(
     total: counts.total,
     matched: counts.matched ?? counts.total,
     hidden: 0,
+    private: 0,
   };
 }
 

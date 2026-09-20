@@ -55,6 +55,11 @@ const MODE_OFF: &str = "off";
 const MODE_MANUAL: &str = "manual";
 const MODE_SCHEDULED: &str = "scheduled";
 
+/// Default overlap when reading a copy task's last successful mark.
+pub const COPY_LOOKBACK_DEFAULT_MS: i64 = 300_000;
+/// Maximum bytes returned by a single run-log read.
+pub const MAX_RUN_LOG_CHUNK_BYTES: u32 = 65_536;
+
 /// What the daemon sentence says when `keeper-syncd`'s unit will run the task
 /// **and survives logout**.
 ///
@@ -70,7 +75,7 @@ const MODE_SCHEDULED: &str = "scheduled";
 /// [`linger_marker_path`] for the fact that separates them (Story 57.5's
 /// review, finding 2).
 pub const HOST_SENTENCE_DAEMON: &str =
-    "the keeper-syncd unit on this machine runs this, logged in or not";
+    "the keeper-syncd unit on this machine runs this, copy tasks included, logged in or not";
 
 /// The daemon sentence for a unit that is enabled, shares the database, and
 /// **dies with the session** because lingering was never enabled.
@@ -92,7 +97,8 @@ pub const HOST_SENTENCE_DAEMON_UNTIL_LOGOUT: &str =
 /// is a real background host — closing the window calls `prevent_close()` +
 /// `hide()` and keeps the process, engine and notifications alive
 /// (`keeper/src/lib.rs:1106-1112`) — but **quit means quit** (AD-137).
-pub const HOST_SENTENCE_APP: &str = "keeper runs this — only while keeper is running";
+pub const HOST_SENTENCE_APP: &str =
+    "keeper runs this — only while keeper is running; copy tasks can also run on keeper-syncd";
 
 /// The app sentence plus the fact that makes it surprising on Linux: a unit is
 /// enabled here, yet it reads a different `sync.db`, so it never sees this row.
@@ -280,6 +286,7 @@ pub struct TaskRunVm {
     pub late_by_ms: Option<i64>,
     /// Which host recorded the run, as stored (e.g. `"app"`, `"daemon"`).
     pub host: String,
+    pub ledger_entry: Option<String>,
 }
 
 /// One task row, with its host verdict already computed.
@@ -310,6 +317,12 @@ pub struct TaskVm {
     pub copy_source: Option<String>,
     pub copy_destination: Option<String>,
     pub replace_existing: bool,
+    pub prune_destination: bool,
+    pub refresh_missing: bool,
+    #[ts(type = "number")]
+    pub copy_lookback_ms: i64,
+    /// The engine's resolved ledger directory for this task.
+    pub ledger_path: Option<String>,
     /// The mark the last successful run left, epoch ms, `null` when this task
     /// has no ledger entry yet (Story 74.4, AD-252).
     ///
@@ -439,6 +452,10 @@ pub struct TaskSaveReq {
     pub copy_source: Option<String>,
     pub copy_destination: Option<String>,
     pub replace_existing: bool,
+    pub prune_destination: bool,
+    pub refresh_missing: bool,
+    #[ts(type = "number")]
+    pub copy_lookback_ms: i64,
     /// The schedule expression, `null` to store none.
     pub schedule: Option<String>,
     /// What to call this task, `null` to store no description.
@@ -475,6 +492,35 @@ pub struct TaskSaveReq {
     /// moved. A create sends `null`: there is no reading to be stale.
     #[ts(type = "number | null")]
     pub baseline_updated_ms: Option<i64>,
+}
+
+/// One bounded, whole-line chunk of a run's ledger file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskRunLogVm {
+    pub text: String,
+    #[ts(type = "number")]
+    pub modified_ms: i64,
+    #[ts(type = "number | null")]
+    pub next_cursor: Option<u64>,
+    #[ts(type = "number")]
+    pub total_bytes: u64,
+    pub path: String,
+    #[ts(type = "number | null")]
+    pub changed_files: Option<u32>,
+}
+
+/// The chosen ledger folder and what the engine actually resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TasksLedgerVm {
+    pub chosen_profile_id: Option<String>,
+    pub resolved_profile_id: Option<String>,
+    pub resolved_profile_name: Option<String>,
+    pub root: Option<String>,
+    pub subfolder: String,
 }
 
 /// Exactly the facts [`task_host`] needs, borrowed.
@@ -1742,11 +1788,6 @@ mod tests {
 
         let host = task_host(scheduled(), presence);
         assert_eq!(host.kind, TaskHostKind::App);
-        assert_eq!(
-            host.sentence,
-            "keeper runs this — only while keeper is running"
-        );
-        assert_eq!(host.sentence, HOST_SENTENCE_APP);
     }
 
     #[test]

@@ -8,7 +8,7 @@ import type { NoteTagTerm } from "./NoteTagTerm";
  * the space DSL's `origin:` accepts `device:<label>`, which no enum can spell,
  * and the flag set grows without a binding regeneration.
  */
-export type NoteQueryReq = { 
+export type NoteQueryReq = { spaceTerms: boolean, sort: string | null, vaultIds: Array<string>, includePrivate: boolean, 
 /**
  * Free text; `None` for no text filter.
  */
