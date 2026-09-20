@@ -122,7 +122,7 @@ export async function exportTarget(target: PanelTargetVm): Promise<ExportOutcome
   if (target.kind === "recording") {
     return { status: "refused", reason: EXPORT_UNSUPPORTED_SENTENCE };
   }
-  if (target.kind === "task") {
+  if (target.kind === "run") {
     return { status: "refused", reason: EXPORT_NOT_A_DOCUMENT_SENTENCE };
   }
   if (target.kind === "note" && !(await flushed(target.vaultId, target.noteId))) {

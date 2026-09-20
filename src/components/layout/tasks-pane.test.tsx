@@ -17,6 +17,8 @@ vi.mock("@/lib/ipc/client", () => ({
   syncTasks: vi.fn(),
   syncTaskRunNow: vi.fn(),
   syncTaskHistory: vi.fn(),
+  syncTaskRunLog: vi.fn(),
+  revealPath: vi.fn(),
   syncTaskSave: vi.fn(),
   syncTaskForget: vi.fn(),
   // The batched pair Story 59.4's multi-selection drives. Answered in
@@ -34,6 +36,7 @@ vi.mock("@/lib/ipc/client", () => ({
 
 import { LIST_FOLD_MORE_LABEL } from "@/components/layout/list-fold";
 import { PANE_HEADER_IDENTITY_SLOT } from "@/components/layout/pane-header";
+import { PanelStrip } from "@/components/layout/panel-strip";
 import { COLUMN_COLLAPSE_PREFIX } from "@/components/layout/surface-column";
 import {
   formatTaskAgo,
@@ -134,7 +137,6 @@ import { columnMinWidth, SURFACE_COLUMNS } from "@/lib/column-widths";
 import { countLabel } from "@/lib/count-label";
 import type {
   PacedWorkVm,
-  PanelTargetVm,
   TaskBatchReceiptVm,
   TaskListingVm,
   TaskRunVm,
@@ -145,6 +147,7 @@ import {
   syncProfiles,
   syncTaskForget,
   syncTaskHistory,
+  syncTaskRunLog,
   syncTaskRunNow,
   syncTaskSave,
   syncTasks,
@@ -152,7 +155,7 @@ import {
   syncTasksSetEnabled,
 } from "@/lib/ipc/client";
 import { resetColumnFoldForTest } from "@/lib/stores/column-fold";
-import { activePanel, panelsStore, resetPanelsStoreForTest, sameTarget } from "@/lib/stores/panels";
+import { activePanel, panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import {
   SYNC_LIST_FOLDED_FALLBACK,
   SYNC_LIST_UNFOLDED_FALLBACK,
@@ -198,6 +201,7 @@ function run(over: Partial<TaskRunVm> = {}): TaskRunVm {
     trigger: "scheduled",
     lateByMs: 0,
     host: "dev#1",
+    ledgerEntry: null,
     ...over,
   };
 }
@@ -236,6 +240,10 @@ function task(over: Partial<TaskVm> = {}): TaskVm {
     copySource: null,
     copyDestination: null,
     replaceExisting: false,
+    pruneDestination: false,
+    refreshMissing: true,
+    copyLookbackMs: 300_000,
+    ledgerPath: null,
     markMs: null,
     lastRun: run(),
     host: { kind: "app", sentence: SENTENCE_APP, reason: null },
@@ -1959,10 +1967,7 @@ describe("a task's runs open on the row, and are read only when asked for", () =
   });
 
   it("names a run whose host or report the record left blank", async () => {
-    // `host` is `TEXT NOT NULL` with no non-empty constraint and `detail` is
-    // nullable, so the same foreign-writer class `taskReportText` exists for can
-    // leave either blank. Which host ran it is most of the point of this list, so
-    // a blank there is named; a blank report is silence.
+    // Missing host and missing report are distinct, visible facts.
     answer(listing({ tasks: [task({ id: "01SCHED" })] }));
     // Timed from the real clock, because the pane measures every relative time
     // against `Date.now()` at the instant the listing landed.
@@ -1979,11 +1984,6 @@ describe("a task's runs open on the row, and are read only when asked for", () =
     const [blank, named] = screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID);
 
     expect(within(blank).getByText(TASK_HISTORY_NO_HOST_TEXT)).toBeInTheDocument();
-    // The blank report draws no cell at all: the row ends at its host and the
-    // one word saying why it ran, which every run recorded since AD-253
-    // carries. Asserted as the whole text so a cell appearing between them is
-    // red rather than silent.
-    expect(blank.textContent).toBe(`Succeeded5 min ago${TASK_HISTORY_NO_HOST_TEXT}on its schedule`);
     // And the row beside it is unaffected.
     expect(within(named).getByText("dev#1")).toBeInTheDocument();
     expect(within(named).getByText("3 synced")).toBeInTheDocument();
@@ -2774,10 +2774,8 @@ describe("a list of names, and one task at a time", () => {
     // And no WRITE either: a selection is not an action.
     expect(syncTasksSetEnabled).not.toHaveBeenCalled();
     expect(syncTasksForget).not.toHaveBeenCalled();
-    // Story 59.12 put a panel target behind the plain clicks above, and it does
-    // not weaken this claim: `setActiveTarget` is a store write, so the panel
-    // moved three times and the pane still issued exactly one read.
-    expect(activePanel(panelsStore.getState()).target).toEqual({ kind: "task", taskId: "A" });
+    // Choosing configuration does not preview or open a run.
+    expect(activePanel(panelsStore.getState()).target).toBeNull();
   });
 
   it("moves the selection with the arrow keys, and stops at both ends", async () => {
@@ -3385,148 +3383,159 @@ describe("several tasks at once", () => {
  * that measured them any other way would be testing a second idiom rather than
  * proving there is not one.
  */
-describe("a task you can open beside the list", () => {
-  /** What every panel is showing, left to right. */
-  function panelTargets(): (PanelTargetVm | null)[] {
-    return panelsStore.getState().panels.map((panel) => panel.target);
-  }
-
-  async function twoTasks(): Promise<void> {
+describe("a run you can open beside the list", () => {
+  async function showRuns() {
     answer(listing({ tasks: [task({ id: "A" }), task({ id: "B" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue([
+      run({ id: 42, taskId: "A", detail: "first report" }),
+      run({ id: 43, taskId: "A", detail: "second report" }),
+    ]);
     render(<TasksPane />);
-    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+    await screen.findAllByTestId(TASKS_ROW_TESTID);
+    selectRow("A");
+    fireEvent.click(screen.getByRole("button", { name: "Runs: A" }));
+    await screen.findByRole("button", { name: /Run 42 · A/ });
   }
 
-  it("previews a task into the active panel on a plain click, without growing the list", async () => {
-    await twoTasks();
-
-    selectRow("A");
-
-    expect(activePanel(panelsStore.getState()).target).toEqual({ kind: "task", taskId: "A" });
+  it("leaves the strip alone on task selection and previews specific runs", async () => {
+    await showRuns();
+    expect(activePanel(panelsStore.getState()).target).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Run 42 · A/ }));
+    expect(activePanel(panelsStore.getState()).target).toEqual({
+      kind: "run",
+      taskId: "A",
+      runId: 42,
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Run 43 · A/ }));
+    expect(activePanel(panelsStore.getState()).target).toEqual({
+      kind: "run",
+      taskId: "A",
+      runId: 43,
+    });
     expect(panelsStore.getState().panels).toHaveLength(1);
-
-    // And a second plain click REPLACES rather than appends, which is what
-    // makes stepping down a list of twenty leave one panel and not twenty.
     selectRow("B");
-
-    expect(panelTargets()).toEqual([{ kind: "task", taskId: "B" }]);
+    expect(activePanel(panelsStore.getState()).target).toEqual({
+      kind: "run",
+      taskId: "A",
+      runId: 43,
+    });
   });
 
-  it("opens a task beside what was already open on a double click, and puts back what the click displaced", async () => {
-    await twoTasks();
-
-    // Pinned, so there is something under the next preview for the pin to put
-    // back. This is the arrangement a person is in after opening one task.
-    await act(async () => {
-      fireEvent.doubleClick(rowOption("A"));
-      await Promise.resolve();
+  it("renders the clicked run in the strip rather than duplicating TaskDetail", async () => {
+    await showRuns();
+    vi.mocked(syncTaskRunLog).mockResolvedValue({
+      text: "copied report.txt\n",
+      nextCursor: null,
+      totalBytes: 18,
+      changedFiles: 1,
+      modifiedMs: 123,
+      path: "/ledger/A/run.md",
     });
-    expect(panelTargets()).toEqual([{ kind: "task", taskId: "A" }]);
+    render(<PanelStrip />);
+    fireEvent.click(screen.getByRole("button", { name: /Run 42 · A/ }));
+    const panel = screen.getByRole("region", { name: "Run 42 · A" });
+    expect(await within(panel).findByText("first report")).toBeInTheDocument();
+    expect(within(panel).getByRole("region", { name: "Run log" })).toHaveTextContent(
+      "copied report.txt",
+    );
+    expect(screen.getAllByTestId(TASKS_DETAIL_TESTID)).toHaveLength(1);
+  });
 
-    // The gesture as the DOM delivers it: a real double click fires `click`
-    // first, so without `Panel.replaced` this would replace A with B and then
-    // open B beside itself — two panels of B, and A gone.
-    const rowB = rowOption("B");
-    await act(async () => {
-      fireEvent.click(rowB);
-      fireEvent.doubleClick(rowB);
-      await Promise.resolve();
-    });
-
-    expect(panelTargets()).toEqual([
-      { kind: "task", taskId: "A" },
-      { kind: "task", taskId: "B" },
+  it("opens a run beside the prior run without duplicating either", async () => {
+    await showRuns();
+    fireEvent.doubleClick(screen.getByRole("button", { name: /Run 42 · A/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Run 43 · A/ }));
+    fireEvent.doubleClick(screen.getByRole("button", { name: /Run 43 · A/ }));
+    expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([
+      { kind: "run", taskId: "A", runId: 42 },
+      { kind: "run", taskId: "A", runId: 43 },
     ]);
-    expect(activePanel(panelsStore.getState()).target).toEqual({ kind: "task", taskId: "B" });
   });
 
-  it("leaves every panel alone for a modified click, which is a selection gesture only", async () => {
-    await twoTasks();
-
-    // A selected and its panel pinned, so a modifier click that leaked into the
-    // panel would be visible as a changed target rather than only as a count —
-    // and so the Cmd-click below grows a set rather than starting one.
-    selectRow("A");
-    await act(async () => {
-      fireEvent.doubleClick(rowOption("A"));
-      await Promise.resolve();
-    });
-    const before = panelTargets();
-
-    await clickRowWith("B", { metaKey: true });
-    expect(selectedRows()).toEqual(["A", "B"]);
-    expect(panelTargets()).toEqual(before);
-
-    // Back to A, so the Shift below measures a run that ENDS on B — the case
-    // where a leak into the panel would be visible, because the range's last
-    // row is not the row the panel is holding.
-    selectRow("A");
-    await clickRowWith("B", { shiftKey: true });
-    expect(selectedRows()).toEqual(["A", "B"]);
-    expect(panelTargets()).toEqual(before);
-
-    // Somebody assembling a selection to Forget did not ask for a panel, and
-    // the last Shift-click of a range is not the task they were looking at.
-    expect(activePanel(panelsStore.getState()).target).toEqual({ kind: "task", taskId: "A" });
-    expect(sameTarget(panelTargets()[0] ?? null, { kind: "task", taskId: "A" })).toBe(true);
-  });
-
-  /**
-   * The invariant that makes two hosts over one task record safe.
-   *
-   * The pane's own detail region and a task panel are two hosts of one
-   * component, so they cannot word a fact differently — but they CAN be aimed
-   * at different tasks, and the story's claim is that only a gesture which
-   * asked for exactly that will do it. A single click keeps them in lockstep;
-   * the double click is the one that says *keep this one while I look at
-   * another*, which is the whole reason it exists.
-   *
-   * The panel side is read off the store rather than rendered, because
-   * `PanelStrip` is mounted beside this pane by `AppShell` and not by it: what
-   * this file owns is which target the pane PUTS there.
-   */
-  it("keeps the pane's detail region and the panel on one task until a gesture asks otherwise", async () => {
-    await twoTasks();
-
-    // A pinned panel to start from, and it is load-bearing rather than
-    // scene-setting: previewing into the panel a fresh keeper starts with
-    // records `was: null`, and the store deliberately PINS in place rather than
-    // appending when the thing a preview displaced was nothing. So a run that
-    // only ever previewed could never grow a second panel, and a test that
-    // started there would prove the opposite of what it claimed.
-    await act(async () => {
-      fireEvent.doubleClick(rowOption("A"));
-      await Promise.resolve();
-    });
-
-    // Lockstep. A plain click moves both, and does so for every row it lands
-    // on, so a reader stepping down the list never sees two different tasks.
-    for (const id of ["B", "A", "B"]) {
-      selectRow(id);
-      expect(screen.getByTestId(TASKS_DETAIL_TESTID)).toHaveAttribute("data-task-id", id);
-      expect(activePanel(panelsStore.getState()).target).toEqual({ kind: "task", taskId: id });
+  it("marks a task menu without moving selection and applies its verb to that task", async () => {
+    await showRuns();
+    fireEvent.contextMenu(rowOption("B"));
+    for (const name of ["Run now", "Edit", "Disable", "Forget"]) {
+      expect(screen.getByRole("menuitem", { name })).toBeInTheDocument();
     }
-    expect(panelTargets()).toHaveLength(1);
+    expect(rowOption("B")).toHaveAttribute("data-menu-target");
+    expect(selectedRows()).toEqual(["A"]);
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    await waitFor(() => expect(rowOption("B")).not.toHaveAttribute("data-menu-target"));
+    expect(selectedRows()).toEqual(["A"]);
+    await waitFor(() => expect(rowOption("B")).toHaveFocus());
+    fireEvent.contextMenu(rowOption("B"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Disable" }));
+    await waitFor(() =>
+      expect(syncTasksSetEnabled).toHaveBeenCalledWith(
+        [{ id: "B", baselineUpdatedMs: task().updatedMs }],
+        false,
+      ),
+    );
+    expect(rowOption("B")).not.toHaveAttribute("data-menu-target");
+  });
 
-    // The one gesture that asks for a difference, delivered as the DOM delivers
-    // it: B is previewing over A, so pinning it puts A back and opens B beside.
-    const rowB = rowOption("B");
-    await act(async () => {
-      fireEvent.click(rowB);
-      fireEvent.doubleClick(rowB);
-      await Promise.resolve();
+  it("opens the invoked task's edit form without retaining another task's runs", async () => {
+    await showRuns();
+    fireEvent.contextMenu(rowOption("B"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Edit" }));
+    expect(await screen.findByRole("form", { name: "Edit task: B" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Run 42 · A/ })).not.toBeInTheDocument();
+    expect(activePanel(panelsStore.getState()).target).toBeNull();
+  });
+
+  it("offers run verbs by keyboard without selecting the menu's run", async () => {
+    await showRuns();
+    const first = screen.getByRole("button", { name: /Run 42 · A/ });
+    const second = screen.getByRole("button", { name: /Run 43 · A/ });
+    fireEvent.click(first);
+    fireEvent.keyDown(second, { key: "F10", shiftKey: true });
+    for (const name of ["Open beside", "Copy path", "Reveal ledger folder"]) {
+      expect(screen.getByRole("menuitem", { name })).toBeInTheDocument();
+    }
+    expect(second).toHaveAttribute("data-menu-target");
+    expect(first).toHaveAttribute("aria-current", "true");
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    await waitFor(() => expect(second).not.toHaveAttribute("data-menu-target"));
+    await waitFor(() => expect(second).toHaveFocus());
+    expect(activePanel(panelsStore.getState()).target).toEqual({
+      kind: "run",
+      taskId: "A",
+      runId: 42,
     });
+  });
 
-    // The region followed the selection to B and still draws everything Story
-    // 59.1 put in it; the panel that was holding A is still holding A. Two
-    // subjects, and the reader asked for both of them.
-    const region = screen.getByTestId(TASKS_DETAIL_TESTID);
-    expect(region).toHaveAttribute("data-task-id", "B");
-    expect(within(region).getByRole("button", { name: TASK_RUN_NOW_TEXT })).toBeInTheDocument();
-    expect(panelTargets()).toEqual([
-      { kind: "task", taskId: "A" },
-      { kind: "task", taskId: "B" },
-    ]);
+  it("copies the run path without fetching a log page and reports typed refusals", async () => {
+    await showRuns();
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+    try {
+      vi.mocked(syncTaskRunLog).mockResolvedValueOnce({
+        text: "",
+        path: "/ledger/A/run-43.md",
+        nextCursor: null,
+        totalBytes: 100_000,
+        changedFiles: 2,
+        modifiedMs: 123,
+      });
+      const row = screen.getByRole("button", { name: /Run 43 · A/ });
+      fireEvent.contextMenu(row);
+      fireEvent.click(screen.getByRole("menuitem", { name: "Copy path" }));
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith("/ledger/A/run-43.md"));
+      expect(syncTaskRunLog).toHaveBeenLastCalledWith(43, null, 0);
+      vi.mocked(syncTaskRunLog).mockRejectedValueOnce({
+        code: "internal",
+        message: "The run ledger is unavailable",
+        accountId: null,
+        retriable: false,
+      });
+      fireEvent.contextMenu(row);
+      fireEvent.click(screen.getByRole("menuitem", { name: "Copy path" }));
+      expect(await screen.findByText("The run ledger is unavailable")).toBeVisible();
+      expect(writeText).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

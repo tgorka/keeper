@@ -1452,8 +1452,7 @@ function NavigationEntry({ target, onSelect }: { target: PanelTargetVm; onSelect
       alive = false;
     };
   }, [target]);
-  // Every kind the navigation stack can hold gets its own label; a kind a later
-  // epic adds falls back to nothing rather than to a wrong noun.
+  // Every kind the navigation stack can hold gets its own label.
   const fallback =
     target.kind === "note"
       ? target.noteId
@@ -1461,7 +1460,7 @@ function NavigationEntry({ target, onSelect }: { target: PanelTargetVm; onSelect
         ? target.relativePath
         : target.kind === "recording"
           ? target.sessionId
-          : "";
+          : `${target.taskId} · Run ${target.runId}`;
   return <DropdownMenuItem onSelect={onSelect}>{title ?? fallback}</DropdownMenuItem>;
 }
 

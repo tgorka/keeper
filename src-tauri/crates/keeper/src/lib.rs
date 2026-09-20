@@ -1231,6 +1231,9 @@ pub fn run() {
                 // runtime, `pause_all()` runs on backgrounding).
                 sync_ipc::sync_tasks,
                 sync_ipc::sync_task_history,
+                sync_ipc::sync_task_run_log,
+                sync_ipc::sync_tasks_ledger,
+                sync_ipc::sync_tasks_ledger_set,
                 sync_ipc::sync_task_run_now,
                 sync_ipc::sync_task_save,
                 sync_ipc::sync_task_forget,

@@ -155,6 +155,15 @@ vi.mock("@/lib/ipc/client", () => ({
   // Folder sync (Epic 29): only read when the `sync` capability is on, which
   // the default desktop tier below leaves off.
   syncProfiles: vi.fn(() => Promise.resolve([])),
+  syncTasks: vi.fn(async () => ({ tasks: [], unknown: [] })),
+  syncTasksLedger: vi.fn(async () => ({
+    chosenProfileId: null,
+    resolvedProfileId: null,
+    resolvedProfileName: null,
+    root: null,
+    subfolder: "tasks",
+  })),
+  syncTasksLedgerSet: vi.fn(async () => undefined),
   syncStatuses: vi.fn(() => Promise.resolve([])),
   syncProfileSave: vi.fn(),
   syncProfileRemove: vi.fn(),

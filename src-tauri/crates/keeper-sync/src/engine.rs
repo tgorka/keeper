@@ -55,6 +55,17 @@ use crate::tasks;
 use crate::volume::{self, VolumeMarker, VolumeStatus};
 use crate::watch::{FolderWatcher, WatchConfig, WatchEvent};
 
+/// A bounded, whole-line page from a task's persisted run log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRunLog {
+    pub text: String,
+    pub next_cursor: Option<u64>,
+    pub total_bytes: u64,
+    pub path: String,
+    pub changed_files: Option<u32>,
+    pub modified_ms: i64,
+}
+
 /// What one `sync_once` actually did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncOutcome {
@@ -2521,6 +2532,50 @@ impl Engine {
         Ok(())
     }
 
+    pub fn ledger_profile(&self) -> Result<Option<String>> {
+        self.with_db(db::get_ledger_profile)
+    }
+
+    pub fn set_ledger_profile(&self, profile_id: Option<String>) -> Result<()> {
+        self.with_db(|conn| db::set_ledger_profile(conn, profile_id.as_deref()))
+    }
+
+    pub fn tasks_ledger(&self) -> Result<Option<(SyncProfile, String)>> {
+        let profiles = self.list_profiles()?;
+        let chosen = self.ledger_profile()?;
+        let candidate = profiles
+            .iter()
+            .find(|profile| profile.tasks.is_some() && Some(&profile.id) == chosen.as_ref())
+            .or_else(|| profiles.iter().find(|profile| profile.tasks.is_some()));
+        Ok(candidate.and_then(|profile| {
+            profile
+                .tasks
+                .as_ref()
+                .map(|config| (profile.clone(), config.subfolder.clone()))
+        }))
+    }
+
+    pub fn task_ledger_path(&self, id: &str) -> Result<Option<String>> {
+        let task = self
+            .with_db(|conn| db::get_task(conn, id))?
+            .ok_or_else(|| SyncError::Config(format!("No such task: {id}.")))?;
+        let profiles = self.list_profiles()?;
+        Ok(Self::task_ledger_path_for(
+            &task,
+            &profiles,
+            self.ledger_profile()?.as_deref(),
+        ))
+    }
+
+    pub fn task_ledger_path_for(
+        task: &db::TaskRow,
+        profiles: &[SyncProfile],
+        chosen: Option<&str>,
+    ) -> Option<String> {
+        Self::task_ledger_for(task, profiles, chosen, &Self::task_fingerprint(task))
+            .map(|ledger| ledger.path().to_string_lossy().into_owned())
+    }
+
     fn seed_status(&self) -> Result<()> {
         let profiles = self.with_db(db::list_profiles)?;
         let mut status = Self::lock(&self.status);
@@ -3974,8 +4029,14 @@ impl Engine {
         // a panic inside the work cannot leave the id behind and wedge every
         // later quit into holding a lease for a run that ended.
         let _in_flight = self.mark_task_run_in_flight(&task.id);
-        let (outcome, detail) = self
-            .perform_task(task, profiles, trigger.source(), trigger.run_trigger())
+        let (outcome, detail, ledger_entry) = self
+            .perform_task(
+                task,
+                profiles,
+                trigger.source(),
+                trigger.run_trigger(),
+                run_id,
+            )
             .await;
         // The clock is read again rather than reused: a sync pass takes as long
         // as it takes, and a window computed from the instant the task became
@@ -4006,6 +4067,7 @@ impl Engine {
                     outcome,
                     detail: Some(detail.as_str()),
                     next_due_ms,
+                    ledger_entry: ledger_entry.as_deref(),
                 },
             )
         })?;
@@ -4077,8 +4139,9 @@ impl Engine {
         // run does (Story 74.5, AD-253) — and the arms that have a ledger
         // entry to write use it.
         run_trigger: crate::ledger::RunTrigger,
-    ) -> (tasks::TaskOutcome, String) {
-        match task.kind {
+        run_id: i64,
+    ) -> (tasks::TaskOutcome, String, Option<String>) {
+        let (outcome, detail) = match task.kind {
             tasks::TaskKind::Sync => self.perform_sync_task(task, profiles, source).await,
             // No `source`: a release moves no bytes to or from a remote and
             // writes no commit, so there is no provenance for one to name. The
@@ -4094,13 +4157,18 @@ impl Engine {
             // one kind whose work happens outside this crate (AD-224), so the
             // arm is a resolve, a read and one call through the port.
             tasks::TaskKind::Bot => self.perform_bot_task(task, profiles).await,
-            tasks::TaskKind::Copy => self.perform_copy_task(task, profiles, run_trigger).await,
+            tasks::TaskKind::Copy => {
+                return self
+                    .perform_copy_task(task, profiles, run_trigger, run_id)
+                    .await
+            }
             // No `source` here either: a repack rewrites how objects are
             // stored and not one of them, so there is no commit and no
             // provenance. The one kind that runs the shim's `gc` verb
             // (AD-41, AD-234).
             tasks::TaskKind::Gc => self.perform_gc_task(task, profiles).await,
-        }
+        };
+        (outcome, detail, None)
     }
 
     /// What this task IS, fingerprinted — the eight hex characters every one of
@@ -4154,9 +4222,8 @@ impl Engine {
     /// decide which one:
     ///
     /// * a task scoped to a profile uses **that** profile's ledger, or none;
-    /// * a host-wide task uses the first profile that carries one, in the
-    ///   profile order the caller handed over (stable, because the engine's
-    ///   profile list is sorted before it reaches here).
+    /// * a host-wide task prefers the machine-local choice when it carries a
+    ///   ledger, otherwise the first flagged profile in the stable listing.
     ///
     /// `None` is a first-class answer, not a degradation: with no ledger a
     /// copy simply has no mark, so it walks everything and reports to
@@ -4169,13 +4236,28 @@ impl Engine {
         profiles: &[SyncProfile],
         fingerprint: &str,
     ) -> Option<crate::ledger::TaskLedger> {
-        let candidate = profiles.iter().find(|profile| {
+        let chosen = self.ledger_profile().ok().flatten();
+        Self::task_ledger_for(task, profiles, chosen.as_deref(), fingerprint)
+    }
+
+    fn task_ledger_for(
+        task: &db::TaskRow,
+        profiles: &[SyncProfile],
+        chosen: Option<&str>,
+        fingerprint: &str,
+    ) -> Option<crate::ledger::TaskLedger> {
+        let eligible = |profile: &&SyncProfile| {
             profile.tasks.is_some()
                 && task
                     .profile_id
                     .as_ref()
                     .is_none_or(|scoped| scoped == &profile.id)
-        })?;
+        };
+        let candidate = profiles
+            .iter()
+            .filter(eligible)
+            .find(|profile| Some(profile.id.as_str()) == chosen)
+            .or_else(|| profiles.iter().find(eligible))?;
         let config = candidate.tasks.as_ref()?;
         match crate::ledger::TaskLedger::resolve(&candidate.local_path, &config.subfolder, &task.id)
         {
@@ -4197,40 +4279,104 @@ impl Engine {
         }
     }
 
+    fn render_copy_task_config(task: &db::TaskRow) -> Result<String> {
+        #[derive(Serialize)]
+        struct Config<'a> {
+            id: &'a str,
+            kind: &'a str,
+            copy_source: Option<&'a str>,
+            copy_destination: Option<&'a str>,
+            replace_existing: bool,
+            prune_destination: bool,
+            refresh_missing: bool,
+            copy_lookback_ms: i64,
+            schedule: Option<&'a str>,
+        }
+        toml::to_string(&Config {
+            id: &task.id,
+            kind: task.kind.as_str(),
+            copy_source: task.copy_source.as_deref(),
+            copy_destination: task.copy_destination.as_deref(),
+            replace_existing: task.replace_existing,
+            prune_destination: task.prune_destination,
+            refresh_missing: task.refresh_missing,
+            copy_lookback_ms: task.copy_lookback_ms,
+            schedule: task.schedule.as_deref(),
+        })
+        .map_err(|err| {
+            SyncError::Config(format!(
+                "Could not render the copy task configuration: {err}"
+            ))
+        })
+    }
+
     /// A remembered schedule over a copy job, not a profile or journal entry.
     async fn perform_copy_task(
         &self,
         task: &db::TaskRow,
         profiles: &[SyncProfile],
         trigger: crate::ledger::RunTrigger,
-    ) -> (tasks::TaskOutcome, String) {
+        run_id: i64,
+    ) -> (tasks::TaskOutcome, String, Option<String>) {
         use crate::copy::{CopyOptions, CopyOutcome};
         let (Some(source), Some(destination)) = (&task.copy_source, &task.copy_destination) else {
             return (
                 tasks::TaskOutcome::Failed,
                 "this copy task needs a source and a destination path".into(),
+                None,
             );
         };
         let source = Path::new(source);
         let destination = Path::new(destination);
         let fingerprint = Self::task_fingerprint(task);
         let ledger = self.task_ledger(task, profiles, &fingerprint);
+        let previous = ledger
+            .as_ref()
+            .and_then(|ledger| ledger.latest_mark(&fingerprint));
         let options = CopyOptions {
             replace_existing: task.replace_existing,
             // The lower bound is what keeper measured last time, not a date
             // somebody typed (AD-256 rescinded that). No ledger, no mark, full
             // pass — an unreadable history costs a walk, never a skipped file.
-            modified_since_ms: ledger
-                .as_ref()
-                .and_then(|ledger| ledger.latest_mark(&fingerprint)),
+            modified_since_ms: previous
+                .map(|mark| mark.saturating_sub(task.copy_lookback_ms.max(0))),
+            prune_destination: task.prune_destination,
+            refresh_missing: task.refresh_missing,
         };
         // The existing blocking fence preserves the borrowed engine needed for
         // hydration while handing the runtime's work to another worker.
         Self::blocking(|| {
+            if task.prune_destination {
+                let ledger_roots: Vec<_> = profiles
+                    .iter()
+                    .filter_map(|profile| {
+                        profile
+                            .tasks
+                            .as_ref()
+                            .map(|config| profile.local_path.join(&config.subfolder))
+                    })
+                    .collect();
+                let mut protected: Vec<(&str, &Path)> = profiles
+                    .iter()
+                    .map(|profile| ("sync profile root", profile.local_path.as_path()))
+                    .chain(
+                        ledger_roots
+                            .iter()
+                            .map(|root| ("task ledger root", root.as_path())),
+                    )
+                    .collect();
+                if let Some(ledger) = &ledger {
+                    protected.push(("task ledger root", ledger.path()));
+                }
+                if let Err(err) = crate::copy::validate_prune(source, destination, &protected) {
+                    return (tasks::TaskOutcome::Failed, err.to_string(), None);
+                }
+            }
             if !source.exists() {
                 return (
                     tasks::TaskOutcome::Failed,
                     format!("{} does not exist", source.display()),
+                    None,
                 );
             }
             if destination.starts_with(source) {
@@ -4238,6 +4384,7 @@ impl Engine {
                     tasks::TaskOutcome::Failed,
                     "the destination is inside the source, which would copy the tree into itself"
                         .into(),
+                    None,
                 );
             }
             let target = source
@@ -4262,15 +4409,19 @@ impl Engine {
                 content,
             ) {
                 Ok(report) => report,
-                Err(err) => return (tasks::TaskOutcome::Failed, err.to_string()),
+                Err(err) => return (tasks::TaskOutcome::Failed, err.to_string(), None),
             };
             let mut copied = 0;
+            let mut overwritten = 0;
+            let mut deleted = 0;
             let mut identical = 0;
             let mut collisions = 0;
             let mut failed = 0;
             for entry in &report.entries {
                 match entry.outcome {
                     CopyOutcome::Copied => copied += 1,
+                    CopyOutcome::Overwritten => overwritten += 1,
+                    CopyOutcome::Deleted => deleted += 1,
                     CopyOutcome::Identical => identical += 1,
                     CopyOutcome::Collision => collisions += 1,
                     CopyOutcome::Failed { .. } => failed += 1,
@@ -4291,38 +4442,80 @@ impl Engine {
                 &self.platform.now_ms().to_string(),
             );
             let log_error = std::fs::write(&log, &body).err();
-            let mut detail = format!("{} bytes; {} files: {copied} copied, {identical} identical, {collisions} left alone, {failed} failed",
+            let mut detail = format!("{} bytes; {} files: {copied} copied, {overwritten} overwritten, {identical} identical, {deleted} deleted, {collisions} left alone, {failed} failed",
                 report.bytes_copied, report.entries.len());
             if let Some(err) = &log_error {
                 detail.push_str(&format!("; could not write the copy log: {err}"));
             }
             let verdict = if failed > 0 {
                 crate::ledger::RunVerdict::Partial
-            } else {
+            } else if report
+                .mark_ms
+                .is_some_and(|mark| previous.is_none_or(|old| mark > old))
+            {
                 crate::ledger::RunVerdict::Ok
+            } else {
+                crate::ledger::RunVerdict::Idle
             };
-            // The ledger entry, whose NAME is the next run's lower bound. The
-            // mark is the newest mtime this pass covered — `None` when it
-            // covered nothing, in which case the run is still written down
-            // (the person asked, and it happened) but marked with the instant
-            // it finished, which advances nothing a file could hide behind.
+            if verdict == crate::ledger::RunVerdict::Idle {
+                if let Some(mark) = previous {
+                    let phrase = if copied + overwritten > 0 {
+                        "mark unchanged at"
+                    } else {
+                        "nothing newer than the mark"
+                    };
+                    detail.push_str(&format!(
+                        "; {phrase} {} — {} files behind it",
+                        crate::ledger::stamp(mark),
+                        report.behind
+                    ));
+                } else if copied + overwritten > 0 {
+                    detail.push_str("; copied without a usable modification-time mark");
+                } else {
+                    detail.push_str("; nothing to copy");
+                }
+            }
+            let counts = crate::ledger::RunCounts {
+                copied,
+                overwritten,
+                deleted,
+                identical,
+                collision: collisions,
+                failed,
+                behind: report.behind,
+            };
+            let mut ledger_entry = None;
+            // Only a covered-mtime success advances the mark. Idle and failed
+            // passes are recorded at finish time under non-advancing verdicts.
             if let Some(ledger) = &ledger {
+                if let Err(err) = Self::render_copy_task_config(task)
+                    .and_then(|config| ledger.write_config(&config))
+                {
+                    detail.push_str(&format!("; could not write the task configuration: {err}"));
+                }
                 let name = crate::ledger::RunFileName {
-                    mark_ms: report.mark_ms.unwrap_or_else(|| self.platform.now_ms()),
+                    mark_ms: match (verdict.advances_mark(), report.mark_ms) {
+                        (true, Some(mark)) => mark,
+                        _ => self.platform.now_ms(),
+                    },
                     trigger,
                     verdict,
                     fingerprint: fingerprint.clone(),
                 };
                 let header =
                     crate::ledger::render_run_header("copy", trigger, verdict, &name, &detail);
-                if let Err(err) = ledger.write_run(&name, &format!("{header}{body}")) {
-                    // A ledger that cannot be written is a real failure: the
-                    // next run would re-walk the whole tree and, worse, nothing
-                    // in the drive would record that this one happened. Said
-                    // out loud rather than swallowed — but after the copy,
-                    // whose bytes are already verified and safe.
-                    detail.push_str(&format!("; could not write the run ledger entry: {err}"));
-                    return (tasks::TaskOutcome::Failed, detail);
+                match ledger.write_run(&name, &format!("{}{header}{body}", counts.render()), run_id)
+                {
+                    Ok(path) => {
+                        ledger_entry = path
+                            .strip_prefix(ledger.path())
+                            .ok()
+                            .map(|entry| entry.to_string_lossy().into_owned());
+                    }
+                    Err(err) => {
+                        detail.push_str(&format!("; could not write the run ledger entry: {err}"));
+                        return (tasks::TaskOutcome::Failed, detail, None);
+                    }
                 }
             }
             let outcome = if failed > 0 || log_error.is_some() {
@@ -4330,7 +4523,7 @@ impl Engine {
             } else {
                 tasks::TaskOutcome::Ok
             };
-            (outcome, detail)
+            (outcome, detail, ledger_entry)
         })
     }
 
@@ -12197,6 +12390,122 @@ impl Engine {
         self.with_db(|conn| db::task_runs(conn, id, limit))
     }
 
+    pub fn task_run_log(
+        &self,
+        run_id: i64,
+        cursor: Option<u64>,
+        max_bytes: u32,
+    ) -> Result<TaskRunLog> {
+        use std::io::{Read, Seek, SeekFrom};
+        let run = self
+            .with_db(|conn| db::get_task_run(conn, run_id))?
+            .ok_or_else(|| SyncError::Config("This run no longer exists.".into()))?;
+        let entry = run.ledger_entry.as_deref().ok_or_else(|| {
+            SyncError::Config(
+                "This run has no ledger log. Its detail is the available record.".into(),
+            )
+        })?;
+        let root = self
+            .task_ledger_path(&run.task_id)?
+            .ok_or_else(|| SyncError::Config("This task has no available ledger folder.".into()))?;
+        let path = crate::browse::resolve(Path::new(&root), entry)
+            .map_err(|err| SyncError::Config(format!("The run log path is unusable: {err}")))?
+            .ok_or_else(|| SyncError::Config("The run log file is no longer available.".into()))?;
+        let mut file =
+            std::fs::File::open(&path).map_err(|err| SyncError::io("open run log", &path, err))?;
+        let metadata = file
+            .metadata()
+            .map_err(|err| SyncError::io("inspect run log", &path, err))?;
+        if !metadata.is_file() {
+            return Err(SyncError::Config(
+                "The run log is not a regular file.".into(),
+            ));
+        }
+        let total_bytes = metadata.len();
+        let modified = metadata
+            .modified()
+            .map_err(|err| SyncError::io("read run log modification time", &path, err))?;
+        let modified_ms = match modified.duration_since(std::time::UNIX_EPOCH) {
+            Ok(elapsed) => i64::try_from(elapsed.as_millis()).ok(),
+            Err(err) => i64::try_from(err.duration().as_millis()).ok().map(|ms| -ms),
+        }
+        .ok_or_else(|| {
+            SyncError::Config("The run log modification time is out of range.".into())
+        })?;
+        // The fixed-size head is independent of the visible page: a count
+        // read from the tail would change as the person loads older lines.
+        let mut head = [0_u8; 512];
+        let head_len = total_bytes.min(head.len() as u64) as usize;
+        file.read_exact(&mut head[..head_len])
+            .map_err(|err| SyncError::io("read run log counts", &path, err))?;
+        let first_line = head[..head_len]
+            .split(|byte| *byte == b'\n')
+            .next()
+            .unwrap_or(&[]);
+        let changed_files = std::str::from_utf8(first_line)
+            .ok()
+            .and_then(crate::ledger::RunCounts::parse)
+            .and_then(|counts| u32::try_from(counts.changed()).ok());
+        if max_bytes == 0 {
+            return Ok(TaskRunLog {
+                text: String::new(),
+                next_cursor: None,
+                total_bytes,
+                path: path.to_string_lossy().into_owned(),
+                changed_files,
+                modified_ms,
+            });
+        }
+        let end = cursor.unwrap_or(total_bytes);
+        if end > total_bytes {
+            return Err(SyncError::Config(
+                "The run log changed. Load its latest content again.".into(),
+            ));
+        }
+        let budget = u64::from(max_bytes.clamp(1, 64 * 1024 - 512));
+        let start = end.saturating_sub(budget);
+        let probe_start = start.saturating_sub(1);
+        file.seek(SeekFrom::Start(probe_start))
+            .map_err(|err| SyncError::io("seek run log", &path, err))?;
+        let mut bytes = vec![0; (end - probe_start) as usize];
+        file.read_exact(&mut bytes)
+            .map_err(|err| SyncError::io("read run log", &path, err))?;
+        if cursor.is_some() && end < total_bytes && end != 0 && bytes.last() != Some(&b'\n') {
+            return Err(SyncError::Config(
+                "The run log cursor is not at a line boundary. Load its latest content again."
+                    .into(),
+            ));
+        }
+        let skip = if start == 0 {
+            0
+        } else {
+            bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|index| index + 1)
+                .ok_or_else(|| {
+                    SyncError::Config("A run log line exceeds this page's byte budget.".into())
+                })?
+        };
+        let next = probe_start + skip as u64;
+        if next == end && end != 0 {
+            return Err(SyncError::Config(
+                "A run log line exceeds this page's byte budget.".into(),
+            ));
+        }
+        bytes.drain(..skip);
+        let text = String::from_utf8(bytes)
+            .map_err(|_| SyncError::Config("The run log is not valid UTF-8.".into()))?;
+        Ok(TaskRunLog {
+            text,
+            next_cursor: (next > 0).then_some(next),
+            total_bytes,
+            path: path.to_string_lossy().into_owned(),
+            changed_files,
+            modified_ms,
+        })
+    }
+
     /// Forget a task and everything it recorded.
     ///
     /// Including its fault, which is not merely housekeeping: re-creating the
@@ -18468,6 +18777,9 @@ mod tests {
             copy_source: None,
             copy_destination: None,
             replace_existing: false,
+            prune_destination: false,
+            refresh_missing: true,
+            copy_lookback_ms: 300_000,
             schedule: Some(schedule.to_owned()),
             mode: tasks::TaskMode::Scheduled,
             next_due_ms: None,
@@ -18500,6 +18812,326 @@ mod tests {
             kind: tasks::TaskKind::Verify,
             ..task(id, profile_id, schedule)
         }
+    }
+
+    #[test]
+    fn ledger_selection_prefers_the_choice_and_falls_back_within_task_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = Engine::open(Arc::new(TestPlatform::new(dir.path()))).expect("engine");
+        let mut first = profile(dir.path());
+        first.id = "a".into();
+        first.tasks = Some(crate::profile::TasksConfig::default());
+        let mut second = first.clone();
+        second.id = "b".into();
+        second.local_path = dir.path().join("second");
+        engine.upsert_profile(&first).expect("first");
+        engine.upsert_profile(&second).expect("second");
+        let row = task("chosen-ledger", None, "every 5m");
+        engine.save_task(&row, None).expect("task");
+        engine
+            .set_ledger_profile(Some(second.id.clone()))
+            .expect("choice");
+        assert_eq!(
+            engine
+                .tasks_ledger()
+                .expect("resolved")
+                .expect("profile")
+                .0
+                .id,
+            second.id
+        );
+        assert!(Path::new(
+            &engine
+                .task_ledger_path(&row.id)
+                .expect("path")
+                .expect("ledger")
+        )
+        .starts_with(&second.local_path));
+        engine
+            .set_ledger_profile(Some("gone".into()))
+            .expect("unknown");
+        assert_eq!(
+            engine
+                .tasks_ledger()
+                .expect("resolved")
+                .expect("profile")
+                .0
+                .id,
+            first.id
+        );
+        assert_eq!(
+            engine.ledger_profile().expect("stored"),
+            Some("gone".into())
+        );
+        let scoped = task("scoped", Some(&first.id), "every 5m");
+        engine.save_task(&scoped, None).expect("task");
+        engine.set_ledger_profile(Some(second.id)).expect("choice");
+        assert!(Path::new(
+            &engine
+                .task_ledger_path(&scoped.id)
+                .expect("path")
+                .expect("ledger")
+        )
+        .starts_with(&first.local_path));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copy_default_lookback_keeps_each_idle_run_and_pages_exact_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = Engine::open(Arc::new(TestPlatform::new(dir.path()))).expect("engine");
+        let mut profile = profile(dir.path());
+        profile.tasks = Some(crate::profile::TasksConfig::default());
+        std::fs::create_dir_all(&profile.local_path).expect("profile");
+        engine.upsert_profile(&profile).expect("profile");
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        std::fs::create_dir_all(&source).expect("source");
+        std::fs::write(source.join("file"), b"data").expect("file");
+        std::fs::File::options()
+            .write(true)
+            .open(source.join("file"))
+            .expect("open")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(3)),
+            )
+            .expect("mtime");
+        let mut row = task("idle-regression", Some(&profile.id), "every 5m");
+        row.kind = tasks::TaskKind::Copy;
+        row.copy_source = Some(source.to_string_lossy().into_owned());
+        row.copy_destination = Some(destination.to_string_lossy().into_owned());
+        assert_eq!(row.copy_lookback_ms, 300_000);
+        engine.save_task(&row, None).expect("save");
+        for _ in 0..2 {
+            engine
+                .run_task_now(&row.id, tasks::TaskRunDriver::Person)
+                .await
+                .expect("run");
+        }
+        let runs = engine.task_history(&row.id, 2).expect("runs");
+        let newest = runs.iter().max_by_key(|run| run.id).expect("newest");
+        let oldest = runs.iter().min_by_key(|run| run.id).expect("oldest");
+        assert_ne!(
+            newest.ledger_entry, oldest.ledger_entry,
+            "every run keeps its own ledger file"
+        );
+        assert!(newest
+            .ledger_entry
+            .as_deref()
+            .expect("entry")
+            .contains("-idle-"));
+        assert!(newest
+            .detail
+            .as_deref()
+            .expect("detail")
+            .contains("19700101T000003Z"));
+        let first = engine.task_run_log(oldest.id, None, 65536).expect("first");
+        let second = engine.task_run_log(newest.id, None, 65536).expect("second");
+        assert!(first.text.contains("copied=1"));
+        assert!(second.text.contains("identical=1"));
+        std::fs::write(&second.path, "abcd\nefgh\nijkl\n").expect("log");
+        let exact = engine
+            .task_run_log(newest.id, None, 5)
+            .expect("exact last line");
+        assert_eq!(exact.text, "ijkl\n");
+        assert_eq!(exact.next_cursor, Some(10));
+        let boundary = engine.task_run_log(newest.id, None, 10).expect("boundary");
+        assert_eq!(boundary.text, "efgh\nijkl\n");
+        assert_eq!(boundary.next_cursor, Some(5));
+        let path_only = engine.task_run_log(newest.id, None, 0).expect("path only");
+        assert_eq!(path_only.path, second.path);
+        assert!(path_only.text.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copy_prune_refuses_destructive_roots_before_moving_bytes() {
+        for case in ["source", "file", "profile", "ledger"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let engine = Engine::open(Arc::new(TestPlatform::new(dir.path()))).expect("engine");
+            let destination = dir.path().join("destination");
+            std::fs::create_dir_all(&destination).expect("destination");
+            let source = if case == "source" {
+                destination.join("source")
+            } else {
+                dir.path().join("source")
+            };
+            if case == "file" {
+                std::fs::write(&source, b"source").expect("source file");
+            } else {
+                std::fs::create_dir_all(&source).expect("source");
+                std::fs::write(source.join("original"), b"source").expect("source file");
+            }
+            std::fs::write(destination.join("sentinel"), b"untouched").expect("sentinel");
+            let mut profile = profile(dir.path());
+            profile.local_path = if case == "profile" {
+                destination.join("profile")
+            } else {
+                dir.path().join("profile")
+            };
+            profile.tasks = Some(crate::profile::TasksConfig::default());
+            std::fs::create_dir_all(&profile.local_path).expect("profile");
+            let mut row = task("guard", Some(&profile.id), "every 5m");
+            row.kind = tasks::TaskKind::Copy;
+            row.prune_destination = true;
+            row.copy_source = Some(source.to_string_lossy().into_owned());
+            let actual_destination = if case == "ledger" {
+                profile
+                    .local_path
+                    .join(crate::profile::DEFAULT_TASKS_SUBFOLDER)
+            } else {
+                destination.clone()
+            };
+            std::fs::create_dir_all(&actual_destination).expect("destination");
+            std::fs::write(actual_destination.join("sentinel"), b"untouched").expect("sentinel");
+            row.copy_destination = Some(actual_destination.to_string_lossy().into_owned());
+            let (outcome, detail, entry) = engine
+                .perform_copy_task(&row, &[profile], crate::ledger::RunTrigger::Requested, 1)
+                .await;
+            assert_eq!(outcome, tasks::TaskOutcome::Failed, "{case}: {detail}");
+            let reason = match case {
+                "source" => "inside the destination",
+                "file" => "not a directory",
+                "profile" => "sync profile root",
+                _ => "task ledger root",
+            };
+            assert!(
+                detail.contains(reason) && detail.ends_with('.'),
+                "{case}: {detail}"
+            );
+            assert!(entry.is_none());
+            assert_eq!(
+                std::fs::read(actual_destination.join("sentinel")).expect("sentinel"),
+                b"untouched"
+            );
+            let original = if case == "file" {
+                source
+            } else {
+                source.join("original")
+            };
+            assert_eq!(
+                std::fs::read(original).expect("source untouched"),
+                b"source"
+            );
+            assert!(
+                !actual_destination.join("original").exists(),
+                "refuse before copying"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copy_empty_without_ledger_says_nothing_to_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = Engine::open(Arc::new(TestPlatform::new(dir.path()))).expect("engine");
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).expect("source");
+        let mut row = task("empty", None, "every 5m");
+        row.kind = tasks::TaskKind::Copy;
+        row.copy_source = Some(source.to_string_lossy().into_owned());
+        row.copy_destination = Some(
+            dir.path()
+                .join("destination")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let (outcome, detail, _) = engine
+            .perform_copy_task(&row, &[], crate::ledger::RunTrigger::Requested, 1)
+            .await;
+        assert_eq!(outcome, tasks::TaskOutcome::Ok);
+        assert!(detail.contains("nothing to copy"));
+        assert!(!detail.contains("mark none"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copy_lookback_reexamines_only_sources_above_its_adjusted_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let engine = Engine::open(platform).expect("engine");
+        let mut profile = profile(dir.path());
+        profile.tasks = Some(crate::profile::TasksConfig::default());
+        std::fs::create_dir_all(&profile.local_path).expect("profile");
+        engine.upsert_profile(&profile).expect("save profile");
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        std::fs::create_dir_all(&source).expect("source");
+        let write = |name: &str, bytes: &[u8], ms| {
+            let path = source.join(name);
+            std::fs::write(&path, bytes).expect("write");
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .expect("open")
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(ms)),
+                )
+                .expect("mtime");
+        };
+        write("boundary", b"old", 1000);
+        write("recent", b"old", 1001);
+        write("mark", b"mark", 3000);
+        let mut row = task("lookback", Some(&profile.id), "every 5m");
+        row.kind = tasks::TaskKind::Copy;
+        row.copy_source = Some(source.to_string_lossy().into_owned());
+        row.copy_destination = Some(destination.to_string_lossy().into_owned());
+        row.replace_existing = true;
+        row.refresh_missing = false;
+        row.copy_lookback_ms = 2000;
+        engine.save_task(&row, None).expect("save");
+        engine
+            .run_task_now(&row.id, tasks::TaskRunDriver::Person)
+            .await
+            .expect("first");
+        let config_path = PathBuf::from(
+            engine
+                .task_ledger_path(&row.id)
+                .expect("path")
+                .expect("ledger"),
+        )
+        .join(crate::ledger::TASK_CONFIG_FILENAME);
+        let config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).expect("config")).expect("toml");
+        assert_eq!(config["prune_destination"].as_bool(), Some(false));
+        assert_eq!(config["refresh_missing"].as_bool(), Some(false));
+        assert_eq!(config["copy_lookback_ms"].as_integer(), Some(2000));
+        std::fs::remove_file(&config_path).expect("remove config");
+        std::fs::create_dir(&config_path).expect("obstruct config");
+        write("boundary", b"changed", 1000);
+        write("recent", b"changed", 1001);
+        engine
+            .run_task_now(&row.id, tasks::TaskRunDriver::Person)
+            .await
+            .expect("lookback");
+        assert_eq!(
+            std::fs::read(destination.join("boundary")).expect("read"),
+            b"old"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("recent")).expect("read"),
+            b"changed"
+        );
+        let run = engine.task_history(&row.id, 1).expect("history");
+        assert!(run[0]
+            .detail
+            .as_deref()
+            .expect("detail")
+            .contains("1 overwritten"));
+        assert!(run[0]
+            .detail
+            .as_deref()
+            .expect("detail")
+            .contains("mark unchanged at 19700101T000003Z — 1 files behind it"));
+        assert!(run[0]
+            .ledger_entry
+            .as_deref()
+            .expect("entry")
+            .contains("-idle-"));
+        assert_eq!(run[0].outcome, Some(tasks::TaskOutcome::Ok));
+        assert!(run[0]
+            .detail
+            .as_deref()
+            .expect("detail")
+            .contains("could not write the task configuration"));
     }
 
     /// The whole of story 74.4 in one fixture: a copy task whose profile holds
@@ -18542,6 +19174,8 @@ mod tests {
         row.kind = tasks::TaskKind::Copy;
         row.copy_source = Some(source.to_string_lossy().into_owned());
         row.copy_destination = Some(destination.to_string_lossy().into_owned());
+        row.copy_lookback_ms = 0;
+        row.refresh_missing = false;
         engine.save_task(&row, None).expect("save");
 
         // First pass: no mark exists, so everything is carried.
@@ -18589,7 +19223,63 @@ mod tests {
         let body = std::fs::read_to_string(ledger_year.join(&names[0])).expect("body");
         assert!(body.contains("why:         requested"), "{body}");
         assert!(body.contains("copied  5  "), "{body}");
+        assert_eq!(
+            crate::ledger::RunCounts::parse(&body)
+                .expect("counts")
+                .changed(),
+            2
+        );
+        let page = engine.task_run_log(first[0].id, None, 65_536).expect("log");
+        assert_eq!(page.changed_files, Some(2));
+        assert_eq!(page.text, body);
+        let expanded = format!("{body}{}", "copied  4  aa11  café.txt\n".repeat(9000));
+        std::fs::write(&page.path, &expanded).expect("large log");
+        let mut cursor = None;
+        let mut pieces = Vec::new();
+        loop {
+            let page = engine
+                .task_run_log(first[0].id, cursor, 257)
+                .expect("older page");
+            assert_eq!(page.changed_files, Some(2));
+            assert!(page.text.len() <= 257);
+            pieces.push(page.text);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        pieces.reverse();
+        assert_eq!(pieces.concat(), expanded);
+        std::fs::write(&page.path, "legacy log\n").expect("legacy");
+        assert_eq!(
+            engine
+                .task_run_log(first[0].id, None, 1024)
+                .expect("legacy")
+                .changed_files,
+            None
+        );
+        std::fs::write(&page.path, &body).expect("restore");
 
+        platform.advance_ms(10_000);
+        engine
+            .run_task_now(&row.id, tasks::TaskRunDriver::Person)
+            .await
+            .expect("idle run");
+        assert_eq!(engine.task_mark(&row), Some(3_000));
+        let idle = engine.task_history(&row.id, 1).expect("history");
+        assert_eq!(idle[0].outcome, Some(tasks::TaskOutcome::Ok));
+        assert!(idle[0]
+            .detail
+            .as_deref()
+            .expect("detail")
+            .contains("2 files behind it"));
+        assert!(idle[0]
+            .ledger_entry
+            .as_deref()
+            .expect("entry")
+            .contains("-idle-"));
+        // This mtime precedes the idle run's finish clock. A clock stamped as
+        // `ok` would hide it; retaining the covered mark makes it reachable.
         // Now one file changes and one does not. The second pass must carry the
         // changed one and not even look at the other.
         std::fs::remove_dir_all(&destination).expect("clear the destination");
@@ -18600,6 +19290,11 @@ mod tests {
             .await
             .expect("second run");
         let second = engine.task_history(&row.id, 1).expect("history");
+        assert!(second[0]
+            .detail
+            .as_deref()
+            .expect("detail")
+            .contains("1 copied, 0 overwritten, 0 identical, 0 deleted"));
         assert!(
             second[0]
                 .detail
@@ -18663,6 +19358,7 @@ mod tests {
 
         let runs = engine.task_history(&row.id, 1).expect("history");
         assert_eq!(runs[0].outcome, Some(tasks::TaskOutcome::Ok));
+        assert!(engine.task_run_log(runs[0].id, None, 65_536).is_err());
         assert_eq!(engine.task_mark(&row), None);
         // Every pass is a full pass without a mark, which is the honest cost of
         // not configuring a ledger — never a skipped file.
@@ -21219,6 +21915,7 @@ mod tests {
                                             outcome: tasks::TaskOutcome::Ok,
                                             detail: Some("counted, not performed"),
                                             next_due_ms: next,
+                                            ledger_entry: None,
                                         },
                                     )
                                 })

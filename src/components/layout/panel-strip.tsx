@@ -26,18 +26,20 @@
  *
  * # Not every target is a document
  *
- * Story 59.12 gave the vocabulary a `task` target, and a task is not a file
- * with a viewer behind it: the surface that already draws one is the Tasks
- * pane, so this strip imports that pane's `TaskDetail` and hosts it rather than
- * growing a rendering of its own. The rule that survives is the one above — the
- * panel holds a task **id** and nothing else, and goes to `sync_tasks` for
- * everything it draws, so it can say *this is no longer here* — and the rule
- * that is added is that a second host over one record reads and does not write.
- * When it goes back to `sync_tasks` is a shorter list than "every time", and
- * {@link useTaskResolution} spells it out. See {@link TaskPanelBody}.
+ * A run target identifies one recorded execution, not its task configuration.
+ * Facts are read from task history; its ledger is paged independently, so a
+ * missing ledger never hides the run's report. Folded panels perform no reads.
  */
 import { X } from "lucide-react";
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { ExportFileButton } from "@/components/export/export-file-button";
 import {
   FOLD_STRIP,
@@ -46,7 +48,7 @@ import {
   FoldStripName,
 } from "@/components/layout/fold-strip";
 import { PaneHeader } from "@/components/layout/pane-header";
-import { TASKS_CLOCK_TICK_MS, TaskDetail } from "@/components/layout/tasks-pane";
+import { taskOutcomeText, taskReportText } from "@/components/layout/tasks-pane";
 import { deriveTitle, NoteEditor } from "@/components/notes/note-editor";
 import { Button } from "@/components/ui/button";
 import { IconHint } from "@/components/ui/tooltip";
@@ -59,14 +61,16 @@ import {
   type PanelTargetVm,
   syncBrowse,
   syncTaskHistory,
+  syncTaskRunLog,
   syncTasks,
-  type TaskListingVm,
+  type TaskRunLogVm,
   type TaskRunVm,
   type TaskVm,
 } from "@/lib/ipc/client";
 import { useNoteDocument } from "@/lib/stores/notes-editor";
 import { useNotesVaultsStore } from "@/lib/stores/notes-vaults";
 import { type Panel, panelsStore, usePanelsStore } from "@/lib/stores/panels";
+import { settingsUiStore } from "@/lib/stores/settings-ui";
 import { cn } from "@/lib/utils";
 import {
   openWithForProfileEntry,
@@ -123,48 +127,6 @@ export const PANEL_NO_VAULT_SENTENCE = "The vault this note was in is no longer 
  * reason: a silent blank pane is a defect nobody can see.
  */
 export const PANEL_UNSUPPORTED_SENTENCE = "keeper cannot show a recording in a panel yet.";
-
-/**
- * What a task panel says when the record no longer holds the task it names.
- *
- * {@link panelFileGoneSentence}'s wording and its rule: a "not found" without a
- * name is a sentence about nothing, and the id is the only name a task has.
- */
-export function taskPanelGoneSentence(id: string): string {
-  return `keeper could not find a task called ${id} in the task record any more.`;
-}
-
-/**
- * What a task panel says for a row `db::list_tasks` could not decode.
- *
- * The task IS still in the record — this is not the sentence above — so the
- * panel says the one true thing about it and then quotes Rust. `reason` is
- * `UnknownTaskVm.reason`, composed where the decode failed and rendered
- * verbatim, exactly as the pane's own *Written by a newer keeper* list renders
- * it: two surfaces wording one unreadable row differently is how a reader
- * concludes they are two different faults.
- *
- * The prefix says only that the row cannot be read, and deliberately not *why*.
- * `reason` already carries the why — the decoder's own line is of the form
- * *unknown task kind `transcribe`, written by a newer keeper* — and a prefix
- * that named the cause as well produced one sentence blaming a newer keeper
- * twice.
- */
-export function taskPanelUnknownSentence(reason: string): string {
-  return `keeper cannot read this task: ${reason}`;
-}
-
-/**
- * What a task panel says when the task record itself would not read, and the
- * rejection carried no sentence of its own.
- *
- * Deliberately NOT {@link taskPanelGoneSentence}, which is where the file
- * panel's equivalent fallback ({@link PANEL_NO_PROFILE_SENTENCE}) lands: a read
- * that threw says nothing whatsoever about whether the task is still there, and
- * reporting it as forgotten would invite the reader to re-create a task that
- * already exists. The honest claim is about the read.
- */
-export const PANEL_TASK_UNREADABLE_SENTENCE = "keeper could not read the task record.";
 
 /** Test id for one panel frame, suffixed with the panel's id. */
 export const PANEL_TESTID = "panel";
@@ -285,102 +247,54 @@ function useFileResolution(target: PanelTargetVm | null, folded: boolean): FileR
   return resolution;
 }
 
-/**
- * What resolving a task target produced.
- *
- * `readAtMs` rides on the resolved case rather than being read where the detail
- * is drawn, and that is {@link "@/components/layout/tasks-pane"}'s own rule
- * about `now`: every relative time in one detail is measured from ONE instant,
- * so two lines of the same panel cannot disagree about when now is. It is the
- * instant this panel's facts were read, and {@link TaskPanelBody} uses it to
- * re-seed its display clock — not as the clock itself. A panel that measured
- * only from its last read would freeze, which is the defect Story 57.5's sixth
- * finding fixed in the pane: a row reading *in 5 min* still read *in 5 min* an
- * hour later and never reached *due now*.
- */
-type TaskResolution =
-  | { readonly status: "resolving" }
-  | { readonly status: "resolved"; readonly task: TaskVm; readonly readAtMs: number }
-  | { readonly status: "unresolved"; readonly reason: string };
+/** Resolution is tied to both identities, so old facts never flash on a new run. */
+type RunResolution =
+  | { status: "resolved"; task: TaskVm | null; run: TaskRunVm; taskId: string; runId: number }
+  | { status: "unresolved"; reason: string; taskId: string; runId: number };
 
-/** Turn one listing into this panel's answer about one task in it. */
-function resolveTaskFrom(listing: TaskListingVm, taskId: string): TaskResolution {
-  const task = listing.tasks.find((candidate) => candidate.id === taskId);
-  if (task !== undefined) {
-    return { status: "resolved", task, readAtMs: Date.now() };
-  }
-  // Still in the record, just not readable by this build — a different fact
-  // from having gone, and the one the reader can act on (upgrade, or leave it
-  // alone). Checked before the gone sentence, because a row that is present and
-  // undecodable would otherwise be reported as absent.
-  const unknown = listing.unknown.find((row) => row.id === taskId);
-  if (unknown !== undefined) {
-    return { status: "unresolved", reason: taskPanelUnknownSentence(unknown.reason) };
-  }
-  return { status: "unresolved", reason: taskPanelGoneSentence(taskId) };
-}
-
-/**
- * Resolve a task target against the task record as it is right now.
- *
- * Reads the whole listing rather than asking for one task, {@link
- * useFileResolution}'s reason: `sync_tasks` is the ONE task reader, it already
- * carries the host verdict every field of the detail is composed from, and
- * there is no per-id command to ask instead. It is also what makes the two
- * unresolved cases distinguishable at all — `listing.unknown` is on the same
- * payload, so "gone" and "unreadable" are one read apart rather than a guess.
- *
- * `null` for a target that is not a task, and `null` while the panel is folded:
- * a folded panel's body is unmounted, and a folded panel that kept reading the
- * task record would be a poll nobody can see (AD-62's sentence).
- *
- * **When it re-reads, said plainly, because a comment that overstates this
- * would be worse than no comment.** On mount, when the target changes, and when
- * a folded panel is unfolded — {@link useFileResolution}'s dependency set
- * exactly. **Not** when the record changes underneath it: nothing here polls,
- * and nothing here subscribes, because the Tasks pane does neither (AD-62 —
- * this app has one clock per host and it is not in the webview). So a task
- * edited, run or forgotten in the pane while a panel holds it keeps its last
- * read facts until that panel is folded and unfolded, re-targeted, or the
- * window is reopened. The pane's own region is the live surface; a panel is a
- * reading, and {@link TaskPanelBody}'s clock keeps the relative times in that
- * reading honest rather than pretending the facts behind them are fresh.
- */
-function useTaskResolution(target: PanelTargetVm | null, folded: boolean): TaskResolution | null {
-  const taskId = target?.kind === "task" ? target.taskId : null;
-  const [resolution, setResolution] = useState<TaskResolution | null>(null);
-
+function useRunResolution(target: PanelTargetVm | null, folded: boolean): RunResolution | null {
+  const taskId = target?.kind === "run" ? target.taskId : null;
+  const runId = target?.kind === "run" ? target.runId : null;
+  const [resolution, setResolution] = useState<RunResolution | null>(null);
   useEffect(() => {
-    if (taskId === null || folded) {
-      setResolution(null);
-      return;
-    }
+    if (taskId === null || runId === null || folded) return;
     let live = true;
-    setResolution({ status: "resolving" });
-    syncTasks()
-      .then((listing) => {
-        if (live) {
-          setResolution(resolveTaskFrom(listing, taskId));
-        }
+    setResolution(null);
+    void Promise.all([syncTaskHistory(taskId, 50), syncTasks().catch(() => null)])
+      .then(([runs, listing]) => {
+        if (!live) return;
+        const run = runs.find((entry) => entry.id === runId);
+        setResolution(
+          run
+            ? {
+                status: "resolved",
+                task: listing?.tasks.find((task) => task.id === taskId) ?? null,
+                run,
+                taskId,
+                runId,
+              }
+            : {
+                status: "unresolved",
+                reason: `Run ${runId} is no longer in the task record.`,
+                taskId,
+                runId,
+              },
+        );
       })
-      .catch((error: unknown) => {
-        if (live) {
+      .catch((cause: unknown) => {
+        if (live)
           setResolution({
             status: "unresolved",
-            // Rust words a record that will not read. A rejection that carries
-            // no sentence says nothing about whether the task is still there,
-            // so the fallback claims only what is known — see
-            // {@link PANEL_TASK_UNREADABLE_SENTENCE}.
-            reason: isIpcError(error) ? error.message : PANEL_TASK_UNREADABLE_SENTENCE,
+            reason: isIpcError(cause) ? cause.message : String(cause),
+            taskId,
+            runId,
           });
-        }
       });
     return () => {
       live = false;
     };
-  }, [taskId, folded]);
-
-  return resolution;
+  }, [taskId, runId, folded]);
+  return !folded && resolution?.taskId === taskId && resolution.runId === runId ? resolution : null;
 }
 
 /** The sentence a panel shows instead of its target. */
@@ -519,133 +433,226 @@ function NotePanelBody({
   );
 }
 
-/**
- * A task target: the pane's own detail, in a host that only reads (Story 59.12).
- *
- * {@link "@/components/layout/tasks-pane"}'s `TaskDetail`, not a second
- * rendering of a task — two components over one task could word the same fact
- * differently, and that is the defect shape this codebase keeps closing. The
- * whole of what a panel gives up is the `verbs` object: `null` here, so no Run
- * now, no Edit and no Forget is drawn. The reason is in that component's own
- * header, and it is not squeamishness — the pane's `formSaving`, `deleting` and
- * `running` are pane-wide precisely because two write surfaces over one task
- * undo each other, and a second host cannot see the first's in-flight flags.
- *
- * The runs stay, because `sync_task_history` is a **read**. So this holds a
- * history controller of its own: one open section, and the Tasks pane's
- * `historyToken` in miniature — a read is stamped with the token that was
- * current when it was issued, and lands only if that token is still current, so
- * a slow read cannot arrive in a section that has since been closed. Closing
- * forgets what it held for the same reason the pane's does: re-opening should
- * re-read rather than show a list `task_runs` may have trimmed underneath it.
- *
- * **A body per task, which is what makes that last sentence true.** `PanelBody`
- * keys this component on the target's id, so previewing another task into the
- * same panel unmounts this one and mounts a fresh one. Without the key the
- * state survives the change of subject: the section correctly hides while the
- * panel holds somebody else — `historyOpen` compares ids — and then reappears,
- * still holding the run list read minutes ago, the moment the first task is
- * previewed back. That is exactly the stale section the token machinery exists
- * to prevent, arriving by the one route a token cannot see, because nothing was
- * toggled: the target moved out from under it.
- *
- * **And a clock, not a timestamp.** `now` is seeded from the instant the
- * listing landed — so every relative time in one panel is measured from one
- * instant — and then advances on {@link TASKS_CLOCK_TICK_MS}, the pane's own
- * cadence. Story 57.5's sixth finding is why: measured only from the read, a
- * panel left open froze, and *in 5 min* still said *in 5 min* an hour later.
- * The clock moves; the facts under it do not, and
- * {@link useTaskResolution} says exactly when those are re-read.
- *
- * No command this body reaches writes anything. That is worth stating rather
- * than merely being true, because the two it does reach — `sync_tasks` above
- * and `sync_task_history` here — are the only two a task panel is allowed.
- */
-function TaskPanelBody({ resolution }: { resolution: TaskResolution | null }) {
-  const [history, setHistory] = useState<{
-    readonly id: string;
-    /** `null` until this section's read lands: unread, and not empty. */
-    readonly runs: TaskRunVm[] | null;
-    readonly error: string | null;
-  } | null>(null);
-  // Seeded from the read and advanced on the pane's own cadence — see this
-  // component's header. `readAtMs` is read here rather than passed straight
-  // through so that a re-read re-seeds the clock instead of leaving it a tick
-  // behind the facts it is measuring.
-  const readAtMs = resolution?.status === "resolved" ? resolution.readAtMs : null;
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (readAtMs !== null) {
-      setNow(readAtMs);
-    }
-  }, [readAtMs]);
-  useEffect(() => {
-    const clock = setInterval(() => setNow(Date.now()), TASKS_CLOCK_TICK_MS);
-    return () => clearInterval(clock);
-  }, []);
-  const token = useRef(0);
-  const openId = history?.id ?? null;
-  const onHistoryToggle = useCallback(
-    (id: string) => {
-      token.current += 1;
-      if (openId === id) {
-        setHistory(null);
-        return;
-      }
-      const mine = token.current;
-      setHistory({ id, runs: null, error: null });
-      syncTaskHistory(id).then(
-        (runs) => {
-          if (mine === token.current) {
-            setHistory({ id, runs, error: null });
-          }
-        },
-        (cause: unknown) => {
-          if (mine === token.current) {
-            // Rust's sentence where there is one. A refused read is a fault to
-            // report, never an empty list to invent.
-            setHistory({
-              id,
-              runs: null,
-              error: isIpcError(cause) ? cause.message : String(cause),
-            });
-          }
-        },
-      );
-    },
-    [openId],
-  );
+const RUN_LOG_PAGE_BYTES = 65_536;
+const RUN_LOG_WINDOW_BYTES = 1_048_576;
 
-  if (resolution === null || resolution.status === "resolving") {
-    return <PanelReason reason={PANEL_RESOLVING_SENTENCE} />;
-  }
-  if (resolution.status === "unresolved") {
-    return <PanelReason reason={resolution.reason} />;
-  }
-  const task = resolution.task;
+/** Chunks remain separate so a prepend can anchor the previously visible chunk,
+ * even when eviction removes content below it. Never infer changes from text. */
+function RunLog({ runId }: { runId: number }) {
+  const [chunks, setChunks] = useState<{ id: number; text: string; bytes: number }[]>([]);
+  const [page, setPage] = useState<TaskRunLogVm | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [olderWindow, setOlderWindow] = useState(false);
+  const [changed, setChanged] = useState(false);
+  const viewport = useRef<HTMLElement>(null);
+  const sequence = useRef(0);
+  const pending = useRef(false);
+  const anchor = useRef<{ element: Element; top: number } | "tail" | null>(null);
+  const read = useCallback(
+    async (cursor: number | null, previous: TaskRunLogVm | null): Promise<void> => {
+      if (pending.current) return;
+      pending.current = true;
+      const mine = ++sequence.current;
+      setLoading(true);
+      setError(null);
+      try {
+        let next = await syncTaskRunLog(runId, cursor, RUN_LOG_PAGE_BYTES);
+        let reset = cursor === null;
+        if (mine !== sequence.current) return;
+        if (
+          previous &&
+          (next.modifiedMs !== previous.modifiedMs ||
+            next.totalBytes !== previous.totalBytes ||
+            next.path !== previous.path)
+        ) {
+          setChanged(true);
+          setChunks([]);
+          setPage(null);
+          next = await syncTaskRunLog(runId, null, RUN_LOG_PAGE_BYTES);
+          if (mine !== sequence.current) return;
+          reset = true;
+        }
+        const box = viewport.current;
+        const visible =
+          box &&
+          [...box.children].find(
+            (child) => child.getBoundingClientRect().bottom > box.getBoundingClientRect().top,
+          );
+        anchor.current = reset
+          ? "tail"
+          : visible
+            ? {
+                element: visible,
+                top: visible.getBoundingClientRect().top,
+              }
+            : null;
+        const chunk = {
+          id: mine,
+          text: next.text,
+          bytes: new TextEncoder().encode(next.text).byteLength,
+        };
+        setChunks((current) => {
+          const result = reset ? [chunk] : [chunk, ...current];
+          let bytes = result.reduce((sum, item) => sum + item.bytes, 0);
+          while (bytes > RUN_LOG_WINDOW_BYTES && result.length > 1) {
+            const removed = result.pop();
+            if (removed) bytes -= removed.bytes;
+          }
+          return result;
+        });
+        if (reset) {
+          setOlderWindow(false);
+          setChanged(false);
+        } else {
+          setOlderWindow(true);
+        }
+        setPage(next);
+      } catch (cause: unknown) {
+        if (mine === sequence.current) setError(isIpcError(cause) ? cause.message : String(cause));
+      } finally {
+        if (mine === sequence.current) {
+          pending.current = false;
+          setLoading(false);
+        }
+      }
+    },
+    [runId],
+  );
+  useEffect(() => {
+    void read(null, null);
+    return () => {
+      sequence.current += 1;
+      pending.current = false;
+    };
+  }, [read]);
+  useLayoutEffect(() => {
+    if (chunks.length === 0) return;
+    const box = viewport.current;
+    const saved = anchor.current;
+    if (saved === "tail") {
+      if (box) box.scrollTop = box.scrollHeight;
+    } else if (box && saved?.element.isConnected) {
+      box.scrollTop += saved.element.getBoundingClientRect().top - saved.top;
+    }
+    anchor.current = null;
+  }, [chunks]);
   return (
-    <TaskDetail
-      task={task}
-      now={now}
-      // A refusal is what a write was answered with, and this host issues none.
-      refusal={null}
-      // All three read the ONE slot, so this panel can never be handed another
-      // task's runs — the id and the runs it belongs to move together or not at
-      // all. They come apart when the target changes under an open section,
-      // which is exactly when the section must stop being drawn.
-      historyOpen={history?.id === task.id}
-      historyRuns={history?.id === task.id ? history.runs : null}
-      historyError={history?.id === task.id ? history.error : null}
-      onHistoryToggle={onHistoryToggle}
-      // The frame above already names this panel — `aria-label` on its
-      // `<section>`, and the header row under it — so the id is drawn as text
-      // here rather than as a heading. `PanelFrame`'s own rule, for the reason
-      // it gives about a file: a second `h2` naming the same thing would put
-      // two entries in a screen reader's heading list for one task, and in the
-      // lockstep case the pane's region beside this one is already the first.
-      heading={false}
-      verbs={null}
-    />
+    <section aria-label="Log" className="min-w-0 border-border border-t pt-3">
+      <h3 className="text-sm leading-5">Log</h3>
+      {page?.changedFiles === 0 && (
+        <p className="text-muted-foreground text-xs">No files changed.</p>
+      )}
+      <div className="flex min-h-8 flex-wrap items-center gap-2 text-xs">
+        {page?.nextCursor != null && !changed && (
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={loading}
+            onClick={() => void read(page.nextCursor, page)}
+          >
+            {loading ? "Loading older…" : "Load older"}
+          </Button>
+        )}
+        {page && page.nextCursor === null && <span>Beginning of log</span>}
+        {olderWindow || changed ? (
+          <>
+            <span>{changed ? "Log changed." : "Older log content"}</span>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={loading}
+              onClick={() => void read(null, null)}
+            >
+              {changed ? "Reload latest" : "Return to latest"}
+            </Button>
+          </>
+        ) : page?.nextCursor != null ? (
+          <span>Showing latest log content</span>
+        ) : null}
+      </div>
+      {error && (
+        <div role="alert" className="text-sm [overflow-wrap:anywhere]">
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => settingsUiStore.getState().setSettingsOpen(true)}
+          >
+            Settings → Tasks
+          </Button>
+          <p>{error}</p>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={loading}
+            onClick={() => void read(page?.nextCursor ?? null, page)}
+          >
+            Retry
+          </Button>
+        </div>
+      )}
+      {loading && !page && <p role="status">Loading log…</p>}
+      {page && (
+        <section
+          ref={viewport}
+          aria-label="Run log"
+          // biome-ignore lint/a11y/noNoninteractiveTabindex: WKWebView needs an explicit focus stop to keyboard-scroll this read-only region; Return to latest is absent on the initial tail and focuses the wrong scroll ancestor, while a widget role would misrepresent the log.
+          tabIndex={0}
+          className="mt-2 h-80 min-h-0 max-h-[480px] overflow-y-auto rounded-[5px] border border-border bg-background p-2 font-mono text-xs leading-5 outline-none [overflow-anchor:none] focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {chunks.map((chunk) => (
+            <pre key={chunk.id} className="whitespace-pre-wrap font-mono [overflow-wrap:anywhere]">
+              {chunk.text}
+            </pre>
+          ))}
+        </section>
+      )}
+      {page?.path && (
+        <p className="mt-2 font-mono text-xs leading-5 [overflow-wrap:anywhere]">{page.path}</p>
+      )}
+    </section>
+  );
+}
+
+function RunPanelBody({ resolution, runId }: { resolution: RunResolution | null; runId: number }) {
+  return (
+    <div className="flex min-w-0 flex-col gap-3 overflow-y-auto p-3 text-sm leading-5">
+      {resolution === null ? (
+        <p>Reading run…</p>
+      ) : resolution.status === "unresolved" ? (
+        <p>{resolution.reason}</p>
+      ) : (
+        <div className="flex min-w-0 flex-col gap-1 [overflow-wrap:anywhere]">
+          <p>{taskOutcomeText(resolution.run)}</p>
+          <p>Started {new Date(resolution.run.startedMs).toLocaleString()}</p>
+          <p>
+            Duration:{" "}
+            {resolution.run.finishedMs === null
+              ? "Running"
+              : `${resolution.run.finishedMs - resolution.run.startedMs} ms`}
+          </p>
+          <p>Host: {resolution.run.host || "No host recorded"}</p>
+          <p>Trigger: {resolution.run.trigger ?? "Not recorded"}</p>
+          <p>
+            Lateness:{" "}
+            {resolution.run.lateByMs === null ? "Not recorded" : `${resolution.run.lateByMs} ms`}
+          </p>
+          <p className="w-full whitespace-pre-wrap">
+            {taskReportText(resolution.run) ?? "No run report was recorded"}
+          </p>
+          {resolution.task?.copySource && (
+            <p className="font-mono text-xs">Source: {resolution.task.copySource}</p>
+          )}
+          {resolution.task?.copyDestination && (
+            <p className="font-mono text-xs">Destination: {resolution.task.copyDestination}</p>
+          )}
+          {resolution.task?.ledgerPath && (
+            <p className="font-mono text-xs">Ledger: {resolution.task.ledgerPath}</p>
+          )}
+        </div>
+      )}
+      <RunLog runId={runId} />
+    </div>
   );
 }
 
@@ -661,7 +668,7 @@ function PanelBody({
   emptySentence,
   noteReason,
   fileView,
-  taskResolution,
+  runResolution,
   frame,
 }: {
   panelId: string;
@@ -669,7 +676,7 @@ function PanelBody({
   emptySentence: string;
   noteReason: string | null;
   fileView: FilePanelView | null;
-  taskResolution: TaskResolution | null;
+  runResolution: RunResolution | null;
   frame: ReactNode;
 }) {
   if (target === null) {
@@ -699,13 +706,14 @@ function PanelBody({
       );
     case "recording":
       return <PanelReason reason={PANEL_UNSUPPORTED_SENTENCE} />;
-    case "task":
-      // Keyed, so a preview of another task into this panel mounts a fresh
-      // body rather than reconciling one task's controller into another's —
-      // see {@link TaskPanelBody} for the stale run section that survives
-      // otherwise. The note and file bodies need no key: neither holds state
-      // about the target it happens to be showing.
-      return <TaskPanelBody key={target.taskId} resolution={taskResolution} />;
+    case "run":
+      return (
+        <RunPanelBody
+          key={`${target.taskId}:${target.runId}`}
+          runId={target.runId}
+          resolution={runResolution}
+        />
+      );
   }
 }
 
@@ -771,10 +779,7 @@ function useNoteTitle(
  *  ({@link useNoteTitle}): "Note" over a strip standing beside three other
  *  panels answers the question a name is asked.
  *
- *  A task needs no such trip. Its id IS its name — the pane's own detail draws
- *  the same string as the region's heading — and the target carries it, so a
- *  task panel names itself with no resolution at all, folded or not, before any
- *  read has landed and after one has failed. */
+ *  A run carries both ids, so its heading remains stable before reads arrive. */
 function panelName(target: PanelTargetVm | null, noteTitle: string | null): string {
   if (target === null) {
     return "Panel";
@@ -786,8 +791,8 @@ function panelName(target: PanelTargetVm | null, noteTitle: string | null): stri
       return noteTitle ?? "Note";
     case "recording":
       return "Recording";
-    case "task":
-      return target.taskId;
+    case "run":
+      return `Run ${target.runId} · ${target.taskId}`;
   }
 }
 
@@ -874,13 +879,7 @@ function PanelFrame({
       : { status: "resolved", view: viewerFor(fileProfileId, fileResolution.entry) };
   }, [fileResolution, fileProfileId]);
   const fileOwnsRow = fileView?.status === "resolved" && fileView.view.ownsHostRow;
-  // Read here rather than inside the body, `useFileResolution`'s siting: the
-  // hook takes `panel.folded` and answers `null` for a folded panel, and a hook
-  // called from a body that is unmounted while folded could never observe the
-  // state it is guarding against. A task panel keeps this frame's own header
-  // either way — `TaskDetail` draws no host row and never has — so unlike the
-  // note and file cases nothing about the chrome turns on this answer.
-  const taskResolution = useTaskResolution(panel.target, panel.folded);
+  const runResolution = useRunResolution(panel.target, panel.folded);
   const noteTitle = useNoteTitle(
     panel.target?.kind === "note" ? panel.target.vaultId : null,
     panel.target?.kind === "note" ? panel.target.noteId : null,
@@ -1019,16 +1018,14 @@ function PanelFrame({
           // No `border-b` and no `py-*`: `PaneHeader` owns its own bottom edge
           // and its own 40px height, and spelling either here draws it twice.
           className="px-3"
-          // Deliberately not a heading. The viewer inside draws the document's
-          // own heading, and a second `h2` naming the same file would put two
-          // entries in a screen reader's heading list for one document. The
-          // panel is named by the section's `aria-label`, which is how a reader
-          // jumps between panels — a tab strip's job, not an outline's.
-          //
-          // The treatment is the shared one every foldable surface names itself
-          // in, minus the heading semantics: DESIGN.md's `pane-header`
-          // typography, which this row was the one place not to use.
-          identity={<span className={FOLD_STRIP.titleClass}>{name}</span>}
+          // File viewers own their outline heading; a run's heading belongs here.
+          identity={
+            panel.target?.kind === "run" ? (
+              <h2 className="min-w-0 truncate text-title font-semibold leading-5">{name}</h2>
+            ) : (
+              <span className={FOLD_STRIP.titleClass}>{name}</span>
+            )
+          }
           actions={frame}
         />
       )}
@@ -1040,7 +1037,7 @@ function PanelFrame({
             emptySentence={emptySentence}
             noteReason={noteReason}
             fileView={fileView}
-            taskResolution={taskResolution}
+            runResolution={runResolution}
             // Handed to every body and consumed by exactly one: the note editor
             // or the file frame, whichever is drawing this panel's row. A body
             // that draws no row ignores it and the row above is this frame's.

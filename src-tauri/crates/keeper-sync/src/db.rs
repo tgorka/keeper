@@ -552,6 +552,9 @@ fn ensure_task_columns(conn: &Connection) -> Result<()> {
         ("copy_source", "TEXT"),
         ("copy_destination", "TEXT"),
         ("replace_existing", "INTEGER NOT NULL DEFAULT 0"),
+        ("prune_destination", "INTEGER NOT NULL DEFAULT 0"),
+        ("refresh_missing", "INTEGER NOT NULL DEFAULT 1"),
+        ("copy_lookback_ms", "INTEGER NOT NULL DEFAULT 300000"),
     ] {
         if !existing.iter().any(|column| column == name) {
             conn.execute(
@@ -592,7 +595,11 @@ fn ensure_task_run_columns(conn: &Connection) -> Result<()> {
         .query_map([], |r| r.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    for (name, declaration) in [("trigger", "TEXT"), ("late_by_ms", "INTEGER")] {
+    for (name, declaration) in [
+        ("trigger", "TEXT"),
+        ("late_by_ms", "INTEGER"),
+        ("ledger_entry", "TEXT"),
+    ] {
         if !existing.iter().any(|column| column == name) {
             conn.execute(
                 &format!("ALTER TABLE task_runs ADD COLUMN {name} {declaration}"),
@@ -3144,7 +3151,7 @@ const TASK_COLUMNS: &str = "id, profile_id, kind, schedule, mode, next_due_ms, \
                             enabled, updated_ms, running_host, lease_until_ms, \
                             on_missed, description, missed_delay_ms, \
                             bot_id, prompt_subpath, model, copy_source, copy_destination, \
-                            replace_existing";
+                            replace_existing, prune_destination, refresh_missing, copy_lookback_ms";
 
 /// One stored task.
 ///
@@ -3220,6 +3227,9 @@ pub struct TaskRow {
     pub copy_source: Option<String>,
     pub copy_destination: Option<String>,
     pub replace_existing: bool,
+    pub prune_destination: bool,
+    pub refresh_missing: bool,
+    pub copy_lookback_ms: i64,
 }
 
 impl TaskRow {
@@ -3307,6 +3317,7 @@ pub struct TaskRunRow {
     /// question" are different facts and a surface that showed them the same way
     /// would be inventing punctuality.
     pub late_by_ms: Option<i64>,
+    pub ledger_entry: Option<String>,
 }
 
 /// The `tasks` row as SQLite hands it over, before the vocabulary is applied.
@@ -3330,6 +3341,9 @@ type StoredTask = (
     Option<String>,
     Option<String>,
     bool,
+    bool,
+    bool,
+    i64,
 );
 
 /// Read one `tasks` row, tolerating every column but the primary key.
@@ -3383,6 +3397,10 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
         row.get(16).unwrap_or_default(),
         row.get(17).unwrap_or_default(),
         row.get(18).unwrap_or_default(),
+        row.get(19).unwrap_or_default(),
+        row.get(20).unwrap_or(true),
+        row.get(21)
+            .unwrap_or(crate::tasks::COPY_LOOKBACK_DEFAULT_MS),
     ))
 }
 
@@ -3415,6 +3433,9 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         copy_source,
         copy_destination,
         replace_existing,
+        prune_destination,
+        refresh_missing,
+        copy_lookback_ms,
     ) = stored;
     let unknown = |reason: String| UnknownTask {
         id: id.clone(),
@@ -3451,6 +3472,9 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         copy_source,
         copy_destination,
         replace_existing,
+        prune_destination,
+        refresh_missing,
+        copy_lookback_ms,
     };
     if let Err(err) = row.parsed_schedule() {
         return Err(unknown(format!("unreadable schedule: {err}")));
@@ -3546,6 +3570,7 @@ pub fn upsert_task(
     baseline_updated_ms: Option<i64>,
 ) -> Result<TaskSave> {
     crate::tasks::validate_id(&task.id)?;
+    crate::tasks::validate_copy_lookback_ms(task.copy_lookback_ms)?;
     let required: &[(Option<&str>, &str)] = match task.kind {
         // A bot task's prompt is a subpath, so a row with no folder names a
         // file under nothing: `perform_bot_task` refuses it on every run
@@ -3572,6 +3597,34 @@ pub fn upsert_task(
                 task.kind.as_str()
             )));
         }
+    }
+    if task.kind == TaskKind::Copy && task.prune_destination {
+        let profiles = list_profiles(conn)?;
+        // Protect every configured ledger, not only this task's chosen ledger:
+        // pruning another task's history is no safer than pruning our own.
+        let ledger_roots: Vec<_> = profiles
+            .iter()
+            .filter_map(|profile| {
+                profile
+                    .tasks
+                    .as_ref()
+                    .map(|config| profile.local_path.join(&config.subfolder))
+            })
+            .collect();
+        let protected_roots: Vec<_> = profiles
+            .iter()
+            .map(|profile| ("sync profile root", profile.local_path.as_path()))
+            .chain(
+                ledger_roots
+                    .iter()
+                    .map(|root| ("task ledger root", root.as_path())),
+            )
+            .collect();
+        crate::copy::validate_prune(
+            Path::new(task.copy_source.as_deref().unwrap_or_default()),
+            Path::new(task.copy_destination.as_deref().unwrap_or_default()),
+            &protected_roots,
+        )?;
     }
     // The parser's own refusal, propagated unchanged: it already names the
     // rule and quotes the expression, and a second layer of prose around it
@@ -3676,9 +3729,10 @@ pub fn upsert_task(
         "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
                             updated_ms, running_host, lease_until_ms, on_missed,
                             description, missed_delay_ms, bot_id, prompt_subpath, model,
-                            copy_source, copy_destination, replace_existing)
+                            copy_source, copy_destination, replace_existing,
+                            prune_destination, refresh_missing, copy_lookback_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL, ?9, ?10, ?11,
-                 ?12, ?13, ?14, ?15, ?16, ?17)
+                 ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
          ON CONFLICT(id) DO UPDATE SET
              profile_id      = excluded.profile_id,
              kind            = excluded.kind,
@@ -3695,7 +3749,10 @@ pub fn upsert_task(
              model = excluded.model,
              copy_source = excluded.copy_source,
              copy_destination = excluded.copy_destination,
-             replace_existing = excluded.replace_existing",
+             replace_existing = excluded.replace_existing,
+             prune_destination = excluded.prune_destination,
+             refresh_missing = excluded.refresh_missing,
+             copy_lookback_ms = excluded.copy_lookback_ms",
         rusqlite::params![
             &task.id,
             &task.profile_id,
@@ -3714,6 +3771,9 @@ pub fn upsert_task(
             &task.copy_source,
             &task.copy_destination,
             task.replace_existing,
+            task.prune_destination,
+            task.refresh_missing,
+            task.copy_lookback_ms,
         ],
     )?;
     tx.commit()?;
@@ -4369,6 +4429,7 @@ pub struct TaskRunClose<'a> {
     pub finished_ms: i64,
     pub outcome: TaskOutcome,
     pub detail: Option<&'a str>,
+    pub ledger_entry: Option<&'a str>,
     /// The window the task should carry afterwards.
     pub next_due_ms: Option<i64>,
 }
@@ -4389,12 +4450,13 @@ pub struct TaskRunClose<'a> {
 pub fn finish_task_run(conn: &Connection, close: TaskRunClose<'_>) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     tx.execute(
-        "UPDATE task_runs SET finished_ms = ?2, outcome = ?3, detail = ?4 WHERE id = ?1",
+        "UPDATE task_runs SET finished_ms = ?2, outcome = ?3, detail = ?4, ledger_entry = ?5 WHERE id = ?1",
         (
             close.run_id,
             close.finished_ms,
             close.outcome.as_str(),
             close.detail,
+            close.ledger_entry,
         ),
     )?;
     tx.execute(
@@ -4424,65 +4486,82 @@ pub fn finish_task_run(conn: &Connection, close: TaskRunClose<'_>) -> Result<()>
 /// *newest* run and made a surface report an older attempt as the current one.
 pub fn task_runs(conn: &Connection, task_id: &str, limit: usize) -> Result<Vec<TaskRunRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, task_id, started_ms, finished_ms, outcome, detail, host, trigger, late_by_ms
+        "SELECT id, task_id, started_ms, finished_ms, outcome, detail, host, trigger, late_by_ms, ledger_entry
          FROM task_runs WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2",
     )?;
     // A negative `LIMIT` means "every row" to SQLite, which is what
     // `limit as i64` produced for a `usize` above `i64::MAX`.
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let rows = stmt.query_map((task_id, limit), |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, Option<i64>>(3)?,
-            r.get::<_, Option<String>>(4)?,
-            r.get::<_, Option<String>>(5)?,
-            r.get::<_, String>(6)?,
-            r.get::<_, Option<String>>(7)?,
-            r.get::<_, Option<i64>>(8)?,
-        ))
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (id, task_id, started_ms, finished_ms, stored, detail, host, trigger, late_by_ms) =
-            row?;
-        // Skip-and-list, the same tolerance the outcome gets and for the same
-        // reason (NFR-43): a run a newer keeper recorded with a fourth trigger
-        // word is still a run that happened, and dropping the row — or guessing
-        // `Scheduled` — would be worse than saying nothing about why it ran.
-        let trigger = trigger.and_then(|stored| match RunTrigger::parse(&stored) {
-            Some(known) => Some(known),
-            None => {
-                tracing::debug!(run = id, trigger = stored, "an unreadable run trigger");
-                None
-            }
-        });
-        let mut outcome = None;
-        let mut unknown_outcome = None;
-        if let Some(stored) = stored {
-            match TaskOutcome::from_stored(&stored) {
-                Some(known) => outcome = Some(known),
-                None => {
-                    tracing::debug!(run = id, outcome = stored, "an unreadable task outcome");
-                    unknown_outcome = Some(stored);
-                }
-            }
-        }
-        out.push(TaskRunRow {
-            id,
-            task_id,
-            started_ms,
-            finished_ms,
-            outcome,
-            unknown_outcome,
-            detail,
-            host,
-            trigger,
-            late_by_ms,
-        });
+    let rows = stmt.query_map((task_id, limit), read_task_run)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Read one run without assuming it is still among a task's newest page.
+pub fn get_task_run(conn: &Connection, run_id: i64) -> Result<Option<TaskRunRow>> {
+    Ok(conn.query_row(
+        "SELECT id, task_id, started_ms, finished_ms, outcome, detail, host, trigger, late_by_ms, ledger_entry
+         FROM task_runs WHERE id = ?1",
+        [run_id],
+        read_task_run,
+    ).optional()?)
+}
+
+fn read_task_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRunRow> {
+    let id = row.get(0)?;
+    let stored: Option<String> = row.get(4)?;
+    let outcome = stored.as_deref().and_then(TaskOutcome::from_stored);
+    let unknown_outcome = if outcome.is_none() { stored } else { None };
+    if let Some(stored) = &unknown_outcome {
+        tracing::debug!(run = id, outcome = stored, "an unreadable task outcome");
     }
-    Ok(out)
+    let trigger = row.get::<_, Option<String>>(7)?.and_then(|stored| {
+        let trigger = RunTrigger::parse(&stored);
+        if trigger.is_none() {
+            tracing::debug!(run = id, trigger = stored, "an unreadable run trigger");
+        }
+        trigger
+    });
+    Ok(TaskRunRow {
+        id,
+        task_id: row.get(1)?,
+        started_ms: row.get(2)?,
+        finished_ms: row.get(3)?,
+        outcome,
+        unknown_outcome,
+        detail: row.get(5)?,
+        host: row.get(6)?,
+        trigger,
+        late_by_ms: row.get(8)?,
+        ledger_entry: row.get(9)?,
+    })
+}
+
+/// The machine-local ledger selection shared by the app and daemon.
+pub fn get_ledger_profile(conn: &Connection) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'tasks.ledger_profile'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .filter(|value| !value.trim().is_empty()))
+}
+
+pub fn set_ledger_profile(conn: &Connection, profile_id: Option<&str>) -> Result<()> {
+    match profile_id {
+        Some(id) => {
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('tasks.ledger_profile', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [id],
+            )?;
+        }
+        None => {
+            conn.execute("DELETE FROM meta WHERE key = 'tasks.ledger_profile'", [])?;
+        }
+    }
+    Ok(())
 }
 
 /// Forget a task and its history together.
@@ -4584,6 +4663,9 @@ pub fn seed_gc_task(conn: &Connection, profile_id: &str, now_ms: i64) -> Result<
             copy_source: None,
             copy_destination: None,
             replace_existing: false,
+            prune_destination: false,
+            refresh_missing: true,
+            copy_lookback_ms: crate::tasks::COPY_LOOKBACK_DEFAULT_MS,
         };
         upsert_task(conn, &row, None)?;
         true
@@ -4660,6 +4742,9 @@ pub fn seed_clock_tasks(conn: &Connection, now_ms: i64) -> Result<()> {
                     copy_source: None,
                     copy_destination: None,
                     replace_existing: false,
+                    prune_destination: false,
+                    refresh_missing: true,
+                    copy_lookback_ms: crate::tasks::COPY_LOOKBACK_DEFAULT_MS,
                 },
                 None,
             )?;
@@ -7015,6 +7100,9 @@ mod tests {
             copy_source: None,
             copy_destination: None,
             replace_existing: false,
+            prune_destination: false,
+            refresh_missing: true,
+            copy_lookback_ms: crate::tasks::COPY_LOOKBACK_DEFAULT_MS,
             schedule: schedule.map(str::to_owned),
             mode,
             next_due_ms: None,
@@ -7080,18 +7168,103 @@ mod tests {
     #[test]
     fn copy_task_columns_survive_insert_and_update() {
         let c = conn();
+        let dir = tempfile::tempdir().expect("temp dir");
         let mut row = task("copy-columns", None, TaskMode::Manual);
         row.kind = TaskKind::Copy;
         for (source, destination, replace) in [
             ("/source one", "/destination one", true),
             ("/source two", "/destination two", false),
         ] {
-            row.copy_source = Some(source.into());
-            row.copy_destination = Some(destination.into());
+            let source = dir.path().join(source.trim_start_matches('/'));
+            let destination = dir.path().join(destination.trim_start_matches('/'));
+            std::fs::create_dir(&source).expect("source directory");
+            row.copy_source = Some(source.to_string_lossy().into_owned());
+            row.copy_destination = Some(destination.to_string_lossy().into_owned());
             row.replace_existing = replace;
+            row.prune_destination = replace;
+            row.refresh_missing = !replace;
+            row.copy_lookback_ms = if replace { 3_600_000 } else { 0 };
             upsert_task(&c, &row, None).expect("save");
             assert_eq!(get_task(&c, &row.id).expect("read"), Some(row.clone()));
         }
+    }
+
+    #[test]
+    fn prune_task_save_refuses_dangerous_paths_without_changing_the_row() {
+        let c = conn();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = dir.path().join("source");
+        let drive = dir.path().join("drive");
+        let file = dir.path().join("file");
+        std::fs::create_dir(&source).expect("source");
+        std::fs::create_dir(&drive).expect("drive");
+        std::fs::write(&file, "not a directory").expect("file");
+        let mut profile = profile("p");
+        profile.local_path = drive.clone();
+        profile.tasks = Some(crate::profile::TasksConfig {
+            subfolder: "tasks".to_owned(),
+        });
+        upsert_profile(&c, &profile, 0).expect("profile");
+        let mut row = task("safe-copy", None, TaskMode::Manual);
+        row.kind = TaskKind::Copy;
+        row.copy_source = Some(source.to_string_lossy().into_owned());
+        row.copy_destination = Some(dir.path().join("safe").to_string_lossy().into_owned());
+        row.prune_destination = true;
+        upsert_task(&c, &row, None).expect("safe prune");
+        let saved = row.clone();
+        for (source, destination, reason) in [
+            (source.as_path(), dir.path(), "source"),
+            (
+                file.as_path(),
+                dir.path().join("safe").as_path(),
+                "directory",
+            ),
+            (source.as_path(), drive.as_path(), "sync profile root"),
+            (
+                source.as_path(),
+                drive.join("tasks").as_path(),
+                "task ledger root",
+            ),
+        ] {
+            row.copy_source = Some(source.to_string_lossy().into_owned());
+            row.copy_destination = Some(destination.to_string_lossy().into_owned());
+            let error = upsert_task(&c, &row, None).expect_err("unsafe prune refused");
+            assert!(
+                matches!(&error, SyncError::Config(sentence) if sentence.contains(reason)),
+                "the refusal explains {reason}: {error}"
+            );
+            assert_eq!(get_task(&c, &row.id).expect("read"), Some(saved.clone()));
+        }
+    }
+
+    #[test]
+    fn copy_options_migrate_existing_rows_without_disabling_repairs() {
+        let c = conn();
+        upsert_task(&c, &task("old", None, TaskMode::Manual), None).expect("save");
+        for column in ["prune_destination", "refresh_missing", "copy_lookback_ms"] {
+            c.execute(&format!("ALTER TABLE tasks DROP COLUMN {column}"), [])
+                .expect("old schema");
+        }
+        ensure_task_columns(&c).expect("migrate");
+        ensure_task_columns(&c).expect("idempotent");
+        let row = get_task(&c, "old").expect("read").expect("existing row");
+
+        assert!(!row.prune_destination);
+        assert!(row.refresh_missing);
+        assert_eq!(row.copy_lookback_ms, 300_000);
+    }
+
+    #[test]
+    fn ledger_profile_can_be_chosen_and_cleared() {
+        let c = conn();
+        assert_eq!(get_ledger_profile(&c).expect("absent"), None);
+        set_ledger_profile(&c, Some("second")).expect("choose");
+        assert_eq!(
+            get_ledger_profile(&c).expect("read").as_deref(),
+            Some("second")
+        );
+        set_ledger_profile(&c, None).expect("clear");
+        assert_eq!(get_ledger_profile(&c).expect("cleared"), None);
     }
 
     /// A row written the only way a row this build cannot read ever arrives:
@@ -7196,6 +7369,9 @@ mod tests {
                 "copy_source",
                 "copy_destination",
                 "replace_existing",
+                "prune_destination",
+                "refresh_missing",
+                "copy_lookback_ms",
             ]
         );
         assert_eq!(
@@ -7214,6 +7390,7 @@ mod tests {
                 // claimed (AD-253).
                 "trigger",
                 "late_by_ms",
+                "ledger_entry",
             ]
         );
         let tasks_after_first = columns_of(&c, "tasks");
@@ -7589,6 +7766,7 @@ mod tests {
         finish_task_run(
             &c,
             TaskRunClose {
+                ledger_entry: None,
                 run_id: run,
                 task_id: "01F",
                 host: "hostA",
@@ -7703,6 +7881,7 @@ mod tests {
             finish_task_run(
                 &c,
                 TaskRunClose {
+                    ledger_entry: None,
                     run_id: run,
                     task_id: "01C",
                     host: "hostA",
@@ -7764,6 +7943,7 @@ mod tests {
             finish_task_run(
                 &c,
                 TaskRunClose {
+                    ledger_entry: None,
                     run_id: run,
                     task_id: id,
                     host: "hostA",
@@ -8023,6 +8203,7 @@ mod tests {
         finish_task_run(
             &c,
             TaskRunClose {
+                ledger_entry: None,
                 run_id: 1,
                 task_id: "01W",
                 host: "hostA",
@@ -8094,6 +8275,7 @@ mod tests {
         finish_task_run(
             &c,
             TaskRunClose {
+                ledger_entry: None,
                 run_id: slow,
                 task_id: "01X",
                 host: "hostA",
@@ -9478,6 +9660,7 @@ mod tests {
             finish_task_run(
                 &c,
                 TaskRunClose {
+                    ledger_entry: None,
                     run_id: run,
                     task_id: "01I",
                     host: "hostA",
@@ -9518,6 +9701,7 @@ mod tests {
         finish_task_run(
             &c,
             TaskRunClose {
+                ledger_entry: None,
                 run_id: opened,
                 task_id: "01I",
                 host: "hostB",
@@ -9868,6 +10052,49 @@ mod tests {
         assert!(
             get_task(&c, "01HW").expect("get").is_some(),
             "a host-wide task belongs to the machine and survives"
+        );
+    }
+    #[test]
+    fn existing_run_gains_a_nullable_ledger_entry_and_closes_with_its_path() {
+        let c = conn();
+        upsert_task(&c, &task("history", None, TaskMode::Manual), None).expect("save");
+        c.execute(
+            "INSERT INTO task_runs (task_id, started_ms, host) VALUES ('history', 1, 'app')",
+            [],
+        )
+        .expect("old run");
+        let id = c.last_insert_rowid();
+        c.execute("ALTER TABLE task_runs DROP COLUMN ledger_entry", [])
+            .expect("old schema");
+        ensure_task_run_columns(&c).expect("migrate");
+        assert_eq!(
+            get_task_run(&c, id)
+                .expect("read")
+                .expect("run")
+                .ledger_entry,
+            None
+        );
+        finish_task_run(
+            &c,
+            TaskRunClose {
+                run_id: id,
+                task_id: "history",
+                host: "app",
+                finished_ms: 2,
+                outcome: TaskOutcome::Ok,
+                detail: None,
+                ledger_entry: Some("2026/run-1-requested-ok-12345678.md"),
+                next_due_ms: None,
+            },
+        )
+        .expect("close");
+        assert_eq!(
+            get_task_run(&c, id)
+                .expect("read")
+                .expect("run")
+                .ledger_entry
+                .as_deref(),
+            Some("2026/run-1-requested-ok-12345678.md"),
         );
     }
 }

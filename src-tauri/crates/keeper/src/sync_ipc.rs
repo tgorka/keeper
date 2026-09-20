@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use keeper_core::tasks::{
     paced_work, task_host, DaemonPresence, PacedFolderFacts, PacedNotesFacts, PacedWorkVm,
     TaskBatchEntryVm, TaskBatchIdReq, TaskBatchOutcomeKind, TaskBatchReceiptVm, TaskHostFacts,
-    TaskListingVm, TaskRunVm, TaskSaveReq, TaskSchedulePreviewVm, TaskVm, UnknownTaskVm,
+    TaskListingVm, TaskRunLogVm, TaskRunVm, TaskSaveReq, TaskSchedulePreviewVm, TaskVm,
+    TasksLedgerVm, UnknownTaskVm,
 };
 use keeper_core::vm::{
     ExportReceiptVm, FilesDeleteDestinationVm, FilesDeletePlanVm, FilesDeleteReceiptVm,
@@ -1874,6 +1875,7 @@ fn task_run_vm(run: &keeper_sync::db::TaskRunRow) -> TaskRunVm {
         trigger: run.trigger.map(|trigger| trigger.as_str().to_owned()),
         late_by_ms: run.late_by_ms,
         host: run.host.clone(),
+        ledger_entry: run.ledger_entry.clone(),
     }
 }
 
@@ -1907,6 +1909,7 @@ fn task_vm(
     // which already has the engine and the profile list in hand — this function
     // reads a row and decides nothing about the filesystem.
     mark_ms: Option<i64>,
+    ledger_path: Option<String>,
     daemon: DaemonPresence,
 ) -> TaskVm {
     let profile = row
@@ -1945,6 +1948,10 @@ fn task_vm(
         copy_source: row.copy_source.clone(),
         copy_destination: row.copy_destination.clone(),
         replace_existing: row.replace_existing,
+        prune_destination: row.prune_destination,
+        refresh_missing: row.refresh_missing,
+        copy_lookback_ms: row.copy_lookback_ms,
+        ledger_path,
         // Read from the ledger folder's file names, not from a column: the
         // mark lives in the drive so it survives this machine's database
         // (Story 74.4, AD-252). `None` here means either "no ledger folder is
@@ -2210,6 +2217,11 @@ pub async fn sync_tasks(state: tauri::State<'_, AppState>) -> Result<TaskListing
     let engine = engine_of(&state)?;
     let listing = engine.tasks().map_err(|err| sync_ipc_error(&err))?;
     let profiles = engine.list_profiles().map_err(|err| sync_ipc_error(&err))?;
+    // Reuse this snapshot and choice for every ledger path: no per-task task-row,
+    // profile-list, or ledger-preference SQLite reads.
+    let ledger_profile = engine
+        .ledger_profile()
+        .map_err(|err| sync_ipc_error(&err))?;
     let unreadable = engine
         .unreadable_profile_ids()
         .map_err(|err| sync_ipc_error(&err))?;
@@ -2238,6 +2250,11 @@ pub async fn sync_tasks(state: tauri::State<'_, AppState>) -> Result<TaskListing
             &unreadable,
             last_run,
             mark_ms,
+            keeper_sync::engine::Engine::task_ledger_path_for(
+                row,
+                &profiles,
+                ledger_profile.as_deref(),
+            ),
             daemon,
         ));
     }
@@ -2405,6 +2422,80 @@ pub async fn sync_task_history(
         .collect())
 }
 
+#[tauri::command]
+pub async fn sync_task_run_log(
+    state: tauri::State<'_, AppState>,
+    run_id: i64,
+    cursor: Option<u64>,
+    max_bytes: u32,
+) -> Result<TaskRunLogVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let log = tauri::async_runtime::spawn_blocking(move || {
+        engine.task_run_log(
+            run_id,
+            cursor,
+            max_bytes.min(keeper_core::tasks::MAX_RUN_LOG_CHUNK_BYTES),
+        )
+    })
+    .await
+    .map_err(|err| open_failure(format!("The run log could not be read: {err}.")))?
+    .map_err(|err| sync_ipc_error(&err))?;
+    Ok(TaskRunLogVm {
+        text: log.text,
+        modified_ms: log.modified_ms,
+        next_cursor: log.next_cursor,
+        total_bytes: log.total_bytes,
+        path: log.path,
+        changed_files: log.changed_files,
+    })
+}
+
+#[tauri::command]
+pub async fn sync_tasks_ledger(
+    state: tauri::State<'_, AppState>,
+) -> Result<TasksLedgerVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let chosen_profile_id = engine
+        .ledger_profile()
+        .map_err(|err| sync_ipc_error(&err))?;
+    let resolved = engine.tasks_ledger().map_err(|err| sync_ipc_error(&err))?;
+    let (resolved_profile_id, resolved_profile_name, root, subfolder) = match resolved {
+        Some((profile, subfolder)) => {
+            let root = profile
+                .local_path
+                .join(&subfolder)
+                .to_string_lossy()
+                .into_owned();
+            (Some(profile.id), Some(profile.name), Some(root), subfolder)
+        }
+        None => (None, None, None, "tasks".to_owned()),
+    };
+    Ok(TasksLedgerVm {
+        chosen_profile_id,
+        resolved_profile_id,
+        resolved_profile_name,
+        root,
+        subfolder,
+    })
+}
+
+#[tauri::command]
+pub async fn sync_tasks_ledger_set(
+    state: tauri::State<'_, AppState>,
+    profile_id: Option<String>,
+) -> Result<(), IpcError> {
+    let engine = engine_of(&state)?;
+    let dir = state
+        .platform
+        .data_dir()
+        .map_err(crate::ipc::to_ipc_error)?;
+    keeper_core::registry::set_ledger_vault(&dir, profile_id.as_deref().unwrap_or(""))
+        .map_err(crate::ipc::to_ipc_error)?;
+    engine
+        .set_ledger_profile(profile_id)
+        .map_err(|err| sync_ipc_error(&err))
+}
+
 /// Run one task now, recording it exactly as a scheduled run is recorded
 /// (FR-349).
 ///
@@ -2518,6 +2609,9 @@ pub async fn sync_task_save(
         copy_source: req.copy_source.clone(),
         copy_destination: req.copy_destination.clone(),
         replace_existing: req.replace_existing,
+        prune_destination: req.prune_destination,
+        refresh_missing: req.refresh_missing,
+        copy_lookback_ms: req.copy_lookback_ms,
     };
     // The one caller that passes a baseline, and the reason the parameter
     // exists: this form seeded its six values once, so every field it is about
@@ -2559,6 +2653,9 @@ pub async fn sync_task_save(
         &unreadable,
         last_run,
         mark_ms,
+        engine
+            .task_ledger_path(&id)
+            .map_err(|err| sync_ipc_error(&err))?,
         daemon_presence_probe(app_dir).await,
     ))
 }
@@ -6094,6 +6191,32 @@ mod tests {
         assert!(
             !auth.retriable,
             "retrying rejected credentials gets an account locked"
+        );
+    }
+
+    #[test]
+    fn task_log_and_ledger_commands_preserve_the_typed_error_envelope() {
+        use std::future::Future;
+
+        // Check the command futures themselves, not mock rejection shapes:
+        // changing any one command back to String makes this fail to compile.
+        fn typed_command<'a, T, F: Future<Output = Result<T, IpcError>>>(
+            _command: impl FnOnce(tauri::State<'a, AppState>) -> F,
+        ) {
+        }
+        typed_command(|state| sync_task_run_log(state, 1, None, 4096));
+        typed_command(sync_tasks_ledger);
+        typed_command(|state| sync_tasks_ledger_set(state, None));
+
+        let error = SyncError::Config("The run has no ledger entry to read.".to_owned());
+        let rejected = tauri::ipc::InvokeError::from(sync_ipc_error(&error));
+        assert_eq!(
+            rejected.0,
+            serde_json::json!({
+                "code": "internal",
+                "message": error.to_string(),
+                "retriable": false,
+            })
         );
     }
 

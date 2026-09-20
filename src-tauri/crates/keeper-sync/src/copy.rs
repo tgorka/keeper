@@ -1,8 +1,9 @@
 //! One-time verified file copy (Story 33.1, AD-C1 … AD-C6).
 //!
 //! A copy here is a **job, never a relationship** (AD-C1): it walks a source
-//! once, moves the bytes, reports what happened to each file, and changes
-//! nothing about either folder afterwards. No profile, no journal, no state.
+//! once, moves the bytes and reports what happened. AD-282 adds an explicit
+//! destination-prune option for a job's final step; the default removes nothing.
+//! Neither option creates a relationship, profile, journal or watch.
 //!
 //! # What makes it different from `cp`
 //!
@@ -68,6 +69,7 @@
 //! point that it hashes every byte twice. Async callers MUST run it on
 //! `tokio::task::spawn_blocking`, the same rule [`crate::lfs::store`] carries.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -134,6 +136,10 @@ const HASH_CHUNK_BYTES: usize = 128 * 1024;
 pub enum CopyOutcome {
     /// Written, published, and proven by an independent re-read (AD-C2).
     Copied,
+    /// Replaced existing bytes after independently verifying the staged copy.
+    Overwritten,
+    /// Removed a destination file whose source counterpart no longer exists.
+    Deleted,
     /// The destination already held byte-identical content, so nothing was
     /// written. Honest and fast: a re-run of a finished copy touches nothing.
     Identical,
@@ -161,7 +167,7 @@ pub struct CopyEntry {
     pub outcome: CopyOutcome,
     /// SHA-256 of the file's content, lower-case hex, when one was computed.
     ///
-    /// Present for `Copied` (the digest an independent re-read proved) and for
+    /// Present for `Copied` and `Overwritten` (the independently proven digest) and
     /// `Identical` (the digest both sides hashed to). `None` where there is
     /// genuinely nothing to report rather than where it was inconvenient to
     /// carry: a refused entry, a collision left untouched, a failure that never
@@ -190,18 +196,20 @@ pub struct CopyReport {
     /// and it would never be copied. A covered-mtime mark can only be too
     /// small, which costs one extra comparison next time and loses nothing.
     pub mark_ms: Option<i64>,
+    /// Files behind the lower bound: a count, never a per-file log line.
+    pub behind: u64,
 }
 
 /// Choices for one verified copy job.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct CopyOptions {
     /// Replace a destination file whose content differs — but only once the new
     /// bytes have passed verification (AD-C4). Defaults to `false`: the classic
     /// tool that eats the newer file is the failure mode this guards.
     pub replace_existing: bool,
-    /// Copy only sources modified **strictly after** this instant, epoch ms
-    /// (Story 74.4, AD-252).
+    /// Examine sources modified **strictly after** this instant, epoch ms,
+    /// plus missing destinations when `refresh_missing` is enabled.
     ///
     /// Exclusive, and that is the whole point: the value is a *mark* left by a
     /// previous run, naming an instant that run already covered. Including it
@@ -212,6 +220,21 @@ pub struct CopyOptions {
     /// did I ask for"; a mark keeper wrote answers "what has not been copied
     /// yet", which is the question a repeated copy actually has.
     pub modified_since_ms: Option<i64>,
+    /// Explicit post-copy removal of destination files absent from the source.
+    pub prune_destination: bool,
+    /// Examine missing destinations even when their sources are behind the mark.
+    pub refresh_missing: bool,
+}
+
+impl Default for CopyOptions {
+    fn default() -> Self {
+        Self {
+            replace_existing: false,
+            modified_since_ms: None,
+            prune_destination: false,
+            refresh_missing: true,
+        }
+    }
 }
 
 /// One progress update for a job.
@@ -292,7 +315,7 @@ fn copy_verified_hooked(
     content: Option<&dyn ContentSource>,
     hook: ChunkHook<'_>,
 ) -> Result<CopyReport> {
-    let plan = plan_copy(source, content, options)?;
+    let plan = plan_copy(source, destination, content, options)?;
     std::fs::create_dir_all(destination)
         .map_err(|err| SyncError::io("create copy destination", destination, err))?;
 
@@ -301,6 +324,7 @@ fn copy_verified_hooked(
         entries: Vec::with_capacity(plan.files_total as usize),
         bytes_copied: 0,
         mark_ms: None,
+        behind: 0,
     };
 
     // Publish the totals before any byte moves, so a surface never has to
@@ -322,7 +346,7 @@ fn copy_verified_hooked(
             }
             // A file behind the mark is not work and not a line: an earlier
             // run covered it and its own ledger file says so (Story 74.4).
-            PlanItem::Behind => {}
+            PlanItem::Behind => report.behind += 1,
             PlanItem::Refused { rel, reason } => {
                 report.entries.push(CopyEntry {
                     path: display(rel),
@@ -361,7 +385,10 @@ fn copy_verified_hooked(
                         // at it and the destination already held it, which is
                         // exactly "covered". A failure does not: leaving the
                         // mark behind it is what makes the next run try again.
-                        if matches!(outcome, CopyOutcome::Copied | CopyOutcome::Identical) {
+                        if matches!(
+                            outcome,
+                            CopyOutcome::Copied | CopyOutcome::Overwritten | CopyOutcome::Identical
+                        ) {
                             if let Some(modified) = *modified_ms {
                                 report.mark_ms = Some(
                                     report.mark_ms.map_or(modified, |mark| mark.max(modified)),
@@ -380,15 +407,211 @@ fn copy_verified_hooked(
             }
         }
     }
+    if let Some(paths) = &plan.source_paths {
+        if !cancel.load(Ordering::Relaxed) {
+            prune_destination(
+                &plan.root,
+                destination,
+                paths,
+                &plan.items,
+                &mut report,
+                cancel,
+            );
+        }
+    }
 
     report.bytes_copied = report
         .entries
         .iter()
-        .filter(|entry| matches!(entry.outcome, CopyOutcome::Copied))
+        .filter(|entry| {
+            matches!(
+                entry.outcome,
+                CopyOutcome::Copied | CopyOutcome::Overwritten
+            )
+        })
         .map(|entry| entry.bytes)
         .sum();
     reporter.emit(true);
     Ok(report)
+}
+
+/// Refuse destructive overlaps before any copy or prune writes occur.
+pub fn validate_prune(
+    source: &Path,
+    destination: &Path,
+    protected_roots: &[(&str, &Path)],
+) -> Result<()> {
+    fn resolve(path: &Path) -> Result<PathBuf> {
+        match path.canonicalize() {
+            Ok(path) => Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let absolute = std::path::absolute(path)
+                    .map_err(|err| SyncError::io("resolve prune path", path, err))?;
+                match (absolute.parent(), absolute.file_name()) {
+                    (Some(parent), Some(name)) => Ok(resolve(parent)?.join(name)),
+                    _ => Err(SyncError::io("resolve prune path", path, err)),
+                }
+            }
+            Err(err) => Err(SyncError::io("resolve prune path", path, err)),
+        }
+    }
+    if !source.is_dir() {
+        return Err(SyncError::Config(format!(
+            "Cannot prune {}: source {} is not a directory; unrelated destination files would be deleted.",
+            destination.display(), source.display()
+        )));
+    }
+    let source = resolve(source)?;
+    let destination = resolve(destination)?;
+    if source.starts_with(&destination) {
+        return Err(SyncError::Config(format!(
+            "Cannot prune {}: the source {} is inside the destination and would be deleted.",
+            destination.display(),
+            source.display()
+        )));
+    }
+    for (label, root) in protected_roots {
+        let root = resolve(root)?;
+        if root.starts_with(&destination) {
+            return Err(SyncError::Config(format!(
+                "Cannot prune {}: the {label} {} would be deleted.",
+                destination.display(),
+                root.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// One post-copy destination walk. Unreadable source subtrees are not proof
+/// of absence; their refusal protects the entire corresponding subtree.
+fn prune_destination(
+    source: &Path,
+    destination: &Path,
+    source_paths: &HashSet<PathBuf>,
+    items: &[PlanItem],
+    report: &mut CopyReport,
+    cancel: &AtomicBool,
+) {
+    prune_destination_hooked(
+        source,
+        destination,
+        source_paths,
+        items,
+        report,
+        cancel,
+        &mut |_| {},
+    );
+}
+
+// Like the copy chunk hook, this makes a filesystem race deterministic in tests.
+fn prune_destination_hooked(
+    source: &Path,
+    destination: &Path,
+    source_paths: &HashSet<PathBuf>,
+    items: &[PlanItem],
+    report: &mut CopyReport,
+    cancel: &AtomicBool,
+    before_read_dir: &mut dyn FnMut(&Path),
+) {
+    let protected: HashSet<&Path> = items
+        .iter()
+        .filter_map(|item| match item {
+            PlanItem::Refused { rel, .. } => Some(rel.as_path()),
+            _ => None,
+        })
+        .collect();
+    let mut stack = vec![(PathBuf::new(), false)];
+    while let Some((rel, visited)) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let path = destination.join(&rel);
+        if visited {
+            if !rel.as_os_str().is_empty() && !source_paths.contains(&rel) {
+                // remove_dir refuses non-empty directories, including ones
+                // containing a symlink that this pass deliberately preserved.
+                let _ = std::fs::remove_dir(&path);
+            }
+            continue;
+        }
+        if rel.ancestors().any(|ancestor| protected.contains(ancestor)) {
+            continue;
+        }
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) => {
+                report.entries.push(CopyEntry {
+                    path: display(&rel),
+                    bytes: 0,
+                    outcome: CopyOutcome::Failed {
+                        reason: format!("could not inspect prune destination: {err}"),
+                    },
+                    sha256: None,
+                });
+                continue;
+            }
+        };
+        if meta.is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            stack.push((rel.clone(), true));
+            before_read_dir(&path);
+            let children = match children_of(destination, &rel) {
+                Ok(children) => children,
+                Err(err) => {
+                    report.entries.push(CopyEntry {
+                        path: display(&rel),
+                        bytes: 0,
+                        outcome: CopyOutcome::Failed {
+                            reason: format!("could not read prune destination: {err}"),
+                        },
+                        sha256: None,
+                    });
+                    continue;
+                }
+            };
+            stack.extend(children.into_iter().rev().map(|child| (child, false)));
+        } else if meta.is_file() && !source_paths.contains(&rel) {
+            let name = rel.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            if rel.parent() == Some(Path::new(""))
+                && name.starts_with("keeper-copy-")
+                && name.ends_with(".log")
+            {
+                continue;
+            }
+            // Directory-entry spelling is not filesystem identity on APFS/SMB.
+            // Only absence proves that this candidate is safe to remove.
+            match std::fs::symlink_metadata(source.join(&rel)) {
+                Ok(_) => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    report.entries.push(CopyEntry {
+                        path: display(&rel),
+                        bytes: meta.len(),
+                        outcome: CopyOutcome::Failed {
+                            reason: format!("could not inspect prune source: {err}"),
+                        },
+                        sha256: None,
+                    });
+                    continue;
+                }
+            }
+            let outcome = match std::fs::remove_file(&path) {
+                Ok(()) => CopyOutcome::Deleted,
+                Err(err) => CopyOutcome::Failed {
+                    reason: format!("could not delete: {err}"),
+                },
+            };
+            report.entries.push(CopyEntry {
+                path: display(&rel),
+                bytes: meta.len(),
+                outcome,
+                sha256: None,
+            });
+        }
+    }
 }
 
 /// Whether the walk should carry on.
@@ -671,7 +894,7 @@ fn stage(
         staged
             .persist(dst)
             .map_err(|err| SyncError::io("publish copied file", dst, err.error))?;
-        return Ok(Step::Done(CopyOutcome::Copied, Some(digest)));
+        return Ok(Step::Done(CopyOutcome::Overwritten, Some(digest)));
     }
 
     staged
@@ -890,6 +1113,7 @@ struct Plan {
     /// entries — they are recreated, not copied.
     files_total: u64,
     bytes_total: u64,
+    source_paths: Option<HashSet<PathBuf>>,
 }
 
 enum PlanItem {
@@ -916,9 +1140,8 @@ enum PlanItem {
     /// a large tree is mostly this, and a report with one line per file the run
     /// deliberately did not look at buries the handful of lines that matter.
     /// The run that *did* copy it holds its line, in its own ledger file.
-    /// No path: nothing downstream may name it, and that is the invariant
-    /// rather than an omission — a `Behind` item must not be able to leak into
-    /// the report, the progress totals or a log line.
+    /// No path in this item: it must not leak into the report, progress totals
+    /// or log. The optional prune set separately retains every source path.
     Behind,
 }
 
@@ -929,12 +1152,14 @@ enum PlanItem {
 /// also what makes the job's order deterministic — see [`children_of`].
 fn plan_copy(
     source: &Path,
+    destination: &Path,
     content: Option<&dyn ContentSource>,
     options: &CopyOptions,
 ) -> Result<Plan> {
     let root_meta = std::fs::symlink_metadata(source)
         .map_err(|err| SyncError::io("stat copy source", source, err))?;
 
+    let mut source_paths = options.prune_destination.then(HashSet::new);
     if !root_meta.is_dir() {
         // A single-file (or refused) source: the plan's root is its parent, so
         // its one relative path is the file's own name and it lands as
@@ -946,19 +1171,24 @@ fn plan_copy(
             )));
         };
         let rel = PathBuf::from(name);
-        let item = classify(source, rel, content, options)?;
+        if let Some(paths) = &mut source_paths {
+            paths.insert(rel.clone());
+        }
+        let item = classify(source, rel, destination, content, options)?;
         let bytes_total = match &item {
             PlanItem::File { bytes, .. } => *bytes,
             _ => 0,
         };
+        let files_total = u64::from(!matches!(item, PlanItem::Behind));
         return Ok(Plan {
             root: source
                 .parent()
                 .unwrap_or_else(|| Path::new(""))
                 .to_path_buf(),
             items: vec![item],
-            files_total: 1,
+            files_total,
             bytes_total,
+            source_paths,
         });
     }
 
@@ -973,6 +1203,9 @@ fn plan_copy(
     stack.reverse();
 
     while let Some(rel) = stack.pop() {
+        if let Some(paths) = &mut source_paths {
+            paths.insert(rel.clone());
+        }
         let absolute = source.join(&rel);
         let meta = match std::fs::symlink_metadata(&absolute) {
             Ok(meta) => meta,
@@ -998,7 +1231,7 @@ fn plan_copy(
             }
             continue;
         }
-        items.push(classify(&absolute, rel, content, options)?);
+        items.push(classify(&absolute, rel, destination, content, options)?);
     }
 
     // Neither a directory (recreated, not copied) nor a file behind the mark
@@ -1022,6 +1255,7 @@ fn plan_copy(
         items,
         files_total,
         bytes_total,
+        source_paths,
     })
 }
 
@@ -1029,6 +1263,7 @@ fn plan_copy(
 fn classify(
     absolute: &Path,
     rel: PathBuf,
+    destination: &Path,
     content: Option<&dyn ContentSource>,
     options: &CopyOptions,
 ) -> Result<PlanItem> {
@@ -1054,19 +1289,25 @@ fn classify(
     // is both the lower-bound test below and — for the files this run does
     // cover — the next run's mark (Story 74.4, AD-252).
     let modified_ms = match meta.modified() {
-        Ok(time) => match time.duration_since(std::time::UNIX_EPOCH) {
-            Ok(duration) => i64::try_from(duration.as_millis()).ok(),
-            Err(error) => i64::try_from(error.duration().as_millis())
-                .ok()
-                .map(|ms| -ms),
-        },
+        Ok(time) if time <= std::time::SystemTime::now() => {
+            match time.duration_since(std::time::UNIX_EPOCH) {
+                Ok(duration) => i64::try_from(duration.as_millis()).ok(),
+                Err(error) => i64::try_from(error.duration().as_millis())
+                    .ok()
+                    .map(|ms| -ms),
+            }
+        }
         // A filesystem that will not say when a file changed (some network
         // mounts, some archives) cannot be filtered or marked. Both halves
         // below treat that as "no information", never as "old".
-        Err(_) => None,
+        Ok(_) | Err(_) => None,
     };
     if let (Some(bound), Some(modified)) = (options.modified_since_ms, modified_ms) {
-        if modified <= bound {
+        if modified <= bound
+            && (!options.refresh_missing
+                || !matches!(std::fs::symlink_metadata(destination.join(&rel)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound))
+        {
             // Not a skip and not a refusal: this file was covered by an earlier
             // run, whose own record says so. Reporting a line per unchanged
             // file would make the report of an incremental pass over a large
@@ -1276,9 +1517,9 @@ pub fn copy_log_filename(stamp: &str) -> String {
 
 /// Render the copy log.
 ///
-/// Plain text, one file per line, because the point is that a person can read it
-/// in a year with no keeper installed — the same reasoning that put provenance in
-/// git trailers rather than a sidecar. Columns are outcome, size, SHA-256 and
+/// Plain text, one changed or refused file per line; identical files are counts-only.
+/// A person can read it in a year with no keeper installed. Columns are
+/// outcome, size, SHA-256 and
 /// path, in that order: the outcome is what you scan for, and the path is the
 /// only field that can contain spaces, so it goes last and needs no quoting.
 ///
@@ -1292,7 +1533,7 @@ pub fn render_copy_log(
     stamp: &str,
 ) -> String {
     use std::fmt::Write as _;
-    let mut out = String::with_capacity(128 + report.entries.len() * 96);
+    let mut out = String::with_capacity(256);
     let _ = writeln!(out, "keeper copy log");
     let _ = writeln!(out, "when:        {stamp}");
     let _ = writeln!(out, "source:      {}", source.display());
@@ -1304,12 +1545,16 @@ pub fn render_copy_log(
     );
 
     let mut copied = 0usize;
+    let mut overwritten = 0usize;
+    let mut deleted = 0usize;
     let mut identical = 0usize;
     let mut collision = 0usize;
     let mut failed = 0usize;
     for entry in &report.entries {
         match entry.outcome {
             CopyOutcome::Copied => copied += 1,
+            CopyOutcome::Overwritten => overwritten += 1,
+            CopyOutcome::Deleted => deleted += 1,
             CopyOutcome::Identical => identical += 1,
             CopyOutcome::Collision => collision += 1,
             CopyOutcome::Failed { .. } => failed += 1,
@@ -1317,7 +1562,7 @@ pub fn render_copy_log(
     }
     let _ = writeln!(
         out,
-        "files:       {} ({copied} copied, {identical} identical, {collision} left alone, {failed} failed)",
+        "files:       {} ({copied} copied, {overwritten} overwritten, {identical} identical, {deleted} deleted, {collision} left alone, {failed} failed)",
         report.entries.len()
     );
     let _ = writeln!(out, "bytes:       {}", report.bytes_copied);
@@ -1327,7 +1572,9 @@ pub fn render_copy_log(
     for entry in &report.entries {
         let outcome = match &entry.outcome {
             CopyOutcome::Copied => "copied",
-            CopyOutcome::Identical => "identical",
+            CopyOutcome::Overwritten => "overwritten",
+            CopyOutcome::Deleted => "deleted",
+            CopyOutcome::Identical => continue,
             CopyOutcome::Collision => "left-alone",
             CopyOutcome::Failed { .. } => "FAILED",
         };
@@ -1353,6 +1600,182 @@ pub fn render_copy_log(
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn future_mtime_is_copied_without_poisoning_the_mark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        write_file(&source.join("future"), b"future");
+        std::fs::File::options()
+            .write(true)
+            .open(source.join("future"))
+            .expect("open")
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(86400),
+                ),
+            )
+            .expect("mtime");
+        let report = copy_verified(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            None,
+        )
+        .expect("copy");
+        assert_eq!(read_file(&destination.join("future")), b"future");
+        assert_eq!(report.mark_ms, None);
+    }
+
+    #[test]
+    fn pruning_checks_source_existence_for_differently_spelled_candidates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        // A deliberately differently spelled plan simulates a filesystem
+        // returning a case/NFD alias that resolves to an existing source.
+        for (planned, actual) in [("PHOTO", "photo"), ("café", "cafe\u{301}")] {
+            write_file(&source.join(actual), b"keep");
+            write_file(&destination.join(actual), b"keep");
+            let paths = HashSet::from([PathBuf::from(planned)]);
+            let mut report = CopyReport {
+                entries: Vec::new(),
+                bytes_copied: 0,
+                mark_ms: None,
+                behind: 0,
+            };
+            prune_destination(&source, &destination, &paths, &[], &mut report, &off());
+            assert_eq!(read_file(&destination.join(actual)), b"keep");
+            assert!(report.entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn prune_walk_errors_are_failed_entries_not_lost_reports() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        let mut report = CopyReport {
+            entries: Vec::new(),
+            bytes_copied: 7,
+            mark_ms: Some(1000),
+            behind: 0,
+        };
+        prune_destination(
+            &source,
+            &destination,
+            &HashSet::new(),
+            &[],
+            &mut report,
+            &off(),
+        );
+        assert!(
+            matches!(&report.entries[0].outcome, CopyOutcome::Failed { reason } if reason.contains("inspect prune destination"))
+        );
+        std::fs::create_dir_all(destination.join("unreadable")).expect("directory");
+        write_file(&destination.join("obsolete"), b"gone");
+        prune_destination_hooked(
+            &source,
+            &destination,
+            &HashSet::new(),
+            &[],
+            &mut report,
+            &off(),
+            &mut |path| {
+                if path.ends_with("unreadable") {
+                    std::fs::remove_dir(path).expect("remove");
+                    std::fs::write(path, b"changed into file").expect("replace");
+                }
+            },
+        );
+        assert!(report.entries.iter().any(|entry| entry.path == "unreadable"
+            && matches!(&entry.outcome, CopyOutcome::Failed { reason } if reason.contains("read prune destination"))));
+        assert!(
+            !destination.join("obsolete").exists(),
+            "walk continues after a per-path failure"
+        );
+        assert_eq!(report.bytes_copied, 7);
+        assert_eq!(report.mark_ms, Some(1000));
+    }
+
+    #[test]
+    fn pruning_preserves_behind_paths_logs_and_symlinks_and_is_opt_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        write_file(&source.join("retained"), b"source");
+        write_file(&destination.join("retained"), b"destination");
+        write_file(&destination.join("gone/obsolete"), b"old");
+        write_file(&destination.join("keeper-copy-previous.log"), b"log");
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(destination.join("kept")).expect("directory");
+            std::os::unix::fs::symlink(&source, destination.join("kept/link")).expect("symlink");
+        }
+        let mut options = CopyOptions {
+            modified_since_ms: Some(i64::MAX),
+            refresh_missing: false,
+            ..CopyOptions::default()
+        };
+        let untouched =
+            copy_verified(&source, &destination, &options, None, &off(), None).expect("copy");
+        assert_eq!(untouched.behind, 1);
+        assert!(destination.join("gone/obsolete").exists());
+        options.prune_destination = true;
+        let report =
+            copy_verified(&source, &destination, &options, None, &off(), None).expect("prune");
+        assert_eq!(
+            entry(&report, "gone/obsolete").outcome,
+            CopyOutcome::Deleted
+        );
+        assert_eq!(entry(&report, "gone/obsolete").bytes, 3);
+        assert_eq!(report.bytes_copied, 0);
+        assert!(!destination.join("gone").exists());
+        assert_eq!(read_file(&destination.join("retained")), b"destination");
+        assert_eq!(
+            read_file(&destination.join("keeper-copy-previous.log")),
+            b"log"
+        );
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(destination.join("kept/link"))
+            .expect("link")
+            .is_symlink());
+    }
+
+    #[test]
+    fn refresh_missing_controls_a_hole_behind_the_mark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        write_file(&source.join("file"), b"bytes");
+        copy_verified(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            None,
+        )
+        .expect("first");
+        std::fs::remove_file(destination.join("file")).expect("remove");
+        let mut options = CopyOptions {
+            modified_since_ms: Some(i64::MAX),
+            refresh_missing: false,
+            ..CopyOptions::default()
+        };
+        let report =
+            copy_verified(&source, &destination, &options, None, &off(), None).expect("leave hole");
+        assert_eq!(report.behind, 1);
+        assert!(!destination.join("file").exists());
+        options.refresh_missing = true;
+        let report =
+            copy_verified(&source, &destination, &options, None, &off(), None).expect("refresh");
+        assert_eq!(entry(&report, "file").outcome, CopyOutcome::Copied);
+        assert_eq!(read_file(&destination.join("file")), b"bytes");
+    }
 
     /// The mark is a lower bound on work AND the thing the next run inherits,
     /// so one fixture has to prove both halves: what a bound leaves alone, and
@@ -1387,6 +1810,7 @@ mod tests {
             &destination,
             &CopyOptions {
                 modified_since_ms: Some(1000),
+                refresh_missing: false,
                 ..CopyOptions::default()
             },
             Some(&sink),
@@ -1396,6 +1820,7 @@ mod tests {
         .expect("copy");
 
         assert_eq!(report.bytes_copied, 5);
+        assert_eq!(report.behind, 2);
         assert_eq!(read_file(&destination.join("newer")), b"bytes");
         // Exclusive: the file whose mtime IS the mark was covered by the run
         // that left it, and copying it again every pass forever is exactly what
@@ -1469,6 +1894,40 @@ mod tests {
             Some(3000),
             "a file the pass found already present was still accounted for"
         );
+        std::fs::remove_file(destination.join("same")).expect("remove");
+        std::fs::remove_file(destination.join("fresh")).expect("remove");
+        std::fs::create_dir(destination.join("same")).expect("obstruction");
+        std::fs::create_dir(destination.join("fresh")).expect("obstruction");
+        let failed = copy_verified(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            None,
+        )
+        .expect("per-file failures");
+        assert_eq!(failed.mark_ms, None);
+        assert!(failed
+            .entries
+            .iter()
+            .all(|entry| matches!(entry.outcome, CopyOutcome::Failed { .. })));
+        std::fs::remove_dir(destination.join("same")).expect("clear");
+        std::fs::remove_dir(destination.join("fresh")).expect("clear");
+        let retry = copy_verified(
+            &source,
+            &destination,
+            &CopyOptions {
+                modified_since_ms: failed.mark_ms,
+                ..CopyOptions::default()
+            },
+            None,
+            &off(),
+            None,
+        )
+        .expect("retry");
+        assert_eq!(retry.mark_ms, Some(3000));
+        assert_eq!(read_file(&destination.join("same")), b"bytes");
     }
 
     fn off() -> AtomicBool {
@@ -1713,7 +2172,10 @@ mod tests {
         let report =
             copy_verified(&source, &destination, &options, None, &off(), None).expect("copy");
 
-        assert_eq!(entry(&report, "alpha.txt").outcome, CopyOutcome::Copied);
+        assert_eq!(
+            entry(&report, "alpha.txt").outcome,
+            CopyOutcome::Overwritten
+        );
         assert_eq!(read_file(&destination.join("alpha.txt")), b"alpha");
         let fresh = FileSample::of(&destination.join("alpha.txt"))
             .expect("stat")
@@ -2153,68 +2615,73 @@ mod tests {
             serde_json::to_string(&CopyOutcome::Identical).expect("serialize"),
             r#"{"kind":"identical"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&CopyOutcome::Overwritten).expect("serialize"),
+            r#"{"kind":"overwritten"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&CopyOutcome::Deleted).expect("serialize"),
+            r#"{"kind":"deleted"}"#
+        );
     }
 
     #[test]
-    fn the_log_records_every_file_with_its_digest_and_the_ones_that_have_none() {
-        let report = CopyReport {
-            entries: vec![
-                CopyEntry {
-                    path: "a.txt".into(),
-                    bytes: 4,
-                    outcome: CopyOutcome::Copied,
-                    sha256: Some("aa11".into()),
+    fn the_log_lists_changes_and_refusals_but_not_identical_files() {
+        let mut report = CopyReport::default();
+        for (path, outcome, digest) in [
+            ("created", CopyOutcome::Copied, Some("aa11")),
+            ("replaced", CopyOutcome::Overwritten, Some("bb22")),
+            ("removed", CopyOutcome::Deleted, None),
+            ("collision", CopyOutcome::Collision, None),
+            (
+                "failed",
+                CopyOutcome::Failed {
+                    reason: "unreadable".into(),
                 },
-                CopyEntry {
-                    path: "b.txt".into(),
-                    bytes: 8,
-                    outcome: CopyOutcome::Identical,
-                    sha256: Some("bb22".into()),
-                },
-                CopyEntry {
-                    path: "c.txt".into(),
-                    bytes: 2,
-                    outcome: CopyOutcome::Collision,
-                    sha256: None,
-                },
-                CopyEntry {
-                    path: "d.lnk".into(),
-                    bytes: 0,
-                    outcome: CopyOutcome::Failed {
-                        reason: "symbolic link".into(),
-                    },
-                    sha256: None,
-                },
-            ],
-            bytes_copied: 4,
-            mark_ms: None,
-        };
-        let log = render_copy_log(
-            &report,
-            Path::new("/src"),
-            Path::new("/dst"),
-            "2026-07-30T12:00:00+02:00",
+                None,
+            ),
+        ] {
+            report.entries.push(CopyEntry {
+                path: path.into(),
+                bytes: 4,
+                outcome,
+                sha256: digest.map(str::to_owned),
+            });
+        }
+        for index in 0..82 {
+            report.entries.push(CopyEntry {
+                path: format!("same-{index}"),
+                bytes: 4,
+                outcome: CopyOutcome::Identical,
+                sha256: Some("cc33".into()),
+            });
+        }
+        let log = render_copy_log(&report, Path::new("/src"), Path::new("/dst"), "now");
+        assert!(log.contains(
+            "87 (1 copied, 1 overwritten, 82 identical, 1 deleted, 1 left alone, 1 failed)"
+        ));
+        let lines: Vec<_> = log
+            .split("outcome    bytes  sha256  path\n")
+            .nth(1)
+            .expect("columns")
+            .lines()
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "copied  4  aa11  created",
+                "overwritten  4  bb22  replaced",
+                "deleted  4  -  removed",
+                "left-alone  4  -  collision",
+                "FAILED  4  -  failed",
+                "    reason: unreadable",
+            ]
         );
-
-        assert!(log.contains("source:      /src"), "{log}");
-        assert!(log.contains("destination: /dst"), "{log}");
-        assert!(log.contains("2026-07-30T12:00:00+02:00"), "{log}");
-        // The summary line, the one a person reads first in every copy log:
-        // asserted in full, so a column gained or renamed out from under the
-        // reader is red rather than silent. The `skipped` column left with the
-        // date window it counted (AD-256): a file behind the mark is not in
-        // the report at all, so a zero there would be a count of nothing.
-        assert!(
-            log.contains("4 (1 copied, 1 identical, 1 left alone, 1 failed)"),
-            "{log}"
-        );
-        assert!(log.contains("copied  4  aa11  a.txt"), "{log}");
-        assert!(log.contains("identical  8  bb22  b.txt"), "{log}");
-        // An outcome with no digest says so rather than leaving a blank column a
-        // reader would have to guess about.
-        assert!(log.contains("left-alone  2  -  c.txt"), "{log}");
-        assert!(log.contains("FAILED  0  -  d.lnk"), "{log}");
-        assert!(log.contains("reason: symbolic link"), "{log}");
+        report
+            .entries
+            .retain(|entry| entry.outcome == CopyOutcome::Identical);
+        let log = render_copy_log(&report, Path::new("/src"), Path::new("/dst"), "now");
+        assert!(log.ends_with("outcome    bytes  sha256  path\n"));
     }
 
     #[test]
@@ -2230,6 +2697,7 @@ mod tests {
             }],
             bytes_copied: 1,
             mark_ms: None,
+            behind: 0,
         };
         let log = render_copy_log(&report, Path::new("/s"), Path::new("/d"), "now");
         let planted = log
