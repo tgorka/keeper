@@ -20,4 +20,4 @@
  * of a byte-identical copy of it elsewhere. Folding the two together would put
  * a machine-local fact into the classifier that 45.2's registry keys on.
  */
-export type FilesFolderRoleVm = "notesVault" | "recordings";
+export type FilesFolderRoleVm = "notesVault" | "recordings" | "tasks";

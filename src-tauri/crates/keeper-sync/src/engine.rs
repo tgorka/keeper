@@ -97,6 +97,13 @@ pub struct SyncOutcome {
     pub stale: Vec<String>,
 }
 
+/// The ledger destination resolved once for the app and daemon.
+pub struct TasksLedgerResolution {
+    pub profile: SyncProfile,
+    pub subfolder: String,
+    pub source: &'static str,
+}
+
 /// What one convergence had to do beyond merging.
 ///
 /// Two lists rather than one because they ask different things of the user:
@@ -2540,18 +2547,27 @@ impl Engine {
         self.with_db(|conn| db::set_ledger_profile(conn, profile_id.as_deref()))
     }
 
-    pub fn tasks_ledger(&self) -> Result<Option<(SyncProfile, String)>> {
+    pub fn tasks_ledger(&self) -> Result<Option<TasksLedgerResolution>> {
         let profiles = self.list_profiles()?;
         let chosen = self.ledger_profile()?;
         let candidate = profiles
             .iter()
-            .find(|profile| profile.tasks.is_some() && Some(&profile.id) == chosen.as_ref())
+            .find(|profile| Some(&profile.id) == chosen.as_ref())
             .or_else(|| profiles.iter().find(|profile| profile.tasks.is_some()));
-        Ok(candidate.and_then(|profile| {
-            profile
-                .tasks
-                .as_ref()
-                .map(|config| (profile.clone(), config.subfolder.clone()))
+        Ok(candidate.map(|profile| TasksLedgerResolution {
+            profile: profile.clone(),
+            subfolder: profile.tasks.as_ref().map_or_else(
+                || crate::profile::DEFAULT_TASKS_SUBFOLDER.to_owned(),
+                |config| config.subfolder.clone(),
+            ),
+            source: if crate::profile::owned_fields(profile)
+                .iter()
+                .any(|key| key == "tasks")
+            {
+                "folder-file"
+            } else {
+                "default"
+            },
         }))
     }
 
@@ -4222,8 +4238,8 @@ impl Engine {
     /// decide which one:
     ///
     /// * a task scoped to a profile uses **that** profile's ledger, or none;
-    /// * a host-wide task prefers the machine-local choice when it carries a
-    ///   ledger, otherwise the first flagged profile in the stable listing.
+    /// * a host-wide task prefers the machine-local choice, with the default
+    ///   subfolder if unflagged, otherwise the first flagged profile.
     ///
     /// `None` is a first-class answer, not a degradation: with no ledger a
     /// copy simply has no mark, so it walks everything and reports to
@@ -4247,20 +4263,27 @@ impl Engine {
         fingerprint: &str,
     ) -> Option<crate::ledger::TaskLedger> {
         let eligible = |profile: &&SyncProfile| {
-            profile.tasks.is_some()
-                && task
-                    .profile_id
-                    .as_ref()
-                    .is_none_or(|scoped| scoped == &profile.id)
+            task.profile_id
+                .as_ref()
+                .is_none_or(|scoped| scoped == &profile.id)
         };
         let candidate = profiles
             .iter()
             .filter(eligible)
             .find(|profile| Some(profile.id.as_str()) == chosen)
-            .or_else(|| profiles.iter().find(eligible))?;
-        let config = candidate.tasks.as_ref()?;
-        match crate::ledger::TaskLedger::resolve(&candidate.local_path, &config.subfolder, &task.id)
-        {
+            .or_else(|| {
+                profiles
+                    .iter()
+                    .filter(eligible)
+                    .find(|profile| profile.tasks.is_some())
+            })?;
+        let subfolder = candidate
+            .tasks
+            .as_ref()
+            .map_or(crate::profile::DEFAULT_TASKS_SUBFOLDER, |config| {
+                config.subfolder.as_str()
+            });
+        match crate::ledger::TaskLedger::resolve(&candidate.local_path, subfolder, &task.id) {
             Ok(ledger) => Some(ledger),
             // A subfolder the path rules refuse is a configuration fault, and
             // the profile's own validator should have caught it before it was
@@ -18836,7 +18859,7 @@ mod tests {
                 .tasks_ledger()
                 .expect("resolved")
                 .expect("profile")
-                .0
+                .profile
                 .id,
             second.id
         );
@@ -18855,7 +18878,7 @@ mod tests {
                 .tasks_ledger()
                 .expect("resolved")
                 .expect("profile")
-                .0
+                .profile
                 .id,
             first.id
         );
@@ -19366,6 +19389,59 @@ mod tests {
             std::fs::read(destination.join("one")).expect("one"),
             b"bytes"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chosen_unflagged_drive_logs_copy_even_when_folder_file_is_unwritable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = Engine::open(Arc::new(TestPlatform::new(dir.path()))).expect("engine");
+        let profile = profile(dir.path());
+        std::fs::create_dir_all(&profile.local_path).expect("drive");
+        assert!(profile.tasks.is_none());
+        engine.upsert_profile(&profile).expect("profile");
+        engine
+            .set_ledger_profile(Some(profile.id.clone()))
+            .expect("choice");
+        let source = dir.path().join("copy-source");
+        std::fs::create_dir_all(&source).expect("source");
+        std::fs::write(source.join("one"), b"bytes").expect("fixture");
+        let mut row = task("chosen-copy", None, "every 5m");
+        row.kind = tasks::TaskKind::Copy;
+        row.copy_source = Some(source.to_string_lossy().into_owned());
+        row.copy_destination = Some(
+            dir.path()
+                .join("destination")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        engine.save_task(&row, None).expect("save");
+        // A non-directory is unwritable on every host, including root-run CI.
+        std::fs::write(profile.local_path.join(".keeper"), b"not a directory")
+            .expect("obstruction");
+        let sentence =
+            crate::profile::folder::write_tasks_key(&profile, "tasks").expect_err("refused");
+        assert!(sentence.contains("could not be written"));
+        assert!(sentence.contains("Task runs remain logged"));
+        engine
+            .run_task_now(&row.id, tasks::TaskRunDriver::Person)
+            .await
+            .expect("run");
+        let runs = engine.task_history(&row.id, 1).expect("history");
+        assert_eq!(runs[0].outcome, Some(tasks::TaskOutcome::Ok));
+        let entry = runs[0]
+            .ledger_entry
+            .as_ref()
+            .expect("non-NULL ledger entry");
+        let path = profile.local_path.join("tasks").join(&row.id).join(entry);
+        assert!(path.is_file(), "{}", path.display());
+        engine
+            .task_run_log(runs[0].id, None, 65_536)
+            .expect("read log");
+        assert!(engine.task_mark(&row).is_some());
+        let resolution = engine.tasks_ledger().expect("resolve").expect("chosen");
+        assert_eq!(resolution.profile.id, profile.id);
+        assert_eq!(resolution.subfolder, "tasks");
+        assert_eq!(resolution.source, "default");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

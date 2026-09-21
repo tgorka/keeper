@@ -11,6 +11,7 @@ vi.mock("@/lib/ipc/client", () => ({
   syncSetCredential: vi.fn(),
   syncGetCredential: vi.fn(),
   syncClearCredential: vi.fn(),
+  syncFolderTasksFlag: vi.fn(),
   // The Sync view's three per-folder lists, re-read for the folder just added.
   syncActivity: vi.fn(),
   syncPending: vi.fn(),
@@ -61,6 +62,8 @@ import {
   SYNC_SUBJECT_LABEL,
   SYNC_SUBPATHS_LABEL,
   SYNC_TAGS_LABEL,
+  SYNC_TASKS_LABEL,
+  SYNC_TASKS_SUBFOLDER_LABEL,
   SYNC_TOKEN_EDIT_NOTE,
   SYNC_TOKEN_FAILED_PREFIX,
   SYNC_TOKEN_HIDE_LABEL,
@@ -86,6 +89,7 @@ import type { SyncProfileVm } from "@/lib/ipc/client";
 import {
   syncActivity,
   syncClearCredential,
+  syncFolderTasksFlag,
   syncGetCredential,
   syncPending,
   syncProblems,
@@ -146,6 +150,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     recordingsSubfolder: "recordings",
     sessions: false,
     sessionsSubfolder: "60-sessions",
+    tasks: false,
+    tasksSubfolder: "tasks",
     authorOverride: null,
     enabled: true,
     ...over,
@@ -193,6 +199,36 @@ afterEach(() => {
 });
 
 describe("AddFolderForm", () => {
+  it("flags the chosen task ledger subfolder and honours folder-file ownership", async () => {
+    const saved = profileVm({ tasks: true, tasksSubfolder: "run-records" });
+    mockSave.mockResolvedValue(saved);
+    vi.mocked(syncFolderTasksFlag).mockResolvedValue({
+      chosenProfileId: null,
+      resolvedProfileId: saved.id,
+      resolvedProfileName: saved.name,
+      root: `${saved.localPath}/run-records`,
+      subfolder: "run-records",
+      subfolderSource: "folder-file",
+      writable: true,
+      exists: false,
+      notice: null,
+    });
+    const view = render(<AddFolderForm profile={profileVm()} />);
+    fireEvent.click(screen.getByRole("switch", { name: SYNC_TASKS_LABEL }));
+    fireEvent.change(screen.getByLabelText(SYNC_TASKS_SUBFOLDER_LABEL), {
+      target: { value: "run-records" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+    await waitFor(() => expect(syncFolderTasksFlag).toHaveBeenCalledWith(saved.id, "run-records"));
+    expect(mockSave).toHaveBeenCalledWith(
+      expect.objectContaining({ tasks: true, tasksSubfolder: "run-records" }),
+    );
+    view.unmount();
+    render(<AddFolderForm profile={profileVm({ tasks: true, folderOwned: ["tasks"] })} />);
+    expect(screen.getByRole("switch", { name: SYNC_TASKS_LABEL })).toBeDisabled();
+    expect(screen.getByLabelText(SYNC_TASKS_SUBFOLDER_LABEL)).toBeDisabled();
+    expect(screen.getByText(syncFolderOwnedNote("tasks"))).toBeInTheDocument();
+  });
   it("names itself for a screen reader even where no heading is drawn beside it", () => {
     // Every surface titles the form in its own chrome — a section heading, a
     // card title, or the disclosure button that revealed it — so the accessible
@@ -456,6 +492,8 @@ describe("AddFolderForm editing an existing folder", () => {
         recordingsSubfolder: null,
         sessions: false,
         sessionsSubfolder: null,
+        tasks: false,
+        tasksSubfolder: null,
       }),
     );
   });

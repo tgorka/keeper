@@ -6716,8 +6716,18 @@ export async function syncTasksLedger(): Promise<TasksLedgerVm> {
   return await invoke<TasksLedgerVm>("sync_tasks_ledger");
 }
 
-export async function syncTasksLedgerSet(profileId: string | null): Promise<void> {
-  await invoke("sync_tasks_ledger_set", { profileId });
+export async function syncTasksLedgerSet(
+  profileId: string | null,
+  subfolder?: string | null,
+): Promise<TasksLedgerVm> {
+  return await invoke<TasksLedgerVm>("sync_tasks_ledger_set", { profileId, subfolder });
+}
+
+export async function syncFolderTasksFlag(
+  profileId: string,
+  subfolder: string | null,
+): Promise<TasksLedgerVm> {
+  return await invoke<TasksLedgerVm>("sync_folder_tasks_flag", { profileId, subfolder });
 }
 
 /**

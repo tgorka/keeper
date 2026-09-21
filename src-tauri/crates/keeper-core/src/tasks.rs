@@ -289,6 +289,46 @@ pub struct TaskRunVm {
     pub ledger_entry: Option<String>,
 }
 
+/// A copy path's drive attribution and one observed filesystem fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskPathFactsVm {
+    pub path: String,
+    pub drive: Option<String>,
+    pub drive_id: Option<String>,
+    pub exists: bool,
+}
+
+/// Attribute by the longest whole-segment prefix using the Files path rules.
+pub fn path_facts<'a>(
+    path: &str,
+    profiles: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+    exists: bool,
+) -> TaskPathFactsVm {
+    let normal = crate::vm::normalise_folder_path(path);
+    let mut matched = None;
+    let mut longest = 0;
+    for (id, name, root) in profiles {
+        let root = crate::vm::normalise_folder_path(root);
+        if (normal == root
+            || normal
+                .strip_prefix(&root)
+                .is_some_and(|rest| rest.starts_with('/')))
+            && (matched.is_none() || root.len() > longest)
+        {
+            longest = root.len();
+            matched = Some((id, name));
+        }
+    }
+    TaskPathFactsVm {
+        path: path.to_owned(),
+        drive: matched.map(|(_, name)| name.to_owned()),
+        drive_id: matched.map(|(id, _)| id.to_owned()),
+        exists,
+    }
+}
+
 /// One task row, with its host verdict already computed.
 ///
 /// `kind` and `mode` are `String` rather than enums on purpose: a row a newer
@@ -316,6 +356,8 @@ pub struct TaskVm {
     pub model: Option<String>,
     pub copy_source: Option<String>,
     pub copy_destination: Option<String>,
+    pub copy_source_facts: Option<TaskPathFactsVm>,
+    pub copy_destination_facts: Option<TaskPathFactsVm>,
     pub replace_existing: bool,
     pub prune_destination: bool,
     pub refresh_missing: bool,
@@ -521,6 +563,11 @@ pub struct TasksLedgerVm {
     pub resolved_profile_name: Option<String>,
     pub root: Option<String>,
     pub subfolder: String,
+    #[ts(type = "\"folder-file\" | \"default\" | \"none\"")]
+    pub subfolder_source: String,
+    pub writable: bool,
+    pub exists: bool,
+    pub notice: Option<String>,
 }
 
 /// Exactly the facts [`task_host`] needs, borrowed.
@@ -1392,6 +1439,25 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn copy_path_facts_match_segments_case_and_nested_drives() {
+        let profiles = [
+            ("outer", "Disk", "/Volumes/merope"),
+            ("inner", "Photos", "/Volumes/merope/Photos"),
+        ];
+        let facts = path_facts("/volumes/MEROPE/photos/x", profiles, false);
+        assert_eq!(facts.drive_id.as_deref(), Some("inner"));
+        assert_eq!(facts.drive.as_deref(), Some("Photos"));
+        assert!(!facts.exists);
+        assert_eq!(
+            path_facts("/Volumes/merope/Photos2", profiles, true)
+                .drive_id
+                .as_deref(),
+            Some("outer")
+        );
+        assert_eq!(path_facts("/tmp/x", profiles, false).drive_id, None);
+    }
 
     /// A scheduled, enabled, host-wide task — the shape every gate is measured
     /// against, mutated per test by struct update.

@@ -222,6 +222,8 @@ pub struct SyncProfileVm {
     /// rather than `notes_subfolder` — the form prefills from the value that
     /// would actually be used, and `60-sessions` is spelled once, in Rust.
     pub sessions_subfolder: String,
+    pub tasks: bool,
+    pub tasks_subfolder: String,
     /// The canonical camelCase profile keys a `.keeper/keeper.toml` layer
     /// currently sets for this folder, sorted (Story 56.12).
     ///
@@ -281,6 +283,11 @@ impl From<&SyncProfile> for SyncProfileVm {
             sessions_subfolder: p.sessions.as_ref().map_or_else(
                 || DEFAULT_SESSIONS_SUBFOLDER.to_owned(),
                 |sessions| sessions.subfolder.clone(),
+            ),
+            tasks: p.tasks.is_some(),
+            tasks_subfolder: p.tasks.as_ref().map_or_else(
+                || keeper_sync::profile::DEFAULT_TASKS_SUBFOLDER.to_owned(),
+                |tasks| tasks.subfolder.clone(),
             ),
             // Last, because it describes the fields above rather than adding
             // one: the set of keys a folder file has taken out of this
@@ -784,6 +791,10 @@ pub struct SyncProfileReq {
     /// name, and a silent correction would save against a folder nobody named.
     #[serde(default)]
     pub sessions_subfolder: Option<String>,
+    #[serde(default)]
+    pub tasks: Option<bool>,
+    #[serde(default)]
+    pub tasks_subfolder: Option<String>,
 }
 
 /// Mint an opaque, sortable, collision-free id.
@@ -1179,6 +1190,22 @@ fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncPr
                 (profile.sessions.as_mut(), sessions_subfolder(req))
             {
                 config.subfolder = subfolder;
+            }
+        }
+    }
+    match req.tasks {
+        Some(true) => {
+            let mut config = profile.tasks.clone().unwrap_or_default();
+            if let Some(subfolder) = &req.tasks_subfolder {
+                config.subfolder = subfolder.trim().to_owned();
+            }
+            profile.tasks = Some(config);
+        }
+        Some(false) => profile.tasks = None,
+        None => {
+            if let (Some(config), Some(subfolder)) = (profile.tasks.as_mut(), &req.tasks_subfolder)
+            {
+                config.subfolder = subfolder.trim().to_owned();
             }
         }
     }
@@ -1909,7 +1936,7 @@ fn task_vm(
     // which already has the engine and the profile list in hand — this function
     // reads a row and decides nothing about the filesystem.
     mark_ms: Option<i64>,
-    ledger_path: Option<String>,
+    paths: TaskPaths,
     daemon: DaemonPresence,
 ) -> TaskVm {
     let profile = row
@@ -1947,11 +1974,13 @@ fn task_vm(
         model: row.model.clone(),
         copy_source: row.copy_source.clone(),
         copy_destination: row.copy_destination.clone(),
+        copy_source_facts: paths.source,
+        copy_destination_facts: paths.destination,
         replace_existing: row.replace_existing,
         prune_destination: row.prune_destination,
         refresh_missing: row.refresh_missing,
         copy_lookback_ms: row.copy_lookback_ms,
-        ledger_path,
+        ledger_path: paths.ledger,
         // Read from the ledger folder's file names, not from a column: the
         // mark lives in the drive so it survives this machine's database
         // (Story 74.4, AD-252). `None` here means either "no ledger folder is
@@ -1964,6 +1993,36 @@ fn task_vm(
         updated_ms: row.updated_ms,
         last_run,
         host,
+    }
+}
+
+struct TaskPaths {
+    ledger: Option<String>,
+    source: Option<keeper_core::tasks::TaskPathFactsVm>,
+    destination: Option<keeper_core::tasks::TaskPathFactsVm>,
+}
+
+fn copy_path_facts(
+    row: &keeper_sync::db::TaskRow,
+    profiles: &[SyncProfile],
+    ledger: Option<String>,
+) -> TaskPaths {
+    let facts = |path: &str| {
+        keeper_core::tasks::path_facts(
+            path,
+            profiles.iter().filter_map(|profile| {
+                profile
+                    .local_path
+                    .to_str()
+                    .map(|root| (profile.id.as_str(), profile.name.as_str(), root))
+            }),
+            std::fs::symlink_metadata(path).is_ok(),
+        )
+    };
+    TaskPaths {
+        ledger,
+        source: row.copy_source.as_deref().map(facts),
+        destination: row.copy_destination.as_deref().map(facts),
     }
 }
 
@@ -2250,10 +2309,14 @@ pub async fn sync_tasks(state: tauri::State<'_, AppState>) -> Result<TaskListing
             &unreadable,
             last_run,
             mark_ms,
-            keeper_sync::engine::Engine::task_ledger_path_for(
+            copy_path_facts(
                 row,
                 &profiles,
-                ledger_profile.as_deref(),
+                keeper_sync::engine::Engine::task_ledger_path_for(
+                    row,
+                    &profiles,
+                    ledger_profile.as_deref(),
+                ),
             ),
             daemon,
         ));
@@ -2455,25 +2518,55 @@ pub async fn sync_tasks_ledger(
     state: tauri::State<'_, AppState>,
 ) -> Result<TasksLedgerVm, IpcError> {
     let engine = engine_of(&state)?;
+    ledger_vm(&engine, None)
+}
+
+fn ledger_vm(
+    engine: &keeper_sync::Engine,
+    notice: Option<String>,
+) -> Result<TasksLedgerVm, IpcError> {
     let chosen_profile_id = engine
         .ledger_profile()
         .map_err(|err| sync_ipc_error(&err))?;
     let resolved = engine.tasks_ledger().map_err(|err| sync_ipc_error(&err))?;
-    let (resolved_profile_id, resolved_profile_name, root, subfolder) = match resolved {
-        Some((profile, subfolder)) => {
-            let root = profile
-                .local_path
-                .join(&subfolder)
-                .to_string_lossy()
-                .into_owned();
-            (Some(profile.id), Some(profile.name), Some(root), subfolder)
-        }
-        None => (None, None, None, "tasks".to_owned()),
-    };
+    let (resolved_profile_id, resolved_profile_name, root, subfolder, source, writable) =
+        match resolved {
+            Some(resolution) => {
+                let profile = resolution.profile;
+                let root = profile
+                    .local_path
+                    .join(&resolution.subfolder)
+                    .to_string_lossy()
+                    .into_owned();
+                let writable = keeper_sync::profile::folder::tasks_key_writable(&profile);
+                (
+                    Some(profile.id),
+                    Some(profile.name),
+                    Some(root),
+                    resolution.subfolder,
+                    resolution.source,
+                    writable,
+                )
+            }
+            None => (
+                None,
+                None,
+                None,
+                keeper_sync::profile::DEFAULT_TASKS_SUBFOLDER.to_owned(),
+                "none",
+                false,
+            ),
+        };
     Ok(TasksLedgerVm {
         chosen_profile_id,
         resolved_profile_id,
         resolved_profile_name,
+        exists: root
+            .as_ref()
+            .is_some_and(|root| std::fs::symlink_metadata(root).is_ok()),
+        subfolder_source: source.to_owned(),
+        writable,
+        notice,
         root,
         subfolder,
     })
@@ -2483,8 +2576,29 @@ pub async fn sync_tasks_ledger(
 pub async fn sync_tasks_ledger_set(
     state: tauri::State<'_, AppState>,
     profile_id: Option<String>,
-) -> Result<(), IpcError> {
+    subfolder: Option<String>,
+) -> Result<TasksLedgerVm, IpcError> {
     let engine = engine_of(&state)?;
+    let chosen = profile_id
+        .as_ref()
+        .map(|id| {
+            engine
+                .list_profiles()
+                .map_err(|err| sync_ipc_error(&err))?
+                .into_iter()
+                .find(|profile| &profile.id == id)
+                .ok_or_else(|| sync_ipc_error(&SyncError::Config(format!("No such folder: {id}."))))
+        })
+        .transpose()?;
+    let subfolder =
+        subfolder.unwrap_or_else(|| keeper_sync::profile::DEFAULT_TASKS_SUBFOLDER.to_owned());
+    if let Some(profile) = &chosen {
+        let mut checked = profile.clone();
+        checked.tasks = Some(keeper_sync::profile::TasksConfig {
+            subfolder: subfolder.clone(),
+        });
+        checked.validate().map_err(|err| sync_ipc_error(&err))?;
+    }
     let dir = state
         .platform
         .data_dir()
@@ -2493,7 +2607,50 @@ pub async fn sync_tasks_ledger_set(
         .map_err(crate::ipc::to_ipc_error)?;
     engine
         .set_ledger_profile(profile_id)
-        .map_err(|err| sync_ipc_error(&err))
+        .map_err(|err| sync_ipc_error(&err))?;
+    let notice = chosen.as_ref().and_then(|profile| {
+        keeper_sync::profile::folder::write_tasks_key(profile, &subfolder).err()
+    });
+    ledger_vm(&engine, notice)
+}
+
+#[tauri::command]
+pub async fn sync_folder_tasks_flag(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+    subfolder: Option<String>,
+) -> Result<TasksLedgerVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let mut profile = engine
+        .list_profiles()
+        .map_err(|err| sync_ipc_error(&err))?
+        .into_iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| {
+            sync_ipc_error(&SyncError::Config(format!("No such folder: {profile_id}.")))
+        })?;
+    if subfolder.is_none()
+        && keeper_sync::profile::owned_fields(&profile)
+            .iter()
+            .any(|key| key == "tasks")
+    {
+        return Err(sync_ipc_error(&SyncError::Config(
+            "This folder's tasks flag is set in .keeper/keeper.toml. Remove it there to unflag the folder.".into(),
+        )));
+    }
+    profile.tasks = subfolder
+        .as_ref()
+        .map(|subfolder| keeper_sync::profile::TasksConfig {
+            subfolder: subfolder.clone(),
+        });
+    profile.validate().map_err(|err| sync_ipc_error(&err))?;
+    engine
+        .upsert_profile(&profile)
+        .map_err(|err| sync_ipc_error(&err))?;
+    let notice = subfolder.and_then(|subfolder| {
+        keeper_sync::profile::folder::write_tasks_key(&profile, &subfolder).err()
+    });
+    ledger_vm(&engine, notice)
 }
 
 /// Run one task now, recording it exactly as a scheduled run is recorded
@@ -2653,9 +2810,13 @@ pub async fn sync_task_save(
         &unreadable,
         last_run,
         mark_ms,
-        engine
-            .task_ledger_path(&id)
-            .map_err(|err| sync_ipc_error(&err))?,
+        copy_path_facts(
+            stored,
+            &profiles,
+            engine
+                .task_ledger_path(&id)
+                .map_err(|err| sync_ipc_error(&err))?,
+        ),
         daemon_presence_probe(app_dir).await,
     ))
 }
@@ -3478,6 +3639,7 @@ fn files_listing_vm(
             .recordings
             .as_ref()
             .map(|recordings| recordings.subfolder.as_str()),
+        tasks_subfolder: profile.tasks.as_ref().map(|tasks| tasks.subfolder.as_str()),
     };
     let (state, entries, detail, truncated) = match listing {
         browse::BrowseListing::Listed(dir) => {
@@ -5269,6 +5431,27 @@ pub fn tray_snapshot(app: &tauri::AppHandle) -> (keeper_sync::progress::TraySync
 mod tests {
     use super::*;
 
+    #[test]
+    fn tasks_flag_defaults_validates_and_preserves_absent_controls() {
+        let mut request = req();
+        request.tasks = Some(true);
+        let flagged = parse_req(&request, None).expect("flag");
+        assert_eq!(flagged.tasks.as_ref().expect("tasks").subfolder, "tasks");
+        let mut prior = flagged.clone();
+        prior.tasks.as_mut().expect("tasks").subfolder = "70-tasks".into();
+        assert_eq!(
+            parse_req(&req(), Some(&prior)).expect("preserved").tasks,
+            prior.tasks
+        );
+        request.tasks_subfolder = Some("/abs".into());
+        assert!(parse_req(&request, Some(&prior)).is_err());
+        request.tasks = Some(false);
+        request.tasks_subfolder = None;
+        assert!(parse_req(&request, Some(&prior))
+            .expect("unflag")
+            .tasks
+            .is_none());
+    }
     fn req() -> SyncProfileReq {
         SyncProfileReq {
             id: None,
@@ -5297,6 +5480,8 @@ mod tests {
             recordings_subfolder: None,
             sessions: None,
             sessions_subfolder: None,
+            tasks: None,
+            tasks_subfolder: None,
         }
     }
 
@@ -5306,7 +5491,7 @@ mod tests {
     /// struct: the bug is a lost KEY, and serde is what decides what a key is.
     ///
     /// A field the request has a slot for.
-    const EXPRESSED: [&str; 22] = [
+    const EXPRESSED: [&str; 23] = [
         "name",
         "localPath",
         "remoteUrl",
@@ -5333,6 +5518,7 @@ mod tests {
         // Expressed from birth (FR-222): the Sync form shipped its switch in the
         // same change that added the field, so it never had a PRESERVED phase.
         "sessions",
+        "tasks",
         // Moved out of PRESERVED by Story 56.12, in the shape the `recordings`
         // comment above records: the folder's Advanced settings now render all
         // three, so a save from the app expresses what it shows.
@@ -5366,24 +5552,13 @@ mod tests {
     /// configured where the repository can say it — `.keeper/keeper.toml`, which
     /// travels with the folder — rather than clicked per machine. A save from a
     /// form that has never shown the list must not be able to empty it.
-    const PRESERVED: [&str; 7] = [
+    const PRESERVED: [&str; 6] = [
         "id",
         "volumeId",
         "enabled",
         "lfsNever",
         "lfsPruneLocal",
         "regenerable",
-        // The task ledger's flag (Story 74.3, AD-251), preserved for exactly
-        // the reason `lfsNever` is: no form shows it yet, so no request may
-        // express it, and `parse_req` keeps it because it starts from
-        // `prior.clone()`. It is set today by editing the folder's own
-        // `.keeper/keeper.toml`, which is also where it travels from — and the
-        // rule this list encodes is what stops a save from a form that has
-        // never shown the flag from silently clearing it, which would make
-        // every copy task on that folder stop marking how far it got. It moves
-        // to EXPRESSED in the same change that adds the control (DW-258), the
-        // way `recordings` did in Story 41.7.
-        "tasks",
     ];
 
     fn json_fields(profile: &SyncProfile) -> serde_json::Map<String, serde_json::Value> {
@@ -5502,11 +5677,7 @@ mod tests {
         prior.volume_id = Some("01VOLUME".into());
         prior.lfs_never = vec!["*.psd".into()];
         prior.regenerable = vec!["index.md".into()];
-        // The task ledger's flag, which no form expresses yet (Story 74.3): a
-        // fresh profile holds no ledger, so `Some(..)` here is a value a fresh
-        // one never has — which is what gives the preservation assertion teeth
-        // rather than letting it pass for both a save that kept the flag and a
-        // save that dropped it.
+        // The form can now move this flag, while an absent control preserves it.
         prior.tasks = Some(keeper_sync::profile::TasksConfig {
             subfolder: "70-tasks".into(),
         });
@@ -5568,6 +5739,8 @@ mod tests {
         // overlapping neither of the two subfolders above.
         edit.sessions = Some(true);
         edit.sessions_subfolder = Some("60-sessions".into());
+        edit.tasks = Some(true);
+        edit.tasks_subfolder = Some("tasks".into());
         // The three virtualization knobs (Story 56.12), each moved off `prior`'s
         // distinctive value AND off a fresh profile's, so the EXPRESSED
         // assertion cannot be satisfied by standing on either.
@@ -6206,7 +6379,7 @@ mod tests {
         }
         typed_command(|state| sync_task_run_log(state, 1, None, 4096));
         typed_command(sync_tasks_ledger);
-        typed_command(|state| sync_tasks_ledger_set(state, None));
+        typed_command(|state| sync_tasks_ledger_set(state, None, None));
 
         let error = SyncError::Config("The run has no ledger entry to read.".to_owned());
         let rejected = tauri::ipc::InvokeError::from(sync_ipc_error(&error));

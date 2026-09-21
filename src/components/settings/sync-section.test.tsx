@@ -144,6 +144,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     recordingsSubfolder: "recordings",
     sessions: false,
     sessionsSubfolder: "60-sessions",
+    tasks: false,
+    tasksSubfolder: "tasks",
     authorOverride: null,
     enabled: true,
     ...over,
@@ -678,6 +680,8 @@ describe("SyncSection add-profile form", () => {
         recordingsSubfolder: null,
         sessions: false,
         sessionsSubfolder: null,
+        tasks: false,
+        tasksSubfolder: null,
       }),
     );
     // Nothing was typed into the token field, so the keychain was left alone.

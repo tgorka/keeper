@@ -246,6 +246,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     recordingsSubfolder: "recordings",
     sessions: false,
     sessionsSubfolder: "60-sessions",
+    tasks: false,
+    tasksSubfolder: "tasks",
     authorOverride: null,
     enabled: true,
     ...over,

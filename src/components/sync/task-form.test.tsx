@@ -65,7 +65,6 @@ import {
   TASK_FORM_MISSED_DELAY_LABEL,
   TASK_FORM_MISSED_DELAY_NOT_A_NUMBER,
   TASK_FORM_MISSED_DELAY_NOTE,
-  TASK_FORM_MODE_LABEL,
   TASK_FORM_MODE_NOTE,
   TASK_FORM_ON_MISSED_LABEL,
   TASK_FORM_ON_MISSED_NOTE,
@@ -143,6 +142,8 @@ function taskVm(over: Partial<TaskVm> = {}): TaskVm {
     model: null,
     copySource: null,
     copyDestination: null,
+    copySourceFacts: null,
+    copyDestinationFacts: null,
     replaceExisting: false,
     pruneDestination: false,
     refreshMissing: true,
@@ -193,6 +194,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     recordingsSubfolder: "recordings",
     sessions: false,
     sessionsSubfolder: "60-sessions",
+    tasks: false,
+    tasksSubfolder: "tasks",
     authorOverride: null,
     enabled: true,
     ...over,
@@ -296,7 +299,7 @@ describe("TaskForm creation and new kinds", () => {
     const saved = vi.fn();
     render(<TaskForm onSaved={saved} />);
     fireEvent.change(screen.getByLabelText("Id"), { target: { value: "empty-schedule" } });
-    fireEvent.change(screen.getByLabelText("Mode"), { target: { value: "scheduled" } });
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(
@@ -524,6 +527,23 @@ describe("TaskForm creation and new kinds", () => {
     const [added] = mockSave.mock.calls[0] ?? [];
     expect(Object.keys(added ?? {}).filter((key) => key.startsWith("modified"))).toStrictEqual([]);
   });
+  it("keeps scheduling controls absent for manual and off, and restores the scheduled draft", async () => {
+    render(<TaskForm />);
+    expect(screen.getByRole("radio", { name: "manual" })).toBeChecked();
+    expect(screen.queryByLabelText(TASK_FORM_SCHEDULE_LABEL)).toBeNull();
+    expect(screen.queryByLabelText(TASK_FORM_SCHEDULE_OFFER_LABEL)).toBeNull();
+    expect(screen.queryByRole("radiogroup", { name: TASK_FORM_ON_MISSED_LABEL })).toBeNull();
+    expect(mockPreview).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
+    fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
+      target: { value: "0 3 * * *" },
+    });
+    fireEvent.click(screen.getByRole("radio", { name: "off" }));
+    expect(screen.queryByLabelText(TASK_FORM_SCHEDULE_LABEL)).toBeNull();
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
+    expect(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL)).toHaveValue("0 3 * * *");
+    await waitFor(() => expect(mockPreview).toHaveBeenCalledWith("0 3 * * *"));
+  });
 });
 
 describe("TaskForm, adding a task", () => {
@@ -543,9 +563,7 @@ describe("TaskForm, adding a task", () => {
     // Chosen rather than defaulted into, so the assertion below is about what
     // the controls express and not about what the initial state happened to be.
     fireEvent.change(screen.getByLabelText(TASK_FORM_KIND_LABEL), { target: { value: "sync" } });
-    fireEvent.change(screen.getByLabelText(TASK_FORM_MODE_LABEL), {
-      target: { value: "scheduled" },
-    });
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
       target: { value: "@daily" },
     });
@@ -609,9 +627,7 @@ describe("TaskForm, adding a task", () => {
     });
     render(<TaskForm />);
     await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
-    fireEvent.change(screen.getByLabelText(TASK_FORM_MODE_LABEL), {
-      target: { value: "scheduled" },
-    });
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
 
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
 
@@ -639,6 +655,7 @@ describe("TaskForm, adding a task", () => {
     render(<TaskForm />);
     await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
 
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), { target: { value: "  " } });
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
 
@@ -692,10 +709,11 @@ describe("TaskForm, adding a task", () => {
     await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
 
     fireEvent.change(screen.getByLabelText(TASK_FORM_ID_LABEL), { target: { value: "nightly" } });
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
       target: { value: "0 3 * * *" },
     });
-    fireEvent.change(screen.getByLabelText(TASK_FORM_MODE_LABEL), { target: { value: "manual" } });
+    fireEvent.click(screen.getByRole("radio", { name: "manual" }));
     fireEvent.click(screen.getByLabelText(TASK_FORM_ENABLED_LABEL));
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
 
@@ -705,8 +723,11 @@ describe("TaskForm, adding a task", () => {
     // Nothing typed is lost to a refusal, and no surface hides the form out from
     // under the sentence that says what to fix.
     expect(screen.getByLabelText(TASK_FORM_ID_LABEL)).toHaveValue("nightly");
+    expect(screen.queryByLabelText(TASK_FORM_SCHEDULE_LABEL)).toBeNull();
+    expect(screen.getByRole("radio", { name: "manual" })).toBeChecked();
+    expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ schedule: "0 3 * * *" }));
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     expect(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL)).toHaveValue("0 3 * * *");
-    expect(screen.getByLabelText(TASK_FORM_MODE_LABEL)).toHaveValue("manual");
     expect(screen.getByLabelText(TASK_FORM_ENABLED_LABEL)).toHaveAttribute(
       "data-state",
       "unchecked",
@@ -741,6 +762,7 @@ describe("TaskForm, adding a task", () => {
       const view = render(<TaskForm />);
       await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
 
+      fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
       fireEvent.change(screen.getByLabelText(field), { target: { value: typed } });
       fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
 
@@ -794,6 +816,7 @@ describe("TaskForm, adding a task", () => {
     ).toBeInTheDocument();
     // Non-fatal: host-wide is still offered and the form still saves.
     expect(screen.getByText(TASK_HOST_WIDE_TEXT)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
       target: { value: "@daily" },
     });
@@ -830,18 +853,18 @@ describe("TaskForm, editing a task", () => {
     expect(screen.getByLabelText(TASK_FORM_ID_LABEL)).toHaveValue("01SCHED");
     expect(screen.getByLabelText(TASK_FORM_ID_LABEL)).toHaveAttribute("readonly");
     expect(screen.getByLabelText(TASK_FORM_KIND_LABEL)).toHaveValue("release");
-    expect(screen.getByLabelText(TASK_FORM_MODE_LABEL)).toHaveValue("manual");
+    expect(screen.getByRole("radio", { name: "manual" })).toBeChecked();
     expect(screen.getByLabelText(TASK_FORM_ENABLED_LABEL)).toHaveAttribute(
       "data-state",
       "unchecked",
     );
-    expect(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL)).toHaveValue("0 3 * * *");
+    expect(screen.queryByLabelText(TASK_FORM_SCHEDULE_LABEL)).toBeNull();
     await waitFor(() =>
       expect(screen.getByLabelText(TASK_FORM_PROFILE_LABEL)).toHaveValue("01FOLDER"),
     );
 
-    fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
-      target: { value: "@weekly" },
+    fireEvent.change(screen.getByLabelText(TASK_FORM_DESCRIPTION_LABEL), {
+      target: { value: "Nightly archive" },
     });
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
 
@@ -856,8 +879,8 @@ describe("TaskForm, editing a task", () => {
           mode: "manual",
           enabled: false,
           profileId: "01FOLDER",
-          schedule: "@weekly",
-          description: null,
+          schedule: "0 3 * * *",
+          description: "Nightly archive",
           onMissed: "run_now",
           // Absent on the stored row, and this edit touched nothing about it.
           missedDelayMs: null,
@@ -1002,6 +1025,7 @@ describe("TaskForm, which kind of task this is", () => {
     await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
 
     fireEvent.change(screen.getByLabelText(TASK_FORM_KIND_LABEL), { target: { value: "verify" } });
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
       target: { value: "@daily" },
     });
@@ -1038,6 +1062,7 @@ describe("TaskForm, which kind of task this is", () => {
     await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
 
     fireEvent.change(screen.getByLabelText(TASK_FORM_KIND_LABEL), { target: { value: "release" } });
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
       target: { value: "@daily" },
     });
@@ -1124,13 +1149,9 @@ describe("TaskForm, the missed-window policy", () => {
     render(<TaskForm task={stored} />);
     await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
 
-    const picker = screen.getByLabelText(TASK_FORM_ON_MISSED_LABEL);
-    expect(picker).toHaveValue("run_now");
-    expect(
-      Array.from(picker.querySelectorAll("option")).map((option) => option.getAttribute("value")),
-    ).toEqual(["run_now", "delay", "skip"]);
-
-    fireEvent.change(picker, { target: { value: "skip" } });
+    expect(screen.getByRole("radio", { name: "run_now" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: "delay" })).not.toBeChecked();
+    fireEvent.click(screen.getByRole("radio", { name: "skip" }));
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
 
     await waitFor(() =>
@@ -1148,7 +1169,7 @@ describe("TaskForm, the missed-window policy", () => {
     render(<TaskForm task={taskVm({ onMissed: "delay" })} />);
     await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
 
-    expect(screen.getByLabelText(TASK_FORM_ON_MISSED_LABEL)).toHaveValue("delay");
+    expect(screen.getByRole("radio", { name: "delay" })).toBeChecked();
 
     fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
       target: { value: "@weekly" },
@@ -1204,9 +1225,7 @@ describe("TaskForm, how long the delay is", () => {
 
     expect(screen.queryByLabelText(TASK_FORM_MISSED_DELAY_LABEL)).toBeNull();
 
-    fireEvent.change(screen.getByLabelText(TASK_FORM_ON_MISSED_LABEL), {
-      target: { value: "delay" },
-    });
+    fireEvent.click(screen.getByRole("radio", { name: "delay" }));
     const box = screen.getByLabelText(TASK_FORM_MISSED_DELAY_LABEL);
     expect(box).toHaveValue("");
     expect(screen.getByRole("button", { name: TASK_FORM_MISSED_DELAY_NOTE })).toBeInTheDocument();
@@ -1216,9 +1235,7 @@ describe("TaskForm, how long the delay is", () => {
     // incoherent one whatever the policy is, so a hidden non-empty box could
     // refuse a save with its cause off screen.
     fireEvent.change(box, { target: { value: "240" } });
-    fireEvent.change(screen.getByLabelText(TASK_FORM_ON_MISSED_LABEL), {
-      target: { value: "skip" },
-    });
+    fireEvent.click(screen.getByRole("radio", { name: "skip" }));
     expect(screen.getByLabelText(TASK_FORM_MISSED_DELAY_LABEL)).toHaveValue("240");
   });
 
@@ -1411,24 +1428,6 @@ describe("TaskForm, the task's description", () => {
       "the one that backs up the photos",
     );
   });
-
-  it("tells the reader why this is the only name they can ever change", async () => {
-    // The note carries a fact about the *id*, and it is the reason the field
-    // exists: an add form sends `""` to have Rust mint a ULID, and an edit form
-    // cannot change an id at all because `task_runs.task_id` joins on it. A
-    // reader who does not know that keeps hunting for an editable name. Asserted
-    // against the id notes rather than against a copy of the sentence, so the
-    // two cannot come to disagree about which one is frozen.
-    render(<TaskForm />);
-    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
-
-    expect(screen.getByRole("button", { name: TASK_FORM_DESCRIPTION_NOTE })).toBeInTheDocument();
-    expect(TASK_FORM_DESCRIPTION_NOTE).toContain("the only name of this task you can ever change");
-    expect(TASK_FORM_DESCRIPTION_NOTE).toContain("sent exactly as typed");
-    // The two rules it is quoting, each stated where it is actually enforced.
-    expect(TASK_FORM_ID_ADD_NOTE).toContain("Leave it blank and keeper mints one");
-    expect(TASK_FORM_ID_EDIT_NOTE).toContain("The id cannot change");
-  });
 });
 
 /**
@@ -1454,6 +1453,7 @@ describe("TaskForm, the task's description", () => {
 describe("TaskForm, help for writing a schedule", () => {
   it("offers every form the dialect accepts, expression first", async () => {
     render(<TaskForm />);
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     const menu = await screen.findByLabelText(TASK_FORM_SCHEDULE_OFFER_LABEL);
 
     // The option list is the offered list, in order, and each option leads with
@@ -1478,6 +1478,7 @@ describe("TaskForm, help for writing a schedule", () => {
 
   it("types the chosen form into the box and keeps claiming nothing itself", async () => {
     render(<TaskForm />);
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     const menu = await screen.findByLabelText(TASK_FORM_SCHEDULE_OFFER_LABEL);
     const box = screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL);
     const chosen = TASK_SCHEDULE_OFFERS[2];
@@ -1497,6 +1498,7 @@ describe("TaskForm, help for writing a schedule", () => {
     const onSaved = vi.fn();
     mockSave.mockResolvedValue(taskVm());
     render(<TaskForm onSaved={onSaved} />);
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     const menu = await screen.findByLabelText(TASK_FORM_SCHEDULE_OFFER_LABEL);
 
     fireEvent.change(menu, { target: { value: "@daily" } });
@@ -1523,6 +1525,7 @@ describe("TaskForm, help for writing a schedule", () => {
     const instants = [NOW + 61_000, NOW + 987_654, NOW + 3_600_000];
     mockPreview.mockResolvedValue(previewVm({ expression: "0 3 * * *", instants }));
     render(<TaskForm />);
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
 
     fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
       target: { value: "0 3 * * *" },
@@ -1557,6 +1560,7 @@ describe("TaskForm, help for writing a schedule", () => {
     mockPreview.mockResolvedValue(previewVm({ expression: "0 0 30 2 *", refusal }));
     mockSave.mockResolvedValue(taskVm());
     render(<TaskForm />);
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     const box = screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL);
 
     fireEvent.change(box, { target: { value: "0 0 30 2 *" } });
@@ -1585,6 +1589,7 @@ describe("TaskForm, help for writing a schedule", () => {
 
   it("asks nothing about an empty box, because empty is a choice", async () => {
     render(<TaskForm />);
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     await screen.findByLabelText(TASK_FORM_SCHEDULE_OFFER_LABEL);
 
     expect(mockPreview).not.toHaveBeenCalled();
@@ -1618,6 +1623,7 @@ describe("TaskForm, help for writing a schedule", () => {
         }),
     );
     render(<TaskForm />);
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     const box = screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL);
 
     // (1) THE ALREADY-ANSWERED PREVIOUS EXPRESSION. `@daily`'s answer has landed
@@ -1690,6 +1696,7 @@ describe("TaskForm, help for writing a schedule", () => {
       retriable: false,
     });
     render(<TaskForm />);
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
       target: { value: "@daily" },
     });
@@ -1728,6 +1735,7 @@ describe("TaskForm, help for writing a schedule", () => {
       }),
     );
     render(<TaskForm />);
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
       target: { value: "@daily" },
     });
@@ -1750,6 +1758,7 @@ describe("TaskForm, help for writing a schedule", () => {
         }),
     );
     render(<TaskForm />);
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     const menu = await screen.findByLabelText(TASK_FORM_SCHEDULE_OFFER_LABEL);
     expect(menu).toBeEnabled();
 
@@ -1863,11 +1872,10 @@ wording needs rewriting rather than this regex widening`,
     // second one is new.
     mockProfiles.mockResolvedValue([]);
     render(<TaskForm onSaved={vi.fn()} />);
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     expect(screen.getByRole("button", { name: TASK_FORM_ON_MISSED_NOTE })).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText(TASK_FORM_ON_MISSED_LABEL), {
-      target: { value: "delay" },
-    });
+    fireEvent.click(screen.getByRole("radio", { name: "delay" }));
     fireEvent.change(screen.getByLabelText(TASK_FORM_MISSED_DELAY_LABEL), {
       target: { value: "240" },
     });
@@ -1986,6 +1994,7 @@ wording needs rewriting rather than this regex widening`,
 
   it("is the sentence the form actually renders", async () => {
     render(<TaskForm />);
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     // Reachable through the schedule box's hint, which carries the dialect and
     // its bounds as one sentence: what may be typed and what is refused at
     // either end are one question, and two hovers would make somebody find the
@@ -2031,6 +2040,7 @@ describe("TaskForm, the standing prose is beside its label rather than under it"
 
   it.each(MOVED)("keeps %s reachable without standing in the flow", async (_what, prose) => {
     render(<TaskForm />);
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     // Reachable: the hint's accessible name, because the tooltip body is not in
     // the tree until a pointer arrives — the name is what a screen reader reads
     // and the only thing a test can hold the sentence by.

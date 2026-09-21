@@ -779,8 +779,12 @@ function useNoteTitle(
  *  ({@link useNoteTitle}): "Note" over a strip standing beside three other
  *  panels answers the question a name is asked.
  *
- *  A run carries both ids, so its heading remains stable before reads arrive. */
-function panelName(target: PanelTargetVm | null, noteTitle: string | null): string {
+ *  A run uses the task's name once resolved, with its immutable id as fallback. */
+function panelName(
+  target: PanelTargetVm | null,
+  noteTitle: string | null,
+  task: TaskVm | null,
+): string {
   if (target === null) {
     return "Panel";
   }
@@ -792,7 +796,7 @@ function panelName(target: PanelTargetVm | null, noteTitle: string | null): stri
     case "recording":
       return "Recording";
     case "run":
-      return `Run ${target.runId} · ${target.taskId}`;
+      return `Run ${target.runId} · ${task?.description?.trim() ? task.description : target.taskId}`;
   }
 }
 
@@ -885,7 +889,11 @@ function PanelFrame({
     panel.target?.kind === "note" ? panel.target.noteId : null,
     panel.folded,
   );
-  const name = panelName(panel.target, noteTitle);
+  const name = panelName(
+    panel.target,
+    noteTitle,
+    runResolution?.status === "resolved" ? runResolution.task : null,
+  );
   const FoldGlyph = panel.folded ? FOLD_STRIP.unfoldIcon : FOLD_STRIP.foldIcon;
   // Folded, the tooltip and the accessible name are ONE string and it carries
   // the panel's name, because a folded panel has nothing else on screen: a

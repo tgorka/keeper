@@ -220,8 +220,6 @@ const SPACES = [
 ].map(([id, name, query, icon, defaultKey]) => ({
   id,
   name,
-  vaultId: "v1",
-  vaultName: "tgdrive",
   updatedMs: null,
   query,
   icon,
@@ -235,15 +233,6 @@ const SPACES = [
   error: null,
   warnings: [],
 }));
-
-/**
- * The rail envelope the shell answers with since epic 79: the rows, plus the
- * drives they came from, so a multi-drive rail has something to group by.
- */
-const SPACE_RAIL = {
-  rows: SPACES,
-  vaults: [{ vaultId: "v1", vaultName: "tgdrive", available: true, reason: "" }],
-};
 
 const TAGS = [
   ["epic22", 1],
@@ -1240,7 +1229,7 @@ const ANSWERS: Record<string, unknown> = {
   notes_service_file_names_get: ["index.md", "agents.md", "claude.md", "log.md"],
   notes_embedding_model_get: null,
   notes_note_marks: { rev: "mock", ranges: [] },
-  notes_spaces: SPACE_RAIL,
+  notes_spaces: SPACES,
   notes_tag_tree: { nodes: TAGS },
   notes_templates: [],
   notes_capture_impact: [],
@@ -1317,6 +1306,8 @@ const ANSWERS: Record<string, unknown> = {
       recordingsSubfolder: "recordings",
       sessions: true,
       sessionsSubfolder: "60-sessions",
+      tasks: true,
+      tasksSubfolder: "tasks",
       folderOwned: [],
     },
     {
@@ -1353,6 +1344,8 @@ const ANSWERS: Record<string, unknown> = {
       recordingsSubfolder: "recordings",
       sessions: false,
       sessionsSubfolder: "60-sessions",
+      tasks: false,
+      tasksSubfolder: "tasks",
       folderOwned: ["releaseTtlMs", "virtualOverBytes", "virtualPatterns"],
     },
     {
@@ -1391,6 +1384,8 @@ const ANSWERS: Record<string, unknown> = {
       recordingsSubfolder: "recordings",
       sessions: false,
       sessionsSubfolder: "60-sessions",
+      tasks: false,
+      tasksSubfolder: "tasks",
       folderOwned: [],
     },
   ] satisfies SyncProfileVm[],
@@ -1849,6 +1844,8 @@ const NO_KIND_PAYLOAD = {
   model: null,
   copySource: null,
   copyDestination: null,
+  copySourceFacts: null,
+  copyDestinationFacts: null,
   replaceExisting: false,
   pruneDestination: false,
   refreshMissing: true,
@@ -2030,6 +2027,39 @@ const TASKS: TaskVm[] = [
     // Off, and deliberately NOT unhosted: nothing is wrong with this row and
     // the user switched it off on purpose.
     host: { kind: "off", sentence: HOST_SENTENCES.off, reason: null },
+  },
+  {
+    ...NO_KIND_PAYLOAD,
+    id: "01JCOPYNOTESGGGGGGGGGGGGGG",
+    kind: "copy",
+    mode: "manual",
+    enabled: true,
+    profileId: null,
+    profile: null,
+    schedule: "@daily",
+    description: "copy notes to the light drive",
+    copySource: "/Volumes/merope/tgdrive/10-notes",
+    copyDestination: "/Volumes/merope/tgdrive-light/10-notes",
+    copySourceFacts: {
+      path: "/Volumes/merope/tgdrive/10-notes",
+      drive: "tgdrive",
+      driveId: "p1",
+      exists: true,
+    },
+    copyDestinationFacts: {
+      path: "/Volumes/merope/tgdrive-light/10-notes",
+      drive: "tgdrive-light",
+      driveId: "p3",
+      exists: true,
+    },
+    onMissed: "run_now",
+    missedDelayMs: null,
+    nextDueMs: null,
+    runningHost: null,
+    leaseUntilMs: null,
+    updatedMs: NOW - 9000,
+    lastRun: null,
+    host: { kind: "onRequest", sentence: HOST_SENTENCES.onRequest, reason: null },
   },
 ];
 

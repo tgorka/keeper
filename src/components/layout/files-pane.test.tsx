@@ -2218,13 +2218,15 @@ describe("FilesPane — what it is and how big", () => {
    * by anything this component could compute — the pane has no way to tell the
    * three apart other than the field, which is the property being pinned.
    */
-  it("marks the vault and the recordings folder from configuration, not from a name", async () => {
+  it("marks configured role folders rather than matching their names", async () => {
     await expandVault(
       [
         entry("Second Brain", "folder", "Second Brain", undefined, {
           folderRole: "notesVault",
         }),
         entry("Clips", "folder", "Clips", undefined, { folderRole: "recordings" }),
+        entry("Run records", "folder", "Run records", undefined, { folderRole: "tasks" }),
+        entry("tasks", "folder"),
         entry("10-notes", "folder"),
       ],
       {
@@ -2232,11 +2234,15 @@ describe("FilesPane — what it is and how big", () => {
         notesSubfolder: "Second Brain",
         recordings: true,
         recordingsSubfolder: "Clips",
+        tasks: true,
+        tasksSubfolder: "Run records",
       },
     );
 
     expect(glyphOf("Second Brain")).toBe("lucide-notebook-pen");
     expect(glyphOf("Clips")).toBe("lucide-clapperboard");
+    expect(glyphOf("Run records")).toBe("lucide-list-checks");
+    expect(glyphOf("tasks")).toBe("lucide-folder");
     // The decoy is an ordinary closed folder, glyph and all.
     expect(glyphOf("10-notes")).toBe("lucide-folder");
 
@@ -2245,6 +2251,7 @@ describe("FilesPane — what it is and how big", () => {
     // question everybody asks.
     expect(describedBySlot("Second Brain", FILES_ROLE_SLOT)).toBe("Your notes vault");
     expect(describedBySlot("Clips", FILES_ROLE_SLOT)).toBe("Where recordings are saved");
+    expect(describedBySlot("Run records", FILES_ROLE_SLOT)).toBe("Where task ledgers are written");
     expect(describedBySlot("10-notes", FILES_ROLE_SLOT)).toBeNull();
   });
 
