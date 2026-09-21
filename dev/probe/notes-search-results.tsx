@@ -60,6 +60,7 @@ const props = {
   onSelect: () => {},
   onSelectBeside: () => {},
   onToggleTag: () => {},
+  onSetTagTerm: () => {},
   onVerb: () => {},
 };
 ReactDOM.createRoot(root).render(

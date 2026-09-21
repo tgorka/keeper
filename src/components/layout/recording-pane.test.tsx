@@ -1134,6 +1134,8 @@ describe("RecordingPane — the way across to Notes (Story 45.19, FR-197)", () =
   const RECORDINGS_SPACE: NoteSpaceVm = {
     id: "spaces/2026-08-09-recordings.md",
     name: "Recordings",
+    vaultId: "v1",
+    vaultName: "Recordings vault",
     defaultKey: "recordings",
     query: "is:recording",
     sort: "modified desc",
@@ -1183,7 +1185,10 @@ describe("RecordingPane — the way across to Notes (Story 45.19, FR-197)", () =
       error: null,
     });
     vi.mocked(notesSpaces).mockReset();
-    vi.mocked(notesSpaces).mockResolvedValue([]);
+    vi.mocked(notesSpaces).mockResolvedValue({
+      rows: [],
+      vaults: [{ vaultId: "v1", vaultName: "Recordings vault", available: true, reason: "" }],
+    });
     vi.mocked(notesSpaceTouch).mockReset().mockResolvedValue(RECORDINGS_SPACE);
     primaryViewStore.getState().setView("recording");
     resetNotesFiltersStoreForTest();
@@ -1194,9 +1199,10 @@ describe("RecordingPane — the way across to Notes (Story 45.19, FR-197)", () =
   });
 
   it("offers the space, named as the user named it, and goes there", async () => {
-    vi.mocked(notesSpaces).mockResolvedValue([
-      { ...RECORDINGS_SPACE, name: "Sessions", leafName: "Sessions" },
-    ]);
+    vi.mocked(notesSpaces).mockResolvedValue({
+      rows: [{ ...RECORDINGS_SPACE, name: "Sessions", leafName: "Sessions" }],
+      vaults: [{ vaultId: "v1", vaultName: "Recordings vault", available: true, reason: "" }],
+    });
     render(<RecordingPane />);
 
     const button = await screen.findByTestId(RECORDINGS_SPACE_TESTID);
@@ -1223,10 +1229,13 @@ describe("RecordingPane — the way across to Notes (Story 45.19, FR-197)", () =
     // TWO spaces, and one of them is the user's own space NAMED "Recordings":
     // a link decided by name would light up here and take the user to somebody
     // else's saved query. The identity is `keeper.default`.
-    vi.mocked(notesSpaces).mockResolvedValue([
-      { ...RECORDINGS_SPACE, id: "spaces/inbox.md", name: "Inbox", defaultKey: "inbox" },
-      IMPOSTOR,
-    ]);
+    vi.mocked(notesSpaces).mockResolvedValue({
+      rows: [
+        { ...RECORDINGS_SPACE, id: "spaces/inbox.md", name: "Inbox", defaultKey: "inbox" },
+        IMPOSTOR,
+      ],
+      vaults: [{ vaultId: "v1", vaultName: "Recordings vault", available: true, reason: "" }],
+    });
     render(<RecordingPane />);
 
     await waitFor(() => expect(notesSpaces).toHaveBeenCalled());

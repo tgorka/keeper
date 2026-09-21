@@ -4153,6 +4153,8 @@ pub enum FilesFolderRoleVm {
     /// This folder is where the profile's recordings are written
     /// (`recordings.subfolder`).
     Recordings,
+    /// This folder holds task ledgers (`tasks.subfolder`).
+    Tasks,
 }
 
 /// The configured folder roles of one profile, as [`FilesEntryVm::new`] needs
@@ -4170,6 +4172,7 @@ pub struct FilesFolderRoles<'a> {
     /// The profile's `recordings.subfolder`, profile-relative, exactly as
     /// stored.
     pub recordings_subfolder: Option<&'a str>,
+    pub tasks_subfolder: Option<&'a str>,
 }
 
 impl FilesFolderRoles<'_> {
@@ -4205,6 +4208,8 @@ impl FilesFolderRoles<'_> {
             Some(FilesFolderRoleVm::NotesVault)
         } else if matches(self.recordings_subfolder) {
             Some(FilesFolderRoleVm::Recordings)
+        } else if matches(self.tasks_subfolder) {
+            Some(FilesFolderRoleVm::Tasks)
         } else {
             None
         }
@@ -4220,13 +4225,14 @@ impl FilesFolderRoles<'_> {
 /// vault, `NotesConfig::validate` refuses an empty subfolder, and returning
 /// `true` for it here would mark every entry of an empty-string listing.
 fn same_folder_path(left: &str, right: &str) -> bool {
-    let normalise = |path: &str| {
-        path.replace('\\', "/")
-            .trim_matches('/')
-            .to_ascii_lowercase()
-    };
-    let left = normalise(left);
-    !left.is_empty() && left == normalise(right)
+    let left = normalise_folder_path(left);
+    !left.is_empty() && left == normalise_folder_path(right)
+}
+
+pub(crate) fn normalise_folder_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_matches('/')
+        .to_ascii_lowercase()
 }
 
 /// Why one path's content is still on this computer, and until when (Story
@@ -10046,9 +10052,28 @@ mod tests {
     /// both real ones, so it fails on three assertions at once.
     #[test]
     fn the_vault_and_the_recordings_folder_come_from_configuration_not_from_a_name() {
+        let task_roles = FilesFolderRoles {
+            tasks_subfolder: Some("tasks"),
+            ..Default::default()
+        };
+        assert_eq!(
+            task_roles.role_of("tasks", true),
+            Some(FilesFolderRoleVm::Tasks)
+        );
+        assert_eq!(task_roles.role_of("tasks", false), None);
+        assert_eq!(FilesFolderRoles::default().role_of("tasks", true), None);
+        let shared = FilesFolderRoles {
+            notes_subfolder: Some("tasks"),
+            ..task_roles
+        };
+        assert_eq!(
+            shared.role_of("tasks", true),
+            Some(FilesFolderRoleVm::NotesVault)
+        );
         let roles = FilesFolderRoles {
             notes_subfolder: Some("Second Brain"),
             recordings_subfolder: Some("Clips"),
+            tasks_subfolder: Some("tasks"),
         };
         let role_of = |name: &str, is_dir: bool| {
             FilesEntryVm::new(FilesEntryFacts {
@@ -10119,6 +10144,7 @@ mod tests {
             FilesFolderRoles {
                 notes_subfolder: Some(configured),
                 recordings_subfolder: None,
+                tasks_subfolder: None,
             }
             .role_of(path, true)
         };

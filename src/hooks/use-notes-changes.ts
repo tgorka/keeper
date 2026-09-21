@@ -24,7 +24,7 @@ function queryKey(state: NotesFiltersState): string {
 async function readWindow(vaultId: string): Promise<NoteListVm> {
   const filters = notesFiltersStore.getState();
   if (isFolderScope(filters.scope)) {
-    const folder = await notesTree(vaultId, filters.scope.path);
+    const folder = await notesTree(filters.scope.vaultId, filters.scope.path);
     return {
       rows: folder.notes,
       total: folder.notes.length,
@@ -35,13 +35,19 @@ async function readWindow(vaultId: string): Promise<NoteListVm> {
       offset: 0,
     };
   }
-  return await notesList(vaultId, noteQueryFor(filters, 0, notesListStore.getState().limit));
+  return await notesList(
+    filters.scope.kind === "space" ? filters.scope.vaultId : vaultId,
+    noteQueryFor(filters, 0, notesListStore.getState().limit),
+  );
 }
 
 /** One Rust-composed page; every selected vault's stream invalidates that page. */
 export function useNotesChanges(vaultId: string | null, ready = true): void {
   const filterKey = useNotesFiltersStore(queryKey);
   const vaultKey = useNotesFiltersStore((state) => JSON.stringify(state.vaultIds));
+  const scopeVaultId = useNotesFiltersStore((state) =>
+    state.scope.kind === "all" ? null : state.scope.vaultId,
+  );
   const limit = useNotesListStore((state) => state.limit);
   const epoch = useRef(0);
   const refresh = useRef<(() => void) | null>(null);
@@ -91,14 +97,14 @@ export function useNotesChanges(vaultId: string | null, ready = true): void {
   useEffect(() => {
     if (!ready || vaultId === null) return;
     const selected: string[] = JSON.parse(vaultKey);
-    const ids = [...new Set([vaultId, ...selected])];
+    const ids = [...new Set([vaultId, ...selected, ...(scopeVaultId ? [scopeVaultId] : [])])];
     const subscriptions: string[] = [];
     let cancelled = false;
     for (const id of ids) {
       void notesSubscribeChanges(id, (batch) => {
         if (cancelled || batch.vaultId !== id) return;
-        if (id === vaultId) notesFiltersStore.getState().requestSpacesReload();
-        if (!selected.length || selected.includes(id)) refresh.current?.();
+        notesFiltersStore.getState().requestSpacesReload();
+        if (!selected.length || selected.includes(id) || id === scopeVaultId) refresh.current?.();
       })
         .then((subscription) => {
           if (cancelled) void notesUnsubscribeChanges(subscription);
@@ -112,5 +118,5 @@ export function useNotesChanges(vaultId: string | null, ready = true): void {
       cancelled = true;
       for (const subscription of subscriptions) void notesUnsubscribeChanges(subscription);
     };
-  }, [vaultId, vaultKey, ready]);
+  }, [vaultId, vaultKey, scopeVaultId, ready]);
 }

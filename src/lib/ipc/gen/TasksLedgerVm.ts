@@ -3,4 +3,4 @@
 /**
  * The chosen ledger folder and what the engine actually resolved.
  */
-export type TasksLedgerVm = { chosenProfileId: string | null, resolvedProfileId: string | null, resolvedProfileName: string | null, root: string | null, subfolder: string, };
+export type TasksLedgerVm = { chosenProfileId: string | null, resolvedProfileId: string | null, resolvedProfileName: string | null, root: string | null, subfolder: string, subfolderSource: "folder-file" | "default" | "none", writable: boolean, exists: boolean, notice: string | null, };

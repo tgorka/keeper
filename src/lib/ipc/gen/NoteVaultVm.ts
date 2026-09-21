@@ -26,7 +26,7 @@ name: string,
 /**
  * Vault subfolder inside the profile root, e.g. `notes`.
  */
-subfolder: string, 
+subfolder: string, spacesSubfolder: string, 
 /**
  * Absolute vault root, display-only — every command addresses notes by id or
  * vault-relative path, never by a path the webview composed.

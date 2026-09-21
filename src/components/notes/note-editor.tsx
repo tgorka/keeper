@@ -28,6 +28,7 @@
 import {
   ArrowLeft,
   ArrowRight,
+  ChevronDown,
   Files,
   FolderSearch,
   History,
@@ -49,7 +50,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { IconHint } from "@/components/ui/tooltip";
+import { HoverHint, IconHint } from "@/components/ui/tooltip";
 import { useNotesBody } from "@/hooks/use-notes-body";
 import {
   type NoteWriteVm,
@@ -1100,12 +1101,18 @@ export function NoteEditor({
         // the note lives — which is the same ruling `PaneHeader` makes one
         // level up about identity against the controls.
         identity={
-          <>
-            <h1 className="min-w-0 truncate font-heading text-title">{deriveTitle(body.text)}</h1>
-            <span className="min-w-0 flex-1 truncate font-mono text-meta text-muted-foreground">
-              {path ?? ""}
-            </span>
-          </>
+          <HoverHint label={deriveTitle(body.text)} detail={path ?? undefined}>
+            <fieldset
+              aria-label={deriveTitle(body.text)}
+              aria-description={path ?? undefined}
+              className="flex min-w-0 flex-1 items-center gap-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <h1 className="min-w-0 truncate font-heading text-title">{deriveTitle(body.text)}</h1>
+              <span className="min-w-0 flex-1 truncate font-mono text-meta text-muted-foreground">
+                {path ?? ""}
+              </span>
+            </fieldset>
+          </HoverHint>
         }
         // Group 2 — status. One box for all three captions, reserved from the
         // strings this machine's own clock produces, so a save cannot widen it.
@@ -1505,6 +1512,7 @@ function NavigationButton({
           <Button
             size="icon-sm"
             variant="ghost"
+            className="relative"
             aria-label={label}
             aria-keyshortcuts="Alt+ArrowLeft Alt+ArrowRight"
             disabled={disabled}
@@ -1516,6 +1524,16 @@ function NavigationButton({
               event.currentTarget.focus();
               clearHold();
               held.current = false;
+              const bounds = event.currentTarget.getBoundingClientRect();
+              if (
+                event.clientX >= bounds.right - 12 &&
+                event.clientY >= bounds.bottom - 12 &&
+                bounds.width > 0
+              ) {
+                held.current = true;
+                changeOpen(true);
+                return;
+              }
               holdTimer.current = window.setTimeout(() => {
                 held.current = true;
                 holdTimer.current = null;
@@ -1554,6 +1572,12 @@ function NavigationButton({
               <ArrowLeft aria-hidden="true" />
             ) : (
               <ArrowRight aria-hidden="true" />
+            )}
+            {!disabled && (
+              <ChevronDown
+                aria-hidden="true"
+                className="absolute right-0.5 bottom-0.5 size-2.5 text-muted-foreground"
+              />
             )}
           </Button>
         </DropdownMenuTrigger>

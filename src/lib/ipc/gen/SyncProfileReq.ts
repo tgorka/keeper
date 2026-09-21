@@ -123,4 +123,4 @@ sessions: boolean | null,
  * verbatim rule, not `notes_subfolder`'s tidying: the validator refuses by
  * name, and a silent correction would save against a folder nobody named.
  */
-sessionsSubfolder: string | null, };
+sessionsSubfolder: string | null, tasks: boolean | null, tasksSubfolder: string | null, };

@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TasksSection } from "@/components/settings/tasks-section";
-import type { IpcError, SyncProfileVm, TaskVm } from "@/lib/ipc/client";
+import type { IpcError, SyncProfileVm, TasksLedgerVm, TaskVm } from "@/lib/ipc/client";
 import { syncProfiles, syncTasks, syncTasksLedger, syncTasksLedgerSet } from "@/lib/ipc/client";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -11,12 +11,17 @@ vi.mock("@/lib/ipc/client", () => ({
   syncTasksLedgerSet: vi.fn(),
 }));
 
-const ledger = {
+const LEDGER_NOTICE = "Permission denied writing .keeper/keeper.toml";
+const ledger: TasksLedgerVm = {
   chosenProfileId: "missing",
   resolvedProfileId: "archive",
   resolvedProfileName: "Archive",
   root: "/archive/tasks",
   subfolder: "tasks",
+  subfolderSource: "default",
+  writable: false,
+  exists: false,
+  notice: LEDGER_NOTICE,
 };
 beforeEach(() => {
   vi.clearAllMocks();
@@ -35,13 +40,18 @@ beforeEach(() => {
       } as TaskVm,
     ],
   });
-  vi.mocked(syncTasksLedgerSet).mockResolvedValue(undefined);
+  vi.mocked(syncTasksLedgerSet).mockResolvedValue(ledger);
 });
 
 describe("Tasks settings", () => {
   it("displays engine resolution instead of claiming the unavailable choice is active", async () => {
     render(<TasksSection open />);
     expect(await screen.findByText("/archive/tasks")).toBeInTheDocument();
+    expect(screen.getByText(/Subfolder source: default/)).toHaveTextContent(
+      "Folder file writable: no",
+    );
+    expect(screen.getByText(/engine default keeps task logs/)).toBeInTheDocument();
+    expect(screen.getByText(LEDGER_NOTICE)).toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "Ledger folder" })).toHaveValue("missing");
     expect(screen.getByText(/chosen folder could not be honoured/)).toBeInTheDocument();
     expect(screen.getByText("/archive/tasks/copy")).toBeInTheDocument();
@@ -52,7 +62,7 @@ describe("Tasks settings", () => {
   it("acknowledges a saved choice only after the engine resolves it and refreshes task paths", async () => {
     render(<TasksSection open />);
     await screen.findByText("/archive/tasks");
-    vi.mocked(syncTasksLedger).mockResolvedValue({ ...ledger, chosenProfileId: "archive" });
+    vi.mocked(syncTasksLedgerSet).mockResolvedValue({ ...ledger, chosenProfileId: "archive" });
     vi.mocked(syncTasks).mockResolvedValue({
       unknown: [],
       tasks: [
@@ -67,7 +77,7 @@ describe("Tasks settings", () => {
     await act(async () =>
       fireEvent.change(screen.getByRole("combobox"), { target: { value: "archive" } }),
     );
-    expect(syncTasksLedgerSet).toHaveBeenCalledWith("archive");
+    expect(syncTasksLedgerSet).toHaveBeenCalledWith("archive", "tasks");
     expect(screen.getByRole("combobox")).toHaveValue("archive");
     expect(screen.getByText("/new-ledger/copy")).toBeInTheDocument();
     expect(screen.queryByText(/chosen folder could not be honoured/)).not.toBeInTheDocument();
@@ -100,5 +110,27 @@ describe("Tasks settings", () => {
     render(<TasksSection open />);
     expect(await screen.findByRole("alert")).toHaveTextContent("Task ledger is unavailable");
     expect(screen.queryByText("/archive/tasks")).toBeNull();
+  });
+
+  it("saves a chosen subfolder and displays the resolved path returned by the write", async () => {
+    vi.mocked(syncTasksLedger).mockResolvedValue({ ...ledger, chosenProfileId: "archive" });
+    render(<TasksSection open />);
+    await screen.findByText("/archive/tasks");
+    fireEvent.change(screen.getByLabelText("Task subfolder"), { target: { value: "run-records" } });
+    vi.mocked(syncTasksLedgerSet).mockResolvedValue({
+      ...ledger,
+      chosenProfileId: "archive",
+      subfolder: "run-records",
+      root: "/archive/run-records",
+      subfolderSource: "folder-file",
+      writable: true,
+      notice: null,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save subfolder" }));
+    expect(await screen.findByText("/archive/run-records")).toBeInTheDocument();
+    expect(syncTasksLedgerSet).toHaveBeenCalledWith("archive", "run-records");
+    expect(screen.getByText(/Subfolder source: folder-file/)).toHaveTextContent(
+      "Folder file writable: yes",
+    );
   });
 });

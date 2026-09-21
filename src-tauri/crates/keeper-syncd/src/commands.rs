@@ -4292,10 +4292,11 @@ fn cmd_tasks_ledger(
     }
     let chosen = engine.ledger_profile()?;
     let resolved = engine.tasks_ledger()?;
-    let root = resolved.as_ref().map(|(profile, subfolder)| {
-        profile
+    let root = resolved.as_ref().map(|resolution| {
+        resolution
+            .profile
             .local_path
-            .join(subfolder)
+            .join(&resolution.subfolder)
             .to_string_lossy()
             .into_owned()
     });
@@ -4305,7 +4306,8 @@ fn cmd_tasks_ledger(
     });
     printer.json(&serde_json::json!({
         "chosenProfileId": chosen,
-        "resolvedProfileId": resolved.as_ref().map(|(profile, _)| &profile.id),
+        "resolvedProfileId": resolved.as_ref().map(|resolution| &resolution.profile.id),
+        "subfolderSource": resolved.as_ref().map_or("none", |resolution| resolution.source),
         "root": root,
     }));
     Ok(EXIT_OK)

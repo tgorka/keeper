@@ -143,6 +143,7 @@ import type {
   TaskVm,
 } from "@/lib/ipc/client";
 import {
+  revealPath,
   syncPacedWork,
   syncProfiles,
   syncTaskForget,
@@ -154,6 +155,7 @@ import {
   syncTasksForget,
   syncTasksSetEnabled,
 } from "@/lib/ipc/client";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { resetColumnFoldForTest } from "@/lib/stores/column-fold";
 import { activePanel, panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import {
@@ -239,6 +241,8 @@ function task(over: Partial<TaskVm> = {}): TaskVm {
     model: null,
     copySource: null,
     copyDestination: null,
+    copySourceFacts: null,
+    copyDestinationFacts: null,
     replaceExisting: false,
     pruneDestination: false,
     refreshMissing: true,
@@ -342,6 +346,10 @@ function detailButton(name: string): HTMLElement {
 }
 
 beforeEach(() => {
+  capabilitiesStore
+    .getState()
+    .applySnapshot({ ...DEFAULT_CAPABILITIES, revealInFileManager: true });
+  vi.mocked(revealPath).mockResolvedValue(undefined);
   // Every form this pane reveals reads the folder list as it mounts, so a test
   // that opens one needs an answer here or the read never resolves.
   vi.mocked(syncProfiles).mockResolvedValue([]);
@@ -370,6 +378,77 @@ afterEach(() => {
 });
 
 describe("the Tasks pane", () => {
+  it("names both copy drives and reveals each existing path without claiming machine-wide scope", async () => {
+    const source = { path: "/photos/source", drive: "Photos", driveId: "photos", exists: true };
+    const destination = {
+      path: "/archive/backup",
+      drive: "Archive",
+      driveId: "archive",
+      exists: true,
+    };
+    answer(
+      listing({
+        tasks: [
+          task({
+            kind: "copy",
+            copySource: source.path,
+            copyDestination: destination.path,
+            copySourceFacts: source,
+            copyDestinationFacts: destination,
+          }),
+        ],
+      }),
+    );
+    render(<TasksPane />);
+    const detail = within(await screen.findByTestId(TASKS_DETAIL_TESTID));
+    expect(rowOption("01SCHED")).toHaveTextContent(
+      "/photos/source · Photos → /archive/backup · Archive",
+    );
+    expect(detail.queryByText(TASK_HOST_WIDE_TEXT)).toBeNull();
+    fireEvent.click(
+      detail.getByRole("button", { name: "Reveal in Finder: Source /photos/source" }),
+    );
+    await waitFor(() => expect(revealPath).toHaveBeenCalledWith(source.path));
+    fireEvent.click(
+      detail.getByRole("button", { name: "Reveal in Finder: Destination /archive/backup" }),
+    );
+    await waitFor(() => expect(revealPath).toHaveBeenCalledWith(destination.path));
+    fireEvent.contextMenu(rowOption("01SCHED"));
+    expect(screen.getByRole("menuitem", { name: "Reveal source in Finder" })).not.toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(
+      screen.getByRole("menuitem", { name: "Reveal destination in Finder" }),
+    ).not.toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("treats a missing copy destination as normal and reports an actual reveal failure", async () => {
+    answer(
+      listing({
+        tasks: [
+          task({
+            kind: "copy",
+            mode: "manual",
+            copySourceFacts: { path: "/source", drive: null, driveId: null, exists: true },
+            copyDestinationFacts: { path: "/new", drive: null, driveId: null, exists: false },
+          }),
+        ],
+      }),
+    );
+    render(<TasksPane />);
+    const detail = within(await screen.findByTestId(TASKS_DETAIL_TESTID));
+    expect(
+      detail.getByRole("button", { name: "Reveal in Finder: Destination /new" }),
+    ).toBeDisabled();
+    expect(detail.getByText("Not there yet — created by the first run")).toBeInTheDocument();
+    expect(detail.queryByRole("alert")).toBeNull();
+    expect(detail.queryByText(TASK_NEXT_DUE_LABEL)).toBeNull();
+    expect(detail.queryByText(TASK_SCHEDULE_LABEL)).toBeNull();
+    vi.mocked(revealPath).mockRejectedValueOnce(new Error("Finder unavailable"));
+    fireEvent.click(detail.getByRole("button", { name: "Reveal in Finder: Source /source" }));
+    expect(await detail.findByRole("alert")).toHaveTextContent("Finder unavailable");
+  });
   it("states, per row, the kind, schedule, host, next due, last run, outcome and report", async () => {
     answer(listing());
     render(<TasksPane />);
@@ -945,6 +1024,7 @@ describe("the Tasks pane creates, changes and forgets a task", () => {
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_TITLE }));
     await screen.findByRole("form", { name: TASK_FORM_ADD_TITLE });
 
+    fireEvent.click(screen.getByRole("radio", { name: "scheduled" }));
     fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
       target: { value: "@daily" },
     });
@@ -2520,10 +2600,7 @@ describe("the row says enough to act on", () => {
     }
   });
 
-  it("shows a task's own words when it has any, and nothing at all when it does not", async () => {
-    // `taskDescriptionText`'s rule, which is `taskReportText`'s: blank and
-    // absent are one rendered state — nothing — while the store keeps them
-    // apart. A heading over an empty string reads as a failed read.
+  it("titles tasks by their name and keeps the immutable id secondary", async () => {
     answer(
       listing({
         tasks: [
@@ -2536,11 +2613,6 @@ describe("the row says enough to act on", () => {
     render(<TasksPane />);
     await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(3));
 
-    // Story 59.1 re-sited the description under the name in the detail region —
-    // it is a sentence about the task rather than a scannable cell, and a 320px
-    // line cannot hold one. Each task is therefore chosen in turn, which is also
-    // what makes this three assertions about three tasks rather than three reads
-    // of whatever happened to be open.
     const descriptionOf = (id: string): HTMLElement | null => {
       selectRow(id);
       return within(screen.getByTestId(TASKS_DETAIL_TESTID)).queryByTestId(
@@ -2548,7 +2620,10 @@ describe("the row says enough to act on", () => {
       );
     };
 
-    expect(descriptionOf("01NAMED")).toHaveTextContent("the photos, nightly");
+    expect(descriptionOf("01NAMED")).toHaveTextContent("01NAMED");
+    expect(within(rowOption("01NAMED")).getByText("the photos, nightly")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "the photos, nightly" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Runs: the photos, nightly" })).toBeInTheDocument();
     // Asserted on the ELEMENT, not on its text. A text query cannot tell a
     // paragraph that was never rendered from one rendered around three spaces,
     // and that is the whole distinction here: mutating `taskDescriptionText` to

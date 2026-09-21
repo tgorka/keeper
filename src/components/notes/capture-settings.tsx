@@ -152,13 +152,14 @@ function CaptureSettingsForm({ vault }: { vault: NoteVaultVm }) {
   /**
    * Persist exactly one knob.
    *
-   * Every other field goes as `null` — "the caller did not express this" — so a
-   * template change cannot carry a half-typed tag with it, which is what a
-   * whole-form save would do (AD-34-9).
+   * Other editable fields go as `null` — "the caller did not express this" —
+   * while the spaces location is carried through unchanged. A template change
+   * cannot carry a half-typed tag with it (AD-34-9).
    */
   const save = (patch: Partial<NoteVaultSettingsReq>) => {
     const settings: NoteVaultSettingsReq = {
       subfolder: null,
+      spacesSubfolder: vault.spacesSubfolder,
       journalTemplate: null,
       defaultTemplate: null,
       captureTemplate: null,

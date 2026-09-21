@@ -1168,3 +1168,38 @@ invisibly, on whether a ledger folder was configured.
   `refresh_missing` costs more than the hashing (DW-274).
 - **Status / owner:** decided. Owner is the architect; Epic 78 implements it; NFR-77 and
   NFR-78 are the bars.
+
+## D-23 — keeper writes one key into a folder file, and a chosen drive is a ledger drive
+
+The folder tier (epic 46, AD-98…AD-101) was built read-only: a synced folder's own
+`.keeper/keeper.toml` is overlaid onto the stored profile at read time, the table never
+learns what the file said, and the file wins. Nothing in keeper wrote such a file. Epic 74
+put the task ledger's flag into that tier on purpose — a run recorded on one machine has
+to be readable on the other, so the folder has to be a fact both machines read — and
+epic 78 made the *choice* of drive machine-local. Between them, nothing set the flag, and
+the owner's chosen drive never held a log.
+
+- **What changes:** choosing a drive in Settings → Tasks writes `[folder.tasks]
+  subfolder = "…"` into that drive's `.keeper/keeper.toml` (creating it), and the engine
+  resolves an explicitly chosen drive with the default subfolder even when the key is
+  missing, so an unwritable file costs a sentence and never a ledger-less run. Tasks
+  joins notes, recordings and sessions in the folder form and the Files tree. (AD-297,
+  AD-298; FR-646…FR-652; NFR-85, NFR-87)
+- **The bounds on the write:** one block, keeper's own spelling, appended or replaced in
+  place; every other byte identical; the same value is not rewritten (the file syncs,
+  and a no-op rewrite is a commit); a file that does not parse, or spells the key
+  another way, is refused with a sentence and left alone; the result is re-parsed before
+  the rename. The reader is unchanged, so 0.8.31 reads what this build writes.
+- **What it is not:** a general settings writer for folder files, a rewrite of
+  hand-written keys, or a change to AD-98's rule that the file wins. The machine-local
+  choice stays machine-local; clearing it removes nothing from the file.
+- **What it amends:** AD-285's *"an unknown or unflagged choice costs nothing, never a
+  run"* now applies to an unknown choice only; an unflagged choice of a drive that exists
+  is honoured. Story 78.5's flagged-only picker is superseded by an every-drive picker
+  whose choice is what flags.
+- **Revisit triggers:** the daemon needing to read folder files (DW-279); a field-level
+  TOML edit being required in the field (DW-280); a second key wanting to travel the
+  same way (epic 79's spaces-folder setting names this writer; a table with more than
+  one field needs field-level editing first).
+- **Status / owner:** decided. Owner is the architect; Epic 80 implements it; NFR-85 is
+  the bar.

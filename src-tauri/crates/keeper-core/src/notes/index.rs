@@ -1214,12 +1214,25 @@ pub struct IndexCache {
     pub schema: u32,
     /// The vault this cache belongs to; a mismatch means discard.
     pub vault_id: String,
+    /// Required: pre-field caches cannot vouch for their parsed space flags.
+    pub spaces_prefix: String,
     /// When the cache was written, ms since the Unix epoch. Diagnostics only —
     /// freshness is decided per entry by the `(size, mtime_ns, ino)` triple, not
     /// by this.
     pub built_ms: i64,
     /// Every entry as of the write.
     pub entries: Vec<IndexEntry>,
+}
+
+impl IndexCache {
+    #[must_use]
+    pub fn adopt(bytes: &[u8], vault_id: &str, spaces_prefix: &str) -> Option<Vec<IndexEntry>> {
+        let cache: Self = serde_json::from_slice(bytes).ok()?;
+        (cache.schema == INDEX_SCHEMA
+            && cache.vault_id == vault_id
+            && cache.spaces_prefix == spaces_prefix)
+            .then_some(cache.entries)
+    }
 }
 
 #[cfg(test)]
@@ -1865,6 +1878,7 @@ And again, the same service: [[auth-service]]{ :depends_on }.\n";
         let cache = IndexCache {
             schema: INDEX_SCHEMA,
             vault_id: "v".to_owned(),
+            spaces_prefix: "spaces/".into(),
             built_ms: 1_700_000_000_000,
             entries: vec![entry("a", "a.md", "Ay")],
         };
@@ -1873,6 +1887,31 @@ And again, the same service: [[auth-service]]{ :depends_on }.\n";
         assert!(json.contains("\"mtimeNs\":1"), "json was: {json}");
         let back: IndexCache = serde_json::from_str(&json).expect("deserialize cache");
         assert_eq!(back.entries, cache.entries);
+    }
+
+    #[test]
+    fn notes_cache_discards_entries_parsed_under_another_spaces_prefix() {
+        let cache = IndexCache {
+            schema: INDEX_SCHEMA,
+            vault_id: "v".into(),
+            spaces_prefix: "spaces/".into(),
+            built_ms: 0,
+            entries: vec![entry("space", "spaces/a.md", "A")],
+        };
+        let bytes = serde_json::to_vec(&cache).expect("cache");
+        assert_eq!(
+            IndexCache::adopt(&bytes, "v", "spaces/").expect("same prefix"),
+            cache.entries
+        );
+        assert!(IndexCache::adopt(&bytes, "v", "saved-searches/").is_none());
+        let mut old = serde_json::to_value(cache).expect("cache");
+        old.as_object_mut().expect("object").remove("spacesPrefix");
+        assert!(IndexCache::adopt(
+            &serde_json::to_vec(&old).expect("old cache"),
+            "v",
+            "spaces/"
+        )
+        .is_none());
     }
 
     // -----------------------------------------------------------------------

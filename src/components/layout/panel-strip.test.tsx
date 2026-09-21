@@ -995,6 +995,19 @@ describe("a run in a panel", () => {
     expect(syncTaskRunLog).toHaveBeenCalledWith(42, null, 65_536);
   });
 
+  it("uses the resolved task name while keeping run lookup bound to its id", async () => {
+    syncTasks.mockResolvedValue({
+      tasks: [{ id: "archive", description: "Nightly photos" }],
+      unknown: [],
+    });
+    await mount();
+    expect(
+      await screen.findByRole("heading", { name: "Run 42 · Nightly photos" }),
+    ).toBeInTheDocument();
+    expect(syncTaskHistory).toHaveBeenCalledWith("archive");
+    expect(await screen.findByRole("region", { name: "Run log" })).toHaveTextContent("latest line");
+  });
+
   it("keeps the visible text anchored when an older chunk arrives", async () => {
     await mount();
     const viewport = await screen.findByRole("region", { name: "Run log" });

@@ -65,9 +65,20 @@ export function HoverHint({
     <TooltipProvider delayDuration={HOVER_HINT_DELAY_MS} skipDelayDuration={0}>
       <Tooltip delayDuration={HOVER_HINT_DELAY_MS}>
         <TooltipTrigger asChild>{children}</TooltipTrigger>
-        <TooltipContent side={side} className="max-w-xs flex-col items-start whitespace-normal">
-          <span className="w-full break-words [overflow-wrap:anywhere]">{label}</span>
-          {detail && <span className="line-clamp-3 w-full break-words">{detail}</span>}
+        <TooltipContent
+          side={side}
+          sideOffset={4}
+          collisionPadding={8}
+          className="max-w-[min(320px,calc(100vw-16px))] flex-col items-start gap-1 whitespace-normal text-xs leading-4"
+        >
+          <strong className="w-full break-words font-semibold [overflow-wrap:anywhere]">
+            {label}
+          </strong>
+          {detail && (
+            <span className="w-full break-words font-normal text-muted-foreground [overflow-wrap:anywhere]">
+              {detail}
+            </span>
+          )}
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>

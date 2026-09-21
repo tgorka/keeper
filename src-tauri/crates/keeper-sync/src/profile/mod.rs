@@ -284,6 +284,9 @@ pub struct NotesConfig {
     /// corrected.
     #[serde(default = "default_subfolder")]
     pub subfolder: String,
+    /// Vault-relative directory holding saved space notes.
+    #[serde(default = "default_spaces_subfolder")]
+    pub spaces_subfolder: String,
     /// Vault-relative path template for a day's journal entry.
     #[serde(default = "default_journal_template")]
     pub journal_template: String,
@@ -319,10 +322,15 @@ pub struct NotesConfig {
     pub cadence: NotesCadence,
 }
 
+fn default_spaces_subfolder() -> String {
+    "spaces".to_owned()
+}
+
 impl Default for NotesConfig {
     fn default() -> Self {
         Self {
             subfolder: DEFAULT_NOTES_SUBFOLDER.to_owned(),
+            spaces_subfolder: default_spaces_subfolder(),
             journal_template: DEFAULT_JOURNAL_TEMPLATE.to_owned(),
             default_template: None,
             capture_template: None,
@@ -384,6 +392,38 @@ impl NotesConfig {
             return Err(SyncError::Config(format!(
                 "notes subfolder must not name .obsidian; keeper never reads or writes an \
                  Obsidian configuration folder: {subfolder}"
+            )));
+        }
+        let spaces = self.spaces_subfolder.trim();
+        if spaces.is_empty() {
+            return Err(SyncError::Config(
+                "notes spaces subfolder must not be empty".into(),
+            ));
+        }
+        if Path::new(spaces).is_absolute()
+            || spaces.starts_with(['/', '\\'])
+            || spaces.as_bytes().get(1) == Some(&b':')
+        {
+            return Err(SyncError::Config(format!(
+                "notes spaces subfolder must be relative to the vault folder: {spaces}"
+            )));
+        }
+        if spaces.split(['/', '\\']).any(|part| part == "..") {
+            return Err(SyncError::Config(format!(
+                "notes spaces subfolder must not escape the vault folder: {spaces}"
+            )));
+        }
+        if spaces
+            .split(['/', '\\'])
+            .any(|part| part.eq_ignore_ascii_case(".obsidian"))
+        {
+            return Err(SyncError::Config(format!(
+                "notes spaces subfolder must not name .obsidian: {spaces}"
+            )));
+        }
+        if subfolders_overlap(spaces, "templates") || subfolders_overlap(spaces, "journal") {
+            return Err(SyncError::Config(format!(
+                "notes spaces subfolder must not overlap templates/ or journal/: {spaces}"
             )));
         }
         if self.cadence.commit_idle_ms < MIN_COMMIT_IDLE_MS {
@@ -2068,6 +2108,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn notes_spaces_subfolder_refuses_unsafe_or_overlapping_paths() {
+        for (bad, sentence) in [
+            ("", "must not be empty"),
+            ("/abs", "must be relative"),
+            ("C:\\spaces", "must be relative"),
+            ("a/../b", "must not escape"),
+            (".obsidian", "must not name .obsidian"),
+            ("templates", "must not overlap"),
+            ("journal/x", "must not overlap"),
+            (".", "must not overlap"),
+        ] {
+            let config = NotesConfig {
+                spaces_subfolder: bad.into(),
+                ..NotesConfig::default()
+            };
+            let error = config.validate().expect_err(bad).to_string();
+            assert!(
+                error.contains("notes spaces subfolder") && error.contains(sentence),
+                "{error}"
+            );
+        }
+        for good in ["saved-searches", "meta/spaces"] {
+            assert!(NotesConfig {
+                spaces_subfolder: good.into(),
+                ..NotesConfig::default()
+            }
+            .validate()
+            .is_ok());
+        }
+    }
+
     /// The floors REFUSE rather than clamp, unlike `poll_interval_ms`. Nothing
     /// can carry a below-floor cadence by accident — the field did not exist
     /// before this release and `#[serde(default)]` fills in a working one — so
@@ -2124,6 +2196,7 @@ mod tests {
         let sparse: NotesConfig = serde_json::from_str("{}").expect("parse");
         assert_eq!(sparse, NotesConfig::default());
         assert_eq!(sparse.subfolder, DEFAULT_NOTES_SUBFOLDER);
+        assert_eq!(sparse.spaces_subfolder, "spaces");
         assert_eq!(sparse.journal_template, DEFAULT_JOURNAL_TEMPLATE);
         assert_eq!(sparse.default_template, None);
         // Story 45.16. `None` here is not laziness: Inbox is `is:untagged`, so

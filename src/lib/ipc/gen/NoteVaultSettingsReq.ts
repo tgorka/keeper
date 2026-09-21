@@ -8,7 +8,7 @@ import type { NoteCadenceVm } from "./NoteCadenceVm";
  * reset it (AD-34-9): the request carries what the user changed, and everything
  * absent keeps the value already in force.
  */
-export type NoteVaultSettingsReq = { subfolder: string | null, journalTemplate: string | null, defaultTemplate: string | null, 
+export type NoteVaultSettingsReq = { subfolder: string | null, spacesSubfolder: string | null, journalTemplate: string | null, defaultTemplate: string | null, 
 /**
  * The template a quick capture starts from. An empty string clears it —
  * "the user chose no template" and "the user never touched the field" are

@@ -2223,9 +2223,27 @@ keeper-syncd tasks set backup --kind copy --copy-source /source \
 `keeper-syncd tasks ledger <SEL>` chooses a folder by id or unambiguous name;
 `keeper-syncd tasks ledger --none` clears that choice. The app's machine-local
 `tasks.ledger_vault` setting mirrors into the same engine selection. With no
-choice, or with a choice that is gone or no longer flagged for tasks, the engine
-uses the first flagged folder. Settings shows what actually resolved, not only
-what was chosen. Files stay under `<profile>/<tasks-subfolder>/<task-id>/<year>/`;
+choice, or with a choice that is gone, the engine uses the first flagged folder.
+An explicitly chosen existing drive needs no tasks key: its subfolder defaults
+to `tasks`, so the very next copy run writes a log even before any folder file
+has been written. Settings shows the resolved path, its existence, the flag's
+source and whether the folder file is editable.
+
+Choosing a drive in Settings writes a minimal `[folder.tasks]` block into
+`.keeper/keeper.toml`, creating it when absent. The subfolder is editable and
+validated against the other folder roles. An unchanged value costs no write;
+only keeper's marked block is replaced, with neighbouring bytes untouched.
+Hand-written task keys and malformed TOML are not rewritten. A write failure
+returns a sentence, while the machine-local choice continues to produce run
+logs using the resolved default when no tasks key exists. Clearing the choice
+does not remove the drive's flag or any log. The folder form also offers the
+tasks role; Files marks its configured folder, never a folder merely named
+`tasks`.
+
+The daemon honours the same database choice and reports `subfolderSource` in
+its JSON. It does not read or write folder files; custom folder-file subfolders
+still require the app's folder tier (DW-279).
+Files stay under `<profile>/<tasks-subfolder>/<task-id>/<year>/`;
 each task's `task.toml` records its configuration beside that history.
 
 ### The schedules offered on a desktop host

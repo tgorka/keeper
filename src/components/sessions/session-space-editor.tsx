@@ -57,12 +57,7 @@ import { Label } from "@/components/ui/label";
 import { spaceQueryText } from "@/hooks/use-notes-actions";
 import type { NoteSpaceFieldVm, SessionSpaceVm } from "@/lib/ipc/client";
 import { notesSpaceTerms, sessionsSpaceSave } from "@/lib/ipc/client";
-import {
-  nextTagChipState,
-  type TagChip,
-  tagChipState,
-  withTagTerm,
-} from "@/lib/stores/notes-filters";
+import { flipTagTerm, type TagChip, tagChipState, withTagTerm } from "@/lib/stores/notes-filters";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
@@ -817,13 +812,13 @@ export function SessionSpaceEditor({
                     <TagFilterChip
                       key={chip.tag}
                       chip={chip}
-                      onCycle={(tag) =>
+                      onToggleSign={(tag) =>
                         editDraft((draft) => ({
                           ...draft,
                           tags: withTagTerm(
                             draft.tags,
                             tag,
-                            nextTagChipState(tagChipState(draft.tags, tag)),
+                            flipTagTerm(tagChipState(draft.tags, tag)),
                           ),
                         }))
                       }

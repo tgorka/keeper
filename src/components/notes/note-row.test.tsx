@@ -63,7 +63,7 @@ function renderRow(order: NoteOrder) {
       canReveal={true}
       onSelect={vi.fn()}
       onSelectBeside={vi.fn()}
-      onToggleTag={vi.fn()}
+      onSetTagTerm={vi.fn()}
       onVerb={vi.fn()}
     />,
   );
@@ -139,7 +139,7 @@ function renderNoteRow(overrides: Partial<NoteRowVm> = {}): HTMLElement {
       canReveal={true}
       onSelect={vi.fn()}
       onSelectBeside={vi.fn()}
-      onToggleTag={vi.fn()}
+      onSetTagTerm={vi.fn()}
       onVerb={vi.fn()}
     />,
   );
@@ -157,7 +157,7 @@ it("reveals the complete truncated title and prose on focus, even when unread pr
   act(() => button.focus());
   const hint = screen.getByRole("tooltip");
   expect(hint).toHaveTextContent(title);
-  expect(within(hint).getByText(snippet)).toHaveClass("line-clamp-3");
+  expect(within(hint).getByText(snippet)).toBeInTheDocument();
   expect(hint.querySelector("b")).toBeNull();
 });
 
@@ -223,7 +223,7 @@ function renderForMenu(overrides: Partial<NoteRowVm> = {}, canReveal = true) {
       canReveal={canReveal}
       onSelect={onSelect}
       onSelectBeside={onSelectBeside}
-      onToggleTag={vi.fn()}
+      onSetTagTerm={vi.fn()}
       onVerb={onVerb}
     />,
   );
@@ -382,7 +382,7 @@ describe("search evidence", () => {
       canReveal: true,
       onSelect: vi.fn(),
       onSelectBeside: vi.fn(),
-      onToggleTag: vi.fn(),
+      onSetTagTerm: vi.fn(),
       onVerb: vi.fn(),
     };
     const note = row(
@@ -414,11 +414,40 @@ describe("search evidence", () => {
         canReveal={true}
         onSelect={vi.fn()}
         onSelectBeside={vi.fn()}
-        onToggleTag={vi.fn()}
+        onSetTagTerm={vi.fn()}
         onVerb={vi.fn()}
       />,
     );
     expect(screen.getByText("matched by meaning")).toBeInTheDocument();
     expect(container.querySelector("mark")).toBeNull();
   });
+});
+
+it("prefers unqueried tags in stable order and still exposes tags on search hits", () => {
+  const props = {
+    selected: false,
+    tabIndex: 0,
+    canReveal: true,
+    onSelect: vi.fn(),
+    onSelectBeside: vi.fn(),
+    onSetTagTerm: vi.fn(),
+    onVerb: vi.fn(),
+  };
+  const note = row(
+    { value: 0, source: "default" },
+    {
+      tags: ["work", "invoices", "urgent", "draft"],
+      hit: { snippet: "found", marks: [], why: "meaning", score: 1 },
+    },
+  );
+  const { rerender } = render(
+    <NoteRow {...props} row={note} tagTerms={[{ tag: "work", term: "include" }]} />,
+  );
+  expect(
+    screen.getAllByRole("button", { name: /^Tag .*on this note$/ }).map((item) => item.textContent),
+  ).toEqual(["invoices", "urgent", "draft"]);
+  rerender(<NoteRow {...props} row={note} tagTerms={[]} />);
+  expect(
+    screen.getAllByRole("button", { name: /^Tag .*on this note$/ }).map((item) => item.textContent),
+  ).toEqual(["work", "invoices", "urgent"]);
 });

@@ -67,8 +67,9 @@
  * accessibility regression.
  */
 import { AlertTriangle, Pin } from "lucide-react";
-import type { ReactNode, Ref } from "react";
+import { type ReactNode, type Ref, useRef, useState } from "react";
 import { NOTE_DELETE_LABEL } from "@/components/notes/note-actions";
+import { SignedPopover } from "@/components/notes/signed-popover";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -81,8 +82,9 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { HoverHint } from "@/components/ui/tooltip";
 import { useLongPress } from "@/hooks/use-long-press";
 import { formatDraftAge } from "@/lib/format-time";
-import type { NoteOrder, NoteRowVm } from "@/lib/ipc/client";
+import type { NoteOrder, NoteRowVm, NoteTagTerm } from "@/lib/ipc/client";
 import { markRuns } from "@/lib/mark-runs";
+import type { TagChip } from "@/lib/stores/notes-filters";
 import { cn } from "@/lib/utils";
 
 /** How many tag chips a row shows before it collapses the rest into `+n`. */
@@ -185,6 +187,51 @@ export const NOTE_ROW_REVEAL_LABEL = "Reveal in Finder";
 /** The row verbs the list binds to keys and the menu offers by name. */
 export type NoteRowVerb = "e" | "p" | "u" | "r" | "d";
 
+function RowTag({
+  tag,
+  tagTerms,
+  onSetTagTerm,
+}: {
+  tag: string;
+  tagTerms: readonly TagChip[];
+  onSetTagTerm: (tag: string, term: NoteTagTerm) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          ref={trigger}
+          type="button"
+          aria-label={`Tag ${tag}, on this note`}
+          className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-meta text-muted-foreground leading-none outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+          onClick={(event) => event.stopPropagation()}
+          onDoubleClick={(event) => event.stopPropagation()}
+        >
+          {tag}
+        </button>
+      </PopoverTrigger>
+      <SignedPopover
+        matches={[tag]}
+        chips={tagTerms}
+        onChoose={(chosen, term) => {
+          setOpen(false);
+          onSetTagTerm(chosen, term);
+        }}
+        onCloseAutoFocus={(event) => {
+          event.preventDefault();
+          if (trigger.current?.isConnected) trigger.current.focus();
+          else
+            document
+              .querySelector<HTMLTextAreaElement>('textarea[aria-label="Search notes"]')
+              ?.focus();
+        }}
+      />
+    </Popover>
+  );
+}
+
 export function NoteRow({
   row,
   selected,
@@ -192,7 +239,8 @@ export function NoteRow({
   canReveal,
   onSelect,
   onSelectBeside,
-  onToggleTag,
+  onSetTagTerm,
+  tagTerms = [],
   onVerb,
   ref,
 }: {
@@ -208,8 +256,9 @@ export function NoteRow({
   onSelect: (row: NoteRowVm) => void;
   /** Double click: open this note beside what is open (Story 46.12, AD-90). */
   onSelectBeside: (row: NoteRowVm) => void;
-  /** Clicking a tag chip filters by it; it never opens the note. */
-  onToggleTag: (tag: string) => void;
+  /** A tag proposes a signed filter; opening the proposal changes nothing. */
+  onSetTagTerm: (tag: string, term: NoteTagTerm) => void;
+  tagTerms?: readonly TagChip[];
   /**
    * The row's verbs, dispatched exactly as the list's keys dispatch them — one
    * handler, so a menu item and its keystroke cannot come to do different
@@ -223,9 +272,13 @@ export function NoteRow({
   // listening for. Off the phone tier every handler is a no-op.
   const longPress = useLongPress();
   const menuTarget = useMenuTarget();
-  const visibleTags = row.hit ? 0 : VISIBLE_TAGS;
-  const shownTags = row.tags.slice(0, visibleTags);
-  const hiddenTags = row.tags.slice(visibleTags);
+  const queried = new Set(tagTerms.map((chip) => chip.tag));
+  const tags = [
+    ...row.tags.filter((tag) => !queried.has(tag)),
+    ...row.tags.filter((tag) => queried.has(tag)),
+  ];
+  const shownTags = tags.slice(0, VISIBLE_TAGS);
+  const hiddenTags = tags.slice(VISIBLE_TAGS);
   const overflow = hiddenTags.length;
   // The accessible name puts state before content, but only where state changes
   // what the row MEANS — which for an unread, agent-touched note it does.
@@ -334,21 +387,7 @@ export function NoteRow({
                 : row.snippet}
           </span>
           {shownTags.map((tag) => (
-            // A real button, not a styled span: it changes what the list shows,
-            // so it has to be reachable and announce what it does.
-            <button
-              key={tag}
-              type="button"
-              aria-label={`Tag ${tag}, on this note`}
-              className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-meta text-muted-foreground leading-none outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
-              onClick={(event) => {
-                // The chip filters; the row opens. Without this the two fight.
-                event.stopPropagation();
-                onToggleTag(tag);
-              }}
-            >
-              {tag}
-            </button>
+            <RowTag key={tag} tag={tag} tagTerms={tagTerms} onSetTagTerm={onSetTagTerm} />
           ))}
           {overflow > 0 && (
             <Popover>
@@ -375,18 +414,7 @@ export function NoteRow({
                 <p className="font-medium text-muted-foreground text-xs">{NOTE_MORE_TAGS_LABEL}</p>
                 <span className="flex max-h-40 flex-wrap gap-1 overflow-y-auto">
                   {hiddenTags.map((tag) => (
-                    <button
-                      key={tag}
-                      type="button"
-                      aria-label={`Tag ${tag}, on this note`}
-                      className="rounded-full bg-muted px-1.5 py-0.5 text-meta text-muted-foreground leading-none outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        onToggleTag(tag);
-                      }}
-                    >
-                      {tag}
-                    </button>
+                    <RowTag key={tag} tag={tag} tagTerms={tagTerms} onSetTagTerm={onSetTagTerm} />
                   ))}
                 </span>
               </PopoverContent>

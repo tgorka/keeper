@@ -31,6 +31,7 @@
 import { ChevronDown, ChevronRight, Folder } from "lucide-react";
 import { useEffect, useState } from "react";
 import { FoldSection } from "@/components/layout/sidebar-group";
+import { DriveHeading } from "@/components/notes/space-list";
 import { notesTree } from "@/lib/ipc/client";
 import { notesFiltersStore, useNotesFiltersStore } from "@/lib/stores/notes-filters";
 import { notesRailFoldStore, useNotesRailFold } from "@/lib/stores/notes-rail-fold";
@@ -115,7 +116,7 @@ function FolderNode({
             "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
             active ? "bg-accent text-accent-foreground" : "hover:bg-accent/50",
           )}
-          onClick={() => notesFiltersStore.getState().setScope({ kind: "folder", path })}
+          onClick={() => notesFiltersStore.getState().setScope({ kind: "folder", vaultId, path })}
         >
           <Folder aria-hidden="true" className="size-3 shrink-0 text-muted-foreground" />
           <span className="min-w-0 truncate text-sm">{name}</span>
@@ -141,14 +142,22 @@ function FolderNode({
   );
 }
 
-export function PhysicalTree({ vaultId }: { vaultId: string | null }) {
+export function PhysicalTree({
+  vaultId,
+  driveName,
+}: {
+  vaultId: string | null;
+  driveName?: string;
+}) {
   // Story 47.3: the fold lives in the rail's cookie, not in this component. It
   // was a `useState` here, which meant the tree re-collapsed on every surface
   // switch — and it was the ONLY foldable thing in the whole notes rail, which
   // is how a rail with three sections shipped with one control.
   const folded = useNotesRailFold((state) => state.groups.files);
   const [dirs, setDirs] = useState<string[] | null>(null);
-  const activePath = useNotesFiltersStore((s) => (s.scope.kind === "folder" ? s.scope.path : null));
+  const activePath = useNotesFiltersStore((s) =>
+    s.scope.kind === "folder" && s.scope.vaultId === vaultId ? s.scope.path : null,
+  );
 
   // `vaultId` is the reason this effect exists, not a value it reads. Dropping it
   // leaves the previous vault's directory names under the new vault's heading, which
@@ -194,10 +203,11 @@ export function PhysicalTree({ vaultId }: { vaultId: string | null }) {
       icon={folded ? ChevronRight : ChevronDown}
       folded={folded}
       onToggle={() => notesRailFoldStore.getState().toggleGroup("files")}
-      id="notes-rail-files"
+      id={`notes-rail-files-${vaultId}`}
       className="shrink-0"
       bodyClassName="max-h-48 overflow-y-auto"
     >
+      {driveName && <DriveHeading name={driveName} />}
       {dirs !== null && (
         <div aria-label="Folder tree" role="tree">
           {dirs.map((dir, index) => (

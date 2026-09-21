@@ -1234,6 +1234,7 @@ pub fn run() {
                 sync_ipc::sync_task_run_log,
                 sync_ipc::sync_tasks_ledger,
                 sync_ipc::sync_tasks_ledger_set,
+                sync_ipc::sync_folder_tasks_flag,
                 sync_ipc::sync_task_run_now,
                 sync_ipc::sync_task_save,
                 sync_ipc::sync_task_forget,

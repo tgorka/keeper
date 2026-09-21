@@ -213,6 +213,8 @@ export type { NoteOrder } from "./gen/NoteOrder";
 export type { NoteOrderSource } from "./gen/NoteOrderSource";
 export type { NoteQueryCheckVm } from "./gen/NoteQueryCheckVm";
 export type { NoteQueryReq } from "./gen/NoteQueryReq";
+export type { NoteRailVaultVm } from "./gen/NoteRailVaultVm";
+export type { NoteRailVm } from "./gen/NoteRailVm";
 export type { NoteRefVm } from "./gen/NoteRefVm";
 export type { NoteRevisionVm } from "./gen/NoteRevisionVm";
 export type { NoteRowVm } from "./gen/NoteRowVm";
@@ -467,6 +469,7 @@ import type { NoteListVm } from "./gen/NoteListVm";
 import type { NoteMarksVm } from "./gen/NoteMarksVm";
 import type { NoteQueryCheckVm } from "./gen/NoteQueryCheckVm";
 import type { NoteQueryReq } from "./gen/NoteQueryReq";
+import type { NoteRailVm } from "./gen/NoteRailVm";
 import type { NoteRefVm } from "./gen/NoteRefVm";
 import type { NoteRevisionVm } from "./gen/NoteRevisionVm";
 import type { NoteRowVm } from "./gen/NoteRowVm";
@@ -4412,8 +4415,8 @@ export async function notesGallery(
  *
  * Rejects with: `unsupported`, `internal`.
  */
-export async function notesSpaces(vaultId: string): Promise<NoteSpaceVm[]> {
-  return await invoke<NoteSpaceVm[]>("notes_spaces", { vaultId });
+export async function notesSpaces(vaultId: string, vaultIds: string[] = []): Promise<NoteRailVm> {
+  return await invoke<NoteRailVm>("notes_spaces", { vaultId, vaultIds });
 }
 
 /**
@@ -6713,8 +6716,18 @@ export async function syncTasksLedger(): Promise<TasksLedgerVm> {
   return await invoke<TasksLedgerVm>("sync_tasks_ledger");
 }
 
-export async function syncTasksLedgerSet(profileId: string | null): Promise<void> {
-  await invoke("sync_tasks_ledger_set", { profileId });
+export async function syncTasksLedgerSet(
+  profileId: string | null,
+  subfolder?: string | null,
+): Promise<TasksLedgerVm> {
+  return await invoke<TasksLedgerVm>("sync_tasks_ledger_set", { profileId, subfolder });
+}
+
+export async function syncFolderTasksFlag(
+  profileId: string,
+  subfolder: string | null,
+): Promise<TasksLedgerVm> {
+  return await invoke<TasksLedgerVm>("sync_folder_tasks_flag", { profileId, subfolder });
 }
 
 /**

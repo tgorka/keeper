@@ -24,6 +24,8 @@ import { primaryViewStore } from "@/lib/stores/primary-view";
 const SPACE: NoteSpaceVm = {
   id: "recordings",
   name: "Recordings",
+  vaultId: "vault",
+  vaultName: "Recordings vault",
   defaultKey: RECORDINGS_SPACE_KEY,
   query: "is:recording",
   sort: "modified desc",

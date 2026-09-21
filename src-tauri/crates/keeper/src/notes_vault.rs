@@ -143,6 +143,14 @@ pub struct Vault {
 }
 
 impl Vault {
+    pub fn spaces_dir(&self) -> &str {
+        self.config.spaces_subfolder.trim().trim_end_matches('/')
+    }
+
+    pub fn spaces_prefix(&self) -> String {
+        format!("{}/", self.spaces_dir())
+    }
+
     /// The absolute path of a vault-relative note path.
     fn join(&self, rel: &str) -> PathBuf {
         self.root.join(rel)
@@ -294,7 +302,10 @@ pub fn refresh(app: &AppHandle) {
         match guard.get_mut(&vault.id) {
             // Same root: adopt the new configuration in place, so a settings
             // save does not throw away a warm index.
-            Some(slot) if slot.vault.root == vault.root => {
+            Some(slot)
+                if slot.vault.root == vault.root
+                    && slot.vault.spaces_dir() == vault.spaces_dir() =>
+            {
                 slot.vault.name = vault.name;
                 slot.vault.config = vault.config;
                 slot.vault.excludes = vault.excludes;
@@ -571,6 +582,7 @@ pub fn vault_vm(vault: &Vault, unread: u32) -> NoteVaultVm {
         profile_id: vault.id.clone(),
         name: vault.name.clone(),
         subfolder: vault.config.subfolder.clone(),
+        spaces_subfolder: vault.spaces_dir().to_owned(),
         root: vault.root.to_string_lossy().into_owned(),
         indexed: is_indexed(&vault.id),
         note_count: snapshot(&vault.id).map_or(0, |snapshot| {
@@ -1522,6 +1534,7 @@ async fn apply_batch(
         return Vec::new();
     }
     let now = now_ms();
+    let spaces_prefix = vault.spaces_prefix();
     let mut changed = false;
     let mut changes = Vec::new();
     for rel in batch {
@@ -1546,7 +1559,7 @@ async fn apply_batch(
                 let Some(text) = read_bounded(&absolute) else {
                     continue;
                 };
-                let entry = parse_note(rel, &stat, &text, now);
+                let entry = parse_note(rel, &stat, &text, now, &spaces_prefix);
                 if let Some(old) = state.entries.get(rel).filter(|old| old.id != entry.id) {
                     changes.push(SearchChange::Remove(old.id.clone()));
                 }
@@ -1820,7 +1833,7 @@ fn load_cache(vault: &Vault) -> Vec<IndexEntry> {
         // mount. Not an error; just a slower start.
         return Vec::new();
     };
-    adopt_cache(&bytes, &vault.id).unwrap_or_else(|| {
+    adopt_cache(&bytes, &vault.id, &vault.spaces_prefix()).unwrap_or_else(|| {
         tracing::info!(
             vault = %vault.id,
             "notes: index cache discarded; rescanning (deleting .keeper/index.json is a \
@@ -1836,12 +1849,8 @@ fn load_cache(vault: &Vault) -> Vec<IndexEntry> {
 /// A bad schema, a mismatched `vault_id` (a cache copied to another machine), a
 /// truncated file and a wrong-shaped document all take **exactly one branch** —
 /// discard and rescan. Never an error, never a user-visible failure (AD-57).
-fn adopt_cache(bytes: &[u8], vault_id: &str) -> Option<Vec<IndexEntry>> {
-    let cache: IndexCache = serde_json::from_slice(bytes).ok()?;
-    if cache.schema != INDEX_SCHEMA || cache.vault_id != vault_id {
-        return None;
-    }
-    Some(cache.entries)
+fn adopt_cache(bytes: &[u8], vault_id: &str, spaces_prefix: &str) -> Option<Vec<IndexEntry>> {
+    IndexCache::adopt(bytes, vault_id, spaces_prefix)
 }
 
 /// Whether a cached entry still describes the file the walk just stat'd.
@@ -1894,6 +1903,7 @@ fn write_cache(vault: &Vault, state: &ReconcilerState) {
     let cache = IndexCache {
         schema: INDEX_SCHEMA,
         vault_id: vault.id.clone(),
+        spaces_prefix: vault.spaces_prefix(),
         built_ms: now_ms(),
         entries: state.entries.values().cloned().collect(),
     };
@@ -1935,13 +1945,20 @@ async fn read_and_parse(
     for chunk in to_parse.chunks(per_lane) {
         let chunk: Vec<Seen> = chunk.to_vec();
         let root = vault.root.clone();
+        let spaces_prefix = vault.spaces_prefix();
         set.spawn_blocking(move || {
             let mut out = Vec::with_capacity(chunk.len());
             for note in chunk {
                 let Some(text) = read_bounded(&root.join(&note.rel)) else {
                     continue;
                 };
-                out.push(parse_note(&note.rel, &note.stat, &text, now));
+                out.push(parse_note(
+                    &note.rel,
+                    &note.stat,
+                    &text,
+                    now,
+                    &spaces_prefix,
+                ));
             }
             out
         });
@@ -1993,18 +2010,24 @@ fn read_bounded(path: &Path) -> Option<String> {
 /// length and `ino` is zero. Nothing downstream of this call reads either; the
 /// timestamps a query compares against come from the frontmatter keeper just
 /// wrote.
-pub fn index_written(rel: &str, text: &str) -> IndexEntry {
+pub fn index_written(rel: &str, text: &str, spaces_prefix: &str) -> IndexEntry {
     let now = now_ms();
     let stat = FileStat {
         size: u64::try_from(text.len()).unwrap_or(u64::MAX),
         mtime_ns: i128::from(now) * 1_000_000,
         ino: 0,
     };
-    parse_note(rel, &stat, text, now)
+    parse_note(rel, &stat, text, now, spaces_prefix)
 }
 
 /// Turn bytes into an [`IndexEntry`] through the pure core. No IO here.
-fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry {
+fn parse_note(
+    rel: &str,
+    stat: &FileStat,
+    text: &str,
+    now_ms: i64,
+    spaces_prefix: &str,
+) -> IndexEntry {
     let (fm, body_offset) = Frontmatter::parse(text);
     let body = text.get(body_offset..).unwrap_or("");
     let mut flags: Vec<String> = Vec::new();
@@ -2045,7 +2068,7 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
     // in, a generated listing under `spaces/` becomes a space that selects
     // nothing and says its query cannot be read — which is what the vault that
     // prompted this was showing. That is not a broken space; it is not a space.
-    if rel.starts_with("spaces/") && !keeper_core::notes::is_okf_reserved(rel) {
+    if rel.starts_with(spaces_prefix) && !keeper_core::notes::is_okf_reserved(rel) {
         flags.push("space".to_owned());
         if let Some(FieldValue::Map(pairs)) = fm.get("keeper") {
             if pairs.iter().any(|(key, value)| {
@@ -2328,7 +2351,13 @@ pub fn read_space_entry(vault: &Vault, rel: &str) -> Result<IndexEntry, NotesErr
     let meta = std::fs::symlink_metadata(&path)
         .map_err(|error| NotesError::NotFound(format!("{rel}: {error}")))?;
     let source = read_note(vault, rel)?;
-    Ok(parse_note(rel, &file_stat(&meta), &source, now_ms()))
+    Ok(parse_note(
+        rel,
+        &file_stat(&meta),
+        &source,
+        now_ms(),
+        &vault.spaces_prefix(),
+    ))
 }
 
 /// Write a note atomically.
@@ -3757,6 +3786,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cross_drive_creation_names_the_source_space_without_inheriting_it() {
+        use keeper_core::notes::vm::NoteCreateReq;
+        let mut source = test_vault("outside-space-source");
+        source.id = crate::sync_ipc::new_ulid();
+        source.name = "Work".into();
+        let mut target = test_vault("outside-space-target");
+        target.id = crate::sync_ipc::new_ulid();
+        target.name = "Personal".into();
+        write_note(
+            &source,
+            "spaces/bali.md",
+            "---\nid: bali\nkeeper:\n  space: tag:travel\n  folder: trips\n---\n# Bali\n",
+        )
+        .expect("space");
+        let space = read_space_entry(&source, "spaces/bali.md").expect("space entry");
+        let mut receivers = Vec::new();
+        for vault in [&source, &target] {
+            let entries = if vault.id == source.id {
+                vec![space.clone()]
+            } else {
+                Vec::new()
+            };
+            let (_, index) = watch::channel(IndexBuilder::from_entries(entries).snapshot());
+            let (_, progress) = watch::channel(NoteIndexProgressVm {
+                vault_id: vault.id.clone(),
+                scanned: 0,
+                total_estimate: 0,
+                phase: "ready".into(),
+            });
+            let (_, search) = watch::channel(NoteSearchStateVm {
+                vault_id: vault.id.clone(),
+                phase: "words".into(),
+                indexed: 0,
+                total: 0,
+                embedded: 0,
+                embeddable: 0,
+                model: String::new(),
+                sentence: String::new(),
+            });
+            let (work, receiver) = mpsc::unbounded_channel();
+            receivers.push(receiver);
+            registry().insert(
+                vault.id.clone(),
+                Slot {
+                    vault: vault.clone(),
+                    index,
+                    progress,
+                    search,
+                    heads: Arc::new(HashMap::new()),
+                    work,
+                    cadence: Cadence::default(),
+                },
+            );
+        }
+        let created = crate::notes_ipc::notes_create(
+            target.id.clone(),
+            NoteCreateReq {
+                title: Some("Trip".into()),
+                body: None,
+                template: None,
+                dest: None,
+                tags: Vec::new(),
+                space: Some(space.id),
+                space_vault_id: Some(source.id.clone()),
+            },
+        )
+        .await
+        .expect("create outside source drive");
+        assert_eq!(
+            created.notices,
+            ["«Bali» lives on Work; this note was created on Personal and is not in that space."]
+        );
+        assert!(!created.note.path.starts_with("trips/"));
+        let text = read_note(&target, &created.note.path).expect("written target note");
+        let entry = index_written(&created.note.path, &text, &target.spaces_prefix());
+        assert!(!entry.tags.iter().any(|tag| tag == "travel"));
+        assert!(source.root.join("spaces/bali.md").exists());
+        registry().remove(&source.id);
+        registry().remove(&target.id);
+        drop(receivers);
+        std::fs::remove_dir_all(source.root).expect("source cleanup");
+        std::fs::remove_dir_all(target.root).expect("target cleanup");
+    }
+
+    #[tokio::test]
     async fn saving_and_parking_publish_their_spaces_before_the_rail_reload() {
         // Isolate TZ in a child process: changing the parent environment would
         // race every date test running beside this one.
@@ -3851,9 +3965,10 @@ mod tests {
         )
         .await
         .expect("save base");
-        let rows = crate::notes_ipc::notes_spaces(vault.id.clone())
+        let rows = crate::notes_ipc::notes_spaces(vault.id.clone(), Vec::new())
             .await
-            .expect("rail");
+            .expect("rail")
+            .rows;
         assert!(rows.iter().any(|row| row.id == base.id));
         assert!(rows.iter().any(|row| row.id == "keeper:group:Journal"));
         let saved = crate::notes_ipc::notes_space_save(
@@ -3876,16 +3991,23 @@ mod tests {
         )
         .await
         .expect("park combined");
-        let rows = crate::notes_ipc::notes_spaces(vault.id.clone())
+        let rows = crate::notes_ipc::notes_spaces(vault.id.clone(), Vec::new())
             .await
-            .expect("reload");
+            .expect("reload")
+            .rows;
         for id in [&saved.id, &parked.id] {
             let row = rows
                 .iter()
                 .find(|row| &row.id == id)
                 .expect("visible saved row");
             let query = keeper_core::notes::query::parse(&row.query).expect("stored query");
-            let mut note = parse_note("note.md", &stat(0, 0, 0), "---\ntags: [three]\n---\n", 0);
+            let mut note = parse_note(
+                "note.md",
+                &stat(0, 0, 0),
+                "---\ntags: [three]\n---\n",
+                0,
+                "spaces/",
+            );
             assert!(!keeper_core::notes::query::eval(
                 &query,
                 &note,
@@ -3940,9 +4062,10 @@ mod tests {
         );
         assert_eq!(refreshed.id, parked.id);
         assert!(refreshed.expires_ms.expect("fresh expiry") > old_expiry);
-        let reloaded = crate::notes_ipc::notes_spaces(vault.id.clone())
+        let reloaded = crate::notes_ipc::notes_spaces(vault.id.clone(), Vec::new())
             .await
-            .expect("rail");
+            .expect("rail")
+            .rows;
         assert_eq!(
             reloaded
                 .iter()
@@ -3970,9 +4093,10 @@ mod tests {
             &keeper_core::notes::lifetime::expiry_stamp(now_ms() + 20 * 3_600_000),
         );
         std::fs::write(vault.root.join(&parked_entry.path), source).expect("caption boundary");
-        let rows = crate::notes_ipc::notes_spaces(vault.id.clone())
+        let rows = crate::notes_ipc::notes_spaces(vault.id.clone(), Vec::new())
             .await
-            .expect("caption");
+            .expect("caption")
+            .rows;
         assert_eq!(
             rows.iter()
                 .find(|row| row.id == parked.id)
@@ -4161,6 +4285,7 @@ mod tests {
              A bare property name: [G](G.md){ cites }\n\
              A pair holding a literal: [H](H.md){ :type=\"Metric\" }\n\
              Behind the emphasis: **[I](I.md)**{ :depends_on }\n",
+            "spaces/",
         );
 
         let at = |target: &str| {
@@ -4371,36 +4496,38 @@ mod tests {
         let good = serde_json::to_vec(&IndexCache {
             schema: INDEX_SCHEMA,
             vault_id: "01VAULT".to_owned(),
+            spaces_prefix: "spaces/".into(),
             built_ms: 1,
             entries: vec![entry("note.md", stat(1, 1, 1))],
         })
         .expect("a cache serializes");
         assert!(
-            adopt_cache(&good, "01VAULT").is_some(),
+            adopt_cache(&good, "01VAULT", "spaces/").is_some(),
             "a well-formed cache for this vault is adopted"
         );
 
         // Truncated to half its bytes: rebuilt silently.
-        assert!(adopt_cache(&good[..good.len() / 2], "01VAULT").is_none());
+        assert!(adopt_cache(&good[..good.len() / 2], "01VAULT", "spaces/").is_none());
         // Not JSON at all.
-        assert!(adopt_cache(b"", "01VAULT").is_none());
-        assert!(adopt_cache(b"not json", "01VAULT").is_none());
+        assert!(adopt_cache(b"", "01VAULT", "spaces/").is_none());
+        assert!(adopt_cache(b"not json", "01VAULT", "spaces/").is_none());
         // The right shape, a schema this build does not know.
         let stale = serde_json::to_vec(&IndexCache {
             schema: INDEX_SCHEMA + 1,
             vault_id: "01VAULT".to_owned(),
+            spaces_prefix: "spaces/".into(),
             built_ms: 1,
             entries: Vec::new(),
         })
         .expect("a cache serializes");
-        assert!(adopt_cache(&stale, "01VAULT").is_none());
+        assert!(adopt_cache(&stale, "01VAULT", "spaces/").is_none());
         // A cache copied from another machine names another vault.
         assert!(
-            adopt_cache(&good, "01OTHERVAULT").is_none(),
+            adopt_cache(&good, "01OTHERVAULT", "spaces/").is_none(),
             "a cache for a different vault is rejected rather than trusted"
         );
         // The right type with a missing field.
-        assert!(adopt_cache(br#"{"schema":1}"#, "01VAULT").is_none());
+        assert!(adopt_cache(br#"{"schema":1}"#, "01VAULT", "spaces/").is_none());
     }
 
     #[test]
@@ -4410,12 +4537,13 @@ mod tests {
         let old_cache = serde_json::to_vec(&IndexCache {
             schema: 4,
             vault_id: "01VAULT".to_owned(),
+            spaces_prefix: "spaces/".into(),
             built_ms: 1,
             entries: vec![old_entry],
         })
         .expect("old cache serializes");
         assert!(
-            adopt_cache(&old_cache, "01VAULT").is_none(),
+            adopt_cache(&old_cache, "01VAULT", "spaces/").is_none(),
             "unchanged notes must not retain raw markdown previews after upgrade"
         );
     }

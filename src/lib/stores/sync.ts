@@ -524,6 +524,8 @@ export async function setSyncProfileRecordingsSubfolder(
     recordingsSubfolder: subfolder,
     sessions: folderOwned.has("sessions") ? null : stored.sessions,
     sessionsSubfolder: folderOwned.has("sessions") ? null : stored.sessionsSubfolder,
+    tasks: folderOwned.has("tasks") ? null : stored.tasks,
+    tasksSubfolder: folderOwned.has("tasks") ? null : stored.tasksSubfolder,
   });
 }
 

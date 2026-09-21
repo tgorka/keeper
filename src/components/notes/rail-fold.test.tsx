@@ -44,6 +44,8 @@ const SPACES: NoteSpaceVm[] = [
   {
     id: "s-inbox",
     name: "Inbox",
+    vaultId: "vault-1",
+    vaultName: "Personal",
     restore: { tagTerms: {}, origin: null, flags: [], text: null, sort: null, opaque: false },
     pinned: false,
     ttlHours: null,
@@ -115,7 +117,10 @@ describe("a rail section never shrinks below its own caption", () => {
 });
 
 beforeEach(() => {
-  mockSpaces.mockReset().mockResolvedValue(SPACES);
+  mockSpaces.mockReset().mockResolvedValue({
+    rows: SPACES,
+    vaults: [{ vaultId: "vault-1", vaultName: "Personal", available: true, reason: "" }],
+  });
   mockRestore.mockReset().mockResolvedValue(0);
   mockTagTree.mockReset().mockResolvedValue(TAGS);
   mockTree.mockReset().mockResolvedValue(FOLDERS);
@@ -179,18 +184,18 @@ describe("the notes rail folds Spaces", () => {
 describe("the notes rail folds Tags", () => {
   it("hides the tree and keeps the header, so there is a way back", async () => {
     renderRail();
-    await screen.findByRole("button", { name: /^Tag client/ });
+    await screen.findByRole("button", { name: "Include tag client" });
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse Tags" }));
 
-    expect(screen.queryByRole("button", { name: /^Tag client/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Include tag client" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Expand Tags" })).toHaveAttribute(
       "aria-expanded",
       "false",
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Expand Tags" }));
-    expect(await screen.findByRole("button", { name: /^Tag client/ })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Include tag client" })).toBeInTheDocument();
   });
 
   /**
@@ -203,7 +208,7 @@ describe("the notes rail folds Tags", () => {
    */
   it("gives the column its height back while folded and takes it again when opened", async () => {
     renderRail();
-    await screen.findByRole("button", { name: /^Tag client/ });
+    await screen.findByRole("button", { name: "Include tag client" });
     expect(section("Tags")).toHaveClass("flex-1");
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse Tags" }));

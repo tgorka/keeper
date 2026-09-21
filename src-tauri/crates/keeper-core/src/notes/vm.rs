@@ -52,6 +52,7 @@ pub struct NoteVaultVm {
     pub name: String,
     /// Vault subfolder inside the profile root, e.g. `notes`.
     pub subfolder: String,
+    pub spaces_subfolder: String,
     /// Absolute vault root, display-only — every command addresses notes by id or
     /// vault-relative path, never by a path the webview composed.
     pub root: String,
@@ -338,7 +339,27 @@ pub struct NoteFolderVm {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
+pub struct NoteRailVaultVm {
+    pub vault_id: String,
+    pub vault_name: String,
+    pub available: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteRailVm {
+    pub rows: Vec<NoteSpaceVm>,
+    pub vaults: Vec<NoteRailVaultVm>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct NoteSpaceVm {
+    pub vault_id: String,
+    pub vault_name: String,
     pub restore: NoteSpaceRestoreVm,
     pub pinned: bool,
     #[ts(type = "number | null")]
@@ -1266,6 +1287,7 @@ pub struct NoteCreateReq {
     /// an ordinary note — a space deleted between the click and the write is
     /// not a reason to lose the thought.
     pub space: Option<String>,
+    pub space_vault_id: Option<String>,
 }
 
 /// What a create produced, and anything the person who asked for it has to be
@@ -1360,6 +1382,7 @@ pub struct NoteSpaceReq {
 #[ts(export)]
 pub struct NoteVaultSettingsReq {
     pub subfolder: Option<String>,
+    pub spaces_subfolder: Option<String>,
     pub journal_template: Option<String>,
     pub default_template: Option<String>,
     /// The template a quick capture starts from. An empty string clears it —

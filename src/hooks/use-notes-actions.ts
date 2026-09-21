@@ -92,8 +92,10 @@ function activeVaultId(): string | null {
  * Settings → Sync rather than reporting a failure, because there is nothing
  * broken, only nothing configured.
  */
-export async function createNote(spaceId: string | null = null): Promise<NoteCreateVm | null> {
-  const vaultId = activeVaultId();
+export async function createNote(
+  spaceId: string | null = null,
+  vaultId: string | null = activeVaultId(),
+): Promise<NoteCreateVm | null> {
   if (vaultId === null) {
     return null;
   }
@@ -104,6 +106,7 @@ export async function createNote(spaceId: string | null = null): Promise<NoteCre
     dest: null,
     tags: [],
     space: spaceId,
+    spaceVaultId: spaceId === null ? null : vaultId,
   });
   panelsStore.getState().setActiveTarget({ kind: "note", vaultId, noteId: created.note.id });
   return created;
@@ -304,7 +307,9 @@ export function openNotesSpace(vaultId: string, space: NoteSpaceVm): Promise<Not
     const filters = notesFiltersStore.getState();
     // Re-selecting the active row is not permission to discard in-space edits.
     if (
-      (filters.scope.kind === "space" && filters.scope.id === space.id) ||
+      (filters.scope.kind === "space" &&
+        filters.scope.id === space.id &&
+        filters.scope.vaultId === space.vaultId) ||
       (filters.scope.kind === "all" && space.id === ALL_SPACE_ID)
     )
       return space;
@@ -330,9 +335,15 @@ export function openNotesSpace(vaultId: string, space: NoteSpaceVm): Promise<Not
       filters.tagTerms.length > 0 ||
       query.flags.length > 0 ||
       query.origin !== null;
-    if (outgoingId !== space.id && baseline?.ttlHours == null && changed && meaningful) {
+    if (
+      (outgoingId !== space.id ||
+        (filters.scope.kind === "space" && filters.scope.vaultId !== space.vaultId)) &&
+      baseline?.ttlHours == null &&
+      changed &&
+      meaningful
+    ) {
       await notesSpacePark(
-        vaultId,
+        filters.scope.kind === "space" ? filters.scope.vaultId : vaultId,
         filters.scope.kind === "space" ? filters.scope.name : "All notes",
         {
           baseSpaceId: query.spaceTerms ? query.spaceId : null,
@@ -348,7 +359,7 @@ export function openNotesSpace(vaultId: string, space: NoteSpaceVm): Promise<Not
     if (!current()) return space;
     const acknowledged = space.id.startsWith("keeper:")
       ? space
-      : await notesSpaceTouch(vaultId, space.id);
+      : await notesSpaceTouch(space.vaultId, space.id);
     if (current()) notesFiltersStore.getState().enterSpace(acknowledged);
     return acknowledged;
   });

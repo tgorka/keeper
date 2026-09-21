@@ -51,6 +51,8 @@ function space(p: Partial<NoteSpaceVm> = {}): NoteSpaceVm {
   return {
     id: p.id ?? "s1",
     name: p.name ?? "Active work",
+    vaultId: p.vaultId ?? "vault-1",
+    vaultName: p.vaultName ?? "Personal",
     updatedMs: p.updatedMs ?? null,
     query: p.query ?? "tag:client/acme -tag:draft",
     sort: p.sort ?? "modified desc",
@@ -142,9 +144,7 @@ describe("editing a space changes what it selects", () => {
     open();
 
     // Cycle the include chip to exclude, and drop the exclusion entirely.
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Tag client/acme: included. Exclude it instead." }),
-    );
+    fireEvent.click(await screen.findByRole("button", { name: "Exclude tag client/acme" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear tag draft filter" }));
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -155,7 +155,7 @@ describe("editing a space changes what it selects", () => {
   it("adds a tag by typing it, from a list that is still there to be browsed (Story 44.13)", async () => {
     open();
 
-    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    await screen.findByRole("button", { name: "Exclude tag client/acme" });
     const field = screen.getByLabelText("Add a tag");
     // Re-anchored by Story 53.2. The browse half is unchanged — the list is
     // populated before a key is pressed, which is the half the `<select>` this
@@ -189,7 +189,7 @@ describe("editing a space changes what it selects", () => {
     // above the Save button, whether or not anybody had come to choose a tag.
     open();
 
-    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    await screen.findByRole("button", { name: "Exclude tag client/acme" });
 
     expect(screen.getByLabelText("Add a tag")).toBeInTheDocument();
     expect(screen.queryByRole("listbox")).toBeNull();
@@ -201,7 +201,7 @@ describe("editing a space changes what it selects", () => {
     // and Escape is asserted separately below.
     const { onClose } = open();
 
-    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    await screen.findByRole("button", { name: "Exclude tag client/acme" });
     const field = screen.getByLabelText("Add a tag");
     act(() => {
       field.focus();
@@ -237,7 +237,7 @@ describe("editing a space changes what it selects", () => {
     // to leave the dialog alone once the event is `defaultPrevented`.
     const { onClose } = open();
 
-    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    await screen.findByRole("button", { name: "Exclude tag client/acme" });
     const field = screen.getByLabelText("Add a tag");
     act(() => {
       field.focus();
@@ -250,7 +250,7 @@ describe("editing a space changes what it selects", () => {
     expect(onClose).not.toHaveBeenCalled();
     // The draft is still on screen and the caret is still in the chooser, so the
     // next keystroke brings the same list back.
-    expect(screen.getByRole("button", { name: /Tag client\/acme/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Exclude tag client/acme" })).toBeInTheDocument();
     expect(document.activeElement).toBe(field);
 
     fireEvent.keyDown(field, { key: "Escape" });
@@ -268,7 +268,7 @@ describe("editing a space changes what it selects", () => {
     // back in, so nothing here decides what a tag is.
     open();
 
-    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    await screen.findByRole("button", { name: "Exclude tag client/acme" });
     const field = screen.getByLabelText("Add a tag");
     fireEvent.change(field, { target: { value: "client/newco" } });
 
@@ -285,7 +285,7 @@ describe("editing a space changes what it selects", () => {
     // write the space on the keystroke meant to add a term to it.
     open();
 
-    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    await screen.findByRole("button", { name: "Exclude tag client/acme" });
     fireEvent.keyDown(screen.getByLabelText("Add a tag"), { key: "Enter" });
 
     expect(mockSave).not.toHaveBeenCalled();
@@ -298,9 +298,7 @@ describe("editing a space changes what it selects", () => {
   it("keeps a cycled chip where it was, so the query keeps its order", async () => {
     open();
 
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Tag client/acme: included. Exclude it instead." }),
-    );
+    fireEvent.click(await screen.findByRole("button", { name: "Exclude tag client/acme" }));
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
@@ -318,7 +316,7 @@ describe("editing a space changes what it selects", () => {
     });
     open(space({ query: 'tag:client/acme is:pinned origin:agent text:"quarterly review"' }));
 
-    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    await screen.findByRole("button", { name: "Exclude tag client/acme" });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
@@ -433,7 +431,7 @@ describe("the icon", () => {
   it("persists the icon that was chosen", async () => {
     open();
 
-    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    await screen.findByRole("button", { name: "Exclude tag client/acme" });
     fireEvent.click(screen.getByRole("button", { name: "star" }));
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -467,7 +465,7 @@ describe("the icon", () => {
     // `no-such-glyph` cannot become a real icon by accident.
     open(space({ icon: "no-such-glyph" }));
 
-    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    await screen.findByRole("button", { name: "Exclude tag client/acme" });
     for (const name of ["No icon", "star", "flag", "inbox"]) {
       expect(screen.getByRole("button", { name })).toHaveAttribute("aria-pressed", "false");
     }
@@ -508,7 +506,7 @@ describe("the icon", () => {
     // narrow, press the glyph, save, and assert the CALL carries it. Stopping
     // at "the button is on screen" would leave the act unverified.
     open();
-    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    await screen.findByRole("button", { name: "Exclude tag client/acme" });
 
     fireEvent.change(screen.getByLabelText("Search icons"), { target: { value: "template" } });
 
@@ -529,7 +527,7 @@ describe("the icon", () => {
 
   it("finds a glyph by the word a person types rather than lucide's name", async () => {
     open();
-    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    await screen.findByRole("button", { name: "Exclude tag client/acme" });
 
     fireEvent.change(screen.getByLabelText("Search icons"), { target: { value: "money" } });
 
@@ -538,7 +536,7 @@ describe("the icon", () => {
 
   it("says so when a search names nothing, and browsing comes back on clear", async () => {
     open();
-    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    await screen.findByRole("button", { name: "Exclude tag client/acme" });
     const search = screen.getByLabelText("Search icons");
 
     fireEvent.change(search, { target: { value: "qqzzx" } });
@@ -552,7 +550,7 @@ describe("the icon", () => {
 
   it("groups the set so it can be browsed without searching", async () => {
     open();
-    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    await screen.findByRole("button", { name: "Exclude tag client/acme" });
 
     // Queried BY NAME, not by role alone, and that is the whole assertion.
     // `aria-labelledby` pointing at nothing renders byte-identically — the
@@ -1037,7 +1035,7 @@ describe("the space editor is a form you can reach both ends of", () => {
    */
   it("caps the panel height and scrolls the form inside it, so both ends are reachable", async () => {
     open();
-    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    await screen.findByRole("button", { name: "Exclude tag client/acme" });
 
     const panel = screen.getByRole("dialog");
     // A height-capped flex column that clips — the Settings idiom
@@ -1084,7 +1082,7 @@ describe("the space editor is a form you can reach both ends of", () => {
    */
   it("keeps the icon chooser and the terms section from absorbing the body's overflow", async () => {
     open();
-    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    await screen.findByRole("button", { name: "Exclude tag client/acme" });
 
     const panel = screen.getByRole("dialog");
     const body = panel.querySelector<HTMLElement>(":scope > .overflow-y-auto");

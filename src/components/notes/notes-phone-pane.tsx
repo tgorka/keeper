@@ -51,7 +51,7 @@ import { NoteEditor } from "@/components/notes/note-editor";
 import { NoteFilterBar } from "@/components/notes/note-filter-bar";
 import { NoteList } from "@/components/notes/note-list";
 import { type NotesEmptyKind, NotesEmptyState } from "@/components/notes/notes-empty-state";
-import { NEW_NOTE_LABEL, NOTES_COUNT_SLOT } from "@/components/notes/notes-pane";
+import { NOTES_COUNT_SLOT } from "@/components/notes/notes-pane";
 import { SpaceNamePopover } from "@/components/notes/space-name-popover";
 import { VaultSwitcher } from "@/components/notes/vault-switcher";
 import { Button } from "@/components/ui/button";
@@ -92,6 +92,9 @@ import { syncErrorMessage } from "@/lib/stores/sync";
 
 /** The list level's title, and the note level's back target. */
 export const NOTES_PHONE_TITLE = "Notes";
+
+/** The phone's create control; the desktop creates from the search field. */
+export const NEW_NOTE_LABEL = "New note";
 
 /** The note level's back control: the level beneath it is the list. */
 export const NOTES_PHONE_BACK_TO_LIST = `Back to ${NOTES_PHONE_TITLE}`;
@@ -134,6 +137,7 @@ export function NotesPhoneList({
   const activeVaultId = useNotesVaultsStore((s) => s.activeVaultId);
   const activeVault = useActiveVault();
   const searchText = useNotesFiltersStore((s) => s.text);
+  const tagTerms = useNotesFiltersStore((s) => s.tagTerms);
   const filtered = useNotesFiltersStore(isFiltered);
   const filterReason = useNotesFiltersStore(emptyFilterReason);
   const searchNonce = useNotesFiltersStore((s) => s.searchNonce);
@@ -438,7 +442,8 @@ export function NotesPhoneList({
           onSelect={openRow}
           // A phone has one panel: opening beside is opening.
           onSelectBeside={openRow}
-          onToggleTag={(tag) => notesFiltersStore.getState().cycleTag(tag)}
+          tagTerms={tagTerms}
+          onSetTagTerm={(tag, term) => notesFiltersStore.getState().setTagTerm(tag, term)}
           onVerb={runVerb}
           onGrow={() => notesListStore.getState().growWindow()}
         />

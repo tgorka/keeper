@@ -154,7 +154,7 @@ sessions: boolean,
  * rather than `notes_subfolder` — the form prefills from the value that
  * would actually be used, and `60-sessions` is spelled once, in Rust.
  */
-sessionsSubfolder: string, 
+sessionsSubfolder: string, tasks: boolean, tasksSubfolder: string, 
 /**
  * The canonical camelCase profile keys a `.keeper/keeper.toml` layer
  * currently sets for this folder, sorted (Story 56.12).

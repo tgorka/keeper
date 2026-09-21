@@ -55,16 +55,12 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { IconHint } from "@/components/ui/tooltip";
 import { spaceQueryText } from "@/hooks/use-notes-actions";
 import type { NoteSpaceFieldVm, NoteSpaceVm, NoteTemplateVm } from "@/lib/ipc/client";
 import { notesSpaceSave, notesSpaceTerms, notesTagTree, notesTemplates } from "@/lib/ipc/client";
-import {
-  nextTagChipState,
-  type TagChip,
-  tagChipState,
-  withTagTerm,
-} from "@/lib/stores/notes-filters";
+import { flipTagTerm, type TagChip, tagChipState, withTagTerm } from "@/lib/stores/notes-filters";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
@@ -236,6 +232,8 @@ export function SpaceEditor({
   const orderId = useId();
   const templateId = useId();
   const folderId = useId();
+  const pinnedId = useId();
+  const temporaryId = useId();
   const [name, setName] = useState(space?.name ?? initialName);
   const [icon, setIcon] = useState<string | null>(space?.icon ?? null);
   const [pinned, setPinned] = useState(space?.pinned ?? false);
@@ -536,20 +534,12 @@ export function SpaceEditor({
             />
           </div>
           <p className="text-muted-foreground text-xs">Use / to group spaces</p>
-          <label className="flex min-h-8 items-center gap-2">
-            <input
-              type="checkbox"
-              checked={pinned}
-              onChange={(event) => setPinned(event.target.checked)}
-            />
+          <label htmlFor={pinnedId} className="flex min-h-8 items-center gap-2">
+            <Switch id={pinnedId} checked={pinned} onCheckedChange={setPinned} />
             Pinned space
           </label>
-          <label className="flex min-h-8 items-center gap-2">
-            <input
-              type="checkbox"
-              checked={temporary}
-              onChange={(event) => setTemporary(event.target.checked)}
-            />
+          <label htmlFor={temporaryId} className="flex min-h-8 items-center gap-2">
+            <Switch id={temporaryId} checked={temporary} onCheckedChange={setTemporary} />
             Temporary space
           </label>
           {temporary && (
@@ -832,13 +822,13 @@ export function SpaceEditor({
                     <TagFilterChip
                       key={chip.tag}
                       chip={chip}
-                      onCycle={(tag) =>
+                      onToggleSign={(tag) =>
                         editDraft((draft) => ({
                           ...draft,
                           tags: withTagTerm(
                             draft.tags,
                             tag,
-                            nextTagChipState(tagChipState(draft.tags, tag)),
+                            flipTagTerm(tagChipState(draft.tags, tag)),
                           ),
                         }))
                       }

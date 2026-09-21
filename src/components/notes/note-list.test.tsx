@@ -81,7 +81,7 @@ function renderList(rows: NoteRowVm[], onVerb = vi.fn()) {
       selectedId={null}
       onSelect={vi.fn()}
       onSelectBeside={vi.fn()}
-      onToggleTag={vi.fn()}
+      onSetTagTerm={vi.fn()}
       onVerb={onVerb}
       onGrow={vi.fn()}
     />,
@@ -100,7 +100,7 @@ describe("NoteList affordances", () => {
       selectedId: "same",
       onSelect,
       onSelectBeside: vi.fn(),
-      onToggleTag: vi.fn(),
+      onSetTagTerm: vi.fn(),
       onVerb: vi.fn(),
       onGrow: vi.fn(),
     };
@@ -143,7 +143,7 @@ describe("NoteList affordances", () => {
 
   it("filters by a row's tag chip instead of opening the note", () => {
     const onSelect = vi.fn();
-    const onToggleTag = vi.fn();
+    const onSetTagTerm = vi.fn();
     render(
       <NoteList
         rows={[row({ id: "5", title: "Tagged", tags: ["work/clients"] })]}
@@ -151,14 +151,16 @@ describe("NoteList affordances", () => {
         selectedId={null}
         onSelect={onSelect}
         onSelectBeside={vi.fn()}
-        onToggleTag={onToggleTag}
+        onSetTagTerm={onSetTagTerm}
         onVerb={vi.fn()}
         onGrow={vi.fn()}
       />,
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Tag work/clients, on this note" }));
-    expect(onToggleTag).toHaveBeenCalledWith("work/clients");
+    expect(onSetTagTerm).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Exclude tag work/clients" }));
+    expect(onSetTagTerm).toHaveBeenCalledWith("work/clients", "exclude");
     expect(onSelect).not.toHaveBeenCalled();
   });
 
@@ -223,7 +225,7 @@ describe("NoteList affordances", () => {
         selectedId={null}
         onSelect={onSelect}
         onSelectBeside={vi.fn()}
-        onToggleTag={vi.fn()}
+        onSetTagTerm={vi.fn()}
         onVerb={vi.fn()}
         onGrow={vi.fn()}
       />,
@@ -303,7 +305,7 @@ describe("NoteList — the tags a row could not fit", () => {
   });
 
   function renderTagged() {
-    const onToggleTag = vi.fn();
+    const onSetTagTerm = vi.fn();
     const onSelect = vi.fn();
     render(
       <NoteList
@@ -312,12 +314,12 @@ describe("NoteList — the tags a row could not fit", () => {
         selectedId={null}
         onSelect={onSelect}
         onSelectBeside={vi.fn()}
-        onToggleTag={onToggleTag}
+        onSetTagTerm={onSetTagTerm}
         onVerb={vi.fn()}
         onGrow={vi.fn()}
       />,
     );
-    return { onToggleTag, onSelect };
+    return { onSetTagTerm, onSelect };
   }
 
   it("names the tags it is hiding rather than only counting them", () => {
@@ -331,7 +333,7 @@ describe("NoteList — the tags a row could not fit", () => {
   });
 
   it("opens the hidden tags, and each one still filters", () => {
-    const { onToggleTag, onSelect } = renderTagged();
+    const { onSetTagTerm, onSelect } = renderTagged();
 
     fireEvent.click(
       screen.getByRole("button", { name: `${NOTE_MORE_TAGS_LABEL} invoices, urgent` }),
@@ -344,7 +346,9 @@ describe("NoteList — the tags a row could not fit", () => {
     expect(within(panel).getByRole("button", { name: "Tag invoices, on this note" })).toBeVisible();
     fireEvent.click(within(panel).getByRole("button", { name: "Tag urgent, on this note" }));
 
-    expect(onToggleTag).toHaveBeenCalledWith("urgent");
+    expect(onSetTagTerm).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Include tag urgent" }));
+    expect(onSetTagTerm).toHaveBeenCalledWith("urgent", "include");
     // A React portal still propagates through the React tree, so a panel click
     // that reached the row would open a note the user was only reading a tag off.
     expect(onSelect).not.toHaveBeenCalled();
@@ -358,7 +362,7 @@ describe("NoteList — the tags a row could not fit", () => {
         selectedId={null}
         onSelect={vi.fn()}
         onSelectBeside={vi.fn()}
-        onToggleTag={vi.fn()}
+        onSetTagTerm={vi.fn()}
         onVerb={vi.fn()}
         onGrow={vi.fn()}
       />,
@@ -518,7 +522,7 @@ describe("NoteList — a vault, not a screenful", () => {
         selectedId="n2"
         onSelect={vi.fn()}
         onSelectBeside={vi.fn()}
-        onToggleTag={vi.fn()}
+        onSetTagTerm={vi.fn()}
         onVerb={vi.fn()}
         onGrow={vi.fn()}
       />,

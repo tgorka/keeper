@@ -80,7 +80,12 @@ import type { SyncProfileVm } from "@/lib/ipc/client";
 // belongs to one open of one form rather than to state worth keeping in sync.
 // The notes flag is the exception — it DOES change what the vault mirror holds,
 // so it is followed by a refresh of that mirror.
-import { syncClearCredential, syncGetCredential, syncSetCredential } from "@/lib/ipc/client";
+import {
+  syncClearCredential,
+  syncFolderTasksFlag,
+  syncGetCredential,
+  syncSetCredential,
+} from "@/lib/ipc/client";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import {
   ensureNotesVaultsHydrated,
@@ -535,6 +540,9 @@ export const SYNC_SESSIONS_NOTE =
 export const SYNC_SESSIONS_SUBFOLDER_LABEL = "Sessions subfolder";
 export const SYNC_SESSIONS_SUBFOLDER_NOTE = "Left empty, keeper picks the subfolder itself.";
 
+export const SYNC_TASKS_LABEL = "This folder holds task ledgers";
+export const SYNC_TASKS_SUBFOLDER_LABEL = "Task ledger subfolder";
+
 /**
  * The access-token field (Story 32.7, AD-S7; Story 34.4, AD-34-7; Story 34.12,
  * which overrides AD-34-7). The token is written to the OS keychain in a second
@@ -728,6 +736,8 @@ interface SyncFormValues {
    * (keeper's default stands), a deliberate clear on an edit (refused by name).
    */
   sessionsSubfolder: string;
+  tasks: boolean;
+  tasksSubfolder: string;
 }
 
 const EMPTY_FORM: SyncFormValues = {
@@ -764,6 +774,8 @@ const EMPTY_FORM: SyncFormValues = {
   sessions: false,
   // Empty for the recordings reason directly above.
   sessionsSubfolder: "",
+  tasks: false,
+  tasksSubfolder: "tasks",
 };
 
 /**
@@ -820,6 +832,8 @@ function formValuesFor(profile: SyncProfileVm): SyncFormValues {
     // flag and the subfolder that would be in force (AD-34-8).
     sessions: profile.sessions,
     sessionsSubfolder: profile.sessionsSubfolder,
+    tasks: profile.tasks,
+    tasksSubfolder: profile.tasksSubfolder,
   };
 }
 
@@ -1518,7 +1532,18 @@ export function AddFolderForm({
           folderOwned.has("sessions") || !sessions || (sessionsSubfolder === "" && !editing)
             ? null
             : sessionsSubfolder,
+        tasks: reducedCapability || folderOwned.has("tasks") ? null : form.tasks,
+        tasksSubfolder:
+          reducedCapability || folderOwned.has("tasks") || !form.tasks ? null : form.tasksSubfolder,
       });
+      // Remember the created profile before the folder-file leg, so a retry
+      // cannot create another profile if that write is refused.
+      if (!editing) setCreatedId(saved.id);
+      let tasksNotice: string | null = null;
+      if (!reducedCapability && !folderOwned.has("tasks") && (form.tasks || profile?.tasks)) {
+        const result = await syncFolderTasksFlag(saved.id, form.tasks ? form.tasksSubfolder : null);
+        tasksNotice = result.notice;
+      }
       // `saveSyncProfile` re-reads the profile/status mirror, but the Sync
       // view's three per-folder lists are a *second* mirror on a deliberately
       // slower poll. Reading them here — from whichever surface saved the
@@ -1594,6 +1619,11 @@ export function AddFolderForm({
           // The secret is committed; there is no reason to leave it legible.
           setTokenVisible(false);
         }
+      }
+      if (tasksNotice) {
+        setError(tasksNotice);
+        onSaved?.(saved, false);
+        return;
       }
       if (!editing) {
         // Both stores now hold what this form was for, so the draft is spent:
@@ -1936,6 +1966,35 @@ export function AddFolderForm({
                 </p>
               )}
             </>
+          )}
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-tasks`}>{SYNC_TASKS_LABEL}</Label>
+            <Switch
+              id={`${fieldId}-tasks`}
+              checked={form.tasks}
+              disabled={disabled || saving || folderOwned.has("tasks")}
+              onCheckedChange={(tasks) => setForm((live) => ({ ...live, tasks }))}
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">
+            Task ledger: configuration and run logs sync with this drive.
+          </p>
+          {folderOwned.has("tasks") && (
+            <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("tasks")}</p>
+          )}
+          {form.tasks && (
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <Label htmlFor={`${fieldId}-tasks-subfolder`}>{SYNC_TASKS_SUBFOLDER_LABEL}</Label>
+              <Input
+                id={`${fieldId}-tasks-subfolder`}
+                className="w-56"
+                value={form.tasksSubfolder}
+                disabled={disabled || saving || folderOwned.has("tasks")}
+                onChange={(event) =>
+                  setForm((live) => ({ ...live, tasksSubfolder: event.target.value }))
+                }
+              />
+            </div>
           )}
         </>
       )}

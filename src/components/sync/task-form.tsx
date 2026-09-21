@@ -68,6 +68,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Switch } from "@/components/ui/switch";
 import { IconHint } from "@/components/ui/tooltip";
 import type {
@@ -124,7 +125,7 @@ export const TASK_FORM_ID_ADD_NOTE =
 export const TASK_FORM_ID_EDIT_NOTE =
   "The id cannot change: the run history is joined to it, so a new id here would create a second task and orphan everything this one has recorded.";
 
-export const TASK_FORM_DESCRIPTION_LABEL = "Description";
+export const TASK_FORM_DESCRIPTION_LABEL = "Name";
 /**
  * What the description is *for*, which is a fact about the id rather than about
  * this box (Story 59.5).
@@ -147,7 +148,7 @@ export const TASK_FORM_DESCRIPTION_LABEL = "Description";
  * correct.
  */
 export const TASK_FORM_DESCRIPTION_NOTE =
-  "Optional, and the only name of this task you can ever change: an id is minted by keeper when you leave it blank, and it can never be edited afterwards because the run history is joined to it. Leave this empty to store none. Whatever you type is sent exactly as typed.";
+  "The name shown in every task list. You can change this without changing the id or its run history. Leave it empty to show the id.";
 
 export const TASK_FORM_KIND_LABEL = "Kind";
 /**
@@ -751,7 +752,7 @@ export function TaskForm({
    * defect this story exists to avoid, so it is guarded twice on purpose.
    */
   useEffect(() => {
-    if (form.schedule === "") {
+    if (form.mode !== "scheduled" || form.schedule === "") {
       setSchedulePreview(null);
       return;
     }
@@ -772,7 +773,7 @@ export function TaskForm({
     return () => {
       abandoned = true;
     };
-  }, [form.schedule]);
+  }, [form.schedule, form.mode]);
 
   // Reported on every change and on unmount, so the surface that revealed this
   // form always knows whether a write is in flight — see `onSavingChange`.
@@ -955,6 +956,20 @@ export function TaskForm({
       )}
       <div className={TASK_FORM_ROW_CLASS}>
         <div className={TASK_FORM_LABEL_CLASS}>
+          <Label htmlFor={`${fieldId}-description`}>{TASK_FORM_DESCRIPTION_LABEL}</Label>
+          <FieldHint label={TASK_FORM_DESCRIPTION_NOTE} />
+        </div>
+        <Input
+          id={`${fieldId}-description`}
+          className={TASK_FORM_CONTROL_CLASS}
+          value={form.description}
+          disabled={saving}
+          placeholder="nightly backup of the photos"
+          onChange={(event) => setForm((live) => ({ ...live, description: event.target.value }))}
+        />
+      </div>
+      <div className={TASK_FORM_ROW_CLASS}>
+        <div className={TASK_FORM_LABEL_CLASS}>
           <Label htmlFor={`${fieldId}-id`}>{TASK_FORM_ID_LABEL}</Label>
           {!editing && <FieldHint label={TASK_FORM_ID_ADD_NOTE} />}
         </div>
@@ -973,27 +988,6 @@ export function TaskForm({
           a person cannot do the thing they are at that moment trying to do. A
           refusal behind a hover is a refusal somebody hits before they read. */}
       {editing && <p className="text-muted-foreground text-xs">{TASK_FORM_ID_EDIT_NOTE}</p>}
-
-      {/* Directly under the id, because it is the same question answered the
-          other way: the box above is a key that is frozen or minted, and this one
-          is the name a person actually reads. An `Input` and not a `Textarea` —
-          this is a name rather than a note, the row that will draw it has one
-          line for it, and a box that invites paragraphs would be promising a
-          surface that does not exist. */}
-      <div className={TASK_FORM_ROW_CLASS}>
-        <div className={TASK_FORM_LABEL_CLASS}>
-          <Label htmlFor={`${fieldId}-description`}>{TASK_FORM_DESCRIPTION_LABEL}</Label>
-          <FieldHint label={TASK_FORM_DESCRIPTION_NOTE} />
-        </div>
-        <Input
-          id={`${fieldId}-description`}
-          className={TASK_FORM_CONTROL_CLASS}
-          value={form.description}
-          disabled={saving}
-          placeholder="nightly backup of the photos"
-          onChange={(event) => setForm((live) => ({ ...live, description: event.target.value }))}
-        />
-      </div>
 
       {/* The option text is the stored spelling itself: the row's badge already
           shows `task.kind` verbatim, and two words for one stored value is
@@ -1033,19 +1027,21 @@ export function TaskForm({
           <Label htmlFor={`${fieldId}-mode`}>{TASK_FORM_MODE_LABEL}</Label>
           <FieldHint label={TASK_FORM_MODE_NOTE} />
         </div>
-        <select
+        <RadioGroup
           id={`${fieldId}-mode`}
-          className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
+          aria-label={TASK_FORM_MODE_LABEL}
+          className="flex flex-wrap gap-3"
           value={form.mode}
           disabled={saving}
-          onChange={(event) => setForm((live) => ({ ...live, mode: event.target.value }))}
+          onValueChange={(mode) => setForm((live) => ({ ...live, mode }))}
         >
           {TASK_MODES.map((mode) => (
-            <option key={mode} value={mode}>
+            <Label key={mode} className="flex min-h-9 items-center gap-2">
+              <RadioGroupItem value={mode} />
               {mode}
-            </option>
+            </Label>
           ))}
-        </select>
+        </RadioGroup>
       </div>
 
       <div className={TASK_FORM_ROW_CLASS}>
@@ -1066,12 +1062,9 @@ export function TaskForm({
         />
       </div>
 
-      {/* A native `<select>`, not the Radix one, and the reason is recorded in
-          `session-file-actions.tsx`: Radix's `Select` throws on an empty-string
-          value by design, and "the whole machine" IS the empty-string sentinel
-          for `profileId: null`. A `"__wide__"` sentinel translated back to `null`
-          on the way out would be the same thing wearing a disguise. All three
-          menus here are native so the form is one idiom rather than two. */}
+      {/* Dynamic folders and task kinds stay menus; the fixed three-way mode
+          and missed-window choices use radios. Native select keeps the empty
+          string that means a host-wide task without translating a sentinel. */}
       {form.kind !== "copy" && (
         <>
           <div className={TASK_FORM_ROW_CLASS}>
@@ -1129,22 +1122,24 @@ export function TaskForm({
         />
       )}
 
-      <div className={TASK_FORM_ROW_CLASS}>
-        <div className={TASK_FORM_LABEL_CLASS}>
-          <Label htmlFor={`${fieldId}-schedule`}>{TASK_FORM_SCHEDULE_LABEL}</Label>
-          <FieldHint label={TASK_FORM_SCHEDULE_HINT} />
-        </div>
-        <Input
-          id={`${fieldId}-schedule`}
-          className={TASK_FORM_CONTROL_CLASS}
-          value={form.schedule}
-          disabled={saving}
-          placeholder="0 3 * * *"
-          onChange={(event) => setForm((live) => ({ ...live, schedule: event.target.value }))}
-        />
-      </div>
+      {form.mode === "scheduled" && (
+        <>
+          <div className={TASK_FORM_ROW_CLASS}>
+            <div className={TASK_FORM_LABEL_CLASS}>
+              <Label htmlFor={`${fieldId}-schedule`}>{TASK_FORM_SCHEDULE_LABEL}</Label>
+              <FieldHint label={TASK_FORM_SCHEDULE_HINT} />
+            </div>
+            <Input
+              id={`${fieldId}-schedule`}
+              className={TASK_FORM_CONTROL_CLASS}
+              value={form.schedule}
+              disabled={saving}
+              placeholder="0 3 * * *"
+              onChange={(event) => setForm((live) => ({ ...live, schedule: event.target.value }))}
+            />
+          </div>
 
-      {/* Directly under the box, because it is the answer to the question the
+          {/* Directly under the box, because it is the answer to the question the
           box asks. Both spellings are `text-muted-foreground` and neither is a
           `role="alert"`: this is help about text somebody is still writing, and
           the one paragraph in this form that reports a *failure* is the refusal
@@ -1156,105 +1151,105 @@ export function TaskForm({
           no instants is possible in principle — Rust's search window is finite —
           and it renders nothing rather than a sentence about the search window,
           because copy for a state nobody can reach is copy nobody can check. */}
-      {shownPreview !== null &&
-        (shownPreview.refusal !== null ? (
-          <p
-            className="text-muted-foreground text-xs"
-            data-testid={TASK_FORM_SCHEDULE_PREVIEW_TESTID}
-          >
-            {TASK_FORM_SCHEDULE_REFUSAL_PREFIX}
-            {shownPreview.refusal}
-          </p>
-        ) : (
-          shownPreview.instants.length > 0 && (
-            <p
-              className="text-muted-foreground text-xs"
-              data-testid={TASK_FORM_SCHEDULE_PREVIEW_TESTID}
-            >
-              {taskFormScheduleFiresNote(shownPreview.instants)}
-            </p>
-          )
-        ))}
+          {shownPreview !== null &&
+            (shownPreview.refusal !== null ? (
+              <p
+                className="text-muted-foreground text-xs"
+                data-testid={TASK_FORM_SCHEDULE_PREVIEW_TESTID}
+              >
+                {TASK_FORM_SCHEDULE_REFUSAL_PREFIX}
+                {shownPreview.refusal}
+              </p>
+            ) : (
+              shownPreview.instants.length > 0 && (
+                <p
+                  className="text-muted-foreground text-xs"
+                  data-testid={TASK_FORM_SCHEDULE_PREVIEW_TESTID}
+                >
+                  {taskFormScheduleFiresNote(shownPreview.instants)}
+                </p>
+              )
+            ))}
 
-      {/* An action, not a value — see {@link TASK_FORM_SCHEDULE_OFFER_NOTE}. The
+          {/* An action, not a value — see {@link TASK_FORM_SCHEDULE_OFFER_NOTE}. The
           `value` is pinned to `""` so the control always reads as its own
           placeholder rather than pretending to mirror the box, and native for the
           reason the other four menus are. */}
-      <div className={TASK_FORM_ROW_CLASS}>
-        <div className={TASK_FORM_LABEL_CLASS}>
-          <Label htmlFor={`${fieldId}-schedule-offer`}>{TASK_FORM_SCHEDULE_OFFER_LABEL}</Label>
-          <FieldHint label={TASK_FORM_SCHEDULE_OFFER_NOTE} />
-        </div>
-        <select
-          id={`${fieldId}-schedule-offer`}
-          className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
-          value=""
-          disabled={saving}
-          onChange={(event) => {
-            const chosen = event.target.value;
-            if (chosen === "") {
-              return;
-            }
-            setForm((live) => ({ ...live, schedule: chosen }));
-          }}
-        >
-          <option value="">{TASK_FORM_SCHEDULE_OFFER_PLACEHOLDER}</option>
-          {TASK_SCHEDULE_OFFERS.map((offer) => (
-            <option key={offer.expression} value={offer.expression}>
-              {taskFormScheduleOfferText(offer)}
-            </option>
-          ))}
-        </select>
-      </div>
+          <div className={TASK_FORM_ROW_CLASS}>
+            <div className={TASK_FORM_LABEL_CLASS}>
+              <Label htmlFor={`${fieldId}-schedule-offer`}>{TASK_FORM_SCHEDULE_OFFER_LABEL}</Label>
+              <FieldHint label={TASK_FORM_SCHEDULE_OFFER_NOTE} />
+            </div>
+            <select
+              id={`${fieldId}-schedule-offer`}
+              className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
+              value=""
+              disabled={saving}
+              onChange={(event) => {
+                const chosen = event.target.value;
+                if (chosen === "") {
+                  return;
+                }
+                setForm((live) => ({ ...live, schedule: chosen }));
+              }}
+            >
+              <option value="">{TASK_FORM_SCHEDULE_OFFER_PLACEHOLDER}</option>
+              {TASK_SCHEDULE_OFFERS.map((offer) => (
+                <option key={offer.expression} value={offer.expression}>
+                  {taskFormScheduleOfferText(offer)}
+                </option>
+              ))}
+            </select>
+          </div>
 
-      {/* Beside the schedule because it is a question about the schedule, and
-          native for the reason the other three menus are. The option text is
-          the stored spelling itself — the same rule the kind menu states: two
-          words for one stored value is the drift AD-C7 forbids, and this is the
-          vocabulary `tasks list --json` prints. */}
-      <div className={TASK_FORM_ROW_CLASS}>
-        <div className={TASK_FORM_LABEL_CLASS}>
-          <Label htmlFor={`${fieldId}-on-missed`}>{TASK_FORM_ON_MISSED_LABEL}</Label>
-          {/* Composed, not written: the sentence has to describe the wait THIS
+          {/* The missed-window choice only applies to a scheduled task. */}
+          <div className={TASK_FORM_ROW_CLASS}>
+            <div className={TASK_FORM_LABEL_CLASS}>
+              <Label htmlFor={`${fieldId}-on-missed`}>{TASK_FORM_ON_MISSED_LABEL}</Label>
+              {/* Composed, not written: the sentence has to describe the wait THIS
               task will actually do, and a literal `30` in it would be false for
               every task that chose otherwise. An unparseable box falls back to
               the default's number rather than saying nothing, because the hint
               explains the setting and the refusal at the top explains the box. */}
-          <FieldHint label={taskFormOnMissedNote(effectiveDelayMinutes)} />
-        </div>
-        <select
-          id={`${fieldId}-on-missed`}
-          className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
-          value={form.onMissed}
-          disabled={saving}
-          onChange={(event) => setForm((live) => ({ ...live, onMissed: event.target.value }))}
-        >
-          {TASK_MISSED_POLICIES.map((policy) => (
-            <option key={policy} value={policy}>
-              {policy}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      {showMissedDelay && (
-        <div className={TASK_FORM_ROW_CLASS}>
-          <div className={TASK_FORM_LABEL_CLASS}>
-            <Label htmlFor={`${fieldId}-missed-delay`}>{TASK_FORM_MISSED_DELAY_LABEL}</Label>
-            <FieldHint label={TASK_FORM_MISSED_DELAY_NOTE} />
+              <FieldHint label={taskFormOnMissedNote(effectiveDelayMinutes)} />
+            </div>
+            <RadioGroup
+              id={`${fieldId}-on-missed`}
+              aria-label={TASK_FORM_ON_MISSED_LABEL}
+              className="flex flex-wrap gap-3"
+              value={form.onMissed}
+              disabled={saving}
+              onValueChange={(onMissed) => setForm((live) => ({ ...live, onMissed }))}
+            >
+              {TASK_MISSED_POLICIES.map((policy) => (
+                <Label key={policy} className="flex min-h-9 items-center gap-2">
+                  <RadioGroupItem value={policy} />
+                  {policy}
+                </Label>
+              ))}
+            </RadioGroup>
           </div>
-          <Input
-            id={`${fieldId}-missed-delay`}
-            className={TASK_FORM_CONTROL_CLASS}
-            value={form.missedDelayMinutes}
-            disabled={saving}
-            inputMode="numeric"
-            placeholder={String(TASK_MISSED_DELAY_MINUTES)}
-            onChange={(event) =>
-              setForm((live) => ({ ...live, missedDelayMinutes: event.target.value }))
-            }
-          />
-        </div>
+
+          {showMissedDelay && (
+            <div className={TASK_FORM_ROW_CLASS}>
+              <div className={TASK_FORM_LABEL_CLASS}>
+                <Label htmlFor={`${fieldId}-missed-delay`}>{TASK_FORM_MISSED_DELAY_LABEL}</Label>
+                <FieldHint label={TASK_FORM_MISSED_DELAY_NOTE} />
+              </div>
+              <Input
+                id={`${fieldId}-missed-delay`}
+                className={TASK_FORM_CONTROL_CLASS}
+                value={form.missedDelayMinutes}
+                disabled={saving}
+                inputMode="numeric"
+                placeholder={String(TASK_MISSED_DELAY_MINUTES)}
+                onChange={(event) =>
+                  setForm((live) => ({ ...live, missedDelayMinutes: event.target.value }))
+                }
+              />
+            </div>
+          )}
+        </>
       )}
 
       <div className="flex items-center gap-2">

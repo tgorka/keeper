@@ -101,6 +101,7 @@
  */
 import {
   ChevronRight,
+  FolderSearch,
   Info,
   ListChecks,
   MoreHorizontal,
@@ -112,6 +113,7 @@ import {
 } from "lucide-react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { FILES_REVEAL_LABEL } from "@/components/layout/files-pane";
 import { FoldToggle, useFold } from "@/components/layout/list-fold";
 import { PANE_HEADER_GAP_PX, PaneHeader } from "@/components/layout/pane-header";
 import { type PriorityAction, PriorityActions } from "@/components/layout/priority-actions";
@@ -148,7 +150,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { MENU_TARGET_RING, useMenuTarget } from "@/components/ui/menu-target";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { IconHint } from "@/components/ui/tooltip";
+import { HoverHint, IconHint } from "@/components/ui/tooltip";
 import { columnMinWidth } from "@/lib/column-widths";
 import { type CountNoun, countLabel, RUNS } from "@/lib/count-label";
 import type {
@@ -169,6 +171,7 @@ import {
   syncTasksForget,
   syncTasksSetEnabled,
 } from "@/lib/ipc/client";
+import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { columnFoldStore } from "@/lib/stores/column-fold";
 import { panelsStore, usePanelsStore } from "@/lib/stores/panels";
 import { hydrateSyncListSizes } from "@/lib/stores/sync-detail";
@@ -1109,6 +1112,82 @@ export function taskDescriptionText(description: string | null): string | null {
   return description;
 }
 
+export function taskTitle(task: TaskVm): string {
+  return taskDescriptionText(task.description) ?? task.id;
+}
+
+function taskPathText(path: string | null, facts: TaskVm["copySourceFacts"]): string {
+  return `${facts?.path ?? path ?? "No path configured"} · ${facts?.drive ?? "outside any drive"}`;
+}
+
+function taskScopeText(task: TaskVm): string {
+  return task.kind === "copy"
+    ? `${taskPathText(task.copySource, task.copySourceFacts)} → ${taskPathText(task.copyDestination, task.copyDestinationFacts)}`
+    : (task.profile ?? (task.profileId === null ? TASK_HOST_WIDE_TEXT : task.profileId));
+}
+
+function CopyPathFact({
+  label,
+  path,
+  facts,
+}: {
+  label: "Source" | "Destination";
+  path: string | null;
+  facts: TaskVm["copySourceFacts"];
+}) {
+  const canReveal = useCapabilitiesStore((state) => state.capabilities.revealInFileManager);
+  const [error, setError] = useState<string | null>(null);
+  const resolvedPath = facts?.path ?? path;
+  const text = taskPathText(path, facts);
+  return (
+    <div className="min-w-0">
+      <div className="flex items-start gap-2">
+        <div className="min-w-0 flex-1">
+          <p className="font-medium text-xs">{label}</p>
+          <HoverHint
+            label={resolvedPath ?? "No path configured"}
+            detail={facts?.drive ?? "outside any drive"}
+          >
+            <p title={text} className="break-words font-mono text-xs [overflow-wrap:anywhere]">
+              {text}
+            </p>
+          </HoverHint>
+        </div>
+        {canReveal && (
+          <IconHint label={FILES_REVEAL_LABEL}>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label={`${FILES_REVEAL_LABEL}: ${label} ${resolvedPath ?? ""}`}
+              disabled={!resolvedPath || facts?.exists !== true}
+              onClick={() => {
+                if (!resolvedPath) return;
+                void revealPath(resolvedPath)
+                  .then(() => setError(null))
+                  .catch((cause: unknown) => setError(messageOf(cause)));
+              }}
+            >
+              <FolderSearch className="size-4" />
+            </Button>
+          </IconHint>
+        )}
+      </div>
+      {facts?.exists === false && (
+        <p className="text-muted-foreground text-xs">
+          {label === "Destination"
+            ? "Not there yet — created by the first run"
+            : "This folder is not there"}
+        </p>
+      )}
+      {error && (
+        <p role="alert" className="text-destructive text-xs">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
 /** One `label: value` cell, so a row reads without a table header above it. */
 function Field({
   label,
@@ -1473,6 +1552,16 @@ function TaskRow({
   const trigger = useRef<HTMLDivElement>(null);
   const focusHandoff = useRef(false);
   const unhosted = task.host.kind === "unhosted";
+  const canReveal = useCapabilitiesStore((state) => state.capabilities.revealInFileManager);
+  const [pathError, setPathError] = useState<string | null>(null);
+  const title = taskTitle(task);
+  const scope = taskScopeText(task);
+  const reveal = (path: string | null) => {
+    if (!path) return;
+    void revealPath(path)
+      .then(() => setPathError(null))
+      .catch((cause: unknown) => setPathError(messageOf(cause)));
+  };
   return (
     <ContextMenu
       onOpenChange={(open) => {
@@ -1480,63 +1569,80 @@ function TaskRow({
         menu.onOpenChange(task.id)(open);
       }}
     >
-      <ContextMenuTrigger asChild>
-        <div
-          ref={(element) => {
-            trigger.current = element;
-            optionRef(element);
-          }}
-          role="option"
-          data-testid={TASKS_ROW_TESTID}
-          data-task-id={task.id}
-          tabIndex={tabIndex}
-          aria-selected={selected}
-          {...menu.rowProps(task.id)}
-          aria-haspopup="menu"
-          onClick={(event) => onRowClick(event, task.id)}
-          onKeyDown={(event) => {
-            menuKey(event);
-            // Space belongs to the list's own handler, where the modifier that
-            // makes it a toggle is decoded beside the arrows — one place for the
-            // keys this list owns. Enter is the plain activation the element lost
-            // when it stopped being a button.
-            if (event.key === "Enter") {
-              event.preventDefault();
-              onActivate(task.id);
-            }
-          }}
-          className={cn(
-            "flex w-full flex-col gap-1 border-border border-b px-3 py-2 text-left",
-            "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-            "rounded-[7px]",
-            MENU_TARGET_RING,
-            selected ? "bg-accent" : "hover:bg-accent",
-          )}
-        >
-          <span className="flex min-w-0 items-center gap-2">
-            {/* Both stored spellings, the kind badge's rule: a kind or a mode a
+      <HoverHint label={title} detail={title !== task.id ? task.id : undefined}>
+        <ContextMenuTrigger asChild>
+          <div
+            ref={(element) => {
+              trigger.current = element;
+              optionRef(element);
+            }}
+            role="option"
+            data-testid={TASKS_ROW_TESTID}
+            data-task-id={task.id}
+            tabIndex={tabIndex}
+            aria-selected={selected}
+            aria-description={task.kind === "copy" ? scope : undefined}
+            {...menu.rowProps(task.id)}
+            aria-haspopup="menu"
+            onClick={(event) => onRowClick(event, task.id)}
+            onKeyDown={(event) => {
+              menuKey(event);
+              // Space belongs to the list's own handler, where the modifier that
+              // makes it a toggle is decoded beside the arrows — one place for the
+              // keys this list owns. Enter is the plain activation the element lost
+              // when it stopped being a button.
+              if (event.key === "Enter") {
+                event.preventDefault();
+                onActivate(task.id);
+              }
+            }}
+            className={cn(
+              "flex w-full flex-col gap-1 border-border border-b px-3 py-2 text-left",
+              "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+              "rounded-[7px]",
+              MENU_TARGET_RING,
+              selected ? "bg-accent" : "hover:bg-accent",
+            )}
+          >
+            <span className="flex min-w-0 items-center gap-2">
+              {/* Both stored spellings, the kind badge's rule: a kind or a mode a
             newer keeper wrote is shown rather than hidden (NFR-43). */}
-            <Badge variant="secondary">{task.kind}</Badge>
-            <Badge variant="outline">{task.mode}</Badge>
-            <span className="truncate font-medium text-foreground text-sm">{task.id}</span>
-          </span>
-          <span className="flex min-w-0 items-center justify-between gap-2 text-xs">
-            {/* The host WORD only. Its sentence and its reason are Rust's and are
+              <Badge variant="secondary">{task.kind}</Badge>
+              <Badge variant="outline">{task.mode}</Badge>
+              <span className="truncate font-medium text-foreground text-sm">{title}</span>
+            </span>
+            {task.kind === "copy" && (
+              <HoverHint label={scope}>
+                <span className="truncate text-muted-foreground text-xs">{scope}</span>
+              </HoverHint>
+            )}
+            <span className="flex min-w-0 items-center justify-between gap-2 text-xs">
+              {/* The host WORD only. Its sentence and its reason are Rust's and are
             rendered whole in the detail — a line this narrow would clip them,
             and a clipped host claim is the one thing AD-137 cannot tolerate.
             What the word has to carry alone is the alarm, which is why an
             unhosted row is coloured here as well as named. */}
-            <span
-              className={unhosted ? "truncate text-destructive" : "truncate text-muted-foreground"}
-            >
-              {HOST_KIND_LABELS[task.host.kind] ?? task.host.kind}
+              <HoverHint
+                label={HOST_KIND_LABELS[task.host.kind] ?? task.host.kind}
+                detail={task.host.sentence}
+              >
+                <span
+                  className={
+                    unhosted ? "truncate text-destructive" : "truncate text-muted-foreground"
+                  }
+                >
+                  {HOST_KIND_LABELS[task.host.kind] ?? task.host.kind}
+                </span>
+              </HoverHint>
+              {task.mode === "scheduled" && (
+                <span className="shrink-0 text-muted-foreground">
+                  {formatTaskDue(task.nextDueMs, now)}
+                </span>
+              )}
             </span>
-            <span className="shrink-0 text-muted-foreground">
-              {formatTaskDue(task.nextDueMs, now)}
-            </span>
-          </span>
-        </div>
-      </ContextMenuTrigger>
+          </div>
+        </ContextMenuTrigger>
+      </HoverHint>
       <ContextMenuContent
         aria-label={task.id}
         className="w-60 max-w-[calc(100vw-16px)]"
@@ -1555,6 +1661,22 @@ function TaskRow({
         <ContextMenuItem className="min-h-8" disabled={actions.disabled} onSelect={actions.toggle}>
           {task.enabled ? "Disable" : "Enable"}
         </ContextMenuItem>
+        {task.kind === "copy" && canReveal && (
+          <>
+            <ContextMenuItem
+              disabled={task.copySourceFacts?.exists !== true}
+              onSelect={() => reveal(task.copySourceFacts?.path ?? task.copySource)}
+            >
+              Reveal source in Finder
+            </ContextMenuItem>
+            <ContextMenuItem
+              disabled={task.copyDestinationFacts?.exists !== true}
+              onSelect={() => reveal(task.copyDestinationFacts?.path ?? task.copyDestination)}
+            >
+              Reveal destination in Finder
+            </ContextMenuItem>
+          </>
+        )}
         <ContextMenuItem
           className="min-h-8"
           disabled={actions.disabled}
@@ -1567,6 +1689,11 @@ function TaskRow({
           Forget
         </ContextMenuItem>
       </ContextMenuContent>
+      {pathError && (
+        <p role="alert" className="px-3 text-destructive text-xs">
+          {pathError}
+        </p>
+      )}
     </ContextMenu>
   );
 }
@@ -1665,20 +1792,33 @@ export function TaskDetail({
           <div className="flex items-center gap-2">
             <Badge variant="secondary">{task.kind}</Badge>
             <Badge variant="outline">{task.mode}</Badge>
-            <h2 className="truncate font-medium text-foreground text-sm">{task.id}</h2>
+            <HoverHint
+              label={taskTitle(task)}
+              detail={taskTitle(task) !== task.id ? task.id : undefined}
+            >
+              <h2
+                aria-label={taskTitle(task)}
+                className="truncate font-medium text-foreground text-sm"
+              >
+                {taskTitle(task)}
+              </h2>
+            </HoverHint>
           </div>
-          {/* The task's own words, when it has any (Story 59.5). Under the name
-              because the name is what it describes, and absent when blank —
-              `TASK_LAST_REPORT_LABEL`'s rule: a heading over an empty string
-              reads as a failed read. */}
           {taskDescriptionText(task.description) !== null && (
-            <p data-testid={TASKS_DESCRIPTION_TESTID} className="text-foreground text-xs">
-              {taskDescriptionText(task.description)}
+            <p
+              data-testid={TASKS_DESCRIPTION_TESTID}
+              className="text-muted-foreground text-xs [overflow-wrap:anywhere]"
+            >
+              {task.id}
             </p>
           )}
-          <p className="truncate text-muted-foreground text-xs">
-            {task.profile ?? (task.profileId === null ? TASK_HOST_WIDE_TEXT : task.profileId)}
-          </p>
+          {task.kind !== "copy" && (
+            <HoverHint label={taskScopeText(task)}>
+              <p title={taskScopeText(task)} className="truncate text-muted-foreground text-xs">
+                {taskScopeText(task)}
+              </p>
+            </HoverHint>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <Button
@@ -1720,10 +1860,24 @@ export function TaskDetail({
           </Button>
         </div>
       </div>
+      {task.kind === "copy" && (
+        <div className="grid min-w-0 gap-3">
+          <CopyPathFact label="Source" path={task.copySource} facts={task.copySourceFacts} />
+          <CopyPathFact
+            label="Destination"
+            path={task.copyDestination}
+            facts={task.copyDestinationFacts}
+          />
+        </div>
+      )}
 
       <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <Field label={TASK_SCHEDULE_LABEL}>{task.schedule ?? TASK_NO_SCHEDULE_TEXT}</Field>
-        <Field label={TASK_NEXT_DUE_LABEL}>{formatTaskDue(task.nextDueMs, now)}</Field>
+        {task.mode === "scheduled" && (
+          <>
+            <Field label={TASK_SCHEDULE_LABEL}>{task.schedule ?? TASK_NO_SCHEDULE_TEXT}</Field>
+            <Field label={TASK_NEXT_DUE_LABEL}>{formatTaskDue(task.nextDueMs, now)}</Field>
+          </>
+        )}
         <Field label={TASK_LAST_RUN_LABEL}>
           {task.lastRun === null ? neverRanText : formatTaskAgo(task.lastRun.startedMs, now)}
         </Field>
@@ -1819,7 +1973,7 @@ export function TaskDetail({
         // Named for its task, `FoldToggle`'s reason — kept even though exactly
         // one of these is on screen now, because the name a reader hears should
         // not depend on how many happen to be mounted.
-        aria-label={`${TASK_HISTORY_TITLE}: ${task.id}`}
+        aria-label={`${TASK_HISTORY_TITLE}: ${taskTitle(task)}`}
         disabled={busy}
         onClick={() => onHistoryToggle(task.id)}
         className="self-start"
@@ -3240,9 +3394,17 @@ export function TasksPane() {
                         >
                           <span className="flex items-center gap-2">
                             <Badge variant="outline">{TASKS_UNKNOWN_BADGE}</Badge>
-                            <span className="truncate font-medium text-foreground text-sm">
-                              {row.id === "" ? TASKS_UNKNOWN_NO_ID_TEXT : row.id}
-                            </span>
+                            <HoverHint
+                              label={row.id === "" ? TASKS_UNKNOWN_NO_ID_TEXT : row.id}
+                              detail={row.reason}
+                            >
+                              <span
+                                title={row.id === "" ? TASKS_UNKNOWN_NO_ID_TEXT : row.id}
+                                className="truncate font-medium text-foreground text-sm"
+                              >
+                                {row.id === "" ? TASKS_UNKNOWN_NO_ID_TEXT : row.id}
+                              </span>
+                            </HoverHint>
                           </span>
                           <span className="text-muted-foreground text-sm">{row.reason}</span>
                         </li>

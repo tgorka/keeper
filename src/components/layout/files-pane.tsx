@@ -621,6 +621,7 @@ export { VIEWER_ICON } from "@/lib/viewers";
 const FOLDER_ROLE_ICON: Record<FilesFolderRoleVm, LucideIcon> = {
   notesVault: NotebookPen,
   recordings: Clapperboard,
+  tasks: ListChecks,
 };
 
 /** What a role-carrying folder's icon means, for the row's title. Two folders
@@ -628,6 +629,7 @@ const FOLDER_ROLE_ICON: Record<FilesFolderRoleVm, LucideIcon> = {
 const FOLDER_ROLE_TITLE: Record<FilesFolderRoleVm, string> = {
   notesVault: "Your notes vault",
   recordings: "Where recordings are saved",
+  tasks: "Where task ledgers are written",
 };
 
 /** One `treeitem`: a profile root, or one entry inside one. */

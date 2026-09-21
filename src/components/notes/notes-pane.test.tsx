@@ -33,6 +33,7 @@ const VAULT_A: NoteVaultVm = {
   profileId: "profile-a",
   name: "Mind",
   subfolder: "notes",
+  spacesSubfolder: "spaces",
   root: "/home/dev/mind/notes",
   indexed: true,
   noteCount: 3,
@@ -123,6 +124,7 @@ let vaultList: NoteVaultVm[] = [VAULT_A, VAULT_B];
  */
 const SEEDED_SPACES: NoteSpaceVm[] = [
   space("s-inbox", "Inbox", "is:untagged", "inbox", "inbox"),
+  space("keeper:all", "All notes", "", "files", null),
   space("s-journal", "Journal", "is:journal", "calendar-days", "journal"),
   space("s-pinned", "Pinned", "is:pinned", "pin", "pinned"),
   space("s-recordings", "Recordings", "is:recording", "video", "recordings"),
@@ -141,6 +143,8 @@ function space(
   return {
     id,
     name,
+    vaultId: VAULT_A.id,
+    vaultName: VAULT_A.name,
     query,
     sort: "modified desc",
     sortEffective: "modified desc",
@@ -308,7 +312,10 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     notesList: vi.fn(async (vaultId: string, query: NoteQueryReq) => evaluate(vaultId, query)),
     notesTree: vi.fn(async () => ({ relDir: "", dirs: [], notes: [] })),
     notesTagTree: vi.fn(async () => ({ nodes: [] })),
-    notesSpaces: vi.fn(async () => spaceList),
+    notesSpaces: vi.fn(async (vaultId: string) => ({
+      rows: spaceList.map((row) => ({ ...row, vaultId, vaultName: VAULT_A.name })),
+      vaults: [{ vaultId, vaultName: VAULT_A.name, available: true, reason: "" }],
+    })),
     notesSpacesRestoreDefaults: vi.fn(async () => 0),
     notesSpaceTouch: vi.fn(async (_vault: string, id: string) => {
       const found = spaceList.find((entry) => entry.id === id);
@@ -348,15 +355,10 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
   };
 });
 
-import {
-  COLUMN_COLLAPSE_PREFIX,
-  COLUMN_EXPAND_PREFIX,
-  COLUMN_RAIL_CONTROL_SLOT,
-} from "@/components/layout/surface-column";
+import { COLUMN_COLLAPSE_PREFIX, COLUMN_EXPAND_PREFIX } from "@/components/layout/surface-column";
 import { NOTE_DELETE_CANCEL, NOTE_DELETE_CONFIRM } from "@/components/notes/note-delete-dialog";
 import { NOTES_SEARCH_PLACEHOLDER } from "@/components/notes/note-filter-bar";
 import {
-  NEW_NOTE_LABEL,
   NOTES_COUNT_SLOT,
   NOTES_NOTICE_SLOT,
   NOTES_RAIL_LIST_LABEL,
@@ -570,14 +572,8 @@ describe("NotesPane columns", () => {
 
     fireEvent.click(screen.getByRole("button", { name: railFold }));
 
-    // The rail's rows are gone — the spaces, the trees, the switcher — and what
-    // the rail could DO is on the strip instead. New note is the SAME control at
-    // 48px, which is why it is still findable by the words a user reads; before
-    // the second cut of this story it was simply absent, which is the defect.
-    expect(screen.getByRole("button", { name: NEW_NOTE_LABEL })).toHaveAttribute(
-      "data-slot",
-      COLUMN_RAIL_CONTROL_SLOT,
-    );
+    // Creation stays in All notes and the search bar, not a redundant rail button.
+    expect(screen.queryByRole("button", { name: "New note" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Inbox" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Note, Pricing/ })).toBeInTheDocument();
     expect(
@@ -594,7 +590,7 @@ describe("NotesPane columns", () => {
     fireEvent.click(screen.getByRole("button", { name: listFold }));
 
     expect(screen.queryByRole("button", { name: /Note, Pricing/ })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: NEW_NOTE_LABEL })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "New note" })).not.toBeInTheDocument();
   });
 
   it("puts a seam on each column, and takes the folded one's away", async () => {
@@ -655,28 +651,9 @@ describe("NotesPane columns", () => {
     // Which vault is active is a fact the strip would otherwise destroy, so it
     // rides the control that leads back to the switcher.
     expect(screen.getByRole("button", { name: `Vaults, ${VAULT_A.name}` })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: NEW_NOTE_LABEL })).toBeEnabled();
     for (const section of ["Spaces", "Tags", "Files"]) {
       expect(screen.getByRole("button", { name: section })).toBeInTheDocument();
     }
-  });
-
-  it("makes a note from the folded rail without spending the fold", async () => {
-    renderPane();
-    await waitForRows("Pricing");
-    fireEvent.click(screen.getByRole("button", { name: railFold }));
-
-    fireEvent.click(screen.getByRole("button", { name: NEW_NOTE_LABEL }));
-
-    // The create is the one rail control that does its whole job at 48px: the
-    // note is written and opened in the strip beside, and the column the user
-    // put away stays away.
-    await waitFor(() => expect(notesCreate).toHaveBeenCalled());
-    expect(
-      screen.getByRole("button", {
-        name: `${COLUMN_EXPAND_PREFIX} ${SURFACE_COLUMNS["notes-rail"].label}`,
-      }),
-    ).toBeInTheDocument();
   });
 
   it("opens the section the rail names, including one the user had folded", async () => {
@@ -748,6 +725,7 @@ describe("NotesPane filters", () => {
 
     // One chip: everything tagged `work`.
     fireEvent.click(screen.getAllByRole("button", { name: "Tag work, on this note" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "Include tag work" }));
     await waitFor(() => {
       expect(screen.queryByRole("button", { name: /Note, Garden/ })).not.toBeInTheDocument();
     });
@@ -757,6 +735,7 @@ describe("NotesPane filters", () => {
     // Two chips intersect — AND, never OR. `Standup` carries `work` but not
     // `urgent`, so a union would leave it on screen and this would fail.
     fireEvent.click(screen.getByRole("button", { name: "Tag urgent, on this note" }));
+    fireEvent.click(screen.getByRole("button", { name: "Include tag urgent" }));
     await waitFor(() => {
       expect(screen.queryByRole("button", { name: /Note, Standup/ })).not.toBeInTheDocument();
     });
@@ -781,6 +760,7 @@ describe("NotesPane filters", () => {
 
     // `Garden` is not tagged `work`, so this filter excludes the open note.
     fireEvent.click(screen.getAllByRole("button", { name: "Tag work, on this note" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "Include tag work" }));
     await waitFor(() => {
       expect(screen.queryByRole("button", { name: /Note, Garden/ })).not.toBeInTheDocument();
     });
@@ -1000,7 +980,7 @@ describe("NotesPane rail", () => {
 
     // It is a filter like every other row, so it is dismissible in place and
     // widening brings the rest back rather than needing a second visit.
-    fireEvent.click(screen.getByRole("button", { name: "Clear Recordings scope" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clear scope Recordings" }));
     await waitFor(() => {
       expect(screen.getByRole("button", { name: /Note, Pricing/ })).toBeInTheDocument();
     });
@@ -1196,7 +1176,7 @@ describe("NotesPane — new note", () => {
     renderPane();
     await waitForRows("Pricing");
 
-    fireEvent.click(screen.getByRole("button", { name: NEW_NOTE_LABEL }));
+    await newNoteInSpace("All notes");
 
     // Opened: the pane hands the new id to the editor, which is what puts the
     // caret in its body (`new-note-caret.test.tsx` proves the other half).
@@ -1288,13 +1268,35 @@ describe("NotesPane — new note", () => {
     expect(document.querySelector(`[data-slot="${NOTES_NOTICE_SLOT}"]`)).toBeNull();
   });
 
+  it("shows the backend notice when a space creates into another drive", async () => {
+    renderPane();
+    await waitForRows("Pricing");
+    act(() => {
+      notesFiltersStore.getState().enterSpace(SEEDED_SPACES[0]);
+      notesFiltersStore.getState().setVaultIds(["vault-a", "vault-b"]);
+    });
+    const notice = "Inbox belongs to Mind; this note was created in Work.";
+    vi.mocked(notesCreate).mockResolvedValueOnce({
+      note: { id: "cross-drive", vaultId: "vault-b", path: "cross-drive.md", title: "New note" },
+      notices: [notice],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "New note from search" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Work\b/ }));
+    await waitFor(() =>
+      expect(notesCreate).toHaveBeenCalledWith(
+        "vault-b",
+        expect.objectContaining({ space: "s-inbox", spaceVaultId: "vault-a" }),
+      ),
+    );
+    expect(await screen.findByText(notice)).toBeVisible();
+  });
+
   it("offers no create while no vault is flagged", async () => {
     vaultList = [];
     renderPane();
 
-    await waitFor(() => {
-      expect(screen.getByRole("button", { name: NEW_NOTE_LABEL })).toBeDisabled();
-    });
+    await screen.findByRole("button", { name: "Open Settings → Sync" });
+    expect(screen.queryByRole("button", { name: "New note from search" })).not.toBeInTheDocument();
   });
 });
 

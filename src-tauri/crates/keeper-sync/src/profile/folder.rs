@@ -57,6 +57,117 @@ pub const FOLDER_CONFIG_DIR: &str = ".keeper";
 /// The shared file: this folder, on every machine.
 const SHARED_FILE: &str = "keeper.toml";
 
+/// Whether Settings can edit the single-key block without touching hand-written TOML.
+pub fn tasks_key_writable(profile: &SyncProfile) -> bool {
+    let path = profile.local_path.join(FOLDER_CONFIG_DIR).join(SHARED_FILE);
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.permissions().readonly()) {
+        return false;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+                return false;
+            };
+            match table.get("folder").and_then(|folder| folder.get("tasks")) {
+                None => true,
+                Some(tasks) => tasks.get("subfolder").is_some_and(|subfolder| {
+                    let block = format!("# keeper: task ledgers\n[folder.tasks]\nsubfolder = {subfolder}\n# keeper: end task ledgers\n");
+                    text.contains(&block)
+                }),
+            }
+        }
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Write only keeper's own tasks block, retaining every neighbouring byte.
+/// A refusal is a sentence for Settings; the local choice still resolves.
+pub fn write_tasks_key(profile: &SyncProfile, subfolder: &str) -> Result<(), String> {
+    use std::io::Write;
+
+    let mut checked = profile.clone();
+    checked.tasks = Some(super::TasksConfig {
+        subfolder: subfolder.to_owned(),
+    });
+    checked.validate().map_err(|error| error.to_string())?;
+    let directory = profile.local_path.join(FOLDER_CONFIG_DIR);
+    let path = directory.join(SHARED_FILE);
+    let refusal = |reason: String| {
+        format!("The folder file {} could not be written: {reason} Task runs remain logged using this machine's resolved ledger (the default tasks folder when this drive has no tasks key).", path.display())
+    };
+    let original = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(refusal(error.to_string())),
+    };
+    let table: toml::Table =
+        toml::from_str(&original).map_err(|error| refusal(format!("{error}")))?;
+    let existing = table.get("folder").and_then(|folder| folder.get("tasks"));
+    let wanted = toml::Value::String(subfolder.to_owned());
+    if existing.and_then(|tasks| tasks.get("subfolder")) == Some(&wanted) {
+        return Ok(());
+    }
+    const START: &str = "# keeper: task ledgers\n";
+    const END: &str = "# keeper: end task ledgers\n";
+    let block = format!("{START}[folder.tasks]\nsubfolder = {wanted}\n{END}");
+    let updated = if existing.is_some() {
+        let start = original.find(START).ok_or_else(|| {
+            refusal("the tasks key is hand-written; edit it in the folder file.".into())
+        })?;
+        let end = original[start..]
+            .find(END)
+            .map(|end| start + end + END.len())
+            .ok_or_else(|| refusal("the tasks block is not in keeper's editable shape.".into()))?;
+        // A marker alone is not ownership: accept only the exact single-key block.
+        let old = existing
+            .and_then(|tasks| tasks.get("subfolder"))
+            .ok_or_else(|| refusal("the tasks block has no subfolder.".into()))?;
+        let expected = format!("{START}[folder.tasks]\nsubfolder = {old}\n{END}");
+        if original[start..end] != expected {
+            return Err(refusal(
+                "the tasks block was edited by hand; edit it in the folder file.".into(),
+            ));
+        }
+        format!("{}{}{}", &original[..start], block, &original[end..])
+    } else {
+        let separator = if original.is_empty() || original.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        format!("{original}{separator}{block}")
+    };
+    let reparsed: toml::Table =
+        toml::from_str(&updated).map_err(|error| refusal(format!("{error}")))?;
+    if reparsed
+        .get("folder")
+        .and_then(|folder| folder.get("tasks"))
+        .and_then(|tasks| tasks.get("subfolder"))
+        != Some(&wanted)
+    {
+        return Err(refusal(
+            "the resulting file would not read back the requested subfolder.".into(),
+        ));
+    }
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.permissions().readonly()) {
+        return Err(refusal("the folder file is read-only.".into()));
+    }
+    std::fs::create_dir_all(&directory).map_err(|error| refusal(error.to_string()))?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(&directory).map_err(|error| refusal(error.to_string()))?;
+    temporary
+        .write_all(updated.as_bytes())
+        .map_err(|error| refusal(error.to_string()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| refusal(error.to_string()))?;
+    temporary
+        .persist(&path)
+        .map_err(|error| refusal(error.to_string()))?;
+    Ok(())
+}
+
 /// Whether a folder file may set one [`SyncProfile`] field, and if not, why.
 ///
 /// Three answers rather than a boolean, because the two refusals are different
@@ -875,6 +986,43 @@ mod tests {
 
     fn profile(root: &Path) -> SyncProfile {
         SyncProfile::new("01J", "tgdrive", root, "https://example.invalid/r.git")
+    }
+
+    #[test]
+    fn tasks_key_writer_preserves_neighbours_and_noop_mtime() {
+        let dir = tempfile::tempdir().expect("directory");
+        let profile = profile(dir.path());
+        let config = dir.path().join(".keeper");
+        std::fs::create_dir(&config).expect("config");
+        let path = config.join("keeper.toml");
+        let before = "# a person's comment\n[folder]\nname = 'unchanged'\n\n[settings]\n";
+        std::fs::write(&path, before).expect("fixture");
+        write_tasks_key(&profile, "tasks").expect("append");
+        let first = std::fs::read_to_string(&path).expect("read");
+        assert!(first.starts_with(before));
+        let modified = std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        write_tasks_key(&profile, "tasks").expect("no-op");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("metadata")
+                .modified()
+                .expect("mtime"),
+            modified
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), first);
+        write_tasks_key(&profile, "logs").expect("replace");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            first.replace("subfolder = \"tasks\"", "subfolder = \"logs\"")
+        );
+        let foreign = "[folder]\ntasks = { subfolder = 'foreign' }\n";
+        std::fs::write(&path, foreign).expect("foreign");
+        assert!(write_tasks_key(&profile, "logs").is_err());
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), foreign);
+        assert!(!tasks_key_writable(&profile));
     }
 
     fn tier() -> FolderTier {

@@ -38,6 +38,7 @@ describe("SpaceNamePopover", () => {
       'client/acme · "budget"',
     );
     fireEvent.change(input, { target: { value: "Trip" } });
+    fireEvent.click(screen.getByRole("switch", { name: "Temporary space" }));
     fireEvent.keyDown(input, { key: "Enter" });
     await waitFor(() => expect(screen.queryByLabelText("Name")).not.toBeInTheDocument());
     expect(save).toHaveBeenCalledWith("Trip", { ttlHours: null });
@@ -72,7 +73,7 @@ describe("SpaceNamePopover", () => {
       .mockResolvedValue(undefined);
     render(<Harness save={save} />);
     fireEvent.click(screen.getByRole("button", { name: "Save as space" }));
-    fireEvent.click(screen.getByLabelText("Temporary space"));
+    expect(screen.getByRole("switch", { name: "Temporary space" })).toBeChecked();
     const hours = screen.getByLabelText("Expires after inactivity (hours)");
     fireEvent.change(hours, { target: { value: "0" } });
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();

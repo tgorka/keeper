@@ -41,17 +41,8 @@
  * cannot, the create still happens and the sentence Rust composed is shown
  * above the list. Nothing here parses a query; the surface sends a space id.
  */
-import {
-  FilePlus,
-  FilterX,
-  Folder,
-  Layers,
-  NotebookPen,
-  NotebookText,
-  Search,
-  Tags,
-} from "lucide-react";
-import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
+import { FilterX, Folder, Layers, NotebookPen, NotebookText, Search, Tags } from "lucide-react";
+import { Fragment, type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 import { PanelStrip } from "@/components/layout/panel-strip";
 import { type SurfaceRail, useSurfaceColumn } from "@/components/layout/surface-column";
 import { NoteDeleteDialog } from "@/components/notes/note-delete-dialog";
@@ -72,7 +63,7 @@ import {
 } from "@/hooks/use-notes-actions";
 import { useNotesChanges } from "@/hooks/use-notes-changes";
 import { countLabel, NOTES } from "@/lib/count-label";
-import type { NoteRowVm, NoteSpaceVm } from "@/lib/ipc/client";
+import type { NoteRailVaultVm, NoteRowVm, NoteSpaceVm } from "@/lib/ipc/client";
 import { notesSubscribeSearch, notesUnsubscribeChanges } from "@/lib/ipc/client";
 import { ALL_SPACE_ID } from "@/lib/notes/all-spaces";
 import { columnFoldStore } from "@/lib/stores/column-fold";
@@ -104,7 +95,6 @@ import {
 import { activePanel, panelsStore, usePanelsStore } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { syncErrorMessage } from "@/lib/stores/sync";
-import { cn } from "@/lib/utils";
 
 /** What a failed verb reads as when the rejection carries no message. */
 const NOTES_ACTION_FAILED = "keeper could not do that to this note.";
@@ -118,9 +108,6 @@ export const NOTES_RAIL_LIST_LABEL = "Note list";
 
 /** The name a saved space gets when it is promoted from the chip bar. */
 export const UNTITLED_SPACE_NAME = "Untitled space";
-
-/** The rail's create control, kept verbatim so a test names what a user reads. */
-export const NEW_NOTE_LABEL = "New note";
 
 /**
  * Test id for the line that says how many notes this lens holds (Story 44.11).
@@ -152,6 +139,8 @@ export function NotesPane() {
   const vaults = useNotesVaultsStore((s) => s.vaults);
   const activeVaultId = useNotesVaultsStore((s) => s.activeVaultId);
   const activeVault = useActiveVault();
+  const selectedVaultIds = useNotesFiltersStore((s) => s.vaultIds);
+  const [railVaults, setRailVaults] = useState<NoteRailVaultVm[]>([]);
   const scope = useNotesFiltersStore((s) => s.scope);
   const tagTerms = useNotesFiltersStore((s) => s.tagTerms);
   const searchText = useNotesFiltersStore((s) => s.text);
@@ -288,9 +277,9 @@ export function NotesPane() {
    * stale explanation over a note it is not about.
    */
   const onCreate = useCallback(
-    (spaceId: string | null) => {
+    (spaceId: string | null, vaultId?: string) => {
       setActionError(null);
-      void createNote(spaceId)
+      void createNote(spaceId, vaultId)
         .then((created) => setNotices(created?.notices ?? []))
         .catch(report);
     },
@@ -500,13 +489,6 @@ export function NotesPane() {
       detail: activeVault?.name ?? null,
       onSelect: () => columnFoldStore.getState().toggleColumn("notes-rail"),
     },
-    {
-      id: "new-note",
-      icon: FilePlus,
-      label: NEW_NOTE_LABEL,
-      disabled: activeVaultId === null,
-      onSelect: () => onCreate(null),
-    },
     { id: "spaces", icon: Layers, label: "Spaces", onSelect: () => openSection("spaces") },
     { id: "tags", icon: Tags, label: "Tags", onSelect: () => openSection("tags") },
     { id: "files", icon: Folder, label: "Files", onSelect: () => openSection("files") },
@@ -600,26 +582,6 @@ export function NotesPane() {
             <div className="shrink-0 p-2">
               <VaultSwitcher />
             </div>
-            {/* The rail's own create (Story 44.6). At the head of the column and
-                not inside the Spaces group: this one makes a note in the vault,
-                which the default list shows, while the `+` on a space row makes a
-                note that space will list. Two different promises need two
-                different controls. */}
-            <div className="shrink-0 px-2 pb-2">
-              <button
-                type="button"
-                disabled={activeVaultId === null}
-                onClick={() => onCreate(null)}
-                className={cn(
-                  "flex w-full items-center gap-2 rounded-md border border-border px-2 py-1.5 text-left text-sm outline-none",
-                  "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
-                  "disabled:pointer-events-none disabled:opacity-50",
-                )}
-              >
-                <FilePlus aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
-                {NEW_NOTE_LABEL}
-              </button>
-            </div>
             {/* Every group below is unbounded — spaces as much as tags, now that
                 the four fixed rows are spaces too — so they share one scroll
                 container and everything in it stays reachable at every size
@@ -627,11 +589,27 @@ export function NotesPane() {
             <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pt-1">
               <SpaceList
                 vaultId={activeVaultId}
-                onNewNote={(space) => onCreate(space.id === ALL_SPACE_ID ? null : space.id)}
-                savedSpace={savedSpace?.vaultId === activeVaultId ? savedSpace.space : null}
+                vaultIds={selectedVaultIds}
+                onVaults={setRailVaults}
+                onNewNote={(space) =>
+                  onCreate(space.id === ALL_SPACE_ID ? null : space.id, space.vaultId)
+                }
+                savedSpace={savedSpace?.space ?? null}
               />
-              <TagTree vaultId={activeVaultId} />
-              <PhysicalTree vaultId={activeVaultId} />
+              {railVaults
+                .filter((drive) => drive.available)
+                .map((drive) => (
+                  <Fragment key={drive.vaultId}>
+                    <TagTree
+                      vaultId={drive.vaultId}
+                      driveName={railVaults.length > 1 ? drive.vaultName : undefined}
+                    />
+                    <PhysicalTree
+                      vaultId={drive.vaultId}
+                      driveName={railVaults.length > 1 ? drive.vaultName : undefined}
+                    />
+                  </Fragment>
+                ))}
             </div>
           </>
         )}
@@ -653,6 +631,7 @@ export function NotesPane() {
                 onSaveAsSpace={onSaveAsSpace}
                 searchRef={searchRef}
                 onHideServiceFilesChange={onHideServiceFilesChange}
+                onCreateNotices={setNotices}
               />
             )}
             {actionError !== null && (
@@ -735,7 +714,8 @@ export function NotesPane() {
                 selectedVaultId={activeNote?.vaultId ?? null}
                 onSelect={openRow}
                 onSelectBeside={openRowBeside}
-                onToggleTag={(tag) => notesFiltersStore.getState().cycleTag(tag)}
+                tagTerms={tagTerms}
+                onSetTagTerm={(tag, term) => notesFiltersStore.getState().setTagTerm(tag, term)}
                 onVerb={runVerb}
                 onGrow={() => notesListStore.getState().growWindow()}
               />

@@ -218,7 +218,7 @@ describe("one field retains its controls", () => {
     expect(notesFiltersStore.getState().tagTerms).toEqual([{ tag: "draft", term: "exclude" }]);
   });
 
-  it("removes the last chip only at a collapsed caret start; clicks retain the three-state cycle", () => {
+  it("removes the last chip only at a collapsed caret start", () => {
     notesFiltersStore.getState().setTagTerm("draft", "include");
     notesFiltersStore.getState().setTagTerm("client", "include");
     const field = mount();
@@ -229,15 +229,6 @@ describe("one field retains its controls", () => {
     field.setSelectionRange(0, 0);
     fireEvent.keyDown(field, { key: "Backspace" });
     expect(notesFiltersStore.getState().tagTerms).toEqual([{ tag: "draft", term: "include" }]);
-    const included = screen.getByRole("button", {
-      name: "Tag draft: included. Exclude it instead.",
-    });
-    expect(included).toHaveAttribute("tabindex", "-1");
-    fireEvent.click(included);
-    fireEvent.click(
-      screen.getByRole("button", { name: "Tag draft: excluded. Stop filtering by it." }),
-    );
-    expect(notesFiltersStore.getState().tagTerms).toEqual([]);
   });
 
   it("serializes sort, drives and private choices made through the real controls", async () => {
@@ -267,50 +258,49 @@ describe("one field retains its controls", () => {
     expect(screen.queryByRole("button", { name: "Relevance" })).toBeNull();
   });
 
-  it("keeps the eight keyboard controls in their agreed order", () => {
-    mount();
-    expect(
-      screen
-        .getAllByRole("button")
-        .slice(0, 8)
-        .map((button) => button.getAttribute("aria-label")),
-    ).toEqual([
-      "Changed by agent",
-      "Pinned only",
-      "Hide service files",
-      "Sort notes",
-      "Search drives",
-      "Include private notes",
-      "New note from search",
-      "Save as space",
-    ]);
-  });
-
   it("asks which selected drive receives a new note and keeps the prompt", async () => {
     notesFiltersStore.getState().setVaultIds(["v1", "v2"]);
     notesFiltersStore.setState({
-      scope: { kind: "space", id: "journal", name: "Journal", defaultKey: null },
+      scope: { kind: "space", vaultId: "v1", id: "journal", name: "Journal", defaultKey: null },
     });
     notesFiltersStore.getState().setText("A thought to keep");
     notesFiltersStore.getState().setTagTerm("client", "include");
     notesFiltersStore.getState().setTagTerm("draft", "exclude");
-    const field = mount();
+    const notices = ["Journal belongs to Work; the note was created in Personal."];
+    vi.mocked(notesCreate).mockResolvedValueOnce({
+      note: { id: "new", vaultId: "v2", path: "new.md", title: "New note" },
+      notices,
+    });
+    const onCreateNotices = vi.fn();
+    render(<NoteFilterBar onSaveAsSpace={vi.fn()} onCreateNotices={onCreateNotices} />);
+    const field = screen.getByRole("combobox", { name: "Search notes" });
     fireEvent.click(screen.getByRole("button", { name: "New note from search" }));
     expect(notesCreate).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Personal" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Personal\b/ }));
     await waitFor(() =>
       expect(notesCreate).toHaveBeenCalledWith(
         "v2",
-        expect.objectContaining({ body: "A thought to keep", tags: ["client"], space: null }),
+        expect.objectContaining({
+          body: "A thought to keep",
+          tags: ["client"],
+          space: "journal",
+          spaceVaultId: "v1",
+        }),
       ),
     );
+    expect(onCreateNotices).toHaveBeenCalledWith(notices);
     expect(field).toHaveValue("A thought to keep");
     fireEvent.click(screen.getByRole("button", { name: "New note from search" }));
-    fireEvent.click(screen.getByRole("button", { name: "Work" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Work\b/ }));
     await waitFor(() =>
       expect(notesCreate).toHaveBeenLastCalledWith(
         "v1",
-        expect.objectContaining({ body: "A thought to keep", tags: ["client"], space: "journal" }),
+        expect.objectContaining({
+          body: "A thought to keep",
+          tags: ["client"],
+          space: "journal",
+          spaceVaultId: "v1",
+        }),
       ),
     );
   });

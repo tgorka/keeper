@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   type SyncProfileVm,
@@ -19,6 +20,7 @@ export function TasksSection({ open }: { open: boolean }) {
   const [tasks, setTasks] = useState<TaskVm[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [subfolder, setSubfolder] = useState("tasks");
   const generation = useRef(0);
   const reload = useCallback(() => {
     const mine = ++generation.current;
@@ -29,6 +31,7 @@ export function TasksSection({ open }: { open: boolean }) {
       .then(([next, folders, listing]) => {
         if (mine !== generation.current) return;
         setLedger(next);
+        setSubfolder(next.subfolder);
         setProfiles(folders);
         setTasks(listing.tasks.filter((task) => task.kind === "copy"));
       })
@@ -46,16 +49,17 @@ export function TasksSection({ open }: { open: boolean }) {
     };
   }, [reload]);
 
-  const choose = async (profileId: string) => {
+  const choose = async (profileId: string, folder = subfolder) => {
     if (busy) return;
     const mine = ++generation.current;
     setBusy(true);
     setError(null);
     try {
-      await syncTasksLedgerSet(profileId || null);
-      const [next, listing] = await Promise.all([syncTasksLedger(), syncTasks()]);
+      const next = await syncTasksLedgerSet(profileId || null, profileId ? folder : null);
+      const listing = await syncTasks();
       if (mine !== generation.current) return;
       setLedger(next);
+      setSubfolder(next.subfolder);
       setTasks(listing.tasks.filter((task) => task.kind === "copy"));
     } catch (cause) {
       if (mine === generation.current) setError(syncErrorMessage(cause));
@@ -96,6 +100,22 @@ export function TasksSection({ open }: { open: boolean }) {
           </option>
         ))}
       </select>
+      <Label htmlFor={`${id}-subfolder`}>Task subfolder</Label>
+      <div className="flex min-w-0 gap-2">
+        <Input
+          id={`${id}-subfolder`}
+          value={subfolder}
+          disabled={busy || ledger === null}
+          onChange={(event) => setSubfolder(event.target.value)}
+        />
+        <Button
+          variant="outline"
+          disabled={busy || !ledger?.chosenProfileId}
+          onClick={() => void choose(ledger?.chosenProfileId ?? "")}
+        >
+          Save subfolder
+        </Button>
+      </div>
       {busy && (
         <p role="status" className="text-xs">
           Reading task ledger settings…
@@ -118,6 +138,28 @@ export function TasksSection({ open }: { open: boolean }) {
               <p className="font-mono text-xs leading-5 [overflow-wrap:anywhere]">{ledger.root}</p>
             )}
             <p className="text-muted-foreground text-xs">Task subfolder: {ledger.subfolder}</p>
+            <p className="text-muted-foreground text-xs">
+              Subfolder source: {ledger.subfolderSource}. Folder file writable:{" "}
+              {ledger.writable ? "yes" : "no"}.
+            </p>
+            {ledger.root && (
+              <p className="text-muted-foreground text-xs">
+                {ledger.exists
+                  ? "The ledger folder exists."
+                  : "The ledger folder will be created by the first run."}
+              </p>
+            )}
+            {ledger.notice && (
+              <p role="status" className="text-xs">
+                {ledger.notice}
+              </p>
+            )}
+            {!ledger.writable && ledger.subfolderSource === "default" && (
+              <p role="status" className="text-xs">
+                The folder file could not be written. The engine default keeps task logs on this
+                machine.
+              </p>
+            )}
             {ledger.chosenProfileId !== null &&
               ledger.chosenProfileId !== ledger.resolvedProfileId && (
                 <p role="status" className="text-xs">
@@ -131,7 +173,9 @@ export function TasksSection({ open }: { open: boolean }) {
           )}
           {tasks.map((task) => (
             <div key={task.id} className="flex min-w-0 flex-col gap-1 border-t pt-2">
-              <h4 className="font-medium [overflow-wrap:anywhere]">{task.id}</h4>
+              <h4 className="font-medium [overflow-wrap:anywhere]">
+                {task.description?.trim() || task.id}
+              </h4>
               <p className="text-xs">Task configuration (task.toml) and run ledgers:</p>
               <p className="font-mono text-xs leading-5 [overflow-wrap:anywhere]">
                 {task.ledgerPath ?? "No ledger folder configured"}
