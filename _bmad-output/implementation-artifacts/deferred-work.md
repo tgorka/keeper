@@ -6382,6 +6382,55 @@ location: `src/components/layout/panel-strip.tsx` (`RunPanelBody`), `crates/keep
 reason: the log file is written once, at the end of the run (`ledger.write_run`, `engine.rs:4318`), so an in-flight run has no entry and the panel says so; the copy engine's `CopyProgress` sink exists for the one-shot surface and could feed the panel a live bar, but a task run is claimed and closed by the engine's tick with no subscriber today. Wire it when the owner opens a running task's row and expects to watch it.
 status: open
 
+### DW-276: New note from search carries exclude chips as negated terms.
+
+origin: epic 79's plan, 2026-09-20 (Story 79.11)
+location: `src/components/notes/note-filter-bar.tsx` (`createFromSearch`, the `term === "include"` filter), `src-tauri/crates/keeper-core/src/notes/vm.rs` (`NoteCreateReq.tags`), `src-tauri/crates/keeper/src/notes_ipc.rs` (`notes_create`)
+reason: FR-597 promises "the included tags" and the create path drops exclude chips silently (`:223`). Carrying them would mean either a note that names what it is not (a `-tag` has no meaning on a note) or a seeding rule that reads the exclusion — a `NoteCreateReq` change in the shell for a case nobody has reported. Decide after 79.11 has been in the owner's hands.
+status: open
+
+### DW-277: A merged tag tree across the selected drives.
+
+origin: epic 79's plan, 2026-09-20 (AD-294, Story 79.5)
+location: `src-tauri/crates/keeper-core/src/notes/index.rs` (`IndexEntry::tag_tree`), `src-tauri/crates/keeper/src/notes_ipc.rs` (`notes_tag_tree`), `src/components/notes/tag-tree.tsx`
+reason: 79.5 groups the tag tree per drive, which is what the owner asked for and what keeps composition O(spaces). A union — one `client` node whose count sums both drives — reads better once three or more drives are routinely selected, and costs a keeper-core merge over two `BTreeMap`s. Not before someone selects three drives and says the repeated nodes are noise.
+status: open
+
+### DW-278: The app writes `notes.spacesSubfolder` into the folder's `.keeper/keeper.toml`.
+
+origin: epic 79's plan, 2026-09-20 (Story 79.9)
+location: `src-tauri/crates/keeper/src/notes_ipc.rs` (`notes_vault_settings_save`), `src-tauri/crates/keeper-sync/src/profile/folder.rs` (the folder tier's "resolved at read time, never written back" rule, `:31-38`)
+reason: a rename made in Settings is stored in this machine's `sync.db`; it reaches the other clones only when the key is written into the folder file, by hand today. Epic 80's AD-297 makes the app the first writer of one `[folder]` key (`tasks`) and records that amendment as D-23; a second key should ride that decision once it has landed and been used, not fork it in the same wave. Until then the Settings row says the value is this machine's and names the file that makes it travel.
+status: open
+
+### DW-279: `keeper-syncd` never installs the folder tier, so a `[folder.tasks]` key is invisible to the daemon.
+
+origin: epic 80's plan, 2026-09-20 (AD-297, NFR-87)
+location: `crates/keeper-syncd/src/main.rs` (engine open), `keeper-sync/src/profile/folder.rs:40-42` (`install_folder_tier` is app-only: `crates/keeper/src/lib.rs:391-394`)
+reason: the daemon sees `sync.db`'s table only, so a drive flagged by the app's Settings write (AD-297) or by a hand-edited `keeper.toml` is unflagged to the daemon on the same machine, and a daemon-only host resolves a ledger only through the machine-local choice plus the default subfolder. That is correct today because the default is the same on both sides, but a non-default subfolder written into the file is honoured by the app and not by the daemon. Installing the tier in the daemon needs the host label and the main-folder nomination the app has at `lib.rs:361-394`, and a decision about `keeper.<host>.toml` on a host with no GUI.
+status: open
+
+### DW-280: Settings cannot edit a `tasks` key a person wrote in a shape keeper does not own.
+
+origin: epic 80's plan, 2026-09-20 (AD-297, NFR-85)
+location: `keeper-sync/src/profile/folder.rs` (`write_tasks_key`), `src/components/settings/tasks-section.tsx`
+reason: `toml::Table` carries no spans (`keeper-core/src/config/mod.rs:238-241`) and the tree has no `toml_edit` dependency, so the writer can replace only the `[folder.tasks]` block it wrote itself; `tasks = { subfolder = "x" }` or a dotted key under `[folder]` is refused with a sentence and the box is disabled. A field-level editor is a new dependency (`toml_edit` is in the lock transitively, not a direct dependency of any crate here) and a `cargo deny` question; revisit if the refusal is met in the field.
+status: open
+
+### DW-281: Every copy task on a machine writes to the one chosen ledger drive.
+
+origin: epic 80's plan, 2026-09-20 (What stays out)
+location: `keeper-sync/src/db.rs` (`tasks` columns), `keeper-sync/src/engine.rs` (`task_ledger_for`), `src/components/sync/task-form.tsx`
+reason: the owner asked for logs "on all drives" and got a flag any drive can carry plus one machine-local choice; a per-task override (`ledger_profile_id` on the row, a picker on the copy form, a fourth arm in the resolution) would let two copy tasks on one machine keep their histories on two drives. Not asked for; named so the resolution rule's fourth arm is designed once rather than bolted on.
+status: open
+
+### DW-282: `sessions` has a `[folder]` key and no Files-tree role.
+
+origin: epic 80's plan, 2026-09-20 (AD-298)
+location: `keeper-core/src/vm.rs:4150-4156` (`FilesFolderRoleVm`), `src/components/layout/files-pane.tsx:621-631`
+reason: the role vocabulary now lags exactly one flag; a sessions zone is a folder keeper adopts rather than writes, so its glyph and title need a sentence of their own, and the sessions surface may prefer no marker at all. One variant, one icon, one title, one test arm when somebody wants it.
+status: open
+
 ## Triage of 2026-09-17
 
 Six read-only lanes verified every open entry of this ledger against the tree on 2026-09-17 (epic 73, story 73.5). This section is the triage's result; the next planning session reads this, not the six agent reports.

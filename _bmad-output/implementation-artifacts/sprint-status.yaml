@@ -48,6 +48,32 @@ tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 
 development_status:
+  # Epic 80: the tasks half of the 0.8.31 field report — the ledger a chosen drive never got, a tasks drive flagged like a notes drive, a copy row that names its drives, a name over the id, a form that hides what its mode ignores, Finder for both paths.
+  # Stack rungs: epic80-tasks-core (80.1 engine/writer/VMs/daemon, 80.2 request/VM/role, 80.3 path facts) then epic80-tasks-surface (80.1 Settings, 80.2 form row + Files icon, 80.3 row/detail/hint primitive, 80.4, 80.5, 80.6).
+  # Stack publication is reserved for the coordinator by this checkout's rules.
+  epic-80: backlog
+  80-1-choosing-the-drive-is-the-whole-act: backlog
+  80-2-a-tasks-drive-is-marked-like-a-notes-drive: backlog
+  80-3-a-task-says-what-it-acts-on: backlog
+  80-4-a-task-gets-a-name: backlog
+  80-5-a-form-shows-only-what-its-mode-uses: backlog
+  80-6-every-path-is-one-click-from-finder: backlog
+  # DW-258 closes with 80-2; the coordinator marks it so.
+
+  # Epic 79: the notes half of the owner's field report on 0.8.31 — chips, the one-line bar, switches, the multi-drive rail, rail verbs, hover hints, row tags, the spaces folder, the history caret, new-note-from-space — triaged before planning.
+  # Stack rungs: epic79-notes-core (79.5 composition half, 79.6's one rail.rs line, 79.9) then epic79-notes-surface (79.1, 79.2, 79.3, 79.4, 79.5 rendering half, 79.6, 79.7, 79.8, 79.10, 79.11); epic 80's rungs land below both.
+  epic-79: backlog
+  79-1-the-chips-sign-is-the-control: backlog
+  79-2-one-line-one-row-of-controls: backlog
+  79-3-include-and-exclude-are-drawn: backlog
+  79-4-switches-not-checkboxes: backlog
+  79-5-the-rail-follows-the-drives: backlog
+  79-6-the-rail-says-less-and-shows-more: backlog
+  79-7-a-truncated-string-has-one-hover-contract: backlog
+  79-8-a-tag-in-a-row-proposes: backlog
+  79-9-the-spaces-folder-is-a-setting: backlog
+  79-10-the-history-has-a-visible-handle: backlog
+  79-11-new-note-from-a-search-keeps-its-space: backlog
   # Stack (bottom → top), merged 2026-09-20 into main as 92d4375:
   #   #375 epic7778/plan (docs only) → #376 epic77/notes (keeper-core + shell + React, epic 77)
   #   → #377 epic78/tasks (keeper-sync + shell + daemon + React, epic 78).
