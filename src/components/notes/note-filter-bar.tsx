@@ -7,15 +7,12 @@ import {
   FilePlus,
   Folder,
   HardDrive,
-  Loader,
   LockKeyhole,
   LockKeyholeOpen,
   Minus,
   Pin,
   Plus,
   Save,
-  Search,
-  Sparkles,
   Tags,
   X,
 } from "lucide-react";
@@ -186,7 +183,8 @@ export function NoteFilterBar({
   }, [menu]);
   const indexing = searchState?.phase === "indexing";
   const meaning = searchState?.phase === "meaning" && !notice;
-  const Glyph = indexing ? Loader : meaning ? Sparkles : Search;
+  // The search phase is carried by the field's description, not by a glyph in
+  // front of the prompt: the owner asked for that first icon to go.
   const mode = indexing ? "Indexing" : meaning ? "Words + meaning" : "Words";
   const settingsLabel = "Meaning is off — choose an embedding model in Settings";
   const meaningOff =
@@ -305,14 +303,6 @@ export function NoteFilterBar({
           ),
           driveDescription,
         ].join(". ")}
-        glyph={
-          <Glyph
-            aria-hidden="true"
-            data-slot="search-state-glyph"
-            data-phase={mode}
-            className="size-5"
-          />
-        }
         controls={[
           <Popover
             key="tags"
@@ -638,7 +628,7 @@ export function NoteFilterBar({
               {scope.kind === "space"
                 ? scope.name.replace(/^["“«]|["”»]$/g, "") === filters.enteredSpace?.restore.text
                   ? "Space"
-                  : `Space: ${scope.name}`
+                  : scope.name
                 : scopeLabel(scope)}
             </span>
             <IconHint label={`Clear scope ${scopeLabel(scope)}`}>

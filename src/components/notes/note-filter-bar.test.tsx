@@ -205,17 +205,21 @@ describe("inline signed suggestions", () => {
 });
 
 describe("one field retains its controls", () => {
-  it.each([" ", "budget"])("clears %j in one activation and leaves filters intact", (text) => {
+  it.each([" ", "budget"])("resets %j and the tag chips in one activation", (text) => {
     notesFiltersStore.getState().setTagTerm("draft", "exclude");
+    notesFiltersStore.getState().setPinnedOnly(true);
     notesFiltersStore.getState().setText(text);
     const ref = createRef<HTMLTextAreaElement>();
     render(<NoteFilterBar onSaveAsSpace={vi.fn()} searchRef={ref} />);
-    const clear = screen.getByRole("button", { name: "Clear search" });
-    fireEvent.click(clear);
+    const reset = screen.getByRole("button", { name: "Reset search" });
+    fireEvent.click(reset);
     expect(ref.current).toHaveValue("");
     expect(ref.current).toHaveFocus();
-    expect(clear).toBeDisabled();
-    expect(notesFiltersStore.getState().tagTerms).toEqual([{ tag: "draft", term: "exclude" }]);
+    expect(reset).toBeDisabled();
+    // The whole query goes, not only the prompt: a tag or an `is:pinned` left
+    // filtering the list is what made the old Clear read as broken.
+    expect(notesFiltersStore.getState().tagTerms).toEqual([]);
+    expect(notesFiltersStore.getState().pinnedOnly).toBe(false);
   });
 
   it("removes the last chip only at a collapsed caret start", () => {
@@ -256,6 +260,19 @@ describe("one field retains its controls", () => {
     expect(screen.getByRole("button", { name: "Relevance" })).toBeVisible();
     fireEvent.change(field, { target: { value: " " } });
     expect(screen.queryByRole("button", { name: "Relevance" })).toBeNull();
+  });
+
+  it("names the space on its badge without spelling out that it is one", () => {
+    notesFiltersStore.setState({
+      scope: { kind: "space", vaultId: "v1", id: "projects", name: "Projects", defaultKey: null },
+    });
+    render(<NoteFilterBar onSaveAsSpace={vi.fn()} />);
+    // The folder glyph already says what kind of scope this is; a `Space:`
+    // prefix spent a third of a narrow badge repeating it.
+    const badge = screen.getByText("Projects");
+    expect(badge).toBeInTheDocument();
+    expect(screen.queryByText(/Space: /)).toBeNull();
+    expect(screen.getByRole("button", { name: "Clear scope Projects" })).toBeInTheDocument();
   });
 
   it("asks which selected drive receives a new note and keeps the prompt", async () => {

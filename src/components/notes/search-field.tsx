@@ -25,7 +25,6 @@ export function SearchField({
   text,
   chips,
   children,
-  glyph,
   controls,
   phone,
   searchRef,
@@ -34,12 +33,12 @@ export function SearchField({
   text: string;
   chips: readonly TagChip[];
   children: ReactNode;
-  glyph: ReactNode;
   /**
    * The bar's own controls, rendered inside the field on physical row 1
    * (FR-619). They are the field's first flow items, so the caret shares
    * their last row when ≥ 96 px remain and starts a full-width row of its
-   * own otherwise — the same rule the chips used to be measured by.
+   * own otherwise. The reset action closes that row; nothing is reserved
+   * outside the flow, so the second and later lines span the whole field.
    */
   controls: ReactNode;
   phone: boolean;
@@ -55,6 +54,12 @@ export function SearchField({
   const [requested, setRequested] = useState(false);
   const vocabularyNonce = useNotesFiltersStore((state) => state.spacesNonce);
   const vaultId = useNotesVaultsStore((state) => state.activeVaultId);
+  const enteredSpace = useNotesFiltersStore((state) => state.enteredSpace);
+  // What the trailing control does, said in its own name: outside a space it
+  // empties the prompt and the chips, inside one it puts the space's saved
+  // query back. It is enabled whenever either of those would change something.
+  const resetLabel = enteredSpace ? `Reset to ${enteredSpace.name}` : "Reset search";
+  const resettable = enteredSpace !== null || text !== "" || chips.length > 0;
   const [vocabulary, setVocabulary] = useState<readonly string[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -185,14 +190,6 @@ export function SearchField({
           data-slot="search-field"
           className="flex min-w-0 items-start rounded-[5px] border border-input p-2 focus-within:ring-2 focus-within:ring-ring"
         >
-          <span
-            className={cn(
-              "flex w-5 shrink-0 items-center text-muted-foreground",
-              phone ? "h-11" : "h-6",
-            )}
-          >
-            {glyph}
-          </span>
           <div
             ref={flow}
             className={cn(
@@ -210,6 +207,33 @@ export function SearchField({
             </span>
             <div ref={controlFlow} data-slot="search-controls" className="contents">
               {controls}
+            </div>
+            <IconHint label={resetLabel}>
+              <Button
+                type="button"
+                variant="ghost"
+                aria-label={resetLabel}
+                disabled={!resettable}
+                className={cn("shrink-0 p-0 text-muted-foreground", phone ? "size-11" : "size-6")}
+                onClick={() => {
+                  setToken(null);
+                  notesFiltersStore.getState().resetSearch();
+                  input.current?.focus();
+                }}
+              >
+                <X aria-hidden="true" className="size-4" />
+              </Button>
+            </IconHint>
+            <div
+              ref={chipFlow}
+              data-slot="filter-tags"
+              onPointerUp={() => input.current?.focus()}
+              className={cn(
+                capped ? "flex w-full min-w-0 flex-wrap gap-1 overflow-y-auto" : "contents",
+                capped && (phone ? "max-h-[140px]" : "max-h-20"),
+              )}
+            >
+              {children}
             </div>
             <textarea
               ref={attach}
@@ -290,37 +314,7 @@ export function SearchField({
                   setToken(null);
               }}
             />
-            <div
-              ref={chipFlow}
-              data-slot="filter-tags"
-              onPointerUp={() => input.current?.focus()}
-              className={cn(
-                capped ? "flex w-full min-w-0 flex-wrap gap-1 overflow-y-auto" : "contents",
-                capped && (phone ? "max-h-[140px]" : "max-h-20"),
-              )}
-            >
-              {children}
-            </div>
           </div>
-          <IconHint label="Clear search">
-            <Button
-              type="button"
-              variant="ghost"
-              aria-label="Clear search"
-              disabled={text === ""}
-              className={cn(
-                "ml-1 shrink-0 p-0 text-muted-foreground",
-                phone ? "size-11" : "size-6",
-              )}
-              onClick={() => {
-                setToken(null);
-                notesFiltersStore.getState().setText("");
-                input.current?.focus();
-              }}
-            >
-              <X aria-hidden="true" className="size-4" />
-            </Button>
-          </IconHint>
           <span id={`${id}-description`} className="sr-only">
             {description}
           </span>
