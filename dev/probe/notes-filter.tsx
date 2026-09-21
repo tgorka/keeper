@@ -38,6 +38,7 @@ if (fixture !== "none") {
 if (fixture === "long" || fixture === "many") {
   filters.setScope({
     kind: "folder",
+    vaultId: "probe",
     path: "projects/An unusually long scope that must not move any control",
   });
   filters.setTagTerm("projects/an-extremely-long-tag-that-must-keep-its-dismiss-target", "include");

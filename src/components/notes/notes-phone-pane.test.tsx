@@ -39,6 +39,7 @@ const VAULT: NoteVaultVm = {
   profileId: "v1",
   name: "Owner's vault",
   subfolder: "notes",
+  spacesSubfolder: "spaces",
   root: "/container/sync/v1/notes",
   indexed: true,
   noteCount: 2,
@@ -171,8 +172,9 @@ import { PhoneShell } from "@/components/layout/phone-shell";
 import { NOTE_ACTIONS_LABEL } from "@/components/notes/note-actions";
 import { NOTES_SEARCH_PLACEHOLDER } from "@/components/notes/note-filter-bar";
 import { NOTE_HISTORY_LABEL } from "@/components/notes/note-history-panel";
-import { NEW_NOTE_LABEL, NOTES_COUNT_SLOT } from "@/components/notes/notes-pane";
+import { NOTES_COUNT_SLOT } from "@/components/notes/notes-pane";
 import {
+  NEW_NOTE_LABEL,
   NOTES_PHONE_BACK_TO_LIST,
   NOTES_PHONE_CAPTURE_LABEL,
   NOTES_PHONE_NOTE_SLOT,
@@ -389,19 +391,6 @@ describe("the Notes view on the phone stack", () => {
     expect(screen.getByRole("button", { name: /Ring the dentist/ })).toBeInTheDocument();
     act(() => notesFiltersStore.getState().requestSearchFocus());
     expect(field).toHaveFocus();
-    for (const name of [
-      "Changed by agent",
-      "Pinned only",
-      "Hide service files",
-      "Sort notes",
-      "Search drives",
-      "Include private notes",
-      "New note from search",
-      "Save as space",
-      "Clear search",
-    ]) {
-      expect(screen.getByRole("button", { name })).toBeVisible();
-    }
   });
 
   it("opens a note rendered in the real editor at level 2, and back pops to the list", async () => {

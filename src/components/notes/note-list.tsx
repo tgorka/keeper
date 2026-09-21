@@ -46,8 +46,9 @@
 import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 import { NoteRow, type NoteRowVerb } from "@/components/notes/note-row";
 import { useWindowedRows } from "@/components/ui/window-list";
-import type { NoteRowVm } from "@/lib/ipc/client";
+import type { NoteRowVm, NoteTagTerm } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import type { TagChip } from "@/lib/stores/notes-filters";
 
 /** The row height the window paces by; matches chat-row density, and matches
  * `h-16` on the row itself. */
@@ -75,7 +76,8 @@ export function NoteList({
   selectedVaultId = null,
   onSelect,
   onSelectBeside,
-  onToggleTag,
+  onSetTagTerm,
+  tagTerms = [],
   onVerb,
   onGrow,
 }: {
@@ -93,7 +95,8 @@ export function NoteList({
    * gesture in the notes list that the file list does not answer to.
    */
   onSelectBeside: (row: NoteRowVm) => void;
-  onToggleTag: (tag: string) => void;
+  onSetTagTerm: (tag: string, term: NoteTagTerm) => void;
+  tagTerms?: readonly TagChip[];
   /**
    * The single-key verbs, `⌘⇧R` and `Delete`, dispatched on the row under the
    * cursor. `d` ASKS — it opens the confirmation and never deletes, which is
@@ -257,7 +260,8 @@ export function NoteList({
                 canReveal={canReveal}
                 onSelect={onSelect}
                 onSelectBeside={onSelectBeside}
-                onToggleTag={onToggleTag}
+                onSetTagTerm={onSetTagTerm}
+                tagTerms={tagTerms}
                 onVerb={onVerb}
               />
             </li>

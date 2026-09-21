@@ -267,6 +267,28 @@ pub fn claimed(existing: &[ExistingSpace]) -> BTreeSet<String> {
         .collect()
 }
 
+/// Refuse a rename that would leave indexed space notes behind. No file moves
+/// belong to a settings save; the caller supplies the published snapshot.
+pub fn rename_refusal<'a>(
+    current: &str,
+    requested: &str,
+    entries: impl IntoIterator<Item = &'a super::index::IndexEntry>,
+) -> Option<String> {
+    let current = current.trim().trim_end_matches('/');
+    let requested = requested.trim().trim_end_matches('/');
+    if current == requested {
+        return None;
+    }
+    let prefix = format!("{current}/");
+    let count = entries
+        .into_iter()
+        .filter(|entry| entry.has_flag("space") && entry.path.starts_with(&prefix))
+        .count();
+    (count != 0).then(|| format!(
+        "{current}/ still holds {count} space notes; move them into {requested}/ first, then set the folder."
+    ))
+}
+
 /// The vault directory, as the seeder needs it.
 ///
 /// **This port exists because Story 44.3 shipped green and did nothing.** Every
@@ -280,6 +302,7 @@ pub fn claimed(existing: &[ExistingSpace]) -> BTreeSet<String> {
 /// What is left in the shell is the four bodies, and each is one `std::fs` call
 /// or one existing `notes_vault` function.
 pub trait SeedVault {
+    fn spaces_dir(&self) -> &str;
     /// Read a vault-relative file.
     ///
     /// The `io::Error` is handed back whole rather than folded into an
@@ -479,7 +502,7 @@ pub fn seed(vault: &mut dyn SeedVault, mode: SeedMode) -> SeedOutcome {
     let mut written = Vec::new();
     for space in planned {
         let filename = naming::note_filename(space.name, &vault.today(), &taken);
-        let rel = format!("{SPACES_DIR}/{filename}");
+        let rel = format!("{}/{filename}", vault.spaces_dir());
         let id = vault.new_id();
         let note = render_note(space, &id, &vault.now_local());
         if let Err(error) = vault.write(&rel, &note) {
@@ -644,12 +667,13 @@ fn read_ledger(vault: &dyn SeedVault) -> Result<Option<BTreeSet<String>>, String
 /// than taking the whole run down. That is the conservative direction here —
 /// the run still cannot write over it, because its filename is in `taken`.
 fn read_existing(vault: &dyn SeedVault) -> Result<Vec<ExistingSpace>, String> {
-    let names = match vault.list(SPACES_DIR) {
+    let spaces_dir = vault.spaces_dir();
+    let names = match vault.list(spaces_dir) {
         Ok(names) => names,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => {
             return Err(format!(
-                "{SPACES_DIR}/ is there and could not be listed ({error}); leaving this vault's spaces alone"
+                "{spaces_dir}/ is there and could not be listed ({error}); leaving this vault's spaces alone"
             ))
         }
     };
@@ -657,7 +681,7 @@ fn read_existing(vault: &dyn SeedVault) -> Result<Vec<ExistingSpace>, String> {
         .into_iter()
         .filter(|name| name.ends_with(".md"))
         .map(|filename| {
-            let rel = format!("{SPACES_DIR}/{filename}");
+            let rel = format!("{spaces_dir}/{filename}");
             let source = vault.read(&rel).unwrap_or_default();
             let (fm, body_offset) = Frontmatter::parse(&source);
             let stem = filename.strip_suffix(".md").unwrap_or(&filename);
@@ -669,10 +693,6 @@ fn read_existing(vault: &dyn SeedVault) -> Result<Vec<ExistingSpace>, String> {
         })
         .collect())
 }
-
-/// Where a space note lives, named here because [`seed`] composes the path and
-/// the shell must not compose a second one.
-pub const SPACES_DIR: &str = "spaces";
 
 /// The note keeper writes for one default.
 ///
@@ -794,6 +814,7 @@ mod tests {
     /// The shell's own impl is the same four calls over `notes_vault`.
     struct DiskVault {
         root: std::path::PathBuf,
+        spaces_dir: String,
         ids: u32,
         /// Every `write` the run attempted, in order, whether or not it landed.
         attempted: Vec<String>,
@@ -805,6 +826,7 @@ mod tests {
         fn new(root: std::path::PathBuf) -> Self {
             Self {
                 root,
+                spaces_dir: "spaces".into(),
                 ids: 0,
                 attempted: Vec::new(),
                 refuse: None,
@@ -813,6 +835,9 @@ mod tests {
     }
 
     impl SeedVault for DiskVault {
+        fn spaces_dir(&self) -> &str {
+            &self.spaces_dir
+        }
         fn read(&self, rel: &str) -> std::io::Result<String> {
             std::fs::read_to_string(self.root.join(rel))
         }
@@ -865,10 +890,63 @@ mod tests {
         DiskVault::new(dir)
     }
 
+    #[test]
+    fn configured_spaces_folder_is_seeded_and_read_back() {
+        let mut vault = temp_vault();
+        vault.spaces_dir = "meta/saved-searches".into();
+        let SeedOutcome::Wrote(paths) = seed(&mut vault, SeedMode::FirstRun) else {
+            panic!("defaults must be written");
+        };
+        assert_eq!(paths.len(), DEFAULT_SPACES.len());
+        assert!(paths
+            .iter()
+            .all(|path| path.starts_with("meta/saved-searches/")));
+        assert_eq!(
+            read_existing(&vault).expect("read defaults").len(),
+            DEFAULT_SPACES.len()
+        );
+        assert!(!vault.root.join("spaces").exists());
+        assert_eq!(
+            seed(&mut vault, SeedMode::Restore),
+            SeedOutcome::AlreadySatisfied
+        );
+        std::fs::remove_dir_all(&vault.root).expect("cleanup");
+    }
+
+    #[test]
+    fn rename_refusal_names_both_folders_and_counts_only_stranded_spaces() {
+        use crate::notes::seed::{inherit, projected};
+        let mut entries = Vec::new();
+        for i in 0..6 {
+            entries.push(projected(
+                &inherit("path:spaces/**"),
+                &format!("Note {i}"),
+                "",
+                "2026-09-20",
+                0,
+                "spaces/",
+            ));
+        }
+        entries.push(projected(
+            &inherit("path:spaces-archive/**"),
+            "Other",
+            "",
+            "2026-09-20",
+            0,
+            "spaces/",
+        ));
+        assert_eq!(
+            rename_refusal("spaces", "saved-searches", &entries).as_deref(),
+            Some("spaces/ still holds 6 space notes; move them into saved-searches/ first, then set the folder.")
+        );
+        assert!(rename_refusal("spaces", "spaces", &entries).is_none());
+        assert!(rename_refusal("empty", "saved-searches", &entries).is_none());
+    }
+
     /// Put a space note in `spaces/`, the way `notes_space_save` writes one:
     /// no `title` key, the name as the body's heading.
     fn put_space(vault: &DiskVault, filename: &str, name: &str, query: &str) {
-        let dir = vault.root.join(SPACES_DIR);
+        let dir = vault.root.join(vault.spaces_dir());
         std::fs::create_dir_all(&dir).expect("spaces/");
         let text = format!(
             "---\nid: 01USER{filename}\ncreated: 2026-08-08T09:00:00+02:00\nkeeper:\n  space: '{query}'\n  sort: modified desc\n  limit: 500\n---\n\n# {name}\n"
@@ -1610,7 +1688,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let mut vault = temp_vault();
         put_space(&vault, "2026-08-08-inbox.md", "Inbox", "is:untagged");
-        let dir = vault.root.join(SPACES_DIR);
+        let dir = vault.root.join(vault.spaces_dir());
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).expect("chmod");
 
         let outcome = seed(&mut vault, SeedMode::FirstRun);
@@ -2105,7 +2183,7 @@ mod tests {
             let filename = format!("2026-08-08-{}.md", naming::slug(space.name));
             vault
                 .write(
-                    &format!("{SPACES_DIR}/{filename}"),
+                    &format!("{}/{filename}", vault.spaces_dir()),
                     &render_note(space, "01OLD", "2026-08-08T09:00:00+02:00"),
                 )
                 .expect("plant one of keeper's own");
@@ -2193,7 +2271,7 @@ mod tests {
             let filename = format!("2026-08-08-{}.md", naming::slug(space.name));
             vault
                 .write(
-                    &format!("{SPACES_DIR}/{filename}"),
+                    &format!("{}/{filename}", vault.spaces_dir()),
                     &render_note(space, "01OLD", "2026-08-08T09:00:00+02:00"),
                 )
                 .expect("plant one of keeper's own");

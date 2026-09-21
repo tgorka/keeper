@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NoteFilterBar } from "@/components/notes/note-filter-bar";
-import type { NoteSpaceVm } from "@/lib/ipc/client";
+import type { NoteRailVm, NoteSpaceVm } from "@/lib/ipc/client";
 import { ALL_SPACE_ID } from "@/lib/notes/all-spaces";
 import { ALL_NOTES_SCOPE } from "@/lib/stores/notes-filters";
 
@@ -53,7 +53,28 @@ import { notesFiltersStore, resetNotesFiltersStoreForTest } from "@/lib/stores/n
 
 import { notesVaultsStore } from "@/lib/stores/notes-vaults";
 
-const mockSpaces = vi.mocked(notesSpaces);
+function rail(rows: NoteSpaceVm[]): NoteRailVm {
+  return {
+    rows,
+    vaults: [
+      ...new Map(
+        rows.map((row) => [
+          row.vaultId,
+          { vaultId: row.vaultId, vaultName: row.vaultName, available: true, reason: "" },
+        ]),
+      ).values(),
+    ],
+  };
+}
+
+const mockSpaces = {
+  mockReset: () => vi.mocked(notesSpaces).mockReset(),
+  mockResolvedValue: (rows: NoteSpaceVm[]) => vi.mocked(notesSpaces).mockResolvedValue(rail(rows)),
+  mockResolvedValueOnce: (rows: NoteSpaceVm[]) => {
+    vi.mocked(notesSpaces).mockResolvedValueOnce(rail(rows));
+    return mockSpaces;
+  },
+};
 const mockRestore = vi.mocked(notesSpacesRestoreDefaults);
 const mockTerms = vi.mocked(notesSpaceTerms);
 const mockSave = vi.mocked(notesSpaceSave);
@@ -66,6 +87,8 @@ function space(p: Partial<NoteSpaceVm> & Pick<NoteSpaceVm, "id" | "name">): Note
   return {
     id: p.id,
     name: p.name,
+    vaultId: p.vaultId ?? "vault-1",
+    vaultName: p.vaultName ?? "Personal",
     updatedMs: p.updatedMs ?? null,
     query: p.query ?? "tag:client/acme",
     sort: p.sort ?? "modified desc",
@@ -104,9 +127,11 @@ beforeEach(() => {
   mockRestore.mockReset();
   mockRestore.mockResolvedValue(0);
   vi.mocked(notesSpaceTouch).mockImplementation(async (_vault, id) => {
-    const results = mockSpaces.mock.results;
-    const rows: NoteSpaceVm[] = await results[results.length - 1]?.value;
-    const found = rows.find((row) => row.id === id);
+    const results = vi.mocked(notesSpaces).mock.results;
+    const result = results[results.length - 1];
+    if (result?.type !== "return") throw new Error("Space list missing");
+    const listing: NoteRailVm = await result.value;
+    const found = listing.rows.find((row) => row.id === id);
     if (!found) throw new Error("Space missing");
     return found;
   });
@@ -248,7 +273,11 @@ describe("SpaceList hierarchy and lifetime", () => {
       fireEvent.change(field, { target: { value: "new prompt" } });
       fireEvent.change(field, { target: { value: "old prompt" } });
     } else if (change === "scope")
-      act(() => notesFiltersStore.getState().setScope({ kind: "folder", path: "journal" }));
+      act(() =>
+        notesFiltersStore
+          .getState()
+          .setScope({ kind: "folder", vaultId: "vault-1", path: "journal" }),
+      );
     else act(() => notesFiltersStore.getState().setTagTerm("work", "exclude"));
     const expected = notesFiltersStore.getState();
     await act(async () => release(target));
@@ -368,7 +397,7 @@ describe("SpaceList hierarchy and lifetime", () => {
 
 describe("SpaceList rows", () => {
   it("selects All notes from another scope without offering synthetic file actions", async () => {
-    notesFiltersStore.getState().setScope({ kind: "folder", path: "projects" });
+    notesFiltersStore.getState().setScope({ kind: "folder", vaultId: "vault-1", path: "projects" });
     mockSpaces.mockResolvedValue([
       space({ id: ALL_SPACE_ID, name: "All notes", query: "" }),
       space({ id: "s1", name: "Work" }),
@@ -399,7 +428,9 @@ describe("SpaceList rows", () => {
       "Add to current search",
       "Pin space",
       "Edit space…",
+      "Duplicate space",
       "New note in this space",
+      "Add sub-space",
       "New space…",
       "Delete space…",
     ]);
@@ -435,6 +466,7 @@ describe("SpaceList rows", () => {
         kind: "space",
         id: "s1",
         name: "Active work",
+        vaultId: "vault-1",
         defaultKey: null,
       }),
     );
@@ -457,6 +489,7 @@ describe("SpaceList rows", () => {
     await waitFor(() =>
       expect(notesFiltersStore.getState().scope).toEqual({
         kind: "space",
+        vaultId: "vault-1",
         id: "s1",
         name: "Sessions",
         defaultKey: "recordings",
@@ -566,6 +599,84 @@ describe("SpaceList rows", () => {
   });
 });
 
+it("keeps one drive unheaded and renders four named groups without merging identical ids", async () => {
+  mockSpaces.mockResolvedValue([space({ id: ALL_SPACE_ID, name: "All notes" })]);
+  const { rerender } = render(<SpaceList vaultId="vault-1" />);
+  await screen.findByRole("button", { name: "All notes" });
+  expect(screen.queryByRole("group", { name: "Personal" })).toBeNull();
+  mockSpaces.mockResolvedValue(
+    ["Personal", "Work", "Archive", "Shared"].map((name, index) =>
+      space({
+        id: ALL_SPACE_ID,
+        name: "All notes",
+        vaultId: `vault-${index + 1}`,
+        vaultName: name,
+      }),
+    ),
+  );
+  rerender(<SpaceList vaultId="vault-1" vaultIds={["vault-1", "vault-2", "vault-3", "vault-4"]} />);
+  for (const name of ["Personal", "Work", "Archive", "Shared"])
+    expect(await screen.findByRole("group", { name })).toBeVisible();
+  expect(screen.getAllByRole("button", { name: "All notes" })).toHaveLength(4);
+});
+
+it("duplicates the targeted drive's definition under a new identity without changing search", async () => {
+  const original = space({
+    id: "trip",
+    name: "Journal/Bali",
+    vaultId: "other",
+    vaultName: "Work",
+    pinned: true,
+    ttlHours: 48,
+    text: "budget",
+  });
+  const copy = { ...original, id: "copy", name: "Journal/Bali copy", leafName: "Bali copy" };
+  mockSpaces.mockResolvedValue([original]);
+  mockSave.mockImplementation(async (_vault, req) => {
+    expect(req.id).toBeNull();
+    mockSpaces.mockResolvedValue([original, copy]);
+    return copy;
+  });
+  render(<SpaceList vaultId="vault-1" />);
+  await chooseSpaceAction("Journal/Bali", "Duplicate space");
+  expect(await screen.findByRole("button", { name: "Journal/Bali copy" })).toBeVisible();
+  expect(mockSave).toHaveBeenCalledWith(
+    "other",
+    expect.objectContaining({
+      name: "Journal/Bali copy",
+      query: original.query,
+      sort: original.sort,
+      pinned: true,
+      ttlHours: 48,
+      text: "budget",
+    }),
+  );
+  expect(notesFiltersStore.getState().scope).toEqual(ALL_NOTES_SCOPE);
+});
+
+it("opens a temporary sub-space draft with its caret after the parent slash", async () => {
+  mockSpaces.mockResolvedValue([space({ id: "trip", name: "Journal/Bali" })]);
+  render(<SpaceList vaultId="vault-1" />);
+  await chooseSpaceAction("Journal/Bali", "Add sub-space");
+  const name = (await screen.findByRole("textbox", { name: "Name" })) as HTMLInputElement;
+  expect(name).toHaveValue("Journal/Bali/");
+  expect(name.selectionStart).toBe("Journal/Bali/".length);
+  expect(screen.getByRole("switch", { name: "Temporary space" })).toBeChecked();
+  expect(mockSave).not.toHaveBeenCalled();
+});
+
+it("shows Temporary with its clock and pinned rows without a caption", async () => {
+  mockSpaces.mockResolvedValue([
+    space({ id: "keeper:temporary", name: "Temporary", icon: "clock", descendants: 1 }),
+    space({ id: "trip", name: "Trip", parent: "keeper:temporary", pinned: true }),
+  ]);
+  render(<SpaceList vaultId="vault-1" />);
+  const temporary = await screen.findByRole("button", { name: "Temporary" });
+  expect(temporary.querySelector('[data-space-icon="clock"]')).toBeInTheDocument();
+  expect(screen.queryByText("PINNED")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Trip" })).toBeVisible();
+});
+
 describe("SpaceList icons", () => {
   it("draws the icon the space stored", async () => {
     mockSpaces.mockResolvedValue([space({ id: "s1", name: "Starred", icon: "star" })]);
@@ -648,7 +759,7 @@ describe("SpaceList editing", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     expect(await screen.findByRole("button", { name: "Renamed" })).toBeInTheDocument();
-    expect(mockSpaces).toHaveBeenCalledTimes(2);
+    expect(notesSpaces).toHaveBeenCalledTimes(2);
   });
 
   it("leaves the list alone when the editor is cancelled", async () => {
@@ -661,7 +772,7 @@ describe("SpaceList editing", () => {
 
     await waitFor(() => expect(screen.queryByLabelText("Name")).not.toBeInTheDocument());
     expect(mockSave).not.toHaveBeenCalled();
-    expect(mockSpaces).toHaveBeenCalledTimes(1);
+    expect(notesSpaces).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -736,7 +847,7 @@ describe("SpaceList restore", () => {
     expect(screen.queryByText(RESTORE_FAILED)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Active work" })).toBeInTheDocument();
     // A failed restore is not a reason to re-read a list nothing changed in.
-    expect(mockSpaces).toHaveBeenCalledTimes(1);
+    expect(notesSpaces).toHaveBeenCalledTimes(1);
   });
 
   it("falls back to a plain sentence when the rejection carries no message", async () => {
@@ -823,7 +934,7 @@ describe("SpaceList delete", () => {
 
     await waitFor(() => expect(mockDelete).toHaveBeenCalledWith("vault-1", "s1"));
     // Re-read, so the row goes. Two calls: the mount's and the deletion's.
-    await waitFor(() => expect(mockSpaces).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(notesSpaces).toHaveBeenCalledTimes(2));
     await waitFor(() =>
       expect(screen.queryByRole("button", { name: "Recordings" })).not.toBeInTheDocument(),
     );
@@ -904,7 +1015,7 @@ describe("SpaceList delete", () => {
     fireEvent.click(await screen.findByRole("button", { name: NOTE_DELETE_CONFIRM }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("spaces/clients.md is read-only");
-    expect(mockSpaces).toHaveBeenCalledTimes(1);
+    expect(notesSpaces).toHaveBeenCalledTimes(1);
     // The confirmation is still open, so the rail behind it is `aria-hidden`
     // by Radix's modal — `hidden: true` is asking about the DOM rather than
     // about what a screen reader is currently being offered.

@@ -24,36 +24,27 @@
  * a lie, and the number people want from this tree is "how much is under here",
  * not "how much survives what I have already narrowed to".
  *
- * Selecting a node cycles that tag through the three states story 43.3 gave the
- * chip — off, include, exclude — after clearing everything else; ⇧-selecting
- * cycles it inside the existing intersection instead of replacing it. Both are
- * filters, never navigations (UX-DR41) — the open note stays open even when the
- * new intersection excludes its row.
- *
- * A node's state is on the node, not in a tooltip: `+`/`−` beside the count, a
- * background for include and a struck-through destructive one for exclude, and
- * the state spelled in the accessible name. The tree and the filter bar read the
- * same {@link tagChipState}, so the two surfaces cannot disagree about what a
- * tag is doing.
+ * The sign alone changes polarity, the label is inert, and × removes. Tree
+ * choices share the bar's chip grammar without clearing unrelated filters.
  *
  * The tree is unbounded, so it owns its own scroll container and pairs
  * `min-h-0 flex-1` with it (the AD-34-4 rule): however many tags a vault grows,
  * everything below this in the column stays reachable.
  */
-import { ChevronDown, ChevronRight, Minus, Plus } from "lucide-react";
+import { ChevronDown, ChevronRight, Plus } from "lucide-react";
 import { useEffect, useState } from "react";
 import { FoldSection } from "@/components/layout/sidebar-group";
+import { TagFilterChip } from "@/components/notes/note-filter-bar";
+import { DriveHeading } from "@/components/notes/space-list";
 import type { NoteTagNodeVm } from "@/lib/ipc/client";
 import { notesTagTree } from "@/lib/ipc/client";
 import {
-  nextTagChipState,
   notesFiltersStore,
   type TagChip,
   tagChipState,
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
 import { notesRailFoldStore, useNotesRailFold } from "@/lib/stores/notes-rail-fold";
-import { cn } from "@/lib/utils";
 
 function TagNode({
   node,
@@ -100,60 +91,32 @@ function TagNode({
         ) : (
           <span aria-hidden="true" className="size-4 shrink-0" />
         )}
-        <button
-          type="button"
-          // The count belongs in the accessible name, not in a visually adjacent
-          // orphan a screen reader would read as a separate number.
-          // "items", not "notes": since Story 42.5 the number behind a node is
-          // notes plus recordings, and a name that says otherwise is the exact
-          // half-truth this story deleted.
-          //
-          // The state and what a press will do are both in the name, because
-          // `aria-pressed` has two values and this control has three: a node
-          // reporting `pressed=false` while it is actively excluding notes would
-          // be worse than saying nothing.
-          aria-label={
-            term === "include"
-              ? `Tag ${node.path}, ${node.count} items: included. Exclude it instead.`
-              : term === "exclude"
-                ? `Tag ${node.path}, ${node.count} items: excluded. Stop filtering by it.`
-                : `Tag ${node.path}, ${node.count} items, filter`
-          }
-          className={cn(
-            "flex min-w-0 flex-1 items-center gap-1 rounded-md px-1.5 py-1 text-left outline-none",
-            "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-            term === "include" && "bg-accent text-accent-foreground",
-            term === "exclude" && "bg-destructive/15 text-destructive line-through",
-            term === "off" && "hover:bg-accent/50",
-          )}
-          onClick={(event) => {
-            const filters = notesFiltersStore.getState();
-            if (event.shiftKey) {
-              // Cycle inside the existing intersection rather than replacing it:
-              // several chips mean all of them, which is the contract of the bar.
-              filters.cycleTag(node.path);
-              return;
-            }
-            // A plain press is "show me this and nothing else", so the rest of
-            // the bar goes — but this node keeps advancing, so a second press
-            // excludes and a third clears. The next state is read BEFORE the
-            // clear; cycling after it would restart every press at include and
-            // leave exclude unreachable without the shift key.
-            const next = nextTagChipState(term);
-            filters.clearAll();
-            filters.setTagTerm(node.path, next);
-          }}
-        >
-          {term !== "off" && (
-            <span aria-hidden="true" className="shrink-0">
-              {term === "exclude" ? <Minus className="size-3" /> : <Plus className="size-3" />}
+        <div className="flex min-w-0 flex-1 items-center gap-1">
+          {term === "off" ? (
+            <span className="inline-flex min-w-0 items-center gap-1 text-sm">
+              <button
+                type="button"
+                aria-label={`Include tag ${node.path}`}
+                className="flex size-6 shrink-0 items-center justify-center rounded-full outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+                onClick={() => notesFiltersStore.getState().setTagTerm(node.path, "include")}
+              >
+                <Plus aria-hidden="true" className="size-3" />
+              </button>
+              <span className="truncate">{node.name}</span>
             </span>
+          ) : (
+            <TagFilterChip
+              chip={{ tag: node.path, term }}
+              tabStop
+              onToggleSign={() => notesFiltersStore.getState().toggleTagSign(node.path)}
+              onRemove={() => notesFiltersStore.getState().removeTag(node.path)}
+            />
           )}
-          <span className="min-w-0 truncate text-sm">{node.name}</span>
-          <span aria-hidden="true" className="ml-auto shrink-0 text-muted-foreground text-xs">
+          <span className="ml-auto shrink-0 text-muted-foreground text-xs">
             {node.count}
+            <span className="sr-only"> items</span>
           </span>
-        </button>
+        </div>
       </div>
       {hasChildren && isOpen && (
         <div role="group" className="pl-3">
@@ -175,7 +138,7 @@ function TagNode({
   );
 }
 
-export function TagTree({ vaultId }: { vaultId: string | null }) {
+export function TagTree({ vaultId, driveName }: { vaultId: string | null; driveName?: string }) {
   const [nodes, setNodes] = useState<NoteTagNodeVm[]>([]);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
   const tagTerms = useNotesFiltersStore((s) => s.tagTerms);
@@ -187,6 +150,7 @@ export function TagTree({ vaultId }: { vaultId: string | null }) {
       return;
     }
     let cancelled = false;
+    setNodes([]);
     void notesTagTree(vaultId)
       .then((tree) => {
         if (!cancelled) {
@@ -218,7 +182,7 @@ export function TagTree({ vaultId }: { vaultId: string | null }) {
       icon={folded ? ChevronRight : ChevronDown}
       folded={folded}
       onToggle={() => notesRailFoldStore.getState().toggleGroup("tags")}
-      id="notes-rail-tags"
+      id={`notes-rail-tags-${vaultId}`}
       // `flex-1` without `min-h-0`, and the missing half is the point. A flex
       // item with `min-height: 0` may be laid out shorter than its own contents,
       // and this section's header is `shrink-0` — so when the rail ran out of
@@ -233,6 +197,7 @@ export function TagTree({ vaultId }: { vaultId: string | null }) {
       className={folded ? "shrink-0" : "flex-1"}
       bodyClassName="flex min-h-0 flex-1 flex-col"
     >
+      {driveName && <DriveHeading name={driveName} />}
       <div aria-label="Tag tree" className="min-h-0 flex-1 overflow-y-auto" role="tree">
         {nodes.map((node, index) => (
           <TagNode

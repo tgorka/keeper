@@ -220,6 +220,8 @@ const SPACES = [
 ].map(([id, name, query, icon, defaultKey]) => ({
   id,
   name,
+  vaultId: "v1",
+  vaultName: "tgdrive",
   updatedMs: null,
   query,
   icon,
@@ -233,6 +235,15 @@ const SPACES = [
   error: null,
   warnings: [],
 }));
+
+/**
+ * The rail envelope the shell answers with since epic 79: the rows, plus the
+ * drives they came from, so a multi-drive rail has something to group by.
+ */
+const SPACE_RAIL = {
+  rows: SPACES,
+  vaults: [{ vaultId: "v1", vaultName: "tgdrive", available: true, reason: "" }],
+};
 
 const TAGS = [
   ["epic22", 1],
@@ -1229,7 +1240,7 @@ const ANSWERS: Record<string, unknown> = {
   notes_service_file_names_get: ["index.md", "agents.md", "claude.md", "log.md"],
   notes_embedding_model_get: null,
   notes_note_marks: { rev: "mock", ranges: [] },
-  notes_spaces: SPACES,
+  notes_spaces: SPACE_RAIL,
   notes_tag_tree: { nodes: TAGS },
   notes_templates: [],
   notes_capture_impact: [],

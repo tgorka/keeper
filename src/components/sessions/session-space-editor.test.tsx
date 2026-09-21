@@ -110,7 +110,7 @@ describe("SessionSpaceEditor identity", () => {
   it("saves an existing space under its own path, so a rename rewrites one file", async () => {
     const { onSaved } = open(space());
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Work items" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -202,7 +202,7 @@ describe("SessionSpaceEditor terms", () => {
   it("cycles a tag chip from include to exclude and writes the negated term", async () => {
     open(space());
 
-    fireEvent.click(await screen.findByRole("button", { name: /Tag task: included/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Exclude tag task" }));
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
@@ -266,8 +266,7 @@ describe("SessionSpaceEditor terms", () => {
   it("refuses to save a space with no terms at all", async () => {
     open(space());
 
-    fireEvent.click(await screen.findByRole("button", { name: /Tag task: included/ }));
-    fireEvent.click(screen.getByRole("button", { name: /Tag task: excluded/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Clear tag task filter" }));
 
     expect(await screen.findByText(SPACE_NO_TERMS)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
@@ -277,7 +276,7 @@ describe("SessionSpaceEditor terms", () => {
   it("refuses to save a space with no name", async () => {
     open(space());
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "   " } });
 
     expect(await screen.findByText(SPACE_NO_NAME)).toBeInTheDocument();
@@ -300,7 +299,7 @@ describe("SessionSpaceEditor sort and position", () => {
       }),
     );
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     expect(screen.getByLabelText("Sort by")).toHaveValue("modified");
     expect(screen.getByLabelText("Direction")).toHaveValue("desc");
 
@@ -324,7 +323,7 @@ describe("SessionSpaceEditor sort and position", () => {
   it("shows a stored sort key it does not offer, rather than silently reading as another", async () => {
     open(space({ sort: "recorded desc", sortEffective: "recorded desc" }));
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     expect(screen.getByLabelText("Sort by")).toHaveValue("recorded");
 
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -341,7 +340,7 @@ describe("SessionSpaceEditor sort and position", () => {
   it("says nothing extra about a sort whose name gives it away", async () => {
     open(space({ sort: "modified desc", sortEffective: "modified desc" }));
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     expect(screen.queryByText(SESSION_SPACE_SORT_NOTES["order asc"])).not.toBeInTheDocument();
   });
 
@@ -353,7 +352,7 @@ describe("SessionSpaceEditor sort and position", () => {
   it("reads a cleared position as unset rather than as zero-the-position", async () => {
     open(space({ order: 4 }));
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     fireEvent.change(screen.getByLabelText("Position"), { target: { value: "" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -364,7 +363,7 @@ describe("SessionSpaceEditor sort and position", () => {
   it("keeps a fractional position, which is what a drag writes", async () => {
     open(space({ order: 2 }));
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     fireEvent.change(screen.getByLabelText("Position"), { target: { value: "2.5" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -385,7 +384,7 @@ describe("SessionSpaceEditor fold and row cap", () => {
   it("row 9: sends both keys back untouched when something else was edited", async () => {
     open(space({ folded: true, rows: 5 }));
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Work items" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -398,7 +397,7 @@ describe("SessionSpaceEditor fold and row cap", () => {
   it("seeds both controls from the space's own file", async () => {
     open(space({ folded: false, rows: 5 }));
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     expect(screen.getByLabelText(SESSION_SPACE_FOLDED_LABEL)).toHaveValue("unfolded");
     expect(screen.getByLabelText(SESSION_SPACE_ROWS_LABEL)).toHaveValue(5);
   });
@@ -412,7 +411,7 @@ describe("SessionSpaceEditor fold and row cap", () => {
   it("row 10: writes neither key for a space that was given neither", async () => {
     open(space());
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     expect(screen.getByLabelText(SESSION_SPACE_FOLDED_LABEL)).toHaveValue("unset");
     expect(screen.getByLabelText(SESSION_SPACE_ROWS_LABEL)).toHaveValue(null);
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -424,7 +423,7 @@ describe("SessionSpaceEditor fold and row cap", () => {
   it("row 11: writes exactly what the two controls were set to", async () => {
     open(space());
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     fireEvent.change(screen.getByLabelText(SESSION_SPACE_FOLDED_LABEL), {
       target: { value: "folded" },
     });
@@ -440,7 +439,7 @@ describe("SessionSpaceEditor fold and row cap", () => {
   it("clears a stored fold back to nothing said", async () => {
     open(space({ folded: true }));
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     fireEvent.change(screen.getByLabelText(SESSION_SPACE_FOLDED_LABEL), {
       target: { value: "unset" },
     });
@@ -466,7 +465,7 @@ describe("SessionSpaceEditor fold and row cap", () => {
   ])("reads a cap of %o as %o", async (typed, expected) => {
     open(space({ rows: 5 }));
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     fireEvent.change(screen.getByLabelText(SESSION_SPACE_ROWS_LABEL), { target: { value: typed } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -502,7 +501,7 @@ describe("SessionSpaceEditor failure", () => {
     );
     const { onSaved } = open(space());
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     fireEvent.change(screen.getByLabelText(SESSION_SPACE_CREATE_DIR_LABEL), {
       target: { value: "workspace/logs" },
     });
@@ -519,7 +518,7 @@ describe("SessionSpaceEditor failure", () => {
     mockSave.mockRejectedValue(new Error(""));
     const { onSaved } = open(space());
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     expect(await screen.findByText(SESSION_SPACE_SAVE_FAILED)).toBeInTheDocument();
@@ -538,7 +537,7 @@ describe("SessionSpaceEditor destination", () => {
   it("round-trips the destination a space already names", async () => {
     open(space({ createDir: "logs" }));
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     const field = screen.getByLabelText<HTMLInputElement>(SESSION_SPACE_CREATE_DIR_LABEL);
     expect(field.value).toBe("logs");
 
@@ -550,7 +549,7 @@ describe("SessionSpaceEditor destination", () => {
   it("sends what was typed, trimmed", async () => {
     open(space());
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     fireEvent.change(screen.getByLabelText(SESSION_SPACE_CREATE_DIR_LABEL), {
       target: { value: "  notes/2026  " },
     });
@@ -569,7 +568,7 @@ describe("SessionSpaceEditor destination", () => {
   it("sends an explicit empty destination when the box is cleared", async () => {
     open(space({ createDir: "logs" }));
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     fireEvent.change(screen.getByLabelText(SESSION_SPACE_CREATE_DIR_LABEL), {
       target: { value: "   " },
     });
@@ -589,7 +588,7 @@ describe("SessionSpaceEditor destination", () => {
   it("sends null for a destination nobody touched, so no key is written", async () => {
     open(space({ defaultKey: "tasks", createDirDefault: "tasks" }));
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Backlog" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -605,7 +604,7 @@ describe("SessionSpaceEditor destination", () => {
   it("shows the inherited folder as the placeholder and not as the value", async () => {
     open(space({ defaultKey: "tasks", createDirDefault: "tasks" }));
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     const field = screen.getByLabelText<HTMLInputElement>(SESSION_SPACE_CREATE_DIR_LABEL);
     expect(field.value).toBe("");
     expect(field.placeholder).toBe("tasks");
@@ -619,7 +618,7 @@ describe("SessionSpaceEditor destination", () => {
    */
   it("says which of the two empties an inheriting space is, as the box is typed in", async () => {
     open(space({ defaultKey: "tasks", createDirDefault: "tasks" }));
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     expect(
       screen.getByText(sessionSpaceCreateDirEmptyNote(null, "tasks") ?? ""),
     ).toBeInTheDocument();
@@ -642,7 +641,7 @@ describe("SessionSpaceEditor destination", () => {
    */
   it("reads an explicit empty destination as the session's own folder on open", async () => {
     open(space({ createDir: "", defaultKey: "refs", createDirDefault: "refs" }));
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     const field = screen.getByLabelText<HTMLInputElement>(SESSION_SPACE_CREATE_DIR_LABEL);
     expect(field.value).toBe("");
     expect(field.placeholder).toBe("The session's own folder");
@@ -692,7 +691,7 @@ describe("SessionSpaceEditor reach", () => {
    */
   it("caps the panel height and scrolls the form inside it, so both ends are reachable", async () => {
     open(space());
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
 
     const panel = screen.getByRole("dialog");
     // A height-capped flex column that clips — the Settings idiom
@@ -739,7 +738,7 @@ describe("SessionSpaceEditor reach", () => {
    */
   it("keeps the icon chooser and the terms section from absorbing the body's overflow", async () => {
     open(space());
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
 
     const panel = screen.getByRole("dialog");
     const body = panel.querySelector<HTMLElement>(":scope > .overflow-y-auto");
@@ -779,7 +778,7 @@ describe("SessionSpaceEditor tag chooser", () => {
   it("opens with the list folded, and the caret is what unfolds it", async () => {
     open(space());
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     expect(screen.queryByRole("listbox")).toBeNull();
 
     const field = screen.getByLabelText("Add a tag");
@@ -799,7 +798,7 @@ describe("SessionSpaceEditor tag chooser", () => {
   it("folds the list on a press elsewhere on the form, and that press still lands", async () => {
     const { onClose } = open(space());
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     const field = screen.getByLabelText("Add a tag");
     act(() => {
       field.focus();
@@ -826,7 +825,7 @@ describe("SessionSpaceEditor tag chooser", () => {
   it("folds the list on Escape and keeps the draft, and the next Escape closes the editor", async () => {
     const { onClose } = open(space());
 
-    await screen.findByRole("button", { name: /Tag task/ });
+    await screen.findByRole("button", { name: "Exclude tag task" });
     const field = screen.getByLabelText("Add a tag");
     act(() => {
       field.focus();
@@ -839,7 +838,7 @@ describe("SessionSpaceEditor tag chooser", () => {
     // The editor and its unsaved draft are both still here, which is the whole
     // difference: one press folds, it does not cancel.
     expect(onClose).not.toHaveBeenCalled();
-    expect(screen.getByRole("button", { name: /Tag task/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Exclude tag task" })).toBeInTheDocument();
     expect(document.activeElement).toBe(field);
 
     fireEvent.keyDown(field, { key: "Escape" });

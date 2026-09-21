@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 fn synthetic(id: &str, name: &str, query: String, icon: Option<&str>) -> NoteSpaceVm {
     NoteSpaceVm {
+        vault_id: String::new(),
+        vault_name: String::new(),
         id: id.into(),
         name: name.into(),
         query,
@@ -162,9 +164,65 @@ pub fn compose_rail(spaces: Vec<NoteSpaceVm>, uncategorized: String) -> Vec<Note
     out
 }
 
+/// Concatenate already ordered rails in selection order. This adds one linear
+/// pass over the rows, without querying or sorting across drives.
+#[must_use]
+pub fn compose_rail_multi(
+    drives: impl IntoIterator<Item = (String, String, Vec<NoteSpaceVm>)>,
+) -> Vec<NoteSpaceVm> {
+    drives
+        .into_iter()
+        .flat_map(|(id, name, rows)| {
+            rows.into_iter().map(move |mut row| {
+                row.vault_id.clone_from(&id);
+                row.vault_name.clone_from(&name);
+                row
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn multi_drive_preserves_each_rail_and_selection_order() {
+        let first = compose_rail(
+            vec![synthetic("b", "Parent/B", String::new(), None)],
+            "-tag:b".into(),
+        );
+        let second = compose_rail(
+            vec![synthetic("a", "A", String::new(), None)],
+            "-tag:a".into(),
+        );
+        let rows = compose_rail_multi([
+            ("work".into(), "Work".into(), first.clone()),
+            ("home".into(), "Home".into(), second.clone()),
+        ]);
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            first
+                .iter()
+                .chain(&second)
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(rows[..first.len()]
+            .iter()
+            .all(|r| r.vault_id == "work" && r.vault_name == "Work"));
+        assert!(rows[first.len()..]
+            .iter()
+            .all(|r| r.vault_id == "home" && r.vault_name == "Home"));
+        let single = compose_rail_multi([("work".into(), "Work".into(), first.clone())]);
+        for (mut actual, expected) in single.into_iter().zip(first) {
+            actual.vault_id.clear();
+            actual.vault_name.clear();
+            assert_eq!(
+                serde_json::to_value(actual).expect("row"),
+                serde_json::to_value(expected).expect("row")
+            );
+        }
+    }
     #[test]
     fn synthetic_ancestors_are_unique_and_temporary_group_is_conditional() {
         let mut bali = synthetic("bali", "Journal/Bali", "tag:bali".into(), None);

@@ -48,7 +48,7 @@ describe("readable hints", () => {
     expect(screen.getByRole("tooltip")).toHaveTextContent("Delete");
   });
 
-  it("opens the complete row name and bounded plain detail on keyboard focus", () => {
+  it("opens the complete title and full plain detail on keyboard focus", () => {
     const label = "A complete title that the narrow row cannot possibly fit on one line";
     const detail = "First line. Second line. Third line. Fourth line. **Rust** <b>plain text</b>";
     render(
@@ -62,18 +62,8 @@ describe("readable hints", () => {
     act(() => screen.getByRole("button").focus());
     const hint = screen.getByRole("tooltip");
     expect(hint).toHaveTextContent(label);
-    expect(document.querySelector('[data-slot="tooltip-content"]')).toHaveClass("max-w-xs");
-    expect(document.querySelector('[data-slot="tooltip-content"]')).toHaveClass(
-      "bg-popover",
-      "text-popover-foreground",
-      "ring-1",
-      "ring-foreground/10",
-    );
-    expect(document.querySelector('[data-slot="tooltip-content"]')).not.toHaveClass(
-      "bg-foreground",
-    );
-    expect(within(hint).getByText(detail)).toHaveClass("line-clamp-3");
-    expect(within(hint).getByText(label)).not.toHaveClass("truncate");
+    expect(within(hint).getByText(detail)).toHaveTextContent(detail);
+    expect(within(hint).getByText(label).tagName).toBe("STRONG");
     expect(hint.querySelector("b")).toBeNull();
     fireEvent.keyDown(screen.getByRole("button"), { key: "Escape" });
     expect(screen.queryByRole("tooltip")).toBeNull();

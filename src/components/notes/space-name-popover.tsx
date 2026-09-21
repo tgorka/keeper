@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
+import { Switch } from "@/components/ui/switch";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
@@ -30,9 +31,10 @@ export function SpaceNamePopover({
   const { phone } = useShellLayout();
   const ttlId = useId();
   const titleId = useId();
+  const temporaryId = useId();
   const input = useRef<HTMLInputElement>(null);
   const [name, setName] = useState(initialName);
-  const [temporary, setTemporary] = useState(false);
+  const [temporary, setTemporary] = useState(true);
   const [hours, setHours] = useState("48");
   const [saving, setSaving] = useState(false);
   const pending = useRef(false);
@@ -73,7 +75,9 @@ export function SpaceNamePopover({
         onOpenAutoFocus={(event) => {
           event.preventDefault();
           input.current?.focus();
-          input.current?.select();
+          if (initialName.endsWith("/"))
+            input.current?.setSelectionRange(initialName.length, initialName.length);
+          else input.current?.select();
         }}
         onCloseAutoFocus={(event) => {
           event.preventDefault();
@@ -116,12 +120,15 @@ export function SpaceNamePopover({
             }}
           />
           <p className="text-meta text-muted-foreground leading-4">Use / to group spaces</p>
-          <label className={cn("flex items-center gap-2 text-sm", phone ? "min-h-11" : "min-h-8")}>
-            <input
-              type="checkbox"
+          <label
+            htmlFor={temporaryId}
+            className={cn("flex items-center gap-2 text-sm", phone ? "min-h-11" : "min-h-8")}
+          >
+            <Switch
+              id={temporaryId}
               checked={temporary}
               disabled={saving}
-              onChange={(event) => setTemporary(event.target.checked)}
+              onCheckedChange={setTemporary}
             />
             Temporary space
           </label>

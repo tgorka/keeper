@@ -33,7 +33,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 use keeper_core::archive::recordings_fts::kind_for_file_name;
-use keeper_core::notes::default_spaces::{self, SPACES_DIR};
+use keeper_core::notes::default_spaces;
 use keeper_core::notes::embed::{self, NoteEmbedPathVm, NoteEmbedVm};
 use keeper_core::notes::frontmatter::{FieldValue, Frontmatter};
 use keeper_core::notes::index::{IndexEntry, IndexSnapshot, TagTerms};
@@ -108,12 +108,6 @@ const MAX_LINK_TARGETS: usize = 30;
 /// The longest an icon name may be before it is treated as noise rather than as
 /// an icon. Lucide's longest name is well under this.
 const MAX_ICON_BYTES: usize = 64;
-
-// `TEMPLATES_DIR` used to be declared here, beside a comment explaining why
-// `spaces/` was not. Story 44.7 gave the template seeder the same shape as the
-// space seeder, so the constant moved to `keeper-core` for the same reason
-// `SPACES_DIR` lives there: the seeder composes paths under it, and two
-// constants spelling one directory is a rename waiting to half-land.
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -1273,6 +1267,7 @@ pub async fn notes_vault_flag(
             profile_id: profile.id,
             name: profile.name,
             subfolder: String::new(),
+            spaces_subfolder: String::new(),
             root: profile.local_path.to_string_lossy().into_owned(),
             indexed: false,
             note_count: 0,
@@ -1304,6 +1299,21 @@ pub async fn notes_vault_settings_save(
         .find(|profile| profile.id == vault_id)
         .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id.clone())))?;
     let current = profile.notes.clone().unwrap_or_default();
+    if let Some(requested) = &settings.spaces_subfolder {
+        let vault = vault_of(&vault_id)?;
+        let snapshot = notes_vault::snapshot(&vault_id)
+            .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id.clone())))?;
+        if let Some(message) =
+            default_spaces::rename_refusal(vault.spaces_dir(), requested, snapshot.entries().iter())
+        {
+            return Err(IpcError {
+                code: IpcErrorCode::NotesInvalid,
+                message,
+                account_id: None,
+                retriable: false,
+            });
+        }
+    }
     profile.notes = Some(apply_settings(current, &settings));
     engine
         .upsert_profile(&profile)
@@ -1375,6 +1385,9 @@ pub async fn notes_capture_impact(
 /// rather than get the floor. Clamping first means the form shows the value
 /// actually in force (AD-34-8) and the save always lands.
 fn apply_settings(mut config: NotesConfig, req: &NoteVaultSettingsReq) -> NotesConfig {
+    if let Some(subfolder) = &req.spaces_subfolder {
+        config.spaces_subfolder = subfolder.trim().to_owned();
+    }
     if let Some(subfolder) = req.subfolder.as_ref() {
         let trimmed = subfolder.trim().trim_matches('/');
         if !trimmed.is_empty() {
@@ -2000,29 +2013,63 @@ pub async fn notes_gallery(
 
 /// Every space in the vault, each with its parse status (FR-105).
 #[tauri::command]
-pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError> {
-    let vault = vault_of(&vault_id)?;
-    let snapshot = notes_vault::snapshot(&vault_id)
-        .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id)))?;
-    let spaces: Vec<NoteSpaceVm> = snapshot
-        .entries()
-        .iter()
-        .filter(|entry| has_flag(entry, "space"))
-        .map(|entry| {
-            let source = notes_vault::read_note(&vault, &entry.path).unwrap_or_default();
-            let def = space_def(entry, &source);
-            // A broken query is a warning chip on the row, never a failed
-            // command: a space is a file a person or an agent hand-edits.
-            space_vm(
-                def,
-                Some(query::resolve_date(query::DateField::Modified, entry)),
-            )
-        })
-        .collect();
-    Ok(compose_space_rows(
-        spaces,
-        uncategorized_query(&vault, &snapshot),
-    ))
+pub async fn notes_spaces(
+    vault_id: String,
+    vault_ids: Vec<String>,
+) -> Result<keeper_core::notes::vm::NoteRailVm, IpcError> {
+    use keeper_core::notes::vm::{NoteRailVaultVm, NoteRailVm};
+    let selected = if vault_ids.is_empty() {
+        vec![vault_id]
+    } else {
+        vault_ids
+    };
+    let mut vaults = Vec::with_capacity(selected.len());
+    let mut drives = Vec::with_capacity(selected.len());
+    for id in selected {
+        let vault = notes_vault::vault(&id);
+        let name = vault
+            .as_ref()
+            .map_or_else(|| id.clone(), |v| v.name.clone());
+        let snapshot = notes_vault::snapshot(&id);
+        let available = vault.as_ref().is_some_and(|v| v.root.is_dir()) && snapshot.is_some();
+        vaults.push(NoteRailVaultVm {
+            vault_id: id.clone(),
+            vault_name: name.clone(),
+            available,
+            reason: if available {
+                String::new()
+            } else {
+                format!("{name} is unavailable; reconnect the drive to see its spaces.")
+            },
+        });
+        if !available {
+            continue;
+        }
+        let (Some(vault), Some(snapshot)) = (vault, snapshot) else {
+            continue;
+        };
+        let spaces = snapshot
+            .entries()
+            .iter()
+            .filter(|entry| has_flag(entry, "space"))
+            .map(|entry| {
+                let source = notes_vault::read_note(&vault, &entry.path).unwrap_or_default();
+                space_vm(
+                    space_def(entry, &source),
+                    Some(query::resolve_date(query::DateField::Modified, entry)),
+                )
+            })
+            .collect();
+        drives.push((
+            id,
+            name,
+            compose_space_rows(spaces, uncategorized_query(&vault, &snapshot)),
+        ));
+    }
+    Ok(NoteRailVm {
+        rows: keeper_core::notes::rail::compose_rail_multi(drives),
+        vaults,
+    })
 }
 
 fn compose_space_rows(spaces: Vec<NoteSpaceVm>, uncategorized: String) -> Vec<NoteSpaceVm> {
@@ -2066,6 +2113,8 @@ fn space_vm(def: SpaceDef, updated_ms: Option<i64>) -> NoteSpaceVm {
         query::parse(&def.query).err().map(|error| error.message)
     };
     NoteSpaceVm {
+        vault_id: String::new(),
+        vault_name: String::new(),
         restore: space_restore(&def),
         pinned: def.pinned,
         ttl_hours: def.ttl_hours,
@@ -2111,19 +2160,23 @@ fn saved_space_row(vault_id: &str, saved: NoteSpaceVm) -> Result<NoteSpaceVm, Ip
         })
         .collect();
     rows.push(saved);
-    compose_space_rows(rows, String::new())
-        .into_iter()
-        .find(|row| row.id == id)
-        .ok_or_else(|| notes_error(NotesError::NotFound(id)))
+    keeper_core::notes::rail::compose_rail_multi([(
+        vault.id.clone(),
+        vault.name.clone(),
+        compose_space_rows(rows, String::new()),
+    )])
+    .into_iter()
+    .find(|row| row.id == id)
+    .ok_or_else(|| notes_error(NotesError::NotFound(id)))
 }
 fn space_entry_of(vault: &Vault, id: &str) -> Result<IndexEntry, IpcError> {
     if let Ok(entry) = entry_of(&vault.id, id) {
         return notes_vault::read_space_entry(vault, &entry.path).map_err(notes_error);
     }
-    notes_vault::siblings(vault, SPACES_DIR)
+    notes_vault::siblings(vault, vault.spaces_dir())
         .into_iter()
         .filter_map(|name| {
-            notes_vault::read_space_entry(vault, &format!("{SPACES_DIR}/{name}")).ok()
+            notes_vault::read_space_entry(vault, &format!("{}{name}", vault.spaces_prefix())).ok()
         })
         .find(|entry| entry.id == id)
         .ok_or_else(|| notes_error(NotesError::NotFound(id.to_owned())))
@@ -2198,10 +2251,10 @@ pub async fn notes_space_park(
             .into_iter()
             .map(|flag| format!("is:{}", quote(&flag))),
     );
-    let existing = notes_vault::siblings(&vault, SPACES_DIR)
+    let existing = notes_vault::siblings(&vault, vault.spaces_dir())
         .into_iter()
         .filter_map(|name| {
-            notes_vault::read_space_entry(&vault, &format!("{SPACES_DIR}/{name}")).ok()
+            notes_vault::read_space_entry(&vault, &format!("{}{name}", vault.spaces_prefix())).ok()
         })
         .find(|entry| has_flag(entry, "temporary") && entry.title == name);
     let id = existing.as_ref().map(|entry| entry.id.clone());
@@ -2268,6 +2321,9 @@ struct VaultSeedFiles<'a> {
 }
 
 impl default_spaces::SeedVault for VaultSeedFiles<'_> {
+    fn spaces_dir(&self) -> &str {
+        self.vault.spaces_dir()
+    }
     fn read(&self, rel: &str) -> std::io::Result<String> {
         // `contained` refuses a path that leaves the vault. Its refusal is not
         // an absence, so it must not arrive at the seeder as `NotFound` — that
@@ -2599,9 +2655,9 @@ async fn save_space(
     let filename = naming::note_filename(
         &space.name,
         &today(),
-        &notes_vault::siblings(&vault, SPACES_DIR),
+        &notes_vault::siblings(&vault, vault.spaces_dir()),
     );
-    let rel = format!("{SPACES_DIR}/{filename}");
+    let rel = format!("{}{filename}", vault.spaces_prefix());
     let mut pairs = with_presentation(pairs);
     if let Some(hours) = space.ttl_hours.filter(|hours| *hours > 0) {
         let expires = keeper_core::notes::lifetime::expires_at(notes_vault::now_ms(), hours);
@@ -3133,6 +3189,26 @@ pub async fn notes_create(vault_id: String, req: NoteCreateReq) -> Result<NoteCr
 /// a log (DW-162).
 fn create_for_space(vault: &Vault, req: &NoteCreateReq) -> Result<NoteCreateVm, IpcError> {
     let mut notices = Vec::new();
+    if let Some(source_id) = req.space_vault_id.as_deref().filter(|id| *id != vault.id) {
+        let source = vault_of(source_id)?;
+        let space_name = req
+            .space
+            .as_deref()
+            .and_then(|id| space_source(&source, id))
+            .map(|space| space.name);
+        let note = create_note(vault, req, &seed::Seed::default(), None, &mut notices)?;
+        notices.push(match space_name {
+            Some(name) => format!(
+                "«{name}» lives on {}; this note was created on {} and is not in that space.",
+                source.name, vault.name
+            ),
+            None => format!(
+                "The space on {} is no longer available; this note was created on {} without it.",
+                source.name, vault.name
+            ),
+        });
+        return Ok(NoteCreateVm { note, notices });
+    }
     let asked = req.space.as_deref().filter(|id| !id.trim().is_empty());
     let Some(space_id) = asked else {
         let note = create_note(vault, req, &seed::Seed::default(), None, &mut notices)?;
@@ -3160,7 +3236,7 @@ fn create_for_space(vault: &Vault, req: &NoteCreateReq) -> Result<NoteCreateVm, 
         Ok(source) => {
             let (_, body_at) = Frontmatter::parse(&source);
             let body = source.get(body_at..).unwrap_or_default();
-            let entry = notes_vault::index_written(&note.path, &source);
+            let entry = notes_vault::index_written(&note.path, &source, &vault.spaces_prefix());
             if let Some(sentence) = seed::verdict(
                 &space.name,
                 &space.query,
@@ -3569,6 +3645,7 @@ pub async fn notes_journal_today(vault_id: String) -> Result<NoteRefVm, IpcError
         // Today's journal is reached by `⌘⌥J`, the tray and the palette, never
         // from a space row, so there is no space to inherit from.
         space: None,
+        space_vault_id: None,
     };
     create_journal(&vault, &rel, &req)
 }
@@ -5580,6 +5657,7 @@ fn resolve_capture_draft(
             dest: None,
             tags: Vec::new(),
             space: None,
+            space_vault_id: None,
         },
         // Everything a capture carries, from the one producer (Story 45.16):
         // the reserved `keeper.capture` mark the Inbox lens has always read,
@@ -6159,6 +6237,7 @@ fn blank_note() -> NoteCreateReq {
         dest: None,
         tags: Vec::new(),
         space: None,
+        space_vault_id: None,
     }
 }
 
@@ -6804,6 +6883,7 @@ mod tests {
                 dest: None,
                 tags: Vec::new(),
                 space: None,
+                space_vault_id: None,
             },
             &seed::Seed::default(),
             None,
@@ -7087,6 +7167,7 @@ mod tests {
             NotesConfig::default(),
             &NoteVaultSettingsReq {
                 subfolder: None,
+                spaces_subfolder: None,
                 journal_template: None,
                 default_template: None,
                 capture_template: None,
@@ -7116,6 +7197,7 @@ mod tests {
             stored.clone(),
             &NoteVaultSettingsReq {
                 subfolder: None,
+                spaces_subfolder: None,
                 journal_template: None,
                 default_template: None,
                 capture_template: None,
@@ -7133,6 +7215,7 @@ mod tests {
             stored,
             &NoteVaultSettingsReq {
                 subfolder: None,
+                spaces_subfolder: None,
                 journal_template: None,
                 default_template: Some(String::new()),
                 capture_template: None,

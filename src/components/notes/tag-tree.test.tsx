@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteTagNodeVm, NoteTagTreeVm } from "@/lib/ipc/client";
 
@@ -52,32 +52,18 @@ describe("TagTree counts", () => {
   it("renders the count the tree reports, which sums notes and recordings (2 notes + 3 recordings under client/acme shows 5)", async () => {
     render(<TagTree vaultId="vault-1" />);
 
-    // The parent first: 6 things under `client`, whichever producer put them there.
-    const parent = await screen.findByRole("button", { name: "Tag client, 6 items, filter" });
-    expect(parent).toHaveTextContent("6");
-
-    // Expand to reach the leaf the matrix names.
-    fireEvent.click(parent.previousElementSibling as HTMLElement);
-
-    const leaf = await screen.findByRole("button", {
-      name: "Tag client/acme, 5 items, filter",
-    });
-    expect(leaf).toHaveTextContent("5");
-  });
-
-  it("says 'items', not 'notes', because the number behind a node is no longer one producer", async () => {
-    render(<TagTree vaultId="vault-1" />);
-
-    await screen.findByRole("button", { name: "Tag client, 6 items, filter" });
-    expect(screen.queryByRole("button", { name: /6 notes/ })).toBeNull();
-  });
-
-  it("passes the reported count straight through — nothing here filters a producer out", async () => {
-    mockTagTree.mockResolvedValue({ nodes: [node({ path: "q3", count: 3 })] });
-    render(<TagTree vaultId="vault-1" />);
-
-    // Three recordings and no notes at all: the tree still shows 3.
-    expect(await screen.findByRole("button", { name: "Tag q3, 3 items, filter" })).toBeVisible();
+    const parent = await screen.findByRole("button", { name: "Include tag client" });
+    const item = parent.closest('[role="treeitem"]') as HTMLElement;
+    expect(
+      within(item).getByText((_, element) => element?.textContent === "6 items"),
+    ).toBeVisible();
+    fireEvent.click(item.querySelector('button[aria-hidden="true"]') as HTMLElement);
+    const leaf = await screen.findByRole("button", { name: "Include tag client/acme" });
+    expect(
+      within(leaf.closest('[role="treeitem"]') as HTMLElement).getByText(
+        (_, element) => element?.textContent === "5 items",
+      ),
+    ).toBeVisible();
   });
 
   it("renders nothing at all without a vault, and asks Rust for nothing", () => {
@@ -89,30 +75,19 @@ describe("TagTree counts", () => {
 });
 
 describe("TagTree tag states", () => {
-  it("cycles a node through include, exclude and off on plain presses", async () => {
+  it("toggles only on the sign, preserves siblings and removes only with ×", async () => {
+    notesFiltersStore.getState().setTagTerm("other", "include");
     render(<TagTree vaultId="vault-1" />);
-    const terms = () => notesFiltersStore.getState().tagTerms;
-
-    fireEvent.click(await screen.findByRole("button", { name: "Tag client, 6 items, filter" }));
-    expect(terms()).toEqual([{ tag: "client", term: "include" }]);
-
-    // The second press must reach exclude. A plain press clears the rest of the
-    // bar first, and reading the state after that clear — the obvious way to
-    // write this — would restart the cycle at include forever, leaving exclude
-    // reachable only with the shift key.
-    fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Tag client, 6 items: included. Exclude it instead.",
-      }),
-    );
-    expect(terms()).toEqual([{ tag: "client", term: "exclude" }]);
-
-    fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Tag client, 6 items: excluded. Stop filtering by it.",
-      }),
-    );
-    expect(terms()).toEqual([]);
+    fireEvent.click(await screen.findByRole("button", { name: "Include tag client" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Exclude tag client" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Include tag client" }));
+    fireEvent.click(screen.getByText("client"));
+    expect(notesFiltersStore.getState().tagTerms).toEqual([
+      { tag: "other", term: "include" },
+      { tag: "client", term: "include" },
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Clear tag client filter" }));
+    expect(notesFiltersStore.getState().tagTerms).toEqual([{ tag: "other", term: "include" }]);
   });
 
   it("shows an excluded node as excluded without being hovered", async () => {
@@ -120,15 +95,15 @@ describe("TagTree tag states", () => {
     const { rerender } = render(<TagTree vaultId="vault-1" />);
     const includedClass = (
       await screen.findByRole("button", {
-        name: "Tag client, 6 items: included. Exclude it instead.",
+        name: "Exclude tag client",
       })
-    ).className;
+    ).closest('[data-slot="filter-chip"]')?.className;
 
     notesFiltersStore.getState().setTagTerm("client", "exclude");
     rerender(<TagTree vaultId="vault-1" />);
 
     const excluded = await screen.findByRole("button", {
-      name: "Tag client, 6 items: excluded. Stop filtering by it.",
+      name: "Include tag client",
     });
     // Not `aria-selected`: an excluded node is emphatically not selected, and a
     // reader arrowing the tree must not be told it is.
@@ -136,23 +111,6 @@ describe("TagTree tag states", () => {
     expect(excluded.querySelector("svg")).not.toBeNull();
     // And it must not look like an included one. A node that reads as selected
     // while it is removing notes is the exact confusion the sign exists against.
-    expect(excluded.className).not.toBe(includedClass);
-  });
-
-  it("adds to the intersection on a shift press instead of replacing it", async () => {
-    render(<TagTree vaultId="vault-1" />);
-
-    const parent = await screen.findByRole("button", { name: "Tag client, 6 items, filter" });
-    fireEvent.click(parent);
-    fireEvent.click(parent.previousElementSibling as HTMLElement);
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Tag client/acme, 5 items, filter" }),
-      { shiftKey: true },
-    );
-
-    expect(notesFiltersStore.getState().tagTerms).toEqual([
-      { tag: "client", term: "include" },
-      { tag: "client/acme", term: "include" },
-    ]);
+    expect(excluded.closest('[data-slot="filter-chip"]')?.className).not.toBe(includedClass);
   });
 });

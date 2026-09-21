@@ -64,9 +64,9 @@ export function useRecordingsSpace(): NoteSpaceVm | null {
     }
     let live = true;
     void notesSpaces(vaultId)
-      .then((spaces) => {
+      .then((rail) => {
         if (live) {
-          setSpace(spaces.find((one) => one.defaultKey === RECORDINGS_SPACE_KEY) ?? null);
+          setSpace(rail.rows.find((one) => one.defaultKey === RECORDINGS_SPACE_KEY) ?? null);
         }
       })
       .catch(() => {

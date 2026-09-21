@@ -116,6 +116,7 @@ export function wikilinkSource(
             // to be reachable by the link that was just written and by nothing
             // else, so it inherits nothing.
             space: null,
+            spaceVaultId: null,
           }).then((created) => {
             onCreated?.(created.note.id);
           });

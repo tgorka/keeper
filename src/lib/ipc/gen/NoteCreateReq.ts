@@ -28,4 +28,4 @@ dest: string | null, tags: Array<string>,
  * an ordinary note — a space deleted between the click and the write is
  * not a reason to lose the thought.
  */
-space: string | null, };
+space: string | null, spaceVaultId: string | null, };

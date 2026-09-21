@@ -23,7 +23,7 @@
  * A tag appears in {@link NotesFiltersState.tagTerms} at most once, which is the
  * whole of how "include and exclude the same tag" is made impossible rather than
  * resolved by precedence (FR-148, UX-DR54): there is one entry per tag, the
- * cycle rewrites it in place, and {@link noteQueryFor} ships it as a map keyed by
+ * sign action rewrites it in place, and {@link noteQueryFor} ships it as a map keyed by
  * tag so the wire cannot carry the contradiction either.
  *
  * `folder` scope is the one that does not go through {@link NoteQueryReq}: the
@@ -63,6 +63,7 @@ export type NoteScope =
       readonly kind: "space";
       readonly id: string;
       readonly name: string;
+      readonly vaultId: string;
       /**
        * Which seeded default this space is, `null` for every other space.
        *
@@ -74,7 +75,7 @@ export type NoteScope =
        */
       readonly defaultKey: string | null;
     }
-  | { readonly kind: "folder"; readonly path: string };
+  | { readonly kind: "folder"; readonly vaultId: string; readonly path: string };
 
 /** The unscoped list — every note in the vault, in the vault's own order. */
 export const ALL_NOTES_SCOPE = { kind: "all" } as const satisfies NoteScope;
@@ -96,7 +97,7 @@ export function scopeLabel(scope: NoteScope): string {
  * {@link NoteQueryReq}. A vault-relative directory is not one of the query's
  * axes, and `notes_tree` returns the folder's own rows (FR-106).
  */
-export function isFolderScope(scope: NoteScope): scope is { kind: "folder"; path: string } {
+export function isFolderScope(scope: NoteScope): scope is Extract<NoteScope, { kind: "folder" }> {
   return scope.kind === "folder";
 }
 
@@ -109,7 +110,7 @@ function sameScope(a: NoteScope, b: NoteScope): boolean {
     return a.id === b.id;
   }
   if (a.kind === "folder" && b.kind === "folder") {
-    return a.path === b.path;
+    return a.vaultId === b.vaultId && a.path === b.path;
   }
   return true;
 }
@@ -130,29 +131,16 @@ export interface TagChip {
   readonly term: NoteTagTerm;
 }
 
-/** The order one press walks. */
-const CYCLE: readonly TagChipState[] = ["off", "include", "exclude"];
-
-/**
- * The state one press moves a chip to.
- *
- * Include before exclude, because including is what people do far more often
- * and the common case has to be one press. Exported because the cycle order is
- * the control's contract and two surfaces press it: the chip in the bar goes
- * through {@link NotesFiltersState.cycleTag}, and a plain press in the tag tree
- * has to read the next state *before* it clears the rest of the bar — a second
- * definition of the order is a tree and a bar that disagree about what a press
- * does.
- */
-export function nextTagChipState(state: TagChipState): TagChipState {
-  return CYCLE[(CYCLE.indexOf(state) + 1) % CYCLE.length] ?? "off";
+/** A sign press can change polarity, never remove a term. */
+export function flipTagTerm(state: TagChipState): NoteTagTerm {
+  return state === "include" ? "exclude" : "include";
 }
 
 /**
  * What `tag` is currently doing in a chip list, `off` when it is doing nothing.
  *
  * The one reader of {@link NotesFiltersState.tagTerms}' shape. The tag tree, the
- * cycle and the space editor all ask this rather than each searching the array,
+ * sign action and the space editor all ask this rather than each searching the array,
  * so a node in the tree and the same tag's chip in the bar cannot end up drawing
  * two different states.
  */
@@ -200,6 +188,29 @@ function restoredSort(value: string | null): NoteSortChoice | null {
   return { key: key as NoteSortChoice["key"], dir: dir as NoteSortChoice["dir"] };
 }
 
+/** Compare only the editable restore projection, never viewing preferences. */
+export function spaceDrift(state: NotesFiltersState): boolean {
+  const space = state.enteredSpace;
+  if (!space) return false;
+  const restore = space.restore;
+  const terms = restore.opaque ? {} : restore.tagTerms;
+  const flags = restore.opaque ? [] : restore.flags;
+  const sort = restore.opaque ? null : restoredSort(restore.sort);
+  return (
+    state.scope.kind !== "space" ||
+    state.scope.id !== space.id ||
+    state.scope.vaultId !== space.vaultId ||
+    state.text !== (restore.opaque ? "" : (restore.text ?? "")) ||
+    state.tagTerms.length !== Object.keys(terms).length ||
+    state.tagTerms.some(({ tag, term }) => terms[tag] !== term) ||
+    state.flags.length !== flags.length ||
+    state.flags.some((flag) => !flags.includes(flag)) ||
+    state.origin !== (restore.opaque ? null : restore.origin) ||
+    state.sort?.key !== sort?.key ||
+    state.sort?.dir !== sort?.dir
+  );
+}
+
 export interface NotesFiltersState {
   /** The selected sidebar scope; `all` when none is. */
   scope: NoteScope;
@@ -242,16 +253,12 @@ export interface NotesFiltersState {
   searchNonce: number;
   /** Select a scope. Selecting the active one again clears it back to `all`. */
   setScope: (scope: Exclude<NoteScope, { kind: "space" }>) => void;
-  /**
-   * Advance one tag chip: off → include → exclude → off. A chip that reaches
-   * `off` leaves the array, so the bar shows exactly the terms that are doing
-   * something.
-   */
-  cycleTag: (tag: string) => void;
+  /** Flip a tag's polarity without removing it; an absent tag becomes included. */
+  toggleTagSign: (tag: string) => void;
+  resetToEnteredSpace: () => void;
   /**
    * Put one tag chip in a named state, `off` removing it. The explicit form the
-   * space editor (43.4) needs, and what {@link NotesFiltersState.cycleTag} is
-   * written in terms of, so there is one place a chip changes state.
+   * space editor needs, and the single place a chip changes state.
    */
   setTagTerm: (tag: string, term: TagChipState) => void;
   /**
@@ -401,7 +408,13 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
     const restore = space.restore;
     set({
       enteredSpace: space,
-      scope: { kind: "space", id: space.id, name: space.name, defaultKey: space.defaultKey },
+      scope: {
+        kind: "space",
+        id: space.id,
+        name: space.name,
+        vaultId: space.vaultId,
+        defaultKey: space.defaultKey,
+      },
       tagTerms: restore.opaque
         ? []
         : Object.entries(restore.tagTerms).map(([tag, term]) => ({ tag, term })),
@@ -450,14 +463,14 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
       sort: null,
       enteredSpace: null,
     })),
-  cycleTag: (tag) =>
+  toggleTagSign: (tag) =>
     set((state) => ({
-      tagTerms: withTagTerm(
-        state.tagTerms,
-        tag,
-        nextTagChipState(tagChipState(state.tagTerms, tag)),
-      ),
+      tagTerms: withTagTerm(state.tagTerms, tag, flipTagTerm(tagChipState(state.tagTerms, tag))),
     })),
+  resetToEnteredSpace: () => {
+    const state = notesFiltersStore.getState();
+    if (state.enteredSpace) state.enterSpace(state.enteredSpace);
+  },
   setTagTerm: (tag, term) => set((state) => ({ tagTerms: withTagTerm(state.tagTerms, tag, term) })),
   removeTag: (tag) => set((state) => ({ tagTerms: withTagTerm(state.tagTerms, tag, "off") })),
   setText: (text) => set({ text }),

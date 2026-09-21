@@ -9,6 +9,7 @@ import {
 import {
   ALL_NOTES_SCOPE,
   emptyFilterReason,
+  flipTagTerm,
   hydrateHideServiceFiles,
   hydrateIncludePrivate,
   isFiltered,
@@ -18,7 +19,6 @@ import {
   persistHideServiceFiles,
   persistIncludePrivate,
   resetNotesFiltersStoreForTest,
-  tagChipState,
 } from "@/lib/stores/notes-filters";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -43,6 +43,8 @@ function space(id: string, restore: Partial<NoteSpaceVm["restore"]> = {}): NoteS
   return {
     id,
     name: id,
+    vaultId: "vault-1",
+    vaultName: "Personal",
     defaultKey: null,
     restore: {
       tagTerms: {},
@@ -59,8 +61,8 @@ function space(id: string, restore: Partial<NoteSpaceVm["restore"]> = {}): NoteS
 describe("noteQueryFor", () => {
   it("sends every active tag, so Rust intersects rather than unions them", () => {
     const state = notesFiltersStore.getState();
-    state.cycleTag("work");
-    state.cycleTag("urgent");
+    state.setTagTerm("work", "include");
+    state.setTagTerm("urgent", "include");
 
     expect(noteQueryFor(notesFiltersStore.getState(), 0, 200).tags).toEqual({
       work: "include",
@@ -81,8 +83,8 @@ describe("noteQueryFor", () => {
 
   it("drops a tag from the request when its chip is cleared", () => {
     const state = notesFiltersStore.getState();
-    state.cycleTag("work");
-    state.cycleTag("urgent");
+    state.setTagTerm("work", "include");
+    state.setTagTerm("urgent", "include");
     state.removeTag("urgent");
 
     // Widening is a shorter term set, never a switch to a different predicate.
@@ -216,8 +218,8 @@ describe("dropLastChip", () => {
   it("walks the bar down from its end, one press at a time", () => {
     const state = notesFiltersStore.getState();
     state.enterSpace(space("s-inbox"));
-    state.cycleTag("work");
-    state.cycleTag("urgent");
+    state.setTagTerm("work", "include");
+    state.setTagTerm("urgent", "include");
     state.setAgentOnly(true);
     state.setPinnedOnly(true);
 
@@ -242,7 +244,7 @@ describe("dropLastChip", () => {
 describe("isFiltered", () => {
   it("separates an unfiltered list from one narrowed by a lone chip", () => {
     expect(isFiltered(notesFiltersStore.getState())).toBe(false);
-    notesFiltersStore.getState().cycleTag("work");
+    notesFiltersStore.getState().setTagTerm("work", "include");
     // This boolean is what picks between "this vault is empty" and "no notes
     // match these filters", so a false negative would word an over-filtered
     // list as an empty vault.
@@ -250,22 +252,20 @@ describe("isFiltered", () => {
   });
 });
 
-describe("the three-state tag chip", () => {
-  it("cycles off, include, exclude, off", () => {
-    const cycle = () => notesFiltersStore.getState().cycleTag("draft");
+describe("tag chip signs", () => {
+  it("flips each chip state into its next sign", () => {
+    expect(flipTagTerm("off")).toBe("include");
+    expect(flipTagTerm("include")).toBe("exclude");
+    expect(flipTagTerm("exclude")).toBe("include");
+  });
 
-    expect(tagChipState(terms(), "draft")).toBe("off");
-    cycle();
-    expect(tagChipState(terms(), "draft")).toBe("include");
-    cycle();
-    expect(tagChipState(terms(), "draft")).toBe("exclude");
-    cycle();
-    // Off is the absence of a term, not a third kind of term.
-    expect(tagChipState(terms(), "draft")).toBe("off");
-    expect(terms()).toEqual([]);
-    // And the cycle keeps going rather than sticking at either end.
-    cycle();
-    expect(tagChipState(terms(), "draft")).toBe("include");
+  it("ten alternating flips never empty tagTerms", () => {
+    const state = notesFiltersStore.getState();
+    state.setTagTerm("draft", "include");
+    for (let flip = 0; flip < 10; flip += 1) {
+      state.toggleTagSign("draft");
+      expect(terms()).toEqual([{ tag: "draft", term: flip % 2 === 0 ? "exclude" : "include" }]);
+    }
   });
 
   it("cannot hold one tag as both included and excluded", () => {

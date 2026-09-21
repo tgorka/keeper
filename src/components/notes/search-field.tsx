@@ -26,6 +26,7 @@ export function SearchField({
   chips,
   children,
   glyph,
+  controls,
   phone,
   searchRef,
   description,
@@ -34,6 +35,13 @@ export function SearchField({
   chips: readonly TagChip[];
   children: ReactNode;
   glyph: ReactNode;
+  /**
+   * The bar's own controls, rendered inside the field on physical row 1
+   * (FR-619). They are the field's first flow items, so the caret shares
+   * their last row when ≥ 96 px remain and starts a full-width row of its
+   * own otherwise — the same rule the chips used to be measured by.
+   */
+  controls: ReactNode;
   phone: boolean;
   searchRef?: Ref<HTMLTextAreaElement>;
   description: string;
@@ -42,6 +50,7 @@ export function SearchField({
   const input = useRef<HTMLTextAreaElement | null>(null);
   const flow = useRef<HTMLDivElement>(null);
   const chipFlow = useRef<HTMLDivElement>(null);
+  const controlFlow = useRef<HTMLDivElement>(null);
   const textMeasure = useRef<HTMLSpanElement>(null);
   const [requested, setRequested] = useState(false);
   const vocabularyNonce = useNotesFiltersStore((state) => state.spacesNonce);
@@ -103,6 +112,7 @@ export function SearchField({
     element.style.height = "20px";
     const height = element.scrollHeight;
     element.style.height = `${Math.min(60, Math.max(20, height))}px`;
+    const width = flow.current?.clientWidth ?? 0;
     const tokens = chipFlow.current;
     if (tokens) {
       // Children are the actual whole-token boxes; offsets are relative to the flow.
@@ -113,12 +123,19 @@ export function SearchField({
       setCapped(
         Boolean(first && last && last.offsetTop + last.offsetHeight - first.offsetTop > max),
       );
-      const width = flow.current?.clientWidth ?? 0;
-      const remaining = last && !capped ? width - last.offsetLeft - last.offsetWidth - 4 : width;
-      const inlineWidth = remaining >= 96 ? remaining : width;
-      setMultiline(text.includes("\n") || (textMeasure.current?.offsetWidth ?? 0) > inlineWidth);
     }
-  }, [text, phone, capped]);
+    // The caret shares a row with the CONTROLS, not with the chips: since
+    // FR-619 the chips follow the text instead of preceding it, so what
+    // decides whether the prompt fits inline is the space left after the
+    // last control on its row.
+    const controlBoxes = Array.from(controlFlow.current?.children ?? []) as HTMLElement[];
+    const lastControl = controlBoxes[controlBoxes.length - 1];
+    const remaining = lastControl
+      ? width - lastControl.offsetLeft - lastControl.offsetWidth - 4
+      : width;
+    const inlineWidth = remaining >= 96 ? remaining : width;
+    setMultiline(text.includes("\n") || (textMeasure.current?.offsetWidth ?? 0) > inlineWidth);
+  }, [text, phone]);
   // Measure committed DOM after any token or wrapping change, not just text edits.
   useLayoutEffect(() => measure());
   useLayoutEffect(() => {
@@ -191,16 +208,8 @@ export function SearchField({
                 {text}
               </span>
             </span>
-            <div
-              ref={chipFlow}
-              data-slot="filter-tags"
-              onPointerUp={() => input.current?.focus()}
-              className={cn(
-                capped ? "flex w-full min-w-0 flex-wrap gap-1 overflow-y-auto" : "contents",
-                capped && (phone ? "max-h-[140px]" : "max-h-20"),
-              )}
-            >
-              {children}
+            <div ref={controlFlow} data-slot="search-controls" className="contents">
+              {controls}
             </div>
             <textarea
               ref={attach}
@@ -281,6 +290,17 @@ export function SearchField({
                   setToken(null);
               }}
             />
+            <div
+              ref={chipFlow}
+              data-slot="filter-tags"
+              onPointerUp={() => input.current?.focus()}
+              className={cn(
+                capped ? "flex w-full min-w-0 flex-wrap gap-1 overflow-y-auto" : "contents",
+                capped && (phone ? "max-h-[140px]" : "max-h-20"),
+              )}
+            >
+              {children}
+            </div>
           </div>
           <IconHint label="Clear search">
             <Button

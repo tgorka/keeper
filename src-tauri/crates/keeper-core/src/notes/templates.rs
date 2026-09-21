@@ -1642,6 +1642,9 @@ mod tests {
     }
 
     impl default_spaces::SeedVault for FakeVault {
+        fn spaces_dir(&self) -> &str {
+            "spaces"
+        }
         fn read(&self, rel: &str) -> std::io::Result<String> {
             self.files
                 .get(rel)

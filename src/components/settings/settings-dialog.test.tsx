@@ -1137,6 +1137,7 @@ describe("SettingsDialog quick capture", () => {
           profileId: "v1",
           name: "Second Brain",
           subfolder: "notes",
+          spacesSubfolder: "spaces",
           root: "/Users/t/Sync/notes",
           indexed: true,
           noteCount: 3,

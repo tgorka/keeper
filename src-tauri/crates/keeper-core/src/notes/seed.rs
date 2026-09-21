@@ -47,12 +47,6 @@ use crate::notes::templates;
 /// it is in the Journal space and is not.
 pub const JOURNAL_DIR: &str = "journal";
 
-/// The folder prefix that makes the index flag a note `space`.
-///
-/// Inverts `keeper::notes_vault::parse_note`'s `rel.starts_with("spaces/")`,
-/// with the separator baked in so a folder called `spaces-archive` is not one.
-pub const SPACES_DIR: &str = "spaces/";
-
 /// Characters that make a path segment a pattern rather than a folder name.
 const GLOB_META: [char; 6] = ['*', '?', '[', ']', '{', '}'];
 
@@ -414,7 +408,8 @@ pub fn capture_verdict(
     stamp: &str,
     now_ms: i64,
 ) -> Option<String> {
-    let entry = projected(&capture(tag), "", "", stamp, now_ms);
+    // Captures have no destination folder, so no spaces prefix can match.
+    let entry = projected(&capture(tag), "", "", stamp, now_ms, "/");
     verdict(space_name, query, &entry, "", now_ms)
 }
 
@@ -470,7 +465,14 @@ pub fn capture_tag_cost(
 /// the filename this projects is the filename a create would pick in an empty
 /// folder. `now_ms` must mean the same instant as `stamp`, because the date
 /// predicates compare against it.
-pub fn projected(seed: &Seed, title: &str, body: &str, stamp: &str, now_ms: i64) -> IndexEntry {
+pub fn projected(
+    seed: &Seed,
+    title: &str,
+    body: &str,
+    stamp: &str,
+    now_ms: i64,
+    spaces_prefix: &str,
+) -> IndexEntry {
     let dir = seed.dest.clone().unwrap_or_default();
     let date = stamp.get(..DATE_LEN).unwrap_or_default();
     let filename = naming::note_filename(title, date, &[]);
@@ -496,7 +498,7 @@ pub fn projected(seed: &Seed, title: &str, body: &str, stamp: &str, now_ms: i64)
     // seed a destination for exactly that reason, but `path:spaces/**` does
     // not — so a seed really can land here, and a projection that missed it
     // would tell a spaces space its new note will not appear when it will.
-    if path.starts_with(SPACES_DIR) && !crate::notes::is_okf_reserved(&path) {
+    if path.starts_with(spaces_prefix) && !crate::notes::is_okf_reserved(&path) {
         flags.push("space".to_owned());
     }
     // 44.7's rule, mirrored whole: a template is a note TAGGED `template`
@@ -566,7 +568,7 @@ mod tests {
     /// models of one thing is the defect this whole module exists to refuse.
     fn create_into(name: &str, query: &str) -> (Seed, Option<String>) {
         let seed = inherit(query);
-        let entry = projected(&seed, "Note", "", STAMP, NOW_MS);
+        let entry = projected(&seed, "Note", "", STAMP, NOW_MS, "spaces/");
         let told = verdict(name, query, &entry, "", NOW_MS);
         (seed, told)
     }
@@ -791,7 +793,7 @@ mod tests {
     #[test]
     fn a_text_term_is_answered_from_the_body_the_note_will_actually_have() {
         let seed = inherit("text:agenda");
-        let entry = projected(&seed, "Note", "", STAMP, NOW_MS);
+        let entry = projected(&seed, "Note", "", STAMP, NOW_MS, "spaces/");
         assert!(verdict("Agenda", "text:agenda", &entry, "", NOW_MS).is_some());
         assert_eq!(
             verdict("Agenda", "text:agenda", &entry, "## Agenda\n", NOW_MS),
@@ -904,7 +906,7 @@ mod tests {
             assert!(capture(Some(typed)).tags.is_empty(), "{typed:?}");
         }
         assert!(
-            !projected(&capture(Some("template")), "", "", STAMP, NOW_MS)
+            !projected(&capture(Some("template")), "", "", STAMP, NOW_MS, "spaces/")
                 .has_flag(templates::TEMPLATE_TAG),
             "a capture must never be indexed as a template"
         );
@@ -918,10 +920,15 @@ mod tests {
             capture_tag("Template/Inbox").as_deref(),
             Some("template/inbox")
         );
-        assert!(
-            !projected(&capture(Some("template/inbox")), "", "", STAMP, NOW_MS)
-                .has_flag(templates::TEMPLATE_TAG)
-        );
+        assert!(!projected(
+            &capture(Some("template/inbox")),
+            "",
+            "",
+            STAMP,
+            NOW_MS,
+            "spaces/"
+        )
+        .has_flag(templates::TEMPLATE_TAG));
     }
 
     /// **The finding this story had to answer, asked rather than reasoned
@@ -1053,7 +1060,7 @@ mod tests {
             capture_verdict("Agenda", "text:agenda", Some("capture"), STAMP, NOW_MS).is_some(),
             "keeper cannot promise a space that reads the body"
         );
-        let entry = projected(&capture(None), "", "", STAMP, NOW_MS);
+        let entry = projected(&capture(None), "", "", STAMP, NOW_MS, "spaces/");
         assert!(entry.snippet.is_empty());
         assert!(entry.title.is_empty());
     }
@@ -1063,17 +1070,25 @@ mod tests {
     #[test]
     fn a_projected_note_is_named_the_way_the_create_path_names_one() {
         assert_eq!(
-            projected(&Seed::default(), "Standup notes", "", STAMP, NOW_MS).path,
+            projected(
+                &Seed::default(),
+                "Standup notes",
+                "",
+                STAMP,
+                NOW_MS,
+                "spaces/"
+            )
+            .path,
             "2026-08-09-standup-notes.md"
         );
         assert_eq!(
-            projected(&capture(None), "", "", STAMP, NOW_MS).path,
+            projected(&capture(None), "", "", STAMP, NOW_MS, "spaces/").path,
             "2026-08-09-untitled.md"
         );
         // A stamp too short to carry a date leaves the name undated rather than
         // panicking on a slice: `note_filename` already treats "" as no date.
         assert_eq!(
-            projected(&Seed::default(), "Note", "", "2026", NOW_MS).path,
+            projected(&Seed::default(), "Note", "", "2026", NOW_MS, "spaces/").path,
             "note.md"
         );
     }
@@ -1094,12 +1109,12 @@ mod tests {
     fn a_projected_note_carries_the_flags_its_folder_gives_it_and_not_only_its_tags() {
         let into_spaces = inherit("path:spaces/**");
         assert_eq!(into_spaces.dest.as_deref(), Some("spaces"), "reachable");
-        assert!(projected(&into_spaces, "Note", "", STAMP, NOW_MS).has_flag("space"));
+        assert!(projected(&into_spaces, "Note", "", STAMP, NOW_MS, "spaces/").has_flag("space"));
         assert_eq!(
             verdict(
                 "Saved views",
                 "path:spaces/** is:space",
-                &projected(&into_spaces, "Note", "", STAMP, NOW_MS),
+                &projected(&into_spaces, "Note", "", STAMP, NOW_MS, "spaces/"),
                 "",
                 NOW_MS
             ),
@@ -1113,7 +1128,8 @@ mod tests {
             "reachable"
         );
         assert!(
-            projected(&into_templates, "Note", "", STAMP, NOW_MS).has_flag(templates::TEMPLATE_TAG),
+            projected(&into_templates, "Note", "", STAMP, NOW_MS, "spaces/")
+                .has_flag(templates::TEMPLATE_TAG),
             "44.7 grandfathers the folder, and the projection has to grandfather it too"
         );
         // A folder that merely BEGINS with the word is not the folder.
@@ -1121,7 +1137,7 @@ mod tests {
             dest: Some("spaces-archive".to_owned()),
             ..Seed::default()
         };
-        assert!(!projected(&elsewhere, "Note", "", STAMP, NOW_MS).has_flag("space"));
+        assert!(!projected(&elsewhere, "Note", "", STAMP, NOW_MS, "spaces/").has_flag("space"));
     }
 
     /// A9. The positive witness for every `!has_flag(TEMPLATE_TAG)` assertion
@@ -1131,7 +1147,16 @@ mod tests {
     fn the_template_flag_is_really_set_when_the_seed_really_asks_for_it() {
         let seed = inherit("is:template");
         assert_eq!(seed.tags, [templates::TEMPLATE_TAG]);
-        assert!(projected(&seed, "Note", "", STAMP, NOW_MS).has_flag(templates::TEMPLATE_TAG));
+        assert!(projected(&seed, "Note", "", STAMP, NOW_MS, "spaces/")
+            .has_flag(templates::TEMPLATE_TAG));
+    }
+
+    #[test]
+    fn configured_spaces_prefix_replaces_the_old_folder() {
+        let old = inherit("path:spaces/**");
+        let new = inherit("path:saved-searches/**");
+        assert!(!projected(&old, "Note", "", STAMP, NOW_MS, "saved-searches/").has_flag("space"));
+        assert!(projected(&new, "Note", "", STAMP, NOW_MS, "saved-searches/").has_flag("space"));
     }
 
     /// A6. The filter the Settings surface renders, which was a decision living

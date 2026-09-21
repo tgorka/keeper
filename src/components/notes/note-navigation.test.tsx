@@ -118,3 +118,29 @@ it("supports local Back/Forward chords without opening history and refuses an em
   fireEvent.contextMenu(screen.getByRole("button", { name: "Forward" }));
   expect(screen.queryByRole("menu")).toBeNull();
 });
+
+it("opens history from the caret corner without navigating or adding a third button", async () => {
+  const back = navigation();
+  vi.spyOn(back, "getBoundingClientRect").mockReturnValue({
+    x: 0,
+    y: 0,
+    left: 0,
+    top: 0,
+    right: 32,
+    bottom: 32,
+    width: 32,
+    height: 32,
+    toJSON: () => ({}),
+  });
+  expect(screen.getAllByRole("button")).toHaveLength(2);
+  expect(back.querySelectorAll("svg")).toHaveLength(2);
+  expect(screen.getByRole("button", { name: "Forward" }).querySelectorAll("svg")).toHaveLength(1);
+  fireEvent.pointerDown(back, { button: 0, clientX: 28, clientY: 28 });
+  expect(await screen.findByRole("menu", { name: "Back navigation history" })).toBeInTheDocument();
+  fireEvent.click(back);
+  expect(activePanel(panelsStore.getState()).target).toEqual({
+    kind: "note",
+    vaultId: "v",
+    noteId: "D",
+  });
+});

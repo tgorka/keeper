@@ -42,6 +42,7 @@ function vault(p: Partial<NoteVaultVm> = {}): NoteVaultVm {
     profileId: p.profileId ?? "v1",
     name: p.name ?? "Second Brain",
     subfolder: p.subfolder ?? "notes",
+    spacesSubfolder: p.spacesSubfolder ?? "spaces",
     root: p.root ?? "/Users/t/Sync/notes",
     indexed: p.indexed ?? true,
     noteCount: p.noteCount ?? 12,
@@ -240,6 +241,7 @@ describe("CaptureSettingsSection", () => {
     await waitFor(() => expect(mockSave).toHaveBeenCalled());
     expect(mockSave).toHaveBeenCalledWith("v1", {
       subfolder: null,
+      spacesSubfolder: "spaces",
       journalTemplate: null,
       defaultTemplate: null,
       captureTemplate: "templates/capture.md",
@@ -300,6 +302,7 @@ describe("CaptureSettingsSection", () => {
     await waitFor(() => expect(mockSave).toHaveBeenCalled());
     expect(mockSave).toHaveBeenCalledWith("v1", {
       subfolder: null,
+      spacesSubfolder: "spaces",
       journalTemplate: null,
       defaultTemplate: null,
       captureTemplate: null,
