@@ -268,7 +268,7 @@ describe("SpaceList hierarchy and lifetime", () => {
     expect(row).toHaveAttribute("aria-current", "true");
     await waitFor(() => expect(notesSpaceTouch).toHaveBeenCalledWith("vault-1", "work"));
     const field = screen.getByRole("combobox", { name: "Search notes" });
-    if (change === "clear") fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+    if (change === "clear") fireEvent.click(screen.getByRole("button", { name: "Reset search" }));
     else if (change === "edit-and-undo") {
       fireEvent.change(field, { target: { value: "new prompt" } });
       fireEvent.change(field, { target: { value: "old prompt" } });
@@ -320,7 +320,7 @@ describe("SpaceList hierarchy and lifetime", () => {
     );
     fireEvent.click(await screen.findByRole("button", { name: "Work" }));
     await waitFor(() => expect(notesSpacePark).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reset search" }));
     await act(async () => release(target));
     expect(screen.getByRole("combobox", { name: "Search notes" })).toHaveValue("");
     expect(notesFiltersStore.getState().scope).toEqual(ALL_NOTES_SCOPE);

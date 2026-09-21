@@ -257,6 +257,16 @@ export interface NotesFiltersState {
   toggleTagSign: (tag: string) => void;
   resetToEnteredSpace: () => void;
   /**
+   * The trailing control's whole act: reset the search, not merely the text.
+   *
+   * Inside an entered space this restores that space's saved query — the
+   * previous state a person expects back — and outside one it empties the
+   * prompt and the tag chips together. Clearing the text while leaving three
+   * tag chips filtering the list is the state the owner reported as "it did
+   * not reset"; the two facts are one control's business.
+   */
+  resetSearch: () => void;
+  /**
    * Put one tag chip in a named state, `off` removing it. The explicit form the
    * space editor needs, and the single place a chip changes state.
    */
@@ -470,6 +480,19 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
   resetToEnteredSpace: () => {
     const state = notesFiltersStore.getState();
     if (state.enteredSpace) state.enterSpace(state.enteredSpace);
+  },
+  resetSearch: () => {
+    const state = notesFiltersStore.getState();
+    if (state.enteredSpace) {
+      state.enterSpace(state.enteredSpace);
+      return;
+    }
+    // Everything the bar shows as a chip of the QUERY goes: the prompt, the
+    // tags and the flags. `is:pinned` left filtering the list after a reset is
+    // the same surprise as tags surviving a clear. The scope is deliberately
+    // kept — it is the rail's selection rather than part of the query, and it
+    // carries its own dismiss.
+    set({ text: "", tagTerms: [], flags: [], origin: null, pinnedOnly: false, agentOnly: false });
   },
   setTagTerm: (tag, term) => set((state) => ({ tagTerms: withTagTerm(state.tagTerms, tag, term) })),
   removeTag: (tag) => set((state) => ({ tagTerms: withTagTerm(state.tagTerms, tag, "off") })),
