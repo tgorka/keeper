@@ -48,6 +48,14 @@ tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 
 development_status:
+  # Epic 83: the owner's two asks on the epic-82 build — read the setup QR code with the camera on desktop, and let the sidebar's Add account add a Matrix account or set up / change the keeper account. Grounded with three measurements on hesperia (WKWebView camera exposure, zxing-wasm vs jsqr on the owner's real 1447-char code) before planning.
+  # Stack rungs: epic83-plan (docs), then epic83-core (83.3's keeper-core rule + AccountSetupVm.replaces + binding and fixture ripple), then epic83-surface (83.1 menu + dialog, 83.2 scanner, 83.3 sheet sentence and shell call site, Info.plist, docs/account.md).
+  epic-83: in-progress
+  83-1-add-account-offers-a-matrix-or-a-keeper-account: review
+  83-2-a-camera-reads-the-setup-code: review
+  83-3-a-change-says-which-account-it-replaces: review
+  # DW-298…DW-299 are opened by this plan; none closes here.
+
   # Epic 82: an optional account (OIDC sign-in whose token is a general credential) and a per-person config repository synced to every device, bootstrapped from one input (setup link / QR / paste). Owner approved the model 2026-09-23 with one amendment: the account's tiers sit above ~/.keeper and below the main folder.
   # Stack rungs: epic82-plan (docs), then epic82-core (82.1–82.4: descriptor, OIDC client, repository layout, account layer tiers in keeper-core; the config-repository transport in keeper-sync; generated bindings), then epic82-shell-surface (82.5–82.7: shell IPC, web-auth port, deep links, Settings › Account, setup and share sheets, drive and bot credential choice, durable docs). The tip passed the full macOS gate (scripts/check-macos.sh on hesperia) and the Linux gate; each rung passed the Linux gate alone. The iOS compile is CI's job (hesperia's Xcode links swift-rs for macOS).
   # Review wave: three lanes (security audit, repository + layers, frontend UX) -> binding fix-wave rulings, every fix with a regression test (core fixes mutation-proved). Settings › Account (signed out, setup sheet, signed in, share QR, blocked, offline) proved in Chrome against the dev harness.
