@@ -76,7 +76,9 @@ other.
 ## Spaces and the query language
 
 A space is a saved query, stored as an ordinary note under `spaces/` — so it syncs, it has
-history, and an agent can write one with a text editor.
+history, and an agent can write one with a text editor. Being a definition rather than a
+note you write, it is a service file of the note list: hidden while the eye toggle is on,
+listed in the rail.
 
 ```markdown
 ---
@@ -191,9 +193,13 @@ and carries no marks, because there is no word to mark. With no model chosen sea
 only and the bar says so. keeper ships no model and downloads none (D-4, D-21).
 
 **Service files.** The eye toggle in the bar hides `index.md`, `agents.md`, `claude.md` and
-`log.md` from the list — on by default, remembered across launches; the count line says how
-many it hid. The names are a setting (`notes.service_file_names`). A hidden note still opens
-from a link, still matches `⌘⇧F`, and is still in the Files tree.
+`log.md` from the list, and the space definitions in each drive's spaces folder
+(`<spaces folder>/`, `spaces/` unless the drive says otherwise) — on by default, remembered
+across launches; the count line says how many it hid, and turning the toggle off shows them
+again. The names are a setting (`notes.service_file_names`); the spaces folder is the drive's.
+Only the plain list hides space definitions: inside a space, its own query decides. A hidden
+note still opens from a link, still matches `⌘⇧F`, and is still in the Files tree; a space
+definition is still in the rail.
 
 `⌘⇧F` searches everything at once: messages, notes and session files. It was the chat
 search shortcut and is now the search shortcut; a person who wants to find a sentence

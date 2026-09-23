@@ -147,10 +147,25 @@ export interface NoteDocument {
    * Where Rust wants the caret once the document exists, as a byte offset into
    * `text`, or null for "wherever the editor would put it" — the end of the body.
    *
-   * Set only when the template the note was created from declared a `{{cursor}}`.
-   * The editor consumes it once.
+   * Set only by the opening `reset`, and only when the template the note was
+   * created from declared a `{{cursor}}`. The editor places it once and then
+   * nulls it through {@link consumeCaretHint}, so nothing that arrives later can
+   * send the caret back there.
    */
   cursor: number | null;
+  /**
+   * How many times content that did not come from the editor has replaced the
+   * buffer: the opening `reset`, an `external` write applied live, an accepted
+   * pending revision. Monotonic for the life of the document.
+   *
+   * This, not `base`, is what the editor reconciles on. `base` also moves when a
+   * save is acknowledged, and that is Rust agreeing with text the editor already
+   * shows — possibly text it has moved past, if the user kept typing through the
+   * round trip. Pushing `base` into CodeMirror then would splice those keystrokes
+   * away. A save therefore never bumps this, and neither does anything else the
+   * editor itself originated.
+   */
+  externalEdition: number;
   /** An external revision awaiting the user's decision, or null. */
   pending: NotePending | null;
   /** Set by a `gone` batch: the note is no longer on disk. */
@@ -209,6 +224,7 @@ export const EMPTY_NOTE_DOCUMENT: NoteDocument = Object.freeze({
   dirty: false,
   path: null,
   cursor: null,
+  externalEdition: 0,
   pending: null,
   gone: false,
   saving: false,
@@ -371,6 +387,7 @@ export function applyBodyBatch(vaultId: string, noteId: string, batch: NoteBodyB
           path: batch.path ?? null,
           dirty: false,
           cursor: batch.cursor,
+          externalEdition: document.externalEdition + 1,
           pending: null,
           gone: false,
           error: null,
@@ -392,6 +409,7 @@ export function applyBodyBatch(vaultId: string, noteId: string, batch: NoteBodyB
           frontmatter: batch.frontmatter,
           rev: batch.rev,
           pending: null,
+          externalEdition: document.externalEdition + 1,
         };
       case "diverged":
         return {
@@ -434,8 +452,15 @@ export function acceptPending(vaultId: string, noteId: string): void {
       rev: document.pending.rev,
       dirty: false,
       pending: null,
+      externalEdition: document.externalEdition + 1,
     };
   });
+}
+
+/** The editor has put the caret where the template asked: forget the hint, so
+ *  the next reconcile leaves the caret wherever the user has taken it since. */
+export function consumeCaretHint(vaultId: string, noteId: string): void {
+  mutate(vaultId, noteId, () => ({ cursor: null }));
 }
 
 /**

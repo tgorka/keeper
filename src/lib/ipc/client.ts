@@ -216,6 +216,7 @@ export type { NoteQueryReq } from "./gen/NoteQueryReq";
 export type { NoteRailVaultVm } from "./gen/NoteRailVaultVm";
 export type { NoteRailVm } from "./gen/NoteRailVm";
 export type { NoteRefVm } from "./gen/NoteRefVm";
+export type { NoteReleaseReq } from "./gen/NoteReleaseReq";
 export type { NoteRevisionVm } from "./gen/NoteRevisionVm";
 export type { NoteRowVm } from "./gen/NoteRowVm";
 export type { NoteSearchBatch } from "./gen/NoteSearchBatch";
@@ -471,6 +472,7 @@ import type { NoteQueryCheckVm } from "./gen/NoteQueryCheckVm";
 import type { NoteQueryReq } from "./gen/NoteQueryReq";
 import type { NoteRailVm } from "./gen/NoteRailVm";
 import type { NoteRefVm } from "./gen/NoteRefVm";
+import type { NoteReleaseReq } from "./gen/NoteReleaseReq";
 import type { NoteRevisionVm } from "./gen/NoteRevisionVm";
 import type { NoteRowVm } from "./gen/NoteRowVm";
 import type { NoteSearchBatch } from "./gen/NoteSearchBatch";
@@ -4609,9 +4611,20 @@ export async function notesOpen(
 /**
  * Close one body subscription, aborting its backend producer. Idempotent — an
  * unknown id is a no-op.
+ *
+ * The last editor of a note passes a `release`: the words that had not reached
+ * disk (`text`, typed against `baseRev`; `null` when the editor was clean) ride
+ * this one call, so no separate save can race the close. Rust then writes them
+ * and, when `discard` allows it, decides — resolving `true` when it removed an
+ * untouched new note (a note created with nothing in it that nobody wrote in).
+ * `discard` is `false` while a panel still targets the note. A channel that was
+ * not the note's last closes with `null`, which never removes anything.
  */
-export async function notesClose(subscriptionId: string): Promise<void> {
-  await invoke<void>("notes_close", { subscriptionId });
+export async function notesClose(
+  subscriptionId: string,
+  release: NoteReleaseReq | null,
+): Promise<boolean> {
+  return await invoke<boolean>("notes_close", { subscriptionId, release });
 }
 
 /**

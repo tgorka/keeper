@@ -64,6 +64,7 @@ import {
 import { followExternalUrl, resolveWikilink } from "@/lib/notes/follow-link";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import {
+  consumeCaretHint,
   markSaved,
   notesEditorStore,
   readNoteDocument,
@@ -411,7 +412,6 @@ export function NoteEditor({
   // Two editors are two subscriptions to two documents in one store, and the
   // only thing that keeps them apart is that the key is a prop rather than a
   // module-scoped "current".
-  const base = useNoteDocument(vaultId, noteId, (document) => document.base);
   const rev = useNoteDocument(vaultId, noteId, (document) => document.rev);
   const frontmatter = useNoteDocument(vaultId, noteId, (document) => document.frontmatter);
   const path = useNoteDocument(vaultId, noteId, (document) => document.path);
@@ -763,15 +763,54 @@ export function NoteEditor({
           refreshMarks();
         }
       });
+      // Adopt text this view did not type, minimally and unrecorded. `flash`
+      // paints what moved, for somebody else's edit; a sibling view's typing is
+      // the person's own, visible in the panel they are typing in.
+      const adopt = (text: string, flash: boolean) => {
+        const splice = preview.spliceBetween(editorView.state.doc.toString(), text);
+        if (splice === null) {
+          return;
+        }
+        editorView.dispatch({
+          changes: splice,
+          // Someone else's edit must not pollute the user's undo history, and
+          // must not be echoed back to Rust as a local edit.
+          annotations: [
+            state.Transaction.remote.of(true),
+            state.Transaction.addToHistory.of(false),
+          ],
+        });
+        if (flash) {
+          preview.flashExternal(editorView, splice.from, splice.from + splice.insert.length);
+        }
+      };
       let previousDocument = readNoteDocument(vaultId, noteId);
       const stopDocument = notesEditorStore.subscribe(() => {
         const current = readNoteDocument(vaultId, noteId);
         if (current === previousDocument) return;
+        const was = previousDocument;
         const changed =
-          current.rev !== previousDocument.rev ||
-          current.base !== previousDocument.base ||
-          current.text !== previousDocument.text;
+          current.rev !== was.rev || current.base !== was.base || current.text !== was.text;
         previousDocument = current;
+        // Two panels on one note are two views of one buffer: what one types,
+        // the other shows — or the other's next keystroke would report a buffer
+        // without it, and the autosave would write that. Mirrored here, in the
+        // store's own notification, rather than from a render: `editBuffer`
+        // runs inside the keystroke's own update, so the store is never behind
+        // this view's typing at this moment, where a rendered `text` can be a
+        // keystroke behind by the time an effect runs. The view that typed
+        // already equals `text` and splices nothing. A save acknowledgement
+        // leaves `text` alone, so keystrokes typed through it are never
+        // touched; content from outside moves `externalEdition` and is the
+        // reconcile effect's, which flashes it and places the caret. A
+        // document that is gone (no views) is not an empty note to mirror.
+        if (
+          current.views > 0 &&
+          current.text !== was.text &&
+          current.externalEdition === was.externalEdition
+        ) {
+          adopt(current.text, false);
+        }
         if (changed)
           queueMicrotask(() => {
             if (!disposed) refreshMarks();
@@ -780,22 +819,7 @@ export function NoteEditor({
       refreshMarks();
 
       runtimeRef.current = {
-        applyExternal: (text: string) => {
-          const splice = preview.spliceBetween(editorView.state.doc.toString(), text);
-          if (splice === null) {
-            return;
-          }
-          editorView.dispatch({
-            changes: splice,
-            // Someone else's edit must not pollute the user's undo history, and
-            // must not be echoed back to Rust as a local edit.
-            annotations: [
-              state.Transaction.remote.of(true),
-              state.Transaction.addToHistory.of(false),
-            ],
-          });
-          preview.flashExternal(editorView, splice.from, splice.from + splice.insert.length);
-        },
+        applyExternal: (text: string) => adopt(text, true),
         placeCaret: (at: number) => {
           const clamped = Math.max(0, Math.min(at, editorView.state.doc.length));
           editorView.dispatch({
@@ -834,10 +858,13 @@ export function NoteEditor({
       editorView.focus();
       // The document almost never exists yet when this chunk lands — the channel
       // delivers `Reset` after the lazy import resolves — so the caret hint is
-      // consumed here, once the runtime is able to act on it.
+      // consumed here, once the runtime is able to act on it. Consumed, not just
+      // read: a hint left in the store would be placed again by the next
+      // reconcile, wherever the user had typed to by then.
       const opening = readNoteDocument(vaultId, noteId).cursor;
       if (opening !== null) {
         runtimeRef.current.placeCaret(opening);
+        consumeCaretHint(vaultId, noteId);
       }
     })();
 
@@ -851,16 +878,29 @@ export function NoteEditor({
     // teardown of the editor and keeps the effect honest about what it closes over.
   }, [vaultId, noteId, openExternal, openWikilink]);
 
-  // The opening `Reset` usually lands AFTER the editor chunk, so this is the
-  // effect that actually gets to honour the caret hint: the document has just
-  // been spliced in, and only now is there anything to put a caret into.
-  const openingCursor = body.cursor;
+  // Content that did not come from this editor — the opening `Reset`, which
+  // usually lands AFTER the editor chunk, an external write applied live, an
+  // accepted revision — is spliced in here, and the caret hint with it when the
+  // boot closure did not get to it first.
+  //
+  // Keyed on the store's external edition and NOT on `base`: a save
+  // acknowledgement moves `base` to the bytes that were written, which the
+  // editor already shows or has typed past. Reconciling on it re-placed the
+  // template caret on every autosave and spliced away whatever was typed
+  // during the round trip, so a save must reach nothing in CodeMirror.
+  const externalEdition = useNoteDocument(vaultId, noteId, (document) => document.externalEdition);
   useEffect(() => {
-    runtimeRef.current?.applyExternal(base);
-    if (openingCursor !== null) {
-      runtimeRef.current?.placeCaret(openingCursor);
+    const runtime = runtimeRef.current;
+    if (runtime === null || noteId === null || externalEdition === 0) {
+      return;
     }
-  }, [base, openingCursor]);
+    const document = readNoteDocument(vaultId, noteId);
+    runtime.applyExternal(document.base);
+    if (document.cursor !== null) {
+      runtime.placeCaret(document.cursor);
+      consumeCaretHint(vaultId, noteId);
+    }
+  }, [vaultId, noteId, externalEdition]);
 
   useEffect(() => {
     if (mode === "edit") {

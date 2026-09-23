@@ -578,6 +578,34 @@ function withPanel(panels: readonly Panel[], id: string, next: (panel: Panel) =>
   return panels.map((panel) => (panel.id === id ? next(panel) : panel));
 }
 
+/**
+ * One history stack without `target`, and without the dead steps taking it out
+ * leaves behind: neighbours that now name the same thing become one step (the
+ * later, which is the one Back reaches first), and a top step naming what the
+ * panel already shows is dropped. Either left in, a press of Back or Forward
+ * would visibly do nothing.
+ */
+function withoutTarget(
+  stack: readonly PanelTargetVm[],
+  target: PanelTargetVm,
+  showing: PanelTargetVm | null,
+): PanelTargetVm[] {
+  const kept: PanelTargetVm[] = [];
+  for (const entry of stack) {
+    if (sameTarget(entry, target)) continue;
+    const last = kept.length - 1;
+    if (last >= 0 && sameTarget(kept[last], entry)) {
+      kept[last] = entry;
+    } else {
+      kept.push(entry);
+    }
+  }
+  while (kept.length > 0 && sameTarget(kept[kept.length - 1], showing)) {
+    kept.pop();
+  }
+  return kept;
+}
+
 function navigate(panelId: string | undefined, direction: "back" | "forward", steps = 1): void {
   const { panels, activeId } = panelsStore.getState();
   const id = panelId ?? activeId;
@@ -766,8 +794,41 @@ export const panelsStore = createStore<PanelsState>()((set, get) => ({
 
   closeTarget: (target) => {
     const { panels, activeId } = get();
-    const kept = panels.filter((panel) => !sameTarget(panel.target, target));
+    // A deleted target is no step back either: Back onto it would open a note
+    // that is gone, and words typed there would be dropped without a sound.
+    const holds = (entry: PanelTargetVm | null) => entry !== null && sameTarget(entry, target);
+    const pruned = panels.map((panel) => {
+      const { replaced } = panel;
+      if (
+        !panel.back.some(holds) &&
+        !panel.forward.some(holds) &&
+        (replaced === null ||
+          (!holds(replaced.was) && !replaced.back.some(holds) && !replaced.forward.some(holds)))
+      ) {
+        return panel;
+      }
+      const was = replaced === null || holds(replaced.was) ? null : replaced.was;
+      return {
+        ...panel,
+        back: withoutTarget(panel.back, target, panel.target),
+        forward: withoutTarget(panel.forward, target, panel.target),
+        // A preview's saved stacks are what a double click puts back, so they
+        // are pruned too. A displaced document that was the deleted one leaves
+        // `was: null`: pinning then keeps the preview where it is.
+        replaced:
+          replaced === null
+            ? null
+            : {
+                was,
+                back: withoutTarget(replaced.back, target, was),
+                forward: withoutTarget(replaced.forward, target, was),
+              },
+      };
+    });
+    const kept = pruned.filter((panel) => !sameTarget(panel.target, target));
     if (kept.length === panels.length) {
+      // Nothing shows it. The stacks are never persisted, so no cookie either.
+      if (pruned.some((panel, at) => panel !== panels[at])) set({ panels: pruned });
       return;
     }
     // The list may not empty. Blanking the survivor rather than refusing to act

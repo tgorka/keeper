@@ -23,17 +23,18 @@
  * the live view's own selection and focus rather than a value this test handed
  * it.
  */
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { NoteBodyBatch } from "@/lib/ipc/client";
+import type { NoteBodyBatch, NoteWriteVm } from "@/lib/ipc/client";
 
 const notesOpen =
   vi.fn<(v: string, n: string, on: (b: NoteBodyBatch) => void) => Promise<string>>();
+const notesSave = vi.fn<(s: string, text: string, rev: string) => Promise<NoteWriteVm>>();
 
 vi.mock("@/lib/ipc/client", () => ({
   notesOpen: (v: string, n: string, on: (b: NoteBodyBatch) => void) => notesOpen(v, n, on),
   notesClose: vi.fn(async () => {}),
-  notesSave: vi.fn(async () => ({ frontmatter: "", rev: "r1", path: "n.md", conflictCopy: null })),
+  notesSave: (s: string, text: string, rev: string) => notesSave(s, text, rev),
   notesBufferReport: vi.fn(async () => {}),
   notesTagTree: vi.fn(async () => ({ nodes: [] })),
   notesBacklinks: vi.fn(async () => []),
@@ -47,7 +48,13 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 import { EditorView } from "@codemirror/view";
-import { resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
+import { NOTE_AUTOSAVE_IDLE_MS } from "@/hooks/use-notes-body";
+import {
+  acceptPending,
+  applyBodyBatch,
+  readNoteDocument,
+  resetNotesEditorStoreForTest,
+} from "@/lib/stores/notes-editor";
 import { withRangeRects } from "@/test/layout";
 import { NOTE_ACTIONS_TEXT } from "./note-actions";
 import { NoteEditor } from "./note-editor";
@@ -105,6 +112,32 @@ function openOn(body: string, cursor: number | null): void {
   });
 }
 
+/**
+ * Open the editor with the channel holding its `reset` back, and return the
+ * delivery. This is the order the running app usually sees — the lazy editor
+ * chunk lands first, the snapshot second — so the caret hint is placed by the
+ * editor's reconcile effect rather than by its boot closure.
+ */
+function openHeldBack(body: string, cursor: number | null): () => void {
+  let push: ((batch: NoteBodyBatch) => void) | null = null;
+  notesOpen.mockImplementation(async (_vault, _note, onBatch) => {
+    push = onBatch;
+    return "sub-1";
+  });
+  return () => {
+    act(() => {
+      push?.({
+        kind: "reset",
+        text: body,
+        frontmatter: BLOCK,
+        rev: "r0",
+        cursor,
+        path: "2026-08-09-untitled.md",
+      });
+    });
+  };
+}
+
 /** The live editor, once its lazy chunk has landed and the reset has been applied. */
 async function view(body: string): Promise<EditorView> {
   return await waitFor(() => {
@@ -118,11 +151,80 @@ async function view(body: string): Promise<EditorView> {
   });
 }
 
+/** What `notes_save` acknowledges: the body is on disk at the next revision. */
+const WRITTEN: NoteWriteVm = {
+  rev: "r1",
+  path: "2026-08-09-untitled.md",
+  frontmatter: BLOCK,
+  conflictCopy: null,
+};
+
+/**
+ * Type `text` at `at` the way a keystroke reaches CodeMirror: an unannotated
+ * user transaction, so the editor's own update listener reports it to the
+ * store and arms the autosave exactly as a real key would.
+ */
+function type(editor: EditorView, at: number, text: string): void {
+  act(() => {
+    editor.dispatch({
+      changes: { from: at, insert: text },
+      selection: { anchor: at + text.length },
+      userEvent: "input.type",
+    });
+  });
+}
+
+/** Let the autosave's idle timer fire, and the write it starts go out. Only the
+ *  timeout pair is faked: CodeMirror's frames and React's scheduler stay real. */
+async function idleUntilAutosave(): Promise<void> {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(NOTE_AUTOSAVE_IDLE_MS);
+  });
+}
+
+/** The template body every hint test opens, and its `{{cursor}}` on line 2. */
+const SCAFFOLDED = "# Standup\n\n## Agenda\n";
+const HINT = 10;
+
+/**
+ * Both orders the opening snapshot and the lazy editor chunk can arrive in. They
+ * place the caret hint through different code — the boot closure, or the
+ * reconcile effect — and each has to spend it.
+ */
+const ORDERS: ReadonlyArray<readonly [string, boolean]> = [
+  ["the snapshot lands before the editor chunk", false],
+  ["the editor chunk lands before the snapshot", true],
+];
+
+/** Open the templated note in the given order, and return the editor once the
+ *  caret sits on the hint. */
+async function openTemplated(noteId: string, heldBack: boolean): Promise<EditorView> {
+  let deliver = () => {};
+  if (heldBack) {
+    deliver = openHeldBack(SCAFFOLDED, HINT);
+  } else {
+    openOn(SCAFFOLDED, HINT);
+  }
+  render(<NoteEditor vaultId="v1" noteId={noteId} />);
+  await screen.findByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_TEXT}`) });
+  if (heldBack) {
+    await view("");
+  }
+  deliver();
+  const editor = await view(SCAFFOLDED);
+  await waitFor(() => {
+    expect(editor.state.selection.main.head).toBe(HINT);
+  });
+  return editor;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
+  notesSave.mockImplementation(async () => WRITTEN);
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   resetNotesEditorStoreForTest();
 });
 
@@ -179,5 +281,137 @@ describe("a note that was just created", () => {
       expect(editor.state.selection.main.head).toBe(10);
     });
     expect(editor.state.doc.lineAt(10).number).toBe(2);
+  });
+});
+
+/**
+ * The editor owns the text while the user is typing; a save acknowledgement is
+ * Rust agreeing with what the editor already shows. So an acknowledgement must
+ * reach nothing in CodeMirror — not the caret (which used to be sent back to the
+ * template's `{{cursor}}` on every autosave) and not the document (which used to
+ * be spliced back to the bytes that were written, dropping whatever was typed
+ * while the write was in flight).
+ */
+describe("a save acknowledgement", () => {
+  it.each(
+    ORDERS,
+  )("leaves the caret where the typing left it, not on the template's hint (%s)", async (_order, heldBack) => {
+    const editor = await openTemplated("saved-1", heldBack);
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    // Somewhere other than the hint: under the agenda, at the end of the body.
+    type(editor, SCAFFOLDED.length, "- ship it");
+    const typedTo = SCAFFOLDED.length + "- ship it".length;
+    await idleUntilAutosave();
+    vi.useRealTimers();
+
+    expect(notesSave).toHaveBeenCalledTimes(1);
+    await waitFor(() => {
+      expect(readNoteDocument("v1", "saved-1").savedAtMs).not.toBeNull();
+    });
+    await act(async () => {});
+    expect(readNoteDocument("v1", "saved-1").dirty).toBe(false);
+    expect(editor.state.selection.main.head).toBe(typedTo);
+  });
+
+  it("keeps what was typed while the write was in flight, and stays unsaved", async () => {
+    const opened = "# Standup\n";
+    openOn(opened, null);
+    let land: (write: NoteWriteVm) => void = () => {};
+    notesSave.mockImplementationOnce(
+      () =>
+        new Promise<NoteWriteVm>((resolve) => {
+          land = resolve;
+        }),
+    );
+    render(<NoteEditor vaultId="v1" noteId="saved-2" />);
+    await screen.findByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_TEXT}`) });
+    const editor = await view(opened);
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    type(editor, opened.length, "first");
+    await idleUntilAutosave();
+    expect(notesSave).toHaveBeenCalledWith("sub-1", `${opened}first`, "r0");
+    // The write is out and has not answered; the user keeps going.
+    type(editor, editor.state.doc.length, " second");
+    vi.useRealTimers();
+
+    await act(async () => {
+      land(WRITTEN);
+    });
+    await waitFor(() => {
+      expect(readNoteDocument("v1", "saved-2").saving).toBe(false);
+    });
+    await act(async () => {});
+
+    const mine = `${opened}first second`;
+    expect(editor.state.doc.toString()).toBe(mine);
+    expect(readNoteDocument("v1", "saved-2").text).toBe(mine);
+    // Rust holds "first" only, so " second" is still owed a write.
+    expect(readNoteDocument("v1", "saved-2").dirty).toBe(true);
+  });
+});
+
+/**
+ * The other half of the same contract: content that did NOT come from this
+ * editor still has to reach it. A write from outside keeper lands live on a
+ * clean buffer, and a revision the user accepts from the diff bar replaces a
+ * dirty one — both through the one reconcile path a save must not trigger.
+ */
+describe("a revision from outside the editor", () => {
+  const opened = "# Standup\n";
+  const theirs = "# Standup\n\nadded by an agent\n";
+
+  it.each(
+    ORDERS,
+  )("lands live in a clean editor, without sending the caret back to the hint (%s)", async (_order, heldBack) => {
+    // A templated note, so the opening caret hint is in play: it was placed
+    // once, on open, and a later write must not place it again.
+    const appended = `${SCAFFOLDED}- added by an agent\n`;
+    const editor = await openTemplated("outside-1", heldBack);
+    // The user moves to the top without typing, so the buffer stays clean.
+    act(() => {
+      editor.dispatch({ selection: { anchor: 0 }, userEvent: "select" });
+    });
+
+    act(() => {
+      applyBodyBatch("v1", "outside-1", {
+        kind: "external",
+        rev: "r1",
+        frontmatter: BLOCK,
+        text: appended,
+      });
+    });
+
+    await waitFor(() => {
+      expect(editor.state.doc.toString()).toBe(appended);
+    });
+    expect(editor.state.selection.main.head).toBe(0);
+  });
+
+  it("replaces a dirty editor's text only once the user accepts it", async () => {
+    openOn(opened, null);
+    render(<NoteEditor vaultId="v1" noteId="outside-2" />);
+    await screen.findByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_TEXT}`) });
+    const editor = await view(opened);
+    type(editor, opened.length, "mine");
+
+    act(() => {
+      applyBodyBatch("v1", "outside-2", {
+        kind: "external",
+        rev: "r1",
+        frontmatter: BLOCK,
+        text: theirs,
+      });
+    });
+    await act(async () => {});
+    expect(editor.state.doc.toString()).toBe(`${opened}mine`);
+
+    act(() => {
+      acceptPending("v1", "outside-2");
+    });
+    await waitFor(() => {
+      expect(editor.state.doc.toString()).toBe(theirs);
+    });
   });
 });

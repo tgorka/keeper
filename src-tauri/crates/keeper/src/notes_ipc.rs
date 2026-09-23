@@ -29,6 +29,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -42,6 +43,7 @@ use keeper_core::notes::template_update::{
     self, TemplateUpdateAppliedVm, TemplateUpdateApplyReq, TemplateUpdateOfferVm,
     TemplateUpdateResultVm,
 };
+use keeper_core::notes::vm::NoteReleaseReq;
 use keeper_core::notes::vm::{EmbeddingModelVm, NoteHitVm, NoteMarksVm, NoteSearchStateVm};
 use keeper_core::notes::vm::{
     NoteAttachSourceVm, NoteAttachTargetVm, NoteAttachmentVm, NoteBodyBatch, NoteBodyVm,
@@ -57,6 +59,7 @@ use keeper_core::notes::{
     NotesError,
 };
 use keeper_core::registry;
+use keeper_core::registry::PristineNote;
 #[cfg(desktop)]
 use keeper_core::vm::ExportReceiptVm;
 use keeper_core::vm::{
@@ -218,6 +221,17 @@ struct BodySub {
     note_id: String,
     channel: Channel<NoteBodyBatch>,
     state: Mutex<BodyState>,
+    /// Held across every write through this subscription, and `true` once
+    /// `notes_close` has let it go: a save that finds it `true` writes nothing,
+    /// so no save can land after the release decided (AD-304).
+    released: Mutex<bool>,
+}
+
+/// The release gate of one subscription, tolerating poisoning like `lock_body`.
+fn lock_released(sub: &BodySub) -> MutexGuard<'_, bool> {
+    sub.released
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Split a note into its frontmatter block and its body.
@@ -244,12 +258,16 @@ fn join_note(frontmatter: &str, body: &str) -> String {
 /// document, block included — and is **never re-read from disk**, which is what
 /// makes it a true common ancestor and what makes the clean/dirty distinction
 /// meaningful (AD-58). `mine` is the editor's buffer, which is the **body alone**,
-/// kept current by `notes_buffer_report`.
+/// kept current by `notes_buffer_report`. `written` is the revision THIS
+/// subscription last wrote, and nothing else moves it — `base` and `rev` also
+/// follow external edits — so it is what tells our own autosave apart from
+/// somebody else's write.
 struct BodyState {
     rel: String,
     base: String,
     rev: String,
     mine: Option<String>,
+    written: Option<String>,
 }
 
 impl BodyState {
@@ -325,6 +343,242 @@ fn take_caret(note_id: &str) -> Option<u32> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(note_id)
+}
+
+/// The new notes THIS process created that nobody has written in yet, by note
+/// id → (vault id, what creation wrote) (AD-304). The `notes.pristine.<vault>`
+/// registry row mirrors it, so a crash or a quit is handled at the next start;
+/// [`sweep_pristine`] handles only the rows NOT in here.
+///
+/// Lock order: a subscription's `released` gate before this, and this before
+/// `SUBSCRIPTIONS` (the sweep asks who holds a note under it); never this while
+/// holding `SUBSCRIPTIONS`. Nothing but the map is touched under it — no vault
+/// IO, since a vault on a removable volume can stall an `open` indefinitely,
+/// and no registry IO, which [`PRISTINE_ROWS`] serialises instead — so a close
+/// waits on it for a map operation at most.
+type PristineMap = HashMap<String, (String, PristineNote)>;
+static PRISTINE: LazyLock<Mutex<PristineMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How many notes [`PRISTINE`] holds, stored under its lock after every
+/// change, so the close of an ordinary note — nearly every close — does not
+/// take the lock at all while nothing is pristine.
+static PRISTINE_HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// Serialises the read-modify-write of `notes.pristine.` rows, apart from
+/// [`PRISTINE`] so a busy settings database never stalls a close.
+static PRISTINE_ROWS: Mutex<()> = Mutex::new(());
+
+fn pristine() -> MutexGuard<'static, PristineMap> {
+    PRISTINE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Publish how many notes `held` holds; the caller still holds its lock.
+fn count_pristine(held: &PristineMap) {
+    PRISTINE_HELD.store(held.len(), AtomicOrdering::Release);
+}
+
+fn pristine_rows() -> MutexGuard<'static, ()> {
+    PRISTINE_ROWS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Read-modify-write one drive's `notes.pristine.` row under
+/// [`PRISTINE_ROWS`], which is what keeps two edits from losing each other.
+fn edit_pristine_row(data_dir: &Path, vault_id: &str, edit: impl FnOnce(&mut Vec<PristineNote>)) {
+    let _rows = pristine_rows();
+    let mut row = match registry::get_pristine_notes(data_dir, vault_id) {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::warn!(%error, vault = %vault_id, "notes: could not read the list of untouched new notes");
+            return;
+        }
+    };
+    let before = row.clone();
+    edit(&mut row);
+    if row == before {
+        return;
+    }
+    if let Err(error) = registry::set_pristine_notes(data_dir, vault_id, &row) {
+        tracing::warn!(%error, vault = %vault_id, "notes: could not record the list of untouched new notes");
+    }
+}
+
+/// After a create that writes nothing: remember what it wrote, in memory and in
+/// `notes.pristine.<vault>`, so its editor's release can remove it again if
+/// nobody writes in it (AD-304).
+///
+/// The file is read back rather than assembled — capture's rule: the bytes on
+/// disk are the only ones a later read can be compared with. A read-back
+/// failure remembers nothing and the note simply stays, which is said at INFO
+/// because a decision that declines to act has to be visible (DW-162).
+fn remember_pristine(data_dir: Option<&Path>, vault: &Vault, note: &NoteRefVm) {
+    let document = match notes_vault::read_note(vault, &note.path) {
+        Ok(document) => document,
+        Err(error) => {
+            tracing::info!(
+                %error,
+                note = %note.path,
+                "notes: a new note could not be read back, so it stays even if nobody writes in it"
+            );
+            return;
+        }
+    };
+    let entry = PristineNote {
+        note_id: note.id.clone(),
+        path: note.path.clone(),
+        document,
+    };
+    {
+        let mut held = pristine();
+        held.insert(note.id.clone(), (vault.id.clone(), entry.clone()));
+        count_pristine(&held);
+    }
+    if let Some(dir) = data_dir {
+        edit_pristine_row(dir, &vault.id, |row| {
+            row.retain(|known| known.note_id != entry.note_id);
+            row.push(entry);
+        });
+    }
+}
+
+/// Forget a pristine note, in memory and in its drive's row. Neither is
+/// touched unless this process remembered the note, so closing an ordinary
+/// note takes no lock while nothing is pristine and never costs registry IO.
+fn forget_pristine(data_dir: Option<&Path>, vault_id: &str, note_id: &str) -> Option<PristineNote> {
+    if PRISTINE_HELD.load(AtomicOrdering::Acquire) == 0 {
+        return None;
+    }
+    let (_, forgotten) = {
+        let mut held = pristine();
+        let forgotten = held.remove(note_id);
+        count_pristine(&held);
+        forgotten
+    }?;
+    if let Some(dir) = data_dir {
+        edit_pristine_row(dir, vault_id, |row| {
+            row.retain(|known| known.note_id != note_id)
+        });
+    }
+    Some(forgotten)
+}
+
+/// The release's decision: `true` when THIS process remembered the note, the
+/// file at `rel` still reads as what creation wrote, and it was removed. The
+/// pointer is forgotten on every outcome — whoever wrote in the note made it an
+/// ordinary note for good.
+fn discard_if_untouched(data_dir: Option<&Path>, vault: &Vault, note_id: &str, rel: &str) -> bool {
+    let Some(pristine) = forget_pristine(data_dir, &vault.id, note_id) else {
+        return false;
+    };
+    reads_as_created(vault, &pristine, rel) && remove_untouched(vault, rel)
+}
+
+/// Whether the note at `rel` still reads as what creation wrote. Every
+/// uncertainty — an unreadable file, a moved one, one byte of difference —
+/// says no, and the note is kept (`dismiss_stub`'s rule).
+fn reads_as_created(vault: &Vault, pristine: &PristineNote, rel: &str) -> bool {
+    let disk = match notes_vault::read_note(vault, rel) {
+        Ok(disk) => disk,
+        Err(error) => {
+            tracing::debug!(%error, note = %rel, "notes: a new note could not be re-read, so it is kept");
+            return false;
+        }
+    };
+    if !pristine.is_untouched(rel, &disk) {
+        tracing::debug!(note = %rel, "notes: somebody wrote in a new note, so it is kept");
+        return false;
+    }
+    true
+}
+
+/// Remove a note [`reads_as_created`] just vouched for, saying how it went.
+fn remove_untouched(vault: &Vault, rel: &str) -> bool {
+    match unlink_untouched(vault, rel) {
+        Ok(()) => {
+            tracing::info!(note = %rel, "notes: nobody wrote in a new note, so it was removed");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, note = %rel, "notes: an untouched new note could not be removed");
+            false
+        }
+    }
+}
+
+/// Unlink a note keeper proved nobody wrote in — NFR-30's one other exception,
+/// for `dismiss_stub`'s reason: trashing it would keep the empty note under
+/// another name, and there is nothing in it to recover. The tail is
+/// `trash_note`'s: the index drops the entry, the list row goes, and the
+/// removal is what the next cadence tick commits.
+fn unlink_untouched(vault: &Vault, rel: &str) -> Result<(), NotesError> {
+    let path = notes_vault::contained(vault, rel)?;
+    std::fs::remove_file(&path)
+        .map_err(|error| NotesError::Name(format!("remove {rel}: {error}")))?;
+    notes_vault::touch(&vault.id, vec![rel.to_owned()]);
+    notes_vault::mark_dirty(&vault.id);
+    Ok(())
+}
+
+/// At every vault registration: settle the pristine notes a previous run left
+/// in this drive's row (the ids NOT in [`PRISTINE`]).
+///
+/// Each is decided on its own, right before its unlink: under [`PRISTINE`], a
+/// note an editor holds at that moment — a panel restored onto it — is adopted
+/// instead, so its release decides as if this process had created it, and it
+/// stays in the row. Every other one is removed when its bytes are still
+/// creation's, and dropped from the row either way. Vault IO happens outside
+/// the lock, so an editor that opens the note between that decision and the
+/// unlink finds it gone, and its next save writes it back.
+pub(crate) fn sweep_pristine(data_dir: &Path, vault: &Vault) {
+    let row = {
+        let _rows = pristine_rows();
+        match registry::get_pristine_notes(data_dir, &vault.id) {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::warn!(%error, vault = %vault.id, "notes: could not read the list of untouched new notes");
+                return;
+            }
+        }
+    };
+    let mut settled: HashSet<String> = HashSet::new();
+    for note in row {
+        if pristine().contains_key(&note.note_id) {
+            continue;
+        }
+        let untouched = reads_as_created(vault, &note, &note.path);
+        {
+            let mut held = pristine();
+            if held.contains_key(&note.note_id) {
+                continue;
+            }
+            // Asked under PRISTINE, and the adoption counted before
+            // SUBSCRIPTIONS is let go: an editor whose release removes its
+            // subscription after this look is then sure to find it.
+            let subs = subscriptions();
+            let held_open = subs
+                .values()
+                .filter_map(|sub| sub.body.as_ref())
+                .any(|body| body.vault_id == vault.id && body.note_id == note.note_id);
+            if held_open {
+                held.insert(note.note_id.clone(), (vault.id.clone(), note));
+                count_pristine(&held);
+                continue;
+            }
+        }
+        if untouched {
+            remove_untouched(vault, &note.path);
+        }
+        settled.insert(note.note_id);
+    }
+    if settled.is_empty() {
+        return;
+    }
+    edit_pristine_row(data_dir, &vault.id, |row| {
+        row.retain(|known| !settled.contains(&known.note_id));
+    });
 }
 
 fn subscriptions() -> MutexGuard<'static, HashMap<String, Subscription>> {
@@ -708,8 +962,19 @@ async fn project_list(
             &platform.data_dir().map_err(crate::ipc::to_ipc_error)?,
         )
         .map_err(crate::ipc::to_ipc_error)?;
+        // A space definition is a service file of the default lens only: inside
+        // a space the user chose a query, and it decides what that shows.
+        let default_lens = req
+            .space_id
+            .as_deref()
+            .is_none_or(|id| id.is_empty() || id == ALL_SPACE_ID);
         matched.retain(|entry| {
             !keeper_core::notes::service_files::is_service_file(&entry.path, &names)
+                && !(default_lens
+                    && keeper_core::notes::service_files::hides_space_definition(
+                        &entry.flags,
+                        &req.flags,
+                    ))
         });
     }
     let hidden = u32::try_from(before_hiding - matched.len()).unwrap_or(u32::MAX);
@@ -3163,9 +3428,23 @@ fn now_local() -> String {
 
 /// Create a note (FR-98, FR-160). No dialog anywhere in the path (UX-DR35).
 #[tauri::command]
-pub async fn notes_create(vault_id: String, req: NoteCreateReq) -> Result<NoteCreateVm, IpcError> {
+pub async fn notes_create(
+    state: State<'_, AppState>,
+    vault_id: String,
+    req: NoteCreateReq,
+) -> Result<NoteCreateVm, IpcError> {
     let vault = vault_of(&vault_id)?;
-    create_for_space(&vault, &req)
+    let created = create_for_space(&vault, &req)?;
+    // Only a create that supplied nothing is removed again if nobody writes in
+    // it (AD-304): a title is a name somebody chose, a body is words.
+    if req.writes_nothing() {
+        remember_pristine(
+            state.platform.data_dir().ok().as_deref(),
+            &vault,
+            &created.note,
+        );
+    }
+    Ok(created)
 }
 
 /// Create a note the space it was asked for from will actually list
@@ -3187,7 +3466,10 @@ pub async fn notes_create(vault_id: String, req: NoteCreateReq) -> Result<NoteCr
 /// A create that could not do what was asked **says so at `INFO`**, because a
 /// decision only the returned value carries is a decision nobody can debug from
 /// a log (DW-162).
-fn create_for_space(vault: &Vault, req: &NoteCreateReq) -> Result<NoteCreateVm, IpcError> {
+pub(crate) fn create_for_space(
+    vault: &Vault,
+    req: &NoteCreateReq,
+) -> Result<NoteCreateVm, IpcError> {
     let mut notices = Vec::new();
     if let Some(source_id) = req.space_vault_id.as_deref().filter(|id| *id != vault.id) {
         let source = vault_of(source_id)?;
@@ -3917,7 +4199,9 @@ pub async fn notes_open(
             base: text,
             rev,
             mine: None,
+            written: None,
         }),
+        released: Mutex::new(false),
     });
     let watcher = Arc::clone(&sub);
     let task = tauri::async_runtime::spawn(async move {
@@ -4011,11 +4295,132 @@ fn lock_body(sub: &BodySub) -> MutexGuard<'_, BodyState> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Close an editor subscription.
+/// Close an editor subscription, and with `release`, let the note go (AD-304).
+///
+/// The last editor's unsaved words ride the close, so they cannot race it: two
+/// IPC calls are not ordered, and a flush that landed after the close would
+/// either be refused (the words lost) or recreate a removed note. `release` is
+/// `None` for a channel nobody edited through (an orphan opened after its view
+/// was already gone), and its `discard` is `false` for an editor that goes while
+/// its note stays on screen; neither ever removes anything.
+///
+/// Answers `true` when the note was removed: nobody wrote in a note that was
+/// created with nothing in it, and this was the last editor holding it.
 #[tauri::command]
-pub async fn notes_close(subscription_id: String) -> Result<(), IpcError> {
-    unregister(&subscription_id);
-    Ok(())
+pub async fn notes_close(
+    state: State<'_, AppState>,
+    subscription_id: String,
+    release: Option<NoteReleaseReq>,
+) -> Result<bool, IpcError> {
+    release_subscription(
+        state.platform.data_dir().ok().as_deref(),
+        &subscription_id,
+        release,
+        notes_vault::vault,
+    )
+}
+
+/// `notes_close` without the command plumbing; `vault` resolves a vault id.
+///
+/// The subscription's `released` gate is held from before the flush until the
+/// decision is taken, and it is set first, so every save on this subscription
+/// either finished before the release began or writes nothing. The removal of
+/// this subscription and the count of the note's remaining editors are one
+/// `SUBSCRIPTIONS` critical section, so of two editors closing at once exactly
+/// one sees itself as the last.
+fn release_subscription(
+    data_dir: Option<&Path>,
+    subscription_id: &str,
+    release: Option<NoteReleaseReq>,
+    vault: impl Fn(&str) -> Option<Vault>,
+) -> Result<bool, IpcError> {
+    let found = subscriptions()
+        .get(subscription_id)
+        .and_then(|sub| sub.body.clone());
+    let Some(sub) = found else {
+        // Unknown, already closed, or not an editor: as before, a no-op.
+        unregister(subscription_id);
+        return Ok(false);
+    };
+    let mut released = lock_released(&sub);
+    if *released {
+        return Ok(false);
+    }
+    *released = true;
+    let vault = vault(&sub.vault_id);
+    let words = release.as_ref().and_then(|release| {
+        release
+            .text
+            .as_deref()
+            .map(|text| (text, release.base_rev.as_str()))
+    });
+    let flushed = match (words, &vault) {
+        (Some((text, base_rev)), Some(vault)) => flush_on_release(&sub, vault, text, base_rev),
+        (Some(_), None) => Err(notes_error(NotesError::VaultUnknown(sub.vault_id.clone()))),
+        (None, _) => Ok(()),
+    };
+    let remaining = {
+        let mut subs = subscriptions();
+        subs.remove(subscription_id);
+        subs.values()
+            .filter_map(|other| other.body.as_ref())
+            .filter(|other| other.vault_id == sub.vault_id && other.note_id == sub.note_id)
+            .count()
+    };
+    if let Err(error) = flushed {
+        tracing::warn!(
+            note = %sub.note_id,
+            message = %error.message,
+            "notes: the last words typed into a note could not be written as its editor closed"
+        );
+        // Words were typed: whatever is on disk, this note is never removed.
+        forget_pristine(data_dir, &sub.vault_id, &sub.note_id);
+        return Err(error);
+    }
+    // Only a release that lets the note go may remove it: a fold or a view
+    // switch keeps the note in front of the person and must never take it away.
+    if !release.as_ref().is_some_and(|release| release.discard) || remaining > 0 {
+        return Ok(false);
+    }
+    let Some(vault) = vault else {
+        // The pointer stays for the next start's sweep.
+        return Ok(false);
+    };
+    // `rel` follows a rename by id (`watch_body`), and a renamed note is kept.
+    let rel = lock_body(&sub).rel.clone();
+    Ok(discard_if_untouched(data_dir, &vault, &sub.note_id, &rel))
+}
+
+/// The release's write. A body already on disk — an autosave that landed first
+/// — is not written again: the second write would read as somebody else's edit
+/// against the stale `base_rev` and leave a conflict copy.
+///
+/// Nor is this subscription's own autosave somebody else's edit when the
+/// buffer has moved past it: a save still in flight as the editor closed lands
+/// first, and the release's words descend from it. So when the disk holds
+/// exactly what this subscription last wrote, that is the base; anything else
+/// on disk is a real other side and `base_rev` stands.
+fn flush_on_release(
+    sub: &BodySub,
+    vault: &Vault,
+    text: &str,
+    base_rev: &str,
+) -> Result<(), IpcError> {
+    let (rel, written) = {
+        let state = lock_body(sub);
+        (state.rel.clone(), state.written.clone())
+    };
+    let disk = notes_vault::read_note(vault, &rel).unwrap_or_default();
+    if split_note(&disk).1 == text {
+        return Ok(());
+    }
+    let disk_rev = notes_vault::content_rev(&disk);
+    let base_rev = if written.as_deref() == Some(disk_rev.as_str()) {
+        disk_rev.as_str()
+    } else {
+        base_rev
+    };
+    write_through(sub, vault, text, base_rev, None).map(|_| ())
 }
 
 /// The editor's dirty-text heartbeat.
@@ -4128,6 +4533,9 @@ fn heading_title(body: &str) -> String {
 /// copy **first**, and only then is the buffer written. So a diverged save keeps
 /// both sides, and it does so only at save time, never before the user has seen
 /// the diff bar.
+///
+/// A subscription `notes_close` has released writes nothing and answers
+/// NotFound, exactly as one already unregistered would (AD-304).
 #[tauri::command]
 pub async fn notes_save(
     subscription_id: String,
@@ -4137,32 +4545,71 @@ pub async fn notes_save(
 ) -> Result<NoteWriteVm, IpcError> {
     let sub = body_sub(&subscription_id)?;
     let vault = vault_of(&sub.vault_id)?;
-    let rel = lock_body(&sub).rel.clone();
+    save_gated(
+        &subscription_id,
+        &sub,
+        &vault,
+        &text,
+        &base_rev,
+        frontmatter.as_deref(),
+    )
+}
 
-    let disk = notes_vault::read_note(&vault, &rel).unwrap_or_default();
+/// A save through `sub`, behind its `released` gate. The gate is held across
+/// the whole read → compose → write → state update, which is what lets a
+/// release order itself against every save on the same subscription — including
+/// one that resolved the subscription before the close removed it.
+fn save_gated(
+    subscription_id: &str,
+    sub: &BodySub,
+    vault: &Vault,
+    text: &str,
+    base_rev: &str,
+    frontmatter: Option<&str>,
+) -> Result<NoteWriteVm, IpcError> {
+    let released = lock_released(sub);
+    if *released {
+        return Err(notes_error(NotesError::NotFound(
+            subscription_id.to_owned(),
+        )));
+    }
+    let written = write_through(sub, vault, text, base_rev, frontmatter);
+    drop(released);
+    written
+}
+
+/// One write through a subscription. The caller holds `sub.released` and has
+/// checked it is `false`.
+fn write_through(
+    sub: &BodySub,
+    vault: &Vault,
+    text: &str,
+    base_rev: &str,
+    frontmatter: Option<&str>,
+) -> Result<NoteWriteVm, IpcError> {
+    let rel = lock_body(sub).rel.clone();
+
+    let disk = notes_vault::read_note(vault, &rel).unwrap_or_default();
     let disk_rev = notes_vault::content_rev(&disk);
     let conflict_copy = if disk_rev == base_rev || disk.is_empty() {
         None
     } else {
-        notes_vault::write_conflict_copy(&vault, &rel, &disk)
+        notes_vault::write_conflict_copy(vault, &rel, &disk)
     };
 
     let stamped = {
-        let state = lock_body(&sub);
-        save_document(
-            frontmatter.as_deref().unwrap_or_else(|| state.split().0),
-            &text,
-            &disk,
-        )
+        let state = lock_body(sub);
+        save_document(frontmatter.unwrap_or_else(|| state.split().0), text, &disk)
     };
-    notes_vault::write_note(&vault, &rel, &stamped).map_err(notes_error)?;
+    notes_vault::write_note(vault, &rel, &stamped).map_err(notes_error)?;
     let rev = notes_vault::content_rev(&stamped);
     let block = split_note(&stamped).0.to_owned();
     {
-        let mut state = lock_body(&sub);
+        let mut state = lock_body(sub);
         state.base = stamped;
         state.rev = rev.clone();
         state.mine = None;
+        state.written = Some(rev.clone());
     }
     Ok(NoteWriteVm {
         rev,
@@ -5795,6 +6242,10 @@ async fn stream_changes(
     // lens below the page produced no op and no message — invisible then,
     // because nothing showed the number, and a stale count on screen now.
     let mut sent: Option<(u32, u32, u32, u32)> = None;
+    // The space definitions last sent. The default lens hides them as service
+    // files, so an external edit to one can move no row and no count; the rail
+    // reloads on every batch, and this is what makes that edit send one.
+    let mut sent_spaces: Option<u64> = None;
     // A cold search database may not exist yet. Keep the subscription alive
     // until the search publish catches up rather than ending on that read.
     loop {
@@ -5813,9 +6264,35 @@ async fn stream_changes(
                 index
             })
             .collect();
+        // Read before the window, so a space edit that breaks the list — a
+        // deleted space, a query that no longer parses — still reaches the
+        // rail, which is the edit this revision exists to deliver.
+        let spaces =
+            keeper_core::notes::service_files::space_definitions_revision(index.borrow().entries());
         let rows = match current_window(platform.as_ref(), &vault).await {
             Ok(rows) => rows,
             Err(_) => {
+                // No rows to diff, so the last counts ride an empty batch: the
+                // surface reloads the rail and asks for the list, and that read
+                // is what shows the error.
+                if let Some(counts) =
+                    sent.filter(|_| sent_spaces.is_some_and(|last| last != spaces))
+                {
+                    if channel
+                        .send(NoteChangeBatch {
+                            vault_id: vault.id.clone(),
+                            ops: Vec::new(),
+                            total: counts.0,
+                            matched: counts.1,
+                            hidden: counts.2,
+                            private: counts.3,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    sent_spaces = Some(spaces);
+                }
                 if !wait_for_list_change(
                     &mut index,
                     &mut search_state,
@@ -5837,7 +6314,7 @@ async fn stream_changes(
             diff_ops(&previous, &next, &rows.rows)
         };
         previous = next;
-        if (!ops.is_empty() || sent != Some(counts))
+        if (!ops.is_empty() || sent != Some(counts) || sent_spaces != Some(spaces))
             && channel
                 .send(NoteChangeBatch {
                     vault_id: vault.id.clone(),
@@ -5853,6 +6330,7 @@ async fn stream_changes(
             return;
         }
         sent = Some(counts);
+        sent_spaces = Some(spaces);
         if !wait_for_list_change(
             &mut index,
             &mut search_state,
@@ -6155,7 +6633,12 @@ pub fn tray_new_note(app: &AppHandle) {
         None,
         &mut Vec::new(),
     ) {
-        Ok(reference) => emit_open(app, &reference),
+        Ok(reference) => {
+            // A blank note: removed again if nobody writes in it (AD-304).
+            let data_dir = app.state::<AppState>().platform.data_dir().ok();
+            remember_pristine(data_dir.as_deref(), &vault, &reference);
+            emit_open(app, &reference);
+        }
         Err(error) => {
             tracing::warn!(message = %error.message, "notes: tray could not create a note");
         }
@@ -6931,6 +7414,485 @@ mod tests {
         std::fs::remove_dir_all(&vault.root).ok();
     }
 
+    /// A settings directory of its own per test, so one test's
+    /// `notes.pristine.` row is never another's.
+    fn pristine_data_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "keeper-ipc-data-{tag}-{}-{}",
+            std::process::id(),
+            crate::sync_ipc::new_ulid()
+        ));
+        std::fs::create_dir_all(&dir).expect("data dir");
+        dir
+    }
+
+    fn nothing_asked() -> NoteCreateReq {
+        NoteCreateReq {
+            title: None,
+            body: None,
+            template: None,
+            dest: None,
+            tags: Vec::new(),
+            space: None,
+            space_vault_id: None,
+        }
+    }
+
+    /// A create that wrote nothing, remembered as `notes_create` does.
+    fn create_untouched(vault: &Vault, data_dir: &Path, req: &NoteCreateReq) -> NoteRefVm {
+        assert!(req.writes_nothing());
+        let note = create_note(vault, req, &seed::Seed::default(), None, &mut Vec::new())
+            .expect("create the note");
+        remember_pristine(Some(data_dir), vault, &note);
+        note
+    }
+
+    /// What `notes_open` registers, minus the index wait and the watcher.
+    fn open_editor(vault: &Vault, note: &NoteRefVm) -> String {
+        let text = notes_vault::read_note(vault, &note.path).expect("read the note");
+        let rev = notes_vault::content_rev(&text);
+        let sub = Arc::new(BodySub {
+            vault_id: vault.id.clone(),
+            note_id: note.id.clone(),
+            channel: Channel::new(|_| Ok(())),
+            state: Mutex::new(BodyState {
+                rel: note.path.clone(),
+                base: text,
+                rev,
+                mine: None,
+                written: None,
+            }),
+            released: Mutex::new(false),
+        });
+        register(Some(sub), tauri::async_runtime::spawn(async {}))
+    }
+
+    /// An editor's save, as `notes_save` makes it once it has resolved the
+    /// subscription (the test vaults are not in the vault registry).
+    fn save(vault: &Vault, subscription_id: &str, text: &str, base_rev: &str) -> NoteWriteVm {
+        let sub = body_sub(subscription_id).expect("live subscription");
+        save_gated(subscription_id, &sub, vault, text, base_rev, None).expect("save")
+    }
+
+    fn rev_of(subscription_id: &str) -> String {
+        lock_body(&body_sub(subscription_id).expect("live subscription"))
+            .rev
+            .clone()
+    }
+
+    fn release(
+        vault: &Vault,
+        data_dir: &Path,
+        subscription_id: &str,
+        release: Option<NoteReleaseReq>,
+    ) -> Result<bool, IpcError> {
+        let known = vault.clone();
+        release_subscription(Some(data_dir), subscription_id, release, move |id| {
+            (id == known.id).then(|| known.clone())
+        })
+    }
+
+    /// A clean release of a note nobody keeps on screen.
+    fn clean() -> Option<NoteReleaseReq> {
+        Some(NoteReleaseReq {
+            text: None,
+            base_rev: String::new(),
+            discard: true,
+        })
+    }
+
+    fn row_of_pristine(data_dir: &Path, vault: &Vault) -> Vec<String> {
+        registry::get_pristine_notes(data_dir, &vault.id)
+            .expect("read the row")
+            .into_iter()
+            .map(|note| note.note_id)
+            .collect()
+    }
+
+    #[test]
+    fn an_untouched_new_note_is_removed_when_its_editor_lets_it_go() {
+        let (vault, dir) = (test_vault("pristine-gone"), pristine_data_dir("gone"));
+        let note = create_untouched(&vault, &dir, &nothing_asked());
+        assert_eq!(row_of_pristine(&dir, &vault), vec![note.id.clone()]);
+        let editor = open_editor(&vault, &note);
+
+        assert!(release(&vault, &dir, &editor, clean()).expect("release"));
+        assert!(
+            !vault.root.join(&note.path).exists(),
+            "the empty note is gone"
+        );
+        assert!(
+            !vault.root.join(".keeper/trash").exists(),
+            "unlinked, not trashed: a trash copy would keep the empty note under another name"
+        );
+        assert!(
+            row_of_pristine(&dir, &vault).is_empty(),
+            "and nothing is left to sweep"
+        );
+        std::fs::remove_dir_all(&vault.root).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_note_typed_back_to_nothing_is_still_removed() {
+        let (vault, dir) = (
+            test_vault("pristine-typed-back"),
+            pristine_data_dir("typed-back"),
+        );
+        let note = create_untouched(&vault, &dir, &nothing_asked());
+        let editor = open_editor(&vault, &note);
+        let typed = save(&vault, &editor, "hello\n", &rev_of(&editor));
+        save(&vault, &editor, "\n", &typed.rev);
+
+        assert!(release(&vault, &dir, &editor, clean()).expect("release"));
+        assert!(!vault.root.join(&note.path).exists());
+        std::fs::remove_dir_all(&vault.root).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_release_carries_the_last_words_and_the_note_is_kept() {
+        let (vault, dir) = (test_vault("pristine-words"), pristine_data_dir("words"));
+        let note = create_untouched(&vault, &dir, &nothing_asked());
+        let editor = open_editor(&vault, &note);
+        let words = Some(NoteReleaseReq {
+            text: Some("hello".to_owned()),
+            base_rev: rev_of(&editor),
+            discard: true,
+        });
+
+        assert!(!release(&vault, &dir, &editor, words).expect("release"));
+        let disk = notes_vault::read_note(&vault, &note.path).expect("kept");
+        assert_eq!(
+            split_note(&disk).1,
+            "hello",
+            "the words rode the close to disk"
+        );
+        assert!(
+            row_of_pristine(&dir, &vault).is_empty(),
+            "an ordinary note now"
+        );
+        std::fs::remove_dir_all(&vault.root).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_save_after_the_release_writes_nothing() {
+        let (vault, dir) = (
+            test_vault("pristine-late-save"),
+            pristine_data_dir("late-save"),
+        );
+        let note = create_untouched(&vault, &dir, &nothing_asked());
+        let editor = open_editor(&vault, &note);
+        let base = rev_of(&editor);
+        let sub = body_sub(&editor).expect("live subscription");
+
+        assert!(release(&vault, &dir, &editor, clean()).expect("release"));
+        // A save that lost the race to the release, holding the subscription it
+        // resolved before the close: the gate refuses it, so it cannot bring the
+        // removed note back.
+        assert!(*lock_released(&sub), "the release closed the gate");
+        let late = save_gated(&editor, &sub, &vault, "late words", &base, None);
+        assert!(late.is_err(), "a released subscription saves nothing");
+        assert!(
+            !vault.root.join(&note.path).exists(),
+            "and nothing resurrected the note"
+        );
+        std::fs::remove_dir_all(&vault.root).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_the_last_of_two_editors_decides() {
+        let (vault, dir) = (test_vault("pristine-two"), pristine_data_dir("two"));
+        let note = create_untouched(&vault, &dir, &nothing_asked());
+        let first = open_editor(&vault, &note);
+        let second = open_editor(&vault, &note);
+
+        assert!(!release(&vault, &dir, &first, clean()).expect("first release"));
+        assert!(
+            vault.root.join(&note.path).exists(),
+            "another editor still holds it"
+        );
+        assert!(release(&vault, &dir, &second, clean()).expect("second release"));
+        assert!(!vault.root.join(&note.path).exists());
+        std::fs::remove_dir_all(&vault.root).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_orphan_close_never_removes_a_note() {
+        let (vault, dir) = (test_vault("pristine-orphan"), pristine_data_dir("orphan"));
+        let note = create_untouched(&vault, &dir, &nothing_asked());
+        let orphan = open_editor(&vault, &note);
+
+        assert!(!release(&vault, &dir, &orphan, None).expect("orphan close"));
+        assert!(vault.root.join(&note.path).exists());
+        assert_eq!(
+            row_of_pristine(&dir, &vault),
+            vec![note.id.clone()],
+            "the view that reopened it will release it"
+        );
+        let owner = open_editor(&vault, &note);
+        assert!(release(&vault, &dir, &owner, clean()).expect("owner release"));
+        std::fs::remove_dir_all(&vault.root).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_flush_already_on_disk_is_not_written_twice() {
+        let (vault, dir) = (test_vault("pristine-flushed"), pristine_data_dir("flushed"));
+        let note = create_untouched(&vault, &dir, &nothing_asked());
+        let editor = open_editor(&vault, &note);
+        let stale = rev_of(&editor);
+        // The autosave landed first; the release still carries the same words
+        // against the revision the editor had before it.
+        save(&vault, &editor, "hello", &stale);
+        let words = Some(NoteReleaseReq {
+            text: Some("hello".to_owned()),
+            base_rev: stale,
+            discard: true,
+        });
+
+        assert!(!release(&vault, &dir, &editor, words).expect("release"));
+        assert_eq!(
+            conflict_copies(&vault),
+            0,
+            "the words were already on disk, so no conflict copy"
+        );
+        std::fs::remove_dir_all(&vault.root).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn conflict_copies(vault: &Vault) -> usize {
+        std::fs::read_dir(&vault.root)
+            .expect("list the vault")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("conflict"))
+            .count()
+    }
+
+    #[test]
+    fn a_release_after_its_own_autosave_leaves_no_conflict_copy() {
+        let (vault, dir) = (
+            test_vault("pristine-inflight"),
+            pristine_data_dir("inflight"),
+        );
+        let note = create_untouched(&vault, &dir, &nothing_asked());
+        let editor = open_editor(&vault, &note);
+        let stale = rev_of(&editor);
+        // "abc" was in flight as the person typed "d" and left: the autosave
+        // lands first, and the release carries the newer buffer against the
+        // revision the editor had before that save resolved.
+        save(&vault, &editor, "abc", &stale);
+        let words = Some(NoteReleaseReq {
+            text: Some("abcd".to_owned()),
+            base_rev: stale.clone(),
+            discard: true,
+        });
+
+        assert!(!release(&vault, &dir, &editor, words).expect("release"));
+        let disk = notes_vault::read_note(&vault, &note.path).expect("kept");
+        assert_eq!(split_note(&disk).1, "abcd", "the last words landed");
+        assert_eq!(
+            conflict_copies(&vault),
+            0,
+            "our own autosave is not somebody else's edit"
+        );
+
+        // Somebody else's write under the same stale revision is still one.
+        let other = create_untouched(&vault, &dir, &nothing_asked());
+        let editor = open_editor(&vault, &other);
+        let stale = rev_of(&editor);
+        save(&vault, &editor, "abc", &stale);
+        let theirs = notes_vault::read_note(&vault, &other.path).expect("read");
+        notes_vault::write_note(&vault, &other.path, &format!("{theirs}\nfrom elsewhere"))
+            .expect("their write");
+        let words = Some(NoteReleaseReq {
+            text: Some("abcd".to_owned()),
+            base_rev: stale,
+            discard: true,
+        });
+        assert!(!release(&vault, &dir, &editor, words).expect("release"));
+        assert_eq!(conflict_copies(&vault), 1, "their side is kept aside");
+        std::fs::remove_dir_all(&vault.root).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_note_kept_on_screen_is_not_discarded_by_its_last_close() {
+        let (vault, dir) = (
+            test_vault("pristine-kept-on-screen"),
+            pristine_data_dir("on-screen"),
+        );
+        let note = create_untouched(&vault, &dir, &nothing_asked());
+        let folded = open_editor(&vault, &note);
+        let kept = Some(NoteReleaseReq {
+            text: None,
+            base_rev: String::new(),
+            discard: false,
+        });
+
+        assert!(!release(&vault, &dir, &folded, kept).expect("fold"));
+        assert!(
+            vault.root.join(&note.path).exists(),
+            "a folded panel still shows the note"
+        );
+        assert_eq!(
+            row_of_pristine(&dir, &vault),
+            vec![note.id.clone()],
+            "still untouched, so the close that lets it go may remove it"
+        );
+        let reopened = open_editor(&vault, &note);
+        assert!(release(&vault, &dir, &reopened, clean()).expect("close"));
+        assert!(!vault.root.join(&note.path).exists());
+        std::fs::remove_dir_all(&vault.root).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_templated_note_is_untouched_as_created() {
+        let (vault, dir) = (
+            test_vault("pristine-template"),
+            pristine_data_dir("template"),
+        );
+        notes_vault::write_note(
+            &vault,
+            "templates/stamp.md",
+            "# {{date}} {{time:HH:mm:ss}}\n",
+        )
+        .expect("template");
+        let req = NoteCreateReq {
+            template: Some("templates/stamp.md".to_owned()),
+            ..nothing_asked()
+        };
+        let note = create_untouched(&vault, &dir, &req);
+        let editor = open_editor(&vault, &note);
+
+        assert!(
+            release(&vault, &dir, &editor, clean()).expect("release"),
+            "a scaffold nobody wrote under is still nothing written"
+        );
+        assert!(!vault.root.join(&note.path).exists());
+        assert!(vault.root.join("templates/stamp.md").exists());
+        std::fs::remove_dir_all(&vault.root).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_renamed_or_pinned_new_note_is_kept() {
+        let (vault, dir) = (test_vault("pristine-kept"), pristine_data_dir("kept"));
+        let renamed = create_untouched(&vault, &dir, &nothing_asked());
+        let editor = open_editor(&vault, &renamed);
+        std::fs::rename(vault.root.join(&renamed.path), vault.root.join("named.md"))
+            .expect("rename");
+        lock_body(&body_sub(&editor).expect("live")).rel = "named.md".to_owned();
+        assert!(!release(&vault, &dir, &editor, clean()).expect("release renamed"));
+        assert!(
+            vault.root.join("named.md").exists(),
+            "a rename is somebody's act"
+        );
+
+        let pinned = create_untouched(&vault, &dir, &nothing_asked());
+        let editor = open_editor(&vault, &pinned);
+        let disk = notes_vault::read_note(&vault, &pinned.path).expect("read");
+        notes_vault::write_note(
+            &vault,
+            &pinned.path,
+            &Frontmatter::set_in(&disk, "pinned", FieldValue::Bool(true)),
+        )
+        .expect("pin");
+        assert!(!release(&vault, &dir, &editor, clean()).expect("release pinned"));
+        assert!(vault.root.join(&pinned.path).exists(), "so is a pin");
+        assert!(row_of_pristine(&dir, &vault).is_empty());
+        std::fs::remove_dir_all(&vault.root).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_sweep_removes_what_a_previous_run_left() {
+        let (vault, dir) = (test_vault("pristine-sweep"), pristine_data_dir("sweep"));
+        // A note a previous run created: on disk and in the row, not in memory.
+        let left = create_note(
+            &vault,
+            &nothing_asked(),
+            &seed::Seed::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .expect("left behind");
+        let document = notes_vault::read_note(&vault, &left.path).expect("read");
+        // One this run holds, which only its own release may decide.
+        let held = create_untouched(&vault, &dir, &nothing_asked());
+        let mut row = registry::get_pristine_notes(&dir, &vault.id).expect("row");
+        row.push(PristineNote {
+            note_id: left.id.clone(),
+            path: left.path.clone(),
+            document,
+        });
+        registry::set_pristine_notes(&dir, &vault.id, &row).expect("seed the row");
+
+        sweep_pristine(&dir, &vault);
+        assert!(
+            !vault.root.join(&left.path).exists(),
+            "the leftover is removed"
+        );
+        assert!(
+            vault.root.join(&held.path).exists(),
+            "this run's note is left alone"
+        );
+        assert_eq!(row_of_pristine(&dir, &vault), vec![held.id.clone()]);
+        forget_pristine(Some(dir.as_path()), &vault.id, &held.id);
+        std::fs::remove_dir_all(&vault.root).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_sweep_adopts_a_leftover_an_editor_holds() {
+        let (vault, dir) = (test_vault("pristine-adopt"), pristine_data_dir("adopt"));
+        // A note a previous run created, which a panel restored at start
+        // already has open when the sweep reaches it.
+        let left = create_note(
+            &vault,
+            &nothing_asked(),
+            &seed::Seed::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .expect("left behind");
+        let document = notes_vault::read_note(&vault, &left.path).expect("read");
+        registry::set_pristine_notes(
+            &dir,
+            &vault.id,
+            &[PristineNote {
+                note_id: left.id.clone(),
+                path: left.path.clone(),
+                document,
+            }],
+        )
+        .expect("seed the row");
+        let restored = open_editor(&vault, &left);
+
+        sweep_pristine(&dir, &vault);
+        assert!(
+            vault.root.join(&left.path).exists(),
+            "never removed under an open editor"
+        );
+        assert_eq!(
+            row_of_pristine(&dir, &vault),
+            vec![left.id.clone()],
+            "its release decides now"
+        );
+        assert!(
+            release(&vault, &dir, &restored, clean()).expect("release"),
+            "adopted: the editor's release removes it as if this run had made it"
+        );
+        assert!(!vault.root.join(&left.path).exists());
+        assert!(row_of_pristine(&dir, &vault).is_empty());
+        std::fs::remove_dir_all(&vault.root).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn row(id: &str, title: &str) -> NoteRowVm {
         NoteRowVm {
             vault_id: "vault".to_owned(),
@@ -7431,6 +8393,7 @@ mod tests {
             base: "---\nid: 01AAA\n---\nhello".to_owned(),
             rev: "5-x".to_owned(),
             mine: None,
+            written: None,
         };
         assert!(!state.is_dirty(), "no report yet is not dirty");
         state.mine = Some("hello".to_owned());

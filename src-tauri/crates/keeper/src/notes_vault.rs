@@ -348,7 +348,12 @@ pub fn refresh(app: &AppHandle) {
     // arms, no later refresh ever retries, and the app comes up with a notes
     // subsystem that is silent and will not recover. Spawned, the same stall
     // costs exactly the seeding it was in, and the next refresh tries again.
+    // The untouched new notes a previous run left (AD-304) are settled on the
+    // same thread and the same terms: they are read from the vault, which can
+    // stall like the seeding.
+    let data_dir = app.state::<crate::ipc::AppState>().platform.data_dir().ok();
     for vault in registered {
+        let data_dir = data_dir.clone();
         tauri::async_runtime::spawn_blocking(move || {
             crate::notes_ipc::seed_default_spaces(&vault);
             // The templates go in beside the spaces, on the same terms:
@@ -356,6 +361,9 @@ pub fn refresh(app: &AppHandle) {
             // than the index, and never on a vault that has already been
             // offered them (Story 44.7).
             crate::notes_ipc::seed_default_templates(&vault);
+            if let Some(dir) = &data_dir {
+                crate::notes_ipc::sweep_pristine(dir, &vault);
+            }
         });
     }
     // A `git` repoint tears the engine down and closes the tap; re-arming here
@@ -3763,6 +3771,7 @@ pub fn set_active_vault(platform: &dyn Platform, vault_id: &str) -> Result<(), N
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keeper_core::error::CoreError;
 
     /// A vault rooted at a real, canonical scratch directory. `tempfile` is not
     /// a dependency of this crate; `std::env::temp_dir()` plus the pid is the
@@ -3840,9 +3849,9 @@ mod tests {
                 },
             );
         }
-        let created = crate::notes_ipc::notes_create(
-            target.id.clone(),
-            NoteCreateReq {
+        let created = crate::notes_ipc::create_for_space(
+            &target,
+            &NoteCreateReq {
                 title: Some("Trip".into()),
                 body: None,
                 template: None,
@@ -3852,7 +3861,6 @@ mod tests {
                 space_vault_id: Some(source.id.clone()),
             },
         )
-        .await
         .expect("create outside source drive");
         assert_eq!(
             created.notices,
@@ -4924,5 +4932,150 @@ mod tests {
             "keeper-note://01VAULT/attachments/%2E%2E/etc/passwd",
             "a traversal attempt survives as text and is refused on resolution"
         );
+    }
+
+    /// A `Platform` whose data dir is a scratch tree of the test's own, so a
+    /// list that reads settings reads the defaults, never the user's registry.
+    struct ScratchPlatform {
+        data_dir: PathBuf,
+    }
+
+    impl keeper_core::platform::Platform for ScratchPlatform {
+        fn data_dir(&self) -> Result<PathBuf, CoreError> {
+            Ok(self.data_dir.clone())
+        }
+        fn keychain_set(&self, _key: &str, _value: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn keychain_get(&self, _key: &str) -> Result<Option<String>, CoreError> {
+            Ok(None)
+        }
+        fn keychain_delete(&self, _key: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn open_url(&self, _url: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn notify(
+            &self,
+            _title: &str,
+            _body: &str,
+            _target: &keeper_core::vm::NotifyTarget,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
+            Err(CoreError::Unsupported("unused".to_owned()))
+        }
+        fn exclude_from_backup(&self, _path: &Path) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    /// AD-303: with service files hidden, the plain list withholds a space
+    /// definition and counts it; turning the toggle off shows it; inside a space
+    /// whose query admits it, nothing is withheld.
+    #[tokio::test]
+    async fn a_space_definition_is_a_service_file_of_the_plain_list_only() {
+        use keeper_core::notes::vm::NoteQueryReq;
+        let mut vault = test_vault("space-service-file");
+        vault.id = crate::sync_ipc::new_ulid();
+        let platform = ScratchPlatform {
+            data_dir: vault.root.join(".test-data"),
+        };
+        // The space's query admits the space note itself, so the scoped list
+        // can show whether AD-303 still withholds it there.
+        let files = [
+            (
+                "spaces/defs.md",
+                "---\nid: defs\ntags: [def]\nkeeper:\n  space: tag:def\n---\n# Defs\n",
+            ),
+            ("plain.md", "---\nid: plain\ntags: [def]\n---\n# Plain\n"),
+        ];
+        let mut entries = Vec::new();
+        for (rel, text) in files {
+            write_note(&vault, rel, text).expect("fixture note");
+            entries.push(index_written(rel, text, &vault.spaces_prefix()));
+        }
+        let space_id = entries
+            .iter()
+            .find(|entry| entry.path == "spaces/defs.md")
+            .expect("space entry")
+            .id
+            .clone();
+        let (_, index) = watch::channel(IndexBuilder::from_entries(entries).snapshot());
+        let (_, progress) = watch::channel(NoteIndexProgressVm {
+            vault_id: vault.id.clone(),
+            scanned: 0,
+            total_estimate: 0,
+            phase: "ready".into(),
+        });
+        let (_, search) = watch::channel(NoteSearchStateVm {
+            vault_id: vault.id.clone(),
+            phase: "words".into(),
+            indexed: 0,
+            total: 0,
+            embedded: 0,
+            embeddable: 0,
+            model: String::new(),
+            sentence: String::new(),
+        });
+        let (work, receiver) = mpsc::unbounded_channel();
+        registry().insert(
+            vault.id.clone(),
+            Slot {
+                vault: vault.clone(),
+                index,
+                progress,
+                search,
+                heads: Arc::new(HashMap::new()),
+                work,
+                cadence: Cadence::default(),
+            },
+        );
+        let list = |hide_service_files: bool, space_id: Option<String>| {
+            let vault = vault.clone();
+            let platform = &platform;
+            async move {
+                let req = NoteQueryReq {
+                    space_terms: true,
+                    sort: None,
+                    vault_ids: vec![vault.id.clone()],
+                    include_private: false,
+                    text: None,
+                    hide_service_files,
+                    tags: BTreeMap::new(),
+                    space_id,
+                    origin: None,
+                    flags: Vec::new(),
+                    offset: 0,
+                    limit: 100,
+                };
+                let answer = crate::notes_ipc::project_vaults(platform, &vault, &req)
+                    .await
+                    .expect("list");
+                let mut titles: Vec<_> = answer.rows.into_iter().map(|row| row.title).collect();
+                titles.sort();
+                (titles, answer.hidden)
+            }
+        };
+        let scope = || Some(space_id.clone());
+
+        assert_eq!(list(true, None).await, (vec!["Plain".to_owned()], 1));
+        assert_eq!(
+            list(false, None).await,
+            (vec!["Defs".to_owned(), "Plain".to_owned()], 0)
+        );
+        assert_eq!(
+            list(true, scope()).await,
+            (vec!["Defs".to_owned(), "Plain".to_owned()], 0)
+        );
+
+        registry().remove(&vault.id);
+        drop(receiver);
+        std::fs::remove_dir_all(vault.root).expect("cleanup");
     }
 }

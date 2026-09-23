@@ -1290,6 +1290,43 @@ pub struct NoteCreateReq {
     pub space_vault_id: Option<String>,
 }
 
+impl NoteCreateReq {
+    /// Whether the caller supplied nothing to write — no title and no body
+    /// (AD-304). Only such a create is removed again when nobody writes in it:
+    /// a title is a name somebody chose (a wikilink's "create and link" stub
+    /// must keep resolving), a body is words. Tags, a template and a space are
+    /// what creation itself puts there, so they do not count.
+    pub fn writes_nothing(&self) -> bool {
+        self.title
+            .as_deref()
+            .is_none_or(|title| title.trim().is_empty())
+            && self
+                .body
+                .as_deref()
+                .is_none_or(|body| body.trim().is_empty())
+    }
+}
+
+/// What the last editor of a note hands back as it lets the note go (AD-304).
+///
+/// The final flush and the "was anything written?" decision travel in ONE
+/// command, because two IPC calls are not ordered: a flush that arrived after
+/// the close would either lose the last words or recreate a removed note.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteReleaseReq {
+    /// The buffer that had not reached disk; `None` when the editor was clean.
+    pub text: Option<String>,
+    /// The revision `text` was typed against (the editor's `rev`). Unused when
+    /// `text` is `None`.
+    pub base_rev: String,
+    /// Whether the note may go if nothing was written in it. `false` when the
+    /// person still has it in front of them — a folded panel, a switched view —
+    /// so an unmount that keeps the note's panel flushes and never removes it.
+    pub discard: bool,
+}
+
 /// What a create produced, and anything the person who asked for it has to be
 /// told (Story 44.6).
 ///
@@ -1423,6 +1460,41 @@ pub enum NoteFlag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_create_that_supplies_nothing_writes_nothing() {
+        let blank = NoteCreateReq {
+            title: None,
+            body: None,
+            template: Some("templates/daily.md".to_owned()),
+            dest: Some("inbox".to_owned()),
+            tags: vec!["work".to_owned()],
+            space: Some("01SPACE".to_owned()),
+            space_vault_id: Some("vault".to_owned()),
+        };
+        // What creation itself puts there — a template, a folder, tags, a space
+        // — is not somebody writing.
+        assert!(blank.writes_nothing());
+        // An empty search prompt reaches the create as blank strings.
+        let whitespace = NoteCreateReq {
+            title: Some("  ".to_owned()),
+            body: Some(" \n\t".to_owned()),
+            ..blank.clone()
+        };
+        assert!(whitespace.writes_nothing());
+        // A wikilink's "create and link" stub: a name somebody chose.
+        let titled = NoteCreateReq {
+            title: Some("Foo".to_owned()),
+            ..blank.clone()
+        };
+        assert!(!titled.writes_nothing());
+        // New note from a search that had words in it.
+        let worded = NoteCreateReq {
+            body: Some("x".to_owned()),
+            ..blank
+        };
+        assert!(!worded.writes_nothing());
+    }
 
     #[test]
     fn a_row_serialises_camel_case_including_the_two_absent_by_empty_string_fields() {
