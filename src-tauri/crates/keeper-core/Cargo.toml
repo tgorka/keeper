@@ -36,6 +36,11 @@ mime = { workspace = true }
 mime_guess = { workspace = true }
 # HTTP client for the Beeper unofficial email-code login flow (Story 2.3, AD-17).
 reqwest = { workspace = true }
+# The organisation account's OIDC client (Epic 82, AD-310). See the workspace
+# manifest for why default features are off; `oauth2-reqwest` runs it on the
+# reqwest above, so no second HTTP or TLS stack enters the tree.
+openidconnect = { workspace = true }
+oauth2-reqwest = { workspace = true }
 # Account registry (keeper.db, WAL) and opaque ULID account ids.
 rusqlite = { workspace = true }
 # Derived notes chunk identities; already locked transitively (AD-261).
@@ -92,3 +97,6 @@ prost = "0.14"
 [dev-dependencies]
 # The privacy lifecycle tests observe real localhost connection/cancellation.
 tokio = { workspace = true, features = ["net"] }
+# Epic 82's OIDC tests sign ID tokens with an RSA key generated per test run
+# (no private key is checked in). Already in the graph via `openidconnect`.
+rsa = "0.9"

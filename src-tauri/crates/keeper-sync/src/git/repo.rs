@@ -647,10 +647,10 @@ pub fn clone(
 /// Deliberately not a person: it appears only in reflogs on hosts where no git
 /// identity was ever configured, and claiming to be a human there would be a
 /// lie. Commits keeper makes carry the real device signature instead.
-const IDENTITY_NAME: &str = "keeper";
+pub(crate) const FALLBACK_IDENTITY_NAME: &str = "keeper";
 /// `.invalid` is reserved by RFC 2606 and can never be a deliverable address,
 /// which is the honest way to say "no mailbox".
-const IDENTITY_EMAIL: &str = "keeper@keeper.invalid";
+pub(crate) const FALLBACK_IDENTITY_EMAIL: &str = "keeper@keeper.invalid";
 
 /// Write `index.sparse=false` into the repository's own `.git/config`.
 ///
@@ -750,10 +750,10 @@ pub fn enforce_local_config_with_filter(
     // from any scope, must keep winning inside a folder they also use by hand.
     if repo.committer().is_none() {
         config
-            .set_raw_value("user.name", IDENTITY_NAME)
+            .set_raw_value("user.name", FALLBACK_IDENTITY_NAME)
             .map_err(|err| SyncError::Git(format!("could not set user.name: {err}")))?;
         config
-            .set_raw_value("user.email", IDENTITY_EMAIL)
+            .set_raw_value("user.email", FALLBACK_IDENTITY_EMAIL)
             .map_err(|err| SyncError::Git(format!("could not set user.email: {err}")))?;
     }
 

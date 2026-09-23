@@ -1573,6 +1573,11 @@ pub enum EgressKind {
     Update,
     /// Opt-in diagnostics, statistics, remote config or an active synthetic study.
     Telemetry,
+    /// The host of one destination the organisation account's descriptor names:
+    /// its identity provider, the address the descriptor was fetched from, its
+    /// settings repository, or the forge's own sign-in (Epic 82). Present only
+    /// while an account is configured.
+    Account,
 }
 
 /// One network destination keeper contacts, derived from live app state (Story
@@ -5135,6 +5140,12 @@ pub enum ConfigTierVm {
     UserGlobal,
     /// `~/.keeper/keeper.<host>.toml` — this user, this machine only.
     UserGlobalMachine,
+    /// `<clone>/<login>/keeper.toml` — the signed-in account's config
+    /// repository, every device.
+    AccountShared,
+    /// `<clone>/<login>/keeper.<device>.toml` — the account's repository, this
+    /// device.
+    AccountDevice,
     /// `<main>/.keeper/keeper.toml` — the designated main sync folder, shared
     /// with every machine that syncs it.
     MainShared,
@@ -5144,6 +5155,9 @@ pub enum ConfigTierVm {
     FolderShared,
     /// `<folder>/.keeper/keeper.<host>.toml` — one folder, this machine.
     FolderMachine,
+    /// `account.toml` — the account descriptor. Sets no key; only its faults
+    /// carry this tier.
+    Account,
 }
 
 /// One settings key whose value is decided by a file rather than by the app
@@ -5262,7 +5276,7 @@ impl ConfigLayersVm {
                     key,
                     tier,
                     path: source.path.display().to_string(),
-                    source: tier.phrase(source.folder.as_deref()),
+                    source: tier.phrase(&source),
                     folder: source.folder,
                 }
             })
@@ -5316,24 +5330,35 @@ impl ConfigTierVm {
         match tier {
             LayerTier::UserGlobal => Self::UserGlobal,
             LayerTier::UserGlobalMachine => Self::UserGlobalMachine,
+            LayerTier::AccountShared => Self::AccountShared,
+            LayerTier::AccountDevice => Self::AccountDevice,
             LayerTier::MainShared => Self::MainShared,
             LayerTier::MainMachine => Self::MainMachine,
             LayerTier::FolderShared => Self::FolderShared,
             LayerTier::FolderMachine => Self::FolderMachine,
+            LayerTier::AccountDescriptor => Self::Account,
         }
     }
 
     /// How this layer is described to the person reading Settings.
     ///
     /// Two axes, both of which the user has to be able to tell apart to know
-    /// which file to open: *whose* file it is (yours, the main folder's, this
-    /// folder's) and *how far it reaches* (every machine, or only this one).
+    /// which file to open: *whose* file it is (yours, your account's, the main
+    /// folder's, this folder's) and *how far it reaches* (every machine, or
+    /// only this one).
     /// A folder layer names its folder when the layer knew it, because "a
-    /// folder's settings file" is not an instruction anyone can act on.
-    fn phrase(self, folder: Option<&str>) -> String {
+    /// folder's settings file" is not an instruction anyone can act on. An
+    /// account layer names the account and where the file lives in its
+    /// repository — host and path — and says the clone on disk is not the
+    /// place to edit: every sync puts the repository's copy back.
+    fn phrase(self, source: &crate::config::LayerSource) -> String {
+        let folder = source.folder.as_deref();
         match (self, folder) {
             (Self::UserGlobal, _) => "your settings file, for every machine and folder".to_owned(),
             (Self::UserGlobalMachine, _) => "your settings file for this machine".to_owned(),
+            (Self::AccountShared, _) => account_phrase(source, "for every device"),
+            (Self::AccountDevice, _) => account_phrase(source, "for this device"),
+            (Self::Account, _) => "your account file, account.toml".to_owned(),
             (Self::MainShared, Some(name)) => {
                 format!("the shared settings file in {name}, for every machine")
             }
@@ -5359,6 +5384,43 @@ impl ConfigTierVm {
                 "a folder's own settings file, for this machine".to_owned()
             }
         }
+    }
+}
+
+fn account_phrase(source: &crate::config::LayerSource, reach: &str) -> String {
+    let at = match source.repo_host.as_deref() {
+        Some(host) => format!("{host}/{}", repo_relative(&source.path)),
+        None => repo_relative(&source.path),
+    };
+    format!(
+        "{} settings file {at} in its repository, {reach}; change it in the repository, because \
+         keeper's local copy is replaced at the next sync, and settings read at startup follow \
+         at the next launch",
+        account_owner(source.account.as_deref()),
+    )
+}
+
+/// "your Acme account's", or "your account's" when the name is unknown.
+fn account_owner(name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!("your {name} account's"),
+        None => "your account's".to_owned(),
+    }
+}
+
+/// `tgorka/keeper.toml` for `<clone>/tgorka/keeper.toml`: the account files sit
+/// directly in the person's directory, so the last two components are the
+/// path inside the repository.
+fn repo_relative(path: &std::path::Path) -> String {
+    let file = path.file_name().map(|name| name.to_string_lossy());
+    let dir = path
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .map(|name| name.to_string_lossy());
+    match (dir, file) {
+        (Some(dir), Some(file)) => format!("{dir}/{file}"),
+        (None, Some(file)) => file.into_owned(),
+        _ => path.display().to_string(),
     }
 }
 
@@ -10209,6 +10271,18 @@ mod tests {
                 tier,
                 path: PathBuf::from(path),
                 folder: folder.map(str::to_owned),
+                account: None,
+                repo_host: None,
+            }
+        }
+
+        /// An account layer as the loader stamps it; with no account name the
+        /// repository host is unknown too.
+        fn account_source(tier: LayerTier, path: &str, account: Option<&str>) -> LayerSource {
+            LayerSource {
+                account: account.map(str::to_owned),
+                repo_host: account.map(|_| "git.acme.dev".to_owned()),
+                ..source(tier, path, None)
             }
         }
 
@@ -10280,27 +10354,47 @@ mod tests {
 
         /// A machine-scoped layer says "this machine". Two people syncing one
         /// folder need to be able to tell which of the two files they are
-        /// looking at from the sentence alone.
+        /// looking at from the sentence alone; an account layer says "this
+        /// device" and names the account and the file inside its repository.
         #[test]
         fn every_tier_gets_a_distinct_sentence_naming_its_reach() {
             let phrases: Vec<String> = [
-                (LayerTier::UserGlobal, None),
-                (LayerTier::UserGlobalMachine, None),
-                (LayerTier::MainShared, Some("tgdrive")),
-                (LayerTier::MainMachine, Some("tgdrive")),
-                (LayerTier::FolderShared, Some("photos")),
-                (LayerTier::FolderMachine, Some("photos")),
+                source(LayerTier::UserGlobal, "/f/.keeper/keeper.toml", None),
+                source(LayerTier::UserGlobalMachine, "/f/.keeper/keeper.toml", None),
+                account_source(
+                    LayerTier::AccountShared,
+                    "/data/account/acme/repo/tgorka/keeper.toml",
+                    Some("Acme"),
+                ),
+                account_source(
+                    LayerTier::AccountDevice,
+                    "/data/account/acme/repo/tgorka/keeper.laptop.toml",
+                    Some("Acme"),
+                ),
+                source(
+                    LayerTier::MainShared,
+                    "/f/.keeper/keeper.toml",
+                    Some("tgdrive"),
+                ),
+                source(
+                    LayerTier::MainMachine,
+                    "/f/.keeper/keeper.toml",
+                    Some("tgdrive"),
+                ),
+                source(
+                    LayerTier::FolderShared,
+                    "/f/.keeper/keeper.toml",
+                    Some("photos"),
+                ),
+                source(
+                    LayerTier::FolderMachine,
+                    "/f/.keeper/keeper.toml",
+                    Some("photos"),
+                ),
             ]
             .into_iter()
-            .map(|(tier, folder)| {
-                let vm = ConfigLayersVm::new(
-                    vec![(
-                        "k".to_owned(),
-                        source(tier, "/f/.keeper/keeper.toml", folder),
-                    )],
-                    Vec::new(),
-                    None,
-                );
+            .map(|source| {
+                let vm = ConfigLayersVm::new(vec![("k".to_owned(), source)], Vec::new(), None);
                 vm.overrides[0].source.clone()
             })
             .collect();
@@ -10309,11 +10403,49 @@ mod tests {
                 vec![
                     "your settings file, for every machine and folder",
                     "your settings file for this machine",
+                    "your Acme account's settings file git.acme.dev/tgorka/keeper.toml in its repository, for every device; change it in the repository, because keeper's local copy is replaced at the next sync, and settings read at startup follow at the next launch",
+                    "your Acme account's settings file git.acme.dev/tgorka/keeper.laptop.toml in its repository, for this device; change it in the repository, because keeper's local copy is replaced at the next sync, and settings read at startup follow at the next launch",
                     "the shared settings file in tgdrive, for every machine",
                     "the shared settings file in tgdrive, for this machine",
                     "photos's own settings file, for every machine",
                     "photos's own settings file, for this machine",
                 ]
+            );
+        }
+
+        /// An account layer projects with its own wire tier, its absolute path
+        /// for the editor, no folder, and a sentence that still reads when the
+        /// account's name was not known.
+        #[test]
+        fn an_account_override_crosses_as_an_account_tier_with_no_folder() {
+            let vm = ConfigLayersVm::new(
+                vec![(
+                    "recording.fps".to_owned(),
+                    account_source(
+                        LayerTier::AccountDevice,
+                        "/data/account/acme/repo/tgorka/keeper.laptop.toml",
+                        None,
+                    ),
+                )],
+                Vec::new(),
+                None,
+            );
+            let [only] = &vm.overrides[..] else {
+                panic!("expected exactly one override, got {:?}", vm.overrides);
+            };
+            assert_eq!(only.tier, ConfigTierVm::AccountDevice);
+            assert_eq!(
+                only.path,
+                "/data/account/acme/repo/tgorka/keeper.laptop.toml"
+            );
+            assert_eq!(only.folder, None);
+            assert_eq!(
+                only.source,
+                "your account's settings file tgorka/keeper.laptop.toml in its repository, for this device; change it in the repository, because keeper's local copy is replaced at the next sync, and settings read at startup follow at the next launch"
+            );
+            assert_eq!(
+                serde_json::to_string(&ConfigTierVm::AccountShared).expect("serialize"),
+                "\"accountShared\""
             );
         }
 

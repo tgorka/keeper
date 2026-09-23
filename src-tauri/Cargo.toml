@@ -83,6 +83,16 @@ mime_guess = "2"
 # HTTP client for the Beeper unofficial email-code login flow (Story 2.3, AD-17).
 # rustls-only to match matrix-sdk's TLS backend — no second TLS stack (no native-tls/OpenSSL).
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# keeper's own OIDC client for the organisation account (Epic 82, AD-310):
+# discovery, PKCE S256, ID-token verification, refresh, revocation and the
+# logout URL. `default-features = false` is load-bearing — the defaults pull
+# oauth2's reqwest 0.12 client and a second reqwest (and webpki-roots) into
+# the tree. The HTTP side is `oauth2-reqwest`, the maintainer's reqwest 0.13
+# adapter, already in the lock via matrix-sdk 0.18; it is pinned exactly
+# because it is an alpha. Both MIT. `rsa` (verification only here) carries
+# RUSTSEC-2023-0071, which concerns private-key operations keeper never does.
+openidconnect = { version = "4.0.1", default-features = false }
+oauth2-reqwest = "=0.1.0-alpha.3"
 # Platform ports
 dirs = "6"
 # Destination free-space probe for the recording validate-on-Start pre-flight
@@ -118,6 +128,27 @@ objc2 = "0.6"
 # direct name for a crate that was going to be compiled either way.
 objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKPDFConfiguration"] }
 block2 = "0.6"
+# The account sign-in sheet (Epic 82, AD-311): `ASWebAuthenticationSession`,
+# presented from `crates/keeper/src/web_auth_apple.rs` on macOS and iOS — the
+# only new crate of the epic's shell half. `Zlib OR Apache-2.0 OR MIT` (0.3.2),
+# passes the cargo-deny license firewall. No default features: the list names
+# exactly the session, its callback matcher and the presentation-anchor
+# protocol; on macOS it pulls `objc2-app-kit` (already in the tree) for the
+# `NSWindow` anchor, and nothing else.
+objc2-authentication-services = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "ASFoundation",
+    "ASWebAuthenticationSession",
+    "ASWebAuthenticationSessionCallback",
+] }
+# The macOS presentation anchor for that sheet: the main window's `NSWindow`.
+# Already in the tree through tao/muda; only the direct name is new.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSResponder",
+    "NSWindow",
+] }
 objc2-foundation = { version = "0.3", features = [
     "NSURL",
     "NSError",

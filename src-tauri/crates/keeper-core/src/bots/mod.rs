@@ -424,6 +424,45 @@ pub fn resolve_token(
     platform.keychain_get(&provider_token_key(provider_id))
 }
 
+/// The bearer token for `(provider_id, bot)`, honouring the provider's
+/// credential source (Epic 82, AD-315).
+///
+/// `account` is the shell's in-memory view of the configured account. With
+/// none, this is exactly [`resolve_token`]: no registry row is read, so an
+/// install without an account pays nothing and cannot fail on the database.
+/// A provider opted into *this* account
+/// (`bots.provider_credential_source.<id> = account:<account id>`) sends the
+/// account's access token — refreshed as needed, never stored under the
+/// provider — and fails with the account's own error when it cannot give one,
+/// so the caller can say "Sign in again" rather than "the token went missing".
+/// A row bound to another account is not this account's to answer.
+pub async fn resolve_credential(
+    platform: &dyn Platform,
+    http: &reqwest::Client,
+    account: Option<&crate::org_account::descriptor::AccountDescriptor>,
+    provider_id: &str,
+    bot: Option<&str>,
+) -> Result<Option<String>, crate::org_account::AccountError> {
+    use crate::org_account::AccountError;
+    let internal = |e: CoreError| AccountError::Internal(e.to_string());
+    let Some(account) = account else {
+        return resolve_token(platform, provider_id, bot).map_err(internal);
+    };
+    let data_dir = platform.data_dir().map_err(internal)?;
+    let source = crate::registry::get_bots_provider_credential_source(
+        &data_dir,
+        provider_id,
+        Some(&account.id),
+    )
+    .map_err(internal)?;
+    if source.is_none() {
+        return resolve_token(platform, provider_id, bot).map_err(internal);
+    }
+    crate::org_account::oidc::access_token(platform, http, account)
+        .await
+        .map(Some)
+}
+
 /// Store a provider's default credential behind the secret port (Story 61.1,
 /// FR-370).
 ///
