@@ -244,9 +244,23 @@ confirmation.
    the link starts it.
 2. **An inline link, for operators without hosting:** `keeper://setup?d=<base64url(JSON)>`.
    The whole descriptor travels in the link.
-3. **A paste.** Paste either link, or a bare `https://…json` URL, into the field in
-   Settings › Account, or into the first-run step *Sign in with an organisation account*.
-   This covers a Mac, which cannot scan a QR code.
+3. **A paste or a scan.** Paste either link, or a bare `https://…json` URL, into the setup
+   field, or choose *Scan a QR code* beside it and hold the code up to the camera. The field
+   is in three places, and they behave the same: Settings › Account, the first-run step
+   *Sign in with an organisation account*, and **Add account › keeper account…** at the
+   foot of the sidebar.
+
+   Scanning runs inside keeper's window. The camera preview and the decoding (zxing-cpp,
+   compiled to WebAssembly and shipped inside the app, so nothing is downloaded) stay on
+   the device. Only the decoded text leaves the scanner, and it goes to the same place a
+   paste goes. The camera stops as soon as a code is read, when you cancel, and when the
+   window closes or is hidden (keeper keeps running, the scan does not). macOS asks once for
+   camera access, with the same sentence recording uses. If you refused, the scanner names
+   the System Settings pane and offers to open it; a camera that stops mid-scan says so.
+
+   *Scan a QR code* appears only where the window can reach a camera: on the Mac, not in
+   the iOS app. On an iPhone, point the Camera app at the code, which opens the link in
+   keeper.
 
 keeper then shows **one confirmation sheet**:
 - the account's name;
@@ -256,6 +270,17 @@ keeper then shows **one confirmation sheet**:
 **Nothing is written before you choose *Continue*.** *Cancel* writes nothing. A setup link
 can point keeper at anyone's identity provider, which is why both hosts are always on the
 screen. Continue only for hosts you recognise.
+
+If this device already has a different keeper account, the sheet also says so ("This
+replaces *name* on this device …"). *Continue* signs you out of that account and forgets
+it here, then sets up the new one. The old account's files in its settings repository are
+kept.
+
+**Add account** at the foot of the sidebar offers both kinds of account: *Matrix account…*
+opens the Matrix sign-in, as before. *keeper account…* opens the setup field. Once an
+account is configured it reads *Change keeper account…* and says that a link for another
+account replaces the current one. Whether a link really does is decided when it is read,
+and the confirmation sheet says so.
 
 After *Continue*, keeper:
 1. writes `account.toml`;

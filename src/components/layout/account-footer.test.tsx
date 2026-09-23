@@ -22,14 +22,28 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
   };
 });
 
-import { AccountFooter } from "@/components/layout/account-footer";
+import {
+  CHANGE_KEEPER_ACCOUNT_TITLE,
+  changeKeeperAccountDescription,
+  KEEPER_ACCOUNT_DESCRIPTION,
+  KEEPER_ACCOUNT_TITLE,
+  KeeperAccountDialog,
+} from "@/components/account/keeper-account-dialog";
+import {
+  AccountFooter,
+  ADD_KEEPER_ACCOUNT_LABEL,
+  ADD_MATRIX_ACCOUNT_LABEL,
+  CHANGE_KEEPER_ACCOUNT_LABEL,
+} from "@/components/layout/account-footer";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { dndGetGlobal, dndSetGlobal } from "@/lib/ipc/client";
+import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
 import { addAccountStore } from "@/lib/stores/add-account";
 import { encryptionStatusStore } from "@/lib/stores/encryption-status";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { accountVm } from "@/test/account-fixture";
 
 function account(id: string, userId: string, hue = 0, provider: Provider = "password"): AccountVm {
   return {
@@ -56,8 +70,18 @@ function renderFooter(collapsed = false) {
   return render(
     <TooltipProvider>
       <AccountFooter collapsed={collapsed} />
+      {/* Mounted at the app root in the app; here beside the footer that opens it. */}
+      <KeeperAccountDialog />
     </TooltipProvider>,
   );
+}
+
+/** Open the Add account menu (Radix opens on pointer-down, as for the row menu). */
+async function openAddMenu() {
+  const trigger = screen.getByRole("button", { name: "Add account" });
+  fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+  fireEvent.pointerUp(trigger, { button: 0 });
+  return await screen.findByRole("menu");
 }
 
 /** Open the per-account dropdown menu and return the menu element. Radix opens
@@ -77,6 +101,7 @@ beforeEach(() => {
   encryptionStatusStore.getState().reset();
   primaryViewStore.getState().setView("inbox");
   addAccountStore.getState().closeAddAccount();
+  accountStore.setState({ vm: NO_ACCOUNT, setupLink: null, entryOpen: false });
   signOutHandler.mockReset();
   signOutHandler.mockResolvedValue(undefined);
 });
@@ -110,12 +135,39 @@ describe("AccountFooter", () => {
     ).toBeInTheDocument();
   });
 
-  it("the Add Account button opens the add-account overlay and is never count-gated", () => {
-    // No accounts at all: Add Account is still present.
+  it("Add account offers a Matrix account, which opens the login overlay, and is never count-gated", async () => {
+    // No accounts at all: Add account is still present.
     renderFooter();
     expect(addAccountStore.getState().open).toBe(false);
-    fireEvent.click(screen.getByRole("button", { name: "Add account" }));
+    const menu = await openAddMenu();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: ADD_MATRIX_ACCOUNT_LABEL }));
     expect(addAccountStore.getState().open).toBe(true);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("Add account offers a keeper account, which opens the keeper-account entry", async () => {
+    renderFooter(true);
+    const menu = await openAddMenu();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: ADD_KEEPER_ACCOUNT_LABEL }));
+
+    const dialog = await screen.findByRole("dialog", { name: KEEPER_ACCOUNT_TITLE });
+    expect(within(dialog).getByText(KEEPER_ACCOUNT_DESCRIPTION)).toBeInTheDocument();
+    // The one entry field, not a second one.
+    expect(within(dialog).getByLabelText("Paste a setup link")).toBeInTheDocument();
+    expect(addAccountStore.getState().open).toBe(false);
+  });
+
+  it("with a keeper account set up, offers to change it and says what that replaces", async () => {
+    accountStore.getState().setVm(accountVm({ name: "Acme" }));
+    renderFooter();
+    const menu = await openAddMenu();
+    expect(
+      within(menu).queryByRole("menuitem", { name: ADD_KEEPER_ACCOUNT_LABEL }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: CHANGE_KEEPER_ACCOUNT_LABEL }));
+
+    const dialog = await screen.findByRole("dialog", { name: CHANGE_KEEPER_ACCOUNT_TITLE });
+    expect(within(dialog).getByText(changeKeeperAccountDescription("Acme"))).toBeInTheDocument();
   });
 
   it("shows a syncing spinner when no status batch has arrived yet", () => {

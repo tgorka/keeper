@@ -13,11 +13,14 @@
  * a per-process `revision` that only grows, so the store keeps the newest and
  * drops an older one whichever road it came by.
  *
- * It also holds the one piece of state that is the webview's own: which setup
- * link the confirmation sheet is open on. Settings, the first-run wizard and a
- * `keeper://setup` deep link all open the SAME sheet through
- * {@link AccountState.openSetup}, so there is one sheet and one set of words
- * for "check these hosts before you continue", whichever way somebody arrived.
+ * It also holds the two pieces of state that are the webview's own: which
+ * setup link the confirmation sheet is open on, and whether the keeper-account
+ * entry dialog (Add account › keeper account…) is up. Settings, the first-run
+ * wizard, that dialog and a `keeper://setup` deep link all open the SAME sheet
+ * through {@link AccountState.openSetup}, so there is one sheet and one set of
+ * words for "check these hosts before you continue", whichever way somebody
+ * arrived — and submitting a link closes the entry dialog, so only one of the
+ * two surfaces is ever up.
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
@@ -52,20 +55,32 @@ export interface AccountState {
   vm: OrgAccountVm;
   /** The link the setup sheet is open on, or `null` while it is closed. */
   setupLink: string | null;
+  /** Whether the keeper-account entry dialog is open. */
+  entryOpen: boolean;
   /** Record a snapshot from the subscription or a command's answer, unless a newer one is held. */
   setVm: (vm: OrgAccountVm) => void;
-  /** Open the confirmation sheet on a pasted, scanned or deep-linked setup link. */
+  /**
+   * Open the confirmation sheet on a pasted, scanned or deep-linked setup
+   * link. The entry dialog hands over to the sheet: it closes.
+   */
   openSetup: (link: string) => void;
   /** Close the confirmation sheet. */
   closeSetup: () => void;
+  /** Open the keeper-account entry dialog. */
+  openEntry: () => void;
+  /** Close the keeper-account entry dialog. */
+  closeEntry: () => void;
 }
 
 export const accountStore = createStore<AccountState>()((set) => ({
   vm: NO_ACCOUNT,
   setupLink: null,
+  entryOpen: false,
   setVm: (vm) => set((state) => (vm.revision < state.vm.revision ? state : { vm })),
-  openSetup: (link) => set({ setupLink: link }),
+  openSetup: (link) => set({ setupLink: link, entryOpen: false }),
   closeSetup: () => set({ setupLink: null }),
+  openEntry: () => set({ entryOpen: true }),
+  closeEntry: () => set({ entryOpen: false }),
 }));
 
 /** React selector hook over {@link accountStore}. */

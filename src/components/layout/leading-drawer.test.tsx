@@ -18,9 +18,11 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
   };
 });
 
+import { ADD_MATRIX_ACCOUNT_LABEL } from "@/components/layout/account-footer";
 import { LeadingDrawer } from "@/components/layout/leading-drawer";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { accountsStore } from "@/lib/stores/accounts";
+import { addAccountStore } from "@/lib/stores/add-account";
 import { bridgeHealthStore } from "@/lib/stores/bridge-health";
 import { draftsStore } from "@/lib/stores/drafts";
 import { leadingDrawerStore } from "@/lib/stores/leading-drawer";
@@ -78,6 +80,7 @@ beforeEach(() => {
   roomsStore.getState().selectRoom(null);
   settingsUiStore.getState().setSettingsOpen(false);
   leadingDrawerStore.getState().close();
+  addAccountStore.getState().closeAddAccount();
   accountsStore.getState().addAccount(account);
 });
 
@@ -105,6 +108,18 @@ describe("LeadingDrawer", () => {
       screen.getByRole("button", { name: `Account menu for ${account.userId}` }),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add account" })).toBeInTheDocument();
+  });
+
+  it("offers Add account's menu from inside the drawer, and a Matrix account opens the overlay", async () => {
+    renderDrawer();
+    await openDrawer();
+    // The phone's only way to Add account is this drawer; its menu opening
+    // inside a modal Sheet is the part a desktop test cannot vouch for.
+    const trigger = screen.getByRole("button", { name: "Add account" });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    fireEvent.pointerUp(trigger, { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: ADD_MATRIX_ACCOUNT_LABEL }));
+    expect(addAccountStore.getState().open).toBe(true);
   });
 
   it("renders as a modal dialog (radix focus-trapping Sheet)", async () => {

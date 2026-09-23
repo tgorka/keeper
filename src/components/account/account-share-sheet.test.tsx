@@ -59,6 +59,11 @@ describe("AccountShareSheet", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: SHARE_COPY_LABEL }));
     await screen.findByRole("button", { name: SHARE_COPIED_LABEL });
+    // The reset timer is set by a passive effect after the "Copied" render. Under
+    // load `findByRole` can resolve before that effect runs, and `act` flushes it
+    // only after its callback — so advancing first would register the timer after
+    // the clock moved and it would never fire. Flush, then advance.
+    await act(async () => {});
     act(() => vi.advanceTimersByTime(SHARE_COPIED_RESET_MS));
     expect(screen.getByRole("button", { name: SHARE_COPY_LABEL })).toBeInTheDocument();
   });
