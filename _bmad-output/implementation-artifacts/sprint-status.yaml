@@ -41,13 +41,24 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-03
-last_updated: 2026-09-20
+last_updated: 2026-09-23
 project: keeper
 project_key: NOKEY
 tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 
 development_status:
+  # Epic 81: the owner's five notes on 0.8.32 — the caret that jumps on save, space definitions as service files, the empty new note that leaves, a scope of several spaces (one or more per drive, a union), history that takes its space with it — triaged, then two items clarified with the owner, before planning.
+  # Stack rungs: epic81-plan (docs), then epic81-fixes (81.1 cursor, 81.2 service files + spaces revision, 81.3 empty note), then epic81-spaces (81.4 multi-space, 81.5 history follows scope). Each rung passed the full macOS gate (scripts/check-macos.sh on hesperia: fmt, clippy -D warnings, workspace tests, bindings) and the Linux frontend gate alone before publication.
+  # Review wave: three bmad-review lanes (shell-as-compiler, core, frontend) -> amendments A1-A11 in the epic's Review-wave amendments; the tip equals the gated tree.
+  epic-81: in-progress
+  81-1-the-caret-stays-where-you-type: review
+  81-2-space-definitions-are-service-files: review
+  81-3-an-untouched-new-note-leaves: review
+  81-4-a-scope-is-a-selection-of-spaces: review
+  81-5-history-takes-its-space-with-it: review
+  # DW-283…DW-289 are opened by this plan; DW-287 closes with 81.3 (review wave A6).
+
   # Epic 80: the tasks half of the 0.8.31 field report — the ledger a chosen drive never got, a tasks drive flagged like a notes drive, a copy row that names its drives, a name over the id, a form that hides what its mode ignores, Finder for both paths.
   # Stack rungs: epic80-tasks-core (80.1 engine/writer/VMs/daemon, 80.2 request/VM/role, 80.3 path facts) then epic80-tasks-surface (80.1 Settings, 80.2 form row + Files icon, 80.3 row/detail/hint primitive, 80.4, 80.5, 80.6).
   # Stack publication is reserved for the coordinator by this checkout's rules.
