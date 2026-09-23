@@ -1342,6 +1342,7 @@ pub async fn account_setup_resolve(
     let vm = state::setup_vm(
         setup_id.clone(),
         &d,
+        descriptor().as_ref(),
         device_name(&data_dir, &d.id),
         device_class(),
         registered,
@@ -1374,7 +1375,7 @@ pub async fn account_setup_confirm(
     // descriptor they were made under: a different account, or the same id
     // pointing at another identity provider, client or repository, starts
     // from none of them — its tokens must never reach the new hosts.
-    let replaced = descriptor().filter(|previous| replaces(previous, &d));
+    let replaced = descriptor().filter(|previous| d.replaces(previous));
     if let Some(previous) = replaced {
         if let Ok(http) = http() {
             // The new sign-in's sheet opens next; a provider sign-out page
@@ -1625,13 +1626,6 @@ fn present_end_session(
             "account: the provider's sign-out page closed"
         );
     });
-}
-
-/// Whether confirming `new` ends `previous`: another id, or the same id
-/// with any sign-in or repository setting changed. Only the display name
-/// may change without a sign-out.
-fn replaces(previous: &AccountDescriptor, new: &AccountDescriptor) -> bool {
-    previous.id != new.id || previous.auth != new.auth || previous.config != new.config
 }
 
 /// Remove what this device keeps for account `account_id`: the drives' and
@@ -1893,46 +1887,6 @@ mod tests {
             "not a url",
         ] {
             assert!(!is_account_callback(other), "{other}");
-        }
-    }
-
-    fn acme() -> AccountDescriptor {
-        descriptor::parse_json(
-            r#"{
-                "version": 1,
-                "id": "acme",
-                "name": "Acme",
-                "auth": { "issuer": "https://id.acme.dev", "client_id": "keeper" },
-                "config": { "url": "https://git.acme.dev/git/people/keeper-config.git" }
-            }"#,
-        )
-        .expect("descriptor")
-    }
-
-    /// A setup under the same id that points anywhere else ends the old
-    /// session; only a new display name keeps it.
-    #[test]
-    fn any_sign_in_or_repository_change_replaces_the_account() {
-        let old = acme();
-        let renamed = AccountDescriptor {
-            name: "Acme Corp".to_owned(),
-            ..acme()
-        };
-        assert!(!replaces(&old, &renamed));
-        assert!(!replaces(&old, &acme()));
-
-        let mut other_issuer = acme();
-        other_issuer.auth.issuer = "https://id.evil.example".to_owned();
-        let mut other_token = acme();
-        other_token.auth.endpoints.token = Some("https://id.acme.dev/other-token".to_owned());
-        let mut other_repo = acme();
-        other_repo.config.url = "https://git.evil.example/keeper-config.git".to_owned();
-        let other_id = AccountDescriptor {
-            id: "globex".to_owned(),
-            ..acme()
-        };
-        for new in [other_issuer, other_token, other_repo, other_id] {
-            assert!(replaces(&old, &new), "{new:?}");
         }
     }
 

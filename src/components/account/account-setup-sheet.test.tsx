@@ -32,6 +32,7 @@ function setupVm(over: Partial<AccountSetupVm> = {}): AccountSetupVm {
     deviceName: "hesperia",
     deviceClass: "desktop",
     registered: false,
+    replaces: null,
     ...over,
   };
 }

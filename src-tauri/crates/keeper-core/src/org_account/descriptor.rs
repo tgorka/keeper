@@ -406,6 +406,13 @@ impl AccountDescriptor {
             RepoAuthConfig::None => "none",
         }
     }
+
+    /// Whether confirming `self` ends `previous`: another id, or the same id
+    /// with any sign-in or repository setting changed. Only the display name
+    /// may change without a sign-out.
+    pub fn replaces(&self, previous: &AccountDescriptor) -> bool {
+        previous.id != self.id || previous.auth != self.auth || previous.config != self.config
+    }
 }
 
 fn host_of(url: &str) -> String {
