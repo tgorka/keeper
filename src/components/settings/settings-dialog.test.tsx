@@ -23,6 +23,27 @@ vi.mock("@/lib/ipc/client", () => ({
       restartCheckIntervalMs: 60_000,
     }),
   ),
+  // Settings › Account (Epic 82) re-reads the account on open. No account is
+  // this suite's world, so every pre-existing section renders exactly as before.
+  accountState: vi.fn(() =>
+    Promise.resolve({
+      configured: false,
+      id: null,
+      name: null,
+      issuerHost: null,
+      repoHost: null,
+      repoMode: null,
+      state: "none",
+      sentence: null,
+      identity: null,
+      device: null,
+      devices: [],
+      lastSyncedMs: null,
+      forgeConnected: false,
+      faults: [],
+      revision: 0,
+    }),
+  ),
   encryptionPosture: vi.fn(() => Promise.resolve(null)),
   honorRemoteDeletions: vi.fn(() => Promise.resolve(false)),
   setHonorRemoteDeletions: vi.fn(() => Promise.resolve()),

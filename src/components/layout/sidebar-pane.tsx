@@ -14,6 +14,7 @@ import {
   Stamp,
   WifiOff,
 } from "lucide-react";
+import { AccountStatusLine } from "@/components/account/account-status-line";
 import { AccountFooter } from "@/components/layout/account-footer";
 import {
   FOLD_STRIP,
@@ -546,6 +547,10 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
           region. The account row is always mounted while signed in; the pill
           shows only while disconnected. */}
       <div className="mt-auto flex shrink-0 flex-col">
+        {/* The account's one line (Epic 82, UX-DR116): beside the offline
+            pill, in its shape, and silent unless the account is offline, needs
+            a sign-in, or was blocked. */}
+        <AccountStatusLine collapsed={collapsed} />
         {/* Persistent offline pill (UX-DR18): shown only while disconnected, using
             the amber `held` tokens. Non-interactive and keyboard-irrelevant;
             `role="status"` announces the connectivity change without a toast. No

@@ -94,22 +94,44 @@ pub fn open_voice_link<'a>(urls: impl IntoIterator<Item = &'a str>) -> bool {
     true
 }
 
-/// Install the deep-link handler: voice links are performed here, and every
-/// other `keeper://` URL goes to `oauth` — the OIDC callback registry that
-/// owned the whole handler before this story. One handler, because the
-/// plugin keeps one, and a second `on_open_url` would replace the first.
+/// Install the deep-link handler: voice links are performed here, a
+/// `keeper://setup` link goes to the account's confirmation sheet (Epic 82),
+/// and every other `keeper://` URL goes to `oauth` — the OIDC callback
+/// registry that owned the whole handler before Story 63.5. One handler,
+/// because the plugin keeps one, and a second `on_open_url` would replace
+/// the first.
+///
+/// A link that launched keeper is routed the same way, once, from
+/// `get_current()` — on Linux and Windows it arrives as a launch argument,
+/// never as an event; on Apple platforms it arrives as the event, after this.
 pub fn install_deep_link(app: &AppHandle, oauth: impl Fn(&str) -> bool + Send + Sync + 'static) {
+    let oauth = std::sync::Arc::new(oauth);
+    let handle = app.clone();
+    let on_event = std::sync::Arc::clone(&oauth);
     app.deep_link().on_open_url(move |event| {
-        let urls = event.urls();
-        if open_voice_link(urls.iter().map(|url| url.as_str())) {
-            tracing::debug!("deep-link: received keeper://voice URL");
-            return;
-        }
-        for url in &urls {
-            let handled = oauth(url.as_str());
-            tracing::debug!(handled, "deep-link: received keeper:// URL");
-        }
+        route_links(&handle, &event.urls(), on_event.as_ref());
     });
+    match app.deep_link().get_current() {
+        Ok(Some(urls)) => route_links(app, &urls, oauth.as_ref()),
+        Ok(None) => {}
+        Err(error) => tracing::debug!(%error, "deep-link: no launch link to read"),
+    }
+}
+
+fn route_links(app: &AppHandle, urls: &[url::Url], oauth: &dyn Fn(&str) -> bool) {
+    if open_voice_link(urls.iter().map(|url| url.as_str())) {
+        tracing::debug!("deep-link: received keeper://voice URL");
+        return;
+    }
+    for url in urls {
+        if crate::account_ipc::is_setup_link(url) {
+            tracing::debug!("deep-link: received keeper://setup URL");
+            crate::account_ipc::setup_link_arrived(app, url.as_str());
+            continue;
+        }
+        let handled = oauth(url.as_str());
+        tracing::debug!(handled, "deep-link: received keeper:// URL");
+    }
 }
 
 /// Refuse a hotkey command where the surface does not exist (AD-27): the

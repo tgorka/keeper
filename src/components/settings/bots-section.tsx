@@ -80,6 +80,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useVoiceFacts } from "@/hooks/use-voice-facts";
@@ -87,6 +88,7 @@ import type {
   BotProbeVm,
   BotProviderVm,
   BotVm,
+  CredentialSource,
   ProviderKind,
   VoiceEventVm,
 } from "@/lib/ipc/client";
@@ -95,12 +97,15 @@ import {
   botsBotRemove,
   botsBotSave,
   botsBotsList,
+  botsProviderCredentialSourceGet,
+  botsProviderCredentialSourceSet,
   botsProviderProbe,
   botsProviderRemove,
   botsProviderSave,
   botsProvidersList,
   voiceEvents,
 } from "@/lib/ipc/client";
+import { accountUsable, useAccountStore } from "@/lib/stores/account";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
@@ -141,6 +146,19 @@ export const BOTS_BASE_URL_NOTE =
 /** What a row with no stored key says. Not a fault by itself — a loopback
  *  Ollama legitimately has none — so it states the fact and stops. */
 export const BOTS_NO_TOKEN_CAPTION = "No key stored.";
+
+/**
+ * The account as this endpoint's key (Epic 82, AD-315, UX-DR116 (5)): sent as
+ * `Authorization: Bearer` with a fresh account token. Offered only while the
+ * account can stand in, or when this endpoint already uses it.
+ */
+export function botsAccountCredentialLabel(accountName: string): string {
+  return `Use my ${accountName} account`;
+}
+export const BOTS_ACCOUNT_CREDENTIAL_NOTE =
+  "keeper sends a fresh token from your account with every request to this endpoint, so no key needs to be stored for it.";
+export const BOTS_ACCOUNT_SOURCE_FAILED_PREFIX =
+  "The endpoint was saved, but keeper could not record where its key comes from: ";
 
 /** What a row whose secret went missing says. This one IS a fault. */
 export const BOTS_SECRET_MISSING_CAPTION =
@@ -625,20 +643,70 @@ export function BotProviderForm({
   const [clearToken, setClearToken] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // Where the key comes from. Read only when an account is configured: an
+  // install without one asks nothing new, and every endpoint is a keychain one.
+  // Read again whenever the account itself changes: Rust answers `account`
+  // only for a row bound to the account configured now, so the answer given
+  // for a previous (forgotten or replaced) account is not this one's.
+  const account = useAccountStore((s) => s.vm);
+  const [source, setSource] = useState<CredentialSource>("keychain");
+  const [storedSource, setStoredSource] = useState<CredentialSource>("keychain");
+  // An add that stored its endpoint but not its source: the retry finishes
+  // THAT endpoint instead of creating a second one (the drive form's
+  // `createdId`).
+  const [createdId, setCreatedId] = useState<string | null>(null);
+  const providerId = provider?.id;
+  const accountId = account.configured ? account.id : null;
+  useEffect(() => {
+    setStoredSource("keychain");
+    setSource("keychain");
+    if (providerId === undefined || accountId === null) {
+      return;
+    }
+    let abandoned = false;
+    void botsProviderCredentialSourceGet(providerId)
+      .then((value) => {
+        if (!abandoned) {
+          setStoredSource(value);
+          setSource(value);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      abandoned = true;
+    };
+  }, [providerId, accountId]);
+  const accountOffered = accountUsable(account) || storedSource === "account";
+  const useAccount = accountOffered && source === "account";
 
   const save = () => {
     setSaving(true);
     setError(null);
+    const nextSource: CredentialSource = useAccount ? "account" : "keychain";
     void botsProviderSave({
-      id: provider?.id ?? null,
+      id: providerId ?? createdId,
       kind,
       name,
       baseUrl,
-      // Blank means unchanged, never cleared — see the module doc.
-      token: token.length === 0 ? null : token,
-      clearToken,
+      // Blank means unchanged, never cleared — see the module doc. With the
+      // account as the key the field is hidden and nothing is sent.
+      token: useAccount || token.length === 0 ? null : token,
+      clearToken: !useAccount && clearToken,
     })
-      .then(onDone)
+      .then(async (saved) => {
+        if (nextSource !== storedSource) {
+          try {
+            await botsProviderCredentialSourceSet(saved.id, nextSource);
+          } catch (raw) {
+            if (provider === undefined) {
+              setCreatedId(saved.id);
+            }
+            setError(`${BOTS_ACCOUNT_SOURCE_FAILED_PREFIX}${syncErrorMessage(raw)}`);
+            return;
+          }
+        }
+        onDone();
+      })
       .catch((raw: unknown) => {
         // Rust's sentence verbatim: the base-URL grammar is its decision and
         // its wording names exactly what was wrong.
@@ -678,24 +746,42 @@ export function BotProviderForm({
         onChange={(event) => setBaseUrl(event.target.value)}
       />
       <p className="text-muted-foreground text-xs">{BOTS_BASE_URL_NOTE}</p>
-      <Label htmlFor="bots-provider-token">{BOTS_TOKEN_LABEL}</Label>
-      <Input
-        id="bots-provider-token"
-        type="password"
-        value={token}
-        onChange={(event) => setToken(event.target.value)}
-      />
-      <p className="text-muted-foreground text-xs">{BOTS_TOKEN_NOTE}</p>
-      {provider?.hasToken === true && (
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          aria-pressed={clearToken}
-          onClick={() => setClearToken(!clearToken)}
-        >
-          {BOTS_CLEAR_TOKEN_LABEL}
-        </Button>
+      {accountOffered && (
+        <div className="flex flex-col gap-1">
+          <Label className="flex items-center gap-2">
+            <Checkbox
+              checked={source === "account"}
+              onCheckedChange={(next) => setSource(next === true ? "account" : "keychain")}
+            />
+            {botsAccountCredentialLabel(account.name ?? "organisation")}
+          </Label>
+          {useAccount && (
+            <p className="text-muted-foreground text-xs">{BOTS_ACCOUNT_CREDENTIAL_NOTE}</p>
+          )}
+        </div>
+      )}
+      {!useAccount && (
+        <>
+          <Label htmlFor="bots-provider-token">{BOTS_TOKEN_LABEL}</Label>
+          <Input
+            id="bots-provider-token"
+            type="password"
+            value={token}
+            onChange={(event) => setToken(event.target.value)}
+          />
+          <p className="text-muted-foreground text-xs">{BOTS_TOKEN_NOTE}</p>
+          {provider?.hasToken === true && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              aria-pressed={clearToken}
+              onClick={() => setClearToken(!clearToken)}
+            >
+              {BOTS_CLEAR_TOKEN_LABEL}
+            </Button>
+          )}
+        </>
       )}
       {error !== null && (
         <p role="alert" className="text-destructive text-xs">

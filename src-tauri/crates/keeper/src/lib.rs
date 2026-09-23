@@ -5,6 +5,11 @@
 // default type-layout recursion depth; raise it as matrix-sdk recommends.
 #![recursion_limit = "256"]
 
+// The organisation account and its config repository (Epic 82): the runtime
+// that joins keeper-core's decisions to keeper-sync's git, and its commands.
+// Every target — the phone signs in and reads its settings from the same
+// repository — and registered in the shared handler list.
+mod account_ipc;
 // The Bots surface's sync-free commands (Epic 61, Story 61.4; split in Story
 // 62.1). On every target: a provider is a URL plus a credential and a
 // conversation two tables in the `keeper.db` every platform already opens.
@@ -129,6 +134,12 @@ mod voice_window;
 // sources (Story 20.4, FR-76) — test-only; it ships no code.
 #[cfg(test)]
 mod zero_egress;
+// The account sign-in's browser leg (Epic 82, AD-311): where a sheet's
+// outcome goes (every target, tested on Linux), and `ASWebAuthenticationSession`
+// itself on the two Apple targets.
+mod web_auth;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod web_auth_apple;
 
 #[cfg(desktop)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -393,6 +404,11 @@ pub fn run() {
                     layers.main_folder.clone(),
                 ));
                 keeper_core::config::install(layers);
+                // The account's two layers (Epic 82, AD-309), from the clone
+                // already on disk, straight after the stack they sit inside
+                // and before the first setting either could change is read.
+                // No network, and nothing at all without `account.toml`.
+                account_ipc::boot(app.state::<ipc::AppState>().platform.as_ref());
                 let imported = keeper_core::registry::import_config_file(&data_dir);
                 debug_log::init(&data_dir);
                 // First, so every line under it can be read as "this build said".
@@ -435,14 +451,29 @@ pub fn run() {
             }
 
             // Forward every incoming `keeper://` deep link: `keeper://voice/talk`
-            // starts a turn (Story 63.5, FR-422) and everything else goes to
-            // the OAuth-callback registry, which matches it to its in-flight
-            // OIDC flow by the `state` query param (Story 2.2). An unmatched /
-            // spurious callback is ignored inside `resolve`. The registry
-            // lives in the managed `AppState` and is cloned into the `'static`
-            // handler.
+            // starts a turn (Story 63.5, FR-422), an organisation account's
+            // `keeper://oauth/<id>/…` callback goes to the account's own
+            // registry (Epic 82), and everything else to the Matrix
+            // OAuth-callback registry, which matches it to its in-flight OIDC
+            // flow by the `state` query param (Story 2.2). An unmatched /
+            // spurious callback is ignored inside `resolve`. The registries
+            // live in the managed `AppState` and are cloned into the
+            // `'static` handler.
             let flows = app.state::<ipc::AppState>().oauth_flows.clone();
-            voice_reach::install_deep_link(app.handle(), move |url| flows.resolve(url));
+            let account_flows = app.state::<ipc::AppState>().account_flows.clone();
+            // Only the account's sign-ins are shown in the sheet (Epic 82).
+            web_auth::install(app.handle(), account_flows.clone());
+            // This phone's idiom and model, read here because setup runs on
+            // the UIKit main thread and `UIDevice` wants it.
+            #[cfg(target_os = "ios")]
+            account_ipc::init_device();
+            voice_reach::install_deep_link(app.handle(), move |url| {
+                if account_ipc::is_account_callback(url) {
+                    account_flows.resolve(url)
+                } else {
+                    flows.resolve(url)
+                }
+            });
 
             // Build + install the native menu bar from the action registry (Story
             // 9.3): standard macOS App/Edit/Window submenus plus one generated
@@ -821,6 +852,12 @@ pub fn run() {
             #[cfg(desktop)]
             sessions_root::start(app.handle());
 
+            // The account's network half (Epic 82): sign-in state is already
+            // known from the keychain and the layers are already in force from
+            // the clone, so this only fetches, publishes and swaps the layers
+            // if the repository moved. Nothing without an account.
+            account_ipc::kick(app.handle());
+
             Ok(())
         });
 
@@ -956,6 +993,25 @@ pub fn run() {
                 voice_reach::voice_hotkey_get,
                 voice_reach::voice_hotkey_set,
                 voice_reach::voice_hotkey_clear,
+                // The organisation account (Epic 82): every target, in the
+                // shared body, because the phone signs in too and the
+                // Account section is present on every tier.
+                account_ipc::account_state,
+                account_ipc::account_subscribe,
+                account_ipc::account_unsubscribe,
+                account_ipc::account_setup_resolve,
+                account_ipc::account_setup_confirm,
+                account_ipc::account_sign_in,
+                account_ipc::account_cancel_sign_in,
+                account_ipc::account_sync,
+                account_ipc::account_rename_device,
+                account_ipc::account_share,
+                account_ipc::account_sign_out,
+                account_ipc::account_forget,
+                account_ipc::sync_credential_source_get,
+                account_ipc::sync_credential_source_set,
+                account_ipc::bots_provider_credential_source_get,
+                account_ipc::bots_provider_credential_source_set,
                 ipc::bridge_catalog,
                 ipc::bridge_discover,
                 ipc::bridge_login_start,

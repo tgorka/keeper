@@ -92,11 +92,16 @@ type PlatformRecorder = crate::recorder::IosRecorder;
 pub struct AppState {
     pub platform: Arc<dyn Platform>,
     pub accounts: AccountManager,
-    /// In-flight OIDC (OAuth 2.0 / MSC3861) callback registry (Story 2.2). The
-    /// deep-link `on_open_url` handler resolves incoming `keeper://oauth/callback`
-    /// URLs against it; each `login_oidc` call registers its pending flow here,
-    /// and `cancel_oidc` aborts all pending flows.
+    /// In-flight Matrix OIDC (OAuth 2.0 / MSC3861) callback registry (Story
+    /// 2.2). The deep-link `on_open_url` handler resolves incoming
+    /// `keeper://oauth/callback` URLs against it; each `login_oidc` call
+    /// registers its pending flow here, and `cancel_oidc` aborts all pending
+    /// flows — which is why the organisation account keeps its own.
     pub oauth_flows: Arc<OAuthFlowRegistry>,
+    /// In-flight organisation-account sign-ins (Epic 82): the sign-in sheet,
+    /// the loopback listener and `keeper://oauth/<id>/…` deep links resolve
+    /// here, so cancelling a Matrix sign-in never ends an account's.
+    pub account_flows: Arc<OAuthFlowRegistry>,
     /// In-flight Beeper email-code login registry (Story 2.3). Holds the
     /// intermediate login-request id between `beeper_request_code` and
     /// `login_beeper` (keyed by email) so it never crosses IPC; `cancel_beeper`
@@ -485,6 +490,7 @@ impl AppState {
             accounts: AccountManager::new(platform.as_ref(), &data_dir),
             platform,
             oauth_flows: Arc::new(OAuthFlowRegistry::new()),
+            account_flows: Arc::new(OAuthFlowRegistry::new()),
             beeper_flows: Arc::new(BeeperFlowRegistry::new()),
             exports: Arc::new(ExportRegistry::default()),
             copies: Arc::new(crate::copy_ipc::CopyRegistry::default()),
@@ -713,6 +719,20 @@ impl Platform for DesktopPlatform {
             .map_err(|e| CoreError::Internal(format!("could not open the system browser: {e}")))
     }
 
+    /// The account sign-in (Epic 82, AD-311): `ASWebAuthenticationSession`
+    /// over the main window on macOS, whose callback comes straight back to
+    /// the flow registry; a redirect the sheet cannot match (a loopback
+    /// `http` one) opens the default browser as before. Linux and Windows
+    /// keep the port's default — the browser plus the `keeper://` deep link.
+    #[cfg(target_os = "macos")]
+    fn start_web_auth(&self, url: &str, callback_scheme: &str) -> Result<(), CoreError> {
+        if crate::web_auth::sheet_can_deliver(callback_scheme) {
+            crate::web_auth::start(url, callback_scheme)
+        } else {
+            self.open_url(url)
+        }
+    }
+
     fn notify(&self, title: &str, body: &str, target: &NotifyTarget) -> Result<(), CoreError> {
         use tauri_plugin_notification::NotificationExt;
 
@@ -896,6 +916,17 @@ impl Platform for IosPlatform {
         // it hands the URL to the OS (Safari / the default handler).
         tauri_plugin_opener::open_url(url, None::<&str>)
             .map_err(|e| CoreError::Internal(format!("could not open the system browser: {e}")))
+    }
+
+    /// The account sign-in (Epic 82, AD-311): `ASWebAuthenticationSession`
+    /// over the main window, which returns the callback itself rather than
+    /// through a `keeper://` link Launch Services has to deliver.
+    fn start_web_auth(&self, url: &str, callback_scheme: &str) -> Result<(), CoreError> {
+        if crate::web_auth::sheet_can_deliver(callback_scheme) {
+            crate::web_auth::start(url, callback_scheme)
+        } else {
+            self.open_url(url)
+        }
     }
 
     fn notify(&self, title: &str, body: &str, target: &NotifyTarget) -> Result<(), CoreError> {
@@ -2213,12 +2244,13 @@ pub async fn login_oidc(
     .map_err(to_ipc_error)
 }
 
-/// Cancel any in-progress OIDC flow(s) (Story 2.2).
+/// Cancel any in-progress Matrix OIDC flow(s) (Story 2.2).
 ///
-/// Aborts every pending flow in the registry (there is at most one add-account
-/// flow at a time in the UI); the awaiting `authenticate` resolves as cancelled,
-/// `add_account` rolls back, and the UI returns quietly to the form. Idempotent —
-/// with no pending flow it is a no-op.
+/// Aborts every pending flow in the Matrix registry (there is at most one
+/// add-account flow at a time in the UI); the awaiting `authenticate` resolves
+/// as cancelled, `add_account` rolls back, and the UI returns quietly to the
+/// form. An organisation-account sign-in waits in its own registry and is not
+/// touched. Idempotent — with no pending flow it is a no-op.
 #[tauri::command]
 pub fn cancel_oidc(state: State<'_, AppState>) -> Result<(), IpcError> {
     state.oauth_flows.cancel_all();
@@ -11870,6 +11902,14 @@ pub async fn egress_list(
     if let Some(destination) = telemetry.egress() {
         destinations.push(destination);
     }
+    // The account's destinations (Epic 82): the sign-in host, the host the
+    // setup link was fetched from when this run knows it, the config
+    // repository and, in `oauth` mode, the forge — none without an account.
+    let (descriptor, source) = crate::account_ipc::egress_inputs();
+    destinations.extend(keeper_core::egress::org_account_egress(
+        descriptor.as_ref(),
+        source.as_ref(),
+    ));
     Ok(destinations)
 }
 

@@ -77,6 +77,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { AccountStatusPill, useAccountStatusShown } from "@/components/account/account-status-line";
 import { ApprovalPane } from "@/components/approval/approval-pane";
 import { BotsPhoneConversation, BotsPhoneList } from "@/components/bots/bots-phone-pane";
 import { CapturePhoneSheet } from "@/components/capture/capture-phone-sheet";
@@ -784,22 +785,7 @@ export function PhoneShell() {
   // `!offline`), so at most one connectivity indicator ever shows. Clears the
   // moment connectivity returns (`offline` flips false) — never a toast; the UI
   // keeps rendering from the local mirror throughout.
-  const offlinePill =
-    isReducedCapability && offline && !refreshing && pullDy === null ? (
-      <div
-        data-testid="offline-band"
-        className="pointer-events-none absolute top-[calc(var(--safe-top)+var(--phone-header))] right-0 left-0 z-10 flex justify-center pt-2"
-      >
-        <div
-          role="status"
-          data-testid="offline-pill"
-          className="flex items-center gap-2 rounded-full bg-held/10 px-3 py-1.5 text-held text-xs shadow-xs"
-        >
-          <WifiOff aria-hidden="true" className="size-4 shrink-0" />
-          <span>{OFFLINE_PILL_TEXT}</span>
-        </div>
-      </div>
-    ) : null;
+  const showOfflinePill = isReducedCapability && offline && !refreshing && pullDy === null;
 
   // The stale-resume "Connecting…" pill (Story 14.4): a quiet transient indicator
   // under the Inbox header while a resumed sync is still answering. Hidden while
@@ -811,19 +797,43 @@ export function PhoneShell() {
   // never overlap; a passive resume with no gesture still shows it (Review R2).
   // Clears on the sync answering or its own timeout backstop — never stuck.
   const connecting = useStaleResumePill();
-  const connectingPill =
-    connecting && !refreshing && !offline && pullDy === null ? (
+  const showConnectingPill = connecting && !refreshing && !offline && pullDy === null;
+
+  // The organisation account's line (Epic 82, UX-DR116 (4)) sits beside the
+  // offline pill, as it does in the sidebar footer: this shell is what the
+  // phone AND a desktop window below the sidebar breakpoint render, so without
+  // it "sign in again", "blocked" and "offline" would have no surface outside
+  // Settings there. Not tier-gated — it speaks for the account, not for the
+  // connection — and it yields the slot to the pull gesture and the refresh
+  // like the pills above it.
+  const showAccountPill = useAccountStatusShown() !== null && !refreshing && pullDy === null;
+
+  const statusBand =
+    showOfflinePill || showConnectingPill || showAccountPill ? (
       <div
-        data-testid="stale-resume-band"
-        className="pointer-events-none absolute top-[calc(var(--safe-top)+var(--phone-header))] right-0 left-0 z-10 flex justify-center pt-2"
+        data-testid="status-band"
+        className="pointer-events-none absolute top-[calc(var(--safe-top)+var(--phone-header))] right-0 left-0 z-10 flex flex-col items-center gap-1 pt-2"
       >
-        <div
-          role="status"
-          data-testid="stale-resume-pill"
-          className="rounded-full bg-held/10 px-3 py-1.5 text-held text-xs shadow-xs"
-        >
-          Connecting…
-        </div>
+        {showOfflinePill && (
+          <div
+            role="status"
+            data-testid="offline-pill"
+            className="flex items-center gap-2 rounded-full bg-held/10 px-3 py-1.5 text-held text-xs shadow-xs"
+          >
+            <WifiOff aria-hidden="true" className="size-4 shrink-0" />
+            <span>{OFFLINE_PILL_TEXT}</span>
+          </div>
+        )}
+        {showConnectingPill && (
+          <div
+            role="status"
+            data-testid="stale-resume-pill"
+            className="rounded-full bg-held/10 px-3 py-1.5 text-held text-xs shadow-xs"
+          >
+            Connecting…
+          </div>
+        )}
+        {showAccountPill && <AccountStatusPill />}
       </div>
     ) : null;
 
@@ -886,8 +896,7 @@ export function PhoneShell() {
         {level === 0 && drawerOpenZone}
         {level === 0 && pullDownZone}
         {level === 0 && pullIndicator}
-        {level === 0 && offlinePill}
-        {level === 0 && connectingPill}
+        {level === 0 && statusBand}
         <PhoneInboxHeader drawerButtonRef={drawerButtonRef} magnifierRef={magnifierRef} />
         <div className="flex min-h-0 min-w-0 flex-1">
           <ChatListPane />

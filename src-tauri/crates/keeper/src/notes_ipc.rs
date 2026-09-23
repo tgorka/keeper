@@ -1166,6 +1166,7 @@ async fn query_embedding(
         }
     }
     let endpoint = notes_vault::embedding_endpoint(platform, &model.provider)
+        .await
         .map_err(|_| "the provider is unavailable")?;
     let client = notes_vault::embedding_client().map_err(|_| "the provider is unavailable")?;
     let inputs = vec![format!("{}{query}", embed::query_prefix(&model.model))];

@@ -6,6 +6,7 @@ import { RecordingAdvancedControls } from "@/components/recording/recording-adva
 import { RecordingDestinationControls } from "@/components/recording/recording-destination-controls";
 import { SessionsSettingsSection } from "@/components/sessions/sessions-settings";
 import { AboutSection } from "@/components/settings/about-section";
+import { AccountSection } from "@/components/settings/account-section";
 import {
   SDK_STORE_ENCRYPTED_STATUS,
   SDK_STORE_STATUS_LOADING,
@@ -211,6 +212,11 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
 
   return (
     <>
+      {/* First, on every tier, behind no capability (Epic 82, UX-DR116): an
+          account is how settings arrive on a device, so setting one up is the
+          first thing Settings offers — and with no account it is one sentence
+          and one field, so an install that never meets one loses nothing. */}
+      <AccountSection open={open} />
       <div className="flex min-w-0 flex-col gap-3 text-sm">
         <p>{sdkStatus}</p>
         <p className="text-muted-foreground">{STORAGE_HONESTY_SENTENCE}</p>

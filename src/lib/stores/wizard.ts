@@ -21,8 +21,13 @@ import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
 import { accountsStore } from "@/lib/stores/accounts";
 
-/** The ordered steps of the first-run wizard. */
-export type WizardStep = "welcome" | "addAccount" | "discovery" | "done";
+/**
+ * The steps of the first-run wizard. `orgAccount` is the optional one (Epic
+ * 82): reached from Welcome, or opened by a setup link, and outside the
+ * numbered path — skipping it continues to `addAccount` exactly as Welcome's
+ * own button does.
+ */
+export type WizardStep = "welcome" | "orgAccount" | "addAccount" | "discovery" | "done";
 
 export interface WizardState {
   /** Whether the wizard surface is currently shown (takes precedence over the shell). */

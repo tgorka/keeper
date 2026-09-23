@@ -93,6 +93,18 @@ targets:
         # reason as the two sentences above — the build's plist merge is the last
         # word, and install-ios.sh reads the key off the installed bundle.
         NSSupportsLiveActivities: true
+        # The `keeper://` scheme (Epic 82, AD-311): without it Launch Services
+        # has nowhere to deliver `keeper://setup?…` — the setup link a person
+        # taps or the Camera app reads off a QR code — nor any `keeper://oauth/…`
+        # callback that does not come back through the sign-in sheet. The
+        # deep-link plugin writes the same entry at build time from
+        # tauri.conf.json's `plugins.deep-link.mobile`, and removes the key
+        # when that list is empty, so the two must agree. Duplicated in
+        # crates/keeper/Info.ios.plist for the same reason as the sentences
+        # above: that file is the last word in the build's plist merge.
+        CFBundleURLTypes:
+          - CFBundleURLName: keeper
+            CFBundleURLSchemes: [keeper]
     entitlements:
       path: keeper_iOS/keeper_iOS.entitlements
       # Source of truth for the entitlements (Story 14.7, FR-65): XcodeGen REGENERATES
@@ -143,6 +155,11 @@ targets:
       # discipline of the two above rather than a necessity — the framework is
       # named where every other one is, and `otool -L` on the bundle proves it.
       - sdk: ActivityKit.framework
+      # The account sign-in sheet (Epic 82): `ASWebAuthenticationSession` is
+      # reached only by class name from `web_auth_apple.rs`, so like Speech it
+      # is linked by this line or not at all — without it the sheet's class is
+      # missing at run time and sign-in cannot start.
+      - sdk: AuthenticationServices.framework
       # The widget extension that draws the Live Activity, embedded under
       # PlugIns/ (XcodeGen's `embed` defaults to true on an application target;
       # ProjectSpec.md, "Dependency"). Its shared attributes file is compiled

@@ -222,26 +222,26 @@ pub(crate) fn bot_of(dir: &Path, bot_id: &str) -> Result<Bot, IpcError> {
 /// somebody clears the entry in Keychain Access. A keychain failure reads as
 /// "no credential", which is the honest floor: `has_token` drives a sentence
 /// about a missing credential, and claiming one is present on a port keeper
-/// could not read would be the claim that lies.
+/// could not read would be the claim that lies. A provider set to use the
+/// account has one by construction (Epic 82, AD-315).
 fn has_provider_token(state: &AppState, provider_id: &str) -> bool {
-    keeper_core::bots::resolve_token(state.platform.as_ref(), provider_id, None)
-        .ok()
-        .flatten()
-        .is_some()
+    crate::account_ipc::provider_has_credential(state.platform.as_ref(), provider_id)
 }
 
 /// Assemble the endpoint for one provider, optionally addressing one bot.
 ///
-/// The token comes from `keeper_core::bots::resolve_token`, which knows the
-/// bot-then-provider fallback order the far side demands; the join of base URL,
-/// kind and profile prefix is `Endpoint::url`'s. Neither is re-derived here.
-fn endpoint_of(
+/// The token comes from `keeper_core::bots::resolve_credential`, which knows
+/// the bot-then-provider fallback order the far side demands and the
+/// provider's choice of the account instead; the join of base URL, kind and
+/// profile prefix is `Endpoint::url`'s. Neither is re-derived here.
+async fn endpoint_of(
     state: &AppState,
     row: &store::ProviderRow,
     bot: Option<&str>,
 ) -> Result<Endpoint, IpcError> {
-    let token = keeper_core::bots::resolve_token(state.platform.as_ref(), &row.provider.id, bot)
-        .map_err(to_ipc_error)?;
+    let token = crate::account_ipc::bot_credential(state.platform.as_ref(), &row.provider.id, bot)
+        .await
+        .map_err(crate::account_ipc::account_ipc_error)?;
     Ok(Endpoint::new(&row.provider, bot, token))
 }
 
@@ -282,7 +282,10 @@ async fn session_caps(state: &AppState, row: &store::ProviderRow) -> SessionCapa
     if let Some(caps) = capabilities().get(&provider.id, &provider.base_url) {
         return caps;
     }
-    let caps = match (endpoint_of(state, row, None), discover::discovery_client()) {
+    let caps = match (
+        endpoint_of(state, row, None).await,
+        discover::discovery_client(),
+    ) {
         (Ok(endpoint), Ok(client)) => remote::probe_capabilities(&client, &endpoint).await,
         _ => SessionCapabilities::NONE,
     };
@@ -326,7 +329,7 @@ async fn reconcile_remote(state: &AppState, dir: &Path) {
             return;
         };
         for bot in &bots {
-            let Ok(endpoint) = endpoint_of(state, row, Some(&bot.target)) else {
+            let Ok(endpoint) = endpoint_of(state, row, Some(&bot.target)).await else {
                 continue;
             };
             match remote::list_sessions(&client, &endpoint).await {
@@ -508,7 +511,7 @@ pub async fn bots_provider_probe(
     // asked again too on the next list read — the way a gateway that came
     // back from a dead spell gets its session API noticed.
     capabilities().forget(&provider_id);
-    let endpoint = endpoint_of(&state, &row, None)?;
+    let endpoint = endpoint_of(&state, &row, None).await?;
     let client = http::client(read_timeout_of(&row)).map_err(bots_error)?;
     let probe = discover::health(&client, &endpoint).await;
     let health = ProviderHealth {
@@ -539,7 +542,7 @@ pub async fn bots_models_list(
 ) -> Result<Vec<BotModelVm>, IpcError> {
     let dir = data_dir(&state)?;
     let row = provider_of(&dir, &provider_id)?;
-    let endpoint = endpoint_of(&state, &row, bot.as_deref())?;
+    let endpoint = endpoint_of(&state, &row, bot.as_deref()).await?;
     let client = http::client(read_timeout_of(&row)).map_err(bots_error)?;
     discover::models(&client, &endpoint)
         .await
@@ -569,7 +572,7 @@ pub async fn bots_bot_probe(
 ) -> Result<BotProbeVm, IpcError> {
     let dir = data_dir(&state)?;
     let row = provider_of(&dir, &provider_id)?;
-    let endpoint = endpoint_of(&state, &row, Some(&target))?;
+    let endpoint = endpoint_of(&state, &row, Some(&target)).await?;
     let client = http::client(read_timeout_of(&row)).map_err(bots_error)?;
     Ok(discover::probe_bot(&client, &endpoint, &target).await)
 }
@@ -794,7 +797,9 @@ async fn remote_history(
         return None;
     }
     let bot = store::get_bot(dir, &row.bot_id).ok().flatten()?;
-    let endpoint = endpoint_of(state, &provider, Some(&bot.target)).ok()?;
+    let endpoint = endpoint_of(state, &provider, Some(&bot.target))
+        .await
+        .ok()?;
     let client = discover::discovery_client().ok()?;
     match remote::fetch_messages(&client, &endpoint, remote_id).await {
         Ok(found) => Some(found),
@@ -1234,7 +1239,7 @@ async fn open_turn(
     let dir = data_dir(state)?;
     let bot = bot_of(&dir, &req.bot_id)?;
     let row = provider_of(&dir, &bot.provider_id)?;
-    let endpoint = endpoint_of(state, &row, Some(&bot.target))?;
+    let endpoint = endpoint_of(state, &row, Some(&bot.target)).await?;
     let now = now_ms();
 
     // The conversation, created on the first message so a titled conversation
@@ -1416,7 +1421,7 @@ async fn offered_models(state: &AppState, dir: &Path, bot: &Bot) -> Vec<BotModel
     let Ok(row) = provider_of(dir, &bot.provider_id) else {
         return Vec::new();
     };
-    let Ok(endpoint) = endpoint_of(state, &row, Some(&bot.target)) else {
+    let Ok(endpoint) = endpoint_of(state, &row, Some(&bot.target)).await else {
         return Vec::new();
     };
     let Ok(client) = http::client(read_timeout_of(&row)) else {
@@ -1492,7 +1497,7 @@ pub async fn bots_message_retry(
         .ok_or_else(|| no_such("conversation", &req.session_id))?;
     let bot = bot_of(&dir, &session_row.bot_id)?;
     let row = provider_of(&dir, &bot.provider_id)?;
-    let endpoint = endpoint_of(&state, &row, Some(&bot.target))?;
+    let endpoint = endpoint_of(&state, &row, Some(&bot.target)).await?;
     let continuity = adopt_identity(&state, &dir, &row, &mut session_row).await?;
 
     let history = session::list_messages(&dir, &req.session_id).map_err(to_ipc_error)?;
@@ -2131,7 +2136,7 @@ pub(crate) async fn discovered_model(
     model: &str,
 ) -> Option<BotModelVm> {
     let row = provider_of(dir, &bot.provider_id).ok()?;
-    let endpoint = endpoint_of(state, &row, Some(&bot.target)).ok()?;
+    let endpoint = endpoint_of(state, &row, Some(&bot.target)).await.ok()?;
     let client = http::client(read_timeout_of(&row)).ok()?;
     let models = discover::models(&client, &endpoint).await.ok()?;
     models.into_iter().find(|candidate| candidate.id == model)

@@ -51,6 +51,11 @@ export function telemetryRemoteConfig(): Promise<TelemetryRemoteConfigVm> {
   return invoke("telemetry_remote_config");
 }
 
+export type { AccountDeviceVm } from "./gen/AccountDeviceVm";
+export type { AccountIdentityVm } from "./gen/AccountIdentityVm";
+export type { AccountSetupVm } from "./gen/AccountSetupVm";
+export type { AccountShareVm } from "./gen/AccountShareVm";
+export type { AccountStateVm } from "./gen/AccountStateVm";
 export type { AccountVm } from "./gen/AccountVm";
 export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 export type { AuditOutcome } from "./gen/AuditOutcome";
@@ -129,6 +134,7 @@ export type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
 export type { DaemonPresence } from "./gen/DaemonPresence";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
+export type { DeviceClassVm } from "./gen/DeviceClassVm";
 export type { DiscoveredBridgeVm } from "./gen/DiscoveredBridgeVm";
 export type { DockBadgeMode } from "./gen/DockBadgeMode";
 export type { DocumentFormat } from "./gen/DocumentFormat";
@@ -240,6 +246,7 @@ export type { NoteVaultVm } from "./gen/NoteVaultVm";
 export type { NoteWriteVm } from "./gen/NoteWriteVm";
 export type { NotificationPermission } from "./gen/NotificationPermission";
 export type { NotifyTarget } from "./gen/NotifyTarget";
+export type { OrgAccountVm } from "./gen/OrgAccountVm";
 export type { OutboxVm } from "./gen/OutboxVm";
 export type { PacedWorkKind } from "./gen/PacedWorkKind";
 export type { PacedWorkStanding } from "./gen/PacedWorkStanding";
@@ -395,6 +402,8 @@ export type { WordBlockVm } from "./gen/WordBlockVm";
 export type { WordRunVm } from "./gen/WordRunVm";
 export type { WordsVm } from "./gen/WordsVm";
 
+import type { AccountSetupVm } from "./gen/AccountSetupVm";
+import type { AccountShareVm } from "./gen/AccountShareVm";
 import type { AccountVm } from "./gen/AccountVm";
 import type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 import type { BackupStatus } from "./gen/BackupStatus";
@@ -488,6 +497,7 @@ import type { NoteTemplateVm } from "./gen/NoteTemplateVm";
 import type { NoteVaultSettingsReq } from "./gen/NoteVaultSettingsReq";
 import type { NoteVaultVm } from "./gen/NoteVaultVm";
 import type { NoteWriteVm } from "./gen/NoteWriteVm";
+import type { OrgAccountVm } from "./gen/OrgAccountVm";
 import type { OutboxVm } from "./gen/OutboxVm";
 import type { PacedWorkVm } from "./gen/PacedWorkVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
@@ -7679,5 +7689,149 @@ export async function listenSpokenStream(
 ): Promise<() => void> {
   return await listen<BotStreamEvent>(BOTS_SPOKEN_STREAM_EVENT, (event) => {
     onEvent(event.payload);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The optional account (Epic 82, AD-308…AD-316).
+//
+// One organisation account per install: an OIDC sign-in whose token is a
+// general credential, plus a per-person config repository. Every sentence the
+// UI shows about it is Rust's (`OrgAccountVm.sentence`); nothing here composes
+// a state word. No token ever crosses this boundary — the credential-source
+// setters below name WHERE a credential comes from, never what it is.
+// ---------------------------------------------------------------------------
+
+/** The account as Rust sees it now. No network: it reads the descriptor and the stored session. */
+export async function accountState(): Promise<OrgAccountVm> {
+  return await invoke<OrgAccountVm>("account_state");
+}
+
+/**
+ * Follow the account: a snapshot on subscribe, then every change — sign-in
+ * progress, a repository sync, going offline. Resolves with the subscription
+ * id; {@link accountUnsubscribe} tears it down.
+ */
+export async function accountSubscribe(onVm: (vm: OrgAccountVm) => void): Promise<string> {
+  return await subscribeWithStringId<OrgAccountVm>("account_subscribe", onVm);
+}
+
+/** Stop following the account. */
+export async function accountUnsubscribe(subscriptionId: string): Promise<void> {
+  await invoke<void>("account_unsubscribe", { subscriptionId });
+}
+
+/**
+ * Read a setup link, a descriptor URL or a pasted link, fetch the descriptor
+ * when it is a URL, and answer what the confirmation sheet shows. Nothing is
+ * written; Rust keeps the parsed descriptor by `setupId` for the confirm.
+ * Rejects with Rust's own sentence on a refusal.
+ */
+export async function accountSetupResolve(input: string): Promise<AccountSetupVm> {
+  return await invoke<AccountSetupVm>("account_setup_resolve", { input });
+}
+
+/**
+ * Continue from the confirmation sheet: store the descriptor, sign in, connect
+ * the forge where the descriptor asks for it, sync the repository and apply
+ * its settings. Progress arrives over {@link accountSubscribe}; this resolves
+ * with where it ended.
+ */
+export async function accountSetupConfirm(
+  setupId: string,
+  deviceName: string,
+): Promise<OrgAccountVm> {
+  return await invoke<OrgAccountVm>("account_setup_confirm", { setupId, deviceName });
+}
+
+/** Sign in again with the stored descriptor. */
+export async function accountSignIn(): Promise<OrgAccountVm> {
+  return await invoke<OrgAccountVm>("account_sign_in");
+}
+
+/** Cancel a sign-in whose browser round trip is still open. */
+export async function accountCancelSignIn(): Promise<void> {
+  await invoke<void>("account_cancel_sign_in");
+}
+
+/**
+ * Fetch the config repository and re-apply its settings. Rust throttles an
+ * unforced call to one per 15 minutes, which is why the window-focus caller
+ * passes `false` and "Sync now" passes `true`. Rust runs no timer of its own
+ * (AD-62), so these two callers ARE the schedule.
+ */
+export async function accountSync(force: boolean): Promise<OrgAccountVm> {
+  return await invoke<OrgAccountVm>("account_sync", { force });
+}
+
+/** Rename this device; its two files inside the person's directory move in one commit. */
+export async function accountRenameDevice(name: string): Promise<OrgAccountVm> {
+  return await invoke<OrgAccountVm>("account_rename_device", { name });
+}
+
+/** The setup link for another device or person, and its QR code as SVG. */
+export async function accountShare(): Promise<AccountShareVm> {
+  return await invoke<AccountShareVm>("account_share");
+}
+
+/**
+ * Sign out: the session is revoked and forgotten and the account's settings
+ * stop applying. The descriptor and the local copy of the repository stay, so
+ * signing in again needs no setup link.
+ */
+export async function accountSignOut(): Promise<OrgAccountVm> {
+  return await invoke<OrgAccountVm>("account_sign_out");
+}
+
+/**
+ * Forget the account on this device: sign out, delete `account.toml` and the
+ * local copy of the repository. The repository on the server is never touched.
+ */
+export async function accountForget(): Promise<OrgAccountVm> {
+  return await invoke<OrgAccountVm>("account_forget");
+}
+
+/** Where a credential comes from: this device's keychain, or the account. */
+export type CredentialSource = "keychain" | "account";
+
+/** Where a drive's git credential comes from (AD-315). */
+export async function syncCredentialSourceGet(profileId: string): Promise<CredentialSource> {
+  return await invoke<CredentialSource>("sync_credential_source_get", { profileId });
+}
+
+/** Choose where a drive's git credential comes from. */
+export async function syncCredentialSourceSet(
+  profileId: string,
+  source: CredentialSource,
+): Promise<void> {
+  await invoke<void>("sync_credential_source_set", { profileId, source });
+}
+
+/** Where a bot endpoint's key comes from (AD-315). */
+export async function botsProviderCredentialSourceGet(
+  providerId: string,
+): Promise<CredentialSource> {
+  return await invoke<CredentialSource>("bots_provider_credential_source_get", { providerId });
+}
+
+/** Choose where a bot endpoint's key comes from. */
+export async function botsProviderCredentialSourceSet(
+  providerId: string,
+  source: CredentialSource,
+): Promise<void> {
+  await invoke<void>("bots_provider_credential_source_set", { providerId, source });
+}
+
+/**
+ * The Tauri event the shell emits when a `keeper://setup?…` link reaches
+ * keeper — while it runs, or the link that started it. The payload is the
+ * link as received; the webview opens the confirmation sheet on it.
+ */
+export const ACCOUNT_SETUP_EVENT = "keeper://account-setup";
+
+/** Subscribe to setup links. Resolves with an unlisten function. */
+export async function listenAccountSetup(onLink: (link: string) => void): Promise<() => void> {
+  return await listen<string>(ACCOUNT_SETUP_EVENT, (event) => {
+    onLink(event.payload);
   });
 }

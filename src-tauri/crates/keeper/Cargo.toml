@@ -73,6 +73,10 @@ tauri-plugin-notification = { workspace = true }
 # Percent-decoding raw-body IPC headers (filename/caption) for the pasted-image
 # send path (Story 3.7). Already in the tree via url/matrix-sdk.
 percent-encoding = { workspace = true }
+# The account's setup links and callback URLs (Epic 82): `keeper://setup`
+# routing and the descriptor's source URL are `url::Url`s from keeper-core
+# and the deep-link plugin. Already in the tree; only the edge is new.
+url = { workspace = true }
 
 [dev-dependencies]
 # Paused-clock (`tokio::time::pause`) tests for the quit finalize bound (Story
@@ -149,6 +153,13 @@ objc2-avf-audio = { workspace = true }
 # Story 64.2, AD-182, AD-188): `NLLanguageRecognizer`, reached only from
 # `voice_macos.rs`'s audited `detect_language`. No network path.
 objc2-natural-language = { workspace = true }
+# The account sign-in sheet (Epic 82, AD-311): `ASWebAuthenticationSession`
+# with the main window's `NSWindow` as its anchor, reached only from
+# `web_auth_apple.rs`'s audited functions (docs/constraints-and-limitations.md).
+# The sheet shares Safari's cookies (non-ephemeral), so the identity provider's
+# session and a passkey manager's prompt both carry over.
+objc2-authentication-services = { workspace = true }
+objc2-app-kit = { workspace = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 security-framework = { workspace = true }
@@ -168,7 +179,11 @@ objc2-user-notifications = { workspace = true }
 # window's view controller, reached only from `share_ios.rs`'s one audited
 # `#[allow(unsafe_code)]` function. Already in the tree through wry/tao; only
 # the edge (and the classes the feature list names) is new.
-objc2-ui-kit = { workspace = true }
+# The window is the account sign-in sheet's presentation anchor (Epic 82,
+# `web_auth_apple.rs`), and `UIDevice`'s idiom and model name this device's
+# class and default name in the account's config repository (AD-314) — both
+# safe bindings, read on the main thread.
+objc2-ui-kit = { workspace = true, features = ["UIWindow", "UIDevice"] }
 # The voice port (Epic 62, Story 62.4, AD-165–AD-167): `SFSpeechRecognizer` +
 # `SFSpeechAudioBufferRecognitionRequest` (objc2-speech) and `AVAudioSession`,
 # `AVAudioEngine`, `AVSpeechSynthesizer` (objc2-avf-audio), reached only from
@@ -189,3 +204,6 @@ objc2-avf-audio = { workspace = true }
 # `voice_ios.rs`'s audited `detect_language`. No network path.
 objc2-natural-language = { workspace = true }
 block2 = { workspace = true }
+# The account sign-in sheet (Epic 82, AD-311): the same crate and module as the
+# macOS table above; the anchor is the main window's `UIWindow`.
+objc2-authentication-services = { workspace = true }

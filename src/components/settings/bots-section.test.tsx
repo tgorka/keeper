@@ -33,7 +33,7 @@
  *   the device reported — so a Polish phone with English assets can pick
  *   English here as well as in the sheet.
  */
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VOICE_TARGET_LABEL, VOICE_TARGET_RECENT_LABEL } from "@/components/bots/bot-voice-target";
 import { VOICE_LOCALE_LABEL, WAKE_SWITCH_LABEL } from "@/components/bots/bot-voice-wake";
@@ -54,6 +54,7 @@ import {
   BOTS_TOKEN_LABEL,
   BotsSection,
   botProbeSentence,
+  botsAccountCredentialLabel,
   formatVoiceEventAge,
   removalSentence,
   VOICE_EVENTS_EMPTY,
@@ -71,8 +72,10 @@ import type {
   BotVm,
   VoiceEventVm,
 } from "@/lib/ipc/client";
+import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { voiceStore } from "@/lib/stores/voice";
+import { accountVm } from "@/test/account-fixture";
 
 const botsProvidersList = vi.fn();
 const botsBotsList = vi.fn();
@@ -86,6 +89,8 @@ const voiceAvailability = vi.fn();
 const voiceWakeGet = vi.fn();
 const voiceEvents = vi.fn();
 const voiceTargetSet = vi.fn();
+const botsProviderCredentialSourceGet = vi.fn();
+const botsProviderCredentialSourceSet = vi.fn();
 
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
@@ -105,6 +110,10 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     voiceTargetSet: (botId: string | null) => voiceTargetSet(botId),
     // Epic 68 (AD-216): the picker reads each bot's first-token median too.
     voiceTargetSpeeds: () => Promise.resolve([]),
+    // Epic 82: where an endpoint's key comes from. Read only with an account.
+    botsProviderCredentialSourceGet: (id: string) => botsProviderCredentialSourceGet(id),
+    botsProviderCredentialSourceSet: (id: string, source: string) =>
+      botsProviderCredentialSourceSet(id, source),
   };
 });
 
@@ -384,6 +393,83 @@ describe("BotsSection", () => {
       "Ollama here is removed, along with every bot on it and the key stored for it.",
     );
     expect(dialog).toHaveTextContent("Conversations you have already had are kept.");
+  });
+});
+
+describe("BotProviderForm with an organisation account (Epic 82, AD-315)", () => {
+  afterEach(() => {
+    accountStore.setState({ vm: NO_ACCOUNT, setupLink: null });
+  });
+
+  it("offers the account as the key only while it is usable, and sends no key when chosen", async () => {
+    botsProviderCredentialSourceGet.mockResolvedValue("keychain");
+    botsProviderCredentialSourceSet.mockResolvedValue(undefined);
+    render(<BotsSection open />);
+    const endpoints = await screen.findByRole("list", { name: "Endpoints" });
+    fireEvent.click(within(endpoints).getByRole("button", { name: BOTS_EDIT_LABEL }));
+    const USE_ACME = botsAccountCredentialLabel("Acme");
+    // No account: the form is exactly what it was.
+    expect(screen.queryByLabelText(USE_ACME)).not.toBeInTheDocument();
+    expect(botsProviderCredentialSourceGet).not.toHaveBeenCalled();
+
+    act(() => accountStore.getState().setVm(accountVm()));
+    await waitFor(() => expect(botsProviderCredentialSourceGet).toHaveBeenCalledWith("prov-1"));
+    fireEvent.change(screen.getByLabelText(BOTS_TOKEN_LABEL), { target: { value: "sk-typed" } });
+    fireEvent.click(screen.getByLabelText(USE_ACME));
+    expect(screen.queryByLabelText(BOTS_TOKEN_LABEL)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: BOTS_SAVE_LABEL }));
+    await waitFor(() =>
+      expect(botsProviderCredentialSourceSet).toHaveBeenCalledWith("prov-1", "account"),
+    );
+    expect(botsProviderSave).toHaveBeenCalledWith(
+      expect.objectContaining({ token: null, clearToken: false }),
+    );
+  });
+
+  it("finishes the endpoint it created when the source write failed, instead of adding another", async () => {
+    const created: BotProviderVm = { ...PROVIDER, id: "prov-new", name: "Work" };
+    botsProvidersList.mockResolvedValue([]);
+    botsBotsList.mockResolvedValue([]);
+    botsProviderSave.mockResolvedValue(created);
+    botsProviderCredentialSourceSet
+      .mockRejectedValueOnce({ code: "internal", message: "disk full" })
+      .mockResolvedValue(undefined);
+    accountStore.getState().setVm(accountVm());
+    render(<BotsSection open />);
+    fireEvent.click(await screen.findByRole("button", { name: BOTS_ADD_PROVIDER_LABEL }));
+    fireEvent.change(screen.getByLabelText(BOTS_NAME_LABEL), { target: { value: "Work" } });
+    fireEvent.click(screen.getByLabelText(botsAccountCredentialLabel("Acme")));
+
+    fireEvent.click(screen.getByRole("button", { name: BOTS_SAVE_LABEL }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("disk full");
+    fireEvent.click(screen.getByRole("button", { name: BOTS_SAVE_LABEL }));
+
+    await waitFor(() => expect(botsProviderSave).toHaveBeenCalledTimes(2));
+    expect(botsProviderSave.mock.calls.map(([request]) => request.id)).toEqual([null, "prov-new"]);
+    // The choice survived the failure: the retry still asks for the account.
+    await waitFor(() =>
+      expect(botsProviderCredentialSourceSet).toHaveBeenLastCalledWith("prov-new", "account"),
+    );
+  });
+
+  it("reads the key's source again when the account is replaced", async () => {
+    botsProviderCredentialSourceGet.mockResolvedValue("account");
+    accountStore.getState().setVm(accountVm());
+    render(<BotsSection open />);
+    const endpoints = await screen.findByRole("list", { name: "Endpoints" });
+    fireEvent.click(within(endpoints).getByRole("button", { name: BOTS_EDIT_LABEL }));
+    expect(await screen.findByLabelText(botsAccountCredentialLabel("Acme"))).toBeChecked();
+    expect(screen.queryByLabelText(BOTS_TOKEN_LABEL)).not.toBeInTheDocument();
+
+    // A different account now: Rust answers for the row as bound to IT, and a
+    // row bound to Acme is a keychain row as far as Globex is concerned.
+    botsProviderCredentialSourceGet.mockResolvedValue("keychain");
+    act(() => accountStore.getState().setVm(accountVm({ id: "globex", name: "Globex" })));
+
+    expect(await screen.findByLabelText(BOTS_TOKEN_LABEL)).toBeInTheDocument();
+    expect(screen.getByLabelText(botsAccountCredentialLabel("Globex"))).not.toBeChecked();
+    expect(botsProviderCredentialSourceGet).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -9,6 +9,7 @@ import type {
   InboxRoomVm,
   SyncProfileVm,
 } from "@/lib/ipc/client";
+import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
@@ -21,6 +22,7 @@ import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
 import { searchSurfaceStore } from "@/lib/stores/search-surface";
+import { accountVm } from "@/test/account-fixture";
 
 // Mock the typed IPC wrapper so the mounted panes never touch Tauri. The inbox
 // subscription captures its `onInbox` handler so a test can stream rows; every
@@ -1273,6 +1275,64 @@ describe("PhoneShell persistent offline pill (Story 14.6)", () => {
     arrangeOfflineAccount();
     render(<PhoneShell />);
     expect(screen.queryByTestId("offline-pill")).not.toBeInTheDocument();
+  });
+});
+
+describe("PhoneShell organisation account line (Epic 82, UX-DR116 (4))", () => {
+  const BLOCKED =
+    "This sign-in belongs to someone else: tgorka/user.toml records a different account. Settings from the repository were not loaded.";
+
+  afterEach(() => {
+    accountStore.setState({ vm: NO_ACCOUNT, setupLink: null });
+  });
+
+  it("speaks on a narrow desktop window, where this shell replaces the sidebar", () => {
+    // beforeEach leaves the desktop-safe default: this is not the phone tier.
+    accountStore.getState().setVm(accountVm({ state: "blocked", sentence: BLOCKED }));
+    render(<PhoneShell />);
+
+    expect(screen.getByText(BLOCKED).closest("[role=status]")).not.toBeNull();
+  });
+
+  it("sits beside the phone's offline pill rather than replacing it", () => {
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    accountsStore.getState().addAccount(account);
+    act(() => {
+      accountStatusStore.getState().setStatus(account.accountId, "offline");
+    });
+    accountStore.getState().setVm(
+      accountVm({
+        state: "needsSignIn",
+        sentence: "Sign in again to keep your settings in sync.",
+      }),
+    );
+    render(<PhoneShell />);
+
+    expect(screen.getByTestId("offline-pill")).toBeInTheDocument();
+    expect(
+      screen.getByText("Sign in again to keep your settings in sync.").closest("[role=status]"),
+    ).not.toBeNull();
+  });
+
+  it("yields the header slot to a pull gesture, then returns", () => {
+    mockRectWidth(390);
+    accountStore.getState().setVm(accountVm({ state: "blocked", sentence: BLOCKED }));
+    render(<PhoneShell />);
+    expect(screen.getByText(BLOCKED)).toBeInTheDocument();
+
+    const zone = screen.getByTestId("pull-down-search");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientY: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientY: 40 });
+    expect(screen.queryByText(BLOCKED)).not.toBeInTheDocument();
+
+    fireEvent.pointerCancel(zone, { pointerId: 1 });
+    expect(screen.getByText(BLOCKED)).toBeInTheDocument();
+  });
+
+  it("is silent while the account is up to date", () => {
+    accountStore.getState().setVm(accountVm());
+    render(<PhoneShell />);
+    expect(screen.queryByText("Up to date.")).not.toBeInTheDocument();
   });
 });
 

@@ -74,7 +74,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { IconHint } from "@/components/ui/tooltip";
-import type { SyncProfileVm } from "@/lib/ipc/client";
+import type { CredentialSource, SyncProfileVm } from "@/lib/ipc/client";
 // The credential calls are made straight from the form rather than through the
 // mirror store: none of them change anything the store mirrors, and the read
 // belongs to one open of one form rather than to state worth keeping in sync.
@@ -82,10 +82,13 @@ import type { SyncProfileVm } from "@/lib/ipc/client";
 // so it is followed by a refresh of that mirror.
 import {
   syncClearCredential,
+  syncCredentialSourceGet,
+  syncCredentialSourceSet,
   syncFolderTasksFlag,
   syncGetCredential,
   syncSetCredential,
 } from "@/lib/ipc/client";
+import { accountUsable, useAccountStore } from "@/lib/stores/account";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import {
   ensureNotesVaultsHydrated,
@@ -591,6 +594,20 @@ export const SYNC_TOKEN_EDIT_FAILED_PREFIX =
   "The changes were saved, but the token was not stored: ";
 export const SYNC_TOKEN_REMOVE_FAILED_PREFIX =
   "The changes were saved, but the token was not removed: ";
+
+/**
+ * The account as this folder's credential (Epic 82, AD-315, UX-DR116 (5)).
+ * Offered only while an account can actually stand in — or when this folder
+ * already uses it, so the choice can be undone — and choosing it HIDES the
+ * token field rather than disabling it: there is nothing to type.
+ */
+export function syncAccountCredentialLabel(accountName: string): string {
+  return `Use my ${accountName} account`;
+}
+export const SYNC_ACCOUNT_CREDENTIAL_NOTE =
+  "keeper signs this folder's git requests with your account, asking it for a fresh token each time, so no token needs to be stored for this folder.";
+export const SYNC_ACCOUNT_SOURCE_FAILED_PREFIX =
+  "The folder was saved, but keeper could not record where its credential comes from: ";
 
 /** The submit, worded for what it does, and the way out of a revealed form. */
 export const SYNC_ADD_SUBMIT_LABEL = "Add folder";
@@ -1280,6 +1297,44 @@ export function AddFolderForm({
   }, [profileId]);
 
   /**
+   * Where this folder's credential comes from (AD-315): the keychain token
+   * below, or the account. Read only when an account is configured — an
+   * install without one asks nothing new (the epic's first rule) and every
+   * folder there is a keychain folder by definition. Read again whenever the
+   * account itself changes: Rust answers `account` only for a row bound to the
+   * account configured now, so what it said about a forgotten or replaced
+   * account is not this one's answer.
+   */
+  const account = useAccountStore((s) => s.vm);
+  const [source, setSource] = useState<CredentialSource>("keychain");
+  const [storedSource, setStoredSource] = useState<CredentialSource>("keychain");
+  const accountId = account.configured ? account.id : null;
+  useEffect(() => {
+    setStoredSource("keychain");
+    setSource("keychain");
+    if (profileId === undefined || accountId === null) {
+      return;
+    }
+    let abandoned = false;
+    void syncCredentialSourceGet(profileId)
+      .then((value) => {
+        if (!abandoned) {
+          setStoredSource(value);
+          setSource(value);
+        }
+      })
+      .catch(() => {
+        // Unread ⇒ the keychain answer stands, which is what every folder was
+        // before accounts existed; the choice is still offered to change it.
+      });
+    return () => {
+      abandoned = true;
+    };
+  }, [profileId, accountId]);
+  const accountOffered = accountUsable(account) || storedSource === "account";
+  const useAccount = accountOffered && source === "account";
+
+  /**
    * What the notes flag currently IS on disk, as against what the form shows.
    *
    * A save writes the flag only when these two disagree, so a folder that is not
@@ -1424,7 +1479,12 @@ export function AddFolderForm({
     // with, so a keychain read landing mid-save cannot change what the save
     // means. The field on its own cannot tell "remove it" from "keeper never
     // found out what is there".
-    const credential = credentialWrite(stored, form.token);
+    // A folder that signs with the account touches no keychain token: the
+    // field is hidden, so whatever it holds is not an instruction.
+    const credential: CredentialWrite = useAccount
+      ? { kind: "none" }
+      : credentialWrite(stored, form.token);
+    const nextSource: CredentialSource = useAccount ? "account" : "keychain";
     // Read off the form before anything is written, so the request cannot be
     // changed by whatever the awaits below do to the fields: the add branch
     // blanks the draft, but only once the whole save — profile *and* token —
@@ -1539,6 +1599,24 @@ export function AddFolderForm({
       // Remember the created profile before the folder-file leg, so a retry
       // cannot create another profile if that write is refused.
       if (!editing) setCreatedId(saved.id);
+      // Where the credential comes from, when that changed — FIRST, straight
+      // after the save that gave the folder its id. Saving a profile can start
+      // its first pass at once, and a pass that runs before this row lands
+      // runs with no credential at all and records an authentication failure.
+      // Its own write and its own failure, for the token leg's reason below:
+      // the folder is stored.
+      if (nextSource !== storedSource) {
+        try {
+          await syncCredentialSourceSet(saved.id, nextSource);
+        } catch (raw) {
+          setError(`${SYNC_ACCOUNT_SOURCE_FAILED_PREFIX}${syncErrorMessage(raw)}`);
+          onSaved?.(saved, false);
+          return;
+        }
+        if (editing) {
+          setStoredSource(nextSource);
+        }
+      }
       let tasksNotice: string | null = null;
       if (!reducedCapability && !folderOwned.has("tasks") && (form.tasks || profile?.tasks)) {
         const result = await syncFolderTasksFlag(saved.id, form.tasks ? form.tasksSubfolder : null);
@@ -1633,6 +1711,7 @@ export function AddFolderForm({
         setForm(EMPTY_FORM);
         setTokenVisible(false);
         setCreatedId(null);
+        setSource("keychain");
       }
       onSaved?.(saved, true);
     } catch (raw) {
@@ -2350,10 +2429,29 @@ export function AddFolderForm({
           <p className="text-muted-foreground text-xs">{SYNC_AUTHOR_NOTE}</p>
         </div>
       )}
+      {/* The account as the credential (Epic 82): first-order rather than
+          inside Advanced, because it is the easy path the account exists to
+          offer — and present only where it can work (UX-DR116 (5)). */}
+      {accountOffered && (
+        <div className="flex flex-col gap-1">
+          <Label className="flex items-center gap-2">
+            <Checkbox
+              checked={source === "account"}
+              disabled={disabled || saving}
+              onCheckedChange={(next) => setSource(next === true ? "account" : "keychain")}
+            />
+            {syncAccountCredentialLabel(account.name ?? "organisation")}
+          </Label>
+          {useAccount && (
+            <p className="text-muted-foreground text-xs">{SYNC_ACCOUNT_CREDENTIAL_NOTE}</p>
+          )}
+        </div>
+      )}
       {/* The credential: last inside Advanced on the desktop, and a first-order
           field on the phone (Story 66.1, AD-199), where a profile IS a remote
-          URL plus a credential and there is no disclosure to open. */}
-      {(expanded || reducedCapability) && (
+          URL plus a credential and there is no disclosure to open. Absent, not
+          disabled, while the account is the credential. */}
+      {(expanded || reducedCapability) && !useAccount && (
         <div className={cn("flex flex-col gap-2", !reducedCapability && "pl-1")}>
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor={`${fieldId}-token`}>{SYNC_TOKEN_LABEL}</Label>

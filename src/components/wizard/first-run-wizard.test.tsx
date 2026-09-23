@@ -1,8 +1,10 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SETUP_LINK_LABEL } from "@/components/account/account-setup-sheet";
 import type { BridgeCatalogState } from "@/hooks/use-bridge-catalog";
 import type { BridgeDiscoveryState } from "@/hooks/use-bridge-discovery";
 import type { AccountVm, BridgeDiscoveryVm, BridgeNetworkVm } from "@/lib/ipc/client";
+import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { accountsStore } from "@/lib/stores/accounts";
 import { wizardStore } from "@/lib/stores/wizard";
 
@@ -71,7 +73,12 @@ vi.mock("@/lib/ipc/client", () => ({
 const mockToastError = vi.hoisted(() => vi.fn());
 vi.mock("sonner", () => ({ toast: { error: mockToastError } }));
 
-import { FirstRunWizard, SKIP_AT_STARTUP_LABEL } from "@/components/wizard/first-run-wizard";
+import {
+  FirstRunWizard,
+  ORG_ACCOUNT_SKIP_LABEL,
+  ORG_ACCOUNT_STEP_LABEL,
+  SKIP_AT_STARTUP_LABEL,
+} from "@/components/wizard/first-run-wizard";
 
 const matrixNetwork: BridgeNetworkVm = {
   networkId: "whatsapp",
@@ -396,5 +403,37 @@ describe("FirstRunWizard", () => {
     expect(wizardStore.getState().active).toBe(false);
     // With an account added, finish() does not dismiss into an empty inbox.
     expect(wizardStore.getState().dismissed).toBe(false);
+  });
+
+  describe("the optional organisation-account step (Epic 82)", () => {
+    afterEach(() => {
+      accountStore.setState({ vm: NO_ACCOUNT, setupLink: null });
+    });
+
+    it("is chosen from Welcome, hands a pasted link to the sheet, and skips to Add account", () => {
+      render(<FirstRunWizard />);
+      fireEvent.click(screen.getByRole("button", { name: ORG_ACCOUNT_STEP_LABEL }));
+      expect(wizardStore.getState().step).toBe("orgAccount");
+      // Outside the numbered path: it says so rather than "Step 0 of 4".
+      expect(screen.getByText(`Optional: ${ORG_ACCOUNT_STEP_LABEL}`)).toBeInTheDocument();
+
+      fireEvent.change(screen.getByLabelText(SETUP_LINK_LABEL), {
+        target: { value: "keeper://setup?d=eyJ9" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      expect(accountStore.getState().setupLink).toBe("keeper://setup?d=eyJ9");
+
+      fireEvent.click(screen.getByRole("button", { name: ORG_ACCOUNT_SKIP_LABEL }));
+      expect(wizardStore.getState().step).toBe("addAccount");
+    });
+
+    it("opens on a setup link that arrives while Welcome is up — the link that started keeper", () => {
+      render(<FirstRunWizard />);
+      expect(wizardStore.getState().step).toBe("welcome");
+
+      act(() => accountStore.getState().openSetup("keeper://setup?d=eyJ9"));
+
+      expect(wizardStore.getState().step).toBe("orgAccount");
+    });
   });
 });

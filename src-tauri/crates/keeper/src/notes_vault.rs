@@ -1204,7 +1204,7 @@ async fn sync_search(
     }).await.unwrap_or(false)
 }
 
-pub(crate) fn embedding_endpoint(
+pub(crate) async fn embedding_endpoint(
     platform: &dyn Platform,
     provider: &str,
 ) -> Result<keeper_core::bots::Endpoint, String> {
@@ -1215,7 +1215,8 @@ pub(crate) fn embedding_endpoint(
     let row = store::get_provider(&dir, provider)
         .map_err(|_| "Could not read the embedding provider.")?
         .ok_or("Embedding provider is missing — choose one in Settings.")?;
-    let token = keeper_core::bots::resolve_token(platform, provider, None)
+    let token = crate::account_ipc::bot_credential(platform, provider, None)
+        .await
         .map_err(|_| "Could not read the embedding provider credential.")?;
     Ok(Endpoint::new(&row.provider, None, token))
 }
@@ -1315,7 +1316,7 @@ async fn embed_tick(
         backfill.complete = true;
         return;
     }
-    let endpoint = match embedding_endpoint(state.platform.as_ref(), &model.provider) {
+    let endpoint = match embedding_endpoint(state.platform.as_ref(), &model.provider).await {
         Ok(endpoint) => endpoint,
         Err(sentence) => {
             backfill.refused = true;
