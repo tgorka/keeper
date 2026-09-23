@@ -594,6 +594,20 @@ pub const KEYS: &[KeySpec] = &[
         example: "",
     },
     KeySpec {
+        key: "notes.pristine.",
+        family: true,
+        scope: Scope::SessionState,
+        settable: Settable::Never(
+            "it lists the notes keeper created on this device that nobody has written in yet, \
+             so it can remove them when their editor closes or at the next start",
+        ),
+        shape: Shape::Json,
+        default: "",
+        summary: "Per notes drive: the new notes nobody has written in yet, and what creation put \
+                  in each.",
+        example: "",
+    },
+    KeySpec {
         key: "notes.read.",
         family: true,
         scope: Scope::SessionState,

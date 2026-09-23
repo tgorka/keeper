@@ -182,7 +182,7 @@ let spaceList: NoteSpaceVm[] = SEEDED_SPACES;
  * flag must be one the entry carries. No row here carries any flag but
  * `recording`, exactly as `has_flag` would report.
  *
- * A `spaceId` is resolved the way Rust resolves it: the space's stored query
+ * The first of `spaces` is resolved the way Rust resolves it: the space's stored query
  * text is parsed and applied, and then its `keeper.limit` caps what the space
  * SELECTS (Story 44.11). Only the `is:` forms the seeded defaults use are
  * understood here, and an unknown one throws rather than quietly matching
@@ -194,9 +194,10 @@ let spaceList: NoteSpaceVm[] = SEEDED_SPACES;
  * test can tell a count of the set from a count of the page.
  */
 function evaluate(vaultId: string, query: NoteQueryReq): NoteListVm {
-  const stored = spaceList.find((candidate) => candidate.id === query.spaceId);
-  if (query.spaceId !== null && stored === undefined) {
-    throw new Error(`no such space: ${query.spaceId}`);
+  const spaceId = query.spaces[0]?.spaceId;
+  const stored = spaceList.find((candidate) => candidate.id === spaceId);
+  if (spaceId !== undefined && stored === undefined) {
+    throw new Error(`no such space: ${spaceId}`);
   }
   const rows = (contents[vaultId] ?? []).filter((candidate) => {
     for (const [tag, term] of Object.entries(query.tags)) {
@@ -357,7 +358,7 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
 
 import { COLUMN_COLLAPSE_PREFIX, COLUMN_EXPAND_PREFIX } from "@/components/layout/surface-column";
 import { NOTE_DELETE_CANCEL, NOTE_DELETE_CONFIRM } from "@/components/notes/note-delete-dialog";
-import { NOTES_SEARCH_PLACEHOLDER } from "@/components/notes/note-filter-bar";
+import { NOTES_SEARCH_PLACEHOLDER, SAVE_UNION_REFUSED } from "@/components/notes/note-filter-bar";
 import {
   NOTES_COUNT_SLOT,
   NOTES_NOTICE_SLOT,
@@ -418,6 +419,21 @@ it("saves through the pane naming flow and reveals the acknowledged row without 
   fireEvent.submit(name.closest("form") as HTMLFormElement);
   expect(await screen.findByRole("button", { name: "Quarterly budget" })).toBeVisible();
   expect(notesFiltersStore.getState().text).toBe("Pricing");
+});
+
+it("says why ⌘⇧S cannot save a selection of several spaces", async () => {
+  renderPane();
+  await waitForRows("Pricing");
+  act(() => {
+    const filters = notesFiltersStore.getState();
+    filters.toggleSpace({ id: "x", name: "Work", vaultId: "vault-a", defaultKey: null });
+    filters.toggleSpace({ id: "y", name: "Home", vaultId: "vault-a", defaultKey: null });
+  });
+
+  fireEvent.keyDown(window, { key: "S", metaKey: true, shiftKey: true });
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(SAVE_UNION_REFUSED);
+  expect(screen.queryByLabelText("Name")).toBeNull();
 });
 
 it("opens a result in its owning drive even when another drive is active", async () => {
@@ -971,7 +987,7 @@ describe("NotesPane rail", () => {
 
     // `a4` carries `session:`; `a1` does not, and no tag, folder or filename
     // convention distinguishes them — only the seeded space's own `is:recording`
-    // does, sent as a `spaceId` and evaluated against the space the vault holds.
+    // does, sent in `spaces` and evaluated against the space the vault holds.
     await waitFor(() => {
       expect(screen.queryByRole("button", { name: /Note, Pricing/ })).not.toBeInTheDocument();
     });

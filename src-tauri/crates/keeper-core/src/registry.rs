@@ -1559,6 +1559,104 @@ pub fn set_capture_draft(
     set_setting(data_dir, &capture_draft_key(key), &value)
 }
 
+/// The `settings` key prefix listing the notes keeper created in one drive that
+/// nobody has written in yet, as far as this device knows (AD-304):
+/// `notes.pristine.<vault_id>`.
+///
+/// **One row per drive holding a list**, not a row per note: the settings table
+/// cannot enumerate a prefix, so the next start could not find per-note rows a
+/// crash left behind, and every note ever created would leave a cleared row.
+const NOTES_PRISTINE_PREFIX: &str = "notes.pristine.";
+
+/// A new note nobody has written in yet, and what creation wrote into it.
+///
+/// The whole file is kept, read back from disk, rather than recomposed: a
+/// template's `{{now}}` makes creation's bytes unrepeatable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PristineNote {
+    /// The note's stable id: a rename keeps it.
+    pub note_id: String,
+    /// The vault-relative path creation wrote.
+    pub path: String,
+    /// The whole file creation wrote, frontmatter included.
+    pub document: String,
+}
+
+impl PristineNote {
+    /// Whether `on_disk`, read at `path`, is still what creation wrote.
+    ///
+    /// `false` when the path moved (a rename is somebody's act), when the
+    /// frontmatter block differs once `updated` is taken out of both — a tag, a
+    /// pin, a property, or a DIFFERENT note that reused the freed filename and
+    /// so carries another `id` — or when the body differs beyond surrounding
+    /// whitespace ([`CaptureDraft::is_untouched`]'s rule: a save may settle a
+    /// trailing newline nobody typed). `updated` is the one field every save
+    /// restamps, so a note typed in and typed back to nothing still counts as
+    /// nothing written.
+    pub fn is_untouched(&self, path: &str, on_disk: &str) -> bool {
+        use crate::notes::frontmatter::Frontmatter;
+
+        if path != self.path {
+            return false;
+        }
+        let was = Frontmatter::remove_in(&self.document, "updated");
+        let now = Frontmatter::remove_in(on_disk, "updated");
+        let (_, was_at) = Frontmatter::parse(&was);
+        let (_, now_at) = Frontmatter::parse(&now);
+        was[..was_at] == now[..now_at] && was[was_at..].trim() == now[now_at..].trim()
+    }
+}
+
+/// The `settings` key for one drive's pristine notes.
+fn pristine_notes_key(vault_id: &str) -> String {
+    format!("{NOTES_PRISTINE_PREFIX}{vault_id}")
+}
+
+/// Read the pristine notes recorded for one drive (AD-304).
+///
+/// Absent, cleared and unreadable all read as an empty list: the worst a lost
+/// row costs is an empty note that stays. Only unreadable content warns, as
+/// [`get_capture_draft`] does, because the cleared value is the ordinary state.
+pub fn get_pristine_notes(data_dir: &Path, vault_id: &str) -> Result<Vec<PristineNote>, CoreError> {
+    let Some(raw) = get_setting(data_dir, &pristine_notes_key(vault_id))? else {
+        return Ok(Vec::new());
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    match serde_json::from_str::<Vec<PristineNote>>(&raw) {
+        Ok(notes) => Ok(notes),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %vault_id,
+                "notes: the list of untouched new notes is malformed; they will be kept"
+            );
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// Write one drive's pristine notes; an empty slice writes the cleared value
+/// `""`, which [`get_pristine_notes`] reads back silently.
+pub fn set_pristine_notes(
+    data_dir: &Path,
+    vault_id: &str,
+    notes: &[PristineNote],
+) -> Result<(), CoreError> {
+    let value = if notes.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(notes).map_err(|error| {
+            CoreError::Internal(format!(
+                "could not serialise the untouched new notes: {error}"
+            ))
+        })?
+    };
+    set_setting(data_dir, &pristine_notes_key(vault_id), &value)
+}
+
 /// The `settings` key prefix for one capture window's remembered placement
 /// (Story 45.15, FR-192).
 ///
@@ -3420,6 +3518,109 @@ mod tests {
         assert!(
             !blank.is_untouched("ring the dentist"),
             "a thought, however short, is a page of its own"
+        );
+    }
+
+    #[test]
+    fn pristine_notes_are_per_drive_and_clear_to_absent() {
+        let dir = temp_dir();
+        assert_eq!(get_pristine_notes(&dir, "v1").expect("absent"), Vec::new());
+        let one = PristineNote {
+            note_id: "01ONE".to_owned(),
+            path: "2026-09-23-untitled.md".to_owned(),
+            document: "---\nid: 01ONE\n---\n".to_owned(),
+        };
+        let two = PristineNote {
+            note_id: "01TWO".to_owned(),
+            path: "inbox/2026-09-23-untitled.md".to_owned(),
+            document: "---\nid: 01TWO\n---\n# Daily\n".to_owned(),
+        };
+        set_pristine_notes(&dir, "v1", std::slice::from_ref(&one)).expect("set v1");
+        set_pristine_notes(&dir, "v2", std::slice::from_ref(&two)).expect("set v2");
+        assert_eq!(get_pristine_notes(&dir, "v1").expect("v1"), vec![one]);
+        assert_eq!(
+            get_pristine_notes(&dir, "v2").expect("v2"),
+            vec![two.clone()],
+            "one drive's row must not move another's"
+        );
+
+        set_pristine_notes(&dir, "v1", &[]).expect("clear v1");
+        assert_eq!(get_pristine_notes(&dir, "v1").expect("cleared"), Vec::new());
+        assert_eq!(
+            get_setting(&dir, "notes.pristine.v1").expect("raw row"),
+            Some(String::new()),
+            "the cleared value is the empty string, read back silently"
+        );
+        assert_eq!(get_pristine_notes(&dir, "v2").expect("v2 kept"), vec![two]);
+
+        // A row keeper cannot read keeps every note: nothing is removed on a guess.
+        set_setting(&dir, "notes.pristine.v2", "{ not json").expect("corrupt");
+        assert_eq!(
+            get_pristine_notes(&dir, "v2").expect("malformed"),
+            Vec::new()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pristine_note_is_untouched_until_somebody_writes_or_names_it() {
+        use crate::notes::frontmatter::{FieldValue, Frontmatter};
+
+        let path = "2026-09-23-untitled.md";
+        let document = "---\nid: 01NEW\ncreated: 2026-09-23T10:00:00+02:00\n\
+                        updated: 2026-09-23T10:00:00+02:00\n---\n# Daily\n";
+        let pristine = PristineNote {
+            note_id: "01NEW".to_owned(),
+            path: path.to_owned(),
+            document: document.to_owned(),
+        };
+        assert!(pristine.is_untouched(path, document), "as created");
+
+        // Every save restamps `updated` and may settle a trailing newline: a
+        // note typed in and typed back to nothing is still nothing written.
+        let saved = Frontmatter::set_in(
+            document,
+            "updated",
+            FieldValue::Str("2026-09-23T10:05:00+02:00".to_owned()),
+        );
+        assert_ne!(saved, document);
+        assert!(
+            pristine.is_untouched(path, &format!("{saved}\n\n")),
+            "restamped"
+        );
+        assert!(
+            pristine.is_untouched(path, &saved.replace("# Daily\n", "# Daily  \n \n")),
+            "whitespace around the body is not writing"
+        );
+
+        assert!(
+            !pristine.is_untouched(path, &format!("{document}ring the dentist\n")),
+            "a word in the body"
+        );
+        let tagged = Frontmatter::set_in(
+            document,
+            "tags",
+            FieldValue::List(vec![FieldValue::Str("work".to_owned())]),
+        );
+        assert!(
+            !pristine.is_untouched(path, &tagged),
+            "a tag is somebody's act"
+        );
+        let pinned = Frontmatter::set_in(document, "pinned", FieldValue::Bool(true));
+        assert!(!pristine.is_untouched(path, &pinned), "so is a pin");
+        let property = Frontmatter::set_in(document, "status", FieldValue::Str("draft".to_owned()));
+        assert!(!pristine.is_untouched(path, &property), "and a property");
+
+        // The filename a removed note freed is reused by the next untitled note:
+        // the same bytes but another id is somebody else's note.
+        let other = document.replace("01NEW", "01OTHER");
+        assert!(
+            !pristine.is_untouched(path, &other),
+            "a different note at the same path"
+        );
+        assert!(
+            !pristine.is_untouched("renamed.md", document),
+            "a rename is somebody's act"
         );
     }
 

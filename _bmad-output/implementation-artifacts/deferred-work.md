@@ -6476,3 +6476,53 @@ Six read-only lanes verified every open entry of this ledger against the tree on
 - **L5379** — the fix must accept leaking one thread per hung mount per pass (uninterruptible syscall, uncancellable) — a design decision, not an edit.
 - **L5450** — widening `branch`/`excludes`/`tags` to `Option` moves three fields across the EXPRESSED/PRESERVED classification — an API decision, and the shell crate cannot build here.
 - **L5593** — `size` vs `size_bytes` is a published-contract break (docs/sync.md §13); do it at the next deliberate `--json` version bump together with L4397's discriminator.
+
+### DW-283: Saved prompts inside a union narrow by words and do not rank or use meaning.
+
+origin: epic 81's plan, 2026-09-23 (AD-306, bp-spaces P2)
+location: `src-tauri/crates/keeper/src/notes_ipc.rs` (`project_list`'s `LensTest.words` / `PromptWords`, `sole_prompt`, `LAST_EMBEDDING`), `src-tauri/crates/keeper-core/src/notes/merge.rs` (`merge_rows`)
+reason: inside a union, a space's saved prompt selects through the lexical pool and does not rank. A single space is unchanged and still ranks by its prompt with meaning. Ranking a union would cost one embedding per distinct prompt per list refresh. `LAST_EMBEDDING` caches one, so every keystroke and every stream wake would call the provider once per prompt. `merge_rows` would then compare scores computed from different texts across drives. Only unions holding text-bearing spaces (parked and bar-saved searches) are affected. Revisit when a union is reported missing a note that one of its spaces finds alone. The shape is a per-prompt embedding cache keyed by text, plus a rank rule that never compares scores across texts.
+status: open
+
+### DW-284: Save a same-drive selection of spaces as one space, `(a) | (b)`.
+
+origin: epic 81's plan, 2026-09-23 (AD-306, bp-spaces P4, UX-DR111)
+location: `src/hooks/use-notes-actions.ts` (`captureSpaceDraft`), `src-tauri/crates/keeper/src/notes_ipc.rs` (`compose_space_query`, `notes_space_save`), `src-tauri/crates/keeper-core/src/notes/query.rs` (the `|` operator)
+reason: *Save as space* is disabled for two or more members, because one saved space cannot carry per-drive meaning (DW-268). When every member lives on one drive, the DSL can express the union as `(a) | (b)` over the members' composed queries. Prompts (DW-283), per-member caps (`counts::union_keep`) and per-member orderings do not compose into one query, so the saved space would not always list what the union lists. Decide after the owner has used selections. One option composes queries only and refuses when a member has a prompt or a cap. The other saves anyway and says in a sentence what differs.
+status: open
+
+### DW-285: A new session file created from a session space is not removed when nobody writes in it.
+
+origin: epic 81's plan, 2026-09-23 (AD-304, bp-closenav P2)
+location: `src/components/sessions/session-spaces.tsx:741-753` (the create, `sessionsFileNewKind`) and `:484-488` (opened as a `file` panel target), `src-tauri/crates/keeper/src/sessions_ipc.rs` (`sessions_file_new_kind`)
+reason: the pinned AD-304 listed session-space create among the eligible creates. It is not a notes-vault create. It writes a session file with no note id and opens it as a `file` panel target (AD-109) with no body subscription, so neither the pristine pointer nor the release reaches it. Covering it needs a pointer of its own and a release on the file viewer's close, with the same byte proof.
+status: open
+
+### DW-286: Quit or crash within the autosave window loses the text, and now the pristine file with it.
+
+origin: epic 81's plan, 2026-09-23 (AD-304, bp-closenav P7)
+location: `src/hooks/use-notes-body.ts` (`NOTE_AUTOSAVE_IDLE_MS`), `src-tauri/crates/keeper/src/lib.rs` (main-window close hides; `RunEvent::ExitRequested` flushes no notes), `src-tauri/crates/keeper/src/notes_ipc.rs` (`sweep_pristine`)
+reason: no notes flush exists on quit and there is no `beforeunload` in the notes code, so up to 1.5 s of typing that never reached disk is lost, as before this epic. What is new: if that note was an untouched new note, its file is still pristine on disk, and the next start's sweep removes it. Nothing on disk is lost, because the words were never in the file. But the note the person had just started is gone, where before it would have been left empty. A bounded quit flush would close both: Rust asks each webview for its dirty buffers and waits a fixed time.
+status: open
+
+### DW-287: A stale unmount flush writes a conflict copy of the person's own words.
+
+origin: epic 81's plan, 2026-09-23 (AD-304, bp-closenav Q3)
+location: `src-tauri/crates/keeper/src/notes_ipc.rs` (`flush_on_release`, `write_through`, `BodySub.state.rev`), `src/hooks/use-notes-body.ts` (the last-view release)
+reason: an in-flight save moves disk from R0 to R1 with text X, then the release carries Y against R0. The flush sees `base_rev != disk` and writes a conflict copy holding X, the person's own earlier words, before writing Y. This is pre-existing `notes_save` behaviour. `flush_on_release` skips only the identical-text case. A fix needs a per-subscription "last revision this subscription wrote". `state.rev` is not that, because `Diverged` sets it to the foreign revision.
+status: done (2026-09-23, epic 81 review fix wave A6)
+resolution: `BodyState.written` records the revision this subscription last wrote (set only in `write_through`); `flush_on_release` takes the disk revision as its base when it equals `written`, so a release after the person's own in-flight autosave writes no conflict copy. By inspection, awaits CI macOS.
+
+### DW-288: Session zones' `_spaces/` definitions are listed as notes.
+
+origin: epic 81's plan, 2026-09-23 (AD-303; adjacent finding in the service-files triage)
+location: `src-tauri/crates/keeper-core/src/sessions/spaces.rs:58`, `src-tauri/crates/keeper/src/notes_vault.rs` (`parse_note`, `is_internal`), `src-tauri/crates/keeper/src/notes_ipc.rs` (`project_list`'s service-file pass)
+reason: session zones keep their space definitions at `<zone>/_spaces/*.md` inside the vault tree (e.g. `60-sessions/…`). The index stamps `space` only against the notes spaces folder, so these definitions still appear in the plain notes list. Hiding them needs a second flag, or a sessions-zone rule in `parse_note`. It also needs a decision on whether session zones belong in the notes list at all.
+status: open
+
+### DW-289: Every space saved from the bar carries `keeper.limit` equal to the list window.
+
+origin: epic 81's plan, 2026-09-23 (bp-spaces P3, aside)
+location: `src/hooks/use-notes-actions.ts:234-250` (`captureSpaceDraft` sends `limit` from `notesListStore`: `NOTES_PAGE_SIZE = 200`, grown by `growWindow`), `src-tauri/crates/keeper/src/notes_ipc.rs` (`notes_space_save` writes `limit` when it is above 0)
+reason: the window is a rendering page. `keeper.limit` caps what a space *selects* (Story 44.11, DW-163's resolution). A search saved while the window was 200, or 400 after scrolling, becomes a space that silently selects at most that many notes. In a union (AD-306) that cap is honoured per space. So caps, meant as a deliberate property of a space, are the common case by accident. The draft should send no limit (uncapped) unless the person set one. Spaces saved already keep what they have.
+status: open

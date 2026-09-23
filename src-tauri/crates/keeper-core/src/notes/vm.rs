@@ -1216,6 +1216,18 @@ pub struct NoteIndexProgressVm {
     pub phase: String,
 }
 
+/// One selected space: the drive its note lives on and which note it is (AD-306).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteSpaceRefReq {
+    /// The drive the space's query is read from.
+    pub vault_id: String,
+    /// A space note's id, or `keeper:uncategorized`. Never `keeper:all`,
+    /// `keeper:temporary` or `keeper:group:*`: those do not scope.
+    pub space_id: String,
+}
+
 /// The note-list query the frontend sends (FR-103).
 ///
 /// `origin` and `flags` are plain strings rather than closed enums on purpose:
@@ -1225,6 +1237,9 @@ pub struct NoteIndexProgressVm {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct NoteQueryReq {
+    /// Whether the spaces' own terms narrow the result. False only when
+    /// `spaces` holds exactly one entered space whose saved terms are already
+    /// on the bar as chips.
     #[serde(default = "default_space_terms")]
     pub space_terms: bool,
     #[serde(default)]
@@ -1248,8 +1263,12 @@ pub struct NoteQueryReq {
     /// has to resolve by precedence. An off chip is an absent key — a term that
     /// admits everything has no business on the wire.
     pub tags: BTreeMap<String, NoteTagTerm>,
-    /// When set, the space whose query further narrows the result.
-    pub space_id: Option<String>,
+    /// The spaces that narrow the result, in the order they were selected;
+    /// empty for the unscoped list (AD-306). Each drive searched is narrowed by
+    /// the union of the spaces that live on it or, when none does, by the
+    /// union of all of them (FR-629 generalised).
+    #[serde(default)]
+    pub spaces: Vec<NoteSpaceRefReq>,
     /// `local` | `agent` | `remote` | `device:<label>`.
     pub origin: Option<String>,
     /// `is:` flag names the result must carry.
@@ -1261,6 +1280,50 @@ pub struct NoteQueryReq {
     /// selects and is not this (Story 44.11); the page walks over whatever the
     /// space selected.
     pub limit: u32,
+}
+
+impl NoteQueryReq {
+    /// The drives this query searches: the selection; with nothing selected,
+    /// the drives its spaces live on; with no spaces either, `home`.
+    /// Deduplicated, in first-mention order.
+    #[must_use]
+    pub fn search_drives<'a>(&'a self, home: &'a str) -> Vec<&'a str> {
+        let mut drives = Vec::new();
+        if self.vault_ids.is_empty() {
+            for space in &self.spaces {
+                push_unique(&mut drives, &space.vault_id);
+            }
+        } else {
+            for id in &self.vault_ids {
+                push_unique(&mut drives, id);
+            }
+        }
+        if drives.is_empty() {
+            drives.push(home);
+        }
+        drives
+    }
+
+    /// Every drive other than `home` whose index can change this answer: the
+    /// drives it searches and the drives its spaces are read from.
+    /// Deduplicated, in first-mention order.
+    #[must_use]
+    pub fn other_drives<'a>(&'a self, home: &'a str) -> Vec<&'a str> {
+        let mut drives = Vec::new();
+        let read = self.spaces.iter().map(|space| space.vault_id.as_str());
+        for drive in self.search_drives(home).into_iter().chain(read) {
+            if drive != home {
+                push_unique(&mut drives, drive);
+            }
+        }
+        drives
+    }
+}
+
+fn push_unique<'a>(drives: &mut Vec<&'a str>, drive: &'a str) {
+    if !drives.contains(&drive) {
+        drives.push(drive);
+    }
 }
 
 /// A new note (FR-98). No dialog anywhere in this path — every field is optional
@@ -1288,6 +1351,43 @@ pub struct NoteCreateReq {
     /// not a reason to lose the thought.
     pub space: Option<String>,
     pub space_vault_id: Option<String>,
+}
+
+impl NoteCreateReq {
+    /// Whether the caller supplied nothing to write — no title and no body
+    /// (AD-304). Only such a create is removed again when nobody writes in it:
+    /// a title is a name somebody chose (a wikilink's "create and link" stub
+    /// must keep resolving), a body is words. Tags, a template and a space are
+    /// what creation itself puts there, so they do not count.
+    pub fn writes_nothing(&self) -> bool {
+        self.title
+            .as_deref()
+            .is_none_or(|title| title.trim().is_empty())
+            && self
+                .body
+                .as_deref()
+                .is_none_or(|body| body.trim().is_empty())
+    }
+}
+
+/// What the last editor of a note hands back as it lets the note go (AD-304).
+///
+/// The final flush and the "was anything written?" decision travel in ONE
+/// command, because two IPC calls are not ordered: a flush that arrived after
+/// the close would either lose the last words or recreate a removed note.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteReleaseReq {
+    /// The buffer that had not reached disk; `None` when the editor was clean.
+    pub text: Option<String>,
+    /// The revision `text` was typed against (the editor's `rev`). Unused when
+    /// `text` is `None`.
+    pub base_rev: String,
+    /// Whether the note may go if nothing was written in it. `false` when the
+    /// person still has it in front of them — a folded panel, a switched view —
+    /// so an unmount that keeps the note's panel flushes and never removes it.
+    pub discard: bool,
 }
 
 /// What a create produced, and anything the person who asked for it has to be
@@ -1423,6 +1523,41 @@ pub enum NoteFlag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_create_that_supplies_nothing_writes_nothing() {
+        let blank = NoteCreateReq {
+            title: None,
+            body: None,
+            template: Some("templates/daily.md".to_owned()),
+            dest: Some("inbox".to_owned()),
+            tags: vec!["work".to_owned()],
+            space: Some("01SPACE".to_owned()),
+            space_vault_id: Some("vault".to_owned()),
+        };
+        // What creation itself puts there — a template, a folder, tags, a space
+        // — is not somebody writing.
+        assert!(blank.writes_nothing());
+        // An empty search prompt reaches the create as blank strings.
+        let whitespace = NoteCreateReq {
+            title: Some("  ".to_owned()),
+            body: Some(" \n\t".to_owned()),
+            ..blank.clone()
+        };
+        assert!(whitespace.writes_nothing());
+        // A wikilink's "create and link" stub: a name somebody chose.
+        let titled = NoteCreateReq {
+            title: Some("Foo".to_owned()),
+            ..blank.clone()
+        };
+        assert!(!titled.writes_nothing());
+        // New note from a search that had words in it.
+        let worded = NoteCreateReq {
+            body: Some("x".to_owned()),
+            ..blank
+        };
+        assert!(!worded.writes_nothing());
+    }
 
     #[test]
     fn a_row_serialises_camel_case_including_the_two_absent_by_empty_string_fields() {
@@ -1649,5 +1784,81 @@ mod tests {
             renamed.consequence,
             theirs.consequence
         );
+    }
+
+    fn query(vault_ids: &[&str], spaces: &[(&str, &str)]) -> NoteQueryReq {
+        NoteQueryReq {
+            space_terms: true,
+            sort: None,
+            vault_ids: vault_ids.iter().map(|id| (*id).to_owned()).collect(),
+            include_private: false,
+            text: None,
+            hide_service_files: false,
+            tags: BTreeMap::new(),
+            spaces: spaces
+                .iter()
+                .map(|(vault_id, space_id)| NoteSpaceRefReq {
+                    vault_id: (*vault_id).to_owned(),
+                    space_id: (*space_id).to_owned(),
+                })
+                .collect(),
+            origin: None,
+            flags: Vec::new(),
+            offset: 0,
+            limit: 0,
+        }
+    }
+
+    /// The shell crate that reads this cannot build here, so the camelCase
+    /// contract with the frontend is defended at the type.
+    #[test]
+    fn a_query_names_each_space_with_its_drive() {
+        let wire = r#"{"spaces":[{"vaultId":"a","spaceId":"x"},{"vaultId":"b","spaceId":"y"}],
+            "tags":{},"flags":[],"offset":0,"limit":60,"text":null}"#;
+        let req: NoteQueryReq = serde_json::from_str(wire).expect("frontend-shaped query");
+        assert_eq!(
+            req.spaces,
+            [
+                NoteSpaceRefReq {
+                    vault_id: "a".into(),
+                    space_id: "x".into()
+                },
+                NoteSpaceRefReq {
+                    vault_id: "b".into(),
+                    space_id: "y".into()
+                },
+            ]
+        );
+        let unscoped: NoteQueryReq =
+            serde_json::from_str(r#"{"tags":{},"flags":[],"offset":0,"limit":60}"#)
+                .expect("a query that names no space");
+        assert!(unscoped.spaces.is_empty());
+    }
+
+    #[test]
+    fn search_drives_prefer_the_selection_then_the_spaces_drives_then_home() {
+        // The selection wins, even over the drives the spaces live on.
+        let selected = query(&["a", "c", "a"], &[("b", "x")]);
+        assert_eq!(selected.search_drives("home"), ["a", "c"]);
+        // With nothing selected, a space on Work searches Work alone — not the
+        // active drive the command was sent to.
+        let spaces = query(&[], &[("b", "x"), ("a", "y"), ("b", "z")]);
+        assert_eq!(spaces.search_drives("home"), ["b", "a"]);
+        assert_eq!(query(&[], &[("work", "x")]).search_drives("home"), ["work"]);
+        // Unscoped and unselected is the drive the command was sent to.
+        assert_eq!(query(&[], &[]).search_drives("home"), ["home"]);
+    }
+
+    #[test]
+    fn other_drives_watch_a_lens_drive_outside_the_selection() {
+        // A space read from C narrows a list of A, so C's index can change it.
+        assert_eq!(query(&["a"], &[("c", "x")]).other_drives("a"), ["c"]);
+        // Home is never "other", and each drive is named once.
+        let req = query(&["home", "b"], &[("b", "x"), ("home", "y"), ("c", "z")]);
+        assert_eq!(req.other_drives("home"), ["b", "c"]);
+        // One selected drive that is home wakes nothing else.
+        assert!(query(&["home"], &[]).other_drives("home").is_empty());
+        // One selected drive that is NOT home is searched, so it wakes home.
+        assert_eq!(query(&["b"], &[]).other_drives("home"), ["b"]);
     }
 }

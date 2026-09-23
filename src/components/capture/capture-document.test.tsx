@@ -48,7 +48,10 @@ const notesCaptureDraft = vi.fn<(key: string) => Promise<NoteCreateVm>>();
 const notesCaptureHide = vi.fn<() => Promise<void>>();
 const notesOpen =
   vi.fn<(v: string, n: string, on: (b: NoteBodyBatch) => void) => Promise<string>>();
-const notesClose = vi.fn<(id: string) => Promise<void>>();
+const notesClose =
+  vi.fn<
+    (id: string, release: { text: string | null; baseRev: string } | null) => Promise<boolean>
+  >();
 const notesSave =
   vi.fn<(id: string, text: string, rev: string, block?: string) => Promise<NoteWriteVm>>();
 const notesAttachSources = vi.fn<(v: string, s: string[]) => Promise<NoteAttachSourceVm[]>>();
@@ -72,7 +75,8 @@ vi.mock("@/lib/ipc/client", () => ({
   notesCaptureHide: () => notesCaptureHide(),
   listenNotesCaptureShown: (onShown: () => void) => listenNotesCaptureShown(onShown),
   notesOpen: (v: string, n: string, on: (b: NoteBodyBatch) => void) => notesOpen(v, n, on),
-  notesClose: (id: string) => notesClose(id),
+  notesClose: (id: string, release: { text: string | null; baseRev: string } | null) =>
+    notesClose(id, release),
   notesSave: (id: string, text: string, rev: string, block?: string) =>
     notesSave(id, text, rev, block),
   notesAttachSources: (v: string, s: string[]) => notesAttachSources(v, s),
@@ -223,7 +227,7 @@ beforeEach(() => {
   onCaptureShown = null;
   notesCaptureDraft.mockResolvedValue(page("01CAPTUREPAGE"));
   notesCaptureHide.mockResolvedValue(undefined);
-  notesClose.mockResolvedValue(undefined);
+  notesClose.mockResolvedValue(false);
   notesSave.mockResolvedValue({
     rev: "r1",
     path: "2026-08-10-untitled.md",
@@ -465,16 +469,17 @@ describe("the quick-capture draft window", () => {
     });
     // The old page's subscription must not outlive the page: a channel still
     // pushing into a store pointed at another note is how one note's revision
-    // gets stamped onto another.
-    expect(notesClose).toHaveBeenCalledWith("sub-1");
+    // gets stamped onto another. Its release carries no words: the forced
+    // save already wrote them.
+    expect(notesClose).toHaveBeenCalledWith("sub-1", expect.objectContaining({ text: null }));
 
     // Exactly one write for that page, and this is the assertion the
     // `saveOpenNote` doc comment claims and nothing enforced. `useNotesBody`'s
-    // unmount flush fires when the note swaps; if the forced save had not
+    // unmount release fires when the note swaps; if the forced save had not
     // adopted its own acknowledgement, `dirty` would still be true and the
-    // same text would go out again against the revision the first write has
-    // already superseded — which Rust reads as somebody else's edit and
-    // answers with a conflict copy, on a note the person just filed.
+    // same text would go out again with the release, against the revision the
+    // first write has already superseded — which Rust reads as somebody else's
+    // edit and answers with a conflict copy, on a note the person just filed.
     expect(notesSave.mock.calls.filter((call) => call[0] === "sub-1")).toHaveLength(1);
   });
 

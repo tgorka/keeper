@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { PanelTargetVm } from "@/lib/ipc/client";
+import type { NoteSpaceVm, PanelTargetVm } from "@/lib/ipc/client";
+import {
+  noteQueryFor,
+  notesFiltersStore,
+  resetNotesFiltersStoreForTest,
+} from "@/lib/stores/notes-filters";
 import {
   activePanel,
   hydratePanels,
@@ -46,6 +51,7 @@ function clearCookies(): void {
 beforeEach(() => {
   clearCookies();
   resetPanelsStoreForTest();
+  resetNotesFiltersStoreForTest();
 });
 
 describe("per-panel navigation", () => {
@@ -453,6 +459,191 @@ describe("a target that was deliberately deleted", () => {
 
     expect(store().panels).toBe(before);
   });
+  it("and leaves no step back or forward onto it", () => {
+    store().setActiveTarget(NOTE_ONE);
+    store().setActiveTarget(NOTE_TWO);
+    store().setActiveTarget(A);
+    store().back();
+
+    store().closeTarget(NOTE_ONE);
+    store().closeTarget(A);
+
+    expect(shown()).toEqual([NOTE_TWO]);
+    expect(activePanel(store()).back).toEqual([]);
+    expect(activePanel(store()).forward).toEqual([]);
+  });
+
+  it("leaves no step that goes nowhere: a doubled neighbour or a top step onto what is shown", () => {
+    store().setActiveTarget(NOTE_ONE);
+    store().setActiveTarget(B);
+    store().setActiveTarget(NOTE_ONE);
+
+    store().closeTarget(B);
+
+    // N1 → B → N1 with B gone is just N1, which the panel is already showing.
+    expect(activePanel(store()).back).toEqual([]);
+
+    store().setActiveTarget(C);
+    store().setActiveTarget(NOTE_TWO);
+    store().setActiveTarget(C);
+    store().setActiveTarget(A);
+    store().closeTarget(NOTE_TWO);
+
+    expect(activePanel(store()).back.map((entry) => entry.target)).toEqual([NOTE_ONE, C]);
+  });
+
+  it("and a double click cannot bring it back from the preview it displaced", () => {
+    store().openPanel(A);
+    store().setActiveTarget(NOTE_ONE);
+    store().back();
+    // A single click: NOTE_ONE now lives only in the stacks the preview saved.
+    store().setActiveTarget(B);
+
+    store().closeTarget(NOTE_ONE);
+    store().openPanel(B);
+
+    const [restored] = store().panels;
+    expect(restored?.target).toEqual(A);
+    expect(restored?.forward).toEqual([]);
+  });
+});
+
+describe("history follows the notes scope (AD-305)", () => {
+  function row(id: string, tag: string, vaultId = "v1"): NoteSpaceVm {
+    const restore: NoteSpaceVm["restore"] = {
+      tagTerms: { [tag]: "include" },
+      origin: null,
+      flags: [],
+      text: null,
+      sort: null,
+      opaque: false,
+    };
+    return {
+      id,
+      name: id,
+      vaultId,
+      vaultName: vaultId,
+      defaultKey: null,
+      error: null,
+      restore,
+    } as NoteSpaceVm;
+  }
+  const X = row("X", "work");
+  const Y = row("Y", "home", "v2");
+  const filters = () => notesFiltersStore.getState();
+  const scopeIds = () =>
+    noteQueryFor(filters(), 0, 20).spaces.map((ref) => `${ref.vaultId}:${ref.spaceId}`);
+
+  beforeEach(() => {
+    filters().setRailSpaces([X, Y]);
+    filters().enterSpace(X);
+    store().setActiveTarget(NOTE_ONE);
+    filters().enterSpace(Y);
+  });
+
+  it("going back restores the scope the note was opened under, and forward returns", () => {
+    store().setActiveTarget(NOTE_TWO);
+
+    store().back();
+    expect(scopeIds()).toEqual(["v1:X"]);
+    expect(filters().tagTerms).toEqual([{ tag: "work", term: "include" }]);
+
+    store().forward();
+    expect(scopeIds()).toEqual(["v2:Y"]);
+    expect(filters().enteredSpace?.id).toBe("Y");
+  });
+
+  it("a search the person typed survives the scope following history", () => {
+    filters().setText("tax");
+    store().setActiveTarget(NOTE_TWO);
+
+    store().back();
+
+    expect(noteQueryFor(filters(), 0, 20)).toMatchObject({
+      spaces: [{ vaultId: "v1", spaceId: "X" }],
+      spaceTerms: true,
+      text: "tax",
+    });
+    // Y's own chip goes with Y; only the typed search follows.
+    expect(filters().tagTerms).toEqual([]);
+    expect(filters().enteredSpace).toBeNull();
+  });
+
+  it("a stamp naming a space the rail no longer lists leaves the scope alone", () => {
+    store().setActiveTarget(NOTE_TWO);
+    filters().setRailSpaces([Y]);
+
+    store().back();
+
+    expect(activePanel(store()).target).toEqual(NOTE_ONE);
+    expect(scopeIds()).toEqual(["v2:Y"]);
+  });
+
+  it("stepping onto a file leaves the scope alone", () => {
+    // A is opened under X and stepped back onto under Y, so a restore of A's
+    // stamp would be visible as X.
+    filters().enterSpace(X);
+    store().setActiveTarget(A);
+    store().setActiveTarget(NOTE_TWO);
+    filters().enterSpace(Y);
+
+    store().back();
+
+    expect(activePanel(store()).target).toEqual(A);
+    expect(scopeIds()).toEqual(["v2:Y"]);
+  });
+
+  it("a direct jump applies the landed entry's stamp", () => {
+    store().setActiveTarget(A);
+    store().setActiveTarget(NOTE_TWO);
+
+    store().back(undefined, 2);
+
+    expect(activePanel(store()).target).toEqual(NOTE_ONE);
+    expect(scopeIds()).toEqual(["v1:X"]);
+  });
+
+  it("a target restored from the cookie carries no stamp", () => {
+    const cookie = panelsCookie(
+      [
+        {
+          id: "p",
+          target: NOTE_ONE,
+          scope: null,
+          replaced: null,
+          folded: false,
+          back: [],
+          forward: [],
+        },
+      ],
+      "p",
+    );
+    resetPanelsStoreForTest();
+    hydratePanels(cookie);
+    store().setActiveTarget(NOTE_TWO);
+
+    store().back();
+
+    expect(activePanel(store()).target).toEqual(NOTE_ONE);
+    expect(scopeIds()).toEqual(["v2:Y"]);
+  });
+
+  it("the double-click restore keeps the displaced note's stamp", () => {
+    // Pinned first, so the single click below displaces a real document.
+    store().openPanel(NOTE_ONE);
+    store().setActiveTarget(NOTE_TWO);
+    store().openPanel(NOTE_TWO);
+    const restored = store().panels[0];
+    if (restored === undefined) throw new Error("expected the restored panel");
+    expect(restored.target).toEqual(NOTE_ONE);
+
+    store().focusPanel(restored.id);
+    store().setActiveTarget(B);
+    store().back();
+
+    expect(activePanel(store()).target).toEqual(NOTE_ONE);
+    expect(scopeIds()).toEqual(["v1:X"]);
+  });
 });
 
 describe("surviving a restart", () => {
@@ -479,7 +670,7 @@ describe("surviving a restart", () => {
     // panel has to come back when the drive does, and it cannot come back if the
     // restore quietly filtered it out for being unreachable.
     const cookie = panelsCookie(
-      [{ id: "p", target: A, replaced: null, folded: false, back: [], forward: [] }],
+      [{ id: "p", target: A, scope: null, replaced: null, folded: false, back: [], forward: [] }],
       "p",
     );
     resetPanelsStoreForTest();
@@ -490,7 +681,7 @@ describe("surviving a restart", () => {
 
   it("hydrates once, so a double-invoked effect does not re-restore over a click", () => {
     const cookie = panelsCookie(
-      [{ id: "p", target: A, replaced: null, folded: false, back: [], forward: [] }],
+      [{ id: "p", target: A, scope: null, replaced: null, folded: false, back: [], forward: [] }],
       "p",
     );
     resetPanelsStoreForTest();
@@ -530,7 +721,17 @@ describe("surviving a restart", () => {
   it("forgets the arrangement when nothing is open", () => {
     expect(
       panelsCookie(
-        [{ id: "p", target: null, replaced: null, folded: false, back: [], forward: [] }],
+        [
+          {
+            id: "p",
+            target: null,
+            scope: null,
+            replaced: null,
+            folded: false,
+            back: [],
+            forward: [],
+          },
+        ],
         "p",
       ),
     ).toContain("max-age=0");
@@ -545,6 +746,7 @@ describe("surviving a restart", () => {
     const panels = Array.from({ length: 20 }, (_, index) => ({
       id: `p${index}`,
       target: { kind: "file", profileId: "p1", relativePath: `${long}/${index}.md` } as const,
+      scope: null,
       replaced: null,
       folded: false,
       back: [],
@@ -856,6 +1058,7 @@ describe("a fold that survives a restart", () => {
     const panels = Array.from({ length: 20 }, (_, index) => ({
       id: `p${index}`,
       target: { kind: "file", profileId: "p1", relativePath: `${long}/${index}.md` } as const,
+      scope: null,
       replaced: null,
       folded: true,
       back: [],
@@ -884,9 +1087,25 @@ describe("a fold that survives a restart", () => {
     const value = cookieValue(
       panelsCookie(
         [
-          { id: "p0", target: null, replaced: null, folded: true, back: [], forward: [] },
-          { id: "p1", target: A, replaced: null, folded: false, back: [], forward: [] },
-          { id: "p2", target: B, replaced: null, folded: true, back: [], forward: [] },
+          {
+            id: "p0",
+            target: null,
+            scope: null,
+            replaced: null,
+            folded: true,
+            back: [],
+            forward: [],
+          },
+          {
+            id: "p1",
+            target: A,
+            scope: null,
+            replaced: null,
+            folded: false,
+            back: [],
+            forward: [],
+          },
+          { id: "p2", target: B, scope: null, replaced: null, folded: true, back: [], forward: [] },
         ],
         "p1",
       ),

@@ -170,6 +170,39 @@ pub fn page(selection: Selection, offset: u32, size: u32) -> Range<usize> {
     (start as usize)..(end as usize)
 }
 
+/// Which candidates a union of spaces keeps (AD-306): a note stays when some
+/// space that admits it would keep it on its own. An uncapped space keeps
+/// everything it admits; a capped one keeps the first `cap` in its own order.
+///
+/// Capping the union as a whole would let one busy space crowd a quiet one out
+/// of a list both were chosen for, and ignoring the caps would make `X or Y`
+/// list more of X than X lists alone — and every space saved from the bar
+/// carries a cap, so that would be the common case rather than an edge.
+///
+/// `lenses` yields, per space, its cap and the positions (into the candidate
+/// list) it admits, in that space's own order. A position past `candidates`
+/// names nothing and keeps nothing.
+#[must_use]
+pub fn union_keep(
+    candidates: usize,
+    lenses: impl IntoIterator<Item = (Option<u32>, Vec<usize>)>,
+) -> Vec<bool> {
+    let mut keep = vec![false; candidates];
+    for (cap, admitted) in lenses {
+        let kept = cap.map_or(admitted.len(), |cap| {
+            admitted
+                .len()
+                .min(usize::try_from(cap).unwrap_or(usize::MAX))
+        });
+        for position in &admitted[..kept] {
+            if let Some(slot) = keep.get_mut(*position) {
+                *slot = true;
+            }
+        }
+    }
+    keep
+}
+
 /// The cap a space's `keeper.limit` sets, or `None` for a space that sets none.
 ///
 /// **Absent and zero are the same answer, and that is a repair.** Until this
@@ -333,5 +366,41 @@ mod tests {
         let selection = select(usize::MAX, None);
         assert_eq!(selection.matched, u32::MAX);
         assert_eq!(selection.total, u32::MAX);
+    }
+
+    #[test]
+    fn a_union_keeps_what_some_space_would_keep_alone() {
+        let kept = |keep: Vec<bool>| {
+            keep.iter()
+                .enumerate()
+                .filter_map(|(i, kept)| kept.then_some(i))
+                .collect::<Vec<_>>()
+        };
+        // A capped at two keeps its first two; the uncapped B keeps all it
+        // admits, including the one A declined.
+        assert_eq!(
+            kept(union_keep(
+                4,
+                [(Some(2), vec![0, 1, 2]), (None, vec![2, 3])]
+            )),
+            [0, 1, 2, 3]
+        );
+        // Each cap binds in its OWN space's order, not the union's.
+        assert_eq!(
+            kept(union_keep(
+                2,
+                [(Some(1), vec![0, 1]), (Some(1), vec![1, 0])]
+            )),
+            [0, 1]
+        );
+        // A note past every admitting space's cap is dropped, and one no space
+        // admits was never in.
+        assert_eq!(
+            kept(union_keep(
+                4,
+                [(Some(1), vec![0, 2]), (Some(1), vec![1, 2])]
+            )),
+            [0, 1]
+        );
     }
 }

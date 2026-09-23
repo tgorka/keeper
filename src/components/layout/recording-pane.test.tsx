@@ -1219,7 +1219,7 @@ describe("RecordingPane — the way across to Notes (Story 45.19, FR-197)", () =
     await waitFor(() =>
       expect(notesFiltersStore.getState().scope).toMatchObject({
         kind: "space",
-        id: RECORDINGS_SPACE.id,
+        spaces: [expect.objectContaining({ id: RECORDINGS_SPACE.id })],
       }),
     );
     expect(notesFiltersStore.getState().flags).toContain("recording");

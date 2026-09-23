@@ -19,12 +19,19 @@
 import { EditorView } from "@codemirror/view";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { NoteBodyBatch } from "@/lib/ipc/client";
+import type { NoteBodyBatch, NoteReleaseReq } from "@/lib/ipc/client";
+import {
+  activePanel,
+  panelsStore,
+  resetPanelsStoreForTest,
+  usePanelsStore,
+} from "@/lib/stores/panels";
 import { withRangeRects } from "@/test/layout";
 
 const notesOpen =
   vi.fn<(v: string, n: string, on: (b: NoteBodyBatch) => void) => Promise<string>>();
-const notesClose = vi.fn<(subscriptionId: string) => Promise<void>>();
+const notesClose =
+  vi.fn<(subscriptionId: string, release: NoteReleaseReq | null) => Promise<boolean>>();
 const notesSave =
   vi.fn<
     (
@@ -38,7 +45,7 @@ const notesBufferReport =
 
 vi.mock("@/lib/ipc/client", () => ({
   notesOpen: (v: string, n: string, on: (b: NoteBodyBatch) => void) => notesOpen(v, n, on),
-  notesClose: (id: string) => notesClose(id),
+  notesClose: (id: string, release: NoteReleaseReq | null) => notesClose(id, release),
   notesSave: (id: string, text: string, rev: string) => notesSave(id, text, rev),
   notesBufferReport: (id: string, text: string, rev: string) => notesBufferReport(id, text, rev),
   notesTagTree: vi.fn(async () => ({ nodes: [] })),
@@ -90,7 +97,7 @@ beforeEach(() => {
     });
     return SUBSCRIPTIONS[noteId] ?? "sub-unknown";
   });
-  notesClose.mockResolvedValue(undefined);
+  notesClose.mockResolvedValue(false);
   notesSave.mockImplementation(async (_id, _text, _rev) => ({
     frontmatter: "",
     rev: "rev-saved",
@@ -107,6 +114,7 @@ afterEach(() => {
   // reds for one cause, none of them pointing at it.
   vi.useRealTimers();
   resetNotesEditorStoreForTest();
+  resetPanelsStoreForTest();
 });
 
 /**
@@ -262,7 +270,7 @@ describe("two notes open at once", () => {
 });
 
 describe("closing one of two panels", () => {
-  it("flushes and closes that note's channel and leaves the other's alone", async () => {
+  it("releases that note with its unflushed words in ONE close and leaves the other alone", async () => {
     const { one, closeOne } = await mountBoth();
     type(one, "unflushed\n");
     await waitFor(() => {
@@ -271,16 +279,18 @@ describe("closing one of two panels", () => {
 
     act(closeOne);
 
+    // The words that had not reached the disk ride the close itself, on their
+    // own channel and against their own revision — a save sent beside it is a
+    // second IPC call Rust could run after the close and refuse.
     await waitFor(() => {
-      expect(notesClose).toHaveBeenCalledExactlyOnceWith("sub-one");
+      expect(notesClose).toHaveBeenCalledExactlyOnceWith("sub-one", {
+        text: `${ONE_BODY}unflushed\n`,
+        baseRev: `rev-${ONE}`,
+        // No panel targets the note in this harness, so nothing keeps it.
+        discard: true,
+      });
     });
-    // The words that had not reached the disk went with it, on their own
-    // channel and against their own revision.
-    expect(notesSave).toHaveBeenCalledExactlyOnceWith(
-      "sub-one",
-      `${ONE_BODY}unflushed\n`,
-      `rev-${ONE}`,
-    );
+    expect(notesSave).not.toHaveBeenCalled();
     // And the surviving note kept its document, its channel and its buffer.
     // Before 46.12 the leaving editor's cleanup called `closeNote()`, which
     // emptied the one mirror both editors were reading — so closing a panel
@@ -288,6 +298,153 @@ describe("closing one of two panels", () => {
     expect(readNoteDocument(VAULT, TWO).subscriptionId).toBe("sub-two");
     expect(readNoteDocument(VAULT, TWO).text).toBe(TWO_BODY);
     expect(screen.getByTestId("panel-two")).toBeInTheDocument();
+  });
+
+  it("releases a clean editor with no words", async () => {
+    const { closeOne } = await mountBoth();
+    act(closeOne);
+    await waitFor(() => {
+      expect(notesClose).toHaveBeenCalledExactlyOnceWith("sub-one", {
+        text: null,
+        baseRev: `rev-${ONE}`,
+        discard: true,
+      });
+    });
+  });
+});
+
+const NOTE_ONE = { kind: "note", vaultId: VAULT, noteId: ONE } as const;
+const NOTE_TWO = { kind: "note", vaultId: VAULT, noteId: TWO } as const;
+
+/**
+ * The panel strip's lifecycle without its chrome: one editor per unfolded note
+ * panel, driven by the real panel store. `panel-strip.tsx` renders no body for
+ * a folded panel, which is what makes a fold an unmount.
+ */
+function Strip() {
+  const panels = usePanelsStore((state) => state.panels);
+  return (
+    <>
+      {panels.map((panel) =>
+        panel.folded || panel.target?.kind !== "note" ? null : (
+          <div key={panel.id} data-testid={panel.id}>
+            <NoteEditor vaultId={panel.target.vaultId} noteId={panel.target.noteId} />
+          </div>
+        ),
+      )}
+    </>
+  );
+}
+
+/** Rust's side of AD-304: an untouched new note goes only when it may. */
+function removeWhenDiscarded(): void {
+  notesClose.mockImplementation(async (_id, release) => release?.discard === true);
+}
+
+describe("letting go of a new note nobody wrote in (AD-304)", () => {
+  it("folding the only panel on it flushes without discarding, and the panel keeps it", async () => {
+    removeWhenDiscarded();
+    panelsStore.getState().setActiveTarget(NOTE_ONE);
+    const [panel] = panelsStore.getState().panels;
+    render(<Strip />);
+    await waitFor(() => expect(viewIn(panel.id).state.doc.toString()).toBe(ONE_BODY));
+
+    act(() => panelsStore.getState().toggleFold(panel.id));
+
+    await waitFor(() => {
+      expect(notesClose).toHaveBeenCalledExactlyOnceWith("sub-one", {
+        text: null,
+        baseRev: `rev-${ONE}`,
+        discard: false,
+      });
+    });
+    await act(async () => {});
+    expect(panelsStore.getState().panels).toEqual([
+      expect.objectContaining({ id: panel.id, target: NOTE_ONE, folded: true }),
+    ]);
+  });
+
+  it("moving the panel to another note discards it, and the removal leaves history", async () => {
+    removeWhenDiscarded();
+    panelsStore.getState().setActiveTarget(NOTE_ONE);
+    const [panel] = panelsStore.getState().panels;
+    render(<Strip />);
+    await waitFor(() => expect(viewIn(panel.id).state.doc.toString()).toBe(ONE_BODY));
+
+    act(() => panelsStore.getState().setActiveTarget(NOTE_TWO));
+
+    await waitFor(() => {
+      expect(notesClose).toHaveBeenCalledExactlyOnceWith("sub-one", {
+        text: null,
+        baseRev: `rev-${ONE}`,
+        discard: true,
+      });
+    });
+    // No step back leads onto the note Rust removed.
+    await waitFor(() => expect(activePanel(panelsStore.getState()).back).toEqual([]));
+    expect(activePanel(panelsStore.getState()).target).toEqual(NOTE_TWO);
+  });
+
+  it("left before its open resolved, it is still released and may go", async () => {
+    removeWhenDiscarded();
+    const opens = notesOpen.getMockImplementation();
+    // The executor form: this project's `lib` predates `Promise.withResolvers`.
+    let resolveOne: (id: string) => void = () => {};
+    notesOpen.mockImplementation(async (vault, noteId, onBatch) => {
+      if (noteId === ONE) return await new Promise<string>((resolve) => (resolveOne = resolve));
+      if (opens === undefined) throw new Error("expected the default open");
+      return await opens(vault, noteId, onBatch);
+    });
+    panelsStore.getState().setActiveTarget(NOTE_ONE);
+    render(<Strip />);
+    await waitFor(() => expect(notesOpen).toHaveBeenCalledWith(VAULT, ONE, expect.any(Function)));
+
+    // ⌘⌥N again, before the first note's channel answered.
+    act(() => panelsStore.getState().setActiveTarget(NOTE_TWO));
+    await act(async () => resolveOne("sub-one"));
+
+    await waitFor(() => {
+      expect(notesClose).toHaveBeenCalledExactlyOnceWith("sub-one", {
+        text: null,
+        baseRev: "",
+        discard: true,
+      });
+    });
+    await waitFor(() => expect(activePanel(panelsStore.getState()).back).toEqual([]));
+  });
+});
+
+describe("a note panel whose note is not there", () => {
+  function openFails(error: { code: string; message: string }): void {
+    const opens = notesOpen.getMockImplementation();
+    notesOpen.mockImplementation(async (vault, noteId, onBatch) => {
+      if (noteId === ONE) throw error;
+      if (opens === undefined) throw new Error("expected the default open");
+      return await opens(vault, noteId, onBatch);
+    });
+    // TWO beside ONE, so closing ONE's panel is a real close and not a blank.
+    panelsStore.getState().setActiveTarget(NOTE_TWO);
+    panelsStore.getState().openPanel(NOTE_ONE);
+  }
+  const targets = () => panelsStore.getState().panels.map((panel) => panel.target);
+
+  it("closes when opening it answers that the note does not exist", async () => {
+    // What `notes_error` makes of `NotesError::NotFound` in keeper's notes_ipc.rs.
+    openFails({ code: "internal", message: `no such note: ${ONE}` });
+
+    render(<Strip />);
+
+    await waitFor(() => expect(targets()).toEqual([NOTE_TWO]));
+  });
+
+  it("stays, showing why, when opening it failed for another reason", async () => {
+    openFails({ code: "internal", message: "the disk refused" });
+
+    render(<Strip />);
+
+    await waitFor(() => expect(readNoteDocument(VAULT, ONE).error).toBe("the disk refused"));
+    await act(async () => {});
+    expect(targets()).toEqual([NOTE_TWO, NOTE_ONE]);
   });
 });
 
@@ -336,5 +493,65 @@ describe("two panels showing the same note", () => {
     expect(readNoteDocument(VAULT, ONE).views).toBe(1);
     expect(readNoteDocument(VAULT, ONE).text).toBe(`${ONE_BODY}typed in the left one\n`);
     expect(readNoteDocument(VAULT, ONE).subscriptionId).toBe("sub-one");
+  });
+
+  /** Both views, booted over the note's body. */
+  async function mountSame(): Promise<{ a: EditorView; b: EditorView }> {
+    render(<SameNote />);
+    return await waitFor(() => {
+      const a = viewIn("panel-a");
+      const b = viewIn("panel-b");
+      expect(a.state.doc.toString()).toBe(ONE_BODY);
+      expect(b.state.doc.toString()).toBe(ONE_BODY);
+      return { a, b };
+    });
+  }
+
+  it("what one view types and saves the other shows, and typing there keeps it", async () => {
+    const { a, b } = await mountSame();
+
+    type(a, "typed in A\n");
+    fireEvent.blur(a.contentDOM);
+    await waitFor(() => expect(readNoteDocument(VAULT, ONE).savedAtMs).not.toBeNull());
+
+    expect(b.state.doc.toString()).toBe(`${ONE_BODY}typed in A\n`);
+
+    type(b, "typed in B\n");
+
+    // The buffer the next autosave writes: B's keystroke did not report a
+    // document without A's words.
+    const both = `${ONE_BODY}typed in A\ntyped in B\n`;
+    expect(readNoteDocument(VAULT, ONE).text).toBe(both);
+    expect(a.state.doc.toString()).toBe(both);
+  });
+
+  it("keystrokes typed in one view while its save is in flight survive the ack in both", async () => {
+    // The executor form: this project's `lib` predates `Promise.withResolvers`.
+    let ack: () => void = () => {};
+    notesSave.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          ack = () =>
+            resolve({
+              frontmatter: "",
+              rev: "rev-saved",
+              path: "notes/saved.md",
+              conflictCopy: null,
+            });
+        }),
+    );
+    const { a, b } = await mountSame();
+    type(a, "first\n");
+    fireEvent.blur(a.contentDOM);
+    await waitFor(() => expect(notesSave).toHaveBeenCalledOnce());
+
+    type(a, "second\n");
+    await act(async () => ack());
+
+    const both = `${ONE_BODY}first\nsecond\n`;
+    await waitFor(() => expect(readNoteDocument(VAULT, ONE).saving).toBe(false));
+    expect(a.state.doc.toString()).toBe(both);
+    expect(b.state.doc.toString()).toBe(both);
+    expect(readNoteDocument(VAULT, ONE)).toMatchObject({ text: both, dirty: true });
   });
 });

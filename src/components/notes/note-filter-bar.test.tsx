@@ -264,7 +264,10 @@ describe("one field retains its controls", () => {
 
   it("names the space on its badge without spelling out that it is one", () => {
     notesFiltersStore.setState({
-      scope: { kind: "space", vaultId: "v1", id: "projects", name: "Projects", defaultKey: null },
+      scope: {
+        kind: "space",
+        spaces: [{ vaultId: "v1", id: "projects", name: "Projects", defaultKey: null }],
+      },
     });
     render(<NoteFilterBar onSaveAsSpace={vi.fn()} />);
     // The folder glyph already says what kind of scope this is; a `Space:`
@@ -278,7 +281,10 @@ describe("one field retains its controls", () => {
   it("asks which selected drive receives a new note and keeps the prompt", async () => {
     notesFiltersStore.getState().setVaultIds(["v1", "v2"]);
     notesFiltersStore.setState({
-      scope: { kind: "space", vaultId: "v1", id: "journal", name: "Journal", defaultKey: null },
+      scope: {
+        kind: "space",
+        spaces: [{ vaultId: "v1", id: "journal", name: "Journal", defaultKey: null }],
+      },
     });
     notesFiltersStore.getState().setText("A thought to keep");
     notesFiltersStore.getState().setTagTerm("client", "include");
@@ -320,6 +326,84 @@ describe("one field retains its controls", () => {
         }),
       ),
     );
+  });
+
+  describe("a selection of several spaces (AD-306)", () => {
+    const INBOX = { vaultId: "v1", id: "inbox", name: "Inbox", defaultKey: null };
+    const IDEAS = { vaultId: "v1", id: "ideas", name: "Ideas", defaultKey: null };
+    const HOME = { vaultId: "v2", id: "inbox", name: "Inbox", defaultKey: null };
+
+    it("gives each space a chip whose × removes only that one, naming the drive when two are involved", () => {
+      notesFiltersStore.setState({ scope: { kind: "space", spaces: [INBOX, IDEAS, HOME] } });
+      mount();
+
+      // Two spaces are called Inbox; the drive is what tells them apart.
+      expect(
+        screen.getByText("Inbox", { selector: '[aria-description="Inbox — Work"]' }),
+      ).toBeVisible();
+      expect(
+        screen.getByText("Inbox", { selector: '[aria-description="Inbox — Personal"]' }),
+      ).toBeVisible();
+      // The × buttons are told apart the same way.
+      fireEvent.click(screen.getByRole("button", { name: "Clear scope Inbox — Personal" }));
+
+      expect(noteQueryFor(notesFiltersStore.getState(), 0, 20).spaces).toEqual([
+        { vaultId: "v1", spaceId: "inbox" },
+        { vaultId: "v1", spaceId: "ideas" },
+      ]);
+    });
+
+    it("offers each space's own drive and marks the other selected drives outside", async () => {
+      notesFiltersStore.getState().setVaultIds(["v1", "v2", "v3"]);
+      notesVaultsStore.setState({
+        vaults: [
+          { id: "v1", name: "Work" },
+          { id: "v2", name: "Personal" },
+          { id: "v3", name: "Archive" },
+        ] as NoteVaultVm[],
+      });
+      notesFiltersStore.setState({ scope: { kind: "space", spaces: [IDEAS, HOME] } });
+      mount();
+
+      fireEvent.click(screen.getByRole("button", { name: "New note from search" }));
+      const rows = screen
+        .getAllByRole("button", { name: / — (in|outside) / })
+        .map((row) => row.textContent);
+      expect(rows).toEqual([
+        "Work — in Ideas",
+        "Personal — in Inbox",
+        "Archive — outside Ideas or Inbox",
+      ]);
+
+      fireEvent.click(screen.getByRole("button", { name: "Personal — in Inbox" }));
+      await waitFor(() =>
+        expect(notesCreate).toHaveBeenCalledWith(
+          "v2",
+          expect.objectContaining({ space: "inbox", spaceVaultId: "v2" }),
+        ),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "New note from search" }));
+      fireEvent.click(screen.getByRole("button", { name: "Archive — outside Ideas or Inbox" }));
+      await waitFor(() =>
+        expect(notesCreate).toHaveBeenLastCalledWith(
+          "v3",
+          expect.objectContaining({ space: "ideas", spaceVaultId: "v1" }),
+        ),
+      );
+    });
+
+    it("refuses Save as space for a selection and says why", () => {
+      notesFiltersStore.setState({ scope: { kind: "space", spaces: [INBOX, IDEAS] } });
+      notesFiltersStore.getState().setText("budget");
+      mount();
+
+      const save = screen.getByRole("button", { name: "Save as space" });
+      expect(save).toBeDisabled();
+      expect(save).toHaveAttribute(
+        "aria-description",
+        "A selection of several spaces can't be saved as one space — open one of them to save it.",
+      );
+    });
   });
 
   it("exposes preserved flag and origin terms as removable filters", () => {

@@ -182,6 +182,9 @@ const NOTES = [
 
 const noteRows = NOTES.map(([id, title, body, tags, modified, pinned], index) => ({
   id,
+  // `NoteRowVm.vaultId` (epic 77): a row opens in its own drive, and a row
+  // without one opened as "the vault this note was in is no longer set up".
+  vaultId: "v1",
   title,
   path: `${title
     .toLowerCase()
@@ -201,8 +204,13 @@ const noteRows = NOTES.map(([id, title, body, tags, modified, pinned], index) =>
   sessionId: id === "n3" ? "01SESSION" : null,
 }));
 
-/** The five defaults 44.3 seeds, plus the shapes a real vault grows. */
-const SPACES = [
+/**
+ * The five defaults 44.3 seeds, plus the shapes a real vault grows — as one
+ * drive's rail rows. `notes_spaces` answers `NoteRailVm` (epic 79), one group
+ * per drive the search covers, every row stamped with its drive; a bare array
+ * left the Notes surface throwing on `rail.vaults` in this shell.
+ */
+const SPACE_ROWS = [
   ["keeper:all", "All notes", "", "notebook", null],
   ["s-inbox", "Inbox", "is:untagged", "inbox", "inbox"],
   ["s-journal", "Journal", "is:journal", "calendar-days", "journal"],
@@ -217,22 +225,48 @@ const SPACES = [
     "shapes",
     null,
   ],
-].map(([id, name, query, icon, defaultKey]) => ({
-  id,
-  name,
-  updatedMs: null,
-  query,
-  icon,
-  defaultKey,
-  order: 0,
-  sort: "",
-  sortEffective: "modified desc",
-  limit: 0,
-  template: null,
-  folder: null,
-  error: null,
-  warnings: [],
-}));
+] as const;
+
+function railRows(vaultId: string, vaultName: string) {
+  return SPACE_ROWS.map(([id, name, query, icon, defaultKey]) => ({
+    vaultId,
+    vaultName,
+    id,
+    name,
+    leafName: name,
+    parent: null,
+    depth: 0,
+    descendants: 0,
+    updatedMs: null,
+    query,
+    text: null,
+    icon,
+    defaultKey,
+    order: 0,
+    sort: "",
+    sortEffective: "modified desc",
+    limit: 0,
+    template: null,
+    folder: null,
+    pinned: false,
+    ttlHours: null,
+    expiresMs: null,
+    expiryPhrase: "",
+    // The fixtures are query-only spaces: entering one restores nothing into
+    // the bar and its lens does the narrowing, as Rust does for a query it
+    // cannot project onto chips.
+    restore: {
+      tagTerms: {},
+      origin: null,
+      flags: [],
+      text: null,
+      sort: null,
+      opaque: id !== "keeper:all",
+    },
+    error: null,
+    warnings: [],
+  }));
+}
 
 const TAGS = [
   ["epic22", 1],
@@ -1229,7 +1263,8 @@ const ANSWERS: Record<string, unknown> = {
   notes_service_file_names_get: ["index.md", "agents.md", "claude.md", "log.md"],
   notes_embedding_model_get: null,
   notes_note_marks: { rev: "mock", ranges: [] },
-  notes_spaces: SPACES,
+  // `true` means Rust removed an untouched new note; the mock never creates one.
+  notes_close: false,
   notes_tag_tree: { nodes: TAGS },
   notes_templates: [],
   notes_capture_impact: [],
@@ -3002,6 +3037,34 @@ const COPY_FIXTURES = [
 const copyJobs = new Map<string, CopyJobVm>();
 
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  // One rail group per drive the search covers: the selection, or the active
+  // drive when nothing is selected — `notes_spaces(vault_id, vault_ids)`.
+  notes_spaces: (payload) => {
+    const selected = (payload.vaultIds as string[] | undefined) ?? [];
+    const ids = selected.length > 0 ? selected : [payload.vaultId as string];
+    const vaults = (ANSWERS.notes_vaults as { id: string; name: string }[]).filter((vault) =>
+      ids.includes(vault.id),
+    );
+    return {
+      rows: vaults.flatMap((vault) => railRows(vault.id, vault.name)),
+      vaults: vaults.map((vault) => ({
+        vaultId: vault.id,
+        vaultName: vault.name,
+        available: true,
+        reason: "",
+      })),
+    };
+  },
+  // Opening a space acknowledges it with its row (and would restart a
+  // temporary space's lifetime); the fixtures have none, so the row is as listed.
+  notes_space_touch: (payload) => {
+    const vault = (ANSWERS.notes_vaults as { id: string; name: string }[]).find(
+      (candidate) => candidate.id === payload.vaultId,
+    );
+    return railRows(vault?.id ?? "v1", vault?.name ?? "tgdrive").find(
+      (row) => row.id === payload.spaceId,
+    );
+  },
   notes_hide_service_files_set: (payload) => {
     ANSWERS.notes_hide_service_files_get = Boolean(payload.hidden);
   },

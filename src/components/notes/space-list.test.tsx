@@ -49,9 +49,13 @@ import {
   notesTagTree,
   notesTemplates,
 } from "@/lib/ipc/client";
-import { notesFiltersStore, resetNotesFiltersStoreForTest } from "@/lib/stores/notes-filters";
-
+import {
+  notesFiltersStore,
+  resetNotesFiltersStoreForTest,
+  scopeSpaces,
+} from "@/lib/stores/notes-filters";
 import { notesVaultsStore } from "@/lib/stores/notes-vaults";
+import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 
 function rail(rows: NoteSpaceVm[]): NoteRailVm {
   return {
@@ -350,7 +354,11 @@ describe("SpaceList hierarchy and lifetime", () => {
     const target = await screen.findByRole("button", { name: "Travel" });
     fireEvent.click(target);
     fireEvent.click(target);
-    await waitFor(() => expect(notesFiltersStore.getState().scope).toMatchObject({ id: "second" }));
+    await waitFor(() =>
+      expect(notesFiltersStore.getState().scope).toMatchObject({
+        spaces: [expect.objectContaining({ id: "second" })],
+      }),
+    );
     expect(notesSpacePark).toHaveBeenCalledTimes(1);
     expect(notesSpacePark).toHaveBeenCalledWith(
       "vault-1",
@@ -371,17 +379,27 @@ describe("SpaceList hierarchy and lifetime", () => {
     notesFiltersStore.getState().enterSpace(first);
     render(<SpaceList vaultId="vault-1" />);
     fireEvent.click(await screen.findByRole("button", { name: "Travel" }));
-    await waitFor(() => expect(notesFiltersStore.getState().scope).toMatchObject({ id: "second" }));
+    await waitFor(() =>
+      expect(notesFiltersStore.getState().scope).toMatchObject({
+        spaces: [expect.objectContaining({ id: "second" })],
+      }),
+    );
     expect(notesSpacePark).not.toHaveBeenCalled();
     act(() => notesFiltersStore.getState().setText("temporary draft"));
     fireEvent.click(screen.getByRole("button", { name: "Work" }));
-    await waitFor(() => expect(notesFiltersStore.getState().scope).toMatchObject({ id: "first" }));
+    await waitFor(() =>
+      expect(notesFiltersStore.getState().scope).toMatchObject({
+        spaces: [expect.objectContaining({ id: "first" })],
+      }),
+    );
     expect(notesSpacePark).not.toHaveBeenCalled();
     act(() => notesFiltersStore.getState().setText("must not lose this"));
     vi.mocked(notesSpacePark).mockRejectedValueOnce(new Error("Vault is read-only"));
     fireEvent.click(screen.getByRole("button", { name: "Travel" }));
     expect(await screen.findByText("Vault is read-only")).toBeVisible();
-    expect(notesFiltersStore.getState().scope).toMatchObject({ id: "first" });
+    expect(notesFiltersStore.getState().scope).toMatchObject({
+      spaces: [expect.objectContaining({ id: "first" })],
+    });
     expect(notesFiltersStore.getState().text).toBe("must not lose this");
   });
 
@@ -390,8 +408,289 @@ describe("SpaceList hierarchy and lifetime", () => {
     notesFiltersStore.getState().setSort({ key: "name", dir: "asc" });
     render(<SpaceList vaultId="vault-1" />);
     fireEvent.click(await screen.findByRole("button", { name: "Work" }));
-    await waitFor(() => expect(notesFiltersStore.getState().scope).toMatchObject({ id: "next" }));
+    await waitFor(() =>
+      expect(notesFiltersStore.getState().scope).toMatchObject({
+        spaces: [expect.objectContaining({ id: "next" })],
+      }),
+    );
     expect(notesSpacePark).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The plan a space's confirmation shows, with the fields a test asserts on
+ * carrying values a paraphrase would not produce.
+ */
+function plan(name: string, seeded: boolean) {
+  return {
+    path: `spaces/2026-08-09-${name.toLowerCase()}.md`,
+    question: `Delete the space "${name}"?`,
+    consequence: seeded
+      ? "A space is a saved view, and keeper seeded this one."
+      : "A space is a saved view.",
+    recovery: "keeper moves it into the vault's trash.",
+  };
+}
+
+describe("SpaceList selection of several spaces (AD-306)", () => {
+  const work = space({
+    id: "x",
+    name: "Work",
+    restore: {
+      tagTerms: { work: "include" },
+      flags: [],
+      origin: null,
+      text: null,
+      sort: null,
+      opaque: false,
+    },
+  });
+  const home = space({
+    id: "y",
+    name: "Home",
+    vaultId: "vault-2",
+    vaultName: "Family",
+    restore: {
+      tagTerms: { home: "include" },
+      flags: [],
+      origin: null,
+      text: null,
+      sort: null,
+      opaque: false,
+    },
+  });
+  const trips = space({ id: "z", name: "Trips", vaultId: "vault-2", vaultName: "Family" });
+  const members = () => scopeSpaces(notesFiltersStore.getState().scope).map((member) => member.id);
+
+  it("⌘-click adds a space, Ctrl-click too, and a plain click replaces the selection", async () => {
+    mockSpaces.mockResolvedValue([work, home, trips]);
+    render(<SpaceList vaultId="vault-1" />);
+    const workRow = await screen.findByRole("button", { name: "Work" });
+    const homeRow = screen.getByRole("button", { name: "Home" });
+
+    fireEvent.click(workRow);
+    await waitFor(() => expect(members()).toEqual(["x"]));
+    fireEvent.click(homeRow, { metaKey: true });
+    await waitFor(() => expect(members()).toEqual(["x", "y"]));
+    expect(workRow).toHaveAttribute("aria-pressed", "true");
+    expect(homeRow).toHaveAttribute("aria-pressed", "true");
+    // Pressed, but neither row is the whole scope any more.
+    expect(workRow).not.toHaveAttribute("aria-current");
+    fireEvent.click(screen.getByRole("button", { name: "Trips" }), { ctrlKey: true });
+    await waitFor(() => expect(members()).toEqual(["x", "y", "z"]));
+
+    fireEvent.click(homeRow);
+
+    await waitFor(() => expect(members()).toEqual(["y"]));
+    expect(notesFiltersStore.getState().enteredSpace?.id).toBe("y");
+    expect(notesFiltersStore.getState().tagTerms).toEqual([{ tag: "home", term: "include" }]);
+    expect(homeRow).toHaveAttribute("aria-current", "true");
+    expect(workRow).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("⌘-click on a member takes it out, and on All notes means All notes", async () => {
+    mockSpaces.mockResolvedValue([
+      space({ id: ALL_SPACE_ID, name: "All notes", query: "" }),
+      work,
+      home,
+    ]);
+    render(<SpaceList vaultId="vault-1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Work" }), { metaKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "Home" }), { metaKey: true });
+    await waitFor(() => expect(members()).toEqual(["x", "y"]));
+
+    fireEvent.click(screen.getByRole("button", { name: "Work" }), { metaKey: true });
+    await waitFor(() => expect(members()).toEqual(["y"]));
+
+    fireEvent.click(screen.getByRole("button", { name: "All notes" }), { metaKey: true });
+    await waitFor(() => expect(notesFiltersStore.getState().scope).toEqual(ALL_NOTES_SCOPE));
+  });
+
+  it("leaving a selection by a plain click parks nothing", async () => {
+    mockSpaces.mockResolvedValue([work, home, trips]);
+    render(<SpaceList vaultId="vault-1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Work" }), { metaKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "Home" }), { metaKey: true });
+    await waitFor(() => expect(members()).toEqual(["x", "y"]));
+    act(() => notesFiltersStore.getState().setText("budget"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Trips" }));
+
+    await waitFor(() => expect(members()).toEqual(["z"]));
+    expect(notesSpacePark).not.toHaveBeenCalled();
+  });
+
+  it("⌘+Space and ⌘+Enter toggle the focused row from the keyboard", async () => {
+    mockSpaces.mockResolvedValue([work, home]);
+    render(<SpaceList vaultId="vault-1" />);
+    const workRow = await screen.findByRole("button", { name: "Work" });
+
+    // `fireEvent` answers `!defaultPrevented`. An unprevented chord would let
+    // the button's own activation open the row as well — jsdom never
+    // synthesises that click, so the prevention is the thing to assert.
+    expect(fireEvent.keyDown(workRow, { key: " ", metaKey: true })).toBe(false);
+    await waitFor(() => expect(members()).toEqual(["x"]));
+    expect(
+      fireEvent.keyDown(screen.getByRole("button", { name: "Home" }), {
+        key: "Enter",
+        ctrlKey: true,
+      }),
+    ).toBe(false);
+    await waitFor(() => expect(members()).toEqual(["x", "y"]));
+    fireEvent.keyDown(workRow, { key: " ", ctrlKey: true });
+    await waitFor(() => expect(members()).toEqual(["y"]));
+    // A toggle never fills the bar from a space.
+    expect(notesFiltersStore.getState().tagTerms).toEqual([]);
+  });
+
+  it("a held chord toggles once, not on every key repeat", async () => {
+    mockSpaces.mockResolvedValue([work, home]);
+    render(<SpaceList vaultId="vault-1" />);
+    const workRow = await screen.findByRole("button", { name: "Work" });
+
+    fireEvent.keyDown(workRow, { key: "Enter", metaKey: true });
+    expect(fireEvent.keyDown(workRow, { key: "Enter", metaKey: true, repeat: true })).toBe(false);
+    // Toggles run in order, so a repeat that had toggled Work back out would
+    // show here as Home alone.
+    fireEvent.keyDown(screen.getByRole("button", { name: "Home" }), {
+      key: "Enter",
+      metaKey: true,
+    });
+
+    await waitFor(() => expect(members()).toEqual(["x", "y"]));
+  });
+
+  it("offers Add to selection and Remove from selection from the row's menu", async () => {
+    mockSpaces.mockResolvedValue([work, home]);
+    render(<SpaceList vaultId="vault-1" />);
+    await chooseSpaceAction("Work", "Add to selection");
+    await waitFor(() => expect(members()).toEqual(["x"]));
+    await chooseSpaceAction("Home", "Add to selection");
+    await waitFor(() => expect(members()).toEqual(["x", "y"]));
+
+    await chooseSpaceAction("Work", "Remove from selection");
+
+    await waitFor(() => expect(members()).toEqual(["y"]));
+  });
+
+  it("deleting a member takes only that one out of the selection", async () => {
+    mockSpaces.mockResolvedValue([work, space({ id: "w2", name: "Clients" })]);
+    mockDeletePlan.mockResolvedValue(plan("Clients", false));
+    render(<SpaceList vaultId="vault-1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Work" }), { metaKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "Clients" }), { metaKey: true });
+    await waitFor(() => expect(members()).toEqual(["x", "w2"]));
+
+    await chooseSpaceAction("Clients", "Delete space…");
+    fireEvent.click(await screen.findByRole("button", { name: NOTE_DELETE_CONFIRM }));
+
+    await waitFor(() => expect(members()).toEqual(["x"]));
+  });
+
+  describe("a plain click queued behind a ⌘-click", () => {
+    /** Hold Work's touch open so the next click has to queue behind it (the
+     *  executor form: this project's `lib` predates `Promise.withResolvers`).
+     *  The release waits for the touch to have been sent: releasing before
+     *  that would leave the rail's queue blocked for every test after this one. */
+    function holdWorkTouch(): () => Promise<void> {
+      let release: (() => void) | null = null;
+      vi.mocked(notesSpaceTouch).mockImplementationOnce(
+        () =>
+          new Promise<NoteSpaceVm>((resolve) => {
+            release = () => resolve(work);
+          }),
+      );
+      return async () => {
+        await waitFor(() => expect(release).not.toBeNull());
+        await act(async () => release?.());
+      };
+    }
+
+    it("still lands: the ⌘-click's own change is not an edit that cancels it", async () => {
+      mockSpaces.mockResolvedValue([work, home]);
+      render(<SpaceList vaultId="vault-1" />);
+      const release = holdWorkTouch();
+      fireEvent.click(await screen.findByRole("button", { name: "Work" }), { metaKey: true });
+      fireEvent.click(screen.getByRole("button", { name: "Home" }));
+
+      await release();
+
+      await waitFor(() => expect(members()).toEqual(["y"]));
+    });
+
+    it("yields to a search typed after the click", async () => {
+      mockSpaces.mockResolvedValue([work, home]);
+      render(<SpaceList vaultId="vault-1" />);
+      const release = holdWorkTouch();
+      fireEvent.click(await screen.findByRole("button", { name: "Work" }), { metaKey: true });
+      fireEvent.click(screen.getByRole("button", { name: "Home" }));
+      act(() => notesFiltersStore.getState().setText("tax"));
+
+      await release();
+      // Everything queued has run once the next entry does.
+      fireEvent.click(screen.getByRole("button", { name: "Work" }), { metaKey: true });
+      await waitFor(() => expect(members()).toEqual(["x"]));
+
+      expect(notesFiltersStore.getState().text).toBe("tax");
+    });
+  });
+
+  describe("history's space restore needs a rail that is reading", () => {
+    const NOTE = { kind: "note", vaultId: "vault-1", noteId: "n1" } as const;
+    const OTHER = { kind: "note", vaultId: "vault-1", noteId: "n2" } as const;
+
+    /** Open NOTE under Work, move on to OTHER under All notes. */
+    async function stampWorkThenLeave(): Promise<void> {
+      fireEvent.click(await screen.findByRole("button", { name: "Work" }));
+      await waitFor(() => expect(members()).toEqual(["x"]));
+      act(() => panelsStore.getState().setActiveTarget(NOTE));
+      act(() => notesFiltersStore.getState().setScope(ALL_NOTES_SCOPE));
+      act(() => panelsStore.getState().setActiveTarget(OTHER));
+    }
+
+    beforeEach(() => {
+      resetPanelsStoreForTest();
+    });
+    afterEach(() => {
+      resetPanelsStoreForTest();
+    });
+
+    it("Back restores the space while the rail lists it", async () => {
+      mockSpaces.mockResolvedValue([work, home]);
+      render(<SpaceList vaultId="vault-1" />);
+      await stampWorkThenLeave();
+
+      act(() => panelsStore.getState().back());
+
+      expect(members()).toEqual(["x"]);
+    });
+
+    it("after the drive changes, Back onto the old drive's space leaves the scope alone", async () => {
+      mockSpaces.mockResolvedValue([work, home]);
+      const { rerender } = render(<SpaceList vaultId="vault-1" />);
+      await stampWorkThenLeave();
+      // The next drive's rail never answers, so only the drive change can
+      // retire the rows the first one read.
+      vi.mocked(notesSpaces).mockReturnValue(new Promise<NoteRailVm>(() => {}));
+      rerender(<SpaceList vaultId="vault-2" />);
+
+      act(() => panelsStore.getState().back());
+
+      expect(panelsStore.getState().panels[0]?.target).toEqual(NOTE);
+      expect(notesFiltersStore.getState().scope).toEqual(ALL_NOTES_SCOPE);
+    });
+
+    it("with the rail unmounted, Back leaves the scope alone", async () => {
+      mockSpaces.mockResolvedValue([work, home]);
+      const { unmount } = render(<SpaceList vaultId="vault-1" />);
+      await stampWorkThenLeave();
+      unmount();
+
+      act(() => panelsStore.getState().back());
+
+      expect(panelsStore.getState().panels[0]?.target).toEqual(NOTE);
+      expect(notesFiltersStore.getState().scope).toEqual(ALL_NOTES_SCOPE);
+    });
   });
 });
 
@@ -425,6 +724,7 @@ describe("SpaceList rows", () => {
     expect(notesFiltersStore.getState().scope).toEqual(ALL_NOTES_SCOPE);
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
       "Open space",
+      "Add to selection",
       "Add to current search",
       "Pin space",
       "Edit space…",
@@ -464,10 +764,7 @@ describe("SpaceList rows", () => {
     await waitFor(() =>
       expect(notesFiltersStore.getState().scope).toEqual({
         kind: "space",
-        id: "s1",
-        name: "Active work",
-        vaultId: "vault-1",
-        defaultKey: null,
+        spaces: [{ id: "s1", name: "Active work", vaultId: "vault-1", defaultKey: null }],
       }),
     );
   });
@@ -489,10 +786,7 @@ describe("SpaceList rows", () => {
     await waitFor(() =>
       expect(notesFiltersStore.getState().scope).toEqual({
         kind: "space",
-        vaultId: "vault-1",
-        id: "s1",
-        name: "Sessions",
-        defaultKey: "recordings",
+        spaces: [{ vaultId: "vault-1", id: "s1", name: "Sessions", defaultKey: "recordings" }],
       }),
     );
   });
@@ -873,21 +1167,6 @@ describe("SpaceList restore", () => {
 
 describe("SpaceList delete", () => {
   /**
-   * The plan a space's confirmation shows, with the fields a test asserts on
-   * carrying values a paraphrase would not produce.
-   */
-  function plan(name: string, seeded: boolean) {
-    return {
-      path: `spaces/2026-08-09-${name.toLowerCase()}.md`,
-      question: `Delete the space "${name}"?`,
-      consequence: seeded
-        ? "A space is a saved view, and keeper seeded this one."
-        : "A space is a saved view.",
-      recovery: "keeper moves it into the vault's trash.",
-    };
-  }
-
-  /**
    * Declining removes nothing — and this asserts the COMMAND was not called
    * rather than that the dialog closed. A dialog that closed while the delete
    * was in flight looks identical on screen and is the opposite outcome.
@@ -976,11 +1255,9 @@ describe("SpaceList delete", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Recordings" }));
     await waitFor(() =>
-      expect(notesFiltersStore.getState().scope).toMatchObject({
+      expect(notesFiltersStore.getState().scope).toEqual({
         kind: "space",
-        id: "s1",
-        name: "Recordings",
-        defaultKey: "recordings",
+        spaces: [{ vaultId: "vault-1", id: "s1", name: "Recordings", defaultKey: "recordings" }],
       }),
     );
     expect(notesFiltersStore.getState().sort).toEqual({ key: "modified", dir: "desc" });
@@ -989,7 +1266,10 @@ describe("SpaceList delete", () => {
     await chooseSpaceAction("Clients", "Delete space…");
     fireEvent.click(await screen.findByRole("button", { name: NOTE_DELETE_CONFIRM }));
     await waitFor(() => expect(mockDelete).toHaveBeenCalledWith("vault-1", "s2"));
-    expect(notesFiltersStore.getState().scope).toMatchObject({ kind: "space", id: "s1" });
+    expect(notesFiltersStore.getState().scope).toMatchObject({
+      kind: "space",
+      spaces: [expect.objectContaining({ id: "s1" })],
+    });
 
     // Deleting the active one puts it back to all notes.
     mockDeletePlan.mockResolvedValue(plan("Recordings", true));

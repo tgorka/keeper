@@ -147,8 +147,9 @@ export function SearchSettingsSection({ open }: { open: boolean }) {
           }}
         />
         <p className="text-muted-foreground text-sm">
-          Comma-separated file names, hidden from the note list in any folder. Links, Files and
-          search everywhere still find them.
+          Comma-separated file names, hidden from the note list in any folder, as are space
+          definitions in the spaces folder. The eye toggle shows them again; links, Files and search
+          everywhere still find them.
         </p>
       </div>
       {showEmbedding && (

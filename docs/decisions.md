@@ -1203,3 +1203,43 @@ the owner's chosen drive never held a log.
   one field needs field-level editing first).
 - **Status / owner:** decided. Owner is the architect; Epic 80 implements it; NFR-85 is
   the bar.
+
+## D-24 — keeper removes a new note nobody wrote in, and it unlinks rather than trashes
+
+NFR-30 is the notes phase's one unacceptable failure: no keeper code path deletes or
+overwrites a note body without a recoverable copy, and every delete goes to
+`<vault>/.keeper/trash/`. Story 42.4 made the first exception. A recording stub proved byte
+for byte to be what keeper composed is unlinked, because "trashing it would leave the
+empty note behind under another name, which is precisely the litter dismissing exists to
+prevent" (`ipc.rs`, `dismiss_stub`). Epic 81 makes the second, for the same reason and
+under the same discipline.
+
+- **What changes:** a note keeper created on this device with no title and no words
+  (the pane, the phone, the palette, ⌘⌥N, a space row, the tray, an empty *New note
+  from search*) is removed from disk when the last editor holding it lets it go and no
+  panel still shows it, if its file is still exactly what creation wrote. A quit or a
+  crash is caught at the drive's next registration. (AD-304; FR-665…FR-668; NFR-89)
+- **The proof it requires:** a pointer recorded at creation, read back from disk,
+  never assembled. At release, the file at the path creation wrote must have the same
+  frontmatter block once `updated` is set aside, which proves the id and that no tag,
+  pin or property was written. Its body must be the same up to surrounding whitespace.
+  The last words the editor held are written in the same command before the check, and a
+  per-subscription gate means no save can land after it.
+- **Every uncertainty keeps the file:** a read error, a rename, a different block, a
+  word, a failed flush, a second editor still open, a panel that still shows the note,
+  an orphan close whose note was opened again. Leaving an empty note behind is untidy.
+  Deleting a note somebody wrote in is the mistake this rule exists to make impossible.
+- **Why unlink and not trash:** a trashed empty note is still an empty note, in a folder
+  a person has to empty. The removal is staged and committed like any other, so if the
+  cadence already committed the creation, history holds it. Those bytes are keeper's
+  own by construction.
+- **What it is not:** a general empty-note cleaner. It never touches a note that existed
+  before this device created it, a wikilink's *create and link* note (it has a title),
+  a capture page (reused, Story 45.14), a journal entry, or anything created with words.
+  It is not a trash bypass for any other path.
+- **Revisit triggers:** a third unlink exception (then fold the three into one guarded
+  helper with one proof contract); any report of a removed note that held words (the
+  proof is wrong, so stop removing); a notes quit flush (DW-286), which would change what
+  a crash can leave behind.
+- **Status / owner:** decided. Owner is the architect. Epic 81 (AD-304, Story 81.3)
+  implements it; `unlink_untouched` in `notes_ipc.rs` is its only unlink.

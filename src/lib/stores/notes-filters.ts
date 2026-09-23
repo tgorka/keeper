@@ -43,6 +43,26 @@ import {
 import { ALL_SPACE_ID } from "@/lib/notes/all-spaces";
 
 /**
+ * One space a scope holds (AD-306): enough to name it, search it in its own
+ * drive, and speak about it — never the whole rail row.
+ */
+export interface NoteScopeSpace {
+  readonly id: string;
+  readonly name: string;
+  readonly vaultId: string;
+  /**
+   * Which seeded default this space is, `null` for every other space.
+   *
+   * Carried on the scope so a surface can speak about *this* space without
+   * re-reading the space list or, worse, matching on its name — a default
+   * is renameable like any other, and a sentence that stopped appearing
+   * because someone called Recordings "Sessions" would be a bug nobody
+   * connects to the rename.
+   */
+  readonly defaultKey: string | null;
+}
+
+/**
  * What the list is scoped to — the sidebar row that is selected, or `all` when
  * none is. Every one of these is a filter and not a route (UX-DR41).
  *
@@ -61,30 +81,46 @@ export type NoteScope =
   | { readonly kind: "all" }
   | {
       readonly kind: "space";
-      readonly id: string;
-      readonly name: string;
-      readonly vaultId: string;
       /**
-       * Which seeded default this space is, `null` for every other space.
-       *
-       * Carried on the scope so a surface can speak about *this* space without
-       * re-reading the space list or, worse, matching on its name — a default
-       * is renameable like any other, and a sentence that stopped appearing
-       * because someone called Recordings "Sessions" would be a bug nobody
-       * connects to the rename.
+       * The selected spaces, in the order they were selected (AD-306). Each
+       * drive searched is narrowed by the union of the spaces that live on it
+       * or, when none does, by the union of all of them. Never empty: a scope
+       * with no spaces is `all`.
        */
-      readonly defaultKey: string | null;
+      readonly spaces: readonly [NoteScopeSpace, ...NoteScopeSpace[]];
     }
   | { readonly kind: "folder"; readonly vaultId: string; readonly path: string };
 
 /** The unscoped list — every note in the vault, in the vault's own order. */
 export const ALL_NOTES_SCOPE = { kind: "all" } as const satisfies NoteScope;
 
+/**
+ * A space's identity across drives: one id can name rows on two drives
+ * (Uncategorized always does), so the drive is part of the key.
+ */
+export function spaceKey(space: { readonly vaultId: string; readonly id: string }): string {
+  return `${space.vaultId}:${space.id}`;
+}
+
+/** The spaces a scope holds, in scope order; none for `all` and a folder. */
+export function scopeSpaces(scope: NoteScope): readonly NoteScopeSpace[] {
+  return scope.kind === "space" ? scope.spaces : [];
+}
+
+/** Whether `space` (on its drive) is one of the scope's members. */
+export function scopeHas(
+  scope: NoteScope,
+  space: { readonly vaultId: string; readonly id: string },
+): boolean {
+  const key = spaceKey(space);
+  return scopeSpaces(scope).some((member) => spaceKey(member) === key);
+}
+
 /** The chip label for a scope, as the bar renders it. */
 export function scopeLabel(scope: NoteScope): string {
   switch (scope.kind) {
     case "space":
-      return scope.name;
+      return scope.spaces.map((space) => space.name).join(" or ");
     case "folder":
       return scope.path === "" ? "All files" : scope.path;
     default:
@@ -101,18 +137,27 @@ export function isFolderScope(scope: NoteScope): scope is Extract<NoteScope, { k
   return scope.kind === "folder";
 }
 
-/** Whether two scopes name the same thing (so re-selecting one clears it). */
-function sameScope(a: NoteScope, b: NoteScope): boolean {
-  if (a.kind !== b.kind) {
-    return false;
-  }
+/**
+ * Whether two scopes name the same thing. Spaces compare by drive and id, in
+ * order: the first member's ordering sorts a union, so a reordered selection
+ * is a different list.
+ */
+export function sameScope(a: NoteScope, b: NoteScope): boolean {
   if (a.kind === "space" && b.kind === "space") {
-    return a.id === b.id;
+    return (
+      a.spaces.length === b.spaces.length &&
+      a.spaces.every((space, index) => spaceKey(space) === spaceKey(b.spaces[index]))
+    );
   }
   if (a.kind === "folder" && b.kind === "folder") {
     return a.vaultId === b.vaultId && a.path === b.path;
   }
-  return true;
+  return a.kind === b.kind;
+}
+
+/** The four scope fields of a rail row — the scope never holds the whole row. */
+function scopeSpaceOf(space: NoteScopeSpace): NoteScopeSpace {
+  return { id: space.id, name: space.name, vaultId: space.vaultId, defaultKey: space.defaultKey };
 }
 
 /**
@@ -198,8 +243,8 @@ export function spaceDrift(state: NotesFiltersState): boolean {
   const sort = restore.opaque ? null : restoredSort(restore.sort);
   return (
     state.scope.kind !== "space" ||
-    state.scope.id !== space.id ||
-    state.scope.vaultId !== space.vaultId ||
+    state.scope.spaces.length !== 1 ||
+    spaceKey(state.scope.spaces[0]) !== spaceKey(space) ||
     state.text !== (restore.opaque ? "" : (restore.text ?? "")) ||
     state.tagTerms.length !== Object.keys(terms).length ||
     state.tagTerms.some(({ tag, term }) => terms[tag] !== term) ||
@@ -209,6 +254,27 @@ export function spaceDrift(state: NotesFiltersState): boolean {
     state.sort?.key !== sort?.key ||
     state.sort?.dir !== sort?.dir
   );
+}
+
+/**
+ * The bar with an entered space's restored terms taken back out, leaving only
+ * what the person added on top (AD-306, AD-305). Those terms belong to the
+ * space's own lens; left on the bar once the scope stops being that one space,
+ * they would AND it onto whatever the scope became — X ∩ (X ∪ Y) is just X.
+ */
+function withoutRestored(state: NotesFiltersState, space: NoteSpaceVm): Partial<NotesFiltersState> {
+  const restore = space.restore;
+  if (restore.opaque) return {};
+  const flags = state.flags.filter((flag) => !restore.flags.includes(flag));
+  const origin = state.origin === restore.origin ? null : state.origin;
+  return {
+    tagTerms: state.tagTerms.filter(({ tag, term }) => restore.tagTerms[tag] !== term),
+    text: state.text === (restore.text ?? "") ? "" : state.text,
+    flags,
+    pinnedOnly: flags.includes("pinned"),
+    origin,
+    agentOnly: origin === "agent",
+  };
 }
 
 export interface NotesFiltersState {
@@ -235,13 +301,43 @@ export interface NotesFiltersState {
   sort: NoteSortChoice | null;
   vaultIds: readonly string[];
   includePrivate: boolean;
+  /**
+   * The space whose saved search the bar was filled from, `null` when none
+   * was. Non-null only while the scope is exactly that one space: only
+   * {@link NotesFiltersState.enterSpace} sets it, and every other scope change
+   * clears it, so drift and reset (79.2) speak about a single entered space.
+   */
   readonly enteredSpace: NoteSpaceVm | null;
+  /**
+   * The rail's rows as last read (AD-305): what {@link NotesFiltersState.restoreScope}
+   * checks a remembered space against, and where it finds that space's saved
+   * search. `null` until the rail has been read for the active drive. Not a
+   * filter — `clearAll` leaves it alone.
+   */
+  readonly railSpaces: readonly NoteSpaceVm[] | null;
+  setRailSpaces: (rows: readonly NoteSpaceVm[] | null) => void;
   spacesNonce: number;
   setSort: (sort: NoteSortChoice | null) => void;
   setVaultIds: (ids: readonly string[]) => void;
   setIncludePrivate: (on: boolean) => void;
   enterSpace: (space: NoteSpaceVm) => void;
   mergeSpace: (space: NoteSpaceVm) => void;
+  /**
+   * Add `space` to the selection or take it out (AD-306): the ⌘-click, a
+   * scope chip's ×, a deleted member. It never fills the bar from a space;
+   * leaving a single entered space takes that space's restored terms back
+   * out, so the person's own additions narrow the union and nothing else.
+   * The last member out leaves the scope `all` with the bar as it was.
+   */
+  toggleSpace: (space: NoteScopeSpace) => void;
+  /**
+   * Follow history onto the scope a note was opened under (AD-305). Nothing
+   * happens when the scope already is that one, or when a space it names is
+   * no longer a healthy rail row. An untouched bar follows the space as a
+   * rail click would; a search the person typed stays, minus the outgoing
+   * space's own restored terms.
+   */
+  restoreScope: (scope: NoteScope) => void;
   requestSpacesReload: () => void;
   /**
    * A monotonic nonce bumped by the palette's Open Note… / Search Notes actions.
@@ -393,6 +489,8 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
   vaultIds: [],
   includePrivate: false,
   enteredSpace: null,
+  railSpaces: null,
+  setRailSpaces: (railSpaces) => set({ railSpaces }),
   spacesNonce: 0,
   setSort: (sort) => set({ sort }),
   setVaultIds: (vaultIds) => set({ vaultIds: [...new Set(vaultIds)] }),
@@ -418,13 +516,7 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
     const restore = space.restore;
     set({
       enteredSpace: space,
-      scope: {
-        kind: "space",
-        id: space.id,
-        name: space.name,
-        vaultId: space.vaultId,
-        defaultKey: space.defaultKey,
-      },
+      scope: { kind: "space", spaces: [scopeSpaceOf(space)] },
       tagTerms: restore.opaque
         ? []
         : Object.entries(restore.tagTerms).map(([tag, term]) => ({ tag, term })),
@@ -463,6 +555,73 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
         flags: [...new Set([...state.flags, ...restore.flags])],
         origin: state.origin ?? restore.origin,
       };
+    });
+  },
+  toggleSpace: (space) =>
+    set((state) => {
+      const key = spaceKey(space);
+      const members = scopeSpaces(state.scope);
+      const next = scopeHas(state.scope, space)
+        ? members.filter((member) => spaceKey(member) !== key)
+        : [...members, scopeSpaceOf(space)];
+      const [first, ...rest] = next;
+      // The last one out is today's scope ×: the bar stays, the scope's sort goes.
+      if (first === undefined) return { scope: ALL_NOTES_SCOPE, enteredSpace: null, sort: null };
+      return {
+        ...(state.enteredSpace ? withoutRestored(state, state.enteredSpace) : {}),
+        scope: { kind: "space", spaces: [first, ...rest] },
+        enteredSpace: null,
+      };
+    }),
+  restoreScope: (stamp) => {
+    const state = notesFiltersStore.getState();
+    if (sameScope(state.scope, stamp)) return;
+    const rows: NoteSpaceVm[] = [];
+    for (const member of scopeSpaces(stamp)) {
+      const row = state.railSpaces?.find((each) => spaceKey(each) === spaceKey(member));
+      // All or nothing: a partial union is a scope nobody chose.
+      if (row === undefined || row.error !== null) return;
+      rows.push(row);
+    }
+    // The members as the rail reads them now, not as the stamp remembered them:
+    // a space renamed since the note was opened is shown under its new name.
+    const [first, ...rest] = rows.map(scopeSpaceOf);
+    const scope: NoteScope =
+      stamp.kind === "space" && first ? { kind: "space", spaces: [first, ...rest] } : stamp;
+    const untouched = state.enteredSpace
+      ? !spaceDrift(state)
+      : state.text.trim() === "" &&
+        state.tagTerms.length === 0 &&
+        state.flags.length === 0 &&
+        state.origin === null &&
+        !state.agentOnly &&
+        !state.pinnedOnly;
+    const [only] = rows;
+    if (untouched && rows.length === 1 && only) {
+      state.enterSpace(only);
+      return;
+    }
+    if (untouched) {
+      // The bar held nothing but the outgoing space's own search.
+      set({
+        scope,
+        enteredSpace: null,
+        tagTerms: [],
+        text: "",
+        flags: [],
+        origin: null,
+        agentOnly: false,
+        pinnedOnly: false,
+        sort: null,
+      });
+      return;
+    }
+    // The person typed a search of their own: it stays, and follows the scope.
+    set({
+      ...(state.enteredSpace ? withoutRestored(state, state.enteredSpace) : {}),
+      scope,
+      enteredSpace: null,
+      sort: null,
     });
   },
   requestSpacesReload: () => set((state) => ({ spacesNonce: state.spacesNonce + 1 })),
@@ -521,6 +680,10 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
       if (state.flags.length) return { flags: state.flags.slice(0, -1) };
       if (state.tagTerms.length > 0) {
         return { tagTerms: state.tagTerms.slice(0, -1) };
+      }
+      if (state.scope.kind === "space" && state.scope.spaces.length > 1) {
+        const [first, ...rest] = state.scope.spaces;
+        return { scope: { kind: "space", spaces: [first, ...rest.slice(0, -1)] } };
       }
       if (state.scope.kind !== "all") {
         return { scope: ALL_NOTES_SCOPE, sort: null, enteredSpace: null };
@@ -590,9 +753,14 @@ export function isScopeOnly(state: NotesFiltersState): boolean {
  *
  * **No scope contributes a flag any more** (Story 44.3). A scope is a space or
  * a folder, and a space's terms are its own DSL text in the vault, evaluated by
- * Rust from `spaceId`. The table that mapped four hard-coded rows onto
- * `untagged`/`journal`/`pinned`/`recording` is gone with the rows; those four
- * strings now live where every other query term lives, in the note.
+ * Rust from `spaces` — each named with the drive it is read from (AD-306). The
+ * table that mapped four hard-coded rows onto `untagged`/`journal`/`pinned`/
+ * `recording` is gone with the rows; those four strings now live where every
+ * other query term lives, in the note.
+ *
+ * `spaceTerms` is false only for a single entered space whose saved terms are
+ * already on the bar: Rust applying them again would stop a removed chip from
+ * widening the space.
  *
  * `pinnedOnly` is the one flag left, and it is a chip rather than a scope.
  */
@@ -606,15 +774,17 @@ export function noteQueryFor(
     flags.push("pinned");
   }
   const text = state.text.trim();
+  const spaces = scopeSpaces(state.scope);
   return {
     text: text === "" ? null : text,
     // Keyed by tag, so the request cannot say "include and exclude draft" — the
     // same thing the three-state chip guarantees at this end (FR-148).
     tags: Object.fromEntries(state.tagTerms.map((chip) => [chip.tag, chip.term])),
-    spaceId: state.scope.kind === "space" ? state.scope.id : null,
+    spaces: spaces.map((space) => ({ vaultId: space.vaultId, spaceId: space.id })),
     spaceTerms:
-      state.scope.kind !== "space" ||
-      state.enteredSpace?.id !== state.scope.id ||
+      spaces.length !== 1 ||
+      state.enteredSpace === null ||
+      spaceKey(state.enteredSpace) !== spaceKey(spaces[0]) ||
       state.enteredSpace.restore.opaque,
     // The DSL's origin vocabulary: `agent` is a commit whose `Keeper-Source` is
     // `bot`. There is one chip because there is one question people ask of it.
@@ -695,6 +865,7 @@ export function resetNotesFiltersStoreForTest(): void {
   notesFiltersStore.getState().clearAll();
   notesFiltersStore.getState().setHideServiceFiles(true);
   notesFiltersStore.getState().setIncludePrivate(false);
+  notesFiltersStore.getState().setRailSpaces(null);
   acknowledgedPrivate = false;
   privateWrites = Promise.resolve();
   privateHydration = null;

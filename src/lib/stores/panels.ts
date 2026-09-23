@@ -43,6 +43,7 @@ import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
 import { writeCookie } from "@/components/ui/cookie-writer";
 import type { PanelTargetVm } from "@/lib/ipc/client";
+import { type NoteScope, notesFiltersStore } from "@/lib/stores/notes-filters";
 
 /** The cookie the panel list is remembered in. One cookie for the whole list. */
 export const PANELS_COOKIE = "keeper_panels";
@@ -85,6 +86,17 @@ export const PANELS_COOKIE_BUDGET = 3500;
  * unremarkable as a file panel, and `openPanel` has one fewer branch.
  */
 
+/**
+ * One step of a panel's history: what it showed, and the notes scope in force
+ * when it was followed (AD-305). `scope` is `null` when nobody knows — a
+ * target restored from the cookie, where the stacks and their stamps are never
+ * written — and stepping onto such an entry leaves the scope alone.
+ */
+export interface PanelHistoryEntry {
+  readonly target: PanelTargetVm;
+  readonly scope: NoteScope | null;
+}
+
 /** One panel. */
 export interface Panel {
   /** Stable for as long as the panel exists; regenerated across a restart,
@@ -92,8 +104,10 @@ export interface Panel {
   readonly id: string;
   /** What it shows, or `null` for the one panel a fresh keeper starts with. */
   readonly target: PanelTargetVm | null;
-  readonly back: PanelTargetVm[];
-  readonly forward: PanelTargetVm[];
+  /** The notes scope {@link target} was opened under, `null` when unknown. */
+  readonly scope: NoteScope | null;
+  readonly back: PanelHistoryEntry[];
+  readonly forward: PanelHistoryEntry[];
   /**
    * What this panel showed before the single click that set {@link target} —
    * `null` when {@link target} was not set by a single click.
@@ -114,9 +128,9 @@ export interface Panel {
    * a row and pinning the third still puts the original document back.
    */
   readonly replaced: {
-    readonly was: PanelTargetVm | null;
-    readonly back: PanelTargetVm[];
-    readonly forward: PanelTargetVm[];
+    readonly was: PanelHistoryEntry | null;
+    readonly back: PanelHistoryEntry[];
+    readonly forward: PanelHistoryEntry[];
   } | null;
   /**
    * Whether this panel is folded away: its header only, no body, and no share
@@ -239,7 +253,8 @@ export interface PanelsState {
    * deliberately deleted, so a panel explaining that it cannot be found would be
    * keeper reporting the user's own action back to them as a fault. Every panel
    * holding it closes; the last panel cannot close, so it is emptied instead and
-   * shows the same sentence a fresh keeper shows.
+   * shows the same sentence a fresh keeper shows. Every back and forward stack
+   * forgets it too, so no step of history leads onto it.
    */
   closeTarget: (target: PanelTargetVm) => void;
 }
@@ -247,10 +262,15 @@ export interface PanelsState {
 /** Monotonic, so no two panels in one session share an id even after a close. */
 let nextPanelId = 1;
 
-function makePanel(target: PanelTargetVm | null, folded = false): Panel {
+function makePanel(
+  target: PanelTargetVm | null,
+  folded = false,
+  scope: NoteScope | null = null,
+): Panel {
   const panel: Panel = {
     id: `panel-${nextPanelId}`,
     target,
+    scope,
     replaced: null,
     folded,
     back: [],
@@ -258,6 +278,11 @@ function makePanel(target: PanelTargetVm | null, folded = false): Panel {
   };
   nextPanelId += 1;
   return panel;
+}
+
+/** What a panel is showing, as the history entry it becomes once it moves on. */
+function entryOf(panel: Panel): PanelHistoryEntry | null {
+  return panel.target === null ? null : { target: panel.target, scope: panel.scope };
 }
 
 /**
@@ -578,6 +603,34 @@ function withPanel(panels: readonly Panel[], id: string, next: (panel: Panel) =>
   return panels.map((panel) => (panel.id === id ? next(panel) : panel));
 }
 
+/**
+ * One history stack without `target`, and without the dead steps taking it out
+ * leaves behind: neighbours that now name the same thing become one step (the
+ * later, which is the one Back reaches first), and a top step naming what the
+ * panel already shows is dropped. Either left in, a press of Back or Forward
+ * would visibly do nothing.
+ */
+function withoutTarget(
+  stack: readonly PanelHistoryEntry[],
+  target: PanelTargetVm,
+  showing: PanelTargetVm | null,
+): PanelHistoryEntry[] {
+  const kept: PanelHistoryEntry[] = [];
+  for (const entry of stack) {
+    if (sameTarget(entry.target, target)) continue;
+    const last = kept.length - 1;
+    if (last >= 0 && sameTarget(kept[last].target, entry.target)) {
+      kept[last] = entry;
+    } else {
+      kept.push(entry);
+    }
+  }
+  while (kept.length > 0 && sameTarget(kept[kept.length - 1].target, showing)) {
+    kept.pop();
+  }
+  return kept;
+}
+
 function navigate(panelId: string | undefined, direction: "back" | "forward", steps = 1): void {
   const { panels, activeId } = panelsStore.getState();
   const id = panelId ?? activeId;
@@ -587,14 +640,16 @@ function navigate(panelId: string | undefined, direction: "back" | "forward", st
   }
   const source = panel[direction];
   const index = source.length - steps;
-  const target = source[index];
-  if (!target) return;
+  const entry = source[index];
+  if (!entry) return;
   const opposite = direction === "back" ? "forward" : "back";
-  const moved = panel.target === null ? [] : [panel.target];
+  const outgoing = entryOf(panel);
+  const moved = outgoing === null ? [] : [outgoing];
   const next = withPanel(panels, id, (current) =>
     shown({
       ...current,
-      target,
+      target: entry.target,
+      scope: entry.scope,
       replaced: null,
       [direction]: source.slice(0, index),
       [opposite]: [...current[opposite], ...moved, ...source.slice(index + 1).reverse()].slice(
@@ -604,6 +659,11 @@ function navigate(panelId: string | undefined, direction: "back" | "forward", st
   );
   panelsStore.setState({ panels: next, activeId: id });
   persist(next, id);
+  // The scope follows only onto a note: a file, recording or run is not in the
+  // notes list, and stepping onto one must not change a list nobody is walking.
+  if (entry.target.kind === "note" && entry.scope !== null) {
+    notesFiltersStore.getState().restoreScope(entry.scope);
+  }
 }
 
 export const panelsStore = createStore<PanelsState>()((set, get) => ({
@@ -619,21 +679,20 @@ export const panelsStore = createStore<PanelsState>()((set, get) => ({
       // second click of a double click into a lost preview.
       return;
     }
-    const next = withPanel(panels, activeId, (panel) =>
-      shown({
+    const next = withPanel(panels, activeId, (panel) => {
+      const outgoing = entryOf(panel);
+      return shown({
         ...panel,
         target,
-        back:
-          panel.target === null
-            ? panel.back
-            : [...panel.back, panel.target].slice(-PANEL_HISTORY_CAP),
+        scope: notesFiltersStore.getState().scope,
+        back: outgoing === null ? panel.back : [...panel.back, outgoing].slice(-PANEL_HISTORY_CAP),
         forward: [],
         // The first preview in a run records what the panel really held; the
         // ones after it keep pointing at that, so pinning the fourth preview
         // still puts the original document back.
-        replaced: panel.replaced ?? { was: panel.target, back: panel.back, forward: panel.forward },
-      }),
-    );
+        replaced: panel.replaced ?? { was: outgoing, back: panel.back, forward: panel.forward },
+      });
+    });
     set({ panels: next });
     persist(next, activeId);
   },
@@ -695,11 +754,13 @@ export const panelsStore = createStore<PanelsState>()((set, get) => ({
       // The single click that opened this gesture displaced a real document.
       // Put it back and open the target beside it, which is what the double
       // click looked like.
+      const { was, back, forward } = active.replaced;
       const restored = withPanel(panels, activeId, (panel) => ({
         ...panel,
-        target: active.replaced === null ? panel.target : active.replaced.was,
-        back: active.replaced?.back ?? panel.back,
-        forward: active.replaced?.forward ?? panel.forward,
+        target: was.target,
+        scope: was.scope,
+        back,
+        forward,
         replaced: null,
       }));
       appendBeside(set, restored, activeId, target);
@@ -711,6 +772,7 @@ export const panelsStore = createStore<PanelsState>()((set, get) => ({
         shown({
           ...panel,
           target,
+          scope: notesFiltersStore.getState().scope,
           replaced: null,
         }),
       );
@@ -766,17 +828,48 @@ export const panelsStore = createStore<PanelsState>()((set, get) => ({
 
   closeTarget: (target) => {
     const { panels, activeId } = get();
-    const kept = panels.filter((panel) => !sameTarget(panel.target, target));
+    // A deleted target is no step back either: Back onto it would open a note
+    // that is gone, and words typed there would be dropped without a sound.
+    const holds = (entry: PanelHistoryEntry | null) =>
+      entry !== null && sameTarget(entry.target, target);
+    const pruned = panels.map((panel) => {
+      const { replaced } = panel;
+      if (
+        !panel.back.some(holds) &&
+        !panel.forward.some(holds) &&
+        (replaced === null ||
+          (!holds(replaced.was) && !replaced.back.some(holds) && !replaced.forward.some(holds)))
+      ) {
+        return panel;
+      }
+      const was = replaced === null || holds(replaced.was) ? null : replaced.was;
+      return {
+        ...panel,
+        back: withoutTarget(panel.back, target, panel.target),
+        forward: withoutTarget(panel.forward, target, panel.target),
+        // A preview's saved stacks are what a double click puts back, so they
+        // are pruned too. A displaced document that was the deleted one leaves
+        // `was: null`: pinning then keeps the preview where it is.
+        replaced:
+          replaced === null
+            ? null
+            : {
+                was,
+                back: withoutTarget(replaced.back, target, was?.target ?? null),
+                forward: withoutTarget(replaced.forward, target, was?.target ?? null),
+              },
+      };
+    });
+    const kept = pruned.filter((panel) => !sameTarget(panel.target, target));
     if (kept.length === panels.length) {
+      // Nothing shows it. The stacks are never persisted, so no cookie either.
+      if (pruned.some((panel, at) => panel !== panels[at])) set({ panels: pruned });
       return;
     }
     // The list may not empty. Blanking the survivor rather than refusing to act
     // is what keeps the deleted thing off the screen: a refusal here would leave
     // the user staring at the note they just threw away.
-    const next =
-      kept.length === 0
-        ? [makePanel(null)]
-        : kept.map((panel) => (panel.replaced === null ? panel : { ...panel, replaced: null }));
+    const next = kept.length === 0 ? [makePanel(null)] : kept.map(clearPreview);
     // Focus follows the same rule as closing one panel by hand: the panel that
     // slides into the first closed one's place, or the one on its left.
     const stillActive = next.some((panel) => panel.id === activeId);
@@ -814,7 +907,7 @@ function appendBeside(
   activeId: string,
   target: PanelTargetVm,
 ): void {
-  const created = makePanel(target);
+  const created = makePanel(target, false, notesFiltersStore.getState().scope);
   const at = panels.findIndex((panel) => panel.id === activeId);
   const next = [...panels];
   next.splice(at === -1 ? next.length : at + 1, 0, created);

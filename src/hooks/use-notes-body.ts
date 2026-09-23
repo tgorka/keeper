@@ -11,15 +11,19 @@
  *   idle. Rust needs the current buffer to run the three-way merge when someone
  *   else writes the file; a merge against a stale `mine` would raise the diff
  *   bar for hunks the user has already moved past.
- * - **The write.** `notes_save` after 1.5 s of typing idle, on blur, on ⌘S and
- *   on close. It carries the revision the buffer opened at, which is what lets
- *   Rust write a conflict copy before overwriting a file that moved on
- *   underneath us (NFR-30).
+ * - **The write.** `notes_save` after 1.5 s of typing idle, on blur and on ⌘S.
+ *   It carries the revision the buffer opened at, which is what lets Rust write
+ *   a conflict copy before overwriting a file that moved on underneath us
+ *   (NFR-30).
  * - **The close.** `notes_close`, so a subscription never outlives the surface
- *   that was reading it.
+ *   that was reading it. The last view's close is also the note's release: the
+ *   words not yet on disk ride it rather than a separate save that could land
+ *   after it, and Rust answers whether it removed a new note nobody wrote in
+ *   (AD-304) — which then leaves every panel and every step of history. It may
+ *   remove one only when no panel still targets the note (`discard`).
  *
  * There is no save button anywhere in the product (UX-DR35), so `save()` is
- * what all four of those paths call — never a verb the user sees.
+ * what the first three of those paths call — never a verb the user sees.
  *
  * # Every one of those is now addressed to a note (Story 46.12)
  *
@@ -46,12 +50,13 @@
  * retarget one panel onto what another already shows. That is one document with
  * two views, never two buffers over one file, so the document is reference
  * counted in the store: the first view opens the channel, the last one out
- * flushes the buffer and closes it. A view that arrives while the open is still
- * in flight simply finds the document already there.
+ * releases it. A view that arrives while the open is still in flight simply
+ * finds the document already there.
  */
 import { useCallback, useEffect, useRef } from "react";
 import {
   type IpcError,
+  type NoteReleaseReq,
   notesBufferReport,
   notesClose,
   notesOpen,
@@ -70,6 +75,7 @@ import {
   readNoteDocument,
   useNoteDocument,
 } from "@/lib/stores/notes-editor";
+import { panelsStore, sameTarget } from "@/lib/stores/panels";
 
 /** How long the buffer may run ahead of Rust while the user is typing. */
 export const NOTE_BUFFER_REPORT_IDLE_MS = 400;
@@ -84,6 +90,48 @@ function isIpcError(value: unknown): value is IpcError {
   }
   const candidate = value as Record<string, unknown>;
   return typeof candidate.code === "string" && typeof candidate.message === "string";
+}
+
+/**
+ * Whether a refused `notes_open` means the note is not there at all — a panel
+ * restored onto a note the startup sweep removed, or one deleted elsewhere.
+ *
+ * Read from the sentence because the envelope has no code of its own for it:
+ * `notes_error` in keeper's `notes_ipc.rs` folds `NotesError::NotFound` (and an
+ * unknown vault) into `internal`, and the sentence is `NotesError::NotFound`'s
+ * Display in keeper-core's `notes/mod.rs`, `no such note: {id}`.
+ */
+function isNoteNotFound(error: unknown): boolean {
+  return (
+    isIpcError(error) && error.code === "internal" && error.message.startsWith("no such note:")
+  );
+}
+
+/**
+ * Whether a released note may be removed when nothing was written in it: only
+ * when no panel still targets it. A fold, a switch of primary view, or any
+ * other unmount that keeps the panel's target lets the editor go but not the
+ * note — the person can still see it, or get it back with one click.
+ */
+function mayDiscard(vaultId: string, noteId: string): boolean {
+  const note = { kind: "note", vaultId, noteId } as const;
+  return !panelsStore.getState().panels.some((panel) => sameTarget(panel.target, note));
+}
+
+/** Hand one subscription back to Rust, and follow a removal out of every panel. */
+function release(vaultId: string, noteId: string, subscriptionId: string, request: NoteReleaseReq) {
+  notesClose(subscriptionId, request)
+    .then((removed) => {
+      if (removed) {
+        // Nobody wrote in a new note, so Rust removed it. Back onto it
+        // would open nothing, and words typed there would go nowhere.
+        panelsStore.getState().closeTarget({ kind: "note", vaultId, noteId });
+      }
+    })
+    .catch(() => {
+      // Nothing left to tell: the surface that would have shown it is
+      // going away.
+    });
 }
 
 /**
@@ -111,10 +159,10 @@ function isIpcError(value: unknown): value is IpcError {
  * the failure for the editor's own caption, and one write must not produce two
  * different error channels.
  *
- * Unlike the flush on the last release this reports back into the store, so
- * `dirty` clears and a later unmount flush does not re-send the same text
- * against a revision the first write has already superseded — which Rust would
- * read as somebody else's edit and answer with a conflict copy.
+ * Unlike the release on the last close this reports back into the store, so
+ * `dirty` clears and that release does not re-send the same text against a
+ * revision the first write has already superseded — which Rust would read as
+ * somebody else's edit and answer with a conflict copy.
  */
 export async function saveNote(vaultId: string, noteId: string): Promise<boolean> {
   const document = readNoteDocument(vaultId, noteId);
@@ -152,13 +200,6 @@ export interface UseNotesBody {
   saving: boolean;
   /** Whether the note has left the disk under us. */
   gone: boolean;
-  /**
-   * Where Rust asked for the caret on the opening `Reset`, or null.
-   *
-   * Only ever a template's `{{cursor}}`. The editor consumes it once the document
-   * exists; without one the caret goes to the end of the body.
-   */
-  cursor: number | null;
   /** Adopt an edit and arm the heartbeat and the write. */
   onEdit: (text: string) => void;
   /** Write the buffer now (blur, ⌘S, close). */
@@ -171,7 +212,6 @@ export function useNotesBody(vaultId: string | null, noteId: string | null): Use
   const pending = useNoteDocument(vaultId, noteId, (document) => document.pending);
   const saving = useNoteDocument(vaultId, noteId, (document) => document.saving);
   const gone = useNoteDocument(vaultId, noteId, (document) => document.gone);
-  const cursor = useNoteDocument(vaultId, noteId, (document) => document.cursor);
   const reportTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
@@ -221,15 +261,33 @@ export function useNotesBody(vaultId: string | null, noteId: string | null): Use
     if (opening) {
       void notesOpen(vaultId, noteId, (batch) => applyBodyBatch(vaultId, noteId, batch))
         .then((subscriptionId) => {
-          if (!adoptBodySubscription(vaultId, noteId, generation, subscriptionId)) {
-            // This document was dropped — or dropped and reopened — while the
-            // open was in flight. Close the orphan rather than leaking a
-            // subscription pushing into a document nothing is mounted over.
-            void notesClose(subscriptionId);
+          if (adoptBodySubscription(vaultId, noteId, generation, subscriptionId)) {
+            return;
+          }
+          // This document was dropped — or dropped and reopened — while the
+          // open was in flight. Close the orphan rather than leaking a
+          // subscription pushing into a document nothing is mounted over.
+          // Nothing was edited through it, so it carries no words; but when
+          // no view came back for the note it is still the last one out, and
+          // a new note left before its open resolved (⌘⌥N twice) must go
+          // like any other.
+          if (readNoteDocument(vaultId, noteId).views === 0) {
+            release(vaultId, noteId, subscriptionId, {
+              text: null,
+              baseRev: "",
+              discard: mayDiscard(vaultId, noteId),
+            });
+          } else {
+            notesClose(subscriptionId, null).catch(() => {});
           }
         })
         .catch((error: unknown) => {
           markSaveFailed(vaultId, noteId, isIpcError(error) ? error.message : String(error));
+          if (isNoteNotFound(error)) {
+            // A panel onto a note that is not there has nothing to offer:
+            // typing into it would write nowhere.
+            panelsStore.getState().closeTarget({ kind: "note", vaultId, noteId });
+          }
         });
     }
     return () => {
@@ -248,18 +306,20 @@ export function useNotesBody(vaultId: string | null, noteId: string | null): Use
       }
       // Switching notes — or switching vaults, which hands this hook a null
       // note while the buffer is still dirty — must not strand keystrokes in
-      // the webview. Flush first, close second. Unreported on purpose: by the
-      // time the write resolves this document is gone, and stamping its
-      // revision onto whatever replaced it would be a genuine corruption.
-      if (closed.dirty) {
-        notesSave(closed.subscriptionId, closed.text, closed.rev).catch(() => {
-          // Nothing left to tell: the surface that would have shown it is
-          // going away.
-        });
-      }
-      void notesClose(closed.subscriptionId);
+      // the webview. The words ride the close itself: a save sent beside it is
+      // a second IPC call, and Rust could run the close first and refuse the
+      // save. Unreported on purpose: by the time the release resolves this
+      // document is gone, and stamping its revision onto whatever replaced it
+      // would be a genuine corruption.
+      release(vaultId, noteId, closed.subscriptionId, {
+        text: closed.dirty ? closed.text : null,
+        baseRev: closed.rev,
+        // Read now, not at mount: by the time this cleanup runs the panel has
+        // already moved on, folded, or gone.
+        discard: mayDiscard(vaultId, noteId),
+      });
     };
   }, [vaultId, noteId]);
 
-  return { text, dirty, pending, saving, gone, cursor, onEdit, save };
+  return { text, dirty, pending, saving, gone, onEdit, save };
 }

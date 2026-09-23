@@ -145,6 +145,35 @@ it("re-queries the combined result when any selected drive changes", async () =>
   expect(notesListStore.getState().private).toBe(2);
 });
 
+it("reads a union from the active drive and refreshes it when a space's own drive changes", async () => {
+  notesFiltersStore.getState().setVaultIds(["v1"]);
+  notesFiltersStore
+    .getState()
+    .toggleSpace({ id: "x", name: "Work", vaultId: "v1", defaultKey: null });
+  notesFiltersStore
+    .getState()
+    .toggleSpace({ id: "y", name: "Home", vaultId: "v2", defaultKey: null });
+  renderHook(() => useNotesChanges("v1"));
+  await waitFor(() => expect(notesListStore.getState().loaded).toBe(true));
+  expect(notesList).toHaveBeenLastCalledWith(
+    "v1",
+    expect.objectContaining({
+      spaces: [
+        { vaultId: "v1", spaceId: "x" },
+        { vaultId: "v2", spaceId: "y" },
+      ],
+    }),
+  );
+  // v2 is not a selected drive, but its index decides Home's lens.
+  const home = vi.mocked(notesSubscribeChanges).mock.calls.find(([id]) => id === "v2");
+  expect(home).toBeDefined();
+  const reads = vi.mocked(notesList).mock.calls.length;
+
+  await act(async () => home?.[1]({ ...batch, vaultId: "v2" }));
+
+  expect(vi.mocked(notesList).mock.calls.length).toBe(reads + 1);
+});
+
 it("rejects a late answer after a drive or private toggle changed the query", async () => {
   let release: (vm: NoteListVm) => void = () => {};
   vi.mocked(notesList).mockImplementationOnce(

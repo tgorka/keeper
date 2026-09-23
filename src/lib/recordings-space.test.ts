@@ -70,7 +70,11 @@ describe("openRecordingsSpace", () => {
     notesFiltersStore.getState().setText("old budget");
     openRecordingsSpace(SPACE);
     expect(primaryViewStore.getState().view).toBe("notes");
-    await waitFor(() => expect(notesFiltersStore.getState().scope).toMatchObject({ id: SPACE.id }));
+    await waitFor(() =>
+      expect(notesFiltersStore.getState().scope).toMatchObject({
+        spaces: [expect.objectContaining({ id: SPACE.id })],
+      }),
+    );
     expect(notesFiltersStore.getState().text).toBe("");
     expect(notesFiltersStore.getState().flags).toEqual(["recording"]);
     expect(notesSpacePark).toHaveBeenCalledWith(
@@ -92,7 +96,7 @@ describe("openRecordingsSpace", () => {
     });
     expect(primaryViewStore.getState().view).toBe("notes");
     expect(noteQueryFor(notesFiltersStore.getState(), 0, 20)).toMatchObject({
-      spaceId: SPACE.id,
+      spaces: [{ vaultId: SPACE.vaultId, spaceId: SPACE.id }],
       text: "unsaved interview",
       tags: { transcribed: "exclude" },
       sort: "name asc",
