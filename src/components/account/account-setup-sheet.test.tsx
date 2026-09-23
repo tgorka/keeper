@@ -13,6 +13,7 @@ import {
   SETUP_CONTINUE_LABEL,
   SETUP_DEVICE_LABEL,
   SETUP_DONE_LABEL,
+  setupReplacesSentence,
 } from "@/components/account/account-setup-sheet";
 import type { AccountSetupVm, OrgAccountVm } from "@/lib/ipc/client";
 import { accountCancelSignIn, accountSetupConfirm, accountSetupResolve } from "@/lib/ipc/client";
@@ -32,6 +33,7 @@ function setupVm(over: Partial<AccountSetupVm> = {}): AccountSetupVm {
     deviceName: "hesperia",
     deviceClass: "desktop",
     registered: false,
+    replaces: null,
     ...over,
   };
 }
@@ -141,5 +143,20 @@ describe("AccountSetupSheet", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: SETUP_CANCEL_SIGN_IN_LABEL }));
     expect(accountCancelSignIn).toHaveBeenCalledTimes(1);
+  });
+
+  it("says which account Continue replaces, and only when it replaces one", async () => {
+    mockResolve.mockResolvedValue(setupVm({ replaces: "Old Corp" }));
+    const { unmount } = render(<AccountSetupSheet />);
+    act(() => accountStore.getState().openSetup("keeper://setup?a"));
+    expect(await screen.findByText(setupReplacesSentence("Old Corp"))).toBeInTheDocument();
+    unmount();
+    act(() => accountStore.getState().closeSetup());
+
+    // A first account, or the same account again: nothing is replaced.
+    mockResolve.mockResolvedValue(setupVm({ replaces: null }));
+    open();
+    expect(await screen.findByRole("button", { name: SETUP_CONTINUE_LABEL })).toBeInTheDocument();
+    expect(screen.queryByText(/This replaces/)).not.toBeInTheDocument();
   });
 });

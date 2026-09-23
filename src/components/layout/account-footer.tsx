@@ -9,11 +9,13 @@
  * global {@link SettingsDialog}), Beeper coverage (Beeper accounts only, opens
  * {@link BeeperCoverageDisclosure} in a Dialog), and "Sign out…" opening an
  * {@link AlertDialog} defaulting to keep-local-archive sign-out via
- * {@link useSignOut}. An always-present, never-count-gated "Add Account" entry
- * sits below the rows. Collapsed, each row is an avatar-only button and the menu
- * / add controls become icon buttons.
+ * {@link useSignOut}. An always-present, never-count-gated "Add account" menu
+ * sits below the rows: a Matrix account (the login overlay) or a keeper
+ * account (the keeper-account dialog, reworded to "Change" once one is set
+ * up). Collapsed, each row is an avatar-only button and the menu / add
+ * controls become icon buttons.
  *
- * Renders only the Add Account button when there are no accounts.
+ * Renders only the Add account menu when there are no accounts.
  */
 import {
   CloudOff,
@@ -77,6 +79,7 @@ import {
   incognitoGetAccount,
   incognitoSetAccount,
 } from "@/lib/ipc/client";
+import { accountStore, useAccountStore } from "@/lib/stores/account";
 import { useAccountStatus } from "@/lib/stores/account-status";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useAddAccountStore } from "@/lib/stores/add-account";
@@ -764,9 +767,59 @@ function AccountRow({ account, collapsed }: { account: AccountVm; collapsed: boo
   );
 }
 
+export const ADD_MATRIX_ACCOUNT_LABEL = "Matrix account…";
+export const ADD_KEEPER_ACCOUNT_LABEL = "keeper account…";
+export const CHANGE_KEEPER_ACCOUNT_LABEL = "Change keeper account…";
+
+/**
+ * Add account: which kind (AD-318). The trigger keeps its label and name in
+ * both shapes, so the width the sidebar is measured against is unchanged; it
+ * only opens a menu now instead of going straight to the Matrix login. The
+ * keeper account is one per device, so once there is one the item says it
+ * changes it rather than adding a second.
+ */
+function AddAccountMenu({ collapsed }: { collapsed: boolean }) {
+  const openAddAccount = useAddAccountStore((s) => s.openAddAccount);
+  const keeperConfigured = useAccountStore((s) => s.vm.configured);
+
+  const trigger = collapsed ? (
+    // A narrow left rail when folded, so the hint opens to the right of it.
+    <IconHint side="right" label="Add account">
+      <DropdownMenuTrigger asChild>
+        <Button type="button" variant="ghost" size="icon" aria-label="Add account">
+          <Plus aria-hidden="true" />
+        </Button>
+      </DropdownMenuTrigger>
+    </IconHint>
+  ) : (
+    <DropdownMenuTrigger asChild>
+      <Button
+        type="button"
+        variant="ghost"
+        aria-label="Add account"
+        className="w-full justify-start gap-2"
+      >
+        <Plus aria-hidden="true" />
+        Add account
+      </Button>
+    </DropdownMenuTrigger>
+  );
+
+  return (
+    <DropdownMenu>
+      {trigger}
+      <DropdownMenuContent side={collapsed ? "right" : "top"} align={collapsed ? "end" : "start"}>
+        <DropdownMenuItem onSelect={openAddAccount}>{ADD_MATRIX_ACCOUNT_LABEL}</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => accountStore.getState().openEntry()}>
+          {keeperConfigured ? CHANGE_KEEPER_ACCOUNT_LABEL : ADD_KEEPER_ACCOUNT_LABEL}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 export function AccountFooter({ collapsed }: AccountFooterProps) {
   const accounts = useAccountsStore((s) => s.accounts);
-  const openAddAccount = useAddAccountStore((s) => s.openAddAccount);
   // A single shared Settings dialog for the whole footer, driven by the shared
   // open-state store (Story 3.1) so the verify banner / UTD stub open the same
   // one — never one per account row.
@@ -785,31 +838,7 @@ export function AccountFooter({ collapsed }: AccountFooterProps) {
         <AccountRow key={account.accountId} account={account} collapsed={collapsed} />
       ))}
 
-      {collapsed ? (
-        // A narrow left rail when folded, so the hint opens to the right of it.
-        <IconHint side="right" label="Add account">
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            aria-label="Add account"
-            onClick={openAddAccount}
-          >
-            <Plus aria-hidden="true" />
-          </Button>
-        </IconHint>
-      ) : (
-        <Button
-          type="button"
-          variant="ghost"
-          aria-label="Add account"
-          className="w-full justify-start gap-2"
-          onClick={openAddAccount}
-        >
-          <Plus aria-hidden="true" />
-          Add account
-        </Button>
-      )}
+      <AddAccountMenu collapsed={collapsed} />
     </div>
   );
 }

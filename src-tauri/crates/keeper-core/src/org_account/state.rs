@@ -99,6 +99,10 @@ pub struct AccountSetupVm {
     pub device_class: DeviceClass,
     /// This device is already known on this install.
     pub registered: bool,
+    /// The display name of the account this install has now, when confirming
+    /// would replace it (sign it out and forget it here). `None` for a first
+    /// setup, or for the same account under a new display name.
+    pub replaces: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -291,10 +295,12 @@ fn clock(at_ms: i64, now_ms: i64) -> String {
     }
 }
 
-/// The confirmation sheet for a resolved setup input.
+/// The confirmation sheet for a resolved setup input. `previous` is the
+/// descriptor this install has now, if any.
 pub fn setup_vm(
     setup_id: String,
     d: &AccountDescriptor,
+    previous: Option<&AccountDescriptor>,
     device_name: String,
     device_class: DeviceClass,
     registered: bool,
@@ -308,6 +314,9 @@ pub fn setup_vm(
         device_name,
         device_class,
         registered,
+        replaces: previous
+            .filter(|previous| d.replaces(previous))
+            .map(|previous| previous.name.clone()),
     }
 }
 
@@ -457,5 +466,74 @@ mod tests {
         let vm = vm(&facts);
         assert_eq!(vm.device.map(|d| d.slug).as_deref(), Some("work-mac"));
         assert_eq!(vm.devices.iter().filter(|d| d.this_device).count(), 1);
+    }
+
+    fn setup(previous: Option<&AccountDescriptor>, new: &AccountDescriptor) -> AccountSetupVm {
+        setup_vm(
+            "s".to_owned(),
+            new,
+            previous,
+            "mac".to_owned(),
+            DeviceClass::Desktop,
+            false,
+        )
+    }
+
+    /// The sheet names the account a link would end, and only then.
+    #[test]
+    fn the_setup_sheet_names_the_account_it_would_replace() {
+        let old = descriptor();
+        assert_eq!(
+            setup(None, &old).replaces,
+            None,
+            "a first setup replaces nothing"
+        );
+        assert_eq!(
+            setup(Some(&old), &old).replaces,
+            None,
+            "the same account again"
+        );
+        let renamed = AccountDescriptor {
+            name: "Acme Corp".to_owned(),
+            ..descriptor()
+        };
+        assert_eq!(
+            setup(Some(&old), &renamed).replaces,
+            None,
+            "a new display name only"
+        );
+        let other = AccountDescriptor {
+            id: "globex".to_owned(),
+            name: "Globex".to_owned(),
+            ..descriptor()
+        };
+        assert_eq!(setup(Some(&old), &other).replaces.as_deref(), Some("Acme"));
+    }
+
+    /// A setup under the same id that points anywhere else ends the old
+    /// session; only a new display name keeps it.
+    #[test]
+    fn any_sign_in_or_repository_change_replaces_the_account() {
+        let old = descriptor();
+        let renamed = AccountDescriptor {
+            name: "Acme Corp".to_owned(),
+            ..descriptor()
+        };
+        assert!(!renamed.replaces(&old));
+        assert!(!descriptor().replaces(&old));
+
+        let mut other_issuer = descriptor();
+        other_issuer.auth.issuer = "https://id.evil.example".to_owned();
+        let mut other_token = descriptor();
+        other_token.auth.endpoints.token = Some("https://id.acme.dev/other-token".to_owned());
+        let mut other_repo = descriptor();
+        other_repo.config.url = "https://git.evil.example/keeper-config.git".to_owned();
+        let other_id = AccountDescriptor {
+            id: "globex".to_owned(),
+            ..descriptor()
+        };
+        for new in [other_issuer, other_token, other_repo, other_id] {
+            assert!(new.replaces(&old), "{new:?}");
+        }
     }
 }

@@ -3,7 +3,7 @@ import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { accountVm } from "@/test/account-fixture";
 
 beforeEach(() => {
-  accountStore.setState({ vm: NO_ACCOUNT, setupLink: null });
+  accountStore.setState({ vm: NO_ACCOUNT, setupLink: null, entryOpen: false });
 });
 
 describe("accountStore.setVm", () => {
@@ -29,5 +29,17 @@ describe("accountStore.setVm", () => {
     // snapshot is also revision 0 must still be mirrored.
     accountStore.getState().setVm(accountVm({ revision: 0 }));
     expect(accountStore.getState().vm.configured).toBe(true);
+  });
+});
+
+describe("accountStore.openSetup", () => {
+  it("hands the entry dialog over to the sheet, so only one surface is up", () => {
+    const { openEntry, openSetup } = accountStore.getState();
+    openEntry();
+    openSetup("keeper://setup?descriptor=https%3A%2F%2Fid.acme.dev%2Fk.json");
+    expect(accountStore.getState()).toMatchObject({
+      entryOpen: false,
+      setupLink: "keeper://setup?descriptor=https%3A%2F%2Fid.acme.dev%2Fk.json",
+    });
   });
 });

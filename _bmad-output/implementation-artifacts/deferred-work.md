@@ -6582,3 +6582,17 @@ origin: epic 82's plan, 2026-09-23 (AD-308; spec §2.1)
 location: `src-tauri/crates/keeper-core/src/org_account/descriptor.rs` (`FILE_NAME`, one `account.toml`), `src-tauri/crates/keeper/src/account_ipc.rs` (one account's state), `src/components/settings/account-section.tsx`
 reason: the config repository defines who is using keeper, and two people on one device are two OS users. The `id` is already in the schema, the redirect URI (`keeper://oauth/<id>/…`), the keychain keys (`account/<id>/…`) and the clone path (`<data>/account/<id>/repo`), so a list of accounts can come later without a migration. What a second account would need to decide: which account's tiers win when both set a key (the stack has one account slot), which account a drive or provider's `account` source means, and how the Settings section lists them.
 status: open
+
+### DW-298: No in-app setup-code scanner on iOS.
+
+origin: epic 83's plan, 2026-09-23 (AD-317)
+location: `src-tauri/crates/keeper/gen/apple/keeper_iOS/Info.plist` (no `NSCameraUsageDescription`), `src/components/account/setup-code-scanner.tsx` (offered only where `navigator.mediaDevices` exists)
+reason: WebKit exposes `navigator.mediaDevices` only to an app that declares a camera usage string, and the iOS app declares none: recording, the only other camera user, is desktop-only. The iPhone's Camera app already reads a setup QR code and opens `keeper://setup` in keeper (AD-311), so an in-app scanner would add a permission prompt for a path that already works. Closing this means adding the iOS usage string, so the same scanner appears there without code changes.
+status: open
+
+### DW-299: An inline setup link makes a dense QR code.
+
+origin: epic 83's plan, 2026-09-23 (AD-317; measured on the owner's makistack descriptor)
+location: `src-tauri/crates/keeper-core/src/org_account/descriptor.rs` (`setup_link`, `d=` form)
+reason: a descriptor with a forge in `oauth` mode is about 1.1 KB of JSON, so `keeper://setup?d=<base64url>` is about 1450 characters, a version-33-class code. zxing-wasm reads it at about 2 px per module, so scanning works from a laptop camera; a phone's QR reader held far from the screen may not. Two ways to shorten it, neither built: serve the descriptor and share `descriptor=<url>` (the operator's choice: the makistack config repository is private), or add a compressed inline form (deflate before base64url), which `parse_setup_input` would have to accept on every device before any device emits it.
+status: open

@@ -4638,6 +4638,9 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       deviceName: ACCOUNT_THIS_DEVICE.name,
       deviceClass: "desktop",
       registered: false,
+      // Rust names the account a confirm would replace; `?account=ready`
+      // therefore shows the change path.
+      replaces: accountVm.configured ? accountVm.name : null,
     };
   },
   account_setup_confirm: (payload) => {

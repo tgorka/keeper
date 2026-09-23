@@ -9,4 +9,10 @@ export type AccountSetupVm = { setupId: string, name: string, issuerHost: string
 /**
  * This device is already known on this install.
  */
-registered: boolean, };
+registered: boolean, 
+/**
+ * The display name of the account this install has now, when confirming
+ * would replace it (sign it out and forget it here). `None` for a first
+ * setup, or for the same account under a new display name.
+ */
+replaces: string | null, };

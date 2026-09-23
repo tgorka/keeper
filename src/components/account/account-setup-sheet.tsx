@@ -31,7 +31,8 @@
  * round trip rather than leaving it waiting for five minutes behind a closed
  * surface.
  */
-import { useEffect, useState } from "react";
+import { ScanQrCode } from "lucide-react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -74,6 +75,15 @@ export const SETUP_DONE_LABEL = "Done";
 export const SETUP_CLOSE_LABEL = "Close";
 /** What a failure says when Rust gave no sentence of its own. */
 export const SETUP_FAILED = "keeper couldn't set up the account.";
+
+/**
+ * The one sentence the confirm step adds when Continue would replace the
+ * account this device already has (AD-319). Rust names the account
+ * (`setup.replaces`); the sheet only words it.
+ */
+export function setupReplacesSentence(name: string): string {
+  return `This replaces ${name} on this device: keeper signs you out of it first. Its files in the settings repository are kept.`;
+}
 
 /**
  * The states a confirm can resolve in that mean the account is NOT set up and
@@ -122,25 +132,61 @@ export function AccountSetupSheet() {
 export const SETUP_LINK_LABEL = "Paste a setup link";
 export const SETUP_LINK_PLACEHOLDER = "keeper://setup?… or https://…";
 
+export const SCAN_SETUP_CODE_LABEL = "Scan a QR code";
+export const SCAN_HINT = "Hold the setup code up to the camera.";
+export const SCAN_STARTING = "Starting the camera…";
+export const SCAN_DENIED =
+  "keeper can't use the camera. Allow it in System Settings › Privacy & Security › Camera, or paste the link instead.";
+export const SCAN_OPEN_CAMERA_SETTINGS_LABEL = "Open Camera settings";
+export const SCAN_NO_CAMERA = "No camera found. Paste the link instead.";
+export const SCAN_FAILED = "The camera could not start. Paste the link instead.";
+
 /**
- * The one entry field: Settings › Account and the wizard's optional step both
- * mount this, and both hand the link to the same sheet. Nothing is parsed
- * here — `account_setup_resolve` owns the grammar and its refusal sentence
- * appears in the sheet. Continue is never disabled (UX-DR116 (1): the
- * signed-out section shows no disabled control); an empty submit does nothing.
+ * Whether this webview can offer the scan at all (AD-317). WebKit exposes
+ * `getUserMedia` only where the app declares a camera use — the macOS bundle
+ * does, the iOS one does not — so where it is missing the control is absent,
+ * not disabled (AD-27): the phone's own Camera app already opens a
+ * `keeper://setup` code.
+ */
+export function canScanSetupCode(): boolean {
+  return typeof navigator.mediaDevices?.getUserMedia === "function";
+}
+
+// Lazy so neither the decoder nor its wasm is in the main chunk: most people
+// never scan, and those who do scan once.
+const SetupCodeScanner = lazy(() =>
+  import("@/components/account/setup-code-scanner").then((module) => ({
+    default: module.SetupCodeScanner,
+  })),
+);
+
+/**
+ * The one entry field: Settings › Account, the wizard's optional step and the
+ * footer's keeper-account dialog all mount this, and all hand the link to the
+ * same sheet. Nothing is parsed here — `account_setup_resolve` owns the grammar
+ * and its refusal sentence appears in the sheet; a scanned code's text takes
+ * exactly the road a pasted link does. Continue is never disabled (UX-DR116
+ * (1): the signed-out section shows no disabled control); an empty submit does
+ * nothing. The paste input stays usable while the camera runs, so somebody who
+ * gives up on the scan can paste without putting it away first.
  */
 export function SetupLinkField({ id }: { id: string }) {
   const [link, setLink] = useState("");
+  const [scanning, setScanning] = useState(false);
+  const submit = (raw: string) => {
+    const trimmed = raw.trim();
+    if (trimmed !== "") {
+      setScanning(false);
+      setLink("");
+      accountStore.getState().openSetup(trimmed);
+    }
+  };
   return (
     <form
       className="flex flex-col gap-1"
       onSubmit={(event) => {
         event.preventDefault();
-        const trimmed = link.trim();
-        if (trimmed !== "") {
-          accountStore.getState().openSetup(trimmed);
-          setLink("");
-        }
+        submit(link);
       }}
     >
       <Label htmlFor={id}>{SETUP_LINK_LABEL}</Label>
@@ -157,7 +203,20 @@ export function SetupLinkField({ id }: { id: string }) {
         <Button type="submit" variant="outline">
           {SETUP_CONTINUE_LABEL}
         </Button>
+        {!scanning && canScanSetupCode() && (
+          <Button type="button" variant="outline" onClick={() => setScanning(true)}>
+            <ScanQrCode aria-hidden="true" />
+            {SCAN_SETUP_CODE_LABEL}
+          </Button>
+        )}
       </div>
+      {scanning && (
+        <div className="pt-2">
+          <Suspense fallback={<Waiting sentence={SCAN_STARTING} />}>
+            <SetupCodeScanner onScanned={submit} onCancel={() => setScanning(false)} />
+          </Suspense>
+        </div>
+      )}
     </form>
   );
 }
@@ -287,6 +346,9 @@ function SetupFlow({ link }: { link: string }) {
                 <p className="text-muted-foreground text-xs">{SETUP_DEVICE_NOTE}</p>
               </div>
             )}
+            {phase.setup.replaces !== null && (
+              <p className="text-sm">{setupReplacesSentence(phase.setup.replaces)}</p>
+            )}
             <div className="flex gap-2">
               <Button type="submit" disabled={deviceName.trim() === ""}>
                 {SETUP_CONTINUE_LABEL}
@@ -355,7 +417,7 @@ function SetupFacts({ setup }: { setup: AccountSetupVm }) {
  * sentence yet it is the spinner alone: the words are Rust's, and until Rust
  * has said anything the sheet does not invent a line for it.
  */
-function Waiting({ sentence }: { sentence: string | null }) {
+export function Waiting({ sentence }: { sentence: string | null }) {
   return (
     <div role="status" aria-busy="true" className="flex items-center gap-3">
       <span

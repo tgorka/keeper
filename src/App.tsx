@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { AccountSetupSheet } from "@/components/account/account-setup-sheet";
+import { KeeperAccountDialog } from "@/components/account/keeper-account-dialog";
 import { LoginScreen } from "@/components/auth/login-screen";
 import { AppShell } from "@/components/layout/app-shell";
 import { AtRestEncryptionChoice } from "@/components/settings/at-rest-encryption-choice";
@@ -265,8 +266,11 @@ function App() {
       <NoBackgroundSyncDisclosure />
       {/* The one setup confirmation sheet (UX-DR116), above the content gate
           like the Toaster: a setup link can arrive over the wizard, the login
-          screen or the shell, and it must open the same sheet on each. */}
+          screen or the shell, and it must open the same sheet on each. The
+          keeper-account entry the footer's Add account opens sits beside it:
+          submitting a link there hands over to the sheet. */}
       <AccountSetupSheet />
+      <KeeperAccountDialog />
       {content}
     </>
   );
