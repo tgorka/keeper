@@ -15,14 +15,15 @@ import {
 import { Lamp } from "@/components/ui/lamp";
 import { MENU_TARGET_RING, useMenuTarget } from "@/components/ui/menu-target";
 import { HoverHint, IconHint } from "@/components/ui/tooltip";
-import { openNotesSpace } from "@/hooks/use-notes-actions";
+import { openNotesSpace, toggleNotesSpace } from "@/hooks/use-notes-actions";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import type { NoteRailVaultVm, NoteSpaceVm } from "@/lib/ipc/client";
 import { notesSpaceSave, notesSpaces, notesSpacesRestoreDefaults } from "@/lib/ipc/client";
 import { ALL_SPACE_ID, GROUP_SPACE_PREFIX, TEMPORARY_SPACE_ID } from "@/lib/notes/all-spaces";
 import {
-  ALL_NOTES_SCOPE,
   notesFiltersStore,
+  scopeSpaces,
+  spaceKey,
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
 import { notesRailFoldStore, useNotesRailFold } from "@/lib/stores/notes-rail-fold";
@@ -93,24 +94,15 @@ export function SpaceList({
   const nonce = useNotesFiltersStore((state) => state.spacesNonce);
   const [pendingSpace, setPendingSpace] = useState<NoteSpaceVm | null>(null);
   const opening = useRef(0);
-  const scopedSpaceId = useNotesFiltersStore((state) =>
-    state.scope.kind === "space"
-      ? state.scope.id
-      : state.scope.kind === "all"
-        ? ALL_SPACE_ID
-        : null,
-  );
-  const activeSpaceId = pendingSpace?.id ?? scopedSpaceId;
+  const scope = useNotesFiltersStore((state) => state.scope);
   const folded = useNotesRailFold((state) => state.groups.spaces);
-  const scopedVaultId = useNotesFiltersStore((state) =>
-    state.scope.kind === "space" ? state.scope.vaultId : vaultId,
-  );
   const vaultKey = JSON.stringify(vaultIds);
   const reload = useCallback(
     async (reveal?: NoteSpaceVm | null) => {
       const generation = ++request.current;
       if (vaultId === null) {
         setSpaces([]);
+        notesFiltersStore.getState().setRailSpaces(null);
         return;
       }
       try {
@@ -118,6 +110,7 @@ export function SpaceList({
         if (generation !== request.current) return;
         const rows = rail.rows;
         setSpaces(rows);
+        notesFiltersStore.getState().setRailSpaces(rows);
         setRailVaults(rail.vaults);
         onVaults?.(rail.vaults);
         if (reveal) {
@@ -152,9 +145,15 @@ export function SpaceList({
     setCreating(null);
     setNotice(null);
     setSpaces([]);
+    notesFiltersStore.getState().setRailSpaces(null);
     setPendingSpace(null);
     opening.current += 1;
   }, [vaultId]);
+  // History restores a space only onto a row the rail can vouch for. A rail
+  // that is not mounted is not reading, so its last rows would vouch for a
+  // space sync may since have removed: no rail, no space restore — the phone's
+  // rule.
+  useEffect(() => () => notesFiltersStore.getState().setRailSpaces(null), []);
   useEffect(() => {
     void nonce;
     const reveal = savedSpace !== lastSaved.current ? savedSpace : null;
@@ -196,6 +195,21 @@ export function SpaceList({
         if (request === opening.current) setPendingSpace(null);
       });
   };
+  // ⌘/Ctrl-click: add the space to the selection or take it out (AD-306).
+  const pick = (space: NoteSpaceVm) => {
+    if (vaultId === null) return;
+    void toggleNotesSpace(vaultId, space)
+      .then((acknowledged) => {
+        setSpaces((current) =>
+          current.map((row) =>
+            row.id === acknowledged.id && row.vaultId === acknowledged.vaultId ? acknowledged : row,
+          ),
+        );
+      })
+      .catch(report);
+  };
+  const selectedKeys = new Set(scopeSpaces(scope).map(spaceKey));
+  const soleScope = scope.kind !== "space" || scope.spaces.length === 1;
   const pin = async (space: NoteSpaceVm) => {
     if (vaultId === null) return;
     try {
@@ -288,11 +302,17 @@ export function SpaceList({
     return siblings.map((space, index) => {
       const group = space.id === TEMPORARY_SPACE_ID || space.id.startsWith(GROUP_SPACE_PREFIX);
       const synthetic = space.id.startsWith("keeper:");
-      const key = `${space.vaultId}:${space.id}`;
+      const key = spaceKey(space);
       const expanded = !collapsed.has(key);
       const hasChildren = space.descendants > 0;
-      const active =
-        space.id === activeSpaceId && space.vaultId === (pendingSpace?.vaultId ?? scopedVaultId);
+      const active = pendingSpace
+        ? spaceKey(pendingSpace) === key
+        : space.id === ALL_SPACE_ID
+          ? scope.kind === "all" && space.vaultId === vaultId
+          : selectedKeys.has(key);
+      // Every member is pressed; only the row that IS the whole scope is current.
+      const current = active && (pendingSpace !== null || soleScope);
+      const member = selectedKeys.has(key);
       const subtitle =
         space.error !== null
           ? SPACE_BROKEN_SUBTITLE
@@ -357,7 +377,7 @@ export function SpaceList({
                       }}
                       {...menu.rowProps(key)}
                       aria-haspopup="menu"
-                      aria-current={active ? "true" : undefined}
+                      aria-current={current ? "true" : undefined}
                       aria-pressed={group ? undefined : active}
                       aria-expanded={group ? expanded : menu.rowProps(key)["aria-expanded"]}
                       aria-controls={group ? childId : undefined}
@@ -381,9 +401,26 @@ export function SpaceList({
                               clientY: bounds.bottom,
                             }),
                           );
+                        } else if (
+                          (event.metaKey || event.ctrlKey) &&
+                          (event.key === " " || event.key === "Enter") &&
+                          !group &&
+                          space.id !== ALL_SPACE_ID
+                        ) {
+                          // Prevented so the button's own activation cannot open it as well.
+                          event.preventDefault();
+                          // A held chord repeats; toggling on every repeat would
+                          // flip the row in and out of the selection.
+                          if (!event.repeat) pick(space);
                         }
                       }}
-                      onClick={() => (group ? toggle(key) : open(space))}
+                      onClick={(event) =>
+                        group
+                          ? toggle(key)
+                          : (event.metaKey || event.ctrlKey) && space.id !== ALL_SPACE_ID
+                            ? pick(space)
+                            : open(space)
+                      }
                     >
                       {group && <Chevron aria-hidden="true" className="mt-1 size-3 shrink-0" />}
                       {(!group || space.icon) && (
@@ -444,6 +481,14 @@ export function SpaceList({
                     <ContextMenuItem disabled={space.error !== null} onSelect={() => open(space)}>
                       Open space
                     </ContextMenuItem>
+                    {space.id !== ALL_SPACE_ID && (
+                      <ContextMenuItem
+                        disabled={!member && space.error !== null}
+                        onSelect={() => pick(space)}
+                      >
+                        {member ? "Remove from selection" : "Add to selection"}
+                      </ContextMenuItem>
+                    )}
                     <ContextMenuItem
                       disabled={space.error !== null}
                       onSelect={() => {
@@ -637,12 +682,10 @@ export function SpaceList({
           onClose={() => setDeleting(null)}
           onDeleted={() => {
             const filters = notesFiltersStore.getState();
-            if (
-              filters.scope.kind === "space" &&
-              filters.scope.id === deleting &&
-              filters.scope.vaultId === actionVaultId
-            )
-              filters.setScope(ALL_NOTES_SCOPE);
+            const member = scopeSpaces(filters.scope).find(
+              (space) => space.vaultId === actionVaultId && space.id === deleting,
+            );
+            if (member) filters.toggleSpace(member);
             setDeleting(null);
             void reload();
           }}

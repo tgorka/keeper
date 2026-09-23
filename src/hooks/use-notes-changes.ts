@@ -11,6 +11,7 @@ import {
   type NotesFiltersState,
   noteQueryFor,
   notesFiltersStore,
+  scopeSpaces,
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
 import { notesListStore, useNotesListStore } from "@/lib/stores/notes-list";
@@ -35,18 +36,23 @@ async function readWindow(vaultId: string): Promise<NoteListVm> {
       offset: 0,
     };
   }
-  return await notesList(
-    filters.scope.kind === "space" ? filters.scope.vaultId : vaultId,
-    noteQueryFor(filters, 0, notesListStore.getState().limit),
-  );
+  // Always the active drive: a scope's spaces name their own drives on the wire,
+  // so the command's vault no longer has to be the lens's (AD-306).
+  return await notesList(vaultId, noteQueryFor(filters, 0, notesListStore.getState().limit));
 }
 
 /** One Rust-composed page; every selected vault's stream invalidates that page. */
 export function useNotesChanges(vaultId: string | null, ready = true): void {
   const filterKey = useNotesFiltersStore(queryKey);
   const vaultKey = useNotesFiltersStore((state) => JSON.stringify(state.vaultIds));
-  const scopeVaultId = useNotesFiltersStore((state) =>
-    state.scope.kind === "all" ? null : state.scope.vaultId,
+  // The drives the scope reads from: a change there can change this answer even
+  // when the drive is not one the person selected.
+  const scopeDrivesKey = useNotesFiltersStore((state) =>
+    JSON.stringify(
+      state.scope.kind === "folder"
+        ? [state.scope.vaultId]
+        : [...new Set(scopeSpaces(state.scope).map((space) => space.vaultId))],
+    ),
   );
   const limit = useNotesListStore((state) => state.limit);
   const epoch = useRef(0);
@@ -97,14 +103,17 @@ export function useNotesChanges(vaultId: string | null, ready = true): void {
   useEffect(() => {
     if (!ready || vaultId === null) return;
     const selected: string[] = JSON.parse(vaultKey);
-    const ids = [...new Set([vaultId, ...selected, ...(scopeVaultId ? [scopeVaultId] : [])])];
+    const scopeDrives: string[] = JSON.parse(scopeDrivesKey);
+    const ids = [...new Set([vaultId, ...selected, ...scopeDrives])];
     const subscriptions: string[] = [];
     let cancelled = false;
     for (const id of ids) {
       void notesSubscribeChanges(id, (batch) => {
         if (cancelled || batch.vaultId !== id) return;
         notesFiltersStore.getState().requestSpacesReload();
-        if (!selected.length || selected.includes(id) || id === scopeVaultId) refresh.current?.();
+        if (!selected.length || selected.includes(id) || scopeDrives.includes(id)) {
+          refresh.current?.();
+        }
       })
         .then((subscription) => {
           if (cancelled) void notesUnsubscribeChanges(subscription);
@@ -118,5 +127,5 @@ export function useNotesChanges(vaultId: string | null, ready = true): void {
       cancelled = true;
       for (const subscription of subscriptions) void notesUnsubscribeChanges(subscription);
     };
-  }, [vaultId, vaultKey, scopeVaultId, ready]);
+  }, [vaultId, vaultKey, scopeDrivesKey, ready]);
 }

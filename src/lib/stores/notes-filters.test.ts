@@ -19,6 +19,7 @@ import {
   persistHideServiceFiles,
   persistIncludePrivate,
   resetNotesFiltersStoreForTest,
+  scopeSpaces,
 } from "@/lib/stores/notes-filters";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -39,12 +40,17 @@ beforeEach(() => {
 /** The current chip states, which is what every assertion here is about. */
 const terms = () => notesFiltersStore.getState().tagTerms;
 
-function space(id: string, restore: Partial<NoteSpaceVm["restore"]> = {}): NoteSpaceVm {
+function space(
+  id: string,
+  restore: Partial<NoteSpaceVm["restore"]> = {},
+  vaultId = "vault-1",
+): NoteSpaceVm {
   return {
     id,
     name: id,
-    vaultId: "vault-1",
-    vaultName: "Personal",
+    vaultId,
+    vaultName: vaultId,
+    error: null,
     defaultKey: null,
     restore: {
       tagTerms: {},
@@ -97,7 +103,7 @@ describe("noteQueryFor", () => {
     state.setPinnedOnly(true);
 
     // The seeded Pinned space says `is:pinned` in its own frontmatter, which
-    // Rust evaluates from `spaceId`. If the store still carried a scope→flag
+    // Rust evaluates from `spaces`. If the store still carried a scope→flag
     // table this would be `["pinned", "pinned"]` or would double-filter.
     expect(noteQueryFor(notesFiltersStore.getState(), 0, 200).flags).toEqual(["pinned"]);
   });
@@ -111,15 +117,15 @@ describe("noteQueryFor", () => {
       notesFiltersStore.getState().enterSpace(space(`s-${key}`));
       const query = noteQueryFor(notesFiltersStore.getState(), 0, 200);
       expect(query.flags).toEqual([]);
-      expect(query.spaceId).toBe(`s-${key}`);
+      expect(query.spaces).toEqual([{ vaultId: "vault-1", spaceId: `s-${key}` }]);
     }
   });
 
-  it("sends a space id rather than a flag for a space scope", () => {
+  it("names a space scope with its drive rather than as a flag", () => {
     notesFiltersStore.getState().enterSpace(space("space-1"));
 
     const query = noteQueryFor(notesFiltersStore.getState(), 0, 200);
-    expect(query.spaceId).toBe("space-1");
+    expect(query.spaces).toEqual([{ vaultId: "vault-1", spaceId: "space-1" }]);
     expect(query.flags).toEqual([]);
   });
 
@@ -149,7 +155,7 @@ describe("space entry and explicit merging", () => {
       sort: "name asc",
       vaultIds: ["other"],
       includePrivate: true,
-      spaceId: "B",
+      spaces: [{ vaultId: "vault-1", spaceId: "B" }],
       spaceTerms: false,
     });
     state.removeTag("draft");
@@ -161,7 +167,7 @@ describe("space entry and explicit merging", () => {
     expect(notesFiltersStore.getState().text).toBe("saved prompt");
     state.enterSpace(space("keeper:all"));
     expect(noteQueryFor(notesFiltersStore.getState(), 0, 20)).toMatchObject({
-      spaceId: null,
+      spaces: [],
       text: null,
       vaultIds: ["other"],
       includePrivate: true,
@@ -177,7 +183,7 @@ describe("space entry and explicit merging", () => {
       text: "pricing",
       tags: { work: "include", draft: "exclude" },
       flags: ["archived"],
-      spaceId: "A",
+      spaces: [{ vaultId: "vault-1", spaceId: "A" }],
       vaultIds: ["v2"],
     });
   });
@@ -192,7 +198,7 @@ describe("space entry and explicit merging", () => {
     expect(terms()).toEqual([{ tag: "draft", term: "include" }]);
     state.enterSpace(space("opaque", { opaque: true }));
     expect(noteQueryFor(notesFiltersStore.getState(), 0, 20)).toMatchObject({
-      spaceId: "opaque",
+      spaces: [{ vaultId: "vault-1", spaceId: "opaque" }],
       spaceTerms: true,
       tags: {},
       text: null,
@@ -207,7 +213,7 @@ it.each(["scope", "escape"] as const)("forgets an explicit space sort on leaving
   if (exit === "scope") state.setScope(ALL_NOTES_SCOPE);
   else state.dropLastChip();
   expect(noteQueryFor(notesFiltersStore.getState(), 0, 20)).toMatchObject({
-    spaceId: null,
+    spaces: [],
     sort: null,
     text: "budget",
   });
@@ -238,6 +244,226 @@ describe("dropLastChip", () => {
     // An empty bar absorbs further presses rather than throwing or wrapping.
     drop();
     expect(isFiltered(notesFiltersStore.getState())).toBe(false);
+  });
+});
+
+describe("a selection of spaces (AD-306)", () => {
+  const query = () => noteQueryFor(notesFiltersStore.getState(), 0, 20);
+
+  it("adding a space from another drive names both on the wire and keeps only the person's own chips", () => {
+    const state = notesFiltersStore.getState();
+    state.enterSpace(space("X", { tagTerms: { work: "include" }, text: "budget" }));
+    state.setTagTerm("draft", "exclude");
+
+    state.toggleSpace(space("Y", {}, "vault-2"));
+
+    expect(query()).toMatchObject({
+      spaces: [
+        { vaultId: "vault-1", spaceId: "X" },
+        { vaultId: "vault-2", spaceId: "Y" },
+      ],
+      spaceTerms: true,
+      tags: { draft: "exclude" },
+      text: null,
+    });
+    expect(notesFiltersStore.getState().enteredSpace).toBeNull();
+  });
+
+  it("taking a union back to one space applies its lens without re-entering it", () => {
+    const state = notesFiltersStore.getState();
+    state.enterSpace(space("X", { tagTerms: { work: "include" } }));
+    state.toggleSpace(space("Y", {}, "vault-2"));
+    state.setText("tax");
+
+    state.toggleSpace(space("Y", {}, "vault-2"));
+
+    expect(query()).toMatchObject({
+      spaces: [{ vaultId: "vault-1", spaceId: "X" }],
+      spaceTerms: true,
+      text: "tax",
+    });
+    expect(terms()).toEqual([]);
+    // Not entered, so a reset empties the bar instead of refilling it from X.
+    notesFiltersStore.getState().resetSearch();
+    expect(notesFiltersStore.getState().text).toBe("");
+    expect(terms()).toEqual([]);
+  });
+
+  it("the last space out leaves every note in scope and the bar as it was", () => {
+    const state = notesFiltersStore.getState();
+    state.toggleSpace(space("X"));
+    state.setText("tax");
+
+    state.toggleSpace(space("X"));
+
+    expect(notesFiltersStore.getState().scope).toEqual(ALL_NOTES_SCOPE);
+    expect(query().text).toBe("tax");
+  });
+
+  it("counts one id on two drives as two members", () => {
+    const state = notesFiltersStore.getState();
+    state.toggleSpace(space("keeper:uncategorized", {}, "vault-1"));
+    state.toggleSpace(space("keeper:uncategorized", {}, "vault-2"));
+    expect(query().spaces).toHaveLength(2);
+
+    state.toggleSpace(space("keeper:uncategorized", {}, "vault-2"));
+
+    expect(query().spaces).toEqual([{ vaultId: "vault-1", spaceId: "keeper:uncategorized" }]);
+  });
+
+  it("walks a union down one space at a time on Esc", () => {
+    const state = notesFiltersStore.getState();
+    state.toggleSpace(space("X"));
+    state.toggleSpace(space("Y"));
+    state.toggleSpace(space("Z"));
+
+    notesFiltersStore.getState().dropLastChip();
+    expect(query().spaces.map((ref) => ref.spaceId)).toEqual(["X", "Y"]);
+    notesFiltersStore.getState().dropLastChip();
+    notesFiltersStore.getState().dropLastChip();
+    expect(notesFiltersStore.getState().scope).toEqual(ALL_NOTES_SCOPE);
+  });
+
+  it("says a union's name as its spaces joined by or", () => {
+    const state = notesFiltersStore.getState();
+    state.toggleSpace(space("Work"));
+    state.toggleSpace(space("Home", {}, "vault-2"));
+    expect(emptyFilterReason(notesFiltersStore.getState())).toBe("Narrowed by Work or Home.");
+  });
+});
+
+describe("restoreScope (AD-305)", () => {
+  const X = space("X", { tagTerms: { work: "include" }, text: "budget" });
+  const Y = space("Y", { tagTerms: { home: "include" } }, "vault-2");
+  const stampOf = (row: NoteSpaceVm) => {
+    notesFiltersStore.getState().enterSpace(row);
+    return notesFiltersStore.getState().scope;
+  };
+
+  it("an untouched bar follows the stamp as a rail click would", () => {
+    const stamp = stampOf(X);
+    notesFiltersStore.getState().setRailSpaces([X, Y]);
+    notesFiltersStore.getState().enterSpace(Y);
+
+    notesFiltersStore.getState().restoreScope(stamp);
+
+    const state = notesFiltersStore.getState();
+    expect(state.enteredSpace?.id).toBe("X");
+    expect(state.text).toBe("budget");
+    expect(terms()).toEqual([{ tag: "work", term: "include" }]);
+  });
+
+  it("a search the person typed follows the scope without the outgoing space's own chips", () => {
+    const stamp = stampOf(X);
+    notesFiltersStore.getState().setRailSpaces([X, Y]);
+    notesFiltersStore.getState().enterSpace(Y);
+    notesFiltersStore.getState().setText("tax");
+
+    notesFiltersStore.getState().restoreScope(stamp);
+
+    const state = notesFiltersStore.getState();
+    expect(state.enteredSpace).toBeNull();
+    expect(noteQueryFor(state, 0, 20)).toMatchObject({
+      spaces: [{ vaultId: "vault-1", spaceId: "X" }],
+      spaceTerms: true,
+      text: "tax",
+    });
+    // Y's `home` chip is Y's lens, not the person's: left on, it would AND onto
+    // X and empty the list.
+    expect(terms()).toEqual([]);
+  });
+
+  it("leaves the scope alone for a stamp naming a space the rail no longer lists", () => {
+    const stamp = stampOf(X);
+    notesFiltersStore.getState().setRailSpaces([Y]);
+    notesFiltersStore.getState().enterSpace(Y);
+
+    notesFiltersStore.getState().restoreScope(stamp);
+
+    expect(notesFiltersStore.getState().enteredSpace?.id).toBe("Y");
+  });
+
+  it("leaves the scope alone before the rail was read, and for a space whose query broke", () => {
+    const stamp = stampOf(X);
+    notesFiltersStore.getState().enterSpace(Y);
+    notesFiltersStore.getState().restoreScope(stamp);
+    expect(notesFiltersStore.getState().enteredSpace?.id).toBe("Y");
+
+    notesFiltersStore.getState().setRailSpaces([{ ...X, error: "bad query" }, Y]);
+    notesFiltersStore.getState().restoreScope(stamp);
+    expect(notesFiltersStore.getState().enteredSpace?.id).toBe("Y");
+  });
+
+  it("does not re-enter the scope already in force", () => {
+    const stamp = stampOf(X);
+    notesFiltersStore.getState().setRailSpaces([X, Y]);
+    notesFiltersStore.getState().removeTag("work");
+
+    notesFiltersStore.getState().restoreScope(stamp);
+
+    expect(terms()).toEqual([]);
+    expect(notesFiltersStore.getState().enteredSpace?.id).toBe("X");
+  });
+
+  it("an untouched bar going back to every note is emptied", () => {
+    notesFiltersStore.getState().setRailSpaces([X, Y]);
+    notesFiltersStore.getState().enterSpace(Y);
+
+    notesFiltersStore.getState().restoreScope(ALL_NOTES_SCOPE);
+
+    const state = notesFiltersStore.getState();
+    expect(state.scope).toEqual(ALL_NOTES_SCOPE);
+    expect(isFiltered(state)).toBe(false);
+  });
+
+  it("follows a folder stamp and keeps what the person typed", () => {
+    notesFiltersStore.getState().setText("tax");
+    const folder = { kind: "folder", vaultId: "vault-1", path: "Projects" } as const;
+
+    notesFiltersStore.getState().restoreScope(folder);
+
+    expect(notesFiltersStore.getState().scope).toEqual(folder);
+    expect(notesFiltersStore.getState().text).toBe("tax");
+  });
+
+  describe("a stamp of several spaces", () => {
+    const unionStamp = () => {
+      notesFiltersStore.getState().toggleSpace(X);
+      notesFiltersStore.getState().toggleSpace(Y);
+      return notesFiltersStore.getState().scope;
+    };
+    const names = () =>
+      scopeSpaces(notesFiltersStore.getState().scope).map((member) => member.name);
+
+    it("an untouched bar takes the union with an empty bar, under the names the rail reads now", () => {
+      const stamp = unionStamp();
+      notesFiltersStore.getState().setRailSpaces([{ ...X, name: "Clients" }, Y]);
+      notesFiltersStore.getState().enterSpace(Y);
+
+      notesFiltersStore.getState().restoreScope(stamp);
+
+      const state = notesFiltersStore.getState();
+      expect(names()).toEqual(["Clients", "Y"]);
+      expect(state.enteredSpace).toBeNull();
+      expect(state.text).toBe("");
+      expect(terms()).toEqual([]);
+      expect(emptyFilterReason(state)).toBe("Narrowed by Clients or Y.");
+    });
+
+    it("a search the person typed stays, without the outgoing space's own chips", () => {
+      const stamp = unionStamp();
+      notesFiltersStore.getState().setRailSpaces([{ ...X, name: "Clients" }, Y]);
+      notesFiltersStore.getState().enterSpace(Y);
+      notesFiltersStore.getState().setText("tax");
+
+      notesFiltersStore.getState().restoreScope(stamp);
+
+      const state = notesFiltersStore.getState();
+      expect(names()).toEqual(["Clients", "Y"]);
+      expect(state.text).toBe("tax");
+      expect(terms()).toEqual([]);
+      expect(state.enteredSpace).toBeNull();
+    });
   });
 });
 

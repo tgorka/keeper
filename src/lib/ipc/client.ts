@@ -225,6 +225,7 @@ export type { NoteSearchReq } from "./gen/NoteSearchReq";
 export type { NoteSearchStateVm } from "./gen/NoteSearchStateVm";
 export type { NoteSpaceFieldVm } from "./gen/NoteSpaceFieldVm";
 export type { NoteSpaceParkReq } from "./gen/NoteSpaceParkReq";
+export type { NoteSpaceRefReq } from "./gen/NoteSpaceRefReq";
 export type { NoteSpaceReq } from "./gen/NoteSpaceReq";
 export type { NoteSpaceRestoreVm } from "./gen/NoteSpaceRestoreVm";
 export type { NoteSpaceTagVm } from "./gen/NoteSpaceTagVm";

@@ -46,7 +46,7 @@ import { Fragment, type KeyboardEvent, useCallback, useEffect, useRef, useState 
 import { PanelStrip } from "@/components/layout/panel-strip";
 import { type SurfaceRail, useSurfaceColumn } from "@/components/layout/surface-column";
 import { NoteDeleteDialog } from "@/components/notes/note-delete-dialog";
-import { NoteFilterBar } from "@/components/notes/note-filter-bar";
+import { NoteFilterBar, SAVE_UNION_REFUSED } from "@/components/notes/note-filter-bar";
 import { NoteList } from "@/components/notes/note-list";
 import { type NotesEmptyKind, NotesEmptyState } from "@/components/notes/notes-empty-state";
 import { PhysicalTree } from "@/components/notes/physical-tree";
@@ -77,6 +77,7 @@ import {
   persistHideServiceFiles,
   persistIncludePrivate,
   scopeLabel,
+  scopeSpaces,
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
 import { notesListStore, useNotesListStore } from "@/lib/stores/notes-list";
@@ -292,6 +293,12 @@ export function NotesPane() {
     (trigger?: HTMLButtonElement) => {
       const anchor =
         trigger ?? document.querySelector<HTMLButtonElement>('button[aria-label="Save as space"]');
+      // The button says why it is disabled; the chord has no button to say it,
+      // so it says it here rather than doing nothing.
+      if (scopeSpaces(scope).length > 1) {
+        setActionError(SAVE_UNION_REFUSED);
+        return;
+      }
       const draft = captureSpaceDraft();
       if (anchor === null || draft === null) return;
       const parts = [
@@ -424,7 +431,10 @@ export function NotesPane() {
     emptyKind =
       searchText.trim() !== ""
         ? "no-search-matches"
-        : scope.kind === "space" && scope.defaultKey === "recordings" && scopeOnly
+        : scope.kind === "space" &&
+            scope.spaces.length === 1 &&
+            scope.spaces[0].defaultKey === "recordings" &&
+            scopeOnly
           ? "no-recordings"
           : filtered
             ? "no-matches"

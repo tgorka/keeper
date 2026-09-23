@@ -4128,7 +4128,7 @@ mod tests {
                 sort: None,
                 text: None,
                 tags: BTreeMap::new(),
-                space_id: None,
+                spaces: Vec::new(),
                 origin: None,
                 flags: Vec::new(),
                 offset: 0,
@@ -4148,7 +4148,10 @@ mod tests {
             let space = crate::notes_ipc::notes_space_save(vault.id.clone(), space)
                 .await
                 .expect("sort space");
-            req.space_id = Some(space.id);
+            req.spaces = vec![keeper_core::notes::vm::NoteSpaceRefReq {
+                vault_id: vault.id.clone(),
+                space_id: space.id,
+            }];
             req.space_terms = false;
             req.vault_ids = vec![vault.id.clone()];
             let answer =
@@ -4170,6 +4173,183 @@ mod tests {
         registry().remove(&vault.id);
         worker.abort();
         std::fs::remove_dir_all(vault.local_path).ok();
+    }
+
+    /// AD-306: a scope holding a space on each drive searches each drive
+    /// through its own space, and a drive holding none of them through all.
+    #[cfg(desktop)]
+    #[tokio::test]
+    async fn a_scope_of_two_spaces_searches_each_drive_through_its_own() {
+        use keeper_core::notes::vm::{NoteQueryReq, NoteSpaceRefReq};
+        let mut a = test_vault("two-spaces-a");
+        a.id = crate::sync_ipc::new_ulid();
+        let mut b = test_vault("two-spaces-b");
+        b.id = crate::sync_ipc::new_ulid();
+        b.name = "Archive".into();
+        let space = |id: &str, query: &str, extra: &str| {
+            format!("---\nid: {id}\nkeeper:\n  space: {query}\n{extra}---\n# {id}\n")
+        };
+        // Titles name the drive; a1 is the newer of A's two `a` notes, so it
+        // is the one a cap of one keeps under any ordering.
+        let note = |title: &str, tag: &str, updated: &str| {
+            let id = title.replace(' ', "-");
+            format!("---\nid: {id}\nupdated: {updated}\ntags: [{tag}]\n---\n# {title}\n")
+        };
+        let (newer, older) = ("2026-01-02T00:00:00Z", "2026-01-01T00:00:00Z");
+        let files: [(&Vault, &str, String); 11] = [
+            (&a, "spaces/x.md", space("x", "tag:a", "")),
+            (&a, "spaces/z.md", space("z", "tag:c", "")),
+            (&a, "spaces/cap.md", space("cap", "tag:a", "  limit: 1\n")),
+            (&b, "spaces/y.md", space("y", "tag:b", "")),
+            (&a, "a1.md", note("A a1", "a", newer)),
+            (&a, "a2.md", note("A a2", "a", older)),
+            (&a, "b.md", note("A b", "b", older)),
+            (&a, "c.md", note("A c", "c", older)),
+            (&b, "a.md", note("B a", "a", older)),
+            (&b, "b.md", note("B b", "b", older)),
+            (&b, "c.md", note("B c", "c", older)),
+        ];
+        let mut entries: HashMap<String, Vec<IndexEntry>> = HashMap::new();
+        // Each space's id as the index assigns it, by its path.
+        let mut ids: HashMap<&str, String> = HashMap::new();
+        for (vault, rel, text) in &files {
+            write_note(vault, rel, text).expect("fixture note");
+            let entry = index_written(rel, text, &vault.spaces_prefix());
+            ids.insert(*rel, entry.id.clone());
+            entries.entry(vault.id.clone()).or_default().push(entry);
+        }
+        let mut receivers = Vec::new();
+        for vault in [&a, &b] {
+            let (_, index) = watch::channel(
+                IndexBuilder::from_entries(entries.remove(&vault.id).unwrap_or_default())
+                    .snapshot(),
+            );
+            let (_, progress) = watch::channel(NoteIndexProgressVm {
+                vault_id: vault.id.clone(),
+                scanned: 0,
+                total_estimate: 0,
+                phase: "ready".into(),
+            });
+            let (_, search) = watch::channel(NoteSearchStateVm {
+                vault_id: vault.id.clone(),
+                phase: "words".into(),
+                indexed: 0,
+                total: 0,
+                embedded: 0,
+                embeddable: 0,
+                model: String::new(),
+                sentence: String::new(),
+            });
+            let (work, receiver) = mpsc::unbounded_channel();
+            receivers.push(receiver);
+            registry().insert(
+                vault.id.clone(),
+                Slot {
+                    vault: vault.clone(),
+                    index,
+                    progress,
+                    search,
+                    heads: Arc::new(HashMap::new()),
+                    work,
+                    cadence: Cadence::default(),
+                },
+            );
+        }
+        let on = |vault: &Vault, name: &str| NoteSpaceRefReq {
+            vault_id: vault.id.clone(),
+            space_id: ids[format!("spaces/{name}.md").as_str()].clone(),
+        };
+        let listed = |vault_ids: Vec<String>, spaces: Vec<NoteSpaceRefReq>| {
+            let a = a.clone();
+            async move {
+                let req = NoteQueryReq {
+                    space_terms: true,
+                    sort: None,
+                    vault_ids,
+                    include_private: false,
+                    text: None,
+                    hide_service_files: false,
+                    tags: BTreeMap::new(),
+                    spaces,
+                    origin: None,
+                    flags: Vec::new(),
+                    offset: 0,
+                    limit: 100,
+                };
+                let answer =
+                    crate::notes_ipc::project_vaults(&crate::ipc::DesktopPlatform, &a, &req)
+                        .await
+                        .expect("list");
+                let mut titles: Vec<_> = answer.rows.into_iter().map(|row| row.title).collect();
+                titles.sort();
+                (titles, answer.notice)
+            }
+        };
+        let list = |vault_ids: Vec<String>, spaces: Vec<NoteSpaceRefReq>| {
+            let listed = &listed;
+            async move {
+                let (titles, notice) = listed(vault_ids, spaces).await;
+                assert_eq!(notice, None);
+                titles
+            }
+        };
+        let both = vec![a.id.clone(), b.id.clone()];
+
+        // Each drive through its own space.
+        assert_eq!(
+            list(both.clone(), vec![on(&a, "x"), on(&b, "y")]).await,
+            ["A a1", "A a2", "B b"]
+        );
+        // One space still narrows every selected drive (FR-629).
+        assert_eq!(
+            list(both.clone(), vec![on(&a, "x")]).await,
+            ["A a1", "A a2", "B a"]
+        );
+        // Two spaces on one drive: that drive, and the drive with none, through
+        // both.
+        assert_eq!(
+            list(both.clone(), vec![on(&a, "x"), on(&a, "z")]).await,
+            ["A a1", "A a2", "A c", "B a", "B c"]
+        );
+        // A capped space keeps its cap beside another drive's space…
+        assert_eq!(
+            list(both.clone(), vec![on(&a, "cap"), on(&b, "y")]).await,
+            ["A a1", "B b"]
+        );
+        // …and beside another space on its own drive, where the union caps
+        // each space on its own rather than the whole.
+        assert_eq!(
+            list(vec![a.id.clone()], vec![on(&a, "cap"), on(&a, "z")]).await,
+            ["A a1", "A c"]
+        );
+        // Nothing selected: a scope on B searches B alone, not the active A.
+        assert_eq!(list(Vec::new(), vec![on(&b, "y")]).await, ["B b"]);
+
+        // A space that cannot be read keeps only the drive it narrows out of
+        // the list, and says so by name; the other drive lists as usual.
+        let gone = NoteSpaceRefReq {
+            vault_id: b.id.clone(),
+            space_id: "gone".to_owned(),
+        };
+        let (titles, notice) = listed(both.clone(), vec![on(&a, "x"), gone.clone()]).await;
+        assert_eq!(titles, ["A a1", "A a2"]);
+        let notice = notice.expect("B's absence is said");
+        assert!(
+            notice.contains("Archive") && notice.contains("gone"),
+            "names the drive and the space: {notice}"
+        );
+        // A space on a drive nobody searches narrows nothing, so it cannot
+        // fail the list either.
+        assert_eq!(
+            list(vec![a.id.clone()], vec![on(&a, "x"), gone]).await,
+            ["A a1", "A a2"]
+        );
+
+        registry().remove(&a.id);
+        registry().remove(&b.id);
+        drop(receivers);
+        std::fs::remove_dir_all(a.root).expect("a cleanup");
+        std::fs::remove_dir_all(b.root).expect("b cleanup");
     }
 
     fn stat(size: u64, mtime_ns: i128, ino: u64) -> FileStat {
@@ -4980,7 +5160,7 @@ mod tests {
     /// whose query admits it, nothing is withheld.
     #[tokio::test]
     async fn a_space_definition_is_a_service_file_of_the_plain_list_only() {
-        use keeper_core::notes::vm::NoteQueryReq;
+        use keeper_core::notes::vm::{NoteQueryReq, NoteSpaceRefReq};
         let mut vault = test_vault("space-service-file");
         vault.id = crate::sync_ipc::new_ulid();
         let platform = ScratchPlatform {
@@ -5036,7 +5216,7 @@ mod tests {
                 cadence: Cadence::default(),
             },
         );
-        let list = |hide_service_files: bool, space_id: Option<String>| {
+        let list = |hide_service_files: bool, spaces: Vec<NoteSpaceRefReq>| {
             let vault = vault.clone();
             let platform = &platform;
             async move {
@@ -5048,7 +5228,7 @@ mod tests {
                     text: None,
                     hide_service_files,
                     tags: BTreeMap::new(),
-                    space_id,
+                    spaces,
                     origin: None,
                     flags: Vec::new(),
                     offset: 0,
@@ -5062,11 +5242,16 @@ mod tests {
                 (titles, answer.hidden)
             }
         };
-        let scope = || Some(space_id.clone());
+        let scope = || {
+            vec![NoteSpaceRefReq {
+                vault_id: vault.id.clone(),
+                space_id: space_id.clone(),
+            }]
+        };
 
-        assert_eq!(list(true, None).await, (vec!["Plain".to_owned()], 1));
+        assert_eq!(list(true, Vec::new()).await, (vec!["Plain".to_owned()], 1));
         assert_eq!(
-            list(false, None).await,
+            list(false, Vec::new()).await,
             (vec!["Defs".to_owned(), "Plain".to_owned()], 0)
         );
         assert_eq!(

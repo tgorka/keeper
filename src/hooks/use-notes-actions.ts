@@ -53,7 +53,13 @@ import { ALL_SPACE_ID } from "@/lib/notes/all-spaces";
 import { captureSheetStore } from "@/lib/stores/capture-sheet";
 import { openCaptureWindow } from "@/lib/stores/capture-windows";
 import type { TagChip } from "@/lib/stores/notes-filters";
-import { noteQueryFor, notesFiltersStore } from "@/lib/stores/notes-filters";
+import {
+  noteQueryFor,
+  notesFiltersStore,
+  scopeHas,
+  scopeSpaces,
+  spaceKey,
+} from "@/lib/stores/notes-filters";
 import { notesListStore } from "@/lib/stores/notes-list";
 import { notesVaultsStore } from "@/lib/stores/notes-vaults";
 import { panelsStore } from "@/lib/stores/panels";
@@ -229,16 +235,23 @@ export interface SpaceSaveDraft {
   request: NoteSpaceReq;
 }
 export function captureSpaceDraft(): SpaceSaveDraft | null {
-  const vaultId = activeVaultId();
-  if (vaultId === null) return null;
+  const activeVault = activeVaultId();
+  if (activeVault === null) return null;
   const { limit } = notesListStore.getState();
   const filters = notesFiltersStore.getState();
+  // One saved space cannot hold a union's per-drive meaning, so a selection
+  // of several is not offered for saving at all (DW-268 stands).
+  const members = scopeSpaces(filters.scope);
+  if (members.length > 1) return null;
   const query = noteQueryFor(filters, 0, limit);
+  const base = query.spaceTerms ? (members[0] ?? null) : null;
   return {
-    vaultId,
+    // A base is resolved in the drive it is saved into, so the draft goes to
+    // the base's own drive — the scope may be a space on another one.
+    vaultId: base?.vaultId ?? activeVault,
     request: {
       id: null,
-      baseSpaceId: query.spaceTerms ? query.spaceId : null,
+      baseSpaceId: base?.id ?? null,
       name: "",
       query: spaceQueryText({
         tags: filters.tagTerms,
@@ -278,43 +291,87 @@ export async function saveFilterAsSpace(
 let spaceEntries: Promise<unknown> = Promise.resolve();
 let spaceEntryRequest = 0;
 let queryGeneration = 0;
+// Set while a queued entry applies its own scope change, which is the queue's
+// doing and not an edit that should cancel the entries behind it.
+let applyingEntry = false;
 // Count query edits, including edit-and-undo, but not rail reload/focus notifications.
 notesFiltersStore.subscribe((state, previous) => {
   if (
-    state.scope !== previous.scope ||
-    state.tagTerms !== previous.tagTerms ||
-    state.text !== previous.text ||
-    state.flags !== previous.flags ||
-    state.origin !== previous.origin ||
-    state.sort !== previous.sort ||
-    state.vaultIds !== previous.vaultIds ||
-    state.includePrivate !== previous.includePrivate ||
-    state.hideServiceFiles !== previous.hideServiceFiles
+    !applyingEntry &&
+    (state.scope !== previous.scope ||
+      state.tagTerms !== previous.tagTerms ||
+      state.text !== previous.text ||
+      state.flags !== previous.flags ||
+      state.origin !== previous.origin ||
+      state.sort !== previous.sort ||
+      state.vaultIds !== previous.vaultIds ||
+      state.includePrivate !== previous.includePrivate ||
+      state.hideServiceFiles !== previous.hideServiceFiles)
   )
     queryGeneration += 1;
 });
-export function openNotesSpace(vaultId: string, space: NoteSpaceVm): Promise<NoteSpaceVm> {
-  const request = ++spaceEntryRequest;
-  const generation = queryGeneration;
+
+/** Apply a queued entry's own change to the scope. */
+function applyEntry(change: () => void): void {
+  applyingEntry = true;
+  try {
+    change();
+  } finally {
+    applyingEntry = false;
+  }
+}
+
+/**
+ * Run one rail entry after every earlier one, handing it a check that says
+ * nothing edited the query, the active drive is the one it was asked on, and —
+ * for a plain click, where only the newest one counts — that no later plain
+ * click superseded it.
+ *
+ * "Nothing edited the query" starts at different moments for the two kinds. A
+ * plain click yields to anything the person does after clicking, so it counts
+ * from the click. A ⌘-click counts from when it starts: each is its own
+ * addition, so none cancels another. Neither is cancelled by an earlier
+ * entry's own scope change ({@link applyEntry}).
+ */
+function enqueueSpaceEntry(
+  supersedes: boolean,
+  run: (current: () => boolean) => Promise<NoteSpaceVm>,
+): Promise<NoteSpaceVm> {
+  const request = supersedes ? ++spaceEntryRequest : spaceEntryRequest;
   const activeVault = activeVaultId();
-  const current = () =>
-    request === spaceEntryRequest &&
-    generation === queryGeneration &&
-    activeVault === activeVaultId();
-  const entry = spaceEntries.then(async () => {
+  const clicked = queryGeneration;
+  const entry = spaceEntries.then(() => {
+    const generation = supersedes ? clicked : queryGeneration;
+    return run(
+      () =>
+        (!supersedes || request === spaceEntryRequest) &&
+        generation === queryGeneration &&
+        activeVault === activeVaultId(),
+    );
+  });
+  spaceEntries = entry.catch(() => {});
+  return entry;
+}
+
+/** A plain rail click: the selection becomes this one space, its saved search on the bar. */
+export function openNotesSpace(vaultId: string, space: NoteSpaceVm): Promise<NoteSpaceVm> {
+  return enqueueSpaceEntry(true, async (current) => {
     if (space.error !== null) throw new Error(space.error);
     if (!current()) return space;
     const filters = notesFiltersStore.getState();
+    const outgoing = scopeSpaces(filters.scope);
+    const sole = outgoing.length === 1 ? outgoing[0] : undefined;
     // Re-selecting the active row is not permission to discard in-space edits.
+    // A plain click on one member of a union is a real change: it narrows to it.
     if (
-      (filters.scope.kind === "space" &&
-        filters.scope.id === space.id &&
-        filters.scope.vaultId === space.vaultId) ||
+      (sole !== undefined && spaceKey(sole) === spaceKey(space)) ||
       (filters.scope.kind === "all" && space.id === ALL_SPACE_ID)
     )
       return space;
     const baseline =
-      filters.scope.kind === "space" && filters.enteredSpace?.id === filters.scope.id
+      sole !== undefined &&
+      filters.enteredSpace !== null &&
+      spaceKey(filters.enteredSpace) === spaceKey(sole)
         ? filters.enteredSpace
         : null;
     const query = noteQueryFor(filters, 0, notesListStore.getState().limit);
@@ -328,43 +385,62 @@ export function openNotesSpace(vaultId: string, space: NoteSpaceVm): Promise<Not
       filters.tagTerms.length !==
         Object.keys(restore?.opaque ? {} : (restore?.tagTerms ?? {})).length ||
       filters.tagTerms.some(({ tag, term }) => restore?.opaque || restore?.tagTerms[tag] !== term);
-    const outgoingId = filters.scope.kind === "space" ? filters.scope.id : ALL_SPACE_ID;
     const meaningful =
-      (query.spaceTerms && query.spaceId !== null) ||
+      (query.spaceTerms && query.spaces.length > 0) ||
       query.text !== null ||
       filters.tagTerms.length > 0 ||
       query.flags.length > 0 ||
       query.origin !== null;
+    // A park needs one base and one drive, so leaving a union parks nothing.
     if (
-      (outgoingId !== space.id ||
-        (filters.scope.kind === "space" && filters.scope.vaultId !== space.vaultId)) &&
+      outgoing.length <= 1 &&
+      (sole !== undefined || space.id !== ALL_SPACE_ID) &&
       baseline?.ttlHours == null &&
       changed &&
       meaningful
     ) {
-      await notesSpacePark(
-        filters.scope.kind === "space" ? filters.scope.vaultId : vaultId,
-        filters.scope.kind === "space" ? filters.scope.name : "All notes",
-        {
-          baseSpaceId: query.spaceTerms ? query.spaceId : null,
-          tagTerms: query.tags,
-          origin: query.origin,
-          flags: query.flags,
-          text: query.text,
-          sort: query.sort,
-        },
-      );
+      await notesSpacePark(sole?.vaultId ?? vaultId, sole?.name ?? "All notes", {
+        baseSpaceId: query.spaceTerms ? (sole?.id ?? null) : null,
+        tagTerms: query.tags,
+        origin: query.origin,
+        flags: query.flags,
+        text: query.text,
+        sort: query.sort,
+      });
       notesFiltersStore.getState().requestSpacesReload();
     }
     if (!current()) return space;
     const acknowledged = space.id.startsWith("keeper:")
       ? space
       : await notesSpaceTouch(space.vaultId, space.id);
-    if (current()) notesFiltersStore.getState().enterSpace(acknowledged);
+    if (current()) applyEntry(() => notesFiltersStore.getState().enterSpace(acknowledged));
     return acknowledged;
   });
-  spaceEntries = entry.catch(() => {});
-  return entry;
+}
+
+/**
+ * A ⌘/Ctrl-click on a rail row: add the space to the selection, or take it
+ * out (AD-306). Nothing is parked and the bar is never filled from a space.
+ * All notes is not a member of anything, so it opens as a plain click would.
+ */
+export function toggleNotesSpace(vaultId: string, space: NoteSpaceVm): Promise<NoteSpaceVm> {
+  if (space.id === ALL_SPACE_ID) return openNotesSpace(vaultId, space);
+  return enqueueSpaceEntry(false, async (current) => {
+    const filters = notesFiltersStore.getState();
+    // A member whose query broke can still be taken out of the selection.
+    if (scopeHas(filters.scope, space)) {
+      if (current()) applyEntry(() => filters.toggleSpace(space));
+      return space;
+    }
+    if (space.error !== null) throw new Error(space.error);
+    if (!current()) return space;
+    // Added to a selection is opened: a temporary space is touched and keeps its lifetime.
+    const acknowledged = space.id.startsWith("keeper:")
+      ? space
+      : await notesSpaceTouch(space.vaultId, space.id);
+    if (current()) applyEntry(() => notesFiltersStore.getState().toggleSpace(acknowledged));
+    return acknowledged;
+  });
 }
 
 /**

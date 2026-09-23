@@ -239,6 +239,7 @@ describe("AppShell", () => {
         {
           id: "p",
           target: { kind: "file", profileId: "p1", relativePath: "docs/report.pdf" },
+          scope: null,
           replaced: null,
           folded: false,
           back: [],
@@ -580,6 +581,7 @@ describe("AppShell", () => {
         {
           id: "p",
           target: { kind: "file", profileId: "p1", relativePath: "docs/report.pdf" },
+          scope: null,
           replaced: null,
           folded: false,
           back: [],

@@ -43,7 +43,6 @@ use keeper_core::notes::template_update::{
     self, TemplateUpdateAppliedVm, TemplateUpdateApplyReq, TemplateUpdateOfferVm,
     TemplateUpdateResultVm,
 };
-use keeper_core::notes::vm::NoteReleaseReq;
 use keeper_core::notes::vm::{EmbeddingModelVm, NoteHitVm, NoteMarksVm, NoteSearchStateVm};
 use keeper_core::notes::vm::{
     NoteAttachSourceVm, NoteAttachTargetVm, NoteAttachmentVm, NoteBodyBatch, NoteBodyVm,
@@ -54,8 +53,9 @@ use keeper_core::notes::vm::{
     NoteSearchReq, NoteSpaceReq, NoteSpaceTermsVm, NoteSpaceVm, NoteTagNodeVm, NoteTagTreeVm,
     NoteTemplateVm, NoteVaultSettingsReq, NoteVaultVm, NoteWriteVm,
 };
+use keeper_core::notes::vm::{NoteReleaseReq, NoteSpaceRefReq};
 use keeper_core::notes::{
-    attach, counts, csv, naming, order, query, search, seed, sort, tags, templates, widget,
+    attach, counts, csv, merge, naming, order, query, search, seed, sort, tags, templates, widget,
     NotesError,
 };
 use keeper_core::registry;
@@ -716,10 +716,7 @@ fn matches_filter(
     }
     // A conflict copy is hidden from the default lens and surfaced as a conflict
     // row instead (FR-116), so it appears only when asked for by name.
-    let default_lens = req
-        .space_id
-        .as_deref()
-        .is_none_or(|id| id.is_empty() || id == ALL_SPACE_ID);
+    let default_lens = default_lens(req);
     if default_lens
         && has_flag(entry, "conflict")
         && !req.flags.iter().any(|flag| flag == "conflict")
@@ -756,14 +753,16 @@ fn query_sort(req: &NoteQueryReq) -> Result<Option<sort::SpaceSort>, IpcError> {
         })
 }
 
+/// Whether a scope's spaces admit `entry`: any one of them does (AD-306).
+/// Only called with at least one lens; the default lens has none to test.
 fn space_matches(
     req: &NoteQueryReq,
-    parsed: Option<&query::Query>,
+    lenses: &[LensTest],
     entry: &IndexEntry,
     body: &mut dyn FnMut() -> String,
     now_ms: i64,
 ) -> bool {
-    !req.space_terms || parsed.is_none_or(|parsed| query::eval(parsed, entry, body, now_ms))
+    !req.space_terms || lenses.iter().any(|lens| lens.admits(entry, body, now_ms))
 }
 
 fn meaning_notice(state: Option<&NoteSearchStateVm>, configured: bool) -> Option<String> {
@@ -804,30 +803,21 @@ fn fold(value: &str) -> String {
 /// - **the page** — `req.offset`/`req.limit`, how many rows this one read
 ///   carries over the wire. Never a count of anything, and after Story 44.10
 ///   never a count of what is rendered either.
+///
+/// `lenses` are the scope's spaces that narrow THIS drive, each already read
+/// from its own drive ([`merge::DriveScope`]); empty for the default lens.
 async fn project_list(
     platform: &dyn keeper_core::platform::Platform,
     vault: &Vault,
     req: &NoteQueryReq,
-    scope_vault: &Vault,
+    lenses: &[&SpaceLens],
     whole: bool,
     embedding: &mut Option<EmbeddingAnswer>,
 ) -> Result<NoteListVm, IpcError> {
     let snapshot = notes_vault::snapshot(&vault.id)
         .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault.id.clone())))?;
     let heads = notes_vault::heads(&vault.id).unwrap_or_default();
-    let scope_snapshot = notes_vault::snapshot(&scope_vault.id)
-        .ok_or_else(|| notes_error(NotesError::VaultUnknown(scope_vault.id.clone())))?;
-    let space = match req.space_id.as_deref() {
-        Some(id) if !id.is_empty() && id != ALL_SPACE_ID => {
-            Some(space_lens(scope_vault, &scope_snapshot, id)?)
-        }
-        _ => None,
-    };
-    let prompt = if req.space_terms {
-        space.as_ref().and_then(|space| space.text.as_deref())
-    } else {
-        None
-    };
+    let prompt = sole_prompt(req, lenses.first().copied());
     let text = req
         .text
         .as_deref()
@@ -895,37 +885,24 @@ async fn project_list(
     // brings its own ordering (Story 44.4) — the value that has sat in
     // `keeper.sort` since Story 37.4 and that nothing read until now — and its
     // own selection cap (Story 44.11), which is the neighbouring value 44.4
-    // left where it was.
+    // left where it was. A union of spaces (AD-306) admits what any of them
+    // admits, is ordered by the first, and caps per space below.
+    let union = req.spaces.len() > 1;
+    let tests = lens_tests(vault, &snapshot, lenses, union);
+    let now_ms = notes_vault::local_now_ms();
+    // A union with a capped space caps each space on its own below, so the one
+    // pass that tests the lenses records which of them admitted each entry —
+    // `admissions[admitted_at[path] + k]` for lens `k` — and nothing is tested twice.
+    let capped_union = lenses.len() > 1 && lenses.iter().any(|lens| lens.limit.is_some());
+    let mut admissions: Vec<bool> = Vec::new();
+    let mut admitted_at: HashMap<&str, usize> = HashMap::new();
     let (mut matched, ordering, cap, space_name): (
         Vec<&IndexEntry>,
         Option<sort::SpaceSort>,
         Option<u32>,
         String,
-    ) = match space {
-        Some(lens) => {
-            let mut parsed = lens.query;
-            // Bound to this snapshot so `backlink:` and title-resolved `link:`
-            // can be answered at all; the binding is per snapshot revision.
-            if let Some(parsed) = &mut parsed {
-                query::bind_index(parsed, &snapshot);
-            }
-            let now_ms = notes_vault::local_now_ms();
-            (
-                snapshot
-                    .entries()
-                    .iter()
-                    .filter(|entry| {
-                        let mut body = body_reader(vault, &entry.path);
-                        space_matches(req, parsed.as_ref(), entry, &mut body, now_ms)
-                            && matches_filter(entry, &public_req, &tags, heads.get(&entry.path))
-                    })
-                    .collect(),
-                Some(lens.ordering),
-                lens.limit,
-                lens.name,
-            )
-        }
-        None => {
+    ) = match lenses {
+        [] => {
             // Folded once for the whole walk, not once per entry (NFR-28).
             let tags = TagTerms::new(&req.tags);
             (
@@ -944,6 +921,37 @@ async fn project_list(
                 String::new(),
             )
         }
+        [first, ..] => (
+            snapshot
+                .entries()
+                .iter()
+                .filter(|entry| {
+                    let mut body = body_reader(vault, &entry.path);
+                    if !capped_union {
+                        return space_matches(req, &tests, entry, &mut body, now_ms)
+                            && matches_filter(entry, &public_req, &tags, heads.get(&entry.path));
+                    }
+                    if !matches_filter(entry, &public_req, &tags, heads.get(&entry.path)) {
+                        return false;
+                    }
+                    let at = admissions.len();
+                    admissions.extend(tests.iter().map(|test| {
+                        space_matches(req, std::slice::from_ref(test), entry, &mut body, now_ms)
+                    }));
+                    if admissions[at..].contains(&true) {
+                        admitted_at.insert(entry.path.as_str(), at);
+                        true
+                    } else {
+                        admissions.truncate(at);
+                        false
+                    }
+                })
+                .collect(),
+            Some(first.ordering),
+            // Several spaces on one drive cap each on its own, after the sort.
+            if lenses.len() == 1 { first.limit } else { None },
+            first.name.clone(),
+        ),
     };
     if let Some(scores) = &scores {
         let ids: HashSet<&str> = scores.iter().map(|hit| hit.note_id.as_str()).collect();
@@ -964,10 +972,7 @@ async fn project_list(
         .map_err(crate::ipc::to_ipc_error)?;
         // A space definition is a service file of the default lens only: inside
         // a space the user chose a query, and it decides what that shows.
-        let default_lens = req
-            .space_id
-            .as_deref()
-            .is_none_or(|id| id.is_empty() || id == ALL_SPACE_ID);
+        let default_lens = default_lens(req);
         matched.retain(|entry| {
             !keeper_core::notes::service_files::is_service_file(&entry.path, &names)
                 && !(default_lens
@@ -1018,21 +1023,44 @@ async fn project_list(
     // most recent" mean what it says: sort first, then keep the first twenty.
     // Capping the unsorted set would keep twenty arbitrary matches and change
     // which ones every time the index walked in a different order.
-    let selection = counts::select(matched.len(), cap);
-    // A cap that declined notes is the one way this function does nothing on
-    // purpose, and a decline nobody is told about is indistinguishable from a
-    // vault that simply has fewer notes in it. `debug!` reaches no log the
-    // shipped app writes (DW-162), so the level is `keeper-core`'s — asserted
-    // there against the floor the app's own filter sets — and this call site
-    // matches over it rather than picking one, the shape `seed_default_spaces`
-    // uses and for the reason it learned.
-    if let Some((level, message)) = selection.report(&space_name) {
-        if level <= tracing::Level::WARN {
-            tracing::warn!(vault = %vault.id, "notes: {message}");
-        } else {
-            tracing::info!(vault = %vault.id, "notes: {message}");
+    let selection = if capped_union {
+        // Each space keeps what it would keep alone, in its own order: an
+        // explicit sort or a ranking orders every space the same way, so the
+        // union's order is already each one's; otherwise it is the space's sort.
+        let own_order = explicit_sort.is_none() && scores.is_none();
+        let per_space: Vec<(Option<u32>, Vec<usize>)> = lenses
+            .iter()
+            .enumerate()
+            .map(|(k, lens)| {
+                let mut admitted: Vec<usize> = (0..matched.len())
+                    .filter(|&i| {
+                        admitted_at
+                            .get(matched[i].path.as_str())
+                            .is_some_and(|&at| admissions[at + k])
+                    })
+                    .collect();
+                if own_order {
+                    admitted.sort_by(|&a, &b| sort::compare(lens.ordering, matched[a], matched[b]));
+                }
+                if lens.limit.is_some() {
+                    let alone = counts::select(admitted.len(), lens.limit);
+                    report_selection(vault, alone, &lens.name);
+                }
+                (lens.limit, admitted)
+            })
+            .collect();
+        let before = matched.len();
+        let mut keep = counts::union_keep(before, per_space).into_iter();
+        matched.retain(|_| keep.next().unwrap_or(false));
+        counts::Selection {
+            matched: u32::try_from(before).unwrap_or(u32::MAX),
+            total: u32::try_from(matched.len()).unwrap_or(u32::MAX),
         }
-    }
+    } else {
+        let selection = counts::select(matched.len(), cap);
+        report_selection(vault, selection, &space_name);
+        selection
+    };
     // The page size is the caller's, bounded so nobody can ask for 10 000 rows
     // of JSON and undo AD-58. WHICH rows that page names is `counts::page`'s,
     // in the crate that can prove it: the cap has to bind before the offset, or
@@ -1092,6 +1120,25 @@ async fn project_list(
         offset,
         hidden,
     })
+}
+
+/// Say that a cap declined notes, at the level `keeper-core` decided.
+///
+/// A cap that declined notes is the one way a list does nothing on purpose,
+/// and a decline nobody is told about is indistinguishable from a vault that
+/// simply has fewer notes in it. `debug!` reaches no log the shipped app
+/// writes (DW-162), so the level is `keeper-core`'s — asserted there against
+/// the floor the app's own filter sets — and this matches over it rather than
+/// picking one, the shape `seed_default_spaces` uses and for the reason it
+/// learned.
+fn report_selection(vault: &Vault, selection: counts::Selection, space: &str) {
+    if let Some((level, message)) = selection.report(space) {
+        if level <= tracing::Level::WARN {
+            tracing::warn!(vault = %vault.id, "notes: {message}");
+        } else {
+            tracing::info!(vault = %vault.id, "notes: {message}");
+        }
+    }
 }
 
 type EmbeddingAnswer = Result<Option<(String, Vec<f32>)>, &'static str>;
@@ -1467,6 +1514,153 @@ fn space_lens(
     })
 }
 
+/// Whether a scope member's id names a lens at all. An empty or `keeper:all`
+/// id names none, as `space_id` never did; the frontend never sends one.
+fn names_a_lens(space_id: &str) -> bool {
+    !space_id.is_empty() && space_id != ALL_SPACE_ID
+}
+
+/// No space narrows this query: the default lens, which hides conflict copies
+/// (FR-116), archived notes (FR-119) and space definitions (AD-303).
+fn default_lens(req: &NoteQueryReq) -> bool {
+    !req.spaces.iter().any(|space| names_a_lens(&space.space_id))
+}
+
+/// One scope member's lens, read from its OWN drive (AD-306), so a space on B
+/// is never resolved against A's snapshot (AD-294).
+fn member_lens(space: &&NoteSpaceRefReq) -> Result<SpaceLens, IpcError> {
+    let vault = vault_of(&space.vault_id)?;
+    let snapshot = notes_vault::snapshot(&vault.id)
+        .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault.id.clone())))?;
+    space_lens(&vault, &snapshot, &space.space_id)
+}
+
+/// The spaces a query names, each resolved only when a searched drive needs
+/// it ([`merge::DriveScope`]): a member that cannot be read keeps the drives
+/// it narrows out of the list, never the others.
+fn scope_members(req: &NoteQueryReq) -> Vec<&NoteSpaceRefReq> {
+    req.spaces
+        .iter()
+        .filter(|space| names_a_lens(&space.space_id))
+        .collect()
+}
+
+/// The drive a scope member lives on.
+fn home_of<'a>(space: &'a &NoteSpaceRefReq) -> &'a str {
+    &space.vault_id
+}
+
+/// Why `drive` could not be listed: the space it needed could not be read.
+/// Named, and the drive it lives on, because the person chose it by name.
+fn unreadable_member(drive: &str, space: &NoteSpaceRefReq, error: &IpcError) -> String {
+    let home = notes_vault::vault(&space.vault_id);
+    let name = if space.space_id == UNCATEGORIZED_SPACE_ID {
+        "Uncategorized".to_owned()
+    } else {
+        notes_vault::snapshot(&space.vault_id)
+            .and_then(|snapshot| {
+                snapshot
+                    .by_id(&space.space_id)
+                    .map(|entry| entry.title.clone())
+            })
+            .unwrap_or_else(|| space.space_id.clone())
+    };
+    let home = home.map_or_else(|| space.vault_id.clone(), |home| home.name);
+    format!(
+        "Drive {drive} could not be listed: the space {name} on {home} could not be read — {}",
+        error.message
+    )
+}
+
+/// A space's saved prompt ranks the list only when the scope names exactly
+/// one space. Inside a union it selects by its words instead ([`PromptWords`]):
+/// ranking would need one embedding per prompt per refresh, and merged scores
+/// from different texts would not compare.
+fn sole_prompt<'a>(req: &NoteQueryReq, lens: Option<&'a SpaceLens>) -> Option<&'a str> {
+    lens.filter(|_| req.space_terms && req.spaces.len() == 1)
+        .and_then(|lens| lens.text.as_deref())
+}
+
+/// The prompt a space contributes as a word filter, inside a union only.
+fn union_prompt(lens: &SpaceLens, union: bool) -> Option<&str> {
+    lens.text
+        .as_deref()
+        .filter(|text| union && !text.trim().is_empty())
+}
+
+/// How a saved prompt selects inside a union: the notes its words find, and
+/// no ranking.
+enum PromptWords {
+    /// The search index's lexical answer, by note id.
+    Ids(HashSet<String>),
+    /// The index is not open or still indexing: the same fallback the list's
+    /// own text search takes.
+    Text(String),
+}
+
+impl PromptWords {
+    fn read(text: &str, index: Option<&SearchIndex>) -> Self {
+        match index.and_then(|index| index.query(text, search_index::LEXICAL_POOL).ok()) {
+            Some(hits) => Self::Ids(hits.into_iter().map(|hit| hit.note_id).collect()),
+            None => Self::Text(text.trim().to_owned()),
+        }
+    }
+
+    fn admits(&self, entry: &IndexEntry) -> bool {
+        match self {
+            Self::Ids(ids) => ids.contains(&entry.id),
+            Self::Text(text) => entry.matches_text(text),
+        }
+    }
+}
+
+/// One space's membership test on one drive: its query bound to that drive's
+/// snapshot and, inside a union, its prompt's words.
+struct LensTest {
+    query: Option<query::Query>,
+    words: Option<PromptWords>,
+}
+
+impl LensTest {
+    fn admits(&self, entry: &IndexEntry, body: &mut dyn FnMut() -> String, now_ms: i64) -> bool {
+        self.words.as_ref().is_none_or(|words| words.admits(entry))
+            && self
+                .query
+                .as_ref()
+                .is_none_or(|query| query::eval(query, entry, body, now_ms))
+    }
+}
+
+fn lens_tests(
+    vault: &Vault,
+    snapshot: &IndexSnapshot,
+    lenses: &[&SpaceLens],
+    union: bool,
+) -> Vec<LensTest> {
+    let prompted = lenses
+        .iter()
+        .any(|lens| union_prompt(lens, union).is_some());
+    let index = if prompted
+        && notes_vault::search_state(&vault.id).is_some_and(|state| state.phase != "indexing")
+    {
+        SearchIndex::open_read_only(&vault.keeper_dir().join(SEARCH_DB_FILE)).ok()
+    } else {
+        None
+    };
+    lenses
+        .iter()
+        .map(|lens| LensTest {
+            // Bound to this snapshot so `backlink:` and title-resolved `link:`
+            // can be answered at all; the binding is per snapshot revision.
+            query: lens.query.clone().map(|mut query| {
+                query::bind_index(&mut query, snapshot);
+                query
+            }),
+            words: union_prompt(lens, union).map(|text| PromptWords::read(text, index.as_ref())),
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Vault commands
 // ---------------------------------------------------------------------------
@@ -1839,14 +2033,37 @@ pub async fn notes_list(
     project_vaults(state.platform.as_ref(), &vault, &query).await
 }
 
+/// The list for a query sent to `vault`, the active drive (AD-306).
+///
+/// Each drive searched is narrowed by the spaces that live on it, or by all of
+/// them when none does, and a space is read off its own drive only when a
+/// drive searched needs it. A space that cannot be read — deleted, or on a
+/// drive that went away — keeps the drives it narrows out of the list with a
+/// notice naming it, and the other drives list as usual. With nothing
+/// selected, a query that names spaces on one drive searches that drive alone,
+/// paged as the plain single-drive list always was, and fails as it always did
+/// when a space it needs cannot be read.
 pub(crate) async fn project_vaults(
     platform: &dyn keeper_core::platform::Platform,
     vault: &Vault,
     req: &NoteQueryReq,
 ) -> Result<NoteListVm, IpcError> {
+    let members = scope_members(req);
+    let mut scope = merge::DriveScope::new(&members, home_of);
+    let drives = req.search_drives(&vault.id);
     let mut embedding = None;
-    if req.vault_ids.is_empty() {
-        return project_list(platform, vault, req, vault, false, &mut embedding).await;
+    if let ([drive], true) = (drives.as_slice(), req.vault_ids.is_empty()) {
+        let lenses = scope
+            .for_drive(drive, member_lens)
+            .map_err(|(_, error)| error.clone())?;
+        let other;
+        let target = if *drive == vault.id {
+            vault
+        } else {
+            other = vault_of(drive)?;
+            &other
+        };
+        return project_list(platform, target, req, &lenses, false, &mut embedding).await;
     }
     let mut pages = Vec::new();
     let mut totals = Vec::new();
@@ -1856,34 +2073,26 @@ pub(crate) async fn project_vaults(
     let mut notice = None;
     let mut inner = req.clone();
     inner.offset = 0;
-    let ids: std::collections::BTreeSet<_> = req.vault_ids.iter().collect();
+    let ids: std::collections::BTreeSet<&str> = drives.into_iter().collect();
     let mut snapshots = HashMap::new();
     let explicit = query_sort(req)?;
-    let lens = match req.space_id.as_deref() {
-        Some(id) if !id.is_empty() && id != ALL_SPACE_ID => {
-            let snapshot = notes_vault::snapshot(&vault.id)
-                .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault.id.clone())))?;
-            Some(space_lens(vault, &snapshot, id)?)
-        }
-        _ => None,
-    };
-    let prompt = req.text.as_deref().or_else(|| {
-        lens.as_ref()
-            .filter(|_| req.space_terms)
-            .and_then(|lens| lens.text.as_deref())
-    });
-    let browsing = prompt.is_none_or(|text| text.trim().is_empty());
     for id in ids {
         let result = match vault_of(id) {
-            Ok(target) => {
-                project_list(platform, &target, &inner, vault, true, &mut embedding).await
-            }
-            Err(error) => Err(error),
+            Ok(target) => match scope.for_drive(id, member_lens) {
+                Ok(lenses) => {
+                    project_list(platform, &target, &inner, &lenses, true, &mut embedding)
+                        .await
+                        .map_err(|error| {
+                            format!("Drive {id} could not be listed: {}", error.message)
+                        })
+                }
+                Err((space, error)) => Err(unreadable_member(&target.name, space, error)),
+            },
+            Err(error) => Err(format!("Drive {id} could not be listed: {}", error.message)),
         };
         let answer = match result {
             Ok(answer) => answer,
-            Err(error) => {
-                let sentence = format!("Drive {id} could not be listed: {}", error.message);
+            Err(sentence) => {
                 notice = Some(match notice {
                     Some(previous) => format!("{previous} {sentence}"),
                     None => sentence,
@@ -1897,7 +2106,7 @@ pub(crate) async fn project_vaults(
         private = private.saturating_add(answer.private);
         notice = notice.or(answer.notice);
         if let Some(snapshot) = notes_vault::snapshot(id) {
-            snapshots.insert(id.clone(), snapshot);
+            snapshots.insert(id.to_owned(), snapshot);
         }
         pages.push(answer.rows);
     }
@@ -1906,9 +2115,14 @@ pub(crate) async fn project_vaults(
     } else {
         req.limit.min(MAX_LIMIT)
     };
-    let (mut rows, total) = keeper_core::notes::merge::merge_rows(pages, &totals);
-    if explicit.is_some() || browsing {
-        let ordering = explicit.or_else(|| lens.as_ref().map(|lens| lens.ordering));
+    let (mut rows, total) = merge::merge_rows(pages, &totals);
+    let prompt = req
+        .text
+        .as_deref()
+        .or_else(|| sole_prompt(req, scope.first()));
+    if explicit.is_some() || prompt.is_none_or(|text| text.trim().is_empty()) {
+        // A union is ordered by the space chosen first, as on one drive.
+        let ordering = explicit.or_else(|| scope.first().map(|lens| lens.ordering));
         rows.sort_by(|a, b| {
             let left = snapshots.get(&a.vault_id).and_then(|s| s.by_id(&a.id));
             let right = snapshots.get(&b.vault_id).and_then(|s| s.by_id(&b.id));
@@ -6253,11 +6467,17 @@ async fn stream_changes(
             let state = search_state.borrow_and_update();
             (state.vault_id.clone(), state.phase.clone())
         };
+        // Every other drive whose index can change this answer: the drives
+        // it searches and the drives its spaces are read from (AD-306).
         let mut secondary: Vec<_> = last_queries()
             .get(&vault.id)
             .into_iter()
-            .flat_map(|req| req.vault_ids.clone())
-            .filter(|id| id != &vault.id)
+            .flat_map(|req| {
+                req.other_drives(&vault.id)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
             .filter_map(|id| notes_vault::subscribe_index(&id))
             .map(|mut index| {
                 index.mark_unchanged();
@@ -6359,7 +6579,7 @@ async fn wait_for_list_change(
     loop {
         let multiple = last_queries()
             .get(&previous.0)
-            .is_some_and(|req| req.vault_ids.len() > 1);
+            .is_some_and(|req| !req.other_drives(&previous.0).is_empty());
         tokio::select! {
             changed = index.changed() => return changed.is_ok(),
             changed = search.changed() => {
@@ -6436,7 +6656,7 @@ fn default_query(data_dir: Option<&std::path::Path>) -> NoteQueryReq {
             .and_then(|dir| registry::get_hide_service_files(dir).ok())
             .unwrap_or(true),
         tags: std::collections::BTreeMap::new(),
-        space_id: None,
+        spaces: Vec::new(),
         origin: None,
         flags: Vec::new(),
         offset: 0,
@@ -7295,6 +7515,47 @@ mod tests {
             result.is_err(),
             "a single-drive subscription must stop observing secondary drives"
         );
+        // Nothing selected, and a space read from the secondary drive: that
+        // drive's index can change this list, so it wakes it (AD-306).
+        let mut scoped = default_query(None);
+        scoped.spaces = vec![keeper_core::notes::vm::NoteSpaceRefReq {
+            vault_id: "secondary".into(),
+            space_id: "space".into(),
+        }];
+        last_queries().insert(id.clone(), Arc::new(scoped));
+        secondary_tx
+            .send(Arc::new(IndexSnapshot::default()))
+            .expect("secondary revision under a space");
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_for_list_change(
+                &mut index,
+                &mut search,
+                &(id.clone(), "words".into()),
+                &mut secondary,
+            ),
+        )
+        .await;
+        assert!(result.expect("a space's own drive must wake the list it narrows"));
+        last_queries().insert(id.clone(), Arc::new(default_query(None)));
+        secondary_tx
+            .send(Arc::new(IndexSnapshot::default()))
+            .expect("secondary revision after the space is left");
+        let result = tokio::time::timeout(
+            Duration::from_millis(1100),
+            wait_for_list_change(
+                &mut index,
+                &mut search,
+                &(id.clone(), "words".into()),
+                &mut secondary,
+            ),
+        )
+        .await;
+        last_queries().remove(&id);
+        assert!(
+            result.is_err(),
+            "a list no space narrows must stop observing that space's drive"
+        );
     }
 
     #[test]
@@ -7995,17 +8256,49 @@ mod tests {
 
     #[test]
     fn restored_chips_can_widen_a_space_without_changing_its_identity() {
-        let parsed = query::parse("tag:one tag:two").expect("query");
+        let lens = |source: &str| LensTest {
+            query: Some(query::parse(source).expect("query")),
+            words: None,
+        };
+        let space = [lens("tag:one tag:two")];
         let mut note = entry("one.md", "One");
         note.tags.push("one".into());
         let mut req = default_query(None);
         req.tags.insert("one".into(), NoteTagTerm::Include);
         req.space_terms = false;
         let mut body = String::new;
-        assert!(space_matches(&req, Some(&parsed), &note, &mut body, 0));
+        assert!(space_matches(&req, &space, &note, &mut body, 0));
         assert!(matches_filter(&note, &req, &TagTerms::new(&req.tags), None));
         req.space_terms = true;
-        assert!(!space_matches(&req, Some(&parsed), &note, &mut body, 0));
+        assert!(!space_matches(&req, &space, &note, &mut body, 0));
+    }
+
+    #[test]
+    fn a_union_of_spaces_admits_what_any_one_of_them_admits() {
+        let lens = |source: &str| LensTest {
+            query: Some(query::parse(source).expect("query")),
+            words: None,
+        };
+        let mut note = entry("one.md", "One");
+        note.tags.push("one".into());
+        let req = default_query(None);
+        let mut body = String::new;
+        let union = [lens("tag:two"), lens("tag:one")];
+        assert!(space_matches(&req, &union, &note, &mut body, 0));
+        assert!(!space_matches(&req, &union[..1], &note, &mut body, 0));
+        assert!(
+            !space_matches(&req, &[], &note, &mut body, 0),
+            "a scope with no lens to test admits nothing"
+        );
+        // A saved prompt inside a union selects by its words, and a query that
+        // admits the note does not overrule words that do not.
+        let worded = |text: &str| LensTest {
+            query: Some(query::parse("tag:one").expect("query")),
+            words: Some(PromptWords::Text(text.into())),
+        };
+        let unworded = worded("budget");
+        assert!(space_matches(&req, &[worded("one")], &note, &mut body, 0));
+        assert!(!space_matches(&req, &[unworded], &note, &mut body, 0));
     }
 
     /// The editor never sees a `---`, which is what makes "the first keystroke

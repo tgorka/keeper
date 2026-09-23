@@ -155,12 +155,17 @@ pub fn compose_rail(spaces: Vec<NoteSpaceVm>, uncategorized: String) -> Vec<Note
             out[parent].descendants = out[parent].descendants.saturating_add(count);
         }
     }
-    out.push(synthetic(
+    let mut uncategorized = synthetic(
         "keeper:uncategorized",
         "Uncategorized",
         uncategorized,
         Some("shapes"),
-    ));
+    );
+    // Its query is composed from every other space rather than written as
+    // chips, so entering it can restore nothing onto the bar — and a lens that
+    // restored nothing must still be applied, or the row lists every note.
+    uncategorized.restore.opaque = true;
+    out.push(uncategorized);
     out
 }
 
@@ -322,5 +327,16 @@ mod tests {
             ]
         );
         assert_eq!(rows[1].descendants, 3);
+    }
+
+    #[test]
+    fn entering_uncategorized_applies_its_lens_because_nothing_restores_it() {
+        let rows = compose_rail(
+            vec![synthetic("a", "A", "tag:a".into(), None)],
+            "-(tag:a)".into(),
+        );
+        let uncategorized = rows.last().expect("uncategorized row");
+        assert_eq!(uncategorized.id, "keeper:uncategorized");
+        assert!(uncategorized.restore.opaque);
     }
 }

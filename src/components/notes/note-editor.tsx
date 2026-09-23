@@ -72,7 +72,7 @@ import {
 } from "@/lib/stores/notes-editor";
 import { notesFiltersStore } from "@/lib/stores/notes-filters";
 import { ensureNotesVaultsHydrated, useNotesVaultsStore } from "@/lib/stores/notes-vaults";
-import { panelsStore, usePanelsStore } from "@/lib/stores/panels";
+import { type PanelHistoryEntry, panelsStore, usePanelsStore } from "@/lib/stores/panels";
 import { filePathForNote, SHOW_IN_FILES_LABEL, showNoteInFiles } from "@/lib/vault-link";
 import { AttachFileButton } from "./attach-file-button";
 import { ATTACHMENTS_LABEL, AttachmentsPanel } from "./attachments-panel";
@@ -1518,7 +1518,7 @@ function NavigationButton({
 }: {
   panelId: string;
   direction: "back" | "forward";
-  entries: readonly PanelTargetVm[];
+  entries: readonly PanelHistoryEntry[];
 }) {
   const [open, setOpen] = useState(false);
   const [showAll, setShowAll] = useState(false);
@@ -1632,7 +1632,7 @@ function NavigationButton({
           <NavigationEntry
             // biome-ignore lint/suspicious/noArrayIndexKey: stack position identifies repeated visits and is the navigation step count.
             key={index}
-            target={entries[entries.length - 1 - index]}
+            target={entries[entries.length - 1 - index].target}
             onSelect={() => panelsStore.getState()[direction](panelId, index + 1)}
           />
         ))}

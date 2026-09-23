@@ -27,10 +27,14 @@ import { HoverHint, IconHint } from "@/components/ui/tooltip";
 import { notesCreate, tagsVocabulary } from "@/lib/ipc/client";
 import {
   ALL_NOTES_SCOPE,
+  type NoteScope,
+  type NoteScopeSpace,
   type NoteSortChoice,
   notesFiltersStore,
   persistIncludePrivate,
   scopeLabel,
+  scopeSpaces,
+  spaceKey,
   type TagChip,
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
@@ -43,6 +47,30 @@ import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
 export const NOTES_SEARCH_PLACEHOLDER = "Search notes";
+
+export const SAVE_UNION_REFUSED =
+  "A selection of several spaces can't be saved as one space — open one of them to save it.";
+
+/** One row of the New note from search chooser: a drive, and the space the note is cited in. */
+interface CreateChoice {
+  readonly vaultId: string;
+  readonly space: NoteScopeSpace | null;
+}
+
+/**
+ * Where a note made from this search may go (FR-640, generalised by AD-306):
+ * each selected space's own drive, in scope order, then every selected drive
+ * that holds none of them.
+ */
+function createChoices(scope: NoteScope, selectedIds: readonly string[]): CreateChoice[] {
+  const members = scopeSpaces(scope);
+  return [
+    ...members.map((space) => ({ vaultId: space.vaultId, space })),
+    ...selectedIds
+      .filter((id) => !members.some((space) => space.vaultId === id))
+      .map((vaultId) => ({ vaultId, space: null })),
+  ];
+}
 
 /** Shared split-action grammar; search chips opt out of sequential focus. */
 export function TagFilterChip({
@@ -205,6 +233,11 @@ export function NoteFilterBar({
     searchState?.sentence ||
     (meaningOff ? settingsLabel : "");
   const selectedIds = vaultIds.length ? vaultIds : vaultId ? [vaultId] : [];
+  const members = scopeSpaces(scope);
+  const choices = createChoices(scope, selectedIds);
+  const driveName = (id: string) => vaults?.find((vault) => vault.id === id)?.name ?? id;
+  // Two drives can each hold a space of one name, so a union across drives says whose.
+  const spansDrives = new Set(members.map((space) => space.vaultId)).size > 1;
   const driveDescription = vaultIds.length
     ? `Search drives: ${vaultIds.map((id) => vaults?.find((vault) => vault.id === id)?.name ?? id).join(", ")}`
     : "Search the active drive only";
@@ -242,11 +275,15 @@ export function NoteFilterBar({
       settingsObserver.current.observe(document.body, { childList: true, subtree: true });
     }
   }
-  async function createFromSearch(id: string) {
+  async function createFromSearch(choice: CreateChoice) {
     if (creating) return;
     setCreating(true);
     setActionError(null);
     const snapshot = notesFiltersStore.getState();
+    // An "outside" row still names the first space, so Rust can say the note
+    // lands outside it rather than create it silently elsewhere.
+    const cited = choice.space ?? scopeSpaces(snapshot.scope)[0] ?? null;
+    const id = choice.vaultId;
     try {
       const created = await notesCreate(id, {
         title: null,
@@ -254,11 +291,8 @@ export function NoteFilterBar({
         tags: snapshot.tagTerms.filter((chip) => chip.term === "include").map((chip) => chip.tag),
         template: null,
         dest: null,
-        space:
-          snapshot.scope.kind === "space" && !snapshot.scope.id.startsWith("keeper:")
-            ? snapshot.scope.id
-            : null,
-        spaceVaultId: snapshot.scope.kind === "space" ? snapshot.scope.vaultId : null,
+        space: cited && !cited.id.startsWith("keeper:") ? cited.id : null,
+        spaceVaultId: cited?.vaultId ?? null,
       });
       onCreateNotices?.(created.notices);
       panelsStore
@@ -557,14 +591,12 @@ export function NoteFilterBar({
                   variant="ghost"
                   className={iconClass}
                   aria-label="New note from search"
-                  disabled={creating || selectedIds.length === 0}
+                  disabled={creating || choices.length === 0}
                   onClick={(event) => {
-                    if (
-                      selectedIds.length === 1 &&
-                      (scope.kind !== "space" || selectedIds[0] === scope.vaultId)
-                    ) {
+                    const [only] = choices;
+                    if (choices.length === 1 && only) {
                       event.preventDefault();
-                      void createFromSearch(selectedIds[0]);
+                      void createFromSearch(only);
                     }
                   }}
                 >
@@ -575,20 +607,18 @@ export function NoteFilterBar({
             <PopoverContent align="start" collisionPadding={8} className={popupClass}>
               <p className="text-xs">Choose a drive for the new note</p>
               <div className={cn("overflow-y-auto", phone ? "max-h-[264px]" : "max-h-48")}>
-                {(scope.kind === "space"
-                  ? [scope.vaultId, ...selectedIds.filter((id) => id !== scope.vaultId)]
-                  : selectedIds
-                ).map((id) => (
+                {choices.map((choice) => (
                   <button
-                    key={id}
+                    key={choice.space ? spaceKey(choice.space) : choice.vaultId}
                     type="button"
                     disabled={creating}
                     className={optionClass}
-                    onClick={() => void createFromSearch(id)}
+                    onClick={() => void createFromSearch(choice)}
                   >
-                    {vaults?.find((vault) => vault.id === id)?.name ?? id}
-                    {scope.kind === "space" &&
-                      ` — ${id === scope.vaultId ? "in" : "outside"} ${scope.name}`}
+                    {driveName(choice.vaultId)}
+                    {choice.space
+                      ? ` — in ${choice.space.name}`
+                      : members.length > 0 && ` — outside ${scopeLabel(scope)}`}
                   </button>
                 ))}
               </div>
@@ -603,11 +633,13 @@ export function NoteFilterBar({
               aria-description={
                 !vaultId
                   ? "Choose a drive before saving a space."
-                  : !savable
-                    ? "Add a search term or filter before saving a space."
-                    : undefined
+                  : members.length > 1
+                    ? SAVE_UNION_REFUSED
+                    : !savable
+                      ? "Add a search term or filter before saving a space."
+                      : undefined
               }
-              disabled={!savable || !vaultId}
+              disabled={!savable || !vaultId || members.length > 1}
               onClick={(event) => onSaveAsSpace(event.currentTarget)}
             >
               <Save aria-hidden="true" className="size-4" />
@@ -615,36 +647,60 @@ export function NoteFilterBar({
           </IconHint>,
         ]}
       >
-        {scope.kind !== "all" && (
-          <span
-            data-slot="filter-chip"
-            className={cn(
-              "inline-flex max-w-full shrink-0 items-center gap-1 rounded-[7px] border border-border bg-muted pl-2 text-meta font-medium text-foreground",
-              phone ? "h-11" : "h-6",
-            )}
-          >
-            <Folder aria-hidden="true" className="size-4 shrink-0" />
-            <span className="min-w-0 truncate" aria-description={scopeLabel(scope)}>
-              {scope.kind === "space"
-                ? scope.name.replace(/^["“«]|["”»]$/g, "") === filters.enteredSpace?.restore.text
+        {(scope.kind === "folder"
+          ? [
+              {
+                key: "folder",
+                label: scopeLabel(scope),
+                description: scopeLabel(scope),
+                clear: () => filters.setScope(ALL_NOTES_SCOPE),
+              },
+            ]
+          : members.map((space) => ({
+              key: spaceKey(space),
+              // AD-292: a space named after its own saved prompt reads as "Space".
+              label:
+                space.name.replace(/^["“«]|["”»]$/g, "") === filters.enteredSpace?.restore.text
                   ? "Space"
-                  : scope.name
-                : scopeLabel(scope)}
+                  : space.name,
+              // Also the × button's name: two same-named members on two drives
+              // would otherwise be two identical buttons to assistive tech.
+              description: spansDrives ? `${space.name} — ${driveName(space.vaultId)}` : space.name,
+              clear: () => filters.toggleSpace(space),
+            }))
+        ).map(({ key, label, description, clear }) => {
+          const shown = (
+            <span className="min-w-0 truncate" aria-description={description}>
+              {label}
             </span>
-            <IconHint label={`Clear scope ${scopeLabel(scope)}`}>
-              <button
-                type="button"
-                tabIndex={-1}
-                aria-label={`Clear scope ${scopeLabel(scope)}`}
-                onPointerDown={(event) => event.preventDefault()}
-                onClick={() => filters.setScope(ALL_NOTES_SCOPE)}
-                className={cn("flex shrink-0 items-center justify-center", target)}
-              >
-                <X aria-hidden="true" className="size-3" />
-              </button>
-            </IconHint>
-          </span>
-        )}
+          );
+          const clearLabel = `Clear scope ${description}`;
+          return (
+            <span
+              key={key}
+              data-slot="filter-chip"
+              className={cn(
+                "inline-flex max-w-full shrink-0 items-center gap-1 rounded-[7px] border border-border bg-muted pl-2 text-meta font-medium text-foreground",
+                phone ? "h-11" : "h-6",
+              )}
+            >
+              <Folder aria-hidden="true" className="size-4 shrink-0" />
+              {spansDrives ? <HoverHint label={description}>{shown}</HoverHint> : shown}
+              <IconHint label={clearLabel}>
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  aria-label={clearLabel}
+                  onPointerDown={(event) => event.preventDefault()}
+                  onClick={clear}
+                  className={cn("flex shrink-0 items-center justify-center", target)}
+                >
+                  <X aria-hidden="true" className="size-3" />
+                </button>
+              </IconHint>
+            </span>
+          );
+        })}
         {tagTerms.map((chip) => (
           <TagFilterChip
             key={chip.tag}
