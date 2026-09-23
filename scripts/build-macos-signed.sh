@@ -111,6 +111,42 @@ else
   echo "==> Build sha: not stated (no stamp file); build.rs will probe git if it can, else say unknown"
 fi
 
+# --- Observability is not optional for a shipped build ---------------------
+# `build.rs` embeds the PostHog host and public project token through
+# `option_env!`, so a build that never saw them produces a binary which can
+# report nothing — no statistics, no diagnostics — no matter what the person
+# using it consents to. Every artefact this script produces is installed on a
+# real machine, so the pair is REQUIRED here rather than merely honoured.
+#
+# Resolution order, first hit wins:
+#   1. the environment, which is how the driving workstation passes values it
+#      already resolved (see `install-macos.sh`) — this keeps the Mac out of
+#      1Password, whose vault is frequently locked on a remote host;
+#   2. `deploy/posthog/client.env.1p` for the host, plus `op read` for the
+#      token, which is the documented local-developer path.
+# Both values are public and end up readable inside the distributed binary;
+# neither is a secret, and `scripts/check-client-secrets.ts` still runs after
+# the build to prove nothing privileged rode along.
+CLIENT_ENV="$REPO_ROOT/deploy/posthog/client.env.1p"
+if [ -z "${KEEPER_POSTHOG_HOST:-}" ] && [ -r "$CLIENT_ENV" ]; then
+  KEEPER_POSTHOG_HOST="$(sed -n 's/^KEEPER_POSTHOG_HOST=//p' "$CLIENT_ENV" | head -1)"
+fi
+if [ -z "${KEEPER_POSTHOG_PROJECT_TOKEN:-}" ] && [ -r "$CLIENT_ENV" ] && command -v op >/dev/null; then
+  OP_TOKEN_REF="$(sed -n 's/^KEEPER_POSTHOG_PROJECT_TOKEN=//p' "$CLIENT_ENV" | head -1)"
+  case "$OP_TOKEN_REF" in
+    op://*) KEEPER_POSTHOG_PROJECT_TOKEN="$(op read --no-newline "$OP_TOKEN_REF" 2>/dev/null || true)" ;;
+    *) KEEPER_POSTHOG_PROJECT_TOKEN="$OP_TOKEN_REF" ;;
+  esac
+fi
+if [ -z "${KEEPER_POSTHOG_HOST:-}" ] || [ -z "${KEEPER_POSTHOG_PROJECT_TOKEN:-}" ]; then
+  echo "error: observability config missing; this build would ship unable to report anything." >&2
+  echo "       Export KEEPER_POSTHOG_HOST and KEEPER_POSTHOG_PROJECT_TOKEN, or unlock 1Password" >&2
+  echo "       so $CLIENT_ENV resolves. Both values are public client configuration." >&2
+  exit 1
+fi
+export KEEPER_POSTHOG_HOST KEEPER_POSTHOG_PROJECT_TOKEN
+echo "==> Observability: embedding $KEEPER_POSTHOG_HOST (public project token withheld from this log)"
+
 bash "$SCRIPT_DIR/build-keeper-rec.sh"
 bunx tauri build \
   --config src-tauri/crates/keeper/tauri.conf.json \

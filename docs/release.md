@@ -273,6 +273,20 @@ the maintainer environment or a real PostHog personal/secure key for a build.
 The trusted manual provisioning path is documented in
 [credentials.md](credentials.md#posthog-maintainer-runbook).
 
+**Every shipped build must carry that configuration, and the scripts enforce
+it.** `build.rs` embeds the host and public project token through
+`option_env!`, so a build that never saw the pair produces a binary which can
+report nothing — no statistics, no diagnostics — regardless of what the person
+using it later consents to. Both artefact paths go through
+`scripts/build-macos-signed.sh`, which now refuses to build without them,
+before Tauri runs. It takes the pair from the environment first and falls back
+to `deploy/posthog/client.env.1p` plus `op read`; `scripts/install-macos.sh`
+resolves the values on the driving workstation (environment, then the tracked
+client file, then `gh variable get`) and passes them to the Mac, so a locked
+1Password on the build host cannot silently produce a blind build. Until
+2026-09-21 neither script supplied anything, and every locally installed
+build was inert.
+
 | Check | Scope and gate |
 | --- | --- |
 | CI `frontend`: provisioning and environment safety | `node --test scripts/posthog/*.test.mjs`, no credentials or live service; fixtures are not live API evidence |
