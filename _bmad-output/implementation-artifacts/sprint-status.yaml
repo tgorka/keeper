@@ -48,6 +48,21 @@ tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 
 development_status:
+  # Epic 82: an optional account (OIDC sign-in whose token is a general credential) and a per-person config repository synced to every device, bootstrapped from one input (setup link / QR / paste). Owner approved the model 2026-09-23 with one amendment: the account's tiers sit above ~/.keeper and below the main folder.
+  # Stack rungs: epic82-plan (docs), then epic82-core (82.1–82.4: descriptor, OIDC client, repository layout, account layer tiers in keeper-core; the config-repository transport in keeper-sync; generated bindings), then epic82-shell-surface (82.5–82.7: shell IPC, web-auth port, deep links, Settings › Account, setup and share sheets, drive and bot credential choice, durable docs). The tip passed the full macOS gate (scripts/check-macos.sh on hesperia) and the Linux gate; each rung passed the Linux gate alone. The iOS compile is CI's job (hesperia's Xcode links swift-rs for macOS).
+  # Review wave: three lanes (security audit, repository + layers, frontend UX) -> binding fix-wave rulings, every fix with a regression test (core fixes mutation-proved). Settings › Account (signed out, setup sheet, signed in, share QR, blocked, offline) proved in Chrome against the dev harness.
+  # Task acceptance 2 (fresh macOS + iOS installs, a 1Password passkey, both repository auth modes against a real provider) is owed on hesperia and an iPhone.
+  # Contract amendments A1 (module org_account, TS OrgAccountVm) and A2 (egress, Forget this account, the drive's credential spelling) are in the epic's text.
+  epic-82: in-progress
+  82-1-a-setup-link-names-the-account: review
+  82-2-keeper-signs-you-in-itself: review
+  82-3-your-directory-in-the-config-repository: review
+  82-4-the-accounts-files-are-layers: review
+  82-5-the-shell-carries-the-sign-in: review
+  82-6-settings-account-and-one-setup-sheet: review
+  82-7-the-account-opens-drives-and-bots: review
+  # DW-290…DW-297 are opened by this plan; none closes here.
+
   # Epic 81: the owner's five notes on 0.8.32 — the caret that jumps on save, space definitions as service files, the empty new note that leaves, a scope of several spaces (one or more per drive, a union), history that takes its space with it — triaged, then two items clarified with the owner, before planning.
   # Stack rungs: epic81-plan (docs), then epic81-fixes (81.1 cursor, 81.2 service files + spaces revision, 81.3 empty note), then epic81-spaces (81.4 multi-space, 81.5 history follows scope). Each rung passed the full macOS gate (scripts/check-macos.sh on hesperia: fmt, clippy -D warnings, workspace tests, bindings) and the Linux frontend gate alone before publication.
   # Review wave: three bmad-review lanes (shell-as-compiler, core, frontend) -> amendments A1-A11 in the epic's Review-wave amendments; the tip equals the gated tree.
