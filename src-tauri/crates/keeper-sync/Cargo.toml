@@ -23,7 +23,10 @@ rusqlite = { workspace = true }
 ulid = { workspace = true }
 url = { workspace = true }
 reqwest = { workspace = true }
-gix = { workspace = true }
+# `tree-editor` builds the config repository's commits straight from the
+# origin tip's tree (`config_repo`). A feature flag with no dependencies of its
+# own: adds no crate.
+gix = { workspace = true, features = ["tree-editor"] }
 notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
 globset = { workspace = true }

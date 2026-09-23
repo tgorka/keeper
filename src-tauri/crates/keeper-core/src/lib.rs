@@ -31,6 +31,7 @@ pub mod media;
 pub mod notes;
 pub mod notify;
 pub mod oauth;
+pub mod org_account;
 pub mod palette;
 pub mod panels;
 pub mod platform;

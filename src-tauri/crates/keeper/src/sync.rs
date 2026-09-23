@@ -77,7 +77,14 @@ impl SyncPlatform for ShellSyncPlatform {
     /// held *here* would be a second cache over one keychain with its own
     /// invalidation domain — the engine would keep spending a credential the user
     /// had already corrected through `sync_set_credential`. Do not add one.
+    ///
+    /// A drive set to "Use my account" (Epic 82, AD-315) has no keychain
+    /// item: its credential is the account's access token, refreshed as
+    /// needed, and keeper-sync spends it exactly as it would a stored token.
     fn secret_get(&self, key: &str) -> SyncResult<Option<String>> {
+        if let Some(answer) = crate::account_ipc::drive_credential(&self.platform, key) {
+            return answer.map(Some).map_err(SyncError::Config);
+        }
         self.platform
             .keychain_get(key)
             .map_err(|err| SyncError::Config(format!("keychain read failed: {err}")))

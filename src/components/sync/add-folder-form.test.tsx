@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -12,6 +12,10 @@ vi.mock("@/lib/ipc/client", () => ({
   syncGetCredential: vi.fn(),
   syncClearCredential: vi.fn(),
   syncFolderTasksFlag: vi.fn(),
+  // Where a folder's credential comes from (Epic 82). Read only once an
+  // account is configured, so every suite below that has none never calls it.
+  syncCredentialSourceGet: vi.fn(),
+  syncCredentialSourceSet: vi.fn(),
   // The Sync view's three per-folder lists, re-read for the folder just added.
   syncActivity: vi.fn(),
   syncPending: vi.fn(),
@@ -81,6 +85,7 @@ import {
   SYNC_VIRTUAL_OVER_NONE_NOTE,
   SYNC_VIRTUAL_OVER_PROTECTED_ONLY_NOTE,
   SYNC_VIRTUAL_PATTERNS_LABEL,
+  syncAccountCredentialLabel,
   syncFolderOwnedNote,
   syncInForceNote,
   syncReleaseInForceNote,
@@ -89,6 +94,8 @@ import type { SyncProfileVm } from "@/lib/ipc/client";
 import {
   syncActivity,
   syncClearCredential,
+  syncCredentialSourceGet,
+  syncCredentialSourceSet,
   syncFolderTasksFlag,
   syncGetCredential,
   syncPending,
@@ -98,9 +105,11 @@ import {
   syncSetCredential,
   syncStatuses,
 } from "@/lib/ipc/client";
+import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { resetSyncStoreForTest, SYNC_RECORDINGS_SUBFOLDER_LABEL } from "@/lib/stores/sync";
 import { resetSyncDetailStoreForTest, syncDetailStore } from "@/lib/stores/sync-detail";
+import { accountVm } from "@/test/account-fixture";
 
 const mockSave = vi.mocked(syncProfileSave);
 const mockProfiles = vi.mocked(syncProfiles);
@@ -399,6 +408,91 @@ describe("AddFolderForm", () => {
     fireEvent.click(pressed);
 
     expect(token).toHaveAttribute("type", "password");
+  });
+});
+
+describe("AddFolderForm with an organisation account (Epic 82, AD-315)", () => {
+  const USE_ACME = syncAccountCredentialLabel("Acme");
+
+  afterEach(() => {
+    accountStore.setState({ vm: NO_ACCOUNT, setupLink: null });
+  });
+
+  it("offers no account choice without a signed-in, usable account", async () => {
+    render(<AddFolderForm />);
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    expect(screen.queryByLabelText(USE_ACME)).not.toBeInTheDocument();
+    expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toBeInTheDocument();
+
+    // Configured but offline: a credential that cannot be obtained is not offered.
+    act(() => accountStore.getState().setVm(accountVm({ state: "offline" })));
+    expect(screen.queryByLabelText(USE_ACME)).not.toBeInTheDocument();
+
+    act(() => accountStore.getState().setVm(accountVm({ state: "ready" })));
+    expect(screen.getByLabelText(USE_ACME)).toBeInTheDocument();
+  });
+
+  it("hides the token field when the account is chosen, and records the source instead of a token", async () => {
+    accountStore.getState().setVm(accountVm());
+    mockSave.mockResolvedValue(profileVm());
+    vi.mocked(syncCredentialSourceSet).mockResolvedValue(undefined);
+    const onSaved = vi.fn();
+    render(<AddFolderForm onSaved={onSaved} />);
+    await fillRequired();
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    fireEvent.change(screen.getByLabelText(SYNC_TOKEN_LABEL), { target: { value: "ghp_typed" } });
+
+    fireEvent.click(screen.getByLabelText(USE_ACME));
+    // Absent, not disabled: there is nothing to type while the account signs.
+    expect(screen.queryByLabelText(SYNC_TOKEN_LABEL)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith(profileVm(), true));
+    expect(syncCredentialSourceSet).toHaveBeenCalledWith("p2", "account");
+    // The token typed before the switch is not an instruction once hidden.
+    expect(mockSetCredential).not.toHaveBeenCalled();
+  });
+
+  it("keeps offering the choice on a folder that already uses the account, even offline", async () => {
+    accountStore.getState().setVm(accountVm({ state: "offline" }));
+    vi.mocked(syncCredentialSourceGet).mockResolvedValue("account");
+    render(<AddFolderForm profile={profileVm()} />);
+
+    const choice = await screen.findByLabelText(USE_ACME);
+    await waitFor(() => expect(choice).toBeChecked());
+  });
+
+  it("records the account as the source before the Sync view's lists are re-read", async () => {
+    // Saving a profile can start its first pass at once; the source row has to
+    // land straight after the save, not behind the slower legs that follow it.
+    accountStore.getState().setVm(accountVm());
+    mockSave.mockResolvedValue(profileVm());
+    mockActivity.mockReturnValue(new Promise<never>(() => {}));
+    vi.mocked(syncCredentialSourceSet).mockResolvedValue(undefined);
+    render(<AddFolderForm />);
+    await fillRequired();
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    fireEvent.click(screen.getByLabelText(USE_ACME));
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() => expect(mockActivity).toHaveBeenCalled());
+    expect(syncCredentialSourceSet).toHaveBeenCalledWith("p2", "account");
+  });
+
+  it("reads the folder's source again when the account is replaced", async () => {
+    accountStore.getState().setVm(accountVm());
+    vi.mocked(syncCredentialSourceGet).mockResolvedValue("account");
+    render(<AddFolderForm profile={profileVm()} />);
+    await waitFor(() => expect(screen.getByLabelText(USE_ACME)).toBeChecked());
+
+    // Rust answers for the row as bound to the account configured NOW.
+    vi.mocked(syncCredentialSourceGet).mockResolvedValue("keychain");
+    act(() => accountStore.getState().setVm(accountVm({ id: "globex", name: "Globex" })));
+
+    await waitFor(() =>
+      expect(screen.getByLabelText(syncAccountCredentialLabel("Globex"))).not.toBeChecked(),
+    );
+    expect(syncCredentialSourceGet).toHaveBeenCalledTimes(2);
   });
 });
 

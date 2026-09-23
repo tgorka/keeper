@@ -52,7 +52,8 @@
     "deep-link": {
       "desktop": {
         "schemes": ["keeper"]
-      }
+      },
+      "mobile": [{ "scheme": ["keeper"], "appLink": false }]
     },
     "updater": {
       "endpoints": ["https://github.com/tgorka/keeper/releases/latest/download/latest.json"],
@@ -74,6 +75,9 @@
     "macOS": {
       "minimumSystemVersion": "11.0",
       "entitlements": "./keeper-rec.entitlements"
+    },
+    "iOS": {
+      "frameworks": ["AuthenticationServices"]
     }
   }
 }

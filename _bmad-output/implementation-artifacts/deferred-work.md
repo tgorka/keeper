@@ -6526,3 +6526,59 @@ origin: epic 81's plan, 2026-09-23 (bp-spaces P3, aside)
 location: `src/hooks/use-notes-actions.ts:234-250` (`captureSpaceDraft` sends `limit` from `notesListStore`: `NOTES_PAGE_SIZE = 200`, grown by `growWindow`), `src-tauri/crates/keeper/src/notes_ipc.rs` (`notes_space_save` writes `limit` when it is above 0)
 reason: the window is a rendering page. `keeper.limit` caps what a space *selects* (Story 44.11, DW-163's resolution). A search saved while the window was 200, or 400 after scrolling, becomes a space that silently selects at most that many notes. In a union (AD-306) that cap is honoured per space. So caps, meant as a deliberate property of a space, are the common case by accident. The draft should send no limit (uncapped) unless the person set one. Spaces saved already keep what they have.
 status: open
+
+### DW-290: Sign-in on Android (Auth Tab, Custom Tabs) does not exist, because Android does not.
+
+origin: epic 82's plan, 2026-09-23 (AD-311, spec §3.1)
+location: `src-tauri/crates/keeper-core/src/platform.rs` (`Platform::start_web_auth`, default `open_url`), `src-tauri/crates/keeper/src/web_auth.rs` (the platform modules), `src-tauri/crates/keeper/src/ipc.rs:460-464` (no Android `Platform`)
+reason: keeper has no Android target, no `gen/android` and no Android `Platform`, so there is nothing to put an auth tab into. When Android exists, the evidence says: `AuthTabIntent` from `androidx.browser` ≥ 1.9.0, launched through Tauri's `startActivityForResult` and parsed with `AuthenticateUserResultContract` (public since 1.10, a spike is needed); a Custom Tabs bridge activity with an intent-filter and `onResume` cancel detection as the fallback; and not tauri-plugin-web-auth, which has no cancel handling (`research-account-2026-09-23.md` §7.3, §7.6). The device class there is smallest-width ≥ 600 dp → `tablet`. Recorded as deferred work, not as a stub.
+status: open
+
+### DW-291: keeper does not administer other people's directories in the config repository.
+
+origin: epic 82's plan, 2026-09-23 (AD-312, AD-313, D-25; spec §2.3, decision 5)
+location: `src-tauri/crates/keeper-core/src/org_account/layout.rs` (`is_own_path`, `plan`), `src-tauri/crates/keeper-sync/src/config_repo.rs` (`commit_and_push`'s path refusal)
+reason: the owner asked for user management. keeper's answer is the QR code and link onboarding plus the person's own identity, roles and devices. An admin who wants to edit another person's `keeper.toml`, remove a leaver's directory or reset a device does it in the forge today. A keeper surface for it would need, at least: a role that grants it (decided by the IdP, read like `required_role`), a write guard that is not `is_own_path`, an audit trail in the commit, and a decision on whether keeper may ever rewrite a file it did not create. D-25 records why keeper does not. Revisit when an operator reports that the forge's own UI is not enough.
+status: open
+
+### DW-292: On Forgejo, one device's forge sign-in or refresh invalidates the forge refresh token on every other device.
+
+origin: epic 82's plan, 2026-09-23 (AD-310, `oauth` mode; spec §3.5)
+location: `src-tauri/crates/keeper-core/src/org_account/session.rs` (`forge_connect`, `forge_token`), `docs/account.md` §"Operator notes"
+reason: Forgejo v16 defaults `INVALIDATE_REFRESH_TOKENS = true`, and a grant is unique per (user, app). Every token issuance increments the grant's counter, and a refresh token with a stale counter is rejected as "token was already used". Gitea's default is `false` (`research-account-2026-09-23.md` §8.2 item 6). This is inferred from code and not tested live. With two devices in `oauth` mode, the second device's forge leg would fail at its next refresh and ask to reconnect the repository. Options: document `INVALIDATE_REFRESH_TOKENS = false` for keeper's app (done in `docs/account.md`); treat the forge's `invalid_grant` as *reconnect* rather than *sign in again* (done by FR-693's wording); or avoid the forge's own tokens (`same` mode, or DW-295's exchange). Verify on a Forgejo 16 instance with two devices.
+status: open
+
+### DW-293: A drive on a sub-path forge gets no API base, and its PR handoff silently skips.
+
+origin: epic 82's plan, 2026-09-23 (AD-316; triage row "Forge API base from the remote URL")
+location: `src-tauri/crates/keeper-sync/src/engine.rs:36685-36736` (`forge_api_target`), `:12189-12197` (`do_open_pr`), the test at `:25332`
+reason: `forge_api_target` splits the path at the first `/` and requires exactly `owner/repo`, so `https://host/git/owner/repo.git` returns `None` and the worktree lane's PR round trip degrades to "branch is waiting" with only a warning. Taking the last two segments is not a fix in general, because a URL cannot say how deep the forge's root is: Gitea at `/a/`, GitLab at the root with a nested group, or GitLab at `/a` all fit `https://h/a/b/c.git` (`research-account-2026-09-23.md` §8.6). The config repository does not use this function (AD-316). Drives need an explicit per-drive API base, or an account's `api_base` when the drive is on the same forge. Out of this epic, because nothing in the owner's ask reaches the PR handoff.
+status: open
+
+### DW-294: The OAuth redirect default is `keeper://`, not RFC 8252's reverse-DNS scheme, and no reverse-DNS scheme is registered for deep links.
+
+origin: epic 82's plan, 2026-09-23 (AD-311; spec §3.1, decision 3)
+location: `src-tauri/crates/keeper-core/src/org_account/descriptor.rs` (`redirect_uri`, `forge_redirect_uri` defaults), `src-tauri/crates/keeper/tauri.conf.json:52-55` (`deep-link.desktop.schemes: ["keeper"]`), `gen/apple/project.yml` (`CFBundleURLTypes`)
+reason: RFC 8252 §7.1 says a private-use scheme MUST be reverse-DNS (`dev.tgorka.keeper:/oauth/…`), and §8.4 says an authorization server SHOULD reject a scheme with no period. The owner kept `keeper://` as asked. Zitadel accepts custom schemes, Gitea and Forgejo showed no scheme validation, and Authelia is unverified (`research-account-2026-09-23.md` §9.2 T1). A descriptor may already name any `redirect_uri`. On macOS and iOS a reverse-DNS value works through the auth session, which needs no registration for its callback scheme. On other desktops it arrives by deep link, and only `keeper` is registered. Revisit when a provider refuses `keeper://`: register `dev.tgorka.keeper` with the deep-link plugin, and decide whether the default moves.
+status: open
+
+### DW-295: One access token serves every service that accepts it; there is no per-service token exchange.
+
+origin: epic 82's plan, 2026-09-23 (AD-315 and its refinement A2c; spec §3.6)
+location: `src-tauri/crates/keeper-core/src/org_account/session.rs` (`access_token`), `src-tauri/crates/keeper/src/account_ipc.rs` / the `SyncPlatform::secret_get` bridge, `src-tauri/crates/keeper-core/src/bots/**` (the provider credential read)
+reason: a drive or a bot provider set to "Use my account" receives the sign-in access token. A token carrying N audiences can be replayed at any of the N, and RFC 9700 §2.3 asks for tokens restricted to one resource server or a small set (`research-account-2026-09-23.md` §6.5). Zitadel and authentik 2026.8 support RFC 8693 token exchange, which would mint a per-service token with one audience. Two consequences today: an operator must add every service's audience to the one token, through `extra_scopes`; and a drive on a forge that accepts only its own tokens (the `oauth`-mode forge) cannot use the account, because the drive receives the IdP token, not the forge token. Revisit when a second service is set to the account, or when an operator asks for narrow tokens.
+status: open
+
+### DW-296: `mainSyncFolder` cannot come from the account's device file.
+
+origin: epic 82's plan, 2026-09-23 (AD-309, AD-101 held)
+location: `src-tauri/crates/keeper-core/src/config/mod.rs` (`LayerTier::may_set_main_folder`, `:179-181`), `keeper/src/lib.rs` (boot order: the main folder is learned in phase one, before the account tiers are installed)
+reason: only `~/.keeper/` may elect the main folder (AD-101), and the account tiers are refused with the existing fault. A person who wants their main folder to follow them per device would write it into `<login>/keeper.<device>.toml`. But the main folder is learned in phase one from `~/.keeper` alone, disk-only and before any account tier exists, and it decides where the next two tiers are read from. Letting the repository elect it would make a remote file choose a local path, and would need a second boot phase. Revisit if the owner asks for a new device's first launch to pick its main folder from the repository.
+status: open
+
+### DW-297: One account per install.
+
+origin: epic 82's plan, 2026-09-23 (AD-308; spec §2.1)
+location: `src-tauri/crates/keeper-core/src/org_account/descriptor.rs` (`FILE_NAME`, one `account.toml`), `src-tauri/crates/keeper/src/account_ipc.rs` (one account's state), `src/components/settings/account-section.tsx`
+reason: the config repository defines who is using keeper, and two people on one device are two OS users. The `id` is already in the schema, the redirect URI (`keeper://oauth/<id>/…`), the keychain keys (`account/<id>/…`) and the clone path (`<data>/account/<id>/repo`), so a list of accounts can come later without a migration. What a second account would need to decide: which account's tiers win when both set a key (the stack has one account slot), which account a drive or provider's `account` source means, and how the Settings section lists them.
+status: open

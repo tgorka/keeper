@@ -116,7 +116,8 @@ async fn prepare(platform: Arc<dyn Platform>, spec: &BotTaskSpec) -> Result<Task
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("no provider called '{}' exists", bot.provider_id))?;
     let token =
-        keeper_core::bots::resolve_token(platform.as_ref(), &row.provider.id, Some(&bot.target))
+        crate::account_ipc::bot_credential(platform.as_ref(), &row.provider.id, Some(&bot.target))
+            .await
             .map_err(|error| error.to_string())?;
     let endpoint = Endpoint::new(&row.provider, Some(&bot.target), token);
     let read_timeout = match row.read_timeout_ms {

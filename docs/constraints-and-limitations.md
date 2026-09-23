@@ -255,3 +255,34 @@ safe binding. Current inventory:
   second and never one per buffer. Only a number in `0.0..=1.0` leaves the tap; no sample
   does. There is no second tap: `installTapOnBus:` allows one per bus, and the level shares
   the recogniser's.
+- The account sign-in sheet, macOS and iOS (Epic 82, AD-311):
+  `ASWebAuthenticationSession` (`initWithURL:callback:completionHandler:` with
+  `ASWebAuthenticationSessionCallback callbackWithCustomScheme:` behind
+  `available!(macos = 14.4, ios = 17.4)`, else the deprecated-but-shipping
+  `initWithURL:callbackURLScheme:completionHandler:`; `setPresentationContextProvider:`,
+  `setPrefersEphemeralWebBrowserSession:` — always `false`, so the sheet shares Safari's
+  cookies and offers passkeys — `start`, `cancel`), the framework's
+  `ASWebAuthenticationSessionErrorDomain` extern static, and one Objective-C class of
+  keeper's own, `Anchor` (`define_class!`, `NSObject` subclass, main-thread-only,
+  implementing `ASWebAuthenticationPresentationContextProviding` by returning the main
+  window) via objc2-authentication-services 0.3.2 (`Zlib OR Apache-2.0 OR MIT`, features
+  `std`, `block2`, `ASFoundation`, `ASWebAuthenticationSession`,
+  `ASWebAuthenticationSessionCallback` — the epic's one new crate) and, on macOS,
+  objc2-app-kit (`NSWindow`, already in the tree), behind
+  `keeper_core::platform::Platform::start_web_auth` — `crates/keeper/src/web_auth_apple.rs`:
+  the `anchor` module (`#[allow(unsafe_code)]` on the module, because `define_class!` is
+  `unsafe impl`s by construction), `window_of` (one per target: `NSWindow` from
+  `PlatformWebview::ns_window` retained, or `UIWindow` through
+  `PlatformWebview::view_controller`), `present`, `is_session_error` and `cancel_all` —
+  each function-level `#[allow(unsafe_code)]` with a `// SAFETY:` comment on every block.
+  The session, the anchor (a weak property on the session) and the completion block are
+  held together in a main-thread table keyed by the flow's `state` until the main
+  thread's next turn after the completion ran, never released from inside it. The
+  completion hands the callback URL to `OAuthFlowRegistry::resolve`, a cancel to
+  `OAuthFlowRegistry::cancel` for that one `state`, and any other ending to the flow as an
+  `error=` callback so it ends at once (`crates/keeper/src/web_auth.rs`, tested on Linux).
+  On iOS the class is reached only by name, so `gen/apple/project.yml` links
+  `AuthenticationServices.framework` explicitly (Speech's reason). Linux and Windows keep
+  the port's default — the system browser and the `keeper://` deep link. **Not yet
+  compiled anywhere**: written on the Linux host, where the shell crate does not build;
+  the macOS and iOS CI jobs are its first compile and hesperia/kalypso its first run.

@@ -13,7 +13,7 @@
 
   Only keys the macOS file also carries belong here — every other iOS key
   lives in `gen/apple/project.yml` (AD-32), which is what `xcodegen
-  generate` and a plain Xcode run see — with one exception, stated below.
+  generate` and a plain Xcode run see — with two exceptions, stated below.
   The sentences MUST equal the ones in `project.yml`: that copy is the
   project's truth, this copy is the override that reaches the bundle.
 -->
@@ -40,5 +40,24 @@
 	-->
 	<key>NSSupportsLiveActivities</key>
 	<true/>
+	<!--
+	  The `keeper://` scheme (Epic 82, AD-311): the account's setup link and any
+	  OAuth callback that does not return through the sign-in sheet. The macOS
+	  file does not carry this key, so, like NSSupportsLiveActivities, it is
+	  stated here because a phone with no URL type drops every setup link on
+	  the floor. MUST equal project.yml's entry and the one the deep-link
+	  plugin writes from tauri.conf.json's `plugins.deep-link.mobile`.
+	-->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>keeper</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>keeper</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

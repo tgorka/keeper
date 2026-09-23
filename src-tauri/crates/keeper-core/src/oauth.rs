@@ -160,6 +160,19 @@ impl OAuthFlowRegistry {
         }
     }
 
+    /// Cancel one in-flight flow: send [`OAuthCallback::Cancelled`] to the
+    /// sender registered under `state` and remove it. An unknown `state` is a
+    /// no-op. Used when the platform's auth session reports that the person
+    /// dismissed it, so a sibling flow (the Matrix login, the other account
+    /// leg) keeps waiting.
+    pub fn cancel(&self, state: &str) {
+        let sender = self.lock().remove(state);
+        if let Some(tx) = sender {
+            // A dropped receiver is already-cancelled.
+            let _ = tx.send(OAuthCallback::Cancelled);
+        }
+    }
+
     /// Lock helper that recovers a poisoned mutex (a panicking send would only
     /// have left a fully-formed map behind), avoiding an `.unwrap()`.
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, oneshot::Sender<OAuthCallback>>> {
@@ -287,6 +300,24 @@ mod tests {
         ));
         // Registry is empty: a subsequent callback matches nothing.
         assert!(!registry.resolve("keeper://oauth/callback?state=a"));
+    }
+
+    /// `cancel` ends exactly the named flow; its sibling keeps waiting.
+    #[tokio::test]
+    async fn cancel_ends_one_flow_and_leaves_the_rest() {
+        let registry = OAuthFlowRegistry::new();
+        let rx_a = registry.register("a".to_owned());
+        let _rx_b = registry.register("b".to_owned());
+
+        registry.cancel("a");
+        registry.cancel("unknown");
+
+        assert!(matches!(
+            rx_a.await.expect("sender not dropped"),
+            OAuthCallback::Cancelled
+        ));
+        assert!(!registry.resolve("keeper://oauth/callback?state=a"));
+        assert!(registry.resolve("keeper://oauth/callback?code=x&state=b"));
     }
 
     /// Dropping the receiver (flow ended) leaves a stale sender; resolving it is

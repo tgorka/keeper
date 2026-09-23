@@ -13,11 +13,17 @@
 //! ```text
 //! ~/.keeper/keeper.toml                 user, every machine, every folder
 //! ~/.keeper/keeper.<host>.toml          user, THIS machine
+//! <clone>/<login>/keeper.toml           your account, every device
+//! <clone>/<login>/keeper.<device>.toml  your account, THIS device
 //! <main>/.keeper/keeper.toml            the main sync folder, every machine
 //! <main>/.keeper/keeper.<host>.toml     the main sync folder, THIS machine
 //! <folder>/.keeper/keeper.toml          that folder only
 //! <folder>/.keeper/keeper.<host>.toml   that folder, this machine
 //! ```
+//!
+//! The two account files come from the clone of the signed-in person's config
+//! repository (Epic 82). They are the one part of the stack that changes while
+//! keeper runs: [`install_account_layers`] swaps them after a fetch.
 //!
 //! Precedence is that order, later wins, **per key** — a machine file that sets
 //! one key does not discard the shared file's other keys.
@@ -34,7 +40,7 @@
 //!
 //! # Two phases, because the layers below need a database the layers above configure
 //!
-//! Three of the six files are keyed on sync-folder paths, which live in
+//! The main and folder files are keyed on sync-folder paths, which live in
 //! `sync.db`, which is not open until the supervisor starts — and which itself
 //! needs `sync.git_path` from the settings. AD-101 cuts that cycle by recording
 //! the main folder's path in the user-global layer: **phase one** ([`load_app_layers`])
@@ -59,7 +65,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -79,9 +86,11 @@ pub const FILE_STEM: &str = "keeper";
 /// Which file a value came from, and therefore how it is ordered against the
 /// others.
 ///
-/// **Declaration order is precedence order** — later wins. `resolve` relies on
-/// nothing but iterating the tiers in this order, so reordering these variants
-/// reorders the stack.
+/// **Declaration order is precedence order** — later wins. The frozen stack is
+/// merged by reading the files in this order, and the live account tiers are
+/// merged into it by comparing tiers (`Ord`), so reordering these variants
+/// reorders the stack. [`LayerTier::AccountDescriptor`] is last only because it
+/// is not a layer at all; nothing compares against it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LayerTier {
@@ -94,6 +103,16 @@ pub enum LayerTier {
     /// `mainSyncFolder` example is a macOS-only `/Volumes` mount) and the only
     /// file `keys::layer_may_set` will accept a machine-local key in.
     UserGlobalMachine,
+    /// `<clone>/<login>/keeper.toml` — this person's account, every device.
+    ///
+    /// Read from the per-person config repository's clone, so it is above
+    /// `~/.keeper` on purpose: the repository wins over this machine's hand
+    /// edits. It is below the main folder, which keeps its authority. Live, not
+    /// frozen: see [`install_account_layers`].
+    AccountShared,
+    /// `<clone>/<login>/keeper.<device>.toml` — this person's account, this
+    /// device. Machine-scoped, so it is where a machine-local key may live.
+    AccountDevice,
     /// `<main>/.keeper/keeper.toml` — the designated main sync folder, shared.
     MainShared,
     /// `<main>/.keeper/keeper.<host>.toml` — the main sync folder, this machine.
@@ -102,13 +121,20 @@ pub enum LayerTier {
     FolderShared,
     /// `<folder>/.keeper/keeper.<host>.toml` — one non-main folder, this machine.
     FolderMachine,
+    /// `~/.keeper/account.toml` — the account descriptor. **Not a layer** and
+    /// not in [`LayerTier::ORDER`]: it sets no key, it only says where the
+    /// account tiers come from. It exists so a broken descriptor's faults are
+    /// reported in the same list, with the same wording, as a layer's.
+    AccountDescriptor,
 }
 
 impl LayerTier {
     /// Every tier, in precedence order (later wins).
-    pub const ORDER: [LayerTier; 6] = [
+    pub const ORDER: [LayerTier; 8] = [
         LayerTier::UserGlobal,
         LayerTier::UserGlobalMachine,
+        LayerTier::AccountShared,
+        LayerTier::AccountDevice,
         LayerTier::MainShared,
         LayerTier::MainMachine,
         LayerTier::FolderShared,
@@ -124,7 +150,10 @@ impl LayerTier {
     pub fn machine_scoped(self) -> bool {
         matches!(
             self,
-            LayerTier::UserGlobalMachine | LayerTier::MainMachine | LayerTier::FolderMachine
+            LayerTier::UserGlobalMachine
+                | LayerTier::AccountDevice
+                | LayerTier::MainMachine
+                | LayerTier::FolderMachine
         )
     }
 
@@ -133,16 +162,21 @@ impl LayerTier {
     /// A non-main folder may only set keys that are *about itself* (`[folder]`).
     /// That is not a courtesy: it is what stops two folders fighting over
     /// `hotkey.global`, where the winner would be whichever the supervisor
-    /// happened to open last.
+    /// happened to open last. The descriptor is not a layer and sets nothing.
     pub fn may_set_settings(self) -> bool {
-        !matches!(self, LayerTier::FolderShared | LayerTier::FolderMachine)
+        !matches!(
+            self,
+            LayerTier::FolderShared | LayerTier::FolderMachine | LayerTier::AccountDescriptor
+        )
     }
 
     /// Whether `mainSyncFolder` is honoured at this tier.
     ///
     /// Only the user-global files. A folder naming the main folder is either a
     /// no-op or a loop, and it is the fact that has to be readable *before* any
-    /// folder is known (AD-101).
+    /// folder is known (AD-101). An account file may not either: the repository
+    /// is shared by every device, and which directory is the main folder is a
+    /// fact about one machine's disk.
     pub fn may_set_main_folder(self) -> bool {
         matches!(self, LayerTier::UserGlobal | LayerTier::UserGlobalMachine)
     }
@@ -150,7 +184,13 @@ impl LayerTier {
     /// Whether a `[folder]` table means anything at this tier — i.e. whether the
     /// file lives inside a sync folder at all.
     pub fn has_folder(self) -> bool {
-        !matches!(self, LayerTier::UserGlobal | LayerTier::UserGlobalMachine)
+        matches!(
+            self,
+            LayerTier::MainShared
+                | LayerTier::MainMachine
+                | LayerTier::FolderShared
+                | LayerTier::FolderMachine
+        )
     }
 
     /// A stable human name for logs and the settings pane.
@@ -158,10 +198,13 @@ impl LayerTier {
         match self {
             LayerTier::UserGlobal => "user",
             LayerTier::UserGlobalMachine => "user, this machine",
+            LayerTier::AccountShared => "your account's settings (every device)",
+            LayerTier::AccountDevice => "your account's settings (this device)",
             LayerTier::MainShared => "main folder",
             LayerTier::MainMachine => "main folder, this machine",
             LayerTier::FolderShared => "folder",
             LayerTier::FolderMachine => "folder, this machine",
+            LayerTier::AccountDescriptor => "account.toml",
         }
     }
 }
@@ -176,6 +219,14 @@ pub struct LayerSource {
     pub path: PathBuf,
     /// The sync-folder root this layer belongs to, when it belongs to one.
     pub folder: Option<String>,
+    /// The account's display name, when this layer comes from the account's
+    /// config repository — "Set by a file" has to say *whose* repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The account's repository host, so "Set by a file" can say where the
+    /// file really lives: the clone on disk is replaced at every sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_host: Option<String>,
 }
 
 /// A settings value resolved from a layer file rather than the `settings` table.
@@ -503,14 +554,19 @@ pub fn parse_layer_file(
             // silently ignoring the other spelling is the worst outcome.
             "mainSyncFolder" | "main_sync_folder" => {
                 if !tier.may_set_main_folder() {
+                    let why = if tier.has_folder() {
+                        "a sync folder cannot elect itself"
+                    } else {
+                        "your account's repository is shared by every device, and the main \
+                         folder is a path on one of them"
+                    };
                     file.faults.push(fault(
                         LayerFaultKind::MainFolderInFolderLayer,
                         Some(name),
                         None,
                         format!(
                             "{name} is only honoured in ~/.keeper/{FILE_STEM}.toml and \
-                             ~/.keeper/{FILE_STEM}.<host>.toml; a sync folder cannot elect \
-                             itself, so this line is ignored"
+                             ~/.keeper/{FILE_STEM}.<host>.toml; {why}, so this line is ignored"
                         ),
                     ));
                     continue;
@@ -591,6 +647,8 @@ pub fn parse_layer_file(
                                 tier,
                                 path: path.to_path_buf(),
                                 folder: folder.map(str::to_owned),
+                                account: None,
+                                repo_host: None,
                             },
                         },
                     );
@@ -607,12 +665,18 @@ pub fn parse_layer_file(
                     continue;
                 };
                 if !tier.has_folder() {
+                    let place = match tier {
+                        LayerTier::AccountShared | LayerTier::AccountDevice => {
+                            "your account's files"
+                        }
+                        _ => "~/.keeper/",
+                    };
                     file.faults.push(fault(
                         LayerFaultKind::UnknownTable,
                         Some(name),
                         None,
                         format!(
-                            "[folder] names no folder in ~/.keeper/; folder settings belong in \
+                            "[folder] names no folder in {place}; folder settings belong in \
                              <folder>/.keeper/{FILE_STEM}.toml, where they travel with the folder"
                         ),
                     ));
@@ -764,16 +828,16 @@ fn apply_file(layers: &mut AppLayers, path: &Path, tier: LayerTier, folder: Opti
 /// The installed stack.
 ///
 /// A `OnceLock`, not an `RwLock`. There is exactly one writer, [`install`], and
-/// it runs before anything reads: after phase one the resolved set never
-/// changes, because the only later layers are per-folder and a folder may not
-/// set a settings key at all. So a lock would guard nothing, and it is not free
-/// — an `RwLock` read is a read-modify-write on a shared cacheline, and
+/// it runs before anything reads: after phase one the files it holds never
+/// change, because the only later *file* layers are per-folder and a folder may
+/// not set a settings key at all. So a lock would guard nothing, and it is not
+/// free — an `RwLock` read is a read-modify-write on a shared cacheline, and
 /// [`setting_override`] is called by every one of the ~40 typed getters on the
 /// startup path, several of them in loops. `OnceLock::get` is one acquire load.
 ///
-/// The one thing that genuinely mutates after install is the fault list
-/// (`push_fault`, for the shell's phase two), so that — and only that — gets a
-/// `Mutex`, off the hot path.
+/// Two things genuinely mutate after install: the fault list (`push_fault`,
+/// for the shell's phase two), which gets a `Mutex` off the hot path, and the
+/// account tiers, which live beside this stack in [`ACCOUNT`] rather than in it.
 static LAYERS: OnceLock<AppLayers> = OnceLock::new();
 
 /// Faults raised after [`install`], by the shell's phase two.
@@ -804,6 +868,19 @@ pub fn install(layers: AppLayers) {
 /// Consulted by [`crate::registry::get_setting`] **before** it opens a database
 /// connection.
 pub fn setting_override(key: &str) -> Option<SettingOverride> {
+    let frozen = frozen_override(key);
+    with_account_layers(|account| {
+        let Some(account) = account.and_then(|layers| layers.overrides.get(key)) else {
+            return frozen;
+        };
+        match frozen {
+            Some(frozen) if frozen.source.tier > account.source.tier => Some(frozen),
+            _ => Some(account.clone()),
+        }
+    })
+}
+
+fn frozen_override(key: &str) -> Option<SettingOverride> {
     #[cfg(test)]
     if let Some(layers) = test_layers() {
         return layers.overrides.get(key).cloned();
@@ -816,14 +893,29 @@ pub fn setting_override(key: &str) -> Option<SettingOverride> {
 /// The settings pane reads this to mark a control "set by a file" instead of
 /// letting a person move a slider that will not take.
 pub fn overrides() -> Vec<(String, LayerSource)> {
-    with_installed(|layers| {
+    let frozen: Vec<(String, LayerSource)> = with_installed(|layers| {
         layers
             .overrides
             .iter()
             .map(|(key, over)| (key.clone(), over.source.clone()))
             .collect()
     })
-    .unwrap_or_default()
+    .unwrap_or_default();
+    with_account_layers(|account| {
+        let Some(account) = account else {
+            return frozen;
+        };
+        let mut merged: BTreeMap<String, LayerSource> = frozen.into_iter().collect();
+        for (key, over) in &account.overrides {
+            match merged.get(key) {
+                Some(existing) if existing.tier > over.source.tier => {}
+                _ => {
+                    merged.insert(key.clone(), over.source.clone());
+                }
+            }
+        }
+        merged.into_iter().collect()
+    })
 }
 
 /// The designated main sync folder, for the shell's phase two.
@@ -831,10 +923,17 @@ pub fn main_folder() -> Option<PathBuf> {
     with_installed(|layers| layers.main_folder.clone()).flatten()
 }
 
-/// Everything wrong with the layer files: phase one's faults, then any the shell
-/// added afterwards.
+/// Everything wrong with the layer files: phase one's faults, then the
+/// account's (the descriptor and identity faults the shell set, then the
+/// account files' own), then any the shell added afterwards.
 pub fn faults() -> Vec<LayerFault> {
     let mut all = with_installed(|layers| layers.faults.clone()).unwrap_or_default();
+    with_account_slot(|slot| {
+        all.extend(read_lock(&slot.faults).iter().cloned());
+        if let Some(layers) = read_lock(&slot.layers).as_ref() {
+            all.extend(layers.faults.iter().cloned());
+        }
+    });
     all.extend(late_faults().iter().cloned());
     all
 }
@@ -852,6 +951,178 @@ fn with_installed<T>(read: impl FnOnce(&AppLayers) -> T) -> Option<T> {
         return Some(read(&layers));
     }
     LAYERS.get().map(read)
+}
+
+// ---------------------------------------------------------------------------
+// The account tiers (Epic 82, AD-309)
+// ---------------------------------------------------------------------------
+
+/// Where the signed-in person's two layer files are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountLayerSource {
+    /// `<clone>/<login>` — this person's own directory in the config repository.
+    pub dir: PathBuf,
+    /// This device's name, the `<device>` of `keeper.<device>.toml`.
+    pub device: String,
+    /// The account's display name, for "Set by a file" and the fault list.
+    pub account_name: String,
+    /// The config repository's host (`git.acme.dev`).
+    pub repo_host: String,
+}
+
+/// The account's two files, parsed and merged (device over shared, per key).
+#[derive(Debug, Clone, Default)]
+pub struct AccountLayers {
+    pub overrides: BTreeMap<String, SettingOverride>,
+    pub faults: Vec<LayerFault>,
+}
+
+/// Read `keeper.toml` and `keeper.<device>.toml` from the person's directory,
+/// with the same parser, the same `[settings]` rights and the same faults as
+/// `~/.keeper/`. `mainSyncFolder` and `[folder]` are refused by the tiers'
+/// predicates, not by anything here. Cannot fail; an absent file is silent.
+///
+/// A layer file (or the directory itself) that is a symlink is a fault, never
+/// followed: anyone who can push to the repository could otherwise point the
+/// account's settings at a file outside the clone.
+pub fn load_account_layers(src: &AccountLayerSource) -> AccountLayers {
+    let mut read = AppLayers::default();
+    // `layer_paths` folds the device name to a filename the way it folds a
+    // host label, so a device called `../x` cannot leave the directory.
+    let [shared, device] = layer_paths(&src.dir, &src.device);
+    let dir_is_link = std::fs::symlink_metadata(&src.dir).is_ok_and(|m| m.file_type().is_symlink());
+    for (path, tier) in [
+        (shared, LayerTier::AccountShared),
+        (device, LayerTier::AccountDevice),
+    ] {
+        let not_a_file =
+            dir_is_link || std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file());
+        if not_a_file {
+            read.faults.push(LayerFault {
+                kind: LayerFaultKind::Unreadable,
+                path,
+                tier: Some(tier),
+                folder: None,
+                key: None,
+                line: None,
+                message: "is a link or a folder in the settings repository, not a file, so this layer was skipped".to_owned(),
+            });
+            continue;
+        }
+        apply_file(&mut read, &path, tier, None);
+    }
+    let mut overrides = read.overrides;
+    for over in overrides.values_mut() {
+        over.source.account = Some(src.account_name.clone());
+        over.source.repo_host = Some(src.repo_host.clone());
+    }
+    AccountLayers {
+        overrides,
+        faults: read.faults,
+    }
+}
+
+/// Swap the account tiers in, live. `None` clears them (sign-out, or an
+/// identity that no longer matches). Keys read on every access take effect at
+/// once; keys consumed only at boot take effect at the next launch.
+pub fn install_account_layers(layers: Option<AccountLayers>) {
+    match &layers {
+        Some(layers) => {
+            for fault in &layers.faults {
+                tracing::warn!(%fault, "config: account layer fault");
+            }
+            tracing::info!(
+                overrides = layers.overrides.len(),
+                faults = layers.faults.len(),
+                "config: account layers installed"
+            );
+        }
+        None => tracing::info!("config: account layers cleared"),
+    }
+    with_account_slot(|slot| {
+        let installed = layers.is_some();
+        let previous = {
+            let mut guard = slot
+                .layers
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::replace(&mut *guard, layers)
+        };
+        slot.installed.store(installed, Ordering::Release);
+        drop(previous);
+    });
+}
+
+/// Replace the account's own faults — a broken `account.toml`, a sign-in that
+/// belongs to someone else — which are reported beside the layer faults.
+pub fn set_account_faults(faults: Vec<LayerFault>) {
+    for fault in &faults {
+        tracing::warn!(%fault, "config: account fault");
+    }
+    with_account_slot(|slot| {
+        *slot
+            .faults
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = faults;
+    });
+}
+
+/// The live account state.
+///
+/// An `RwLock`, because unlike [`LAYERS`] this has a writer after boot: a fetch
+/// that changed the person's files. `installed` mirrors `layers.is_some()` so
+/// [`setting_override`] takes no lock at all when no account is installed —
+/// an install without an account pays one atomic load over what it paid before.
+struct AccountSlot {
+    installed: AtomicBool,
+    layers: RwLock<Option<AccountLayers>>,
+    faults: RwLock<Vec<LayerFault>>,
+}
+
+impl AccountSlot {
+    const fn new() -> Self {
+        Self {
+            installed: AtomicBool::new(false),
+            layers: RwLock::new(None),
+            faults: RwLock::new(Vec::new()),
+        }
+    }
+}
+
+#[cfg(not(test))]
+static ACCOUNT: AccountSlot = AccountSlot::new();
+
+#[cfg(not(test))]
+fn with_account_slot<T>(read: impl FnOnce(&AccountSlot) -> T) -> T {
+    read(&ACCOUNT)
+}
+
+// Per-thread in tests, for the reason the frozen stack's overlay is: each test
+// swaps accounts freely without racing its neighbours' reads. The swap, the
+// lock and the merge are the production code; only the slot's address differs.
+#[cfg(test)]
+thread_local! {
+    static ACCOUNT: AccountSlot = const { AccountSlot::new() };
+}
+
+#[cfg(test)]
+fn with_account_slot<T>(read: impl FnOnce(&AccountSlot) -> T) -> T {
+    ACCOUNT.with(read)
+}
+
+fn with_account_layers<T>(read: impl FnOnce(Option<&AccountLayers>) -> T) -> T {
+    with_account_slot(|slot| {
+        if !slot.installed.load(Ordering::Acquire) {
+            return read(None);
+        }
+        read(read_lock(&slot.layers).as_ref())
+    })
+}
+
+fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    // A writer only ever replaces the whole value, so a poisoned lock holds
+    // either the old account or the new one — never half of either.
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -910,6 +1181,8 @@ pub(crate) fn layers_from(entries: &[(&str, &str, LayerTier)]) -> AppLayers {
                     tier: *tier,
                     path: PathBuf::from(format!("/test/{}.toml", tier.label())),
                     folder: None,
+                    account: None,
+                    repo_host: None,
                 },
             },
         );
@@ -1725,5 +1998,417 @@ mod tests {
             );
         }
         assert_eq!(setting_override("debug.mode"), None);
+    }
+
+    // -- the account tiers (Epic 82) ---------------------------------------
+
+    /// Clears this thread's account slot when dropped, so a failing assertion
+    /// cannot leak an installed account into the next test on the thread.
+    struct AccountGuard;
+
+    impl Drop for AccountGuard {
+        fn drop(&mut self) {
+            install_account_layers(None);
+            set_account_faults(Vec::new());
+        }
+    }
+
+    /// A home with a main folder, and an account directory beside it.
+    struct AccountFixture {
+        home: PathBuf,
+        main: PathBuf,
+        account: PathBuf,
+    }
+
+    impl AccountFixture {
+        fn new() -> Self {
+            let home = temp_dir();
+            let main = home.join("tgdrive");
+            std::fs::create_dir_all(&main).expect("create the main folder");
+            let account = home.join("clone").join("tgorka");
+            std::fs::create_dir_all(&account).expect("create the account dir");
+            write(
+                &keeper_dir(&home).join("keeper.toml"),
+                &format!("mainSyncFolder = {:?}\n", main.display().to_string()),
+            );
+            Self {
+                home,
+                main,
+                account,
+            }
+        }
+
+        /// The file `tier` reads, on host `testbox` / device `laptop`.
+        fn path(&self, tier: LayerTier) -> PathBuf {
+            match tier {
+                LayerTier::UserGlobal => keeper_dir(&self.home).join("keeper.toml"),
+                LayerTier::UserGlobalMachine => keeper_dir(&self.home).join("keeper.testbox.toml"),
+                LayerTier::AccountShared => self.account.join("keeper.toml"),
+                LayerTier::AccountDevice => self.account.join("keeper.laptop.toml"),
+                LayerTier::MainShared => keeper_dir(&self.main).join("keeper.toml"),
+                LayerTier::MainMachine => keeper_dir(&self.main).join("keeper.testbox.toml"),
+                other => panic!("{other:?} is not an app or account tier"),
+            }
+        }
+
+        fn set(&self, tier: LayerTier, settings: &str) {
+            let mut text = String::new();
+            if tier == LayerTier::UserGlobal {
+                text.push_str(&format!(
+                    "mainSyncFolder = {:?}\n",
+                    self.main.display().to_string()
+                ));
+            }
+            text.push_str("[settings]\n");
+            text.push_str(settings);
+            write(&self.path(tier), &text);
+        }
+
+        fn source(&self) -> AccountLayerSource {
+            AccountLayerSource {
+                dir: self.account.clone(),
+                device: "laptop".to_owned(),
+                account_name: "Acme".to_owned(),
+                repo_host: "git.acme.dev".to_owned(),
+            }
+        }
+
+        /// Install the frozen stack and the account tiers the way the shell does.
+        fn install(&self) -> (TestLayerGuard, AccountGuard) {
+            let frozen = install_for_test(load_app_layers(&self.home, "testbox"));
+            install_account_layers(Some(load_account_layers(&self.source())));
+            (frozen, AccountGuard)
+        }
+    }
+
+    impl Drop for AccountFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    fn resolved(key: &str) -> Option<(String, LayerTier)> {
+        setting_override(key).map(|o| (o.value, o.source.tier))
+    }
+
+    /// [`faults`] without the process-global late faults, which
+    /// `install_then_read_resolves_through_the_process_global` pushes from
+    /// another thread. Late faults only ever grow, so a snapshot taken after the
+    /// read covers everything that read could have seen.
+    fn own_faults() -> Vec<LayerFault> {
+        let all = faults();
+        let late = late_faults().clone();
+        all.into_iter().filter(|f| !late.contains(f)).collect()
+    }
+
+    /// The owner's precedence, pair by pair across the six app and account
+    /// tiers: account beats `~/.keeper` (both files), the device file beats the
+    /// account's shared file, and the main folder beats the account. Each pair is
+    /// checked through `setting_override` and through `overrides()`, because the
+    /// two merge the live tiers separately and the badge must agree with the value.
+    #[test]
+    fn every_adjacent_pair_across_user_account_and_main_resolves_to_the_later_one() {
+        let tiers = [
+            LayerTier::UserGlobal,
+            LayerTier::UserGlobalMachine,
+            LayerTier::AccountShared,
+            LayerTier::AccountDevice,
+            LayerTier::MainShared,
+            LayerTier::MainMachine,
+        ];
+        assert_eq!(&LayerTier::ORDER[..6], &tiers);
+        for pair in tiers.windows(2) {
+            let (earlier, later) = (pair[0], pair[1]);
+            let fixture = AccountFixture::new();
+            fixture.set(earlier, "\"recording.segment_mb\" = 240\n");
+            fixture.set(later, "\"recording.segment_mb\" = 480\n");
+            let _installed = fixture.install();
+            assert_eq!(
+                resolved("recording.segment_mb"),
+                Some(("480".to_owned(), later)),
+                "{later:?} must beat {earlier:?}"
+            );
+            assert_eq!(
+                overrides()
+                    .into_iter()
+                    .map(|(key, source)| (key, source.tier))
+                    .collect::<Vec<_>>(),
+                vec![("recording.segment_mb".to_owned(), later)],
+                "overrides() must name the same winner as setting_override for {earlier:?} vs {later:?}"
+            );
+        }
+    }
+
+    /// Non-adjacent and per-key: the main folder's shared file beats the
+    /// account's device file, `~/.keeper`'s machine file loses to the account's
+    /// shared file, and a key only `~/.keeper` sets is not hidden by an account
+    /// that sets other keys.
+    #[test]
+    fn account_tiers_merge_per_key_into_the_frozen_stack() {
+        let fixture = AccountFixture::new();
+        fixture.set(
+            LayerTier::UserGlobal,
+            "\"undo_send.window\" = 5\n\"recording.codec\" = \"h264\"\n",
+        );
+        fixture.set(LayerTier::UserGlobalMachine, "\"recording.fps\" = 10\n");
+        fixture.set(
+            LayerTier::AccountShared,
+            "\"recording.fps\" = 15\n\"recording.codec\" = \"hevc\"\n",
+        );
+        fixture.set(LayerTier::AccountDevice, "\"recording.segment_mb\" = 240\n");
+        fixture.set(LayerTier::MainShared, "\"recording.segment_mb\" = 480\n");
+        let _installed = fixture.install();
+        assert!(own_faults().is_empty(), "faults: {:?}", own_faults());
+
+        assert_eq!(
+            resolved("recording.fps"),
+            Some(("15".to_owned(), LayerTier::AccountShared))
+        );
+        assert_eq!(
+            resolved("recording.codec"),
+            Some(("hevc".to_owned(), LayerTier::AccountShared))
+        );
+        assert_eq!(
+            resolved("undo_send.window"),
+            Some(("5".to_owned(), LayerTier::UserGlobal))
+        );
+        assert_eq!(
+            resolved("recording.segment_mb"),
+            Some(("480".to_owned(), LayerTier::MainShared))
+        );
+        assert_eq!(
+            overrides()
+                .into_iter()
+                .map(|(key, source)| (key, source.tier))
+                .collect::<Vec<_>>(),
+            vec![
+                ("recording.codec".to_owned(), LayerTier::AccountShared),
+                ("recording.fps".to_owned(), LayerTier::AccountShared),
+                ("recording.segment_mb".to_owned(), LayerTier::MainShared),
+                ("undo_send.window".to_owned(), LayerTier::UserGlobal),
+            ]
+        );
+    }
+
+    /// An account's value names the account and its file, and belongs to no
+    /// folder — "Set by a file" has to say whose repository to edit.
+    #[test]
+    fn an_account_override_names_its_account_and_its_file() {
+        let fixture = AccountFixture::new();
+        fixture.set(LayerTier::AccountDevice, "\"recording.fps\" = 30\n");
+        let _installed = fixture.install();
+        let source = setting_override("recording.fps")
+            .expect("the account sets it")
+            .source;
+        assert_eq!(source.account.as_deref(), Some("Acme"));
+        assert_eq!(source.path, fixture.account.join("keeper.laptop.toml"));
+        assert_eq!(source.folder, None);
+    }
+
+    /// AD-101 holds in the repository too: an account file cannot elect the main
+    /// folder, cannot carry `[folder]`, and cannot put a machine-local key in the
+    /// file every device reads. Each refusal is a fault naming the account
+    /// file, and the rest of the file still applies.
+    #[test]
+    fn main_sync_folder_folder_tables_and_shared_machine_keys_are_refused_in_account_files() {
+        let fixture = AccountFixture::new();
+        write(
+            &fixture.path(LayerTier::AccountShared),
+            "mainSyncFolder = \"/elsewhere\"\n\
+             [settings]\n\
+             \"recording.fps\" = 30\n\
+             \"sync.git_path\" = \"/opt/homebrew/bin/git\"\n\
+             [folder]\n\
+             recordingsSubfolder = \"x\"\n",
+        );
+        write(
+            &fixture.path(LayerTier::AccountDevice),
+            "main_sync_folder = \"/elsewhere\"\n\
+             [settings]\n\
+             \"sync.git_path\" = \"/usr/bin/git\"\n",
+        );
+        let layers = load_account_layers(&fixture.source());
+        let mut kinds: Vec<_> = layers
+            .faults
+            .iter()
+            .map(|f| (f.kind, f.tier, f.key.clone()))
+            .collect();
+        kinds.sort_by_key(|(_, _, key)| key.clone());
+        assert_eq!(
+            kinds,
+            vec![
+                (
+                    LayerFaultKind::UnknownTable,
+                    Some(LayerTier::AccountShared),
+                    Some("folder".to_owned())
+                ),
+                (
+                    LayerFaultKind::MainFolderInFolderLayer,
+                    Some(LayerTier::AccountShared),
+                    Some("mainSyncFolder".to_owned())
+                ),
+                (
+                    LayerFaultKind::MainFolderInFolderLayer,
+                    Some(LayerTier::AccountDevice),
+                    Some("main_sync_folder".to_owned())
+                ),
+                (
+                    LayerFaultKind::KeyRefused,
+                    Some(LayerTier::AccountShared),
+                    Some("sync.git_path".to_owned())
+                ),
+            ]
+        );
+        // The good lines survived, and the machine-local key landed from the
+        // device file, which is the one place it may live.
+        assert_eq!(
+            layers
+                .overrides
+                .get("recording.fps")
+                .map(|o| o.value.as_str()),
+            Some("30")
+        );
+        assert_eq!(
+            layers
+                .overrides
+                .get("sync.git_path")
+                .map(|o| (o.value.as_str(), o.source.tier)),
+            Some(("/usr/bin/git", LayerTier::AccountDevice))
+        );
+
+        // Installed, the faults join the settings pane's list and the main
+        // folder is still the one ~/.keeper named.
+        let _installed = fixture.install();
+        assert_eq!(main_folder(), Some(fixture.main.clone()));
+        let listed: Vec<_> = own_faults().into_iter().map(|f| f.path).collect();
+        assert_eq!(listed.len(), 4, "{listed:?}");
+        assert!(listed.iter().all(|path| path.starts_with(&fixture.account)));
+    }
+
+    /// A layer file the repository holds as a symlink is never followed: its
+    /// target (here outside the clone) applies nothing, and the fault names it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_account_layer_is_a_fault_and_never_followed() {
+        let fixture = AccountFixture::new();
+        let outside = fixture.home.join("outside.toml");
+        write(&outside, "[settings]\n\"recording.fps\" = 60\n");
+        std::os::unix::fs::symlink(&outside, fixture.path(LayerTier::AccountShared)).expect("link");
+        fixture.set(LayerTier::AccountDevice, "\"recording.segment_mb\" = 240\n");
+
+        let layers = load_account_layers(&fixture.source());
+
+        assert_eq!(layers.overrides.get("recording.fps"), None);
+        assert_eq!(
+            layers
+                .overrides
+                .get("recording.segment_mb")
+                .map(|o| o.value.as_str()),
+            Some("240"),
+            "the regular device file still applies"
+        );
+        assert_eq!(
+            layers
+                .faults
+                .iter()
+                .map(|f| (f.kind, f.tier, f.path.clone()))
+                .collect::<Vec<_>>(),
+            vec![(
+                LayerFaultKind::Unreadable,
+                Some(LayerTier::AccountShared),
+                fixture.path(LayerTier::AccountShared)
+            )]
+        );
+    }
+
+    /// The tiers are live: a fetch that changed the files swaps the new values
+    /// in, and clearing them (sign-out) hands every key back to `~/.keeper` and
+    /// drops the account's faults with them.
+    #[test]
+    fn swapping_and_clearing_the_account_layers_takes_effect_on_the_next_read() {
+        let fixture = AccountFixture::new();
+        fixture.set(LayerTier::UserGlobal, "\"recording.fps\" = 10\n");
+        fixture.set(LayerTier::AccountShared, "\"recording.fps\" = 30\n");
+        let (_frozen, _account) = fixture.install();
+        assert_eq!(
+            resolved("recording.fps"),
+            Some(("30".to_owned(), LayerTier::AccountShared))
+        );
+
+        fixture.set(
+            LayerTier::AccountShared,
+            "\"recording.fps\" = 60\n\"recording.codec\" = \"banana\"\n",
+        );
+        install_account_layers(Some(load_account_layers(&fixture.source())));
+        assert_eq!(
+            resolved("recording.fps"),
+            Some(("60".to_owned(), LayerTier::AccountShared))
+        );
+        assert_eq!(
+            own_faults().iter().map(|f| f.kind).collect::<Vec<_>>(),
+            vec![LayerFaultKind::ValueShape]
+        );
+
+        set_account_faults(vec![LayerFault::late(
+            LayerFaultKind::Malformed,
+            "/h/.keeper/account.toml",
+            "the descriptor is broken",
+        )]);
+        assert_eq!(own_faults().len(), 2);
+
+        install_account_layers(None);
+        assert_eq!(
+            resolved("recording.fps"),
+            Some(("10".to_owned(), LayerTier::UserGlobal))
+        );
+        assert_eq!(
+            overrides()
+                .into_iter()
+                .map(|(key, source)| (key, source.tier))
+                .collect::<Vec<_>>(),
+            vec![("recording.fps".to_owned(), LayerTier::UserGlobal)]
+        );
+        // The descriptor fault is the shell's to clear, not the layers'.
+        assert_eq!(
+            own_faults()
+                .into_iter()
+                .map(|f| f.message)
+                .collect::<Vec<_>>(),
+            vec!["the descriptor is broken"]
+        );
+        set_account_faults(Vec::new());
+        assert!(own_faults().is_empty());
+    }
+
+    /// No account, or an account installed and then cleared, answers exactly
+    /// what the frozen stack alone answers — values, sources and faults.
+    #[test]
+    fn no_account_answers_exactly_what_the_frozen_stack_answers() {
+        let fixture = AccountFixture::new();
+        fixture.set(LayerTier::UserGlobal, "\"recording.fps\" = 10\n");
+        fixture.set(
+            LayerTier::MainShared,
+            "\"recording.codec\" = \"hevc\"\n\"nope\" = 1\n",
+        );
+        let frozen = load_app_layers(&fixture.home, "testbox");
+        let _layers = install_for_test(frozen.clone());
+        let snapshot = || {
+            (
+                setting_override("recording.fps"),
+                setting_override("recording.codec"),
+                overrides(),
+                own_faults(),
+            )
+        };
+        let before = snapshot();
+        assert_eq!(before.0.as_ref(), frozen.overrides.get("recording.fps"));
+        assert_eq!(before.3, frozen.faults);
+
+        fixture.set(LayerTier::AccountShared, "\"recording.fps\" = 30\n");
+        install_account_layers(Some(load_account_layers(&fixture.source())));
+        let _account = AccountGuard;
+        assert_ne!(snapshot(), before);
+        install_account_layers(None);
+        assert_eq!(snapshot(), before);
     }
 }

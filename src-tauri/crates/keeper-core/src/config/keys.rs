@@ -381,7 +381,39 @@ pub const KEYS: &[KeySpec] = &[
         summary: "Whether the Favorites section of the room list starts collapsed.",
         example: "true",
     },
+    // ---- account ---------------------------------------------------------
+    KeySpec {
+        key: "account.",
+        family: true,
+        scope: Scope::SessionState,
+        settable: Settable::Never(
+            "it is this install's record of one organisation account — its device name in the \
+             account's repository and when that repository last synced — and a file carrying it \
+             to another device would make two devices write the same files",
+        ),
+        shape: Shape::Text,
+        default: "",
+        summary: "Per organisation account id: `account.<id>.device_slug` (this device's name in \
+                  the account's repository) and `account.<id>.last_synced_ms` (the last sync, in \
+                  ms since the Unix epoch). Forgetting the account deletes both.",
+        example: "",
+    },
     // ---- bots ------------------------------------------------------------
+    KeySpec {
+        key: "bots.provider_credential_source.",
+        family: true,
+        scope: Scope::SessionState,
+        settable: Settable::Never(
+            "it is the choice made in a provider's form, and a file flipping it would send the \
+             account's token to a server the person never chose to give it to",
+        ),
+        shape: Shape::Text,
+        default: "",
+        summary: "Per bot provider: `account:<account id>` sends that organisation account's \
+                  sign-in token while it is the configured account; absent uses the provider's \
+                  own saved token.",
+        example: "",
+    },
     KeySpec {
         key: "bots.message_details",
         family: false,
@@ -803,6 +835,21 @@ pub const KEYS: &[KeySpec] = &[
         example: "\"/opt/homebrew/bin/git\"",
     },
     KeySpec {
+        key: "sync.credential_source.",
+        family: true,
+        scope: Scope::SessionState,
+        settable: Settable::Never(
+            "it is the choice made in a drive's form, and a file flipping it would send the \
+             account's token to a remote the person never chose to give it to",
+        ),
+        shape: Shape::Text,
+        default: "",
+        summary: "Per drive: `account:<account id>` authenticates with that organisation \
+                  account's sign-in token while it is the configured account; absent uses the \
+                  drive's own saved token.",
+        example: "",
+    },
+    KeySpec {
         key: "sync.list_folded",
         family: false,
         scope: Scope::UserGlobal,
@@ -1059,13 +1106,20 @@ Files are read in this order, and a later one wins:
 ```
 ~/.keeper/keeper.toml                 you, on every machine, in every folder
 ~/.keeper/keeper.<host>.toml          you, on this machine
+<clone>/<login>/keeper.toml           your account, on every device
+<clone>/<login>/keeper.<device>.toml  your account, on this device
 <main>/.keeper/keeper.toml            the main sync folder, on every machine
 <main>/.keeper/keeper.<host>.toml     the main sync folder, on this machine
 <folder>/.keeper/keeper.toml          that folder, on every machine
 <folder>/.keeper/keeper.<host>.toml   that folder, on this machine
 ```
 
-`<host>` is this machine's short hostname. A file looks like this:
+`<host>` is this machine's short hostname. The two account files exist only
+when you are signed in to an account: `<login>` is your directory in the
+account's config repository and `<device>` is this device's name there. They
+are read from keeper's clone of that repository and replaced whenever it
+fetches, so the repository wins over this machine's `~/.keeper` files. A file
+looks like this:
 
 ```toml
 mainSyncFolder = "/Volumes/merope/tgdrive"   # only in ~/.keeper/keeper.toml
@@ -1078,10 +1132,13 @@ mainSyncFolder = "/Volumes/merope/tgdrive"   # only in ~/.keeper/keeper.toml
 recordingsSubfolder = "40-media/recordings"
 ```
 
-A `[settings]` table is accepted in `~/.keeper/` and in the **main** sync
-folder. In any other folder it is a fault that names itself, because no key
-below is about one folder: everything a folder decides about itself lives in
-`[folder]`, which is that folder's sync profile.
+A `[settings]` table is accepted in `~/.keeper/`, in your account's files and
+in the **main** sync folder. In any other folder it is a fault that names
+itself, because no key below is about one folder: everything a folder decides
+about itself lives in `[folder]`, which is that folder's sync profile.
+`mainSyncFolder` in an account file is a fault, because which folder is the
+main one is a fact about one machine's disk; so is `[folder]`, which belongs in
+the folder it describes.
 
 A key set by a file keeps winning. It is not imported into the table once at
 boot and then lost to the next toggle — the settings pane shows the control as

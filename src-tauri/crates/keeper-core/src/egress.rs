@@ -5,7 +5,8 @@
 //! app state, the exact set of hosts the app talks to — each account's Matrix
 //! homeserver, plus Beeper's `api.beeper.com` when (and only when) a Beeper account
 //! exists, plus the host of every folder-sync profile's git remote, plus the host
-//! of every configured AI provider, plus the one signed auto-update endpoint. The
+//! of every configured AI provider, plus the hosts an organisation account's
+//! descriptor names ([`org_account_egress`]), plus the one signed auto-update endpoint. The
 //! Settings → About surface renders this set
 //! directly (never a hardcoded doc), so the claim can never drift from reality.
 //!
@@ -257,6 +258,90 @@ pub fn compute_egress(
         label: "Signed app updates".to_owned(),
     });
 
+    endpoints
+}
+
+/// The destinations the organisation account's descriptor names (Epic 82), as
+/// [`EgressKind::Account`] hosts: the identity provider and any endpoint it
+/// overrides, the address the descriptor was fetched from when keeper still
+/// knows it, the settings repository and its API base, and — in `oauth` mode —
+/// the forge's own sign-in. No descriptor, no entries: an install without an
+/// account discloses exactly what it did before.
+///
+/// Kept beside [`compute_egress`] rather than inside it for the telemetry
+/// row's reason: the shell appends it from state the other inputs do not
+/// carry. Reduced by the same [`remote_host`], and deduplicated by host — an
+/// issuer and a forge on one host are one destination.
+///
+/// Discovery can name further hosts (a `jwks_uri` on a CDN); those are the
+/// identity provider's to choose and are disclosed in `docs/egress.md`, not
+/// guessed here.
+pub fn org_account_egress(
+    descriptor: Option<&crate::org_account::descriptor::AccountDescriptor>,
+    descriptor_url: Option<&url::Url>,
+) -> Vec<EgressEndpointVm> {
+    use crate::org_account::descriptor::RepoAuthConfig;
+
+    let Some(d) = descriptor else {
+        return Vec::new();
+    };
+    let name = &d.name;
+    let sign_in = format!("{name} account sign-in");
+    let repository = format!("{name} settings repository");
+    let mut named: Vec<(&str, String)> = vec![(d.auth.issuer.as_str(), sign_in.clone())];
+    let endpoints = &d.auth.endpoints;
+    for endpoint in [
+        &endpoints.authorization,
+        &endpoints.token,
+        &endpoints.userinfo,
+        &endpoints.revocation,
+        &endpoints.end_session,
+        &endpoints.jwks,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        named.push((endpoint, sign_in.clone()));
+    }
+    if let Some(url) = descriptor_url {
+        named.push((url.as_str(), format!("{name} account setup")));
+    }
+    named.push((d.config.url.as_str(), repository.clone()));
+    if let Some(api_base) = &d.config.api_base {
+        named.push((api_base, repository.clone()));
+    }
+    if let RepoAuthConfig::Oauth(forge) = &d.config.auth {
+        let forge_sign_in = format!("{name} settings repository sign-in");
+        for url in [
+            &forge.issuer,
+            &forge.authorize_url,
+            &forge.token_url,
+            &forge.signin_url,
+            &forge.user_url,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            named.push((url, forge_sign_in.clone()));
+        }
+    }
+
+    let mut endpoints: Vec<EgressEndpointVm> = Vec::new();
+    for (url, label) in named {
+        // A `{api_base}` template has no host of its own; the API base row
+        // already discloses where it points.
+        let Some(host) = remote_host(url) else {
+            continue;
+        };
+        if endpoints.iter().any(|e| e.url == host) {
+            continue;
+        }
+        endpoints.push(EgressEndpointVm {
+            url: host,
+            kind: EgressKind::Account,
+            label,
+        });
+    }
     endpoints
 }
 
@@ -766,6 +851,7 @@ mod tests {
             EgressKind::BotProvider,
             EgressKind::Update,
             EgressKind::Telemetry,
+            EgressKind::Account,
         ];
 
         // Wildcard-free exhaustive match: a new `EgressKind` variant makes this
@@ -778,6 +864,7 @@ mod tests {
                 EgressKind::BotProvider => {}
                 EgressKind::Update => {}
                 EgressKind::Telemetry => {}
+                EgressKind::Account => {}
             }
         }
 
@@ -796,6 +883,9 @@ mod tests {
         );
         telemetry.study_config().expect("synthetic study consent");
         out.extend(telemetry.egress());
+        let account =
+            account_fixture(r#""config": { "url": "https://id.acme.dev/git/keeper-config.git" }"#);
+        out.extend(org_account_egress(Some(&account), None));
 
         for kind in ALL_KINDS {
             assert!(
@@ -810,6 +900,61 @@ mod tests {
             ALL_KINDS.len(),
             "the everything-on fleet must disclose exactly one entry per kind, so this \
              gate keeps covering every kind rather than one kind several times"
+        );
+    }
+
+    fn account_fixture(config: &str) -> crate::org_account::descriptor::AccountDescriptor {
+        crate::org_account::descriptor::parse_json(&format!(
+            r#"{{ "version": 1, "id": "acme", "name": "Acme",
+                 "auth": {{ "issuer": "https://id.acme.dev", "client_id": "keeper" }},
+                 {config} }}"#
+        ))
+        .expect("descriptor fixture")
+    }
+
+    #[test]
+    fn no_account_discloses_nothing_new() {
+        assert!(org_account_egress(None, None).is_empty());
+    }
+
+    #[test]
+    fn an_account_discloses_each_host_its_descriptor_names_once_and_host_only() {
+        let account = account_fixture(
+            r#""config": {
+                "url": "https://git.acme.dev/git/people/keeper-config.git",
+                "api_base": "https://git.acme.dev/git/api/v1",
+                "auth": {
+                    "mode": "oauth",
+                    "issuer": "https://forge-id.acme.dev",
+                    "client_id": "c",
+                    "scope": "openid read:user",
+                    "user_url": "{api_base}/user"
+                }
+            }"#,
+        );
+        let source =
+            url::Url::parse("https://www.acme.dev/.well-known/keeper-account.json").expect("url");
+        let out = org_account_egress(Some(&account), Some(&source));
+        let rows: Vec<(EgressKind, &str, &str)> = out
+            .iter()
+            .map(|e| (e.kind, e.url.as_str(), e.label.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (EgressKind::Account, "id.acme.dev", "Acme account sign-in"),
+                (EgressKind::Account, "www.acme.dev", "Acme account setup"),
+                (
+                    EgressKind::Account,
+                    "git.acme.dev",
+                    "Acme settings repository"
+                ),
+                (
+                    EgressKind::Account,
+                    "forge-id.acme.dev",
+                    "Acme settings repository sign-in"
+                ),
+            ]
         );
     }
 

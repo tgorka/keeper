@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { AccountSetupSheet } from "@/components/account/account-setup-sheet";
 import { LoginScreen } from "@/components/auth/login-screen";
 import { AppShell } from "@/components/layout/app-shell";
 import { AtRestEncryptionChoice } from "@/components/settings/at-rest-encryption-choice";
@@ -6,6 +7,7 @@ import { NoBackgroundSyncDisclosure } from "@/components/settings/no-background-
 import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import { FirstRunWizard } from "@/components/wizard/first-run-wizard";
+import { useAccountMirror } from "@/hooks/use-account-mirror";
 import { useActiveChatReporter } from "@/hooks/use-active-chat-reporter";
 import { useAppLifecycle } from "@/hooks/use-app-lifecycle";
 import { useAutoUpdate } from "@/hooks/use-auto-update";
@@ -88,6 +90,10 @@ function App() {
   // background, and ask for a restart rather than performing one. Desktop only
   // (the phone tier has no in-app updater) and off if `update.auto` says so.
   useAutoUpdate();
+  // The optional account (Epic 82): mirror it, open the setup sheet on a
+  // `keeper://setup` link, and ask for an unforced sync whenever keeper comes
+  // back into focus — Rust runs no timer, so focus is the cadence.
+  useAccountMirror();
   const hydrated = useAccountsStore((s) => s.hydrated);
   const hasAccount = useAccountsStore((s) => s.accounts.length > 0);
   const addAccountOpen = useAddAccountStore((s) => s.open);
@@ -257,6 +263,10 @@ function App() {
           own gates open (reduced tier + an Account + wizard closed + latch unshown);
           it renders null everywhere else. */}
       <NoBackgroundSyncDisclosure />
+      {/* The one setup confirmation sheet (UX-DR116), above the content gate
+          like the Toaster: a setup link can arrive over the wizard, the login
+          screen or the shell, and it must open the same sheet on each. */}
+      <AccountSetupSheet />
       {content}
     </>
   );

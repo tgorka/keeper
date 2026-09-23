@@ -46,6 +46,10 @@
 
 import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
+  AccountDeviceVm,
+  AccountSetupVm,
+  AccountShareVm,
+  AccountStateVm,
   AccountVm,
   AutoUpdateRestartVm,
   AutoUpdateVm,
@@ -74,6 +78,7 @@ import type {
   FilesReleaseVm,
   GrantScope,
   HotkeyVm,
+  OrgAccountVm,
   PacedWorkVm,
   RecordingCaptureSourcesVm,
   RecordingSettingsVm,
@@ -3036,6 +3041,191 @@ const COPY_FIXTURES = [
 ];
 const copyJobs = new Map<string, CopyJobVm>();
 
+// ---------------------------------------------------------------------------
+// The optional account (Epic 82).
+//
+// Signed out by default — "no account configured", the state every install
+// starts in and the one that must look like keeper before accounts existed.
+// `?account=ready` (or `offline`, `needsSignIn`, `blocked`, `signedOut`) boots
+// into a signed-in fixture instead, so Settings › Account, the status line and
+// the credential choices on the drive and endpoint forms can all be looked at.
+// Pasting any link into Settings › Account walks the whole setup sheet —
+// through "Finish signing in…" (with Cancel sign-in) and the sync — and the
+// word `refuse` anywhere in it answers Rust's refusal instead.
+//
+// Every answer is what Rust would answer, sentences included (`state.rs`
+// `compose`), and every snapshot carries the next `revision`, as Rust's do. An
+// unforced `account_sync` inside the 15-minute throttle answers the VM
+// unchanged, so a focus in the browser does not wipe the fixture being looked
+// at; boot counts as the last attempt, as the shell's own boot sync does.
+// ---------------------------------------------------------------------------
+
+const NO_ACCOUNT_VM: OrgAccountVm = {
+  configured: false,
+  id: null,
+  name: null,
+  issuerHost: null,
+  repoHost: null,
+  repoMode: null,
+  state: "none",
+  sentence: null,
+  identity: null,
+  device: null,
+  devices: [],
+  lastSyncedMs: null,
+  forgeConnected: false,
+  faults: [],
+  revision: 0,
+};
+
+const ACCOUNT_THIS_DEVICE: AccountDeviceVm = {
+  slug: "hesperia",
+  name: "hesperia",
+  class: "desktop",
+  platform: "macos",
+  thisDevice: true,
+};
+
+/** A signed-in account in `state`, with the sentence Rust would write for it. */
+function signedInAccount(state: AccountStateVm, device = ACCOUNT_THIS_DEVICE): OrgAccountVm {
+  const sentences: Partial<Record<AccountStateVm, string>> = {
+    ready: "Up to date.",
+    syncing: "Syncing your settings…",
+    signingIn: "Finish signing in to Acme in the browser.",
+    offline: "Offline — using settings from 14:02.",
+    needsSignIn: "Sign in again to keep your settings in sync.",
+    blocked:
+      "This sign-in belongs to someone else: tgorka/user.toml records a different account. Settings from the repository were not loaded.",
+    signedOut: "Sign in to Acme to use your settings on this device.",
+  };
+  const signedOut = state === "signedOut" || state === "signingIn";
+  return {
+    configured: true,
+    id: "acme",
+    name: "Acme",
+    issuerHost: "id.acme.dev",
+    repoHost: "git.acme.dev",
+    repoMode: "same",
+    state,
+    sentence: sentences[state] ?? null,
+    identity: signedOut
+      ? null
+      : {
+          login: "tgorka",
+          displayName: "Tomasz Gorka",
+          email: "tgorka@acme.dev",
+          roles: ["keeper", "staff"],
+        },
+    device: signedOut ? null : device,
+    devices: signedOut
+      ? []
+      : [
+          device,
+          {
+            slug: "iphone-3f2a",
+            name: "iphone-3f2a",
+            class: "mobile",
+            platform: "ios",
+            thisDevice: false,
+          },
+          {
+            slug: "ipad-91c0",
+            name: "ipad-91c0",
+            class: "tablet",
+            platform: "ios",
+            thisDevice: false,
+          },
+        ],
+    lastSyncedMs: state === "ready" ? Date.now() : null,
+    forgeConnected: false,
+    faults: [],
+    revision: 0,
+  };
+}
+
+const ACCOUNT_FIXTURES: readonly AccountStateVm[] = [
+  "ready",
+  "offline",
+  "needsSignIn",
+  "blocked",
+  "signedOut",
+];
+const accountParam = new URLSearchParams(window.location.search).get("account");
+let accountVm: OrgAccountVm = ACCOUNT_FIXTURES.includes(accountParam as AccountStateVm)
+  ? signedInAccount(accountParam as AccountStateVm)
+  : NO_ACCOUNT_VM;
+/** The one subscriber, so every write can push the new snapshot. */
+let accountWatcher: MockChannel<OrgAccountVm> | null = null;
+/** Per-drive and per-endpoint credential sources (`keychain` unless chosen). */
+const credentialSources = new Map<string, string>();
+/** Rust's per-process counter: every snapshot it emits is newer than the last. */
+let accountRevision = 0;
+/** Rust's throttle: an unforced sync inside this window answers the VM unchanged. */
+const ACCOUNT_SYNC_THROTTLE_MS = 15 * 60 * 1000;
+/** Boot is the last attempt, as the shell's boot-time background sync makes it. */
+let accountLastAttemptMs = Date.now();
+/** The open browser round trip, so Cancel sign-in can end it as Rust's registry does. */
+let accountSignInCancel: (() => void) | null = null;
+
+function setAccount(next: OrgAccountVm): OrgAccountVm {
+  accountRevision += 1;
+  accountVm = { ...next, revision: accountRevision };
+  accountWatcher?.onmessage?.(accountVm);
+  return accountVm;
+}
+
+/**
+ * A sign-in as Rust runs it: "Finish signing in…" while the browser is open,
+ * the repository sync, then the outcome — or, when Cancel sign-in is pressed
+ * first, the signed-out state the confirm resolves with (it resolves, it does
+ * not reject). The pauses are only long enough to see each state.
+ */
+function accountSignInFlow(device: AccountDeviceVm): Promise<OrgAccountVm> {
+  // The project's `lib` predates `Promise.withResolvers`.
+  let resolve: (vm: OrgAccountVm) => void = () => {};
+  const promise = new Promise<OrgAccountVm>((settle) => {
+    resolve = settle;
+  });
+  setAccount(signedInAccount("signingIn", device));
+  const signIn = setTimeout(() => {
+    accountSignInCancel = null;
+    setAccount(signedInAccount("syncing", device));
+    setTimeout(() => {
+      accountLastAttemptMs = Date.now();
+      resolve(setAccount(signedInAccount("ready", device)));
+    }, 1000);
+  }, 2500);
+  accountSignInCancel = () => {
+    clearTimeout(signIn);
+    accountSignInCancel = null;
+    resolve(setAccount(signedInAccount("signedOut", device)));
+  };
+  return promise;
+}
+
+/**
+ * A QR-shaped picture of the link — NOT a scannable code; Rust's `qr_svg`
+ * draws the real one. Deterministic per link so the card does not flicker.
+ */
+function mockQrSvg(link: string): string {
+  const size = 25;
+  let seed = [...link].reduce((hash, char) => (hash * 31 + char.charCodeAt(0)) >>> 0, 7);
+  const cells: string[] = [];
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      seed = (seed * 1_103_515_245 + 12_345) >>> 0;
+      const finder = (x < 7 || x >= size - 7) && y < 7 ? true : x < 7 && y >= size - 7;
+      const on = finder
+        ? x % 6 === 0 || y % 6 === 0 || (x % 6 >= 2 && x % 6 <= 4 && y % 6 >= 2 && y % 6 <= 4)
+        : (seed & 1) === 1;
+      if (on) {
+        cells.push(`<rect x="${x + 4}" y="${y + 4}" width="1" height="1"/>`);
+      }
+    }
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size + 8} ${size + 8}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#fff"/><g fill="#000">${cells.join("")}</g></svg>`;
+}
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   // One rail group per drive the search covers: the selection, or the active
   // drive when nothing is selected — `notes_spaces(vault_id, vault_ids)`.
@@ -4417,6 +4607,102 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     slides: null,
     sheets: null,
   }),
+  // The optional account (Epic 82) — see the fixtures above HANDLERS.
+  account_state: () => accountVm,
+  account_subscribe: (payload) => {
+    accountWatcher = payload.channel as MockChannel<OrgAccountVm>;
+    accountWatcher.onmessage?.(accountVm);
+    return "account-subscription";
+  },
+  account_unsubscribe: () => {
+    accountWatcher = null;
+    return null;
+  },
+  account_setup_resolve: (payload): AccountSetupVm => {
+    const input = String(payload.input ?? "");
+    if (input.includes("refuse")) {
+      throw {
+        code: "invalidInput",
+        message:
+          "This setup link asks keeper to send a client secret, and keeper never holds one. Ask whoever gave you the link for a public-client descriptor.",
+        accountId: null,
+        retriable: false,
+      };
+    }
+    return {
+      setupId: "setup-mock",
+      name: "Acme",
+      issuerHost: "id.acme.dev",
+      repoHost: "git.acme.dev",
+      repoMode: "same",
+      deviceName: ACCOUNT_THIS_DEVICE.name,
+      deviceClass: "desktop",
+      registered: false,
+    };
+  },
+  account_setup_confirm: (payload) => {
+    const name = String(payload.deviceName ?? ACCOUNT_THIS_DEVICE.name);
+    return accountSignInFlow({ ...ACCOUNT_THIS_DEVICE, slug: name, name });
+  },
+  account_sign_in: () => accountSignInFlow(accountVm.device ?? ACCOUNT_THIS_DEVICE),
+  account_cancel_sign_in: () => {
+    accountSignInCancel?.();
+    return null;
+  },
+  account_sync: (payload) => {
+    if (accountVm.identity === null) {
+      return accountVm;
+    }
+    const now = Date.now();
+    if (payload.force !== true && now - accountLastAttemptMs < ACCOUNT_SYNC_THROTTLE_MS) {
+      return accountVm;
+    }
+    accountLastAttemptMs = now;
+    // A fetch cannot mend a dead grant or a sign-in that belongs to someone
+    // else: Rust publishes the same state again.
+    if (accountVm.state === "needsSignIn" || accountVm.state === "blocked") {
+      return setAccount(accountVm);
+    }
+    return setAccount(signedInAccount("ready", accountVm.device ?? ACCOUNT_THIS_DEVICE));
+  },
+  account_rename_device: (payload) => {
+    const name = String(payload.name ?? "");
+    const renamed = { ...(accountVm.device ?? ACCOUNT_THIS_DEVICE), slug: name, name };
+    return setAccount({
+      ...accountVm,
+      device: renamed,
+      devices: accountVm.devices.map((device) => (device.thisDevice ? renamed : device)),
+    });
+  },
+  account_share: (): AccountShareVm => {
+    const link =
+      "keeper://setup?descriptor=https%3A%2F%2Fid.acme.dev%2F.well-known%2Fkeeper-account.json";
+    return { link, qrSvg: mockQrSvg(link) };
+  },
+  account_sign_out: () => setAccount(signedInAccount("signedOut")),
+  account_forget: () => {
+    // Rust clears every source row bound to the forgotten account, so no drive
+    // or endpoint switches to the next account by itself.
+    for (const [key, source] of credentialSources) {
+      if (source === "account") {
+        credentialSources.delete(key);
+      }
+    }
+    return setAccount(NO_ACCOUNT_VM);
+  },
+  sync_credential_source_get: (payload) =>
+    credentialSources.get(`sync/${String(payload.profileId)}`) ?? "keychain",
+  sync_credential_source_set: (payload) => {
+    credentialSources.set(`sync/${String(payload.profileId)}`, String(payload.source));
+    return null;
+  },
+  bots_provider_credential_source_get: (payload) =>
+    credentialSources.get(`bots/${String(payload.providerId)}`) ?? "keychain",
+  bots_provider_credential_source_set: (payload) => {
+    credentialSources.set(`bots/${String(payload.providerId)}`, String(payload.source));
+    return null;
+  },
+
   /**
    * The path plugin's directory lookup, which is not one of the app's own
    * commands and is the only non-`keeper` invoke any screen makes (Story 59.8).

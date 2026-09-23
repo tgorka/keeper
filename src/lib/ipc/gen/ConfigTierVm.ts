@@ -10,4 +10,4 @@
  * which compiles on Linux — rather than silently reaching the frontend as a
  * variant no surface has a sentence for.
  */
-export type ConfigTierVm = "userGlobal" | "userGlobalMachine" | "mainShared" | "mainMachine" | "folderShared" | "folderMachine";
+export type ConfigTierVm = "userGlobal" | "userGlobalMachine" | "accountShared" | "accountDevice" | "mainShared" | "mainMachine" | "folderShared" | "folderMachine" | "account";

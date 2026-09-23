@@ -1731,6 +1731,214 @@ pub fn notes_read_mark_set(data_dir: &Path, note_id: &str, rev: &str) -> Result<
     set_setting(data_dir, &notes_read_mark_key(note_id), rev)
 }
 
+/// Remove a settings row. Idempotent: an absent key is not an error.
+fn delete_setting(data_dir: &Path, key: &str) -> Result<(), CoreError> {
+    let conn = open(data_dir)?;
+    conn.execute(
+        "DELETE FROM settings WHERE key = ?1",
+        rusqlite::params![key],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not delete setting: {e}")))?;
+    Ok(())
+}
+
+/// The stored credential-source value: `account:<account id>` (Epic 82,
+/// AD-315). The id ties the opt-in to the account it was made for, so a later,
+/// different account never answers for a drive or provider set up under the
+/// first. Absence means the keychain, so a drive or provider that never opted
+/// in reads exactly as it did before the account existed.
+fn credential_source_value(account_id: &str) -> String {
+    format!("account:{account_id}")
+}
+
+/// The row to write for a requested credential source: `None` or `"keychain"`
+/// ⇒ `None` (the row is deleted), `"account"` ⇒ the value bound to
+/// `account_id`. Anything else — or `"account"` with no account — is refused
+/// rather than stored as a third state.
+fn credential_source_row(
+    source: Option<&str>,
+    account_id: Option<&str>,
+) -> Result<Option<String>, CoreError> {
+    match (source, account_id) {
+        (None | Some("keychain"), _) => Ok(None),
+        (Some("account"), Some(id)) if !id.is_empty() => Ok(Some(credential_source_value(id))),
+        (Some("account"), _) => Err(CoreError::Internal(
+            "no account is set up to use as a credential".to_owned(),
+        )),
+        (Some(other), _) => Err(CoreError::Internal(format!(
+            "unknown credential source {other:?}; expected \"keychain\" or \"account\""
+        ))),
+    }
+}
+
+/// `Some("account")` when a stored row is bound to `account_id`.
+fn bound_to(row: Option<String>, account_id: &str) -> Option<String> {
+    (row.as_deref() == Some(credential_source_value(account_id).as_str()))
+        .then(|| "account".to_owned())
+}
+
+const SYNC_CREDENTIAL_SOURCE_PREFIX: &str = "sync.credential_source.";
+const BOTS_CREDENTIAL_SOURCE_PREFIX: &str = "bots.provider_credential_source.";
+
+/// `sync.credential_source.<profile_id>`: where a drive's git credential comes
+/// from (Epic 82, AD-315).
+fn sync_credential_source_key(profile_id: &str) -> String {
+    format!("{SYNC_CREDENTIAL_SOURCE_PREFIX}{profile_id}")
+}
+
+/// `bots.provider_credential_source.<provider_id>`: where a bot provider's
+/// bearer token comes from (Epic 82, AD-315).
+fn bots_provider_credential_source_key(provider_id: &str) -> String {
+    format!("{BOTS_CREDENTIAL_SOURCE_PREFIX}{provider_id}")
+}
+
+/// Whether drive `profile_id` uses the configured account's access token
+/// (`Some("account")`) or its own keychain item (`None`). `account_id` is the
+/// configured account: a row bound to any other account reads as the
+/// keychain, and with no account the database is not read at all.
+pub fn get_sync_credential_source(
+    data_dir: &Path,
+    profile_id: &str,
+    account_id: Option<&str>,
+) -> Result<Option<String>, CoreError> {
+    let Some(account_id) = account_id else {
+        return Ok(None);
+    };
+    Ok(bound_to(
+        get_setting(data_dir, &sync_credential_source_key(profile_id))?,
+        account_id,
+    ))
+}
+
+/// Opt drive `profile_id` into (`Some("account")`, bound to `account_id`) or
+/// out of (`None` / `Some("keychain")`) the account credential.
+pub fn set_sync_credential_source(
+    data_dir: &Path,
+    profile_id: &str,
+    source: Option<&str>,
+    account_id: Option<&str>,
+) -> Result<(), CoreError> {
+    match credential_source_row(source, account_id)? {
+        Some(value) => set_setting(data_dir, &sync_credential_source_key(profile_id), &value),
+        None => delete_setting(data_dir, &sync_credential_source_key(profile_id)),
+    }
+}
+
+/// Whether bot provider `provider_id` sends the configured account's access
+/// token (`Some("account")`) or its own keychain item (`None`), by the same
+/// rule as [`get_sync_credential_source`].
+pub fn get_bots_provider_credential_source(
+    data_dir: &Path,
+    provider_id: &str,
+    account_id: Option<&str>,
+) -> Result<Option<String>, CoreError> {
+    let Some(account_id) = account_id else {
+        return Ok(None);
+    };
+    Ok(bound_to(
+        get_setting(data_dir, &bots_provider_credential_source_key(provider_id))?,
+        account_id,
+    ))
+}
+
+/// Opt bot provider `provider_id` into or out of the account credential.
+pub fn set_bots_provider_credential_source(
+    data_dir: &Path,
+    provider_id: &str,
+    source: Option<&str>,
+    account_id: Option<&str>,
+) -> Result<(), CoreError> {
+    match credential_source_row(source, account_id)? {
+        Some(value) => set_setting(
+            data_dir,
+            &bots_provider_credential_source_key(provider_id),
+            &value,
+        ),
+        None => delete_setting(data_dir, &bots_provider_credential_source_key(provider_id)),
+    }
+}
+
+/// Delete every drive and bot-provider credential-source row bound to
+/// `account_id` — on forget, and when another account replaces it — so those
+/// drives and providers fall back to their own keychain items.
+pub fn clear_credential_sources(data_dir: &Path, account_id: &str) -> Result<(), CoreError> {
+    let conn = open(data_dir)?;
+    conn.execute(
+        "DELETE FROM settings WHERE value = ?1 \
+         AND (substr(key, 1, length(?2)) = ?2 OR substr(key, 1, length(?3)) = ?3)",
+        rusqlite::params![
+            credential_source_value(account_id),
+            SYNC_CREDENTIAL_SOURCE_PREFIX,
+            BOTS_CREDENTIAL_SOURCE_PREFIX
+        ],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not clear credential sources: {e}")))?;
+    Ok(())
+}
+
+/// When account `account_id`'s config repository last synced, ms since the
+/// Unix epoch (Epic 82). What "Offline — using settings from 14:02" reads.
+fn account_last_synced_ms_key(account_id: &str) -> String {
+    format!("account.{account_id}.last_synced_ms")
+}
+
+/// Read the last successful config-repository sync. Absent or unparsable ⇒ `None`.
+pub fn get_account_last_synced_ms(
+    data_dir: &Path,
+    account_id: &str,
+) -> Result<Option<i64>, CoreError> {
+    Ok(
+        get_setting(data_dir, &account_last_synced_ms_key(account_id))?
+            .and_then(|raw| raw.parse().ok()),
+    )
+}
+
+/// Record a successful config-repository sync at `ms`.
+pub fn set_account_last_synced_ms(
+    data_dir: &Path,
+    account_id: &str,
+    ms: i64,
+) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        &account_last_synced_ms_key(account_id),
+        &ms.to_string(),
+    )
+}
+
+/// This install's device slug in account `account_id`'s config repository
+/// (Epic 82, AD-314) — persisted because on iOS it carries a random suffix
+/// that must not change.
+fn account_device_slug_key(account_id: &str) -> String {
+    format!("account.{account_id}.device_slug")
+}
+
+/// Read this install's device slug. Absent or blank ⇒ `None`.
+pub fn get_account_device_slug(
+    data_dir: &Path,
+    account_id: &str,
+) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, &account_device_slug_key(account_id))?
+        .filter(|slug| !slug.trim().is_empty()))
+}
+
+/// Record this install's device slug.
+pub fn set_account_device_slug(
+    data_dir: &Path,
+    account_id: &str,
+    slug: &str,
+) -> Result<(), CoreError> {
+    set_setting(data_dir, &account_device_slug_key(account_id), slug)
+}
+
+/// Forget what this install recorded about account `account_id` — its device
+/// slug and last sync — so setting it (or another account) up again starts
+/// clean rather than claiming a registration that is gone.
+pub fn forget_account_state(data_dir: &Path, account_id: &str) -> Result<(), CoreError> {
+    delete_setting(data_dir, &account_last_synced_ms_key(account_id))?;
+    delete_setting(data_dir, &account_device_slug_key(account_id))
+}
+
 /// The `settings` key holding the Undo-Send window in whole seconds (Story 8.3).
 /// Stored as a decimal string; absent / unparsable ⇒ the default of 10 s.
 const UNDO_SEND_WINDOW_KEY: &str = "undo_send.window";
@@ -4529,6 +4737,134 @@ mod tests {
         // it is the one a hand-edited or truncated row gets.
         set_setting(&dir, UI_FIRST_RUN_SETUP_SKIPPED_KEY, "yes").expect("write a stray value");
         assert!(!get_first_run_setup_skipped(&dir).expect("read a stray value"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn credential_source_is_account_only_when_opted_in_and_keychain_clears_it() {
+        let dir = temp_dir();
+        let acme = Some("acme");
+        // Never opted in ⇒ the keychain, exactly as before the account existed.
+        assert_eq!(
+            get_sync_credential_source(&dir, "p1", acme).expect("read"),
+            None
+        );
+        set_sync_credential_source(&dir, "p1", Some("account"), acme).expect("opt in");
+        assert_eq!(
+            get_sync_credential_source(&dir, "p1", acme).expect("read"),
+            Some("account".to_owned())
+        );
+        // Per profile: a sibling drive is untouched, and so is the bots family.
+        assert_eq!(
+            get_sync_credential_source(&dir, "p2", acme).expect("read"),
+            None
+        );
+        assert_eq!(
+            get_bots_provider_credential_source(&dir, "p1", acme).expect("read"),
+            None
+        );
+        // "keychain" deletes the row rather than storing a second spelling.
+        set_sync_credential_source(&dir, "p1", Some("keychain"), acme).expect("opt out");
+        assert_eq!(
+            get_setting(&dir, "sync.credential_source.p1").expect("read raw"),
+            None
+        );
+        // A third value is refused, "account" needs an account, and a stray
+        // stored value is not the account.
+        assert!(set_bots_provider_credential_source(&dir, "b", Some("vault"), acme).is_err());
+        assert!(set_bots_provider_credential_source(&dir, "b", Some("account"), None).is_err());
+        set_setting(&dir, "bots.provider_credential_source.b", "account").expect("stray");
+        assert_eq!(
+            get_bots_provider_credential_source(&dir, "b", acme).expect("read"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_credential_source_answers_only_for_the_account_it_was_set_for() {
+        let dir = temp_dir();
+        set_sync_credential_source(&dir, "p1", Some("account"), Some("acme")).expect("opt in");
+        set_bots_provider_credential_source(&dir, "b1", Some("account"), Some("acme"))
+            .expect("opt in");
+        set_sync_credential_source(&dir, "p2", Some("account"), Some("globex")).expect("opt in");
+        assert_eq!(
+            get_setting(&dir, "sync.credential_source.p1").expect("raw"),
+            Some("account:acme".to_owned())
+        );
+
+        // Another account configured, or none: the Acme drive is not theirs.
+        assert_eq!(
+            get_sync_credential_source(&dir, "p1", Some("globex")).expect("read"),
+            None
+        );
+        assert_eq!(
+            get_sync_credential_source(&dir, "p1", None).expect("read"),
+            None
+        );
+
+        // Forgetting Acme clears exactly Acme's rows, in both families.
+        clear_credential_sources(&dir, "acme").expect("clear");
+        assert_eq!(
+            get_setting(&dir, "sync.credential_source.p1").expect("raw"),
+            None
+        );
+        assert_eq!(
+            get_setting(&dir, "bots.provider_credential_source.b1").expect("raw"),
+            None
+        );
+        assert_eq!(
+            get_sync_credential_source(&dir, "p2", Some("globex")).expect("read"),
+            Some("account".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_account_reads_no_credential_source_row() {
+        // A data dir that is a file: any database access fails.
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("not-a-dir");
+        std::fs::write(&file, "x").expect("file");
+        assert_eq!(
+            get_sync_credential_source(&file, "p1", None).expect("no read"),
+            None
+        );
+        assert_eq!(
+            get_bots_provider_credential_source(&file, "b1", None).expect("no read"),
+            None
+        );
+        assert!(get_sync_credential_source(&file, "p1", Some("acme")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn account_state_is_kept_per_account_and_forgotten_with_it() {
+        let dir = temp_dir();
+        set_account_device_slug(&dir, "acme", "work-mac").expect("slug");
+        set_account_last_synced_ms(&dir, "acme", 42).expect("synced");
+        set_account_device_slug(&dir, "globex", "den").expect("slug");
+
+        assert_eq!(
+            get_account_device_slug(&dir, "acme").expect("read"),
+            Some("work-mac".to_owned())
+        );
+        assert_eq!(
+            get_account_last_synced_ms(&dir, "globex").expect("read"),
+            None
+        );
+
+        forget_account_state(&dir, "acme").expect("forget");
+        assert_eq!(get_account_device_slug(&dir, "acme").expect("read"), None);
+        assert_eq!(
+            get_account_last_synced_ms(&dir, "acme").expect("read"),
+            None
+        );
+        assert_eq!(
+            get_account_device_slug(&dir, "globex").expect("read"),
+            Some("den".to_owned())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

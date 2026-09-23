@@ -39,6 +39,7 @@ pub mod anomaly;
 pub mod backoff;
 pub mod bots_fs;
 pub mod browse;
+pub mod config_repo;
 pub mod copy;
 pub mod credential;
 pub mod db;

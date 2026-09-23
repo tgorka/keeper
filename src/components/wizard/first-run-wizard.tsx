@@ -12,6 +12,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import { SetupLinkField } from "@/components/account/account-setup-sheet";
 import { LoginScreen } from "@/components/auth/login-screen";
 import { BridgeCard } from "@/components/bridges/bridge-card";
 import {
@@ -35,15 +36,24 @@ import {
   firstRunSetupSkippedGet,
   firstRunSetupSkippedSet,
 } from "@/lib/ipc/client";
+import { useAccountStore } from "@/lib/stores/account";
 import { accountsStore, useAccountsStore } from "@/lib/stores/accounts";
 import { useWizardStore, type WizardStep } from "@/lib/stores/wizard";
 
 /** The ordered steps rendered as progress dots. */
 const STEPS: readonly WizardStep[] = ["welcome", "addAccount", "discovery", "done"];
 
+/** Welcome's secondary action, and the optional step's own words (UX-DR116 (6)). */
+export const ORG_ACCOUNT_STEP_LABEL = "Sign in with an organisation account";
+export const ORG_ACCOUNT_STEP_NOTE =
+  "If your organisation gave you a setup link or a QR code, paste the link here. keeper then brings your settings to this device. This step is optional: keeper works fully without it.";
+export const ORG_ACCOUNT_SKIP_LABEL = "Skip this step";
+export const ORG_ACCOUNT_NEXT_LABEL = "Continue";
+
 /** The human label for each step, shown under the progress dots. */
 const STEP_LABEL: Record<WizardStep, string> = {
   welcome: "Welcome",
+  orgAccount: ORG_ACCOUNT_STEP_LABEL,
   addAccount: "Add account",
   discovery: "Connect bridges",
   done: "Done",
@@ -63,7 +73,17 @@ export const SKIP_AT_STARTUP_LABEL = "Don't open setup when keeper starts";
  */
 export function FirstRunWizard() {
   const step = useWizardStore((s) => s.step);
+  const goTo = useWizardStore((s) => s.goTo);
   const finish = useWizardStore((s) => s.finish);
+  // A setup link that arrives while Welcome is up — including the one that
+  // started keeper — lands on the optional account step, with the sheet over
+  // it, so what is behind the sheet is the step the link is about.
+  const setupLink = useAccountStore((s) => s.setupLink);
+  useEffect(() => {
+    if (setupLink !== null && step === "welcome") {
+      goTo("orgAccount");
+    }
+  }, [setupLink, step, goTo]);
   // Whether the "Skip setup?" confirm is open. Esc opens it (asks once) rather
   // than exiting the wizard immediately.
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -162,6 +182,7 @@ export function FirstRunWizard() {
 
       <div className="flex min-h-0 flex-1 flex-col">
         {step === "welcome" && <WelcomeStep />}
+        {step === "orgAccount" && <OrgAccountStep />}
         {step === "addAccount" && <AddAccountStep />}
         {step === "discovery" && <DiscoveryStep />}
         {step === "done" && <DoneStep onFinish={finish} />}
@@ -223,6 +244,8 @@ export function FirstRunWizard() {
 
 /** The step progress indicator: a dot per step plus the current step label. */
 function ProgressDots({ step }: { step: WizardStep }) {
+  // The optional step is outside the numbered path: no dot is lit and the
+  // line says it is optional rather than claiming a "Step 0 of 4".
   const activeIndex = STEPS.indexOf(step);
   return (
     <header className="flex shrink-0 flex-col items-center gap-2 border-border border-b px-6 py-4">
@@ -238,7 +261,9 @@ function ProgressDots({ step }: { step: WizardStep }) {
         ))}
       </div>
       <p className="text-muted-foreground text-sm">
-        Step {activeIndex + 1} of {STEPS.length}: {STEP_LABEL[step]}
+        {activeIndex === -1
+          ? `Optional: ${STEP_LABEL[step]}`
+          : `Step ${activeIndex + 1} of ${STEPS.length}: ${STEP_LABEL[step]}`}
       </p>
     </header>
   );
@@ -260,7 +285,45 @@ function WelcomeStep() {
         <Button type="button" onClick={() => goTo("addAccount")}>
           Get started
         </Button>
+        <Button type="button" variant="ghost" onClick={() => goTo("orgAccount")}>
+          {ORG_ACCOUNT_STEP_LABEL}
+        </Button>
       </div>
+    </div>
+  );
+}
+
+/**
+ * The optional account step (Epic 82): the same paste field Settings › Account
+ * mounts, handing the link to the same sheet. Once an account is signed in the
+ * step shows Rust's sentence and moves on; skipping it is today's flow.
+ */
+function OrgAccountStep() {
+  const goTo = useWizardStore((s) => s.goTo);
+  const signedIn = useAccountStore((s) => s.vm.identity !== null);
+  const sentence = useAccountStore((s) => s.vm.sentence);
+  return (
+    <div className="mx-auto flex w-full max-w-md flex-1 flex-col justify-center gap-6 p-6">
+      <div className="flex flex-col gap-2 text-center">
+        <h1 className="font-heading text-display">{ORG_ACCOUNT_STEP_LABEL}</h1>
+        <p className="text-muted-foreground text-sm">{ORG_ACCOUNT_STEP_NOTE}</p>
+      </div>
+      {signedIn ? (
+        sentence !== null && (
+          <p role="status" className="text-center text-sm">
+            {sentence}
+          </p>
+        )
+      ) : (
+        <SetupLinkField id="wizard-account-setup-link" />
+      )}
+      <Button
+        type="button"
+        variant={signedIn ? "default" : "ghost"}
+        onClick={() => goTo("addAccount")}
+      >
+        {signedIn ? ORG_ACCOUNT_NEXT_LABEL : ORG_ACCOUNT_SKIP_LABEL}
+      </Button>
     </div>
   );
 }

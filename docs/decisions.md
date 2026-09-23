@@ -1243,3 +1243,39 @@ under the same discipline.
   a crash can leave behind.
 - **Status / owner:** decided. Owner is the architect. Epic 81 (AD-304, Story 81.3)
   implements it; `unlink_untouched` in `notes_ipc.rs` is its only unlink.
+
+## D-25 — keeper does not administer other people's directories
+
+The owner asked for user management. keeper has no server, and the per-person config
+repository it syncs is a git repository that a forge's permissions may leave writable by
+everyone in it. Epic 82 decides what keeper does there, and what it refuses to be.
+
+- **What keeper manages:** the signed-in person's own identity (shown, never edited),
+  their roles (read from the identity provider, never assigned), their own directory
+  `<login>/` in the config repository, and their own devices inside it. It onboards other
+  people by showing a setup link as a QR code or a copyable link. Each person then signs
+  in as themselves, and keeper creates *their* directory from the template. (AD-312,
+  AD-313; FR-689…FR-691; UX-DR116)
+- **What it refuses:** writing, staging or pushing any path outside the signed-in
+  person's `<login>/`; rewriting a file that exists, their own `user.toml` included;
+  loading a directory whose `user.toml` records a different identity; and any surface
+  that lists, edits, resets or removes another person's directory or devices. The
+  refusal is structural. `is_own_path` guards the planner, the transport refuses `..` and
+  absolute paths again, and the planner only ever creates.
+- **Why:** people, roles and access belong to the identity provider and the forge,
+  which have audit trails, permissions and admins. A keeper that could edit another
+  person's settings would be an unaudited admin tool that anyone with repository write
+  access could use, from any device, with whatever roles their token happens to carry.
+  A forge that lets everyone write everywhere is the operator's choice. keeper must not
+  be the tool that makes the choice dangerous.
+- **What it is not:** a restriction on the operator. They may edit any directory in
+  the forge, seed `_template/`, pre-create `<login>/user.toml` for a person with an
+  `identity_field` of their choosing, or remove a leaver. keeper reads whatever it finds
+  there, subject to the identity check.
+- **Revisit triggers:** an operator for whom the forge's UI is not enough (DW-291);
+  a role-gated admin mode, which would need an IdP-decided role, a different write
+  guard, and a commit trail naming who changed whose file; a second account per install
+  (DW-297), which changes whose directory is "own".
+- **Status / owner:** decided. Owner is the architect. Epic 82 implements it:
+  `org_account::layout::is_own_path` and `plan`, and `keeper_sync::config_repo`'s path
+  refusal.

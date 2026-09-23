@@ -42,10 +42,12 @@
 //!
 //! # Credentials and diagnostics
 //!
-//! The credential is sent as HTTP Basic through the same sensitive header path
-//! the LFS client uses (AD-53), and the request URL never carries userinfo: a
-//! URL that arrives with `user:token@` is stripped before it is used and the
-//! `credential` argument is the only secret this push may present. Every
+//! The credential is sent as HTTP Basic — or, for a caller that holds a bearer
+//! token rather than a username/secret pair ([`HttpAuth::Bearer`]), as
+//! `Authorization: Bearer` — through the same sensitive header path the LFS
+//! client uses (AD-53), and the request URL never carries userinfo: a URL that
+//! arrives with `user:token@` is stripped before it is used and the `auth`
+//! argument is the only secret this push may present. Every
 //! diagnostic — the server's own `ng` and side-band lines included — passes
 //! through [`cli::scrub_userinfo`] before it becomes an error (NFR-26).
 
@@ -113,6 +115,27 @@ pub struct PushReport {
     pub server_lines: Vec<String>,
 }
 
+/// How a push authenticates.
+///
+/// No `Debug`: both arms carry the secret.
+#[derive(Clone, Copy)]
+pub enum HttpAuth<'a> {
+    /// RFC 7617 Basic from the pair exactly as given.
+    Basic(&'a Credential),
+    /// RFC 6750 `Authorization: Bearer <token>`.
+    Bearer(&'a str),
+}
+
+impl HttpAuth<'_> {
+    /// The `Authorization` value, marked sensitive.
+    fn header(self, host: &str) -> Result<HeaderValue> {
+        match self {
+            Self::Basic(credential) => basic_header(credential, host),
+            Self::Bearer(token) => batch::sensitive_auth(&format!("Bearer {token}"), host),
+        }
+    }
+}
+
 /// Push local `refs/heads/<lane>` to the same ref at `remote_url`.
 ///
 /// Never a force (AD-50): refused client-side, before any bytes are sent,
@@ -131,11 +154,27 @@ pub async fn push(
     lane: &str,
     credential: Option<&Credential>,
 ) -> Result<PushReport> {
+    push_with_auth(
+        client,
+        repo,
+        remote_url,
+        lane,
+        credential.map(HttpAuth::Basic),
+    )
+    .await
+}
+
+/// [`push`], authenticating with any [`HttpAuth`] rather than only Basic.
+pub async fn push_with_auth(
+    client: &reqwest::Client,
+    repo: &Path,
+    remote_url: &str,
+    lane: &str,
+    auth: Option<HttpAuth<'_>>,
+) -> Result<PushReport> {
     let base = parse_remote(remote_url)?;
     let host = base.host_str().unwrap_or("unknown host").to_owned();
-    let auth = credential
-        .map(|credential| basic_header(credential, &host))
-        .transpose()?;
+    let auth = auth.map(|auth| auth.header(&host)).transpose()?;
     let refname = format!("refs/heads/{lane}");
 
     let advertisement = discover(client, &base, auth.as_ref(), &host).await?;

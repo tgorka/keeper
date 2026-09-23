@@ -48,6 +48,24 @@ pub trait Platform: Send + Sync {
     /// concrete browser-open lives in the `keeper` shell.
     fn open_url(&self, url: &str) -> Result<(), CoreError>;
 
+    /// Present an authorization URL in the platform's auth session
+    /// (ASWebAuthenticationSession on Apple, non-ephemeral, so the identity
+    /// provider's cookies are shared with the default browser) (AD-311).
+    ///
+    /// `callback_scheme` is the redirect URI's scheme (`keeper` by default).
+    /// The callback URL — or the person's cancellation — is delivered through
+    /// [`crate::oauth::OAuthFlowRegistry`] by `state`: the shell's completion
+    /// handler calls `flows.resolve(url)` or `flows.cancel(state)`. A loopback
+    /// redirect never comes here; the core serves it itself and calls
+    /// [`Platform::open_url`].
+    ///
+    /// The default opens the system browser, where the deep link delivers the
+    /// callback exactly as the Matrix OIDC flow's does.
+    fn start_web_auth(&self, url: &str, callback_scheme: &str) -> Result<(), CoreError> {
+        let _ = callback_scheme;
+        self.open_url(url)
+    }
+
     /// Post a desktop notification (title + body) carrying a typed click-through
     /// [`NotifyTarget`] (Story 10.4, FR-51). The kept desktop backend has no
     /// per-notification click callback, so the shell records `target` as the "last
