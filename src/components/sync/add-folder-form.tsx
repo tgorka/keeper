@@ -49,6 +49,13 @@
  *     it — so repointing a profile is not an edit to it but a different folder.
  *     While adding, the path is both picked and typeable, and a leading `~` is
  *     resolved here rather than in Rust ({@link syncExpandHome} says why).
+ *   - An add can start PREFILLED from a drive the person syncs on another
+ *     device (Epic 84, AD-323, UX-DR118) — the same form, never a second one.
+ *     Only what travels is filled in: the name, the remote, the branch, the
+ *     roles and their subfolders, and the portable policy fields. The folder is
+ *     still this device's to choose, and the token is still this device's to
+ *     type; the account is ticked when the offer signs with it and the account
+ *     can stand in now.
  *
  * The heading is deliberately not part of this component: each surface titles
  * it in its own chrome — Settings with a section heading, the Sync view with
@@ -60,7 +67,7 @@
 import { homeDir } from "@tauri-apps/api/path";
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import { ChevronDown, ChevronRight, Eye, EyeOff } from "lucide-react";
-import { type FormEvent, useEffect, useId, useState } from "react";
+import { type FormEvent, useEffect, useId, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -74,7 +81,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { IconHint } from "@/components/ui/tooltip";
-import type { CredentialSource, SyncProfileVm } from "@/lib/ipc/client";
+import type { CredentialSource, DriveOfferVm, SyncProfileVm } from "@/lib/ipc/client";
 // The credential calls are made straight from the form rather than through the
 // mirror store: none of them change anything the store mirrors, and the read
 // belongs to one open of one form rather than to state worth keeping in sync.
@@ -855,6 +862,51 @@ function formValuesFor(profile: SyncProfileVm): SyncFormValues {
 }
 
 /**
+ * A drive offered by the account as the fields an add starts from (Epic 84).
+ *
+ * Everything the offer does not say keeps the blank add's value, which is how
+ * the form already says "keeper picks": the folder, the direction, the watcher
+ * windows and the token belong to this device. A policy field the offer leaves
+ * unset (`null`) keeps keeper's own default rather than a number nobody chose.
+ *
+ * On the reduced tier the recordings and sessions switches are absent, so an
+ * offer cannot turn them on there: a switch the person cannot see is not a
+ * choice they made (AD-27). Tasks are not sent from that tier at all.
+ */
+function formValuesForOffer(offer: DriveOfferVm, reduced: boolean): SyncFormValues {
+  return {
+    ...EMPTY_FORM,
+    name: offer.name,
+    remoteUrl: offer.remoteUrl,
+    branch: offer.branch,
+    lfsThresholdMb:
+      offer.lfsThresholdBytes === null
+        ? EMPTY_FORM.lfsThresholdMb
+        : String(offer.lfsThresholdBytes / 1024 / 1024),
+    virtualPatterns: offer.virtualPatterns?.join(", ") ?? EMPTY_FORM.virtualPatterns,
+    virtualOverMb:
+      offer.virtualOverBytes === null
+        ? EMPTY_FORM.virtualOverMb
+        : String(offer.virtualOverBytes / 1024 / 1024),
+    releaseHours:
+      offer.releaseTtlMs === null
+        ? EMPTY_FORM.releaseHours
+        : String(offer.releaseTtlMs / MS_PER_HOUR),
+    excludes: offer.excludes.join(", "),
+    tags: offer.tags.join(", "),
+    commitSubjectTemplate: offer.commitSubjectTemplate ?? "",
+    notesVault: offer.notes !== null,
+    notesSubfolder: offer.notes ?? EMPTY_FORM.notesSubfolder,
+    recordings: !reduced && offer.recordings !== null,
+    recordingsSubfolder: reduced ? "" : (offer.recordings ?? ""),
+    sessions: !reduced && offer.sessions !== null,
+    sessionsSubfolder: reduced ? "" : (offer.sessions ?? ""),
+    tasks: offer.tasks !== null,
+    tasksSubfolder: offer.tasks ?? EMPTY_FORM.tasksSubfolder,
+  };
+}
+
+/**
  * The number a numeric box holds, or `null` when it holds nothing usable.
  *
  * Empty, unparseable and non-positive all mean the same thing to this form —
@@ -1169,25 +1221,61 @@ const TOKEN_NOTES: Record<StoredToken["kind"], string> = {
  * @param onCancel - Rendered as a Cancel button beside the submit. A surface
  *   that reveals the form behind an action passes this, so leaving changes
  *   nothing; one that keeps the form permanently on screen passes nothing.
+ * @param prefill - A drive the account offers (Epic 84): an add form starts
+ *   from its portable fields instead of blank. Read once, on mount, like
+ *   `profile` — a surface that switches offers remounts the form with a `key`.
+ *   Ignored when `profile` is given: an edit starts from what is stored.
+ * @param onPristineChange - Told whether the form still holds nothing but what
+ *   it opened with — no field changed, no credential choice changed, and no
+ *   folder already created by it. A surface that could replace this form (an
+ *   offer's `Add…`) asks this first, so a draft is never thrown away unseen.
+ * @param revealRequest - Each new value brings the form into view and puts
+ *   the focus on its first empty required field: the name, the folder chooser,
+ *   then the remote. A surface increments it when it has sent someone here.
  */
 export function AddFolderForm({
   profile,
+  prefill,
   disabled = false,
   className,
   onSaved,
   onCancel,
+  onPristineChange,
+  revealRequest = 0,
 }: {
   profile?: SyncProfileVm;
+  prefill?: DriveOfferVm;
   disabled?: boolean;
   className?: string;
   onSaved?: (profile: SyncProfileVm, settled: boolean) => void;
   onCancel?: () => void;
+  onPristineChange?: (pristine: boolean) => void;
+  revealRequest?: number;
 }) {
   const editing = profile !== undefined;
-  // Seeded once, deliberately (see `profile` above).
-  const [form, setForm] = useState<SyncFormValues>(() =>
-    profile === undefined ? EMPTY_FORM : formValuesFor(profile),
-  );
+  /**
+   * Story 66.1: the same form is the phone's profile sheet (AD-199). What the
+   * phone cannot choose — the folder, the direction, a watcher's windows, the
+   * recorder and sessions flags — is absent from it by the tier the
+   * capabilities report, never a control that fails on tap (AD-27). Read
+   * before the fields are seeded, because a prefill must not switch on what
+   * this tier does not show.
+   */
+  const reducedCapability = useIsReducedCapabilityPlatform();
+  // Seeded once, deliberately (see `profile` above), and kept: what the form
+  // opened with is the baseline its pristine report compares against.
+  const [initialForm] = useState<SyncFormValues>(() => {
+    if (profile !== undefined) {
+      return formValuesFor(profile);
+    }
+    return prefill === undefined ? EMPTY_FORM : formValuesForOffer(prefill, reducedCapability);
+  });
+  const [form, setForm] = useState<SyncFormValues>(initialForm);
+  const formElement = useRef<HTMLFormElement>(null);
+  const nameField = useRef<HTMLInputElement>(null);
+  const pathField = useRef<HTMLInputElement>(null);
+  const chooseFolderButton = useRef<HTMLButtonElement>(null);
+  const remoteField = useRef<HTMLInputElement>(null);
   const [expanded, setExpanded] = useState(false);
   /**
    * The profile keys this folder's own config file decides (Story 56.12).
@@ -1230,13 +1318,6 @@ export function AddFolderForm({
    * open it happened in and the next open starts masked.
    */
   const [tokenVisible, setTokenVisible] = useState(false);
-  /**
-   * Story 66.1: the same form is the phone's profile sheet (AD-199). What the
-   * phone cannot choose — the folder, the direction, a watcher's windows, the
-   * recorder and sessions flags — is absent from it by the tier the
-   * capabilities report, never a control that fails on tap (AD-27).
-   */
-  const reducedCapability = useIsReducedCapabilityPlatform();
   /**
    * This machine's home directory, or `null` while it is unknown (Story 59.8).
    *
@@ -1306,12 +1387,25 @@ export function AddFolderForm({
    * account is not this one's answer.
    */
   const account = useAccountStore((s) => s.vm);
-  const [source, setSource] = useState<CredentialSource>("keychain");
+  // An offered drive that signs with the account starts with the account
+  // chosen — decided once, as the form opens, and only if the account could
+  // stand in THEN (fix R21). Recomputed later, an account coming back online
+  // would tick the box under somebody who had already typed a token, hide the
+  // field and drop what they typed.
+  const [openedSource] = useState<CredentialSource>(() =>
+    !editing && prefill?.credential === "account" && accountUsable(account)
+      ? "account"
+      : "keychain",
+  );
+  const [openedAccountId] = useState(() => (account.configured ? account.id : null));
+  const [source, setSource] = useState<CredentialSource>(openedSource);
   const [storedSource, setStoredSource] = useState<CredentialSource>("keychain");
   const accountId = account.configured ? account.id : null;
   useEffect(() => {
     setStoredSource("keychain");
-    setSource("keychain");
+    // A different account than the one the form opened with is not the one
+    // the preselection was about.
+    setSource(profileId === undefined && accountId === openedAccountId ? openedSource : "keychain");
     if (profileId === undefined || accountId === null) {
       return;
     }
@@ -1330,9 +1424,41 @@ export function AddFolderForm({
     return () => {
       abandoned = true;
     };
-  }, [profileId, accountId]);
+  }, [profileId, accountId, openedAccountId, openedSource]);
   const accountOffered = accountUsable(account) || storedSource === "account";
   const useAccount = accountOffered && source === "account";
+
+  /**
+   * Whether this form still holds only what it opened with (fix R20). Every
+   * field is a string or a boolean, so a key-by-key comparison is exact.
+   */
+  const pristine =
+    createdId === null &&
+    source === openedSource &&
+    (Object.keys(initialForm) as (keyof SyncFormValues)[]).every(
+      (field) => form[field] === initialForm[field],
+    );
+  useEffect(() => {
+    onPristineChange?.(pristine);
+  }, [pristine, onPristineChange]);
+
+  /**
+   * Bring the form into view and focus its first empty required field, each
+   * time the surface asks. Read from the fields themselves rather than from
+   * `form`, so this runs on the request and not on every keystroke.
+   */
+  useEffect(() => {
+    if (revealRequest === 0) {
+      return;
+    }
+    formElement.current?.scrollIntoView?.({ block: "nearest" });
+    const target = [
+      nameField.current?.value === "" ? nameField.current : null,
+      pathField.current?.value === "" ? chooseFolderButton.current : null,
+      remoteField.current?.value === "" ? remoteField.current : null,
+    ].find((candidate) => candidate !== null);
+    target?.focus();
+  }, [revealRequest]);
 
   /**
    * What the notes flag currently IS on disk, as against what the form shows.
@@ -1729,6 +1855,7 @@ export function AddFolderForm({
 
   return (
     <form
+      ref={formElement}
       aria-label={title}
       className={cn("flex flex-col gap-2", className)}
       onSubmit={(event) => {
@@ -1738,6 +1865,7 @@ export function AddFolderForm({
       <div className="flex items-center justify-between gap-2">
         <Label htmlFor={`${fieldId}-name`}>{SYNC_NAME_LABEL}</Label>
         <Input
+          ref={nameField}
           id={`${fieldId}-name`}
           className="w-56"
           value={form.name}
@@ -1776,6 +1904,7 @@ export function AddFolderForm({
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor={`${fieldId}-path`}>{SYNC_FOLDER_LABEL}</Label>
             <Input
+              ref={pathField}
               id={`${fieldId}-path`}
               className="w-56 font-mono"
               placeholder={SYNC_FOLDER_PLACEHOLDER}
@@ -1817,6 +1946,7 @@ export function AddFolderForm({
                 {SYNC_HOME_FOLDER_LABEL}
               </Button>
               <Button
+                ref={chooseFolderButton}
                 type="button"
                 variant="outline"
                 size="sm"
@@ -1846,6 +1976,7 @@ export function AddFolderForm({
       <div className="flex items-center justify-between gap-2">
         <Label htmlFor={`${fieldId}-remote`}>{SYNC_REMOTE_URL_LABEL}</Label>
         <Input
+          ref={remoteField}
           id={`${fieldId}-remote`}
           className="w-56"
           value={form.remoteUrl}

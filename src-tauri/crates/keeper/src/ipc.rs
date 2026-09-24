@@ -2214,9 +2214,12 @@ pub async fn login_password(
     username: String,
     password: String,
 ) -> Result<AccountVm, IpcError> {
-    auth::login_password(state.platform.as_ref(), &homeserver, &username, &password)
+    let added = auth::login_password(state.platform.as_ref(), &homeserver, &username, &password)
         .await
-        .map_err(to_ipc_error)
+        .map_err(to_ipc_error)?;
+    // The account travels in the person's `matrix.toml` (Epic 84, AD-325).
+    crate::account_ipc::note_local_change();
+    Ok(added)
 }
 
 /// OIDC (OAuth 2.0 / MSC3861) login command (Story 2.2).
@@ -2235,13 +2238,15 @@ pub async fn login_oidc(
     state: State<'_, AppState>,
     homeserver: String,
 ) -> Result<AccountVm, IpcError> {
-    auth::login_oidc(
+    let added = auth::login_oidc(
         state.platform.as_ref(),
         &homeserver,
         state.oauth_flows.clone(),
     )
     .await
-    .map_err(to_ipc_error)
+    .map_err(to_ipc_error)?;
+    crate::account_ipc::note_local_change();
+    Ok(added)
 }
 
 /// Cancel any in-progress Matrix OIDC flow(s) (Story 2.2).
@@ -2290,11 +2295,13 @@ pub async fn login_beeper(
     email: String,
     code: String,
 ) -> Result<AccountVm, IpcError> {
-    state
+    let added = state
         .beeper_flows
         .login(state.platform.as_ref(), &email, &code)
         .await
-        .map_err(to_ipc_error)
+        .map_err(to_ipc_error)?;
+    crate::account_ipc::note_local_change();
+    Ok(added)
 }
 
 /// Cancel the in-progress Beeper login flow for `email` (Story 2.3). Drops that
@@ -12013,7 +12020,10 @@ pub async fn sign_out(state: State<'_, AppState>, account_id: String) -> Result<
         .accounts
         .sign_out(&state.platform, &account_id)
         .await
-        .map_err(to_ipc_error)
+        .map_err(to_ipc_error)?;
+    // The account leaves the person's `matrix.toml` for this device.
+    crate::account_ipc::note_local_change();
+    Ok(())
 }
 
 /// Deliberately delete one account's local archive (Story 5.7, FR-6). Delegates

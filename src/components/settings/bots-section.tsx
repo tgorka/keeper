@@ -67,7 +67,7 @@
  * here through {@link useVoiceFacts} rather than a stream, because Settings
  * is a dialog over whatever pane is open.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { BotVoiceWake } from "@/components/bots/bot-voice-wake";
 import {
   AlertDialog,
@@ -84,15 +84,18 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useVoiceFacts } from "@/hooks/use-voice-facts";
+import { ACCOUNT_OFFERS_TITLE, offerUrlHost } from "@/lib/account-offers";
 import type {
   BotProbeVm,
   BotProviderVm,
   BotVm,
   CredentialSource,
   ProviderKind,
+  ProviderOfferVm,
   VoiceEventVm,
 } from "@/lib/ipc/client";
 import {
+  accountOfferAddProvider,
   botsBotProbe,
   botsBotRemove,
   botsBotSave,
@@ -169,6 +172,30 @@ export const BOTS_SECTION_EMPTY = "No endpoint yet.";
 
 /** What a failed read says when Rust gave no sentence. */
 export const BOTS_SECTION_READ_FAILED = "keeper couldn't read your endpoints.";
+
+/**
+ * The endpoints the account offers from the person's other devices (Epic 84,
+ * UX-DR118). One that signs with the account, while the account can stand
+ * in, is one tap: Rust adds it, its account key and its bots. Any other needs
+ * a key typed on this device, so it opens the endpoint form prefilled — the
+ * ellipsis says a form follows.
+ */
+export const BOTS_OFFER_ADD_LABEL = "Add";
+export const BOTS_OFFER_ADD_FORM_LABEL = "Add…";
+/** What a refused one-tap add says when Rust gave no sentence of its own. */
+export const BOTS_OFFER_ADD_FAILED = "keeper couldn't add this endpoint.";
+/** Said at the endpoint form when an offer's Add… would throw away a draft (fix R20). */
+export const BOTS_OFFER_DRAFT_SENTENCE = "Save or cancel the endpoint you are adding first.";
+
+/**
+ * What an offer of a kind this build does not speak says in place of an add
+ * (fix R22) — Rust's own refusal for the same offer, word for word. Offering
+ * the form instead would save it as an `ollama` endpoint pointed at a server
+ * that is not one.
+ */
+export function botsOfferUnknownKindSentence(kind: string): string {
+  return `This version of keeper cannot talk to a ${kind} provider.`;
+}
 
 /** The two kinds, spelled as they are stored. */
 const KINDS: readonly ProviderKind[] = ["ollama", "hermes"];
@@ -335,6 +362,45 @@ export function BotsSection({ open }: { open: boolean }) {
     id: string;
     name: string;
   } | null>(null);
+  /**
+   * The account's endpoint offers (Epic 84), and what this open of the section
+   * did with them. `offerAdded` hides a row between Rust's yes and the next
+   * snapshot, which drops the offer anyway — a second tap in that gap would
+   * only earn a refusal. `offerPrefill` is the offer the add form was opened
+   * from, if any.
+   */
+  const account = useAccountStore((s) => s.vm);
+  const [offerBusy, setOfferBusy] = useState<string | null>(null);
+  const [offerErrors, setOfferErrors] = useState<Record<string, string>>({});
+  const [offerAdded, setOfferAdded] = useState<readonly string[]>([]);
+  const [offerPrefill, setOfferPrefill] = useState<ProviderOfferVm | null>(null);
+  const providerOffers = account.offers.providers.filter(
+    (offer) => !offerAdded.includes(offer.key),
+  );
+  /**
+   * Whether the open endpoint form holds anything of the person's own (fix
+   * R20), the line that says why an offer did not replace it, and the request
+   * that brings the form into view with its key field focused — the form
+   * opens at the top of the section, far from the offer that opened it.
+   */
+  const [providerFormPristine, setProviderFormPristine] = useState(true);
+  const [offerNotice, setOfferNotice] = useState<string | null>(null);
+  const [providerReveal, setProviderReveal] = useState(0);
+  const openOfferForm = (offer: ProviderOfferVm) => {
+    if (adding !== "provider" || providerFormPristine) {
+      setOfferPrefill(offer);
+      setAdding("provider");
+      setOfferNotice(null);
+    } else {
+      setOfferNotice(BOTS_OFFER_DRAFT_SENTENCE);
+    }
+    setProviderReveal((count) => count + 1);
+  };
+  const closeProviderForm = () => {
+    setAdding(null);
+    setOfferPrefill(null);
+    setOfferNotice(null);
+  };
 
   // The voice facts, so the wake control above the endpoints can decide
   // whether it exists and what it shows (Story 63.5).
@@ -414,6 +480,23 @@ export function BotsSection({ open }: { open: boolean }) {
       .finally(refresh);
   };
 
+  const addOffer = (offer: ProviderOfferVm) => {
+    setOfferBusy(offer.key);
+    setOfferErrors(({ [offer.key]: _cleared, ...rest }) => rest);
+    void accountOfferAddProvider(offer.key)
+      .then(() => setOfferAdded((held) => [...held, offer.key]))
+      .catch((raw: unknown) =>
+        setOfferErrors((held) => ({
+          ...held,
+          [offer.key]: syncErrorMessage(raw, BOTS_OFFER_ADD_FAILED),
+        })),
+      )
+      .finally(() => {
+        setOfferBusy(null);
+        refresh();
+      });
+  };
+
   return (
     <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -423,7 +506,11 @@ export function BotsSection({ open }: { open: boolean }) {
             type="button"
             variant="outline"
             size="sm"
-            onClick={() => setAdding(adding === "provider" ? null : "provider")}
+            onClick={() => {
+              setOfferPrefill(null);
+              setOfferNotice(null);
+              setAdding(adding === "provider" ? null : "provider");
+            }}
           >
             {BOTS_ADD_PROVIDER_LABEL}
           </Button>
@@ -449,13 +536,26 @@ export function BotsSection({ open }: { open: boolean }) {
         </p>
       )}
 
+      {adding === "provider" && offerNotice !== null && (
+        <p role="status" className="text-xs">
+          {offerNotice}
+        </p>
+      )}
       {adding === "provider" && (
         <BotProviderForm
+          key={offerPrefill?.key ?? "blank"}
+          prefill={offerPrefill ?? undefined}
+          onPristineChange={setProviderFormPristine}
+          revealRequest={providerReveal}
           onDone={() => {
-            setAdding(null);
+            if (offerPrefill !== null) {
+              const added = offerPrefill.key;
+              setOfferAdded((held) => [...held, added]);
+            }
+            closeProviderForm();
             refresh();
           }}
-          onCancel={() => setAdding(null)}
+          onCancel={closeProviderForm}
         />
       )}
 
@@ -526,6 +626,69 @@ export function BotsSection({ open }: { open: boolean }) {
             </li>
           ))}
         </ul>
+      )}
+
+      {providerOffers.length > 0 && (
+        <section aria-labelledby="bots-offers-title" className="flex flex-col gap-2">
+          <p id="bots-offers-title" className="font-medium">
+            {ACCOUNT_OFFERS_TITLE}
+          </p>
+          <ul className="flex flex-col gap-2">
+            {providerOffers.map((offer) => {
+              // A kind this build cannot speak gets Rust's sentence and no add
+              // at all (fix R22). Otherwise one tap only where Rust will say
+              // yes — the offer signs with the account and the account can
+              // stand in now — and the form everywhere else.
+              const known = KINDS.some((kind) => kind === offer.kind);
+              const oneTap = known && offer.credential === "account" && accountUsable(account);
+              return (
+                <li key={offer.key} className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="min-w-40 flex-1">
+                      {offer.name} — {offer.kind} at {offerUrlHost(offer.baseUrl)}
+                    </span>
+                    {oneTap && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        aria-label={`${BOTS_OFFER_ADD_LABEL} ${offer.name}`}
+                        disabled={offerBusy !== null}
+                        onClick={() => addOffer(offer)}
+                      >
+                        {BOTS_OFFER_ADD_LABEL}
+                      </Button>
+                    )}
+                    {known && !oneTap && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        aria-label={`${BOTS_OFFER_ADD_FORM_LABEL} ${offer.name}`}
+                        onClick={() => openOfferForm(offer)}
+                      >
+                        {BOTS_OFFER_ADD_FORM_LABEL}
+                      </Button>
+                    )}
+                  </div>
+                  {!known && (
+                    <p className="text-muted-foreground text-xs">
+                      {botsOfferUnknownKindSentence(offer.kind)}
+                    </p>
+                  )}
+                  {offer.bots.length > 0 && (
+                    <p className="text-muted-foreground text-xs">{offer.bots.join(", ")}</p>
+                  )}
+                  {offerErrors[offer.key] !== undefined && (
+                    <p role="alert" className="text-destructive text-xs">
+                      {offerErrors[offer.key]}
+                    </p>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </section>
       )}
 
       {adding === "bot" && providerList.length > 0 && (
@@ -629,20 +792,42 @@ export function removalSentence(target: { kind: "provider" | "bot"; name: string
  */
 export function BotProviderForm({
   provider,
+  prefill,
   onDone,
   onCancel,
+  onPristineChange,
+  revealRequest = 0,
 }: {
   provider?: BotProviderVm;
+  /**
+   * An endpoint the account offers (Epic 84): an add starts from its kind,
+   * name and base URL, and asks for its key as any add does. Read once, on
+   * mount — the section remounts the form under the offer's key. The section
+   * offers no form for a kind this build does not speak.
+   */
+  prefill?: ProviderOfferVm;
   onDone: () => void;
   onCancel: () => void;
+  /** Told whether the form still holds only what it opened with (fix R20). */
+  onPristineChange?: (pristine: boolean) => void;
+  /** Each new value scrolls the form into view and focuses its key field. */
+  revealRequest?: number;
 }) {
-  const [kind, setKind] = useState<ProviderKind>(provider?.kind ?? "ollama");
-  const [name, setName] = useState(provider?.name ?? "");
-  const [baseUrl, setBaseUrl] = useState(provider?.baseUrl ?? "");
+  const [initial] = useState(() => ({
+    kind: provider?.kind ?? KINDS.find((known) => known === prefill?.kind) ?? "ollama",
+    name: provider?.name ?? prefill?.name ?? "",
+    baseUrl: provider?.baseUrl ?? prefill?.baseUrl ?? "",
+  }));
+  const [kind, setKind] = useState<ProviderKind>(initial.kind);
+  const [name, setName] = useState(initial.name);
+  const [baseUrl, setBaseUrl] = useState(initial.baseUrl);
   const [token, setToken] = useState("");
   const [clearToken, setClearToken] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const container = useRef<HTMLDivElement>(null);
+  const tokenField = useRef<HTMLInputElement>(null);
+  const saveButton = useRef<HTMLButtonElement>(null);
   // Where the key comes from. Read only when an account is configured: an
   // install without one asks nothing new, and every endpoint is a keychain one.
   // Read again whenever the account itself changes: Rust answers `account`
@@ -657,6 +842,26 @@ export function BotProviderForm({
   const [createdId, setCreatedId] = useState<string | null>(null);
   const providerId = provider?.id;
   const accountId = account.configured ? account.id : null;
+  const pristine =
+    createdId === null &&
+    kind === initial.kind &&
+    name === initial.name &&
+    baseUrl === initial.baseUrl &&
+    token === "" &&
+    !clearToken &&
+    source === storedSource;
+  useEffect(() => {
+    onPristineChange?.(pristine);
+  }, [pristine, onPristineChange]);
+  useEffect(() => {
+    if (revealRequest === 0) {
+      return;
+    }
+    container.current?.scrollIntoView?.({ block: "nearest" });
+    // The key is what an offered endpoint still needs; with the account as
+    // the key there is no field, and Save is what is left.
+    (tokenField.current ?? saveButton.current)?.focus();
+  }, [revealRequest]);
   useEffect(() => {
     setStoredSource("keychain");
     setSource("keychain");
@@ -716,7 +921,7 @@ export function BotProviderForm({
   };
 
   return (
-    <div className="flex flex-col gap-2 rounded-md border border-border p-3">
+    <div ref={container} className="flex flex-col gap-2 rounded-md border border-border p-3">
       <div className="flex flex-wrap items-center gap-1">
         <span className="text-muted-foreground text-xs">{BOTS_KIND_LABEL}</span>
         {KINDS.map((option) => (
@@ -764,6 +969,7 @@ export function BotProviderForm({
         <>
           <Label htmlFor="bots-provider-token">{BOTS_TOKEN_LABEL}</Label>
           <Input
+            ref={tokenField}
             id="bots-provider-token"
             type="password"
             value={token}
@@ -789,7 +995,7 @@ export function BotProviderForm({
         </p>
       )}
       <div className="flex gap-2">
-        <Button type="button" size="sm" disabled={saving} onClick={save}>
+        <Button ref={saveButton} type="button" size="sm" disabled={saving} onClick={save}>
           {BOTS_SAVE_LABEL}
         </Button>
         <Button type="button" variant="outline" size="sm" onClick={onCancel}>

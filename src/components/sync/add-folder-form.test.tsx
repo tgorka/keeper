@@ -107,9 +107,14 @@ import {
 } from "@/lib/ipc/client";
 import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
-import { resetSyncStoreForTest, SYNC_RECORDINGS_SUBFOLDER_LABEL } from "@/lib/stores/sync";
+import {
+  resetSyncStoreForTest,
+  SYNC_DEFAULT_LFS_THRESHOLD_BYTES,
+  SYNC_DEFAULT_RELEASE_TTL_MS,
+  SYNC_RECORDINGS_SUBFOLDER_LABEL,
+} from "@/lib/stores/sync";
 import { resetSyncDetailStoreForTest, syncDetailStore } from "@/lib/stores/sync-detail";
-import { accountVm } from "@/test/account-fixture";
+import { accountVm, driveOffer } from "@/test/account-fixture";
 
 const mockSave = vi.mocked(syncProfileSave);
 const mockProfiles = vi.mocked(syncProfiles);
@@ -1774,5 +1779,126 @@ describe("AddFolderForm on the phone (Story 66.1, AD-199)", () => {
     expect(screen.queryByTestId(SYNC_FORM_PATH_TESTID)).toBeNull();
     expect(screen.queryByText(SYNC_PATH_FIXED_NOTE)).not.toBeInTheDocument();
     expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toBeInTheDocument();
+  });
+});
+
+describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", () => {
+  const MiB = 1024 * 1024;
+
+  afterEach(() => {
+    accountStore.setState({ vm: NO_ACCOUNT, setupLink: null });
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+  });
+
+  /** Pick the folder — the one thing an offer cannot carry — and add. */
+  async function chooseFolderAndAdd() {
+    fireEvent.click(screen.getByRole("button", { name: SYNC_CHOOSE_FOLDER_LABEL }));
+    await waitFor(() =>
+      expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent("/Users/alice/notes"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    return mockSave.mock.calls[0][0];
+  }
+
+  it("carries the other device's policy into the save, in the wire's units", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9" }));
+    render(
+      <AddFolderForm
+        prefill={driveOffer({
+          tasks: null,
+          lfsThresholdBytes: 8 * MiB,
+          virtualPatterns: ["attachments/**", "*.psd"],
+          virtualOverBytes: 64 * MiB,
+          releaseTtlMs: 72 * 60 * 60 * 1000,
+          tags: ["notes", "acme"],
+          commitSubjectTemplate: "{profile}: {changed} changed",
+        })}
+      />,
+    );
+    expect(await chooseFolderAndAdd()).toMatchObject({
+      lfsThresholdBytes: 8 * MiB,
+      virtualPatterns: ["attachments/**", "*.psd"],
+      virtualOverBytes: 64 * MiB,
+      releaseTtlMs: 72 * 60 * 60 * 1000,
+      tags: ["notes", "acme"],
+      commitSubjectTemplate: "{profile}: {changed} changed",
+    });
+  });
+
+  it("keeps keeper's own defaults where the offer says nothing", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9" }));
+    render(<AddFolderForm prefill={driveOffer({ tasks: null })} />);
+    expect(await chooseFolderAndAdd()).toMatchObject({
+      lfsThresholdBytes: SYNC_DEFAULT_LFS_THRESHOLD_BYTES,
+      virtualPatterns: [],
+      virtualOverBytes: 0,
+      releaseTtlMs: SYNC_DEFAULT_RELEASE_TTL_MS,
+      tags: [],
+      commitSubjectTemplate: "",
+    });
+  });
+
+  it("on the phone, turns on nothing the phone does not show, and needs no folder", async () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true });
+    mockSave.mockResolvedValue(profileVm({ id: "p9" }));
+    render(
+      <AddFolderForm
+        prefill={driveOffer({ recordings: "recordings", sessions: "60-sessions", tasks: "ledger" })}
+      />,
+    );
+    const submit = screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL });
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(mockSave.mock.calls[0][0]).toMatchObject({
+      localPath: "",
+      notes: true,
+      notesSubfolder: "vault",
+      recordings: false,
+      recordingsSubfolder: null,
+      sessions: false,
+      sessionsSubfolder: null,
+      tasks: null,
+      tasksSubfolder: null,
+    });
+  });
+
+  it("does not tick the account under a typed token when the account comes back later", async () => {
+    const USE_ACME = syncAccountCredentialLabel("Acme");
+    accountStore.getState().setVm(accountVm({ state: "offline" }));
+    render(<AddFolderForm prefill={driveOffer({ credential: "account" })} />);
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    fireEvent.change(screen.getByLabelText(SYNC_TOKEN_LABEL), { target: { value: "ghp_typed" } });
+
+    act(() => accountStore.getState().setVm(accountVm({ state: "ready", revision: 1 })));
+
+    // Offered now, since the account can stand in — but not chosen for them.
+    expect(await screen.findByLabelText(USE_ACME)).not.toBeChecked();
+    expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toHaveValue("ghp_typed");
+  });
+
+  it("reports a draft while it still has a created folder to finish, though no field moved", async () => {
+    // The phone: no folder to choose, so an untouched offer can be saved as is.
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true });
+    accountStore.getState().setVm(accountVm());
+    mockSave.mockResolvedValue(profileVm({ id: "p9" }));
+    vi.mocked(syncCredentialSourceSet).mockRejectedValue({
+      code: "internal",
+      message: "disk full",
+    });
+    const onPristineChange = vi.fn();
+    render(
+      <AddFolderForm
+        prefill={driveOffer({ credential: "account", tasks: null })}
+        onPristineChange={onPristineChange}
+      />,
+    );
+    expect(onPristineChange).toHaveBeenLastCalledWith(true);
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+    expect(await screen.findByText(/disk full/)).toBeInTheDocument();
+    // Replacing this form now would lose the folder p9 it must finish.
+    expect(onPristineChange).toHaveBeenLastCalledWith(false);
   });
 });

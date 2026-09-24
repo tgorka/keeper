@@ -33,23 +33,31 @@
 //! within [`SYNC_INTERVAL_MS`] unless forced. There is no interval here
 //! (AD-62).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use keeper_core::bots::{self, store, Bot, BotIdentity, Provider, ProviderKind};
 use keeper_core::config::{self as layers, AccountLayerSource};
+use keeper_core::error::CoreError;
 use keeper_core::oauth::{OAuthCallback, OAuthFlowRegistry};
 use keeper_core::org_account::descriptor::{self, AccountDescriptor, RepoAuthConfig, SetupInput};
 use keeper_core::org_account::layout::{
     self, DeviceClass, DeviceEntry, PlanInput, RepoFiles, Resolution, UserRecord,
 };
+use keeper_core::org_account::manifest::{
+    self, BotRecord, BotsFile, DriveRecord, DrivesFile, MatrixFile, MatrixRecord, ProviderRecord,
+};
 use keeper_core::org_account::session::{self, GitAuth, Identity};
+use keeper_core::org_account::settings_sync::{
+    self, FirstSync, Merged, ProviderRef, SyncedFile, Values,
+};
 use keeper_core::org_account::state::{
-    self, AccountFacts, AccountIdentityVm, AccountPhase, AccountProblem, AccountSetupVm,
-    AccountShareVm, AccountVm,
+    self, AccountFacts, AccountIdentityVm, AccountOffersVm, AccountPhase, AccountProblem,
+    AccountSetupVm, AccountShareVm, AccountStateVm, AccountVm,
 };
 use keeper_core::org_account::{oidc, AccountError};
 use keeper_core::platform::Platform;
@@ -60,6 +68,7 @@ use keeper_sync::SyncError;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
 
+use crate::account_settings;
 use crate::ipc::{to_ipc_error, AppState};
 
 /// The event the webview opens the setup sheet on; the payload is the link.
@@ -101,6 +110,12 @@ struct Inner {
     /// Setups resolved but not yet confirmed, by `setup_id`. Nothing is
     /// written before the person presses Continue.
     setups: HashMap<String, (AccountDescriptor, Option<url::Url>)>,
+    /// Drives, bot providers and Matrix accounts the person uses on other
+    /// devices and not on this one, from the last sync that read them.
+    offers: AccountOffersVm,
+    /// The providers in the person's `bots.toml` as the last sync left it —
+    /// what adding an offered provider reads its bots from.
+    offered_providers: Vec<ProviderRecord>,
 }
 
 #[derive(Default)]
@@ -127,6 +142,13 @@ struct Runtime {
     /// launched keeper), delivered from [`account_subscribe`].
     pending_link: Mutex<Option<String>>,
     webview_listening: AtomicBool,
+    /// A synced setting, drive, provider, bot or Matrix account changed here
+    /// since the last sync began: the next sync skips the throttle, and a
+    /// sync that finds one set when it ends runs once more (AD-325).
+    dirty: AtomicBool,
+    /// The app, once it is up: what a sync kicked by a local change runs
+    /// with, and what a pulled setting with live state is applied through.
+    app: std::sync::OnceLock<AppHandle>,
 }
 
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(Runtime::default);
@@ -411,7 +433,7 @@ fn facts(inner: &Inner) -> AccountFacts {
             .descriptor
             .as_ref()
             .is_some_and(|d| matches!(d.config.auth, RepoAuthConfig::Oauth(_))),
-        offers: Default::default(),
+        offers: inner.offers.clone(),
     }
 }
 
@@ -523,6 +545,7 @@ fn apply_clone(
             layers::install_account_layers(None);
             inner.devices.clear();
             inner.repo_faults.clear();
+            clear_offers(inner);
             inner.problem = Some(AccountProblem::Blocked {
                 login: identity.login.clone(),
                 recorded,
@@ -533,6 +556,7 @@ fn apply_clone(
             layers::install_account_layers(None);
             inner.devices.clear();
             inner.repo_faults.clear();
+            clear_offers(inner);
             Found::Missing
         }
         Resolution::Mine { .. } => {
@@ -640,17 +664,52 @@ pub fn boot(platform: &dyn Platform) {
 
 /// Launch, second half: the background sync, once the app is up.
 pub fn kick(app: &AppHandle) {
-    use tauri::Manager;
-
+    // A second call is ignored, and every call hands in the one app.
+    let _ = RUNTIME.app.set(app.clone());
     if descriptor().is_none() {
         return;
     }
+    spawn_sync(app, true);
+}
+
+fn spawn_sync(app: &AppHandle, force: bool) {
+    use tauri::Manager;
+
     let state = app.state::<AppState>();
     let platform = Arc::clone(&state.platform);
     let flows = Arc::clone(&state.account_flows);
     tauri::async_runtime::spawn(async move {
-        sync(platform, flows, true).await;
+        sync(platform, flows, force).await;
     });
+}
+
+/// Write-back (AD-325): every write of a setting that travels in the
+/// person's files marks the account dirty. Installed once at launch, before
+/// anything writes a setting; the pulled values a sync applies are written
+/// with the observer suppressed, so they never count as a local change.
+pub fn watch_settings() {
+    registry::set_setting_observer(Box::new(|key: &str| {
+        if settings_sync::synced_file(key).is_some() {
+            note_local_change();
+        }
+    }));
+}
+
+/// Something the person's files carry changed on this device: a synced
+/// setting, or a drive, bot provider, bot, credential choice or Matrix
+/// account added or removed. The next sync runs now rather than after the
+/// throttle; one already running runs once more when it ends. Nothing at
+/// all without an account.
+pub fn note_local_change() {
+    if descriptor().is_none() {
+        return;
+    }
+    RUNTIME.dirty.store(true, Ordering::SeqCst);
+    // Before the app is up the launch sync is still to come, and it will
+    // find the flag.
+    if let Some(app) = RUNTIME.app.get() {
+        spawn_sync(app, false);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -817,6 +876,13 @@ fn refuse(inner: &mut Inner) {
     inner.identity = None;
     inner.devices.clear();
     inner.repo_faults.clear();
+    clear_offers(inner);
+}
+
+/// Offers belong to the directory they were read from; without it, none.
+fn clear_offers(inner: &mut Inner) {
+    inner.offers = AccountOffersVm::default();
+    inner.offered_providers.clear();
 }
 
 /// Sign in (when `interactive`), connect the forge, fetch, resolve, publish
@@ -872,6 +938,7 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
                         if someone_else {
                             inner.devices.clear();
                             inner.repo_faults.clear();
+                            clear_offers(inner);
                             inner.last_synced_ms = None;
                             // The device keeps its name, but registers it anew
                             // in the new person's directory.
@@ -1083,6 +1150,20 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
         Err(sentence) => Some(AccountProblem::Failed(sentence)),
     };
 
+    // 6b. The person's settings and what they use (Epic 84): merged against
+    //     the tip each attempt commits on, written back where they changed,
+    //     then applied here — in its own commit, after the registration.
+    let leg = RepoLeg {
+        http,
+        d: &d,
+        spec: &spec,
+        author: &author,
+        oauth,
+    };
+    let settings_problem =
+        sync_settings(Arc::clone(&platform), &leg, &mut auth, &identity, &device).await;
+    let problem = problem.or(settings_problem);
+
     // 7. The layers, from the clone as it now stands. A first registration
     //    counts only once the repository holds it.
     let synced = now_ms();
@@ -1112,8 +1193,636 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
     });
 }
 
-/// One sync: at most every [`SYNC_INTERVAL_MS`] unless `force`, never while
-/// another runs, never without someone signed in.
+/// What every push to the config repository in one run shares.
+struct RepoLeg<'a> {
+    http: &'static reqwest::Client,
+    d: &'a AccountDescriptor,
+    spec: &'a RepoSpec,
+    author: &'a Author,
+    oauth: bool,
+}
+
+/// Whether a planned file's new bytes went into the attempt's commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Staged {
+    /// The repository already says it; nothing to write.
+    Unneeded,
+    /// Written into the commit: it landed exactly when the push did.
+    Written,
+    /// Needed writing and was not (it would not render, or the file may not
+    /// be rewritten): this device's changes to it are still to push.
+    Dropped,
+}
+
+/// One settings file as an attempt merged and staged it.
+struct PlannedFile {
+    merged: Merged,
+    staged: Staged,
+}
+
+/// One manifest as an attempt merged and staged it.
+struct PlannedManifest<T> {
+    records: Vec<T>,
+    staged: Staged,
+}
+
+/// The person's two settings files and three manifests as one attempt
+/// planned them. The last attempt's is kept, so the push's outcome decides
+/// which base is recorded and what is applied.
+struct Planned {
+    shared: Option<PlannedFile>,
+    device: Option<PlannedFile>,
+    /// `None` where the file was not planned (this device's drives could not
+    /// be listed, or the file is not TOML): it offers nothing either.
+    drives: Option<PlannedManifest<DriveRecord>>,
+    providers: Option<PlannedManifest<ProviderRecord>>,
+    matrix: Option<PlannedManifest<MatrixRecord>>,
+}
+
+/// This device's manifests as it last pushed them (R17): what tells a field
+/// changed here from one another device changed.
+struct ManifestBases {
+    drives: Option<Vec<DriveRecord>>,
+    providers: Option<Vec<ProviderRecord>>,
+    matrix: Option<Vec<MatrixRecord>>,
+}
+
+/// Everything a settings plan reads besides the worktree, fixed for the run.
+struct SettingsInput {
+    descriptor: AccountDescriptor,
+    identity: Identity,
+    device: String,
+    class: DeviceClass,
+    mine: account_settings::Mine,
+    /// The synced keys' rows as the local side was read: a row that no
+    /// longer holds its value at apply time was changed here meanwhile.
+    stored: BTreeMap<String, String>,
+    local_shared: Values,
+    local_device: Values,
+    base_shared: Option<Values>,
+    base_device: Option<Values>,
+    manifest_bases: ManifestBases,
+}
+
+const DRIVES_MANIFEST: &str = "drives";
+const BOTS_MANIFEST: &str = "bots";
+const MATRIX_MANIFEST: &str = "matrix";
+
+/// A manifest base as stored, or `None` when there is none or it does not
+/// read — then every entry this device has counts as changed here, which
+/// is what a first sync is.
+fn manifest_base<T: serde::de::DeserializeOwned>(
+    data_dir: &Path,
+    account_id: &str,
+    which: &str,
+) -> Result<Option<Vec<T>>, CoreError> {
+    let Some(json) = registry::get_account_manifest_base(data_dir, account_id, which)? else {
+        return Ok(None);
+    };
+    match serde_json::from_str(&json) {
+        Ok(base) => Ok(Some(base)),
+        Err(error) => {
+            tracing::warn!(%error, which, "account: a manifest base is malformed; starting over");
+            Ok(None)
+        }
+    }
+}
+
+/// Merge the person's settings files and manifests with this device's,
+/// push what changed as `"{login}: settings from {device}"`, record the
+/// bases, apply what the other devices changed and publish the offers.
+///
+/// Nothing is merged when this device's side cannot be read: its local
+/// changes stay dirty against an unchanged base and go on the next sync.
+async fn sync_settings(
+    platform: Arc<dyn Platform>,
+    leg: &RepoLeg<'_>,
+    auth: &mut RepoAuth,
+    identity: &Identity,
+    device: &str,
+) -> Option<AccountProblem> {
+    let data_dir = platform.data_dir().ok()?;
+    let read = {
+        let (platform, data_dir) = (Arc::clone(&platform), data_dir.clone());
+        let (descriptor, identity, device) = (leg.d.clone(), identity.clone(), device.to_owned());
+        on_blocking_pool(move || -> Result<SettingsInput, CoreError> {
+            let mine = account_settings::gather(&platform, &data_dir, &descriptor.id)?;
+            let id = descriptor.id.as_str();
+            let keys: Vec<&str> = settings_sync::synced_keys(SyncedFile::Shared)
+                .chain(settings_sync::synced_keys(SyncedFile::Device))
+                .collect();
+            let base_shared =
+                registry::get_account_settings_base(&data_dir, id, SyncedFile::Shared)?;
+            let base_device =
+                registry::get_account_settings_base(&data_dir, id, SyncedFile::Device)?;
+            Ok(SettingsInput {
+                stored: registry::stored_settings(&data_dir, &keys)?,
+                local_shared: settings_sync::local_values(
+                    &data_dir,
+                    SyncedFile::Shared,
+                    &mine.catalog,
+                    base_shared.as_ref(),
+                )?,
+                local_device: settings_sync::local_values(
+                    &data_dir,
+                    SyncedFile::Device,
+                    &mine.catalog,
+                    base_device.as_ref(),
+                )?,
+                base_shared,
+                base_device,
+                manifest_bases: ManifestBases {
+                    drives: manifest_base(&data_dir, id, DRIVES_MANIFEST)?,
+                    providers: manifest_base(&data_dir, id, BOTS_MANIFEST)?,
+                    matrix: manifest_base(&data_dir, id, MATRIX_MANIFEST)?,
+                },
+                mine,
+                class: device_class(),
+                device,
+                identity,
+                descriptor,
+            })
+        })
+        .await
+    };
+    let input = match read {
+        Ok(Ok(input)) => Arc::new(input),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "account: this device's settings could not be read; nothing was merged");
+            return None;
+        }
+        Err(sentence) => return Some(AccountProblem::Failed(sentence)),
+    };
+
+    let kept: Arc<Mutex<Option<Planned>>> = Arc::default();
+    let plan = {
+        let (input, kept) = (Arc::clone(&input), Arc::clone(&kept));
+        move |root: &Path| -> Vec<Write> {
+            let (writes, planned) = plan_settings(root, &input);
+            *lock(kept.as_ref()) = planned;
+            writes
+        }
+    };
+    let message = format!("{}: settings from {device}", identity.login);
+    let http = leg.http;
+    let pushed = with_forge_retry(platform.as_ref(), http, leg.d, auth, |auth| {
+        let (spec, author, message, plan, interrupt) = (
+            leg.spec.clone(),
+            leg.author.clone(),
+            message.clone(),
+            plan.clone(),
+            interrupt(),
+        );
+        off_runtime(move || async move {
+            config_repo::commit_and_push(http, &spec, &auth, &author, &message, plan, &interrupt)
+                .await
+        })
+    })
+    .await;
+    let (landed, problem) = match pushed {
+        Ok(Ok(PushResult::Pushed { head })) => {
+            tracing::info!(%head, "account: published the person's settings");
+            (true, None)
+        }
+        Ok(Ok(PushResult::NothingToDo)) => (true, None),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "account: the person's settings could not be published");
+            (false, repo_problem(&error, leg.oauth))
+        }
+        Err(sentence) => (false, Some(AccountProblem::Failed(sentence))),
+    };
+    // No attempt planned (the directory stopped being the person's, or no
+    // attempt ran): nothing is recorded or applied.
+    let Some(planned) = lock(kept.as_ref()).take() else {
+        return problem;
+    };
+
+    // What another device changed is applied first: only once it is known
+    // which keys landed can the bases say what this device has synced.
+    let files = [
+        (
+            SyncedFile::Shared,
+            planned.shared.as_ref(),
+            &input.local_shared,
+            input.base_shared.as_ref(),
+        ),
+        (
+            SyncedFile::Device,
+            planned.device.as_ref(),
+            &input.local_device,
+            input.base_device.as_ref(),
+        ),
+    ];
+    let changes: Vec<(String, Option<String>)> = files
+        .iter()
+        .filter_map(|(_, file, _, _)| file.as_ref())
+        .flat_map(|file| file.merged.apply.iter().cloned())
+        .collect();
+    let unapplied = if changes.is_empty() {
+        account_settings::Unapplied::default()
+    } else {
+        let app = RUNTIME.app.get().cloned();
+        let runtime = tokio::runtime::Handle::current();
+        let (platform, data_dir, input) =
+            (Arc::clone(&platform), data_dir.clone(), Arc::clone(&input));
+        // Suppressed: a value another device chose is not a change made
+        // here, and must not send this device straight back to the network.
+        let applied = on_blocking_pool(move || {
+            registry::with_observer_suppressed(|| {
+                account_settings::apply(
+                    app.as_ref(),
+                    &platform,
+                    &data_dir,
+                    &runtime,
+                    &changes,
+                    &input.stored,
+                )
+            })
+        })
+        .await;
+        match applied {
+            Ok(unapplied) => unapplied,
+            // Whether anything was written is unknown: record nothing, so
+            // the next sync merges from the old bases.
+            Err(sentence) => {
+                tracing::warn!(%sentence, "account: the pulled settings were not applied");
+                return problem.or(Some(AccountProblem::Failed(sentence)));
+            }
+        }
+    };
+    for (which, file, local, base) in files {
+        let Some(file) = file else {
+            continue;
+        };
+        let written = file.staged.synced(landed);
+        let settled =
+            account_settings::settled_base(&file.merged, written, local, base, &unapplied);
+        if let Err(error) =
+            registry::set_account_settings_base(&data_dir, &leg.d.id, which, &settled)
+        {
+            tracing::warn!(%error, "account: the settings base was not recorded");
+        }
+    }
+
+    // A manifest whose state is in the repository now takes this device's
+    // list as its base; otherwise the old base stands, and this device's
+    // changes still read as its own next time.
+    let id = leg.d.id.as_str();
+    let mine = &input.mine;
+    record_manifest_base(
+        &data_dir,
+        id,
+        DRIVES_MANIFEST,
+        planned.drives.as_ref(),
+        mine.drives.as_deref(),
+        landed,
+    );
+    record_manifest_base(
+        &data_dir,
+        id,
+        BOTS_MANIFEST,
+        planned.providers.as_ref(),
+        Some(mine.providers.as_slice()),
+        landed,
+    );
+    record_manifest_base(
+        &data_dir,
+        id,
+        MATRIX_MANIFEST,
+        planned.matrix.as_ref(),
+        Some(mine.matrix.as_slice()),
+        landed,
+    );
+
+    let offers = manifest::offers(
+        planned
+            .drives
+            .as_ref()
+            .map_or(&[][..], |p| p.records.as_slice()),
+        planned
+            .providers
+            .as_ref()
+            .map_or(&[][..], |p| p.records.as_slice()),
+        planned
+            .matrix
+            .as_ref()
+            .map_or(&[][..], |p| p.records.as_slice()),
+        mine.drives.as_deref().unwrap_or_default(),
+        &mine.providers,
+        &mine.matrix,
+    );
+    update(|inner| {
+        inner.offers = offers;
+        inner.offered_providers = planned.providers.map(|p| p.records).unwrap_or_default();
+    });
+    problem
+}
+
+impl Staged {
+    /// Whether the repository now holds what was planned: nothing needed
+    /// writing, or the write went out with a push that landed.
+    fn synced(self, landed: bool) -> bool {
+        match self {
+            Staged::Unneeded => true,
+            Staged::Written => landed,
+            Staged::Dropped => false,
+        }
+    }
+}
+
+/// Store this device's list as the manifest's base once the repository
+/// holds it (R17). Nothing for a manifest that was not planned, or whose
+/// side here could not be read.
+fn record_manifest_base<T: serde::Serialize>(
+    data_dir: &Path,
+    account_id: &str,
+    which: &str,
+    planned: Option<&PlannedManifest<T>>,
+    mine: Option<&[T]>,
+    landed: bool,
+) {
+    let (Some(planned), Some(mine)) = (planned, mine) else {
+        return;
+    };
+    if !planned.staged.synced(landed) {
+        return;
+    }
+    let recorded = serde_json::to_string(mine)
+        .map_err(|error| CoreError::Internal(error.to_string()))
+        .and_then(|json| registry::set_account_manifest_base(data_dir, account_id, which, &json));
+    if let Err(error) = recorded {
+        tracing::warn!(%error, which, "account: a manifest base was not recorded");
+    }
+}
+
+/// One attempt's plan, against the worktree at the tip it commits on: read
+/// both settings files and the three manifests, merge each with this
+/// device's side, and write back exactly the files whose values changed.
+fn plan_settings(root: &Path, input: &SettingsInput) -> (Vec<Write>, Option<Planned>) {
+    let files = WorktreeFiles(root);
+    let identity = &input.identity;
+    let login = identity.login.as_str();
+    let mine = matches!(
+        layout::resolve(
+            &files,
+            login,
+            &identity.sub,
+            &identity.iss,
+            &input.descriptor.config.identity_field,
+        ),
+        Resolution::Mine { .. }
+    );
+    if !mine {
+        return (Vec::new(), None);
+    }
+    let catalog = &input.mine.catalog;
+    // A2': a pulled value that names nothing on this device is not applied.
+    let resolve = |key: &str, value: &str| settings_sync::from_portable(key, value, catalog);
+    let last_change = |rel: &str| match config_repo::last_change_secs(root, rel) {
+        Ok(secs) => secs,
+        Err(error) => {
+            tracing::debug!(%error, rel, "account: a device's settings history was not read");
+            None
+        }
+    };
+    let mut writes = Vec::new();
+    let shared = merge_settings_file(
+        &files,
+        login,
+        settings_sync::shared_path(login),
+        SyncedFile::Shared,
+        || settings_sync::seed_shared(&files),
+        &input.local_shared,
+        input.base_shared.as_ref(),
+        &resolve,
+        &mut writes,
+    );
+    let device = merge_settings_file(
+        &files,
+        login,
+        settings_sync::device_path(login, &input.device),
+        SyncedFile::Device,
+        || settings_sync::seed_device(&files, login, input.class, &input.device, &last_change),
+        &input.local_device,
+        input.base_device.as_ref(),
+        &resolve,
+        &mut writes,
+    );
+
+    let me = input.device.as_str();
+    // The devices the person's directory lists at this tip: a slug no longer
+    // there (a rename, a removed device) is pruned from every entry.
+    let known: Vec<String> = layout::devices(&files, login)
+        .into_iter()
+        .map(|entry| entry.slug)
+        .collect();
+    let bases = &input.manifest_bases;
+    let drives = input.mine.drives.as_ref().and_then(|mine| {
+        let rel = manifest::drives_path(login);
+        let current = readable(&files, &rel)?;
+        let remote = parse_manifest(&rel, current.as_deref(), DrivesFile::parse)?;
+        let merged =
+            manifest::merge_drives(&remote.drives, mine, bases.drives.as_deref(), me, &known);
+        let unchanged = merged == remote.drives;
+        let file = DrivesFile {
+            drives: merged,
+            ..remote
+        };
+        let staged = stage(
+            login,
+            rel,
+            current.is_some(),
+            unchanged,
+            file.drives.is_empty(),
+            || file.render(),
+            &mut writes,
+        );
+        Some(PlannedManifest {
+            records: file.drives,
+            staged,
+        })
+    });
+    let providers = {
+        let rel = manifest::bots_path(login);
+        readable(&files, &rel).and_then(|current| {
+            let remote = parse_manifest(&rel, current.as_deref(), BotsFile::parse)?;
+            let merged = manifest::merge_providers(
+                &remote.providers,
+                &input.mine.providers,
+                bases.providers.as_deref(),
+                me,
+                &known,
+            );
+            let unchanged = merged == remote.providers;
+            let file = BotsFile {
+                providers: merged,
+                ..remote
+            };
+            let staged = stage(
+                login,
+                rel,
+                current.is_some(),
+                unchanged,
+                file.providers.is_empty(),
+                || file.render(),
+                &mut writes,
+            );
+            Some(PlannedManifest {
+                records: file.providers,
+                staged,
+            })
+        })
+    };
+    let matrix = {
+        let rel = manifest::matrix_path(login);
+        readable(&files, &rel).and_then(|current| {
+            let remote = parse_manifest(&rel, current.as_deref(), MatrixFile::parse)?;
+            let merged = manifest::merge_matrix(
+                &remote.accounts,
+                &input.mine.matrix,
+                bases.matrix.as_deref(),
+                me,
+                &known,
+            );
+            let unchanged = merged == remote.accounts;
+            let file = MatrixFile {
+                accounts: merged,
+                ..remote
+            };
+            let staged = stage(
+                login,
+                rel,
+                current.is_some(),
+                unchanged,
+                file.accounts.is_empty(),
+                || file.render(),
+                &mut writes,
+            );
+            Some(PlannedManifest {
+                records: file.accounts,
+                staged,
+            })
+        })
+    };
+    (
+        writes,
+        Some(Planned {
+            shared,
+            device,
+            drives,
+            providers,
+            matrix,
+        }),
+    )
+}
+
+/// The file's bytes (`Some(None)` when it is absent), or `None` when
+/// something other than a regular file stands there — the repository would
+/// refuse to replace it, so it is left alone (`unusable_files` says so).
+fn readable(files: &WorktreeFiles<'_>, rel: &str) -> Option<Option<Vec<u8>>> {
+    (!files.is_non_regular(rel)).then(|| files.read(rel))
+}
+
+/// A manifest as the tip holds it, an empty one when it is absent, or
+/// `None` when it does not read — then it is neither rewritten nor offered
+/// from, so a hand edit gone wrong is not flattened by the next sync.
+fn parse_manifest<T: Default>(
+    rel: &str,
+    current: Option<&[u8]>,
+    parse: fn(&[u8]) -> Result<T, String>,
+) -> Option<T> {
+    match current.map(parse).transpose() {
+        Ok(remote) => Some(remote.unwrap_or_default()),
+        Err(why) => {
+            tracing::warn!(rel, %why, "account: a file in the settings repository was left as it is");
+            None
+        }
+    }
+}
+
+/// Merge one settings file: the tip's copy, or a seed when there is none.
+#[allow(clippy::too_many_arguments)]
+fn merge_settings_file(
+    files: &WorktreeFiles<'_>,
+    login: &str,
+    rel: String,
+    file: SyncedFile,
+    seed: impl FnOnce() -> Option<(Values, FirstSync)>,
+    local: &Values,
+    base: Option<&Values>,
+    resolve: &dyn Fn(&str, &str) -> Option<String>,
+    writes: &mut Vec<Write>,
+) -> Option<PlannedFile> {
+    let current = readable(files, &rel)?;
+    let remote = match current
+        .as_deref()
+        .map(|bytes| Values::parse(bytes, file))
+        .transpose()
+    {
+        Ok(remote) => remote,
+        Err(why) => {
+            tracing::warn!(rel, %why, "account: a settings file was left as it is");
+            return None;
+        }
+    };
+    let seed = if remote.is_none() { seed() } else { None };
+    let merged = settings_sync::merge(remote.as_ref(), seed, local, base, resolve);
+    let staged = stage(
+        login,
+        rel,
+        current.is_some(),
+        !merged.changed,
+        merged.file == Values::default(),
+        || merged.file.render(),
+        writes,
+    );
+    Some(PlannedFile { merged, staged })
+}
+
+/// Write a file back when what it says differs from the tip's copy —
+/// compared as values, so the formatting and comments someone gave it by
+/// hand survive every sync that changes nothing. A file with nothing in it
+/// is never created, and only the five files the person's directory may
+/// have rewritten are touched (AD-324).
+fn stage(
+    login: &str,
+    rel: String,
+    exists: bool,
+    unchanged: bool,
+    empty: bool,
+    render: impl FnOnce() -> Result<String, String>,
+    writes: &mut Vec<Write>,
+) -> Staged {
+    if (exists && unchanged) || (!exists && empty) {
+        return Staged::Unneeded;
+    }
+    if !layout::is_rewritable(login, &rel) {
+        return Staged::Dropped;
+    }
+    match render() {
+        Ok(text) => {
+            writes.push(Write {
+                rel: PathBuf::from(rel),
+                bytes: text.into_bytes(),
+                replace: exists,
+            });
+            Staged::Written
+        }
+        Err(why) => {
+            tracing::warn!(rel, %why, "account: a settings file could not be written out");
+            Staged::Dropped
+        }
+    }
+}
+
+/// One sync: at most every [`SYNC_INTERVAL_MS`] unless `force` or a local
+/// change is waiting, never while another runs, never without someone
+/// signed in.
+///
+/// A local change that finds a sync running leaves the dirty flag set (the
+/// gate is taken, so its own sync returns at once); the running sync sees
+/// the flag when it ends and goes once more. That is the whole coalescing:
+/// any number of changes during one sync cost one more, and no timer.
 async fn sync(
     platform: Arc<dyn Platform>,
     flows: Arc<OAuthFlowRegistry>,
@@ -1125,14 +1834,25 @@ async fn sync(
         let due = inner
             .last_attempt_ms
             .is_none_or(|at| now_ms().saturating_sub(at) >= SYNC_INTERVAL_MS);
-        if inner.descriptor.is_none() || inner.identity.is_none() || !(force || due) {
+        let dirty = RUNTIME.dirty.load(Ordering::SeqCst);
+        if inner.descriptor.is_none() || inner.identity.is_none() || !(force || due || dirty) {
             return state::vm(&facts(&inner));
         }
     }
     let Ok(_gate) = RUNTIME.gate.try_lock() else {
         return current_vm();
     };
-    cancellable(queued_at, converge(platform, flows, false)).await;
+    loop {
+        RUNTIME.dirty.store(false, Ordering::SeqCst);
+        cancellable(
+            queued_at,
+            converge(Arc::clone(&platform), Arc::clone(&flows), false),
+        )
+        .await;
+        if !RUNTIME.dirty.load(Ordering::SeqCst) || epoch() != queued_at {
+            break;
+        }
+    }
     current_vm()
 }
 
@@ -1140,9 +1860,23 @@ async fn sync(
 /// cancel, sign-out or forget comes while it waits.
 async fn sign_in_and_sync(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>) -> AccountVm {
     let queued_at = epoch();
-    let _gate = RUNTIME.gate.lock().await;
+    let gate = RUNTIME.gate.lock().await;
+    RUNTIME.dirty.store(false, Ordering::SeqCst);
     cancellable(queued_at, converge(platform, flows, true)).await;
+    drop(gate);
+    resync_if_dirty();
     current_vm()
+}
+
+/// A change noted while the gate was held by something other than `sync`
+/// (a sign-in, a rename) found its own sync refused and nothing to re-run
+/// it: run it now that the gate is free.
+fn resync_if_dirty() {
+    if RUNTIME.dirty.load(Ordering::SeqCst) {
+        if let Some(app) = RUNTIME.app.get() {
+            spawn_sync(app, false);
+        }
+    }
 }
 
 /// End anything in flight or queued, and wait until it has let go —
@@ -1484,6 +2218,13 @@ pub async fn account_rename_device(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<AccountVm, IpcError> {
+    let renamed = rename_device(state, name).await;
+    // The gate is free again: a change noted during the rename goes now.
+    resync_if_dirty();
+    renamed
+}
+
+async fn rename_device(state: State<'_, AppState>, name: String) -> Result<AccountVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     let to = layout::device_slug(&name);
     let _gate = RUNTIME.gate.lock().await;
@@ -1665,6 +2406,7 @@ pub async fn account_sign_out(state: State<'_, AppState>) -> Result<AccountVm, I
         inner.forge_connected = false;
         inner.devices.clear();
         inner.repo_faults.clear();
+        clear_offers(inner);
         inner.problem = None;
         inner.phase = AccountPhase::Idle;
     });
@@ -1740,7 +2482,9 @@ pub fn sync_credential_source_set(
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     let (source, bound_to) = parse_source(&source, account_id())?;
     registry::set_sync_credential_source(&data_dir, &profile_id, source, bound_to.as_deref())
-        .map_err(to_ipc_error)
+        .map_err(to_ipc_error)?;
+    note_local_change();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1768,7 +2512,135 @@ pub fn bots_provider_credential_source_set(
         source,
         bound_to.as_deref(),
     )
-    .map_err(to_ipc_error)
+    .map_err(to_ipc_error)?;
+    note_local_change();
+    Ok(())
+}
+
+/// Add a bot provider the person uses on another device, with its bots, set
+/// to use the account (AD-323). Only for an offer whose credential is the
+/// account, while the account is usable: any other needs a key, which only
+/// the person can give, so the frontend opens the filled-in form instead.
+#[tauri::command]
+pub fn account_offer_add_provider(state: State<'_, AppState>, key: String) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let (record, account_id) = {
+        let inner = lock(&RUNTIME.inner);
+        let offered = inner.offers.providers.iter().any(|offer| offer.key == key);
+        let record = inner
+            .offered_providers
+            .iter()
+            .find(|record| ProviderRef::new(&record.kind, &record.base_url).reference() == key)
+            .filter(|_| offered)
+            .cloned();
+        let vm = state::vm(&facts(&inner));
+        let usable = vm.identity.is_some()
+            && matches!(vm.state, AccountStateVm::Ready | AccountStateVm::Syncing);
+        let account_id = inner
+            .descriptor
+            .as_ref()
+            .filter(|_| usable)
+            .map(|d| d.id.clone());
+        (record, account_id)
+    };
+    let Some(record) = record else {
+        return Err(refusal(
+            "This provider is no longer offered by your account. Sync, then try again.",
+        ));
+    };
+    if record.credential != "account" {
+        return Err(refusal(
+            "This provider uses its own key. Add it with the form and paste the key.",
+        ));
+    }
+    let Some(account_id) = account_id else {
+        return Err(refusal(
+            "Your account is not ready on this device. Sign in to it, then add the provider.",
+        ));
+    };
+    let Some(kind) = ProviderKind::from_registry_str(&record.kind) else {
+        return Err(refusal(format!(
+            "This version of keeper cannot talk to a {} provider.",
+            record.kind
+        )));
+    };
+    let base_url = bots::parse_base_url(&record.base_url)
+        .map_err(|error| refusal(format!("{}: {error}", record.base_url)))?
+        .normalized;
+    // Every target is checked before anything is written, so a refusal
+    // leaves no half-added provider behind.
+    let mut offered_bots = record.bots.clone();
+    offered_bots.sort_by_key(|bot| bot.pin_order);
+    for bot in &offered_bots {
+        bots::parse_bot_target(&bot.target)
+            .map_err(|error| refusal(format!("{}: {error}", bot.target)))?;
+    }
+    let provider = Provider {
+        id: crate::bots_ipc::new_id(),
+        kind,
+        name: record.name.clone(),
+        base_url,
+        created_ms: now_ms(),
+    };
+    if let Err(error) = add_offered_provider(&data_dir, &provider, &account_id, offered_bots) {
+        // All or nothing: a provider without its account credential or some
+        // of its bots is not what the person asked for.
+        let undone = store::delete_provider(&data_dir, &provider.id).and_then(|()| {
+            registry::set_bots_provider_credential_source(&data_dir, &provider.id, None, None)
+        });
+        if let Err(undo) = undone {
+            tracing::warn!(%undo, "account: a half-added provider could not be removed");
+        }
+        return Err(to_ipc_error(error));
+    }
+    update(|inner| {
+        inner.offers.providers.retain(|offer| offer.key != key);
+    });
+    note_local_change();
+    Ok(())
+}
+
+/// The writes of [`account_offer_add_provider`]: the provider row, its
+/// account credential and its bots — after the ones already pinned, in the
+/// offer's order.
+fn add_offered_provider(
+    data_dir: &Path,
+    provider: &Provider,
+    account_id: &str,
+    offered_bots: Vec<BotRecord>,
+) -> Result<(), CoreError> {
+    store::insert_provider(data_dir, provider)?;
+    registry::set_bots_provider_credential_source(
+        data_dir,
+        &provider.id,
+        Some("account"),
+        Some(account_id),
+    )?;
+    let pinned = store::list_bots(data_dir)?.len();
+    for (offset, bot) in offered_bots.into_iter().enumerate() {
+        let target = bot.target.trim().to_owned();
+        let name = match bot.name.trim() {
+            "" => target.clone(),
+            name => name.to_owned(),
+        };
+        store::insert_bot(
+            data_dir,
+            &Bot {
+                id: crate::bots_ipc::new_id(),
+                provider_id: provider.id.clone(),
+                target,
+                name,
+                pin_order: i64::try_from(pinned + offset).unwrap_or(i64::MAX),
+                identity: BotIdentity {
+                    shape: bot.shape,
+                    colour: bot.colour,
+                    mark: bot.mark,
+                },
+                created_ms: now_ms(),
+            },
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1911,5 +2783,97 @@ mod tests {
         assert!(!files.is_non_regular("tgorka/keeper.mac.toml"));
         assert!(!files.is_non_regular("../tgorka/keeper.toml"));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn staged(
+        rel: &str,
+        exists: bool,
+        unchanged: bool,
+        empty: bool,
+        rendered: Result<&str, &str>,
+    ) -> (Staged, Vec<Write>) {
+        let mut writes = Vec::new();
+        let staged = stage(
+            "tgorka",
+            rel.to_owned(),
+            exists,
+            unchanged,
+            empty,
+            || rendered.map(str::to_owned).map_err(str::to_owned),
+            &mut writes,
+        );
+        (staged, writes)
+    }
+
+    /// A file is written only when what it says changes — a sync that
+    /// changed nothing pushes nothing, whatever its formatting — and only
+    /// an existing file is replaced.
+    #[test]
+    fn a_file_is_written_back_only_when_its_values_change() {
+        let rel = "tgorka/settings.toml";
+        let (unneeded, none) = staged(rel, true, true, false, Ok("reformatted"));
+        assert_eq!(unneeded, Staged::Unneeded);
+        assert!(none.is_empty());
+        let (written, changed) = staged(rel, true, false, false, Ok("new"));
+        assert_eq!(written, Staged::Written);
+        assert!(changed[0].replace);
+        assert_eq!(changed[0].bytes, b"new");
+        let (_, created) = staged(rel, false, false, false, Ok("new"));
+        assert_eq!(created.len(), 1);
+        assert!(!created[0].replace);
+    }
+
+    /// An absent file with nothing to say stays absent; one already there
+    /// is still rewritten when its last entry goes.
+    #[test]
+    fn an_empty_file_is_never_created_but_may_be_emptied() {
+        let rel = "tgorka/drives.toml";
+        assert_eq!(
+            staged(rel, false, false, true, Ok("# header\n")).0,
+            Staged::Unneeded
+        );
+        assert_eq!(
+            staged(rel, true, false, true, Ok("# header\n")).0,
+            Staged::Written
+        );
+    }
+
+    /// A file that needed writing and could not be — outside the five of
+    /// AD-324, or not renderable — is reported dropped, so its base keeps
+    /// this device's changes to push; nothing is written for it.
+    #[test]
+    fn a_write_that_cannot_happen_is_dropped() {
+        for rel in [
+            "tgorka/keeper.toml",
+            "tgorka/user.toml",
+            "tgorka/devices/mac.toml",
+            "someone/settings.toml",
+            "_template/settings.toml",
+        ] {
+            let (outcome, writes) = staged(rel, true, false, false, Ok("new"));
+            assert_eq!(outcome, Staged::Dropped, "{rel}");
+            assert!(writes.is_empty(), "{rel}");
+        }
+        let (unrendered, writes) = staged("tgorka/settings.toml", true, false, false, Err("no"));
+        assert_eq!(unrendered, Staged::Dropped);
+        assert!(writes.is_empty());
+    }
+
+    /// A manifest that does not read is left alone — neither rewritten nor
+    /// offered from — while an absent one is an empty list.
+    #[test]
+    fn a_manifest_that_does_not_read_is_left_alone() {
+        assert_eq!(
+            parse_manifest("tgorka/drives.toml", None, DrivesFile::parse),
+            Some(DrivesFile::default())
+        );
+        assert_eq!(
+            parse_manifest(
+                "tgorka/drives.toml",
+                Some(&b"[[drive]\nbroken"[..]),
+                DrivesFile::parse
+            ),
+            None
+        );
     }
 }

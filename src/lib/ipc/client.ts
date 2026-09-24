@@ -53,6 +53,7 @@ export function telemetryRemoteConfig(): Promise<TelemetryRemoteConfigVm> {
 
 export type { AccountDeviceVm } from "./gen/AccountDeviceVm";
 export type { AccountIdentityVm } from "./gen/AccountIdentityVm";
+export type { AccountOffersVm } from "./gen/AccountOffersVm";
 export type { AccountSetupVm } from "./gen/AccountSetupVm";
 export type { AccountShareVm } from "./gen/AccountShareVm";
 export type { AccountStateVm } from "./gen/AccountStateVm";
@@ -140,6 +141,7 @@ export type { DockBadgeMode } from "./gen/DockBadgeMode";
 export type { DocumentFormat } from "./gen/DocumentFormat";
 export type { DocumentVm } from "./gen/DocumentVm";
 export type { DraftMirrorBatch } from "./gen/DraftMirrorBatch";
+export type { DriveOfferVm } from "./gen/DriveOfferVm";
 export type { EditVersionVm } from "./gen/EditVersionVm";
 export type { Effect } from "./gen/Effect";
 export type { EgressEndpointVm } from "./gen/EgressEndpointVm";
@@ -177,6 +179,7 @@ export type { IpcErrorCode } from "./gen/IpcErrorCode";
 export type { LifecyclePhase } from "./gen/LifecyclePhase";
 export type { LoginFieldVm } from "./gen/LoginFieldVm";
 export type { LoginFlowVm } from "./gen/LoginFlowVm";
+export type { MatrixOfferVm } from "./gen/MatrixOfferVm";
 export type { MediaKindVm } from "./gen/MediaKindVm";
 export type { MediaVm } from "./gen/MediaVm";
 export type { MenuItemVm } from "./gen/MenuItemVm";
@@ -267,6 +270,7 @@ export type { PdfProbeVm } from "./gen/PdfProbeVm";
 export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ProviderKind } from "./gen/ProviderKind";
+export type { ProviderOfferVm } from "./gen/ProviderOfferVm";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
 export type { RecordingApplicationVm } from "./gen/RecordingApplicationVm";
 export type { RecordingCaptureSourcesPatchVm } from "./gen/RecordingCaptureSourcesPatchVm";
@@ -7789,6 +7793,17 @@ export async function accountSignOut(): Promise<OrgAccountVm> {
  */
 export async function accountForget(): Promise<OrgAccountVm> {
   return await invoke<OrgAccountVm>("account_forget");
+}
+
+/**
+ * Add an endpoint the person uses on another device, from the account's offer
+ * (Epic 84, AD-323): the endpoint, its account credential and its bots, in pin
+ * order. Rust refuses with its own sentence unless the offer uses the account
+ * and the account is usable now — the endpoint form, prefilled, is the way in
+ * then, because it has to ask for a key.
+ */
+export async function accountOfferAddProvider(key: string): Promise<void> {
+  await invoke<void>("account_offer_add_provider", { key });
 }
 
 /** Where a credential comes from: this device's keychain, or the account. */

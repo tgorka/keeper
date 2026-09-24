@@ -10,6 +10,10 @@
 // Every target — the phone signs in and reads its settings from the same
 // repository — and registered in the shared handler list.
 mod account_ipc;
+// The device's half of the account's settings sync (Epic 84): its drives,
+// providers and Matrix accounts as portable records, and where a pulled
+// setting is written. Every target, like the account itself.
+mod account_settings;
 // The Bots surface's sync-free commands (Epic 61, Story 61.4; split in Story
 // 62.1). On every target: a provider is a URL plus a credential and a
 // conversation two tables in the `keeper.db` every platform already opens.
@@ -408,6 +412,9 @@ pub fn run() {
                 // already on disk, straight after the stack they sit inside
                 // and before the first setting either could change is read.
                 // No network, and nothing at all without `account.toml`.
+                // The write-back observer (Epic 84, AD-325) goes in first, so
+                // no write of a synced setting from here on is missed.
+                account_ipc::watch_settings();
                 account_ipc::boot(app.state::<ipc::AppState>().platform.as_ref());
                 let imported = keeper_core::registry::import_config_file(&data_dir);
                 debug_log::init(&data_dir);
@@ -1008,6 +1015,7 @@ pub fn run() {
                 account_ipc::account_share,
                 account_ipc::account_sign_out,
                 account_ipc::account_forget,
+                account_ipc::account_offer_add_provider,
                 account_ipc::sync_credential_source_get,
                 account_ipc::sync_credential_source_set,
                 account_ipc::bots_provider_credential_source_get,

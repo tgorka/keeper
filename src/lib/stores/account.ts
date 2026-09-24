@@ -46,8 +46,8 @@ export const NO_ACCOUNT: OrgAccountVm = {
   devices: [],
   lastSyncedMs: null,
   forgeConnected: false,
-  offers: { drives: [], providers: [], matrix: [] },
   faults: [],
+  offers: { drives: [], providers: [], matrix: [] },
   revision: 0,
 };
 

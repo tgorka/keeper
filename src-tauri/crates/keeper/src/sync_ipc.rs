@@ -1350,6 +1350,8 @@ pub async fn sync_profile_save(
         state.inner(),
         crate::ipc::RecordingsIndexTrigger::because("a synced folder was saved"),
     );
+    // The drive travels in the person's `drives.toml` (Epic 84, AD-325).
+    crate::account_ipc::note_local_change();
     Ok(SyncProfileVm::from(&answer))
 }
 
@@ -1425,6 +1427,7 @@ pub async fn sync_profile_remove(
         state.inner(),
         crate::ipc::RecordingsIndexTrigger::because("a synced folder was removed").forgetting(id),
     );
+    crate::account_ipc::note_local_change();
     Ok(())
 }
 
@@ -2647,6 +2650,8 @@ pub async fn sync_folder_tasks_flag(
     engine
         .upsert_profile(&profile)
         .map_err(|err| sync_ipc_error(&err))?;
+    // The drive's tasks role travels in the person's `drives.toml`.
+    crate::account_ipc::note_local_change();
     let notice = subfolder.and_then(|subfolder| {
         keeper_sync::profile::folder::write_tasks_key(&profile, &subfolder).err()
     });

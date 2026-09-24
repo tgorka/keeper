@@ -89,6 +89,27 @@ export function forgetSentence(name: string): string {
   return `keeper signs out of ${name}, deletes this device's copy of your account's settings and its account.toml, and stops applying them. The repository on the server is untouched, and so are your other devices and other people.`;
 }
 
+/**
+ * The line under the status while settings are actually travelling (Epic 84,
+ * UX-DR118; fix R18): that settings sync with the account, and — only when
+ * there is something — what the person's other devices use that this one does
+ * not. It carries no time: the status sentence above already says when. Each
+ * count is left out at zero rather than said as "0 drives", and the whole
+ * second sentence is absent when every count is (AD-27).
+ */
+export function accountSyncLine(vm: OrgAccountVm): string {
+  const synced = "Your settings sync with this account.";
+  const counts = [
+    [vm.offers.drives.length, "drive", "drives"],
+    [vm.offers.providers.length, "bot provider", "bot providers"],
+    [vm.offers.matrix.length, "Matrix account", "Matrix accounts"],
+  ] as const;
+  const offered = counts
+    .filter(([n]) => n > 0)
+    .map(([n, one, many]) => `${n} ${n === 1 ? one : many}`);
+  return offered.length === 0 ? synced : `${synced} On your other devices: ${offered.join(", ")}.`;
+}
+
 export function AccountSection({ open }: { open: boolean }) {
   const vm = useAccountStore((s) => s.vm);
 
@@ -215,6 +236,11 @@ function ConfiguredAccount({ vm }: { vm: OrgAccountVm }) {
       )}
 
       {vm.sentence !== null && <p role="status">{vm.sentence}</p>}
+      {/* Only where settings do travel: a blocked directory or a dead grant is
+          exactly when they do not, and the status above says so. */}
+      {(vm.state === "ready" || vm.state === "syncing" || vm.state === "offline") && (
+        <p className="text-muted-foreground">{accountSyncLine(vm)}</p>
+      )}
       <Faults faults={vm.faults} />
       {error !== null && (
         <p role="alert" className="text-destructive">

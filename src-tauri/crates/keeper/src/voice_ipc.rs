@@ -859,6 +859,57 @@ pub fn voice_rearm() {
     });
 }
 
+/// The voice settings changed underneath the turn — the person's other
+/// device changed them, and a sync wrote them here (Epic 84, AD-325). The
+/// same effects [`voice_wake_set`] and [`voice_locale_set`] carry out, from
+/// what the registry now answers: the port's language, the stop phrase and
+/// the phrase armed or disarmed. A phrase this build would refuse to type is
+/// left unarmed rather than guessed at. Spawned, for [`voice_rearm`]'s
+/// reason; before [`boot`] there is nothing to arm, and boot reads the
+/// registry itself.
+pub fn voice_settings_applied() {
+    tauri::async_runtime::spawn(async {
+        let mut voice = voice();
+        let Some(data_dir) = voice.data_dir.clone() else {
+            return;
+        };
+        let (locale, enabled, phrase, stop_phrase) = match synced_voice_settings(&data_dir) {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::warn!(%error, "voice: the synced settings could not be read");
+                return;
+            }
+        };
+        voice.port.set_locale(locale);
+        match (
+            WakePhrase::parse(&phrase),
+            WakePhrase::parse_stop(&stop_phrase),
+        ) {
+            (Ok(wake), Ok(stop)) => {
+                voice.turn.set_stop(Some(stop));
+                arm(&mut voice, enabled.then_some(wake));
+            }
+            (wake, stop) => tracing::warn!(
+                wake_refused = wake.is_err(),
+                stop_refused = stop.is_err(),
+                "voice: a synced phrase was refused; the phrase stays as it was"
+            ),
+        }
+    });
+}
+
+/// The four voice settings a sync can change, as the registry answers them.
+fn synced_voice_settings(
+    data_dir: &Path,
+) -> Result<(Option<String>, bool, String, String), keeper_core::error::CoreError> {
+    Ok((
+        registry::get_bots_voice_locale(data_dir)?,
+        registry::get_bots_wake_enabled(data_dir)?,
+        registry::get_bots_wake_phrase(data_dir)?,
+        registry::get_bots_stop_phrase(data_dir)?,
+    ))
+}
+
 /// Ask for the recogniser and the microphone, by name, once, with the reason
 /// the plist strings give — on this deliberate act and never at launch
 /// (FR-408, AD-171). `None` when both are granted; otherwise why not, in the

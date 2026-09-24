@@ -21,6 +21,7 @@ import {
   ACCOUNT_SECTION_TITLE,
   ACCOUNT_SIGN_OUT_LABEL,
   AccountSection,
+  accountSyncLine,
 } from "@/components/settings/account-section";
 import type { OrgAccountVm } from "@/lib/ipc/client";
 import {
@@ -32,7 +33,7 @@ import {
   accountSync,
 } from "@/lib/ipc/client";
 import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
-import { accountVm } from "@/test/account-fixture";
+import { accountVm, driveOffer, matrixOffer, providerOffer } from "@/test/account-fixture";
 
 const mockState = vi.mocked(accountState);
 
@@ -269,5 +270,54 @@ describe("AccountSection signed in", () => {
 
     expect(screen.getByRole("status")).toHaveTextContent("Syncing your settings…");
     expect(screen.queryByRole("button", { name: "Cancel sign-in" })).not.toBeInTheDocument();
+  });
+});
+
+describe("AccountSection's settings line (Epic 84, UX-DR118)", () => {
+  const SYNCED = "Your settings sync with this account.";
+
+  it("says settings sync here, with no time of its own — the status already says when", () => {
+    accountStore.getState().setVm(accountVm({ lastSyncedMs: Date.UTC(2026, 8, 24, 12, 0) }));
+    render(<AccountSection open />);
+    expect(screen.getByText(SYNCED)).toBeInTheDocument();
+    expect(screen.queryByText(/Last synced/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/On your other devices/)).not.toBeInTheDocument();
+  });
+
+  it("stays while offline, where the settings last synced are still the ones in use", () => {
+    accountStore
+      .getState()
+      .setVm(accountVm({ state: "offline", sentence: "Offline — using settings from 14:02." }));
+    render(<AccountSection open />);
+    expect(screen.getByText(SYNCED)).toBeInTheDocument();
+  });
+
+  it("is absent wherever settings do not travel, though an identity is still held", () => {
+    for (const state of ["blocked", "needsSignIn", "signedOut"] as const) {
+      accountStore.getState().setVm(accountVm({ state, revision: 0 }));
+      const view = render(<AccountSection open />);
+      expect(screen.queryByText(new RegExp(SYNCED))).not.toBeInTheDocument();
+      view.unmount();
+    }
+  });
+
+  it("counts what the other devices use, leaving out zeros and saying one as one", () => {
+    const offers = (drives: number, providers: number, matrix: number) =>
+      accountVm({
+        offers: {
+          drives: Array.from({ length: drives }, (_, i) => driveOffer({ key: `d${i}` })),
+          providers: Array.from({ length: providers }, (_, i) => providerOffer({ key: `p${i}` })),
+          matrix: Array.from({ length: matrix }, (_, i) => matrixOffer({ key: `m${i}` })),
+        },
+      });
+    expect(accountSyncLine(offers(2, 1, 0))).toBe(
+      `${SYNCED} On your other devices: 2 drives, 1 bot provider.`,
+    );
+    expect(accountSyncLine(offers(1, 2, 3))).toBe(
+      `${SYNCED} On your other devices: 1 drive, 2 bot providers, 3 Matrix accounts.`,
+    );
+    expect(accountSyncLine(offers(0, 0, 1))).toBe(
+      `${SYNCED} On your other devices: 1 Matrix account.`,
+    );
   });
 });

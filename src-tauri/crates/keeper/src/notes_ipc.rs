@@ -1715,6 +1715,8 @@ pub async fn notes_vault_flag(
         .upsert_profile(&profile)
         .map_err(|error| crate::sync_ipc::sync_ipc_error(&error))?;
     notes_vault::refresh(&app);
+    // The drive's notes role travels in the person's `drives.toml`.
+    crate::account_ipc::note_local_change();
 
     // An unflagged profile has no vault to describe, and a vault whose folder is
     // not mounted right now is not registered either. Both answer with what is
@@ -1779,6 +1781,7 @@ pub async fn notes_vault_settings_save(
         .upsert_profile(&profile)
         .map_err(|error| crate::sync_ipc::sync_ipc_error(&error))?;
     notes_vault::refresh(&app);
+    crate::account_ipc::note_local_change();
     let vault = vault_of(&vault_id)?;
     let unread = notes_vault::unread_count(state.platform.as_ref(), &vault.id);
     Ok(notes_vault::vault_vm(&vault, unread))
@@ -2003,10 +2006,17 @@ pub fn notes_embedding_model_set(
     });
     if previous != model {
         registry::set_embedding_model(&dir, model).map_err(crate::ipc::to_ipc_error)?;
-        *LAST_EMBEDDING.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        notes_vault::embedding_model_changed();
+        embedding_model_applied();
     }
     Ok(())
+}
+
+/// The embedding model changed: what the last query embedded with is stale,
+/// and every vault's index re-embeds. Also what a sync calls when it writes
+/// the model another device chose (Epic 84).
+pub(crate) fn embedding_model_applied() {
+    *LAST_EMBEDDING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    notes_vault::embedding_model_changed();
 }
 
 /// Drop the index cache and cold-scan; progress arrives on the index channel.

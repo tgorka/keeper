@@ -27,6 +27,11 @@ vi.mock("@/lib/ipc/client", () => ({
   syncProblems: vi.fn(() =>
     Promise.resolve({ warning: null, error: null, parked: [], conflicts: [], unspellable: [] }),
   ),
+  // Epic 84: an offered drive can arrive with its task ledger on and signing
+  // with the account, so its add makes both second writes.
+  syncFolderTasksFlag: vi.fn(() => Promise.resolve({ notice: null })),
+  syncCredentialSourceGet: vi.fn(() => Promise.resolve("keychain")),
+  syncCredentialSourceSet: vi.fn(() => Promise.resolve()),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -43,6 +48,9 @@ import {
   SYNC_DEVICE_SAVED_SENTENCE,
   SYNC_NO_PROFILES_SENTENCE,
   SYNC_NOW_LABEL,
+  SYNC_OFFER_ADD_LABEL,
+  SYNC_OFFER_DRAFT_SENTENCE,
+  SYNC_OFFERS_SENTENCE,
   SYNC_OPEN_PATH_LABEL,
   SYNC_PAUSE_LABEL,
   SYNC_PROGRESS_LABEL,
@@ -68,17 +76,25 @@ import {
   SYNC_EXCLUDES_LABEL,
   SYNC_FORM_PATH_TESTID,
   SYNC_NAME_LABEL,
+  SYNC_NOTES_LABEL,
+  SYNC_NOTES_SUBFOLDER_LABEL,
+  SYNC_RECORDINGS_LABEL,
   SYNC_REMOTE_URL_LABEL,
   SYNC_SETTLE_LABEL,
   SYNC_SUBPATHS_LABEL,
   SYNC_TAGS_LABEL,
+  SYNC_TASKS_LABEL,
+  SYNC_TASKS_SUBFOLDER_LABEL,
   SYNC_TOKEN_EDIT_NOTE,
   SYNC_TOKEN_FAILED_PREFIX,
   SYNC_TOKEN_LABEL,
   SYNC_TOKEN_SHOW_LABEL,
+  syncAccountCredentialLabel,
 } from "@/components/sync/add-folder-form";
+import { ACCOUNT_OFFERS_TITLE } from "@/lib/account-offers";
 import type { SyncOutcomeVm, SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
 import {
+  syncCredentialSourceSet,
   syncDevice,
   syncDeviceSetLabel,
   syncFolderNow,
@@ -92,9 +108,11 @@ import {
   syncStatuses,
   syncVerify,
 } from "@/lib/ipc/client";
+import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { resetSyncStoreForTest } from "@/lib/stores/sync";
 import { resetSyncDetailStoreForTest } from "@/lib/stores/sync-detail";
+import { accountVm, driveOffer } from "@/test/account-fixture";
 
 const mockProfiles = vi.mocked(syncProfiles);
 const mockStatuses = vi.mocked(syncStatuses);
@@ -729,6 +747,118 @@ describe("SyncSection add-profile form", () => {
       "git@github.com:alice/half-typed",
     );
     expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent("relative/path");
+  });
+});
+
+describe("SyncSection drives from the account (Epic 84, UX-DR118)", () => {
+  afterEach(() => {
+    accountStore.setState({ vm: NO_ACCOUNT, setupLink: null });
+  });
+
+  it("has no offers block while the account offers no drive", async () => {
+    accountStore.getState().setVm(accountVm());
+    render(<SyncSection open />);
+    await screen.findByText(RUST_LINE);
+    expect(screen.queryByRole("region", { name: ACCOUNT_OFFERS_TITLE })).not.toBeInTheDocument();
+    expect(screen.queryByText(SYNC_OFFERS_SENTENCE)).not.toBeInTheDocument();
+  });
+
+  it("opens the add form prefilled from the offer, and adds it with the account", async () => {
+    const offer = driveOffer({ credential: "account" });
+    accountStore
+      .getState()
+      .setVm(accountVm({ offers: { drives: [offer], providers: [], matrix: [] } }));
+    mockPicker.mockResolvedValue("/Users/alice/acme-notes");
+    mockSave.mockResolvedValue(profileVm({ id: "p2", name: offer.name }));
+    render(<SyncSection open />);
+    await screen.findByText(RUST_LINE);
+
+    const block = screen.getByRole("region", { name: ACCOUNT_OFFERS_TITLE });
+    expect(block).toHaveTextContent(SYNC_OFFERS_SENTENCE);
+    expect(block).toHaveTextContent("git.acme.dev");
+    expect(block).toHaveTextContent("on iphone-3f2a, ipad-91c0");
+    // The blank add form sits below; the offer's Add… fills THAT form.
+    expect(screen.getByLabelText(SYNC_NAME_LABEL)).toHaveValue("");
+    fireEvent.click(
+      within(block).getByRole("button", { name: `${SYNC_OFFER_ADD_LABEL} ${offer.name}` }),
+    );
+
+    expect(screen.getByLabelText(SYNC_NAME_LABEL)).toHaveValue("Acme notes");
+    expect(screen.getByLabelText(SYNC_REMOTE_URL_LABEL)).toHaveValue(
+      "https://git.acme.dev/tgorka/notes.git",
+    );
+    expect(screen.getByRole("switch", { name: SYNC_NOTES_LABEL })).toBeChecked();
+    expect(screen.getByLabelText(SYNC_NOTES_SUBFOLDER_LABEL)).toHaveValue("vault");
+    expect(screen.getByRole("switch", { name: SYNC_TASKS_LABEL })).toBeChecked();
+    expect(screen.getByLabelText(SYNC_TASKS_SUBFOLDER_LABEL)).toHaveValue("ledger");
+    expect(screen.getByRole("switch", { name: SYNC_RECORDINGS_LABEL })).not.toBeChecked();
+    // The offer signs with the account and the account can stand in: chosen.
+    expect(screen.getByLabelText(syncAccountCredentialLabel("Acme"))).toBeChecked();
+    // The folder is still this device's to choose — and the person is taken
+    // straight to it.
+    expect(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL })).toBeDisabled();
+    expect(screen.getByRole("button", { name: SYNC_CHOOSE_FOLDER_LABEL })).toHaveFocus();
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_CHOOSE_FOLDER_LABEL }));
+    await waitFor(() =>
+      expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent(
+        "/Users/alice/acme-notes",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: null,
+          name: "Acme notes",
+          localPath: "/Users/alice/acme-notes",
+          remoteUrl: "https://git.acme.dev/tgorka/notes.git",
+          branch: "trunk",
+          excludes: [".DS_Store"],
+          notes: true,
+          notesSubfolder: "vault",
+          recordings: false,
+          tasks: true,
+          tasksSubfolder: "ledger",
+        }),
+      ),
+    );
+    await waitFor(() =>
+      expect(vi.mocked(syncCredentialSourceSet)).toHaveBeenCalledWith("p2", "account"),
+    );
+    // Added: not offered again, though the account's snapshot still lists it
+    // until a later sync reaches the repository.
+    await waitFor(() =>
+      expect(screen.queryByRole("region", { name: ACCOUNT_OFFERS_TITLE })).not.toBeInTheDocument(),
+    );
+    expect(accountStore.getState().vm.offers.drives).toHaveLength(1);
+  });
+
+  it("asks for a token instead when the offered drive has its own", async () => {
+    accountStore
+      .getState()
+      .setVm(accountVm({ offers: { drives: [driveOffer()], providers: [], matrix: [] } }));
+    render(<SyncSection open />);
+    await screen.findByText(RUST_LINE);
+    fireEvent.click(screen.getByRole("button", { name: `${SYNC_OFFER_ADD_LABEL} Acme notes` }));
+    expect(screen.getByLabelText(syncAccountCredentialLabel("Acme"))).not.toBeChecked();
+  });
+
+  it("never throws away a folder being added: it says so and takes the person to it", async () => {
+    accountStore
+      .getState()
+      .setVm(accountVm({ offers: { drives: [driveOffer()], providers: [], matrix: [] } }));
+    render(<SyncSection open />);
+    await screen.findByText(RUST_LINE);
+    fireEvent.change(screen.getByLabelText(SYNC_NAME_LABEL), { target: { value: "my draft" } });
+
+    fireEvent.click(screen.getByRole("button", { name: `${SYNC_OFFER_ADD_LABEL} Acme notes` }));
+
+    expect(screen.getByLabelText(SYNC_NAME_LABEL)).toHaveValue("my draft");
+    expect(screen.getByLabelText(SYNC_REMOTE_URL_LABEL)).toHaveValue("");
+    expect(screen.getByText(SYNC_OFFER_DRAFT_SENTENCE)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: SYNC_CHOOSE_FOLDER_LABEL })).toHaveFocus();
   });
 });
 
