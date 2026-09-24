@@ -193,6 +193,8 @@ vi.mock("@/lib/ipc/client", () => ({
   syncProfileSetEnabled: vi.fn(),
   syncFolderNow: vi.fn(),
   syncVerify: vi.fn(),
+  // Settings › Sync's "New drives go in": absent here, as on a phone.
+  syncDriveFolderGet: vi.fn(() => Promise.resolve(null)),
   // The git report (Story 34.14) renders BESIDE the `sync` gate, so it mounts on
   // every desktop tier including one with sync off. `unsupported` is the default
   // here because that is the one state which renders nothing, leaving every

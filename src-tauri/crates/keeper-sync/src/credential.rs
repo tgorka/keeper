@@ -14,8 +14,8 @@
 //!
 //! | consumer | shape | why |
 //! |---|---|---|
-//! | `git` fetch/push | token as the Basic **username**, inert password | what the credential helper feeds git; Forgejo and GitHub both accept it |
-//! | LFS batch + object transfer | `Authorization: Basic base64("<token>:")` | the same Basic credential, pre-encoded because there is no helper in the way |
+//! | `git` fetch/push | token as the Basic **username**, inert password; a GitHub App installation token (`ghs_…`) as the **password** under `x-access-token` | what the credential helper feeds git; Forgejo and GitHub accept a PAT or OAuth token as the username, but GitHub refuses an installation token there (measured 2026-09-24: 401 as username, 200 as `x-access-token:<token>`) |
+//! | LFS batch + object transfer | `Authorization: Basic base64("<username>:<password>")` of that same pair | the same Basic credential, pre-encoded because there is no helper in the way |
 //! | Forgejo REST API | `Authorization: token <token>` | Gitea/Forgejo's own API scheme (`services/auth/basic.go`), which is **not** interchangeable with Basic |
 //!
 //! A fourth consumer gets a method here or it does not get the token.
@@ -27,6 +27,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 
 use crate::git::fetch::Credential;
+
+/// GitHub's documented prefix for a GitHub App installation token.
+const GITHUB_INSTALLATION_PREFIX: &str = "ghs_";
+/// The user name GitHub requires in front of an installation token.
+const GITHUB_INSTALLATION_USER: &str = "x-access-token";
 
 /// A profile's access token, and the only thing allowed to dress it.
 ///
@@ -50,28 +55,44 @@ impl AccessToken {
         Self(raw.into())
     }
 
-    /// The credential `git fetch`/`git push` is given.
+    /// The Basic pair every git-over-HTTPS consumer sends.
     ///
     /// The token goes in the **username** with an inert password: that is the
-    /// shape Forgejo and GitHub both accept, and putting it in the password
-    /// with an empty username is the shape neither does.
+    /// shape Forgejo and GitHub both accept for a personal or OAuth token, and
+    /// putting it in the password with an empty username is the shape neither
+    /// does. A GitHub App installation token is the exception: GitHub answers
+    /// 401 to it as a username and accepts it only as the password of
+    /// `x-access-token`, which is how an organization's token broker
+    /// (`[github_broker]`) hands drives their tokens. GitHub documents the
+    /// `ghs_` prefix as marking exactly that kind of token.
+    fn basic_pair(&self) -> (&str, &str) {
+        if self.0.starts_with(GITHUB_INSTALLATION_PREFIX) {
+            (GITHUB_INSTALLATION_USER, &self.0)
+        } else {
+            (&self.0, "")
+        }
+    }
+
+    /// The credential `git fetch`/`git push` is given ([`Self::basic_pair`]).
     pub fn git(&self) -> Credential {
+        let (username, secret) = self.basic_pair();
         Credential {
-            username: self.0.clone(),
-            secret: String::new(),
+            username: username.to_owned(),
+            secret: secret.to_owned(),
         }
     }
 
     /// `Authorization` for the LFS batch API and every `basic`-adapter transfer.
     ///
     /// The same credential [`Self::git`] returns, encoded by hand because no
-    /// credential helper stands between us and the socket here. The empty
-    /// password after the colon is deliberate and is what Forgejo's
+    /// credential helper stands between us and the socket here. For a token
+    /// login the password after the colon is empty, which is what Forgejo's
     /// `parseToken` reads as a token login.
     pub fn lfs_basic(&self) -> String {
-        // `<token>:` — RFC 7617 user-id, colon, empty password. The user-id
-        // may not itself contain a colon; a PAT never does.
-        format!("Basic {}", BASE64.encode(format!("{}:", self.0)))
+        // RFC 7617 user-id, colon, password. The user-id may not itself
+        // contain a colon; a token never does.
+        let (username, password) = self.basic_pair();
+        format!("Basic {}", BASE64.encode(format!("{username}:{password}")))
     }
 
     /// `Authorization` for the Forgejo REST API (`/api/v1/...`).
@@ -159,6 +180,33 @@ mod tests {
         // And the three are genuinely different strings, which is the whole
         // reason they live together.
         assert_ne!(token.lfs_basic(), token.forge_api());
+    }
+
+    /// A GitHub App installation token (what `[github_broker]` hands a drive)
+    /// is refused by GitHub as a user name, for git and LFS alike, and taken
+    /// as the password of `x-access-token`. Measured against github.com on
+    /// 2026-09-24: 401 one way, 200 the other.
+    #[test]
+    fn an_installation_token_is_the_password_of_x_access_token() {
+        let token = AccessToken::new("ghs_abc123");
+
+        let git = token.git();
+        assert_eq!(git.username, "x-access-token");
+        assert_eq!(git.secret, "ghs_abc123");
+
+        let encoded = token
+            .lfs_basic()
+            .strip_prefix("Basic ")
+            .map(str::to_owned)
+            .expect("a Basic header");
+        let decoded = BASE64.decode(encoded).expect("the header must decode");
+        assert_eq!(
+            String::from_utf8_lossy(&decoded),
+            "x-access-token:ghs_abc123"
+        );
+
+        // An OAuth token that merely contains the prefix later on is not one.
+        assert_eq!(AccessToken::new("gho_ghs_x").git().username, "gho_ghs_x");
     }
 
     #[test]

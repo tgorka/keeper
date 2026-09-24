@@ -58,10 +58,21 @@ import { syncErrorMessage } from "@/lib/stores/sync";
 export const SETUP_SHEET_TITLE = "Set up an account";
 export const SETUP_RESOLVING = "Reading the setup link…";
 export const SETUP_DISCLOSURE =
-  "Check both hosts before you continue. keeper writes nothing until you do.";
+  "Check every host before you continue. keeper writes nothing until you do.";
 export const SETUP_ACCOUNT_LABEL = "Account";
 export const SETUP_ISSUER_LABEL = "Signs in at";
 export const SETUP_REPO_LABEL = "Keeps your settings at";
+/** The GitHub broker a descriptor names (Epic 86, AD-333): a third host to check. */
+export const SETUP_BROKER_LABEL = "Gets GitHub access from";
+/**
+ * Every OTHER host keeper would hand a repository token to under this
+ * descriptor (Epic 86 fix B1, Rust's `AccountSetupVm.forgeHosts`): the web
+ * and API hosts of each GitHub source it adds — a broker adds github.com and
+ * api.github.com. The account's own forge is the settings host above, and the
+ * broker has its own row. A descriptor that pointed GitHub's API at somebody
+ * else's server would show that server here, before anything is written.
+ */
+export const SETUP_FORGE_HOSTS_LABEL = "Also sends repository tokens to";
 export const SETUP_DEVICE_LABEL = "This device's name";
 export const SETUP_DEVICE_NOTE =
   "Names this device's files in your settings repository. You can rename it later.";
@@ -400,7 +411,7 @@ function SetupFlow({ link }: { link: string }) {
   );
 }
 
-/** The four facts a person is asked to check, as a definition list. */
+/** The facts a person is asked to check, as a definition list. */
 function SetupFacts({ setup }: { setup: AccountSetupVm }) {
   return (
     <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2">
@@ -410,6 +421,26 @@ function SetupFacts({ setup }: { setup: AccountSetupVm }) {
       <dd className="break-all font-mono">{setup.issuerHost}</dd>
       <dt className="text-muted-foreground">{SETUP_REPO_LABEL}</dt>
       <dd className="break-all font-mono">{setup.repoHost}</dd>
+      {setup.brokerHost !== null && (
+        <>
+          <dt className="text-muted-foreground">{SETUP_BROKER_LABEL}</dt>
+          <dd className="break-all font-mono">{setup.brokerHost}</dd>
+        </>
+      )}
+      {setup.forgeHosts.length > 0 && (
+        <>
+          <dt className="text-muted-foreground">{SETUP_FORGE_HOSTS_LABEL}</dt>
+          <dd>
+            <ul aria-label={SETUP_FORGE_HOSTS_LABEL} className="flex flex-col gap-0.5">
+              {setup.forgeHosts.map((host) => (
+                <li key={host} className="break-all font-mono">
+                  {host}
+                </li>
+              ))}
+            </ul>
+          </dd>
+        </>
+      )}
       <dt className="text-muted-foreground">{SETUP_CLASS_LABEL}</dt>
       <dd>{DEVICE_CLASS_LABEL[setup.deviceClass]}</dd>
     </dl>

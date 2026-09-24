@@ -45,6 +45,7 @@
  */
 
 import { mockIPC } from "@tauri-apps/api/mocks";
+import { remoteOnSourceHost } from "@/lib/forge-repos";
 import type {
   AccountDeviceVm,
   AccountOffersVm,
@@ -72,12 +73,22 @@ import type {
   BotVm,
   CapabilitiesVm,
   CopyJobVm,
+  CredentialChoicesVm,
+  DeviceCodeVm,
   DocumentVm,
+  DriveFolderVm,
   FileSizeVm,
   FilesEntrySyncVm,
   FilesEntryVm,
   FilesListingVm,
   FilesReleaseVm,
+  ForgeAddReq,
+  ForgeAddResultVm,
+  ForgeNoticeVm,
+  ForgeOwnerVm,
+  ForgeReposVm,
+  ForgeRepoVm,
+  ForgeSourceVm,
   GrantScope,
   HotkeyVm,
   OrgAccountVm,
@@ -3402,6 +3413,365 @@ function mockQrSvg(link: string): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size + 8} ${size + 8}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#fff"/><g fill="#000">${cells.join("")}</g></svg>`;
 }
 
+// ---------------------------------------------------------------------------
+// Repository sources (Epic 86, UX-DR120). Every state of the Browse sheet is
+// reachable from the URL:
+//   - `?account=ready` — two sources: the account's Forgejo (you + the `keeper`
+//     org) and GitHub through the broker (you + two orgs, a restricted-org
+//     notice, one owner the app is not installed on). Other `account=` values
+//     put the account's forge in `needsSignIn` / `unreachable`.
+//   - no account — GitHub alone, by device flow, `notConnected`: Connect shows
+//     a code, and the wait resolves connected after a few seconds (or on
+//     Cancel, `notConnected`).
+//   - `?github=notConnected | unreachable | empty` — GitHub in that state
+//     (`empty`: connected with nothing to list); `?forges=none` — no source,
+//     so every entry point is absent.
+//   - `?github=noGrants` — the broker answers no grants and a device-flow
+//     client id exists, so GitHub is `notConnected` through the broker and
+//     still offers Connect GitHub (`canConnect`, surface #2).
+//   - `?github=fails` — GitHub's first listing fails ("Can't reach …"), and
+//     the shell REMEMBERS it: `forges_list` answers GitHub `unreachable` until
+//     a `forge_repos(…, refresh: true)` succeeds, which is what Try again has
+//     to send (surface #1). A listing that re-read only the sources would stay
+//     stuck here, as it would in the app.
+//   - some repositories are read-only (`r` below), archived or mirrors: their
+//     rows say keeper only downloads them, and the batch adds them pull-only.
+//   - the batch step: a drive named `playground` comes back "holds other
+//     files", the rest are added.
+// ---------------------------------------------------------------------------
+
+const forgesParam = new URLSearchParams(window.location.search).get("forges");
+const githubParam = new URLSearchParams(window.location.search).get("github");
+const BROKER_HOST = "electra.siren-alsephina.ts.net:8455";
+/** The device-flow client id the mock's GitHub source can connect with. */
+const MOCK_GITHUB_CLIENT_ID = "Iv1.0000mockclient";
+/** GitHub through the broker while an account is set up; device flow without one. */
+let githubVia: ForgeSourceVm["via"] =
+  accountVm.configured && githubParam !== "notConnected" ? "broker" : "deviceFlow";
+let githubConnected =
+  githubParam === "connected" ||
+  githubParam === "empty" ||
+  githubParam === "fails" ||
+  (githubVia === "broker" && githubParam !== "unreachable" && githubParam !== "noGrants");
+/** The open device-flow wait, so Cancel can end it as the shell's flag does. */
+let githubConnectSettle: ((connected: boolean) => void) | null = null;
+/** `?github=fails`: the next GitHub listing fails once. */
+let githubFailsNext = githubParam === "fails";
+/**
+ * Why a source's last listing failed, as the shell's `LAST_ERROR` holds it:
+ * `forges_list` answers the source from this until a listing replaces it or
+ * the account changes.
+ */
+const forgeErrors = new Map<string, Pick<ForgeSourceVm, "state" | "sentence">>();
+/** Settings › Sync's "New drives go in", as the person chose it; `null` is keeper's default. */
+let chosenDriveFolder: string | null = null;
+const MOCK_HOME = "/Users/tgorka";
+
+function mockDriveFolder(): DriveFolderVm | null {
+  if (new URLSearchParams(window.location.search).get("platform") === "phone") {
+    return null;
+  }
+  return chosenDriveFolder === null
+    ? { path: `${MOCK_HOME}/keeper/git`, chosen: false }
+    : { path: chosenDriveFolder, chosen: true };
+}
+
+function withStoredError(source: ForgeSourceVm): ForgeSourceVm {
+  const stored = forgeErrors.get(source.id);
+  return stored === undefined ? source : { ...source, ...stored };
+}
+
+function githubSource(): ForgeSourceVm {
+  const base = {
+    id: "github",
+    kind: "github" as const,
+    name: "GitHub",
+    host: "github.com",
+    via: githubVia,
+    credential: "forge:github",
+    // The built-in client id exists in the mock whatever `via` is, so the
+    // broker's no-grants answer still offers Connect GitHub.
+    canConnect: true,
+    appsUrl: `https://github.com/settings/connections/applications/${MOCK_GITHUB_CLIENT_ID}`,
+  };
+  if (githubParam === "unreachable") {
+    return {
+      ...base,
+      canConnect: false,
+      appsUrl: null,
+      state: "unreachable",
+      login: null,
+      sentence: `Your account has no GitHub access on ${BROKER_HOST}. Ask its administrator to add you.`,
+    };
+  }
+  return githubConnected
+    ? { ...base, state: "connected", login: "tgorka", sentence: null }
+    : { ...base, state: "notConnected", login: null, sentence: null };
+}
+
+function accountForgeSource(): ForgeSourceVm {
+  const base = {
+    id: "account-forge",
+    kind: "forgejo" as const,
+    name: accountVm.name ?? "Forgejo",
+    host: accountVm.repoHost ?? "git.acme.dev",
+    via: "accountForge" as const,
+    login: accountVm.identity?.login ?? null,
+    credential: "account",
+    canConnect: false,
+    appsUrl: null,
+  };
+  if (accountVm.state === "ready" || accountVm.state === "syncing") {
+    return { ...base, state: "connected", sentence: null };
+  }
+  if (accountVm.state === "offline") {
+    return { ...base, state: "unreachable", sentence: `Can't reach ${base.host}.` };
+  }
+  return { ...base, state: "needsSignIn", sentence: accountVm.sentence };
+}
+
+function forgeSources(): ForgeSourceVm[] {
+  if (forgesParam === "none") {
+    return [];
+  }
+  const sources = accountVm.configured ? [accountForgeSource(), githubSource()] : [githubSource()];
+  return sources.map(withStoredError);
+}
+
+/** `[owner, name, description, minutes since update, size in kB, flags]`; flags p/f/a/t/m/r (r: read-only). */
+type RepoSeed = readonly [string, string, string | null, number, number, string?];
+
+const GITHUB_REPOS: readonly RepoSeed[] = [
+  ["tgorka", "keeper", "Beeper-style Matrix client that keeps your folders in sync.", 12, 184_320],
+  ["tgorka", "dotfiles", "Shell, editor and terminal configuration.", 180, 2_140, "p"],
+  ["tgorka", "field-recordings", "Raw audio from walks, sorted by place.", 60 * 26, 9_800_000, "p"],
+  ["tgorka", "playground", "Throwaway experiments.", 60 * 24 * 3, 512, "p"],
+  ["tgorka", "notes-template", "A starting point for a notes vault.", 60 * 24 * 40, 64, "t"],
+  ["tgorka", "matrix-rust-sdk", "Matrix Client-Server SDK for Rust.", 60 * 24 * 9, 96_000, "f"],
+  [
+    "tgorka",
+    "tauri",
+    "Build smaller, faster, and more secure desktop applications.",
+    60 * 24 * 30,
+    210_000,
+    "f",
+  ],
+  ["tgorka", "old-blog", "The blog before the blog.", 60 * 24 * 900, 18_000, "a"],
+  ["tgorka", "thesis", "LaTeX sources and figures.", 60 * 24 * 1200, 44_000, "pa"],
+  ["tgorka", "photos-2025", null, 60 * 24 * 60, 12_400_000, "p"],
+  [
+    "tgorka",
+    "recipes",
+    "Things worth cooking twice, with a very long description that has to truncate at one line because nobody wants a paragraph in a list row.",
+    60 * 24 * 5,
+    320,
+  ],
+  ["tgorka", "homelab", "Ansible for the machines under the desk.", 60 * 24 * 2, 1_280, "p"],
+  ["tgorka", "cv", null, 60 * 24 * 120, 900, "p"],
+  ["tgorka", "gitea-mirror", "Mirror of an old self-hosted forge.", 60 * 24 * 14, 6_000, "m"],
+  ["tgorka", "advent-of-code", "Solutions, mostly Rust.", 60 * 24 * 280, 1_700],
+  ["tgorka", "keyboard-layouts", "QMK keymaps.", 60 * 24 * 45, 250],
+  ["makistack", "infra", "Terraform and the runbooks that go with it.", 45, 5_600, "p"],
+  ["makistack", "handbook", "How we work.", 60 * 5, 3_300, "pr"],
+  [
+    "makistack",
+    "github-broker",
+    "Short-lived GitHub App tokens for the team's tools.",
+    90,
+    420,
+    "p",
+  ],
+  [
+    "makistack",
+    "design-system",
+    "Tokens, components and the check that keeps them honest.",
+    60 * 24,
+    12_000,
+  ],
+  ["makistack", "api", "The public API.", 60 * 3, 28_000, "pr"],
+  ["makistack", "web", "The marketing site.", 60 * 24 * 4, 64_000],
+  ["makistack", "mobile", "iOS and Android apps.", 60 * 24 * 6, 140_000, "p"],
+  ["makistack", "legacy-admin", "Replaced by api/admin.", 60 * 24 * 400, 20_000, "pa"],
+  ["makistack", "project-template", "Scaffolding for a new service.", 60 * 24 * 70, 80, "t"],
+  [
+    "makistack",
+    "openapi-generator",
+    "OpenAPI Generator, with our patches.",
+    60 * 24 * 20,
+    190_000,
+    "f",
+  ],
+  ["makistack", "roadmap", null, 60 * 24 * 2, 40, "p"],
+  ["makistack", "brand", "Logos, fonts and the rules for using them.", 60 * 24 * 33, 88_000, "p"],
+  ["hesperia-labs", "sensor-firmware", "Firmware for the field sensors.", 60 * 8, 4_200, "p"],
+  ["hesperia-labs", "datasets", "Published measurement sets.", 60 * 24 * 11, 2_400_000],
+  ["hesperia-labs", "notebooks", "Analysis notebooks.", 60 * 24, 38_000, "p"],
+  ["hesperia-labs", "papers", "Drafts and camera-ready versions.", 60 * 24 * 16, 15_000, "p"],
+  ["hesperia-labs", "calibration", "Calibration curves per sensor batch.", 60 * 24 * 90, 700, "pa"],
+];
+
+const FORGEJO_REPOS: readonly RepoSeed[] = [
+  ["tgorka", "notes", "The notes vault.", 20, 48_000, "p"],
+  ["tgorka", "journal", "Daily pages.", 60 * 10, 6_100, "p"],
+  ["tgorka", "scratch", null, 60 * 24 * 8, 90, "p"],
+  ["keeper", "keeper-config", "Shared settings for keeper on every device.", 60 * 2, 120, "p"],
+  ["keeper", "policies", "What the admins decided, readable by everyone.", 60 * 24 * 6, 80, "pr"],
+  ["keeper", "team-notes", "What the team writes down.", 60 * 24, 21_000, "p"],
+  ["keeper", "recordings", "Meeting recordings.", 60 * 24 * 3, 3_600_000, "p"],
+  ["keeper", "archive-2024", "Last year's drive.", 60 * 24 * 300, 9_000, "pa"],
+];
+
+/** Drives this device has for a repository before the harness added anything. */
+const FORGE_ADDED: Record<string, string[]> = {
+  "tgorka/dotfiles": ["dotfiles"],
+  "makistack/infra": ["infra"],
+  "keeper/keeper-config": ["keeper-config"],
+};
+/** Device slugs from the account's manifest that sync a repository elsewhere. */
+const FORGE_ELSEWHERE: Record<string, string[]> = {
+  "tgorka/notes": ["iphone-3f2a"],
+  "tgorka/field-recordings": ["iphone-3f2a", "ipad-91c0"],
+  "makistack/handbook": ["ipad-91c0"],
+  "keeper/team-notes": ["ipad-91c0"],
+};
+
+/** Rust's one sentence for a repository keeper can only read, in its order. */
+function pullOnlySentence(canPush: boolean, archived: boolean, mirror: boolean): string | null {
+  if (!canPush) {
+    return "You can only read this repository, so keeper only downloads it.";
+  }
+  if (archived) {
+    return "This repository is archived, so keeper only downloads it.";
+  }
+  if (mirror) {
+    return "This repository is a mirror, so keeper only downloads it.";
+  }
+  return null;
+}
+
+function forgeRepoVm(host: string, seed: RepoSeed): ForgeRepoVm {
+  const [owner, name, description, minutes, sizeKb, flags = ""] = seed;
+  const fullName = `${owner}/${name}`;
+  const cloneUrl = `https://${host}/${fullName}.git`;
+  // Marked as `forges::mark` does: this device's drives on the same remote.
+  const here = (ANSWERS.sync_profiles as SyncProfileVm[])
+    .filter((profile) => mockRemoteKey(profile.remoteUrl, "") === mockRemoteKey(cloneUrl, ""))
+    .map((profile) => profile.name);
+  const archived = flags.includes("a");
+  const mirror = flags.includes("m");
+  const canPush = !flags.includes("r");
+  const sentence = pullOnlySentence(canPush, archived, mirror);
+  return {
+    fullName,
+    owner,
+    name,
+    description,
+    private: flags.includes("p"),
+    fork: flags.includes("f"),
+    archived,
+    template: flags.includes("t"),
+    mirror,
+    defaultBranch: "main",
+    cloneUrl,
+    webUrl: `https://${host}/${fullName}`,
+    updatedMs: ago(minutes),
+    sizeKb,
+    canPush,
+    addedAs: [...new Set([...(FORGE_ADDED[fullName] ?? []), ...here])],
+    elsewhere: FORGE_ELSEWHERE[fullName] ?? [],
+    pullOnly: sentence !== null,
+    pullOnlySentence: sentence,
+  };
+}
+
+function forgeReposVm(sourceId: string): ForgeReposVm {
+  const github = sourceId === "github";
+  const seeds = github ? (githubParam === "empty" ? [] : GITHUB_REPOS) : FORGEJO_REPOS;
+  const host = github ? "github.com" : (accountVm.repoHost ?? "git.acme.dev");
+  const repos = seeds.map((seed) => forgeRepoVm(host, seed));
+  const logins = [...new Set(repos.map((repo) => repo.owner))];
+  const owners: ForgeOwnerVm[] = [
+    ...logins.filter((login) => login === "tgorka"),
+    ...logins.filter((login) => login !== "tgorka").sort(),
+  ].map((login) => ({
+    login,
+    isYou: login === "tgorka",
+    count: repos.filter((repo) => repo.owner === login).length,
+  }));
+  const notices: ForgeNoticeVm[] =
+    github && repos.length > 0
+      ? [
+          {
+            sentence:
+              "Some organizations haven't approved keeper, so their private repositories are hidden.",
+            link: `https://github.com/settings/connections/applications/${MOCK_GITHUB_CLIENT_ID}`,
+          },
+          ...(githubVia === "broker"
+            ? [
+                {
+                  sentence: "keeper's GitHub app tgdev isn't installed on siren-alsephina.",
+                  link: null,
+                },
+              ]
+            : []),
+        ]
+      : [];
+  return { sourceId, repos, owners, notices, truncated: false, fetchedMs: Date.now() };
+}
+
+/**
+ * A drive the batch add saved, whole — the fields `sync_profile_save` would
+ * store for a fresh add with keeper's defaults — so the empty-state entry
+ * point (no fixture drive to copy) adds a drive every surface can render.
+ * Pull-only when the repository is, as the shell adds it.
+ */
+function forgeAddedProfile(
+  id: string,
+  item: ForgeAddReq["repos"][number],
+  folder: string,
+  repo: ForgeRepoVm,
+): SyncProfileVm {
+  return {
+    id,
+    name: item.driveName,
+    localPath: folder,
+    remoteUrl: repo.cloneUrl,
+    branch: repo.defaultBranch,
+    direction: repo.pullOnly ? "pullOnly" : "bidirectional",
+    lane: "main",
+    subpaths: [],
+    excludes: [],
+    removable: false,
+    lfsMode: "materialize",
+    lfsThresholdBytes: 4 * 1024 * 1024,
+    virtualPatterns: [],
+    virtualOverBytes: 8 * 1024 * 1024,
+    releaseTtlMs: 24 * 60 * 60 * 1000,
+    settleMs: null,
+    effectiveSettleMs: 10_000,
+    pollIntervalMs: null,
+    effectivePollIntervalMs: 15_000,
+    tags: [],
+    commitSubjectTemplate: "",
+    authorOverride: null,
+    enabled: true,
+    notes: false,
+    notesSubfolder: null,
+    recordings: false,
+    recordingsSubfolder: "recordings",
+    sessions: false,
+    sessionsSubfolder: "60-sessions",
+    tasks: false,
+    tasksSubfolder: "tasks",
+    folderOwned: [],
+  };
+}
+
+/** Answer after `ms`, so a loading state is on screen long enough to look at. */
+function later<T>(ms: number, answer: () => T): Promise<T> {
+  return new Promise((resolve) => setTimeout(() => resolve(answer()), ms));
+}
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   // One rail group per drive the search covers: the selection, or the active
   // drive when nothing is selected — `notes_spaces(vault_id, vault_ids)`.
@@ -4840,13 +5210,24 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       // Rust names the account a confirm would replace; `?account=ready`
       // therefore shows the change path.
       replaces: accountVm.configured ? accountVm.name : null,
+      // A descriptor with `[github_broker]`: a link containing `broker` shows it.
+      brokerHost: input.includes("broker") ? BROKER_HOST : null,
+      // Every OTHER host a token would go to (the account's forge is
+      // `repoHost`, the broker `brokerHost`): a broker adds GitHub's two.
+      forgeHosts: input.includes("broker") ? ["github.com", "api.github.com"] : [],
     };
   },
+  // Each of the four account changes clears the remembered listing failures,
+  // as the shell does with `forges::forget_identity()` (surface #1).
   account_setup_confirm: (payload) => {
+    forgeErrors.clear();
     const name = String(payload.deviceName ?? ACCOUNT_THIS_DEVICE.name);
     return accountSignInFlow({ ...ACCOUNT_THIS_DEVICE, slug: name, name });
   },
-  account_sign_in: () => accountSignInFlow(accountVm.device ?? ACCOUNT_THIS_DEVICE),
+  account_sign_in: () => {
+    forgeErrors.clear();
+    return accountSignInFlow(accountVm.device ?? ACCOUNT_THIS_DEVICE);
+  },
   account_cancel_sign_in: () => {
     accountSignInCancel?.();
     return null;
@@ -4881,8 +5262,12 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       "keeper://setup?descriptor=https%3A%2F%2Fid.acme.dev%2F.well-known%2Fkeeper-account.json";
     return { link, qrSvg: mockQrSvg(link) };
   },
-  account_sign_out: () => setAccount(signedInAccount("signedOut")),
+  account_sign_out: () => {
+    forgeErrors.clear();
+    return setAccount(signedInAccount("signedOut"));
+  },
   account_forget: () => {
+    forgeErrors.clear();
     // Rust clears every source row bound to the forgotten account, so no drive
     // or endpoint switches to the next account by itself.
     for (const [key, source] of credentialSources) {
@@ -4895,7 +5280,33 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   sync_credential_source_get: (payload) =>
     credentialSources.get(`sync/${String(payload.profileId)}`) ?? "keychain",
   sync_credential_source_set: (payload) => {
-    credentialSources.set(`sync/${String(payload.profileId)}`, String(payload.source));
+    const value = String(payload.source);
+    const profile = (ANSWERS.sync_profiles as SyncProfileVm[]).find(
+      (candidate) => candidate.id === String(payload.profileId),
+    );
+    const refuse = (message: string) => {
+      throw { code: "internal", message, accountId: null, retriable: false };
+    };
+    // The shell refuses a `forge:<id>` whose drive's remote is not on that
+    // source's site (surface #21), and the account anywhere but its own
+    // repository host, in its own words.
+    if (value.startsWith("forge:")) {
+      const source = forgeSources().find((candidate) => `forge:${candidate.id}` === value);
+      if (source !== undefined && !remoteOnSourceHost(profile?.remoteUrl ?? "", source.host)) {
+        refuse(`This drive's repository isn't on ${source.host}.`);
+      }
+    }
+    if (value === "account") {
+      if (!accountVm.configured) {
+        refuse("No account is set up on this device.");
+      }
+      if (!remoteOnSourceHost(profile?.remoteUrl ?? "", accountVm.repoHost ?? "git.acme.dev")) {
+        refuse(
+          `This drive's repository isn't on ${accountVm.name ?? "the account"}'s hosts; choose another way to sign in.`,
+        );
+      }
+    }
+    credentialSources.set(`sync/${String(payload.profileId)}`, value);
     return null;
   },
   bots_provider_credential_source_get: (payload) =>
@@ -4963,6 +5374,174 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       providers: accountOffers.providers.filter((candidate) => candidate.key !== key),
     });
     return null;
+  },
+  // Epic 86: repository sources. See the block above `HANDLERS`.
+  forges_list: () => forgeSources(),
+  // The shell's `LAST_ERROR`: a failed listing is remembered and answers the
+  // source in `forges_list`; only a listing that succeeds replaces it, and a
+  // non-refresh read while it stands fails the same way (surface #1).
+  forge_repos: (payload) => {
+    const sourceId = String(payload.sourceId);
+    const refresh = payload.refresh === true;
+    return new Promise<ForgeReposVm>((resolve, reject) =>
+      setTimeout(() => {
+        if (sourceId === "github" && (githubFailsNext || (!refresh && forgeErrors.has(sourceId)))) {
+          githubFailsNext = false;
+          const sentence = "Can't reach api.github.com.";
+          forgeErrors.set(sourceId, { state: "unreachable", sentence });
+          reject({
+            code: "serverUnreachable",
+            message: sentence,
+            accountId: null,
+            retriable: true,
+          });
+          return;
+        }
+        forgeErrors.delete(sourceId);
+        resolve(forgeReposVm(sourceId));
+      }, 700),
+    );
+  },
+  forge_connect_start: (): DeviceCodeVm => ({
+    userCode: "WDJB-MJHT",
+    verificationUri: "https://github.com/login/device",
+    expiresIn: 899,
+  }),
+  forge_connect_wait: () =>
+    new Promise<ForgeSourceVm>((resolve) => {
+      // A second wait ends the first, as the shell's second start cancels the
+      // first poll: the older promise resolves `notConnected` instead of
+      // hanging forever under a panel that is gone.
+      githubConnectSettle?.(false);
+      const approve = setTimeout(() => githubConnectSettle?.(true), 6000);
+      const settle = (connected: boolean) => {
+        clearTimeout(approve);
+        if (githubConnectSettle === settle) {
+          githubConnectSettle = null;
+        }
+        githubConnected = connected;
+        if (connected) {
+          forgeErrors.delete("github");
+        }
+        resolve(githubSource());
+      };
+      githubConnectSettle = settle;
+    }),
+  forge_connect_open: () => {
+    if (githubConnectSettle === null) {
+      throw { code: "internal", message: "No code is waiting.", accountId: null, retriable: false };
+    }
+    console.info("[mock-shell] would open https://github.com/login/device");
+    return null;
+  },
+  forge_connect_cancel: () => {
+    githubConnectSettle?.(false);
+    return null;
+  },
+  forge_disconnect: () => {
+    githubConnected = false;
+    githubVia = "deviceFlow";
+    forgeErrors.delete("github");
+    return githubSource();
+  },
+  forge_default_base_folder: () => mockDriveFolder()?.path ?? null,
+  sync_drive_folder_get: () => mockDriveFolder(),
+  // Rust's rules: empty resets to the default, `~/` is the home folder, and any
+  // other relative path is refused in its own words.
+  sync_drive_folder_set: (payload) => {
+    if (mockDriveFolder() === null) {
+      return null;
+    }
+    const folder = typeof payload.folder === "string" ? payload.folder.trim() : "";
+    if (folder === "") {
+      chosenDriveFolder = null;
+    } else if (folder.startsWith("/")) {
+      chosenDriveFolder = folder;
+    } else if (folder === "~" || folder.startsWith("~/")) {
+      chosenDriveFolder = `${MOCK_HOME}${folder.slice(1)}`;
+    } else {
+      throw {
+        code: "internal",
+        message: `${folder} is not a full path. Choose a folder that starts with / or ~/.`,
+        accountId: null,
+        retriable: false,
+      };
+    }
+    return mockDriveFolder();
+  },
+  // Rust's `credential_choices`: the account only for a remote on its own
+  // repository host; a source only at its own origin, and never the account's
+  // forge a second time. GitHub through the broker names the account.
+  sync_credential_choices: (payload): CredentialChoicesVm => {
+    const remoteUrl = String(payload.remoteUrl ?? "");
+    const accountName = accountVm.name ?? "organisation";
+    const account =
+      accountVm.configured && remoteOnSourceHost(remoteUrl, accountVm.repoHost ?? "git.acme.dev")
+        ? {
+            value: "account",
+            label: `Use my ${accountName} account`,
+            detail: `keeper signs this folder's git requests in with your ${accountName} sign-in, so no token is stored for it.`,
+          }
+        : null;
+    const forges = forgeSources()
+      .filter(
+        (source) => source.credential !== "account" && remoteOnSourceHost(remoteUrl, source.host),
+      )
+      .map((source) =>
+        source.via === "broker" && accountVm.configured
+          ? {
+              value: source.credential,
+              label: `${source.name} access through ${accountName}`,
+              detail: `${accountName} gives keeper a one-hour ${source.name} token for this repository only, as you; nothing is stored for this folder.`,
+            }
+          : {
+              value: source.credential,
+              label: `Sign in with ${source.name}`,
+              detail: `keeper uses your ${source.name} connection, so no token is stored for this folder.`,
+            },
+      );
+    return { account, forges };
+  },
+  // Rust's batch add: each repository's folder is `<base>/<name>`; the one
+  // named `playground` holds other files, which is the conflict the step has
+  // to show on its own row while the rest are added.
+  forge_repos_add: (payload) => {
+    const req = payload.req as ForgeAddReq;
+    const vm = forgeReposVm(req.sourceId);
+    const credential =
+      forgeSources().find((candidate) => candidate.id === req.sourceId)?.credential ??
+      `forge:${req.sourceId}`;
+    return later(1200, () =>
+      req.repos.map((item): ForgeAddResultVm => {
+        const repo = vm.repos.find((candidate) => candidate.fullName === item.fullName);
+        const folder = item.folder ?? `${req.baseFolder ?? "/container"}/${item.driveName}`;
+        if (repo === undefined) {
+          return { fullName: item.fullName, profileId: null, sentence: "That repository is gone." };
+        }
+        // The shell refuses a repository already synced here, whatever folder
+        // the batch names (surface #4): a second drive of it goes through the
+        // single form only.
+        if (repo.addedAs.length > 0) {
+          return {
+            fullName: item.fullName,
+            profileId: null,
+            sentence: `Already syncing here as ${repo.addedAs[0]}.`,
+          };
+        }
+        if (item.driveName === "playground") {
+          return {
+            fullName: item.fullName,
+            profileId: null,
+            sentence: `${folder} holds other files.`,
+          };
+        }
+        const profiles = ANSWERS.sync_profiles as SyncProfileVm[];
+        const id = `p${profiles.length + 1}`;
+        ANSWERS.sync_profiles = [...profiles, forgeAddedProfile(id, item, folder, repo)];
+        credentialSources.set(`sync/${id}`, credential);
+        return { fullName: item.fullName, profileId: id, sentence: null };
+      }),
+    );
   },
   // The three Matrix sign-ins, so the add-account screen can be driven to the
   // end here. Each answers the account Rust would, and takes away the account's

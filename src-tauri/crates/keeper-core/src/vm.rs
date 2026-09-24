@@ -1578,6 +1578,10 @@ pub enum EgressKind {
     /// settings repository, or the forge's own sign-in (Epic 82). Present only
     /// while an account is configured.
     Account,
+    /// A repository source keeper lists from (Epic 86): GitHub's hosts while
+    /// a device-flow connection exists, and the organisation's GitHub broker
+    /// plus GitHub's API while the descriptor names one.
+    Forge,
 }
 
 /// One network destination keeper contacts, derived from live app state (Story

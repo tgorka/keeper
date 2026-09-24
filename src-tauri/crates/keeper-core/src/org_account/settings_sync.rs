@@ -620,6 +620,12 @@ pub struct Catalog {
     /// ([`url_origin`]). A pulled credential source binds the account's
     /// token only to a drive or provider at one of them.
     pub trusted_origins: Vec<String>,
+    /// `(forge source id, its web_base origin)` of every source this device
+    /// can get a token from ([`crate::forges::token_origins`]). A pulled
+    /// `forge:<id>` binds a drive to that source only when the source is
+    /// here and the drive's remote is at its origin; otherwise it stays
+    /// unapplied, and the drive keeps the credential that works.
+    pub forge_origins: Vec<(String, String)>,
 }
 
 impl Catalog {
@@ -653,6 +659,7 @@ impl Catalog {
             bots,
             account_id: None,
             trusted_origins: Vec::new(),
+            forge_origins: Vec::new(),
         })
     }
 
@@ -724,27 +731,33 @@ fn credential_key(key: &str) -> Option<(&'static str, &str)> {
 
 /// Whether a file row is one this build applies: every row but a
 /// credential-source one, which must name a drive or provider by reference
-/// and hold `account`.
+/// and hold `account` — or, for a drive, `forge:<source id>`.
 fn portable_credential_row(key: &str, stored: &str) -> bool {
     match credential_key(key) {
         None => true,
         Some((prefix, reference)) => {
-            let kind = if prefix == SYNC_CREDENTIAL_PREFIX {
-                "drive:"
+            if prefix == SYNC_CREDENTIAL_PREFIX {
+                reference.starts_with("drive:")
+                    && (stored == ACCOUNT_CREDENTIAL
+                        || crate::forges::forge_credential_id(stored).is_some())
             } else {
-                "provider:"
-            };
-            stored == ACCOUNT_CREDENTIAL && reference.starts_with(kind)
+                stored == ACCOUNT_CREDENTIAL && reference.starts_with("provider:")
+            }
         }
     }
 }
 
 /// A credential-source row as it travels: keyed by the drive's or
-/// provider's reference, holding `account`. `None` when the row is not bound
-/// to the configured account (it means the keychain, which is the row's
-/// absence) or names nothing this device can describe.
+/// provider's reference, holding `account` — or a drive's `forge:<id>`,
+/// verbatim. `None` when the row is not bound to the configured account (it
+/// means the keychain, which is the row's absence) or names nothing this
+/// device can describe.
 fn portable_credential(key: &str, stored: &str, catalog: &Catalog) -> Option<(String, String)> {
     let (prefix, id) = credential_key(key)?;
+    if prefix == SYNC_CREDENTIAL_PREFIX && crate::forges::forge_credential_id(stored).is_some() {
+        let reference = catalog.drive_reference(id)?;
+        return Some((format!("{prefix}{reference}"), stored.to_owned()));
+    }
     let account = catalog.account_id.as_deref()?;
     if stored != registry::credential_source_value(account) {
         return None;
@@ -834,6 +847,19 @@ pub fn from_portable(key: &str, portable: &str, catalog: &Catalog) -> Option<Str
         } else {
             catalog.provider(id)?.origin()
         };
+        // A forge connection likewise, only to a drive on that forge.
+        if let Some(source) = crate::forges::forge_credential_id(portable) {
+            if prefix != SYNC_CREDENTIAL_PREFIX {
+                return None;
+            }
+            let forge_origin = catalog
+                .forge_origins
+                .iter()
+                .find(|(id, _)| id == source)
+                .map(|(_, origin)| origin);
+            return (origin.is_some() && origin.as_ref() == forge_origin)
+                .then(|| portable.to_owned());
+        }
         if !catalog.trusted(origin) {
             return None;
         }
@@ -1658,7 +1684,78 @@ mod tests {
             bots: vec![("01BOT".to_owned(), "01PROV".to_owned(), "llama3".to_owned())],
             account_id: None,
             trusted_origins: Vec::new(),
+            forge_origins: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_forge_connection_travels_verbatim_and_binds_only_a_drive_on_that_forge() {
+        let catalog = Catalog {
+            forge_origins: vec![("github".to_owned(), "https://github.com".to_owned())],
+            ..catalog()
+        };
+        // No account is needed: the connection is this device's own.
+        let rows: BTreeMap<String, String> = [(
+            "sync.credential_source.01DRIVE".to_owned(),
+            "forge:github".to_owned(),
+        )]
+        .into();
+        assert_eq!(
+            local_from_rows(rows, &catalog, None),
+            values(&[(DRIVE_CRED, "forge:github")])
+        );
+        let text = format!("[settings]\n\"{DRIVE_CRED}\" = \"forge:github\"\n");
+        let parsed = Values::parse(text.as_bytes(), SyncedFile::Device).expect("parses");
+        assert_eq!(
+            parsed.values.get(DRIVE_CRED).map(String::as_str),
+            Some("forge:github")
+        );
+
+        assert_eq!(
+            from_portable(DRIVE_CRED, "forge:github", &catalog).as_deref(),
+            Some("forge:github")
+        );
+        // Another origin, an unknown source, or a bot provider: never bound.
+        let elsewhere = Catalog {
+            forge_origins: vec![("github".to_owned(), "https://ghe.acme.dev".to_owned())],
+            ..catalog.clone()
+        };
+        assert_eq!(from_portable(DRIVE_CRED, "forge:github", &elsewhere), None);
+        // A source this device cannot get a token from is not in the catalog.
+        let unusable = Catalog {
+            forge_origins: Vec::new(),
+            ..catalog.clone()
+        };
+        assert_eq!(from_portable(DRIVE_CRED, "forge:github", &unusable), None);
+        assert_eq!(from_portable(DRIVE_CRED, "forge:gitlab", &catalog), None);
+        assert_eq!(from_portable(PROVIDER_CRED, "forge:github", &catalog), None);
+        // Spellings of the same origin bind; look-alikes never do.
+        for (remote, binds) in [
+            ("https://github.com:443/acme/notes.git", true),
+            ("HTTPS://GITHUB.COM/acme/notes", true),
+            ("https://github.com.evil.com/acme/notes.git", false),
+            ("https://github.com@evil.com/acme/notes.git", false),
+            ("https://github.com./acme/notes.git", false),
+            ("https://github.com:8443/acme/notes.git", false),
+            ("http://github.com/acme/notes.git", false),
+        ] {
+            let spelt = Catalog {
+                drives: vec![local("01DRIVE", remote, "Notes", "/Users/tg/notes")],
+                ..catalog.clone()
+            };
+            let key = format!(
+                "{SYNC_CREDENTIAL_PREFIX}{}",
+                spelt.drive_reference("01DRIVE").expect("reference")
+            );
+            assert_eq!(
+                from_portable(&key, "forge:github", &spelt).is_some(),
+                binds,
+                "{remote}"
+            );
+        }
+        let provider_row = format!("[settings]\n\"{PROVIDER_CRED}\" = \"forge:github\"\n");
+        let parsed = Values::parse(provider_row.as_bytes(), SyncedFile::Device).expect("parses");
+        assert!(parsed.values.is_empty());
     }
 
     #[test]

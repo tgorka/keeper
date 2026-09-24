@@ -1370,3 +1370,56 @@ back from the repository, and when it stops.
 - **Status / owner:** decided. Owner is the architect. Epic 85 implements it:
   `org_account::device_state`, `layout::free_device_slug`, the shell's restore, and
   the `account.<id>.restored` marker.
+
+## D-28 — Repository tokens come from the forge or the organization's broker; keeper runs no server
+
+The owner asked for a button that lists a person's repositories on GitHub (with their
+organizations) and on Forgejo, and adds them as drives, fetching through the OAuth token
+proxy being built in makistack. keeper is a client only, and a list of private
+repositories needs a token that can read them. Epic 86 decides where those tokens come
+from, and what keeper does and does not run to get them.
+
+- **What changes:** keeper names repository sources: the account's forge, and GitHub,
+  through the broker the descriptor names under `[github_broker]` or through a
+  device-flow connection with a public OAuth client. It lists each, marks what already
+  syncs where, and adds one repository through the existing form or several under a
+  base folder. A drive added from a source signs in through it (`account:<id>` on the
+  account's forge, `forge:<source-id>` otherwise), and that choice travels with the
+  device's settings. A repository keeper cannot push to (read-only, archived, a mirror)
+  is added as a download-only drive. (AD-333…AD-338; FR-734…FR-745; NFR-101…NFR-104)
+- **The broker is the organization's, and keeper speaks its protocol.** makistack's
+  `github-broker` (tgorka/makistack#863) turns the person's ZITADEL sign-in into one-hour
+  GitHub App installation tokens under its own policy. keeper calls `/v1/whoami` and
+  `/v1/token` and ships no broker code. RFC 8693 was considered and dropped: ZITADEL cannot
+  mint upstream tokens, and the one broker that exists speaks another protocol, so a
+  second convention would have been one keeper spoke to nobody.
+- **The least token for each job:** a listing token reads metadata only; a drive's token
+  covers its one repository, with contents write only when one of the person's grants
+  allows it, and read otherwise. keeper chooses the grant the broker's own policy would,
+  so it never asks for what the policy refuses. Forgejo is listed through
+  `/repos/search` under the grant keeper already holds, rather than widening the grant and
+  making every person revoke it first.
+- **Tokens stay where secrets stay, and with the person who got them:** the keychain for a
+  device-flow connection, one item per source and OAuth client; memory for broker tokens
+  and the list, kept for the signed-in identity and forgotten at every sign-in, sign-out,
+  forget and setup. Nothing about a list is written to disk, and nothing is polled in the
+  background.
+- **A token goes only to a host the person saw:** its own forge, whose API must sit on the
+  forge's own host (`api.github.com` for github.com), or the broker; and the setup sheet
+  lists every such host before anything is written. A descriptor cannot name a second
+  Forgejo, because keeper would have no token for it. A travelling `forge:<source-id>`
+  applies only where this device can get that token.
+- **What it amends:** AD-315's credential choice gains `forge:<source-id>` for drives (not
+  for bot providers); AD-326's travelling choice carries it, applied only on that source's
+  host. D-25 holds: approving keeper for an organization, installing the GitHub App and
+  adding someone to the broker's policy are the organization's acts, not keeper's.
+- **Revisited by the review wave (epic 86, amendment A4):** the rules above already carry
+  it. It closed a path by which a descriptor's `api_base` could receive a person's GitHub
+  connection, made caches answer only for the identity that filled them, and turned a
+  silently dropped Forgejo entry into a refusal (DW-330).
+- **Revisit triggers:** #863 merging with a changed protocol (DW-324); GitHub refusing an
+  installation token as the Basic user name (DW-325); the owner registering keeper's
+  OAuth App (DW-323); a second broker for Forgejo.
+- **Status / owner:** decided. Owner is the architect. Epic 86 implements it:
+  `keeper_core::forges`, the descriptor's `[[forges]]` and `[github_broker]`, and the
+  shell's `forge_ipc`.

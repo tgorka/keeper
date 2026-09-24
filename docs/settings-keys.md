@@ -137,6 +137,8 @@ These are facts about one computer. A shared file that sets one of them is a nam
 | | | | | The sync profile that holds this machine's recordings; overrides the plain folder above. |
 | `sync.git_path` | machine-local | absolute path | *(absent)* | `"sync.git_path" = "/opt/homebrew/bin/git"` |
 | | | | | An explicit git binary for folder sync; absent means search PATH. |
+| `sync.drive_folder` | machine-local | absolute path | *(absent)* | `"sync.drive_folder" = "/Users/tgorka/keeper/git"` |
+| | | | | Where drives added from your repositories go; absent means ~/keeper/git. |
 
 Why each one is refused from a shared file:
 
@@ -149,6 +151,7 @@ Why each one is refused from a shared file:
 - `recording.destination_dir` — it is an absolute path, and /Volumes/merope/… does not exist on the other machine
 - `recording.destination_profile_id` — it names a row in this machine's sync.db, and the same folder is a different profile id on the other machine
 - `sync.git_path` — it is an absolute path to a binary, and /opt/homebrew/bin/git is not where git is on the other machine
+- `sync.drive_folder` — it is an absolute path, and /Users/tgorka/keeper/git is not a folder on the other machine
 
 ## Keys no file may set
 
@@ -167,7 +170,7 @@ Not preferences. keeper writes these and reads them back, so a file entry would 
 | `notes.capture_placement.<…>` | text | Per capture window: its remembered position and size, whether it floats above other applications, and whether the lock is on. | it is what a person last did to one capture window — dragged it, resized it, pinned it above other applications or locked it — rewritten on every dismissal |
 | `notes.pristine.<…>` | JSON | Per notes drive: the new notes nobody has written in yet, and what creation put in each. | it lists the notes keeper created on this device that nobody has written in yet, so it can remove them when their editor closes or at the next start |
 | `notes.read.<…>` | text | Per note: the revision this device has acknowledged. | it is this device's record of which revision of a note it has already shown you, and it must never travel — that is what makes an edit from the other machine unread |
-| `sync.credential_source.<…>` | text | Per drive: `account:<account id>` authenticates with that organisation account's sign-in token while it is the configured account; absent uses the drive's own saved token. | it is the choice made in a drive's form, and a file flipping it would send the account's token to a remote the person never chose to give it to |
+| `sync.credential_source.<…>` | text | Per drive: `account:<account id>` authenticates with that organisation account's sign-in token while it is the configured account; `forge:<source id>` with that repository source's connection; absent uses the drive's own saved token. | it is the choice made in a drive's form, and a file flipping it would send the account's token to a remote the person never chose to give it to |
 | `ui.first_run_setup_skipped` | boolean (`1`/`0`) | Whether the person asked keeper not to open first-run setup at startup. | it is the answer somebody gave in the skip dialog, and pre-setting it in a file would hide setup from a person who was never offered it |
 | `ui.ios_sync_disclosure_shown` | boolean (`1`/`0`) | Whether the one-time iOS no-background-sync disclosure has been shown. | it is a one-time latch keeper sets after showing a disclosure, and pre-setting it in a file would suppress a card the person never saw |
 | `ui.recovered_sessions_acknowledged` | JSON | Recovered recording sessions the person has acknowledged. | it is the set of recovered recording sessions somebody has already dismissed, rewritten on every dismissal |

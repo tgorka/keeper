@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -32,6 +32,24 @@ vi.mock("@/lib/ipc/client", () => ({
   syncFolderTasksFlag: vi.fn(() => Promise.resolve({ notice: null })),
   syncCredentialSourceGet: vi.fn(() => Promise.resolve("keychain")),
   syncCredentialSourceSet: vi.fn(() => Promise.resolve()),
+  // Rust's answer to which sign-ins a remote may use: the account for a remote
+  // on its own host (the offers' git.acme.dev), nothing anywhere else.
+  syncCredentialChoices: vi.fn((remoteUrl: string) =>
+    Promise.resolve({
+      account: remoteUrl.startsWith("https://git.acme.dev/")
+        ? {
+            value: "account",
+            label: "Use my Acme account",
+            detail:
+              "keeper signs this folder's git requests in with your Acme sign-in, so no token is stored for it.",
+          }
+        : null,
+      forges: [],
+    }),
+  ),
+  // "New drives go in": read as the section opens, written by its two buttons.
+  syncDriveFolderGet: vi.fn(),
+  syncDriveFolderSet: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -46,6 +64,9 @@ import {
   SYNC_DEVICE_NAME_LABEL,
   SYNC_DEVICE_SAVE_LABEL,
   SYNC_DEVICE_SAVED_SENTENCE,
+  SYNC_DRIVE_FOLDER_CHOOSE_LABEL,
+  SYNC_DRIVE_FOLDER_DEFAULT_LABEL,
+  SYNC_DRIVE_FOLDER_LABEL,
   SYNC_NO_PROFILES_SENTENCE,
   SYNC_NOW_LABEL,
   SYNC_OFFER_ADD_LABEL,
@@ -89,7 +110,6 @@ import {
   SYNC_TOKEN_FAILED_PREFIX,
   SYNC_TOKEN_LABEL,
   SYNC_TOKEN_SHOW_LABEL,
-  syncAccountCredentialLabel,
 } from "@/components/sync/add-folder-form";
 import { ACCOUNT_OFFERS_TITLE } from "@/lib/account-offers";
 import type { SyncOutcomeVm, SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
@@ -97,6 +117,8 @@ import {
   syncCredentialSourceSet,
   syncDevice,
   syncDeviceSetLabel,
+  syncDriveFolderGet,
+  syncDriveFolderSet,
   syncFolderNow,
   syncGetCredential,
   syncOpenPath,
@@ -127,6 +149,11 @@ const mockDevice = vi.mocked(syncDevice);
 const mockSetDeviceLabel = vi.mocked(syncDeviceSetLabel);
 const mockPicker = vi.mocked(openFolder);
 const mockOpenPath = vi.mocked(syncOpenPath);
+const mockDriveFolderGet = vi.mocked(syncDriveFolderGet);
+const mockDriveFolderSet = vi.mocked(syncDriveFolderSet);
+
+/** The account's sign-in, as Rust labels it for the offers' remote. */
+const USE_ACME = "Use my Acme account";
 
 /** The exact line Rust composes — the UI must render it character for character. */
 const RUST_LINE = "tgdrive — 3 waiting to sync";
@@ -204,6 +231,8 @@ beforeEach(() => {
   // answer for the folders that have nothing stored.
   mockGetCredential.mockResolvedValue(null);
   mockOpenPath.mockResolvedValue(undefined);
+  // A phone's answer unless a case says otherwise: no "New drives go in" row.
+  mockDriveFolderGet.mockResolvedValue(null);
   // The path control is gated on a real file manager existing, so these rows
   // render as a desktop would show them.
   capabilitiesStore
@@ -793,7 +822,7 @@ describe("SyncSection drives from the account (Epic 84, UX-DR118)", () => {
     expect(screen.getByLabelText(SYNC_TASKS_SUBFOLDER_LABEL)).toHaveValue("ledger");
     expect(screen.getByRole("switch", { name: SYNC_RECORDINGS_LABEL })).not.toBeChecked();
     // The offer signs with the account and the account can stand in: chosen.
-    expect(screen.getByLabelText(syncAccountCredentialLabel("Acme"))).toBeChecked();
+    expect(await screen.findByLabelText(USE_ACME)).toBeChecked();
     // The folder is still this device's to choose — and the person is taken
     // straight to it.
     expect(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL })).toBeDisabled();
@@ -842,7 +871,7 @@ describe("SyncSection drives from the account (Epic 84, UX-DR118)", () => {
     render(<SyncSection open />);
     await screen.findByText(RUST_LINE);
     fireEvent.click(screen.getByRole("button", { name: `${SYNC_OFFER_ADD_LABEL} Acme notes` }));
-    expect(screen.getByLabelText(syncAccountCredentialLabel("Acme"))).not.toBeChecked();
+    expect(await screen.findByLabelText(USE_ACME)).not.toBeChecked();
   });
 
   it("never throws away a folder being added: it says so and takes the person to it", async () => {
@@ -859,6 +888,70 @@ describe("SyncSection drives from the account (Epic 84, UX-DR118)", () => {
     expect(screen.getByLabelText(SYNC_REMOTE_URL_LABEL)).toHaveValue("");
     expect(screen.getByText(SYNC_OFFER_DRAFT_SENTENCE)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: SYNC_CHOOSE_FOLDER_LABEL })).toHaveFocus();
+  });
+});
+
+describe("SyncSection new drives folder", () => {
+  const DEFAULT = { path: "/Users/alice/keeper/git", chosen: false };
+
+  it("chooses a folder with the picker and goes back to the default", async () => {
+    mockDriveFolderGet.mockResolvedValue(DEFAULT);
+    mockDriveFolderSet.mockImplementation((folder) =>
+      Promise.resolve(folder === null ? DEFAULT : { path: folder, chosen: true }),
+    );
+    mockPicker.mockResolvedValue("/Volumes/data/repos");
+    render(<SyncSection open />);
+
+    expect(await screen.findByText(DEFAULT.path)).toBeInTheDocument();
+    expect(screen.getByText(SYNC_DRIVE_FOLDER_LABEL)).toBeInTheDocument();
+    // keeper's own default: nothing to go back to.
+    expect(
+      screen.queryByRole("button", { name: SYNC_DRIVE_FOLDER_DEFAULT_LABEL }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_DRIVE_FOLDER_CHOOSE_LABEL }));
+    expect(await screen.findByText("/Volumes/data/repos")).toBeInTheDocument();
+    expect(mockDriveFolderSet).toHaveBeenCalledWith("/Volumes/data/repos");
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_DRIVE_FOLDER_DEFAULT_LABEL }));
+    expect(await screen.findByText(DEFAULT.path)).toBeInTheDocument();
+    expect(mockDriveFolderSet).toHaveBeenLastCalledWith(null);
+    expect(
+      screen.queryByRole("button", { name: SYNC_DRIVE_FOLDER_DEFAULT_LABEL }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("writes nothing when the picker is cancelled", async () => {
+    mockDriveFolderGet.mockResolvedValue({ path: "/Volumes/data/repos", chosen: true });
+    render(<SyncSection open />);
+    fireEvent.click(await screen.findByRole("button", { name: SYNC_DRIVE_FOLDER_CHOOSE_LABEL }));
+    await waitFor(() => expect(mockPicker).toHaveBeenCalled());
+    await act(async () => {});
+    expect(mockDriveFolderSet).not.toHaveBeenCalled();
+    expect(screen.getByText("/Volumes/data/repos")).toBeInTheDocument();
+  });
+
+  it("shows Rust's refusal and keeps the folder in force", async () => {
+    const refusal = "keeper can't use repos: choose a full path.";
+    mockDriveFolderGet.mockResolvedValue(DEFAULT);
+    mockDriveFolderSet.mockRejectedValue({ code: "internal", message: refusal });
+    mockPicker.mockResolvedValue("repos");
+    render(<SyncSection open />);
+
+    fireEvent.click(await screen.findByRole("button", { name: SYNC_DRIVE_FOLDER_CHOOSE_LABEL }));
+    expect(await screen.findByText(refusal)).toBeInTheDocument();
+    expect(screen.getByText(DEFAULT.path)).toBeInTheDocument();
+  });
+
+  it("is absent on the phone, whose drives live in the app's container", async () => {
+    render(<SyncSection open />);
+    await screen.findByText(RUST_LINE);
+    await waitFor(() => expect(mockDriveFolderGet).toHaveBeenCalled());
+    await act(async () => {});
+    expect(screen.queryByText(SYNC_DRIVE_FOLDER_LABEL)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: SYNC_DRIVE_FOLDER_CHOOSE_LABEL }),
+    ).not.toBeInTheDocument();
   });
 });
 

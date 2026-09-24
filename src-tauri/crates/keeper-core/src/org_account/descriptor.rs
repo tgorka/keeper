@@ -46,6 +46,84 @@ pub struct AccountDescriptor {
     pub name: String,
     pub auth: AuthConfig,
     pub config: RepoConfig,
+    /// Extra repository sources the browse sheet lists (AD-333). Not part of
+    /// the sign-in: editing them never replaces the account.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forges: Vec<ForgeEntry>,
+    /// The organisation's GitHub broker (makistack `github-broker`): GitHub
+    /// installation tokens for the account's access token (AD-334).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_broker: Option<GithubBroker>,
+}
+
+/// One `[[forges]]` entry: a forge whose repositories keeper can list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForgeEntry {
+    pub kind: ForgeEntryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base: Option<String>,
+    /// The public OAuth client for the device flow (GitHub only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForgeEntryKind {
+    Github,
+    Forgejo,
+}
+
+pub const GITHUB_WEB_BASE: &str = "https://github.com";
+pub const GITHUB_API_BASE: &str = "https://api.github.com";
+/// The id of the forge the account's own `oauth` repository lives on.
+pub const ACCOUNT_FORGE_ID: &str = "account-forge";
+
+impl ForgeEntry {
+    /// The source id: as written, else the kind's name.
+    pub fn source_id(&self) -> &str {
+        self.id.as_deref().unwrap_or(match self.kind {
+            ForgeEntryKind::Github => "github",
+            ForgeEntryKind::Forgejo => "forgejo",
+        })
+    }
+
+    pub fn web_base(&self) -> Option<&str> {
+        self.web_base.as_deref().or(match self.kind {
+            ForgeEntryKind::Github => Some(GITHUB_WEB_BASE),
+            ForgeEntryKind::Forgejo => None,
+        })
+    }
+
+    pub fn api_base(&self) -> Option<&str> {
+        self.api_base.as_deref().or(match self.kind {
+            ForgeEntryKind::Github => Some(GITHUB_API_BASE),
+            ForgeEntryKind::Forgejo => None,
+        })
+    }
+}
+
+/// `[github_broker]`: where GitHub access comes from (AD-333).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubBroker {
+    pub url: String,
+    /// The GitHub App preferred when several grants cover one owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+}
+
+impl GithubBroker {
+    pub fn host(&self) -> String {
+        host_of(&self.url)
+    }
 }
 
 /// The one identity (OIDC).
@@ -398,6 +476,32 @@ impl AccountDescriptor {
         }
     }
 
+    /// The origins this account's own tokens belong to: the issuer, the
+    /// config repository and, in `oauth` mode, the forge. Sorted, once each.
+    pub fn trusted_origins(&self) -> Vec<String> {
+        let mut urls = vec![self.auth.issuer.as_str(), self.config.url.as_str()];
+        if let RepoAuthConfig::Oauth(forge) = &self.config.auth {
+            urls.extend(forge.issuer.as_deref());
+            urls.extend(forge.authorize_url.as_deref());
+        }
+        let mut origins: Vec<String> = urls
+            .into_iter()
+            .filter_map(super::settings_sync::url_origin)
+            .collect();
+        origins.sort();
+        origins.dedup();
+        origins
+    }
+
+    /// Whether a drive at `remote_url` may sign in with this account: the
+    /// remote sits at one of [`trusted_origins`](Self::trusted_origins).
+    /// Anywhere else — github.com among them — the account's token would be
+    /// handed to a stranger, and the stranger would refuse it anyway.
+    pub fn serves_remote(&self, remote_url: &str) -> bool {
+        super::settings_sync::url_origin(remote_url)
+            .is_some_and(|origin| self.trusted_origins().contains(&origin))
+    }
+
     /// `same`, `oauth` or `none`.
     pub fn repo_mode(&self) -> &'static str {
         match self.config.auth {
@@ -640,7 +744,106 @@ pub fn validate(d: &AccountDescriptor) -> Result<(), DescriptorError> {
         }
         RepoAuthConfig::None => {}
     }
+    validate_forges(d)
+}
+
+/// `[[forges]]` and `[github_broker]` (AD-333): every address that will
+/// receive a token is `https` (loopback for tests) and belongs to the forge
+/// the entry names, and every id names one source.
+fn validate_forges(d: &AccountDescriptor) -> Result<(), DescriptorError> {
+    let mut ids: Vec<&str> = Vec::new();
+    if matches!(d.config.auth, RepoAuthConfig::Oauth(_)) {
+        ids.push(ACCOUNT_FORGE_ID);
+    }
+    for (n, forge) in d.forges.iter().enumerate() {
+        let field = |name: &str| format!("forges[{n}].{name}");
+        let id = forge.source_id();
+        if forge.kind == ForgeEntryKind::Forgejo {
+            return Err(DescriptorError::new(
+                "keeper lists only the account's own Forgejo; remove this [[forges]] entry.",
+            ));
+        }
+        if !valid_id(id) {
+            return Err(DescriptorError::new(format!(
+                "The forge id \"{id}\" must be 1 to 32 characters of a-z, 0-9 and -."
+            )));
+        }
+        if id == ACCOUNT_FORGE_ID || ids.contains(&id) {
+            return Err(DescriptorError::new(format!(
+                "Two forges share the id \"{id}\"; give each `[[forges]]` entry its own `id`."
+            )));
+        }
+        ids.push(id);
+        if let Some(name) = &forge.name {
+            require_text(&field("name"), name)?;
+        }
+        let web = plain_url(
+            &field("web_base"),
+            forge.web_base().unwrap_or(GITHUB_WEB_BASE),
+        )?;
+        let api = plain_url(
+            &field("api_base"),
+            forge.api_base().unwrap_or(GITHUB_API_BASE),
+        )?;
+        // The API receives the person's GitHub token: github.com's is
+        // api.github.com and nothing else, and any other forge's lives on
+        // its own host.
+        if is_github_com(&web) {
+            if !is_github_api(&api) {
+                return Err(DescriptorError::new(format!(
+                    "`{}` must be {GITHUB_API_BASE} for github.com; keeper sends a GitHub token only to GitHub.",
+                    field("api_base")
+                )));
+            }
+        } else {
+            same_host(
+                &field("api_base"),
+                &api,
+                "the forge's `web_base`",
+                host_str(&web),
+            )?;
+        }
+        if let Some(client_id) = &forge.client_id {
+            require_text(&field("client_id"), client_id)?;
+        }
+    }
+    if let Some(broker) = &d.github_broker {
+        plain_url("github_broker.url", &broker.url)?;
+        if let Some(app) = &broker.app {
+            require_text("github_broker.app", app)?;
+        }
+        // The broker's installation tokens are github.com's; a `github`
+        // entry pointing elsewhere would send them to another host.
+        let moved = d.forges.iter().any(|forge| {
+            forge.source_id() == "github"
+                && !forge
+                    .web_base()
+                    .and_then(|url| url::Url::parse(url).ok())
+                    .is_some_and(|url| is_github_com(&url))
+        });
+        if moved {
+            return Err(DescriptorError::new(
+                "`[github_broker]` serves github.com, so the forge with id \"github\" must be github.com too.",
+            ));
+        }
+    }
     Ok(())
+}
+
+/// `url` is github.com itself (any spelling: case, a trailing slash, the
+/// default port), not a path under it or another host.
+fn is_github_com(url: &url::Url) -> bool {
+    same_root(url, GITHUB_WEB_BASE)
+}
+
+fn is_github_api(url: &url::Url) -> bool {
+    same_root(url, GITHUB_API_BASE)
+}
+
+fn same_root(url: &url::Url, root: &str) -> bool {
+    url::Url::parse(root).is_ok_and(|root| {
+        url.origin() == root.origin() && url.path().trim_end_matches('/').is_empty()
+    })
 }
 
 /// The `user.toml` fields keeper writes itself; the identity must live in
@@ -1444,6 +1647,203 @@ mod tests {
             .expect_err("refused")
             .message
             .contains("secret"));
+    }
+
+    #[test]
+    fn forges_and_a_broker_parse_with_github_defaults_and_survive_toml() {
+        let text = edited(|v| {
+            v["forges"] = serde_json::json!([
+                { "kind": "github" },
+                { "kind": "github", "id": "ghe", "name": "Acme GitHub",
+                  "web_base": "https://ghe.acme.dev", "api_base": "https://ghe.acme.dev/api/v3",
+                  "client_id": "Iv1.ghe" }
+            ]);
+            v["github_broker"] = serde_json::json!({ "url": "https://broker.acme.dev:8455",
+                                                    "app": "tgdev" });
+        });
+        let d = parse_json(&text).expect("forges descriptor");
+        let github = &d.forges[0];
+        assert_eq!(github.source_id(), "github");
+        assert_eq!(github.web_base(), Some("https://github.com"));
+        assert_eq!(github.api_base(), Some("https://api.github.com"));
+        assert_eq!(d.forges[1].source_id(), "ghe");
+        let broker = d.github_broker.as_ref().expect("broker");
+        assert_eq!(broker.app.as_deref(), Some("tgdev"));
+        assert_eq!(broker.host(), "broker.acme.dev");
+        assert_eq!(parse_toml(&to_toml(&d)).expect("toml round trip"), d);
+        // The sign-in is unchanged, so editing forges never signs anyone out.
+        let plain = parse_json(MINIMAL).expect("minimal");
+        assert!(!d.replaces(&plain));
+    }
+
+    #[test]
+    fn forge_entries_refuse_http_secrets_duplicates_foreign_apis_and_a_moved_brokered_github() {
+        let with = |forges: serde_json::Value, broker: Option<serde_json::Value>| {
+            edited(|v| {
+                v["forges"] = forges;
+                if let Some(broker) = broker {
+                    v["github_broker"] = broker;
+                }
+            })
+        };
+        let ghe = |extra: serde_json::Value| {
+            let mut entry = serde_json::json!({ "kind": "github", "id": "ghe",
+                "web_base": "https://ghe.acme.dev", "api_base": "https://ghe.acme.dev/api/v3",
+                "client_id": "Iv1.ghe" });
+            for (k, value) in extra.as_object().expect("object") {
+                entry[k] = value.clone();
+            }
+            entry
+        };
+        for (needle, text) in [
+            (
+                "forges[0].api_base",
+                with(
+                    serde_json::json!([ghe(
+                        serde_json::json!({ "api_base": "http://ghe.acme.dev/api/v3" })
+                    )]),
+                    None,
+                ),
+            ),
+            (
+                "forges[0].web_base",
+                with(
+                    serde_json::json!([
+                        { "kind": "github", "web_base": "http://github.example" }
+                    ]),
+                    None,
+                ),
+            ),
+            (
+                "public client",
+                with(
+                    serde_json::json!([
+                        { "kind": "github", "client_id": "c", "client_secret": "s" }
+                    ]),
+                    None,
+                ),
+            ),
+            (
+                "share the id \"github\"",
+                with(
+                    serde_json::json!([{ "kind": "github" }, { "kind": "github" }]),
+                    None,
+                ),
+            ),
+            (
+                "share the id \"ghe\"",
+                with(
+                    serde_json::json!([ghe(serde_json::json!({})), ghe(serde_json::json!({}))]),
+                    None,
+                ),
+            ),
+            (
+                "must be 1 to 32",
+                with(
+                    serde_json::json!([ghe(serde_json::json!({ "id": "Big" }))]),
+                    None,
+                ),
+            ),
+            // github.com's token goes to api.github.com and nowhere else.
+            (
+                "must be https://api.github.com for github.com",
+                with(
+                    serde_json::json!([
+                        { "kind": "github", "api_base": "https://collector.evil" }
+                    ]),
+                    None,
+                ),
+            ),
+            (
+                "must be https://api.github.com for github.com",
+                with(
+                    serde_json::json!([
+                        { "kind": "github", "id": "work", "web_base": "https://GitHub.com/",
+                          "api_base": "https://api.github.com/v3" }
+                    ]),
+                    None,
+                ),
+            ),
+            // Any other forge's API lives on its own host.
+            (
+                "`forges[0].api_base` points at collector.evil",
+                with(
+                    serde_json::json!([ghe(
+                        serde_json::json!({ "api_base": "https://collector.evil/api/v3" })
+                    )]),
+                    None,
+                ),
+            ),
+            (
+                "keeper lists only the account's own Forgejo; remove this [[forges]] entry.",
+                with(
+                    serde_json::json!([{ "kind": "forgejo", "id": "cb",
+                        "web_base": "https://codeberg.org",
+                        "api_base": "https://codeberg.org/api/v1" }]),
+                    None,
+                ),
+            ),
+            (
+                "github_broker.url",
+                with(
+                    serde_json::json!([]),
+                    Some(serde_json::json!({ "url": "http://broker.acme.dev" })),
+                ),
+            ),
+            (
+                "must be github.com too",
+                with(
+                    serde_json::json!([
+                        { "kind": "github", "web_base": "https://ghe.acme.dev",
+                          "api_base": "https://ghe.acme.dev/api/v3" }
+                    ]),
+                    Some(serde_json::json!({ "url": "https://b.acme.dev" })),
+                ),
+            ),
+            (
+                "unknown field",
+                with(
+                    serde_json::json!([]),
+                    Some(serde_json::json!({ "url": "https://b.acme.dev", "forges": ["github"] })),
+                ),
+            ),
+        ] {
+            let message = refusal(&text);
+            assert!(message.contains(needle), "{needle}: {message}");
+        }
+        for fine in [
+            // A GitHub Enterprise entry is fine without a broker.
+            with(serde_json::json!([ghe(serde_json::json!({}))]), None),
+            with(
+                serde_json::json!([ghe(serde_json::json!({
+                    "web_base": "http://127.0.0.1:3000", "api_base": "http://127.0.0.1:3000/api/v3"
+                }))]),
+                None,
+            ),
+            // github.com spelt with a trailing slash, next to the broker.
+            with(
+                serde_json::json!([
+                    { "kind": "github", "web_base": "https://github.com/",
+                      "api_base": "https://api.github.com/" }
+                ]),
+                Some(serde_json::json!({ "url": "https://b.acme.dev" })),
+            ),
+        ] {
+            assert!(parse_json(&fine).is_ok(), "{fine}");
+        }
+    }
+
+    #[test]
+    fn the_account_serves_only_remotes_on_its_own_hosts() {
+        let d = parse_json(FORGE).expect("spec example A");
+        assert!(d.serves_remote("https://git.acme.dev/git/people/notes.git"));
+        assert!(d.serves_remote("https://GIT.acme.dev:443/git/tgorka/tgdrive"));
+        // Where the account's token would be a stranger's: GitHub (the
+        // hesperia report, 2026-09-24), a look-alike, plain http, scp.
+        assert!(!d.serves_remote("https://github.com/tgorka/bmad-stepper.git"));
+        assert!(!d.serves_remote("https://git.acme.dev.evil.com/x.git"));
+        assert!(!d.serves_remote("http://git.acme.dev/git/people/notes.git"));
+        assert!(!d.serves_remote("git@git.acme.dev:people/notes.git"));
     }
 
     #[test]

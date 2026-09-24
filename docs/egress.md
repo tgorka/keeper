@@ -25,6 +25,8 @@ and it is enforced in two ways:
 | Each sync profile's **git remote host** (e.g. `github.com`, `forgejo.example.org`) | One entry per distinct remote *host* across your folder-sync profiles (duplicates collapse to one); absent entirely for a profile whose remote is a local path or a pendrive, which reaches no network | Fetch, push and LFS transfer for that folder. Only the **host** is shown — never the repository path, the username, or a credential that a badly-stored profile put in the URL. See `egress::remote_host`. |
 | Each configured **AI provider's host** (e.g. `localhost`, `127.0.0.1`, `gw.example.org`) | One entry per distinct provider *host* across your Bots providers (duplicates collapse to one); absent entirely when no provider is configured, which is how keeper ships | Chat completions, model and capability discovery, and a bot probe against the Hermes or Ollama endpoint you typed. Only the **host** is shown — never the `/v1` path, a profile prefix, or a credential. See the provider chapter below, and `egress::remote_host`. |
 | Each **organisation account destination** (e.g. `id.acme.dev`, `git.acme.dev`) | Only while an account is set up in Settings › Account (`~/.keeper/account.toml`); absent entirely without one, which is how keeper ships. One entry per distinct host the account's descriptor names: its identity provider and any endpoint it overrides, the address the setup link was read from (while keeper still knows it), the settings repository and its `api_base`, and in `oauth` mode the forge's own sign-in | Sign-in, token refresh and sign-out against the identity provider; fetch and push of your own directory in the settings repository; reading the descriptor once when you paste or open a setup link (HTTPS only, no redirects, 64 KiB cap). Only the **host** is shown. The identity provider's discovery document may name further hosts (for example a `jwks_uri` on a CDN); those are the provider's choice and are reached only as it names them. See `egress::org_account_egress`. |
+| **GitHub, for browsing repositories** (`api.github.com`; also `github.com` with a connection) | Only while GitHub is a repository source in use. While the account's descriptor names a GitHub broker (`[github_broker]`): `api.github.com`, the host the broker's tokens are sent to. While this device holds a GitHub connection made with *Connect GitHub*: that source's web host and API host, `github.com` and `api.github.com`. Absent otherwise, which is how keeper ships, since keeper's own GitHub app is not registered yet | `api.github.com`: listing the repositories the person may reach (`/installation/repositories` with a broker's token; `/user` and `/user/repos` with a connection). `github.com`: *Connect GitHub*'s device code, the wait for approval, and the refresh of an expiring connection. A GitHub drive's git and LFS traffic is the sync-remote row above. Only the **host** is shown, labelled *`<source name>` repositories* (*GitHub repositories* for the `github` source). See `egress::forge_egress` and the browsing chapter below. |
+| **The GitHub broker's host** (e.g. `broker.acme.dev`) | Only while the account's descriptor names `[github_broker]`; absent without an account | `GET /v1/whoami` and `POST /v1/token`, each carrying the account's sign-in access token, to get one-hour GitHub tokens for listing and for GitHub drives. See `docs/account.md` § *GitHub through your organization's broker*. Only the **host** is shown, labelled *GitHub access broker*. See `egress::forge_egress`. |
 | **`github.com/tgorka/keeper/releases/...`** (the signed-update `latest.json` endpoint) | On a cadence while the app runs (about every 6 hours, starting 2 minutes after launch) while **Update automatically** is on, and on every "Check for updates" click. Off — the switch in Settings → About, or `update.auto = false` in a config file — leaves the click as the only time it is contacted | Signed auto-updates (NFR-12). Downloads are cryptographically verified against keeper's minisign public key before installing. |
 | **`*.githubusercontent.com`** (GitHub's release-asset CDN) | While an update is downloading: either one the user chose to install, or one the background updater found while **Update automatically** is on | GitHub serves release files (the update binary) from its content-delivery network, which the `github.com` release URL redirects to. Disclosed so the egress list is exhaustive, not just the check endpoint. |
 | **`us.i.posthog.com`** | Only when configured and a relevant local observability category is enabled, or an explicitly started synthetic study is active; all default off | Closed diagnostic/product observations, OTLP diagnostic records/traces, separately consented public remote configuration, or content-isolated synthetic study replay/heatmaps. No raw app log export. See the consent boundary below. |
@@ -123,6 +125,47 @@ spawns nothing — an `ssh://` remote fails at its first sync, DW-241); no `git-
 for the same reason; none of the daemon's rows (`keeper-syncd` does not exist on the phone);
 no `git` credential helper. The phone and the Mac never contact each other — the remote is
 the only meeting point (D-15) — so this section adds no device-to-device destination either.
+
+## Browsing repositories adds GitHub and the organization's broker
+
+Epic 86 (AD-333…AD-335) lets a person list the repositories they can reach and add them as
+drives. It adds the two rows above, and nothing else. What it sends, stated so this file
+can be checked against the code (`keeper-core/src/forges/`, the shell's `forge_ipc.rs`):
+
+| Request | To | When |
+| --- | --- | --- |
+| `GET {issuer}/login/oauth/userinfo`, then `GET {api_base}/repos/search?uid=…&private=true&limit=50&page=N` | the account's forge: hosts the organisation-account row already lists | the person opens the account's forge in *Browse repositories…*, or refreshes it |
+| `GET /v1/whoami`, `POST /v1/token` | the broker's host | listing GitHub through a broker (one token per owner, at most 20 owners), and a GitHub drive's token (one per drive, reused until five minutes before it expires) |
+| `GET /installation/repositories?per_page=100` | `api.github.com` | listing through a broker, per owner, at most 10 pages; a broker listing makes at most 60 requests in all |
+| `POST /login/device/code`, `POST /login/oauth/access_token` | `github.com` | *Connect GitHub*: the code, then polling at GitHub's own `interval` (held between 1 and 60 seconds) only while the flow the person started is open, for at most 30 minutes; and the refresh of an expiring connection |
+| `GET /user`, `GET /user/repos?…&per_page=100` | `api.github.com` | once after connecting, for the login; and listing through a connection, at most 10 pages |
+
+- **A token is a header, never a URL.** Every token rides `Authorization`, only over
+  https (loopback excepted, for tests). A response that redirects is refused rather than
+  followed with the token (`keeper-core/src/forges/mod.rs`).
+- **Nothing runs by itself.** A list is fetched when the person opens a source or refreshes
+  it, and kept in memory for the process and for the person signed in; signing in or out,
+  forgetting the account and setting one up drop it. There is no timer, and nothing about
+  a list is written to disk.
+- **Only hosts the setup sheet showed.** A repository source's API must sit on its own web
+  host (`api.github.com` for github.com), a second Forgejo cannot be named at all, and the
+  setup sheet lists every host that will receive a repository token. So no row here is a
+  host the person was not shown before *Continue*.
+- **The in-use test is the disclosure's own.** Whether a source is in use is decided inside
+  `egress::forge_egress`, not by its caller, so the rows above and the test that pins them
+  cannot drift apart.
+- **Where nothing goes.** Without `[github_broker]` no broker is contacted. Without a
+  GitHub source, GitHub is not contacted for browsing, and keeper's own GitHub app is not
+  registered yet, so an install without a descriptor that names GitHub sends nothing to
+  GitHub for this feature.
+- **Connecting comes before the row.** The row for a connection is computed from the
+  connection, so the device-code request and the wait for approval reach `github.com`
+  while the list does not show it yet. That happens only inside the *Connect GitHub* flow
+  the person started and is watching, and the row appears as soon as the connection is
+  made. It leaves the list again when *Disconnect* deletes the connection.
+- **The broker decides the rest.** The broker itself calls GitHub's App API
+  (`/app/installations/…/access_tokens`) and the identity provider's JWKS. Those are the
+  broker's destinations, not keeper's.
 
 ## An AI provider is a destination you typed, disclosed as a host
 

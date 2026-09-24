@@ -76,6 +76,7 @@ import { type ReactNode, useEffect, useId, useMemo, useState } from "react";
 import { FoldToggle, useFold } from "@/components/layout/list-fold";
 import {
   SYNC_NOW_LABEL,
+  SYNC_OFFER_DRAFT_SENTENCE,
   SYNC_PAUSE_LABEL,
   SYNC_PROGRESS_LABEL,
   SYNC_REMOVE_CANCEL_LABEL,
@@ -87,7 +88,13 @@ import {
   SyncFolderPath,
   syncRemoteHost,
 } from "@/components/settings/sync-section";
-import { AddFolderForm, SYNC_ADD_TITLE, SYNC_EDIT_TITLE } from "@/components/sync/add-folder-form";
+import {
+  AddFolderForm,
+  type AddFolderPrefill,
+  SYNC_ADD_TITLE,
+  SYNC_EDIT_TITLE,
+} from "@/components/sync/add-folder-form";
+import { BrowseReposEntry } from "@/components/sync/browse-repos-sheet";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -756,6 +763,23 @@ export function SyncPane() {
    * empty to populated.
    */
   const [adding, setAdding] = useState(false);
+  /**
+   * A repository picked in Browse repositories (Epic 86): the add form opens
+   * on it, remounted under its key — unless the form already holds something
+   * of the person's own (fix R20), which a replacement would throw away.
+   */
+  const [prefill, setPrefill] = useState<AddFolderPrefill | null>(null);
+  const [addPristine, setAddPristine] = useState(true);
+  const [addNotice, setAddNotice] = useState<string | null>(null);
+  const addFromRepository = (next: AddFolderPrefill) => {
+    if (!adding || addPristine) {
+      setPrefill(next);
+      setAddNotice(null);
+    } else {
+      setAddNotice(SYNC_OFFER_DRAFT_SENTENCE);
+    }
+    setAdding(true);
+  };
   // Story 66.1: this pane is also the phone's Sync surface (Epic 66, AD-198).
   // What the phone cannot do is absent from it, by the tier the capabilities
   // report — never a control that fails on tap.
@@ -817,16 +841,27 @@ export function SyncPane() {
           <p className="text-muted-foreground text-sm">{SYNC_PANE_SUBTITLE}</p>
         </div>
         {profiles !== null && !empty && (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="shrink-0"
-            aria-expanded={adding}
-            onClick={() => setAdding((shown) => !shown)}
-          >
-            {SYNC_ADD_TITLE}
-          </Button>
+          <div className="flex shrink-0 items-center gap-2">
+            <BrowseReposEntry onAddOne={addFromRepository} />
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="shrink-0"
+              aria-expanded={adding}
+              onClick={() => {
+                // Closing the disclosure drops what it was opened on, so the
+                // next open is a blank add.
+                if (adding) {
+                  setPrefill(null);
+                  setAddNotice(null);
+                }
+                setAdding(!adding);
+              }}
+            >
+              {SYNC_ADD_TITLE}
+            </Button>
+          </div>
         )}
       </header>
 
@@ -863,7 +898,12 @@ export function SyncPane() {
             <p className="px-6 pt-4 text-muted-foreground text-sm">{SYNC_PANE_LOADING_SENTENCE}</p>
           )}
           {empty && (
-            <p className="px-6 pt-4 text-muted-foreground text-sm">{SYNC_PANE_EMPTY_SENTENCE}</p>
+            <div className="flex flex-col items-start gap-3 px-6 pt-4">
+              <p className="text-muted-foreground text-sm">{SYNC_PANE_EMPTY_SENTENCE}</p>
+              {/* The other way in when nothing is set up (UX-DR120): pick a
+                  repository instead of typing its URL. Absent without sources. */}
+              <BrowseReposEntry onAddOne={addFromRepository} />
+            </div>
           )}
           {/* Whether it arrived as the empty state or from the header action,
               this is the one add form; see `showAddForm` above for why.
@@ -883,10 +923,32 @@ export function SyncPane() {
             // pixel. Same reasoning as the Recording pane's column, applied to
             // the part of this surface that is actually a form.
             <Card size="sm" className="m-6 w-full max-w-[720px]">
-              <CardContent>
+              <CardContent className="flex flex-col gap-2">
+                {addNotice !== null && (
+                  <p role="status" className="text-xs">
+                    {addNotice}
+                  </p>
+                )}
                 <AddFolderForm
-                  onSaved={(_profile, settled) => setAdding(!settled)}
-                  onCancel={empty ? undefined : () => setAdding(false)}
+                  key={prefill?.key ?? "blank"}
+                  prefill={prefill ?? undefined}
+                  onPristineChange={setAddPristine}
+                  onSaved={(_profile, settled) => {
+                    setAdding(!settled);
+                    if (settled) {
+                      setPrefill(null);
+                      setAddNotice(null);
+                    }
+                  }}
+                  onCancel={
+                    empty
+                      ? undefined
+                      : () => {
+                          setAdding(false);
+                          setPrefill(null);
+                          setAddNotice(null);
+                        }
+                  }
                 />
               </CardContent>
             </Card>

@@ -13,6 +13,8 @@ This is the user and operator document. It covers:
 - how your settings, drives, bot providers and Matrix accounts travel between your devices,
   and how a reinstalled device restores itself;
 - how one sign-in serves your drives, your bots and your Matrix account;
+- how to browse your repositories on your account's forge and on GitHub, and add them as
+  drives, including GitHub access through your organization's broker;
 - what happens offline, at sign-out and when you forget the account;
 - the security properties it keeps.
 
@@ -20,7 +22,9 @@ The design reasoning lives in `_bmad-output/planning-artifacts/`:
 `epic-82-an-optional-account-and-a-config-that-follows-you.md` for the decisions and the
 requirement numbers below, `epic-84-your-settings-follow-you.md` for the settings that
 travel, `epic-85-your-device-comes-back-and-one-sign-in-opens-everything.md` for restoring a
-device and the one sign-in, and `research-account-2026-09-23.md` for the evidence.
+device and the one sign-in, `epic-86-browse-your-repositories-and-add-them-as-drives.md` for
+browsing repositories and the GitHub broker, and `research-account-2026-09-23.md` for the
+evidence.
 
 ## The one idea
 
@@ -41,7 +45,9 @@ device and the one sign-in, and `research-account-2026-09-23.md` for the evidenc
 
 **keeper works fully without an account.** With no descriptor nothing changes: no file is
 read that can fail, no network request is made, and Settings › Account shows only a paste
-field and a sentence saying so.
+field and a sentence saying so. The one feature that can work without an account is
+browsing GitHub through keeper's own GitHub app, and only once that app is registered and
+you connect it (see *Browse your repositories*).
 
 **What the account is not:**
 - **User management for other people.** keeper shows who you are, your roles and your
@@ -69,6 +75,9 @@ field and a sentence saying so.
    - `none`: keeper sends no credential, for a repository that needs none (a local test
      server, for example).
 4. **The descriptor**, served as JSON at an HTTPS URL, or packed into the link itself.
+5. **Optionally, repository sources** for *Browse repositories…*: a GitHub broker
+   (`[github_broker]`) or a GitHub OAuth App (`[[forges]]`). See *Repository sources in the
+   descriptor* and *GitHub through your organization's broker*.
 
 ## The descriptor
 
@@ -228,6 +237,67 @@ Forgejo, Forgejo 16's *Authorized Integrations*, or a test server:
 Omitted fields take their defaults. In B, `config.auth` could be left out entirely: `same`,
 `basic` and `oauth2` are the defaults.
 
+### Repository sources in the descriptor
+
+Two optional tables tell *Browse repositories…* where else to look (see *Browse your
+repositories*). Neither belongs to the sign-in. Adding, editing or removing them never
+signs anyone out and never replaces the account. In the JSON form they are
+`"github_broker": {"url": …, "app": …}` and `"forges": [{"kind": …, …}]`.
+
+```toml
+[github_broker]                   # GitHub access through your organization's broker
+url = "https://broker.acme.dev"   # https; keeper calls <url>/v1/whoami and <url>/v1/token
+app = "acme-bot"                  # optional: the GitHub App to prefer when two grants cover one owner
+
+[[forges]]                        # optional; any number
+kind = "github"                   # github only; a forgejo entry is refused (below)
+id = "github"                     # [a-z0-9-]{1,32}; default: "github"
+name = "GitHub"                   # shown on the source switcher; GitHub's default
+web_base = "https://github.com"   # GitHub's default
+api_base = "https://api.github.com"   # GitHub's default; must be api.github.com for github.com
+client_id = "…"                   # a public OAuth App's client id, for Connect GitHub
+```
+
+- **The account's own forge needs no entry.** In `oauth` mode, with `config.api_base` set,
+  keeper lists the forge your settings repository lives on, with the forge sign-in it
+  already holds. It is shown under the account's `name`.
+- **`[github_broker]`** makes GitHub a source for everyone signed in to the account. The
+  `github` source then gets its tokens from the broker. A GitHub OAuth App (a `client_id`
+  here, or keeper's own) is used only when the broker has no grants for the person.
+- **A `github` entry** is needed only for a `client_id`, a `name`, or a second GitHub
+  source under another `id`. The broker serves only the source whose id is `github`; any
+  other GitHub source connects with its own `client_id`. An entry keeper cannot get a
+  token for is not shown. keeper's own GitHub app is used only by a source on github.com's
+  own two addresses, `https://github.com` and `https://api.github.com`.
+- **The API stays with its forge.** A source whose `web_base` is github.com must use
+  `api_base = "https://api.github.com"`, and any other source must keep its `api_base` on
+  its `web_base`'s host. The API is where keeper sends the source's token, so a descriptor
+  cannot point it anywhere else.
+- **Only the account's own Forgejo is listed.** A `forgejo` entry is refused: "keeper lists
+  only the account's own Forgejo; remove this [[forges]] entry." keeper has no way to get
+  a token for a second Forgejo: Forgejo has no device flow, the broker serves GitHub only,
+  and your account's forge token never goes to another host.
+
+**What keeper refuses.** The whole descriptor is refused, with a sentence, as for any
+other fault:
+- a `web_base`, `api_base` or broker `url` that is not `https` (loopback hosts excepted, for
+  tests), or that carries a user name, a password, a query or a fragment;
+- a client secret, anywhere, as always;
+- two sources with one `id`, or an entry with the id `account-forge`, which belongs to the
+  account's own forge;
+- a `forgejo` entry;
+- a github.com `web_base` whose `api_base` is not `https://api.github.com` ("`forges[N].api_base`
+  must be https://api.github.com for github.com; keeper sends a GitHub token only to
+  GitHub."), or any other `web_base` whose `api_base` is on another host;
+- with `[github_broker]`, a `github` entry that points anywhere but `github.com`: the
+  broker's tokens are github.com's. github.com is compared as an address, so a trailing
+  `/`, upper case or an explicit `:443` is still github.com.
+
+**The setup sheet shows every host that will get a token.** Besides the sign-in host and
+the repository host, it lists the broker's host (*Gets GitHub access from `<host>`*) and
+each repository source's hosts, so nothing receives a token that you did not see before
+*Continue*.
+
 ## Setting up a device
 
 ### Serving the descriptor
@@ -273,6 +343,9 @@ keeper then shows **one confirmation sheet**:
 - the account's name;
 - **the sign-in host and the repository host**, in full;
 - this device's name, which you can edit until the device is registered, and its class.
+- with a `[github_broker]`, the line **Gets GitHub access from `<host>`**, and with
+  repository sources, every host that will receive a repository token, so you see where
+  your tokens can go before you continue.
 
 **Nothing is written before you choose *Continue*.** *Cancel* writes nothing. A setup link
 can point keeper at anyone's identity provider, which is why both hosts are always on the
@@ -639,7 +712,14 @@ the next launch (DW-301).
     `"bots.provider_credential_source.provider:<kind>:<base URL>" = "account"`. A drive or
     provider that uses the keychain has no entry. The value applies only as the account
     you are signed in to, and only to a drive or provider this device has. Otherwise it
-    stays in the file and waits, like any reference (below).
+    stays in the file and waits, like any reference (below). A drive added from a
+    repository source records that source instead, as `"forge:<source id>"` (for example
+    `"forge:github"`). That value names a source, never a token. A device applies it only
+    to a drive whose remote is on that source's host, and only when it can get that
+    source's token itself: it holds a GitHub connection for that source, or the source is
+    served by the broker and you are signed in. Otherwise the value stays in the file,
+    unapplied, and the drive keeps signing in as it did (see *Adding repositories as
+    drives*).
 - **Per-install state stays on the device.** Which notes you have read, where the capture
   window sits and its draft, the notes you just created, one-time answers (the first-run
   answer, the iOS sync notice), and the account's bookkeeping (this device's name, the
@@ -656,7 +736,7 @@ The settings files carry a reference instead:
 | Reference | Used by |
 | --- | --- |
 | `drive:<remote URL>#<branch>` | `notes.active_vault`, `tasks.ledger_vault`, `recording.destination_profile_id` |
-| `drive:<remote URL>#<branch>@<name>` | the same, when two of this device's drives share a repository and branch |
+| `drive:<remote URL>#<branch>^<name>` | the same, when two of this device's drives share a repository and branch |
 | `provider:<kind>:<base URL>` | the provider inside `notes.embedding_model` |
 | `bot:<kind>:<base URL>#<target>` | `bots.voice_target` |
 
@@ -869,6 +949,11 @@ link. The files in the repository are untouched.
 - signs out, if you are signed in;
 - deletes `account.toml`;
 - deletes this device's copy of the repository (`<data>/account/<id>/`);
+- deletes the GitHub connections of the sources the descriptor names
+  (`forge/<source id>/<client id>/session`). A connection through keeper's own GitHub app
+  stays until you disconnect it;
+- forgets every repository list and broker token keeper holds in memory, so nothing
+  fetched for this account is shown to the next one;
 - stops applying the account's layer files, and forgets which version of your settings
   files this device last synced and whether it has restored itself. Setting the same
   account up again on this install therefore restores the device again, and adds nothing
@@ -901,6 +986,8 @@ providers.
   LFS. If the forge is not connected, the drive asks you to sign in again. A token the
   forge refuses is refreshed once.
 - **Any other drive** set to the account gets the sign-in token.
+- **A drive added from a repository source** signs in through that source, not the
+  account: see *Adding repositories as drives*.
 
 Either token is sent the way keeper sends any drive token: as the Basic user name with an
 empty password on git, as Basic `token:` for LFS, and as `token {token}` for the forge's
@@ -934,6 +1021,294 @@ that names several services can be replayed at any of them, so keep the list sho
 - A restored device starts this sign-in once by itself (see *A device that comes back*).
 - The Matrix session stays in this device's keychain and never travels.
 
+## Browse your repositories
+
+*Browse repositories…* lists the repositories you can reach on your account's forge and on
+GitHub, shows which of them you already sync, and adds the ones you pick as drives. It
+sits beside *Add a folder* in Settings › Sync, and in the Sync pane while it is empty. It
+appears only when keeper has somewhere to look:
+- **your account's forge**, when your settings repository lives on a forge in `oauth` mode
+  and the descriptor gives `config.api_base`;
+- **GitHub**, when the descriptor names a GitHub broker (see *GitHub through your
+  organization's broker*) or a GitHub OAuth App (see *Repository sources in the
+  descriptor*), or once keeper's own GitHub app is registered. keeper's own app needs no
+  account, but it is not registered yet, so today GitHub needs a descriptor that names one
+  (DW-323).
+
+With none of these, nothing new appears and nothing is contacted.
+
+A switcher at the top of the sheet picks the source, and keeper remembers the last one
+you used. A source keeper cannot use right now says why, in one sentence, with the one
+thing that helps: *Connect GitHub*, *Sign in*, or *Try again*.
+
+### Your account's forge
+
+keeper lists the forge with the sign-in it already holds for your settings repository, and
+asks for no new consent. It reads who you are from the forge's userinfo, then searches the
+repositories you can reach:
+- your own;
+- those of organizations whose teams you are on;
+- those you collaborate on.
+
+According to Forgejo's code, a public repository of another person on which you can only
+read is left out.
+
+Forgejo does not say whether an owner is a person or an organization. Your own
+repositories come first, as *You*, and every other owner is a group of its own (DW-328).
+
+keeper searches rather than asking for *your repositories*, because that list needs
+`read:user`, which a grant of `openid profile write:repository` lacks. Widening the grant
+would make everyone revoke keeper on the forge first (see *Operator notes*).
+
+### GitHub
+
+What the GitHub list holds depends on where keeper's GitHub tokens come from:
+- **Through your organization's broker** (see *GitHub through your organization's
+  broker*): the owners the broker lets you reach, each listed with a short-lived token for
+  that owner. An owner the broker cannot serve says why, and the others still list.
+- **Through your own connection** (*Connect GitHub*): your repositories, those you
+  collaborate on, and those of every organization you belong to.
+
+When the descriptor names a broker, keeper uses it. Your own connection is offered only
+when the broker has no grants for you and a GitHub OAuth App is configured. Having no
+grants is not an outage. The sheet says "Your account has no GitHub access on
+`<broker host>`. Ask its administrator to add you.", shows no older list, and offers
+*Connect GitHub* when it can.
+
+**Connecting GitHub yourself.**
+- *Connect GitHub* shows a code. *Open github.com* copies it and opens GitHub's device
+  page, where you paste it and approve keeper. keeper opens that page only when it is an
+  https page on the source's own host or a subdomain of it. Any other page gets
+  "`<host>` gave keeper an approval page elsewhere, so keeper does not open it." keeper
+  waits while you approve, and *Cancel* stops waiting, even when GitHub's answer is
+  already on its way: a cancelled connection is never stored. If the page cannot be
+  opened or the code copied, the sheet says so, and the code stays selectable.
+- keeper asks GitHub for `repo` and `read:org`. GitHub has no read-only scope for private
+  repositories, and `read:org` lets keeper see your organizations.
+- The connection is kept in this device's keychain (`forge/<source id>/<client id>/session`)
+  and never leaves the device. Each source and OAuth App has its own item, so a
+  descriptor's own GitHub app never shares, or replaces, a connection made through
+  keeper's. When GitHub made the connection an expiring one, keeper refreshes it a minute
+  early. Reading a connection never deletes it; only *Disconnect* does.
+- **Disconnect** deletes it from the keychain, together with any item an earlier build
+  kept at `forge/<source id>/session`. GitHub offers no way for an app without a secret to
+  revoke a token, so if you want keeper gone on GitHub too, remove it under GitHub ›
+  Settings › Applications; the sheet links keeper's own page there (DW-327).
+
+**Organizations that hide repositories.**
+- **An organization that has not approved keeper** shows only its public repositories.
+  GitHub turns this restriction on by default for new organizations, and hides the rest
+  without an error. When GitHub does name it, keeper says "Some organizations haven't
+  approved keeper, so their private repositories are hidden." It links the page where you
+  ask the organization's owners to approve keeper. Only they can (DW-326).
+- **An organization that uses single sign-on** hides its repositories until you authorize
+  keeper for it. keeper says "Repositories of organizations that use single sign-on are
+  hidden until you authorize keeper for them.", with GitHub's link when GitHub gives one.
+
+### The list
+
+- **Grouped by owner:** *You* first, then organizations and other people, A to Z. Each row
+  shows a lock for a private repository, the chips *Fork*, *Archived*, *Template* and
+  *Mirror*, the description, when it last changed and its size.
+- **What you already sync:**
+  - a repository that a drive on this device syncs reads *Syncing here as `<drive>`* and
+    cannot be selected;
+  - one your other devices sync reads *On `<devices>`*, from `drives.toml`.
+
+  URLs are compared normalized, as for references, so `https://GitHub.com/a/b.git` and
+  `https://github.com/a/b` are one repository.
+- **What keeper can only download.** A repository you can only read, an archived one and
+  a mirror say so on their row: "You can only read this repository, so keeper only
+  downloads it.", "This repository is archived, so keeper only downloads it." or "This
+  repository is a mirror, so keeper only downloads it." keeper adds such a repository as a
+  download-only drive, so it never piles up changes that GitHub or the forge would refuse.
+  Through a broker, a repository counts as writable only when one of your grants gives
+  write access to its contents.
+- **Finding one:** search by name, owner or description; filter by owner; show forks and
+  archived repositories with their switches (both off at first); sort by last update or by
+  name.
+- **At most 1,000 per source.** Past that, keeper says "Only the first 1,000 are listed;
+  search looks only through those." (DW-329). A repository beyond them can still be
+  added by its URL in *Add a folder*.
+- **Fetched when you look, kept in memory.** keeper fetches a source's list the first
+  time you open it and when you choose *Refresh*. It keeps the list only while keeper
+  runs, only for the person who is signed in, and writes nothing about it to disk. Signing
+  in, signing out, forgetting the account and setting one up all forget it. Nothing is
+  fetched in the background. Offline, the sheet shows the failing request's own sentence,
+  which names the host that failed (for example "Can't reach `<host>`."), followed by
+  "Showing the list from `<HH:MM>`." when a list was already fetched.
+- **Trying again means trying again.** *Try again*, and *Sign in* once you have signed in,
+  fetch the list afresh, so a source that failed once recovers without a restart.
+
+### Adding repositories as drives
+
+- **One.** *Add…* on a row opens *Add a folder* filled in: the repository's name as the
+  drive's name, its folder (`<new drives folder>/<name>`, see below), its clone URL, its
+  default branch, *Download only* where keeper can only download it, and the sign-in its
+  source gives. You can change any of them. This is also the way to add a second drive of
+  one repository in another folder.
+- **Which sign-ins the form offers.** keeper asks Rust for the sign-ins a drive at the
+  form's remote may use (`sync_credential_choices`), each with a label and one sentence
+  saying what it means, and offers only those:
+  - *Use my `<account>` account* only for a repository on one of the account's own hosts
+    (its sign-in, config repository and forge). For a GitHub repository it is never
+    offered, and keeper refuses both to save it and to hand the account's token over:
+    GitHub would be given your account's sign-in, and refuse it anyway.
+  - *GitHub access through `<account>`* for a GitHub repository when the account names a
+    broker: the broker gives keeper a one-hour token for that one repository, as you.
+  - *Sign in with GitHub* for a GitHub repository through your own GitHub connection.
+  - Change the remote to another host and the choices follow it; a choice the new remote
+    cannot use goes back to the drive's own token.
+- **Several.** Tick them (⌘A anywhere in the sheet, outside a text field, ticks every
+  visible one not yet added) and choose *Add `<n>` drives…*. The count and the batch are
+  the ticked repositories that are still listed and not yet added.
+  - **Where they go.** On a desktop, new drives go in `~/keeper/git` unless you choose
+    another folder under Settings › Sync › *New drives go in* (`sync.drive_folder`,
+    machine-local; *Use default* goes back). The batch starts from that folder and you can
+    change it for one batch. Each repository goes into `<folder>/<name>`, and you can rename
+    each one. On iPhone and iPad keeper places the folders itself, as for any drive.
+  - **Which folders keeper uses.** A folder must be a full path ("Choose a full folder
+    path."; `~/` means your home folder). It must be absent (keeper creates it), empty
+    (a Finder `.DS_Store` or folder icon does not count), or already a clone of that
+    repository. A folder that holds other files, or a name used twice, blocks only its own
+    row.
+  - **Never on, in or around another drive.** A folder that is already a drive's folder,
+    lies inside one, or contains one is refused. keeper compares the real paths, and on a
+    Mac ignores the difference between upper and lower case, as the disk does.
+  - **What keeper refuses.** A repository that already syncs on this device is refused,
+    with "Already syncing here as `<name>`." Add a second drive of it through *Add…*.
+  - **The result.** The others are added and start syncing, and each row says how it went.
+    If a row fails, keeper removes the empty folders it made for it. Renaming a row clears
+    its old result. One batch runs at a time.
+
+**Which sign-in a drive added this way uses:**
+- **A repository on your account's forge** uses your account, so it gets the forge's own
+  token (see *One sign-in: drives, bots and Matrix*).
+- **A GitHub repository** uses its source, recorded as `forge:<source id>`, for example
+  `forge:github`.
+  - Through a broker, the drive gets a one-hour token for its one repository: with write
+    access to its contents when one of your grants allows it, and read access otherwise,
+    in which case the drive only downloads.
+  - Through your own connection, it gets that connection's token.
+- **Only on the source's host.** keeper gives a source's token only to a drive whose
+  remote is on that source's host (for GitHub, `https://github.com/…`). Any other drive
+  asks you to sign in, and nothing is sent. Choosing a source for a drive on another host
+  is refused: "This drive's repository isn't on `<host>`."
+- **The token's spelling.** It is sent the way keeper sends any drive token: as the Basic
+  user name with an empty password. GitHub accepts that for a connection's token, on git
+  and LFS alike (tested). With a broker's installation token it has not been tried yet
+  (DW-325).
+- **It travels.** Which sign-in each drive uses travels in `settings.<device>.toml`, so a
+  restored device keeps it, once it can get that source's token itself (see *What travels
+  from this device, and what never does*).
+
+## GitHub through your organization's broker
+
+An organization can give its people GitHub access without anyone connecting a GitHub
+account to keeper. A broker holds the organization's GitHub App keys, and hands short-lived
+tokens to people signed in to the account. keeper speaks the protocol of makistack's
+`github-broker` (tgorka/makistack#863). **That broker is an open pull request.** It is
+deployed on the owner's server (tailnet only) but not merged, and it serves no token yet:
+one app has no credentials, and the other is installed nowhere (DW-324). The protocol below
+is the one in its source (`docker/github-broker/app/broker.py` at `7f32b70`). keeper ships
+no broker; it only calls one.
+
+**In the descriptor:**
+
+```toml
+[github_broker]
+url = "https://broker.acme.dev"   # https
+app = "acme-bot"                  # optional
+```
+
+- **`url`:** the broker's base address. keeper calls `<url>/v1/whoami` and
+  `<url>/v1/token`.
+- **`app`:** the GitHub App keeper prefers when two of a person's grants fit a request.
+  keeper considers only the grants that cover the owner, the repository and the permission
+  it is about to ask for, as the broker's own policy does. Among those, `app` wins, and
+  without it keeper takes the first, in the order the broker lists them. So keeper never
+  asks for a token the policy would refuse.
+- The setup sheet shows "Gets GitHub access from `<host>`".
+
+**What keeper sends.** Every request carries the account's sign-in access token as
+`Authorization: Bearer`. The requests:
+1. **`GET <url>/v1/whoami`** answers `{sub, subject, grants: [{app, owners, repositories,
+   permissions}]}`, where `repositories` is `"*"` or a list of names. keeper keeps the
+   answer while it runs, for the person signed in, until an error or a *Refresh*.
+2. **To list,** for each owner in the grants, A to Z, at most 20 owners. Past that, keeper
+   says "`<broker host>` gives you more owners than keeper lists at once; only the first 20
+   are listed."
+   - keeper sends `POST <url>/v1/token` with
+     `{"app": "<app>", "owner": "<owner>", "permissions": {"metadata": "read"}}`, or with
+     `{"contents": "read"}` when no grant covering the owner allows `metadata`;
+   - with that token, it pages
+     `GET https://api.github.com/installation/repositories?per_page=100`, following GitHub's
+     `link` header: up to 10 pages per owner, and 60 requests (the `whoami`, each token and
+     each page) and 1,000 repositories in all. Repositories are grouped by owner before
+     that limit cuts, so yours come first.
+   - An owner whose `owner.type` is `User` is shown as *You* (DW-328).
+   - A repository is writable only when a grant covering it gives `contents: write`, and
+     GitHub's own `permissions.push`, when it sends one, is not false. Anything else is
+     added download-only.
+3. **For a drive** on `https://github.com/<owner>/<repo>`, keeper sends `POST <url>/v1/token`
+   with `{"app": "<app>", "owner": "<owner>", "repositories": ["<repo>"], "permissions":
+   {"contents": "write"}}` when a grant covering it allows write, and with
+   `{"contents": "read"}` otherwise. Such a drive only downloads.
+
+The broker answers `{token, expires_at, app, owner, repositories, permissions}`. Tokens last
+an hour.
+- keeper keeps each one **in memory only**, keyed by the person signed in and by what it
+  asked for, and serves it only while that person is still signed in.
+- It asks for a new one five minutes before `expires_at`.
+- Signing in, signing out, forgetting the account and setting one up forget every token
+  and `whoami` answer.
+- Nothing from the broker is written to the keychain or to disk.
+- keeper follows no redirect with a token.
+
+**The answers keeper handles.** The broker's errors are JSON, `{error, detail}`. The same
+rules apply to `whoami`, to a listing token and to a drive's token. A failing `whoami`
+lists nothing.
+
+| Answer | What keeper does |
+| --- | --- |
+| 401 (any error) | "Sign in again to reach GitHub through your organization." The account's *Sign in* is offered. A 401 straight after keeper has just refreshed your sign-in is a refusal instead, "`<broker host>` did not accept your account's sign-in: `<detail>`", because signing in again would not fix it. |
+| 401 from GitHub on one owner's `installation/repositories` | keeper drops that token, and that owner's notice says "GitHub didn't accept the token `<broker host>` gave keeper for `<owner>`; refresh to try again." The other owners still list. |
+| 404 `not_installed` | That owner's notice: "keeper's GitHub app `<app>` isn't installed on `<owner>`." The other owners still list. |
+| 503 `app_unconfigured` | That owner's notice: "GitHub access for `<owner>` isn't set up on `<broker host>` yet." The other owners still list. |
+| 403 `forbidden` (the policy), or 403 `github_refused` (the installation does not cover it) | That owner's notice: "`<broker host>` refused `<owner>`: `<detail>`." The other owners still list. |
+| `github_refused` with a 5xx status (GitHub itself failing) | The source is unreachable: "GitHub isn't answering `<broker host>` right now." |
+| An owner no grant names (a GitHub drive under another owner, for example) | "`<broker host>` gives you no access to `<owner>`'s repositories." Nothing is asked of the broker. |
+| `whoami` with `subject: null`, or no grants | No access, a state of its own: "Your account has no GitHub access on `<broker host>`. Ask its administrator to add you." No older list is shown. When a GitHub OAuth App is configured, *Connect GitHub* is offered instead. |
+| 400 `bad_request` | The source is unreachable: "keeper couldn't list GitHub's repositories." A 400 means keeper asked wrongly, so the answer is a fault to report, not a retry. |
+| Any other 5xx (503 `idp_unavailable`, 502 `broker_error`) | The source is unreachable: "`<broker host>` can't answer right now.", with *Try again*. |
+| Any other status | "`<broker host>` refused keeper (HTTP `<status>`)." |
+| An answer keeper cannot read | "The GitHub broker sent an answer keeper could not read." |
+| No answer at all | "Can't reach `<host>`.", naming the host that failed, with *Try again*. The broker is often on a private network, such as a tailnet, that a device away from it cannot reach. |
+
+**What the broker decides, and what GitHub decides.**
+- **The broker's policy** says which apps and owners each person may use, keyed by the
+  identity provider's `sub`. Each grant is a ceiling.
+- **The GitHub App's installations** are a second ceiling. GitHub refuses a repository the
+  app is not installed on, or a permission it was not granted.
+- **So the list is not "every organization you belong to".** It is the owners your grants
+  name, where the app is installed.
+- **An installation token acts as the app, not as you.** GitHub's `/user` endpoints refuse
+  it, which is why keeper lists `installation/repositories` owner by owner.
+
+**Running one.** makistack's runbook covers it (`docs/runbooks/github-broker.md` on branch
+`feat/github-broker`). What keeper relies on:
+- **The keys stay in the broker.** It holds each GitHub App's private key and never hands
+  one out. It mints installation tokens narrowed to what was asked for.
+- **It verifies keeper's token.** keeper's access token is checked against the identity
+  provider's JWKS, with the issuer exact and the audience one the broker accepts. For
+  keeper, accept the project whose id keeper requests as an audience
+  (`urn:zitadel:iam:org:project:id:<id>:aud` in `extra_scopes`).
+- **The token must be a JWT.** The identity provider must issue keeper JWT access tokens,
+  as makistack's ZITADEL does for keeper.
+- **Grants are keyed by `sub`,** so a renamed login cannot inherit someone else's grants.
+- **It serves https at its final address.** keeper refuses plain http, except to a
+  loopback host, and follows no redirect with a token.
+
 ## Security notes
 
 - **Setup links show hosts.** A link or QR code can name any identity provider and any
@@ -944,17 +1319,28 @@ that names several services can be replayed at any of them, so keep the list sho
   descriptor are not secret. Sharing the QR code grants no access.
 - **HTTPS only.** Every URL in a descriptor must be `https`, apart from loopback hosts for
   testing. A descriptor is fetched with no redirects and at most 64 KiB.
-- **Tokens live in the keychain only.** A signed-in account keeps its tokens in one keychain
-  item, `account/<id>/session`, plus `account/<id>/forge` in `oauth` mode, under the service
-  `dev.tgorka.keeper`. On macOS that means at most one keychain prompt per item per launch.
-  On iOS the items are this-device-only and never synchronised.
+- **Tokens live in the keychain or in memory only.** A signed-in account keeps its tokens in
+  one keychain item, `account/<id>/session`, plus `account/<id>/forge` in `oauth` mode. A
+  GitHub connection has its own, `forge/<source id>/<client id>/session`. All of them are
+  under the service `dev.tgorka.keeper`. On macOS that means at most one keychain prompt
+  per item per launch. On iOS the items are this-device-only and never synchronised. A
+  broker's tokens and the repository lists are kept in memory only, for the identity that
+  fetched them, and are forgotten at every sign-in, sign-out, *Forget this account* and
+  setup.
 - **Where tokens never go.** Tokens are never sent to keeper's webview, written to a log or
   a file, put in a command line or a URL, or committed to the config repository.
+- **A forge token goes only to its forge.** A repository source's token is sent only to
+  that source's own host (its API, which must sit on the same host, or `api.github.com` for
+  github.com; or git and LFS on its web host) or to the descriptor's broker, only over
+  https (loopback hosts excepted, for tests), and never after a redirect. A drive whose
+  remote is on another host gets no token from that source, and cannot be set to use it.
+  The setup sheet lists every such host before anything is written.
 - **Nothing secret travels in your settings.** The settings files, the lists of drives,
   bot providers and Matrix accounts, and this device's own file carry values and
   descriptions only: never a token, password, session, keychain item or credential. A
   drive's remote is written without any user name or password. A drive or provider
-  records only which credential it uses (`account`, `own` or `none`).
+  records only which credential it uses (`account`, `own` or `none`). A drive added from a
+  repository source records only the source's name, `forge:<source id>`.
 - **Only you arm the microphone.** Listening can travel off, never on, and no layer file
   may set it. Switching it on is a tap on the device that will listen.
 - **The machine fingerprint is yours only.** A device record's `machine` is a SHA-256 of
@@ -973,14 +1359,17 @@ that names several services can be replayed at any of them, so keep the list sho
   from UserInfo whose subject matches, never from the access token.
 - **Disclosed destinations.** While an account is set up, Settings › About lists its hosts
   (the sign-in host, the host the descriptor came from, the repository's host, and in
-  `oauth` mode the forge's host) with keeper's other destinations. With no account the list
-  is unchanged. See `docs/egress.md`.
+  `oauth` mode the forge's host) with keeper's other destinations. GitHub's hosts join the
+  list while GitHub is in use as a repository source, and a broker's host while the
+  descriptor names one. With no account and no GitHub source the list is unchanged. See
+  `docs/egress.md`.
 
 ## Operator notes
 
 These come from the providers' own documentation and source. The epic's research document
-cites each one (`research-account-2026-09-23.md` §6–§8). Where a behaviour was inferred and
-not tested live, it says so.
+cites each one (`research-account-2026-09-23.md` §6–§8). The notes on listing repositories
+and on GitHub cite epic 86's *Verified facts, with sources*. Where a behaviour was inferred
+and not tested live, it says so.
 
 **Any OIDC provider**
 - **Register keeper as a public, native client.** Use PKCE S256, no secret, and the redirect
@@ -1044,6 +1433,28 @@ not tested live, it says so.
 - **`signin_url`** is `https://<forge>[/<subpath>]/user/oauth2/<auth-source-name>?redirect_to={authorize_path_and_query}`.
   People signing in to the forge for the first time land on its link-account page unless
   `[oauth2_client] ENABLE_AUTO_REGISTRATION` is on.
+- **Listing repositories.** *Browse repositories…* reads `GET {issuer}/login/oauth/userinfo`
+  for the person's id, then `GET {api_base}/repos/search?uid=<id>&private=true`, paged by
+  number against `api_base` (Forgejo's `Link` header names `ROOT_URL`). Both work with a
+  `write:repository` grant. `/user/repos` and `/user/orgs` would need `read:user` and
+  `read:organization`, so keeper does not use them, and a working `scope` need not change
+  for browsing.
+
+**GitHub, for *Connect GitHub***
+- **Register an OAuth App**, not a GitHub App, and switch on *Enable Device Flow*. keeper
+  sends no client secret and never needs one: the device flow and its refresh work
+  without it. Put the client id in a `[[forges]]` `github` entry (see *Repository sources
+  in the descriptor*), and leave `web_base` and `api_base` at GitHub's defaults. Never put
+  the secret in a descriptor, which refuses it.
+- **Scopes.** keeper asks for `repo read:org`. GitHub has no read-only scope for private
+  repositories.
+- **Organizations.** GitHub turns OAuth App access restrictions on by default for new
+  organizations. Until an owner approves the app, its private repositories are hidden
+  from everyone who connects through it.
+- **Tokens per person.** GitHub keeps at most 10 tokens per person, app and scope, and an
+  eleventh revokes the oldest. Each device that connects holds one.
+
+**GitHub, through a broker:** see *GitHub through your organization's broker*.
 
 **The Matrix homeserver, for single sign-on**
 - **OAuth for Matrix.** The homeserver must offer OAuth 2.0 for Matrix (MSC3861):
@@ -1099,8 +1510,11 @@ that person's other devices of the same class has one. Both are optional and use
 | The clone | `<data>/account/<id>/repo`, removed by *Forget this account* |
 | The session | keychain `account/<id>/session` (service `dev.tgorka.keeper`) |
 | The forge session (`oauth` mode) | keychain `account/<id>/forge` |
+| A GitHub connection (*Connect GitHub*) | keychain `forge/<source id>/<client id>/session` |
 | Last sync time, this device's name | settings keys `account.<id>.last_synced_ms`, `account.<id>.device_slug` (keeper-owned; see `docs/settings-keys.md`) |
 | A drive or provider using the account | settings keys `sync.credential_source.<profile_id>`, `bots.provider_credential_source.<provider_id>` = `account:<id>`; in `<login>/settings.<device>.toml` as `sync.credential_source.<drive reference>`, `bots.provider_credential_source.<provider reference>` = `"account"` |
+| A drive that signs in through a repository source | settings key `sync.credential_source.<profile_id>` = `forge:<source id>`; in `<login>/settings.<device>.toml` as `sync.credential_source.<drive reference>` = `"forge:<source id>"` |
+| A broker's tokens, repository lists | memory only, for as long as keeper runs |
 | Your preferences | `<login>/settings.toml` (every device), `<login>/settings.<device>.toml` (this device) |
 | Your drives, bot providers and Matrix accounts | `<login>/drives.toml`, `<login>/bots.toml`, `<login>/matrix.toml` |
 | This device, so it can be restored | `<login>/device.<device>.toml` (written only by that device) |

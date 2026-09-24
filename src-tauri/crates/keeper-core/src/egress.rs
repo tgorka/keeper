@@ -345,6 +345,52 @@ pub fn org_account_egress(
     endpoints
 }
 
+/// The repository sources in use (Epic 86), as [`EgressKind::Forge`] hosts:
+/// the web and API hosts of each source this device holds a device-flow
+/// connection to, and — while the descriptor names a `[github_broker]` —
+/// the broker and GitHub's API, which the broker's tokens are sent to. The
+/// account's own forge is already an [`EgressKind::Account`] row. Nothing
+/// configured or connected, nothing listed (AD-53).
+pub fn forge_egress(
+    platform: &dyn crate::platform::Platform,
+    descriptor: Option<&crate::org_account::descriptor::AccountDescriptor>,
+    builtin_github_client_id: Option<&str>,
+) -> Vec<EgressEndpointVm> {
+    use crate::forges::{tokens, TokenVia};
+    let mut named: Vec<(String, String)> = Vec::new();
+    if let Some(broker) = descriptor.and_then(|d| d.github_broker.as_ref()) {
+        named.push((broker.url.clone(), "GitHub access broker".to_owned()));
+        named.push((
+            crate::org_account::descriptor::GITHUB_API_BASE.to_owned(),
+            "GitHub repositories".to_owned(),
+        ));
+    }
+    let connected = crate::forges::sources(descriptor, builtin_github_client_id)
+        .into_iter()
+        .filter(|source| source.via != TokenVia::AccountForge)
+        .filter(|source| tokens::has_connection(platform, source));
+    for source in connected {
+        let label = format!("{} repositories", source.name);
+        named.push((source.web_base, label.clone()));
+        named.push((source.api_base, label));
+    }
+    let mut endpoints: Vec<EgressEndpointVm> = Vec::new();
+    for (url, label) in named {
+        let Some(host) = remote_host(&url) else {
+            continue;
+        };
+        if endpoints.iter().any(|e| e.url == host) {
+            continue;
+        }
+        endpoints.push(EgressEndpointVm {
+            url: host,
+            kind: EgressKind::Forge,
+            label,
+        });
+    }
+    endpoints
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,6 +898,7 @@ mod tests {
             EgressKind::Update,
             EgressKind::Telemetry,
             EgressKind::Account,
+            EgressKind::Forge,
         ];
 
         // Wildcard-free exhaustive match: a new `EgressKind` variant makes this
@@ -865,6 +912,7 @@ mod tests {
                 EgressKind::Update => {}
                 EgressKind::Telemetry => {}
                 EgressKind::Account => {}
+                EgressKind::Forge => {}
             }
         }
 
@@ -886,6 +934,10 @@ mod tests {
         let account =
             account_fixture(r#""config": { "url": "https://id.acme.dev/git/keeper-config.git" }"#);
         out.extend(org_account_egress(Some(&account), None));
+        let p = crate::forges::testing::FakePlatform::default();
+        let enterprise = account_fixture(ENTERPRISE);
+        connect(&p, &enterprise, "ghe");
+        out.extend(forge_egress(&p, Some(&enterprise), None));
 
         for kind in ALL_KINDS {
             assert!(
@@ -914,7 +966,86 @@ mod tests {
 
     #[test]
     fn no_account_discloses_nothing_new() {
+        let p = crate::forges::testing::FakePlatform::default();
         assert!(org_account_egress(None, None).is_empty());
+        // keeper's own GitHub client exists, but nothing is connected to it.
+        assert!(forge_egress(&p, None, Some("Iv1.builtin")).is_empty());
+    }
+
+    const ENTERPRISE: &str = r#""config": { "url": "https://git.acme.dev/c.git" },
+        "forges": [ { "kind": "github", "id": "ghe", "name": "Acme GitHub",
+                      "web_base": "https://ghe.acme.dev",
+                      "api_base": "https://ghe.acme.dev/api/v3", "client_id": "Iv1.x" } ]"#;
+
+    /// A device-flow connection to `source_id` in `p`'s keychain.
+    fn connect(
+        p: &crate::forges::testing::FakePlatform,
+        d: &crate::org_account::descriptor::AccountDescriptor,
+        source_id: &str,
+    ) {
+        let sources = crate::forges::sources(Some(d), Some("Iv1.builtin"));
+        let source = crate::forges::find(&sources, source_id).expect("source");
+        let token = crate::forges::tokens::StoredForgeToken {
+            access_token: "t".to_owned(),
+            refresh_token: None,
+            expires_ms: None,
+            login: "tg".to_owned(),
+            client_id: source.client_id.clone().expect("client"),
+        };
+        crate::forges::tokens::store_session(p, source, &token).expect("connect");
+    }
+
+    fn forge_rows(
+        p: &crate::forges::testing::FakePlatform,
+        d: &crate::org_account::descriptor::AccountDescriptor,
+    ) -> Vec<(String, String)> {
+        forge_egress(p, Some(d), Some("Iv1.builtin"))
+            .into_iter()
+            .map(|e| {
+                assert_eq!(e.kind, EgressKind::Forge);
+                (e.url, e.label)
+            })
+            .collect()
+    }
+
+    /// A source's hosts appear while this device holds a connection to it,
+    /// the broker's while one is configured, and never otherwise (AD-53).
+    #[test]
+    fn forge_hosts_are_disclosed_only_while_in_use() {
+        let p = crate::forges::testing::FakePlatform::default();
+        let enterprise = account_fixture(ENTERPRISE);
+        assert!(
+            forge_rows(&p, &enterprise).is_empty(),
+            "configured but never connected"
+        );
+        connect(&p, &enterprise, "ghe");
+        assert_eq!(
+            forge_rows(&p, &enterprise),
+            [(
+                "ghe.acme.dev".to_owned(),
+                "Acme GitHub repositories".to_owned()
+            )]
+        );
+
+        let brokered = account_fixture(
+            r#""config": { "url": "https://git.acme.dev/c.git" },
+               "github_broker": { "url": "https://electra.example.net:8455" }"#,
+        );
+        let broker_rows = [
+            (
+                "electra.example.net".to_owned(),
+                "GitHub access broker".to_owned(),
+            ),
+            (
+                "api.github.com".to_owned(),
+                "GitHub repositories".to_owned(),
+            ),
+        ];
+        assert_eq!(forge_rows(&p, &brokered), broker_rows);
+        connect(&p, &brokered, "github");
+        let mut connected = broker_rows.to_vec();
+        connected.push(("github.com".to_owned(), "GitHub repositories".to_owned()));
+        assert_eq!(forge_rows(&p, &brokered), connected);
     }
 
     #[test]

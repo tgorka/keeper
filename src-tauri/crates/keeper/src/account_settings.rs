@@ -105,13 +105,20 @@ pub(crate) fn gather(
                 let Some(remote_url) = portable else {
                     continue;
                 };
-                let bound =
-                    registry::get_sync_credential_source(data_dir, &profile.id, Some(account_id))?
-                        .is_some();
+                let source =
+                    registry::get_sync_credential_source(data_dir, &profile.id, Some(account_id))?;
+                let bound = source.as_deref() == Some("account");
+                // A drive signing in with a repository source (`forge:<id>`)
+                // has a credential of its own: "none" would tell other
+                // devices a private repository needs nothing.
+                let forge = source
+                    .as_deref()
+                    .is_some_and(|s| keeper_core::forges::forge_credential_id(s).is_some());
                 // Presence only: the value is never read past this line.
-                let own = platform
-                    .keychain_get(&profile.secret_key())
-                    .is_ok_and(|secret| secret.is_some());
+                let own = forge
+                    || platform
+                        .keychain_get(&profile.secret_key())
+                        .is_ok_and(|secret| secret.is_some());
                 records.push(drive_record(
                     profile,
                     remote_url,
@@ -122,7 +129,7 @@ pub(crate) fn gather(
         }
         None => (None, None),
     };
-    let catalog = catalog(data_dir, account_id, drive_refs)?;
+    let catalog = catalog(platform.as_ref(), data_dir, account_id, drive_refs)?;
 
     let listing = store::list_providers(data_dir)?;
     let grants = store::list_grants(data_dir)?.rows;
@@ -234,34 +241,25 @@ pub(crate) fn local_drive(profile: &SyncProfile) -> LocalDrive {
 /// configured account and trusting only its own origins (F5): a pulled
 /// "use my account" for a drive or provider elsewhere is not applied.
 pub(crate) fn catalog(
+    platform: &dyn Platform,
     data_dir: &Path,
     account_id: &str,
     drives: Option<Vec<LocalDrive>>,
 ) -> Result<Catalog, CoreError> {
     let mut catalog = Catalog::with_bots(data_dir, drives)?;
     catalog.account_id = Some(account_id.to_owned());
-    if let Some(d) = crate::account_ipc::descriptor().filter(|d| d.id == account_id) {
-        catalog.trusted_origins = trusted_origins(&d);
+    let descriptor = crate::account_ipc::descriptor().filter(|d| d.id == account_id);
+    if let Some(d) = &descriptor {
+        catalog.trusted_origins = d.trusted_origins();
     }
+    // A pulled `forge:<id>` applies only to a drive at that source's origin,
+    // and only for a source this device can get a token for.
+    catalog.forge_origins = keeper_core::forges::token_origins(
+        platform,
+        descriptor.as_ref(),
+        keeper_core::forges::BUILTIN_GITHUB_CLIENT_ID,
+    );
     Ok(catalog)
-}
-
-/// The descriptor's issuer, repository and forge origins.
-fn trusted_origins(d: &keeper_core::org_account::descriptor::AccountDescriptor) -> Vec<String> {
-    use keeper_core::org_account::descriptor::RepoAuthConfig;
-
-    let mut urls = vec![d.auth.issuer.as_str(), d.config.url.as_str()];
-    if let RepoAuthConfig::Oauth(forge) = &d.config.auth {
-        urls.extend(forge.issuer.as_deref());
-        urls.extend(forge.authorize_url.as_deref());
-    }
-    let mut origins: Vec<String> = urls
-        .into_iter()
-        .filter_map(settings_sync::url_origin)
-        .collect();
-    origins.sort();
-    origins.dedup();
-    origins
 }
 
 /// A live grant as the device file carries it: its bot by target, its drive

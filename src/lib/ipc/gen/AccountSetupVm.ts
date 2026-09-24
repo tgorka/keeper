@@ -15,4 +15,15 @@ registered: boolean,
  * would replace it (sign it out and forget it here). `None` for a first
  * setup, or for the same account under a new display name.
  */
-replaces: string | null, };
+replaces: string | null, 
+/**
+ * The host GitHub access comes from, when the descriptor names a
+ * `[github_broker]`: the sheet says "Gets GitHub access from <host>".
+ */
+brokerHost: string | null, 
+/**
+ * Every other host a repository token would be sent to: the web and
+ * API hosts of each GitHub source the descriptor adds, in the switcher's
+ * order, once each. The account's own forge is `repo_host`.
+ */
+forgeHosts: Array<string>, };

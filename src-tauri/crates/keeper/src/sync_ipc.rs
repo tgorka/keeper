@@ -1305,7 +1305,19 @@ pub async fn sync_profile_save(
     state: tauri::State<'_, AppState>,
     req: SyncProfileReq,
 ) -> Result<SyncProfileVm, IpcError> {
-    let engine = engine_of(&state)?;
+    save_profile(&app, &state, req).map(|profile| SyncProfileVm::from(&profile))
+}
+
+/// [`sync_profile_save`]'s whole path — validation, the sessions roots, the
+/// recordings archive, the account's drive list — for every caller that adds
+/// a drive, so a drive added from a repository listing is saved exactly as
+/// one added from the form.
+pub(crate) fn save_profile(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    req: SyncProfileReq,
+) -> Result<SyncProfile, IpcError> {
+    let engine = engine_of(state)?;
     // Read the stored profile first so the edit merges onto it rather than
     // replacing it: the upsert writes the whole row (see `parse_req`).
     let prior = match req.id.as_deref() {
@@ -1317,7 +1329,7 @@ pub async fn sync_profile_save(
         None => None,
     };
     #[cfg(not(desktop))]
-    let req = phone_shaped_request(&state, req, prior.as_ref())?;
+    let req = phone_shaped_request(state, req, prior.as_ref())?;
     let mut profile = parse_req(&req, prior.as_ref())?;
     // The phone's default (AD-199): fully virtual, every LFS path a pointer
     // until it is opened. On a new profile only — an edit keeps what is set.
@@ -1333,7 +1345,7 @@ pub async fn sync_profile_save(
     // when nothing sessions-shaped changed. Desktop: the sessions board stays
     // on the Mac (AD-201).
     #[cfg(desktop)]
-    crate::sessions_root::refresh(&app);
+    crate::sessions_root::refresh(app);
     #[cfg(not(desktop))]
     let _ = app;
     // Best effort, and that word is load-bearing: the row is already committed,
@@ -1343,11 +1355,11 @@ pub async fn sync_profile_save(
     // for one folder, because `db::upsert_profile` has no duplicate-path guard.
     // The merge is the honest fallback: it is what was written, minus only the
     // folder-owned keys the write stripped.
-    let answer = profile_by_id(&state, &profile.id).unwrap_or(profile);
+    let answer = profile_by_id(state, &profile.id).unwrap_or(profile);
     // A saved profile may have gained, lost or moved a recordings root, so the
     // archive follows it (the archive follows every recordings root).
     crate::ipc::spawn_recordings_index_rebuild(
-        state.inner(),
+        state,
         crate::ipc::RecordingsIndexTrigger::because("a synced folder was saved"),
     );
     // The drive travels in the person's `drives.toml` (Epic 84, AD-325), and
@@ -1356,7 +1368,7 @@ pub async fn sync_profile_save(
         crate::account_ipc::note_drives(&all);
     }
     crate::account_ipc::note_local_change();
-    Ok(SyncProfileVm::from(&answer))
+    Ok(answer)
 }
 
 /// The subfolder of the app container the phone's folders live under.
@@ -1375,7 +1387,7 @@ pub(crate) const PHONE_FOLDERS_DIR: &str = "sync";
 /// blank.
 #[cfg(not(desktop))]
 fn phone_shaped_request(
-    state: &tauri::State<'_, AppState>,
+    state: &AppState,
     mut req: SyncProfileReq,
     prior: Option<&SyncProfile>,
 ) -> Result<SyncProfileReq, IpcError> {

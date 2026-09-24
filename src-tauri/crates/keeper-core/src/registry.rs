@@ -1880,11 +1880,14 @@ pub fn credential_source_value(account_id: &str) -> String {
 
 /// The row to write for a requested credential source: `None` or `"keychain"`
 /// ⇒ `None` (the row is deleted), `"account"` ⇒ the value bound to
-/// `account_id`. Anything else — or `"account"` with no account — is refused
+/// `account_id`, and — for a drive only — `"forge:<source id>"` stored
+/// verbatim (a repository source's own connection, Epic 86; it needs no
+/// account). Anything else — or `"account"` with no account — is refused
 /// rather than stored as a third state.
 fn credential_source_row(
     source: Option<&str>,
     account_id: Option<&str>,
+    forge_allowed: bool,
 ) -> Result<Option<String>, CoreError> {
     match (source, account_id) {
         (None | Some("keychain"), _) => Ok(None),
@@ -1892,16 +1895,25 @@ fn credential_source_row(
         (Some("account"), _) => Err(CoreError::Internal(
             "no account is set up to use as a credential".to_owned(),
         )),
+        (Some(forge), _)
+            if forge_allowed && crate::forges::forge_credential_id(forge).is_some() =>
+        {
+            Ok(Some(forge.to_owned()))
+        }
         (Some(other), _) => Err(CoreError::Internal(format!(
-            "unknown credential source {other:?}; expected \"keychain\" or \"account\""
+            "unknown credential source {other:?}; expected \"keychain\", \"account\"{}",
+            if forge_allowed {
+                " or \"forge:<source id>\""
+            } else {
+                ""
+            }
         ))),
     }
 }
 
 /// `Some("account")` when a stored row is bound to `account_id`.
-fn bound_to(row: Option<String>, account_id: &str) -> Option<String> {
-    (row.as_deref() == Some(credential_source_value(account_id).as_str()))
-        .then(|| "account".to_owned())
+fn bound_to(row: Option<&str>, account_id: &str) -> Option<String> {
+    (row == Some(credential_source_value(account_id).as_str())).then(|| "account".to_owned())
 }
 
 const SYNC_CREDENTIAL_SOURCE_PREFIX: &str = "sync.credential_source.";
@@ -1919,33 +1931,36 @@ fn bots_provider_credential_source_key(provider_id: &str) -> String {
     format!("{BOTS_CREDENTIAL_SOURCE_PREFIX}{provider_id}")
 }
 
-/// Whether drive `profile_id` uses the configured account's access token
-/// (`Some("account")`) or its own keychain item (`None`). `account_id` is the
-/// configured account: a row bound to any other account reads as the
-/// keychain, and with no account the database is not read at all.
+/// Where drive `profile_id`'s git credential comes from: the configured
+/// account's access token (`Some("account")`), a repository source's
+/// connection (`Some("forge:<id>")`, with or without an account), or its own
+/// keychain item (`None`). `account_id` is the configured account: a row
+/// bound to any other account reads as the keychain.
 pub fn get_sync_credential_source(
     data_dir: &Path,
     profile_id: &str,
     account_id: Option<&str>,
 ) -> Result<Option<String>, CoreError> {
-    let Some(account_id) = account_id else {
-        return Ok(None);
-    };
-    Ok(bound_to(
-        get_setting(data_dir, &sync_credential_source_key(profile_id))?,
-        account_id,
-    ))
+    let row = get_setting(data_dir, &sync_credential_source_key(profile_id))?;
+    if let Some(forge) = row
+        .as_deref()
+        .filter(|row| crate::forges::forge_credential_id(row).is_some())
+    {
+        return Ok(Some(forge.to_owned()));
+    }
+    Ok(account_id.and_then(|account_id| bound_to(row.as_deref(), account_id)))
 }
 
-/// Opt drive `profile_id` into (`Some("account")`, bound to `account_id`) or
-/// out of (`None` / `Some("keychain")`) the account credential.
+/// Opt drive `profile_id` into the account credential (`Some("account")`,
+/// bound to `account_id`), a repository source (`Some("forge:<id>")`), or
+/// back to its own keychain item (`None` / `Some("keychain")`).
 pub fn set_sync_credential_source(
     data_dir: &Path,
     profile_id: &str,
     source: Option<&str>,
     account_id: Option<&str>,
 ) -> Result<(), CoreError> {
-    match credential_source_row(source, account_id)? {
+    match credential_source_row(source, account_id, true)? {
         Some(value) => set_setting(data_dir, &sync_credential_source_key(profile_id), &value),
         None => delete_setting(data_dir, &sync_credential_source_key(profile_id)),
     }
@@ -1963,7 +1978,7 @@ pub fn get_bots_provider_credential_source(
         return Ok(None);
     };
     Ok(bound_to(
-        get_setting(data_dir, &bots_provider_credential_source_key(provider_id))?,
+        get_setting(data_dir, &bots_provider_credential_source_key(provider_id))?.as_deref(),
         account_id,
     ))
 }
@@ -1975,7 +1990,7 @@ pub fn set_bots_provider_credential_source(
     source: Option<&str>,
     account_id: Option<&str>,
 ) -> Result<(), CoreError> {
-    match credential_source_row(source, account_id)? {
+    match credential_source_row(source, account_id, false)? {
         Some(value) => set_setting(
             data_dir,
             &bots_provider_credential_source_key(provider_id),
@@ -2469,6 +2484,46 @@ pub fn get_recording_destination_dir(data_dir: &Path) -> Result<Option<String>, 
 /// only — `recording_start` reads it once at Start and never mid-session.
 pub fn set_recording_destination_dir(data_dir: &Path, dir: &str) -> Result<(), CoreError> {
     set_setting(data_dir, RECORDING_DESTINATION_DIR_KEY, dir)
+}
+
+/// Where drives added from the person's repositories go (Epic 86), until
+/// they choose otherwise: `~/keeper/git`.
+pub const DEFAULT_DRIVE_FOLDER: &[&str] = &["keeper", "git"];
+
+const SYNC_DRIVE_FOLDER_KEY: &str = "sync.drive_folder";
+
+/// The folder new drives go in, and whether the person chose it: the stored
+/// `sync.drive_folder`, else [`DEFAULT_DRIVE_FOLDER`] under `home`. `None`
+/// when nothing is stored and there is no home to put the default in.
+pub fn sync_drive_folder(
+    data_dir: &Path,
+    home: Option<&Path>,
+) -> Result<Option<(PathBuf, bool)>, CoreError> {
+    let stored = get_setting(data_dir, SYNC_DRIVE_FOLDER_KEY)?.filter(|v| !v.trim().is_empty());
+    Ok(match stored {
+        Some(path) => Some((PathBuf::from(path), true)),
+        None => home.map(|home| {
+            let default = DEFAULT_DRIVE_FOLDER
+                .iter()
+                .fold(home.to_path_buf(), |path, part| path.join(part));
+            (default, false)
+        }),
+    })
+}
+
+/// Choose the folder new drives go in; `None` goes back to the default. A
+/// relative path is refused: it would resolve against wherever keeper was
+/// started, which is no folder the person picked.
+pub fn set_sync_drive_folder(data_dir: &Path, folder: Option<&str>) -> Result<(), CoreError> {
+    match folder.map(str::trim).filter(|f| !f.is_empty()) {
+        None => delete_setting(data_dir, SYNC_DRIVE_FOLDER_KEY),
+        Some(folder) if Path::new(folder).is_absolute() => {
+            set_setting(data_dir, SYNC_DRIVE_FOLDER_KEY, folder)
+        }
+        Some(_) => Err(CoreError::Internal(
+            "Choose a full folder path for new drives.".to_owned(),
+        )),
+    }
 }
 
 /// The `settings` key holding the id of the sync profile that holds this
@@ -4682,6 +4737,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn new_drives_go_to_keeper_git_until_the_person_chooses_a_folder() {
+        let dir = temp_dir();
+        let home = Path::new("/Users/x");
+        assert_eq!(
+            sync_drive_folder(&dir, Some(home)).expect("default"),
+            Some((PathBuf::from("/Users/x/keeper/git"), false))
+        );
+        assert_eq!(sync_drive_folder(&dir, None).expect("no home"), None);
+
+        set_sync_drive_folder(&dir, Some("/Volumes/data/repos")).expect("choose");
+        assert_eq!(
+            sync_drive_folder(&dir, Some(home)).expect("chosen"),
+            Some((PathBuf::from("/Volumes/data/repos"), true))
+        );
+        // A relative folder would land wherever keeper was started.
+        assert!(set_sync_drive_folder(&dir, Some("repos")).is_err());
+        assert_eq!(
+            sync_drive_folder(&dir, Some(home))
+                .expect("unchanged")
+                .map(|(_, chosen)| chosen),
+            Some(true)
+        );
+        set_sync_drive_folder(&dir, None).expect("back to the default");
+        assert_eq!(
+            sync_drive_folder(&dir, Some(home)).expect("reset"),
+            Some((PathBuf::from("/Users/x/keeper/git"), false))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Story 41.2: the profile choice is a sibling key of the destination folder
     /// and behaves exactly like it — verbatim round trip, blank ⇒ unset — and it
     /// is deliberately INDEPENDENT of it: "exactly one key in force" is the
@@ -5267,21 +5353,54 @@ mod tests {
     }
 
     #[test]
-    fn no_account_reads_no_credential_source_row() {
+    fn no_account_reads_no_bot_credential_source_row() {
         // A data dir that is a file: any database access fails.
         let dir = temp_dir();
         std::fs::create_dir_all(&dir).expect("dir");
         let file = dir.join("not-a-dir");
         std::fs::write(&file, "x").expect("file");
         assert_eq!(
-            get_sync_credential_source(&file, "p1", None).expect("no read"),
-            None
-        );
-        assert_eq!(
             get_bots_provider_credential_source(&file, "b1", None).expect("no read"),
             None
         );
         assert!(get_sync_credential_source(&file, "p1", Some("acme")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_drive_may_use_a_forge_connection_without_an_account_but_a_bot_may_not() {
+        let dir = temp_dir();
+        set_sync_credential_source(&dir, "p1", Some("forge:github"), None).expect("forge");
+        assert_eq!(
+            get_setting(&dir, "sync.credential_source.p1").expect("raw"),
+            Some("forge:github".to_owned())
+        );
+        for account in [None, Some("acme")] {
+            assert_eq!(
+                get_sync_credential_source(&dir, "p1", account).expect("read"),
+                Some("forge:github".to_owned()),
+                "{account:?}"
+            );
+        }
+        for bad in ["forge:", "forge:GitHub", "forge:a/b"] {
+            assert!(
+                set_sync_credential_source(&dir, "p2", Some(bad), None).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(set_bots_provider_credential_source(
+            &dir,
+            "b1",
+            Some("forge:github"),
+            Some("acme")
+        )
+        .is_err());
+        // Forgetting the account leaves the forge choice alone.
+        clear_credential_sources(&dir, "acme").expect("clear");
+        assert_eq!(
+            get_sync_credential_source(&dir, "p1", None).expect("read"),
+            Some("forge:github".to_owned())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
