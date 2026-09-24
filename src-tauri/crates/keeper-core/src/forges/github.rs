@@ -67,9 +67,9 @@ pub fn parse_installation_repos(body: &[u8]) -> Result<InstallationRepos, ForgeE
         if repo.owner.kind.as_deref() == Some("User") && !user_owners.contains(&repo.owner.login) {
             user_owners.push(repo.owner.login.clone());
         }
-        // An installation's list says nothing about pushing; the broker's
-        // grants decide it (`listing`).
-        repos.push(repo.into_repo(true));
+        // An installation token's `permissions` describe the listing token,
+        // not the person; the broker's grants decide pushing (`listing`).
+        repos.push(repo.into_installation_repo());
     }
     Ok(InstallationRepos {
         total_count: raw.total_count,
@@ -211,6 +211,23 @@ mod tests {
         assert_eq!(page.repos.len(), 2);
         assert_eq!(page.user_owners, ["tgorka"]);
         assert!(parse_installation_repos(PAGE.as_bytes()).is_err());
+    }
+
+    /// GitHub answers `/installation/repositories` with `permissions` taken
+    /// from the token that asked. keeper lists with `metadata: read`, so every
+    /// row says `push: false`; reading that as the person's rights made every
+    /// broker repository download-only on hesperia (2026-09-24).
+    #[test]
+    fn an_installation_list_does_not_read_the_listing_token_s_rights_as_the_person_s() {
+        let body = br#"{"total_count":1,"repositories":[{
+            "name":"tokenizer","full_name":"Neuraffica/tokenizer",
+            "owner":{"login":"Neuraffica","type":"Organization"},
+            "private":true,"default_branch":"main",
+            "clone_url":"https://github.com/Neuraffica/tokenizer.git",
+            "html_url":"https://github.com/Neuraffica/tokenizer",
+            "permissions":{"admin":false,"maintain":false,"push":false,"triage":false,"pull":true}}]}"#;
+        let page = parse_installation_repos(body).expect("page");
+        assert!(page.repos[0].can_push);
     }
 
     #[test]

@@ -113,7 +113,7 @@ struct RawPermissions {
 
 impl RawRepo {
     /// `can_push` is the answer's `permissions.push`, or `push_unsaid` when
-    /// the answer has no `permissions` (an installation's list).
+    /// the answer has no `permissions`.
     pub(crate) fn into_repo(self, push_unsaid: bool) -> ForgeRepo {
         ForgeRepo {
             full_name: self.full_name,
@@ -139,6 +139,15 @@ impl RawRepo {
             size_kb: self.size.filter(|size| *size > 0),
             can_push: self.permissions.map_or(push_unsaid, |p| p.push),
         }
+    }
+
+    /// A repository from `/installation/repositories`. GitHub fills its
+    /// `permissions` from the token that asked, and keeper lists with a
+    /// `metadata: read` token, so `push` there is always `false` and says
+    /// nothing about the person: the broker's grants decide (`listing`).
+    pub(crate) fn into_installation_repo(mut self) -> ForgeRepo {
+        self.permissions = None;
+        self.into_repo(true)
     }
 }
 
