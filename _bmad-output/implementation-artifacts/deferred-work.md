@@ -6763,3 +6763,60 @@ origin: epic 85's review wave, 2026-09-24 (AD-330; Rev85Sem m3)
 location: `src-tauri/crates/keeper/src/account_ipc.rs` (`drive_credential`), keeper-sync `SyncPlatform::secret_get`
 reason: a drive that uses the account on the forge's host asks for the Forgejo token through `secret_get`, which cannot tell a retry after a 401 from an ordinary read. The token is refreshed before it expires, so the common case works; a token the server invalidated early (grant revoked, Forgejo's refresh-token rotation on another device) parks the drive until the next pass after expiry or a person's retry. Closing it needs a `secret_refresh(key)` hook in keeper-sync that the engine calls once on an auth refusal. Guessing from the shell would spend refresh tokens Forgejo invalidates.
 status: open
+
+### DW-323: GitHub through keeper's own sign-in stays dormant until the owner registers keeper's GitHub OAuth App.
+
+origin: epic 86's plan, 2026-09-24 (AD-333, AD-334)
+location: `src-tauri/crates/keeper-core/src/forges/source.rs` (`BUILTIN_GITHUB_CLIENT_ID = None`), `src-tauri/crates/keeper-core/src/forges/device_flow.rs`
+reason: the device flow needs a public client id, and keeper has none yet. `BUILTIN_GITHUB_CLIENT_ID` ships as `None`, so without a descriptor that names a `github` forge with a `client_id`, or a `[github_broker]`, there is no GitHub source at all. The *Connect GitHub* flow, the keychain session and the refresh are built and tested against their parsers, but no one can reach them. Registering the app is the owner's act: an OAuth App (not a GitHub App) named keeper, with the device flow switched on, no secret used, and the scopes `repo read:org` requested by keeper. Its client id is not a secret. Revisit when the owner registers it: set the constant, and run the connect flow once live on hesperia.
+status: open
+
+### DW-324: The GitHub broker is an open makistack PR, and serves no token yet.
+
+origin: epic 86's plan, 2026-09-24 (AD-334, AD-337; amendment A2)
+location: tgorka/makistack#863 (`feat/github-broker`, `docker/github-broker/`, `docs/runbooks/github-broker.md`), `src-tauri/crates/keeper-core/src/forges/broker.rs`
+reason: keeper speaks `github-broker`'s protocol as read from its source at `7f32b70`, but the PR is not merged. It is deployed on electra from the branch, where `tgbot` has no credentials and `tgdev` is installed nowhere, so every token request answers `app_unconfigured` or `not_installed`. keeper shows those as per-owner notices, and lists nothing from GitHub through the broker today. The protocol may still change before merge. What the broker reaches is also not "every organization the person belongs to": it is the owners the policy grants, intersected with where the app is installed (`tgorka`, `neuraffica` for `tgbot`). Revisit when #863 merges: diff `broker.py`'s routes and bodies against `forges::broker`, then run 86.2's and 86.3's owed live checks.
+status: open
+
+### DW-325: Git and LFS with a broker's installation token are unverified in keeper-sync's spelling.
+
+origin: epic 86's plan, 2026-09-24 (AD-336; contract fact on git)
+location: `src-tauri/crates/keeper-sync/src/credential.rs:58-62` (`AccessToken::git`), `:71-75` (`lfs_basic`)
+reason: keeper-sync sends a drive token as the Basic user name with an empty password. The coordinator verified that live on GitHub for an OAuth token (`gho_`): `git ls-remote` succeeded and LFS batch answered 200. The broker hands out installation tokens (`ghs_`), and its runbook documents `x-access-token:<token>`, the password form. GitHub's documentation says the user name is ignored when the token is the password, and a 2012 post (updated 2021) documents the token as the user name, but neither names installation tokens. keeper-sync is left unchanged, as the contract requires. Revisit once `tgbot` is installed: the coordinator runs `git ls-remote` and an LFS batch with a `ghs_` token as the user name, and if GitHub refuses it, keeper-sync gains the `x-access-token` spelling for GitHub hosts.
+status: open
+
+### DW-326: An organization that has not approved keeper's GitHub OAuth App hides its private repositories, and only its owners can fix that.
+
+origin: epic 86's plan, 2026-09-24 (AD-335)
+location: `src-tauri/crates/keeper-core/src/forges/github.rs` (`classify_error`, the restricted-organization notice)
+reason: OAuth App access restrictions are on by default for new organizations. Until an owner approves keeper, the organization's private repositories are missing from `/user/repos` without an error, and its public ones still show. keeper can only say so and link the review page, `https://github.com/settings/connections/applications/<client_id>`, where the person requests approval. The notice appears only when GitHub answers a 403 naming the restriction. A listing that silently drops the private repositories gives keeper nothing to detect, so the notice can be missing while repositories are missing too. The broker path has no such approval: there the GitHub App's installation decides. Revisit if people report missing organization repositories with no notice: a per-organization probe (`GET /orgs/<org>/repos?per_page=1&type=private`) would name them, at one request per organization.
+status: open
+
+### DW-327: Disconnecting GitHub does not revoke keeper's access on GitHub.
+
+origin: epic 86's plan, 2026-09-24 (AD-334)
+location: `src-tauri/crates/keeper/src/forge_ipc.rs` (`forge_disconnect`), `src-tauri/crates/keeper-core/src/forges/device_flow.rs`
+reason: GitHub's token-revocation endpoint (`DELETE /applications/{client_id}/token`) authenticates with the app's client secret, and keeper, a public client, has none. *Disconnect* deletes `forge/<source-id>/<client_id>/session` (and any item an earlier build kept at `forge/<source-id>/session`) from this device's keychain, and the sheet says "Also remove keeper under GitHub › Settings › Applications if you want", linking the source's `appsUrl` (`https://github.com/settings/connections/applications/<client_id>`). Until the person does, the grant stays on GitHub, and a copy of the token elsewhere (none exists by design) would keep working. An unused OAuth token is revoked by GitHub after a year. Revisit if GitHub offers a secret-less revocation for device-flow tokens, or if the broker grows a revoke endpoint.
+status: open
+
+### DW-328: A Forgejo repository's owner is classified by comparing logins, because Forgejo does not say what the owner is.
+
+origin: epic 86's plan, 2026-09-24 (AD-335)
+location: `src-tauri/crates/keeper-core/src/forges/forgejo.rs` (`parse_search`), `src-tauri/crates/keeper-core/src/forges/mark.rs` (grouping)
+reason: Forgejo's `Repository.owner` carries no `type`, and keeper cannot call `/user/orgs` (it needs `read:user` and `read:organization`, which keeper's grant lacks). An owner equal to the forge login is "you". Every other owner is a group of its own, so an organization and a person whose repository you collaborate on look alike, and the owner filter cannot offer "organizations only". On the broker path "you" is inferred the other way round: any owner whose `owner.type` is `User`, because an installation token cannot read `/user`. So another person's account covered by a grant would also read as "you". Revisit if the grouping misleads: telling organizations apart on Forgejo needs either `read:organization` in the grant (and so a revocation on every device) or a per-owner lookup the `write:repository` grant is allowed to make, which has not been verified.
+status: open
+
+### DW-329: A source lists at most 1,000 repositories, and search looks only through those.
+
+origin: epic 86's plan, 2026-09-24 (AD-335, NFR-104)
+location: `src-tauri/crates/keeper-core/src/forges/listing.rs` (the caps: GitHub 10 pages × 100, per owner on the broker path, with at most 20 owners and 60 requests per listing, 1,000 repositories overall; Forgejo 20 × 50, paging while a page is full; repositories are grouped before the cap cuts, so "you" stays first)
+reason: keeper fetches serially and keeps the list in memory, so a cap bounds both the wait and the memory. Past it, the sheet says "Only the first 1,000 are listed; search looks only through those." A repository beyond the cap can still be added by typing its URL into *Add a folder*. Which repositories fall past the cap depends on the endpoint's order: `/user/repos` is asked for `sort=full_name` and Forgejo's search for `sort=alpha`, so there the ones late in the alphabet are dropped, not the oldest; `/installation/repositories` documents no order. Revisit if a person with more repositories asks: a server-side search (GitHub's `GET /search/repositories`, Forgejo's `repos/search?q=`) would reach the rest.
+status: open
+
+### DW-330: A Forgejo forge listed under `[[forges]]` was accepted but could not be browsed.
+
+origin: epic 86's build wave, 2026-09-24 (AD-333, AD-334; CoreForge's `sources()`; ReviewCore86 m10)
+location: `src-tauri/crates/keeper-core/src/org_account/descriptor.rs` (`validate_forges`), `src-tauri/crates/keeper-core/src/forges/source.rs` (`sources`)
+reason: the build wave's descriptor accepted `[[forges]] kind = "forgejo"` with its `web_base` and `api_base`, as the contract froze it, but AD-334 gives keeper no way to get a token for it: Forgejo has no device flow, the broker is GitHub's only, and the account's forge token belongs to the account's own forge (sending it to another host would break NFR-101). `sources()` therefore left the entry out, and the browse sheet did not show it, with no sentence anywhere but `docs/account.md` (AD-27). Only the account's own forge is browsable on Forgejo. Revisit when a second Forgejo is wanted: its own OAuth sign-in (a public PKCE client per forge, like `config.auth`'s forge leg), or a broker that serves Forgejo.
+status: done 2026-09-24
+resolution: DW-330 — resolved by epic 86's review wave (amendment A4, m10): `validate_forges` now refuses a Forgejo `[[forges]]` entry with "keeper lists only the account's own Forgejo; remove this [[forges]] entry.", so the operator sees why at setup instead of the source silently missing. A second Forgejo stays out of scope until it has its own token path.
