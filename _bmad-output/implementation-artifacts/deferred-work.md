@@ -6596,3 +6596,45 @@ origin: epic 83's plan, 2026-09-23 (AD-317; measured on the owner's makistack de
 location: `src-tauri/crates/keeper-core/src/org_account/descriptor.rs` (`setup_link`, `d=` form)
 reason: a descriptor with a forge in `oauth` mode is about 1.1 KB of JSON, so `keeper://setup?d=<base64url>` is about 1450 characters, a version-33-class code. zxing-wasm reads it at about 2 px per module, so scanning works from a laptop camera; a phone's QR reader held far from the screen may not. Two ways to shorten it, neither built: serve the descriptor and share `descriptor=<url>` (the operator's choice: the makistack config repository is private), or add a compressed inline form (deflate before base64url), which `parse_setup_input` would have to accept on every device before any device emits it.
 status: open
+
+### DW-300: A conflict is decided per key, not per field inside a JSON value.
+
+origin: epic 84's plan, 2026-09-24 (AD-320, D-26)
+location: `src-tauri/crates/keeper-core/src/org_account/settings_sync.rs` (`merge`)
+reason: two keys hold JSON: `notes.embedding_model` (`{provider, model}`) and `notes.service_file_names`. When two devices change different parts of one of them between syncs, the device that syncs later wins the whole value, and the other device's part is lost. It is the same rule as for any other key (D-26), applied to a value that is really several. A field-level merge would need a per-key JSON schema and a base for each field. Revisit when a JSON-valued key gains a field two devices plausibly edit independently, or when someone reports a lost half of one.
+status: open
+
+### DW-301: A synced key that is read only at launch applies at the next launch.
+
+origin: epic 84's plan, 2026-09-24 (AD-325, FR-715)
+location: `src-tauri/crates/keeper/src/hotkey.rs:230`, `:370` (hotkeys registered at launch), the shell's apply step
+reason: the four hotkeys (`hotkey.global`, `hotkey.recording`, `hotkey.capture`, `hotkey.voice`) are registered with the OS during setup, and a sync's apply has no live re-registration path for them. A seeded or pulled hotkey therefore sits in the table until the next launch. It is the same "settings read at startup follow at the next launch" rule the account tiers already state (`docs/account.md`, *When a change takes effect*). `debug.mode` and the menu bar go through their live setters and are not affected. Revisit if a person reports a hotkey that "did not sync", or when hotkey registration gains a live apply path the sync can call.
+status: open
+
+### DW-302: A drive's identity is its remote and branch, so two profiles of one repository merge into one record and one offer.
+
+origin: epic 84's plan, 2026-09-24 (AD-321, AD-323)
+location: `src-tauri/crates/keeper-core/src/org_account/manifest.rs` (`merge_drives`, `offers`), the shell's drive catalog
+reason: a device may hold two profiles of the same remote and branch, for example a notes clone and a recordings clone with different subpaths, because nothing prevents it (`sync_ipc.rs:1342-1343`: no duplicate guard). Both map to one identity, so `drives.toml` keeps one record whose fields come from one of them, and another device is offered one drive. A drive reference (`drive:<remote>#<branch>`) likewise resolves to one of the two profiles. Distinguishing them would need a role or subpath in the identity, which would split one drive into several offers for everyone else. Revisit when a person reports two clones of one repository on a device.
+status: open
+
+### DW-303: Everyone who can push to the config repository can write every person's directory, so a synced value is exactly as trusted as a pin.
+
+origin: epic 84's plan, 2026-09-24 (AD-324, D-25, D-26)
+location: `src-tauri/crates/keeper-core/src/org_account/layout.rs` (`is_own_path`, `is_rewritable`), `docs/account.md` § *Your settings, drives and accounts travel*
+reason: keeper's fence limits what keeper writes, never what it reads. In the owner's makistack repository (`keeper/users`), everyone in it can write every directory. Anyone who can push can therefore edit a person's `settings.toml`, and keeper applies it, just as they could already edit that person's `keeper.toml` pins since epic 82. A synced value is less powerful than a pin, since the person can change it back, but it arrives with the same trust. Closing this needs the forge to restrict each directory to its owner (a forge feature, not a keeper one), or keeper to verify that the commits touching `<login>/` are signed by that person, which needs a key that travels safely. Revisit when the repository is shared beyond people who trust each other.
+status: open
+
+### DW-304: The only way to act on an offer in the app is to add it.
+
+origin: epic 84's plan, 2026-09-24 (AD-323, UX-DR118)
+location: `src-tauri/crates/keeper-core/src/org_account/manifest.rs` (`offers`), the *From your account* blocks in Settings › Sync, Settings › Bots and the login screen
+reason: an offer lists everything the person's other devices use and this one does not. A drive the person never wants on this device stays offered until every device that has it removes it, or the entry is deleted from `drives.toml` by hand. A per-device "not here" choice would need a place to live: a device-local setting, or a `declined` list in the record, which every device would have to preserve. Revisit when a person reports an offer they cannot get rid of.
+status: open
+
+### DW-305: A Beeper offer only selects the Beeper tab.
+
+origin: epic 84's plan, 2026-09-24 (AD-323, UX-DR118)
+location: `src/components/auth/login-screen.tsx` (`BeeperTab`, email → code), `src-tauri/crates/keeper-core/src/org_account/manifest.rs` (`MatrixRecord`)
+reason: a Beeper sign-in starts from an email address and a code (`login-screen.tsx:354-357`), and the homeserver is fixed at `matrix.beeper.com`. The record carries the Matrix `user_id`, not the email, so there is nothing to prefill beyond the tab. Carrying the email would put a personal address into the repository for a single field. Revisit if people ask for it.
+status: open

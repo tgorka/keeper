@@ -1279,3 +1279,50 @@ everyone in it. Epic 82 decides what keeper does there, and what it refuses to b
 - **Status / owner:** decided. Owner is the architect. Epic 82 implements it:
   `org_account::layout::is_own_path` and `plan`, and `keeper_sync::config_repo`'s path
   refusal.
+
+## D-26 — A synced setting belongs to the device that changed it last
+
+Epic 82 put a person's settings in a git repository as two pin files keeper creates once
+and never rewrites. The owner asked for every setting to be in the repository after a
+sync, editable in the app and pushed back, and for a new device to start from the
+person's others. Epic 84 makes keeper rewrite five files in the person's own directory,
+and decides who wins when two devices disagree.
+
+- **What changes:** preferences travel in `<login>/settings.toml` (every device) and
+  `<login>/settings.<device>.toml` (this device). Drives, bot providers and Matrix
+  accounts travel in `drives.toml`, `bots.toml` and `matrix.toml`, as offers. keeper
+  merges each settings file key by key, applies the result into this device's settings
+  table (below every layer file, so `keeper.toml` still pins), and pushes. A new device
+  seeds its device file from the same-class device whose file changed most recently.
+  (AD-320…AD-325; FR-713…FR-722; NFR-97, NFR-98)
+- **Who wins:** a device's first sync against an existing file takes the file. After
+  that, per key: a key unchanged here takes the repository's value; a key changed only
+  here is pushed; a key changed both here and in the repository keeps *this* device's
+  value, because the device syncing now is the one whose change reaches the repository
+  last. "Last" means last to sync, not last to be edited: a device that was offline for a
+  week wins with a week-old edit when it comes back. A value a device cannot apply (a
+  drive, a bot or a folder it does not have) is never its change, so it never deletes or
+  replaces it.
+- **The bounds:** keeper rewrites exactly those five files, directly under the signed-in
+  person's own `<login>/`, and never through a link. `user.toml`, `keeper.toml`,
+  `keeper.<device>.toml` and `devices/*.toml` stay create-only. No secret travels: a
+  drive or a provider records only which credential it uses (`account`, `own` or
+  `none`). `sdk_encryption`, `sync.git_path`, every session-state key and every family
+  stay on the device. Nothing offered is added by itself.
+- **Why this rule:** it needs no clock. Two devices' clocks cannot be trusted to agree,
+  and git orders pushes, not edits. Per key rather than per file, because two devices
+  changing two different settings between syncs is the common case, and a whole-file
+  winner would lose one of them. Per key rather than per field, because only two keys
+  hold JSON (DW-300).
+- **What it amends:** D-25's refusal to rewrite a file that exists now excepts these
+  five files in the person's own directory. Its refusal to write another person's
+  directory is unchanged. Epic 82's AD-312 is narrowed the same way (AD-324).
+- **What it is not:** a pin. A synced value is a preference the pane can change, and a
+  layer file still wins over it. Nor is it a trust boundary: anyone who can push to the
+  repository can edit a person's settings, as they already could edit their pins (DW-303).
+- **Revisit triggers:** a report of a lost half of a JSON value (DW-300); a repository
+  shared beyond people who trust each other (DW-303); a second account per install
+  (DW-297), which would need its own answer to whose settings win.
+- **Status / owner:** decided. Owner is the architect. Epic 84 implements it:
+  `org_account::settings_sync::merge`, `layout::is_rewritable`, and
+  `keeper_sync::config_repo`'s `Write.replace`.
