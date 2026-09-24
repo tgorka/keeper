@@ -113,6 +113,16 @@ interface PasswordPrefill {
 }
 
 /**
+ * A single-sign-on offer's click (Epic 85, AD-331): start the SSO flow at this
+ * homeserver. Kept apart from {@link PasswordPrefill} and handed back once
+ * taken, so the Password tab remounting (a trip to Beeper and back) refills
+ * the fields but never starts a second browser round trip nobody asked for.
+ */
+interface SsoStart {
+  homeserver: string;
+}
+
+/**
  * Login surface (FR-1, FR-3, FR-5, AD-17).
  *
  * Two tabs: "Password" wraps the existing password + single-sign-on (OIDC) form
@@ -125,11 +135,14 @@ export function LoginScreen({ addMode = false, onDone }: LoginScreenProps = {}) 
   const addAccount = useAccountsStore((s) => s.addAccount);
   // The Matrix accounts the person uses on their other devices (Epic 84,
   // UX-DR118). Offered only when adding — which is also the first-run step —
-  // and absent while there are none. A choice fills this screen in and nothing
-  // more: a sign-in is still the person's to finish, and nothing is persisted.
+  // and absent while there are none. A password or Beeper choice fills this
+  // screen in and nothing more; a single-sign-on choice also starts the SSO
+  // flow (Epic 85), which the person still finishes in the browser. Nothing is
+  // persisted.
   const matrixOffers = useAccountStore((s) => s.vm.offers.matrix);
   const [tab, setTab] = useState("password");
   const [prefill, setPrefill] = useState<PasswordPrefill | null>(null);
+  const [ssoStart, setSsoStart] = useState<SsoStart | null>(null);
 
   const chooseOffer = (offer: MatrixOfferVm) => {
     // Beeper signs in by email code; there is nothing of the offer to put in
@@ -144,6 +157,11 @@ export function LoginScreen({ addMode = false, onDone }: LoginScreenProps = {}) 
       username: offer.userId,
       askPassword: offer.kind === "password",
     });
+    // Single sign-on needs nothing more than the homeserver, so the click
+    // that chose the account is the click that signs in.
+    if (offer.kind === "oidc") {
+      setSsoStart({ homeserver: offer.homeserverUrl });
+    }
   };
 
   return (
@@ -196,6 +214,8 @@ export function LoginScreen({ addMode = false, onDone }: LoginScreenProps = {}) 
                 addAccount={addAccount}
                 onDone={onDone}
                 prefill={prefill}
+                ssoStart={ssoStart}
+                onSsoTaken={() => setSsoStart(null)}
               />
             </TabsContent>
             <TabsContent value="beeper">
@@ -225,7 +245,13 @@ function PasswordTab({
   addAccount,
   onDone,
   prefill,
-}: TabProps & { prefill: PasswordPrefill | null }) {
+  ssoStart,
+  onSsoTaken,
+}: TabProps & {
+  prefill: PasswordPrefill | null;
+  ssoStart: SsoStart | null;
+  onSsoTaken: () => void;
+}) {
   const [homeserver, setHomeserver] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -270,6 +296,19 @@ function PasswordTab({
     [],
   );
 
+  // A single-sign-on offer's click, taken once. A flow already in the browser
+  // is left alone: it is the one the person is finishing.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on `ssoStart` only — each offer click is one start request; `handleOidc`/`onSsoTaken` are fresh every render and re-running on them would start nothing new but read as if it could.
+  useEffect(() => {
+    if (ssoStart === null) {
+      return;
+    }
+    onSsoTaken();
+    if (!oidcPendingRef.current) {
+      void handleOidc(ssoStart.homeserver);
+    }
+  }, [ssoStart]);
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setErrorCode(null);
@@ -300,10 +339,10 @@ function PasswordTab({
     }
   }
 
-  async function handleOidc() {
+  async function handleOidc(target: string) {
     setErrorCode(null);
     // The homeserver is the only field OIDC needs; guard blank input.
-    const trimmedHomeserver = homeserver.trim();
+    const trimmedHomeserver = target.trim();
     if (trimmedHomeserver === "") {
       setErrorCode("missingFields");
       return;
@@ -416,7 +455,12 @@ function PasswordTab({
         <Button type="submit" disabled={submitting}>
           {submitting ? "Signing in…" : addMode ? "Add account" : "Sign in"}
         </Button>
-        <Button type="button" variant="outline" disabled={submitting} onClick={handleOidc}>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={submitting}
+          onClick={() => void handleOidc(homeserver)}
+        >
           Sign in with single sign-on
         </Button>
         {addMode && (

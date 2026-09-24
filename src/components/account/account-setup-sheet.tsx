@@ -65,8 +65,12 @@ export const SETUP_REPO_LABEL = "Keeps your settings at";
 export const SETUP_DEVICE_LABEL = "This device's name";
 export const SETUP_DEVICE_NOTE =
   "Names this device's files in your settings repository. You can rename it later.";
+/**
+ * The note under a device name the repository already knows (UX-DR119): a
+ * reinstall keeps its name (AD-329), and the first sync brings the rest back.
+ */
 export const SETUP_DEVICE_REGISTERED_NOTE =
-  "This device is already registered under this name. Rename it in Settings › Account.";
+  "This device is already in your settings repository; keeper will restore its drives, bots and settings.";
 export const SETUP_CLASS_LABEL = "Kind of device";
 export const SETUP_CONTINUE_LABEL = "Continue";
 export const SETUP_CANCEL_LABEL = "Cancel";

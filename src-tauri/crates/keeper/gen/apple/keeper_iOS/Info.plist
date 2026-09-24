@@ -24,6 +24,7 @@
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>keeper</string>
+				<string>dev.tgorka.keeper</string>
 			</array>
 		</dict>
 	</array>

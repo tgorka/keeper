@@ -183,6 +183,12 @@ fn normalize_homeserver(url: &str) -> String {
 trait Record: Clone + PartialEq {
     type Id: Ord + Clone;
     fn identity(&self) -> Self::Id;
+    /// The identity each of `remote` is matched to this device's entries
+    /// under; by default its own.
+    fn matched_ids(remote: &[Self], mine: &[Self]) -> Vec<Self::Id> {
+        let _ = mine;
+        remote.iter().map(Record::identity).collect()
+    }
     fn devices_mut(&mut self) -> &mut Vec<String>;
     /// Keep what `remote` knows and this build does not.
     fn absorb(&mut self, remote: &Self);
@@ -202,8 +208,39 @@ fn overlay(mine: &mut Extra, remote: &Extra) {
 
 impl Record for DriveRecord {
     type Id = DriveRef;
+    /// Remote, branch and name: two drives of one repository stay two.
     fn identity(&self) -> DriveRef {
-        DriveRef::new(&self.remote_url, &self.branch)
+        DriveRef::named(&self.remote_url, &self.branch, &self.name)
+    }
+    /// A record whose name no drive here has — written before names were
+    /// part of a drive's identity, or renamed on one device — is still this
+    /// device's drive when this device has exactly one drive on its remote and
+    /// branch, that drive matches no other record, and no other unmatched
+    /// record shares the repository.
+    fn matched_ids(remote: &[Self], mine: &[Self]) -> Vec<DriveRef> {
+        let mine: BTreeSet<DriveRef> = mine.iter().map(Record::identity).collect();
+        let theirs: Vec<DriveRef> = remote.iter().map(Record::identity).collect();
+        theirs
+            .iter()
+            .map(|id| {
+                if mine.contains(id) {
+                    return id.clone();
+                }
+                let mut here = mine.iter().filter(|local| local.same_repository(id));
+                let (Some(only), None) = (here.next(), here.next()) else {
+                    return id.clone();
+                };
+                let unmatched = theirs
+                    .iter()
+                    .filter(|other| other.same_repository(id) && !mine.contains(other))
+                    .count();
+                if unmatched == 1 && !theirs.contains(only) {
+                    only.clone()
+                } else {
+                    id.clone()
+                }
+            })
+            .collect()
     }
     fn devices_mut(&mut self) -> &mut Vec<String> {
         &mut self.devices
@@ -306,16 +343,19 @@ impl Record for MatrixRecord {
 /// (`devices` empty), `mine_base` the list it last pushed. An entry this device
 /// has names `device`, and takes its fields from here only when they changed
 /// here since `mine_base` — so two devices that describe one drive differently
-/// do not rewrite it on every sync. An entry this device lacks stops naming it;
-/// `devices` is pruned to `known_devices` (unless that list is empty, which
-/// means it could not be read); an entry no device names is dropped. Sorted by
-/// identity, URLs written in their one spelling.
+/// do not rewrite it on every sync. An entry this device lacks stops naming it
+/// when `prune_me` — never before this device has restored itself, when an
+/// empty `mine` means "not restored yet", not "removed"; `devices` is pruned
+/// to `known_devices` (unless that list is empty, which means it could not be
+/// read); an entry no device names is dropped. Sorted by identity, URLs
+/// written in their one spelling.
 fn merge<T: Record>(
     remote: &[T],
     mine: &[T],
     mine_base: Option<&[T]>,
     device: &str,
     known_devices: &[String],
+    prune_me: bool,
 ) -> Vec<T> {
     let base: BTreeMap<T::Id, T> = mine_base
         .unwrap_or_default()
@@ -323,12 +363,14 @@ fn merge<T: Record>(
         .filter_map(Record::portable)
         .map(|entry| (entry.identity(), entry.described()))
         .collect();
+    let remote: Vec<T> = remote.iter().filter_map(Record::portable).collect();
+    let mine: Vec<T> = mine.iter().filter_map(Record::portable).collect();
     let mut merged: BTreeMap<T::Id, T> = BTreeMap::new();
-    for entry in remote.iter().filter_map(Record::portable) {
-        merged.entry(entry.identity()).or_insert(entry);
+    for (id, entry) in T::matched_ids(&remote, &mine).into_iter().zip(remote) {
+        merged.entry(id).or_insert(entry);
     }
     let mut here = BTreeSet::new();
-    for entry in mine.iter().filter_map(Record::portable) {
+    for entry in mine {
         let id = entry.identity();
         if !here.insert(id.clone()) {
             continue;
@@ -359,7 +401,7 @@ fn merge<T: Record>(
         .into_iter()
         .filter_map(|(id, mut entry)| {
             let devices = entry.devices_mut();
-            if !here.contains(&id) {
+            if prune_me && !here.contains(&id) {
                 devices.retain(|named| named != device);
             }
             if !known_devices.is_empty() {
@@ -378,8 +420,9 @@ pub fn merge_drives(
     mine_base: Option<&[DriveRecord]>,
     device: &str,
     known_devices: &[String],
+    prune_me: bool,
 ) -> Vec<DriveRecord> {
-    merge(remote, mine, mine_base, device, known_devices)
+    merge(remote, mine, mine_base, device, known_devices, prune_me)
 }
 
 pub fn merge_providers(
@@ -388,8 +431,9 @@ pub fn merge_providers(
     mine_base: Option<&[ProviderRecord]>,
     device: &str,
     known_devices: &[String],
+    prune_me: bool,
 ) -> Vec<ProviderRecord> {
-    merge(remote, mine, mine_base, device, known_devices)
+    merge(remote, mine, mine_base, device, known_devices, prune_me)
 }
 
 pub fn merge_matrix(
@@ -398,15 +442,18 @@ pub fn merge_matrix(
     mine_base: Option<&[MatrixRecord]>,
     device: &str,
     known_devices: &[String],
+    prune_me: bool,
 ) -> Vec<MatrixRecord> {
-    merge(remote, mine, mine_base, device, known_devices)
+    merge(remote, mine, mine_base, device, known_devices, prune_me)
 }
 
 fn missing<'a, T: Record>(remote: &'a [T], mine: &[T]) -> impl Iterator<Item = &'a T> {
     let here: BTreeSet<T::Id> = mine.iter().map(Record::identity).collect();
     remote
         .iter()
-        .filter(move |entry| !here.contains(&entry.identity()))
+        .zip(T::matched_ids(remote, mine))
+        .filter(move |(_, id)| !here.contains(id))
+        .map(|(entry, _)| entry)
 }
 
 /// The drives, providers and Matrix accounts in the repository whose identity
@@ -612,7 +659,7 @@ mod tests {
             drive("https://tg@GitHub.com/acme/a.git", "A renamed", &[]),
             drive("https://github.com/acme/d", "D", &[]),
         ];
-        let merged = merge_drives(&remote, &mine, None, "mac", &[]);
+        let merged = merge_drives(&remote, &mine, None, "mac", &[], true);
         assert_eq!(
             names(&merged),
             [
@@ -646,7 +693,8 @@ mod tests {
         for _ in 0..rounds {
             for (index, (slug, mine)) in devices.iter().enumerate() {
                 let mine = std::slice::from_ref(*mine);
-                let merged = merge_drives(&remote, mine, bases[index].as_deref(), slug, &known);
+                let merged =
+                    merge_drives(&remote, mine, bases[index].as_deref(), slug, &known, true);
                 if merged != remote {
                     pushes += 1;
                     remote = merged;
@@ -671,7 +719,7 @@ mod tests {
         let base = [laptop.clone()];
         laptop.name = "Work notes".to_owned();
         let known = ["laptop".to_owned(), "phone".to_owned()];
-        remote = merge_drives(&remote, &[laptop], Some(&base), "laptop", &known);
+        remote = merge_drives(&remote, &[laptop], Some(&base), "laptop", &known, true);
         assert_eq!(remote[0].name, "Work notes");
     }
 
@@ -683,13 +731,13 @@ mod tests {
             &["laptop", "old-mac"],
         )];
         let known = ["laptop".to_owned(), "studio".to_owned()];
-        let merged = merge_drives(&remote, &[], None, "studio", &known);
+        let merged = merge_drives(&remote, &[], None, "studio", &known, true);
         assert_eq!(
             names(&merged),
             [("A", vec!["laptop"])],
             "a renamed device's old slug goes"
         );
-        let kept = merge_drives(&remote, &[], None, "studio", &[]);
+        let kept = merge_drives(&remote, &[], None, "studio", &[], true);
         assert_eq!(
             names(&kept),
             [("A", vec!["laptop", "old-mac"])],
@@ -737,7 +785,14 @@ mod tests {
             "the second lock refuses a credential"
         );
 
-        let merged = merge_drives(&[secret.clone(), local.clone()], &[], None, "mac", &[]);
+        let merged = merge_drives(
+            &[secret.clone(), local.clone()],
+            &[],
+            None,
+            "mac",
+            &[],
+            true,
+        );
         assert_eq!(merged.len(), 1, "a local remote is dropped");
         assert_eq!(merged[0].remote_url, "https://gitlab.com/me/notes");
         assert!(DrivesFile {
@@ -782,7 +837,7 @@ mod tests {
             }],
             ..ProviderRecord::default()
         }];
-        let merged = merge_providers(&remote, &mine, None, "mac", &[]);
+        let merged = merge_providers(&remote, &mine, None, "mac", &[], true);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].name, "Home Ollama");
         assert_eq!(merged[0].base_url, "http://localhost:11434");
@@ -793,18 +848,19 @@ mod tests {
             Some(&toml::Value::String("low".to_owned()))
         );
 
-        let gone = merge_matrix(
-            &[MatrixRecord {
-                user_id: "@tg:acme.dev".to_owned(),
-                devices: vec!["mac".to_owned()],
-                ..MatrixRecord::default()
-            }],
-            &[],
-            None,
-            "mac",
-            &[],
-        );
+        let only_mac = [MatrixRecord {
+            user_id: "@tg:acme.dev".to_owned(),
+            devices: vec!["mac".to_owned()],
+            ..MatrixRecord::default()
+        }];
+        let gone = merge_matrix(&only_mac, &[], None, "mac", &[], true);
         assert!(gone.is_empty());
+        // Before this device has restored itself, lacking an entry is not
+        // having removed it.
+        let kept = merge_matrix(&only_mac, &[], None, "mac", &[], false);
+        assert_eq!(kept, only_mac);
+        let drives = [drive("https://github.com/acme/a", "A", &["mac"])];
+        assert_eq!(merge_drives(&drives, &[], None, "mac", &[], false), drives);
 
         let written = merge_matrix(
             &[],
@@ -816,6 +872,7 @@ mod tests {
             None,
             "mac",
             &[],
+            true,
         );
         assert_eq!(written[0].homeserver_url, "https://matrix.acme.dev");
     }
@@ -922,7 +979,7 @@ mod tests {
             &mine_matrix,
         );
         let drive_keys: Vec<&str> = offered.drives.iter().map(|d| d.key.as_str()).collect();
-        assert_eq!(drive_keys, ["drive:https://github.com/acme/b#main"]);
+        assert_eq!(drive_keys, ["drive:https://github.com/acme/b#main^B"]);
         assert_eq!(offered.providers.len(), 1);
         assert_eq!(
             offered.providers[0].key,
@@ -941,5 +998,55 @@ mod tests {
             &remote_matrix,
         );
         assert_eq!(none, AccountOffersVm::default());
+    }
+
+    #[test]
+    fn two_drives_of_one_repository_stay_two() {
+        let url = "https://git.acme.dev/tg/tgdrive";
+        let mine = [drive(url, "tgdrive", &[]), drive(url, "tgdrive-light", &[])];
+        let merged = merge_drives(&[], &mine, None, "hesperia", &[], true);
+        assert_eq!(
+            names(&merged),
+            [
+                ("tgdrive", vec!["hesperia"]),
+                ("tgdrive-light", vec!["hesperia"])
+            ]
+        );
+
+        // A device with only one of them keeps both in the file and is
+        // offered the other, under a key that names it.
+        let merged = merge_drives(&merged, &mine[..1], Some(&mine[..1]), "phone", &[], true);
+        assert_eq!(
+            names(&merged),
+            [
+                ("tgdrive", vec!["hesperia", "phone"]),
+                ("tgdrive-light", vec!["hesperia"])
+            ]
+        );
+        let offered = offers(&merged, &[], &[], &mine[..1], &[], &[]);
+        let keys: Vec<&str> = offered.drives.iter().map(|d| d.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["drive:https://git.acme.dev/tg/tgdrive#main^tgdrive-light"]
+        );
+    }
+
+    #[test]
+    fn an_older_record_without_a_matching_name_matches_the_one_drive_of_its_repository() {
+        let url = "https://git.acme.dev/tg/tgdrive";
+        let old = [drive(url, "Drive", &["studio"])];
+        let one = [drive(url, "tgdrive", &[])];
+        let merged = merge_drives(&old, &one, Some(&one), "hesperia", &[], true);
+        assert_eq!(
+            names(&merged),
+            [("Drive", vec!["hesperia", "studio"])],
+            "the same drive, not a second one"
+        );
+        assert!(offers(&old, &[], &[], &one, &[], &[]).drives.is_empty());
+
+        // With two drives here the old record is ambiguous and stays its own.
+        let two = [drive(url, "tgdrive", &[]), drive(url, "tgdrive-light", &[])];
+        let merged = merge_drives(&old, &two, None, "hesperia", &[], true);
+        assert_eq!(merged.len(), 3);
     }
 }

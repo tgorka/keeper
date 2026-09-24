@@ -26,10 +26,21 @@
  * AlertDialogs, and each names what goes and what stays: signing out keeps the
  * account set up and the repository's files where they are; forgetting
  * deletes this device's copy and never touches the server.
+ *
+ * # After a restore (Epic 85, UX-DR119)
+ *
+ * Under the status: Rust's restore sentence and each pending one ("Waiting
+ * for /Volumes/… to restore …"), verbatim and absent when empty. When this
+ * device had listening on and a restore left it off, one sentence says so
+ * with "Turn listening on" and "Keep it off". The microphone is armed only
+ * by the first tap (AD-168): nothing here runs on render, that tap reads the
+ * switch first so a stale offer can never flip listening OFF, and "Keep it
+ * off" writes the switch off as the person's choice and never arms it.
  */
 import { useEffect, useId, useRef, useState } from "react";
 import { DEVICE_CLASS_LABEL, SetupLinkField } from "@/components/account/account-setup-sheet";
 import { AccountShareSheet } from "@/components/account/account-share-sheet";
+import { toggleVoiceListening } from "@/components/bots/bot-listening-toggle";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -53,9 +64,12 @@ import {
   accountState,
   accountSync,
   type OrgAccountVm,
+  voiceWakeGet,
+  voiceWakeSet,
 } from "@/lib/ipc/client";
 import { accountStore, useAccountStore } from "@/lib/stores/account";
 import { syncErrorMessage } from "@/lib/stores/sync";
+import { voiceStore } from "@/lib/stores/voice";
 
 export const ACCOUNT_SECTION_TITLE = "Account";
 export const ACCOUNT_SECTION_NOTE =
@@ -74,6 +88,15 @@ export const ACCOUNT_CANCEL_LABEL = "Cancel";
 export const ACCOUNT_ROLES_LABEL = "Roles";
 /** What a failed call says when Rust gave no sentence of its own. */
 export const ACCOUNT_ACTION_FAILED = "keeper couldn't reach your account.";
+/** Said when a restore left this device's listening off though it was on here (AD-329). */
+export const ACCOUNT_LISTENING_OFF_SENTENCE =
+  "Listening for your wake phrase was on for this device.";
+export const ACCOUNT_LISTENING_ON_LABEL = "Turn listening on";
+export const ACCOUNT_LISTENING_KEEP_OFF_LABEL = "Keep it off";
+/** What a failed "Turn listening on" says when Rust gave no sentence of its own. */
+export const ACCOUNT_LISTENING_FAILED = "keeper couldn't turn listening on.";
+/** What a failed "Keep it off" says when Rust gave no sentence of its own. */
+export const ACCOUNT_LISTENING_KEEP_OFF_FAILED = "keeper couldn't save your listening choice.";
 
 /**
  * What signing out does, and — the question people actually have — what it
@@ -196,6 +219,49 @@ function ConfiguredAccount({ vm }: { vm: OrgAccountVm }) {
       .finally(() => setBusy(false));
   };
 
+  /**
+   * One of the two answers to the listening offer, then the account read
+   * again so the offer goes. Both read the switch from Rust first.
+   */
+  const answerListening = (answer: () => Promise<void>, failed: string) => {
+    setBusy(true);
+    setError(null);
+    void (async () => {
+      await answer();
+      accountStore.getState().setVm(await accountState());
+    })()
+      .catch((raw: unknown) => setError(syncErrorMessage(raw, failed)))
+      .finally(() => setBusy(false));
+  };
+
+  /**
+   * "Turn listening on": the listening verb every menu calls
+   * (`voice_wake_toggle`, which asks for the recogniser and microphone by
+   * name), but only once Rust says the switch is off — a toggle on an offer
+   * older than the switch would turn listening off.
+   */
+  const turnListeningOn = () =>
+    answerListening(async () => {
+      const wake = await voiceWakeGet();
+      if (wake.enabled) {
+        voiceStore.getState().applyWake(wake);
+      } else {
+        await toggleVoiceListening();
+      }
+    }, ACCOUNT_LISTENING_FAILED);
+
+  /**
+   * "Keep it off" (Epic 85, F15): the person's choice written as one, so it
+   * travels to their other devices. Never the toggle — a toggle can arm —
+   * but `voice_wake_set(false, …)` with the phrases Rust holds, so nothing
+   * the person did not type changes and the microphone is never armed.
+   */
+  const keepListeningOff = () =>
+    answerListening(async () => {
+      const wake = await voiceWakeGet();
+      voiceStore.getState().applyWake(await voiceWakeSet(false, wake.phrase, wake.stopPhrase));
+    }, ACCOUNT_LISTENING_KEEP_OFF_FAILED);
+
   return (
     <>
       {vm.identity !== null ? (
@@ -236,6 +302,35 @@ function ConfiguredAccount({ vm }: { vm: OrgAccountVm }) {
       )}
 
       {vm.sentence !== null && <p role="status">{vm.sentence}</p>}
+      {vm.restore.sentence !== null && <p>{vm.restore.sentence}</p>}
+      {vm.restore.pending.map((line) => (
+        <p key={line}>{line}</p>
+      ))}
+      {vm.restore.listeningOff && (
+        <div className="flex flex-col items-start gap-1">
+          <p>{ACCOUNT_LISTENING_OFF_SENTENCE}</p>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={busy}
+              onClick={turnListeningOn}
+            >
+              {ACCOUNT_LISTENING_ON_LABEL}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={busy}
+              onClick={keepListeningOff}
+            >
+              {ACCOUNT_LISTENING_KEEP_OFF_LABEL}
+            </Button>
+          </div>
+        </div>
+      )}
       {/* Only where settings do travel: a blocked directory or a dead grant is
           exactly when they do not, and the status above says so. */}
       {(vm.state === "ready" || vm.state === "syncing" || vm.state === "offline") && (

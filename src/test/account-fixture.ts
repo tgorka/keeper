@@ -42,6 +42,7 @@ export function accountVm(over: Partial<OrgAccountVm> = {}): OrgAccountVm {
     forgeConnected: false,
     faults: [],
     offers: { drives: [], providers: [], matrix: [] },
+    restore: { sentence: null, pending: [], listeningOff: false },
     revision: 0,
     ...over,
   };
@@ -50,8 +51,9 @@ export function accountVm(over: Partial<OrgAccountVm> = {}): OrgAccountVm {
 /** A drive another device syncs (Epic 84): a notes vault with a task ledger. */
 export function driveOffer(over: Partial<DriveOfferVm> = {}): DriveOfferVm {
   return {
-    // Identity is (normalized remote, branch), so the key names the branch below.
-    key: "drive:https://git.acme.dev/tgorka/notes#trunk",
+    // Identity is (normalized remote, branch, name), so the key names the branch
+    // and the name below (Epic 85, AD-327/F2).
+    key: "drive:https://git.acme.dev/tgorka/notes#trunk^Acme notes",
     name: "Acme notes",
     remoteUrl: "https://git.acme.dev/tgorka/notes.git",
     branch: "trunk",

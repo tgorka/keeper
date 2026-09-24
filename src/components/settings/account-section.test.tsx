@@ -12,18 +12,25 @@ vi.mock("@/lib/ipc/client", () => ({
   accountShare: vi.fn(),
   accountSetupResolve: vi.fn(),
   accountSetupConfirm: vi.fn(),
+  voiceWakeGet: vi.fn(),
+  voiceWakeToggle: vi.fn(),
+  voiceWakeSet: vi.fn(),
+  voiceAvailability: vi.fn(),
 }));
 
 import { SETUP_LINK_LABEL } from "@/components/account/account-setup-sheet";
 import {
   ACCOUNT_FORGET_LABEL,
+  ACCOUNT_LISTENING_KEEP_OFF_LABEL,
+  ACCOUNT_LISTENING_OFF_SENTENCE,
+  ACCOUNT_LISTENING_ON_LABEL,
   ACCOUNT_SECTION_NOTE,
   ACCOUNT_SECTION_TITLE,
   ACCOUNT_SIGN_OUT_LABEL,
   AccountSection,
   accountSyncLine,
 } from "@/components/settings/account-section";
-import type { OrgAccountVm } from "@/lib/ipc/client";
+import type { AccountRestoreVm, OrgAccountVm, VoiceWakeVm } from "@/lib/ipc/client";
 import {
   accountForget,
   accountRenameDevice,
@@ -31,8 +38,13 @@ import {
   accountSignOut,
   accountState,
   accountSync,
+  voiceAvailability,
+  voiceWakeGet,
+  voiceWakeSet,
+  voiceWakeToggle,
 } from "@/lib/ipc/client";
 import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
+import { voiceStore } from "@/lib/stores/voice";
 import { accountVm, driveOffer, matrixOffer, providerOffer } from "@/test/account-fixture";
 
 const mockState = vi.mocked(accountState);
@@ -319,5 +331,141 @@ describe("AccountSection's settings line (Epic 84, UX-DR118)", () => {
     expect(accountSyncLine(offers(0, 0, 1))).toBe(
       `${SYNCED} On your other devices: 1 Matrix account.`,
     );
+  });
+});
+
+describe("AccountSection after a restore (Epic 85, UX-DR119)", () => {
+  const RESTORED = "Restored 2 drives, 1 bot provider and your settings from your account.";
+  const WAITING = "Waiting for /Volumes/Field to restore Field recordings.";
+  const WAKE_OFF: VoiceWakeVm = {
+    enabled: false,
+    phrase: "hey nixie",
+    limits: "limits",
+    locale: "en-US",
+    localeChosen: null,
+    onDeviceLocales: ["en-US"],
+    stopPhrase: "stop",
+    voiceTarget: null,
+  };
+  const WAKE_ON: VoiceWakeVm = { ...WAKE_OFF, enabled: true };
+
+  function restored(restore: Partial<AccountRestoreVm>, revision = 0): OrgAccountVm {
+    return accountVm({
+      revision,
+      restore: { sentence: null, pending: [], listeningOff: false, ...restore },
+    });
+  }
+
+  beforeEach(() => {
+    vi.mocked(voiceAvailability).mockResolvedValue(null);
+    voiceStore.setState({ wake: null });
+  });
+
+  it("says Rust's restore sentence and each pending one under the status, verbatim", () => {
+    const second = "Waiting for /Volumes/Archive to restore archive.";
+    accountStore.getState().setVm(restored({ sentence: RESTORED, pending: [WAITING, second] }));
+    render(<AccountSection open />);
+
+    const status = screen.getByRole("status");
+    const lines = [RESTORED, WAITING, second].map((text) => screen.getByText(text));
+    // Under the status, in Rust's order.
+    for (const [before, after] of [
+      [status, lines[0]],
+      [lines[0], lines[1]],
+      [lines[1], lines[2]],
+    ] as const) {
+      expect(before.compareDocumentPosition(after) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+    expect(screen.queryByText(ACCOUNT_LISTENING_OFF_SENTENCE)).not.toBeInTheDocument();
+  });
+
+  it("says nothing of a restore when there was none", () => {
+    accountStore.getState().setVm(restored({}));
+    render(<AccountSection open />);
+    expect(screen.queryByText(/^Restored /)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Waiting for /)).not.toBeInTheDocument();
+    expect(screen.queryByText(ACCOUNT_LISTENING_OFF_SENTENCE)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: ACCOUNT_LISTENING_ON_LABEL }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers listening but never arms the microphone until the person taps", async () => {
+    accountStore.getState().setVm(restored({ listeningOff: true }));
+    render(<AccountSection open />);
+
+    expect(screen.getByText(ACCOUNT_LISTENING_OFF_SENTENCE)).toBeInTheDocument();
+    const turnOn = screen.getByRole("button", { name: ACCOUNT_LISTENING_ON_LABEL });
+    // Rendering, and Settings' open-time read, touch no voice command.
+    await waitFor(() => expect(accountState).toHaveBeenCalled());
+    await Promise.resolve();
+    expect(voiceWakeToggle).not.toHaveBeenCalled();
+    expect(voiceWakeSet).not.toHaveBeenCalled();
+    expect(voiceWakeGet).not.toHaveBeenCalled();
+
+    vi.mocked(voiceWakeGet).mockResolvedValue(WAKE_OFF);
+    vi.mocked(voiceWakeToggle).mockResolvedValue(WAKE_ON);
+    vi.mocked(accountState).mockResolvedValue(restored({ listeningOff: false }, 1));
+    fireEvent.click(turnOn);
+
+    await waitFor(() => expect(voiceWakeToggle).toHaveBeenCalledTimes(1));
+    expect(voiceWakeSet).not.toHaveBeenCalled();
+    // What Rust stored is mirrored, and the account read again takes the offer away.
+    await waitFor(() => expect(voiceStore.getState().wake).toEqual(WAKE_ON));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: ACCOUNT_LISTENING_ON_LABEL }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("never flips listening off from an offer older than the switch", async () => {
+    accountStore.getState().setVm(restored({ listeningOff: true }));
+    vi.mocked(voiceWakeGet).mockResolvedValue(WAKE_ON);
+    render(<AccountSection open />);
+    vi.mocked(accountState).mockResolvedValue(restored({ listeningOff: false }, 1));
+
+    fireEvent.click(screen.getByRole("button", { name: ACCOUNT_LISTENING_ON_LABEL }));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: ACCOUNT_LISTENING_ON_LABEL }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(voiceWakeToggle).not.toHaveBeenCalled();
+    expect(voiceStore.getState().wake).toEqual(WAKE_ON);
+  });
+
+  it("says Rust's sentence when listening cannot be turned on, and keeps the offer", async () => {
+    accountStore.getState().setVm(restored({ listeningOff: true }));
+    vi.mocked(voiceWakeGet).mockResolvedValue(WAKE_OFF);
+    vi.mocked(voiceWakeToggle).mockRejectedValue({
+      code: "internal",
+      message: "the settings table is read-only",
+    });
+    render(<AccountSection open />);
+
+    fireEvent.click(screen.getByRole("button", { name: ACCOUNT_LISTENING_ON_LABEL }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("the settings table is read-only");
+    expect(screen.getByRole("button", { name: ACCOUNT_LISTENING_ON_LABEL })).toBeEnabled();
+  });
+
+  it("keeps listening off as the person's choice, never arming it, and the offer goes", async () => {
+    accountStore.getState().setVm(restored({ listeningOff: true }));
+    vi.mocked(voiceWakeGet).mockResolvedValue(WAKE_OFF);
+    vi.mocked(voiceWakeSet).mockResolvedValue(WAKE_OFF);
+    render(<AccountSection open />);
+    vi.mocked(accountState).mockResolvedValue(restored({ listeningOff: false }, 1));
+
+    fireEvent.click(screen.getByRole("button", { name: ACCOUNT_LISTENING_KEEP_OFF_LABEL }));
+
+    // Written as a choice — off, with the phrases Rust holds — so it travels.
+    await waitFor(() =>
+      expect(voiceWakeSet).toHaveBeenCalledExactlyOnceWith(false, "hey nixie", "stop"),
+    );
+    expect(voiceWakeToggle).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByText(ACCOUNT_LISTENING_OFF_SENTENCE)).toBeNull());
+    expect(screen.queryByRole("button", { name: ACCOUNT_LISTENING_KEEP_OFF_LABEL })).toBeNull();
+    expect(screen.queryByRole("button", { name: ACCOUNT_LISTENING_ON_LABEL })).toBeNull();
+    expect(voiceStore.getState().wake?.enabled).toBe(false);
   });
 });

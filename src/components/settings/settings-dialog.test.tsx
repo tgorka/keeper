@@ -42,6 +42,7 @@ vi.mock("@/lib/ipc/client", () => ({
       forgeConnected: false,
       faults: [],
       offers: { drives: [], providers: [], matrix: [] },
+      restore: { sentence: null, pending: [], listeningOff: false },
       revision: 0,
     }),
   ),

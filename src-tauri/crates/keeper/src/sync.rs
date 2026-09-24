@@ -324,6 +324,16 @@ pub fn git_resolution(platform: &dyn Platform) -> GitResolution {
     resolution
 }
 
+/// Whether `path` names a `git` this installation would drive — the same
+/// check an explicitly configured path gets — for a path another device
+/// chose, before it is written here.
+pub fn git_path_usable(path: &str) -> bool {
+    GitRequest::explicit(PathBuf::from(path), GIT_ADVICE)
+        .resolve()
+        .chosen()
+        .is_some()
+}
+
 /// The explicitly chosen `git`, or `None` for automatic resolution.
 ///
 /// A read failure is `None` — automatic — and is logged rather than swallowed: a

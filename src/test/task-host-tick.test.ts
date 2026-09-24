@@ -82,14 +82,20 @@ describe("the app hosts due tasks on the tick it already owns", () => {
 
   it("keeps that one interval the pre-existing tray tick, with nothing about tasks in it", () => {
     // The interval is identified by what it does, not by its position: the tray
-    // renderers and `notes_vault::cadence_tick` are the whole of its body, and a
-    // task poll spliced in beside them is what this assertion refuses.
+    // renderers, `notes_vault::cadence_tick` and the account's daily pull
+    // (AD-332) are the whole of its body, and a task poll spliced in beside
+    // them is what this assertion refuses.
     const at = LIB.indexOf("tokio::time::interval");
     const block = LIB.slice(at, LIB.indexOf("\n            }", at));
     expect(block).toContain("Duration::from_secs(1)");
     expect(block).toContain("tray::apply_recording_state");
     expect(block).toContain("notes_vault::cadence_tick()");
     expect(block).not.toMatch(/task/i);
+    // The one call added since: the daily pull, once, straight after the
+    // notes cadence and nowhere else in the shell.
+    expect(occurrences(block, "account_ipc::daily_tick()")).toBe(1);
+    expect(block).toMatch(/notes_vault::cadence_tick\(\);\s*account_ipc::daily_tick\(\);/);
+    expect(occurrences(LIB, "daily_tick(")).toBe(1);
   });
 
   it("becomes a task host by starting the supervisor at boot, under #[cfg(desktop)]", () => {

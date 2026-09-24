@@ -316,6 +316,25 @@ pub fn stored_settings(
     Ok(rows)
 }
 
+/// The `settings` table's own rows whose key starts with `prefix` — a key
+/// family, such as the credential-source rows a settings sync carries.
+pub fn stored_settings_by_prefix(
+    data_dir: &Path,
+    prefix: &str,
+) -> Result<std::collections::BTreeMap<String, String>, CoreError> {
+    let conn = open(data_dir)?;
+    let mut stmt = conn
+        .prepare("SELECT key, value FROM settings WHERE substr(key, 1, length(?1)) = ?1")
+        .map_err(|e| CoreError::Internal(format!("could not prepare settings read: {e}")))?;
+    let rows = stmt
+        .query_map(rusqlite::params![prefix], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .and_then(Iterator::collect)
+        .map_err(|e| CoreError::Internal(format!("could not read settings: {e}")))?;
+    Ok(rows)
+}
+
 /// Write (`Some`) or remove (`None`) one value a config-repository sync pulled
 /// (Epic 84). Refused for any key that does not belong in a synced file, so a
 /// repository can never reach session state, a family row or an unknown key.
@@ -1855,7 +1874,7 @@ fn delete_setting(data_dir: &Path, key: &str) -> Result<(), CoreError> {
 /// different account never answers for a drive or provider set up under the
 /// first. Absence means the keychain, so a drive or provider that never opted
 /// in reads exactly as it did before the account existed.
-fn credential_source_value(account_id: &str) -> String {
+pub fn credential_source_value(account_id: &str) -> String {
     format!("account:{account_id}")
 }
 
@@ -2136,10 +2155,94 @@ pub fn set_account_manifest_base(
     )
 }
 
+/// `account.<id>.restored`: `1` once this install's first sync ran the
+/// restore from `device.<me>.toml` (Epic 85, AD-329). From then on this
+/// device's own state is the truth, so it never restores again.
+fn account_restored_key(account_id: &str) -> String {
+    format!("account.{account_id}.restored")
+}
+
+/// Whether this install already restored itself from the account.
+pub fn get_account_restored(data_dir: &Path, account_id: &str) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, &account_restored_key(account_id))?.as_deref() == Some("1"))
+}
+
+/// Record that this install restored itself from the account.
+pub fn set_account_restored(data_dir: &Path, account_id: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, &account_restored_key(account_id), "1")
+}
+
+/// `account.<id>.restore_pending`: what a restore could not create yet — a
+/// drive whose folder's parent is missing (an unmounted volume), a bot grant
+/// whose drive is not here yet — as JSON, retried on every later sync.
+fn account_restore_pending_key(account_id: &str) -> String {
+    format!("account.{account_id}.restore_pending")
+}
+
+/// What is still waiting to be restored; empty when nothing is. A row that
+/// no longer parses is an error rather than an empty answer, because an
+/// empty answer would be written back and lose what was waiting.
+pub fn get_account_restore_pending(
+    data_dir: &Path,
+    account_id: &str,
+) -> Result<crate::org_account::device_state::RestorePending, CoreError> {
+    let Some(raw) = get_setting(data_dir, &account_restore_pending_key(account_id))? else {
+        return Ok(crate::org_account::device_state::RestorePending::default());
+    };
+    serde_json::from_str(&raw).map_err(|e| {
+        CoreError::Internal(format!("what is waiting to be restored is unreadable: {e}"))
+    })
+}
+
+/// Record what is still waiting to be restored; nothing removes the row.
+pub fn set_account_restore_pending(
+    data_dir: &Path,
+    account_id: &str,
+    pending: &crate::org_account::device_state::RestorePending,
+) -> Result<(), CoreError> {
+    if pending.is_empty() {
+        return delete_setting(data_dir, &account_restore_pending_key(account_id));
+    }
+    let json = serde_json::to_string(pending)
+        .map_err(|e| CoreError::Internal(format!("could not record what is waiting: {e}")))?;
+    set_setting(data_dir, &account_restore_pending_key(account_id), &json)
+}
+
+/// `account.<id>.restore_matrix_started`: `1` once a restore started the one
+/// single-sign-on Matrix sign-in it may start on this install.
+fn account_restore_matrix_started_key(account_id: &str) -> String {
+    format!("account.{account_id}.restore_matrix_started")
+}
+
+/// Whether a restore already started its Matrix sign-in on this install.
+pub fn get_account_restore_matrix_started(
+    data_dir: &Path,
+    account_id: &str,
+) -> Result<bool, CoreError> {
+    Ok(
+        get_setting(data_dir, &account_restore_matrix_started_key(account_id))?.as_deref()
+            == Some("1"),
+    )
+}
+
+/// Record that a restore started its Matrix sign-in on this install.
+pub fn set_account_restore_matrix_started(
+    data_dir: &Path,
+    account_id: &str,
+) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        &account_restore_matrix_started_key(account_id),
+        "1",
+    )
+}
+
 /// Forget what this install recorded about account `account_id` — its device
-/// slug, last sync, settings bases and manifest bases — so setting it (or
-/// another account) up again starts clean rather than claiming a registration
-/// that is gone.
+/// slug, last sync, settings bases, manifest bases and restore progress — so
+/// setting it (or another account) up again starts clean rather than claiming
+/// a registration that is gone. `account.<id>.restored` stays: this install
+/// already came back once, and signing in again must not recreate what the
+/// person removed meanwhile.
 pub fn forget_account_state(data_dir: &Path, account_id: &str) -> Result<(), CoreError> {
     use crate::org_account::settings_sync::SyncedFile;
     delete_setting(data_dir, &account_last_synced_ms_key(account_id))?;
@@ -2150,6 +2253,8 @@ pub fn forget_account_state(data_dir: &Path, account_id: &str) -> Result<(), Cor
     for which in MANIFESTS {
         delete_setting(data_dir, &account_manifest_base_key(account_id, which))?;
     }
+    delete_setting(data_dir, &account_restore_pending_key(account_id))?;
+    delete_setting(data_dir, &account_restore_matrix_started_key(account_id))?;
     Ok(())
 }
 
@@ -2933,6 +3038,24 @@ pub fn backfill_hue_index(data_dir: &Path, account_id: &str) -> Result<u8, CoreE
     )
     .map_err(|e| CoreError::Internal(format!("could not backfill hue_index: {e}")))?;
     Ok(hue)
+}
+
+/// Give account `account_id` hue `hue` on the wheel — a restored account
+/// takes the hue it had before. A hue off the wheel is refused; an absent
+/// row is left alone.
+pub fn set_account_hue_index(data_dir: &Path, account_id: &str, hue: u8) -> Result<(), CoreError> {
+    if hue >= HUE_WHEEL_SIZE {
+        return Err(CoreError::Internal(format!(
+            "hue {hue} is not on the {HUE_WHEEL_SIZE}-hue wheel"
+        )));
+    }
+    let conn = open(data_dir)?;
+    conn.execute(
+        "UPDATE accounts SET hue_index = ?1 WHERE account_id = ?2",
+        rusqlite::params![i64::from(hue), account_id],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not set hue_index: {e}")))?;
+    Ok(())
 }
 
 /// Backfill a `NULL` `provider` for a legacy account row with an inferred tag
@@ -5167,6 +5290,8 @@ mod tests {
         let dir = temp_dir();
         set_account_device_slug(&dir, "acme", "work-mac").expect("slug");
         set_account_last_synced_ms(&dir, "acme", 42).expect("synced");
+        set_account_restored(&dir, "acme").expect("restored");
+        set_account_restore_matrix_started(&dir, "acme").expect("matrix");
         set_account_device_slug(&dir, "globex", "den").expect("slug");
 
         assert_eq!(
@@ -5184,6 +5309,11 @@ mod tests {
             get_account_last_synced_ms(&dir, "acme").expect("read"),
             None
         );
+        assert!(
+            get_account_restored(&dir, "acme").expect("read"),
+            "an install that came back once is never restored over again"
+        );
+        assert!(!get_account_restore_matrix_started(&dir, "acme").expect("read"));
         assert_eq!(
             get_account_device_slug(&dir, "globex").expect("read"),
             Some("den".to_owned())
@@ -5251,26 +5381,29 @@ mod tests {
         set_recording_codec(&dir, "h264").expect("seed codec");
         set_debug_mode(&dir, false).expect("seed debug");
         // …while a key that never syncs is still decided by the file.
-        set_setting(&dir, "sync.git_path", "/opt/old/git").expect("seed git");
+        set_setting(&dir, "ui.first_run_setup_skipped", "0").expect("seed latch");
         std::fs::write(
             dir.join(CONFIG_FILE_NAME),
-            r#"{"recording.codec":"hevc","recording.scale_percent":50,"debug.mode":true,"sync.git_path":"/usr/bin/git"}"#,
+            r#"{"recording.codec":"hevc","recording.scale_percent":50,"debug.mode":true,"ui.first_run_setup_skipped":"1"}"#,
         )
         .expect("write config");
         let mut imported = import_config_file(&dir).expect("import");
         imported.sort();
-        assert_eq!(imported, vec!["recording.scale_percent", "sync.git_path"]);
+        assert_eq!(
+            imported,
+            vec!["recording.scale_percent", "ui.first_run_setup_skipped"]
+        );
         assert_eq!(get_recording_codec(&dir).expect("codec"), "h264");
         assert_eq!(get_recording_scale_percent(&dir).expect("scale"), 50);
         assert!(!get_debug_mode(&dir).expect("debug"));
         assert_eq!(
-            get_setting(&dir, "sync.git_path").expect("git"),
-            Some("/usr/bin/git".to_owned())
+            get_setting(&dir, "ui.first_run_setup_skipped").expect("latch"),
+            Some("1".to_owned())
         );
         // Every launch imports again, and still changes nothing synced.
         assert_eq!(
             import_config_file(&dir).expect("again"),
-            vec!["sync.git_path"]
+            vec!["ui.first_run_setup_skipped"]
         );
         assert_eq!(get_recording_codec(&dir).expect("codec"), "h264");
         // Malformed JSON ⇒ a loud Err, and the prior imports stay intact.

@@ -60,8 +60,6 @@ file-controlled instead, and says which file.
 | | | | | Whether the Favorites section of the room list starts collapsed. |
 | `bots.message_details` | user-global | boolean (`1`/`0`) | `0` | `"bots.message_details" = true` |
 | | | | | Whether an answer shows its metadata caption — model, tokens, timings, finish reason, request id. |
-| `bots.wake_enabled` | user-global | boolean (`1`/`0`) | `0` | `"bots.wake_enabled" = true` |
-| | | | | Whether the wake phrase is armed on the phone. Off until chosen: an open microphone is a deliberate act. |
 | `bots.wake_phrase` | user-global | text | `nixie` | `"bots.wake_phrase" = "hej keeper"` |
 | | | | | The phrase that starts a voice turn, as typed; matched case- and diacritic-insensitively. At least 5 letters, at most 5 words. |
 | `bots.voice_locale` | user-global | text | *(absent)* | `"bots.voice_locale" = "en-US"` |
@@ -159,8 +157,9 @@ Not preferences. keeper writes these and reads them back, so a file entry would 
 | Key | Shape | What it holds | Why no file sets it |
 | --- | --- | --- | --- |
 | `sdk_encryption` | boolean (`on`/`off`) | At-rest encryption posture for the local matrix-sdk store; absent means unchosen, which is what gates the first-run question. | the posture is keyed to a per-account passphrase in this machine's Keychain, so flipping it is a re-key of the local store, not a toggle |
-| `account.<…>` | text | Per organisation account id: `account.<id>.device_slug` (this device's name in the account's repository) and `account.<id>.last_synced_ms` (the last sync, in ms since the Unix epoch). Forgetting the account deletes both. | it is this install's record of one organisation account — its device name in the account's repository and when that repository last synced — and a file carrying it to another device would make two devices write the same files |
+| `account.<…>` | text | Per organisation account id: `account.<id>.device_slug` (this device's name in the account's repository), `account.<id>.last_synced_ms` (the last sync, in ms since the Unix epoch), the sync's bases, and the restore's markers (`restored`, `restore_pending`, `restore_matrix_started`). Forgetting the account deletes them all but `restored`, so a second sign-in never restores over what the person removed. | it is this install's record of one organisation account — its device name in the account's repository and when that repository last synced — and a file carrying it to another device would make two devices write the same files |
 | `bots.provider_credential_source.<…>` | text | Per bot provider: `account:<account id>` sends that organisation account's sign-in token while it is the configured account; absent uses the provider's own saved token. | it is the choice made in a provider's form, and a file flipping it would send the account's token to a server the person never chose to give it to |
+| `bots.wake_enabled` | boolean (`1`/`0`) | Whether the wake phrase is armed on the phone. Off until chosen: an open microphone is a deliberate act. | an open microphone is a person's tap on the device that listens, so no file — this machine's, the account's or a folder's — may switch it on |
 | `notes.hide_service_files` | boolean (`1`/`0`) | Whether the notes list is hiding service files. | it remembers the person's last choice in the notes list |
 | `notes.include_private` | boolean (`1`/`0`) | Whether the notes list includes private notes. | it remembers the person's last choice in the notes list |
 | `notes.embedding_model` | JSON | The provider and model chosen for meaning search; blank keeps search words-only. | the model is chosen from the configured providers in Settings |

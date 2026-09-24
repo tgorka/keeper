@@ -21,9 +21,13 @@
 // its tests there; it stays compiled so those tests run on every host.
 #![cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
 
-use std::sync::{Arc, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use keeper_core::error::CoreError;
 use keeper_core::oauth::OAuthFlowRegistry;
+use keeper_core::platform::Platform;
+use keeper_core::vm::NotifyTarget;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
 /// Why a flow ends when its sheet hands back a callback that is not its own.
@@ -136,7 +140,17 @@ fn failure_url(state: &str, reason: &str) -> String {
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const MAIN_WINDOW: &str = "main";
 
-/// Present `url` in `ASWebAuthenticationSession` over the main window.
+/// Present `url` in `ASWebAuthenticationSession` over the main window, for
+/// an account sign-in (its flows are the registry [`install`] recorded).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub fn start(url: &str, callback_scheme: &str) -> Result<(), CoreError> {
+    let (_, flows) = HOST.get().ok_or_else(not_up)?;
+    start_in(url, callback_scheme, Arc::clone(flows))
+}
+
+/// Present `url` in `ASWebAuthenticationSession` over the main window, and
+/// deliver its ending to `flows` — the account's registry, or Matrix's for
+/// a Matrix single sign-on, so neither's cancel can end the other's.
 ///
 /// Returns once the presentation is queued. Whatever happens after — a
 /// callback, a cancel, a sheet that could not start — reaches the registry
@@ -144,15 +158,14 @@ const MAIN_WINDOW: &str = "main";
 /// `with_webview` is the way in because its closure runs on the main thread
 /// (its whole contract) and is handed the native window the sheet anchors to.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub fn start(url: &str, callback_scheme: &str) -> Result<(), keeper_core::error::CoreError> {
-    use keeper_core::error::CoreError;
+pub fn start_in(
+    url: &str,
+    callback_scheme: &str,
+    flows: Arc<OAuthFlowRegistry>,
+) -> Result<(), CoreError> {
     use tauri::Manager;
 
-    let (app, flows) = HOST.get().ok_or_else(|| {
-        CoreError::Unsupported(
-            "the sign-in sheet is not available before the app starts".to_owned(),
-        )
-    })?;
+    let (app, _) = HOST.get().ok_or_else(not_up)?;
     let state = state_of(url)
         .ok_or_else(|| CoreError::Internal("the authorization URL carries no state".to_owned()))?;
     let window = app.get_webview_window(MAIN_WINDOW).ok_or_else(|| {
@@ -163,7 +176,6 @@ pub fn start(url: &str, callback_scheme: &str) -> Result<(), keeper_core::error:
     })?;
     let url = url.to_owned();
     let scheme = callback_scheme.to_owned();
-    let flows = Arc::clone(flows);
     let app = app.clone();
     window
         .with_webview(move |webview| {
@@ -176,14 +188,125 @@ pub fn start(url: &str, callback_scheme: &str) -> Result<(), keeper_core::error:
         .map_err(|error| CoreError::Internal(format!("could not reach the main window: {error}")))
 }
 
-/// Close every sign-in sheet this process has open. Each one's completion
-/// then reports a cancel, which ends its flow through [`finish`].
-pub fn cancel_all() {
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn not_up() -> CoreError {
+    CoreError::Unsupported("the sign-in sheet is not available before the app starts".to_owned())
+}
+
+/// Close the sheet shown for `state`, if it is still open: its flow has
+/// already ended (cancelled or timed out), and a sheet left behind would
+/// answer nobody.
+pub fn close(state: &str) {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     if let Some((app, _)) = HOST.get() {
-        if let Err(error) = app.run_on_main_thread(crate::web_auth_apple::cancel_all) {
+        let state = state.to_owned();
+        if let Err(error) = app.run_on_main_thread(move || crate::web_auth_apple::cancel(&state)) {
+            tracing::warn!(%error, "web auth: could not reach the main thread to close a sheet");
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let _ = state;
+}
+
+/// Close every sign-in sheet that reports to `flows`, leaving the other
+/// registry's open. Each one's completion then reports a cancel, which ends
+/// its flow through [`finish`].
+pub fn cancel_all(flows: &Arc<OAuthFlowRegistry>) {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if let Some((app, _)) = HOST.get() {
+        let flows = Arc::clone(flows);
+        if let Err(error) =
+            app.run_on_main_thread(move || crate::web_auth_apple::cancel_for(&flows))
+        {
             tracing::warn!(%error, "web auth: could not reach the main thread to cancel");
         }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let _ = flows;
+}
+
+/// The platform a Matrix single sign-on runs against (AD-331): the app's
+/// own, except that the authorization page opens in the sign-in sheet where
+/// the platform has one, so the identity provider's session from the
+/// account sign-in carries over and the person is not asked for a password
+/// again. Its ending goes to the Matrix registry the flow waits in; the
+/// redirect (`dev.tgorka.keeper:/oauth/callback`, `oauth::redirect_uri`) is
+/// core's. Elsewhere, and when the sheet cannot be reached, the system
+/// browser opens as before and the deep link delivers the callback.
+pub struct MatrixSignIn<'a> {
+    inner: &'a dyn Platform,
+    flows: Arc<OAuthFlowRegistry>,
+    /// The `state` of the sheet this sign-in opened.
+    shown: Mutex<Option<String>>,
+}
+
+impl<'a> MatrixSignIn<'a> {
+    pub fn new(inner: &'a dyn Platform, flows: Arc<OAuthFlowRegistry>) -> Self {
+        Self {
+            inner,
+            flows,
+            shown: Mutex::new(None),
+        }
+    }
+
+    /// Close the sheet this sign-in opened, once the sign-in has ended: a
+    /// cancel or a timeout ends the flow, not the sheet.
+    pub fn close(&self) {
+        let shown = self
+            .shown
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(state) = shown {
+            close(&state);
+        }
+    }
+}
+
+impl Platform for MatrixSignIn<'_> {
+    fn data_dir(&self) -> Result<PathBuf, CoreError> {
+        self.inner.data_dir()
+    }
+    fn keychain_set(&self, key: &str, value: &str) -> Result<(), CoreError> {
+        self.inner.keychain_set(key, value)
+    }
+    fn keychain_get(&self, key: &str) -> Result<Option<String>, CoreError> {
+        self.inner.keychain_get(key)
+    }
+    fn keychain_delete(&self, key: &str) -> Result<(), CoreError> {
+        self.inner.keychain_delete(key)
+    }
+    fn open_url(&self, url: &str) -> Result<(), CoreError> {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let (Some(state), Ok(redirect)) = (state_of(url), keeper_core::oauth::redirect_uri()) {
+            if sheet_can_deliver(redirect.scheme()) {
+                match start_in(url, redirect.scheme(), Arc::clone(&self.flows)) {
+                    Ok(()) => {
+                        *self.shown.lock().unwrap_or_else(PoisonError::into_inner) = Some(state);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "web auth: the Matrix sign-in opens in the browser");
+                    }
+                }
+            }
+        }
+        self.inner.open_url(url)
+    }
+    fn start_web_auth(&self, url: &str, callback_scheme: &str) -> Result<(), CoreError> {
+        self.inner.start_web_auth(url, callback_scheme)
+    }
+    fn notify(&self, title: &str, body: &str, target: &NotifyTarget) -> Result<(), CoreError> {
+        self.inner.notify(title, body, target)
+    }
+    fn sidecar_path(&self, name: &str) -> Result<PathBuf, CoreError> {
+        self.inner.sidecar_path(name)
+    }
+    fn exclude_from_backup(&self, path: &Path) -> Result<(), CoreError> {
+        self.inner.exclude_from_backup(path)
+    }
+    fn set_badge_count(&self, count: Option<u32>) -> Result<(), CoreError> {
+        self.inner.set_badge_count(count)
     }
 }
 

@@ -1895,6 +1895,31 @@ mod tests {
         );
     }
 
+    /// No file at any tier arms the microphone: a pin of `bots.wake_enabled`
+    /// — this machine's, the account's or the main folder's — is refused by
+    /// name and never reaches the resolved settings.
+    #[test]
+    fn no_layer_may_switch_the_wake_phrase_on() {
+        let text = "[settings]\n\"bots.wake_enabled\" = true\n";
+        for tier in [
+            LayerTier::UserGlobal,
+            LayerTier::UserGlobalMachine,
+            LayerTier::AccountShared,
+            LayerTier::AccountDevice,
+            LayerTier::MainShared,
+            LayerTier::MainMachine,
+        ] {
+            let file = parse_layer_file(Path::new("/x/keeper.testbox.toml"), tier, None, text);
+            assert!(!file.settings.contains_key("bots.wake_enabled"), "{tier:?}");
+            let refusal = file
+                .faults
+                .iter()
+                .find(|f| f.kind == LayerFaultKind::KeyRefused)
+                .unwrap_or_else(|| panic!("{tier:?} must refuse it"));
+            assert_eq!(refusal.key.as_deref(), Some("bots.wake_enabled"));
+        }
+    }
+
     // -- paths and the host label ------------------------------------------
 
     #[test]

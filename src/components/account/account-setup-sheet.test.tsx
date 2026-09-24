@@ -76,14 +76,27 @@ describe("AccountSetupSheet", () => {
     expect(accountStore.getState().vm.configured).toBe(true);
   });
 
-  it("does not let a registered device's name be edited here", async () => {
+  it("does not let a registered device's name be edited here, and says it will be restored", async () => {
     mockResolve.mockResolvedValue(setupVm({ registered: true }));
     open();
 
     expect(await screen.findByText("hesperia")).toBeInTheDocument();
     expect(screen.queryByLabelText(SETUP_DEVICE_LABEL)).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "This device is already in your settings repository; keeper will restore its drives, bots and settings.",
+      ),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: SETUP_CONTINUE_LABEL }));
     await waitFor(() => expect(mockConfirm).toHaveBeenCalledWith("setup-1", "hesperia"));
+  });
+
+  it("promises no restore for a device the repository does not know yet", async () => {
+    mockResolve.mockResolvedValue(setupVm({ registered: false }));
+    open();
+
+    expect(await screen.findByLabelText(SETUP_DEVICE_LABEL)).toBeInTheDocument();
+    expect(screen.queryByText(/keeper will restore/)).not.toBeInTheDocument();
   });
 
   it("renders Rust's refusal verbatim and offers nothing to continue", async () => {

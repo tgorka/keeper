@@ -30,8 +30,9 @@
 //!
 //! A sync runs at launch, on "Sync now", and when the window gains focus — the
 //! frontend asks, and [`account_sync`] refuses to go to the network again
-//! within [`SYNC_INTERVAL_MS`] unless forced. There is no interval here
-//! (AD-62).
+//! within [`SYNC_INTERVAL_MS`] unless forced. The one background pull,
+//! [`daily_tick`], is a due-check on the tray's existing 1 Hz tick; there is
+//! no interval here (AD-62).
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -40,16 +41,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use keeper_core::bots::{self, store, Bot, BotIdentity, Provider, ProviderKind};
+use keeper_core::bots::{self, Provider, ProviderKind};
 use keeper_core::config::{self as layers, AccountLayerSource};
 use keeper_core::error::CoreError;
 use keeper_core::oauth::{OAuthCallback, OAuthFlowRegistry};
 use keeper_core::org_account::descriptor::{self, AccountDescriptor, RepoAuthConfig, SetupInput};
+use keeper_core::org_account::device_state::{self, DeviceStateFile, MatrixState, RestorePending};
 use keeper_core::org_account::layout::{
     self, DeviceClass, DeviceEntry, PlanInput, RepoFiles, Resolution, UserRecord,
 };
 use keeper_core::org_account::manifest::{
-    self, BotRecord, BotsFile, DriveRecord, DrivesFile, MatrixFile, MatrixRecord, ProviderRecord,
+    self, BotsFile, DriveRecord, DrivesFile, MatrixFile, MatrixRecord, ProviderRecord,
 };
 use keeper_core::org_account::session::{self, GitAuth, Identity};
 use keeper_core::org_account::settings_sync::{
@@ -57,7 +59,7 @@ use keeper_core::org_account::settings_sync::{
 };
 use keeper_core::org_account::state::{
     self, AccountFacts, AccountIdentityVm, AccountOffersVm, AccountPhase, AccountProblem,
-    AccountSetupVm, AccountShareVm, AccountStateVm, AccountVm,
+    AccountSetupVm, AccountShareVm, AccountStateVm, AccountVm, RestoreFacts,
 };
 use keeper_core::org_account::{oidc, AccountError};
 use keeper_core::platform::Platform;
@@ -68,14 +70,19 @@ use keeper_sync::SyncError;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
 
-use crate::account_settings;
 use crate::ipc::{to_ipc_error, AppState};
+use crate::{account_restore, account_settings};
 
 /// The event the webview opens the setup sheet on; the payload is the link.
 pub const ACCOUNT_SETUP_EVENT: &str = "keeper://account-setup";
 
 /// How long a sync that was not forced waits after the last attempt.
 pub const SYNC_INTERVAL_MS: i64 = 15 * 60 * 1000;
+
+/// While keeper runs, the repository is pulled at least this often even
+/// when nobody opens the window (AD-332).
+#[cfg(desktop)]
+const DAILY_PULL_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Everything the Account section is drawn from, plus what a sync needs to
 /// remember between runs. Never holds a token.
@@ -116,6 +123,10 @@ struct Inner {
     /// The providers in the person's `bots.toml` as the last sync left it —
     /// what adding an offered provider reads its bots from.
     offered_providers: Vec<ProviderRecord>,
+    /// What restoring this device did and what waits (AD-329). Its
+    /// `listening_off` is computed once per sync and cleared the moment the
+    /// person writes the wake switch, never read from the database here.
+    restore: RestoreFacts,
 }
 
 #[derive(Default)]
@@ -149,6 +160,16 @@ struct Runtime {
     /// The app, once it is up: what a sync kicked by a local change runs
     /// with, and what a pulled setting with live state is applied through.
     app: std::sync::OnceLock<AppHandle>,
+    /// When this process loaded the account at launch: the daily pull's
+    /// clock before any sync has been attempted.
+    #[cfg(desktop)]
+    booted_ms: std::sync::OnceLock<i64>,
+    /// When the daily pull last started a sync, and whether that one is
+    /// still running.
+    #[cfg(desktop)]
+    daily_kicked_ms: Mutex<Option<i64>>,
+    #[cfg(desktop)]
+    daily_running: AtomicBool,
 }
 
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(Runtime::default);
@@ -403,6 +424,110 @@ fn default_device_name() -> String {
     layout::device_slug(&keeper_core::config::read_host_label())
 }
 
+/// This machine to this person (A5): the sha256 of the OS's stable machine
+/// id and the sign-in's `sub`, hex. It tells a reinstall on this machine
+/// from another machine of the same name, and names no hardware to anyone
+/// else. `None` where the OS has no such id (iOS) or it does not read.
+fn machine_fingerprint(sub: &str) -> Option<String> {
+    OS_MACHINE_ID.as_deref().map(|id| fingerprint(id, sub))
+}
+
+/// The OS's machine id, read once per process: it cannot change while
+/// keeper runs, and reading it spawns a process on macOS and Windows.
+static OS_MACHINE_ID: LazyLock<Option<String>> = LazyLock::new(os_machine_id);
+
+/// Whole days since device `slug`'s settings or state file last changed at
+/// the clone's tip (F3): a legacy record untouched this long is taken to be
+/// this machine's own from before a reinstall. `None` when neither file has
+/// a history to read.
+fn untouched_days(root: &Path, login: &str, slug: &str, now_secs: i64) -> Option<u64> {
+    let changed = |rel: String| match config_repo::last_change_secs(root, &rel) {
+        Ok(secs) => secs,
+        Err(error) => {
+            tracing::debug!(%error, rel, "account: a device's history was not read");
+            None
+        }
+    };
+    let newest = [
+        changed(settings_sync::device_path(login, slug)),
+        changed(device_state::path(login, slug)),
+    ]
+    .into_iter()
+    .flatten()
+    .max()?;
+    days_between(newest, now_secs)
+}
+
+/// Whole days from `then_secs` to `now_secs`; a future time is zero days.
+fn days_between(then_secs: i64, now_secs: i64) -> Option<u64> {
+    u64::try_from(now_secs.saturating_sub(then_secs).max(0) / 86_400).ok()
+}
+
+fn fingerprint(machine_id: &str, sub: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let digest = Sha256::new()
+        .chain_update(machine_id.trim().as_bytes())
+        .chain_update([0])
+        .chain_update(sub.as_bytes())
+        .finalize();
+    digest
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
+/// `IOPlatformUUID`, as `ioreg` reports it.
+#[cfg(target_os = "macos")]
+fn os_machine_id() -> Option<String> {
+    let out = std::process::Command::new("/usr/sbin/ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text
+        .lines()
+        .find(|line| line.contains("\"IOPlatformUUID\""))?;
+    let id = line.rsplit('=').next()?.trim().trim_matches('"');
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn os_machine_id() -> Option<String> {
+    let id = std::fs::read_to_string("/etc/machine-id").ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+#[cfg(target_os = "windows")]
+fn os_machine_id() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+
+    // No console window flashes up for a GUI app's child.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("reg")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Cryptography",
+            "/v",
+            "MachineGuid",
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|line| line.contains("MachineGuid"))?;
+    line.split_whitespace().last().map(str::to_owned)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn os_machine_id() -> Option<String> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // The view model and its subscribers
 // ---------------------------------------------------------------------------
@@ -434,6 +559,16 @@ fn facts(inner: &Inner) -> AccountFacts {
             .as_ref()
             .is_some_and(|d| matches!(d.config.auth, RepoAuthConfig::Oauth(_))),
         offers: inner.offers.clone(),
+        restore: inner.restore.clone(),
+    }
+}
+
+/// The person wrote the wake switch — on or off, it is their choice now —
+/// so the "Turn listening on" offer goes at once, not at the next sync.
+fn wake_chosen() {
+    let changed = lock(&RUNTIME.inner).restore.listening_off;
+    if changed {
+        update(|inner| inner.restore.listening_off = false);
     }
 }
 
@@ -658,6 +793,8 @@ fn load_local(platform: &dyn Platform, inner: &mut Inner) -> bool {
 /// first setting they could affect is read. Called straight after
 /// `config::install`; no network, and nothing at all without a descriptor.
 pub fn boot(platform: &dyn Platform) {
+    #[cfg(desktop)]
+    let _ = RUNTIME.booted_ms.set(now_ms());
     let mut inner = lock(&RUNTIME.inner);
     load_local(platform, &mut inner);
 }
@@ -683,12 +820,64 @@ fn spawn_sync(app: &AppHandle, force: bool) {
     });
 }
 
+/// Whether the daily pull is due: a day since the last attempt — or since
+/// launch, before there was one — and since the last time it went itself,
+/// so a sync that could not start (someone else holds the gate, nobody is
+/// signed in) is not asked for again every second.
+#[cfg(desktop)]
+fn daily_due(
+    last_attempt_ms: Option<i64>,
+    booted_ms: i64,
+    kicked_ms: Option<i64>,
+    now: i64,
+) -> bool {
+    let since = last_attempt_ms
+        .unwrap_or(booted_ms)
+        .max(kicked_ms.unwrap_or(i64::MIN));
+    now.saturating_sub(since) >= DAILY_PULL_MS
+}
+
+/// Called from the 1 Hz tray tick (AD-62: no clock of its own): once a day
+/// without a sync, one forced sync is started in the background. Nothing
+/// without an account, and nothing while the last one it started runs.
+/// Desktop only: the tray tick is, and a phone syncs when it is opened.
+#[cfg(desktop)]
+pub fn daily_tick() {
+    use tauri::Manager;
+
+    let (Some(app), Some(&booted)) = (RUNTIME.app.get(), RUNTIME.booted_ms.get()) else {
+        return;
+    };
+    let now = now_ms();
+    {
+        let inner = lock(&RUNTIME.inner);
+        let kicked = *lock(&RUNTIME.daily_kicked_ms);
+        if inner.descriptor.is_none() || !daily_due(inner.last_attempt_ms, booted, kicked, now) {
+            return;
+        }
+    }
+    if RUNTIME.daily_running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    *lock(&RUNTIME.daily_kicked_ms) = Some(now);
+    let state = app.state::<AppState>();
+    let platform = Arc::clone(&state.platform);
+    let flows = Arc::clone(&state.account_flows);
+    tauri::async_runtime::spawn(async move {
+        sync(platform, flows, true).await;
+        RUNTIME.daily_running.store(false, Ordering::SeqCst);
+    });
+}
+
 /// Write-back (AD-325): every write of a setting that travels in the
 /// person's files marks the account dirty. Installed once at launch, before
 /// anything writes a setting; the pulled values a sync applies are written
 /// with the observer suppressed, so they never count as a local change.
 pub fn watch_settings() {
     registry::set_setting_observer(Box::new(|key: &str| {
+        if key == "bots.wake_enabled" {
+            wake_chosen();
+        }
         if settings_sync::synced_file(key).is_some() {
             note_local_change();
         }
@@ -739,7 +928,11 @@ fn interrupt_all() {
     RUNTIME.epoch.fetch_add(1, Ordering::SeqCst);
     RUNTIME.cancel.notify_waiters();
     lock(&RUNTIME.interrupt).store(true, Ordering::SeqCst);
-    crate::web_auth::cancel_all();
+    // Only the account's sheets: a Matrix sign-in beside it is not ours.
+    if let Some(app) = RUNTIME.app.get() {
+        use tauri::Manager;
+        crate::web_auth::cancel_all(&app.state::<AppState>().account_flows);
+    }
 }
 
 /// Wait until no blocking git task is still running.
@@ -879,10 +1072,12 @@ fn refuse(inner: &mut Inner) {
     clear_offers(inner);
 }
 
-/// Offers belong to the directory they were read from; without it, none.
+/// Offers, and what a restore said, belong to the directory they were read
+/// from; without it, none.
 fn clear_offers(inner: &mut Inner) {
     inner.offers = AccountOffersVm::default();
     inner.offered_providers.clear();
+    inner.restore = RestoreFacts::default();
 }
 
 /// Sign in (when `interactive`), connect the forge, fetch, resolve, publish
@@ -1051,10 +1246,34 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
     // 5. Whose directory it is. Someone else's: stop, with no layers.
     //    A device not yet registered for this account takes a name no other
     //    device in the person's directory holds (two machines with one host
-    //    name must not share a device record).
+    //    name must not share a device record) — unless the record of that
+    //    name is this class and platform: then it is this device from before a
+    //    reinstall, and it is adopted and restored from (AD-329).
     let (registered, wanted) = {
         let inner = lock(&RUNTIME.inner);
         (inner.this_device.clone(), inner.wanted_device.clone())
+    };
+    // Only an install not yet registered needs this machine's fingerprint
+    // and the wanted name's history, and both may block (a spawned `ioreg`,
+    // a walk of the repository's log): off the runtime's workers.
+    let (machine, legacy_days) = match &registered {
+        Some(_) => (None, None),
+        None => {
+            let (sub, root, login) = (
+                identity.sub.clone(),
+                spec.dir.clone(),
+                identity.login.clone(),
+            );
+            let slug = layout::device_slug(&wanted.clone().unwrap_or_else(default_device_name));
+            on_blocking_pool(move || {
+                (
+                    machine_fingerprint(&sub),
+                    untouched_days(&root, &login, &slug, now_ms() / 1000),
+                )
+            })
+            .await
+            .unwrap_or((None, None))
+        }
     };
     let device = match &registered {
         Some(device) => device.clone(),
@@ -1064,6 +1283,10 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
                 &identity.login,
                 &wanted.unwrap_or_else(default_device_name),
                 false,
+                device_class(),
+                std::env::consts::OS,
+                machine.as_deref(),
+                legacy_days,
             );
             update(|inner| inner.wanted_device = Some(device.clone()));
             device
@@ -1103,6 +1326,7 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
                 device: &plan_device,
                 class,
                 platform: std::env::consts::OS,
+                machine: machine.as_deref(),
                 now_rfc3339: &now,
             },
         )
@@ -1237,6 +1461,15 @@ struct Planned {
     drives: Option<PlannedManifest<DriveRecord>>,
     providers: Option<PlannedManifest<ProviderRecord>>,
     matrix: Option<PlannedManifest<MatrixRecord>>,
+    /// This device's own file, `None` where it was not planned (something
+    /// other than a file stands there, or it does not read).
+    device_state: Option<PlannedDevice>,
+}
+
+/// `device.<slug>.toml` as an attempt found it (AD-328).
+struct PlannedDevice {
+    /// The file as the tip holds it: what a first restore reads.
+    tip: Option<DeviceStateFile>,
 }
 
 /// This device's manifests as it last pushed them (R17): what tells a field
@@ -1254,9 +1487,16 @@ struct SettingsInput {
     device: String,
     class: DeviceClass,
     mine: account_settings::Mine,
-    /// The synced keys' rows as the local side was read: a row that no
-    /// longer holds its value at apply time was changed here meanwhile.
+    /// The synced keys' rows as the local side was read, keyed as stored: a
+    /// row that no longer holds its value at apply time was changed here
+    /// meanwhile.
     stored: BTreeMap<String, String>,
+    /// Whether this install already restored itself from the account.
+    restored: bool,
+    /// What a restore could not create yet; `None` when it does not read,
+    /// and then this device's file is left alone rather than written
+    /// without it.
+    pending: Option<RestorePending>,
     local_shared: Values,
     local_device: Values,
     base_shared: Option<Values>,
@@ -1306,17 +1546,26 @@ async fn sync_settings(
         let (platform, data_dir) = (Arc::clone(&platform), data_dir.clone());
         let (descriptor, identity, device) = (leg.d.clone(), identity.clone(), device.to_owned());
         on_blocking_pool(move || -> Result<SettingsInput, CoreError> {
-            let mine = account_settings::gather(&platform, &data_dir, &descriptor.id)?;
+            let mut mine = account_settings::gather(&platform, &data_dir, &descriptor.id)?;
+            // Written by this device every sync (F3), so a reinstall on this
+            // machine is told from another machine of the same name.
+            if let Some(file) = &mut mine.device {
+                file.machine = machine_fingerprint(&identity.sub);
+            }
             let id = descriptor.id.as_str();
-            let keys: Vec<&str> = settings_sync::synced_keys(SyncedFile::Shared)
-                .chain(settings_sync::synced_keys(SyncedFile::Device))
-                .collect();
             let base_shared =
                 registry::get_account_settings_base(&data_dir, id, SyncedFile::Shared)?;
             let base_device =
                 registry::get_account_settings_base(&data_dir, id, SyncedFile::Device)?;
+            let pending = registry::get_account_restore_pending(&data_dir, id)
+                .inspect_err(|error| {
+                    tracing::warn!(%error, "account: what waits to be restored does not read");
+                })
+                .ok();
             Ok(SettingsInput {
-                stored: registry::stored_settings(&data_dir, &keys)?,
+                stored: settings_sync::stored_rows(&data_dir)?,
+                restored: registry::get_account_restored(&data_dir, id)?,
+                pending,
                 local_shared: settings_sync::local_values(
                     &data_dir,
                     SyncedFile::Shared,
@@ -1434,6 +1683,7 @@ async fn sync_settings(
                     &platform,
                     &data_dir,
                     &runtime,
+                    &input.mine.catalog,
                     &changes,
                     &input.stored,
                 )
@@ -1511,11 +1761,272 @@ async fn sync_settings(
         &mine.providers,
         &mine.matrix,
     );
+    let device_values = planned.device.as_ref().map(|file| file.merged.file.clone());
+    // Read outside the lock, once per sync: every view reads the cached bool.
+    let listening_off = device_values.as_ref().map(|values| {
+        let wake = registry::stored_settings(&data_dir, &["bots.wake_enabled"])
+            .ok()
+            .and_then(|rows| rows.get("bots.wake_enabled").cloned());
+        settings_sync::listening_off(values, wake.as_deref())
+    });
     update(|inner| {
         inner.offers = offers;
         inner.offered_providers = planned.providers.map(|p| p.records).unwrap_or_default();
+        if let Some(off) = listening_off {
+            inner.restore.listening_off = off;
+        }
     });
+
+    // This device coming back (AD-329): once a sync has landed, the first
+    // time with the tip's own file, then what still waits on every sync.
+    if landed {
+        if let Some(planned_device) = planned.device_state {
+            restore(&platform, &data_dir, &input, planned_device.tip).await;
+        }
+    }
     problem
+}
+
+/// Restore this device from its file at the tip, the first time a sync of
+/// this install lands, and retry what waits on every later one. The marker
+/// is set once what waits has been recorded, whether or not the file
+/// existed: from then on this device's own state is the truth and
+/// overwrites the file, so a drive the person later deletes stays deleted.
+///
+/// Nothing runs while this device's drives or what waits cannot be read:
+/// the plan would take every drive for missing.
+async fn restore(
+    platform: &Arc<dyn Platform>,
+    data_dir: &Path,
+    input: &SettingsInput,
+    tip: Option<DeviceStateFile>,
+) {
+    let (Some(mut pending), true) = (input.pending.clone(), input.mine.catalog.drives_known) else {
+        return;
+    };
+    let account_id = input.descriptor.id.clone();
+    let first = !input.restored;
+    let catalog = &input.mine.catalog;
+    let (plan, present_grants) = match tip.as_ref().filter(|_| first) {
+        Some(file) => {
+            let drives: Vec<_> = catalog
+                .drives
+                .iter()
+                .map(|drive| {
+                    settings_sync::DriveRef::named(&drive.remote_url, &drive.branch, &drive.name)
+                })
+                .collect();
+            let providers: Vec<_> = catalog.providers.iter().map(|(_, p)| p.clone()).collect();
+            let matrix: Vec<String> = input
+                .mine
+                .matrix
+                .iter()
+                .map(|m| m.user_id.clone())
+                .collect();
+            // Grants of the providers this device already has: the plan
+            // leaves those providers out, not their folder permissions.
+            let present_grants = file
+                .providers
+                .iter()
+                .filter(|p| providers.contains(&p.key()))
+                .flat_map(|p| {
+                    let reference = p.key().reference();
+                    p.grants
+                        .iter()
+                        .map(move |grant| device_state::PendingGrant {
+                            provider: reference.clone(),
+                            grant: grant.clone(),
+                        })
+                })
+                .collect();
+            (
+                Some(device_state::restore_plan(
+                    file, &drives, &providers, &matrix,
+                )),
+                present_grants,
+            )
+        }
+        None => (None, Vec::new()),
+    };
+    // A Matrix account signed in here since is no longer waiting.
+    pending.matrix.retain(|waiting| {
+        !input
+            .mine
+            .matrix
+            .iter()
+            .any(|m| m.user_id.trim() == waiting.user_id.trim())
+    });
+    if plan.is_none() && pending.is_empty() {
+        if first {
+            mark_restored(data_dir, &account_id);
+        }
+        return;
+    }
+    let ran = {
+        let (platform, data_dir, account_id) = (
+            Arc::clone(platform),
+            data_dir.to_owned(),
+            account_id.clone(),
+        );
+        let app = RUNTIME.app.get().cloned();
+        on_blocking_pool(move || {
+            // What a restore writes is this device's own state now, which
+            // the next sync publishes — not a change another device made.
+            let outcome = account_restore::run(
+                app.as_ref(),
+                &platform,
+                &data_dir,
+                &account_id,
+                plan,
+                present_grants,
+                &mut pending,
+            );
+            (outcome, pending)
+        })
+        .await
+    };
+    let (outcome, pending) = match ran {
+        Ok((Ok(outcome), pending)) => (outcome, pending),
+        Ok((Err(error), _)) => {
+            tracing::warn!(%error, "account: this device was not restored; the next sync tries again");
+            return;
+        }
+        Err(sentence) => {
+            tracing::warn!(%sentence, "account: this device was not restored; the next sync tries again");
+            return;
+        }
+    };
+    // Only once what waits is safely recorded may the marker say the
+    // restore ran: otherwise the next sync starts it over.
+    if let Err(error) = registry::set_account_restore_pending(data_dir, &account_id, &pending) {
+        tracing::warn!(%error, "account: what waits to be restored was not recorded; the next sync tries again");
+        return;
+    }
+    if first {
+        mark_restored(data_dir, &account_id);
+    }
+    let waiting: Vec<(String, String)> = pending
+        .drives
+        .iter()
+        .map(|table| {
+            let field = |name: &str| {
+                table
+                    .get(name)
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            (field("local_path"), field("name"))
+        })
+        .collect();
+    update(|inner| {
+        if first {
+            inner.restore.restored = Some((outcome.drives, outcome.providers));
+        }
+        inner.restore.waiting = waiting;
+    });
+    // What was made here goes into the person's files on the next pass.
+    if outcome != account_restore::Outcome::default() || first {
+        RUNTIME.dirty.store(true, Ordering::SeqCst);
+    }
+    start_matrix_sign_in(data_dir, &account_id, &pending.matrix);
+}
+
+fn mark_restored(data_dir: &Path, account_id: &str) {
+    if let Err(error) = registry::set_account_restored(data_dir, account_id) {
+        tracing::warn!(%error, "account: could not remember that this device was restored");
+    }
+}
+
+/// Whether keeper's main window has the person's attention: the only time a
+/// sign-in sheet may open by itself (F11).
+fn window_focused(app: &AppHandle) -> bool {
+    use tauri::Manager;
+
+    app.get_webview_window("main")
+        .and_then(|window| window.is_focused().ok())
+        .unwrap_or(false)
+}
+
+/// Start one single sign-on for the first waiting `oidc` Matrix account,
+/// once per install and only while keeper's window is in front — otherwise
+/// it waits for the next focused sync. The sheet carries the account's
+/// identity-provider session, so it is one tap (AD-331). Password and Beeper
+/// accounts stay offers; nothing is signed in without a sign-in.
+fn start_matrix_sign_in(data_dir: &Path, account_id: &str, waiting: &[MatrixState]) {
+    let Some(homeserver) = waiting
+        .iter()
+        .find(|m| m.kind == "oidc" && !m.homeserver_url.trim().is_empty())
+        .map(|m| m.homeserver_url.clone())
+    else {
+        return;
+    };
+    let Some(app) = RUNTIME.app.get().cloned() else {
+        return;
+    };
+    if !window_focused(&app) {
+        return;
+    }
+    match registry::get_account_restore_matrix_started(data_dir, account_id) {
+        Ok(false) => {}
+        Ok(true) => return,
+        Err(error) => {
+            tracing::warn!(%error, "account: whether the Matrix sign-in started does not read");
+            return;
+        }
+    }
+    if let Err(error) = registry::set_account_restore_matrix_started(data_dir, account_id) {
+        tracing::warn!(%error, "account: the Matrix sign-in was not started");
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        use tauri::Manager;
+
+        let state = app.state::<AppState>();
+        if let Err(error) = crate::ipc::sign_in_oidc(state.inner(), &homeserver).await {
+            tracing::info!(reason = %error.message, "account: the restored Matrix sign-in did not finish");
+        }
+    });
+}
+
+/// A Matrix account was added on this device: the preferences this device's
+/// file kept for it while it waited to be restored — its hue and the muted
+/// networks — are applied before `added` is answered, it stops waiting, and
+/// the account travels in the person's files.
+pub fn matrix_account_added(state: &AppState, added: &mut keeper_core::vm::AccountVm) {
+    let Some(account_id) = account_id() else {
+        return;
+    };
+    let Ok(dir) = state.platform.data_dir() else {
+        return;
+    };
+    if let Ok(mut pending) = registry::get_account_restore_pending(&dir, &account_id) {
+        let at = pending
+            .matrix
+            .iter()
+            .position(|m| m.user_id.trim() == added.user_id.trim());
+        if let Some(at) = at {
+            let restored = pending.matrix.remove(at);
+            let applied = (|| -> Result<(), CoreError> {
+                if let Some(hue) = restored.hue_index.and_then(|hue| u8::try_from(hue).ok()) {
+                    registry::set_account_hue_index(&dir, &added.account_id, hue)?;
+                    added.hue_index = hue;
+                }
+                // Through the manager, so the notifier stops raising them
+                // now and not only after a relaunch.
+                for network in &restored.muted_networks {
+                    state
+                        .accounts
+                        .network_mute_set(&state.platform, network, true)?;
+                }
+                registry::set_account_restore_pending(&dir, &account_id, &pending)
+            })();
+            if let Err(error) = applied {
+                tracing::warn!(%error, "account: a restored Matrix account's preferences were not applied");
+            }
+        }
+    }
+    note_local_change();
 }
 
 impl Staged {
@@ -1621,8 +2132,16 @@ fn plan_settings(root: &Path, input: &SettingsInput) -> (Vec<Write>, Option<Plan
         let rel = manifest::drives_path(login);
         let current = readable(&files, &rel)?;
         let remote = parse_manifest(&rel, current.as_deref(), DrivesFile::parse)?;
-        let merged =
-            manifest::merge_drives(&remote.drives, mine, bases.drives.as_deref(), me, &known);
+        // Until this install restored itself, a record naming it is its own
+        // from before a reinstall and must not lose this device (F8).
+        let merged = manifest::merge_drives(
+            &remote.drives,
+            mine,
+            bases.drives.as_deref(),
+            me,
+            &known,
+            input.restored,
+        );
         let unchanged = merged == remote.drives;
         let file = DrivesFile {
             drives: merged,
@@ -1652,6 +2171,7 @@ fn plan_settings(root: &Path, input: &SettingsInput) -> (Vec<Write>, Option<Plan
                 bases.providers.as_deref(),
                 me,
                 &known,
+                input.restored,
             );
             let unchanged = merged == remote.providers;
             let file = BotsFile {
@@ -1683,6 +2203,7 @@ fn plan_settings(root: &Path, input: &SettingsInput) -> (Vec<Write>, Option<Plan
                 bases.matrix.as_deref(),
                 me,
                 &known,
+                input.restored,
             );
             let unchanged = merged == remote.accounts;
             let file = MatrixFile {
@@ -1704,6 +2225,38 @@ fn plan_settings(root: &Path, input: &SettingsInput) -> (Vec<Write>, Option<Plan
             })
         })
     };
+    let device_state = {
+        let rel = device_state::path(login, me);
+        readable(&files, &rel).and_then(|current| {
+            let tip = match current.as_deref().map(DeviceStateFile::parse).transpose() {
+                Ok(tip) => tip,
+                Err(why) => {
+                    tracing::warn!(rel, %why, "account: this device's file was left as it is");
+                    return None;
+                }
+            };
+            // Before this install restored itself the tip's file is what the
+            // restore reads: it is rewritten only once that ran. And when
+            // this device's drives, their schedules or what waits did not
+            // read, it stays as the tip has it.
+            let restoring = !input.restored && tip.is_some();
+            if let (false, Some(mine), Some(pending)) =
+                (restoring, &input.mine.device, &input.pending)
+            {
+                let file = account_restore::rendered(mine, pending, tip.as_ref());
+                stage(
+                    login,
+                    rel,
+                    current.is_some(),
+                    tip.as_ref().is_some_and(|tip| tip.values_eq(&file)),
+                    file.drives.is_empty() && file.providers.is_empty() && file.matrix.is_empty(),
+                    || file.render(),
+                    &mut writes,
+                );
+            }
+            Some(PlannedDevice { tip })
+        })
+    };
     (
         writes,
         Some(Planned {
@@ -1712,6 +2265,7 @@ fn plan_settings(root: &Path, input: &SettingsInput) -> (Vec<Write>, Option<Plan
             drives,
             providers,
             matrix,
+            device_state,
         }),
     )
 }
@@ -1898,10 +2452,11 @@ pub fn is_setup_link(url: &url::Url) -> bool {
     url.scheme() == "keeper" && url.host_str() == Some("setup")
 }
 
-/// Whether a `keeper://` deep link answers an organisation-account sign-in
+/// Whether a deep link answers an organisation-account sign-in
 /// (`keeper://oauth/<id>/…`, the descriptor's redirects and the sign-out
-/// return) rather than Matrix's one fixed `keeper://oauth/callback`. The two
-/// wait in separate registries, so neither's cancel can end the other's.
+/// return) rather than a Matrix sign-in (`dev.tgorka.keeper:/oauth/callback`,
+/// or the older `keeper://oauth/callback`). The two wait in separate
+/// registries, so neither's cancel can end the other's.
 pub fn is_account_callback(url: &str) -> bool {
     url::Url::parse(url).is_ok_and(|url| {
         url.scheme() == "keeper" && url.host_str() == Some("oauth") && url.path() != "/callback"
@@ -1932,9 +2487,16 @@ fn credential_profile(key: &str) -> Option<&str> {
 
 /// The drive credential when the drive uses the account: `None` when `key`
 /// is not a drive credential or the drive keeps its own token in the
-/// keychain; otherwise the account's access token, sent in keeper-sync's own
+/// keychain; otherwise a token of the account's, sent in keeper-sync's own
 /// spelling like any stored token. A drive is only answered for the account
 /// it was set to use (`account:<id>`), never for one that replaced it.
+///
+/// Which token (AD-330): a drive on the forge an `oauth`-mode account signs
+/// in to gets the forge's own token — the forge accepts nothing else, and
+/// Forgejo takes an OAuth token as the Basic username for git and LFS alike
+/// — and every other drive the sign-in's access token. A forge that is not
+/// connected answers the account's `NeedsSignIn`; the forge token refreshes
+/// itself before it expires, so a refused one is replaced on the next pass.
 ///
 /// `secret_get` is synchronous and is called from the sync engine's async
 /// path, so a refresh must not park a runtime worker: on a multi-thread
@@ -1945,17 +2507,36 @@ pub fn drive_credential(platform: &Arc<dyn Platform>, key: &str) -> Option<Resul
 
     let profile = credential_profile(key)?;
     // No account, no change: the drive's own keychain item, read as before.
-    let account_id = account_id()?;
+    let d = descriptor()?;
     let data_dir = platform.data_dir().ok()?;
-    let source = registry::get_sync_credential_source(&data_dir, profile, Some(&account_id))
+    let source = registry::get_sync_credential_source(&data_dir, profile, Some(&d.id))
         .ok()
         .flatten();
     if source.as_deref() != Some("account") {
         return None;
     }
+    let forge = if matches!(d.config.auth, RepoAuthConfig::Oauth(_)) {
+        // Never the sign-in token to a remote whose host is unknown: that
+        // could hand the wrong token to the forge, or any token to a stranger.
+        let Some(remote) = drive_remote(profile) else {
+            return Some(Err(
+                "keeper does not know this drive's remote yet; it will try again".to_owned(),
+            ));
+        };
+        on_forge(&remote, d.forge_host().as_deref(), &d.repo_host())
+    } else {
+        false
+    };
     let platform = Arc::clone(platform);
     let refresh = move || {
-        tauri::async_runtime::block_on(async move { access_token(platform.as_ref()).await })
+        tauri::async_runtime::block_on(async move {
+            if forge {
+                let http = http().map_err(AccountError::Internal)?;
+                oidc::forge_token(platform.as_ref(), http, &d).await
+            } else {
+                access_token(platform.as_ref()).await
+            }
+        })
     };
     let answer = match Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
@@ -1971,6 +2552,63 @@ pub fn drive_credential(platform: &Arc<dyn Platform>, key: &str) -> Option<Resul
         Ok(Err(error)) => Err(format!("the account credential is unavailable: {error}")),
         Err(_) => Err("the account credential could not be read".to_owned()),
     })
+}
+
+/// Every drive's remote by profile id, as the last listing, save or restore
+/// saw it: `secret_get` runs inside the engine, on every fetch and push, and
+/// must not open `sync.db` for it.
+static DRIVE_REMOTES: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
+
+/// Record the drives as they now are; called wherever profiles are listed,
+/// saved or restored.
+pub fn note_drives<'a>(profiles: impl IntoIterator<Item = &'a keeper_sync::SyncProfile>) {
+    let fresh: HashMap<String, String> = profiles
+        .into_iter()
+        .map(|p| (p.id.clone(), p.remote_url.clone()))
+        .collect();
+    *lock(&DRIVE_REMOTES) = fresh;
+}
+
+/// A drive's remote from [`DRIVE_REMOTES`]. On a miss the map is refilled off
+/// this thread from the open engine, and the caller is told to try later.
+fn drive_remote(profile: &str) -> Option<String> {
+    if let Some(remote) = lock(&DRIVE_REMOTES).get(profile) {
+        return Some(remote.clone());
+    }
+    std::thread::spawn(|| {
+        let Some(engine) = crate::sync::engine_if_open() else {
+            return;
+        };
+        match engine.list_profiles() {
+            Ok(profiles) => note_drives(&profiles),
+            Err(error) => tracing::warn!(%error, "account: the drives' remotes could not be read"),
+        }
+    });
+    None
+}
+
+/// The host a git remote names: a URL's host, or the host of scp-style
+/// `user@host:path`. Lowercase, as hosts compare.
+fn remote_host(remote: &str) -> Option<String> {
+    if let Ok(url) = url::Url::parse(remote) {
+        return url.host_str().map(str::to_ascii_lowercase);
+    }
+    let (authority, _) = remote.split_once(':')?;
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    (!host.is_empty() && !host.contains('/')).then(|| host.to_ascii_lowercase())
+}
+
+/// Whether a drive on `remote` lives on the forge an `oauth`-mode account
+/// signs in to: its host is the forge's, or — for a descriptor that names
+/// the forge only through its repository — the config repository's.
+fn on_forge(remote: &str, forge_host: Option<&str>, repo_host: &str) -> bool {
+    let Some(host) = remote_host(remote) else {
+        return false;
+    };
+    forge_host
+        .into_iter()
+        .chain([repo_host])
+        .any(|forge| forge.eq_ignore_ascii_case(&host))
 }
 
 /// What the IPC answers for a stored source: core answers `account` only
@@ -2569,9 +3207,7 @@ pub fn account_offer_add_provider(state: State<'_, AppState>, key: String) -> Re
         .normalized;
     // Every target is checked before anything is written, so a refusal
     // leaves no half-added provider behind.
-    let mut offered_bots = record.bots.clone();
-    offered_bots.sort_by_key(|bot| bot.pin_order);
-    for bot in &offered_bots {
+    for bot in &record.bots {
         bots::parse_bot_target(&bot.target)
             .map_err(|error| refusal(format!("{}: {error}", bot.target)))?;
     }
@@ -2582,64 +3218,20 @@ pub fn account_offer_add_provider(state: State<'_, AppState>, key: String) -> Re
         base_url,
         created_ms: now_ms(),
     };
-    if let Err(error) = add_offered_provider(&data_dir, &provider, &account_id, offered_bots) {
-        // All or nothing: a provider without its account credential or some
-        // of its bots is not what the person asked for.
-        let undone = store::delete_provider(&data_dir, &provider.id).and_then(|()| {
-            registry::set_bots_provider_credential_source(&data_dir, &provider.id, None, None)
-        });
-        if let Err(undo) = undone {
-            tracing::warn!(%undo, "account: a half-added provider could not be removed");
-        }
-        return Err(to_ipc_error(error));
-    }
+    // All or nothing: a provider without its account credential or some of
+    // its bots is not what the person asked for.
+    account_restore::add_provider(
+        &data_dir,
+        &provider,
+        Some(&account_id),
+        record.read_timeout_ms,
+        record.bots.clone(),
+    )
+    .map_err(to_ipc_error)?;
     update(|inner| {
         inner.offers.providers.retain(|offer| offer.key != key);
     });
     note_local_change();
-    Ok(())
-}
-
-/// The writes of [`account_offer_add_provider`]: the provider row, its
-/// account credential and its bots — after the ones already pinned, in the
-/// offer's order.
-fn add_offered_provider(
-    data_dir: &Path,
-    provider: &Provider,
-    account_id: &str,
-    offered_bots: Vec<BotRecord>,
-) -> Result<(), CoreError> {
-    store::insert_provider(data_dir, provider)?;
-    registry::set_bots_provider_credential_source(
-        data_dir,
-        &provider.id,
-        Some("account"),
-        Some(account_id),
-    )?;
-    let pinned = store::list_bots(data_dir)?.len();
-    for (offset, bot) in offered_bots.into_iter().enumerate() {
-        let target = bot.target.trim().to_owned();
-        let name = match bot.name.trim() {
-            "" => target.clone(),
-            name => name.to_owned(),
-        };
-        store::insert_bot(
-            data_dir,
-            &Bot {
-                id: crate::bots_ipc::new_id(),
-                provider_id: provider.id.clone(),
-                target,
-                name,
-                pin_order: i64::try_from(pinned + offset).unwrap_or(i64::MAX),
-                identity: BotIdentity {
-                    shape: bot.shape,
-                    colour: bot.colour,
-                    mark: bot.mark,
-                },
-                created_ms: now_ms(),
-            },
-        )?;
-    }
     Ok(())
 }
 
@@ -2704,6 +3296,77 @@ mod tests {
         assert_eq!(credential_profile("bot_provider_token/p1"), None);
     }
 
+    /// AD-330: only a drive on the forge's host gets the forge token; a
+    /// drive elsewhere keeps the sign-in token.
+    #[test]
+    fn a_drive_gets_the_forge_token_only_on_the_forge_host() {
+        let forge = Some("electra.example.net");
+        let repo = "electra.example.net";
+        assert!(on_forge(
+            "https://electra.example.net/git/tgorka/tgdrive.git",
+            forge,
+            repo
+        ));
+        assert!(on_forge(
+            "https://tgorka@Electra.Example.Net:8443/git/x.git",
+            forge,
+            repo
+        ));
+        assert!(on_forge(
+            "git@electra.example.net:tgorka/x.git",
+            forge,
+            repo
+        ));
+        assert!(!on_forge("https://github.com/tgorka/x.git", forge, repo));
+        assert!(!on_forge("/Volumes/usb/x.git", forge, repo));
+        // A descriptor that names the forge only through its repository.
+        assert!(on_forge(
+            "https://git.acme.dev/a/b.git",
+            None,
+            "git.acme.dev"
+        ));
+        assert!(!on_forge("https://git.acme.dev/a/b.git", None, "other.dev"));
+    }
+
+    /// F3: whole days since a legacy record last changed; a clock behind the
+    /// commit reads as zero, never as a huge number that would adopt.
+    #[test]
+    fn untouched_days_are_whole_days_and_never_negative() {
+        let day = 86_400;
+        assert_eq!(days_between(0, 30 * day - 1), Some(29));
+        assert_eq!(days_between(0, 30 * day), Some(30));
+        assert_eq!(days_between(10 * day, 0), Some(0));
+    }
+
+    /// A5: one machine and one person give one stable fingerprint; another
+    /// person on the same machine, or another machine, gives another; the
+    /// raw machine id never appears in it.
+    #[test]
+    fn the_machine_fingerprint_is_per_machine_and_per_person() {
+        let mine = fingerprint("5A1B-UUID", "sub-1");
+        assert_eq!(mine, fingerprint(" 5A1B-UUID\n", "sub-1"));
+        assert_eq!(mine.len(), 64);
+        assert!(mine.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(mine, fingerprint("5A1B-UUID", "sub-2"));
+        assert_ne!(mine, fingerprint("OTHER-UUID", "sub-1"));
+        assert!(!mine.contains("5a1b"));
+    }
+
+    /// AD-332: a day since the last attempt, or since launch before there
+    /// was one, and since the daily pull last went itself.
+    #[cfg(desktop)]
+    #[test]
+    fn the_daily_pull_is_due_a_day_after_the_last_attempt_or_launch() {
+        let day = DAILY_PULL_MS;
+        assert!(!daily_due(None, 0, None, day - 1));
+        assert!(daily_due(None, 0, None, day));
+        assert!(!daily_due(Some(10), 0, None, day));
+        assert!(daily_due(Some(10), 0, None, day + 10));
+        // A pull that went and could not attempt does not go again at once.
+        assert!(!daily_due(Some(0), 0, Some(day), day + 1));
+        assert!(daily_due(Some(0), 0, Some(day), 2 * day));
+    }
+
     #[test]
     fn a_credential_source_is_keychain_unless_it_says_account() {
         assert_eq!(credential_source_value(None), "keychain");
@@ -2755,6 +3418,7 @@ mod tests {
         }
         for other in [
             "keeper://oauth/callback?code=c&state=s",
+            "dev.tgorka.keeper:/oauth/callback?code=c&state=s",
             "keeper://oauth/callback",
             "keeper://setup?d=abc",
             "https://oauth/acme/callback?state=s",

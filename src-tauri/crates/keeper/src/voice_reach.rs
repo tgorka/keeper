@@ -96,10 +96,10 @@ pub fn open_voice_link<'a>(urls: impl IntoIterator<Item = &'a str>) -> bool {
 
 /// Install the deep-link handler: voice links are performed here, a
 /// `keeper://setup` link goes to the account's confirmation sheet (Epic 82),
-/// and every other `keeper://` URL goes to `oauth` — the OIDC callback
-/// registry that owned the whole handler before Story 63.5. One handler,
-/// because the plugin keeps one, and a second `on_open_url` would replace
-/// the first.
+/// and every other `keeper://` or `dev.tgorka.keeper:` URL goes to `oauth` —
+/// the OIDC callback routing that owned the whole handler before Story 63.5.
+/// One handler, because the plugin keeps one, and a second `on_open_url`
+/// would replace the first.
 ///
 /// A link that launched keeper is routed the same way, once, from
 /// `get_current()` — on Linux and Windows it arrives as a launch argument,

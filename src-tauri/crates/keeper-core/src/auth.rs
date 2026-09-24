@@ -140,7 +140,7 @@ impl AuthProvider for PasswordAuthProvider<'_> {
 ///
 /// Drives matrix-sdk's `client.oauth()` flow: dynamic client registration →
 /// authorization URL → open the system browser (via the [`Platform`] port) →
-/// await the `keeper://oauth/callback?code&state` deep link (matched by the
+/// await the `dev.tgorka.keeper:/oauth/callback?code&state` deep link (matched by the
 /// registry) → `finish_login`. The entire browser round-trip runs inside a
 /// single [`AuthProvider::authenticate`] call because matrix-sdk stashes the
 /// PKCE verifier / state in the in-memory `OAuth` handle, so `build()` and

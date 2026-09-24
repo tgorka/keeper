@@ -424,8 +424,11 @@ pub const KEYS: &[KeySpec] = &[
         shape: Shape::Text,
         default: "",
         summary: "Per organisation account id: `account.<id>.device_slug` (this device's name in \
-                  the account's repository) and `account.<id>.last_synced_ms` (the last sync, in \
-                  ms since the Unix epoch). Forgetting the account deletes both.",
+                  the account's repository), `account.<id>.last_synced_ms` (the last sync, in \
+                  ms since the Unix epoch), the sync's bases, and the restore's markers \
+                  (`restored`, `restore_pending`, `restore_matrix_started`). Forgetting the \
+                  account deletes them all but `restored`, so a second sign-in never \
+                  restores over what the person removed.",
         example: "",
     },
     // ---- bots ------------------------------------------------------------
@@ -458,11 +461,14 @@ pub const KEYS: &[KeySpec] = &[
         key: "bots.wake_enabled",
         family: false,
         scope: Scope::UserGlobal,
-        settable: Settable::AnyLayer,
+        settable: Settable::Never(
+            "an open microphone is a person's tap on the device that listens, so no file — \
+             this machine's, the account's or a folder's — may switch it on",
+        ),
         shape: Shape::Flag01,
         default: "0",
         summary: "Whether the wake phrase is armed on the phone. Off until chosen: an open microphone is a deliberate act.",
-        example: "true",
+        example: "",
     },
     KeySpec {
         key: "bots.wake_phrase",
@@ -1231,8 +1237,9 @@ mod tests {
         /// what AD-98 replaces, and until it is gone it is a real dynamic site.
         /// `apply_synced_setting` writes the keys a config-repository sync pulled
         /// (Epic 84); it refuses every key `settings_sync::synced_file` does not
-        /// place in a synced file, so the set it can reach is exactly the
-        /// classified user-global and machine-local keys. A further entry here
+        /// place in a synced file, so the set it can reach is exactly the keys
+        /// `synced_file` classifies (Epic 85 adds the device-linked keys and the
+        /// two credential-source families). A further entry here
         /// needs its own reason, and adding one without writing it fails this
         /// test by name.
         const DYNAMIC_SITES: &[(&str, &str)] = &[

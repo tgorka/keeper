@@ -10,6 +10,9 @@
 // Every target — the phone signs in and reads its settings from the same
 // repository — and registered in the shared handler list.
 mod account_ipc;
+// This device's drives as its `device.<slug>.toml` carries them, and back
+// (Epic 85): the whole profile but its id and volume, plus its schedules.
+mod account_restore;
 // The device's half of the account's settings sync (Epic 84): its drives,
 // providers and Matrix accounts as portable records, and where a pulled
 // setting is written. Every target, like the account itself.
@@ -694,6 +697,9 @@ pub fn run() {
                         // change.
                         tray::apply_notes_state(&handle, &notes_ipc::tray_snapshot(&handle));
                         notes_vault::cadence_tick();
+                        // The account's daily pull rides the same clock (AD-332):
+                        // a due-check here, the pull itself spawned off the tick.
+                        account_ipc::daily_tick();
                         // Voice rides the same clock (Story 63.5, FR-421): the
                         // tray's status line and verb follow Rust's own turn —
                         // `voice_snapshot`, not the webview's mirror — so the

@@ -14,16 +14,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use keeper_core::bots::grant::GrantScope;
 use keeper_core::bots::store;
 use keeper_core::error::CoreError;
+use keeper_core::org_account::device_state::{
+    DeviceStateFile, GrantState, MatrixState, ProviderState,
+};
 use keeper_core::org_account::manifest::{
     self, BotRecord, DriveRecord, MatrixRecord, ProviderRecord,
 };
-use keeper_core::org_account::settings_sync::{Catalog, DriveRef, Merged, Values};
+use keeper_core::org_account::settings_sync::{self, Catalog, LocalDrive, Merged, Values};
 use keeper_core::platform::Platform;
 use keeper_core::registry;
 use keeper_sync::SyncProfile;
 use tauri::AppHandle;
+
+/// How a grant over every drive is named in the device file, where any
+/// other grant names its drive by reference.
+pub(crate) const EVERY_DRIVE: &str = "*";
 
 /// This device's drives, bot providers and Matrix accounts as the person's
 /// manifests describe them, plus the catalog that translates the settings
@@ -35,6 +43,10 @@ pub(crate) struct Mine {
     pub drives: Option<Vec<DriveRecord>>,
     pub providers: Vec<ProviderRecord>,
     pub matrix: Vec<MatrixRecord>,
+    /// This device as its `device.<slug>.toml` describes it (AD-328), or
+    /// `None` when its drives or their schedules could not be read — then
+    /// the file is left as it is rather than written without them.
+    pub device: Option<DeviceStateFile>,
 }
 
 /// Read [`Mine`] for the configured account `account_id`.
@@ -43,27 +55,54 @@ pub(crate) fn gather(
     data_dir: &Path,
     account_id: &str,
 ) -> Result<Mine, CoreError> {
-    let profiles = match crate::sync::engine(Arc::clone(platform))
-        .and_then(|engine| engine.list_profiles())
-    {
-        Ok(profiles) => Some(profiles),
+    let (profiles, tasks) = match crate::sync::engine(Arc::clone(platform)) {
+        Ok(engine) => {
+            let profiles = engine
+                .list_profiles()
+                .inspect_err(|error| {
+                    tracing::warn!(%error, "account: the drives could not be listed for the settings sync");
+                })
+                .ok();
+            let tasks = engine
+                .tasks()
+                .inspect_err(|error| {
+                    tracing::warn!(%error, "account: the drives' schedules could not be listed");
+                })
+                .ok()
+                .map(|listing| listing.tasks);
+            (profiles, tasks)
+        }
         Err(error) => {
             tracing::warn!(%error, "account: the drives could not be listed for the settings sync");
-            None
+            (None, None)
         }
     };
-    let (drive_refs, drives) = match profiles {
+    if let Some(profiles) = &profiles {
+        crate::account_ipc::note_drives(profiles);
+    }
+    let mut drive_tables = Vec::new();
+    let (drive_refs, drives) = match &profiles {
         Some(profiles) => {
             let mut refs = Vec::with_capacity(profiles.len());
             let mut records = Vec::with_capacity(profiles.len());
-            for profile in &profiles {
+            for profile in profiles {
                 // Every drive translates the settings that name it here,
                 // even one whose remote cannot travel.
-                refs.push((
-                    profile.id.clone(),
-                    DriveRef::new(&profile.remote_url, &profile.branch),
-                ));
-                let Some(remote_url) = manifest::portable_remote(&profile.remote_url) else {
+                refs.push(local_drive(profile));
+                let portable = manifest::portable_remote(&profile.remote_url);
+                // This device's own file keeps a local-path remote: it is a
+                // fact of this device, and restores only this device.
+                if let Some(tasks) = &tasks {
+                    let remote = portable.as_deref().unwrap_or(&profile.remote_url);
+                    let schedules = crate::account_restore::schedules_of(&profile.id, tasks);
+                    match crate::account_restore::drive_table(profile, remote, &schedules) {
+                        Ok(table) => drive_tables.push(table),
+                        Err(why) => {
+                            tracing::warn!(%why, "account: a drive could not be written for this device's file");
+                        }
+                    }
+                }
+                let Some(remote_url) = portable else {
                     continue;
                 };
                 let bound =
@@ -83,10 +122,12 @@ pub(crate) fn gather(
         }
         None => (None, None),
     };
-    let catalog = Catalog::with_bots(data_dir, drive_refs)?;
+    let catalog = catalog(data_dir, account_id, drive_refs)?;
 
     let listing = store::list_providers(data_dir)?;
+    let grants = store::list_grants(data_dir)?.rows;
     let mut providers = Vec::with_capacity(listing.rows.len());
+    let mut provider_states = Vec::with_capacity(listing.rows.len());
     for row in &listing.rows {
         let provider = &row.provider;
         let bound = registry::get_bots_provider_credential_source(
@@ -95,47 +136,208 @@ pub(crate) fn gather(
             Some(account_id),
         )?
         .is_some();
-        let bots = store::list_bots_for_provider(data_dir, &provider.id)?;
+        let bots: Vec<BotRecord> = store::list_bots_for_provider(data_dir, &provider.id)?
+            .into_iter()
+            .map(|bot| BotRecord {
+                target: bot.target,
+                name: bot.name,
+                pin_order: bot.pin_order,
+                shape: bot.identity.shape,
+                colour: bot.identity.colour,
+                mark: bot.identity.mark,
+                extra: BTreeMap::new(),
+            })
+            .collect();
+        let credential = if bound { "account" } else { "own" };
+        let read_timeout_ms = row.read_timeout_ms.and_then(|ms| u64::try_from(ms).ok());
+        provider_states.push(ProviderState {
+            kind: provider.kind.as_registry_str().to_owned(),
+            name: provider.name.clone(),
+            base_url: provider.base_url.clone(),
+            read_timeout_ms,
+            credential: credential.to_owned(),
+            bots: bots.clone(),
+            grants: grants
+                .iter()
+                .filter(|row| row.revoked_ms.is_none() && row.grant.provider_id == provider.id)
+                .filter_map(|row| grant_state(&row.grant, &catalog))
+                .collect(),
+            extra: BTreeMap::new(),
+        });
         providers.push(ProviderRecord {
             kind: provider.kind.as_registry_str().to_owned(),
             name: provider.name.clone(),
             base_url: provider.base_url.clone(),
-            credential: if bound { "account" } else { "own" }.to_owned(),
-            read_timeout_ms: row.read_timeout_ms.and_then(|ms| u64::try_from(ms).ok()),
-            bots: bots
-                .into_iter()
-                .map(|bot| BotRecord {
-                    target: bot.target,
-                    name: bot.name,
-                    pin_order: bot.pin_order,
-                    shape: bot.identity.shape,
-                    colour: bot.identity.colour,
-                    mark: bot.identity.mark,
-                    extra: BTreeMap::new(),
-                })
-                .collect(),
+            credential: credential.to_owned(),
+            read_timeout_ms,
+            bots,
             devices: Vec::new(),
             extra: BTreeMap::new(),
         });
     }
 
-    let matrix = registry::list_accounts(data_dir)?
-        .into_iter()
-        .map(|row| MatrixRecord {
+    let accounts = registry::list_accounts(data_dir)?;
+    // Muted networks are this install's, not one account's: every account
+    // carries the list, and a restore puts back their union.
+    let muted = registry::get_muted_networks(data_dir)?;
+    let mut matrix = Vec::with_capacity(accounts.len());
+    let mut matrix_states = Vec::with_capacity(accounts.len());
+    for row in accounts {
+        let kind = matrix_kind(row.provider.as_deref()).to_owned();
+        matrix_states.push(MatrixState {
+            user_id: row.user_id.clone(),
+            homeserver_url: row.homeserver_url.clone(),
+            kind: kind.clone(),
+            hue_index: row.hue_index.map(i64::from),
+            muted_networks: muted.clone(),
+            extra: BTreeMap::new(),
+        });
+        matrix.push(MatrixRecord {
             user_id: row.user_id,
             homeserver_url: row.homeserver_url,
-            kind: matrix_kind(row.provider.as_deref()).to_owned(),
+            kind,
             devices: Vec::new(),
             extra: BTreeMap::new(),
-        })
-        .collect();
+        });
+    }
 
+    let device = (profiles.is_some() && tasks.is_some()).then(|| DeviceStateFile {
+        drives: drive_tables,
+        providers: provider_states,
+        matrix: matrix_states,
+        // This device's fingerprint is set by the caller, who knows the
+        // sign-in it is keyed to.
+        machine: None,
+        extra: BTreeMap::new(),
+    });
     Ok(Mine {
         catalog,
         drives,
         providers,
         matrix,
+        device,
     })
+}
+
+/// A drive as the catalog knows it.
+pub(crate) fn local_drive(profile: &SyncProfile) -> LocalDrive {
+    LocalDrive {
+        profile_id: profile.id.clone(),
+        remote_url: profile.remote_url.clone(),
+        branch: profile.branch.clone(),
+        name: profile.name.clone(),
+        local_path: profile.local_path.to_string_lossy().into_owned(),
+    }
+}
+
+/// The catalog a pulled setting is translated against, bound to the
+/// configured account and trusting only its own origins (F5): a pulled
+/// "use my account" for a drive or provider elsewhere is not applied.
+pub(crate) fn catalog(
+    data_dir: &Path,
+    account_id: &str,
+    drives: Option<Vec<LocalDrive>>,
+) -> Result<Catalog, CoreError> {
+    let mut catalog = Catalog::with_bots(data_dir, drives)?;
+    catalog.account_id = Some(account_id.to_owned());
+    if let Some(d) = crate::account_ipc::descriptor().filter(|d| d.id == account_id) {
+        catalog.trusted_origins = trusted_origins(&d);
+    }
+    Ok(catalog)
+}
+
+/// The descriptor's issuer, repository and forge origins.
+fn trusted_origins(d: &keeper_core::org_account::descriptor::AccountDescriptor) -> Vec<String> {
+    use keeper_core::org_account::descriptor::RepoAuthConfig;
+
+    let mut urls = vec![d.auth.issuer.as_str(), d.config.url.as_str()];
+    if let RepoAuthConfig::Oauth(forge) = &d.config.auth {
+        urls.extend(forge.issuer.as_deref());
+        urls.extend(forge.authorize_url.as_deref());
+    }
+    let mut origins: Vec<String> = urls
+        .into_iter()
+        .filter_map(settings_sync::url_origin)
+        .collect();
+    origins.sort();
+    origins.dedup();
+    origins
+}
+
+/// A live grant as the device file carries it: its bot by target, its drive
+/// by reference ([`EVERY_DRIVE`] for the whole drive). `None` for a grant
+/// naming a bot or drive this device no longer has.
+fn grant_state(grant: &keeper_core::bots::grant::Grant, catalog: &Catalog) -> Option<GrantState> {
+    let bot = match &grant.bot_id {
+        None => None,
+        Some(id) => Some(
+            catalog
+                .bots
+                .iter()
+                .find(|(bot_id, ..)| bot_id == id)
+                .map(|(_, _, target)| target.clone())?,
+        ),
+    };
+    let drive = match grant.scope.profile_id() {
+        None => EVERY_DRIVE.to_owned(),
+        Some(profile_id) => catalog.drive_reference(profile_id)?,
+    };
+    Some(GrantState {
+        bot,
+        drive,
+        subtree: grant.scope.subpath().map(str::to_owned),
+        mode: grant.mode.as_registry_str().to_owned(),
+        extra: BTreeMap::new(),
+    })
+}
+
+/// A grant from the device file as this device stores it, for the provider
+/// `provider_id`: its bot resolved among that provider's bots by target, its
+/// drive by reference. `None` when the drive is not here (the grant then
+/// waits), `Err` when it can never be made (an unknown mode, a bad subtree,
+/// a bot the provider does not have).
+pub(crate) fn grant_of(
+    state: &GrantState,
+    provider_id: &str,
+    bots: &[keeper_core::bots::Bot],
+    catalog: &Catalog,
+) -> Result<Option<keeper_core::bots::grant::Grant>, String> {
+    use keeper_core::bots::grant::{parse_subpath, Grant, GrantMode};
+
+    let mode = GrantMode::from_registry_str(&state.mode)
+        .ok_or_else(|| format!("\"{}\" is not a grant mode", state.mode))?;
+    let bot_id = match &state.bot {
+        None => None,
+        Some(target) => Some(
+            bots.iter()
+                .find(|bot| bot.provider_id == provider_id && bot.target == *target)
+                .map(|bot| bot.id.clone())
+                .ok_or_else(|| format!("the provider has no bot {target}"))?,
+        ),
+    };
+    let scope = if state.drive == EVERY_DRIVE {
+        GrantScope::Drive
+    } else {
+        let Some(profile_id) = catalog.resolve_drive(&state.drive) else {
+            return Ok(None);
+        };
+        let profile_id = profile_id.to_owned();
+        match &state.subtree {
+            None => GrantScope::Profile { profile_id },
+            Some(subtree) => GrantScope::Subtree {
+                profile_id,
+                subpath: parse_subpath(subtree).map_err(|e| format!("{subtree}: {e}"))?,
+            },
+        }
+    };
+    Ok(Some(Grant {
+        id: crate::bots_ipc::new_id(),
+        provider_id: provider_id.to_owned(),
+        bot_id,
+        scope,
+        mode,
+        created_ms: chrono::Utc::now().timestamp_millis(),
+    }))
 }
 
 /// Which credential a drive uses, as the manifest names it: the account when
@@ -209,6 +411,8 @@ enum Route {
     EmbeddingModel,
     /// The engine holds the ledger choice it was seeded with.
     LedgerVault,
+    /// The engine was built from the git binary it resolved.
+    GitPath,
     Registry,
 }
 
@@ -224,6 +428,7 @@ fn route(key: &str) -> Route {
         }
         "notes.embedding_model" => Route::EmbeddingModel,
         "tasks.ledger_vault" => Route::LedgerVault,
+        "sync.git_path" => Route::GitPath,
         _ => Route::Registry,
     }
 }
@@ -241,16 +446,20 @@ pub(crate) struct Unapplied {
 }
 
 /// Write what the merge decided to apply and move each key's live state.
-/// `snapshot` is the rows the merge's local side was read from; a key whose
-/// row no longer holds that value was changed here meanwhile and is skipped.
-/// The caller runs this under `registry::with_observer_suppressed`, on a
-/// thread that may block (the dock badge's setter is async and is driven
-/// here on `runtime`).
+/// A key is the file's: a credential-source key names its drive or provider
+/// by reference there and is written under its local id here (one this
+/// device lacks is not applied, A2'). `snapshot` is the rows the merge's
+/// local side was read from, keyed as stored; a key whose row no longer
+/// holds that value was changed here meanwhile and is skipped. The caller
+/// runs this under `registry::with_observer_suppressed`, on a thread that
+/// may block (the dock badge's setter is async and is driven here on
+/// `runtime`).
 pub(crate) fn apply(
     app: Option<&AppHandle>,
     platform: &Arc<dyn Platform>,
     data_dir: &Path,
     runtime: &tokio::runtime::Handle,
+    catalog: &Catalog,
     changes: &[(String, Option<String>)],
     snapshot: &BTreeMap<String, String>,
 ) -> Unapplied {
@@ -258,8 +467,25 @@ pub(crate) fn apply(
     let mut voice = false;
     let mut embedding = false;
     for (key, value) in changes {
-        let route = route(key);
-        let written = moved_since(data_dir, key, snapshot).and_then(|moved| {
+        let Some(stored) = settings_sync::stored_key(key, catalog) else {
+            // Its base takes this device's value, so the file's is pulled
+            // again once the drive or provider exists here.
+            unapplied.failed.insert(key.clone());
+            continue;
+        };
+        let local = snapshot.get(&stored).map(String::as_str);
+        if refused_here(
+            &stored,
+            value.as_deref(),
+            local,
+            crate::sync::git_path_usable,
+        ) {
+            // Never written; the base keeps this device's own value.
+            unapplied.failed.insert(key.clone());
+            continue;
+        }
+        let route = route(&stored);
+        let written = moved_since(data_dir, &stored, snapshot).and_then(|moved| {
             if moved {
                 return Ok(false);
             }
@@ -269,7 +495,7 @@ pub(crate) fn apply(
                 data_dir,
                 runtime,
                 route,
-                key,
+                &stored,
                 value.as_deref(),
             )
             .map(|()| true)
@@ -295,6 +521,22 @@ pub(crate) fn apply(
         crate::notes_ipc::embedding_model_applied();
     }
     unapplied
+}
+
+/// A pulled value this device will not take, whatever the merge said: a git
+/// path this machine cannot drive (F12), or turning the at-rest encryption
+/// off where it is on — only a person here may lower that.
+fn refused_here(
+    key: &str,
+    value: Option<&str>,
+    local: Option<&str>,
+    git_usable: impl Fn(&str) -> bool,
+) -> bool {
+    match (key, value) {
+        ("sync.git_path", Some(path)) => !path.trim().is_empty() && !git_usable(path),
+        ("sdk_encryption", Some("off")) => local == Some("on"),
+        _ => false,
+    }
 }
 
 /// Whether `key`'s row changed since `snapshot` was read.
@@ -367,6 +609,13 @@ fn apply_one(
                 }
             }
         }
+        // As `sync_git_path_set` does: forget the resolution and rebuild the
+        // engine on the binary the pulled path names. Before the app is up,
+        // the engine is built from the row written above.
+        #[cfg(desktop)]
+        (Route::GitPath, _) if app.is_some() => {
+            crate::sync::repoint_engine(Arc::clone(platform));
+        }
         // Before the app is up there is no live state to move yet: what it
         // is built from is the registry, written above. Voice and the
         // embedding model follow once per batch, in `apply`.
@@ -431,6 +680,7 @@ mod tests {
             ("bots.voice_locale", Route::Voice),
             ("notes.embedding_model", Route::EmbeddingModel),
             ("tasks.ledger_vault", Route::LedgerVault),
+            ("sync.git_path", Route::GitPath),
             ("recording.codec", Route::Registry),
             ("undo_send.window", Route::Registry),
         ] {
@@ -557,5 +807,48 @@ mod tests {
             settled_base(&merged, true, &Values::default(), Some(&base), &unapplied),
             values(&[("a", "old")])
         );
+    }
+}
+#[cfg(test)]
+mod refused_tests {
+    use super::refused_here;
+
+    /// F12: a git path this machine cannot drive, and encryption turned off
+    /// over this device's "on", are never applied; everything else is.
+    #[test]
+    fn a_pulled_value_this_device_cannot_take_is_refused() {
+        let usable = |path: &str| path == "/usr/bin/git";
+        assert!(refused_here(
+            "sync.git_path",
+            Some("/opt/nope/git"),
+            None,
+            usable
+        ));
+        assert!(!refused_here(
+            "sync.git_path",
+            Some("/usr/bin/git"),
+            None,
+            usable
+        ));
+        assert!(!refused_here("sync.git_path", Some(""), None, usable));
+        assert!(refused_here(
+            "sdk_encryption",
+            Some("off"),
+            Some("on"),
+            usable
+        ));
+        assert!(!refused_here(
+            "sdk_encryption",
+            Some("off"),
+            Some("off"),
+            usable
+        ));
+        assert!(!refused_here(
+            "sdk_encryption",
+            Some("on"),
+            Some("off"),
+            usable
+        ));
+        assert!(!refused_here("debug.mode", Some("1"), None, usable));
     }
 }

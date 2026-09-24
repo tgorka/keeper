@@ -1350,14 +1350,18 @@ pub async fn sync_profile_save(
         state.inner(),
         crate::ipc::RecordingsIndexTrigger::because("a synced folder was saved"),
     );
-    // The drive travels in the person's `drives.toml` (Epic 84, AD-325).
+    // The drive travels in the person's `drives.toml` (Epic 84, AD-325), and
+    // its remote decides which account token it is answered with (AD-330).
+    if let Ok(all) = engine.list_profiles() {
+        crate::account_ipc::note_drives(&all);
+    }
     crate::account_ipc::note_local_change();
     Ok(SyncProfileVm::from(&answer))
 }
 
 /// The subfolder of the app container the phone's folders live under.
 #[cfg(not(desktop))]
-const PHONE_FOLDERS_DIR: &str = "sync";
+pub(crate) const PHONE_FOLDERS_DIR: &str = "sync";
 
 /// Give a phone's profile its folder (Epic 66, AD-199).
 ///
