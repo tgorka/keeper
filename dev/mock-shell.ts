@@ -3074,6 +3074,7 @@ const NO_ACCOUNT_VM: OrgAccountVm = {
   devices: [],
   lastSyncedMs: null,
   forgeConnected: false,
+  offers: { drives: [], providers: [], matrix: [] },
   faults: [],
   revision: 0,
 };
@@ -3138,6 +3139,7 @@ function signedInAccount(state: AccountStateVm, device = ACCOUNT_THIS_DEVICE): O
         ],
     lastSyncedMs: state === "ready" ? Date.now() : null,
     forgeConnected: false,
+    offers: { drives: [], providers: [], matrix: [] },
     faults: [],
     revision: 0,
   };

@@ -40,6 +40,7 @@ export function accountVm(over: Partial<OrgAccountVm> = {}): OrgAccountVm {
     ],
     lastSyncedMs: null,
     forgeConnected: false,
+    offers: { drives: [], providers: [], matrix: [] },
     faults: [],
     revision: 0,
     ...over,

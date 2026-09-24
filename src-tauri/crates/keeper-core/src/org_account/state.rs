@@ -51,10 +51,84 @@ pub struct AccountVm {
     pub forge_connected: bool,
     /// `account.toml` faults, one line each.
     pub faults: Vec<String>,
+    /// Drives, bot providers and Matrix accounts the person uses on their
+    /// other devices and not here. Empty without an account.
+    pub offers: AccountOffersVm,
     /// Increases with every VM this process composes, so a subscriber that
     /// receives two out of order keeps the newer one.
     #[ts(type = "number")]
     pub revision: u64,
+}
+
+/// What the account's repository offers this device (AD-323). Nothing is
+/// added by itself: a drive needs a folder, a Matrix account a sign-in, a
+/// provider a key unless it uses the account.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AccountOffersVm {
+    pub drives: Vec<DriveOfferVm>,
+    pub providers: Vec<ProviderOfferVm>,
+    pub matrix: Vec<MatrixOfferVm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DriveOfferVm {
+    /// `drive:<normalized remote>#<branch>`.
+    pub key: String,
+    pub name: String,
+    pub remote_url: String,
+    pub branch: String,
+    /// `account`, `own` or `none`.
+    pub credential: String,
+    /// Each role's subfolder; `Some` means the role is on.
+    pub notes: Option<String>,
+    pub recordings: Option<String>,
+    pub sessions: Option<String>,
+    pub tasks: Option<String>,
+    pub excludes: Vec<String>,
+    #[ts(type = "number | null")]
+    pub lfs_threshold_bytes: Option<u64>,
+    pub virtual_patterns: Option<Vec<String>>,
+    #[ts(type = "number | null")]
+    pub virtual_over_bytes: Option<u64>,
+    #[ts(type = "number | null")]
+    pub release_ttl_ms: Option<u64>,
+    pub tags: Vec<String>,
+    pub commit_subject_template: Option<String>,
+    /// The device slugs that use it.
+    pub devices: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ProviderOfferVm {
+    /// `provider:<kind>:<normalized base URL>`.
+    pub key: String,
+    pub kind: String,
+    pub name: String,
+    pub base_url: String,
+    /// `account` or `own`.
+    pub credential: String,
+    /// Bot names, in pin order.
+    pub bots: Vec<String>,
+    pub devices: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MatrixOfferVm {
+    /// `matrix:<user id>`.
+    pub key: String,
+    pub user_id: String,
+    pub homeserver_url: String,
+    /// `password`, `oidc` or `beeper`.
+    pub kind: String,
+    pub devices: Vec<String>,
 }
 
 /// The next [`AccountVm::revision`]: monotonic per process, never 0.
@@ -157,6 +231,8 @@ pub struct AccountFacts {
     pub forge_connected: bool,
     /// `oauth` mode: the repository needs its own connection.
     pub forge_needed: bool,
+    /// What the last sync found on the person's other devices.
+    pub offers: AccountOffersVm,
 }
 
 /// Compose the state and its sentence. Precedence, first match wins: a
@@ -196,6 +272,7 @@ pub fn vm(facts: &AccountFacts) -> AccountVm {
             last_synced_ms: None,
             forge_connected: false,
             faults: facts.faults.clone(),
+            offers: AccountOffersVm::default(),
             revision: next_revision(),
         };
     };
@@ -216,6 +293,7 @@ pub fn vm(facts: &AccountFacts) -> AccountVm {
         last_synced_ms: facts.last_synced_ms,
         forge_connected: facts.forge_connected,
         faults: facts.faults.clone(),
+        offers: facts.offers.clone(),
         revision: next_revision(),
     }
 }

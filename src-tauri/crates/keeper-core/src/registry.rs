@@ -227,6 +227,9 @@ pub fn get_setting(data_dir: &Path, key: &str) -> Result<Option<String>, CoreErr
 }
 
 /// Write (insert or overwrite) a single settings value by key.
+///
+/// The installed [`set_setting_observer`] hears `key` after the write lands,
+/// unless the write runs inside [`with_observer_suppressed`].
 pub fn set_setting(data_dir: &Path, key: &str, value: &str) -> Result<(), CoreError> {
     let conn = open(data_dir)?;
     conn.execute(
@@ -235,7 +238,101 @@ pub fn set_setting(data_dir: &Path, key: &str, value: &str) -> Result<(), CoreEr
         rusqlite::params![key, value],
     )
     .map_err(|e| CoreError::Internal(format!("could not write setting: {e}")))?;
+    notify_observer(key);
     Ok(())
+}
+
+/// Told the key of every settings write and delete (Epic 84, AD-325).
+type SettingObserver = Box<dyn Fn(&str) + Send + Sync>;
+
+static SETTING_OBSERVER: std::sync::OnceLock<SettingObserver> = std::sync::OnceLock::new();
+
+thread_local! {
+    /// How many [`with_observer_suppressed`] scopes this thread is inside.
+    static OBSERVER_SUPPRESSED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Install the process-wide observer that hears the key of every settings
+/// write and delete — how a synced preference changed in the app gets pushed
+/// to the account's repository without a timer. The first call wins; a second
+/// is ignored, so a re-run boot step cannot stack observers.
+pub fn set_setting_observer(observer: SettingObserver) {
+    if SETTING_OBSERVER.set(observer).is_err() {
+        tracing::debug!("a settings observer is already installed; keeping the first");
+    }
+}
+
+/// Run `f` with the observer silenced on this thread: the writes a sync applies
+/// from the repository must not look like local changes and kick another sync.
+/// Nests; the observer speaks again once the outermost scope ends, even when
+/// `f` panics.
+pub fn with_observer_suppressed<T>(f: impl FnOnce() -> T) -> T {
+    struct Scope;
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            OBSERVER_SUPPRESSED.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+    OBSERVER_SUPPRESSED.with(|depth| depth.set(depth.get() + 1));
+    let _scope = Scope;
+    f()
+}
+
+fn notify_observer(key: &str) {
+    if OBSERVER_SUPPRESSED.with(std::cell::Cell::get) > 0 {
+        return;
+    }
+    if let Some(observer) = SETTING_OBSERVER.get() {
+        observer(key);
+    }
+}
+
+/// The `settings` table's own rows for `keys`, ignoring every layer file —
+/// what this device has chosen, as opposed to what it currently reads. Absent
+/// keys are absent from the map.
+pub fn stored_settings(
+    data_dir: &Path,
+    keys: &[&str],
+) -> Result<std::collections::BTreeMap<String, String>, CoreError> {
+    let conn = open(data_dir)?;
+    let mut stmt = conn
+        .prepare("SELECT value FROM settings WHERE key = ?1")
+        .map_err(|e| CoreError::Internal(format!("could not prepare settings read: {e}")))?;
+    let mut rows = std::collections::BTreeMap::new();
+    for key in keys {
+        let value = stmt
+            .query_row(rusqlite::params![key], |r| r.get::<_, String>(0))
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(CoreError::Internal(format!(
+                    "could not read setting: {other}"
+                ))),
+            })?;
+        if let Some(value) = value {
+            rows.insert((*key).to_owned(), value);
+        }
+    }
+    Ok(rows)
+}
+
+/// Write (`Some`) or remove (`None`) one value a config-repository sync pulled
+/// (Epic 84). Refused for any key that does not belong in a synced file, so a
+/// repository can never reach session state, a family row or an unknown key.
+pub fn apply_synced_setting(
+    data_dir: &Path,
+    key: &str,
+    value: Option<&str>,
+) -> Result<(), CoreError> {
+    if crate::org_account::settings_sync::synced_file(key).is_none() {
+        return Err(CoreError::Internal(format!(
+            "{key} is not a synced setting, so a sync may not write it"
+        )));
+    }
+    match value {
+        Some(value) => set_setting(data_dir, key, value),
+        None => delete_setting(data_dir, key),
+    }
 }
 
 /// Upsert a pin for `(account_id, room_id)` with the given `sort_order` (Story
@@ -971,7 +1068,11 @@ pub fn scalar_setting_text(value: &serde_json::Value) -> Option<String> {
 /// so an out-of-range hand-edit degrades to the documented default rather than
 /// misbehaving.
 ///
-/// Returns the imported keys (empty when the file is absent — the normal
+/// A key a config repository syncs is only filled when its row is absent: the
+/// file is a first-run seed, not a pin, and rewriting the row at every launch
+/// would undo what the person chose on another device and push it back.
+///
+/// Returns the keys written (empty when the file is absent — the normal
 /// case). A malformed file or a non-scalar value is an `Err` — the caller
 /// reports it loudly and skips the import; it must never abort startup.
 pub fn import_config_file(data_dir: &Path) -> Result<Vec<String>, CoreError> {
@@ -1002,6 +1103,11 @@ pub fn import_config_file(data_dir: &Path) -> Result<Vec<String>, CoreError> {
                 path.display()
             )));
         };
+        if crate::org_account::settings_sync::synced_file(key).is_some()
+            && !stored_settings(data_dir, &[key.as_str()])?.is_empty()
+        {
+            continue;
+        }
         set_setting(data_dir, key, &text)?;
         imported.push(key.clone());
     }
@@ -1731,7 +1837,8 @@ pub fn notes_read_mark_set(data_dir: &Path, note_id: &str, rev: &str) -> Result<
     set_setting(data_dir, &notes_read_mark_key(note_id), rev)
 }
 
-/// Remove a settings row. Idempotent: an absent key is not an error.
+/// Remove a settings row. Idempotent: an absent key is not an error. The
+/// observer hears it exactly as it hears [`set_setting`].
 fn delete_setting(data_dir: &Path, key: &str) -> Result<(), CoreError> {
     let conn = open(data_dir)?;
     conn.execute(
@@ -1739,6 +1846,7 @@ fn delete_setting(data_dir: &Path, key: &str) -> Result<(), CoreError> {
         rusqlite::params![key],
     )
     .map_err(|e| CoreError::Internal(format!("could not delete setting: {e}")))?;
+    notify_observer(key);
     Ok(())
 }
 
@@ -1931,12 +2039,118 @@ pub fn set_account_device_slug(
     set_setting(data_dir, &account_device_slug_key(account_id), slug)
 }
 
+/// Which synced file a settings base is for, as its key segment.
+fn settings_base_segment(file: crate::org_account::settings_sync::SyncedFile) -> &'static str {
+    match file {
+        crate::org_account::settings_sync::SyncedFile::Shared => "shared",
+        crate::org_account::settings_sync::SyncedFile::Device => "device",
+    }
+}
+
+/// `account.<id>.settings_base.{shared,device}`: the synced file's values as
+/// this device last agreed them with the repository (Epic 84, AD-320) — what
+/// tells a local change from a remote one on the next sync.
+fn account_settings_base_key(
+    account_id: &str,
+    file: crate::org_account::settings_sync::SyncedFile,
+) -> String {
+    let segment = settings_base_segment(file);
+    format!("account.{account_id}.settings_base.{segment}")
+}
+
+/// Read the base of one synced file. Absent ⇒ `None`, "never synced"; a row
+/// that no longer parses is treated the same way (and logged), which makes the
+/// next sync a first sync that pulls rather than one that deletes.
+pub fn get_account_settings_base(
+    data_dir: &Path,
+    account_id: &str,
+    file: crate::org_account::settings_sync::SyncedFile,
+) -> Result<Option<crate::org_account::settings_sync::Values>, CoreError> {
+    let Some(raw) = get_setting(data_dir, &account_settings_base_key(account_id, file))? else {
+        return Ok(None);
+    };
+    let base = crate::org_account::settings_sync::Values::from_base_json(&raw);
+    if base.is_none() {
+        tracing::warn!("a stored settings base is malformed; the next sync starts over");
+    }
+    Ok(base)
+}
+
+/// Record the base of one synced file.
+pub fn set_account_settings_base(
+    data_dir: &Path,
+    account_id: &str,
+    file: crate::org_account::settings_sync::SyncedFile,
+    base: &crate::org_account::settings_sync::Values,
+) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        &account_settings_base_key(account_id, file),
+        &base.to_base_json(),
+    )
+}
+
+/// The three offer manifests a base is kept for.
+const MANIFESTS: [&str; 3] = ["drives", "bots", "matrix"];
+
+/// `account.<id>.manifest_base.<which>`: this device's own list for one offer
+/// manifest as it last pushed it (Epic 84) — what tells a record this device
+/// changed from one it merely describes differently.
+fn account_manifest_base_key(account_id: &str, which: &str) -> String {
+    format!("account.{account_id}.manifest_base.{which}")
+}
+
+fn known_manifest(which: &str) -> Result<(), CoreError> {
+    if MANIFESTS.contains(&which) {
+        Ok(())
+    } else {
+        Err(CoreError::Internal(format!(
+            "{which:?} is not an offer manifest; expected drives, bots or matrix"
+        )))
+    }
+}
+
+/// Read the base of one offer manifest (`"drives"`, `"bots"` or `"matrix"`)
+/// as the JSON the shell stored. Absent ⇒ `None`, "never pushed".
+pub fn get_account_manifest_base(
+    data_dir: &Path,
+    account_id: &str,
+    which: &str,
+) -> Result<Option<String>, CoreError> {
+    known_manifest(which)?;
+    get_setting(data_dir, &account_manifest_base_key(account_id, which))
+}
+
+/// Record the base of one offer manifest.
+pub fn set_account_manifest_base(
+    data_dir: &Path,
+    account_id: &str,
+    which: &str,
+    json: &str,
+) -> Result<(), CoreError> {
+    known_manifest(which)?;
+    set_setting(
+        data_dir,
+        &account_manifest_base_key(account_id, which),
+        json,
+    )
+}
+
 /// Forget what this install recorded about account `account_id` — its device
-/// slug and last sync — so setting it (or another account) up again starts
-/// clean rather than claiming a registration that is gone.
+/// slug, last sync, settings bases and manifest bases — so setting it (or
+/// another account) up again starts clean rather than claiming a registration
+/// that is gone.
 pub fn forget_account_state(data_dir: &Path, account_id: &str) -> Result<(), CoreError> {
+    use crate::org_account::settings_sync::SyncedFile;
     delete_setting(data_dir, &account_last_synced_ms_key(account_id))?;
-    delete_setting(data_dir, &account_device_slug_key(account_id))
+    delete_setting(data_dir, &account_device_slug_key(account_id))?;
+    for file in [SyncedFile::Shared, SyncedFile::Device] {
+        delete_setting(data_dir, &account_settings_base_key(account_id, file))?;
+    }
+    for which in MANIFESTS {
+        delete_setting(data_dir, &account_manifest_base_key(account_id, which))?;
+    }
+    Ok(())
 }
 
 /// The `settings` key holding the Undo-Send window in whole seconds (Story 8.3).
@@ -4781,6 +4995,115 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Keys the observer heard on this test's thread.
+    fn heard_here() -> Vec<String> {
+        static HEARD: std::sync::Mutex<Vec<(std::thread::ThreadId, String)>> =
+            std::sync::Mutex::new(Vec::new());
+        set_setting_observer(Box::new(|key| {
+            if let Ok(mut heard) = HEARD.lock() {
+                heard.push((std::thread::current().id(), key.to_owned()));
+            }
+        }));
+        let me = std::thread::current().id();
+        let mut heard = HEARD.lock().expect("heard");
+        let mine = heard
+            .iter()
+            .filter(|(thread, _)| *thread == me)
+            .map(|(_, key)| key.clone())
+            .collect();
+        heard.retain(|(thread, _)| *thread != me);
+        mine
+    }
+
+    #[test]
+    fn the_observer_hears_writes_and_deletes_unless_suppressed() {
+        let dir = temp_dir();
+        heard_here();
+        set_setting(&dir, "recording.codec", "hevc").expect("set");
+        apply_synced_setting(&dir, "recording.codec", None).expect("delete");
+        assert_eq!(heard_here(), ["recording.codec", "recording.codec"]);
+
+        let answer = with_observer_suppressed(|| {
+            with_observer_suppressed(|| {
+                set_setting(&dir, "recording.fps", "30").expect("nested set");
+            });
+            apply_synced_setting(&dir, "recording.fps", None).expect("still suppressed");
+            7
+        });
+        assert_eq!(answer, 7);
+        assert!(
+            heard_here().is_empty(),
+            "suppressed writes are not local changes"
+        );
+
+        set_setting(&dir, "recording.fps", "60").expect("set again");
+        assert_eq!(
+            heard_here(),
+            ["recording.fps"],
+            "the observer speaks again after the scope"
+        );
+
+        assert!(
+            apply_synced_setting(&dir, "notes.read.01ABC", Some("r")).is_err(),
+            "a sync may not write a key that is not synced"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_bases_are_per_file_and_forgotten_with_the_account() {
+        use crate::org_account::settings_sync::{SyncedFile, Values};
+        let dir = temp_dir();
+        let mut base = Values::default();
+        base.values
+            .insert("recording.codec".to_owned(), "hevc".to_owned());
+        assert_eq!(
+            get_account_settings_base(&dir, "acme", SyncedFile::Shared).expect("read"),
+            None
+        );
+        set_account_settings_base(&dir, "acme", SyncedFile::Shared, &base).expect("set");
+        assert_eq!(
+            get_account_settings_base(&dir, "acme", SyncedFile::Shared).expect("read"),
+            Some(base.clone())
+        );
+        assert_eq!(
+            get_account_settings_base(&dir, "acme", SyncedFile::Device).expect("read"),
+            None
+        );
+        set_account_settings_base(&dir, "acme", SyncedFile::Device, &base).expect("set");
+        for which in ["drives", "bots", "matrix"] {
+            assert_eq!(
+                get_account_manifest_base(&dir, "acme", which).expect("read"),
+                None
+            );
+            set_account_manifest_base(&dir, "acme", which, "[]").expect("set");
+            assert_eq!(
+                get_account_manifest_base(&dir, "acme", which).expect("read"),
+                Some("[]".to_owned())
+            );
+        }
+        assert!(set_account_manifest_base(&dir, "acme", "notes", "[]").is_err());
+        set_account_manifest_base(&dir, "globex", "drives", "[1]").expect("set");
+        forget_account_state(&dir, "acme").expect("forget");
+        for file in [SyncedFile::Shared, SyncedFile::Device] {
+            assert_eq!(
+                get_account_settings_base(&dir, "acme", file).expect("read"),
+                None
+            );
+        }
+        for which in ["drives", "bots", "matrix"] {
+            assert_eq!(
+                get_account_manifest_base(&dir, "acme", which).expect("read"),
+                None
+            );
+        }
+        assert_eq!(
+            get_account_manifest_base(&dir, "globex", "drives").expect("read"),
+            Some("[1]".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_credential_source_answers_only_for_the_account_it_was_set_for() {
         let dir = temp_dir();
@@ -4917,35 +5240,43 @@ mod tests {
     }
 
     #[test]
-    fn config_file_import_wins_over_settings_and_reports_malformed_loudly() {
+    fn config_file_import_seeds_synced_keys_and_reports_malformed_loudly() {
         let dir = temp_dir();
         // Absent file ⇒ clean no-op (the normal case).
         assert!(
             import_config_file(&dir).expect("absent is fine").is_empty(),
             "absent config.json imports nothing"
         );
-        // Pre-existing setting…
+        // A row the person (or a sync) already set for a synced key stays…
         set_recording_codec(&dir, "h264").expect("seed codec");
         set_debug_mode(&dir, false).expect("seed debug");
-        // …is overridden by the file (file wins), with bool/number mapping.
+        // …while a key that never syncs is still decided by the file.
+        set_setting(&dir, "sync.git_path", "/opt/old/git").expect("seed git");
         std::fs::write(
             dir.join(CONFIG_FILE_NAME),
-            r#"{"recording.codec":"hevc","recording.scale_percent":50,"debug.mode":true}"#,
+            r#"{"recording.codec":"hevc","recording.scale_percent":50,"debug.mode":true,"sync.git_path":"/usr/bin/git"}"#,
         )
         .expect("write config");
         let mut imported = import_config_file(&dir).expect("import");
         imported.sort();
-        assert_eq!(
-            imported,
-            vec!["debug.mode", "recording.codec", "recording.scale_percent"]
-        );
-        assert_eq!(get_recording_codec(&dir).expect("codec"), "hevc");
+        assert_eq!(imported, vec!["recording.scale_percent", "sync.git_path"]);
+        assert_eq!(get_recording_codec(&dir).expect("codec"), "h264");
         assert_eq!(get_recording_scale_percent(&dir).expect("scale"), 50);
-        assert!(get_debug_mode(&dir).expect("debug"));
+        assert!(!get_debug_mode(&dir).expect("debug"));
+        assert_eq!(
+            get_setting(&dir, "sync.git_path").expect("git"),
+            Some("/usr/bin/git".to_owned())
+        );
+        // Every launch imports again, and still changes nothing synced.
+        assert_eq!(
+            import_config_file(&dir).expect("again"),
+            vec!["sync.git_path"]
+        );
+        assert_eq!(get_recording_codec(&dir).expect("codec"), "h264");
         // Malformed JSON ⇒ a loud Err, and the prior imports stay intact.
         std::fs::write(dir.join(CONFIG_FILE_NAME), "{not json").expect("write bad");
         assert!(import_config_file(&dir).is_err(), "malformed is an Err");
-        assert_eq!(get_recording_codec(&dir).expect("codec intact"), "hevc");
+        assert_eq!(get_recording_scale_percent(&dir).expect("scale intact"), 50);
         // A nested value is rejected too (flat scalars only).
         std::fs::write(
             dir.join(CONFIG_FILE_NAME),

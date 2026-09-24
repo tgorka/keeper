@@ -411,6 +411,7 @@ fn facts(inner: &Inner) -> AccountFacts {
             .descriptor
             .as_ref()
             .is_some_and(|d| matches!(d.config.auth, RepoAuthConfig::Oauth(_))),
+        offers: Default::default(),
     }
 }
 
@@ -1043,6 +1044,7 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
         .map(|write| Write {
             rel: PathBuf::from(write.rel),
             bytes: write.bytes,
+            replace: false,
         })
         .collect()
     };
