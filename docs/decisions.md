@@ -1326,3 +1326,47 @@ and decides who wins when two devices disagree.
 - **Status / owner:** decided. Owner is the architect. Epic 84 implements it:
   `org_account::settings_sync::merge`, `layout::is_rewritable`, and
   `keeper_sync::config_repo`'s `Write.replace`.
+
+## D-27 — A device restores itself once, then speaks for itself
+
+Epic 84 carried a person's preferences between devices and offered their drives, bot
+providers and Matrix accounts, but a device itself could not be rebuilt: half of every
+drive, every schedule and every grant lived only in local databases, and a reinstall
+was a stranger. The owner asked for every setting in the repository, device-linked
+ones too, and for the restore to be automatic. Epic 85 decides what a device may take
+back from the repository, and when it stops.
+
+- **What changes:** each device keeps `<login>/device.<device>.toml`: its drives'
+  whole profiles (minus id and volume binding) with their schedules, its bot providers
+  with their bots and grants, its Matrix accounts. The device-linked keys (the
+  encryption choice, the git path, listening, the voice language, the notes-list
+  choices, and whether each drive and provider uses the account) join
+  `settings.<device>.toml`. A reinstall on the same machine, of the same class and
+  platform, keeps its name; another machine with the same host name does not.
+  (AD-326…AD-332; FR-723…FR-733; NFR-99, NFR-100)
+- **Once:** the first successful sync of an install restores what the file lists and
+  this device lacks, then sets a marker. After that the device's own state is the
+  truth and overwrites its file, so a drive removed here stays removed. What cannot be
+  restored yet (a folder on an unmounted volume, and any grant on it) waits in the
+  file and is restored when it can be; nothing waiting is dropped.
+- **Only its own file:** a device restores from the file that bears its name, and only
+  it writes that file. Another device's drives remain offers (D-26's rule is
+  unchanged), and a removal on one device never deletes anything on another.
+- **What a restore never does:** arm the microphone. Listening travels and is shown,
+  and turning it on is the person's tap on this device. No layer file may set it
+  either. A restore never signs a Matrix account in by itself: it starts one
+  single-sign-on sign-in, which the person completes. No secret travels: a drive's
+  remote loses its userinfo, a credential is `account` or `own`, and a keychain value
+  is never read on the way to the file.
+- **Why once:** a restore that ran at every sync would undo the person's own later
+  choices, and two sources of truth for one device would need a merge nobody could
+  explain. Once, then the device speaks for itself, is the rule a person can predict.
+- **What it amends:** D-26's device-local exceptions shrink (`sdk_encryption` and
+  `sync.git_path` now travel in the device settings file, applied only where they can
+  be); epic 84's "nothing is added by itself" now excepts a device's own file.
+- **Revisit triggers:** a request to restore on demand (DW-310); a device moving to
+  another OS (DW-311); a pre-epic-85 device record taken over by another machine with
+  the same name (DW-317); two devices on Forgejo's refresh-token invalidation (DW-312).
+- **Status / owner:** decided. Owner is the architect. Epic 85 implements it:
+  `org_account::device_state`, `layout::free_device_slug`, the shell's restore, and
+  the `account.<id>.restored` marker.
