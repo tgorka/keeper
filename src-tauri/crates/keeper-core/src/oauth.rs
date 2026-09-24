@@ -3,7 +3,7 @@
 //!
 //! This module is deliberately **tauri-free**: plain `tokio` one-shot channels,
 //! a `std::sync::Mutex<HashMap>`, and `url` parsing. The `keeper` (Tauri) shell
-//! owns the deep-link plugin and forwards each incoming `keeper://oauth/callback`
+//! owns the deep-link plugin and forwards each incoming `dev.tgorka.keeper:/oauth/callback`
 //! URL here via [`OAuthFlowRegistry::resolve`]; the OIDC `AuthProvider` in
 //! [`crate::auth`] registers a pending flow keyed by the OAuth `state` and awaits
 //! its [`OAuthCallback`].
@@ -27,8 +27,11 @@ use url::Url;
 
 use crate::error::CoreError;
 
-/// The custom-scheme redirect URI registered for the native public client.
-pub const REDIRECT_URI: &str = "keeper://oauth/callback";
+/// The redirect URI registered for the native public client: RFC 8252's
+/// private-use scheme in reverse-DNS form. Its scheme is `client_uri`'s host
+/// reversed (and the app's bundle id), which is what homeservers that validate
+/// native redirects (Tuwunel, MAS) require.
+pub const REDIRECT_URI: &str = "dev.tgorka.keeper:/oauth/callback";
 
 /// The client's home-page URL, advertised during dynamic client registration.
 const CLIENT_URI: &str = "https://keeper.tgorka.dev/";
@@ -201,7 +204,7 @@ pub fn redirect_uri() -> Result<Url, CoreError> {
 /// client (RFC 7591 automatic registration).
 ///
 /// `ApplicationType::Native`, a single `AuthorizationCode` grant with the
-/// `keeper://oauth/callback` redirect, the required `client_uri`, and a
+/// `dev.tgorka.keeper:/oauth/callback` redirect, the required `client_uri`, and a
 /// `client_name`. The SDK's serializer forces `token_endpoint_auth_method:
 /// "none"` and adds `refresh_token` + `response_types: ["code"]`, so no
 /// confidential secret is ever embedded.
@@ -235,7 +238,7 @@ mod tests {
         let registry = OAuthFlowRegistry::new();
         let rx = registry.register("abc123".to_owned());
 
-        let url = "keeper://oauth/callback?code=authcode&state=abc123";
+        let url = "dev.tgorka.keeper:/oauth/callback?code=authcode&state=abc123";
         assert!(registry.resolve(url), "matching state should resolve");
 
         match rx.await.expect("sender not dropped") {
@@ -252,7 +255,7 @@ mod tests {
         let registry = OAuthFlowRegistry::new();
         let rx = registry.register("s1".to_owned());
 
-        assert!(registry.resolve("keeper://oauth/callback?error=access_denied&state=s1"));
+        assert!(registry.resolve("dev.tgorka.keeper:/oauth/callback?error=access_denied&state=s1"));
         match rx.await.expect("sender not dropped") {
             OAuthCallback::Error(e) => assert_eq!(e, "access_denied"),
             other => panic!("expected Error, got {other:?}"),
@@ -265,11 +268,11 @@ mod tests {
         let registry = OAuthFlowRegistry::new();
         let _rx = registry.register("real".to_owned());
         assert!(
-            !registry.resolve("keeper://oauth/callback?code=x&state=nope"),
+            !registry.resolve("dev.tgorka.keeper:/oauth/callback?code=x&state=nope"),
             "unknown state must not match"
         );
         // The real flow is untouched.
-        assert!(registry.resolve("keeper://oauth/callback?code=x&state=real"));
+        assert!(registry.resolve("dev.tgorka.keeper:/oauth/callback?code=x&state=real"));
     }
 
     /// A callback with no `state` param, and an unparsable URL, are both ignored.
@@ -277,7 +280,7 @@ mod tests {
     fn resolve_missing_state_and_bad_url_are_ignored() {
         let registry = OAuthFlowRegistry::new();
         let _rx = registry.register("s".to_owned());
-        assert!(!registry.resolve("keeper://oauth/callback?code=x"));
+        assert!(!registry.resolve("dev.tgorka.keeper:/oauth/callback?code=x"));
         assert!(!registry.resolve("not a url at all"));
     }
 
@@ -299,7 +302,7 @@ mod tests {
             OAuthCallback::Cancelled
         ));
         // Registry is empty: a subsequent callback matches nothing.
-        assert!(!registry.resolve("keeper://oauth/callback?state=a"));
+        assert!(!registry.resolve("dev.tgorka.keeper:/oauth/callback?state=a"));
     }
 
     /// `cancel` ends exactly the named flow; its sibling keeps waiting.
@@ -316,8 +319,8 @@ mod tests {
             rx_a.await.expect("sender not dropped"),
             OAuthCallback::Cancelled
         ));
-        assert!(!registry.resolve("keeper://oauth/callback?state=a"));
-        assert!(registry.resolve("keeper://oauth/callback?code=x&state=b"));
+        assert!(!registry.resolve("dev.tgorka.keeper:/oauth/callback?state=a"));
+        assert!(registry.resolve("dev.tgorka.keeper:/oauth/callback?code=x&state=b"));
     }
 
     /// Dropping the receiver (flow ended) leaves a stale sender; resolving it is
@@ -328,7 +331,7 @@ mod tests {
         let rx = registry.register("gone".to_owned());
         drop(rx);
         assert!(
-            !registry.resolve("keeper://oauth/callback?code=x&state=gone"),
+            !registry.resolve("dev.tgorka.keeper:/oauth/callback?code=x&state=gone"),
             "resolving a flow whose receiver dropped returns false"
         );
     }
@@ -341,7 +344,7 @@ mod tests {
         let _rx = registry.register("leak".to_owned());
         registry.remove("leak");
         // The entry is gone: a later callback for that state matches nothing.
-        assert!(!registry.resolve("keeper://oauth/callback?code=x&state=leak"));
+        assert!(!registry.resolve("dev.tgorka.keeper:/oauth/callback?code=x&state=leak"));
         // Idempotent: removing an already-absent state is a harmless no-op.
         registry.remove("leak");
     }

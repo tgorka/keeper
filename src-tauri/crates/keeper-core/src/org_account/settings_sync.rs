@@ -37,23 +37,44 @@ pub enum SyncedFile {
     Device,
 }
 
-/// Keys that stay on this device although their scope would sync them: the
-/// at-rest posture is keyed to this machine's Keychain, a git executable path
-/// is a fact of this disk, an open microphone is armed per device, and a voice
-/// language has to be installed on the device that listens.
-const NEVER_SYNCED: &[&str] = &[
+/// Keys whose scope would keep them off the repository, or send them to every
+/// device, but that describe this device and so travel in its own file: the
+/// at-rest posture, the git executable, the microphone and its language, and
+/// the notes list's last choices. A restore brings them back; the microphone
+/// is never switched on by one ([`from_portable`]).
+const DEVICE_KEYS: &[&str] = &[
     "sdk_encryption",
     "sync.git_path",
     "bots.wake_enabled",
     "bots.voice_locale",
+    "notes.hide_service_files",
+    "notes.include_private",
 ];
 
+/// The wake phrase's switch: an open microphone is a person's tap, never a
+/// sync's.
+const WAKE_ENABLED_KEY: &str = "bots.wake_enabled";
+
+const SYNC_CREDENTIAL_PREFIX: &str = "sync.credential_source.";
+const BOTS_CREDENTIAL_PREFIX: &str = "bots.provider_credential_source.";
+
+/// The one portable value of a credential-source row: this account's token.
+/// Anything else — the keychain, another account — is the row's absence.
+const ACCOUNT_CREDENTIAL: &str = "account";
+
 /// The file `key` is synced in, or `None` when it never leaves this device —
-/// session state, every key family, and keys this build does not know.
+/// session state, every other key family, and keys this build does not know.
+/// The two credential-source families live in the device file, keyed by a
+/// drive or provider reference there and by a local id here.
 pub fn synced_file(key: &str) -> Option<SyncedFile> {
     let spec = keys::spec(key)?;
-    if spec.family || NEVER_SYNCED.contains(&spec.key) {
-        return None;
+    if spec.family {
+        return [SYNC_CREDENTIAL_PREFIX, BOTS_CREDENTIAL_PREFIX]
+            .contains(&spec.key)
+            .then_some(SyncedFile::Device);
+    }
+    if DEVICE_KEYS.contains(&spec.key) {
+        return Some(SyncedFile::Device);
     }
     match spec.scope {
         Scope::UserGlobal => Some(SyncedFile::Shared),
@@ -62,7 +83,8 @@ pub fn synced_file(key: &str) -> Option<SyncedFile> {
     }
 }
 
-/// Every key synced in `file`.
+/// Every exact key synced in `file`; the credential-source families are read
+/// by prefix ([`stored_rows`]).
 pub fn synced_keys(file: SyncedFile) -> impl Iterator<Item = &'static str> {
     keys::KEYS
         .iter()
@@ -121,7 +143,8 @@ impl Values {
                 for (key, value) in flat {
                     let stored = keys::spec(&key)
                         .filter(|_| synced_file(&key) == Some(file))
-                        .and_then(|spec| spec.shape.coerce(&key, &value).ok());
+                        .and_then(|spec| spec.shape.coerce(&key, &value).ok())
+                        .filter(|stored| portable_credential_row(&key, stored));
                     match stored {
                         Some(stored) => {
                             parsed.values.insert(key, stored);
@@ -462,25 +485,72 @@ pub fn normalize_base_url(url: &str) -> String {
     )
 }
 
-/// A drive as every device names it: its remote and branch.
+/// A drive as every device names it: its remote, its branch and its name, so
+/// two drives of one repository (`tgdrive`, `tgdrive-light`) stay two.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DriveRef {
     remote_url: String,
     branch: String,
+    name: Option<String>,
 }
 
+/// Between a drive reference's branch and its name: a character no git
+/// branch name may contain, so neither can be mistaken for the other.
+const NAME_SEPARATOR: char = '^';
+
 impl DriveRef {
+    /// A drive by its remote and branch alone.
     pub fn new(remote_url: &str, branch: &str) -> Self {
         DriveRef {
             remote_url: normalize_remote(remote_url),
             branch: branch.trim().to_owned(),
+            name: None,
         }
     }
 
-    /// `drive:<normalized remote>#<branch>`.
-    pub fn reference(&self) -> String {
-        format!("drive:{}#{}", self.remote_url, self.branch)
+    /// A drive by its remote, branch and name; a blank name names nothing.
+    pub fn named(remote_url: &str, branch: &str, name: &str) -> Self {
+        let name = name.trim();
+        DriveRef {
+            name: (!name.is_empty()).then(|| name.to_owned()),
+            ..DriveRef::new(remote_url, branch)
+        }
     }
+
+    /// `drive:<normalized remote>#<branch>`, then `^<name>` when it is named.
+    pub fn reference(&self) -> String {
+        match &self.name {
+            Some(name) => format!(
+                "drive:{}#{}{NAME_SEPARATOR}{name}",
+                self.remote_url, self.branch
+            ),
+            None => format!("drive:{}#{}", self.remote_url, self.branch),
+        }
+    }
+
+    /// Read a reference back: the branch runs from the last `#` to the first
+    /// `^`, and the name is the rest. `None` for anything else.
+    pub fn parse(reference: &str) -> Option<DriveRef> {
+        let (remote, rest) = reference.strip_prefix("drive:")?.rsplit_once('#')?;
+        Some(match rest.split_once(NAME_SEPARATOR) {
+            Some((branch, name)) => DriveRef::named(remote, branch, name),
+            None => DriveRef::new(remote, rest),
+        })
+    }
+
+    /// The same remote and branch, whatever the name.
+    pub(super) fn same_repository(&self, other: &DriveRef) -> bool {
+        self.remote_url == other.remote_url && self.branch == other.branch
+    }
+}
+
+/// `scheme://host[:port]` of a URL, the port only when it is not the
+/// scheme's default; `None` for anything without a host (an scp remote, a
+/// path).
+pub fn url_origin(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url.trim()).ok()?;
+    parsed.host_str()?;
+    Some(parsed.origin().ascii_serialization()).filter(|origin| origin != "null")
 }
 
 /// A bot provider as every device names it: its kind and base URL.
@@ -503,17 +573,38 @@ impl ProviderRef {
         format!("provider:{}:{}", self.kind, self.base_url)
     }
 
+    /// The base URL's origin ([`url_origin`]).
+    pub fn origin(&self) -> Option<String> {
+        url_origin(&self.base_url)
+    }
+
     /// `bot:<kind>:<normalized base URL>#<target>`.
     pub fn bot_reference(&self, target: &str) -> String {
         format!("bot:{}:{}#{}", self.kind, self.base_url, target)
     }
 }
 
+/// One of this device's drives, as the shell reads it from `sync.db`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalDrive {
+    pub profile_id: String,
+    pub remote_url: String,
+    pub branch: String,
+    pub name: String,
+    /// The folder it syncs.
+    pub local_path: String,
+}
+
+impl LocalDrive {
+    fn key(&self) -> DriveRef {
+        DriveRef::named(&self.remote_url, &self.branch, &self.name)
+    }
+}
+
 /// This device's drives, providers and bots, by local id.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Catalog {
-    /// `(profile id, drive)`.
-    pub drives: Vec<(String, DriveRef)>,
+    pub drives: Vec<LocalDrive>,
     /// Whether `drives` is this device's real drive list. When it could not
     /// be read, no drive reference is translated either way, so a missing
     /// list is never mistaken for drives the person removed.
@@ -522,16 +613,25 @@ pub struct Catalog {
     pub providers: Vec<(String, ProviderRef)>,
     /// `(bot id, provider id, target)`.
     pub bots: Vec<(String, String, String)>,
+    /// The configured account. A credential-source row travels only when it
+    /// is bound to this account, and comes back bound to it.
+    pub account_id: Option<String>,
+    /// The account descriptor's issuer, repository and forge origins
+    /// ([`url_origin`]). A pulled credential source binds the account's
+    /// token only to a drive or provider at one of them.
+    pub trusted_origins: Vec<String>,
 }
 
 impl Catalog {
     /// `drives` from the shell (keeper-core cannot see `sync.db`), `None`
     /// when the drive list could not be read; providers and bots from
     /// `keeper.db`. A provider of a kind this build does not speak has no base
-    /// URL to name it by, and is left out.
+    /// URL to name it by, and is left out. The shell sets
+    /// [`account_id`](Catalog::account_id) and
+    /// [`trusted_origins`](Catalog::trusted_origins).
     pub fn with_bots(
         data_dir: &Path,
-        drives: Option<Vec<(String, DriveRef)>>,
+        drives: Option<Vec<LocalDrive>>,
     ) -> Result<Catalog, CoreError> {
         let providers = store::list_providers(data_dir)?
             .rows
@@ -551,7 +651,47 @@ impl Catalog {
             drives: drives.unwrap_or_default(),
             providers,
             bots,
+            account_id: None,
+            trusted_origins: Vec::new(),
         })
+    }
+
+    fn drive(&self, profile_id: &str) -> Option<&LocalDrive> {
+        self.drives
+            .iter()
+            .find(|drive| drive.profile_id == profile_id)
+    }
+
+    /// How every device names drive `profile_id`: its remote, branch and name.
+    pub fn drive_reference(&self, profile_id: &str) -> Option<String> {
+        Some(self.drive(profile_id)?.key().reference())
+    }
+
+    /// The drive here that `reference` names. A named reference: the drive
+    /// of that name on its remote and branch. An unnamed one (written before
+    /// names travelled): the only drive on its remote and branch; with more
+    /// than one it names none of them.
+    pub fn resolve_drive(&self, reference: &str) -> Option<&str> {
+        let wanted = DriveRef::parse(reference)?;
+        if wanted.name.is_some() {
+            return self
+                .drives
+                .iter()
+                .find(|drive| drive.key() == wanted)
+                .map(|drive| drive.profile_id.as_str());
+        }
+        let mut matches = self
+            .drives
+            .iter()
+            .filter(|drive| drive.key().same_repository(&wanted));
+        match (matches.next(), matches.next()) {
+            (Some(only), None) => Some(&only.profile_id),
+            _ => None,
+        }
+    }
+
+    fn trusted(&self, origin: Option<String>) -> bool {
+        origin.is_some_and(|origin| self.trusted_origins.contains(&origin))
     }
 
     fn provider(&self, id: &str) -> Option<&ProviderRef> {
@@ -571,21 +711,90 @@ const DRIVE_KEYS: &[&str] = &[
 const VOICE_TARGET_KEY: &str = "bots.voice_target";
 const EMBEDDING_MODEL_KEY: &str = "notes.embedding_model";
 
+/// A credential-source key split into its family prefix and the rest: a
+/// local id in the table, a drive or provider reference in the file.
+fn credential_key(key: &str) -> Option<(&'static str, &str)> {
+    [SYNC_CREDENTIAL_PREFIX, BOTS_CREDENTIAL_PREFIX]
+        .into_iter()
+        .find_map(|prefix| {
+            let rest = key.strip_prefix(prefix)?;
+            (!rest.is_empty()).then_some((prefix, rest))
+        })
+}
+
+/// Whether a file row is one this build applies: every row but a
+/// credential-source one, which must name a drive or provider by reference
+/// and hold `account`.
+fn portable_credential_row(key: &str, stored: &str) -> bool {
+    match credential_key(key) {
+        None => true,
+        Some((prefix, reference)) => {
+            let kind = if prefix == SYNC_CREDENTIAL_PREFIX {
+                "drive:"
+            } else {
+                "provider:"
+            };
+            stored == ACCOUNT_CREDENTIAL && reference.starts_with(kind)
+        }
+    }
+}
+
+/// A credential-source row as it travels: keyed by the drive's or
+/// provider's reference, holding `account`. `None` when the row is not bound
+/// to the configured account (it means the keychain, which is the row's
+/// absence) or names nothing this device can describe.
+fn portable_credential(key: &str, stored: &str, catalog: &Catalog) -> Option<(String, String)> {
+    let (prefix, id) = credential_key(key)?;
+    let account = catalog.account_id.as_deref()?;
+    if stored != registry::credential_source_value(account) {
+        return None;
+    }
+    let reference = if prefix == SYNC_CREDENTIAL_PREFIX {
+        catalog.drive_reference(id)?
+    } else {
+        catalog.provider(id)?.reference()
+    };
+    Some((
+        format!("{prefix}{reference}"),
+        ACCOUNT_CREDENTIAL.to_owned(),
+    ))
+}
+
+/// The key a travelling key is stored under here: a credential-source key
+/// names its drive or provider by local id, every other key is itself. `None`
+/// when the drive or provider is not on this device. The shell writes a
+/// merge's [`apply`](Merged::apply) through this.
+pub fn stored_key(key: &str, catalog: &Catalog) -> Option<String> {
+    let Some((prefix, reference)) = credential_key(key) else {
+        return Some(key.to_owned());
+    };
+    let id = if prefix == SYNC_CREDENTIAL_PREFIX {
+        if !catalog.drives_known {
+            return None;
+        }
+        catalog.resolve_drive(reference)?
+    } else {
+        catalog
+            .providers
+            .iter()
+            .find(|(_, provider)| provider.reference() == reference)
+            .map(|(id, _)| id.as_str())?
+    };
+    Some(format!("{prefix}{id}"))
+}
+
 /// A stored value in the form it travels in. `None` when it names a drive,
 /// bot or provider this device does not know ([`local_values`] then takes the
 /// base's value). A blank value (a cleared choice) and every key without a
-/// local id pass through unchanged.
+/// local id pass through unchanged. Credential-source rows change their key
+/// as well and are translated by [`local_values`].
 pub fn to_portable(key: &str, stored: &str, catalog: &Catalog) -> Option<String> {
     let id = stored.trim();
     if id.is_empty() {
         return Some(stored.to_owned());
     }
     if DRIVE_KEYS.contains(&key) {
-        return catalog
-            .drives
-            .iter()
-            .find(|(profile_id, _)| profile_id == id)
-            .map(|(_, drive)| drive.reference());
+        return catalog.drive_reference(id);
     }
     match key {
         VOICE_TARGET_KEY => {
@@ -605,10 +814,33 @@ pub fn to_portable(key: &str, stored: &str, catalog: &Catalog) -> Option<String>
     }
 }
 
-/// A travelling value as this device stores it. `None` when its reference
-/// names nothing here, or when it is an absolute path whose directory does not
-/// exist on this device: it is then kept in the file and not applied.
+/// A travelling value as this device stores it. `None` — kept in the file and
+/// not applied — when its reference names nothing here; when it is an
+/// absolute path that does not exist here, as a directory or a file (the git
+/// executable: a regular executable file outside every drive's folder); when
+/// it would switch the wake phrase on; or when it is a credential source for
+/// a drive or provider this device lacks, one that is not at a trusted
+/// origin of the account, or with no account configured. A credential source
+/// comes back as `account:<this account>`; its key goes through
+/// [`stored_key`].
 pub fn from_portable(key: &str, portable: &str, catalog: &Catalog) -> Option<String> {
+    if let Some((prefix, _)) = credential_key(key) {
+        let stored = stored_key(key, catalog)?;
+        let id = &stored[prefix.len()..];
+        // The account's token goes only where the account itself lives: a
+        // repository file must not send it to a host the person never chose.
+        let origin = if prefix == SYNC_CREDENTIAL_PREFIX {
+            url_origin(&catalog.drive(id)?.remote_url)
+        } else {
+            catalog.provider(id)?.origin()
+        };
+        if !catalog.trusted(origin) {
+            return None;
+        }
+        let account = catalog.account_id.as_deref().filter(|id| !id.is_empty())?;
+        return (portable == ACCOUNT_CREDENTIAL)
+            .then(|| registry::credential_source_value(account));
+    }
     if portable.trim().is_empty() {
         return Some(portable.to_owned());
     }
@@ -616,13 +848,11 @@ pub fn from_portable(key: &str, portable: &str, catalog: &Catalog) -> Option<Str
         if !catalog.drives_known {
             return None;
         }
-        return catalog
-            .drives
-            .iter()
-            .find(|(_, drive)| drive.reference() == portable)
-            .map(|(profile_id, _)| profile_id.clone());
+        return catalog.resolve_drive(portable).map(str::to_owned);
     }
     match key {
+        // Only a person's tap opens the microphone; "off" travels freely.
+        WAKE_ENABLED_KEY if portable == "1" => None,
         VOICE_TARGET_KEY => catalog
             .bots
             .iter()
@@ -644,13 +874,68 @@ pub fn from_portable(key: &str, portable: &str, catalog: &Catalog) -> Option<Str
             })
             .ok()
         }
-        _ if keys::spec(key).is_some_and(|spec| spec.shape == Shape::AbsolutePath)
-            && !Path::new(portable).is_dir() =>
-        {
-            None
+        GIT_PATH_KEY => git_executable(portable, catalog).then(|| portable.to_owned()),
+        _ if keys::spec(key).is_some_and(|spec| spec.shape == Shape::AbsolutePath) => {
+            let path = Path::new(portable);
+            (path.is_dir() || path.is_file()).then(|| portable.to_owned())
         }
         _ => Some(portable.to_owned()),
     }
+}
+
+const GIT_PATH_KEY: &str = "sync.git_path";
+
+/// Whether a pulled git path may be run here: a regular executable file
+/// (through a link, as Homebrew installs it), and neither the path nor what it
+/// points at inside any drive's folder, where anyone who can push to that
+/// drive could put one.
+fn git_executable(portable: &str, catalog: &Catalog) -> bool {
+    let path = Path::new(portable);
+    let (Ok(meta), Ok(real)) = (std::fs::metadata(path), std::fs::canonicalize(path)) else {
+        return false;
+    };
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let executable = true;
+    if !meta.is_file() || !executable || !catalog.drives_known {
+        return false;
+    }
+    !catalog
+        .drives
+        .iter()
+        .filter(|drive| !drive.local_path.is_empty())
+        .any(|drive| {
+            let folder = Path::new(&drive.local_path);
+            let real_folder =
+                std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
+            path.starts_with(folder) || real.starts_with(&real_folder)
+        })
+}
+
+/// Whether this device's file asks for the wake phrase while this device has
+/// it off (`stored_wake` is its `bots.wake_enabled` row): the account view
+/// then offers to turn listening on, and nothing turns it on by itself.
+pub fn listening_off(device_file: &Values, stored_wake: Option<&str>) -> bool {
+    device_file.values.get(WAKE_ENABLED_KEY).map(String::as_str) == Some("1")
+        && stored_wake != Some("1")
+}
+
+/// The `settings` table's own rows for every synced key, both files, the
+/// credential-source families included — the snapshot a merge's local side
+/// is read from, keyed as the table keys them.
+pub fn stored_rows(data_dir: &Path) -> Result<BTreeMap<String, String>, CoreError> {
+    let keys: Vec<&str> = synced_keys(SyncedFile::Shared)
+        .chain(synced_keys(SyncedFile::Device))
+        .collect();
+    let mut rows = registry::stored_settings(data_dir, &keys)?;
+    for prefix in [SYNC_CREDENTIAL_PREFIX, BOTS_CREDENTIAL_PREFIX] {
+        rows.extend(registry::stored_settings_by_prefix(data_dir, prefix)?);
+    }
+    Ok(rows)
 }
 
 /// This device's side of one synced file: the `settings` table's own rows (not
@@ -663,33 +948,53 @@ pub fn local_values(
     base: Option<&Values>,
 ) -> Result<Values, CoreError> {
     let keys: Vec<&str> = synced_keys(file).collect();
-    let rows = registry::stored_settings(data_dir, &keys)?;
+    let mut rows = registry::stored_settings(data_dir, &keys)?;
+    if file == SyncedFile::Device {
+        for prefix in [SYNC_CREDENTIAL_PREFIX, BOTS_CREDENTIAL_PREFIX] {
+            rows.extend(registry::stored_settings_by_prefix(data_dir, prefix)?);
+        }
+    }
     Ok(local_from_rows(rows, catalog, base))
 }
 
 /// A row naming something this device cannot describe right now — a removed
 /// bot or provider, or any drive while the drive list is unreadable — is not
 /// the person deleting the key: it reads as the base's value, so it is neither
-/// pushed as a deletion nor as a change.
+/// pushed as a deletion nor as a change. A credential-source row travels under
+/// its drive's or provider's reference, and only when bound to this account.
 fn local_from_rows(
     rows: BTreeMap<String, String>,
     catalog: &Catalog,
     base: Option<&Values>,
 ) -> Values {
     let based = |key: &str| base.and_then(|base| base.values.get(key)).cloned();
-    let mut values: BTreeMap<String, String> = rows
-        .into_iter()
-        .filter(|(key, _)| catalog.drives_known || !DRIVE_KEYS.contains(&key.as_str()))
-        .filter_map(|(key, stored)| {
-            let portable = to_portable(&key, &stored, catalog).or_else(|| based(&key))?;
-            Some((key, portable))
-        })
-        .collect();
-    if !catalog.drives_known {
-        for key in DRIVE_KEYS {
-            if let Some(value) = based(key) {
-                values.insert((*key).to_owned(), value);
+    let mut values = BTreeMap::new();
+    for (key, stored) in rows {
+        if let Some((prefix, _)) = credential_key(&key) {
+            if prefix == SYNC_CREDENTIAL_PREFIX && !catalog.drives_known {
+                continue;
             }
+            if let Some((portable_key, value)) = portable_credential(&key, &stored, catalog) {
+                values.insert(portable_key, value);
+            }
+            continue;
+        }
+        if !catalog.drives_known && DRIVE_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        if let Some(portable) = to_portable(&key, &stored, catalog).or_else(|| based(&key)) {
+            values.insert(key, portable);
+        }
+    }
+    if !catalog.drives_known {
+        let drive_rows = base
+            .into_iter()
+            .flat_map(|base| &base.values)
+            .filter(|(key, _)| {
+                DRIVE_KEYS.contains(&key.as_str()) || key.starts_with(SYNC_CREDENTIAL_PREFIX)
+            });
+        for (key, value) in drive_rows {
+            values.insert(key.clone(), value.clone());
         }
     }
     Values {
@@ -725,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_are_synced_by_scope_with_the_exclusions() {
+    fn keys_are_synced_by_scope_and_device_linked_ones_in_the_device_file() {
         for key in [
             "recording.codec",
             "notify.previews_enabled",
@@ -740,23 +1045,317 @@ mod tests {
             "tasks.ledger_vault",
             "recording.destination_dir",
             "recording.destination_profile_id",
-        ] {
-            assert_eq!(synced_file(key), Some(SyncedFile::Device), "{key}");
-        }
-        for key in [
             "sdk_encryption",
             "sync.git_path",
             "bots.wake_enabled",
             "bots.voice_locale",
             "notes.hide_service_files",
+            "notes.include_private",
+            "sync.credential_source.01P",
+            "sync.credential_source.drive:https://github.com/acme/notes#main",
+            "bots.provider_credential_source.01PROV",
+        ] {
+            assert_eq!(synced_file(key), Some(SyncedFile::Device), "{key}");
+        }
+        for key in [
             "ui.first_run_setup_skipped",
             "notes.read.01ABC",
+            "notes.capture_draft.main",
+            "notes.pristine.01ABC",
             "account.acme.last_synced_ms",
-            "sync.credential_source.01P",
+            "sync.credential_source.",
             "recordng.fps",
         ] {
             assert_eq!(synced_file(key), None, "{key}");
         }
+        assert!(
+            synced_keys(SyncedFile::Device).all(|key| !key.ends_with('.')),
+            "families are read by prefix, never as a key"
+        );
+    }
+
+    #[test]
+    fn a_pulled_wake_phrase_switch_turns_listening_off_and_never_on() {
+        let catalog = Catalog::default();
+        let resolve = |k: &str, v: &str| from_portable(k, v, &catalog);
+
+        let on = values(&[(WAKE_ENABLED_KEY, "1")]);
+        let merged = merge(
+            Some(&on),
+            None,
+            &values(&[(WAKE_ENABLED_KEY, "0")]),
+            None,
+            &resolve,
+        );
+        assert!(merged.apply.is_empty(), "\"1\" is never applied");
+        assert_eq!(merged.file, on, "it stays in the file");
+        assert_eq!(
+            merged.base_if_pushed,
+            values(&[(WAKE_ENABLED_KEY, "0")]),
+            "the base records this device's own value"
+        );
+        assert!(listening_off(&merged.file, Some("0")));
+        assert!(listening_off(&merged.file, None));
+        assert!(!listening_off(&merged.file, Some("1")));
+
+        let off = values(&[(WAKE_ENABLED_KEY, "0")]);
+        let local = values(&[(WAKE_ENABLED_KEY, "1")]);
+        let merged = merge(Some(&off), None, &local, Some(&local), &resolve);
+        assert_eq!(merged.apply, applied(&[(WAKE_ENABLED_KEY, Some("0"))]));
+        assert!(!listening_off(&merged.file, Some("0")));
+    }
+
+    #[test]
+    fn a_path_is_applied_only_where_it_exists_and_git_only_as_an_executable_outside_drives() {
+        let dir = std::env::temp_dir().join(format!("keeper-a1-{}", std::process::id()));
+        let drive = dir.join("drive");
+        std::fs::create_dir_all(&drive).expect("dirs");
+        let catalog = Catalog {
+            drives_known: true,
+            drives: vec![local("01D", "https://x/y", "y", &drive.to_string_lossy())],
+            ..Catalog::default()
+        };
+        let file = |path: &Path, mode: u32| {
+            std::fs::write(path, b"#!/bin/sh\n").expect("file");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                    .expect("mode");
+            }
+            path.to_string_lossy().into_owned()
+        };
+        let git = file(&dir.join("git"), 0o755);
+        let git_path =
+            |path: &str, catalog: &Catalog| from_portable("sync.git_path", path, catalog);
+        assert_eq!(git_path(&git, &catalog).as_deref(), Some(git.as_str()));
+        assert_eq!(
+            git_path(&git, &Catalog::default()),
+            None,
+            "an unreadable drive list cannot vouch for it"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            git_path(&file(&dir.join("plain"), 0o644), &catalog),
+            None,
+            "not executable"
+        );
+        assert_eq!(
+            git_path(&file(&drive.join("git"), 0o755), &catalog),
+            None,
+            "inside a drive anyone with push access could have put it"
+        );
+        assert_eq!(git_path(&dir.to_string_lossy(), &catalog), None, "a folder");
+        let missing = dir.join("no-git").to_string_lossy().into_owned();
+        assert_eq!(git_path(&missing, &catalog), None);
+        // Other paths still take a folder or a file.
+        let here = dir.to_string_lossy();
+        assert_eq!(
+            from_portable("recording.destination_dir", &here, &catalog).as_deref(),
+            Some(here.as_ref())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn account_catalog() -> Catalog {
+        Catalog {
+            account_id: Some("acme".to_owned()),
+            trusted_origins: vec![
+                "https://github.com".to_owned(),
+                "http://localhost:11434".to_owned(),
+            ],
+            ..catalog()
+        }
+    }
+
+    const DRIVE_CRED: &str =
+        "sync.credential_source.drive:https://github.com/acme/notes#main^Notes";
+    const PROVIDER_CRED: &str =
+        "bots.provider_credential_source.provider:ollama:http://localhost:11434";
+
+    #[test]
+    fn credential_sources_travel_by_reference_and_come_back_bound_to_this_account() {
+        let catalog = account_catalog();
+        let rows: BTreeMap<String, String> = [
+            ("sync.credential_source.01DRIVE", "account:acme"),
+            ("bots.provider_credential_source.01PROV", "account:acme"),
+            // Bound to another account: the keychain, which is no row.
+            ("sync.credential_source.01OLD", "account:globex"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let local = local_from_rows(rows, &catalog, None);
+        assert_eq!(
+            local,
+            values(&[(PROVIDER_CRED, "account"), (DRIVE_CRED, "account")])
+        );
+
+        for (portable, stored) in [
+            (DRIVE_CRED, "sync.credential_source.01DRIVE"),
+            (PROVIDER_CRED, "bots.provider_credential_source.01PROV"),
+        ] {
+            assert_eq!(stored_key(portable, &catalog).as_deref(), Some(stored));
+            assert_eq!(
+                from_portable(portable, "account", &catalog).as_deref(),
+                Some("account:acme")
+            );
+        }
+        assert_eq!(
+            stored_key("recording.codec", &catalog).as_deref(),
+            Some("recording.codec")
+        );
+
+        // A drive this device does not have: kept in the file, not applied,
+        // and the base records this device's own (absent) value.
+        let elsewhere = "sync.credential_source.drive:https://github.com/acme/other#main";
+        assert_eq!(stored_key(elsewhere, &catalog), None);
+        assert_eq!(from_portable(elsewhere, "account", &catalog), None);
+        let remote = values(&[(elsewhere, "account"), (DRIVE_CRED, "account")]);
+        let resolve = |k: &str, v: &str| from_portable(k, v, &catalog);
+        let merged = merge(Some(&remote), None, &Values::default(), None, &resolve);
+        assert_eq!(merged.file, remote);
+        assert_eq!(
+            merged.apply,
+            applied(&[(DRIVE_CRED, Some("account:acme"))]),
+            "only the drive here is bound"
+        );
+        assert_eq!(merged.base_if_pushed, values(&[(DRIVE_CRED, "account")]));
+
+        // Without an account nothing is bound.
+        let signed_out = Catalog {
+            account_id: None,
+            ..account_catalog()
+        };
+        assert_eq!(from_portable(DRIVE_CRED, "account", &signed_out), None);
+
+        // A drive or provider away from the account's own hosts is never
+        // bound from a file, though the person may still choose it here.
+        for untrusted in [
+            vec!["http://localhost:11434".to_owned()],
+            vec![
+                "https://github.com:8443".to_owned(),
+                "http://localhost:11434".to_owned(),
+            ],
+        ] {
+            let catalog = Catalog {
+                trusted_origins: untrusted,
+                ..account_catalog()
+            };
+            assert_eq!(from_portable(DRIVE_CRED, "account", &catalog), None);
+            assert_eq!(
+                from_portable(PROVIDER_CRED, "account", &catalog).as_deref(),
+                Some("account:acme")
+            );
+        }
+        let catalog = Catalog {
+            trusted_origins: vec!["https://github.com".to_owned()],
+            ..account_catalog()
+        };
+        assert_eq!(from_portable(PROVIDER_CRED, "account", &catalog), None);
+        let catalog = account_catalog();
+        let other_account: BTreeMap<String, String> = [(
+            "bots.provider_credential_source.01PROV".to_owned(),
+            "account:globex".to_owned(),
+        )]
+        .into();
+        assert!(
+            local_from_rows(other_account, &catalog, None)
+                .values
+                .is_empty(),
+            "a row bound to another account is the keychain: nothing travels"
+        );
+
+        // A hand-written value other than `account` is kept, never applied.
+        let text = format!("[settings]\n\"{DRIVE_CRED}\" = \"keychain\"\n");
+        let parsed = Values::parse(text.as_bytes(), SyncedFile::Device).expect("parses");
+        assert!(parsed.values.is_empty());
+        assert!(parsed.preserved.contains_key(DRIVE_CRED));
+    }
+
+    fn two_drives() -> Catalog {
+        let remote = "https://git.acme.dev/tg/tgdrive.git";
+        Catalog {
+            drives_known: true,
+            drives: vec![
+                local("01FULL", remote, "tgdrive", "/Users/tg/tgdrive"),
+                local(
+                    "01LIGHT",
+                    remote,
+                    "tgdrive-light",
+                    "/Users/tg/tgdrive-light",
+                ),
+                local(
+                    "01SOLO",
+                    "https://git.acme.dev/tg/solo",
+                    "solo",
+                    "/Users/tg/solo",
+                ),
+            ],
+            ..Catalog::default()
+        }
+    }
+
+    #[test]
+    fn two_drives_of_one_repository_are_told_apart_by_name() {
+        let catalog = two_drives();
+        let full = catalog.drive_reference("01FULL").expect("full");
+        let light = catalog.drive_reference("01LIGHT").expect("light");
+        assert_eq!(full, "drive:https://git.acme.dev/tg/tgdrive#main^tgdrive");
+        assert_eq!(
+            light,
+            "drive:https://git.acme.dev/tg/tgdrive#main^tgdrive-light"
+        );
+        assert_eq!(
+            catalog.drive_reference("01SOLO").as_deref(),
+            Some("drive:https://git.acme.dev/tg/solo#main^solo"),
+            "every reference carries the name"
+        );
+
+        for key in DRIVE_KEYS {
+            let resolve = |reference: &str| from_portable(key, reference, &catalog);
+            assert_eq!(resolve(&full).as_deref(), Some("01FULL"));
+            assert_eq!(resolve(&light).as_deref(), Some("01LIGHT"));
+            assert_eq!(
+                resolve("drive:https://git.acme.dev/tg/tgdrive#main"),
+                None,
+                "an unnamed reference to two drives names neither"
+            );
+            assert_eq!(
+                resolve("drive:https://git.acme.dev/tg/solo#main").as_deref(),
+                Some("01SOLO"),
+                "an unnamed reference to the only drive on its repository resolves"
+            );
+            assert_eq!(
+                resolve("drive:https://git.acme.dev/tg/tgdrive#main^gone"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn a_branch_is_never_read_as_a_name() {
+        let catalog = Catalog {
+            drives_known: true,
+            drives: vec![
+                LocalDrive {
+                    branch: "feature@x".to_owned(),
+                    ..local("01AT", "https://git.acme.dev/r", "r", "/r1")
+                },
+                LocalDrive {
+                    branch: "feature".to_owned(),
+                    ..local("01X", "https://git.acme.dev/r", "x", "/r2")
+                },
+            ],
+            ..Catalog::default()
+        };
+        let at = catalog.drive_reference("01AT").expect("at");
+        assert_eq!(at, "drive:https://git.acme.dev/r#feature@x^r");
+        assert_eq!(catalog.resolve_drive(&at), Some("01AT"));
+        assert_eq!(
+            catalog.resolve_drive("drive:https://git.acme.dev/r#feature@x"),
+            Some("01AT")
+        );
     }
 
     #[test]
@@ -1033,18 +1632,32 @@ mod tests {
         assert_eq!(a.file, file);
     }
 
+    fn local(id: &str, remote: &str, name: &str, path: &str) -> LocalDrive {
+        LocalDrive {
+            profile_id: id.to_owned(),
+            remote_url: remote.to_owned(),
+            branch: "main".to_owned(),
+            name: name.to_owned(),
+            local_path: path.to_owned(),
+        }
+    }
+
     fn catalog() -> Catalog {
         Catalog {
             drives_known: true,
-            drives: vec![(
-                "01DRIVE".to_owned(),
-                DriveRef::new("https://tg:secret@GitHub.com/acme/notes.git/", "main"),
+            drives: vec![local(
+                "01DRIVE",
+                "https://tg:secret@GitHub.com/acme/notes.git/",
+                "Notes",
+                "/Users/tg/notes",
             )],
             providers: vec![(
                 "01PROV".to_owned(),
                 ProviderRef::new("ollama", "HTTP://LocalHost:11434/"),
             )],
             bots: vec![("01BOT".to_owned(), "01PROV".to_owned(), "llama3".to_owned())],
+            account_id: None,
+            trusted_origins: Vec::new(),
         }
     }
 
@@ -1053,7 +1666,7 @@ mod tests {
         let catalog = catalog();
         for key in DRIVE_KEYS {
             let portable = to_portable(key, "01DRIVE", &catalog).expect("known drive");
-            assert_eq!(portable, "drive:https://github.com/acme/notes#main");
+            assert_eq!(portable, "drive:https://github.com/acme/notes#main^Notes");
             assert_eq!(
                 from_portable(key, &portable, &catalog).as_deref(),
                 Some("01DRIVE")

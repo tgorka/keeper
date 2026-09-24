@@ -105,6 +105,9 @@ mod anchor {
 /// One sheet in flight, held until its completion has run.
 struct Live {
     session: Retained<ASWebAuthenticationSession>,
+    /// The registry the sheet reports to: a cancel of one registry's
+    /// sign-ins leaves the other's sheets open.
+    flows: Arc<OAuthFlowRegistry>,
     _anchor: Retained<anchor::Anchor>,
     _completion: RcBlock<dyn Fn(*mut NSURL, *mut NSError)>,
 }
@@ -248,6 +251,7 @@ pub fn present(
             state.to_owned(),
             Live {
                 session: session.clone(),
+                flows: Arc::clone(flows),
                 _anchor: anchor,
                 _completion: completion,
             },
@@ -303,13 +307,15 @@ fn release(app: &tauri::AppHandle, state: String) {
     }
 }
 
-/// Cancel every open sheet. Each one's completion then reports
-/// `CanceledLogin`, which [`ending`] turns into a cancel of its own flow.
+/// Cancel every open sheet that reports to `flows`. Each one's completion
+/// then reports `CanceledLogin`, which [`ending`] turns into a cancel of its
+/// own flow.
 #[allow(unsafe_code)]
-pub fn cancel_all() {
+pub fn cancel_for(flows: &Arc<OAuthFlowRegistry>) {
     let sessions: Vec<Retained<ASWebAuthenticationSession>> = LIVE.with(|live| {
         live.borrow()
             .values()
+            .filter(|live| Arc::ptr_eq(&live.flows, flows))
             .map(|live| live.session.clone())
             .collect()
     });
@@ -319,6 +325,17 @@ pub fn cancel_all() {
         // the main thread (this is reached through `run_on_main_thread`) and
         // outside the table's borrow, since it may run the completion — which
         // only queues its release — before it returns.
+        unsafe { session.cancel() };
+    }
+}
+
+/// Cancel the sheet open for `state`, if there still is one.
+#[allow(unsafe_code)]
+pub fn cancel(state: &str) {
+    let session = LIVE.with(|live| live.borrow().get(state).map(|live| live.session.clone()));
+    if let Some(session) = session {
+        // SAFETY: as in `cancel_all`: safe at any time on a started session,
+        // on the main thread, outside the table's borrow.
         unsafe { session.cancel() };
     }
 }

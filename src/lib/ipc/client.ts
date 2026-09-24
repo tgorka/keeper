@@ -54,6 +54,7 @@ export function telemetryRemoteConfig(): Promise<TelemetryRemoteConfigVm> {
 export type { AccountDeviceVm } from "./gen/AccountDeviceVm";
 export type { AccountIdentityVm } from "./gen/AccountIdentityVm";
 export type { AccountOffersVm } from "./gen/AccountOffersVm";
+export type { AccountRestoreVm } from "./gen/AccountRestoreVm";
 export type { AccountSetupVm } from "./gen/AccountSetupVm";
 export type { AccountShareVm } from "./gen/AccountShareVm";
 export type { AccountStateVm } from "./gen/AccountStateVm";
@@ -823,8 +824,10 @@ export async function loginPassword(
 
 /**
  * OIDC (OAuth 2.0 / MSC3861) login (Story 2.2). Sends the homeserver to the Rust
- * core, which runs the store-less SSS probe, opens the system browser for OAuth
- * consent, awaits the `keeper://oauth/callback` deep link, finishes the token
+ * core, which runs the store-less SSS probe, opens the browser for OAuth
+ * consent (the account's web-auth session where the platform has one, Epic 85
+ * AD-331), awaits the `dev.tgorka.keeper:/oauth/callback` redirect (RFC 8252
+ * reverse-DNS form), finishes the token
  * exchange, persists the session to the Keychain, and writes the registry row.
  * Resolves with the non-secret {@link AccountVm}; rejects with the
  * {@link IpcError} envelope (whose `code` distinguishes non-SSS / OIDC

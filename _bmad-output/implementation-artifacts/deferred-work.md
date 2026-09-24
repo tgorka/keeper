@@ -6561,6 +6561,7 @@ origin: epic 82's plan, 2026-09-23 (AD-311; spec §3.1, decision 3)
 location: `src-tauri/crates/keeper-core/src/org_account/descriptor.rs` (`redirect_uri`, `forge_redirect_uri` defaults), `src-tauri/crates/keeper/tauri.conf.json:52-55` (`deep-link.desktop.schemes: ["keeper"]`), `gen/apple/project.yml` (`CFBundleURLTypes`)
 reason: RFC 8252 §7.1 says a private-use scheme MUST be reverse-DNS (`dev.tgorka.keeper:/oauth/…`), and §8.4 says an authorization server SHOULD reject a scheme with no period. The owner kept `keeper://` as asked. Zitadel accepts custom schemes, Gitea and Forgejo showed no scheme validation, and Authelia is unverified (`research-account-2026-09-23.md` §9.2 T1). A descriptor may already name any `redirect_uri`. On macOS and iOS a reverse-DNS value works through the auth session, which needs no registration for its callback scheme. On other desktops it arrives by deep link, and only `keeper` is registered. Revisit when a provider refuses `keeper://`: register `dev.tgorka.keeper` with the deep-link plugin, and decide whether the default moves.
 status: open
+note: 2026-09-24 — DW-294: epic 85's amendment A3 moved the Matrix OIDC redirect to `dev.tgorka.keeper:/oauth/callback` and registered `dev.tgorka.keeper` for deep links (tauri.conf.json, project.yml, both Info plists), because the homeserver's client registration refused `keeper://`. The account's own redirects (`keeper://oauth/<id>/…`) are unchanged, so the entry stays open for them.
 
 ### DW-295: One access token serves every service that accepts it; there is no per-service token exchange.
 
@@ -6568,6 +6569,11 @@ origin: epic 82's plan, 2026-09-23 (AD-315 and its refinement A2c; spec §3.6)
 location: `src-tauri/crates/keeper-core/src/org_account/session.rs` (`access_token`), `src-tauri/crates/keeper/src/account_ipc.rs` / the `SyncPlatform::secret_get` bridge, `src-tauri/crates/keeper-core/src/bots/**` (the provider credential read)
 reason: a drive or a bot provider set to "Use my account" receives the sign-in access token. A token carrying N audiences can be replayed at any of the N, and RFC 9700 §2.3 asks for tokens restricted to one resource server or a small set (`research-account-2026-09-23.md` §6.5). Zitadel and authentik 2026.8 support RFC 8693 token exchange, which would mint a per-service token with one audience. Two consequences today: an operator must add every service's audience to the one token, through `extra_scopes`; and a drive on a forge that accepts only its own tokens (the `oauth`-mode forge) cannot use the account, because the drive receives the IdP token, not the forge token. Revisit when a second service is set to the account, or when an operator asks for narrow tokens.
 status: open
+note: 2026-09-24 — DW-295: epic 85 (AD-330) removes the second consequence for drives on the account's forge host: such a drive now gets the forge's own token. The first consequence, one sign-in token accepted by many audiences, stays open, and it now reaches Ollama too (DW-308).
+
+DW-302: replace `status: open` with:
+status: done 2026-09-24
+resolution: DW-302 — resolved by epic 85 (AD-327): a drive's identity is its remote, branch and name, `drives.toml` keeps both drives of one repository, each is offered separately, and a reference names the drive when two local drives share remote and branch (`drive:<remote>#<branch>@<name>`).
 
 ### DW-296: `mainSyncFolder` cannot come from the account's device file.
 
@@ -6637,4 +6643,123 @@ status: open
 origin: epic 84's plan, 2026-09-24 (AD-323, UX-DR118)
 location: `src/components/auth/login-screen.tsx` (`BeeperTab`, email → code), `src-tauri/crates/keeper-core/src/org_account/manifest.rs` (`MatrixRecord`)
 reason: a Beeper sign-in starts from an email address and a code (`login-screen.tsx:354-357`), and the homeserver is fixed at `matrix.beeper.com`. The record carries the Matrix `user_id`, not the email, so there is nothing to prefill beyond the tab. Carrying the email would put a personal address into the repository for a single field. Revisit if people ask for it.
+status: open
+
+### DW-306: Chat pins, drafts and read marks stay on the device.
+
+origin: epic 85's plan, 2026-09-24 (AD-326, AD-328)
+location: `src-tauri/crates/keeper-core/src/registry.rs:112-115` (`pins`), `:126-129` (`drafts`), `:141-144` (`chat_incognito`), `:157-160` (`outbox`), `:1820-1838` (`notes.read.*`); `src-tauri/crates/keeper-core/src/config/keys.rs:673` (`notes.read.`)
+reason: the owner asked for "all the settings". These are not settings: they are this install's working state. A pin order is per account and per room, and it would fight across devices whose room lists differ. A draft is half a message (DW-73 already records that it sits in keeper.db in plain text). A note's read mark is what makes another device's edit show as unread here, so carrying it would hide exactly the change it exists to show (`keys.rs:673-684`). A room's per-chat incognito override is a per-room choice that no record has a place for yet. Matrix's own read receipts already travel through the homeserver (`timeline.rs:589`). Revisit if the person asks for pins to follow, as a per-account list in `MatrixState`, which every device would then have to merge.
+status: open
+
+### DW-307: The capture window's place and size stay on the device.
+
+origin: epic 85's plan, 2026-09-24 (AD-326)
+location: `src-tauri/crates/keeper-core/src/config/keys.rs:645` (`notes.capture_placement.`), `:632` (`notes.capture_draft.`), `:659` (`notes.pristine.`)
+reason: the capture window's position, size and pin are rewritten at every dismissal, and they are measured in this display's coordinates. Another device's screen would put the window somewhere off-screen or wrong. The live capture draft pointer and the list of just-created notes are this session's bookkeeping. All three stay `SessionState` and are left out of `synced_file`. Revisit if the capture window gains a placement expressed relative to the screen, which could travel.
+status: open
+
+### DW-308: Hermes keeps its own key, by the owner's choice.
+
+origin: epic 85's plan, 2026-09-24 (the owner's answer 2; AD-330)
+location: `src-tauri/crates/keeper-core/src/bots/http.rs:113-116` (`Authorization: Bearer`), `src-tauri/crates/keeper-core/src/bots/mod.rs:439` (`resolve_credential`); makistack `docs/runbooks/nixie.md` (`API_SERVER_KEY`)
+reason: Hermes on `100.101.101.20:8642` checks a static bearer key and has no way to validate a ZITADEL token (live: `GET /v1/models` without the key gives 401). The owner chose to keep the key rather than put an auth proxy in front of it, since that port reaches the nixie profile with the Paseo MCP broker. A restored Hermes provider therefore has credential `own`, and the existing *secretMissing* health state asks for the key once on each new device. Ollama has no authentication, so "use my account" there sends the sign-in token to a server that ignores it. The owner judged that harmless on the tailnet, but it is still a copy of the token given to one more host (DW-295). Revisit if Hermes gains inbound JWT validation, or if the owner puts `forward_auth` in front of 8642.
+status: open
+
+### DW-309: A drive deleted on another device is not deleted here.
+
+origin: epic 85's plan, 2026-09-24 (AD-328, AD-329)
+location: `src-tauri/crates/keeper-core/src/org_account/device_state.rs` (`restore_plan`), `src-tauri/crates/keeper-core/src/org_account/manifest.rs` (`merge`'s device membership)
+reason: each device's file is written only by that device, and a restore only adds what is absent. When the person removes a drive on the Mac, the Mac's file and its `drives.toml` membership change, and nothing reaches the iPad's profiles. That is deliberate: a removal on one device is not an instruction to delete a clone, possibly with unpushed work, on another. The same holds for providers and Matrix accounts. Revisit if people ask for "remove everywhere", which would need an explicit, per-drive tombstone that each device confirms.
+status: open
+
+### DW-310: A device restores itself once per install.
+
+origin: epic 85's plan, 2026-09-24 (AD-329, D-27)
+location: `src-tauri/crates/keeper-core/src/registry.rs` (`account.<id>.restored`), `src-tauri/crates/keeper/src/account_restore.rs`
+reason: after the first restore, this device's own state is the truth, and it overwrites its file at every sync. A drive the person deletes afterwards therefore stays deleted. But a drive lost through some other cause (a `sync.db` reset, a profile removed by hand) is not brought back by a later sync either. The file forgets it at the next sync, because the file mirrors the device. *Forget this account* and setting it up again restores again, idempotently. Revisit if a "Restore from your account…" command is asked for, which would run the restore on demand against the file as it stands before this device's next write.
+status: open
+
+### DW-311: A device reinstalled with another operating system or class is a new device.
+
+origin: epic 85's plan, 2026-09-24 (AD-329)
+location: `src-tauri/crates/keeper-core/src/org_account/layout.rs:241-271` (`free_device_slug`)
+reason: a name is adopted only when the existing record has the same class and platform. A Mac reinstalled as Linux under the same host name, or an iPhone backup restored to an iPad, gets `name-xxxx`, restores nothing, and leaves the old record and its files in the repository. Adopting across platforms would restore macOS paths (`/Volumes/...`, `/opt/homebrew/bin/git`) onto a disk where they mean nothing. The machine fingerprint (A5) also changes when the operating system itself is reinstalled on Linux (`/etc/machine-id` is regenerated) or on Windows (`MachineGuid` is regenerated). There, reinstalling keeper keeps the device, but reinstalling the OS makes a new one. macOS's `IOPlatformUUID` belongs to the hardware and survives an OS reinstall. Revisit with an explicit choice on the setup sheet ("This is my old hesperia"), which would restore the portable half and leave the paths waiting.
+status: open
+
+### DW-312: With drives on the forge sign-in, one device's forge refresh can disconnect every other device's drives.
+
+origin: epic 85's plan, 2026-09-24 (AD-330; extends DW-292)
+location: `src-tauri/crates/keeper/src/account_ipc.rs` (`drive_credential`, `with_forge_retry`), `src-tauri/crates/keeper-core/src/org_account/oidc.rs:1281-1297` (`forge_token`, `forge_token_refreshed`); makistack `docker/forgejo/.env.template`
+reason: Forgejo keeps one grant per person and app. With `[oauth2] INVALIDATE_REFRESH_TOKENS = true`, each issued token makes the other devices' refresh tokens stale (DW-292, inferred from Forgejo's code, not tested live, and not verified for 15.0.4's default). Until now only the config repository rode the forge token, refreshing at most at each account sync. Now every account-backed drive on electra does, and the forge token lasts one hour (measured), so two active devices would each refresh about hourly and push the other into *reconnect the repository*, taking its drives into `NeedsSignIn` with it. makistack's Forgejo template does not set the key. Revisit by setting `INVALIDATE_REFRESH_TOKENS = false` for electra's Forgejo, after a live two-device check on hesperia and a second device, or by moving drives to per-service tokens (DW-295).
+status: open
+
+### DW-313: A restored drive's schedules carry only their kind, schedule, mode and switch.
+
+origin: epic 85's plan, 2026-09-24 (AD-328)
+location: `src-tauri/crates/keeper-sync/src/db.rs:3150-3154` (`TASK_COLUMNS`), the shell's profile ↔ table rendering
+reason: a drive table's `schedules` are `{kind, schedule, mode, enabled}`, as the contract fixed them. The `tasks` row also holds `on_missed`, `missed_delay_ms`, `description`, a bot task's `bot_id`, `prompt_subpath` and `model`, and a copy task's `copy_source`, `copy_destination`, `replace_existing`, `prune_destination`, `refresh_missing` and `copy_lookback_ms`. A restored schedule gets the defaults for all of those, so a restored bot or copy task is recreated without what makes it that task. Host-wide tasks (a `NULL` `profile_id`) are not carried at all. Revisit when a restored bot or copy task is reported wrong: carry the whole row, minus id, lease and window, with a bot reference translated like a grant's drive.
+status: open
+
+### DW-314: The daily pull runs only while keeper runs, and only on a desktop.
+
+origin: epic 85's plan, 2026-09-24 (AD-332)
+location: `src-tauri/crates/keeper/src/lib.rs:663-707` (the `#[cfg(desktop)]` tray tick), `src-tauri/crates/keeper/src/account_ipc.rs` (`daily_tick`)
+reason: the pull rides the tray tick, so it stops when keeper quits, when the Mac sleeps (no wake hook exists), and on iOS. There the process is suspended soon after it goes to the background, keeper registers no `BGTaskScheduler` job, and a background task gets "thirty seconds or the system's discretion" (`docs/decisions.md:962-963`). keeper-syncd on Linux keeps ticking after the app quits, but it never uses the account. A quit keeper pulls at its next launch (`kick`, forced), and the phone pulls when it comes to the foreground. Revisit if people expect settings to reach a device that has not been opened for days: that needs a job scheduled by each OS.
+status: open
+
+### DW-315: The encryption choice travels as a choice for new accounts, and never re-keys a store already on the device.
+
+origin: epic 85's plan, 2026-09-24 (AD-326)
+location: `src-tauri/crates/keeper-core/src/auth.rs:614-618` (the posture read when an account is added), `:418-435` (`get_encryption_posture`, `set_encryption_posture`)
+reason: `sdk_encryption` is read only when a Matrix account is added, to decide whether its new store gets a keychain passphrase. A restored device therefore creates its stores the way the old one did, which is what the owner asked for. But a value that changes later, because it was pulled from the file or edited there by hand, applies only to accounts added afterwards. An account already on the device keeps the store it has, encrypted or not, and nothing says the two now disagree. Re-keying a store is a migration, not a settings write. Revisit if the Settings pane ever offers changing the posture, which would need the re-key and a sentence about accounts that were not moved.
+status: open
+
+### DW-316: When two drives share a remote, renaming one makes it a different drive to the other devices.
+
+origin: epic 85's plan, 2026-09-24 (AD-327)
+location: `src-tauri/crates/keeper-core/src/org_account/settings_sync.rs` (`DriveRef::reference`, `from_portable`), `src-tauri/crates/keeper-core/src/org_account/manifest.rs` (drive identity)
+reason: with two drives of one remote and branch, the name is part of each drive's identity and of its reference (`…#main@tgdrive-light`). Renaming `tgdrive-light` to `light` on the Mac pushes `@light`. Another device whose drive is still called `tgdrive-light` cannot resolve it, so it keeps its own value (A2'). It also sees `light` as a new offer, while the old record loses the Mac. A drive alone on its remote is unaffected, because its reference carries no name. Revisit if renames of such drives are reported, with a stable portable alias minted once and carried in the record.
+status: open
+
+### DW-317: A device record written before epic 85 has no machine fingerprint, so another machine with the same name, class and platform can adopt it.
+
+origin: epic 85's plan, 2026-09-24 (AD-329, A5)
+location: `src-tauri/crates/keeper-core/src/org_account/layout.rs` (`free_device_slug`, `plan`), `<login>/devices/*.toml`
+reason: `free_device_slug` adopts a record that records no `machine`, so that devices registered before epic 85 (hesperia among them) can come back after a reinstall. The same rule lets a *different* Mac with the same host name, class and platform take such a record over. It then restores the first Mac's drives, and from then on both Macs write one `device.<slug>.toml` and one `settings.<slug>.toml`. Device records are create-only (AD-324), so keeper cannot add the fingerprint to an old record later. A rename does not help either, because it moves the record without rewriting it (`layout.rs:396-397`). The window closes only when the record is written anew, which happens when the person deletes it in the forge and the device registers again. Revisit if it is ever seen. Two ways out: let a device write its fingerprint into its own record at the first sync after the upgrade, which makes `devices/<slug>.toml` rewritable by that device; or refuse to adopt a legacy record whose settings file changed within the last day.
+status: open
+
+### DW-318: An iPhone or iPad that is reinstalled gets a new name, and does not restore itself.
+
+origin: epic 85's plan, 2026-09-24 (AD-329, A5)
+location: `src-tauri/crates/keeper/src/account_ipc.rs:389-398` (`default_device_name` on iOS: the model plus a random four-character suffix), the shell's machine fingerprint (`None` on iOS)
+reason: iOS gives an app no stable machine id, so an iOS device's fingerprint is `None`, and its default name carries a random suffix drawn until the device registers. A reinstalled keeper on the same iPhone therefore proposes a new name, finds no record of it, and starts afresh: it seeds its settings from the latest phone (epic 84) and offers the drives, but restores nothing. The old record and its files stay in the repository. Revisit with an install id kept in the iOS keychain, which outlives the app [INFERENCE: keychain items of a deleted app are not guaranteed to survive], or with the explicit choice DW-311 describes.
+status: open
+
+### DW-319: An iOS reinstall never finds its own device file.
+
+origin: epic 85's review wave, 2026-09-24 (AD-329, A5; Rev85Sem m6b)
+location: `src-tauri/crates/keeper/src/account_ipc.rs` (the iOS default device name, a model plus a random suffix), `src-tauri/crates/keeper-core/src/org_account/layout.rs` (`free_device_slug`)
+reason: iOS offers no stable machine id to fingerprint, and the default name carries a random suffix, so a reinstalled iPhone registers as a new device and is seeded from the latest phone instead of restoring its own file. The person can type the old name on the setup sheet; a fingerprint-free adoption would let any phone with that name take the file. Revisit when iOS gains an app-reinstall-stable identifier keeper may use, or with an explicit "this is my old iPhone" choice.
+status: open
+
+### DW-320: The same repository under a third name is offered once per named drive.
+
+origin: epic 85's review wave, 2026-09-24 (AD-327; Rev85Sem m9)
+location: `src-tauri/crates/keeper-core/src/org_account/manifest.rs` (`offers`)
+reason: drive identity is remote + branch + name, so a device that holds `tgdrive`'s repository under another name is still offered `tgdrive` and `tgdrive-light`; adding one clones the repository again. That is deliberate (two named drives on one repository can differ in subpaths and virtual policy), but for a person who wants one copy per device it reads as duplication. Revisit if a person reports it: an offer could say "you already sync this repository as {name}".
+status: open
+
+### DW-321: The device file shows local paths to everyone who can read the config repository.
+
+origin: epic 85's review wave, 2026-09-24 (AD-328; Rev85Sem m6)
+location: `src-tauri/crates/keeper/src/account_restore.rs` (`drive_table`), `<login>/device.<slug>.toml`
+reason: a device restores itself from its drive tables, so they must carry each drive's local folder (which names the OS user and folder layout), grant subtrees and muted networks. Everyone with clone access to the repository can read them. Commit authors and incognito flags are left out (epic 85 F6). Closing it needs per-directory read permissions on the forge, or encrypting the device file to the person's key. Revisit when the repository is shared beyond people who trust each other (with DW-303).
+status: open
+
+### DW-322: A drive on the forge does not force a token refresh after a refusal.
+
+origin: epic 85's review wave, 2026-09-24 (AD-330; Rev85Sem m3)
+location: `src-tauri/crates/keeper/src/account_ipc.rs` (`drive_credential`), keeper-sync `SyncPlatform::secret_get`
+reason: a drive that uses the account on the forge's host asks for the Forgejo token through `secret_get`, which cannot tell a retry after a 401 from an ordinary read. The token is refreshed before it expires, so the common case works; a token the server invalidated early (grant revoked, Forgejo's refresh-token rotation on another device) parks the drive until the next pass after expiry or a person's retry. Closing it needs a `secret_refresh(key)` hook in keeper-sync that the engine calls once on an auth refusal. Guessing from the shell would spend refresh tokens Forgejo invalidates.
 status: open

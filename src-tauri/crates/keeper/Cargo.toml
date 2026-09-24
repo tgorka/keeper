@@ -36,6 +36,14 @@ tauri-plugin-opener = { workspace = true }
 tauri-plugin-deep-link = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# This device's drive tables in the account's `device.<slug>.toml` (Epic 85,
+# AD-328): core takes a drive's full profile as an opaque `toml::Table` the
+# shell renders. Already in the workspace catalog; no new crate in the lock.
+toml = { workspace = true }
+# This device's fingerprint in the account's device records (Epic 85): a
+# sha256 of the OS machine id and the sign-in's `sub`, so it names this
+# machine to this person only. Already in the lock via keeper-sync.
+sha2 = { workspace = true }
 # Generates the `LifecyclePhase` frontend binding (Epic 14-1) into
 # `src/lib/ipc/gen/` via the `#[ts(export)]` export test, matching keeper-core's
 # VM export step. Bindings dir is set by the workspace `TS_RS_EXPORT_DIR` env.

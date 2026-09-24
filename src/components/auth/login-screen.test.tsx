@@ -594,18 +594,38 @@ describe("LoginScreen Matrix accounts from the account (Epic 84, UX-DR118)", () 
     expect(screen.queryByLabelText("Homeserver")).not.toBeInTheDocument();
   });
 
-  it("prefills a single-sign-on account and signs in through it, without asking for a password", async () => {
-    loginOidc.mockResolvedValue(account);
+  it("starts single sign-on at the offered homeserver on the offer's own click", async () => {
+    loginOidc.mockReturnValue(new Promise(() => {}));
     offering(matrixOffer({ kind: "oidc" }));
     render(<LoginScreen addMode />);
-    const offerButton = screen.getByRole("button", { name: "@tgorka:acme.dev matrix.acme.dev" });
-    fireEvent.click(offerButton);
+    fireEvent.click(screen.getByRole("button", { name: "@tgorka:acme.dev matrix.acme.dev" }));
 
-    expect(screen.getByLabelText("Homeserver")).toHaveValue("https://matrix.acme.dev/");
-    expect(screen.getByLabelText("Username")).toHaveValue("@tgorka:acme.dev");
+    // No second press on "Sign in with single sign-on": the choice is the sign-in.
+    await waitFor(() =>
+      expect(loginOidc).toHaveBeenCalledExactlyOnceWith("https://matrix.acme.dev/"),
+    );
+    expect(await screen.findByText("Complete sign-in in your browser…")).toBeInTheDocument();
+    expect(loginPassword).not.toHaveBeenCalled();
+  });
+
+  it("starts it once: the form coming back after a cancel, and the tab remounting, start nothing", async () => {
+    loginOidc.mockRejectedValue(ipcError("oauthCancelled"));
+    offering(matrixOffer({ kind: "oidc" }));
+    render(<LoginScreen addMode />);
+    fireEvent.click(screen.getByRole("button", { name: "@tgorka:acme.dev matrix.acme.dev" }));
+    await waitFor(() => expect(loginOidc).toHaveBeenCalledTimes(1));
+
+    // Back on the form, the homeserver the offer filled in stays, with no password asked for.
+    expect(await screen.findByLabelText("Homeserver")).toHaveValue("https://matrix.acme.dev/");
     expect(screen.getByLabelText("Password")).not.toHaveFocus();
 
-    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
-    await waitFor(() => expect(loginOidc).toHaveBeenCalledWith("https://matrix.acme.dev/"));
+    // A trip to Beeper and back remounts the Password tab.
+    await openBeeperTab();
+    const password = screen.getByRole("tab", { name: "Password & SSO" });
+    fireEvent.mouseDown(password);
+    fireEvent.click(password);
+    expect(await screen.findByLabelText("Homeserver")).toBeInTheDocument();
+    await Promise.resolve();
+    expect(loginOidc).toHaveBeenCalledTimes(1);
   });
 });

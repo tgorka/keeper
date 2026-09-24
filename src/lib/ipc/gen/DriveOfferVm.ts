@@ -2,7 +2,7 @@
 
 export type DriveOfferVm = { 
 /**
- * `drive:<normalized remote>#<branch>`.
+ * `drive:<normalized remote>#<branch>^<name>`.
  */
 key: string, name: string, remoteUrl: string, branch: string, 
 /**

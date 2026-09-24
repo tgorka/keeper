@@ -94,7 +94,8 @@ pub struct AppState {
     pub accounts: AccountManager,
     /// In-flight Matrix OIDC (OAuth 2.0 / MSC3861) callback registry (Story
     /// 2.2). The deep-link `on_open_url` handler resolves incoming
-    /// `keeper://oauth/callback` URLs against it; each `login_oidc` call
+    /// `dev.tgorka.keeper:/oauth/callback` URLs against it (the sign-in sheet
+    /// delivers there too); each `login_oidc` call
     /// registers its pending flow here, and `cancel_oidc` aborts all pending
     /// flows — which is why the organisation account keeps its own.
     pub oauth_flows: Arc<OAuthFlowRegistry>,
@@ -2214,22 +2215,27 @@ pub async fn login_password(
     username: String,
     password: String,
 ) -> Result<AccountVm, IpcError> {
-    let added = auth::login_password(state.platform.as_ref(), &homeserver, &username, &password)
-        .await
-        .map_err(to_ipc_error)?;
-    // The account travels in the person's `matrix.toml` (Epic 84, AD-325).
-    crate::account_ipc::note_local_change();
+    let mut added =
+        auth::login_password(state.platform.as_ref(), &homeserver, &username, &password)
+            .await
+            .map_err(to_ipc_error)?;
+    // The account travels in the person's `matrix.toml` (Epic 84, AD-325),
+    // and takes the preferences a restore kept for it (Epic 85).
+    crate::account_ipc::matrix_account_added(&state, &mut added);
     Ok(added)
 }
 
 /// OIDC (OAuth 2.0 / MSC3861) login command (Story 2.2).
 ///
 /// Runs the shared add-account flow with the OIDC mechanism: the whole browser
-/// round-trip (open the system browser, await the `keeper://oauth/callback` deep
-/// link, finish the token exchange) happens inside the core `authenticate` step.
+/// round-trip (open the authorization page, await the `dev.tgorka.keeper:/oauth/callback`
+/// redirect, finish the token exchange) happens inside the core `authenticate`
+/// step. Where the platform has a sign-in sheet (Apple) the page opens there,
+/// so the identity provider's session from the account sign-in carries over
+/// (AD-331); elsewhere the system browser opens and the deep link returns.
 /// The pending flow is keyed by its OAuth `state` in the shared registry so the
-/// deep-link `on_open_url` handler can route the callback back to it; a
-/// concurrent `cancel_oidc` aborts it. On success resolves to a non-secret
+/// sheet or the deep-link `on_open_url` handler can route the callback back to
+/// it; a concurrent `cancel_oidc` aborts it. On success resolves to a non-secret
 /// [`AccountVm`]; on failure (unsupported / timed-out / cancelled / failed /
 /// non-SSS) funnels the `CoreError` through [`to_ipc_error`]. No token or
 /// authorization `code`/`state` ever crosses back to JavaScript.
@@ -2238,14 +2244,21 @@ pub async fn login_oidc(
     state: State<'_, AppState>,
     homeserver: String,
 ) -> Result<AccountVm, IpcError> {
-    let added = auth::login_oidc(
-        state.platform.as_ref(),
-        &homeserver,
-        state.oauth_flows.clone(),
-    )
-    .await
-    .map_err(to_ipc_error)?;
-    crate::account_ipc::note_local_change();
+    sign_in_oidc(&state, &homeserver).await
+}
+
+/// The OIDC login's body, for the command and for the one single sign-on a
+/// restore starts by itself (AD-329).
+pub(crate) async fn sign_in_oidc(
+    state: &AppState,
+    homeserver: &str,
+) -> Result<AccountVm, IpcError> {
+    let browser =
+        crate::web_auth::MatrixSignIn::new(state.platform.as_ref(), state.oauth_flows.clone());
+    let added = auth::login_oidc(&browser, homeserver, state.oauth_flows.clone()).await;
+    browser.close();
+    let mut added = added.map_err(to_ipc_error)?;
+    crate::account_ipc::matrix_account_added(state, &mut added);
     Ok(added)
 }
 
@@ -2295,12 +2308,12 @@ pub async fn login_beeper(
     email: String,
     code: String,
 ) -> Result<AccountVm, IpcError> {
-    let added = state
+    let mut added = state
         .beeper_flows
         .login(state.platform.as_ref(), &email, &code)
         .await
         .map_err(to_ipc_error)?;
-    crate::account_ipc::note_local_change();
+    crate::account_ipc::matrix_account_added(&state, &mut added);
     Ok(added)
 }
 

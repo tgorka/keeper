@@ -102,9 +102,11 @@ targets:
         # when that list is empty, so the two must agree. Duplicated in
         # crates/keeper/Info.ios.plist for the same reason as the sentences
         # above: that file is the last word in the build's plist merge.
+        # `dev.tgorka.keeper:` (Epic 85) is the Matrix single sign-on's
+        # RFC 8252 redirect scheme, the only native form homeservers accept.
         CFBundleURLTypes:
           - CFBundleURLName: keeper
-            CFBundleURLSchemes: [keeper]
+            CFBundleURLSchemes: [keeper, dev.tgorka.keeper]
     entitlements:
       path: keeper_iOS/keeper_iOS.entitlements
       # Source of truth for the entitlements (Story 14.7, FR-65): XcodeGen REGENERATES

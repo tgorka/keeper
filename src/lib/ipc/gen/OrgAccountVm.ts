@@ -2,6 +2,7 @@
 import type { AccountDeviceVm } from "./AccountDeviceVm";
 import type { AccountIdentityVm } from "./AccountIdentityVm";
 import type { AccountOffersVm } from "./AccountOffersVm";
+import type { AccountRestoreVm } from "./AccountRestoreVm";
 import type { AccountStateVm } from "./AccountStateVm";
 
 export type OrgAccountVm = { configured: boolean, id: string | null, name: string | null, issuerHost: string | null, repoHost: string | null, 
@@ -22,6 +23,11 @@ faults: Array<string>,
  * other devices and not here. Empty without an account.
  */
 offers: AccountOffersVm, 
+/**
+ * What restoring this device from the account did, and what waits.
+ * Empty without an account.
+ */
+restore: AccountRestoreVm, 
 /**
  * Increases with every VM this process composes, so a subscriber that
  * receives two out of order keeps the newer one.

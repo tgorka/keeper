@@ -48,6 +48,20 @@ tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 
 development_status:
+  # Epic 85: the owner's four asks on the epic-84 build — every setting in the config repository, device-linked ones too, so a device can be restored from it (only tokens and passwords stay local, and OAuth replaces them); a pull at least daily, even in the background; tgdrive-light missing from the repository on hesperia (two drives on one remote); and OAuth for every drive and bot on hesperia, plus Matrix @tgorka on electra through the account. Owner answered 2026-09-24: Matrix — change makistack and deploy (Tuwunel 1.8.1 gets ZITADEL and its OIDC server; @tgorka kept); Hermes keeps its own key; restore is automatic. Coordinator pushback accepted: a restore never arms the microphone.
+  # Stack rungs: epic85-plan (docs + ledgers), then epic85-core (85.1–85.3's keeper-core rules, device_state.rs, layout, the restore registry keys, free_device_slug, AccountRestoreVm, bindings, the OrgAccountVm fixture ripple and the one-line shell hunks the new fields force), then epic85-surface (the shell's device file, restore, forge-token drives, Matrix sheet and dev.tgorka.keeper scheme with oauth.rs's REDIRECT_URI, daily tick and its guard; the restore line, listening offer, sheet note and SSO offer; mock-shell; docs/account.md). makistack is its own PR stack (#860 merged as d1e4405; the OIDC-server follow-up). Shell crate by inspection; CI macOS is the gate.
+  # Contract amendments A1 (bots.wake_enabled is Settable::Never, so no pin arms the microphone), A2 (the setup sheet promises a restore only when registered is already true; a reinstall adopts its name at the first sync), A3 (the Matrix redirect is dev.tgorka.keeper:/oauth/callback), A4 (restore_pending also keeps grants on drives that wait) and A5 (a reinstall adopts its name only on the same machine: new device records carry machine = sha256(OS machine id + sub)) are in the epic's text.
+  # Owed on hesperia: the install; settings.hesperia.toml, device.hesperia.toml and drives.toml in the forge (both tgdrive drives, no secret); drives fetching and pushing on the forge token; Matrix @tgorka through the sheet with no password; a second install restoring itself with listening left off; the daily pull in the log. Front's real-browser proof of the restore line and the SSO offer is owed too.
+  epic-85: in-progress
+  85-1-every-setting-travels: review
+  85-2-two-drives-on-one-remote-stay-two: review
+  85-3-the-device-state-file: review
+  85-4-this-device-restores-itself: review
+  85-5-drives-use-the-forge-sign-in: review
+  85-6-matrix-signs-in-through-the-account: review
+  85-7-a-daily-pull-while-keeper-runs: review
+  # DW-306…DW-318 are opened by this plan; DW-302 closes here (AD-327). Notes are added to DW-294 and DW-295.
+
   # Epic 84: the owner's question on the account build — "is all the settings will be reflected in the file on the sync?": pull them if the file exists, else take them from another of the person's devices, else create them from the template. Owner answered 2026-09-24: synced and editable (new files beside the pins; keeper.toml stays the lock), carry everything (drives, bot providers, Matrix accounts, the preference keys), and a new device's machine-local settings come from the latest device of the same class.
   # Stack rungs: epic84-plan (docs + ledgers), then epic84-core (84.1–84.4 and 84.5's registry observer: settings_sync, manifest, offers VMs, layout::is_rewritable and plan_rename, Shape::to_toml, config_repo Write.replace + last_change_secs, bindings, the OrgAccountVm fixture ripple, and the one-line shell hunks the new fields force), then epic84-surface (84.5's shell sync/apply/command, 84.6's offers UI, mock-shell, docs/account.md). Shell crate by inspection; CI macOS is the gate.
   # Contract amendments A1 (an AbsolutePath value applies only where its directory exists), A2' (superseding A2: a value that cannot be applied here is not applied, and both bases record the local value, so it is never dirty) and A3 (a rename moves settings.<device>.toml and keeps the device base) are in the epic's text.

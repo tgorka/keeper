@@ -11,6 +11,7 @@
 //! <login>/settings.toml               synced preferences, every device
 //! <login>/settings.<device>.toml      synced preferences, one device
 //! <login>/{drives,bots,matrix}.toml   what the person uses, as offers
+//! <login>/device.<device>.toml        this device's state, for a restore
 //! ```
 //!
 //! Nothing here touches a file. `keeper-sync` hands the worktree in through
@@ -160,6 +161,10 @@ pub struct PlanInput<'a> {
     pub device: &'a str,
     pub class: DeviceClass,
     pub platform: &'a str,
+    /// This machine's fingerprint for this person (a hex digest the shell
+    /// derives from the OS's machine id and the account `sub`), or `None`
+    /// where the OS has no stable id (iOS).
+    pub machine: Option<&'a str>,
     pub now_rfc3339: &'a str,
 }
 
@@ -196,12 +201,16 @@ pub fn plan(files: &dyn RepoFiles, input: &PlanInput) -> Vec<PlannedWrite> {
     }
     let device = input.device;
     if device_slug(device) == device {
-        let record = toml_document(&[
+        let mut fields = vec![
             ("name", device),
             ("class", input.class.as_str()),
             ("platform", input.platform),
-            ("created", input.now_rfc3339),
-        ]);
+        ];
+        if let Some(machine) = input.machine {
+            fields.push(("machine", machine));
+        }
+        fields.push(("created", input.now_rfc3339));
+        let record = toml_document(&fields);
         create(device_path(login, device), record.into_bytes());
         if let Some(template) =
             files.read(&format!("_template/class/{}.toml", input.class.as_str()))
@@ -216,7 +225,7 @@ pub fn plan(files: &dyn RepoFiles, input: &PlanInput) -> Vec<PlannedWrite> {
 /// as a link or a folder: keeper neither loads it nor replaces it, and the
 /// person has to fix it in the repository.
 pub fn unusable_files(files: &dyn RepoFiles, login: &str, device: &str) -> Vec<String> {
-    use super::{manifest, settings_sync};
+    use super::{device_state, manifest, settings_sync};
     [
         user_path(login),
         format!("{login}/keeper.toml"),
@@ -227,6 +236,7 @@ pub fn unusable_files(files: &dyn RepoFiles, login: &str, device: &str) -> Vec<S
         manifest::drives_path(login),
         manifest::bots_path(login),
         manifest::matrix_path(login),
+        device_state::path(login, device),
     ]
     .into_iter()
     .filter(|rel| files.is_non_regular(rel))
@@ -238,22 +248,69 @@ pub fn unusable_files(files: &dyn RepoFiles, login: &str, device: &str) -> Vec<S
     .collect()
 }
 
-/// This device's slug for a first registration: `wanted` as a slug, or — when
-/// `devices/<wanted>.toml` already exists and this install did not register
-/// it — the same with a 4-hex suffix, so two machines with one host name
-/// never share a device record and its settings.
+/// How long a device's files must have gone untouched before a record
+/// without a fingerprint is taken as this machine's own from before a
+/// reinstall rather than another machine of the same name still in use.
+pub const LEGACY_ADOPT_DAYS: u64 = 30;
+
+/// This device's slug for a first registration: `wanted` as a slug, unless
+/// `devices/<wanted>.toml` already exists, this install did not register it,
+/// and it is not this machine's own record from before a reinstall — then
+/// the same with a 4-hex suffix, so two machines with one host name never
+/// share a device record and its settings. A record is this machine's own —
+/// adopted, and the device restores from it — when it records this class and
+/// platform, and either `devices/<wanted>.toml` or `device.<wanted>.toml`
+/// carries this `machine` fingerprint, or neither carries one (a device from
+/// before fingerprints) and its files have gone untouched for
+/// [`LEGACY_ADOPT_DAYS`] (`legacy_untouched_days`, the shell's measure of
+/// the newer of its two synced files; `None` when unknown).
+// Each input is one fact about this install the shell reads separately; a
+// struct would only move the same eight names one line down.
+#[allow(clippy::too_many_arguments)]
 pub fn free_device_slug(
     files: &dyn RepoFiles,
     login: &str,
     wanted: &str,
     registered_here: bool,
+    class: DeviceClass,
+    platform: &str,
+    machine: Option<&str>,
+    legacy_untouched_days: Option<u64>,
 ) -> String {
     let wanted = device_slug(wanted);
     let taken = |slug: &str| {
         let rel = device_path(login, slug);
         files.read(&rel).is_some() || files.is_non_regular(&rel)
     };
-    if registered_here || !taken(&wanted) {
+    let rel = device_path(login, &wanted);
+    let state_rel = super::device_state::path(login, &wanted);
+    let fingerprint = |rel: &str| {
+        if files.is_non_regular(rel) {
+            return None;
+        }
+        read_table(files, rel)
+            .and_then(Result::ok)
+            .and_then(|table| string_field(&table, "machine"))
+    };
+    let same_device = || {
+        if files.is_non_regular(&rel) {
+            return false;
+        }
+        let Some(Ok(record)) = read_table(files, &rel) else {
+            return false;
+        };
+        if string_field(&record, "class").as_deref() != Some(class.as_str())
+            || string_field(&record, "platform").as_deref() != Some(platform)
+        {
+            return false;
+        }
+        let recorded = [string_field(&record, "machine"), fingerprint(&state_rel)];
+        if recorded.iter().all(Option::is_none) {
+            return legacy_untouched_days.is_some_and(|days| days >= LEGACY_ADOPT_DAYS);
+        }
+        machine.is_some_and(|ours| recorded.iter().flatten().any(|theirs| theirs == ours))
+    };
+    if registered_here || !taken(&wanted) || same_device() {
         return wanted;
     }
     let mut base = wanted;
@@ -322,9 +379,10 @@ pub fn is_own_path(login: &str, rel: &str) -> bool {
             .all(|segment| !segment.is_empty() && !segment.starts_with('.'))
 }
 
-/// Whether keeper may replace `rel` when it already exists (AD-324): only the
-/// synced preference files and the three offer manifests directly inside
-/// `<login>/`. Everything else stays create-only.
+/// Whether keeper may replace `rel` when it already exists (AD-324, AD-328):
+/// only the synced preference files, the three offer manifests and the
+/// device state files directly inside `<login>/`. Everything else stays
+/// create-only.
 pub fn is_rewritable(login: &str, rel: &str) -> bool {
     if !is_own_path(login, rel) {
         return false;
@@ -340,6 +398,7 @@ pub fn is_rewritable(login: &str, rel: &str) -> bool {
         "settings.toml" | "drives.toml" | "bots.toml" | "matrix.toml" => true,
         _ => name
             .strip_prefix("settings.")
+            .or_else(|| name.strip_prefix("device."))
             .and_then(|rest| rest.strip_suffix(".toml"))
             .is_some_and(|slug| device_slug(slug) == slug),
     }
@@ -419,8 +478,9 @@ pub struct RenameOp {
 }
 
 /// Rename this device: move `devices/<from>.toml` and, when present,
-/// `keeper.<from>.toml` and `settings.<from>.toml` inside `<login>/`. Refused
-/// when `from` is not registered, `to` is not a slug, or `to` is already taken.
+/// `keeper.<from>.toml`, `settings.<from>.toml` and `device.<from>.toml`
+/// inside `<login>/`. Refused when `from` is not registered, `to` is not a
+/// slug, or `to` is already taken.
 pub fn plan_rename(
     files: &dyn RepoFiles,
     login: &str,
@@ -447,6 +507,10 @@ pub fn plan_rename(
         (
             super::settings_sync::device_path(login, from),
             super::settings_sync::device_path(login, to),
+        ),
+        (
+            super::device_state::path(login, from),
+            super::device_state::path(login, to),
         ),
     ];
     let taken = |rel: &String| files.read(rel).is_some();
@@ -541,6 +605,7 @@ mod tests {
             device: "work-mac",
             class: DeviceClass::Desktop,
             platform: "macos",
+            machine: Some("5eed"),
             now_rfc3339: "2026-09-23T10:12:00Z",
         }
     }
@@ -654,6 +719,35 @@ mod tests {
                 class: Some(DeviceClass::Desktop),
                 platform: Some("macos".to_owned()),
             }]
+        );
+        // After a reinstall, this machine's record is adopted; another
+        // machine of the same name, class and platform gets its own.
+        let desktop = DeviceClass::Desktop;
+        assert_eq!(
+            free_device_slug(
+                &tree,
+                "tgorka",
+                "work-mac",
+                false,
+                desktop,
+                "macos",
+                Some("5eed"),
+                None
+            ),
+            "work-mac"
+        );
+        assert_ne!(
+            free_device_slug(
+                &tree,
+                "tgorka",
+                "work-mac",
+                false,
+                desktop,
+                "macos",
+                Some("f00d"),
+                Some(365)
+            ),
+            "work-mac"
         );
 
         assert!(
@@ -783,6 +877,7 @@ mod tests {
             .with("tgorka/devices/work-mac.toml", "")
             .with("tgorka/keeper.work-mac.toml", "")
             .with("tgorka/settings.work-mac.toml", "")
+            .with("tgorka/device.work-mac.toml", "")
             .with("tgorka/devices/home-mac.toml", "")
             .with("tgorka/settings.attic.toml", "");
 
@@ -801,6 +896,10 @@ mod tests {
                 RenameOp {
                     from: "tgorka/settings.work-mac.toml".to_owned(),
                     to: "tgorka/settings.studio.toml".to_owned(),
+                },
+                RenameOp {
+                    from: "tgorka/device.work-mac.toml".to_owned(),
+                    to: "tgorka/device.studio.toml".to_owned(),
                 },
             ]
         );
@@ -835,6 +934,7 @@ mod tests {
             "tgorka/drives.toml",
             "tgorka/bots.toml",
             "tgorka/matrix.toml",
+            "tgorka/device.work-mac.toml",
         ] {
             assert!(is_rewritable("tgorka", rel), "{rel}");
         }
@@ -851,6 +951,10 @@ mod tests {
             "tgorka/settings..toml",
             "tgorka/.settings.toml",
             "tgorka/notes.toml",
+            "tgorka/device.Work Mac.toml",
+            "tgorka/device..toml",
+            "tgorka/devices.toml",
+            "tgorka/devices/device.work-mac.toml",
         ] {
             assert!(!is_rewritable("tgorka", rel), "{rel}");
         }
@@ -925,6 +1029,7 @@ mod tests {
                 "tgorka/drives.toml",
                 "tgorka/bots.toml",
                 "tgorka/matrix.toml",
+                "tgorka/device.work-mac.toml",
             ],
         };
         let named: Vec<String> = unusable_files(&files, "tgorka", "work-mac")
@@ -939,31 +1044,104 @@ mod tests {
                 "tgorka/drives.toml",
                 "tgorka/bots.toml",
                 "tgorka/matrix.toml",
+                "tgorka/device.work-mac.toml",
             ]
         );
     }
 
     #[test]
-    fn a_device_name_another_install_registered_gets_a_suffix() {
-        let tree = Tree::default().with("tgorka/devices/work-mac.toml", "name = \"work-mac\"\n");
+    fn a_device_name_is_adopted_only_by_the_same_machine_and_suffixed_otherwise() {
+        let legacy = "name = \"work-mac\"\nclass = \"desktop\"\nplatform = \"macos\"\n";
+        let tree = Tree::default()
+            .with("tgorka/devices/work-mac.toml", legacy)
+            .with(
+                "tgorka/devices/studio.toml",
+                "name = \"studio\"\nclass = \"desktop\"\nplatform = \"macos\"\nmachine = \"5eed\"\n",
+            )
+            // Registered before fingerprints; its device file has one since.
+            .with(
+                "tgorka/devices/den.toml",
+                "name = \"den\"\nclass = \"desktop\"\nplatform = \"macos\"\n",
+            )
+            .with("tgorka/device.den.toml", "machine = \"beef\"\n");
+        let desktop = DeviceClass::Desktop;
+        let slug = |wanted: &str, here: bool, class, platform, machine, days| {
+            free_device_slug(
+                &tree, "tgorka", wanted, here, class, platform, machine, days,
+            )
+        };
+        let suffixed = |slug: String, base: &str| {
+            let suffix = slug
+                .strip_prefix(&format!("{base}-"))
+                .unwrap_or_else(|| panic!("{slug} is not suffixed"));
+            suffix.len() == 4 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+        };
+        let old = Some(LEGACY_ADOPT_DAYS);
 
         assert_eq!(
-            free_device_slug(&tree, "tgorka", "Work Mac", true),
+            slug("Work Mac", true, desktop, "linux", None, None),
             "work-mac",
             "this install's own record is reused"
         );
-        assert_eq!(free_device_slug(&tree, "tgorka", "den", false), "den");
-        let other = free_device_slug(&tree, "tgorka", "Work Mac", false);
-        let suffix = other.strip_prefix("work-mac-").expect("suffixed");
-        assert_eq!(suffix.len(), 4);
-        assert!(suffix.bytes().all(|b| b.is_ascii_hexdigit()), "{other}");
+        assert_eq!(slug("attic", false, desktop, "macos", None, None), "attic");
+
+        assert_eq!(
+            slug("studio", false, desktop, "macos", Some("5eed"), None),
+            "studio",
+            "same machine"
+        );
+        assert!(
+            suffixed(
+                slug("studio", false, desktop, "macos", Some("f00d"), old),
+                "studio"
+            ),
+            "other machine, however old the files"
+        );
+        assert!(
+            suffixed(slug("studio", false, desktop, "macos", None, old), "studio"),
+            "no fingerprint never adopts a record that has one"
+        );
+
+        assert_eq!(
+            slug("den", false, desktop, "macos", Some("beef"), None),
+            "den",
+            "the device file's fingerprint counts too"
+        );
+        assert!(suffixed(
+            slug("den", false, desktop, "macos", Some("f00d"), old),
+            "den"
+        ));
+
+        assert_eq!(
+            slug("Work Mac", false, desktop, "macos", Some("f00d"), old),
+            "work-mac",
+            "a device from before fingerprints, untouched for a month, is adopted"
+        );
+        for days in [None, Some(LEGACY_ADOPT_DAYS - 1)] {
+            assert!(
+                suffixed(
+                    slug("Work Mac", false, desktop, "macos", Some("f00d"), days),
+                    "work-mac"
+                ),
+                "{days:?}: it may still be in use on another machine"
+            );
+        }
+        for (class, platform) in [(desktop, "linux"), (DeviceClass::Tablet, "macos")] {
+            assert!(suffixed(
+                slug("Work Mac", false, class, platform, None, old),
+                "work-mac"
+            ));
+        }
 
         // The suffix still fits the slug limit.
         let long = "a".repeat(32);
         let tree = Tree::default().with(&format!("tgorka/devices/{long}.toml"), "");
-        let slug = free_device_slug(&tree, "tgorka", &long, false);
+        let slug = free_device_slug(&tree, "tgorka", &long, false, desktop, "macos", None, old);
         assert!(slug.len() <= 32, "{slug}");
         assert_eq!(device_slug(&slug), slug);
-        assert_ne!(slug, long);
+        assert_ne!(
+            slug, long,
+            "a record without class or platform is never adopted"
+        );
     }
 }

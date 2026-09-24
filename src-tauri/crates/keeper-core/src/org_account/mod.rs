@@ -13,6 +13,7 @@
 
 pub mod claims;
 pub mod descriptor;
+pub mod device_state;
 pub mod layout;
 pub mod manifest;
 pub mod settings_sync;

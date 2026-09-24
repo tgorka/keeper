@@ -51,9 +51,9 @@
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["keeper"]
+        "schemes": ["keeper", "dev.tgorka.keeper"]
       },
-      "mobile": [{ "scheme": ["keeper"], "appLink": false }]
+      "mobile": [{ "scheme": ["keeper", "dev.tgorka.keeper"], "appLink": false }]
     },
     "updater": {
       "endpoints": ["https://github.com/tgorka/keeper/releases/latest/download/latest.json"],

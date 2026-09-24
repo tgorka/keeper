@@ -54,6 +54,9 @@ pub struct AccountVm {
     /// Drives, bot providers and Matrix accounts the person uses on their
     /// other devices and not here. Empty without an account.
     pub offers: AccountOffersVm,
+    /// What restoring this device from the account did, and what waits.
+    /// Empty without an account.
+    pub restore: AccountRestoreVm,
     /// Increases with every VM this process composes, so a subscriber that
     /// receives two out of order keeps the newer one.
     #[ts(type = "number")]
@@ -72,11 +75,28 @@ pub struct AccountOffersVm {
     pub matrix: Vec<MatrixOfferVm>,
 }
 
+/// This device coming back from the account (AD-329), in Rust-composed
+/// sentences.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AccountRestoreVm {
+    /// "Restored 2 drives, 1 bot provider and your settings from your
+    /// account." once a restore ran.
+    pub sentence: Option<String>,
+    /// One "Waiting for {path} to restore {name}." per drive whose folder
+    /// cannot be made yet.
+    pub pending: Vec<String>,
+    /// This device's file asks for the wake phrase and this device has it
+    /// off: offer to turn listening on. Nothing turns it on by itself.
+    pub listening_off: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct DriveOfferVm {
-    /// `drive:<normalized remote>#<branch>`.
+    /// `drive:<normalized remote>#<branch>^<name>`.
     pub key: String,
     pub name: String,
     pub remote_url: String,
@@ -233,6 +253,19 @@ pub struct AccountFacts {
     pub forge_needed: bool,
     /// What the last sync found on the person's other devices.
     pub offers: AccountOffersVm,
+    /// What restoring this device did and what waits.
+    pub restore: RestoreFacts,
+}
+
+/// The restore's outcome as the shell knows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreFacts {
+    /// `(drives, bot providers)` restored, once a restore ran.
+    pub restored: Option<(usize, usize)>,
+    /// `(path, name)` of each drive waiting for its folder's parent.
+    pub waiting: Vec<(String, String)>,
+    /// See [`AccountRestoreVm::listening_off`].
+    pub listening_off: bool,
 }
 
 /// Compose the state and its sentence. Precedence, first match wins: a
@@ -273,6 +306,7 @@ pub fn vm(facts: &AccountFacts) -> AccountVm {
             forge_connected: false,
             faults: facts.faults.clone(),
             offers: AccountOffersVm::default(),
+            restore: AccountRestoreVm::default(),
             revision: next_revision(),
         };
     };
@@ -294,7 +328,42 @@ pub fn vm(facts: &AccountFacts) -> AccountVm {
         forge_connected: facts.forge_connected,
         faults: facts.faults.clone(),
         offers: facts.offers.clone(),
+        restore: restore_vm(&facts.restore),
         revision: next_revision(),
+    }
+}
+
+fn restore_vm(facts: &RestoreFacts) -> AccountRestoreVm {
+    let counted = |n: usize, one: &str, many: &str| match n {
+        0 => None,
+        1 => Some(format!("1 {one}")),
+        n => Some(format!("{n} {many}")),
+    };
+    let sentence = facts.restored.map(|(drives, providers)| {
+        let mut parts: Vec<String> = [
+            counted(drives, "drive", "drives"),
+            counted(providers, "bot provider", "bot providers"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        parts.push("your settings".to_owned());
+        let last = parts.pop().unwrap_or_default();
+        let list = if parts.is_empty() {
+            last
+        } else {
+            format!("{} and {last}", parts.join(", "))
+        };
+        format!("Restored {list} from your account.")
+    });
+    AccountRestoreVm {
+        sentence,
+        pending: facts
+            .waiting
+            .iter()
+            .map(|(path, name)| format!("Waiting for {path} to restore {name}."))
+            .collect(),
+        listening_off: facts.listening_off,
     }
 }
 
@@ -544,6 +613,49 @@ mod tests {
         let vm = vm(&facts);
         assert_eq!(vm.device.map(|d| d.slug).as_deref(), Some("work-mac"));
         assert_eq!(vm.devices.iter().filter(|d| d.this_device).count(), 1);
+    }
+
+    #[test]
+    fn the_restore_line_counts_what_came_back_and_names_what_waits() {
+        let restored = |drives, providers| {
+            let mut facts = signed_in();
+            facts.restore.restored = Some((drives, providers));
+            vm(&facts).restore.sentence
+        };
+        assert_eq!(
+            restored(2, 1).as_deref(),
+            Some("Restored 2 drives, 1 bot provider and your settings from your account.")
+        );
+        assert_eq!(
+            restored(1, 0).as_deref(),
+            Some("Restored 1 drive and your settings from your account.")
+        );
+        assert_eq!(
+            restored(0, 3).as_deref(),
+            Some("Restored 3 bot providers and your settings from your account.")
+        );
+        assert_eq!(
+            restored(0, 0).as_deref(),
+            Some("Restored your settings from your account.")
+        );
+
+        let mut facts = signed_in();
+        facts.restore.waiting = vec![("/Volumes/T7/tgdrive".to_owned(), "tgdrive".to_owned())];
+        facts.restore.listening_off = true;
+        let restore = vm(&facts).restore;
+        assert_eq!(restore.sentence, None, "no restore ran");
+        assert_eq!(
+            restore.pending,
+            ["Waiting for /Volumes/T7/tgdrive to restore tgdrive."]
+        );
+        assert!(restore.listening_off);
+
+        facts.descriptor = None;
+        assert_eq!(
+            vm(&facts).restore,
+            AccountRestoreVm::default(),
+            "no account, nothing"
+        );
     }
 
     fn setup(previous: Option<&AccountDescriptor>, new: &AccountDescriptor) -> AccountSetupVm {

@@ -48,6 +48,7 @@ import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
   AccountDeviceVm,
   AccountOffersVm,
+  AccountRestoreVm,
   AccountSetupVm,
   AccountShareVm,
   AccountStateVm,
@@ -3050,9 +3051,12 @@ const copyJobs = new Map<string, CopyJobVm>();
 // `?account=ready` (or `offline`, `needsSignIn`, `blocked`, `signedOut`) boots
 // into a signed-in fixture instead, so Settings › Account, the status line and
 // the credential choices on the drive and endpoint forms can all be looked at.
+// `ready` also boots just restored (Epic 85, AD-329): the restore sentence, one
+// drive waiting for its volume, and listening that was on for this device.
 // Pasting any link into Settings › Account walks the whole setup sheet —
 // through "Finish signing in…" (with Cancel sign-in) and the sync — and the
-// word `refuse` anywhere in it answers Rust's refusal instead.
+// word `refuse` anywhere in it answers Rust's refusal instead, and the word
+// `registered` answers a device the repository already knows (UX-DR119).
 //
 // Every answer is what Rust would answer, sentences included (`state.rs`
 // `compose`), and every snapshot carries the next `revision`, as Rust's do. An
@@ -3077,6 +3081,7 @@ const NO_ACCOUNT_VM: OrgAccountVm = {
   forgeConnected: false,
   faults: [],
   offers: { drives: [], providers: [], matrix: [] },
+  restore: { sentence: null, pending: [], listeningOff: false },
   revision: 0,
 };
 
@@ -3099,7 +3104,7 @@ const ACCOUNT_THIS_DEVICE: AccountDeviceVm = {
 let accountOffers: AccountOffersVm = {
   drives: [
     {
-      key: "drive:https://git.acme.dev/tgorka/notes#main",
+      key: "drive:https://git.acme.dev/tgorka/notes#main^notes",
       name: "notes",
       remoteUrl: "https://git.acme.dev/tgorka/notes.git",
       branch: "main",
@@ -3118,7 +3123,7 @@ let accountOffers: AccountOffersVm = {
       devices: ["iphone-3f2a", "ipad-91c0"],
     },
     {
-      key: "drive:git@github.com:tgorka/field-recordings#main",
+      key: "drive:git@github.com:tgorka/field-recordings#main^Field recordings",
       name: "Field recordings",
       remoteUrl: "git@github.com:tgorka/field-recordings.git",
       branch: "main",
@@ -3155,6 +3160,14 @@ let accountOffers: AccountOffersVm = {
       homeserverUrl: "https://matrix.acme.dev/",
       kind: "password",
       devices: ["iphone-3f2a", "ipad-91c0"],
+    },
+    // Single sign-on (Epic 85, AD-331): choosing it starts the SSO flow.
+    {
+      key: "matrix:@tgorka:electra.acme.dev",
+      userId: "@tgorka:electra.acme.dev",
+      homeserverUrl: "https://electra.acme.dev/",
+      kind: "oidc",
+      devices: ["iphone-3f2a"],
     },
   ],
 };
@@ -3216,6 +3229,7 @@ function signedInAccount(state: AccountStateVm, device = ACCOUNT_THIS_DEVICE): O
     // clears them when the directory is not this person's: so `ready` and
     // `syncing` carry them, and `offline`, `blocked` and the rest do not.
     offers: offersIn(state),
+    restore: accountRestore,
     revision: 0,
   };
 }
@@ -3228,6 +3242,19 @@ const ACCOUNT_FIXTURES: readonly AccountStateVm[] = [
   "signedOut",
 ];
 const accountParam = new URLSearchParams(window.location.search).get("account");
+/**
+ * What the first sync restored (Epic 85, AD-329), as Rust words it. Mutable
+ * because turning listening on takes the offer away, as Rust's next compose
+ * does once `bots.wake_enabled` is on here.
+ */
+let accountRestore: AccountRestoreVm =
+  accountParam === "ready"
+    ? {
+        sentence: "Restored 2 drives, 1 bot provider and your settings from your account.",
+        pending: ["Waiting for /Volumes/Field to restore Field recordings."],
+        listeningOff: true,
+      }
+    : NO_ACCOUNT_VM.restore;
 let accountVm: OrgAccountVm = ACCOUNT_FIXTURES.includes(accountParam as AccountStateVm)
   ? signedInAccount(accountParam as AccountStateVm)
   : NO_ACCOUNT_VM;
@@ -3264,6 +3291,20 @@ function withdrawOffers(next: AccountOffersVm): void {
   accountOffers = next;
   if (accountVm.configured) {
     setAccount({ ...accountVm, offers: offersIn(accountVm.state) });
+  }
+}
+
+/**
+ * The person chose this device's listening — on, or "Keep it off" (Epic 85,
+ * F15) — so the restore's offer goes, as Rust's next compose does.
+ */
+function listeningDecided(): void {
+  if (!accountRestore.listeningOff) {
+    return;
+  }
+  accountRestore = { ...accountRestore, listeningOff: false };
+  if (accountVm.configured) {
+    setAccount({ ...accountVm, restore: accountRestore });
   }
 }
 
@@ -3895,7 +3936,17 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     }
     const stopPhrase = String(payload.stopPhrase ?? "stop").trim();
     voiceWake = { ...voiceWake, enabled: payload.enabled === true, phrase, stopPhrase };
+    listeningDecided();
     voiceWatcher?.onmessage?.(voiceIdle());
+    return voiceWake;
+  },
+  // Epic 68 (AD-218): the one listening verb, flipped from the stored switch.
+  voice_wake_toggle: () => {
+    voiceWake = { ...voiceWake, enabled: !voiceWake.enabled };
+    voiceWatcher?.onmessage?.(voiceIdle());
+    if (voiceWake.enabled) {
+      listeningDecided();
+    }
     return voiceWake;
   },
   voice_locale_set: (payload) => {
@@ -4785,7 +4836,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       repoMode: "same",
       deviceName: ACCOUNT_THIS_DEVICE.name,
       deviceClass: "desktop",
-      registered: false,
+      registered: input.includes("registered"),
       // Rust names the account a confirm would replace; `?account=ready`
       // therefore shows the change path.
       replaces: accountVm.configured ? accountVm.name : null,

@@ -48,6 +48,7 @@ export const NO_ACCOUNT: OrgAccountVm = {
   forgeConnected: false,
   faults: [],
   offers: { drives: [], providers: [], matrix: [] },
+  restore: { sentence: null, pending: [], listeningOff: false },
   revision: 0,
 };
 
