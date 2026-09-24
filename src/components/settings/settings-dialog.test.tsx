@@ -41,6 +41,7 @@ vi.mock("@/lib/ipc/client", () => ({
       lastSyncedMs: null,
       forgeConnected: false,
       faults: [],
+      offers: { drives: [], providers: [], matrix: [] },
       revision: 0,
     }),
   ),

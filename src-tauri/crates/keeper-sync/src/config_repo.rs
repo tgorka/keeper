@@ -2,13 +2,23 @@
 //! (AD-312).
 //!
 //! A person's settings live in one small git repository shared by all their
-//! devices. This module keeps a local copy of it and publishes new files into
-//! it. It knows nothing of what the files mean — the shell hands in the
-//! paths to write, computed by `keeper-core` against the copy this module just
+//! devices. This module keeps a local copy of it and publishes files into it.
+//! It knows nothing of what the files mean — the shell hands in the paths to
+//! write, computed by `keeper-core` against the copy this module just
 //! refreshed — and it is not a sync profile: no `sync.db` row, no watcher, no
 //! journal. It uses the same free functions the engine does
 //! ([`git::repo`], [`git::fetch`], [`git::push_http`]), gix-only, so it runs
 //! unchanged on the phone.
+//!
+//! # What a write may change
+//!
+//! A [`Write`] creates a file. Only one that says [`Write::replace`] may
+//! overwrite what the tip holds at its path, and then only a regular file:
+//! a symbolic link, a directory, a path below a file or a link, and a path
+//! that is not plain and relative are refused whatever the write says. Every
+//! other file the repository holds is never rewritten. Which files the
+//! planner marks `replace` is `keeper-core`'s decision (its layout's
+//! rewritable files); this module only enforces the lock.
 //!
 //! # The local copy is a cache
 //!
@@ -18,8 +28,9 @@
 //! reach the remote is discarded by the next refresh and re-planned against
 //! what the remote holds then. That is what makes the retry in
 //! [`commit_and_push`] honest: each attempt plans against the tip it commits
-//! on, so a file another device created in the meantime is seen as existing
-//! and left alone.
+//! on, so a file another device created in the meantime is seen as existing —
+//! left alone by a create, and replaced only by a write the plan made knowing
+//! what that tip holds.
 //!
 //! # Credentials
 //!
@@ -49,6 +60,7 @@ use crate::{
     git::{
         cli,
         fetch::{self, Credential, FetchOptions, TransferProgress},
+        history,
         push_http::{self, HttpAuth},
         repo,
     },
@@ -133,11 +145,15 @@ pub struct SyncOutcome {
     pub empty_remote: bool,
 }
 
-/// One file to create, repository-relative.
+/// One file to write, repository-relative.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Write {
     pub rel: PathBuf,
     pub bytes: Vec<u8>,
+    /// `false`: create only — a path the tip already holds is refused.
+    /// `true`: a regular file the tip holds at `rel` is overwritten (keeping
+    /// its mode); anything else there is still refused.
+    pub replace: bool,
 }
 
 /// Who a commit is by (author and committer alike).
@@ -169,7 +185,19 @@ pub fn clone_or_fetch(
     refresh(spec, auth, interrupt).map(|(_, outcome, _)| outcome)
 }
 
-/// Create the files `plan` asks for on top of the remote's tip and push them.
+/// When `rel` (repository-relative, `/`-separated) last changed in the copy
+/// at `dir`: the committer time, in seconds since the epoch, of the newest
+/// commit on its branch that added, rewrote or removed it. `None` when no
+/// commit ever touched it, or the branch has no commit yet.
+///
+/// Reads the copy as the last refresh left it; blocking.
+pub fn last_change_secs(dir: &Path, rel: &str) -> Result<Option<i64>> {
+    Ok(history::file_log(dir, rel, 1)?
+        .first()
+        .map(|revision| revision.committed_secs))
+}
+
+/// Write the files `plan` asks for on top of the remote's tip and push them.
 ///
 /// Each attempt refreshes the copy, calls `plan` with its working tree, and —
 /// when `plan` returns anything — commits exactly those files as one commit
@@ -177,9 +205,10 @@ pub fn clone_or_fetch(
 /// as not a fast-forward (another device got there first) starts the next
 /// attempt; after [`MAX_ATTEMPTS`] that refusal is returned.
 ///
-/// Create-only: a `Write` naming a path the tip already holds is refused, as
-/// is one that is absolute or climbs out with `..`, and one whose path — the
-/// file or a directory on the way to it — the tip holds as a symbolic link.
+/// A `Write` naming a path the tip already holds is refused unless it says
+/// [`Write::replace`] and the tip holds a regular file there. Refused either
+/// way: a path that is absolute or climbs out with `..`, one the tip holds as
+/// a symbolic link or a directory, and one below a file or a symbolic link.
 /// `plan` is expected to have filtered these already; this is the second lock
 /// on the door.
 pub async fn commit_and_push<F>(
@@ -206,23 +235,33 @@ where
             for write in plan(&spec.dir) {
                 let rel = tree_path(&write.rel)?;
                 refuse_non_directories_on_the_way(repo, base, &rel)?;
-                if let Some((mode, _)) = entry_at(repo, base, &rel)? {
-                    return Err(SyncError::InvalidPathForRemote {
-                        path: write.rel,
-                        reason: if mode.is_link() {
-                            "is a symbolic link in the repository; keeper does not write through \
-                             links, and files there are never rewritten"
-                        } else {
-                            "already exists in the repository; files there are never rewritten"
-                        }
-                        .to_owned(),
-                    });
-                }
+                let kind = match entry_at(repo, base, &rel)? {
+                    None => gix::object::tree::EntryKind::Blob,
+                    Some((mode, _)) if write.replace && mode.is_blob() => mode.kind(),
+                    Some((mode, _)) => {
+                        return Err(SyncError::InvalidPathForRemote {
+                            path: write.rel,
+                            reason: if mode.is_link() {
+                                "is a symbolic link in the repository; keeper does not write \
+                                 through links, and files there are never rewritten"
+                            } else if !write.replace {
+                                "already exists in the repository; files there are never \
+                                 rewritten"
+                            } else if mode.is_tree() {
+                                "is a directory in the repository; keeper replaces only a file"
+                            } else {
+                                "is not a regular file in the repository; keeper replaces only \
+                                 a file"
+                            }
+                            .to_owned(),
+                        });
+                    }
+                };
                 let blob = repo
                     .write_blob(&write.bytes)
                     .map_err(|err| git_error("could not write a blob", &err))?;
                 editor
-                    .upsert(rel.as_str(), gix::object::tree::EntryKind::Blob, blob)
+                    .upsert(rel.as_str(), kind, blob)
                     .map_err(|err| git_error("could not stage a file", &err))?;
                 any = true;
             }

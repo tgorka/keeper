@@ -21,7 +21,8 @@ use std::{
 };
 
 use keeper_sync::config_repo::{
-    clone_or_fetch, commit_and_push, move_and_push, Author, PushResult, RepoAuth, RepoSpec, Write,
+    clone_or_fetch, commit_and_push, last_change_secs, move_and_push, Author, PushResult, RepoAuth,
+    RepoSpec, Write,
 };
 use keeper_sync::error::SyncError;
 
@@ -353,10 +354,20 @@ fn author() -> Author {
     }
 }
 
+/// A create-only write.
 fn write(rel: &str, text: &str) -> Write {
     Write {
         rel: PathBuf::from(rel),
         bytes: text.as_bytes().to_vec(),
+        replace: false,
+    }
+}
+
+/// A write that may overwrite a regular file.
+fn replacing(rel: &str, text: &str) -> Write {
+    Write {
+        replace: true,
+        ..write(rel, text)
     }
 }
 
@@ -501,8 +512,9 @@ async fn config_repo_a_raced_push_is_replanned_on_the_new_tip_and_keeps_their_fi
     );
 }
 
-/// A write that escapes the repository, or names a file the tip already
-/// holds, is refused before anything is committed or sent.
+/// A write that escapes the repository is refused whether or not it may
+/// replace, and a create-only write naming a file the tip already holds is
+/// refused — before anything is committed or sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_repo_refuses_escaping_paths_and_rewrites() {
     if !have_git() {
@@ -516,32 +528,151 @@ async fn config_repo_refuses_escaping_paths_and_rewrites() {
     let interrupt = AtomicBool::new(false);
     let mac = spec(&harness, &root.path().join("mac"));
 
-    for rel in [
+    let escaping = [
         "../escaped.toml",
         "alice/../../escaped.toml",
         "/tmp/escaped.toml",
-        "alice/user.toml",
-    ] {
+    ];
+    let bad = escaping
+        .iter()
+        .flat_map(|rel| [write(rel, "evil\n"), replacing(rel, "evil\n")])
+        .chain([write("alice/user.toml", "evil\n")]);
+    for bad in bad {
         let err = commit_and_push(
             &client(),
             &mac,
             &RepoAuth::None,
             &author(),
             "bad",
-            |_| vec![write(rel, "evil\n"), write("alice/keeper.toml", "ok\n")],
+            |_| vec![bad.clone(), write("alice/keeper.toml", "ok\n")],
             &interrupt,
         )
         .await
         .expect_err("refused");
-        assert!(
-            matches!(err, SyncError::InvalidPathForRemote { .. }),
-            "{rel}: {err:?}"
-        );
+        let SyncError::InvalidPathForRemote { reason, .. } = &err else {
+            panic!("{bad:?}: {err:?}");
+        };
+        if !escaping.iter().any(|rel| bad.rel == Path::new(rel)) {
+            assert_eq!(
+                reason, "already exists in the repository; files there are never rewritten",
+                "{bad:?}"
+            );
+        }
     }
     assert!(!root.path().join("escaped.toml").exists());
     assert_eq!(harness.pushes(), 0);
     assert_eq!(harness.tip(), tip);
     assert_eq!(harness.show("alice/user.toml"), "login = \"alice\"");
+}
+
+/// A replacing write overwrites the regular file the tip holds, creates one
+/// that is absent, and both land in one pushed commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_repo_a_replacing_write_overwrites_a_file_and_pushes() {
+    if !have_git() {
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let harness = Harness::start(root.path(), None);
+    let scratch = root.path().join("elsewhere");
+    harness.commit_elsewhere(
+        &scratch,
+        &[
+            ("alice/user.toml", "login = \"alice\"\n"),
+            ("alice/settings.toml", "[settings]\n\"a\" = 1\n"),
+        ],
+    );
+    let interrupt = AtomicBool::new(false);
+    let mac = spec(&harness, &root.path().join("mac"));
+
+    let pushed = commit_and_push(
+        &client(),
+        &mac,
+        &RepoAuth::None,
+        &author(),
+        "alice: settings from mac",
+        |_| {
+            vec![
+                replacing("alice/settings.toml", "[settings]\n\"a\" = 2\n"),
+                replacing("alice/drives.toml", "# drives\n"),
+            ]
+        },
+        &interrupt,
+    )
+    .await
+    .expect("replaced");
+    let PushResult::Pushed { head } = pushed else {
+        panic!("expected a push, got {pushed:?}");
+    };
+    assert_eq!(harness.tip().as_deref(), Some(head.as_str()));
+    assert_eq!(harness.pushes(), 1);
+    assert_eq!(harness.show("alice/settings.toml"), "[settings]\n\"a\" = 2");
+    assert_eq!(harness.show("alice/drives.toml"), "# drives");
+    assert_eq!(harness.show("alice/user.toml"), "login = \"alice\"");
+    assert_eq!(
+        git(&harness.bare, &["log", "-1", "--format=%s", BRANCH]),
+        "alice: settings from mac"
+    );
+    assert_eq!(
+        std::fs::read_to_string(mac.dir.join("alice/settings.toml")).expect("worktree"),
+        "[settings]\n\"a\" = 2\n",
+        "the local copy is what was pushed"
+    );
+}
+
+/// Commit `files` in `scratch` (already a clone of the served repository) at
+/// committer time `secs`, and push.
+fn commit_at(scratch: &Path, files: &[(&str, &str)], secs: i64) {
+    for (path, text) in files {
+        let full = scratch.join(path);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+        std::fs::write(full, text).expect("write");
+        git(scratch, &["add", "--", path]);
+    }
+    let output = git_command(scratch)
+        .env("GIT_COMMITTER_DATE", format!("@{secs} +0000"))
+        .args(["commit", "-q", "-m", "at"])
+        .output()
+        .expect("git runs");
+    assert!(output.status.success(), "{output:?}");
+    git(scratch, &["push", "-q", "origin", BRANCH]);
+}
+
+/// A file's last change is the newest commit that touched it — not the tip
+/// when a later commit touched something else, not the commit that created
+/// it — read from the refreshed copy; never touched is `None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_repo_last_change_is_the_newest_commit_touching_the_file() {
+    if !have_git() {
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let harness = Harness::start(root.path(), None);
+    let scratch = root.path().join("elsewhere");
+    harness.commit_elsewhere(&scratch, &[("alice/user.toml", "login = \"alice\"\n")]);
+    commit_at(
+        &scratch,
+        &[("alice/settings.mac.toml", "# 1\n")],
+        1_700_000_000,
+    );
+    commit_at(
+        &scratch,
+        &[("alice/settings.mac.toml", "# 2\n")],
+        1_700_000_100,
+    );
+    commit_at(
+        &scratch,
+        &[("alice/settings.phone.toml", "# 1\n")],
+        1_700_000_200,
+    );
+    let interrupt = AtomicBool::new(false);
+    let mac = spec(&harness, &root.path().join("mac"));
+    clone_or_fetch(&mac, &RepoAuth::None, &interrupt).expect("refreshed");
+
+    let last = |rel| last_change_secs(&mac.dir, rel).expect("read");
+    assert_eq!(last("alice/settings.mac.toml"), Some(1_700_000_100));
+    assert_eq!(last("alice/settings.phone.toml"), Some(1_700_000_200));
+    assert_eq!(last("alice/settings.tablet.toml"), None);
 }
 
 /// The copy is a cache: a local edit, a stray unpushed commit and a file the
@@ -793,7 +924,8 @@ fn commit_link(scratch: &Path, rel: &str, target: &Path) {
 
 /// A path the tip holds as a symbolic link — the file itself, or a directory
 /// on the way to it — is refused by name, and nothing is committed through the
-/// link or into what it points at; nor is a file replaced by a directory.
+/// link or into what it points at; nor is a file replaced by a directory, or a
+/// directory by a file. A write that may replace is refused all the same.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_repo_refuses_to_write_through_a_symlink_in_the_tree() {
@@ -813,27 +945,50 @@ async fn config_repo_refuses_to_write_through_a_symlink_in_the_tree() {
     let interrupt = AtomicBool::new(false);
     let mac = spec(&harness, &root.path().join("mac"));
 
-    for (rel, refused, why) in [
-        ("alice/devices/mac.toml", "alice/devices", "symbolic link"),
-        ("alice/keeper.toml", "alice/keeper.toml", "symbolic link"),
-        ("alice/user.toml/x.toml", "alice/user.toml", "is a file"),
+    // (path written, path refused, why a create is refused, why a replace is)
+    for (rel, refused, why_create, why_replace) in [
+        (
+            "alice/devices/mac.toml",
+            "alice/devices",
+            "symbolic link",
+            "symbolic link",
+        ),
+        (
+            "alice/keeper.toml",
+            "alice/keeper.toml",
+            "symbolic link",
+            "symbolic link",
+        ),
+        (
+            "alice/user.toml/x.toml",
+            "alice/user.toml",
+            "is a file",
+            "is a file",
+        ),
+        ("alice", "alice", "already exists", "is a directory"),
     ] {
-        let err = commit_and_push(
-            &client(),
-            &mac,
-            &RepoAuth::None,
-            &author(),
-            "m",
-            |_| vec![write(rel, "evil\n")],
-            &interrupt,
-        )
-        .await
-        .expect_err("refused");
-        let SyncError::InvalidPathForRemote { path, reason } = &err else {
-            panic!("{rel}: {err:?}");
-        };
-        assert_eq!(path, Path::new(refused), "{rel}: {err}");
-        assert!(reason.contains(why), "{rel}: {err}");
+        for (replace, why) in [(false, why_create), (true, why_replace)] {
+            let bad = Write {
+                replace,
+                ..write(rel, "evil\n")
+            };
+            let err = commit_and_push(
+                &client(),
+                &mac,
+                &RepoAuth::None,
+                &author(),
+                "m",
+                |_| vec![bad.clone()],
+                &interrupt,
+            )
+            .await
+            .expect_err("refused");
+            let SyncError::InvalidPathForRemote { path, reason } = &err else {
+                panic!("{rel} (replace {replace}): {err:?}");
+            };
+            assert_eq!(path, Path::new(refused), "{rel} (replace {replace}): {err}");
+            assert!(reason.contains(why), "{rel} (replace {replace}): {err}");
+        }
     }
     let err = move_and_push(
         &client(),

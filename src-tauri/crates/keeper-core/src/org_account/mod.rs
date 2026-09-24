@@ -5,7 +5,8 @@
 //! Named `org_account` because [`crate::account`] is the Matrix account
 //! supervisor. Everything here is platform-free: the descriptor and its store
 //! ([`descriptor`]), the claim rules ([`claims`]), the repository layout plans
-//! ([`layout`]), the status the UI renders ([`state`]), and the OIDC client
+//! ([`layout`]), the synced preferences ([`settings_sync`]) and offers
+//! ([`manifest`]), the status the UI renders ([`state`]), and the OIDC client
 //! ([`oidc`], [`session`], [`loopback`]). The shell joins these to
 //! `keeper-sync`, which moves the git bytes; this module never depends on it
 //! (AD-40, AD-312).
@@ -13,6 +14,8 @@
 pub mod claims;
 pub mod descriptor;
 pub mod layout;
+pub mod manifest;
+pub mod settings_sync;
 pub mod state;
 
 pub mod loopback;

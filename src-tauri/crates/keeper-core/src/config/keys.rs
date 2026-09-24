@@ -204,6 +204,36 @@ impl Shape {
             },
         }
     }
+
+    /// The TOML value a file carries for a stored string: the inverse of
+    /// [`Shape::coerce`], so `coerce(to_toml(s)) == s` for every stored
+    /// spelling the shape accepts. Flags become booleans and numbers become
+    /// integers, as a person would write them. A stored string that has rotted
+    /// out of its shape is written back as the string it is, never guessed at.
+    pub fn to_toml(self, stored: &str) -> toml::Value {
+        let flag = |on: &str, off: &str| {
+            if stored == on {
+                toml::Value::Boolean(true)
+            } else if stored == off {
+                toml::Value::Boolean(false)
+            } else {
+                toml::Value::String(stored.to_owned())
+            }
+        };
+        let number = || match stored.parse::<i64>() {
+            Ok(n) if n.to_string() == stored => toml::Value::Integer(n),
+            _ => toml::Value::String(stored.to_owned()),
+        };
+        match self {
+            Shape::Flag01 => flag("1", "0"),
+            Shape::FlagOnOff => flag("on", "off"),
+            Shape::FlagTrueFalse => flag("true", "false"),
+            Shape::Int { .. } | Shape::Choice(_) => number(),
+            Shape::Text | Shape::AbsolutePath | Shape::Accelerator | Shape::Json => {
+                toml::Value::String(stored.to_owned())
+            }
+        }
+    }
 }
 
 /// What a TOML value is, for the error sentence.
@@ -1195,14 +1225,20 @@ mod tests {
         /// test needs to notice.
         const SCANNED_CRATES: &[&str] = &["keeper-core", "keeper", "keeper-sync", "keeper-syncd"];
 
-        /// The one place a key is not knowable from the source, with its reason.
+        /// The places a key is not knowable from the source, each with its reason.
         ///
         /// `import_config_file` writes whatever keys `config.json` holds — that is
-        /// what AD-98 replaces, and until it is gone it is a real dynamic site. A
-        /// *second* entry here would need a second reason, and adding one without
-        /// writing that reason fails this test by name.
-        const DYNAMIC_SITES: &[(&str, &str)] =
-            &[("keeper-core/src/registry.rs", "import_config_file")];
+        /// what AD-98 replaces, and until it is gone it is a real dynamic site.
+        /// `apply_synced_setting` writes the keys a config-repository sync pulled
+        /// (Epic 84); it refuses every key `settings_sync::synced_file` does not
+        /// place in a synced file, so the set it can reach is exactly the
+        /// classified user-global and machine-local keys. A further entry here
+        /// needs its own reason, and adding one without writing it fails this
+        /// test by name.
+        const DYNAMIC_SITES: &[(&str, &str)] = &[
+            ("keeper-core/src/registry.rs", "import_config_file"),
+            ("keeper-core/src/registry.rs", "apply_synced_setting"),
+        ];
 
         /// A resolved settings key at one call site.
         #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1559,6 +1595,44 @@ mod tests {
                      `notes.readable` as well as `notes.read.<id>`",
                     spec.key
                 );
+            }
+        }
+    }
+
+    /// A synced file writes values with `to_toml` and reads them back with
+    /// `coerce`; every stored spelling of every key has to survive the trip, and
+    /// flags and numbers are written the way a person would type them.
+    #[test]
+    fn to_toml_is_the_inverse_of_coerce_for_every_shape() {
+        for spec in KEYS.iter().filter(|spec| !spec.family) {
+            let samples: Vec<String> = match spec.shape {
+                Shape::Flag01 => vec!["1".into(), "0".into()],
+                Shape::FlagOnOff => vec!["on".into(), "off".into()],
+                Shape::FlagTrueFalse => vec!["true".into(), "false".into()],
+                Shape::Int { min, max } => vec![min.to_string(), max.to_string()],
+                Shape::Choice(options) => options.iter().map(|o| (*o).to_owned()).collect(),
+                Shape::Text | Shape::AbsolutePath | Shape::Accelerator => {
+                    vec![String::new(), "Cmd+Shift+K".into(), "42".into()]
+                }
+                Shape::Json => vec!["{\"provider\":\"p\",\"model\":\"m\"}".into()],
+            };
+            for stored in samples {
+                let value = spec.shape.to_toml(&stored);
+                assert_eq!(
+                    spec.shape.coerce(spec.key, &value).as_deref(),
+                    Ok(stored.as_str()),
+                    "{} lost {stored:?} through {value:?}",
+                    spec.key
+                );
+                let natural = match spec.shape {
+                    Shape::Flag01 | Shape::FlagOnOff | Shape::FlagTrueFalse => value.is_bool(),
+                    Shape::Int { .. } => value.is_integer(),
+                    Shape::Choice(_) => {
+                        value.is_integer() == stored.parse::<i64>().is_ok() && !value.is_bool()
+                    }
+                    _ => value.is_str(),
+                };
+                assert!(natural, "{} wrote {stored:?} as {value:?}", spec.key);
             }
         }
     }

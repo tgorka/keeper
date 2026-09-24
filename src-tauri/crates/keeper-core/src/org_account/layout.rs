@@ -8,12 +8,16 @@
 //! <login>/keeper.toml                 the person's settings, every device
 //! <login>/keeper.<device>.toml        the person's settings, one device
 //! <login>/devices/<device>.toml       one registered device
+//! <login>/settings.toml               synced preferences, every device
+//! <login>/settings.<device>.toml      synced preferences, one device
+//! <login>/{drives,bots,matrix}.toml   what the person uses, as offers
 //! ```
 //!
 //! Nothing here touches a file. `keeper-sync` hands the worktree in through
 //! [`RepoFiles`], writes what [`plan`] returns, and pushes; every writer filters
 //! through [`is_own_path`] first. Every plan is create-only: a file that exists
-//! is never rewritten, so a second run plans nothing.
+//! is never rewritten, so a second run plans nothing. The synced files are the
+//! one exception, and [`is_rewritable`] names exactly them.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -212,11 +216,17 @@ pub fn plan(files: &dyn RepoFiles, input: &PlanInput) -> Vec<PlannedWrite> {
 /// as a link or a folder: keeper neither loads it nor replaces it, and the
 /// person has to fix it in the repository.
 pub fn unusable_files(files: &dyn RepoFiles, login: &str, device: &str) -> Vec<String> {
+    use super::{manifest, settings_sync};
     [
         user_path(login),
         format!("{login}/keeper.toml"),
         device_layer_path(login, device),
         device_path(login, device),
+        settings_sync::shared_path(login),
+        settings_sync::device_path(login, device),
+        manifest::drives_path(login),
+        manifest::bots_path(login),
+        manifest::matrix_path(login),
     ]
     .into_iter()
     .filter(|rel| files.is_non_regular(rel))
@@ -312,6 +322,29 @@ pub fn is_own_path(login: &str, rel: &str) -> bool {
             .all(|segment| !segment.is_empty() && !segment.starts_with('.'))
 }
 
+/// Whether keeper may replace `rel` when it already exists (AD-324): only the
+/// synced preference files and the three offer manifests directly inside
+/// `<login>/`. Everything else stays create-only.
+pub fn is_rewritable(login: &str, rel: &str) -> bool {
+    if !is_own_path(login, rel) {
+        return false;
+    }
+    let Some(name) = rel
+        .strip_prefix(login)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|name| !name.contains('/'))
+    else {
+        return false;
+    };
+    match name {
+        "settings.toml" | "drives.toml" | "bots.toml" | "matrix.toml" => true,
+        _ => name
+            .strip_prefix("settings.")
+            .and_then(|rest| rest.strip_suffix(".toml"))
+            .is_some_and(|slug| device_slug(slug) == slug),
+    }
+}
+
 const MAX_SLUG: usize = 32;
 
 /// A device name as a file-name slug: lower-case `[a-z0-9-]`, runs of anything
@@ -386,8 +419,8 @@ pub struct RenameOp {
 }
 
 /// Rename this device: move `devices/<from>.toml` and, when present,
-/// `keeper.<from>.toml` inside `<login>/`. Refused when `from` is not
-/// registered, `to` is not a slug, or `to` is already taken.
+/// `keeper.<from>.toml` and `settings.<from>.toml` inside `<login>/`. Refused
+/// when `from` is not registered, `to` is not a slug, or `to` is already taken.
 pub fn plan_rename(
     files: &dyn RepoFiles,
     login: &str,
@@ -409,9 +442,15 @@ pub fn plan_rename(
         return Ok(Vec::new());
     }
     let to_record = device_path(login, to);
-    let from_layer = device_layer_path(login, from);
-    let to_layer = device_layer_path(login, to);
-    if files.read(&to_record).is_some() || files.read(&to_layer).is_some() {
+    let layers = [
+        (device_layer_path(login, from), device_layer_path(login, to)),
+        (
+            super::settings_sync::device_path(login, from),
+            super::settings_sync::device_path(login, to),
+        ),
+    ];
+    let taken = |rel: &String| files.read(rel).is_some();
+    if taken(&to_record) || layers.iter().any(|(_, moved)| taken(moved)) {
         return Err(AccountError::Refused(format!(
             "A device named \"{to}\" is already registered. Pick another name."
         )));
@@ -420,11 +459,13 @@ pub fn plan_rename(
         from: from_record,
         to: to_record,
     }];
-    if files.read(&from_layer).is_some() {
-        ops.push(RenameOp {
-            from: from_layer,
-            to: to_layer,
-        });
+    for (source, destination) in layers {
+        if files.read(&source).is_some() {
+            ops.push(RenameOp {
+                from: source,
+                to: destination,
+            });
+        }
     }
     if ops
         .iter()
@@ -737,11 +778,13 @@ mod tests {
     }
 
     #[test]
-    fn a_rename_moves_both_device_files_and_refuses_collisions() {
+    fn a_rename_moves_every_device_file_and_refuses_collisions() {
         let tree = Tree::default()
             .with("tgorka/devices/work-mac.toml", "")
             .with("tgorka/keeper.work-mac.toml", "")
-            .with("tgorka/devices/home-mac.toml", "");
+            .with("tgorka/settings.work-mac.toml", "")
+            .with("tgorka/devices/home-mac.toml", "")
+            .with("tgorka/settings.attic.toml", "");
 
         let ops = plan_rename(&tree, "tgorka", "work-mac", "studio").expect("rename");
         assert_eq!(
@@ -755,6 +798,10 @@ mod tests {
                     from: "tgorka/keeper.work-mac.toml".to_owned(),
                     to: "tgorka/keeper.studio.toml".to_owned(),
                 },
+                RenameOp {
+                    from: "tgorka/settings.work-mac.toml".to_owned(),
+                    to: "tgorka/settings.studio.toml".to_owned(),
+                },
             ]
         );
         assert_eq!(
@@ -765,6 +812,7 @@ mod tests {
         );
         for (from, to) in [
             ("work-mac", "home-mac"),
+            ("work-mac", "attic"),
             ("gone", "den"),
             ("work-mac", "Den Mac"),
             ("work-mac", "../x"),
@@ -777,6 +825,36 @@ mod tests {
                 "{from} -> {to}"
             );
         }
+    }
+
+    #[test]
+    fn only_the_synced_files_directly_in_the_own_directory_are_rewritable() {
+        for rel in [
+            "tgorka/settings.toml",
+            "tgorka/settings.work-mac.toml",
+            "tgorka/drives.toml",
+            "tgorka/bots.toml",
+            "tgorka/matrix.toml",
+        ] {
+            assert!(is_rewritable("tgorka", rel), "{rel}");
+        }
+        for rel in [
+            "alice/settings.toml",
+            "_template/settings.toml",
+            "tgorka/_template/settings.toml",
+            "tgorka/keeper.toml",
+            "tgorka/keeper.work-mac.toml",
+            "tgorka/user.toml",
+            "tgorka/devices/work-mac.toml",
+            "tgorka/devices/settings.toml",
+            "tgorka/settings.Work Mac.toml",
+            "tgorka/settings..toml",
+            "tgorka/.settings.toml",
+            "tgorka/notes.toml",
+        ] {
+            assert!(!is_rewritable("tgorka", rel), "{rel}");
+        }
+        assert!(!is_rewritable("_template", "_template/settings.toml"));
     }
 
     /// A worktree whose `links` are symlinks (or folders) at those paths.
@@ -834,6 +912,35 @@ mod tests {
             Resolution::NotMine { recorded: None }
         );
         assert!(plan(&linked_user, &input(&user, "sub")).is_empty());
+    }
+
+    #[test]
+    fn a_link_or_folder_at_a_synced_file_is_named_as_a_fault() {
+        let tree = Tree::default();
+        let files = Linked {
+            tree: &tree,
+            links: &[
+                "tgorka/settings.toml",
+                "tgorka/settings.work-mac.toml",
+                "tgorka/drives.toml",
+                "tgorka/bots.toml",
+                "tgorka/matrix.toml",
+            ],
+        };
+        let named: Vec<String> = unusable_files(&files, "tgorka", "work-mac")
+            .into_iter()
+            .map(|sentence| sentence.split(' ').next().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(
+            named,
+            [
+                "tgorka/settings.toml",
+                "tgorka/settings.work-mac.toml",
+                "tgorka/drives.toml",
+                "tgorka/bots.toml",
+                "tgorka/matrix.toml",
+            ]
+        );
     }
 
     #[test]

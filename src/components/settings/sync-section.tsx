@@ -34,11 +34,14 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
+import { ACCOUNT_OFFERS_TITLE } from "@/lib/account-offers";
 import type {
+  DriveOfferVm,
   SyncDeviceVm,
   SyncOutcomeVm,
   SyncProfileVm,
@@ -58,6 +61,7 @@ import {
   syncListSettingsSet,
   syncOpenPath,
 } from "@/lib/ipc/client";
+import { useAccountStore } from "@/lib/stores/account";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import {
   ensureSyncHydrated,
@@ -295,10 +299,62 @@ export const SYNC_LIST_FOLDED_MAX = 50;
 export const SYNC_LIST_UNFOLDED_MIN = 10;
 export const SYNC_LIST_UNFOLDED_MAX = 1000;
 
+/**
+ * The drives the account offers from the person's other devices (Epic 84,
+ * UX-DR118). Present only while there is one: an install with no account, or
+ * with nothing elsewhere, sees the section exactly as before (AD-27).
+ */
+export const SYNC_OFFERS_SENTENCE =
+  "Drives you use on your other devices. Add one to sync it here too.";
+/** Opens the add form below, prefilled — the ellipsis because the folder is still to choose. */
+export const SYNC_OFFER_ADD_LABEL = "Add…";
+/** Said at the add form when an offer's Add… would throw away a draft (fix R20). */
+export const SYNC_OFFER_DRAFT_SENTENCE = "Save or cancel the folder you are adding first.";
+
+/** A drive's roles, as chips, in the form's order. */
+const OFFER_ROLES = [
+  ["notes", "Notes"],
+  ["recordings", "Recordings"],
+  ["sessions", "Sessions"],
+  ["tasks", "Tasks"],
+] as const;
+
 export function SyncSection({ open }: { open: boolean }) {
   const profiles = useSyncStore((state) => state.profiles);
   const statuses = useSyncStore((state) => state.statuses);
   const readError = useSyncStore((state) => state.error);
+  const accountDriveOffers = useAccountStore((state) => state.vm.offers.drives);
+  /**
+   * Offers this open of the section has already added (fix R19). Rust drops an
+   * offer only when a later sync reaches the repository — offline, that can be
+   * a while — and a second Add… in between would make a second folder for the
+   * same remote. The endpoint list does the same.
+   */
+  const [addedOffers, setAddedOffers] = useState<readonly string[]>([]);
+  const driveOffers = accountDriveOffers.filter((offer) => !addedOffers.includes(offer.key));
+  /**
+   * The offer the add form below was opened from, or `null` for a blank add.
+   * The form reads its seed once, on mount, so choosing an offer remounts it
+   * under that offer's key — but only while the form holds nothing of the
+   * person's own (fix R20): a typed field, a changed choice, or a folder it
+   * already created and still has to finish.
+   */
+  const [prefill, setPrefill] = useState<DriveOfferVm | null>(null);
+  const [addPristine, setAddPristine] = useState(true);
+  const [addNotice, setAddNotice] = useState<string | null>(null);
+  // Every Add… sends the person to the form, replaced or not: it sits below the
+  // list, and an Add… that changed something out of sight reads as one that did
+  // nothing. The form scrolls itself in and focuses what is left to fill.
+  const [revealRequest, setRevealRequest] = useState(0);
+  const chooseOffer = (offer: DriveOfferVm) => {
+    if (addPristine) {
+      setPrefill(offer);
+      setAddNotice(null);
+    } else {
+      setAddNotice(SYNC_OFFER_DRAFT_SENTENCE);
+    }
+    setRevealRequest((count) => count + 1);
+  };
 
   /**
    * The list sizes, as text.
@@ -406,14 +462,86 @@ export function SyncSection({ open }: { open: boolean }) {
         const status: SyncStatusVm | undefined = statuses[profile.id];
         return <SyncProfileRow key={profile.id} profile={profile} status={status} />;
       })}
+      {driveOffers.length > 0 && (
+        <section
+          aria-labelledby="settings-sync-offers-title"
+          className="mt-1 flex flex-col gap-2 border-border border-t pt-3"
+        >
+          <p id="settings-sync-offers-title" className="font-medium">
+            {ACCOUNT_OFFERS_TITLE}
+          </p>
+          <p className="text-muted-foreground">{SYNC_OFFERS_SENTENCE}</p>
+          <ul className="flex flex-col gap-2">
+            {driveOffers.map((offer) => (
+              <li key={offer.key} className="flex items-center gap-2">
+                <div className="flex min-w-0 flex-1 flex-col gap-1">
+                  <span className="truncate font-medium" title={offer.name}>
+                    {offer.name}
+                  </span>
+                  <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-muted-foreground text-xs">
+                    <span className="truncate font-mono" title={offer.remoteUrl}>
+                      {syncRemoteHost(offer.remoteUrl)}
+                    </span>
+                    {OFFER_ROLES.map(
+                      ([role, label]) =>
+                        offer[role] !== null && (
+                          <Badge key={role} variant="outline">
+                            {label}
+                          </Badge>
+                        ),
+                    )}
+                    {offer.devices.length > 0 && <span>on {offer.devices.join(", ")}</span>}
+                  </span>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0"
+                  aria-label={`${SYNC_OFFER_ADD_LABEL} ${offer.name}`}
+                  disabled={profiles === null}
+                  onClick={() => chooseOffer(offer)}
+                >
+                  {SYNC_OFFER_ADD_LABEL}
+                </Button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
       <div className="mt-1 flex flex-col gap-2 border-border border-t pt-3">
         <p className="font-medium">{SYNC_ADD_TITLE}</p>
+        {addNotice !== null && (
+          <p role="status" className="text-xs">
+            {addNotice}
+          </p>
+        )}
         {/* No `onCancel`, unlike the Sync view's disclosure: this form is a
             permanent part of the section, so a discard would have nothing to
             close and would have to mean "clear the fields" instead — a second
             meaning for the same control, on the one surface where abandoning a
-            draft already costs a single click on the dialog. */}
-        <AddFolderForm disabled={profiles === null} />
+            draft already costs a single click on the dialog. An offer's Add…
+            fills THIS form rather than opening another (Epic 84): one add form,
+            seeded from the offer, remounted under its key. */}
+        <AddFolderForm
+          key={prefill?.key ?? "blank"}
+          prefill={prefill ?? undefined}
+          disabled={profiles === null}
+          onPristineChange={setAddPristine}
+          revealRequest={revealRequest}
+          onSaved={(_saved, settled) => {
+            // The folder exists from here on, whatever the later legs did, so
+            // its offer is not offered again from this open.
+            if (prefill !== null) {
+              const added = prefill.key;
+              setAddedOffers((held) => [...held, added]);
+            }
+            if (settled) {
+              setPrefill(null);
+              setAddNotice(null);
+            }
+          }}
+        />
       </div>
       <div className="mt-1 flex flex-col gap-2 border-border border-t pt-3">
         <p className="font-medium">{SYNC_LISTS_TITLE}</p>

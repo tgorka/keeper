@@ -1,7 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AccountVm, IpcError, IpcErrorCode } from "@/lib/ipc/client";
+import { ACCOUNT_OFFERS_TITLE } from "@/lib/account-offers";
+import type { AccountVm, IpcError, IpcErrorCode, MatrixOfferVm } from "@/lib/ipc/client";
+import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { accountsStore } from "@/lib/stores/accounts";
+import { accountVm, matrixOffer } from "@/test/account-fixture";
 
 // Mock the typed IPC wrapper so the component never touches Tauri.
 const loginPassword = vi.fn();
@@ -519,5 +522,90 @@ describe("LoginScreen", () => {
     await waitFor(() => {
       expect(cancelBeeper).toHaveBeenCalledExactlyOnceWith("alice@beeper.com");
     });
+  });
+});
+
+describe("LoginScreen Matrix accounts from the account (Epic 84, UX-DR118)", () => {
+  beforeEach(() => {
+    accountsStore.getState().clear();
+    loginPassword.mockReset();
+    loginOidc.mockReset();
+  });
+
+  afterEach(() => {
+    accountStore.setState({ vm: NO_ACCOUNT, setupLink: null });
+    accountsStore.getState().clear();
+  });
+
+  function offering(...matrix: MatrixOfferVm[]) {
+    accountStore.getState().setVm(accountVm({ offers: { drives: [], providers: [], matrix } }));
+  }
+
+  it("has no offers block while the account offers no Matrix account", () => {
+    offering();
+    render(<LoginScreen addMode />);
+    expect(screen.queryByRole("region", { name: ACCOUNT_OFFERS_TITLE })).not.toBeInTheDocument();
+  });
+
+  it("is absent on the first sign-in screen, which is not adding an account", () => {
+    offering(matrixOffer());
+    render(<LoginScreen />);
+    expect(screen.queryByRole("region", { name: ACCOUNT_OFFERS_TITLE })).not.toBeInTheDocument();
+  });
+
+  it("prefills the homeserver and username from the offer, and signs in with them", async () => {
+    loginPassword.mockResolvedValue(account);
+    offering(matrixOffer());
+    render(<LoginScreen addMode />);
+    const block = screen.getByRole("region", { name: ACCOUNT_OFFERS_TITLE });
+    // The user id, and the host in muted text beside it.
+    fireEvent.click(
+      within(block).getByRole("button", { name: "@tgorka:acme.dev matrix.acme.dev" }),
+    );
+
+    expect(screen.getByLabelText("Homeserver")).toHaveValue("https://matrix.acme.dev/");
+    expect(screen.getByLabelText("Username")).toHaveValue("@tgorka:acme.dev");
+    // The one field the offer cannot fill is where the person lands.
+    expect(screen.getByLabelText("Password")).toHaveFocus();
+
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "hunter2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add account" }));
+    await waitFor(() =>
+      expect(loginPassword).toHaveBeenCalledWith(
+        "https://matrix.acme.dev/",
+        "@tgorka:acme.dev",
+        "hunter2",
+      ),
+    );
+  });
+
+  it("selects the Beeper tab for a Beeper account", async () => {
+    offering(
+      matrixOffer({
+        key: "matrix:@tgorka:beeper.com",
+        userId: "@tgorka:beeper.com",
+        homeserverUrl: "https://matrix.beeper.com/",
+        kind: "beeper",
+      }),
+    );
+    render(<LoginScreen addMode />);
+    fireEvent.click(screen.getByRole("button", { name: "@tgorka:beeper.com matrix.beeper.com" }));
+    expect(await screen.findByLabelText("Email")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Homeserver")).not.toBeInTheDocument();
+  });
+
+  it("prefills a single-sign-on account and signs in through it, without asking for a password", async () => {
+    loginOidc.mockResolvedValue(account);
+    offering(matrixOffer({ kind: "oidc" }));
+    render(<LoginScreen addMode />);
+    const offerButton = screen.getByRole("button", { name: "@tgorka:acme.dev matrix.acme.dev" });
+    fireEvent.click(offerButton);
+
+    expect(screen.getByLabelText("Homeserver")).toHaveValue("https://matrix.acme.dev/");
+    expect(screen.getByLabelText("Username")).toHaveValue("@tgorka:acme.dev");
+    expect(screen.getByLabelText("Password")).not.toHaveFocus();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+    await waitFor(() => expect(loginOidc).toHaveBeenCalledWith("https://matrix.acme.dev/"));
   });
 });

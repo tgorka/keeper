@@ -41,13 +41,26 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-03
-last_updated: 2026-09-23
+last_updated: 2026-09-24
 project: keeper
 project_key: NOKEY
 tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 
 development_status:
+  # Epic 84: the owner's question on the account build — "is all the settings will be reflected in the file on the sync?": pull them if the file exists, else take them from another of the person's devices, else create them from the template. Owner answered 2026-09-24: synced and editable (new files beside the pins; keeper.toml stays the lock), carry everything (drives, bot providers, Matrix accounts, the preference keys), and a new device's machine-local settings come from the latest device of the same class.
+  # Stack rungs: epic84-plan (docs + ledgers), then epic84-core (84.1–84.4 and 84.5's registry observer: settings_sync, manifest, offers VMs, layout::is_rewritable and plan_rename, Shape::to_toml, config_repo Write.replace + last_change_secs, bindings, the OrgAccountVm fixture ripple, and the one-line shell hunks the new fields force), then epic84-surface (84.5's shell sync/apply/command, 84.6's offers UI, mock-shell, docs/account.md). Shell crate by inspection; CI macOS is the gate.
+  # Contract amendments A1 (an AbsolutePath value applies only where its directory exists), A2' (superseding A2: a value that cannot be applied here is not applied, and both bases record the local value, so it is never dirty) and A3 (a rename moves settings.<device>.toml and keeps the device base) are in the epic's text.
+  # A two-device check on hesperia (a change travels both ways, a pin still wins, a new desktop seeds from the latest desktop, an offline change pushes later, no secret in the forge) is owed, as is 84.6's real-browser proof.
+  epic-84: in-progress
+  84-1-your-settings-are-two-files-merged-key-by-key: review
+  84-2-a-drive-or-a-bot-travels-by-name-not-by-number: review
+  84-3-a-new-device-starts-from-your-latest-one: review
+  84-4-drives-bots-and-matrix-accounts-travel-as-offers: review
+  84-5-a-change-here-reaches-the-repository-by-itself: review
+  84-6-from-your-account: review
+  # DW-300…DW-305 are opened by this plan; none closes here.
+
   # Epic 83: the owner's two asks on the epic-82 build — read the setup QR code with the camera on desktop, and let the sidebar's Add account add a Matrix account or set up / change the keeper account. Grounded with three measurements on hesperia (WKWebView camera exposure, zxing-wasm vs jsqr on the owner's real 1447-char code) before planning.
   # Stack rungs: epic83-plan (docs), then epic83-core (83.3's keeper-core rule + AccountSetupVm.replaces + binding and fixture ripple), then epic83-surface (83.1 menu + dialog, 83.2 scanner, 83.3 sheet sentence and shell call site, Info.plist, docs/account.md).
   epic-83: in-progress

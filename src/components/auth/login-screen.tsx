@@ -7,7 +7,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import type { AccountVm, IpcError, IpcErrorCode } from "@/lib/ipc/client";
+import { ACCOUNT_OFFERS_TITLE, offerUrlHost } from "@/lib/account-offers";
+import type { AccountVm, IpcError, IpcErrorCode, MatrixOfferVm } from "@/lib/ipc/client";
 import {
   beeperRequestCode,
   cancelBeeper,
@@ -16,6 +17,7 @@ import {
   loginOidc,
   loginPassword,
 } from "@/lib/ipc/client";
+import { useAccountStore } from "@/lib/stores/account";
 import { useAccountsStore } from "@/lib/stores/accounts";
 
 /** Documentation link surfaced for the non-SSS error (Design Notes). */
@@ -97,6 +99,20 @@ interface LoginScreenProps {
 }
 
 /**
+ * What a Matrix offer puts into the Password tab (Epic 84): the homeserver and
+ * the user id it signed in with — the full id, which a homeserver accepts as
+ * the username and which is the same text as the button that was pressed. A
+ * fresh object per click, so choosing the same offer twice fills the fields
+ * again after they were edited.
+ */
+interface PasswordPrefill {
+  homeserver: string;
+  username: string;
+  /** A password account: its one missing field gets the focus. SSO needs none. */
+  askPassword: boolean;
+}
+
+/**
  * Login surface (FR-1, FR-3, FR-5, AD-17).
  *
  * Two tabs: "Password" wraps the existing password + single-sign-on (OIDC) form
@@ -107,6 +123,28 @@ interface LoginScreenProps {
  */
 export function LoginScreen({ addMode = false, onDone }: LoginScreenProps = {}) {
   const addAccount = useAccountsStore((s) => s.addAccount);
+  // The Matrix accounts the person uses on their other devices (Epic 84,
+  // UX-DR118). Offered only when adding — which is also the first-run step —
+  // and absent while there are none. A choice fills this screen in and nothing
+  // more: a sign-in is still the person's to finish, and nothing is persisted.
+  const matrixOffers = useAccountStore((s) => s.vm.offers.matrix);
+  const [tab, setTab] = useState("password");
+  const [prefill, setPrefill] = useState<PasswordPrefill | null>(null);
+
+  const chooseOffer = (offer: MatrixOfferVm) => {
+    // Beeper signs in by email code; there is nothing of the offer to put in
+    // that form, so the choice is the tab itself.
+    if (offer.kind === "beeper") {
+      setTab("beeper");
+      return;
+    }
+    setTab("password");
+    setPrefill({
+      homeserver: offer.homeserverUrl,
+      username: offer.userId,
+      askPassword: offer.kind === "password",
+    });
+  };
 
   return (
     <div className="flex h-dvh items-center justify-center bg-background p-6 text-foreground">
@@ -119,8 +157,32 @@ export function LoginScreen({ addMode = false, onDone }: LoginScreenProps = {}) 
               : "Connect your Matrix account to start chatting."}
           </CardDescription>
         </CardHeader>
-        <CardContent>
-          <Tabs defaultValue="password">
+        <CardContent className="flex flex-col gap-4">
+          {addMode && matrixOffers.length > 0 && (
+            <section aria-labelledby="login-offers-title" className="flex flex-col gap-2">
+              <p id="login-offers-title" className="font-medium text-sm">
+                {ACCOUNT_OFFERS_TITLE}
+              </p>
+              <ul className="flex flex-col gap-1">
+                {matrixOffers.map((offer) => (
+                  <li key={offer.key}>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="h-auto w-full min-w-0 justify-start gap-2 py-1.5"
+                      onClick={() => chooseOffer(offer)}
+                    >
+                      <span className="truncate">{offer.userId}</span>{" "}
+                      <span className="truncate text-muted-foreground">
+                        {offerUrlHost(offer.homeserverUrl)}
+                      </span>
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+          <Tabs value={tab} onValueChange={setTab}>
             <TabsList className="w-full">
               {/* Trigger text avoids the exact string "Password"/"Email" so a
                   tab panel's `aria-labelledby` name never collides with a field
@@ -129,7 +191,12 @@ export function LoginScreen({ addMode = false, onDone }: LoginScreenProps = {}) 
               <TabsTrigger value="beeper">Beeper</TabsTrigger>
             </TabsList>
             <TabsContent value="password">
-              <PasswordTab addMode={addMode} addAccount={addAccount} onDone={onDone} />
+              <PasswordTab
+                addMode={addMode}
+                addAccount={addAccount}
+                onDone={onDone}
+                prefill={prefill}
+              />
             </TabsContent>
             <TabsContent value="beeper">
               <BeeperTab addMode={addMode} addAccount={addAccount} onDone={onDone} />
@@ -153,7 +220,12 @@ interface TabProps {
  * browser round-trip. The password field is cleared after every submit and never
  * lives in any store.
  */
-function PasswordTab({ addMode, addAccount, onDone }: TabProps) {
+function PasswordTab({
+  addMode,
+  addAccount,
+  onDone,
+  prefill,
+}: TabProps & { prefill: PasswordPrefill | null }) {
   const [homeserver, setHomeserver] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -162,6 +234,22 @@ function PasswordTab({ addMode, addAccount, onDone }: TabProps) {
   // `true` while an OIDC flow is pending (the browser round-trip). The form is
   // replaced with a "complete sign-in in your browser" state + Cancel.
   const [oidcPending, setOidcPending] = useState(false);
+  const passwordField = useRef<HTMLInputElement>(null);
+  // An offer chosen above fills the two fields it knows. A password typed for
+  // another account is not this one's, so it goes; and an account that signs
+  // in with a password is handed straight to the one field left to fill.
+  useEffect(() => {
+    if (prefill === null) {
+      return;
+    }
+    setHomeserver(prefill.homeserver);
+    setUsername(prefill.username);
+    setPassword("");
+    setErrorCode(null);
+    if (prefill.askPassword) {
+      passwordField.current?.focus();
+    }
+  }, [prefill]);
 
   // Mirror `oidcPending` into a ref so the unmount cleanup can read the latest
   // value without re-subscribing.
@@ -290,6 +378,7 @@ function PasswordTab({ addMode, addAccount, onDone }: TabProps) {
       <div className="flex flex-col gap-2">
         <Label htmlFor="password">Password</Label>
         <Input
+          ref={passwordField}
           id="password"
           name="password"
           type="password"

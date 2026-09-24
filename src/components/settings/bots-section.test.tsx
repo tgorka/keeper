@@ -44,6 +44,9 @@ import {
   BOTS_EDIT_LABEL,
   BOTS_NAME_LABEL,
   BOTS_NO_TOKEN_CAPTION,
+  BOTS_OFFER_ADD_FORM_LABEL,
+  BOTS_OFFER_ADD_LABEL,
+  BOTS_OFFER_DRAFT_SENTENCE,
   BOTS_REMOVE_LABEL,
   BOTS_SAVE_LABEL,
   BOTS_SECRET_MISSING_CAPTION,
@@ -64,6 +67,7 @@ import {
   VOICE_EVENTS_REFRESH_MS,
   VOICE_EVENTS_TITLE,
 } from "@/components/settings/bots-section";
+import { ACCOUNT_OFFERS_TITLE } from "@/lib/account-offers";
 import type {
   BotProbeVm,
   BotProviderSaveReq,
@@ -75,7 +79,7 @@ import type {
 import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { voiceStore } from "@/lib/stores/voice";
-import { accountVm } from "@/test/account-fixture";
+import { accountVm, providerOffer } from "@/test/account-fixture";
 
 const botsProvidersList = vi.fn();
 const botsBotsList = vi.fn();
@@ -91,6 +95,7 @@ const voiceEvents = vi.fn();
 const voiceTargetSet = vi.fn();
 const botsProviderCredentialSourceGet = vi.fn();
 const botsProviderCredentialSourceSet = vi.fn();
+const accountOfferAddProvider = vi.fn();
 
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
@@ -114,6 +119,8 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     botsProviderCredentialSourceGet: (id: string) => botsProviderCredentialSourceGet(id),
     botsProviderCredentialSourceSet: (id: string, source: string) =>
       botsProviderCredentialSourceSet(id, source),
+    // Epic 84: the one-tap add of an endpoint the account offers.
+    accountOfferAddProvider: (key: string) => accountOfferAddProvider(key),
   };
 });
 
@@ -470,6 +477,144 @@ describe("BotProviderForm with an organisation account (Epic 82, AD-315)", () =>
     expect(await screen.findByLabelText(BOTS_TOKEN_LABEL)).toBeInTheDocument();
     expect(screen.getByLabelText(botsAccountCredentialLabel("Globex"))).not.toBeChecked();
     expect(botsProviderCredentialSourceGet).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("BotsSection offers from the account (Epic 84, UX-DR118)", () => {
+  afterEach(() => {
+    accountStore.setState({ vm: NO_ACCOUNT, setupLink: null });
+  });
+
+  it("has no offers block while the account offers no endpoint", async () => {
+    accountStore.getState().setVm(accountVm());
+    render(<BotsSection open />);
+    await screen.findByRole("list", { name: "Endpoints" });
+    expect(screen.queryByRole("region", { name: ACCOUNT_OFFERS_TITLE })).not.toBeInTheDocument();
+  });
+
+  it("adds an account endpoint in one tap, and says Rust's refusal inline", async () => {
+    const offer = providerOffer();
+    // Rust's own envelope and sentence (`account_offer_add_provider`).
+    const notReady =
+      "Your account is not ready on this device. Sign in to it, then add the provider.";
+    accountOfferAddProvider
+      .mockRejectedValueOnce({
+        code: "internal",
+        message: notReady,
+        accountId: null,
+        retriable: false,
+      })
+      .mockResolvedValue(undefined);
+    accountStore
+      .getState()
+      .setVm(accountVm({ offers: { drives: [], providers: [offer], matrix: [] } }));
+    render(<BotsSection open />);
+
+    const block = await screen.findByRole("region", { name: ACCOUNT_OFFERS_TITLE });
+    expect(block).toHaveTextContent("Acme Hermes — hermes at hermes.acme.dev");
+    expect(block).toHaveTextContent("Research, Scheduler");
+    const add = within(block).getByRole("button", { name: `${BOTS_OFFER_ADD_LABEL} Acme Hermes` });
+    fireEvent.click(add);
+
+    expect(await within(block).findByRole("alert")).toHaveTextContent(notReady);
+    expect(accountOfferAddProvider).toHaveBeenCalledWith(offer.key);
+    // Nothing was typed and no form opened: the one tap is the whole add.
+    expect(botsProviderSave).not.toHaveBeenCalled();
+
+    fireEvent.click(add);
+    await waitFor(() =>
+      expect(screen.queryByRole("region", { name: ACCOUNT_OFFERS_TITLE })).not.toBeInTheDocument(),
+    );
+    expect(accountOfferAddProvider).toHaveBeenCalledTimes(2);
+  });
+
+  it("opens the endpoint form prefilled when the offer needs a key of its own", async () => {
+    accountStore.getState().setVm(
+      accountVm({
+        offers: { drives: [], providers: [providerOffer({ credential: "own" })], matrix: [] },
+      }),
+    );
+    render(<BotsSection open />);
+    const block = await screen.findByRole("region", { name: ACCOUNT_OFFERS_TITLE });
+    expect(
+      within(block).queryByRole("button", { name: `${BOTS_OFFER_ADD_LABEL} Acme Hermes` }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      within(block).getByRole("button", { name: `${BOTS_OFFER_ADD_FORM_LABEL} Acme Hermes` }),
+    );
+
+    expect(screen.getByLabelText(BOTS_NAME_LABEL)).toHaveValue("Acme Hermes");
+    expect(screen.getByLabelText(BOTS_BASE_URL_LABEL)).toHaveValue("https://hermes.acme.dev");
+    expect(screen.getByRole("button", { name: "hermes" })).toHaveAttribute("aria-pressed", "true");
+    // It asks for the key, as any add does — and the person is taken to it.
+    expect(screen.getByLabelText(BOTS_TOKEN_LABEL)).toHaveValue("");
+    expect(screen.getByLabelText(BOTS_TOKEN_LABEL)).toHaveFocus();
+    expect(accountOfferAddProvider).not.toHaveBeenCalled();
+  });
+
+  it("opens the form instead of the one tap while the account cannot stand in", async () => {
+    accountStore.getState().setVm(
+      accountVm({
+        state: "offline",
+        offers: { drives: [], providers: [providerOffer()], matrix: [] },
+      }),
+    );
+    render(<BotsSection open />);
+    const block = await screen.findByRole("region", { name: ACCOUNT_OFFERS_TITLE });
+    expect(
+      within(block).getByRole("button", { name: `${BOTS_OFFER_ADD_FORM_LABEL} Acme Hermes` }),
+    ).toBeInTheDocument();
+    expect(
+      within(block).queryByRole("button", { name: `${BOTS_OFFER_ADD_LABEL} Acme Hermes` }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers no add for a kind this build cannot speak, and says so in Rust's words", async () => {
+    accountStore.getState().setVm(
+      accountVm({
+        offers: {
+          drives: [],
+          providers: [providerOffer({ kind: "omp", name: "Omp" })],
+          matrix: [],
+        },
+      }),
+    );
+    render(<BotsSection open />);
+    const block = await screen.findByRole("region", { name: ACCOUNT_OFFERS_TITLE });
+    expect(block).toHaveTextContent("This version of keeper cannot talk to a omp provider.");
+    expect(within(block).queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  it("never throws away an endpoint being added: it says so and keeps the draft", async () => {
+    const first = providerOffer({ credential: "own" });
+    const second = providerOffer({
+      key: "provider:ollama:http://gpu.acme.dev:11434",
+      kind: "ollama",
+      name: "Acme GPU",
+      baseUrl: "http://gpu.acme.dev:11434",
+      credential: "own",
+    });
+    accountStore
+      .getState()
+      .setVm(accountVm({ offers: { drives: [], providers: [first, second], matrix: [] } }));
+    render(<BotsSection open />);
+    const block = await screen.findByRole("region", { name: ACCOUNT_OFFERS_TITLE });
+    const addForm = (name: string) =>
+      within(block).getByRole("button", { name: `${BOTS_OFFER_ADD_FORM_LABEL} ${name}` });
+
+    // Untouched, the form is simply replaced by the next offer's.
+    fireEvent.click(addForm("Acme Hermes"));
+    fireEvent.click(addForm("Acme GPU"));
+    expect(screen.getByLabelText(BOTS_NAME_LABEL)).toHaveValue("Acme GPU");
+
+    // With a key typed into it, it stays, and the person is told why.
+    fireEvent.change(screen.getByLabelText(BOTS_TOKEN_LABEL), { target: { value: "sk-typed" } });
+    fireEvent.click(addForm("Acme Hermes"));
+    expect(screen.getByLabelText(BOTS_NAME_LABEL)).toHaveValue("Acme GPU");
+    expect(screen.getByLabelText(BOTS_TOKEN_LABEL)).toHaveValue("sk-typed");
+    expect(screen.getByText(BOTS_OFFER_DRAFT_SENTENCE)).toBeInTheDocument();
+    expect(screen.getByLabelText(BOTS_TOKEN_LABEL)).toHaveFocus();
   });
 });
 

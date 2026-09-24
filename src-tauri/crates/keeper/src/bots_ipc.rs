@@ -449,6 +449,8 @@ pub fn bots_provider_save(
     // sessions is not a fact about the new one.
     capabilities().forget(&id);
     let row = provider_of(&dir, &id)?;
+    // The provider travels in the person's `bots.toml` (Epic 84, AD-325).
+    crate::account_ipc::note_local_change();
     Ok(BotProviderVm::compose(
         &row,
         has_provider_token(&state, &id),
@@ -485,6 +487,7 @@ pub fn bots_provider_remove(
         keeper_core::bots::delete_bot_token(state.platform.as_ref(), &provider_id, &bot.target)
             .map_err(to_ipc_error)?;
     }
+    crate::account_ipc::note_local_change();
     Ok(())
 }
 
@@ -641,6 +644,7 @@ pub fn bots_bot_save(state: State<'_, AppState>, req: BotSaveReq) -> Result<BotV
             .map_err(to_ipc_error)?;
     }
     let bot = bot_of(&dir, &id)?;
+    crate::account_ipc::note_local_change();
     Ok(BotVm::compose(&bot))
 }
 
@@ -663,6 +667,7 @@ pub fn bots_bot_remove(state: State<'_, AppState>, bot_id: String) -> Result<(),
         keeper_core::bots::delete_bot_token(state.platform.as_ref(), &bot.provider_id, &bot.target)
             .map_err(to_ipc_error)?;
     }
+    crate::account_ipc::note_local_change();
     Ok(())
 }
 
@@ -2077,6 +2082,8 @@ pub fn bots_bot_identity_save(
         return Err(no_such("bot", &bot_id));
     }
     let bot = bot_of(&dir, &bot_id)?;
+    // Shape, colour and mark travel in the person's `bots.toml`.
+    crate::account_ipc::note_local_change();
     Ok(BotVm::compose(&bot))
 }
 
@@ -2112,6 +2119,7 @@ pub fn bots_bots_reorder(
             retriable: false,
         })?;
     store::reorder_bots(&dir, &plan).map_err(to_ipc_error)?;
+    crate::account_ipc::note_local_change();
     let bots = store::list_bots(&dir).map_err(to_ipc_error)?;
     Ok(bots.iter().map(BotVm::compose).collect())
 }

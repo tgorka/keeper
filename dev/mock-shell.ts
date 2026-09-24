@@ -47,6 +47,7 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
   AccountDeviceVm,
+  AccountOffersVm,
   AccountSetupVm,
   AccountShareVm,
   AccountStateVm,
@@ -3075,6 +3076,7 @@ const NO_ACCOUNT_VM: OrgAccountVm = {
   lastSyncedMs: null,
   forgeConnected: false,
   faults: [],
+  offers: { drives: [], providers: [], matrix: [] },
   revision: 0,
 };
 
@@ -3084,6 +3086,77 @@ const ACCOUNT_THIS_DEVICE: AccountDeviceVm = {
   class: "desktop",
   platform: "macos",
   thisDevice: true,
+};
+
+/**
+ * What the person uses on their other devices and this one lacks (Epic 84,
+ * AD-323): two drives (one signing with the account, one with its own token),
+ * an endpoint that uses the account and carries two bots, and a Matrix
+ * account. Mutable because adding one here takes its offer away — the one-tap
+ * endpoint add, a folder save for the same remote, a Matrix sign-in — as the
+ * shell's next publish does once the thing exists on this device.
+ */
+let accountOffers: AccountOffersVm = {
+  drives: [
+    {
+      key: "drive:https://git.acme.dev/tgorka/notes#main",
+      name: "notes",
+      remoteUrl: "https://git.acme.dev/tgorka/notes.git",
+      branch: "main",
+      credential: "account",
+      notes: "notes",
+      recordings: null,
+      sessions: null,
+      tasks: "tasks",
+      excludes: [".DS_Store", "*.tmp"],
+      lfsThresholdBytes: 8 * 1024 * 1024,
+      virtualPatterns: ["attachments/**"],
+      virtualOverBytes: null,
+      releaseTtlMs: null,
+      tags: ["notes"],
+      commitSubjectTemplate: null,
+      devices: ["iphone-3f2a", "ipad-91c0"],
+    },
+    {
+      key: "drive:git@github.com:tgorka/field-recordings#main",
+      name: "Field recordings",
+      remoteUrl: "git@github.com:tgorka/field-recordings.git",
+      branch: "main",
+      credential: "own",
+      notes: null,
+      recordings: "recordings",
+      sessions: null,
+      tasks: null,
+      excludes: [],
+      lfsThresholdBytes: null,
+      virtualPatterns: null,
+      virtualOverBytes: 64 * 1024 * 1024,
+      releaseTtlMs: 72 * 60 * 60 * 1000,
+      tags: [],
+      commitSubjectTemplate: "{profile}: {changed} changed",
+      devices: ["ipad-91c0"],
+    },
+  ],
+  providers: [
+    {
+      key: "provider:hermes:https://hermes.acme.dev",
+      kind: "hermes",
+      name: "Acme Hermes",
+      baseUrl: "https://hermes.acme.dev",
+      credential: "account",
+      bots: ["Research", "Scheduler"],
+      devices: ["iphone-3f2a"],
+    },
+  ],
+  matrix: [
+    {
+      key: "matrix:@tgorka:acme.dev",
+      userId: "@tgorka:acme.dev",
+      homeserverUrl: "https://matrix.acme.dev/",
+      kind: "password",
+      devices: ["iphone-3f2a", "ipad-91c0"],
+    },
+  ],
 };
 
 /** A signed-in account in `state`, with the sentence Rust would write for it. */
@@ -3139,6 +3212,10 @@ function signedInAccount(state: AccountStateVm, device = ACCOUNT_THIS_DEVICE): O
     lastSyncedMs: state === "ready" ? Date.now() : null,
     forgeConnected: false,
     faults: [],
+    // Rust composes offers only after a converge has read the repository, and
+    // clears them when the directory is not this person's: so `ready` and
+    // `syncing` carry them, and `offline`, `blocked` and the rest do not.
+    offers: offersIn(state),
     revision: 0,
   };
 }
@@ -3172,6 +3249,64 @@ function setAccount(next: OrgAccountVm): OrgAccountVm {
   accountVm = { ...next, revision: accountRevision };
   accountWatcher?.onmessage?.(accountVm);
   return accountVm;
+}
+
+/** The offers a snapshot in `state` carries: Rust has them only after a converge. */
+function offersIn(state: AccountStateVm): AccountOffersVm {
+  return state === "ready" || state === "syncing" ? accountOffers : NO_ACCOUNT_VM.offers;
+}
+
+/**
+ * Take offers away once the thing exists here, and publish — what the shell's
+ * next converge does. A snapshot that carries none keeps carrying none.
+ */
+function withdrawOffers(next: AccountOffersVm): void {
+  accountOffers = next;
+  if (accountVm.configured) {
+    setAccount({ ...accountVm, offers: offersIn(accountVm.state) });
+  }
+}
+
+/**
+ * One spelling for a remote on both sides of a comparison, close enough to
+ * `normalize_remote` for a viewing aid: no trailing `/` or `.git`, one case.
+ */
+function mockRemoteKey(remoteUrl: string, branch: string): string {
+  return `${remoteUrl
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\.git$/, "")
+    .toLowerCase()}#${branch}`;
+}
+
+/**
+ * A Matrix sign-in as Rust answers it. SSO names nobody up front, so the id is
+ * the offered one on that homeserver when there is one — which is who the
+ * browser would have signed in.
+ */
+function matrixSignedIn(
+  homeserver: string,
+  username: string | null,
+  provider: AccountVm["provider"],
+): AccountVm {
+  const homeserverUrl = /^https?:\/\//.test(homeserver) ? homeserver : `https://${homeserver}/`;
+  const host = new URL(homeserverUrl).host;
+  const offered = accountOffers.matrix.find((offer) => new URL(offer.homeserverUrl).host === host);
+  let userId = offered?.userId ?? `@harness:${host}`;
+  if (username !== null) {
+    userId = username.startsWith("@") ? username : `@${username}:${host}`;
+  }
+  withdrawOffers({
+    ...accountOffers,
+    matrix: accountOffers.matrix.filter((offer) => offer.userId !== userId),
+  });
+  return {
+    accountId: `01J8MATRIX${String(Date.now()).padStart(16, "0")}`,
+    userId,
+    homeserverUrl,
+    hueIndex: 1,
+    provider,
+  };
 }
 
 /**
@@ -4140,6 +4275,19 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       existing === undefined
         ? [...profiles, stored]
         : profiles.map((candidate) => (candidate.id === stored.id ? stored : candidate));
+    // Epic 84: a drive the account offered is no longer offered once this
+    // device syncs it, as the shell's next converge would publish.
+    const added = mockRemoteKey(stored.remoteUrl, stored.branch);
+    if (
+      accountOffers.drives.some((offer) => mockRemoteKey(offer.remoteUrl, offer.branch) === added)
+    ) {
+      withdrawOffers({
+        ...accountOffers,
+        drives: accountOffers.drives.filter(
+          (offer) => mockRemoteKey(offer.remoteUrl, offer.branch) !== added,
+        ),
+      });
+    }
     return stored;
   },
   // The two space writes MUTATE the fixture rather than answering and forgetting.
@@ -4705,6 +4853,78 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     credentialSources.set(`bots/${String(payload.providerId)}`, String(payload.source));
     return null;
   },
+  // Epic 84: the one-tap add of an endpoint offered by the account. Rust's
+  // refusals are reproduced word for word and in Rust's order
+  // (`account_ipc.rs`, `account_offer_add_provider`), with its envelope: a
+  // refusal is `internal` and not retriable.
+  account_offer_add_provider: (payload) => {
+    const key = String(payload.key ?? "");
+    const offer = accountOffers.providers.find((candidate) => candidate.key === key);
+    const refuse = (message: string) => {
+      throw { code: "internal", message, accountId: null, retriable: false };
+    };
+    if (offer === undefined || offersIn(accountVm.state).providers.length === 0) {
+      return refuse("This provider is no longer offered by your account. Sync, then try again.");
+    }
+    if (offer.credential !== "account") {
+      return refuse("This provider uses its own key. Add it with the form and paste the key.");
+    }
+    if (accountVm.identity === null || !["ready", "syncing"].includes(accountVm.state)) {
+      return refuse(
+        "Your account is not ready on this device. Sign in to it, then add the provider.",
+      );
+    }
+    if (offer.kind !== "hermes" && offer.kind !== "ollama") {
+      return refuse(`This version of keeper cannot talk to a ${offer.kind} provider.`);
+    }
+    const id = `01J8OFFER${String(BOT_PROVIDERS.length).padStart(17, "0")}`;
+    BOT_PROVIDERS.push({
+      id,
+      kind: offer.kind,
+      name: offer.name,
+      baseUrl: offer.baseUrl,
+      host: new URL(offer.baseUrl).host,
+      isPrivate: false,
+      createdMs: Date.now(),
+      health: "unknown",
+      healthCheckedMs: null,
+      healthDetail: null,
+      readTimeoutMs: null,
+      hasToken: false,
+    });
+    credentialSources.set(`bots/${id}`, "account");
+    // Appended after every bot already pinned, in the offer's own order.
+    for (const name of offer.bots) {
+      BOT_ROWS.push({
+        id: `${id}B${BOT_ROWS.length}`,
+        providerId: id,
+        target: name.toLowerCase(),
+        name,
+        pinOrder: BOT_ROWS.length,
+        shape: null,
+        colour: null,
+        mark: null,
+        createdMs: Date.now(),
+      });
+    }
+    withdrawOffers({
+      ...accountOffers,
+      providers: accountOffers.providers.filter((candidate) => candidate.key !== key),
+    });
+    return null;
+  },
+  // The three Matrix sign-ins, so the add-account screen can be driven to the
+  // end here. Each answers the account Rust would, and takes away the account's
+  // offer for it, as the next converge does once the account exists here.
+  login_password: (payload) =>
+    matrixSignedIn(String(payload.homeserver ?? ""), String(payload.username ?? ""), "password"),
+  login_oidc: (payload) => matrixSignedIn(String(payload.homeserver ?? ""), null, "oidc"),
+  login_beeper: (payload) =>
+    matrixSignedIn(
+      "https://matrix.beeper.com/",
+      `@${String(payload.email ?? "").split("@")[0]}:beeper.com`,
+      "beeper",
+    ),
 
   /**
    * The path plugin's directory lookup, which is not one of the app's own
