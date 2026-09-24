@@ -22,7 +22,13 @@
  *     halves in those words.
  */
 import { useEffect, useState } from "react";
-import { AddFolderForm, SYNC_ADD_TITLE, SYNC_EDIT_TITLE } from "@/components/sync/add-folder-form";
+import {
+  AddFolderForm,
+  type AddFolderPrefill,
+  SYNC_ADD_TITLE,
+  SYNC_EDIT_TITLE,
+} from "@/components/sync/add-folder-form";
+import { BrowseReposEntry } from "@/components/sync/browse-repos-sheet";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -41,7 +47,6 @@ import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { ACCOUNT_OFFERS_TITLE } from "@/lib/account-offers";
 import type {
-  DriveOfferVm,
   SyncDeviceVm,
   SyncOutcomeVm,
   SyncProfileVm,
@@ -333,20 +338,21 @@ export function SyncSection({ open }: { open: boolean }) {
   const [addedOffers, setAddedOffers] = useState<readonly string[]>([]);
   const driveOffers = accountDriveOffers.filter((offer) => !addedOffers.includes(offer.key));
   /**
-   * The offer the add form below was opened from, or `null` for a blank add.
-   * The form reads its seed once, on mount, so choosing an offer remounts it
-   * under that offer's key — but only while the form holds nothing of the
+   * What the add form below was opened from — an offer, or a repository from
+   * Browse repositories (Epic 86) — or `null` for a blank add.
+   * The form reads its seed once, on mount, so choosing one remounts it
+   * under its key — but only while the form holds nothing of the
    * person's own (fix R20): a typed field, a changed choice, or a folder it
    * already created and still has to finish.
    */
-  const [prefill, setPrefill] = useState<DriveOfferVm | null>(null);
+  const [prefill, setPrefill] = useState<AddFolderPrefill | null>(null);
   const [addPristine, setAddPristine] = useState(true);
   const [addNotice, setAddNotice] = useState<string | null>(null);
   // Every Add… sends the person to the form, replaced or not: it sits below the
   // list, and an Add… that changed something out of sight reads as one that did
   // nothing. The form scrolls itself in and focuses what is left to fill.
   const [revealRequest, setRevealRequest] = useState(0);
-  const chooseOffer = (offer: DriveOfferVm) => {
+  const chooseOffer = (offer: AddFolderPrefill) => {
     if (addPristine) {
       setPrefill(offer);
       setAddNotice(null);
@@ -510,7 +516,12 @@ export function SyncSection({ open }: { open: boolean }) {
         </section>
       )}
       <div className="mt-1 flex flex-col gap-2 border-border border-t pt-3">
-        <p className="font-medium">{SYNC_ADD_TITLE}</p>
+        {/* Browse repositories sits beside the heading of the form its Add…
+            fills (UX-DR120), and is absent while there is no source. */}
+        <div className="flex items-center justify-between gap-2">
+          <p className="font-medium">{SYNC_ADD_TITLE}</p>
+          <BrowseReposEntry size="xs" onAddOne={chooseOffer} />
+        </div>
         {addNotice !== null && (
           <p role="status" className="text-xs">
             {addNotice}

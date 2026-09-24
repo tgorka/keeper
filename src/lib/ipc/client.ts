@@ -137,6 +137,7 @@ export type { DaemonPresence } from "./gen/DaemonPresence";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
 export type { DeviceClassVm } from "./gen/DeviceClassVm";
+export type { DeviceCodeVm } from "./gen/DeviceCodeVm";
 export type { DiscoveredBridgeVm } from "./gen/DiscoveredBridgeVm";
 export type { DockBadgeMode } from "./gen/DockBadgeMode";
 export type { DocumentFormat } from "./gen/DocumentFormat";
@@ -166,6 +167,16 @@ export type { FilesListingState } from "./gen/FilesListingState";
 export type { FilesListingVm } from "./gen/FilesListingVm";
 export type { FilesReleaseVm } from "./gen/FilesReleaseVm";
 export type { FilesSyncStatusVm } from "./gen/FilesSyncStatusVm";
+export type { ForgeAddItem } from "./gen/ForgeAddItem";
+export type { ForgeAddReq } from "./gen/ForgeAddReq";
+export type { ForgeAddResultVm } from "./gen/ForgeAddResultVm";
+export type { ForgeKindVm } from "./gen/ForgeKindVm";
+export type { ForgeNoticeVm } from "./gen/ForgeNoticeVm";
+export type { ForgeOwnerVm } from "./gen/ForgeOwnerVm";
+export type { ForgeReposVm } from "./gen/ForgeReposVm";
+export type { ForgeRepoVm } from "./gen/ForgeRepoVm";
+export type { ForgeSourceVm } from "./gen/ForgeSourceVm";
+export type { ForgeStateVm } from "./gen/ForgeStateVm";
 export type { GrantMode } from "./gen/GrantMode";
 export type { GrantScope } from "./gen/GrantScope";
 export type { HeldSendVm } from "./gen/HeldSendVm";
@@ -388,6 +399,7 @@ export type { TextFileVm } from "./gen/TextFileVm";
 export type { TimelineBatch } from "./gen/TimelineBatch";
 export type { TimelineItemVm } from "./gen/TimelineItemVm";
 export type { TimelineOp } from "./gen/TimelineOp";
+export type { TokenViaVm } from "./gen/TokenViaVm";
 export type { ToolName } from "./gen/ToolName";
 export type { TypingBatch } from "./gen/TypingBatch";
 export type { TypistVm } from "./gen/TypistVm";
@@ -448,12 +460,17 @@ import type { ConfigLayersVm } from "./gen/ConfigLayersVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { CopyJobVm } from "./gen/CopyJobVm";
 import type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
+import type { DeviceCodeVm } from "./gen/DeviceCodeVm";
 import type { DraftMirrorBatch } from "./gen/DraftMirrorBatch";
 import type { EditVersionVm } from "./gen/EditVersionVm";
 import type { EmbeddingModelVm } from "./gen/EmbeddingModelVm";
 import type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 import type { ExportProgressVm } from "./gen/ExportProgressVm";
 import type { ExportRequestVm } from "./gen/ExportRequestVm";
+import type { ForgeAddReq } from "./gen/ForgeAddReq";
+import type { ForgeAddResultVm } from "./gen/ForgeAddResultVm";
+import type { ForgeReposVm } from "./gen/ForgeReposVm";
+import type { ForgeSourceVm } from "./gen/ForgeSourceVm";
 import type { HotkeyVm } from "./gen/HotkeyVm";
 import type { InboxBatch } from "./gen/InboxBatch";
 import type { IncognitoVm } from "./gen/IncognitoVm";
@@ -7809,8 +7826,12 @@ export async function accountOfferAddProvider(key: string): Promise<void> {
   await invoke<void>("account_offer_add_provider", { key });
 }
 
-/** Where a credential comes from: this device's keychain, or the account. */
-export type CredentialSource = "keychain" | "account";
+/**
+ * Where a credential comes from: this device's keychain, the account, or a
+ * repository source's connection (Epic 86, AD-336) — `forge:<source-id>`,
+ * which drives accept and bot endpoints refuse.
+ */
+export type CredentialSource = "keychain" | "account" | `forge:${string}`;
 
 /** Where a drive's git credential comes from (AD-315). */
 export async function syncCredentialSourceGet(profileId: string): Promise<CredentialSource> {
@@ -7838,6 +7859,66 @@ export async function botsProviderCredentialSourceSet(
   source: CredentialSource,
 ): Promise<void> {
   await invoke<void>("bots_provider_credential_source_set", { providerId, source });
+}
+
+// ---------------------------------------------------------------------------
+// Repository sources (Epic 86, AD-333…AD-338). Rust lists what a source can
+// reach, marks each repository against this device's drives and the account's
+// manifest, and adds the ones picked. No token crosses this boundary: the
+// device-flow code is the only secret-shaped value here, and it is the one the
+// person types into GitHub themselves.
+// ---------------------------------------------------------------------------
+
+/** Every repository source this install can use, each with its state and sentence. */
+export async function forgesList(): Promise<ForgeSourceVm[]> {
+  return await invoke<ForgeSourceVm[]>("forges_list");
+}
+
+/**
+ * A source's repositories, marked and grouped. Rust keeps the list in memory
+ * per source; `refresh` fetches it again.
+ */
+export async function forgeRepos(sourceId: string, refresh: boolean): Promise<ForgeReposVm> {
+  return await invoke<ForgeReposVm>("forge_repos", { sourceId, refresh });
+}
+
+/** Start a device-flow connection; the shell holds the device code itself. */
+export async function forgeConnectStart(sourceId: string): Promise<DeviceCodeVm> {
+  return await invoke<DeviceCodeVm>("forge_connect_start", { sourceId });
+}
+
+/**
+ * Wait for the person to approve the code. Resolves with the source on success
+ * or on a terminal refusal (its sentence says which); a cancel resolves with
+ * `notConnected`.
+ */
+export async function forgeConnectWait(sourceId: string): Promise<ForgeSourceVm> {
+  return await invoke<ForgeSourceVm>("forge_connect_wait", { sourceId });
+}
+
+/** Open the held device code's verification page — the only browser keeper opens here. */
+export async function forgeConnectOpen(sourceId: string): Promise<void> {
+  await invoke<void>("forge_connect_open", { sourceId });
+}
+
+/** Stop waiting for approval; the pending `forgeConnectWait` resolves `notConnected`. */
+export async function forgeConnectCancel(sourceId: string): Promise<void> {
+  await invoke<void>("forge_connect_cancel", { sourceId });
+}
+
+/** Forget this device's connection to a source. */
+export async function forgeDisconnect(sourceId: string): Promise<ForgeSourceVm> {
+  return await invoke<ForgeSourceVm>("forge_disconnect", { sourceId });
+}
+
+/** Add several repositories as drives; partial success is reported per repository. */
+export async function forgeReposAdd(req: ForgeAddReq): Promise<ForgeAddResultVm[]> {
+  return await invoke<ForgeAddResultVm[]>("forge_repos_add", { req });
+}
+
+/** Where a batch of drives goes by default; `null` where the platform picks (iOS). */
+export async function forgeDefaultBaseFolder(): Promise<string | null> {
+  return await invoke<string | null>("forge_default_base_folder");
 }
 
 /**

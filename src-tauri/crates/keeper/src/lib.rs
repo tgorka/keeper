@@ -57,6 +57,9 @@ mod pdf_export;
 // The `keeper-file://` asset scheme (Story 45.7). Every target since Epic 66
 // (AD-200): it serves files out of a synced folder, and a phone now has one.
 mod file_protocol;
+// Repository sources (Epic 86): the person's GitHub and Forgejo repositories,
+// listed and added as drives. Every target: a phone adds drives too.
+mod forge_ipc;
 #[cfg(desktop)]
 mod hotkey;
 mod ipc;
@@ -1026,6 +1029,16 @@ pub fn run() {
                 account_ipc::sync_credential_source_set,
                 account_ipc::bots_provider_credential_source_get,
                 account_ipc::bots_provider_credential_source_set,
+                // Repository sources (Epic 86): every target, like drives.
+                forge_ipc::forges_list,
+                forge_ipc::forge_repos,
+                forge_ipc::forge_connect_start,
+                forge_ipc::forge_connect_open,
+                forge_ipc::forge_connect_wait,
+                forge_ipc::forge_connect_cancel,
+                forge_ipc::forge_disconnect,
+                forge_ipc::forge_repos_add,
+                forge_ipc::forge_default_base_folder,
                 ipc::bridge_catalog,
                 ipc::bridge_discover,
                 ipc::bridge_login_start,

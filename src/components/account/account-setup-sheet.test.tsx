@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -9,10 +9,12 @@ vi.mock("@/lib/ipc/client", () => ({
 
 import {
   AccountSetupSheet,
+  SETUP_BROKER_LABEL,
   SETUP_CANCEL_SIGN_IN_LABEL,
   SETUP_CONTINUE_LABEL,
   SETUP_DEVICE_LABEL,
   SETUP_DONE_LABEL,
+  SETUP_FORGE_HOSTS_LABEL,
   setupReplacesSentence,
 } from "@/components/account/account-setup-sheet";
 import type { AccountSetupVm, OrgAccountVm } from "@/lib/ipc/client";
@@ -34,6 +36,8 @@ function setupVm(over: Partial<AccountSetupVm> = {}): AccountSetupVm {
     deviceClass: "desktop",
     registered: false,
     replaces: null,
+    brokerHost: null,
+    forgeHosts: [],
     ...over,
   };
 }
@@ -97,6 +101,44 @@ describe("AccountSetupSheet", () => {
 
     expect(await screen.findByLabelText(SETUP_DEVICE_LABEL)).toBeInTheDocument();
     expect(screen.queryByText(/keeper will restore/)).not.toBeInTheDocument();
+  });
+
+  it("names the GitHub broker as a host to check, only when the descriptor has one", async () => {
+    mockResolve.mockResolvedValue(setupVm({ brokerHost: "broker.acme.dev" }));
+    const { unmount } = render(<AccountSetupSheet />);
+    act(() => accountStore.getState().openSetup("keeper://setup?a"));
+    expect(await screen.findByText("broker.acme.dev")).toBeInTheDocument();
+    expect(screen.getByText(SETUP_BROKER_LABEL)).toBeInTheDocument();
+    unmount();
+    act(() => accountStore.getState().closeSetup());
+
+    mockResolve.mockResolvedValue(setupVm());
+    open("keeper://setup?b");
+    await screen.findByText("git.acme.dev");
+    expect(screen.queryByText(SETUP_BROKER_LABEL)).not.toBeInTheDocument();
+  });
+
+  it("lists every other host a repository token would go to, one per line, before Continue", async () => {
+    // The case the list exists for: a descriptor whose GitHub source sends
+    // its API calls to a host other than GitHub's, which no other fact shows.
+    mockResolve.mockResolvedValue(setupVm({ forgeHosts: ["github.com", "api.elsewhere.example"] }));
+    const { unmount } = render(<AccountSetupSheet />);
+    act(() => accountStore.getState().openSetup("keeper://setup?a"));
+    const hosts = await screen.findByRole("list", { name: SETUP_FORGE_HOSTS_LABEL });
+    expect(
+      within(hosts)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual(["github.com", "api.elsewhere.example"]);
+    expect(mockConfirm).not.toHaveBeenCalled();
+    unmount();
+    act(() => accountStore.getState().closeSetup());
+
+    // No other host receives a token: no row claims one does.
+    mockResolve.mockResolvedValue(setupVm());
+    open("keeper://setup?b");
+    await screen.findByText("git.acme.dev");
+    expect(screen.queryByText(SETUP_FORGE_HOSTS_LABEL)).not.toBeInTheDocument();
   });
 
   it("renders Rust's refusal verbatim and offers nothing to continue", async () => {

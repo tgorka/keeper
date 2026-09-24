@@ -44,6 +44,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use keeper_core::bots::{self, Provider, ProviderKind};
 use keeper_core::config::{self as layers, AccountLayerSource};
 use keeper_core::error::CoreError;
+use keeper_core::forges::{self, tokens::ForgeError, ForgeSource};
 use keeper_core::oauth::{OAuthCallback, OAuthFlowRegistry};
 use keeper_core::org_account::descriptor::{self, AccountDescriptor, RepoAuthConfig, SetupInput};
 use keeper_core::org_account::device_state::{self, DeviceStateFile, MatrixState, RestorePending};
@@ -2485,9 +2486,9 @@ fn credential_profile(key: &str) -> Option<&str> {
     key.strip_prefix("sync/")?.strip_suffix("/credential")
 }
 
-/// The drive credential when the drive uses the account: `None` when `key`
-/// is not a drive credential or the drive keeps its own token in the
-/// keychain; otherwise a token of the account's, sent in keeper-sync's own
+/// The drive credential when the drive uses the account or a repository
+/// source: `None` when `key` is not a drive credential or the drive keeps its
+/// own token in the keychain; otherwise a token, sent in keeper-sync's own
 /// spelling like any stored token. A drive is only answered for the account
 /// it was set to use (`account:<id>`), never for one that replaced it.
 ///
@@ -2498,23 +2499,29 @@ fn credential_profile(key: &str) -> Option<&str> {
 /// connected answers the account's `NeedsSignIn`; the forge token refreshes
 /// itself before it expires, so a refused one is replaced on the next pass.
 ///
+/// A drive set to `forge:<source>` (AD-336) gets that source's token, and
+/// only while its remote is at the source's own origin: a token is never
+/// sent to another host, whatever the row says.
+///
 /// `secret_get` is synchronous and is called from the sync engine's async
-/// path, so a refresh must not park a runtime worker: on a multi-thread
-/// runtime `block_in_place` hands this worker's other tasks to the rest of
-/// the pool first; elsewhere the refresh runs on a thread of its own.
+/// path, so a refresh must not park a runtime worker (see [`off_worker`]).
 pub fn drive_credential(platform: &Arc<dyn Platform>, key: &str) -> Option<Result<String, String>> {
-    use tokio::runtime::{Handle, RuntimeFlavor};
-
     let profile = credential_profile(key)?;
-    // No account, no change: the drive's own keychain item, read as before.
-    let d = descriptor()?;
-    let data_dir = platform.data_dir().ok()?;
-    let source = registry::get_sync_credential_source(&data_dir, profile, Some(&d.id))
-        .ok()
-        .flatten();
-    if source.as_deref() != Some("account") {
+    let d = descriptor();
+    // No account and no repository source, no change: the drive's own
+    // keychain item, read as before — no registry row, no HTTP client.
+    if d.is_none() && forges::BUILTIN_GITHUB_CLIENT_ID.is_none() {
         return None;
     }
+    let data_dir = platform.data_dir().ok()?;
+    let source =
+        registry::get_sync_credential_source(&data_dir, profile, d.as_ref().map(|d| d.id.as_str()))
+            .ok()
+            .flatten()?;
+    if let Some(source_id) = forges::forge_credential_id(&source) {
+        return Some(forge_drive_credential(platform, profile, source_id, d));
+    }
+    let d = d.filter(|_| source == "account")?;
     let forge = if matches!(d.config.auth, RepoAuthConfig::Oauth(_)) {
         // Never the sign-in token to a remote whose host is unknown: that
         // could hand the wrong token to the forge, or any token to a stranger.
@@ -2538,20 +2545,63 @@ pub fn drive_credential(platform: &Arc<dyn Platform>, key: &str) -> Option<Resul
             }
         })
     };
-    let answer = match Handle::try_current() {
+    Some(match off_worker(refresh) {
+        Some(Ok(token)) => Ok(token),
+        Some(Err(error)) => Err(format!("the account credential is unavailable: {error}")),
+        None => Err("the account credential could not be read".to_owned()),
+    })
+}
+
+/// A drive set to repository source `source_id`: that source's token for
+/// this drive's remote. `drive_token` refuses a remote that is not at the
+/// source's origin, and on the broker path mints a token for this one
+/// repository only.
+fn forge_drive_credential(
+    platform: &Arc<dyn Platform>,
+    profile: &str,
+    source_id: &str,
+    d: Option<AccountDescriptor>,
+) -> Result<String, String> {
+    let sources = forges::sources(d.as_ref(), forges::BUILTIN_GITHUB_CLIENT_ID);
+    let Some(source) = forges::find(&sources, source_id).cloned() else {
+        return Err(format!(
+            "this drive signs in with \"{source_id}\", which keeper no longer has; choose its credential again"
+        ));
+    };
+    let Some(remote) = drive_remote(profile) else {
+        return Err("keeper does not know this drive's remote yet; it will try again".to_owned());
+    };
+    let platform = Arc::clone(platform);
+    let name = source.name.clone();
+    let refresh = move || {
+        tauri::async_runtime::block_on(async move {
+            let http = http().map_err(ForgeError::Internal)?;
+            forges::tokens::drive_token(platform.as_ref(), http, &source, d.as_ref(), &remote).await
+        })
+    };
+    match off_worker(refresh) {
+        Some(Ok(token)) => Ok(token),
+        Some(Err(error)) => Err(format!("the {name} credential is unavailable: {error}")),
+        None => Err(format!("the {name} credential could not be read")),
+    }
+}
+
+/// Run a blocking credential refresh from a synchronous call that may be on
+/// a runtime worker: on a multi-thread runtime `block_in_place` hands this
+/// worker's other tasks to the rest of the pool first; elsewhere it runs on
+/// a thread of its own. `None` when that thread panicked.
+fn off_worker<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+
+    match Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
-            Ok(tokio::task::block_in_place(refresh))
+            Some(tokio::task::block_in_place(work))
         }
         // A current-thread runtime cannot lend its thread out, and blocking
         // on the app's runtime from inside it would panic.
-        Ok(_) => std::thread::spawn(refresh).join(),
-        Err(_) => Ok(refresh()),
-    };
-    Some(match answer {
-        Ok(Ok(token)) => Ok(token),
-        Ok(Err(error)) => Err(format!("the account credential is unavailable: {error}")),
-        Err(_) => Err("the account credential could not be read".to_owned()),
-    })
+        Ok(_) => std::thread::spawn(work).join().ok(),
+        Err(_) => Some(work()),
+    }
 }
 
 /// Every drive's remote by profile id, as the last listing, save or restore
@@ -2567,6 +2617,31 @@ pub fn note_drives<'a>(profiles: impl IntoIterator<Item = &'a keeper_sync::SyncP
         .map(|p| (p.id.clone(), p.remote_url.clone()))
         .collect();
     *lock(&DRIVE_REMOTES) = fresh;
+}
+
+/// The person's `drives.toml` as the clone on disk holds it, and this
+/// device's name there: what a repository listing marks "on another device"
+/// from. Nothing without an account, a sign-in or a readable file; no
+/// network, like the offers it mirrors.
+pub(crate) fn drive_records(data_dir: &Path) -> (Vec<DriveRecord>, String) {
+    let (id, login, device) = {
+        let inner = lock(&RUNTIME.inner);
+        (
+            inner.descriptor.as_ref().map(|d| d.id.clone()),
+            inner.identity.as_ref().map(|i| i.login.clone()),
+            inner.this_device.clone(),
+        )
+    };
+    let (Some(id), Some(login)) = (id, login) else {
+        return (Vec::new(), String::new());
+    };
+    let clone = clone_dir(data_dir, &id);
+    let records = WorktreeFiles(&clone)
+        .read(&manifest::drives_path(&login))
+        .and_then(|bytes| DrivesFile::parse(&bytes).ok())
+        .map(|file| file.drives)
+        .unwrap_or_default();
+    (records, device.unwrap_or_else(default_device_name))
 }
 
 /// A drive's remote from [`DRIVE_REMOTES`]. On a miss the map is refilled off
@@ -2612,29 +2687,45 @@ fn on_forge(remote: &str, forge_host: Option<&str>, repo_host: &str) -> bool {
 }
 
 /// What the IPC answers for a stored source: core answers `account` only
-/// for a row bound to the configured account.
+/// for a row bound to the configured account, and a drive's `forge:<id>`
+/// verbatim.
 fn credential_source_value(stored: Option<String>) -> String {
-    match stored.as_deref() {
-        Some("account") => "account".to_owned(),
+    match stored {
+        Some(value) if value == "account" || forges::forge_credential_id(&value).is_some() => value,
         _ => "keychain".to_owned(),
     }
 }
 
 /// A source the frontend sent, and the account it binds to: `account`
 /// needs a configured account, whose id the row then records.
+/// `drive_sources` is the repository sources a drive may sign in with
+/// (`forge:<id>`, stored verbatim); `None` for a bot provider, which takes
+/// none of them.
 fn parse_source(
     source: &str,
     account_id: Option<String>,
-) -> Result<(Option<&'static str>, Option<String>), IpcError> {
+    drive_sources: Option<&[ForgeSource]>,
+) -> Result<(Option<String>, Option<String>), IpcError> {
     match source {
         "keychain" => Ok((None, None)),
         "account" => match account_id {
-            Some(id) => Ok((Some("account"), Some(id))),
+            Some(id) => Ok((Some("account".to_owned()), Some(id))),
             None => Err(refusal("No account is set up on this device.")),
         },
-        other => Err(refusal(format!(
-            "\"{other}\" is not a credential source; use \"keychain\" or \"account\"."
-        ))),
+        other => match (drive_sources, forges::forge_credential_id(other)) {
+            (Some(sources), Some(id)) if forges::find(sources, id).is_some() => {
+                Ok((Some(other.to_owned()), account_id))
+            }
+            (Some(_), Some(id)) => Err(refusal(format!(
+                "keeper has no repository source \"{id}\" on this device."
+            ))),
+            (Some(_), None) => Err(refusal(format!(
+                "\"{other}\" is not a credential source; use \"keychain\", \"account\" or \"forge:<source>\"."
+            ))),
+            (None, _) => Err(refusal(format!(
+                "\"{other}\" is not a credential source; use \"keychain\" or \"account\"."
+            ))),
+        },
     }
 }
 
@@ -2770,6 +2861,9 @@ pub async fn account_setup_confirm(
         })?;
     }
     descriptor::store(&path, &d).map_err(to_ipc_error)?;
+    // Listings, broker answers and stored errors were the previous
+    // identity's; the new account starts from the servers.
+    crate::forge_ipc::forget_identity();
     layers::install_account_layers(None);
     layers::set_account_faults(Vec::new());
     let identity = session::identity(state.platform.as_ref(), &d)
@@ -2817,6 +2911,9 @@ pub async fn account_sign_in(state: State<'_, AppState>) -> Result<AccountVm, Ip
     if descriptor().is_none() {
         return Err(refusal("No account is set up on this device."));
     }
+    // Whoever signs in may not be who was signed in: nothing the forge
+    // sources learnt under the previous sign-in carries over.
+    crate::forge_ipc::forget_identity();
     update(|inner| inner.grant_dead = true);
     Ok(sign_in_and_sync(
         Arc::clone(&state.platform),
@@ -3038,6 +3135,7 @@ pub async fn account_sign_out(state: State<'_, AppState>) -> Result<AccountVm, I
     let http = http().map_err(|sentence| account_ipc_error(AccountError::Internal(sentence)))?;
     let end_session = oidc::sign_out(state.platform.as_ref(), http, &d).await;
     layers::install_account_layers(None);
+    crate::forge_ipc::forget_identity();
     let vm = update(|inner| {
         inner.identity = None;
         inner.grant_dead = false;
@@ -3067,6 +3165,7 @@ pub async fn account_sign_out(state: State<'_, AppState>) -> Result<AccountVm, I
 pub async fn account_forget(state: State<'_, AppState>) -> Result<AccountVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     let _gate = stop_running().await;
+    crate::forge_ipc::forget_identity();
     if let Some(d) = descriptor() {
         if let Ok(http) = http() {
             if let Err(error) = oidc::sign_out(state.platform.as_ref(), http, &d).await {
@@ -3074,6 +3173,9 @@ pub async fn account_forget(state: State<'_, AppState>) -> Result<AccountVm, Ipc
             }
         }
         forget_local_state(&data_dir, &d.id)?;
+        // The repository connections this account's descriptor named go
+        // with it; the built-in GitHub one stays until Disconnect.
+        forges::tokens::forget_descriptor_sessions(state.platform.as_ref(), &d);
     }
     let path = descriptor_path(&data_dir);
     match std::fs::remove_file(&path) {
@@ -3093,7 +3195,7 @@ pub async fn account_forget(state: State<'_, AppState>) -> Result<AccountVm, Ipc
 
 /// The configured account's id, the only one a credential choice can bind
 /// to or be answered for.
-fn account_id() -> Option<String> {
+pub(crate) fn account_id() -> Option<String> {
     lock(&RUNTIME.inner)
         .descriptor
         .as_ref()
@@ -3118,11 +3220,49 @@ pub fn sync_credential_source_set(
     source: String,
 ) -> Result<(), IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    let (source, bound_to) = parse_source(&source, account_id())?;
-    registry::set_sync_credential_source(&data_dir, &profile_id, source, bound_to.as_deref())
-        .map_err(to_ipc_error)?;
+    let sources = forges::sources(descriptor().as_ref(), forges::BUILTIN_GITHUB_CLIENT_ID);
+    let (source, bound_to) = parse_source(&source, account_id(), Some(&sources))?;
+    if let Some(forge) = source.as_deref().and_then(forges::forge_credential_id) {
+        forge_remote_matches(&state, &profile_id, &sources, forge)?;
+    }
+    registry::set_sync_credential_source(
+        &data_dir,
+        &profile_id,
+        source.as_deref(),
+        bound_to.as_deref(),
+    )
+    .map_err(to_ipc_error)?;
     note_local_change();
     Ok(())
+}
+
+/// A drive signs in with a repository source only when its remote is on
+/// that source's site: saved anyway, it would fail every sync.
+fn forge_remote_matches(
+    state: &AppState,
+    profile_id: &str,
+    sources: &[ForgeSource],
+    source_id: &str,
+) -> Result<(), IpcError> {
+    let Some(source) = forges::find(sources, source_id) else {
+        return Err(refusal(format!(
+            "keeper has no repository source \"{source_id}\" on this device."
+        )));
+    };
+    let profiles = crate::sync_ipc::engine_of(state)?
+        .list_profiles()
+        .map_err(|error| crate::sync_ipc::sync_ipc_error(&error))?;
+    let Some(profile) = profiles.iter().find(|profile| profile.id == profile_id) else {
+        return Err(refusal("keeper has no such drive on this device."));
+    };
+    if forges::remote_on_source(source, &profile.remote_url) {
+        Ok(())
+    } else {
+        Err(refusal(format!(
+            "This drive's repository isn't on {}.",
+            source.host()
+        )))
+    }
 }
 
 #[tauri::command]
@@ -3143,11 +3283,11 @@ pub fn bots_provider_credential_source_set(
     source: String,
 ) -> Result<(), IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    let (source, bound_to) = parse_source(&source, account_id())?;
+    let (source, bound_to) = parse_source(&source, account_id(), None)?;
     registry::set_bots_provider_credential_source(
         &data_dir,
         &provider_id,
-        source,
+        source.as_deref(),
         bound_to.as_deref(),
     )
     .map_err(to_ipc_error)?;
@@ -3368,11 +3508,15 @@ mod tests {
     }
 
     #[test]
-    fn a_credential_source_is_keychain_unless_it_says_account() {
+    fn a_credential_source_is_keychain_unless_it_says_account_or_a_forge() {
         assert_eq!(credential_source_value(None), "keychain");
         assert_eq!(
             credential_source_value(Some("account".to_owned())),
             "account"
+        );
+        assert_eq!(
+            credential_source_value(Some("forge:github".to_owned())),
+            "forge:github"
         );
         assert_eq!(credential_source_value(Some("junk".to_owned())), "keychain");
     }
@@ -3383,15 +3527,37 @@ mod tests {
     #[test]
     fn choosing_the_account_binds_it_and_needs_one() {
         assert!(matches!(
-            parse_source("keychain", Some("acme".to_owned())),
+            parse_source("keychain", Some("acme".to_owned()), None),
             Ok((None, None))
         ));
         assert!(matches!(
-            parse_source("account", Some("acme".to_owned())),
-            Ok((Some("account"), Some(id))) if id == "acme"
+            parse_source("account", Some("acme".to_owned()), None),
+            Ok((Some(source), Some(id))) if source == "account" && id == "acme"
         ));
-        assert!(parse_source("account", None).is_err());
-        assert!(parse_source("Account", Some("acme".to_owned())).is_err());
+        assert!(parse_source("account", None, None).is_err());
+        assert!(parse_source("Account", Some("acme".to_owned()), None).is_err());
+    }
+
+    /// A drive may sign in with a repository source this device has, and
+    /// needs no account for it; a bot provider never takes one.
+    #[test]
+    fn a_forge_source_is_for_drives_and_must_exist() {
+        let github = ForgeSource {
+            id: "github".to_owned(),
+            kind: forges::ForgeKind::Github,
+            name: "GitHub".to_owned(),
+            web_base: "https://github.com".to_owned(),
+            api_base: "https://api.github.com".to_owned(),
+            client_id: Some("Iv1.test".to_owned()),
+            via: forges::TokenVia::DeviceFlow,
+        };
+        let sources = [github];
+        assert!(matches!(
+            parse_source("forge:github", None, Some(&sources)),
+            Ok((Some(source), None)) if source == "forge:github"
+        ));
+        assert!(parse_source("forge:gitlab", None, Some(&sources)).is_err());
+        assert!(parse_source("forge:github", None, None).is_err());
     }
 
     #[test]

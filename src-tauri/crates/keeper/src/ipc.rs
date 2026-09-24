@@ -11930,6 +11930,14 @@ pub async fn egress_list(
         descriptor.as_ref(),
         source.as_ref(),
     ));
+    // Repository sources (Epic 86, AD-53): a forge's hosts while this device
+    // holds a connection to it, and the broker's while one is configured —
+    // core decides which are in use.
+    destinations.extend(keeper_core::egress::forge_egress(
+        state.platform.as_ref(),
+        descriptor.as_ref(),
+        keeper_core::forges::BUILTIN_GITHUB_CLIENT_ID,
+    ));
     Ok(destinations)
 }
 

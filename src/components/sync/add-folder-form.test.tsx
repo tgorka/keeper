@@ -87,6 +87,7 @@ import {
   SYNC_VIRTUAL_PATTERNS_LABEL,
   syncAccountCredentialLabel,
   syncFolderOwnedNote,
+  syncForgeCredentialLabel,
   syncInForceNote,
   syncReleaseInForceNote,
 } from "@/components/sync/add-folder-form";
@@ -107,6 +108,7 @@ import {
 } from "@/lib/ipc/client";
 import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { forgesStore, resetForgesStoreForTest } from "@/lib/stores/forges";
 import {
   resetSyncStoreForTest,
   SYNC_DEFAULT_LFS_THRESHOLD_BYTES,
@@ -1900,5 +1902,145 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
     expect(await screen.findByText(/disk full/)).toBeInTheDocument();
     // Replacing this form now would lose the folder p9 it must finish.
     expect(onPristineChange).toHaveBeenLastCalledWith(false);
+  });
+});
+
+describe("AddFolderForm opened from a repository (Epic 86, AD-336)", () => {
+  const SIGN_IN_WITH_GITHUB = syncForgeCredentialLabel("GitHub");
+
+  // Repositories on the source's own site: the connection is offered only
+  // for a remote there (surface #21).
+  const ON_GITHUB = "https://github.com/tgorka/notes.git";
+
+  beforeEach(() => {
+    forgesStore.setState({
+      sources: [
+        {
+          id: "github",
+          kind: "github",
+          name: "GitHub",
+          host: "github.com",
+          via: "deviceFlow",
+          state: "connected",
+          login: "tgorka",
+          sentence: null,
+          credential: "forge:github",
+          canConnect: true,
+          appsUrl: null,
+        },
+      ],
+    });
+  });
+
+  afterEach(() => {
+    resetForgesStoreForTest();
+  });
+
+  it("signs with the source's connection, stores no token, and records the source", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9" }));
+    vi.mocked(syncCredentialSourceSet).mockResolvedValue(undefined);
+    render(
+      <AddFolderForm
+        prefill={driveOffer({ credential: "forge:github", remoteUrl: ON_GITHUB, tasks: null })}
+      />,
+    );
+
+    expect(screen.getByLabelText(SIGN_IN_WITH_GITHUB)).toBeChecked();
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    // Nothing to type while the connection is the credential.
+    expect(screen.queryByLabelText(SYNC_TOKEN_LABEL)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_CHOOSE_FOLDER_LABEL }));
+    await waitFor(() =>
+      expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent("/Users/alice/notes"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+    await waitFor(() => expect(syncCredentialSourceSet).toHaveBeenCalledWith("p9", "forge:github"));
+    expect(mockSetCredential).not.toHaveBeenCalled();
+  });
+
+  it("keeps an edited folder on its source's connection, with no account at all", async () => {
+    mockSave.mockResolvedValue(profileVm());
+    vi.mocked(syncCredentialSourceGet).mockResolvedValue("forge:github");
+    render(<AddFolderForm profile={profileVm({ remoteUrl: ON_GITHUB })} />);
+
+    // Read although no account exists: a repository source can be the answer.
+    await waitFor(() => expect(screen.getByLabelText(SIGN_IN_WITH_GITHUB)).toBeChecked());
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    // Saving other changes must not quietly move the folder to the keychain.
+    expect(syncCredentialSourceSet).not.toHaveBeenCalled();
+  });
+
+  it("withdraws the connection while the remote is on another host, and gives it back", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9" }));
+    render(
+      <AddFolderForm
+        prefill={driveOffer({ credential: "forge:github", remoteUrl: ON_GITHUB, tasks: null })}
+      />,
+    );
+    expect(screen.getByLabelText(SIGN_IN_WITH_GITHUB)).toBeChecked();
+
+    // GitHub's token goes only to github.com: a remote elsewhere, or one that
+    // is not https, cannot sign with it, so the token field is back.
+    for (const elsewhere of [
+      "https://git.acme.dev/tgorka/notes.git",
+      "ssh://git@github.com/tgorka/notes.git",
+      "git@github.com:tgorka/notes.git",
+    ]) {
+      fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
+        target: { value: elsewhere },
+      });
+      expect(screen.queryByLabelText(SIGN_IN_WITH_GITHUB)).not.toBeInTheDocument();
+    }
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
+      target: { value: "https://GitHub.com/tgorka/notes-2.git" },
+    });
+    expect(screen.getByLabelText(SIGN_IN_WITH_GITHUB)).toBeChecked();
+    expect(screen.queryByLabelText(SYNC_TOKEN_LABEL)).not.toBeInTheDocument();
+  });
+
+  it("saves a folder moved off the source's host on the keychain, never on the source", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9" }));
+    vi.mocked(syncCredentialSourceSet).mockResolvedValue(undefined);
+    render(
+      <AddFolderForm
+        prefill={driveOffer({ credential: "forge:github", remoteUrl: ON_GITHUB, tasks: null })}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
+      target: { value: "https://git.acme.dev/tgorka/notes.git" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_CHOOSE_FOLDER_LABEL }));
+    await waitFor(() =>
+      expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent("/Users/alice/notes"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    expect(syncCredentialSourceSet).not.toHaveBeenCalled();
+  });
+
+  it("adds a repository keeper can only read as pull-only", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9" }));
+    render(
+      <AddFolderForm
+        prefill={{
+          ...driveOffer({ credential: "forge:github", remoteUrl: ON_GITHUB, tasks: null }),
+          direction: "pullOnly",
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: SYNC_CHOOSE_FOLDER_LABEL }));
+    await waitFor(() =>
+      expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent("/Users/alice/notes"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(mockSave.mock.calls[0][0]).toMatchObject({ direction: "pullOnly" });
   });
 });

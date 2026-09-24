@@ -197,6 +197,13 @@ pub struct AccountSetupVm {
     /// would replace it (sign it out and forget it here). `None` for a first
     /// setup, or for the same account under a new display name.
     pub replaces: Option<String>,
+    /// The host GitHub access comes from, when the descriptor names a
+    /// `[github_broker]`: the sheet says "Gets GitHub access from <host>".
+    pub broker_host: Option<String>,
+    /// Every other host a repository token would be sent to: the web and
+    /// API hosts of each GitHub source the descriptor adds, in the switcher's
+    /// order, once each. The account's own forge is `repo_host`.
+    pub forge_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -464,7 +471,26 @@ pub fn setup_vm(
         replaces: previous
             .filter(|previous| d.replaces(previous))
             .map(|previous| previous.name.clone()),
+        broker_host: d.github_broker.as_ref().map(|broker| broker.host()),
+        forge_hosts: forge_hosts(d),
     }
+}
+
+fn forge_hosts(d: &AccountDescriptor) -> Vec<String> {
+    use crate::forges::{sources, TokenVia, BUILTIN_GITHUB_CLIENT_ID};
+    let mut hosts: Vec<String> = Vec::new();
+    for source in sources(Some(d), BUILTIN_GITHUB_CLIENT_ID) {
+        if source.via == TokenVia::AccountForge {
+            continue;
+        }
+        for url in [&source.web_base, &source.api_base] {
+            let host = crate::forges::host_of(url);
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    hosts
 }
 
 #[cfg(test)]
@@ -725,5 +751,40 @@ mod tests {
         for new in [other_issuer, other_token, other_repo, other_id] {
             assert!(new.replaces(&old), "{new:?}");
         }
+    }
+
+    /// Every host a repository token would reach is on the sheet before the
+    /// person confirms.
+    #[test]
+    fn the_setup_sheet_names_every_forge_host_a_token_would_reach() {
+        assert!(setup(None, &descriptor()).forge_hosts.is_empty());
+        let mut d = descriptor();
+        d.forges = serde_json::from_value(serde_json::json!([
+            { "kind": "github", "id": "ghe", "web_base": "https://ghe.acme.dev",
+              "api_base": "https://ghe.acme.dev/api/v3", "client_id": "Iv1.ghe" },
+            { "kind": "github", "id": "work", "web_base": "https://work.acme.dev",
+              "api_base": "https://work.acme.dev/api/v3", "client_id": "Iv1.w" },
+            // No broker and no client: keeper never sends it a token.
+            { "kind": "github", "id": "idle", "web_base": "https://idle.acme.dev",
+              "api_base": "https://idle.acme.dev/api/v3" }
+        ]))
+        .expect("forges");
+        assert_eq!(
+            setup(None, &d).forge_hosts,
+            ["ghe.acme.dev", "work.acme.dev"]
+        );
+        d.github_broker = Some(crate::org_account::descriptor::GithubBroker {
+            url: "https://b.acme.dev".to_owned(),
+            app: None,
+        });
+        assert_eq!(
+            setup(None, &d).forge_hosts,
+            [
+                "ghe.acme.dev",
+                "work.acme.dev",
+                "github.com",
+                "api.github.com"
+            ]
+        );
     }
 }

@@ -444,7 +444,7 @@ pub(crate) fn run(
     }
 
     // Providers with their bots; one that could not be added waits.
-    let mut catalog = catalog_of(data_dir, account_id, &profiles)?;
+    let mut catalog = catalog_of(platform.as_ref(), data_dir, account_id, &profiles)?;
     let mut grants = present_grants;
     let queued = std::mem::take(&mut pending.providers);
     for state in queued.into_iter().chain(plan_providers) {
@@ -470,7 +470,7 @@ pub(crate) fn run(
         }
     }
     if outcome.providers > 0 {
-        catalog = catalog_of(data_dir, account_id, &profiles)?;
+        catalog = catalog_of(platform.as_ref(), data_dir, account_id, &profiles)?;
     }
 
     // Grants, for providers matched by identity; the same grant already
@@ -530,12 +530,13 @@ pub(crate) fn run(
 }
 
 fn catalog_of(
+    platform: &dyn Platform,
     data_dir: &Path,
     account_id: &str,
     profiles: &[SyncProfile],
 ) -> Result<Catalog, CoreError> {
     let drives = profiles.iter().map(account_settings::local_drive).collect();
-    account_settings::catalog(data_dir, account_id, Some(drives))
+    account_settings::catalog(platform, data_dir, account_id, Some(drives))
 }
 
 /// A path as the filesystem resolves it, or `None` when it does not exist.
@@ -623,14 +624,22 @@ fn drive_folder(
     }
 }
 
-/// Whether an existing folder may take a restored drive: it is empty, or it
-/// is already a clone whose `origin` is the drive's remote.
+/// Whether an existing folder may take a drive of `remote`: it is empty —
+/// bar the files Finder leaves in any folder it opened — or it is already a
+/// clone whose `origin` is that remote. Restores and the batch add from a
+/// repository listing share it.
 #[cfg(desktop)]
-fn folder_accepts(folder: &Path, remote: &str) -> bool {
-    let Ok(mut entries) = std::fs::read_dir(folder) else {
+pub(crate) fn folder_accepts(folder: &Path, remote: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(folder) else {
         return false;
     };
-    if entries.next().is_none() {
+    let finder = |entry: &std::io::Result<std::fs::DirEntry>| {
+        entry
+            .as_ref()
+            .is_ok_and(|entry| matches!(entry.file_name().to_str(), Some(".DS_Store" | "Icon\r")))
+    };
+    let mut own = entries.filter(|entry| !finder(entry));
+    if own.next().is_none() {
         return true;
     }
     std::fs::read_to_string(folder.join(".git").join("config"))
