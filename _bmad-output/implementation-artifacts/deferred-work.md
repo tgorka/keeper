@@ -6776,14 +6776,16 @@ status: open
 origin: epic 86's plan, 2026-09-24 (AD-334, AD-337; amendment A2)
 location: tgorka/makistack#863 (`feat/github-broker`, `docker/github-broker/`, `docs/runbooks/github-broker.md`), `src-tauri/crates/keeper-core/src/forges/broker.rs`
 reason: keeper speaks `github-broker`'s protocol as read from its source at `7f32b70`, but the PR is not merged. It is deployed on electra from the branch, where `tgbot` has no credentials and `tgdev` is installed nowhere, so every token request answers `app_unconfigured` or `not_installed`. keeper shows those as per-owner notices, and lists nothing from GitHub through the broker today. The protocol may still change before merge. What the broker reaches is also not "every organization the person belongs to": it is the owners the policy grants, intersected with where the app is installed (`tgorka`, `neuraffica` for `tgbot`). Revisit when #863 merges: diff `broker.py`'s routes and bodies against `forges::broker`, then run 86.2's and 86.3's owed live checks.
-status: open
+status: done 2026-09-24
+resolution: makistack#863 merged at `e32513c` (2026-09-24 19:10 UTC). The protocol keeper speaks is unchanged from `7f32b70`; only the apps were renamed (`tgbot` → `tgorka`, `tgdev` → `tgorka-dev`), which keeper never names — it takes the app from `/v1/whoami`. `/healthz` reports both apps configured. The first live listing on hesperia then showed "GitHub refused the list (HTTP 403)" for every owner: keeper's GitHub requests carried no `User-Agent`, which api.github.com refuses with a plain-text 403. Measured with a broker `ghs_` token: 403 without one, 200 with `User-Agent: keeper`. `forges::github::get` and the device-flow form now send it, and the broker-listing test's fake refuses a request without one, as GitHub does.
 
 ### DW-325: Git and LFS with a broker's installation token are unverified in keeper-sync's spelling.
 
 origin: epic 86's plan, 2026-09-24 (AD-336; contract fact on git)
 location: `src-tauri/crates/keeper-sync/src/credential.rs:58-62` (`AccessToken::git`), `:71-75` (`lfs_basic`)
 reason: keeper-sync sends a drive token as the Basic user name with an empty password. The coordinator verified that live on GitHub for an OAuth token (`gho_`): `git ls-remote` succeeded and LFS batch answered 200. The broker hands out installation tokens (`ghs_`), and its runbook documents `x-access-token:<token>`, the password form. GitHub's documentation says the user name is ignored when the token is the password, and a 2012 post (updated 2021) documents the token as the user name, but neither names installation tokens. keeper-sync is left unchanged, as the contract requires. Revisit once `tgbot` is installed: the coordinator runs `git ls-remote` and an LFS batch with a `ghs_` token as the user name, and if GitHub refuses it, keeper-sync gains the `x-access-token` spelling for GitHub hosts.
-status: open
+status: done 2026-09-24
+resolution: measured against github.com with a broker token for `tgorka/gh-app-sandbox` (private, `contents: write`): the installation token as the Basic user name is refused (git `ls-remote` fails, LFS batch 401), and as the password of `x-access-token` it is accepted (git `ls-remote` lists `HEAD`, LFS batch 200). keeper-sync's `AccessToken` now spells a `ghs_` token as `x-access-token:<token>` for git and LFS alike; every other token keeps the user-name spelling Forgejo and OAuth/PAT GitHub tokens accept. Test: `credential::an_installation_token_is_the_password_of_x_access_token` (mutation-proved).
 
 ### DW-326: An organization that has not approved keeper's GitHub OAuth App hides its private repositories, and only its owners can fix that.
 

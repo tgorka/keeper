@@ -859,7 +859,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_broker_listing_lists_each_owner_and_turns_one_owner_s_refusal_into_a_notice() {
-        let fake = testing::serve(|seen| match (seen.method.as_str(), seen.path.as_str()) {
+        let fake = testing::serve(|seen| {
+            match (seen.method.as_str(), seen.path.as_str()) {
             ("GET", "/v1/whoami") => Reply::json(
                 200,
                 r#"{"sub":"1","subject":"tomasz","grants":[
@@ -889,6 +890,15 @@ mod tests {
                     None => Reply::json(400, r#"{"error":"bad_request"}"#),
                 }
             }
+            // api.github.com's own rule: no User-Agent, a plain-text 403. keeper
+            // shipped without one once, and every owner read "GitHub refused
+            // the list (HTTP 403)".
+            ("GET", "/installation/repositories") if seen.header("user-agent").is_none() => {
+                Reply::json(
+                    403,
+                    "Request forbidden by administrative rules. Please make sure your request has a User-Agent header",
+                )
+            }
             ("GET", "/installation/repositories") => match seen.header("authorization") {
                 Some("Bearer ghs_tgorka") => Reply::json(
                     200,
@@ -908,6 +918,7 @@ mod tests {
                 other => panic!("unexpected token {other:?}"),
             },
             _ => Reply::json(404, r#"{"error":"not_found"}"#),
+        }
         });
         let p = testing::FakePlatform::default();
         let d = broker_account(&p, &fake.base);

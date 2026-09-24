@@ -10,9 +10,13 @@ use super::tokens::ForgeError;
 /// Pages keeper follows per list (100 repositories each).
 pub const PAGE_CAP: usize = 10;
 
-/// `GET` with the media type and API version keeper was written against.
+/// `GET` with the media type and API version keeper was written against, and
+/// a `User-Agent`: api.github.com refuses a request without one with a plain
+/// text 403 ("Request forbidden by administrative rules"), which reads as
+/// "GitHub refused the list" and hides every repository.
 pub fn get(http: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
     http.get(url)
+        .header(reqwest::header::USER_AGENT, crate::bots::http::USER_AGENT)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
 }
