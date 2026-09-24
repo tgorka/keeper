@@ -2522,18 +2522,23 @@ pub fn drive_credential(platform: &Arc<dyn Platform>, key: &str) -> Option<Resul
         return Some(forge_drive_credential(platform, profile, source_id, d));
     }
     let d = d.filter(|_| source == "account")?;
-    let forge = if matches!(d.config.auth, RepoAuthConfig::Oauth(_)) {
-        // Never the sign-in token to a remote whose host is unknown: that
-        // could hand the wrong token to the forge, or any token to a stranger.
-        let Some(remote) = drive_remote(profile) else {
-            return Some(Err(
-                "keeper does not know this drive's remote yet; it will try again".to_owned(),
-            ));
-        };
-        on_forge(&remote, d.forge_host().as_deref(), &d.repo_host())
-    } else {
-        false
+    // Never the account's token to a remote that is not on one of its own
+    // hosts: GitHub and every other stranger would be handed the person's
+    // sign-in (the hesperia report, 2026-09-24), and would refuse it anyway.
+    let Some(remote) = drive_remote(profile) else {
+        return Some(Err(
+            "keeper does not know this drive's remote yet; it will try again".to_owned(),
+        ));
     };
+    if !d.serves_remote(&remote) {
+        return Some(Err(format!(
+            "this drive's repository is not on {}'s hosts, so it cannot sign in with that \
+             account; choose its credential again",
+            d.name
+        )));
+    }
+    let forge = matches!(d.config.auth, RepoAuthConfig::Oauth(_))
+        && on_forge(&remote, d.forge_host().as_deref(), &d.repo_host());
     let platform = Arc::clone(platform);
     let refresh = move || {
         tauri::async_runtime::block_on(async move {
@@ -3224,6 +3229,8 @@ pub fn sync_credential_source_set(
     let (source, bound_to) = parse_source(&source, account_id(), Some(&sources))?;
     if let Some(forge) = source.as_deref().and_then(forges::forge_credential_id) {
         forge_remote_matches(&state, &profile_id, &sources, forge)?;
+    } else if source.as_deref() == Some("account") {
+        account_remote_matches(&state, &profile_id)?;
     }
     registry::set_sync_credential_source(
         &data_dir,
@@ -3249,13 +3256,8 @@ fn forge_remote_matches(
             "keeper has no repository source \"{source_id}\" on this device."
         )));
     };
-    let profiles = crate::sync_ipc::engine_of(state)?
-        .list_profiles()
-        .map_err(|error| crate::sync_ipc::sync_ipc_error(&error))?;
-    let Some(profile) = profiles.iter().find(|profile| profile.id == profile_id) else {
-        return Err(refusal("keeper has no such drive on this device."));
-    };
-    if forges::remote_on_source(source, &profile.remote_url) {
+    let remote = profile_remote(state, profile_id)?;
+    if forges::remote_on_source(source, &remote) {
         Ok(())
     } else {
         Err(refusal(format!(
@@ -3263,6 +3265,34 @@ fn forge_remote_matches(
             source.host()
         )))
     }
+}
+
+/// A drive signs in with the account only when its remote is on one of the
+/// account's own hosts: anywhere else the person's sign-in would go to a
+/// stranger (`drive_credential` refuses it there too).
+fn account_remote_matches(state: &AppState, profile_id: &str) -> Result<(), IpcError> {
+    let Some(d) = descriptor() else {
+        return Err(refusal("No account is set up on this device."));
+    };
+    if d.serves_remote(&profile_remote(state, profile_id)?) {
+        Ok(())
+    } else {
+        Err(refusal(format!(
+            "This drive's repository isn't on {}'s hosts; choose another way to sign in.",
+            d.name
+        )))
+    }
+}
+
+fn profile_remote(state: &AppState, profile_id: &str) -> Result<String, IpcError> {
+    let profiles = crate::sync_ipc::engine_of(state)?
+        .list_profiles()
+        .map_err(|error| crate::sync_ipc::sync_ipc_error(&error))?;
+    profiles
+        .into_iter()
+        .find(|profile| profile.id == profile_id)
+        .map(|profile| profile.remote_url)
+        .ok_or_else(|| refusal("keeper has no such drive on this device."))
 }
 
 #[tauri::command]

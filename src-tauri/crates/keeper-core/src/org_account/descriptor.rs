@@ -476,6 +476,32 @@ impl AccountDescriptor {
         }
     }
 
+    /// The origins this account's own tokens belong to: the issuer, the
+    /// config repository and, in `oauth` mode, the forge. Sorted, once each.
+    pub fn trusted_origins(&self) -> Vec<String> {
+        let mut urls = vec![self.auth.issuer.as_str(), self.config.url.as_str()];
+        if let RepoAuthConfig::Oauth(forge) = &self.config.auth {
+            urls.extend(forge.issuer.as_deref());
+            urls.extend(forge.authorize_url.as_deref());
+        }
+        let mut origins: Vec<String> = urls
+            .into_iter()
+            .filter_map(super::settings_sync::url_origin)
+            .collect();
+        origins.sort();
+        origins.dedup();
+        origins
+    }
+
+    /// Whether a drive at `remote_url` may sign in with this account: the
+    /// remote sits at one of [`trusted_origins`](Self::trusted_origins).
+    /// Anywhere else — github.com among them — the account's token would be
+    /// handed to a stranger, and the stranger would refuse it anyway.
+    pub fn serves_remote(&self, remote_url: &str) -> bool {
+        super::settings_sync::url_origin(remote_url)
+            .is_some_and(|origin| self.trusted_origins().contains(&origin))
+    }
+
     /// `same`, `oauth` or `none`.
     pub fn repo_mode(&self) -> &'static str {
         match self.config.auth {
@@ -1805,6 +1831,19 @@ mod tests {
         ] {
             assert!(parse_json(&fine).is_ok(), "{fine}");
         }
+    }
+
+    #[test]
+    fn the_account_serves_only_remotes_on_its_own_hosts() {
+        let d = parse_json(FORGE).expect("spec example A");
+        assert!(d.serves_remote("https://git.acme.dev/git/people/notes.git"));
+        assert!(d.serves_remote("https://GIT.acme.dev:443/git/tgorka/tgdrive"));
+        // Where the account's token would be a stranger's: GitHub (the
+        // hesperia report, 2026-09-24), a look-alike, plain http, scp.
+        assert!(!d.serves_remote("https://github.com/tgorka/bmad-stepper.git"));
+        assert!(!d.serves_remote("https://git.acme.dev.evil.com/x.git"));
+        assert!(!d.serves_remote("http://git.acme.dev/git/people/notes.git"));
+        assert!(!d.serves_remote("git@git.acme.dev:people/notes.git"));
     }
 
     #[test]

@@ -304,7 +304,9 @@ The coordinator amended the contract three times during the build wave and once 
   - `forge_connect_wait(source_id) -> ForgeSourceVm` resolves on success or on a terminal error. A cancel resolves with `notConnected`.
   - `forge_connect_cancel(source_id)` and `forge_disconnect(source_id) -> ForgeSourceVm`.
   - `forge_repos_add(req: ForgeAddReq) -> Vec<ForgeAddResultVm>`. One batch runs at a time (A4).
-  - `forge_default_base_folder() -> Option<String>`: `None` on iOS. On desktop it is the parent of the most recently added drive's folder, else `~/Drives`, and `None` only when neither exists. The sheet decides "desktop" from the platform, not from this answer (A4).
+  - `forge_default_base_folder() -> Option<String>`: `None` on iOS. On desktop it is `sync.drive_folder`, else `~/keeper/git` (A5, owner, 2026-09-24: "setup in settings what would be the default folder"; it replaced "the parent of the most recently added drive, else `~/Drives`", which put new drives beside `/Volumes/merope`). The sheet decides "desktop" from the platform, not from this answer (A4).
+  - `sync_drive_folder_get() / sync_drive_folder_set(folder: Option<String>) -> Option<DriveFolderVm { path, chosen }>` back Settings › Sync › *New drives go in* (A5).
+  - `sync_credential_choices(remote_url) -> CredentialChoicesVm { account, forges }`, each a `CredentialChoiceVm { value, label, detail }` authored in Rust (A5). The account is offered, saved (`sync_credential_source_set`) and handed to git (`drive_credential`) only for a remote on one of its own origins (`AccountDescriptor::serves_remote`): the hesperia report showed *Use my makistack account* on a github.com drive, which sent the account's sign-in to GitHub.
   - `AccountSetupVm` gains `forgeHosts: string[]` beside `brokerHost` (A4, B1).
 
 - **UX-DR120: Browse repositories.**

@@ -16,6 +16,8 @@ vi.mock("@/lib/ipc/client", () => ({
   // account is configured, so every suite below that has none never calls it.
   syncCredentialSourceGet: vi.fn(),
   syncCredentialSourceSet: vi.fn(),
+  // Which sign-ins a remote may use: Rust's answer, asked on the same terms.
+  syncCredentialChoices: vi.fn(),
   // The Sync view's three per-folder lists, re-read for the folder just added.
   syncActivity: vi.fn(),
   syncPending: vi.fn(),
@@ -43,6 +45,7 @@ import {
   SYNC_AUTHOR_LABEL,
   SYNC_BRANCH_LABEL,
   SYNC_CHOOSE_FOLDER_LABEL,
+  SYNC_CREDENTIAL_WITHDRAWN_NOTE,
   SYNC_DIRECTION_LABEL,
   SYNC_EDIT_SUBMIT_LABEL,
   SYNC_EDIT_TITLE,
@@ -85,16 +88,15 @@ import {
   SYNC_VIRTUAL_OVER_NONE_NOTE,
   SYNC_VIRTUAL_OVER_PROTECTED_ONLY_NOTE,
   SYNC_VIRTUAL_PATTERNS_LABEL,
-  syncAccountCredentialLabel,
   syncFolderOwnedNote,
-  syncForgeCredentialLabel,
   syncInForceNote,
   syncReleaseInForceNote,
 } from "@/components/sync/add-folder-form";
-import type { SyncProfileVm } from "@/lib/ipc/client";
+import type { CredentialChoicesVm, CredentialChoiceVm, SyncProfileVm } from "@/lib/ipc/client";
 import {
   syncActivity,
   syncClearCredential,
+  syncCredentialChoices,
   syncCredentialSourceGet,
   syncCredentialSourceSet,
   syncFolderTasksFlag,
@@ -129,6 +131,39 @@ const mockClearCredential = vi.mocked(syncClearCredential);
 const mockGetCredential = vi.mocked(syncGetCredential);
 const mockPicker = vi.mocked(openFolder);
 const mockHomeDir = vi.mocked(homeDir);
+const mockChoices = vi.mocked(syncCredentialChoices);
+
+/**
+ * Rust's `sync_credential_choices` answers, word for word as `forges::vm`
+ * composes them for the fixtures' account (Acme, on git.acme.dev) and a GitHub
+ * source. The form renders whatever it is given, so each case says what Rust
+ * answered for its remote.
+ */
+const USE_ACME: CredentialChoiceVm = {
+  value: "account",
+  label: "Use my Acme account",
+  detail:
+    "keeper signs this folder's git requests in with your Acme sign-in, so no token is stored for it.",
+};
+const GITHUB_THROUGH_ACME: CredentialChoiceVm = {
+  value: "forge:github",
+  label: "GitHub access through Acme",
+  detail:
+    "Acme gives keeper a one-hour GitHub token for this repository only, as you; nothing is stored for this folder.",
+};
+const SIGN_IN_WITH_GITHUB: CredentialChoiceVm = {
+  value: "forge:github",
+  label: "Sign in with GitHub",
+  detail: "keeper uses your GitHub connection, so no token is stored for this folder.",
+};
+const NO_CHOICES: CredentialChoicesVm = { account: null, forges: [] };
+/** A remote on the account's own repository host. */
+const ON_ACME = "https://git.acme.dev/alice/notes.git";
+
+/** Rust answers `answers[remote]` for those remotes, and nothing for any other. */
+function rustOffers(answers: Record<string, CredentialChoicesVm>) {
+  mockChoices.mockImplementation((remote) => Promise.resolve(answers[remote] ?? NO_CHOICES));
+}
 
 /** This machine's home, for every test that does not say otherwise. */
 const HOME = "/Users/alice";
@@ -175,10 +210,10 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
 }
 
 /** Fill the three fields the submit button waits on. */
-async function fillRequired() {
+async function fillRequired(remoteUrl = "git@github.com:alice/notes.git") {
   fireEvent.change(screen.getByLabelText(SYNC_NAME_LABEL), { target: { value: "notes" } });
   fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
-    target: { value: "git@github.com:alice/notes.git" },
+    target: { value: remoteUrl },
   });
   fireEvent.click(screen.getByRole("button", { name: SYNC_CHOOSE_FOLDER_LABEL }));
   await waitFor(() =>
@@ -208,6 +243,8 @@ beforeEach(() => {
   // Every form asks the shell where home is as it opens (Story 59.8): the Home
   // control, a typed `~` and the home warning all read this one answer.
   mockHomeDir.mockResolvedValue(HOME);
+  // Rust offers no sign-in for a remote unless a case says it does.
+  rustOffers({});
 });
 
 afterEach(() => {
@@ -419,24 +456,32 @@ describe("AddFolderForm", () => {
 });
 
 describe("AddFolderForm with an organisation account (Epic 82, AD-315)", () => {
-  const USE_ACME = syncAccountCredentialLabel("Acme");
+  beforeEach(() => {
+    rustOffers({ [ON_ACME]: { account: USE_ACME, forges: [] } });
+  });
 
   afterEach(() => {
     accountStore.setState({ vm: NO_ACCOUNT, setupLink: null });
   });
 
-  it("offers no account choice without a signed-in, usable account", async () => {
+  it("offers the account for a remote on its host, only while the account can stand in", async () => {
     render(<AddFolderForm />);
+    fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), { target: { value: ON_ACME } });
     fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
-    expect(screen.queryByLabelText(USE_ACME)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(USE_ACME.label)).not.toBeInTheDocument();
     expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toBeInTheDocument();
 
-    // Configured but offline: a credential that cannot be obtained is not offered.
+    // Configured but offline: Rust offers it for this remote, but a credential
+    // that cannot be obtained is not offered.
     act(() => accountStore.getState().setVm(accountVm({ state: "offline" })));
-    expect(screen.queryByLabelText(USE_ACME)).not.toBeInTheDocument();
+    await waitFor(() => expect(mockChoices).toHaveBeenCalledWith(ON_ACME));
+    await act(async () => {});
+    expect(screen.queryByLabelText(USE_ACME.label)).not.toBeInTheDocument();
 
     act(() => accountStore.getState().setVm(accountVm({ state: "ready" })));
-    expect(screen.getByLabelText(USE_ACME)).toBeInTheDocument();
+    expect(await screen.findByLabelText(USE_ACME.label)).not.toBeChecked();
+    // Rust's sentence for it is the line under it.
+    expect(screen.getByText(USE_ACME.detail)).toBeInTheDocument();
   });
 
   it("hides the token field when the account is chosen, and records the source instead of a token", async () => {
@@ -445,11 +490,11 @@ describe("AddFolderForm with an organisation account (Epic 82, AD-315)", () => {
     vi.mocked(syncCredentialSourceSet).mockResolvedValue(undefined);
     const onSaved = vi.fn();
     render(<AddFolderForm onSaved={onSaved} />);
-    await fillRequired();
+    await fillRequired(ON_ACME);
     fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
     fireEvent.change(screen.getByLabelText(SYNC_TOKEN_LABEL), { target: { value: "ghp_typed" } });
 
-    fireEvent.click(screen.getByLabelText(USE_ACME));
+    fireEvent.click(await screen.findByLabelText(USE_ACME.label));
     // Absent, not disabled: there is nothing to type while the account signs.
     expect(screen.queryByLabelText(SYNC_TOKEN_LABEL)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
@@ -463,10 +508,32 @@ describe("AddFolderForm with an organisation account (Epic 82, AD-315)", () => {
   it("keeps offering the choice on a folder that already uses the account, even offline", async () => {
     accountStore.getState().setVm(accountVm({ state: "offline" }));
     vi.mocked(syncCredentialSourceGet).mockResolvedValue("account");
-    render(<AddFolderForm profile={profileVm()} />);
+    render(<AddFolderForm profile={profileVm({ remoteUrl: ON_ACME })} />);
 
-    const choice = await screen.findByLabelText(USE_ACME);
+    const choice = await screen.findByLabelText(USE_ACME.label);
     await waitFor(() => expect(choice).toBeChecked());
+  });
+
+  it("falls back to the token field when Rust no longer offers the account a folder uses", async () => {
+    // The folder was set to sign with the account, and its remote is not on
+    // the account's host: Rust offers nothing for it.
+    accountStore.getState().setVm(accountVm());
+    vi.mocked(syncCredentialSourceGet).mockResolvedValue("account");
+    vi.mocked(syncCredentialSourceSet).mockResolvedValue(undefined);
+    mockSave.mockResolvedValue(profileVm());
+    render(
+      <AddFolderForm profile={profileVm({ remoteUrl: "https://github.com/alice/notes.git" })} />,
+    );
+
+    // The field that takes the folder's own token is shown, unasked, and says why.
+    expect(await screen.findByText(SYNC_CREDENTIAL_WITHDRAWN_NOTE)).toBeInTheDocument();
+    expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toBeInTheDocument();
+    expect(screen.queryByLabelText(USE_ACME.label)).not.toBeInTheDocument();
+
+    // Saved on the keychain, never on the source Rust refuses here.
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+    await waitFor(() => expect(syncCredentialSourceSet).toHaveBeenCalledWith("p2", "keychain"));
+    expect(syncCredentialSourceSet).not.toHaveBeenCalledWith("p2", "account");
   });
 
   it("records the account as the source before the Sync view's lists are re-read", async () => {
@@ -477,9 +544,8 @@ describe("AddFolderForm with an organisation account (Epic 82, AD-315)", () => {
     mockActivity.mockReturnValue(new Promise<never>(() => {}));
     vi.mocked(syncCredentialSourceSet).mockResolvedValue(undefined);
     render(<AddFolderForm />);
-    await fillRequired();
-    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
-    fireEvent.click(screen.getByLabelText(USE_ACME));
+    await fillRequired(ON_ACME);
+    fireEvent.click(await screen.findByLabelText(USE_ACME.label));
     fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
 
     await waitFor(() => expect(mockActivity).toHaveBeenCalled());
@@ -487,18 +553,23 @@ describe("AddFolderForm with an organisation account (Epic 82, AD-315)", () => {
   });
 
   it("reads the folder's source again when the account is replaced", async () => {
+    // Rust names the account configured now.
+    mockChoices.mockImplementation(() =>
+      Promise.resolve({
+        account: { ...USE_ACME, label: `Use my ${accountStore.getState().vm.name} account` },
+        forges: [],
+      }),
+    );
     accountStore.getState().setVm(accountVm());
     vi.mocked(syncCredentialSourceGet).mockResolvedValue("account");
-    render(<AddFolderForm profile={profileVm()} />);
-    await waitFor(() => expect(screen.getByLabelText(USE_ACME)).toBeChecked());
+    render(<AddFolderForm profile={profileVm({ remoteUrl: ON_ACME })} />);
+    await waitFor(() => expect(screen.getByLabelText(USE_ACME.label)).toBeChecked());
 
     // Rust answers for the row as bound to the account configured NOW.
     vi.mocked(syncCredentialSourceGet).mockResolvedValue("keychain");
     act(() => accountStore.getState().setVm(accountVm({ id: "globex", name: "Globex" })));
 
-    await waitFor(() =>
-      expect(screen.getByLabelText(syncAccountCredentialLabel("Globex"))).not.toBeChecked(),
-    );
+    await waitFor(() => expect(screen.getByLabelText("Use my Globex account")).not.toBeChecked());
     expect(syncCredentialSourceGet).toHaveBeenCalledTimes(2);
   });
 });
@@ -1867,7 +1938,7 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
   });
 
   it("does not tick the account under a typed token when the account comes back later", async () => {
-    const USE_ACME = syncAccountCredentialLabel("Acme");
+    rustOffers({ [driveOffer().remoteUrl]: { account: USE_ACME, forges: [] } });
     accountStore.getState().setVm(accountVm({ state: "offline" }));
     render(<AddFolderForm prefill={driveOffer({ credential: "account" })} />);
     fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
@@ -1876,15 +1947,17 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
     act(() => accountStore.getState().setVm(accountVm({ state: "ready", revision: 1 })));
 
     // Offered now, since the account can stand in — but not chosen for them.
-    expect(await screen.findByLabelText(USE_ACME)).not.toBeChecked();
+    expect(await screen.findByLabelText(USE_ACME.label)).not.toBeChecked();
     expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toHaveValue("ghp_typed");
   });
 
   it("reports a draft while it still has a created folder to finish, though no field moved", async () => {
     // The phone: no folder to choose, so an untouched offer can be saved as is.
     capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true });
+    rustOffers({ [driveOffer().remoteUrl]: { account: USE_ACME, forges: [] } });
     accountStore.getState().setVm(accountVm());
     mockSave.mockResolvedValue(profileVm({ id: "p9" }));
+    // Rust's refusal, surfaced in its own words after the folder was saved.
     vi.mocked(syncCredentialSourceSet).mockRejectedValue({
       code: "internal",
       message: "disk full",
@@ -1897,6 +1970,7 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
       />,
     );
     expect(onPristineChange).toHaveBeenLastCalledWith(true);
+    expect(await screen.findByLabelText(USE_ACME.label)).toBeChecked();
 
     fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
     expect(await screen.findByText(/disk full/)).toBeInTheDocument();
@@ -1906,11 +1980,8 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
 });
 
 describe("AddFolderForm opened from a repository (Epic 86, AD-336)", () => {
-  const SIGN_IN_WITH_GITHUB = syncForgeCredentialLabel("GitHub");
-
-  // Repositories on the source's own site: the connection is offered only
-  // for a remote there (surface #21).
   const ON_GITHUB = "https://github.com/tgorka/notes.git";
+  const ON_GITHUB_TOO = "https://GitHub.com/tgorka/notes-2.git";
 
   beforeEach(() => {
     forgesStore.setState({
@@ -1930,10 +2001,13 @@ describe("AddFolderForm opened from a repository (Epic 86, AD-336)", () => {
         },
       ],
     });
+    const onGithub = { account: null, forges: [SIGN_IN_WITH_GITHUB] };
+    rustOffers({ [ON_GITHUB]: onGithub, [ON_GITHUB_TOO]: onGithub });
   });
 
   afterEach(() => {
     resetForgesStoreForTest();
+    accountStore.setState({ vm: NO_ACCOUNT, setupLink: null });
   });
 
   it("signs with the source's connection, stores no token, and records the source", async () => {
@@ -1945,7 +2019,8 @@ describe("AddFolderForm opened from a repository (Epic 86, AD-336)", () => {
       />,
     );
 
-    expect(screen.getByLabelText(SIGN_IN_WITH_GITHUB)).toBeChecked();
+    expect(await screen.findByLabelText(SIGN_IN_WITH_GITHUB.label)).toBeChecked();
+    expect(screen.getByText(SIGN_IN_WITH_GITHUB.detail)).toBeInTheDocument();
     fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
     // Nothing to type while the connection is the credential.
     expect(screen.queryByLabelText(SYNC_TOKEN_LABEL)).not.toBeInTheDocument();
@@ -1959,13 +2034,30 @@ describe("AddFolderForm opened from a repository (Epic 86, AD-336)", () => {
     expect(mockSetCredential).not.toHaveBeenCalled();
   });
 
+  it("offers only Rust's forge choice for a github.com remote, never the account", async () => {
+    // The account is signed in and usable, and GitHub comes through its broker:
+    // Rust offers that, under its own name, and not the account's sign-in.
+    accountStore.getState().setVm(accountVm());
+    rustOffers({ [ON_GITHUB]: { account: null, forges: [GITHUB_THROUGH_ACME] } });
+    render(
+      <AddFolderForm
+        prefill={driveOffer({ credential: "forge:github", remoteUrl: ON_GITHUB, tasks: null })}
+      />,
+    );
+
+    expect(await screen.findByLabelText(GITHUB_THROUGH_ACME.label)).toBeChecked();
+    expect(screen.getByText(GITHUB_THROUGH_ACME.detail)).toBeInTheDocument();
+    expect(screen.queryByLabelText(USE_ACME.label)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Use my/)).not.toBeInTheDocument();
+  });
+
   it("keeps an edited folder on its source's connection, with no account at all", async () => {
     mockSave.mockResolvedValue(profileVm());
     vi.mocked(syncCredentialSourceGet).mockResolvedValue("forge:github");
     render(<AddFolderForm profile={profileVm({ remoteUrl: ON_GITHUB })} />);
 
     // Read although no account exists: a repository source can be the answer.
-    await waitFor(() => expect(screen.getByLabelText(SIGN_IN_WITH_GITHUB)).toBeChecked());
+    await waitFor(() => expect(screen.getByLabelText(SIGN_IN_WITH_GITHUB.label)).toBeChecked());
     fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
     await act(async () => {});
@@ -1973,34 +2065,28 @@ describe("AddFolderForm opened from a repository (Epic 86, AD-336)", () => {
     expect(syncCredentialSourceSet).not.toHaveBeenCalled();
   });
 
-  it("withdraws the connection while the remote is on another host, and gives it back", async () => {
+  it("falls back to the token field while Rust does not offer the connection, and gives it back", async () => {
     mockSave.mockResolvedValue(profileVm({ id: "p9" }));
     render(
       <AddFolderForm
         prefill={driveOffer({ credential: "forge:github", remoteUrl: ON_GITHUB, tasks: null })}
       />,
     );
-    expect(screen.getByLabelText(SIGN_IN_WITH_GITHUB)).toBeChecked();
+    expect(await screen.findByLabelText(SIGN_IN_WITH_GITHUB.label)).toBeChecked();
 
-    // GitHub's token goes only to github.com: a remote elsewhere, or one that
-    // is not https, cannot sign with it, so the token field is back.
-    for (const elsewhere of [
-      "https://git.acme.dev/tgorka/notes.git",
-      "ssh://git@github.com/tgorka/notes.git",
-      "git@github.com:tgorka/notes.git",
-    ]) {
-      fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
-        target: { value: elsewhere },
-      });
-      expect(screen.queryByLabelText(SIGN_IN_WITH_GITHUB)).not.toBeInTheDocument();
-    }
-    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    // A remote Rust offers no sign-in for: the token field is back, unfolded
+    // without being asked, and says why.
+    fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
+      target: { value: "https://git.acme.dev/tgorka/notes.git" },
+    });
+    expect(await screen.findByText(SYNC_CREDENTIAL_WITHDRAWN_NOTE)).toBeInTheDocument();
+    expect(screen.queryByLabelText(SIGN_IN_WITH_GITHUB.label)).not.toBeInTheDocument();
     expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
-      target: { value: "https://GitHub.com/tgorka/notes-2.git" },
+      target: { value: ON_GITHUB_TOO },
     });
-    expect(screen.getByLabelText(SIGN_IN_WITH_GITHUB)).toBeChecked();
+    await waitFor(() => expect(screen.getByLabelText(SIGN_IN_WITH_GITHUB.label)).toBeChecked());
     expect(screen.queryByLabelText(SYNC_TOKEN_LABEL)).not.toBeInTheDocument();
   });
 
@@ -2019,10 +2105,30 @@ describe("AddFolderForm opened from a repository (Epic 86, AD-336)", () => {
     await waitFor(() =>
       expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent("/Users/alice/notes"),
     );
+    await screen.findByText(SYNC_CREDENTIAL_WITHDRAWN_NOTE);
     fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
     await act(async () => {});
     expect(syncCredentialSourceSet).not.toHaveBeenCalled();
+  });
+
+  it("starts in the folder the repository's Add… named, and adds it there", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9" }));
+    render(
+      <AddFolderForm
+        prefill={{
+          ...driveOffer({ credential: "forge:github", remoteUrl: ON_GITHUB, tasks: null }),
+          localPath: "/Users/alice/keeper/git/notes",
+        }}
+      />,
+    );
+    expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent(
+      "/Users/alice/keeper/git/notes",
+    );
+    await screen.findByLabelText(SIGN_IN_WITH_GITHUB.label);
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(mockSave.mock.calls[0][0]).toMatchObject({ localPath: "/Users/alice/keeper/git/notes" });
   });
 
   it("adds a repository keeper can only read as pull-only", async () => {
@@ -2039,6 +2145,7 @@ describe("AddFolderForm opened from a repository (Epic 86, AD-336)", () => {
     await waitFor(() =>
       expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent("/Users/alice/notes"),
     );
+    await screen.findByLabelText(SIGN_IN_WITH_GITHUB.label);
     fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
     expect(mockSave.mock.calls[0][0]).toMatchObject({ direction: "pullOnly" });

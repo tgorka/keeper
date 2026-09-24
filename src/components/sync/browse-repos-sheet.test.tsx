@@ -158,6 +158,8 @@ beforeEach(() => {
   resetForgesStoreForTest();
   resetSyncStoreForTest();
   accountStore.getState().setVm(NO_ACCOUNT);
+  // Where Rust puts new drives; a case that is about the folder says which.
+  vi.mocked(forgeDefaultBaseFolder).mockResolvedValue(null);
 });
 
 afterEach(() => {
@@ -393,15 +395,33 @@ describe("BrowseReposEntry", () => {
     fireEvent.click(
       within(elsewhere).getByRole("button", { name: `${BROWSE_ADD_ONE_LABEL} tgorka/notes` }),
     );
-    expect(onAddOne).toHaveBeenCalledWith(
-      expect.objectContaining({
-        name: "notes",
-        remoteUrl: "https://github.com/tgorka/notes.git",
-        branch: "main",
-        credential: "forge:github",
-      }),
+    await waitFor(() =>
+      expect(onAddOne).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "notes",
+          remoteUrl: "https://github.com/tgorka/notes.git",
+          branch: "main",
+          credential: "forge:github",
+        }),
+      ),
     );
     expect(onAddOne.mock.calls[0][0]).not.toHaveProperty("direction");
+    // No drive folder from Rust (a phone): the form asks for one.
+    expect(onAddOne.mock.calls[0][0]).not.toHaveProperty("localPath");
+  });
+
+  it("starts a single Add… in <drive folder>/<name>", async () => {
+    vi.mocked(forgeRepos).mockResolvedValue(listing([repo("tgorka/notes")]));
+    vi.mocked(forgeDefaultBaseFolder).mockResolvedValue("/Users/t/keeper/git/");
+    const onAddOne = await openSheet([source()]);
+    await screen.findAllByTestId("forge-repo-row");
+
+    fireEvent.click(screen.getByRole("button", { name: `${BROWSE_ADD_ONE_LABEL} tgorka/notes` }));
+    await waitFor(() =>
+      expect(onAddOne).toHaveBeenCalledWith(
+        expect.objectContaining({ localPath: "/Users/t/keeper/git/notes" }),
+      ),
+    );
   });
 
   it("selects all with ⌘A from the sheet itself, but leaves ⌘A in the search box to the text", async () => {
@@ -480,7 +500,9 @@ describe("BrowseReposEntry", () => {
         name: `${BROWSE_ADD_ONE_LABEL} makistack/handbook`,
       }),
     );
-    expect(onAddOne).toHaveBeenCalledWith(expect.objectContaining({ direction: "pullOnly" }));
+    await waitFor(() =>
+      expect(onAddOne).toHaveBeenCalledWith(expect.objectContaining({ direction: "pullOnly" })),
+    );
   });
 
   it("filters by search and shows forks only when asked", async () => {

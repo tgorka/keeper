@@ -143,6 +143,101 @@ pub struct ForgeAddResultVm {
     pub sentence: Option<String>,
 }
 
+/// One way a drive's git requests can sign in, as the add-folder form offers
+/// it: the value `sync_credential_source_set` stores, its label, and what it
+/// means in one sentence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CredentialChoiceVm {
+    pub value: String,
+    pub label: String,
+    pub detail: String,
+}
+
+/// The sign-ins a drive at one remote may use besides a token of its own.
+/// Rust decides: a sign-in never goes to a host it does not belong to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CredentialChoicesVm {
+    /// The account, when the remote is on one of its own hosts.
+    pub account: Option<CredentialChoiceVm>,
+    /// Repository sources whose origin the remote is at.
+    pub forges: Vec<CredentialChoiceVm>,
+}
+
+/// Where drives added from the person's repositories go.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DriveFolderVm {
+    pub path: String,
+    /// The person chose it; otherwise it is keeper's default, `~/keeper/git`.
+    pub chosen: bool,
+}
+
+/// What a drive at `remote_url` may sign in with. The account only on its
+/// own hosts (`AccountDescriptor::serves_remote`), a repository source only
+/// at its own origin (`remote_on_source`); the account's forge is the
+/// account choice, not a second one.
+pub fn credential_choices(
+    account: Option<&AccountDescriptor>,
+    sources: &[ForgeSource],
+    remote_url: &str,
+) -> CredentialChoicesVm {
+    let account_choice =
+        account
+            .filter(|d| d.serves_remote(remote_url))
+            .map(|d| CredentialChoiceVm {
+                value: "account".to_owned(),
+                label: format!("Use my {} account", d.name),
+                detail: format!(
+                "keeper signs this folder's git requests in with your {} sign-in, so no token is \
+                 stored for it.",
+                d.name
+            ),
+            });
+    let forges = sources
+        .iter()
+        .filter(|source| super::remote_on_source(source, remote_url))
+        .filter_map(|source| {
+            let value = super::credential_for(source);
+            (value != "account").then(|| forge_choice(source, account, value))
+        })
+        .collect();
+    CredentialChoicesVm {
+        account: account_choice,
+        forges,
+    }
+}
+
+fn forge_choice(
+    source: &ForgeSource,
+    account: Option<&AccountDescriptor>,
+    value: String,
+) -> CredentialChoiceVm {
+    match (source.via, account) {
+        (TokenVia::Broker, Some(d)) => CredentialChoiceVm {
+            value,
+            label: format!("{} access through {}", source.name, d.name),
+            detail: format!(
+                "{} gives keeper a one-hour {} token for this repository only, as you; \
+                 nothing is stored for this folder.",
+                d.name, source.name
+            ),
+        },
+        _ => CredentialChoiceVm {
+            value,
+            label: format!("Sign in with {}", source.name),
+            detail: format!(
+                "keeper uses your {} connection, so no token is stored for this folder.",
+                source.name
+            ),
+        },
+    }
+}
+
 /// A source's row in the switcher, without the network. `error` is what the
 /// last listing, token or connect call returned, when it failed.
 pub fn source_vm(
@@ -329,5 +424,40 @@ mod tests {
         let vm = source_vm(&p, &broker_only, None, None);
         assert!(!vm.can_connect);
         assert_eq!(vm.apps_url, None);
+    }
+
+    /// The hesperia report (2026-09-24): a github.com drive offered "Use my
+    /// makistack account", which sent the account's sign-in to GitHub.
+    #[test]
+    fn a_github_drive_is_offered_github_and_never_the_account() {
+        let p = testing::FakePlatform::default();
+        let d = testing::signed_in_account(&p, "");
+        let broker = source(TokenVia::Broker);
+
+        let github = credential_choices(
+            Some(&d),
+            std::slice::from_ref(&broker),
+            "https://github.com/o/r.git",
+        );
+        assert_eq!(github.account, None);
+        assert_eq!(
+            github
+                .forges
+                .iter()
+                .map(|c| (c.value.as_str(), c.label.as_str()))
+                .collect::<Vec<_>>(),
+            [("forge:vm-src", "GitHub access through Acme")]
+        );
+
+        let own = credential_choices(Some(&d), &[broker], "https://git.acme.dev/people/notes.git");
+        assert_eq!(
+            own.account.as_ref().map(|c| c.label.as_str()),
+            Some("Use my Acme account")
+        );
+        assert!(own.forges.is_empty());
+
+        let device = source(TokenVia::DeviceFlow);
+        let plain = credential_choices(None, &[device], "https://github.com/o/r");
+        assert_eq!(plain.forges[0].label, "Sign in with GitHub");
     }
 }

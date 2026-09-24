@@ -19,8 +19,10 @@
  * archived, sort) and the batch preview; both are pure, in
  * `@/lib/forge-repos`.
  *
- * A single `Add…` hands a prefill to the surface's own add form, which asks
- * for the folder; the batch step adds many at once under one base folder.
+ * A single `Add…` hands a prefill to the surface's own add form, starting in
+ * `<drive folder>/<name>` (`forge_default_base_folder`, the folder Settings ›
+ * Sync says new drives go in); the batch step adds many at once under one
+ * base folder, the same one unless the person picks another.
  * No token crosses into the webview: a device-flow connection shows the user
  * code, which the person types into GitHub themselves, and the shell opens
  * the verification page (`forge_connect_open`) — nothing here opens it.
@@ -281,9 +283,15 @@ export function BrowseReposEntry({
  * drive's, its clone URL and default branch, the credential its source signs
  * with (Rust's `ForgeSourceVm.credential` — `account` for the account's own
  * forge, `forge:<id>` for any other; the webview does not decide it, AD-40),
- * and pull-only when keeper can only read the repository.
+ * pull-only when keeper can only read the repository, and the folder the batch
+ * step would give it — `<base>/<name>` — when Rust named a base (not on iOS).
  */
-function repoPrefill(source: ForgeSourceVm, repo: ForgeRepoVm): AddFolderPrefill {
+function repoPrefill(
+  source: ForgeSourceVm,
+  repo: ForgeRepoVm,
+  base: string | null,
+): AddFolderPrefill {
+  const localPath = batchFolder(base, repo.name);
   return {
     key: `forge:${source.id}:${repo.fullName}`,
     name: repo.name,
@@ -291,6 +299,7 @@ function repoPrefill(source: ForgeSourceVm, repo: ForgeRepoVm): AddFolderPrefill
     branch: repo.defaultBranch,
     credential: source.credential,
     ...(repo.pullOnly ? { direction: "pullOnly" as const } : {}),
+    ...(localPath === null ? {} : { localPath }),
     notes: null,
     recordings: null,
     sessions: null,
@@ -455,7 +464,14 @@ function BrowseFlow({
           // Asked again, never served from memory: the list failed, and
           // only a fresh listing replaces what the shell remembers (#1).
           onRetry={() => void load(true)}
-          onAddOne={(repo) => onAddOne(repoPrefill(source, repo))}
+          onAddOne={(repo) => {
+            // Asked at the press, so the folder is the one Settings › Sync
+            // names now. Unanswered, the form opens without one and asks.
+            void forgeDefaultBaseFolder().then(
+              (base) => onAddOne(repoPrefill(source, repo, base)),
+              () => onAddOne(repoPrefill(source, repo, null)),
+            );
+          }}
           onBatch={() => setView("batch")}
           onOpenDrive={() => {
             primaryViewStore.getState().setView("sync");

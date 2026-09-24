@@ -133,6 +133,8 @@ export type { CopyEntryVm } from "./gen/CopyEntryVm";
 export type { CopyJobState } from "./gen/CopyJobState";
 export type { CopyJobVm } from "./gen/CopyJobVm";
 export type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
+export type { CredentialChoicesVm } from "./gen/CredentialChoicesVm";
+export type { CredentialChoiceVm } from "./gen/CredentialChoiceVm";
 export type { DaemonPresence } from "./gen/DaemonPresence";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
@@ -143,6 +145,7 @@ export type { DockBadgeMode } from "./gen/DockBadgeMode";
 export type { DocumentFormat } from "./gen/DocumentFormat";
 export type { DocumentVm } from "./gen/DocumentVm";
 export type { DraftMirrorBatch } from "./gen/DraftMirrorBatch";
+export type { DriveFolderVm } from "./gen/DriveFolderVm";
 export type { DriveOfferVm } from "./gen/DriveOfferVm";
 export type { EditVersionVm } from "./gen/EditVersionVm";
 export type { Effect } from "./gen/Effect";
@@ -460,8 +463,10 @@ import type { ConfigLayersVm } from "./gen/ConfigLayersVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { CopyJobVm } from "./gen/CopyJobVm";
 import type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
+import type { CredentialChoicesVm } from "./gen/CredentialChoicesVm";
 import type { DeviceCodeVm } from "./gen/DeviceCodeVm";
 import type { DraftMirrorBatch } from "./gen/DraftMirrorBatch";
+import type { DriveFolderVm } from "./gen/DriveFolderVm";
 import type { EditVersionVm } from "./gen/EditVersionVm";
 import type { EmbeddingModelVm } from "./gen/EmbeddingModelVm";
 import type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
@@ -7919,6 +7924,35 @@ export async function forgeReposAdd(req: ForgeAddReq): Promise<ForgeAddResultVm[
 /** Where a batch of drives goes by default; `null` where the platform picks (iOS). */
 export async function forgeDefaultBaseFolder(): Promise<string | null> {
   return await invoke<string | null>("forge_default_base_folder");
+}
+
+/**
+ * Settings › Sync's "New drives go in": the folder and whether the person chose
+ * it (otherwise it is keeper's default, `~/keeper/git`). `null` on a phone,
+ * whose drives live in the app's container.
+ */
+export async function syncDriveFolderGet(): Promise<DriveFolderVm | null> {
+  return await invoke<DriveFolderVm | null>("sync_drive_folder_get");
+}
+
+/**
+ * Choose where new drives go; `null` goes back to `~/keeper/git`. A leading
+ * `~/` is the home folder; any other relative path is refused with Rust's
+ * sentence.
+ */
+export async function syncDriveFolderSet(folder: string | null): Promise<DriveFolderVm | null> {
+  return await invoke<DriveFolderVm | null>("sync_drive_folder_set", { folder });
+}
+
+/**
+ * The sign-ins a drive at `remoteUrl` may use besides a token of its own (AD-40):
+ * the account only on its own hosts, a repository source only at its own
+ * origin. Each carries the value `syncCredentialSourceSet` stores, its label
+ * and one sentence saying what it means; the form renders them and decides
+ * nothing.
+ */
+export async function syncCredentialChoices(remoteUrl: string): Promise<CredentialChoicesVm> {
+  return await invoke<CredentialChoicesVm>("sync_credential_choices", { remoteUrl });
 }
 
 /**

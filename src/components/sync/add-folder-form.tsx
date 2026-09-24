@@ -81,8 +81,12 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { IconHint } from "@/components/ui/tooltip";
-import { remoteOnSourceHost } from "@/lib/forge-repos";
-import type { CredentialSource, DriveOfferVm, SyncProfileVm } from "@/lib/ipc/client";
+import type {
+  CredentialChoicesVm,
+  CredentialSource,
+  DriveOfferVm,
+  SyncProfileVm,
+} from "@/lib/ipc/client";
 // The credential calls are made straight from the form rather than through the
 // mirror store: none of them change anything the store mirrors, and the read
 // belongs to one open of one form rather than to state worth keeping in sync.
@@ -90,6 +94,7 @@ import type { CredentialSource, DriveOfferVm, SyncProfileVm } from "@/lib/ipc/cl
 // so it is followed by a refresh of that mirror.
 import {
   syncClearCredential,
+  syncCredentialChoices,
   syncCredentialSourceGet,
   syncCredentialSourceSet,
   syncFolderTasksFlag,
@@ -605,29 +610,26 @@ export const SYNC_TOKEN_REMOVE_FAILED_PREFIX =
   "The changes were saved, but the token was not removed: ";
 
 /**
- * The account as this folder's credential (Epic 82, AD-315, UX-DR116 (5)).
- * Offered only while an account can actually stand in — or when this folder
- * already uses it, so the choice can be undone — and choosing it HIDES the
- * token field rather than disabling it: there is nothing to type.
+ * The sign-ins a folder may use instead of a token of its own — the account
+ * (Epic 82, AD-315) or a repository source's connection (Epic 86, AD-336) —
+ * are Rust's answer for the remote being typed (`sync_credential_choices`,
+ * AD-40): the form renders each choice's label and its one-line detail, and
+ * decides nothing about which host may receive which sign-in. Choosing one
+ * HIDES the token field rather than disabling it: there is nothing to type.
+ *
+ * Asked again this long after the remote stops changing, so a remote being
+ * typed is not a question per keystroke.
  */
-export function syncAccountCredentialLabel(accountName: string): string {
-  return `Use my ${accountName} account`;
-}
-export const SYNC_ACCOUNT_CREDENTIAL_NOTE =
-  "keeper signs this folder's git requests with your account, asking it for a fresh token each time, so no token needs to be stored for this folder.";
-
+export const SYNC_CREDENTIAL_CHOICES_DEBOUNCE_MS = 300;
+/** Rust's answer for a remote no sign-in but its own token may use. */
+const NO_CREDENTIAL_CHOICES: CredentialChoicesVm = { account: null, forges: [] };
 /**
- * A repository source's connection as this folder's credential (Epic 86,
- * AD-336): offered when the form was opened from that source's repository, or
- * when the folder already uses it, and — like the account — it hides the
- * token field rather than disabling it.
+ * Said above the token field when the sign-in this folder was set to use is no
+ * longer one Rust offers for its remote: the folder falls back to a token of
+ * its own, and the field that takes it is shown rather than left folded away.
  */
-export function syncForgeCredentialLabel(sourceName: string): string {
-  return `Sign in with ${sourceName}`;
-}
-export function syncForgeCredentialNote(sourceName: string): string {
-  return `keeper signs this folder's git requests with your ${sourceName} connection, so no token needs to be stored for this folder.`;
-}
+export const SYNC_CREDENTIAL_WITHDRAWN_NOTE =
+  "keeper can't sign in to this remote the way this folder was set to, so it needs a token of its own.";
 export const SYNC_ACCOUNT_SOURCE_FAILED_PREFIX =
   "The folder was saved, but keeper could not record where its credential comes from: ";
 
@@ -883,19 +885,22 @@ function formValuesFor(profile: SyncProfileVm): SyncFormValues {
  * names `account` or `forge:<source-id>` when the add should sign with one.
  * The direction is optional too: a repository keeper can only read (Rust's
  * `pullOnly`) starts as `pullOnly`, because pushes to it would be refused
- * forever; anything else starts as the blank add does.
+ * forever; anything else starts as the blank add does. So is the folder: a
+ * repository from Browse repositories starts in `<drive folder>/<name>` (the
+ * folder Settings › Sync says new drives go in), an offer starts with none.
  */
 export type AddFolderPrefill = Omit<DriveOfferVm, "credential"> & {
   credential?: string;
   direction?: SyncDirection;
+  localPath?: string;
 };
 
 /**
  * A drive offered by the account as the fields an add starts from (Epic 84).
  *
  * Everything the offer does not say keeps the blank add's value, which is how
- * the form already says "keeper picks": the folder, the direction (unless the
- * start says the repository is read-only), the watcher
+ * the form already says "keeper picks": the folder (unless the start names
+ * one), the direction (unless the start says the repository is read-only), the watcher
  * windows and the token belong to this device. A policy field the offer leaves
  * unset (`null`) keeps keeper's own default rather than a number nobody chose.
  *
@@ -907,6 +912,8 @@ function formValuesForOffer(offer: AddFolderPrefill, reduced: boolean): SyncForm
   return {
     ...EMPTY_FORM,
     name: offer.name,
+    // The phone has no folder to choose (AD-199), so none is carried there.
+    localPath: reduced ? EMPTY_FORM.localPath : (offer.localPath ?? EMPTY_FORM.localPath),
     remoteUrl: offer.remoteUrl,
     branch: offer.branch,
     direction: offer.direction ?? EMPTY_FORM.direction,
@@ -1446,14 +1453,15 @@ export function AddFolderForm({
   const [source, setSource] = useState<CredentialSource>(openedSource);
   const [storedSource, setStoredSource] = useState<CredentialSource>("keychain");
   const accountId = account.configured ? account.id : null;
+  // A folder can sign with a repository source without any account (GitHub
+  // works alone), so both reads below run whenever either could be the answer.
+  const asksSources = accountId !== null || forgesKnown;
   useEffect(() => {
     setStoredSource("keychain");
     // A different account than the one the form opened with is not the one
     // the preselection was about.
     setSource(profileId === undefined && accountId === openedAccountId ? openedSource : "keychain");
-    // A folder can sign with a repository source without any account (GitHub
-    // works alone), so the row is read whenever either could be its answer.
-    if (profileId === undefined || (accountId === null && !forgesKnown)) {
+    if (profileId === undefined || !asksSources) {
       return;
     }
     let abandoned = false;
@@ -1471,29 +1479,85 @@ export function AddFolderForm({
     return () => {
       abandoned = true;
     };
-  }, [profileId, accountId, openedAccountId, openedSource, forgesKnown]);
-  const accountOffered = accountUsable(account) || storedSource === "account";
-  const useAccount = accountOffered && source === "account";
+  }, [profileId, accountId, openedAccountId, openedSource, asksSources]);
+
   /**
-   * The repository source this form can sign with: the one it opened with, or
-   * the one the folder already uses — so the choice can be undone. Offered
-   * only while the remote is on that source's host (surface #21): a
-   * `forge:github` folder whose remote was edited to another host would save
-   * and then fail every sync, because the source's token goes only to its own
-   * site. Hidden, the choice is off and the token field is back — the same as
-   * for a source Rust no longer lists, whose host nobody can check.
+   * Which of those sign-ins THIS remote may use, as Rust answers it (AD-40):
+   * the account only on its own hosts, a source only at its own origin. Asked
+   * again for every remote and every account, a little after the remote stops
+   * changing, and an answer is kept only for the remote and account it was
+   * asked about — a slow answer for what was typed a moment ago is dropped.
+   *
+   * Until the answer for what is on screen arrives, the previous one stays
+   * drawn (disabled) so the choices do not blink with every keystroke, and
+   * Save waits: what it stores is always what Rust offered for the remote it
+   * stores. A failed ask offers nothing, which leaves the folder on its own
+   * token.
    */
-  const forgeChoice = [openedSource, storedSource].find((candidate) =>
-    candidate.startsWith("forge:"),
-  ) as `forge:${string}` | undefined;
-  const forgeSource =
-    forgeChoice === undefined
-      ? undefined
-      : forgeSources?.find((candidate) => `forge:${candidate.id}` === forgeChoice);
-  const forgeOffered =
-    forgeSource !== undefined && remoteOnSourceHost(form.remoteUrl, forgeSource.host);
-  const useForge = forgeChoice !== undefined && forgeOffered && source === forgeChoice;
-  const tokenStandsIn = useAccount || useForge;
+  const remoteKey = form.remoteUrl.trim();
+  const choicesKey = `${accountId ?? ""}\n${remoteKey}`;
+  const [answered, setAnswered] = useState<{
+    key: string;
+    choices: CredentialChoicesVm;
+  } | null>(null);
+  const everAnswered = useRef(false);
+  useEffect(() => {
+    if (!asksSources || remoteKey === "") {
+      return;
+    }
+    let abandoned = false;
+    const settle = (choices: CredentialChoicesVm) => {
+      if (!abandoned) {
+        everAnswered.current = true;
+        setAnswered({ key: choicesKey, choices });
+      }
+    };
+    // The first question goes at once: a form opened from a repository should
+    // show its sign-in as it opens, not a beat later.
+    const timer = setTimeout(
+      () => {
+        void syncCredentialChoices(remoteKey).then(settle, () => settle(NO_CREDENTIAL_CHOICES));
+      },
+      everAnswered.current ? SYNC_CREDENTIAL_CHOICES_DEBOUNCE_MS : 0,
+    );
+    return () => {
+      abandoned = true;
+      clearTimeout(timer);
+    };
+  }, [asksSources, remoteKey, choicesKey]);
+  const current =
+    !asksSources || remoteKey === ""
+      ? NO_CREDENTIAL_CHOICES
+      : answered?.key === choicesKey
+        ? answered.choices
+        : null;
+  const choicesPending = current === null;
+  const choices = current ?? answered?.choices ?? NO_CREDENTIAL_CHOICES;
+  // Still offered, offline, to a folder that already uses the account, so the
+  // choice can be undone; offered to anything else only while it can work.
+  const accountChoice =
+    choices.account !== null && (accountUsable(account) || storedSource === "account")
+      ? choices.account
+      : null;
+  const useAccount = accountChoice !== null && source === "account";
+  const forgeChoice = choices.forges.find((choice) => choice.value === source);
+  const useForge = forgeChoice !== undefined;
+  // Before Rust has said anything at all, a chosen sign-in keeps the token
+  // field folded away rather than flashing it for one answer's length.
+  const tokenStandsIn =
+    useAccount || useForge || (choicesPending && answered === null && source !== "keychain");
+  /**
+   * A sign-in this folder was set to use that Rust does not offer for this
+   * remote — a prefill or a stored source the remote has moved away from.
+   * The folder falls back to its own token, and the field that takes it is
+   * unfolded, never a refused source saved silently.
+   */
+  const withdrawn = source !== "keychain" && !choicesPending && !useAccount && !useForge;
+  useEffect(() => {
+    if (withdrawn) {
+      setExpanded(true);
+    }
+  }, [withdrawn]);
 
   /**
    * Whether this form still holds only what it opened with (fix R20). Every
@@ -1639,6 +1703,11 @@ export function AddFolderForm({
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    // Save waits for Rust's answer about the remote it would store (the button
+    // is off meanwhile; this also holds an Enter pressed in a field).
+    if (choicesPending) {
+      return;
+    }
     setSaving(true);
     // Only the save's own error is reset: a failed keychain read still
     // describes the keychain, and it still governs what an empty field means.
@@ -1677,12 +1746,9 @@ export function AddFolderForm({
     const credential: CredentialWrite = tokenStandsIn
       ? { kind: "none" }
       : credentialWrite(stored, form.token);
-    let nextSource: CredentialSource = "keychain";
-    if (useAccount) {
-      nextSource = "account";
-    } else if (useForge) {
-      nextSource = forgeChoice;
-    }
+    // Only a sign-in Rust offers for this remote is ever stored; anything else
+    // is the folder's own token.
+    const nextSource: CredentialSource = useAccount || useForge ? source : "keychain";
     // Read off the form before anything is written, so the request cannot be
     // changed by whatever the awaits below do to the fields: the add branch
     // blanks the draft, but only once the whole save — profile *and* token —
@@ -2632,47 +2698,42 @@ export function AddFolderForm({
           <p className="text-muted-foreground text-xs">{SYNC_AUTHOR_NOTE}</p>
         </div>
       )}
-      {/* The account as the credential (Epic 82): first-order rather than
-          inside Advanced, because it is the easy path the account exists to
-          offer — and present only where it can work (UX-DR116 (5)). */}
-      {accountOffered && (
-        <div className="flex flex-col gap-1">
-          <Label className="flex items-center gap-2">
-            <Checkbox
-              checked={source === "account"}
-              disabled={disabled || saving}
-              onCheckedChange={(next) => setSource(next === true ? "account" : "keychain")}
-            />
-            {syncAccountCredentialLabel(account.name ?? "organisation")}
-          </Label>
-          {useAccount && (
-            <p className="text-muted-foreground text-xs">{SYNC_ACCOUNT_CREDENTIAL_NOTE}</p>
-          )}
-        </div>
-      )}
-      {forgeChoice !== undefined && forgeSource !== undefined && forgeOffered && (
-        <div className="flex flex-col gap-1">
-          <Label className="flex items-center gap-2">
-            <Checkbox
-              checked={useForge}
-              disabled={disabled || saving}
-              onCheckedChange={(next) => setSource(next === true ? forgeChoice : "keychain")}
-            />
-            {syncForgeCredentialLabel(forgeSource.name)}
-          </Label>
-          {useForge && (
-            <p className="text-muted-foreground text-xs">
-              {syncForgeCredentialNote(forgeSource.name)}
-            </p>
-          )}
-        </div>
+      {/* The sign-ins this remote may use instead of a token (Epic 82, Epic 86):
+          first-order rather than inside Advanced, because they are the easy
+          path — and exactly the ones Rust offers for this remote, each in its
+          words, with the sentence that says what choosing it means (AD-40,
+          UX-DR116 (5)). Off while the answer for a changed remote is on its
+          way. */}
+      {[accountChoice, ...choices.forges].map(
+        (choice) =>
+          choice !== null && (
+            <div key={choice.value} className="flex flex-col gap-1">
+              <Label className="flex items-center gap-2">
+                <Checkbox
+                  checked={source === choice.value}
+                  aria-describedby={`${fieldId}-${choice.value}-detail`}
+                  disabled={disabled || saving || choicesPending}
+                  onCheckedChange={(next) =>
+                    setSource(next === true ? (choice.value as CredentialSource) : "keychain")
+                  }
+                />
+                {choice.label}
+              </Label>
+              <p id={`${fieldId}-${choice.value}-detail`} className="text-muted-foreground text-xs">
+                {choice.detail}
+              </p>
+            </div>
+          ),
       )}
       {/* The credential: last inside Advanced on the desktop, and a first-order
           field on the phone (Story 66.1, AD-199), where a profile IS a remote
           URL plus a credential and there is no disclosure to open. Absent, not
-          disabled, while the account is the credential. */}
+          disabled, while a sign-in is the credential. */}
       {(expanded || reducedCapability) && !tokenStandsIn && (
         <div className={cn("flex flex-col gap-2", !reducedCapability && "pl-1")}>
+          {/* Why the field is here now when the folder was set to sign in:
+              read once, so not muted, and not a refusal either. */}
+          {withdrawn && <p className="text-foreground text-xs">{SYNC_CREDENTIAL_WITHDRAWN_NOTE}</p>}
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor={`${fieldId}-token`}>{SYNC_TOKEN_LABEL}</Label>
             <div className="flex w-56 items-center gap-1">
@@ -2727,7 +2788,7 @@ export function AddFolderForm({
           variant="outline"
           size="sm"
           className="w-fit"
-          disabled={disabled || saving || incomplete}
+          disabled={disabled || saving || incomplete || choicesPending}
         >
           {editing ? SYNC_EDIT_SUBMIT_LABEL : SYNC_ADD_SUBMIT_LABEL}
         </Button>

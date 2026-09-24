@@ -21,6 +21,7 @@
  *     access token are the only things deleted. The confirmation says both
  *     halves in those words.
  */
+import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
 import {
   AddFolderForm,
@@ -47,6 +48,7 @@ import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { ACCOUNT_OFFERS_TITLE } from "@/lib/account-offers";
 import type {
+  DriveFolderVm,
   SyncDeviceVm,
   SyncOutcomeVm,
   SyncProfileVm,
@@ -55,13 +57,16 @@ import type {
 } from "@/lib/ipc/client";
 // Read and written straight through rather than through the mirror store: the
 // device name is one app-global string nothing else changes, so mirroring it
-// would be a second source of truth for a value read once per open. Opening a
-// folder is here for the adjacent reason — it changes nothing, so there is no
-// mirrored state for a store action to keep in step.
+// would be a second source of truth for a value read once per open. The drive
+// folder is the same kind of value. Opening a folder is here for the adjacent
+// reason — it changes nothing, so there is no mirrored state for a store
+// action to keep in step.
 import {
   type SyncListSettingsVm,
   syncDevice,
   syncDeviceSetLabel,
+  syncDriveFolderGet,
+  syncDriveFolderSet,
   syncListSettingsGet,
   syncListSettingsSet,
   syncOpenPath,
@@ -316,6 +321,19 @@ export const SYNC_OFFER_ADD_LABEL = "Add…";
 /** Said at the add form when an offer's Add… would throw away a draft (fix R20). */
 export const SYNC_OFFER_DRAFT_SENTENCE = "Save or cancel the folder you are adding first.";
 
+/**
+ * Where drives added from Browse repositories go: Rust's folder (the person's
+ * choice, or `~/keeper/git`), a picker to choose another, and a way back to
+ * the default shown only while there is a choice to undo. Absent on the phone,
+ * whose drives live in the app's container (`sync_drive_folder_get` → null).
+ */
+export const SYNC_DRIVE_FOLDER_LABEL = "New drives go in";
+export const SYNC_DRIVE_FOLDER_NOTE =
+  "Each repository you add from Browse repositories gets a folder of its own in here, named after it.";
+/** The ellipsis because the folder is still to choose, in the system's dialog. */
+export const SYNC_DRIVE_FOLDER_CHOOSE_LABEL = "Choose folder…";
+export const SYNC_DRIVE_FOLDER_DEFAULT_LABEL = "Use default";
+
 /** A drive's roles, as chips, in the form's order. */
 const OFFER_ROLES = [
   ["notes", "Notes"],
@@ -522,6 +540,7 @@ export function SyncSection({ open }: { open: boolean }) {
           <p className="font-medium">{SYNC_ADD_TITLE}</p>
           <BrowseReposEntry size="xs" onAddOne={chooseOffer} />
         </div>
+        <DriveFolderRow open={open} />
         {addNotice !== null && (
           <p role="status" className="text-xs">
             {addNotice}
@@ -607,6 +626,97 @@ export function SyncSection({ open }: { open: boolean }) {
         {listsSaved && <p className="text-muted-foreground text-xs">{SYNC_LISTS_SAVED_SENTENCE}</p>}
         {listsError !== null && <p className="text-destructive text-xs">{listsError}</p>}
       </div>
+    </div>
+  );
+}
+
+/** Settings › Sync's "New drives go in" row; renders nothing until Rust names a folder. */
+function DriveFolderRow({ open }: { open: boolean }) {
+  const [folder, setFolder] = useState<DriveFolderVm | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    let live = true;
+    void syncDriveFolderGet().then(
+      (read) => {
+        if (live) {
+          setFolder(read);
+        }
+      },
+      // Unread: the row stays away, and Browse repositories' batch step still
+      // asks for its folder itself.
+      () => {},
+    );
+    return () => {
+      live = false;
+    };
+  }, [open]);
+
+  const write = async (next: string | null) => {
+    setBusy(true);
+    setError(null);
+    try {
+      setFolder(await syncDriveFolderSet(next));
+    } catch (raw) {
+      // Rust's refusal, in its words; the folder shown is still the one in force.
+      setError(syncErrorMessage(raw));
+    } finally {
+      setBusy(false);
+    }
+  };
+  /** The picker the add form uses; a cancellation writes nothing. */
+  const choose = async () => {
+    let selection: string | string[] | null = null;
+    try {
+      selection = await openFolder({ directory: true });
+    } catch {
+      return;
+    }
+    if (typeof selection === "string") {
+      await write(selection);
+    }
+  };
+
+  if (folder === null) {
+    return null;
+  }
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex min-w-0 flex-col gap-0.5">
+          <Label>{SYNC_DRIVE_FOLDER_LABEL}</Label>
+          <p className="truncate font-mono text-muted-foreground text-xs" title={folder.path}>
+            {folder.path}
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {folder.chosen && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              disabled={busy}
+              onClick={() => void write(null)}
+            >
+              {SYNC_DRIVE_FOLDER_DEFAULT_LABEL}
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            disabled={busy}
+            onClick={() => void choose()}
+          >
+            {SYNC_DRIVE_FOLDER_CHOOSE_LABEL}
+          </Button>
+        </div>
+      </div>
+      <p className="text-muted-foreground text-xs">{SYNC_DRIVE_FOLDER_NOTE}</p>
+      {error !== null && <p className="text-destructive text-xs">{error}</p>}
     </div>
   );
 }

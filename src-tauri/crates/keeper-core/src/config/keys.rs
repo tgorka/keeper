@@ -871,6 +871,19 @@ pub const KEYS: &[KeySpec] = &[
         example: "\"/opt/homebrew/bin/git\"",
     },
     KeySpec {
+        key: "sync.drive_folder",
+        family: false,
+        scope: Scope::MachineLocal,
+        settable: Settable::MachineFileOnly(
+            "it is an absolute path, and /Users/tgorka/keeper/git is not a folder on the other \
+             machine",
+        ),
+        shape: Shape::AbsolutePath,
+        default: "",
+        summary: "Where drives added from your repositories go; absent means ~/keeper/git.",
+        example: "\"/Users/tgorka/keeper/git\"",
+    },
+    KeySpec {
         key: "sync.credential_source.",
         family: true,
         scope: Scope::SessionState,

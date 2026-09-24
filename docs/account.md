@@ -1143,17 +1143,29 @@ grants is not an outage. The sheet says "Your account has no GitHub access on
 ### Adding repositories as drives
 
 - **One.** *Add…* on a row opens *Add a folder* filled in: the repository's name as the
-  drive's name, its clone URL, its default branch, *Download only* where keeper can only
-  download it, and *Sign in with `<source>`*. You choose the folder, as for any drive. This
-  is also the way to add a second drive of one repository in another folder. *Sign in with
-  `<source>`* is offered only while the remote is on that source's host; change the remote
-  to another host and the choice goes away.
+  drive's name, its folder (`<new drives folder>/<name>`, see below), its clone URL, its
+  default branch, *Download only* where keeper can only download it, and the sign-in its
+  source gives. You can change any of them. This is also the way to add a second drive of
+  one repository in another folder.
+- **Which sign-ins the form offers.** keeper asks Rust for the sign-ins a drive at the
+  form's remote may use (`sync_credential_choices`), each with a label and one sentence
+  saying what it means, and offers only those:
+  - *Use my `<account>` account* only for a repository on one of the account's own hosts
+    (its sign-in, config repository and forge). For a GitHub repository it is never
+    offered, and keeper refuses both to save it and to hand the account's token over:
+    GitHub would be given your account's sign-in, and refuse it anyway.
+  - *GitHub access through `<account>`* for a GitHub repository when the account names a
+    broker: the broker gives keeper a one-hour token for that one repository, as you.
+  - *Sign in with GitHub* for a GitHub repository through your own GitHub connection.
+  - Change the remote to another host and the choices follow it; a choice the new remote
+    cannot use goes back to the drive's own token.
 - **Several.** Tick them (⌘A anywhere in the sheet, outside a text field, ticks every
   visible one not yet added) and choose *Add `<n>` drives…*. The count and the batch are
   the ticked repositories that are still listed and not yet added.
-  - **Where they go.** On a desktop you choose a base folder. keeper suggests the parent
-    of the drive you added last, or else `~/Drives`, and the field is there even when it
-    has nothing to suggest. Each repository goes into `<base>/<name>`, and you can rename
+  - **Where they go.** On a desktop, new drives go in `~/keeper/git` unless you choose
+    another folder under Settings › Sync › *New drives go in* (`sync.drive_folder`,
+    machine-local; *Use default* goes back). The batch starts from that folder and you can
+    change it for one batch. Each repository goes into `<folder>/<name>`, and you can rename
     each one. On iPhone and iPad keeper places the folders itself, as for any drive.
   - **Which folders keeper uses.** A folder must be a full path ("Choose a full folder
     path."; `~/` means your home folder). It must be absent (keeper creates it), empty

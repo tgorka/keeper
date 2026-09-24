@@ -73,8 +73,10 @@ import type {
   BotVm,
   CapabilitiesVm,
   CopyJobVm,
+  CredentialChoicesVm,
   DeviceCodeVm,
   DocumentVm,
+  DriveFolderVm,
   FileSizeVm,
   FilesEntrySyncVm,
   FilesEntryVm,
@@ -3461,6 +3463,18 @@ let githubFailsNext = githubParam === "fails";
  * the account changes.
  */
 const forgeErrors = new Map<string, Pick<ForgeSourceVm, "state" | "sentence">>();
+/** Settings › Sync's "New drives go in", as the person chose it; `null` is keeper's default. */
+let chosenDriveFolder: string | null = null;
+const MOCK_HOME = "/Users/tgorka";
+
+function mockDriveFolder(): DriveFolderVm | null {
+  if (new URLSearchParams(window.location.search).get("platform") === "phone") {
+    return null;
+  }
+  return chosenDriveFolder === null
+    ? { path: `${MOCK_HOME}/keeper/git`, chosen: false }
+    : { path: chosenDriveFolder, chosen: true };
+}
 
 function withStoredError(source: ForgeSourceVm): ForgeSourceVm {
   const stored = forgeErrors.get(source.id);
@@ -5267,20 +5281,29 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     credentialSources.get(`sync/${String(payload.profileId)}`) ?? "keychain",
   sync_credential_source_set: (payload) => {
     const value = String(payload.source);
+    const profile = (ANSWERS.sync_profiles as SyncProfileVm[]).find(
+      (candidate) => candidate.id === String(payload.profileId),
+    );
+    const refuse = (message: string) => {
+      throw { code: "internal", message, accountId: null, retriable: false };
+    };
     // The shell refuses a `forge:<id>` whose drive's remote is not on that
-    // source's site (surface #21), in its own words.
+    // source's site (surface #21), and the account anywhere but its own
+    // repository host, in its own words.
     if (value.startsWith("forge:")) {
-      const profile = (ANSWERS.sync_profiles as SyncProfileVm[]).find(
-        (candidate) => candidate.id === String(payload.profileId),
-      );
       const source = forgeSources().find((candidate) => `forge:${candidate.id}` === value);
       if (source !== undefined && !remoteOnSourceHost(profile?.remoteUrl ?? "", source.host)) {
-        throw {
-          code: "internal",
-          message: `This drive's repository isn't on ${source.host}.`,
-          accountId: null,
-          retriable: false,
-        };
+        refuse(`This drive's repository isn't on ${source.host}.`);
+      }
+    }
+    if (value === "account") {
+      if (!accountVm.configured) {
+        refuse("No account is set up on this device.");
+      }
+      if (!remoteOnSourceHost(profile?.remoteUrl ?? "", accountVm.repoHost ?? "git.acme.dev")) {
+        refuse(
+          `This drive's repository isn't on ${accountVm.name ?? "the account"}'s hosts; choose another way to sign in.`,
+        );
       }
     }
     credentialSources.set(`sync/${String(payload.profileId)}`, value);
@@ -5421,10 +5444,64 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     forgeErrors.delete("github");
     return githubSource();
   },
-  forge_default_base_folder: () =>
-    new URLSearchParams(window.location.search).get("platform") === "phone"
-      ? null
-      : "/Users/tgorka/Drives",
+  forge_default_base_folder: () => mockDriveFolder()?.path ?? null,
+  sync_drive_folder_get: () => mockDriveFolder(),
+  // Rust's rules: empty resets to the default, `~/` is the home folder, and any
+  // other relative path is refused in its own words.
+  sync_drive_folder_set: (payload) => {
+    if (mockDriveFolder() === null) {
+      return null;
+    }
+    const folder = typeof payload.folder === "string" ? payload.folder.trim() : "";
+    if (folder === "") {
+      chosenDriveFolder = null;
+    } else if (folder.startsWith("/")) {
+      chosenDriveFolder = folder;
+    } else if (folder === "~" || folder.startsWith("~/")) {
+      chosenDriveFolder = `${MOCK_HOME}${folder.slice(1)}`;
+    } else {
+      throw {
+        code: "internal",
+        message: `${folder} is not a full path. Choose a folder that starts with / or ~/.`,
+        accountId: null,
+        retriable: false,
+      };
+    }
+    return mockDriveFolder();
+  },
+  // Rust's `credential_choices`: the account only for a remote on its own
+  // repository host; a source only at its own origin, and never the account's
+  // forge a second time. GitHub through the broker names the account.
+  sync_credential_choices: (payload): CredentialChoicesVm => {
+    const remoteUrl = String(payload.remoteUrl ?? "");
+    const accountName = accountVm.name ?? "organisation";
+    const account =
+      accountVm.configured && remoteOnSourceHost(remoteUrl, accountVm.repoHost ?? "git.acme.dev")
+        ? {
+            value: "account",
+            label: `Use my ${accountName} account`,
+            detail: `keeper signs this folder's git requests in with your ${accountName} sign-in, so no token is stored for it.`,
+          }
+        : null;
+    const forges = forgeSources()
+      .filter(
+        (source) => source.credential !== "account" && remoteOnSourceHost(remoteUrl, source.host),
+      )
+      .map((source) =>
+        source.via === "broker" && accountVm.configured
+          ? {
+              value: source.credential,
+              label: `${source.name} access through ${accountName}`,
+              detail: `${accountName} gives keeper a one-hour ${source.name} token for this repository only, as you; nothing is stored for this folder.`,
+            }
+          : {
+              value: source.credential,
+              label: `Sign in with ${source.name}`,
+              detail: `keeper uses your ${source.name} connection, so no token is stored for this folder.`,
+            },
+      );
+    return { account, forges };
+  },
   // Rust's batch add: each repository's folder is `<base>/<name>`; the one
   // named `playground` holds other files, which is the conflict the step has
   // to show on its own row while the rest are added.

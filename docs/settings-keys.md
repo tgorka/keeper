@@ -137,6 +137,8 @@ These are facts about one computer. A shared file that sets one of them is a nam
 | | | | | The sync profile that holds this machine's recordings; overrides the plain folder above. |
 | `sync.git_path` | machine-local | absolute path | *(absent)* | `"sync.git_path" = "/opt/homebrew/bin/git"` |
 | | | | | An explicit git binary for folder sync; absent means search PATH. |
+| `sync.drive_folder` | machine-local | absolute path | *(absent)* | `"sync.drive_folder" = "/Users/tgorka/keeper/git"` |
+| | | | | Where drives added from your repositories go; absent means ~/keeper/git. |
 
 Why each one is refused from a shared file:
 
@@ -149,6 +151,7 @@ Why each one is refused from a shared file:
 - `recording.destination_dir` — it is an absolute path, and /Volumes/merope/… does not exist on the other machine
 - `recording.destination_profile_id` — it names a row in this machine's sync.db, and the same folder is a different profile id on the other machine
 - `sync.git_path` — it is an absolute path to a binary, and /opt/homebrew/bin/git is not where git is on the other machine
+- `sync.drive_folder` — it is an absolute path, and /Users/tgorka/keeper/git is not a folder on the other machine
 
 ## Keys no file may set
 

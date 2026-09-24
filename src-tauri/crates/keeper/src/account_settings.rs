@@ -250,7 +250,7 @@ pub(crate) fn catalog(
     catalog.account_id = Some(account_id.to_owned());
     let descriptor = crate::account_ipc::descriptor().filter(|d| d.id == account_id);
     if let Some(d) = &descriptor {
-        catalog.trusted_origins = trusted_origins(d);
+        catalog.trusted_origins = d.trusted_origins();
     }
     // A pulled `forge:<id>` applies only to a drive at that source's origin,
     // and only for a source this device can get a token for.
@@ -260,24 +260,6 @@ pub(crate) fn catalog(
         keeper_core::forges::BUILTIN_GITHUB_CLIENT_ID,
     );
     Ok(catalog)
-}
-
-/// The descriptor's issuer, repository and forge origins.
-fn trusted_origins(d: &keeper_core::org_account::descriptor::AccountDescriptor) -> Vec<String> {
-    use keeper_core::org_account::descriptor::RepoAuthConfig;
-
-    let mut urls = vec![d.auth.issuer.as_str(), d.config.url.as_str()];
-    if let RepoAuthConfig::Oauth(forge) = &d.config.auth {
-        urls.extend(forge.issuer.as_deref());
-        urls.extend(forge.authorize_url.as_deref());
-    }
-    let mut origins: Vec<String> = urls
-        .into_iter()
-        .filter_map(settings_sync::url_origin)
-        .collect();
-    origins.sort();
-    origins.dedup();
-    origins
 }
 
 /// A live grant as the device file carries it: its bot by target, its drive

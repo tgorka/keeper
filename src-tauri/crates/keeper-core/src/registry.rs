@@ -2486,6 +2486,46 @@ pub fn set_recording_destination_dir(data_dir: &Path, dir: &str) -> Result<(), C
     set_setting(data_dir, RECORDING_DESTINATION_DIR_KEY, dir)
 }
 
+/// Where drives added from the person's repositories go (Epic 86), until
+/// they choose otherwise: `~/keeper/git`.
+pub const DEFAULT_DRIVE_FOLDER: &[&str] = &["keeper", "git"];
+
+const SYNC_DRIVE_FOLDER_KEY: &str = "sync.drive_folder";
+
+/// The folder new drives go in, and whether the person chose it: the stored
+/// `sync.drive_folder`, else [`DEFAULT_DRIVE_FOLDER`] under `home`. `None`
+/// when nothing is stored and there is no home to put the default in.
+pub fn sync_drive_folder(
+    data_dir: &Path,
+    home: Option<&Path>,
+) -> Result<Option<(PathBuf, bool)>, CoreError> {
+    let stored = get_setting(data_dir, SYNC_DRIVE_FOLDER_KEY)?.filter(|v| !v.trim().is_empty());
+    Ok(match stored {
+        Some(path) => Some((PathBuf::from(path), true)),
+        None => home.map(|home| {
+            let default = DEFAULT_DRIVE_FOLDER
+                .iter()
+                .fold(home.to_path_buf(), |path, part| path.join(part));
+            (default, false)
+        }),
+    })
+}
+
+/// Choose the folder new drives go in; `None` goes back to the default. A
+/// relative path is refused: it would resolve against wherever keeper was
+/// started, which is no folder the person picked.
+pub fn set_sync_drive_folder(data_dir: &Path, folder: Option<&str>) -> Result<(), CoreError> {
+    match folder.map(str::trim).filter(|f| !f.is_empty()) {
+        None => delete_setting(data_dir, SYNC_DRIVE_FOLDER_KEY),
+        Some(folder) if Path::new(folder).is_absolute() => {
+            set_setting(data_dir, SYNC_DRIVE_FOLDER_KEY, folder)
+        }
+        Some(_) => Err(CoreError::Internal(
+            "Choose a full folder path for new drives.".to_owned(),
+        )),
+    }
+}
+
 /// The `settings` key holding the id of the sync profile that holds this
 /// machine's recordings (Story 41.2, FR-131). Stored as the profile's opaque
 /// ULID; absent / empty ⇒ no profile choice, and the plain
@@ -4693,6 +4733,37 @@ mod tests {
         assert_eq!(
             get_recording_destination_dir(&dir).expect("get blank"),
             None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_drives_go_to_keeper_git_until_the_person_chooses_a_folder() {
+        let dir = temp_dir();
+        let home = Path::new("/Users/x");
+        assert_eq!(
+            sync_drive_folder(&dir, Some(home)).expect("default"),
+            Some((PathBuf::from("/Users/x/keeper/git"), false))
+        );
+        assert_eq!(sync_drive_folder(&dir, None).expect("no home"), None);
+
+        set_sync_drive_folder(&dir, Some("/Volumes/data/repos")).expect("choose");
+        assert_eq!(
+            sync_drive_folder(&dir, Some(home)).expect("chosen"),
+            Some((PathBuf::from("/Volumes/data/repos"), true))
+        );
+        // A relative folder would land wherever keeper was started.
+        assert!(set_sync_drive_folder(&dir, Some("repos")).is_err());
+        assert_eq!(
+            sync_drive_folder(&dir, Some(home))
+                .expect("unchanged")
+                .map(|(_, chosen)| chosen),
+            Some(true)
+        );
+        set_sync_drive_folder(&dir, None).expect("back to the default");
+        assert_eq!(
+            sync_drive_folder(&dir, Some(home)).expect("reset"),
+            Some((PathBuf::from("/Users/x/keeper/git"), false))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

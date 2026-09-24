@@ -23,8 +23,8 @@ use keeper_core::forges::device_flow::{self, DeviceCode};
 use keeper_core::forges::listing::{self, Listing};
 use keeper_core::forges::tokens::{self, ForgeError};
 use keeper_core::forges::vm::{
-    source_vm, DeviceCodeVm, ForgeAddItem, ForgeAddReq, ForgeAddResultVm, ForgeReposVm,
-    ForgeSourceVm,
+    credential_choices, source_vm, CredentialChoicesVm, DeviceCodeVm, DriveFolderVm, ForgeAddItem,
+    ForgeAddReq, ForgeAddResultVm, ForgeReposVm, ForgeSourceVm,
 };
 use keeper_core::forges::{self, mark, ForgeSource};
 use keeper_core::org_account::descriptor::AccountDescriptor;
@@ -285,36 +285,76 @@ pub async fn forge_disconnect(
     Ok(source_vm(platform, &source, d.as_ref(), None))
 }
 
-/// Where a batch of drives goes unless the person says otherwise: beside
-/// the most recently added drive, else `~/Drives`. `None` on a phone, whose
+/// Where a batch of drives goes unless the person says otherwise: the folder
+/// chosen in Settings › Sync, else `~/keeper/git`. `None` on a phone, whose
 /// drives always live in the app's container.
 #[tauri::command]
 pub async fn forge_default_base_folder(
     state: State<'_, AppState>,
 ) -> Result<Option<String>, IpcError> {
-    #[cfg(desktop)]
-    {
-        let profiles = profiles(&state)?;
-        Ok(default_base_folder(&profiles).map(|path| path.to_string_lossy().into_owned()))
-    }
-    #[cfg(not(desktop))]
-    {
-        let _ = state;
-        Ok(None)
-    }
+    Ok(drive_folder(&state)?.map(|vm| vm.path))
 }
 
-/// The parent of the newest drive's folder (ids are ULIDs, so the largest
-/// is the newest) — a removable one's volume is no default — else
-/// `~/Drives`.
+/// Settings › Sync's "New drives go in": the folder and whether the person
+/// chose it. `None` on a phone.
+#[tauri::command]
+pub async fn sync_drive_folder_get(
+    state: State<'_, AppState>,
+) -> Result<Option<DriveFolderVm>, IpcError> {
+    drive_folder(&state)
+}
+
+/// Choose where new drives go; `None` goes back to `~/keeper/git`. A
+/// leading `~/` is the home folder; any other relative path is refused.
+#[tauri::command]
+pub async fn sync_drive_folder_set(
+    state: State<'_, AppState>,
+    folder: Option<String>,
+) -> Result<Option<DriveFolderVm>, IpcError> {
+    #[cfg(desktop)]
+    {
+        let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+        let folder = match folder.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+            None => None,
+            Some(text) => Some(
+                full_path(text)
+                    .map_err(|sentence| forge_ipc_error(&ForgeError::Refused(sentence)))?,
+            ),
+        };
+        let folder = folder.map(|path| path.to_string_lossy().into_owned());
+        registry::set_sync_drive_folder(&data_dir, folder.as_deref()).map_err(to_ipc_error)?;
+    }
+    #[cfg(not(desktop))]
+    let _ = folder;
+    drive_folder(&state)
+}
+
+/// What sign-ins a drive at `remote_url` may use besides a token of its own:
+/// the account only on its own hosts, a repository source only at its own
+/// origin. The add-folder form offers exactly these.
+#[tauri::command]
+pub async fn sync_credential_choices(remote_url: String) -> Result<CredentialChoicesVm, IpcError> {
+    let d = account_ipc::descriptor();
+    let sources = forges::sources(d.as_ref(), forges::BUILTIN_GITHUB_CLIENT_ID);
+    Ok(credential_choices(d.as_ref(), &sources, &remote_url))
+}
+
 #[cfg(desktop)]
-fn default_base_folder(profiles: &[SyncProfile]) -> Option<PathBuf> {
-    profiles
-        .iter()
-        .filter(|profile| !profile.removable)
-        .max_by(|a, b| a.id.cmp(&b.id))
-        .and_then(|profile| profile.local_path.parent().map(Path::to_path_buf))
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Drives")))
+fn drive_folder(state: &AppState) -> Result<Option<DriveFolderVm>, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    Ok(registry::sync_drive_folder(&data_dir, home.as_deref())
+        .map_err(to_ipc_error)?
+        .map(|(path, chosen)| DriveFolderVm {
+            path: path.to_string_lossy().into_owned(),
+            chosen,
+        }))
+}
+
+#[cfg(not(desktop))]
+fn drive_folder(state: &AppState) -> Result<Option<DriveFolderVm>, IpcError> {
+    let _ = state;
+    Ok(None)
 }
 
 /// Add the chosen repositories as drives, each through the same save as
@@ -341,7 +381,7 @@ pub async fn forge_repos_add(
         #[cfg(desktop)]
         base: match req.base_folder.as_deref().map(str::trim) {
             Some(base) if !base.is_empty() => Some(full_path(base)),
-            _ => default_base_folder(&all).map(Ok),
+            _ => drive_folder(&state)?.map(|vm| Ok(PathBuf::from(vm.path))),
         },
         #[cfg(desktop)]
         folders: all
