@@ -6822,3 +6822,108 @@ location: `src-tauri/crates/keeper-core/src/org_account/descriptor.rs` (`validat
 reason: the build wave's descriptor accepted `[[forges]] kind = "forgejo"` with its `web_base` and `api_base`, as the contract froze it, but AD-334 gives keeper no way to get a token for it: Forgejo has no device flow, the broker is GitHub's only, and the account's forge token belongs to the account's own forge (sending it to another host would break NFR-101). `sources()` therefore left the entry out, and the browse sheet did not show it, with no sentence anywhere but `docs/account.md` (AD-27). Only the account's own forge is browsable on Forgejo. Revisit when a second Forgejo is wanted: its own OAuth sign-in (a public PKCE client per forge, like `config.auth`'s forge leg), or a broker that serves Forgejo.
 status: done 2026-09-24
 resolution: DW-330 — resolved by epic 86's review wave (amendment A4, m10): `validate_forges` now refuses a Forgejo `[[forges]]` entry with "keeper lists only the account's own Forgejo; remove this [[forges]] entry.", so the operator sees why at setup instead of the source silently missing. A second Forgejo stays out of scope until it has its own token path.
+
+### DW-331: Nemotron 3 Diarization is not used, and keeper offers one diarizer.
+
+origin: epic 87's plan, 2026-09-28 (AD-340)
+location: `tools/fluidaudio-rs/` (the bridge binds only the community-1 offline pipeline), `src-tauri/crates/keeper-core/src/transcription/models.rs` (`ModelSet.diarizer_dir = "speaker-diarization"`)
+reason: NVIDIA's Nemotron 3 Diarization (released 2026-09-23, OpenMDW-1.1) ranks first on VoiceArena's initial Diarization-Bench at 14.72% DER against 19.3% for the next system, and FluidAudio carries it from v0.17.0. keeper uses pyannote community-1 instead, for two reasons. Nemotron 3 handles at most eight speakers. It also emits only speaker-activity probabilities and no embedding, so the voices bank would need a second embedding model, and a vector from another model cannot be compared with the bank's (research-transcription-2026-09-28.md §5). There is no setting to choose a diarizer: with one engine that feeds the bank, a second choice would only be a way to break matching. Revisit when meetings of more than four people diarize poorly, or when the owner asks: run Nemotron 3 for the segments and community-1's embedding model on each speaker's longest clean spans, so the bank stays in one embedding space. Then measure both on the owner's own meetings, including Polish ones, which Nemotron 3's evaluation does not cover.
+status: open
+
+### DW-332: Dictionary terms do not bias recognition; FluidAudio's CTC vocabulary boosting is not used.
+
+origin: epic 87's plan, 2026-09-28 (AD-347)
+location: `src-tauri/crates/keeper-core/src/transcription/dictionary.rs` (`apply`, after recognition), `tools/fluidaudio-rs/` (no vocabulary binding)
+reason: FluidAudio can bias Parakeet toward a term list by CTC word-spotting and rescoring. That needs a second encoder, `parakeet-ctc-110m` (about 100 MB), whose model is English (its card is tagged `en`). The feature's open upstream issue #967 reports that on 500 English dictations with 51 terms, 278 transcripts changed, many wrongly. keeper applies the dictionary after recognition instead: whole-word, case-insensitive alias → text, recorded in the transcript. A name the recogniser mangled beyond every alias is not recovered. Revisit when a multilingual spotter exists, or when the owner reports names the aliases cannot catch: bind `configureVocabularyBoosting` in the fork, and measure it on Polish before shipping it.
+status: open
+
+### DW-333: The speaker-matching thresholds are uncalibrated.
+
+origin: epic 87's plan, 2026-09-28 (AD-346)
+location: `src-tauri/crates/keeper-core/src/transcription/bank.rs` and `assemble.rs` (`AUTO_MATCH = 0.70`, `SUGGEST = 0.50`, `LINK = 0.60`)
+reason: No source read for this epic calibrates cosine thresholds for pyannote community-1's 256-d embeddings on meeting audio, so the three constants are starting values, not measurements. A threshold set too low assigns the wrong person automatically. A threshold set too high leaves known people unknown, or splits one speaker in two across segment files. The first costs one click to correct, and nothing reaches the bank without a person's confirmation (AD-347). Revisit after the owner has confirmed people in about twenty meetings: compute the same-person and different-person cosine distributions from the bank's own confirmed samples, and set the constants from them.
+status: open
+
+### DW-334: A session that finished while keeper was quitting, or before the models arrived, is not transcribed later by itself.
+
+origin: epic 87's plan, 2026-09-28 (AD-348)
+location: `src-tauri/crates/keeper/src/ipc.rs` (`RecordingSink::finalize`, the enqueue), `src-tauri/crates/keeper/src/transcribe_ipc.rs` (the queue, held in memory)
+reason: The after-recording hook enqueues a job only at finalize, and only when the capability and the models are ready. The queue lives in memory. A session is left untranscribed, with nothing to say so but a missing `transcript.json`, if keeper quits mid-job, if a session finishes before the models are fetched, or if a session is salvaged at boot. A launch-time scan for such sessions would walk every recordings root and compete with the index rebuild. A job interrupted by every quit would also re-run forever. *Transcribe* in Files transcribes such a session on request. Revisit if the owner finds untranscribed meetings: a marker written at enqueue and removed at a terminal phase would let a launch pass find exactly the interrupted ones.
+status: open
+
+### DW-335: Transcription runs only on Apple Silicon Macs with macOS 15 or later; the phone, Linux and Windows have no engine.
+
+origin: epic 87's plan, 2026-09-28 (AD-339, AD-349)
+location: `src-tauri/crates/keeper/src/transcribe_ipc.rs` (`platform_engine`, `AbsentEngine`), `src-tauri/crates/keeper/src/transcribe_macos.rs`
+reason: The engine is FluidAudio through a Swift bridge. `fluidaudio-rs` does not build without Swift on macOS, Parakeet does not load on Intel Macs, and FluidAudio's offline diarizer crashes on macOS 14 (upstream issue #878, an OS bug). Everywhere else `CapabilitiesVm.transcription` is false and the surfaces are absent. The transcripts, the bank and the dictionary still sync to every device as files. Revisit when the owner asks for another platform. The phone could use FluidAudio's iOS support through the same fork. Linux and Windows could use NeMo-Speech.cpp's C SDK (Apache-2.0, ggml), which needs an embedding model beside its diarizers to feed the same bank.
+status: open
+
+### DW-336: Nothing is transcribed while a meeting is being recorded.
+
+origin: epic 87's plan, 2026-09-28 (AD-348)
+location: `src-tauri/crates/keeper/src/ipc.rs` (`RecordingSink::finalize`, the only trigger)
+reason: Transcription starts after the session ends, from the finished segment files. A live transcript would need three things: the audio while it is captured, which keeper-rec only writes to files; FluidAudio's streaming recognisers, which the fork does not bind; and a streaming diarizer, where Sortformer caps at four speakers and Nemotron 3 at eight. It would also compete with the capture itself for the Neural Engine. Revisit when the owner asks for captions during a call.
+status: open
+
+### DW-337: A transcript is not summarised.
+
+origin: epic 87's plan, 2026-09-28
+location: `src-tauri/crates/keeper-core/src/transcription/render.rs` (the markdown carries the transcript only)
+reason: The owner asked for transcripts, speakers and corrections, not summaries. A summary needs a language model, and the only model endpoints keeper talks to are the bot providers a person configured (D-4). Sending a meeting there is a flow of meeting content that nobody has chosen, even though it adds no host. Revisit when the owner asks for it: a *Summarise* action that sends a transcript's text to a provider the person picks, and says so.
+status: open
+
+### DW-338: Transcripts are not in the recordings search index.
+
+origin: epic 87's plan, 2026-09-28 (AD-344)
+location: `src-tauri/crates/keeper-core/src/archive/recordings.rs` (`rebuild_from_disk`), `src-tauri/crates/keeper-core/src/archive/recordings_fts.rs`
+reason: The recordings browser searches `archive.db` and its FTS, which are rebuilt from what the manifests carry. Transcripts are files beside the media (AD-344), and nothing indexes their text yet, so a word said in a meeting cannot be found from the recordings browser. The index is derived and disposable (D-21), so adding transcripts later loses nothing. Revisit when the owner asks to search what was said: index each `transcript.json`'s utterance text and speaker names in `rebuild_from_disk`, and again when a transcript is saved.
+status: open
+
+### DW-339: keeper builds against a vendored fork of fluidaudio-rs that upstream does not carry.
+
+origin: epic 87's plan, 2026-09-28 (AD-339)
+location: `tools/fluidaudio-rs/` (the fork: `LICENSE` MIT kept, `NOTICE` naming FluidInference), `src-tauri/crates/keeper/Cargo.toml` (the macOS path dependency)
+reason: The newest `fluidaudio-rs` on crates.io (0.14.1) discards token timings and speaker embeddings, cannot load models from a directory, and carries a stale-decoder-state bug. It also pins FluidAudio 0.14.8, while FluidAudio is at 0.17.4. keeper's fork extends the bridge and moves FluidAudio forward, so every later FluidAudio fix and model reaches keeper only when someone bumps the fork. Revisit when upstream `fluidaudio-rs` exposes token timings, per-speaker embeddings and loading by path at a current FluidAudio: move back to it, or offer the fork's changes upstream.
+status: open
+
+### DW-340: The microphone track is found by its position in the file, because keeper-rec writes no track labels.
+
+origin: epic 87's plan, 2026-09-28 (AD-345)
+location: `src-tauri/crates/keeper-core/src/transcription/plan.rs` (`assign_track_roles`), `tools/keeper-rec/Sources/keeper-rec/Capture.swift:950-990` (the writer's input order)
+reason: keeper-rec adds system audio first and the microphone second, and writes no track metadata. The manifest records which devices were on, not where their tracks sit. "The second audio track is the microphone" holds only while the writer keeps that order. A change to the writer would silently attribute other people's speech to the person marked as me. Revisit if keeper-rec's writer changes: have it record track roles in `manifest.json`, and read them before falling back to order.
+status: open
+
+### DW-341: The model files' licences travel with the config repository, and one upstream provenance question is open.
+
+origin: epic 87's plan, 2026-09-28 (AD-341)
+location: the account's config repository, `_models/` (the operator's), `src-tauri/crates/keeper-core/src/transcription/render.rs` (the transcript's engine footer)
+reason: Parakeet TDT v3's CoreML port is CC-BY-4.0. The community-1 files in `speaker-diarization-coreml` are CC-BY-4.0 under a scoped NOTICE that requires attribution to pyannote, WeSpeaker, BUT Speech@FIT and Fluid Inference. keeper ships none of these files. The organisation distributes them through its config repository, so their licence and NOTICE files must travel in `_models/` beside them. keeper names the models in each transcript's footer, and nowhere shows their licences. Upstream issue #927 asks for provenance and licensing details for commercial redistribution of those artifacts, and is open. Revisit when #927 is answered, or when keeper adds a model credit to Settings › About.
+status: open
+
+### DW-342: Voice prints are personal data, and consent and GDPR handling are deferred by the owner.
+
+origin: epic 87's plan, 2026-09-28 (the owner: "prywatnosc i rodo - nie trzeba teraz sie przejmowac")
+location: `src-tauri/crates/keeper-core/src/transcription/bank.rs` (people, clips, embeddings)
+reason: The voices bank keeps other people's voice clips and speaker embeddings, and those identify them. Under the GDPR (RODO), biometric data processed to identify a person is a special category (Art. 9). keeper asks nobody's consent, shows no notice, and has no per-person export. Deleting a person removes their files and leaves a tombstone, which erases them on every device the drive reaches. That is the only control. The owner decided on 2026-09-28 not to address this now. Revisit before the bank holds anyone outside the owner's own meetings, or when the owner asks: a consent note per person, an export, and a retention rule.
+status: open
+
+### DW-343: Each engine call copies the audio twice more on its way into FluidAudio.
+
+origin: epic 87's review wave, 2026-09-28 (AD-339)
+location: `src-tauri/crates/keeper/src/transcribe_macos.rs` (`samples.to_vec()` to the worker thread), `tools/fluidaudio-rs/swift/FluidAudioBridge.swift` (the Swift array built from the pointer)
+reason: The `SpeechEngine` trait takes `&[f32]` and keeper's code is `unsafe`-free, so the samples cross to the worker thread by copy, and the bridge builds a Swift array from them. A recording part is at most 30 minutes (about 115 MB per copy), which the measured 1.46 GB peak on hesperia already includes. A three-hour file transcribed from Files would peak near 2 GB. Revisit when a long file is transcribed on a small Mac: take `Arc<[f32]>` in the trait and hand the bridge the buffer without the intermediate array.
+status: open
+
+### DW-344: Model hydration reads the config clone outside the account gate.
+
+origin: epic 87's review wave, 2026-09-28 (AD-341)
+location: `src-tauri/crates/keeper/src/account_ipc.rs` (the models fetch), `src-tauri/crates/keeper-sync/src/config_repo/hydrate.rs`
+reason: The fetch walks `<clone>/_models` while a later account sync may hard-reset the same worktree. A pointer read mid-rewrite would not parse as a pointer and would be copied as a plain file. The completion marker (a digest over every file's oid) then disagrees with the clone, so readiness stays false and the next fetch repairs it; the cost is one failed load, not a wrong model. Revisit if a torn read is ever logged: snapshot the pointers under the account gate before fetching.
+status: open
+
+### DW-345: A Mac on macOS 11–13 that auto-updates receives a bundle it cannot open.
+
+origin: epic 87's review wave, 2026-09-28 (AD-339)
+location: `src-tauri/crates/keeper/tauri.conf.json` (`bundle.macOS.minimumSystemVersion` 14.0), `tools/fluidaudio-rs/Package.swift` (`.macOS(.v14)`), the release's updater feed
+reason: FluidAudio's floor is macOS 14, and its static Swift library is linked into the app, so Epic 87 raised the bundle minimum from 11.0 to 14.0. keeper's updater feed has no OS gate, so an installed keeper on 11–13 would download an update that macOS refuses to launch. The owner's Macs run macOS 26–27. Revisit before the first release that reaches someone on 11–13: either keep a last 11.0-floor build in the feed for those systems, or load the engine lazily so the floor can return to 11.0.
+status: open

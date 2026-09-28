@@ -41,13 +41,28 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-03
-last_updated: 2026-09-24
+last_updated: 2026-09-28
 project: keeper
 project_key: NOKEY
 tracking_system: file-system
 story_location: _bmad-output/implementation-artifacts
 
 development_status:
+  # Epic 87: the owner's two messages of 2026-09-28 (Polish, verbatim in the epic) — transcribe recordings (optionally automatically after a meeting) and any audio/video file, into segmented transcripts with speaker ids; a bank of voice embeddings synced in a drive to recognise people in later meetings; correct words and speaker matches, and a confirmed match updates the bank; inside keeper's Rust; English and maybe Polish; mostly Zoom/Meet video; offline. Second message: no sidecar, fluidaudio-rs on the Mac; a voices folder chosen per drive like recordings, embeddings under a model prefix; a Files glyph for it and a place in tgdrive and neuradrive (70-comms/voices); on by default where possible; use the microphone track; privacy/RODO not now; a dictionary kept like voices; change the "recording transcribes nothing" promise; models from the config repo unless they must be compiled (they are precompiled .mlmodelc); no NAS option; keep voice clips; a gh stack, ready to merge.
+  # Stack rungs: epic87-plan (the epic file, research-transcription-2026-09-28.md, this entry, DW-331…DW-342, D-29 in docs/decisions.md), then epic87-core (keeper-core transcription/: engine port, models, plan, words, assemble, bank, dictionary, corrections, render, vm; the two settings keys and settings-keys.md; FilesFolderRoleVm::Voices; keeper-sync's voices profile role, [folder.voices] and hydrate_lfs_dir; bindings; plus the one-line shell and front hunks the new fields force: the FilesFolderRoles literal in sync_ipc.rs and the FOLDER_ROLE_ICON/TITLE records), then epic87-engine (the vendored tools/fluidaudio-rs fork at FluidAudio 0.17.4 and keeper/src/transcribe_macos.rs, the macOS path dependency), then epic87-surface (transcribe_ipc.rs with AbsentEngine, jobs and commands; the finalize hook; CapabilitiesVm.transcription; account_ipc's model hydration; sync_ipc's voices fields; the viewer, Settings › Transcription, the Files actions, the folder-form switch and the Recording toggle; the zero-egress gate edit, AGENTS.md:144 and the docs). The shell crate and the fork are by inspection on Linux and await CI's macOS job and the hesperia gate.
+  # Contract: local://epic87-contract.md (AD-339…AD-350 pinned by the coordinator). Open questions Q1–Q6 are in the epic (Files' Transcribe on a session folder; replacing an edited transcript; a source scan enforcing NFR-105; one media-extension list; the re-embed call site; "traslacji" read as transcription).
+  # Owed on hesperia: the fork builds and links into the app; the owner's config repo gets _models/ (LFS, models.toml, licence files) and hydration reads ready; tgdrive and neuradrive get [folder.voices] subfolder = "70-comms/voices"; a recorded Meet call transcribes after recording with the owner as You; a Polish file transcribes; a confirmed speaker's clip and embedding reach the other clone; first-load time and peak memory recorded; LFS object addresses stay on electra. Front's real-browser proof of the viewer and Settings › Transcription is owed too.
+  epic-87: in-progress
+  87-1-the-transcript-format-and-the-pure-pipeline: review
+  87-2-the-voices-bank-and-the-dictionary: review
+  87-3-models-from-the-config-repository: review
+  87-4-the-on-device-engine: review
+  87-5-transcription-jobs-commands-and-the-after-recording-hook: review
+  87-6-the-surfaces: review
+  87-7-the-promise-changes: review
+  # DW-331…DW-342 are opened by this plan.
+  # Review wave (2026-09-28): A1–A14, S1–S3, H1–H12 and F1–F10 from three reviews are implemented (the epic's § Review-wave amendments); Q1–Q6 ruled; the macOS minimumSystemVersion rises 11.0 → 14.0 with an rpath to /usr/lib/swift; DW-343…DW-345 opened.
+
   # Epic 86: the owner's ask on the epic-85 build — a button in Sync that lists repositories to add as drives, for GitHub (with the person's organizations) and Forgejo, with the best UI/UX keeper can design, fetching through makistack's OAuth token proxy. Owner decided 2026-09-24: GitHub lists the person's repos plus every organization they belong to; keeper builds the client side only. The proxy turned out to exist as tgorka/makistack#863 (github-broker: open, deployed on electra :8455 from its branch, not merged; tgbot unconfigured, tgdev installed nowhere), so contract amendment A2 dropped RFC 8693 and keeper speaks github-broker's own /v1/whoami + /v1/token.
   # Stack rungs: epic86-plan (this epic file + ledgers), then epic86-core (keeper-core forges/ module: sources, tokens, broker, device_flow, listing, mark; descriptor [[forges]] + [github_broker]; AccountSetupVm.broker_host; registry forge:<id>; settings_sync's forge: travel and origin rule; egress; bindings and the TS fixture ripple), then epic86-surface (the shell's forge_ipc.rs with the broker and device-flow runtimes, forge_repos_add, drive_credential's forge: branch, folder_accepts pub(crate), registration and egress wiring; the browse sheet, entry points, batch view, the add-folder form's forge: option, mock-shell; docs/account.md and docs/egress.md). The shell crate is by inspection and awaits CI's macOS job.
   # Contract amendments A1 (forge:<source-id> on the wire; bots refuse it), A2 (the broker is makistack#863's github-broker; RFC 8693 dropped; [github_broker] { url, app? } serves only github; per-owner installation/repositories listing with per-owner notices; drive tokens scoped to one repo, contents: write) and A3 (forge_connect_open opens the verification page; nothing else opens a browser) are in the epic's text.
