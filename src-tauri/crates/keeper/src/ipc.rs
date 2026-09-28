@@ -1483,6 +1483,8 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // only a desktop macOS build floats the window controls over the webview and
         // needs the app to supply its own drag region and traffic-light clearance.
         overlay_title_bar: cfg!(all(desktop, target_os = "macos")),
+        // Epic 87: the engine lands on a later rung; until then nothing transcribes.
+        transcription: false,
         // Notes (Story 35.2, FR-122, AD-54): a vault IS a synced folder, so notes
         // cannot be available where folder sync is not. `sync` on every target
         // since Epic 66 (AD-200) — see `notes_available`.

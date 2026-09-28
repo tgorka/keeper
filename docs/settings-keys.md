@@ -108,6 +108,10 @@ file-controlled instead, and says which file.
 | | | | | Rows a folder card's lists show once unfolded. |
 | `system.menu_bar_presence` | user-global | boolean (`1`/`0`) | `0` | `"system.menu_bar_presence" = true` |
 | | | | | Whether keeper keeps a menu-bar (tray) presence. |
+| `transcription.after_recording` | user-global | boolean (`1`/`0`) | `1` | `"transcription.after_recording" = false` |
+| | | | | Whether a finished Recording Session saved to a drive that keeps voices is transcribed on this Mac. |
+| `transcription.language` | user-global | one of `auto`, `en`, `pl` | `auto` | `"transcription.language" = "pl"` |
+| | | | | The spoken language transcription expects; `auto` lets the model decide. |
 | `undo_send.window` | user-global | integer 0..=60 | `10` | `"undo_send.window" = 10` |
 | | | | | How long a sent message is held before it dispatches, in seconds. |
 | `update.auto` | user-global | boolean (`1`/`0`) | `1` | `"update.auto" = false` |

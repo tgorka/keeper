@@ -3661,6 +3661,10 @@ fn files_listing_vm(
             .as_ref()
             .map(|recordings| recordings.subfolder.as_str()),
         tasks_subfolder: profile.tasks.as_ref().map(|tasks| tasks.subfolder.as_str()),
+        voices_subfolder: profile
+            .voices
+            .as_ref()
+            .map(|voices| voices.subfolder.as_str()),
     };
     let (state, entries, detail, truncated) = match listing {
         browse::BrowseListing::Listed(dir) => {
@@ -3714,6 +3718,10 @@ fn files_listing_vm(
                         virtual_bytes: entry.virtual_bytes,
                         roles,
                         write,
+                        // Epic 87 fills these on its surface rung.
+                        session_folder: false,
+                        media_here: false,
+                        transcript: None,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -5573,13 +5581,15 @@ mod tests {
     /// configured where the repository can say it — `.keeper/keeper.toml`, which
     /// travels with the folder — rather than clicked per machine. A save from a
     /// form that has never shown the list must not be able to empty it.
-    const PRESERVED: [&str; 6] = [
+    const PRESERVED: [&str; 7] = [
         "id",
         "volumeId",
         "enabled",
         "lfsNever",
         "lfsPruneLocal",
         "regenerable",
+        // Epic 87's voices role: no request expresses it until its surface rung.
+        "voices",
     ];
 
     fn json_fields(profile: &SyncProfile) -> serde_json::Map<String, serde_json::Value> {
@@ -5704,6 +5714,10 @@ mod tests {
         });
         // The opt-out, because a fresh profile now releases the redundant copy.
         prior.lfs_prune_local = false;
+        // Epic 87's voices role, distinctive so the PRESERVED assertion bites.
+        prior.voices = Some(keeper_sync::profile::VoicesConfig {
+            subfolder: "70-comms/voices".into(),
+        });
         // Story 56.1's virtualization policy. A fresh profile virtualizes
         // nothing and has no size floor, so both carry a value a fresh profile
         // never has. They were PRESERVED fields until Story 56.12 rendered them

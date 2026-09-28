@@ -933,6 +933,27 @@ pub const KEYS: &[KeySpec] = &[
         summary: "Whether keeper keeps a menu-bar (tray) presence.",
         example: "true",
     },
+    // ---- transcription ---------------------------------------------------
+    KeySpec {
+        key: "transcription.after_recording",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Flag01,
+        default: "1",
+        summary: "Whether a finished Recording Session saved to a drive that keeps voices is transcribed on this Mac.",
+        example: "false",
+    },
+    KeySpec {
+        key: "transcription.language",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Choice(&["auto", "en", "pl"]),
+        default: "auto",
+        summary: "The spoken language transcription expects; `auto` lets the model decide.",
+        example: "\"pl\"",
+    },
     // ---- ui --------------------------------------------------------------
     KeySpec {
         key: "ui.first_run_setup_skipped",

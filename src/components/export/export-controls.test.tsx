@@ -116,6 +116,8 @@ function entry(name: string, relativePath: string): FilesEntryVm {
     virtualChildren: 0,
     virtualBytes: 0,
     folderRole: null,
+    transcribable: false,
+    transcript: null,
     write: {
       writable: false,
       reason: "This folder is outside a notes vault.",

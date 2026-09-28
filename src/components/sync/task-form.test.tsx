@@ -245,6 +245,8 @@ function promptEntry(
     mtimeMs: null,
     release: null,
     folderRole: null,
+    transcribable: false,
+    transcript: null,
     virtualChildren: 0,
     virtualBytes: 0,
     write: { writable: true, reason: null, caveat: null, caveatShort: null },

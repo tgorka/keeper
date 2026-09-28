@@ -182,6 +182,8 @@ function entry(
     release: null,
     virtualChildren: 0,
     virtualBytes: 0,
+    transcribable: false,
+    transcript: null,
   };
 }
 

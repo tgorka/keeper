@@ -108,6 +108,7 @@ pub struct DriveOfferVm {
     pub recordings: Option<String>,
     pub sessions: Option<String>,
     pub tasks: Option<String>,
+    pub voices: Option<String>,
     pub excludes: Vec<String>,
     #[ts(type = "number | null")]
     pub lfs_threshold_bytes: Option<u64>,

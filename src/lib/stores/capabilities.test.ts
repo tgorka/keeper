@@ -23,6 +23,7 @@ const desktopCapabilities: CapabilitiesVm = {
   bots: true,
   botTools: true,
   overlayTitleBar: true,
+  transcription: true,
 };
 
 afterEach(() => {
@@ -50,6 +51,7 @@ describe("capabilitiesStore", () => {
       bots: false,
       botTools: false,
       overlayTitleBar: false,
+      transcription: false,
     });
   });
 

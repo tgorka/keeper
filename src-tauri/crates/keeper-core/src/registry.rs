@@ -2864,6 +2864,59 @@ pub fn set_recording_camera(data_dir: &Path, enabled: bool) -> Result<(), CoreEr
     )
 }
 
+/// The `settings` key holding whether a finished Recording Session is
+/// transcribed (AD-348). Stored with the registry's `"1"`/`"0"` convention;
+/// default **ON** — the owner asked for transcription "by default when it is
+/// possible", and whether it is possible (capability, models, a voices drive)
+/// is decided at finalize, not here.
+const TRANSCRIPTION_AFTER_RECORDING_KEY: &str = "transcription.after_recording";
+
+/// The default after-recording transcription state: ON (AD-348).
+pub const TRANSCRIPTION_AFTER_RECORDING_DEFAULT: bool = true;
+
+/// Read whether a finished session is transcribed (default ON). A default-ON
+/// flag reads its `"0"` explicitly, so turning it off sticks.
+pub fn get_transcription_after_recording(data_dir: &Path) -> Result<bool, CoreError> {
+    let stored = get_setting(data_dir, TRANSCRIPTION_AFTER_RECORDING_KEY)?;
+    Ok(capture_flag(
+        stored.as_deref(),
+        TRANSCRIPTION_AFTER_RECORDING_DEFAULT,
+    ))
+}
+
+/// Write whether a finished session is transcribed.
+pub fn set_transcription_after_recording(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        TRANSCRIPTION_AFTER_RECORDING_KEY,
+        if enabled { "1" } else { "0" },
+    )
+}
+
+/// The `settings` key holding the language transcription expects: `"auto"`,
+/// `"en"` or `"pl"`; absent or anything else ⇒ `auto`.
+const TRANSCRIPTION_LANGUAGE_KEY: &str = "transcription.language";
+
+/// Read the transcription language. Absent / unrecognized ⇒ `Auto`, so a
+/// hand-edited value degrades to the documented default instead of erroring.
+pub fn get_transcription_language(
+    data_dir: &Path,
+) -> Result<crate::transcription::TranscriptionLanguage, CoreError> {
+    let stored = get_setting(data_dir, TRANSCRIPTION_LANGUAGE_KEY)?;
+    Ok(stored
+        .as_deref()
+        .and_then(crate::transcription::TranscriptionLanguage::from_wire)
+        .unwrap_or_default())
+}
+
+/// Write the transcription language in its wire spelling.
+pub fn set_transcription_language(
+    data_dir: &Path,
+    language: crate::transcription::TranscriptionLanguage,
+) -> Result<(), CoreError> {
+    set_setting(data_dir, TRANSCRIPTION_LANGUAGE_KEY, language.as_wire())
+}
+
 /// The `settings` key holding an explicit path to the `git` binary folder sync
 /// drives (Story 34.14). Stored as the raw absolute path string; absent / empty
 /// ⇒ automatic resolution, which is the default and what almost every install
@@ -4994,6 +5047,46 @@ mod tests {
                 "stored {garbage:?} must read as the default (on)"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcription_after_recording_defaults_on_and_remembers_off() {
+        let dir = temp_dir();
+        assert!(get_transcription_after_recording(&dir).expect("fresh install"));
+        set_transcription_after_recording(&dir, false).expect("turn off");
+        assert!(
+            !get_transcription_after_recording(&dir).expect("read off"),
+            "off must survive the next read, not fall back to the default"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcription_language_defaults_to_auto_and_degrades_to_it() {
+        use crate::transcription::TranscriptionLanguage;
+        let dir = temp_dir();
+        assert_eq!(
+            get_transcription_language(&dir).expect("fresh install"),
+            TranscriptionLanguage::Auto
+        );
+        set_transcription_language(&dir, TranscriptionLanguage::Polish).expect("choose pl");
+        assert_eq!(
+            get_setting(&dir, "transcription.language")
+                .expect("raw")
+                .as_deref(),
+            Some("pl"),
+            "stored in the spelling a keeper.toml layer uses"
+        );
+        assert_eq!(
+            get_transcription_language(&dir).expect("read pl"),
+            TranscriptionLanguage::Polish
+        );
+        set_setting(&dir, "transcription.language", "klingon").expect("garbage");
+        assert_eq!(
+            get_transcription_language(&dir).expect("read garbage"),
+            TranscriptionLanguage::Auto
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -235,6 +235,17 @@ pub const DEFAULT_SESSIONS_SUBFOLDER: &str = "60-sessions";
 /// numbering scheme would be a guess dressed as a convention.
 pub const DEFAULT_TASKS_SUBFOLDER: &str = "tasks";
 
+/// Where the voices bank and the dictionary live inside a voices-flagged
+/// folder, by default (AD-342). Its own constant beside
+/// [`DEFAULT_RECORDINGS_SUBFOLDER`] for the reason this module exists: one
+/// JSON blob has to mean the same thing to the app, to `keeper-syncd` and to
+/// whatever reads `sync.db` next, so the default is spelled once, here.
+///
+/// Unnumbered on purpose, like [`DEFAULT_TASKS_SUBFOLDER`]: a default that
+/// looks like it belongs to somebody else's numbering scheme would be a guess.
+/// The owner's drives say `70-comms/voices` through their own folder file.
+pub const DEFAULT_VOICES_SUBFOLDER: &str = "voices";
+
 /// When a notes-flagged profile commits, and when it pushes (FR-115, AD-62).
 ///
 /// A knob on the profile rather than a scheduler of its own: the 1 Hz
@@ -871,6 +882,108 @@ impl TasksConfig {
     }
 }
 
+/// The voices flag on a profile, and where the bank lives (AD-342).
+///
+/// `Some` means "this synced folder keeps voices": the people, clips,
+/// embeddings and dictionary of the transcription bank, one file per fact so
+/// two machines' additions union without conflicts. A drive with voices is a
+/// transcribing drive. The point of a synced folder is the same as the task
+/// ledger's: a person recognised on one machine is recognised on the other.
+///
+/// This crate stores the flag and understands nothing behind it, exactly as it
+/// does for [`TasksConfig`]: the bank's layout is `keeper-core`'s, and the
+/// engine sees a folder with files in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoicesConfig {
+    /// The bank root, relative to `local_path`. Never empty, never absolute,
+    /// never escaping, and never overlapping this profile's notes vault or
+    /// recordings root — see [`VoicesConfig::validate`] for why each is
+    /// refused rather than corrected.
+    #[serde(default = "default_voices_subfolder")]
+    pub subfolder: String,
+}
+
+impl Default for VoicesConfig {
+    fn default() -> Self {
+        Self {
+            subfolder: DEFAULT_VOICES_SUBFOLDER.to_owned(),
+        }
+    }
+}
+
+impl VoicesConfig {
+    /// The subfolder rules, split out of [`SyncProfile::validate`] for the
+    /// reason [`RecordingsConfig::validate`] is: they are about this field and
+    /// not about the profile.
+    ///
+    /// The profile's notes and recordings blocks are passed IN rather than
+    /// reached for, because the overlap rules are rules about pairs: a bank
+    /// inside a vault would have the notes indexer walk every clip and
+    /// embedding; one that is also a recordings root would have the recorder
+    /// and the bank writer claiming one tree.
+    ///
+    /// Public for the reason [`RecordingsConfig::validate`] is: checking a
+    /// *candidate* block against a stored profile is a thing the settings path
+    /// does before there is a `SyncProfile` to validate.
+    ///
+    /// Every rule REFUSES rather than corrects: a value here is something a
+    /// person typed, or one a folder file carried between clones, where a
+    /// silently corrected value would mean a different bank on every machine.
+    pub fn validate(
+        &self,
+        notes: Option<&NotesConfig>,
+        recordings: Option<&RecordingsConfig>,
+    ) -> Result<()> {
+        let subfolder = self.subfolder.trim();
+        // By components, not by the string: `.` and `./` are not empty and
+        // still name the profile root.
+        if subfolder_components(subfolder).next().is_none() {
+            return Err(SyncError::Config(
+                "voices subfolder must name a folder: the voices bank is a folder inside the \
+                 profile, never the profile root"
+                    .into(),
+            ));
+        }
+        // `Path::join` with an absolute right-hand side DISCARDS the left one,
+        // so an absolute subfolder would put the bank outside the synced
+        // folder, where it never travels. Tested as a string as well, because
+        // absoluteness is platform-shaped and one row is read on every machine.
+        if Path::new(subfolder).is_absolute()
+            || subfolder.starts_with('/')
+            || subfolder.starts_with('\\')
+        {
+            return Err(SyncError::Config(format!(
+                "voices subfolder must be relative to the profile folder, got {subfolder}"
+            )));
+        }
+        if subfolder.split(['/', '\\']).any(|c| c == "..") {
+            return Err(SyncError::Config(format!(
+                "voices subfolder must not escape the profile folder: {subfolder}"
+            )));
+        }
+        if let Some(notes) = notes {
+            let vault = notes.subfolder.trim();
+            if subfolders_overlap(subfolder, vault) {
+                return Err(SyncError::Config(format!(
+                    "voices subfolder {subfolder} overlaps notes subfolder {vault}: one folder \
+                     cannot be both a vault and a voices bank"
+                )));
+            }
+        }
+        if let Some(recordings) = recordings {
+            let rec = recordings.subfolder.trim();
+            if subfolders_overlap(subfolder, rec) {
+                return Err(SyncError::Config(format!(
+                    "voices subfolder {subfolder} overlaps recordings subfolder {rec}: one \
+                     folder cannot be both a recordings root and a voices bank"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The path components of a profile-relative subfolder.
 ///
 /// Empty and `.` components are dropped so `./a//b` compares as `a/b`, and both
@@ -1181,6 +1294,17 @@ pub struct SyncProfile {
     /// they upgraded.
     #[serde(default)]
     pub tasks: Option<TasksConfig>,
+    /// This folder keeps voices, and where inside it (AD-342).
+    ///
+    /// `#[serde(default)]` here IS the migration, exactly as it is for
+    /// `recordings` and `tasks` above: a row written by a keeper that had never
+    /// heard of voices simply has no `voices` key, so it loads as `None` and
+    /// says nothing. No SQL change, nothing to run on upgrade, and a row
+    /// written by this keeper still loads on the older one.
+    ///
+    /// `None` is "keeps no voices", never "voices with the defaults".
+    #[serde(default)]
+    pub voices: Option<VoicesConfig>,
 }
 
 fn default_lfs_threshold() -> u64 {
@@ -1209,6 +1333,9 @@ fn default_sessions_subfolder() -> String {
 }
 fn default_tasks_subfolder() -> String {
     DEFAULT_TASKS_SUBFOLDER.to_owned()
+}
+fn default_voices_subfolder() -> String {
+    DEFAULT_VOICES_SUBFOLDER.to_owned()
 }
 fn default_journal_template() -> String {
     DEFAULT_JOURNAL_TEMPLATE.to_owned()
@@ -1256,6 +1383,7 @@ impl SyncProfile {
             recordings: None,
             sessions: None,
             tasks: None,
+            voices: None,
         }
     }
 
@@ -1384,6 +1512,20 @@ impl SyncProfile {
         self.tasks
             .as_ref()
             .map(|tasks| self.local_path.join(tasks.subfolder.trim()))
+    }
+
+    /// The voices bank root — `local_path` joined with the voices subfolder —
+    /// or `None` when this profile keeps no voices.
+    ///
+    /// Beside [`Self::recordings_root`] and for the same reason: the flag and
+    /// the folder are stored apart, so "where does this profile's bank live"
+    /// gets one answer rather than one per caller. [`Self::validate`] has
+    /// already refused a subfolder that is absolute or escaping, so the join
+    /// cannot leave `local_path`.
+    pub fn voices_root(&self) -> Option<PathBuf> {
+        self.voices
+            .as_ref()
+            .map(|voices| self.local_path.join(voices.subfolder.trim()))
     }
 
     /// Keychain key for this profile's remote credential. Never the secret.
@@ -1520,6 +1662,11 @@ impl SyncProfile {
                 self.recordings.as_ref(),
                 self.sessions.as_ref(),
             )?;
+        }
+        // Given the notes and recordings blocks it is compared against, both
+        // already checked, for the reason the ledger comes last above.
+        if let Some(voices) = &self.voices {
+            voices.validate(self.notes.as_ref(), self.recordings.as_ref())?;
         }
         Ok(())
     }
@@ -2689,5 +2836,144 @@ mod tests {
             ..RecordingsConfig::default()
         });
         assert!(p.validate().is_ok());
+    }
+
+    /// A row written before voices existed has no `voices` key and must load
+    /// as "keeps no voices" — the `#[serde(default)]` migration — or upgrading
+    /// would strand every existing folder in `sync.db`.
+    #[test]
+    fn a_profile_row_written_before_voices_existed_loads_as_keeping_no_voices() {
+        let before = r#"{
+            "id": "01JOLD", "name": "tgdrive", "localPath": "/home/u/tgdrive",
+            "remoteUrl": "https://git.example/u/tgdrive.git", "branch": "main",
+            "direction": "bidirectional", "lane": "main",
+            "subpaths": [], "excludes": [], "removable": false, "volumeId": null,
+            "lfsMode": "materialize", "lfsThresholdBytes": 4194304,
+            "lfsPruneLocal": false, "lfsNever": [],
+            "settleMs": 5000, "pollIntervalMs": 15000, "tags": [],
+            "commitSubjectTemplate": "", "authorOverride": null, "enabled": true,
+            "notes": null,
+            "recordings": {"subfolder": "40-media/recordings"},
+            "sessions": {"subfolder": "60-sessions"},
+            "tasks": null
+        }"#;
+        let parsed: SyncProfile = serde_json::from_str(before).expect("an older row still loads");
+        assert_eq!(parsed.voices, None, "an absent key means: keeps no voices");
+        assert_eq!(parsed.voices_root(), None);
+        assert!(parsed.validate().is_ok());
+
+        let round = serde_json::to_string(&parsed).expect("encode");
+        let back: SyncProfile = serde_json::from_str(&round).expect("decode");
+        assert_eq!(parsed, back);
+    }
+
+    #[test]
+    fn a_voices_block_defaults_its_subfolder_and_roots_inside_the_folder() {
+        let sparse: VoicesConfig = serde_json::from_str("{}").expect("parse");
+        assert_eq!(sparse.subfolder, DEFAULT_VOICES_SUBFOLDER);
+
+        let mut p = profile();
+        p.voices = Some(sparse);
+        assert_eq!(
+            p.voices_root(),
+            Some(PathBuf::from("/home/u/tgdrive/voices")),
+            "the default bank is `voices/` inside the folder keeper already syncs"
+        );
+        assert!(p.validate().is_ok());
+
+        p.voices = Some(VoicesConfig {
+            subfolder: " 70-comms/voices ".to_owned(),
+        });
+        assert_eq!(
+            p.voices_root(),
+            Some(PathBuf::from("/home/u/tgdrive/70-comms/voices")),
+            "trimmed, as every other subfolder is"
+        );
+
+        let round = serde_json::to_string(&p).expect("encode");
+        let back: SyncProfile = serde_json::from_str(&round).expect("decode");
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn a_voices_subfolder_that_leaves_the_profile_folder_is_refused() {
+        for bad in [
+            "",
+            "   ",
+            ".",
+            "./",
+            " ./. ",
+            "a/..",
+            "/abs/voices",
+            "\\voices",
+            "../voices",
+            "a/../../b",
+        ] {
+            // No vault or recordings root to overlap with: the subfolder rule
+            // alone must refuse the profile root.
+            let mut p = profile();
+            p.notes = None;
+            p.recordings = None;
+            p.voices = Some(VoicesConfig {
+                subfolder: bad.to_owned(),
+            });
+            assert!(
+                matches!(p.validate(), Err(SyncError::Config(_))),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// A bank may not be a vault or a recordings root, nor sit inside one or
+    /// contain one: two writers over one tree. Siblings — the owner's live
+    /// layouts — are the ordinary case.
+    #[test]
+    fn voices_may_not_overlap_notes_or_recordings_but_siblings_are_fine() {
+        for (other, voices) in [
+            ("voices", "voices"),
+            ("vault", "vault/voices"),
+            ("70-comms/voices/notes", "70-comms/voices"),
+        ] {
+            let mut p = profile();
+            p.notes = Some(NotesConfig {
+                subfolder: other.to_owned(),
+                ..NotesConfig::default()
+            });
+            p.voices = Some(VoicesConfig {
+                subfolder: voices.to_owned(),
+            });
+            assert!(
+                matches!(&p.validate(), Err(SyncError::Config(m)) if m.contains("notes")),
+                "{voices:?} against vault {other:?} must be refused"
+            );
+
+            let mut p = profile();
+            p.recordings = Some(RecordingsConfig {
+                subfolder: other.to_owned(),
+                ..RecordingsConfig::default()
+            });
+            p.voices = Some(VoicesConfig {
+                subfolder: voices.to_owned(),
+            });
+            assert!(
+                matches!(&p.validate(), Err(SyncError::Config(m)) if m.contains("recordings")),
+                "{voices:?} against recordings {other:?} must be refused"
+            );
+        }
+
+        // neuradrive: meetings and voices side by side under `70-comms`.
+        let mut p = profile();
+        p.notes = Some(NotesConfig {
+            subfolder: "10-notes".to_owned(),
+            ..NotesConfig::default()
+        });
+        p.recordings = Some(RecordingsConfig {
+            subfolder: "70-comms/meetings".to_owned(),
+            ..RecordingsConfig::default()
+        });
+        p.voices = Some(VoicesConfig {
+            subfolder: "70-comms/voices".to_owned(),
+        });
+        assert!(p.validate().is_ok(), "sibling folders are not an overlap");
     }
 }

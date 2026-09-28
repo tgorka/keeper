@@ -325,6 +325,8 @@ function browseEntry(name: string, isDir: boolean, size: FileSizeVm | null): Fil
     // run.
     lfsOid: null,
     mtimeMs: 1_700_000_000_000,
+    transcribable: false,
+    transcript: null,
     // Story 56.9: no release standing, because release is a fact about content
     // keeper itself put here and none of these rows is that. The two rows that
     // are get one below.
@@ -1172,6 +1174,7 @@ const ANSWERS: Record<string, unknown> = {
           // grant bar, the tool rows and the reveal control are reachable in `bun
           // run dev`; flip to `false` to see the phone's shape of the same pane.
           botTools: true,
+          transcription: false,
           overlayTitleBar: true,
         } satisfies CapabilitiesVm),
   // ---------------------------------------------------------------------------
@@ -3122,6 +3125,7 @@ let accountOffers: AccountOffersVm = {
       credential: "account",
       notes: "notes",
       recordings: null,
+      voices: null,
       sessions: null,
       tasks: "tasks",
       excludes: [".DS_Store", "*.tmp"],
@@ -3141,6 +3145,7 @@ let accountOffers: AccountOffersVm = {
       credential: "own",
       notes: null,
       recordings: "recordings",
+      voices: null,
       sessions: null,
       tasks: null,
       excludes: [],

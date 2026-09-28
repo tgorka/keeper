@@ -259,6 +259,11 @@ pub struct CapabilitiesVm {
     /// already owns. Those two config keys are the other half of this fact —
     /// changing them means changing this flag with them.
     pub overlay_title_bar: bool,
+    /// On-device transcription (AD-349) can run here: `true` only on a Mac
+    /// with Apple silicon and macOS ≥ 15 (the diarizer crashes on 14), probed
+    /// at runtime in the shell like `recording`. Says nothing about the
+    /// models; `transcription_status` does.
+    pub transcription: bool,
 }
 
 /// Stable, string-serialized error taxonomy for the IPC envelope.
@@ -4164,6 +4169,9 @@ pub enum FilesFolderRoleVm {
     Recordings,
     /// This folder holds task ledgers (`tasks.subfolder`).
     Tasks,
+    /// This folder keeps the drive's voices bank and dictionary
+    /// (`voices.subfolder`, AD-342).
+    Voices,
 }
 
 /// The configured folder roles of one profile, as [`FilesEntryVm::new`] needs
@@ -4182,6 +4190,8 @@ pub struct FilesFolderRoles<'a> {
     /// stored.
     pub recordings_subfolder: Option<&'a str>,
     pub tasks_subfolder: Option<&'a str>,
+    /// The profile's `voices.subfolder`, profile-relative, exactly as stored.
+    pub voices_subfolder: Option<&'a str>,
 }
 
 impl FilesFolderRoles<'_> {
@@ -4219,6 +4229,8 @@ impl FilesFolderRoles<'_> {
             Some(FilesFolderRoleVm::Recordings)
         } else if matches(self.tasks_subfolder) {
             Some(FilesFolderRoleVm::Tasks)
+        } else if matches(self.voices_subfolder) {
+            Some(FilesFolderRoleVm::Voices)
         } else {
             None
         }
@@ -4438,6 +4450,20 @@ pub struct FilesEntryVm {
     /// bytes, not a bigint, and every other size on this wire is a number.
     #[ts(type = "number")]
     pub virtual_bytes: u64,
+    /// Whether keeper can transcribe this entry here, now (AD-344): a file
+    /// whose extension is one of [`crate::transcription::plan::is_media_file`]'s
+    /// and whose content is on this computer, or a folder holding a recording
+    /// session's `manifest.json` whose audio segments are all here. A pointer
+    /// would only be refused by the planner, so the verb is not offered.
+    /// Decided here so the frontend never keeps its own list of media
+    /// extensions.
+    pub transcribable: bool,
+    /// The ABSOLUTE path of the transcript already written for this entry —
+    /// `<folder>/transcript.json` for a session folder, `<name.ext>.transcript.json`
+    /// beside a media file — or `None` when there is none. An action argument,
+    /// like [`Self::absolute_path`]: a session's transcript sits inside the
+    /// folder and so is in no listing the row belongs to.
+    pub transcript: Option<String>,
 }
 
 /// Everything [`FilesEntryVm::new`] needs, named at the call site.
@@ -4481,6 +4507,17 @@ pub struct FilesEntryFacts<'a> {
     pub virtual_children: u32,
     /// The bytes those children would bring down. `0` with the count.
     pub virtual_bytes: u64,
+    /// Whether this directory holds a recording session's `manifest.json`,
+    /// from the listing's own probe. A file's caller passes `false`.
+    pub session_folder: bool,
+    /// Whether every audio segment the session's manifest lists is real bytes
+    /// here — not an LFS pointer, not virtual — from the listing's probe. Only
+    /// read for a session folder; a file's own content is judged from
+    /// `lfs_oid` and `sync`, so a file's caller passes `true`.
+    pub media_here: bool,
+    /// The existing transcript's absolute path, from the listing's probe
+    /// ([`crate::transcription::plan::existing_transcript`]).
+    pub transcript: Option<String>,
 }
 
 impl FilesEntryVm {
@@ -4542,12 +4579,23 @@ impl FilesEntryVm {
             write,
             virtual_children,
             virtual_bytes,
+            session_folder,
+            media_here,
+            transcript,
         } = facts;
         let kind = if is_dir {
             RecordingNoteTargetKind::Folder
         } else {
             crate::archive::recordings_fts::kind_for_file_name(&name)
         };
+        // Before `name` moves into the row. A file's bytes are the content
+        // only when they are not the pointer standing for it.
+        let content_here = lfs_oid.is_none()
+            && !matches!(
+                sync.status,
+                FilesSyncStatusVm::Virtual | FilesSyncStatusVm::Materializing
+            );
+        let media = !is_dir && content_here && crate::transcription::plan::is_media_file(&name);
         Self {
             name,
             kind,
@@ -4583,6 +4631,12 @@ impl FilesEntryVm {
             // weaker way to say `Virtual` and the two could disagree.
             virtual_children: if is_dir { virtual_children } else { 0 },
             virtual_bytes: if is_dir { virtual_bytes } else { 0 },
+            transcribable: if is_dir {
+                session_folder && media_here
+            } else {
+                media
+            },
+            transcript,
         }
     }
 }
@@ -9421,6 +9475,9 @@ mod tests {
                 write: FilesWriteVm::allowed(),
                 virtual_children: 0,
                 virtual_bytes: 0,
+                session_folder: false,
+                media_here: true,
+                transcript: None,
             });
             assert_eq!(entry.kind, expected, "{name}");
         }
@@ -9445,8 +9502,89 @@ mod tests {
             write: FilesWriteVm::allowed(),
             virtual_children: 0,
             virtual_bytes: 0,
+            session_folder: false,
+            media_here: true,
+            transcript: None,
         });
         assert_eq!(entry.kind, RecordingNoteTargetKind::Folder);
+    }
+
+    /// Transcribability is the core's one media vocabulary for a file and the
+    /// listing's manifest probe for a folder — never a folder's name, and never
+    /// a file's session flag — and only for content that is on this computer.
+    #[test]
+    fn only_media_here_and_session_folders_with_their_audio_here_are_transcribable() {
+        let entry = |name: &str,
+                     is_dir: bool,
+                     session_folder: bool,
+                     status: FilesSyncStatusVm,
+                     lfs_oid: Option<&str>,
+                     media_here: bool| {
+            FilesEntryVm::new(FilesEntryFacts {
+                name: name.to_owned(),
+                relative_path: name.to_owned(),
+                absolute_path: format!("/v/{name}"),
+                is_dir,
+                sync: FilesEntrySyncVm::plain(status),
+                size_bytes: None,
+                lfs_oid: lfs_oid.map(str::to_owned),
+                mtime_ms: None,
+                release: None,
+                roles: FilesFolderRoles::default(),
+                write: FilesWriteVm::allowed(),
+                virtual_children: 0,
+                virtual_bytes: 0,
+                session_folder,
+                media_here,
+                transcript: None,
+            })
+            .transcribable
+        };
+        let synced = FilesSyncStatusVm::Synced;
+        assert!(entry("call.MP4", false, false, synced, None, true));
+        assert!(entry("memo.m4a", false, true, synced, None, true));
+        assert!(
+            entry(
+                "memo.m4a",
+                false,
+                false,
+                FilesSyncStatusVm::Materialized,
+                None,
+                true
+            ),
+            "fetched content is here"
+        );
+        assert!(
+            !entry("notes.md", false, true, synced, None, true),
+            "a file is never a session"
+        );
+        assert!(
+            !entry("clip.mov", true, false, synced, None, true),
+            "a folder named like media is a folder"
+        );
+        assert!(entry(
+            "2026-09-28 1400 standup",
+            true,
+            true,
+            synced,
+            None,
+            true
+        ));
+
+        assert!(
+            !entry("call.mov", false, false, synced, Some("ab12"), true),
+            "a pointer's content is not here"
+        );
+        for status in [FilesSyncStatusVm::Virtual, FilesSyncStatusVm::Materializing] {
+            assert!(
+                !entry("call.mov", false, false, status, None, true),
+                "{status:?}"
+            );
+        }
+        assert!(
+            !entry("2026-09-28 1400 standup", true, true, synced, None, false),
+            "a session with a pointer segment is not transcribable here"
+        );
     }
 
     /// The distinction the whole surface rests on, asserted on the wire: an
@@ -9919,6 +10057,9 @@ mod tests {
             write: FilesWriteVm::allowed(),
             virtual_children: 0,
             virtual_bytes: 0,
+            session_folder: false,
+            media_here: true,
+            transcript: None,
         });
         let json = serde_json::to_string(&entry).expect("serialize files entry");
         assert!(
@@ -9988,6 +10129,9 @@ mod tests {
             write: FilesWriteVm::allowed(),
             virtual_children: 0,
             virtual_bytes: 0,
+            session_folder: false,
+            media_here: true,
+            transcript: None,
         });
         assert_eq!(entry.size, None, "a folder's size is absent, never zero");
         let json = serde_json::to_string(&entry).expect("serialize");
@@ -10041,6 +10185,9 @@ mod tests {
                 write: FilesWriteVm::allowed(),
                 virtual_children: 0,
                 virtual_bytes: 0,
+                session_folder: false,
+                media_here: true,
+                transcript: None,
             })
             .release
         };
@@ -10084,6 +10231,9 @@ mod tests {
             write: FilesWriteVm::allowed(),
             virtual_children: 0,
             virtual_bytes: 0,
+            session_folder: false,
+            media_here: true,
+            transcript: None,
         });
         assert_eq!(unknown.size, None);
         let empty = FilesEntryVm::new(FilesEntryFacts {
@@ -10100,6 +10250,9 @@ mod tests {
             write: FilesWriteVm::allowed(),
             virtual_children: 0,
             virtual_bytes: 0,
+            session_folder: false,
+            media_here: true,
+            transcript: None,
         });
         assert_eq!(
             empty.size.as_ref().map(|size| size.label.as_str()),
@@ -10140,6 +10293,7 @@ mod tests {
             notes_subfolder: Some("Second Brain"),
             recordings_subfolder: Some("Clips"),
             tasks_subfolder: Some("tasks"),
+            voices_subfolder: Some("70-comms/voices"),
         };
         let role_of = |name: &str, is_dir: bool| {
             FilesEntryVm::new(FilesEntryFacts {
@@ -10156,6 +10310,9 @@ mod tests {
                 write: FilesWriteVm::allowed(),
                 virtual_children: 0,
                 virtual_bytes: 0,
+                session_folder: false,
+                media_here: true,
+                transcript: None,
             })
             .folder_role
         };
@@ -10164,6 +10321,11 @@ mod tests {
             Some(FilesFolderRoleVm::NotesVault)
         );
         assert_eq!(role_of("Clips", true), Some(FilesFolderRoleVm::Recordings));
+        assert_eq!(
+            role_of("70-comms/voices", true),
+            Some(FilesFolderRoleVm::Voices)
+        );
+        assert_eq!(role_of("voices", true), None);
         assert_eq!(
             role_of("10-notes", true),
             None,
@@ -10190,6 +10352,9 @@ mod tests {
             write: FilesWriteVm::allowed(),
             virtual_children: 0,
             virtual_bytes: 0,
+            session_folder: false,
+            media_here: true,
+            transcript: None,
         });
         assert_eq!(unconfigured.folder_role, None);
     }
@@ -10211,6 +10376,7 @@ mod tests {
                 notes_subfolder: Some(configured),
                 recordings_subfolder: None,
                 tasks_subfolder: None,
+                voices_subfolder: None,
             }
             .role_of(path, true)
         };
@@ -10254,6 +10420,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&FilesFolderRoleVm::Recordings).expect("serialize"),
             "\"recordings\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FilesFolderRoleVm::Voices).expect("serialize"),
+            "\"voices\""
         );
     }
 

@@ -37,6 +37,7 @@ const DESKTOP_CAPABILITIES = {
   bots: false,
   botTools: false,
   overlayTitleBar: false,
+  transcription: false,
 };
 
 function account(id: string): AccountVm {

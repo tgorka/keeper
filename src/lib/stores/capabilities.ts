@@ -31,6 +31,7 @@ export const DEFAULT_CAPABILITIES: CapabilitiesVm = Object.freeze({
   revealInFileManager: false,
   shareOut: false,
   recording: false,
+  transcription: false,
   sync: false,
   notes: false,
   sessions: false,

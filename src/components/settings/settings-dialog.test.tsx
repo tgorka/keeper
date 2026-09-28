@@ -353,6 +353,7 @@ const DESKTOP_CAPABILITIES = {
   sessions: false,
   bots: false,
   botTools: false,
+  transcription: false,
   overlayTitleBar: false,
 };
 

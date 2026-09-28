@@ -373,6 +373,7 @@ fn drive_record(profile: &SyncProfile, remote_url: String, credential: &str) -> 
             .map(|role| role.subfolder.clone()),
         sessions: profile.sessions.as_ref().map(|role| role.subfolder.clone()),
         tasks: profile.tasks.as_ref().map(|role| role.subfolder.clone()),
+        voices: profile.voices.as_ref().map(|role| role.subfolder.clone()),
         excludes: profile.excludes.clone(),
         lfs_threshold_bytes: Some(profile.lfs_threshold_bytes),
         virtual_patterns: Some(profile.virtual_patterns.clone()),

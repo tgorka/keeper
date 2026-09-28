@@ -60,6 +60,7 @@ export function driveOffer(over: Partial<DriveOfferVm> = {}): DriveOfferVm {
     credential: "own",
     notes: "vault",
     recordings: null,
+    voices: null,
     sessions: null,
     tasks: "ledger",
     excludes: [".DS_Store"],

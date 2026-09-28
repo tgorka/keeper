@@ -244,6 +244,8 @@ function entry(
     lfsOid: null,
     mtimeMs: FIXTURE_MTIME_MS,
     folderRole: null,
+    transcribable: false,
+    transcript: null,
     // Story 45.3's location verdict. The default is the ordinary case for the
     // fixtures in this file — a file inside a vault keeper may write — because
     // most tests are not about writing and would otherwise all have to opt in.

@@ -1092,7 +1092,7 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// reconcile ingests only the session's own stem prefixes (this one and
 /// [`CAMERA_SEGMENT_STEM_PREFIX`], Story 20.1), so a stray `*.mov` (a user
 /// drop) with a trailing digit run never pollutes the authoritative ledger.
-const SEGMENT_STEM_PREFIX: &str = "screen-";
+pub(crate) const SEGMENT_STEM_PREFIX: &str = "screen-";
 
 /// Camera-track segment files are named `camera-####.mov` (Story 20.1,
 /// FR-70/FR-73): the optional webcam's own separate per-segment file, sharing
@@ -1101,7 +1101,7 @@ const SEGMENT_STEM_PREFIX: &str = "screen-";
 const CAMERA_SEGMENT_STEM_PREFIX: &str = "camera-";
 
 /// Audio-only-track segment files are named `audio-####.m4a` (Story 21.3).
-const AUDIO_SEGMENT_STEM_PREFIX: &str = "audio-";
+pub(crate) const AUDIO_SEGMENT_STEM_PREFIX: &str = "audio-";
 
 /// The suffix `keeper-rec` writes an UNFINISHED segment under (Story 41.3,
 /// FR-133, AD-69): the writer's output file is `<name>.<ext>.partial` for the
@@ -1163,7 +1163,7 @@ const LFS_POINTER_PROBE_BYTES: usize = 512;
 /// Total and cheap: an unreadable file, a short read, a missing or unparseable
 /// `size` line all yield `None`, which lands the caller on the ordinary
 /// filesystem answer. No allocation beyond the fixed probe buffer.
-fn lfs_pointer_media_size(path: &Path) -> Option<u64> {
+pub(crate) fn lfs_pointer_media_size(path: &Path) -> Option<u64> {
     use std::io::Read as _;
 
     let mut head = [0u8; LFS_POINTER_PROBE_BYTES];
