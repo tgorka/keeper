@@ -75,6 +75,15 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {
         println!("cargo:rustc-link-arg-cdylib=-Wl,-undefined,dynamic_lookup");
     }
+    // The vendored fluidaudio-rs links a static Swift library built for
+    // deployment target 11, which imports `@rpath/libswift_Concurrency.dylib`;
+    // since macOS 12 that dylib lives in the OS at /usr/lib/swift. A
+    // dependency's own `rustc-link-arg` is not forwarded to this crate's
+    // link, so the rpath is added here or the app aborts at launch with
+    // "Library not loaded: @rpath/libswift_Concurrency.dylib".
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+    }
     // Without these the sha is frozen at whatever the first build saw. `HEAD`
     // changes on a checkout or a branch switch; a plain commit on the SAME
     // branch leaves it untouched and moves only the ref it points at, which

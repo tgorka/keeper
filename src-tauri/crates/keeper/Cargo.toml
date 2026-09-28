@@ -168,6 +168,15 @@ objc2-natural-language = { workspace = true }
 # session and a passkey manager's prompt both carry over.
 objc2-authentication-services = { workspace = true }
 objc2-app-kit = { workspace = true }
+# The on-device speech engine (Epic 87, AD-339): keeper's vendored fork of
+# fluidaudio-rs (MIT, FluidInference; LICENSE + NOTICE in the directory)
+# linking FluidAudio 0.17.4 (Apache-2.0) as a static Swift library — Parakeet
+# recognition, community-1 diarization and AVAssetReader decoding, reached
+# only from `transcribe_macos.rs`. It lives outside `src-tauri/` so it is
+# never a workspace member; its FFI `unsafe` stays inside it. Models load
+# only from `<data_dir>/models`; the fork has no download path. Building it
+# needs Xcode (Swift 6.2+) and fetches FluidAudio through SwiftPM.
+fluidaudio-rs = { path = "../../../tools/fluidaudio-rs" }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 security-framework = { workspace = true }

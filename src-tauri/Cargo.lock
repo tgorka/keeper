@@ -2007,6 +2007,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluidaudio-rs"
+version = "0.14.8-keeper.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4216,6 +4225,7 @@ dependencies = [
  "block2",
  "chrono",
  "dirs 6.0.0",
+ "fluidaudio-rs",
  "fs4",
  "keeper-core",
  "keeper-sync",

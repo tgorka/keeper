@@ -96,11 +96,10 @@
 //!   and both take the resume path below.
 //! - **The microphone grant** is read and asked through `AVAudioApplication`
 //!   (`recordPermission`, `requestRecordPermissionWithCompletionHandler:`),
-//!   which is macOS 14 and later. On an older Mac the class is not
-//!   registered; this port then reports the grant as denied and says why at
-//!   error level, because there is no honest way to read it from the crates
-//!   this build carries. The bundle's `minimumSystemVersion` is 11; voice on
-//!   11–13 is a limit named here, not a silent failure.
+//!   which is macOS 14 and later — the bundle's `minimumSystemVersion` (14,
+//!   FluidAudio's floor), so the class is always registered on a Mac keeper
+//!   launches on. Were it ever absent, this port reports the grant as denied
+//!   and says why at error level rather than failing silently.
 //! - **Whether a microphone exists** is the input node's hardware format:
 //!   Apple documents a zero sample rate or channel count on
 //!   `inputFormatForBus:0` as "input is not enabled" on a Mac with no input
