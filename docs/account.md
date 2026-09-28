@@ -465,6 +465,12 @@ keeper-config.git/
       desktop.toml               # optional: seeds settings.<device>.toml when no other desktop of yours has one
       tablet.toml                #   … iPad
       mobile.toml                #   … phone
+  .gitattributes                 # _models/** filter=lfs diff=lfs merge=lfs -text
+  _models/                       # optional: transcription models, git LFS (docs/transcription.md)
+    models.toml                  # names the set: [asr] dir, [diarizer] dir, [embedding] id
+    parakeet-tdt-0.6b-v3/        # speech recognition (precompiled .mlmodelc + vocabulary)
+    speaker-diarization/         # diarization and speaker embeddings
+    LICENSE, NOTICE              # the models' own licence files travel with them
   tgorka/                        # one directory per person, named by their login
     user.toml                    # who this directory belongs to
     keeper.toml                  # your pinned settings, every device
@@ -512,6 +518,12 @@ it.
 6. **Every sync** merges your settings files and your lists of drives, bot providers and
    Matrix accounts, and describes this device in its own file. It rewrites and pushes them
    only when their content changed (see *Your settings, drives and accounts travel*).
+7. **Models, on a Mac that can transcribe:** after a sync, `_models/` is hydrated into
+   `<data_dir>/models/` through keeper's own LFS client, with the same credential, each
+   file checked against its sha256. The LFS endpoint is derived from the repository's URL
+   alone; a `.lfsconfig` in this repository is never read, so the credential goes to no
+   other host. keeper only reads `_models/`; it never writes there. See
+   `docs/transcription.md`.
 
 **The rules keeper keeps:**
 - **Create-only, except six files.** A file that already exists is never re-copied or
@@ -761,7 +773,7 @@ works the same way: it applies only when that folder exists on this device.
 
 Three more files list what you use, and on which devices:
 - **`drives.toml`:** each drive's name, remote URL and branch; its roles (notes,
-  recordings, sessions, tasks) and their subfolders; the policy a synced folder may carry
+  recordings, sessions, tasks, voices) and their subfolders; the policy a synced folder may carry
   (excludes, the LFS threshold, virtual-file patterns and size floor, the release time,
   tags, the commit subject); and whether it uses your account, its own token, or none.
   The local folder, the direction and the other per-device choices stay on each device.

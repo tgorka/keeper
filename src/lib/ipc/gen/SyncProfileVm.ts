@@ -156,6 +156,18 @@ sessions: boolean,
  */
 sessionsSubfolder: string, tasks: boolean, tasksSubfolder: string, 
 /**
+ * Whether this folder keeps voices — the speaker bank and the dictionary
+ * transcription reads and writes (AD-342). A folder that does is a
+ * "transcribing drive".
+ */
+voices: boolean, 
+/**
+ * The voices subfolder that would be **in force**: the stored one when
+ * this folder keeps voices, and `VoicesConfig`'s own default when it does
+ * not — `recordings_subfolder`'s rule, so `voices` is spelled once, in Rust.
+ */
+voicesSubfolder: string, 
+/**
  * The canonical camelCase profile keys a `.keeper/keeper.toml` layer
  * currently sets for this folder, sorted (Story 56.12).
  *

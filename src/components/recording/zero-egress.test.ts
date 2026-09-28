@@ -1,12 +1,15 @@
 /**
  * Zero-egress source-scan audit over the recording UI (Story 20.4, FR-76,
- * epic-20 exit invariant).
+ * epic-20 exit invariant; the promise as restated by D-29).
  *
- * The recording surfaces must carry NO upload, share-link, transcription, or
- * cloud affordance and no direct network call — recording is fully local. This
- * test reads the recording production sources off disk (node `fs`, never the
- * bundler) and fails loudly — naming the offending file and token — if such an
- * affordance ever appears. It mirrors the Rust `dependency_firewall_holds`
+ * The recording surfaces must carry NO upload, share-link or cloud affordance
+ * and no direct network call — recording adds no network destination. A
+ * recording may be transcribed, on this Mac only (D-29): transcription
+ * vocabulary is allowed here, and the on-device half of that promise is
+ * enforced by `keeper-core/tests/transcription_on_device.rs`. This test reads
+ * the recording production sources off disk (node `fs`, never the bundler) and
+ * fails loudly — naming the offending file and token — if a network call or an
+ * egress affordance ever appears. It mirrors the Rust `dependency_firewall_holds`
  * pattern: every forbidden token is built by string concatenation so this scan
  * file never matches itself.
  *
@@ -60,7 +63,7 @@ function recordingSources(): string[] {
 }
 
 describe("recording UI zero-egress audit (Story 20.4, FR-76)", () => {
-  it("carries no upload/share/transcription/cloud affordance and no network call", () => {
+  it("carries no upload/share/cloud affordance and no network call", () => {
     // Functional network tokens — case-insensitive (a call is a leak in any
     // casing). Built by concatenation: never self-matching.
     const functionalTokens: RegExp[] = [
@@ -73,13 +76,11 @@ describe("recording UI zero-egress audit (Story 20.4, FR-76)", () => {
       new RegExp(`\\baxi${"os"}\\b`, "i"),
     ];
     // Affordance tokens — capitalized whole words (a shipped affordance is a
-    // Title-case label or identifier); `transcri` in any case (no honest copy
-    // needs the word at all).
+    // Title-case label or identifier).
     const affordanceTokens: RegExp[] = [
       new RegExp(`\\bUpl${"oad"}`),
       new RegExp(`\\bSha${"re"}\\b`),
       new RegExp(`\\bClo${"ud"}\\b`),
-      new RegExp(`transc${"ri"}`, "i"),
     ];
     const forbidden = [...functionalTokens, ...affordanceTokens];
 

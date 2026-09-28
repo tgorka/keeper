@@ -25,6 +25,7 @@ import { SyncGitRow } from "@/components/settings/sync-git-row";
 import { DeviceSection, SyncSection } from "@/components/settings/sync-section";
 import { TasksSection } from "@/components/settings/tasks-section";
 import { TelemetrySection } from "@/components/settings/telemetry-section";
+import { TranscriptionSection } from "@/components/settings/transcription-section";
 import { UnsetShortcutRow } from "@/components/settings/unset-shortcut-row";
 import { Button } from "@/components/ui/button";
 import {
@@ -154,6 +155,7 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
   // Screen recording is a desktop-macOS-≥13 capability (Story 16.3); render the
   // Recording section only where it exists — never a dead settings surface.
   const recording = useCapabilitiesStore((s) => s.capabilities.recording);
+  const transcription = useCapabilitiesStore((s) => s.capabilities.transcription);
   // Folder sync needs a usable `git` binary (Epic 29, AD-41); render the Sync
   // section only where the capability reports one — never a dead affordance.
   const sync = useCapabilitiesStore((s) => s.capabilities.sync);
@@ -244,6 +246,7 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
       {/* The Recording section is desktop-macOS-≥13 only (Story 16.3): absent on
               every platform that cannot record, never a dead affordance. */}
       {recording && <RecordingSection open={open} />}
+      {transcription && <TranscriptionSection open={open} />}
       {/* Ungated by any capability, and beside Sync rather than inside it: a
           sessions zone IS a synced folder somebody flagged, but what a space
           does when it arrives is a reading preference and not a sync setting.

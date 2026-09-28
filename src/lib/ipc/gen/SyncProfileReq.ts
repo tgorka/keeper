@@ -123,4 +123,13 @@ sessions: boolean | null,
  * verbatim rule, not `notes_subfolder`'s tidying: the validator refuses by
  * name, and a silent correction would save against a folder nobody named.
  */
-sessionsSubfolder: string | null, tasks: boolean | null, tasksSubfolder: string | null, };
+sessionsSubfolder: string | null, tasks: boolean | null, tasksSubfolder: string | null, 
+/**
+ * Flag or unflag this folder as keeping voices (AD-342). `None` leaves
+ * the flag alone under the rule `recordings` follows.
+ */
+voices: boolean | null, 
+/**
+ * The voices subfolder to pin; `recordings_subfolder`'s verbatim rule.
+ */
+voicesSubfolder: string | null, };

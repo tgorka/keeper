@@ -12,6 +12,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { AutoUpdateRestartVm } from "./gen/AutoUpdateRestartVm";
 import type { AutoUpdateVm } from "./gen/AutoUpdateVm";
 import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
+import type { CorrectionResultVm } from "./gen/CorrectionResultVm";
+import type { DictionaryTermVm } from "./gen/DictionaryTermVm";
 import type { DockBadgeMode } from "./gen/DockBadgeMode";
 import type { DocumentVm } from "./gen/DocumentVm";
 import type { EgressEndpointVm } from "./gen/EgressEndpointVm";
@@ -24,11 +26,133 @@ import type { LifecyclePhase } from "./gen/LifecyclePhase";
 import type { NavState } from "./gen/NavState";
 import type { NotificationPermission } from "./gen/NotificationPermission";
 import type { NotifyTarget } from "./gen/NotifyTarget";
+import type { PersonVm } from "./gen/PersonVm";
 import type { TelemetryConsentVm } from "./gen/TelemetryConsentVm";
 import type { TelemetryEventReq } from "./gen/TelemetryEventReq";
 import type { TelemetryRemoteConfigVm } from "./gen/TelemetryRemoteConfigVm";
 import type { TelemetryStatusVm } from "./gen/TelemetryStatusVm";
 import type { TextFileVm } from "./gen/TextFileVm";
+import type { TranscriptionLanguage } from "./gen/TranscriptionLanguage";
+import type { TranscriptionProgressVm } from "./gen/TranscriptionProgressVm";
+import type { TranscriptionStatusVm } from "./gen/TranscriptionStatusVm";
+import type { TranscriptVm } from "./gen/TranscriptVm";
+
+export type {
+  CorrectionResultVm,
+  DictionaryTermVm,
+  PersonVm,
+  TranscriptionLanguage,
+  TranscriptionProgressVm,
+  TranscriptionStatusVm,
+  TranscriptVm,
+};
+
+export function transcriptionStatus(): Promise<TranscriptionStatusVm> {
+  return invoke("transcription_status");
+}
+export function transcriptionModelsFetch(): Promise<TranscriptionStatusVm> {
+  return invoke("transcription_models_fetch");
+}
+export function transcriptionStart(
+  path: string,
+  onProgress: (progress: TranscriptionProgressVm) => void,
+): Promise<string> {
+  const channel = new Channel<TranscriptionProgressVm>();
+  channel.onmessage = onProgress;
+  return invoke("transcription_start", { path, channel });
+}
+export function transcriptionCancel(jobId: string): Promise<void> {
+  return invoke("transcription_cancel", { jobId });
+}
+export function transcriptRead(path: string): Promise<TranscriptVm> {
+  return invoke("transcript_read", { path });
+}
+export function transcriptEditUtterance(
+  path: string,
+  utteranceId: string,
+  text: string,
+): Promise<CorrectionResultVm> {
+  return invoke("transcript_edit_utterance", { path, utteranceId, text });
+}
+export function transcriptReassignUtterance(
+  path: string,
+  utteranceId: string,
+  speakerId: string,
+): Promise<TranscriptVm> {
+  return invoke("transcript_reassign_utterance", { path, utteranceId, speakerId });
+}
+export function transcriptMergeSpeakers(
+  path: string,
+  fromId: string,
+  intoId: string,
+): Promise<TranscriptVm> {
+  return invoke("transcript_merge_speakers", { path, fromId, intoId });
+}
+export function transcriptRenameSpeaker(
+  path: string,
+  speakerId: string,
+  label: string,
+): Promise<TranscriptVm> {
+  return invoke("transcript_rename_speaker", { path, speakerId, label });
+}
+export function transcriptAssignSpeaker(
+  path: string,
+  speakerId: string,
+  personId: string | null,
+  newName: string | null,
+): Promise<TranscriptVm> {
+  return invoke("transcript_assign_speaker", { path, speakerId, personId, newName });
+}
+export function voicesPeople(profileId: string): Promise<PersonVm[]> {
+  return invoke("voices_people", { profileId });
+}
+export function voicesPersonRename(
+  profileId: string,
+  personId: string,
+  name: string,
+): Promise<PersonVm[]> {
+  return invoke("voices_person_rename", { profileId, personId, name });
+}
+export function voicesPersonDelete(profileId: string, personId: string): Promise<PersonVm[]> {
+  return invoke("voices_person_delete", { profileId, personId });
+}
+export function voicesPersonSetSelf(profileId: string, personId: string): Promise<PersonVm[]> {
+  return invoke("voices_person_set_self", { profileId, personId });
+}
+export function voicesPeopleMerge(
+  profileId: string,
+  fromId: string,
+  intoId: string,
+): Promise<PersonVm[]> {
+  return invoke("voices_people_merge", { profileId, fromId, intoId });
+}
+export function dictionaryTerms(profileId: string): Promise<DictionaryTermVm[]> {
+  return invoke("dictionary_terms", { profileId });
+}
+export function dictionaryTermSave(
+  profileId: string,
+  id: string | null,
+  text: string,
+  aliases: string[],
+): Promise<DictionaryTermVm[]> {
+  return invoke("dictionary_term_save", { profileId, id, text, aliases });
+}
+export function dictionaryTermDelete(profileId: string, id: string): Promise<DictionaryTermVm[]> {
+  return invoke("dictionary_term_delete", { profileId, id });
+}
+export function dictionaryAcceptSuggestion(
+  profileId: string,
+  from: string,
+  to: string,
+): Promise<DictionaryTermVm[]> {
+  return invoke("dictionary_accept_suggestion", { profileId, from, to });
+}
+export function transcriptionSettingsSet(
+  language: TranscriptionLanguage | null,
+  afterRecording: boolean | null,
+): Promise<TranscriptionStatusVm> {
+  return invoke("transcription_settings_set", { language, afterRecording });
+}
 
 export function telemetryStatus(): Promise<TelemetryStatusVm> {
   return invoke("telemetry_status");

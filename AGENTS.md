@@ -141,7 +141,8 @@ Keeper is an open-source, Beeper-style Matrix messenger client (Apache-2.0). It 
 - ❌ No secrets, tokens, or homeserver credentials in code, tests, fixtures, or docs.
 - ❌ Don't shuttle large payloads (media, full timelines) through IPC as JSON/base64 — stream view models for visible ranges; media should use a custom URI scheme handler from the Rust cache.
 - ❌ Don't hold message/room state in a JS store as the source of truth — frontend stores mirror Rust view-model streams only.
-- ❌ Nothing from the bots surface lives in a recording path — no file under `src/components/recording/`, no `recording-*` lib/store, no `use-record*` hook, and no palette verb the zero-egress scan would read as an upload or a transcription (`zero-egress.test.ts`, `src/test/bots-surface-stays-out-of-recording.test.ts`).
+- ❌ Nothing from the bots surface lives in a recording path — no file under `src/components/recording/`, no `recording-*` lib/store, no `use-record*` hook, and no palette verb the zero-egress scan would read as an upload, share or cloud affordance (`zero-egress.test.ts`, `src/test/bots-surface-stays-out-of-recording.test.ts`).
+- ❌ Transcription (Epic 87, D-29) is on this Mac only: engine decisions live in `keeper_core::transcription`; the shell's `transcribe_*.rs` port decides nothing; no network API or model download in the engine path (`keeper-core/tests/transcription_on_device.rs`); models come only from the config repo's `_models/`; the voices bank is written only on a person's confirmation.
 
 ---
 

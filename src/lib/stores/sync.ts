@@ -469,8 +469,23 @@ export async function saveSyncProfile(req: SyncProfileReq): Promise<SyncProfileV
  * `RecordingsConfig::validate`'s own sentence for a subfolder it refuses — so
  * the caller prints the reason beside the field.
  */
-export async function setSyncProfileRecordingsSubfolder(
+export function setSyncProfileRecordingsSubfolder(
   id: string,
+  subfolder: string,
+): Promise<SyncProfileVm> {
+  return setProfileRoleSubfolder(id, "recordings", subfolder);
+}
+
+export function setSyncProfileVoicesSubfolder(
+  id: string,
+  subfolder: string,
+): Promise<SyncProfileVm> {
+  return setProfileRoleSubfolder(id, "voices", subfolder);
+}
+
+async function setProfileRoleSubfolder(
+  id: string,
+  role: "recordings" | "voices",
   subfolder: string,
 ): Promise<SyncProfileVm> {
   const stored = (await syncProfiles()).find((profile) => profile.id === id);
@@ -521,7 +536,9 @@ export async function setSyncProfileRecordingsSubfolder(
     // The one field this call is about. Sent verbatim: Rust trims whitespace and
     // otherwise refuses rather than corrects, and correcting it here would make
     // a save succeed against a folder nobody named.
-    recordingsSubfolder: subfolder,
+    recordingsSubfolder: role === "recordings" ? subfolder : null,
+    voices: null,
+    voicesSubfolder: role === "voices" ? subfolder : null,
     sessions: folderOwned.has("sessions") ? null : stored.sessions,
     sessionsSubfolder: folderOwned.has("sessions") ? null : stored.sessionsSubfolder,
     tasks: folderOwned.has("tasks") ? null : stored.tasks,

@@ -3,6 +3,8 @@
 keeper records your screen to a folder on this Mac. **Nothing uploads** — the
 recording feature adds zero network destinations (verified by an automated
 egress-diff gate in CI), has no telemetry, and writes only where you point it.
+A finished recording can be transcribed, **on this Mac only**: no audio or text
+leaves it for that (see *Transcription* below, and `docs/transcription.md`).
 
 ## What it records
 
@@ -282,6 +284,40 @@ keeper recognises the drive by the marker it wrote at the drive's root, not by
 the mount path, so a stick that comes back on a different mount point is still
 the same drive. If a *different* volume is mounted where yours belongs, that is
 refused too, with its own sentence — adopting it would sync a stranger's disk.
+
+## Transcription
+
+On an Apple Silicon Mac with macOS 15 or later, with the models fetched (Settings
+→ Transcription), keeper can turn a recording into a transcript with speakers.
+It runs in keeper itself, on this Mac; nothing is sent anywhere (D-29,
+`docs/egress.md` § *Transcription adds no egress*).
+
+- **After recording.** When a session ends in a synced folder that **keeps
+  voices** (Settings → Sync, *This folder keeps voices*) and **Transcribe after
+  recording** is on — it is by default (`transcription.after_recording`) —
+  keeper transcribes the session in the background. The switch sits in Settings
+  → Transcription, and in the Recording pane when the destination keeps voices.
+  Finishing the session never waits for it. A session that ended while keeper
+  was quitting, or before the models arrived, is not picked up later by itself:
+  use **Transcribe** on its folder in Files, offered once the session's audio
+  segments are on this Mac (not LFS pointers or virtual files).
+- **The microphone track is you.** With both system audio and the microphone
+  on, the microphone is transcribed on its own and attributed to the person
+  marked as *me* in the voices bank ("You" until one is marked); system audio is
+  transcribed and split by speaker. A microphone line that repeats what the
+  speakers played, mostly word for word and in order, is dropped as echo; a
+  short reply over the far end is kept. A line heard on the microphone never
+  moves to a voice from the call in a correction, or back. The camera's audio is
+  ignored. keeper finds the microphone as the second audio track, the order
+  `keeper-rec` writes.
+- **Where transcripts land.** Beside the media, in the session folder:
+  `transcript.json` (the source of truth) and `transcript.md` (re-rendered on
+  every save). They sync with the folder like any other file. The session's
+  note stub stays as it was; the transcript is its own file.
+
+Speakers are matched against the voices bank of the drive, and you correct
+words and people in the transcript viewer. How that works, and where the models
+come from, is in `docs/transcription.md`.
 
 ## Debug mode (Settings → About)
 

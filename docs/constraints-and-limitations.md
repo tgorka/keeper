@@ -86,6 +86,9 @@ and why:
   `hotkey: OS refused to register global shortcut` and carries on without one.
 - **No recorder sidecar.** `keeper-rec` is Apple-Silicon macOS only, so `externalBin` is
   emptied by `tauri.linux.conf.json` and `CapabilitiesVm.recording` is false.
+- **No transcription engine.** The engine is FluidAudio through a Swift bridge, macOS only
+  (Epic 87, D-29), so `CapabilitiesVm.transcription` is false and the transcription surfaces
+  are absent; transcripts, the voices bank and the dictionary still sync as files (DW-335).
 - **`$XDG_RUNTIME_DIR/tray-icon` must be writable by the app's user.** The tray backend
   writes the icon there; a directory left behind by another user (e.g. a root-run RustDesk
   in the same container) makes the tray fail with `Permission denied` — logged at `warn`,
@@ -286,3 +289,24 @@ safe binding. Current inventory:
   the port's default — the system browser and the `keeper://` deep link. **Not yet
   compiled anywhere**: written on the Linux host, where the shell crate does not build;
   the macOS and iOS CI jobs are its first compile and hesperia/kalypso its first run.
+- On-device transcription, macOS only (Epic 87, D-29, AD-339, DW-339): **no new entry in the
+  shell crate.** The FFI lives in the vendored dependency `tools/fluidaudio-rs/` (a fork of
+  `fluidaudio-rs`, MIT, `LICENSE` kept and `NOTICE` naming FluidInference, over FluidAudio
+  0.17.4): its `src/ffi.rs` declares the `extern "C"` block against `@_cdecl` functions in
+  `swift/FluidAudioBridge.swift`, and its `src/lib.rs` wraps them in a safe API. The crate
+  sits outside `src-tauri/`, so it is never a workspace member and the workspace's
+  `unsafe_code = deny` does not reach it; it is a path dependency only in the keeper crate's
+  `[target.'cfg(target_os = "macos")'.dependencies]`. `crates/keeper/src/transcribe_macos.rs`
+  calls that safe API and carries no `#[allow(unsafe_code)]`. The bridge loads models only
+  from a directory it is given and names none of FluidAudio's download helpers, enforced with
+  keeper's own transcription sources by `keeper-core/tests/transcription_on_device.rs`
+  (NFR-105). Consequences on the Mac: the bundle's `minimumSystemVersion` rises from 11.0 to
+  14.0, FluidAudio's platform floor, below which its statically linked Swift library would
+  stop keeper from launching; transcription itself is offered only on Apple Silicon with
+  macOS 15 or later, because FluidAudio's community-1 diarizer crashes on 14 (upstream #878,
+  AD-349). The static library imports `@rpath/libswift_Concurrency.dylib`, and a
+  dependency's link arguments do not reach the app's link, so `crates/keeper/build.rs` adds
+  the rpath `/usr/lib/swift` on macOS. Building it needs Xcode 26 / Swift 6.2
+  (`swift-tools-version: 6.2`), and SwiftPM fetches FluidAudio from github.com at build
+  time. Linux, Windows and iOS have no engine: the dependency is target-gated, and
+  `transcribe_ipc`'s `AbsentEngine` answers `Unsupported` there (DW-335).

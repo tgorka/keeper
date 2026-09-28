@@ -107,6 +107,8 @@ import { planPriorityActions } from "@/components/layout/priority-actions";
 import { useSurfaceColumn } from "@/components/layout/surface-column";
 import { SyncStatusMark } from "@/components/layout/sync-status-mark";
 import { ATTACH_TO_NOTE_LABEL, AttachToNoteDialog } from "@/components/notes/attach-to-note-dialog";
+import { TranscriptDialog } from "@/components/transcription/transcript-viewer";
+import { TranscriptionJob } from "@/components/transcription/transcription-job";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -172,6 +174,11 @@ import {
 } from "@/lib/stores/files-tree";
 import { useNotesVaultsStore } from "@/lib/stores/notes-vaults";
 import { panelsStore } from "@/lib/stores/panels";
+import {
+  startTranscription,
+  transcriptionRunning,
+  useTranscriptionStore,
+} from "@/lib/stores/transcription";
 import { cn } from "@/lib/utils";
 import { resolveViewer, VIEWER_ICON } from "@/lib/viewers";
 
@@ -197,7 +204,7 @@ export const FILES_PANE_TITLE = "Files";
 
 /** The one honest sentence under the heading: what this shows, and what it can change. */
 export const FILES_PANE_SUBTITLE =
-  "Everything in the folders keeper syncs. Files in a notes vault can be created and deleted here; everything else is read-only.";
+  "Everything in the folders keeper syncs. Files in a notes vault can be created and deleted here.";
 
 /**
  * The column the tree occupies (Story 48.1).
@@ -1025,6 +1032,7 @@ export function filesRowCellPlan(input: FilesRowCellInput): FilesRowCellPlan {
 interface FilesRowAction {
   /** Stable identity, so a promoted control keeps its place as labels change. */
   readonly id: string;
+  readonly disabled?: boolean;
   /** The accessible name, the tooltip, and the words in the menu item. */
   readonly label: string;
   /** The glyph the promoted control draws. */
@@ -1136,6 +1144,10 @@ export function FilesPane() {
   // the recordings row already use. A control that fails on activation is worse
   // than no control.
   const canReveal = useCapabilitiesStore((s) => s.capabilities.revealInFileManager);
+  const canTranscribe = useCapabilitiesStore((s) => s.capabilities.transcription);
+  const transcriptionJobs = useTranscriptionStore((s) => s.jobs);
+  const [transcriptPath, setTranscriptPath] = useState<string | null>(null);
+  const [transcriptionPath, setTranscriptionPath] = useState<string | null>(null);
   // The tree's own surface column is set up further down, once the selection and
   // the refresh it puts on its folded rail exist (Story 48.1).
 
@@ -2592,6 +2604,45 @@ export function FilesPane() {
                   },
                 ]
               : []),
+            // Transcription reads the bytes, so it sits with the state verbs'
+            // side of the list rather than ahead of Fetch: a pointer row is not
+            // `transcribable` (Rust says so), and a fetched one still promotes
+            // Open first. Open transcript reads a file that already exists, so
+            // it needs no models and is offered wherever one is.
+            ...(canTranscribe && entry.transcribable
+              ? [
+                  {
+                    id: "transcribe",
+                    label: transcriptionRunning(transcriptionJobs[entry.absolutePath])
+                      ? `Transcription: ${transcriptionJobs[entry.absolutePath]?.phase}`
+                      : "Transcribe",
+                    icon: AudioLines,
+                    disabled: transcriptionRunning(transcriptionJobs[entry.absolutePath]),
+                    onSelect: () => {
+                      setTranscriptionPath(entry.absolutePath);
+                      // The new transcript's row (and this row's Open transcript)
+                      // only exist once the listing is read again.
+                      void startTranscription(entry.absolutePath, () => {
+                        load(
+                          node.profileId,
+                          nodeKeySubpath(node.parentKey ?? nodeKey(node.profileId, "")),
+                        );
+                        if (node.isFolder) load(node.profileId, nodeKeySubpath(node.key));
+                      });
+                    },
+                  },
+                ]
+              : []),
+            ...(entry.transcript
+              ? [
+                  {
+                    id: "open-transcript",
+                    label: "Open transcript",
+                    icon: AudioLines,
+                    onSelect: () => setTranscriptPath(entry.transcript),
+                  },
+                ]
+              : []),
             // `FolderSearch` and not `FolderOpen`, which is the glyph
             // `properties-panel` gives this same verb. There the glyph decorates
             // a menu item that also spells the words; here it IS the control, on
@@ -2939,13 +2990,14 @@ export function FilesPane() {
             no children still spends the row's gap. */}
         {actions.length > 0 && promoted > 0 && (
           <span className="flex shrink-0 items-center gap-1">
-            {actions.slice(0, promoted).map(({ id, label, icon: Icon, onSelect }) => (
+            {actions.slice(0, promoted).map(({ id, label, icon: Icon, onSelect, disabled }) => (
               <IconHint key={id} label={label}>
                 <Button
                   type="button"
                   variant="ghost"
                   size="icon-sm"
                   tabIndex={actionTabIndex}
+                  disabled={disabled}
                   // The whole visible word as the name rather than a description of
                   // it, so speech input can ask for what the menu spells even
                   // though the eye reads a picture (WCAG 2.5.3).
@@ -3021,7 +3073,11 @@ export function FilesPane() {
               that raised the question. */}
           {actions.map((action) =>
             action.options === undefined ? (
-              <ContextMenuItem key={action.id} onSelect={action.onSelect}>
+              <ContextMenuItem
+                key={action.id}
+                onSelect={action.onSelect}
+                disabled={action.disabled}
+              >
                 {action.label}
               </ContextMenuItem>
             ) : (
@@ -3113,6 +3169,12 @@ export function FilesPane() {
     <>
       <section {...tree.rootProps} className={FILES_COLUMN_CLASS}>
         {tree.chrome}
+        {canTranscribe && transcriptionPath && (
+          <div className="p-2">
+            <TranscriptionJob path={transcriptionPath} onOpen={setTranscriptPath} />
+          </div>
+        )}
+        <TranscriptDialog path={transcriptPath} onClose={() => setTranscriptPath(null)} />
         {/* The heading used to sit here, over the sentence. It is one row up
             now: every foldable surface names itself in its fold row (Story
             48.3), and this pane was the only one that already had a name to

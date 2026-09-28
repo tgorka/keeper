@@ -74,6 +74,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     // Resolved by Rust even for a folder that holds no recordings: it is the
     // subfolder flagging it would use (Story 41.7).
     recordingsSubfolder: "recordings",
+    voices: false,
+    voicesSubfolder: "voices",
     sessions: false,
     sessionsSubfolder: "60-sessions",
     tasks: false,
@@ -222,6 +224,8 @@ describe("actions", () => {
       notesSubfolder: null,
       recordings: false,
       recordingsSubfolder: null,
+      voices: null,
+      voicesSubfolder: null,
       sessions: false,
       sessionsSubfolder: null,
       tasks: null,
@@ -262,6 +266,8 @@ describe("actions", () => {
         notesSubfolder: null,
         recordings: false,
         recordingsSubfolder: null,
+        voices: null,
+        voicesSubfolder: null,
         sessions: false,
         sessionsSubfolder: null,
         tasks: null,

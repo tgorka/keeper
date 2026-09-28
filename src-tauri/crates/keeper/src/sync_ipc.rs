@@ -34,6 +34,7 @@ use keeper_sync::lfs::hydrate::ContentRefusal;
 use keeper_sync::profile::{
     LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_POLL_INTERVAL_MS,
     DEFAULT_RECORDINGS_SUBFOLDER, DEFAULT_SESSIONS_SUBFOLDER, DEFAULT_SETTLE_MS,
+    DEFAULT_VOICES_SUBFOLDER,
 };
 use keeper_sync::progress::{format_bytes, SyncPhase, SyncStatus};
 use keeper_sync::provenance::SyncSource;
@@ -224,6 +225,14 @@ pub struct SyncProfileVm {
     pub sessions_subfolder: String,
     pub tasks: bool,
     pub tasks_subfolder: String,
+    /// Whether this folder keeps voices — the speaker bank and the dictionary
+    /// transcription reads and writes (AD-342). A folder that does is a
+    /// "transcribing drive".
+    pub voices: bool,
+    /// The voices subfolder that would be **in force**: the stored one when
+    /// this folder keeps voices, and `VoicesConfig`'s own default when it does
+    /// not — `recordings_subfolder`'s rule, so `voices` is spelled once, in Rust.
+    pub voices_subfolder: String,
     /// The canonical camelCase profile keys a `.keeper/keeper.toml` layer
     /// currently sets for this folder, sorted (Story 56.12).
     ///
@@ -288,6 +297,11 @@ impl From<&SyncProfile> for SyncProfileVm {
             tasks_subfolder: p.tasks.as_ref().map_or_else(
                 || keeper_sync::profile::DEFAULT_TASKS_SUBFOLDER.to_owned(),
                 |tasks| tasks.subfolder.clone(),
+            ),
+            voices: p.voices.is_some(),
+            voices_subfolder: p.voices.as_ref().map_or_else(
+                || DEFAULT_VOICES_SUBFOLDER.to_owned(),
+                |voices| voices.subfolder.clone(),
             ),
             // Last, because it describes the fields above rather than adding
             // one: the set of keys a folder file has taken out of this
@@ -795,6 +809,13 @@ pub struct SyncProfileReq {
     pub tasks: Option<bool>,
     #[serde(default)]
     pub tasks_subfolder: Option<String>,
+    /// Flag or unflag this folder as keeping voices (AD-342). `None` leaves
+    /// the flag alone under the rule `recordings` follows.
+    #[serde(default)]
+    pub voices: Option<bool>,
+    /// The voices subfolder to pin; `recordings_subfolder`'s verbatim rule.
+    #[serde(default)]
+    pub voices_subfolder: Option<String>,
 }
 
 /// Mint an opaque, sortable, collision-free id.
@@ -1209,6 +1230,25 @@ fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncPr
             }
         }
     }
+    // The voices flag (AD-342): the recordings block's rule once more.
+    // Unflagging removes the block and no files — the bank stays on disk.
+    match req.voices {
+        Some(true) => {
+            let mut config = profile.voices.clone().unwrap_or_default();
+            if let Some(subfolder) = voices_subfolder(req) {
+                config.subfolder = subfolder;
+            }
+            profile.voices = Some(config);
+        }
+        Some(false) => profile.voices = None,
+        None => {
+            if let (Some(config), Some(subfolder)) =
+                (profile.voices.as_mut(), voices_subfolder(req))
+            {
+                config.subfolder = subfolder;
+            }
+        }
+    }
     // Validate here so a bad profile is rejected at the edge with an actionable
     // message rather than deep inside the engine.
     profile.validate().map_err(|err| sync_ipc_error(&err))?;
@@ -1253,6 +1293,14 @@ fn recordings_subfolder(req: &SyncProfileReq) -> Option<String> {
 /// by name, and correcting them here would hide the refusal.
 fn sessions_subfolder(req: &SyncProfileReq) -> Option<String> {
     req.sessions_subfolder
+        .as_ref()
+        .map(|raw| raw.trim().to_owned())
+}
+
+/// The voices subfolder a request expresses, or `None` when it expresses none.
+/// Verbatim after a whitespace trim, for [`recordings_subfolder`]'s reason.
+fn voices_subfolder(req: &SyncProfileReq) -> Option<String> {
+    req.voices_subfolder
         .as_ref()
         .map(|raw| raw.trim().to_owned())
 }
@@ -3704,6 +3752,8 @@ fn files_listing_vm(
                                 hold: schedule.hold().map(str::to_owned),
                                 detail: schedule.sentence().into_owned(),
                             });
+                    let (session_folder, media_here, transcript) =
+                        transcription_facts(&entry.absolute_path, &entry.name, entry.is_dir);
                     FilesEntryVm::new(FilesEntryFacts {
                         name: entry.name,
                         relative_path: entry.relative_path,
@@ -3718,10 +3768,9 @@ fn files_listing_vm(
                         virtual_bytes: entry.virtual_bytes,
                         roles,
                         write,
-                        // Epic 87 fills these on its surface rung.
-                        session_folder: false,
-                        media_here: false,
-                        transcript: None,
+                        session_folder,
+                        media_here,
+                        transcript,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -3790,6 +3839,33 @@ fn files_listing_vm(
         stale: stale && state == FilesListingState::Listed,
         write,
     }
+}
+
+/// Whether a listed entry is a recording session folder, whether a session's
+/// audio is all here, and the transcript already written for it (AD-344).
+/// One `stat` per directory and per media file, none for anything else:
+/// which names are media is the core's call. A session folder's audio is
+/// here exactly when the core could plan it — every segment present and none
+/// an LFS pointer (a released segment is one again) — which is a manifest
+/// read and a head read per segment, only for the few session folders a
+/// listing holds. A file's own content is judged by the core from its facts.
+fn transcription_facts(
+    absolute: &std::path::Path,
+    name: &str,
+    is_dir: bool,
+) -> (bool, bool, Option<String>) {
+    use keeper_core::recording::SessionManifest;
+    use keeper_core::transcription::plan;
+    let session_folder = is_dir && absolute.join("manifest.json").is_file();
+    if !session_folder && (is_dir || !plan::is_media_file(name)) {
+        return (false, true, None);
+    }
+    let media_here = !session_folder
+        || SessionManifest::load(absolute)
+            .is_ok_and(|manifest| plan::plan_for_session(absolute, &manifest).is_ok());
+    let (json, _) = plan::transcript_paths_for(absolute, session_folder);
+    let transcript = json.is_file().then(|| json.to_string_lossy().into_owned());
+    (session_folder, media_here, transcript)
 }
 
 /// Word one entry's sync state (Story 44.17, FR-173).
@@ -5460,6 +5536,53 @@ pub fn tray_snapshot(app: &tauri::AppHandle) -> (keeper_sync::progress::TraySync
 mod tests {
     use super::*;
 
+    /// A session folder is offered for transcription only when every audio
+    /// segment it lists is real bytes here; one pointer segment is enough to
+    /// withhold it, and a media file is left to the core's own facts.
+    #[test]
+    fn a_session_folder_is_media_here_only_when_every_segment_is() {
+        let folder = std::env::temp_dir().join(format!("keeper-facts-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&folder).expect("dir");
+        let manifest = serde_json::json!({
+            "version": 1,
+            "session": "s",
+            "status": "finalized",
+            "captureTarget": {"kind": "display"},
+            "devices": {"systemAudio": true, "microphone": true, "camera": false},
+            "segments": [
+                {"index": 0, "file": "screen-0000.mov", "bytes": 10, "track": "screen"},
+                {"index": 1, "file": "screen-0001.mov", "bytes": 10, "track": "screen"}
+            ],
+        });
+        std::fs::write(folder.join("manifest.json"), manifest.to_string()).expect("manifest");
+        std::fs::write(folder.join("screen-0000.mov"), b"\0\0\0\x18ftypqt  ").expect("seg 0");
+        std::fs::write(folder.join("screen-0001.mov"), b"\0\0\0\x18ftypqt  ").expect("seg 1");
+        let (session, here, transcript) = transcription_facts(&folder, "s", true);
+        assert!(session);
+        assert!(here, "every segment is here");
+        assert_eq!(transcript, None);
+
+        std::fs::write(
+            folder.join("screen-0001.mov"),
+            "version https://git-lfs.github.com/spec/v1\noid sha256:ab\nsize 799000000\n",
+        )
+        .expect("pointer");
+        let (session, here, _) = transcription_facts(&folder, "s", true);
+        assert!(session);
+        assert!(!here, "one segment is only a pointer");
+
+        std::fs::remove_file(folder.join("screen-0001.mov")).expect("remove");
+        assert!(
+            !transcription_facts(&folder, "s", true).1,
+            "one segment is gone"
+        );
+
+        let (session, here, _) = transcription_facts(&folder.join("call.m4a"), "call.m4a", false);
+        assert!(!session);
+        assert!(here, "a file's content is the core's to judge");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
     #[test]
     fn tasks_flag_defaults_validates_and_preserves_absent_controls() {
         let mut request = req();
@@ -5511,6 +5634,8 @@ mod tests {
             sessions_subfolder: None,
             tasks: None,
             tasks_subfolder: None,
+            voices: None,
+            voices_subfolder: None,
         }
     }
 
@@ -5520,7 +5645,7 @@ mod tests {
     /// struct: the bug is a lost KEY, and serde is what decides what a key is.
     ///
     /// A field the request has a slot for.
-    const EXPRESSED: [&str; 23] = [
+    const EXPRESSED: [&str; 24] = [
         "name",
         "localPath",
         "remoteUrl",
@@ -5548,6 +5673,8 @@ mod tests {
         // same change that added the field, so it never had a PRESERVED phase.
         "sessions",
         "tasks",
+        // Expressed from birth (AD-342), like `sessions`.
+        "voices",
         // Moved out of PRESERVED by Story 56.12, in the shape the `recordings`
         // comment above records: the folder's Advanced settings now render all
         // three, so a save from the app expresses what it shows.
@@ -5581,15 +5708,13 @@ mod tests {
     /// configured where the repository can say it — `.keeper/keeper.toml`, which
     /// travels with the folder — rather than clicked per machine. A save from a
     /// form that has never shown the list must not be able to empty it.
-    const PRESERVED: [&str; 7] = [
+    const PRESERVED: [&str; 6] = [
         "id",
         "volumeId",
         "enabled",
         "lfsNever",
         "lfsPruneLocal",
         "regenerable",
-        // Epic 87's voices role: no request expresses it until its surface rung.
-        "voices",
     ];
 
     fn json_fields(profile: &SyncProfile) -> serde_json::Map<String, serde_json::Value> {
@@ -5714,10 +5839,6 @@ mod tests {
         });
         // The opt-out, because a fresh profile now releases the redundant copy.
         prior.lfs_prune_local = false;
-        // Epic 87's voices role, distinctive so the PRESERVED assertion bites.
-        prior.voices = Some(keeper_sync::profile::VoicesConfig {
-            subfolder: "70-comms/voices".into(),
-        });
         // Story 56.1's virtualization policy. A fresh profile virtualizes
         // nothing and has no size floor, so both carry a value a fresh profile
         // never has. They were PRESERVED fields until Story 56.12 rendered them
@@ -5776,6 +5897,9 @@ mod tests {
         edit.sessions_subfolder = Some("60-sessions".into());
         edit.tasks = Some(true);
         edit.tasks_subfolder = Some("tasks".into());
+        // And keeping voices moves `voices` from `None`, beside the rest.
+        edit.voices = Some(true);
+        edit.voices_subfolder = Some("70-comms/voices".into());
         // The three virtualization knobs (Story 56.12), each moved off `prior`'s
         // distinctive value AND off a fresh profile's, so the EXPRESSED
         // assertion cannot be satisfied by standing on either.

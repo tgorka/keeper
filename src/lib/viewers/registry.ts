@@ -89,6 +89,14 @@ export const UNKNOWN_ENTRY: ViewerEntry = row({
   writable: false,
 });
 
+const TRANSCRIPT_ENTRY = row({
+  viewer: "transcript",
+  format: "transcript",
+  label: "Transcript",
+  icon: "file-text",
+  writable: true,
+});
+
 /**
  * The rows the KIND alone decides, by the kind's own name.
  *
@@ -364,6 +372,8 @@ export function resolveViewer(file: ViewerSubject): ViewerEntry {
     // fallback keeps this total in the one case the type system cannot see.
     return KIND_ENTRIES[file.kind] ?? UNKNOWN_ENTRY;
   }
+  const name = file.name.toLowerCase();
+  if (name === "transcript.json" || name.endsWith(".transcript.json")) return TRANSCRIPT_ENTRY;
   const extension = extensionOf(file.name);
   if (extension === null) {
     return UNKNOWN_ENTRY;
@@ -374,7 +384,7 @@ export function resolveViewer(file: ViewerSubject): ViewerEntry {
 /** Every viewer id the table can produce — what a bindings table must cover,
  *  asserted rather than kept in step by hand. */
 export function registeredViewerIds(): ReadonlySet<ViewerId> {
-  const ids = new Set<ViewerId>([UNKNOWN_ENTRY.viewer]);
+  const ids = new Set<ViewerId>([UNKNOWN_ENTRY.viewer, TRANSCRIPT_ENTRY.viewer]);
   for (const entry of Object.values(KIND_ENTRIES)) {
     ids.add(entry.viewer);
   }

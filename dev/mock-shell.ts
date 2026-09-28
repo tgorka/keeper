@@ -118,6 +118,7 @@ import type {
   VoiceWakeVm,
 } from "@/lib/ipc/client";
 import { DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { transcriptionMockHandlers } from "./transcription-fixture";
 
 /** Roughly now, so relative timestamps read as "3 min ago" rather than 1970. */
 const NOW = Date.now();
@@ -319,14 +320,15 @@ function browseEntry(name: string, isDir: boolean, size: FileSizeVm | null): Fil
     sync: { status: "synced", detail: null },
     size: isDir ? null : size,
     folderRole: name === "10-notes" ? "notesVault" : null,
+    transcribable: !isDir && /\.(mov|wav|mp4|m4a)$/.test(name),
+    transcript:
+      name === "meeting.mov" ? "/Volumes/merope/tgdrive/meeting.mov.transcript.json" : null,
     // Story 56.2's two additions. `lfsOid` is null because none of these rows
     // is a virtual path, which is the statement that `size` came off a `stat`;
     // `mtimeMs` is a fixed instant so the harness renders identically on every
     // run.
     lfsOid: null,
     mtimeMs: 1_700_000_000_000,
-    transcribable: false,
-    transcript: null,
     // Story 56.9: no release standing, because release is a fact about content
     // keeper itself put here and none of these rows is that. The two rows that
     // are get one below.
@@ -360,7 +362,9 @@ function lfsEntry(
   lfsOid: string | null,
   release: FilesReleaseVm | null = null,
 ): FilesEntryVm {
-  return { ...browseEntry(name, false, size), sync, lfsOid, release };
+  const row = browseEntry(name, false, size);
+  // Content that is not here cannot be transcribed, which Rust says on the row.
+  return { ...row, sync, lfsOid, release, transcribable: row.transcribable && lfsOid === null };
 }
 
 /** Verbatim from `sync_ipc::sync_mark`, for the reason {@link lfsEntry} gives. */
@@ -400,6 +404,9 @@ const ENTRIES: FilesEntryVm[] = [
   browseEntry("30-work", true, null),
   browseEntry("40-media", true, null),
   browseEntry("50-library", true, null),
+  { ...browseEntry("70-comms/voices", true, null), name: "voices", folderRole: "voices" },
+  { ...browseEntry("meeting.mov", false, { bytes: 4_200_000, label: "4.2 MB" }), kind: "video" },
+  browseEntry("meeting.mov.transcript.json", false, { bytes: 4_200, label: "4.2 kB" }),
   browseEntry(".gitattributes", false, { bytes: 16_384, label: "16.4 kB" }),
   browseEntry("AGENTS.md", false, { bytes: 4_812, label: "4.8 kB" }),
   browseEntry("README.md", false, { bytes: 3_380, label: "3.4 kB" }),
@@ -1163,6 +1170,7 @@ const ANSWERS: Record<string, unknown> = {
           // Story 66.3: the phone's reveal, and false on every desktop.
           shareOut: false,
           recording: true,
+          transcription: true,
           sync: true,
           notes: true,
           sessions: true,
@@ -1174,7 +1182,6 @@ const ANSWERS: Record<string, unknown> = {
           // grant bar, the tool rows and the reveal control are reachable in `bun
           // run dev`; flip to `false` to see the phone's shape of the same pane.
           botTools: true,
-          transcription: false,
           overlayTitleBar: true,
         } satisfies CapabilitiesVm),
   // ---------------------------------------------------------------------------
@@ -1360,6 +1367,8 @@ const ANSWERS: Record<string, unknown> = {
       notesSubfolder: "notes",
       recordings: true,
       recordingsSubfolder: "recordings",
+      voices: true,
+      voicesSubfolder: "70-comms/voices",
       sessions: true,
       sessionsSubfolder: "60-sessions",
       tasks: true,
@@ -1398,6 +1407,8 @@ const ANSWERS: Record<string, unknown> = {
       notesSubfolder: null,
       recordings: false,
       recordingsSubfolder: "recordings",
+      voices: false,
+      voicesSubfolder: "voices",
       sessions: false,
       sessionsSubfolder: "60-sessions",
       tasks: false,
@@ -1438,6 +1449,8 @@ const ANSWERS: Record<string, unknown> = {
       notesSubfolder: null,
       recordings: false,
       recordingsSubfolder: "recordings",
+      voices: false,
+      voicesSubfolder: "voices",
       sessions: false,
       sessionsSubfolder: "60-sessions",
       tasks: false,
@@ -2928,9 +2941,9 @@ let recordingSettings: RecordingSettingsVm = {
   segmentMb: 250,
   durationCapMinutes: 60,
   destinationDir: "/Volumes/merope/tgdrive/recordings",
-  destinationKind: "folder",
-  destinationProfileId: null,
-  destinationProfileName: null,
+  destinationKind: "profile",
+  destinationProfileId: "p1",
+  destinationProfileName: "tgdrive",
   destinationVolume: null,
   pathTemplate: "{yyyy}/{yyyy}-{mm}-{dd} {HH}{MM} {slug}",
   echoCancellation: false,
@@ -3145,7 +3158,7 @@ let accountOffers: AccountOffersVm = {
       credential: "own",
       notes: null,
       recordings: "recordings",
-      voices: null,
+      voices: "70-comms/voices",
       sessions: null,
       tasks: null,
       excludes: [],
@@ -3764,6 +3777,8 @@ function forgeAddedProfile(
     notesSubfolder: null,
     recordings: false,
     recordingsSubfolder: "recordings",
+    voices: false,
+    voicesSubfolder: "voices",
     sessions: false,
     sessionsSubfolder: "60-sessions",
     tasks: false,
@@ -3778,6 +3793,34 @@ function later<T>(ms: number, answer: () => T): Promise<T> {
 }
 
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  ...transcriptionMockHandlers(() => ANSWERS.sync_profiles as SyncProfileVm[]),
+  "plugin:dialog|open": (payload) => {
+    const options = payload.options;
+    return options && typeof options === "object" && "directory" in options && options.directory
+      ? "/Users/tgorka/Documents"
+      : "/Volumes/merope/tgdrive/meeting.mov";
+  },
+  sync_folder_tasks_flag: (payload) => {
+    const profile = (ANSWERS.sync_profiles as SyncProfileVm[]).find(
+      (p) => p.id === payload.profileId,
+    );
+    const subfolder = payload.subfolder === null ? null : String(payload.subfolder);
+    if (profile) {
+      profile.tasks = subfolder !== null;
+      profile.tasksSubfolder = subfolder ?? "tasks";
+    }
+    return {
+      chosenProfileId: profile?.id ?? null,
+      resolvedProfileId: profile?.id ?? null,
+      resolvedProfileName: profile?.name ?? null,
+      root: profile && subfolder ? `${profile.localPath}/${subfolder}` : null,
+      subfolder: subfolder ?? "tasks",
+      subfolderSource: "folder-file",
+      writable: true,
+      exists: true,
+      notice: null,
+    };
+  },
   // One rail group per drive the search covers: the selection, or the active
   // drive when nothing is selected — `notes_spaces(vault_id, vault_ids)`.
   notes_spaces: (payload) => {
@@ -4683,6 +4726,8 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       notesSubfolder: req.notesSubfolder ?? prior.notesSubfolder,
       recordings: req.recordings ?? prior.recordings,
       recordingsSubfolder: req.recordingsSubfolder ?? prior.recordingsSubfolder,
+      voices: req.voices ?? prior.voices,
+      voicesSubfolder: req.voicesSubfolder ?? prior.voicesSubfolder,
       sessions: req.sessions ?? prior.sessions,
       sessionsSubfolder: req.sessionsSubfolder ?? prior.sessionsSubfolder,
     };

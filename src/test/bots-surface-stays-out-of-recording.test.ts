@@ -2,10 +2,11 @@
  * Repo-wide convention test (Story 61.13): the bots surface stays out of every
  * path the recording zero-egress gate scans.
  *
- * Why this exists. The recording feature promises, in six places, that it
- * uploads, shares and transcribes nothing — and `zero-egress.test.ts` keeps
- * that promise literally true by reading the recording sources off disk and
- * failing on any network or affordance token. Epic 61 puts a surface that talks
+ * Why this exists. The recording feature promises that it uploads and shares
+ * nothing and adds no network destination (it transcribes on this Mac only,
+ * D-29) — and `zero-egress.test.ts` keeps that promise literally true by
+ * reading the recording sources off disk and failing on any network or
+ * upload/share/cloud affordance token. Epic 61 puts a surface that talks
  * to the network *on purpose* beside it: a chat pane, a `fetch`-shaped wire in
  * Rust, "Upload"-adjacent vocabulary around pasted images. The gate is left
  * untouched and unwidened, which is only honest while no bots file can land

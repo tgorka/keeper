@@ -178,12 +178,12 @@ function entry(
     lfsOid: null,
     mtimeMs: 1_700_000_000_000,
     folderRole: null,
+    transcribable: false,
+    transcript: null,
     write: { writable: true, reason: null, caveat: null, caveatShort: null },
     release: null,
     virtualChildren: 0,
     virtualBytes: 0,
-    transcribable: false,
-    transcript: null,
   };
 }
 
@@ -517,6 +517,21 @@ describe("Files on the phone — the pane", () => {
         "/private/var/mobile/Containers/keeper/sync/p1/README.md",
       ),
     );
+  });
+
+  it("offers a synced transcript on a phone that cannot transcribe, and no Transcribe", async () => {
+    capabilitiesStore.getState().applySnapshot(PHONE);
+    syncProfiles.mockResolvedValue([profile({ id: "p1", name: "tgdrive" })]);
+    const meeting = {
+      ...entry("meeting", "folder"),
+      transcribable: true,
+      transcript: "/private/var/mobile/Containers/keeper/sync/p1/meeting/transcript.json",
+    };
+    syncBrowse.mockResolvedValue(listing("", [meeting]));
+    render(<FilesPhonePane />);
+    fireEvent.contextMenu(await screen.findByTestId(`${FILES_PHONE_ROW_TESTID}-meeting`));
+    expect(await screen.findByRole("menuitem", { name: "Open transcript" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Transcribe" })).toBeNull();
   });
 
   it("pull-to-refresh past the threshold calls sync_folder_now and re-browses; below it, nothing", async () => {

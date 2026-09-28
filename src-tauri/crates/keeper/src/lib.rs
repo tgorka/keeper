@@ -102,6 +102,12 @@ mod share_ios;
 mod sync;
 mod sync_ipc;
 mod telemetry_ipc;
+// On-device transcription (Epic 87, AD-339): the engine's macOS port over
+// the vendored FluidAudio fork, and the command surface over the port —
+// ungated, like voice, so the command list is identical on every target.
+mod transcribe_ipc;
+#[cfg(target_os = "macos")]
+mod transcribe_macos;
 #[cfg(desktop)]
 mod tray;
 // The voice port's platform implementations: iOS (Story 62.4, AD-165–AD-167)
@@ -1042,6 +1048,30 @@ pub fn run() {
                 forge_ipc::sync_drive_folder_get,
                 forge_ipc::sync_drive_folder_set,
                 forge_ipc::sync_credential_choices,
+                // On-device transcription (Epic 87, AD-339): every target in
+                // the shared body, the engine port decides — a Mac answers for
+                // real, everything else says `Unsupported` — so the frontend
+                // never special-cases the call.
+                transcribe_ipc::transcription_status,
+                transcribe_ipc::transcription_models_fetch,
+                transcribe_ipc::transcription_start,
+                transcribe_ipc::transcription_cancel,
+                transcribe_ipc::transcription_settings_set,
+                transcribe_ipc::transcript_read,
+                transcribe_ipc::transcript_edit_utterance,
+                transcribe_ipc::transcript_reassign_utterance,
+                transcribe_ipc::transcript_merge_speakers,
+                transcribe_ipc::transcript_rename_speaker,
+                transcribe_ipc::transcript_assign_speaker,
+                transcribe_ipc::voices_people,
+                transcribe_ipc::voices_person_rename,
+                transcribe_ipc::voices_person_delete,
+                transcribe_ipc::voices_person_set_self,
+                transcribe_ipc::voices_people_merge,
+                transcribe_ipc::dictionary_terms,
+                transcribe_ipc::dictionary_term_save,
+                transcribe_ipc::dictionary_term_delete,
+                transcribe_ipc::dictionary_accept_suggestion,
                 ipc::bridge_catalog,
                 ipc::bridge_discover,
                 ipc::bridge_login_start,

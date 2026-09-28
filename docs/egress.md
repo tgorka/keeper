@@ -230,14 +230,45 @@ no embedding, and search is words only. The row above is unchanged and no row is
 
 ## Screen recording adds no egress
 
-Screen recording (the macOS recording phase, Epics 16–20) is fully local: the `keeper-rec`
-capture sidecar and the recording UI contact **no network host**, and there is no upload,
-share-link, transcription, or cloud affordance anywhere in the recording feature — recordings
-only ever land in the local destination folder. The per-release egress inventory diff for the
-recording phase is therefore empty. Like the update endpoint, this is enforced by tests:
-source-scan audits fail the build if a network API ever appears in the sidecar's Swift sources
-(`keeper_rec_sidecar_sources_are_network_free` in the `keeper` crate) or an egress affordance
-in the recording frontend (`zero-egress.test.ts`).
+Screen recording (the macOS recording phase, Epics 16–20) adds no network destination: the
+`keeper-rec` capture sidecar and the recording UI contact **no network host**, and there is no
+upload, share-link, or cloud affordance anywhere in the recording feature — recordings only ever
+land in the local destination folder. A finished recording may be transcribed, on this Mac only
+(D-29, next section). The per-release egress inventory diff for the recording phase is
+therefore empty. Like the update endpoint, this is enforced by tests: source-scan audits fail
+the build if a network API ever appears in the sidecar's Swift sources
+(`keeper_rec_sidecar_sources_are_network_free` in the `keeper` crate) or a network call or an
+upload, share or cloud affordance in the recording frontend (`zero-egress.test.ts`).
+
+## Transcription adds no egress
+
+Epic 87 (D-29, AD-339…AD-350) transcribes recordings and any audio or video file, diarizes the
+speakers and matches them against a voices bank — and it adds **no row** to the table above.
+
+- **The engine runs in keeper's process, on this Mac.** Recognition, diarization and speaker
+  embeddings are FluidAudio on the Neural Engine, through the vendored bridge at
+  `tools/fluidaudio-rs/`. There is no transcription server, no NAS option and no cloud
+  fallback; where the Mac cannot transcribe, nothing is transcribed.
+- **The engine never fetches.** It loads a model set only from `<data_dir>/models/`, and only
+  when every file is present and the set is the one the config repository names now (a
+  completion marker written last by a hydration that placed everything). FluidAudio's own
+  download helpers (which reach Hugging Face) are never called by the bridge.
+- **Models hydrate from the account's config repository**, under `_models/` (git LFS), through
+  keeper's own LFS client, from the settings repository host the organisation account row
+  already lists. Unlike a drive, the LFS endpoint is derived from that remote **only**: a
+  `.lfsconfig` in the config repository is never read, so the repository credential never
+  reaches a host the repository names. The object URLs are the ones that endpoint's batch API
+  returns. Each file is checked against its sha256. Without an account there are no models,
+  and Settings › Transcription says so.
+- **Transcripts, voice clips, embeddings and dictionary terms are files** — beside the media, or
+  in the drive the person marked as keeping voices — and leave the Mac only as that drive's
+  sync already carries its files.
+
+Enforced by `keeper-core/tests/transcription_on_device.rs` (NFR-105): it reads
+`keeper_core::transcription`, the shell's `transcribe*.rs` and the bridge's Swift and Rust off
+disk and fails on any network API token, and on any FluidAudio download entry point in the
+bridge. The config repository hydration (keeper-sync `config_repo`) is the one sanctioned fetch
+and lives outside that set.
 
 ## Voice adds no egress
 

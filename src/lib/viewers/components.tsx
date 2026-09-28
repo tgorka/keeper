@@ -22,6 +22,7 @@
  * called from a render path, and a line per frame is a line nobody reads.
  */
 
+import { TranscriptFileViewer } from "@/components/transcription/transcript-viewer";
 import { DocumentViewer } from "@/components/viewers/document-viewer";
 import { MediaViewer } from "@/components/viewers/media-viewer";
 import { TextFileViewer } from "@/components/viewers/text-file-viewer";
@@ -54,6 +55,7 @@ export const VIEWER_COMPONENTS: Partial<Record<ViewerId, ViewerComponent>> = Obj
   // bounded projection for DOCX, PPTX and XLSX, and degrades to the unknown
   // viewer — with the reason Rust worded — for anything it cannot read.
   document: DocumentViewer,
+  transcript: TranscriptFileViewer,
   unknown: UnknownViewer,
 });
 

@@ -1373,7 +1373,7 @@ pub(crate) fn to_ipc_error(err: CoreError) -> IpcError {
 ///
 /// A join failure means the body panicked or the runtime is shutting down; neither
 /// is retriable, so it funnels through [`to_ipc_error`] as `Internal`.
-async fn off_async_runtime<T, F>(body: F) -> Result<T, IpcError>
+pub(crate) async fn off_async_runtime<T, F>(body: F) -> Result<T, IpcError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -1483,8 +1483,6 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // only a desktop macOS build floats the window controls over the webview and
         // needs the app to supply its own drag region and traffic-light clearance.
         overlay_title_bar: cfg!(all(desktop, target_os = "macos")),
-        // Epic 87: the engine lands on a later rung; until then nothing transcribes.
-        transcription: false,
         // Notes (Story 35.2, FR-122, AD-54): a vault IS a synced folder, so notes
         // cannot be available where folder sync is not. `sync` on every target
         // since Epic 66 (AD-200) — see `notes_available`.
@@ -1535,6 +1533,10 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // Epic 66 flipped `notes_available` on for the phone (AD-201, AD-162):
         // the tools spawn and read a drive the phone does not have.
         bot_tools: mac_folder_capability_of(&git_report(&state), cfg!(desktop)),
+        // On-device transcription (AD-349): the engine's own availability
+        // probe — Apple silicon and macOS ≥ 15 on the Mac, `Unsupported`
+        // everywhere else. The models are a separate state.
+        transcription: crate::transcribe_ipc::transcription_supported(),
     })
 }
 
@@ -5968,6 +5970,18 @@ impl RecordingSink {
             &self.manifest,
             self.sync.as_ref().map(|sync| sync.profile_id.as_str()),
         );
+        // AD-348: a finished session on a drive that keeps voices is queued
+        // for transcription on this Mac. After everything else and off this
+        // task: the hook only checks and enqueues, on the blocking pool, and
+        // a session that cannot be transcribed is a log line, never a
+        // recording failure. A failed session holds nothing worth hearing.
+        if !matches!(self.machine.state(), SessionState::Failed) {
+            crate::transcribe_ipc::after_recording(
+                Arc::clone(&self.platform),
+                self.manifest.folder().to_path_buf(),
+                self.sync.as_ref().map(|sync| sync.profile_id.clone()),
+            );
+        }
     }
 }
 
