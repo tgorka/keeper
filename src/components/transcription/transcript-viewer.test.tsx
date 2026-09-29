@@ -17,6 +17,8 @@ vi.mock("@/lib/ipc/client", () => ({
   transcriptReassignUtterance: vi.fn(),
   transcriptRenameSpeaker: vi.fn(),
   transcriptMergeSpeakers: vi.fn(),
+  transcriptSplitUtterance: vi.fn(),
+  transcriptInsertUtterance: vi.fn(),
   dictionaryAcceptSuggestion: vi.fn(),
   transcriptionStatus: vi.fn(),
 }));
@@ -203,6 +205,110 @@ describe("Transcript corrections", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Create person" }));
     await waitFor(() => expect(transcriptionStore.getState().people.drive).toContainEqual(jo));
+  });
+  it("splits a line at the chosen word and shows the two lines Rust returns", async () => {
+    const split = structuredClone(TRANSCRIPT_FIXTURE);
+    const u2 = split.transcript.utterances[1];
+    split.transcript.utterances.splice(2, 0, {
+      ...u2,
+      id: "u4",
+      text: "keeper release and the dictionary.",
+      asrText: "keeper release and the dictionary.",
+      words: u2.words.slice(3),
+    });
+    Object.assign(u2, { text: "Let’s review the", asrText: "Let’s review the" });
+    u2.words = u2.words.slice(0, 3);
+    vi.mocked(ipc.transcriptSplitUtterance).mockResolvedValue(split);
+    render(<TranscriptViewer path={path} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Split… u2" }));
+    // The first word cannot start the new line: nothing would be left on this one.
+    expect(
+      screen.getByRole("button", { name: "Start the new line at word 1, Let’s" }),
+    ).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Start the new line at word 4, keeper" }));
+    expect(
+      await screen.findByRole("button", { name: "Edit u4: keeper release and the dictionary." }),
+    ).toBeVisible();
+    expect(ipc.transcriptSplitUtterance).toHaveBeenCalledWith(path, "u2", 3);
+    expect(screen.getByRole("button", { name: "Edit u2: Let’s review the" })).toBeVisible();
+    const lines = within(screen.getByRole("list", { name: "Utterances" }))
+      .getAllByRole("button", { name: /^Edit u\d+:/ })
+      .map((line) => line.getAttribute("aria-label")?.split(":")[0]);
+    expect(lines).toEqual(["Edit u1", "Edit u2", "Edit u4", "Edit u3"]);
+    expect(screen.queryByRole("button", { name: /^Start the new line/ })).toBeNull();
+  });
+  it("keeps the split open with Rust's sentence when it is refused", async () => {
+    vi.mocked(ipc.transcriptSplitUtterance).mockRejectedValue({
+      code: "refused",
+      message: "A line splits between two of its words.",
+    });
+    render(<TranscriptViewer path={path} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Split… u1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start the new line at word 2, will" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "A line splits between two of its words.",
+    );
+    expect(
+      screen.getByRole("button", { name: "Start the new line at word 2, will" }),
+    ).toBeEnabled();
+  });
+  it("offers no split on a line with fewer than two words", async () => {
+    const typed = structuredClone(TRANSCRIPT_FIXTURE);
+    typed.transcript.utterances[0].words = [];
+    typed.transcript.utterances[1].words = typed.transcript.utterances[1].words.slice(0, 1);
+    vi.mocked(ipc.transcriptRead).mockResolvedValue(typed);
+    render(<TranscriptViewer path={path} />);
+    await screen.findByRole("button", { name: "Split… u3" });
+    expect(screen.queryByRole("button", { name: "Split… u1" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Split… u2" })).toBeNull();
+  });
+  it("adds a typed line after another for the chosen speaker", async () => {
+    const inserted = structuredClone(TRANSCRIPT_FIXTURE);
+    inserted.transcript.utterances.splice(1, 0, {
+      id: "u4",
+      speaker: "S1",
+      origin: "system",
+      start: 5,
+      end: 5,
+      text: "Sounds good.",
+      asrText: "",
+      edited: true,
+      words: [],
+    });
+    vi.mocked(ipc.transcriptInsertUtterance).mockResolvedValue(inserted);
+    render(<TranscriptViewer path={path} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Add a line after u1" }));
+    const speaker = screen.getByRole("combobox", { name: "Speaker for the line after u1" });
+    // It starts on the line's own speaker, and every speaker is offered.
+    expect(speaker).toHaveDisplayValue("Alex");
+    expect(within(speaker).getAllByRole("option")).toHaveLength(3);
+    const text = screen.getByRole("textbox", { name: "Text of the line after u1" });
+    fireEvent.change(text, { target: { value: "   " } });
+    expect(screen.getByRole("button", { name: "Add line" })).toBeDisabled();
+    fireEvent.change(speaker, { target: { value: "S1" } });
+    fireEvent.change(text, { target: { value: "Sounds good." } });
+    fireEvent.click(screen.getByRole("button", { name: "Add line" }));
+    expect(await screen.findByRole("button", { name: "Edit u4: Sounds good." })).toBeVisible();
+    expect(ipc.transcriptInsertUtterance).toHaveBeenCalledWith(path, "u1", "S1", "Sounds good.");
+    expect(screen.getByRole("combobox", { name: "Speaker for u4" })).toHaveDisplayValue(
+      "Speaker 1",
+    );
+    expect(screen.queryByRole("textbox", { name: "Text of the line after u1" })).toBeNull();
+    // A typed line has no recognised text to reveal.
+    expect(screen.getByText("Added by hand")).toBeVisible();
+    expect(screen.queryByText("Edited · Recognised text")).toBeNull();
+  });
+  it("cancels an added line without saving it", async () => {
+    render(<TranscriptViewer path={path} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Add a line after u3" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Text of the line after u3" }), {
+      target: { value: "Not saved" },
+    });
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Text of the line after u3" }), {
+      key: "Escape",
+    });
+    expect(screen.queryByRole("textbox", { name: "Text of the line after u3" })).toBeNull();
+    expect(ipc.transcriptInsertUtterance).not.toHaveBeenCalled();
   });
 });
 describe("Transcript files", () => {

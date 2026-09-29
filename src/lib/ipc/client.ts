@@ -81,6 +81,21 @@ export function transcriptReassignUtterance(
 ): Promise<TranscriptVm> {
   return invoke("transcript_reassign_utterance", { path, utteranceId, speakerId });
 }
+export function transcriptSplitUtterance(
+  path: string,
+  utteranceId: string,
+  wordIndex: number,
+): Promise<TranscriptVm> {
+  return invoke("transcript_split_utterance", { path, utteranceId, wordIndex });
+}
+export function transcriptInsertUtterance(
+  path: string,
+  afterId: string,
+  speakerId: string,
+  text: string,
+): Promise<TranscriptVm> {
+  return invoke("transcript_insert_utterance", { path, afterId, speakerId, text });
+}
 export function transcriptMergeSpeakers(
   path: string,
   fromId: string,

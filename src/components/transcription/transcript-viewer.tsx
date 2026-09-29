@@ -15,13 +15,16 @@ import {
   type TranscriptVm,
   transcriptAssignSpeaker,
   transcriptEditUtterance,
+  transcriptInsertUtterance,
   transcriptMergeSpeakers,
   transcriptRead,
   transcriptReassignUtterance,
   transcriptRenameSpeaker,
+  transcriptSplitUtterance,
 } from "@/lib/ipc/client";
 import type { DictionarySuggestion } from "@/lib/ipc/gen/DictionarySuggestion";
 import type { Speaker } from "@/lib/ipc/gen/Speaker";
+import type { Utterance } from "@/lib/ipc/gen/Utterance";
 import type { VoicesDriveVm } from "@/lib/ipc/gen/VoicesDriveVm";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import {
@@ -143,6 +146,7 @@ export function TranscriptViewer({
   const [suggestions, setSuggestions] = useState<DictionarySuggestion[]>([]);
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  const [panel, setPanel] = useState<{ id: string; kind: "split" | "insert" } | null>(null);
   const generation = useRef(0);
   const drives = useTranscriptionStore((s) => s.status?.voicesDrives);
   const bank = voicesDriveFor(drives, path, profileId);
@@ -153,6 +157,7 @@ export function TranscriptViewer({
     setVm(null);
     setError(null);
     setEditing(null);
+    setPanel(null);
     setBusy(false);
     setSuggestions([]);
     void refreshTranscription();
@@ -197,6 +202,15 @@ export function TranscriptViewer({
         setEditing(null);
       }
       return result.transcript;
+    });
+  };
+  /** Split and insert: the panel closes on success and stays open with the sentence on a refusal. */
+  const changeLines = (operation: () => Promise<TranscriptVm>) => {
+    const mine = generation.current;
+    return act(async () => {
+      const next = await operation();
+      if (generation.current === mine && next.path === path) setPanel(null);
+      return next;
     });
   };
   const utterances = vm?.transcript.utterances;
@@ -326,12 +340,52 @@ export function TranscriptViewer({
                           </option>
                         ))}
                       </select>
-                      {utterance.edited && (
+                      {utterance.edited && utterance.asrText ? (
                         <details className="text-muted-foreground text-xs">
                           <summary>Edited · Recognised text</summary>
                           <p className="whitespace-pre-wrap break-words">{utterance.asrText}</p>
                         </details>
+                      ) : (
+                        utterance.edited && (
+                          <span className="text-muted-foreground text-xs">Added by hand</span>
+                        )
                       )}
+                      <div className="ml-auto flex flex-wrap gap-1">
+                        {utterance.words.length > 1 && (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            aria-label={`Split… ${utterance.id}`}
+                            aria-expanded={panel?.id === utterance.id && panel.kind === "split"}
+                            disabled={busy}
+                            onClick={() =>
+                              setPanel((open) =>
+                                open?.id === utterance.id && open.kind === "split"
+                                  ? null
+                                  : { id: utterance.id, kind: "split" },
+                              )
+                            }
+                          >
+                            Split…
+                          </Button>
+                        )}
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          aria-label={`Add a line after ${utterance.id}`}
+                          aria-expanded={panel?.id === utterance.id && panel.kind === "insert"}
+                          disabled={busy}
+                          onClick={() =>
+                            setPanel((open) =>
+                              open?.id === utterance.id && open.kind === "insert"
+                                ? null
+                                : { id: utterance.id, kind: "insert" },
+                            )
+                          }
+                        >
+                          Add a line after
+                        </Button>
+                      </div>
                     </div>
                     {editing === utterance.id ? (
                       <div className="space-y-2">
@@ -382,6 +436,31 @@ export function TranscriptViewer({
                       >
                         {utterance.text}
                       </button>
+                    )}
+                    {panel?.id === utterance.id && panel.kind === "split" && (
+                      <SplitPanel
+                        utterance={utterance}
+                        busy={busy}
+                        onSplit={(wordIndex) =>
+                          void changeLines(() =>
+                            transcriptSplitUtterance(path, utterance.id, wordIndex),
+                          )
+                        }
+                        onCancel={() => setPanel(null)}
+                      />
+                    )}
+                    {panel?.id === utterance.id && panel.kind === "insert" && (
+                      <InsertPanel
+                        utterance={utterance}
+                        speakers={vm.transcript.speakers}
+                        busy={busy}
+                        onInsert={(speakerId, text) =>
+                          void changeLines(() =>
+                            transcriptInsertUtterance(path, utterance.id, speakerId, text),
+                          )
+                        }
+                        onCancel={() => setPanel(null)}
+                      />
                     )}
                   </li>
                 );
@@ -517,5 +596,101 @@ function SpeakerRow({
         </form>
       )}
     </div>
+  );
+}
+/** The words a line can split before: every one but the first, since a new line needs words on both sides. */
+function SplitPanel({
+  utterance,
+  busy,
+  onSplit,
+  onCancel,
+}: {
+  utterance: Utterance;
+  busy: boolean;
+  onSplit: (wordIndex: number) => void;
+  onCancel: () => void;
+}) {
+  return (
+    <fieldset className="mt-2 min-w-0 space-y-2 rounded-md border p-2">
+      <legend className="px-1 text-muted-foreground text-xs">
+        Choose the word the new line starts with
+      </legend>
+      <div className="flex flex-wrap gap-1">
+        {utterance.words.map((word, index) => (
+          <Button
+            // biome-ignore lint/suspicious/noArrayIndexKey: words repeat; their position in the line is their identity
+            key={index}
+            size="sm"
+            variant="outline"
+            aria-label={`Start the new line at word ${index + 1}, ${word.text}`}
+            disabled={busy || index === 0}
+            onClick={() => onSplit(index)}
+          >
+            {word.text}
+          </Button>
+        ))}
+      </div>
+      <Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>
+        Cancel split
+      </Button>
+    </fieldset>
+  );
+}
+function InsertPanel({
+  utterance,
+  speakers,
+  busy,
+  onInsert,
+  onCancel,
+}: {
+  utterance: Utterance;
+  speakers: readonly Speaker[];
+  busy: boolean;
+  onInsert: (speakerId: string, text: string) => void;
+  onCancel: () => void;
+}) {
+  const [speakerId, setSpeakerId] = useState(utterance.speaker);
+  const [text, setText] = useState("");
+  return (
+    <form
+      className="mt-2 flex min-w-0 flex-wrap gap-2 rounded-md border p-2"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (text.trim()) onInsert(speakerId, text);
+      }}
+    >
+      <select
+        aria-label={`Speaker for the line after ${utterance.id}`}
+        className={`${TRANSCRIPTION_SELECT} max-w-48`}
+        value={speakerId}
+        disabled={busy}
+        onChange={(event) => setSpeakerId(event.target.value)}
+      >
+        {speakers.map((s) => (
+          <option key={s.id} value={s.id}>
+            {speakerName(s)}
+          </option>
+        ))}
+      </select>
+      <Input
+        aria-label={`Text of the line after ${utterance.id}`}
+        className="min-w-0 flex-1 basis-48"
+        value={text}
+        disabled={busy}
+        onChange={(event) => setText(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            onCancel();
+          }
+        }}
+      />
+      <Button type="submit" size="sm" disabled={busy || !text.trim()}>
+        Add line
+      </Button>
+      <Button type="button" size="sm" variant="ghost" onClick={onCancel}>
+        Cancel
+      </Button>
+    </form>
   );
 }

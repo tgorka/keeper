@@ -27,9 +27,10 @@ fn status_word(status: MatchStatus) -> &'static str {
     }
 }
 
-/// The transcript as markdown: title, date, duration, a speaker legend, one
-/// `**[hh:mm:ss] Name:** text` paragraph per utterance, and a footer naming
-/// the models.
+/// The transcript as markdown: title, date, duration, a speaker legend (the
+/// speakers with at least one line — one left lineless by a move is kept in
+/// the JSON only so the move can be undone), one `**[hh:mm:ss] Name:** text`
+/// paragraph per utterance, and a footer naming the models.
 pub fn markdown(t: &Transcript) -> String {
     let mut out = String::new();
     let title = t
@@ -44,7 +45,11 @@ pub fn markdown(t: &Transcript) -> String {
     let _ = writeln!(out, "- Language: {}\n", t.language.as_wire());
 
     out.push_str("## Speakers\n\n");
-    for speaker in &t.speakers {
+    for speaker in t
+        .speakers
+        .iter()
+        .filter(|speaker| t.utterances.iter().any(|u| u.speaker == speaker.id))
+    {
         let _ = write!(
             out,
             "- **{}** ({}, {}",
@@ -127,6 +132,16 @@ mod tests {
         assert!(lines
             .last()
             .is_some_and(|line| line.starts_with("Transcribed on this Mac with parakeet")));
+        let mut moved = t.clone();
+        for utterance in moved.utterances.iter_mut().filter(|u| u.speaker == "S1") {
+            "ME".clone_into(&mut utterance.speaker);
+        }
+        let md = markdown(&moved);
+        assert!(
+            !md.contains("(S1,"),
+            "a speaker without a line is not in the legend: {md}"
+        );
+        assert!(md.contains("- **You** (ME, microphone)"), "{md}");
         t.source.title = Some("2026-09-23 17.29 kelly-sync".to_owned());
         assert_eq!(
             markdown(&t).lines().next(),

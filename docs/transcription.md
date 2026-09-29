@@ -30,6 +30,11 @@ leaves it for this, there is no transcription server, no NAS option and no cloud
   English, Polish — `transcription.language`); *Transcribe after recording*
   (`transcription.after_recording`, on by default); for each drive that keeps voices, its people
   (rename, mark as me, merge, delete) and its dictionary; and *Transcribe a file…*.
+- **Recording › Transcribe a File…** in the menu bar, the ⌘K palette and the ⌘? cheat sheet
+  (registry id `transcription-transcribe-file`): the same native file picker as Settings ›
+  Transcription, for any media file on this Mac. It exists only where transcription runs (the
+  same probe as the Settings pane); its job shows progress in a toast that offers *Open
+  transcript* when done. A file already in a drive is transcribed from its Files row.
 - **Settings › Sync, a folder's form:** *This folder keeps voices* and its subfolder (default
   `voices`), like a recordings folder. A drive that keeps voices is a *transcribing drive*.
   The owner's tgdrive and neuradrive use `70-comms/voices`.
@@ -46,9 +51,9 @@ leaves it for this, there is no transcription server, no NAS option and no cloud
 - **Recording:** see `docs/recording.md` § *Transcription* — after-recording transcription,
   and the microphone track as you.
 - **The transcript viewer:** speakers with how each was matched and the candidates; assign a
-  speaker to a person (existing or new), rename or merge speakers; each line editable, and
-  reassignable to another speaker; dictionary suggestions after an edit; progress while a job
-  runs.
+  speaker to a person (existing or new), rename or merge speakers; each line editable,
+  reassignable to another speaker, splittable in two, and followed by a line you add;
+  dictionary suggestions after an edit; progress while a job runs.
 
 ## Models live in the config repository
 
@@ -134,8 +139,11 @@ diarizer's own `Embedding.mlmodelc`, so a diarizer change is an embedding-model 
 
 ## The voices bank
 
-A drive keeps voices in `<drive>/<voices subfolder>/`. Every fact is its own file, so two
-devices adding at once sync as a union, never as a conflict:
+A drive keeps voices in `<drive>/<voices subfolder>/` (the owner's drives:
+`70-comms/voices/`). This folder is everything keeper knows about who someone is — the people,
+their voice clips, the embeddings recognised against, the dictionary and the tombstones; the
+transcripts only point at it. Every fact is its own file, so two devices adding at once sync as a
+union, never as a conflict:
 
 ```text
 <voices subfolder>/
@@ -194,11 +202,13 @@ Beside the media:
   `call.m4a` never share one.
 
 The JSON is the source of truth; the markdown is re-rendered from it on every save — a title,
-the date and duration, a speaker legend, one `**[hh:mm:ss] Name:** text` line per utterance, and
-a footer naming the models. Transcribing again over a transcript nobody has touched replaces it.
-Over one anyone has corrected — an edited line, a confirmed speaker, a reassigned line, a merge
-or a rename — it is refused with a sentence: delete or rename the transcript first. The check
-runs again just before the job writes, so a correction made while it ran is kept.
+the date and duration, a speaker legend (only the speakers with at least one line, as in the
+viewer), one `**[hh:mm:ss] Name:** text` line per utterance, and a footer naming the models.
+Transcribing again over a transcript nobody has touched replaces it.
+Over one anyone has corrected — an edited line, a confirmed speaker, a reassigned line, a merge,
+a rename, a split or an added line — it is refused with a sentence: delete or rename the
+transcript first.
+The check runs again just before the job writes, so a correction made while it ran is kept.
 
 The JSON (camelCase, pretty-printed, `version` 1; a file from a newer keeper is refused):
 
@@ -216,10 +226,16 @@ The JSON (camelCase, pretty-printed, `version` 1; a file from a newer keeper is 
 - `corrected` — true once any correction was made.
 
 Utterances break on a change of speaker, a silence over 1.5 s, or 40 words. A recording's
-microphone track is transcribed on its own as `ME`. A microphone line is dropped as echo only
-when it has at least four words, one system line covers at least half its time, and the system
-speech around it says at least 60% of its words in the same order; a short reply, or one that
-reuses the far end's words in another order, is kept. Other files mix every audio track and
+microphone track is transcribed on its own and diarized like the system track, because
+sometimes two people, rarely more, share the microphone. Its voice that matches the bank's
+`self` person (cosine ≥ 0.50) is `ME`; with no `self` person, or none matching, the voice that
+talks longest is. Every other voice on the microphone is an ordinary numbered speaker (`S1`,
+`S2`…, numbered with the call's by first appearance) with `origin` `microphone`, matched against
+the bank like any speaker. `ME` carries its voice's embedding. A microphone line — `ME`'s or
+another voice's — is dropped as echo only when it has at least four words, one system line
+covers at least half its time, and the system speech around it says at least 60% of its words
+in the same order; a short reply, or one that reuses the far end's words in another order, is
+kept. A voice left with no line after that is no speaker. Other files mix every audio track and
 diarize them all.
 
 ## Corrections
@@ -232,10 +248,24 @@ In the viewer:
   this transcript only — the transcript changes, the bank does not. A speaker left with no lines
   stays in the transcript, hidden from the legend and still offered as a target, so the move
   can be undone. A line heard on your microphone cannot move to a voice from the call, or back,
-  and those two speakers cannot be merged.
+  and those two speakers cannot be merged; voices on the microphone can be merged and lines
+  moved among them.
+- **Split a line** before one of its words — the words before stay, the rest become a new line
+  right after it, same speaker and track, each half timed and worded from its words. An
+  untouched line's `asrText` is cut at the same word; an edited one (or one where the dictionary
+  joined words) keeps its whole `asrText` on the first half. A line splits only between two of
+  its words.
+- **Add a line after** another — a speaker and text the recogniser missed. It starts and ends
+  where the line before it ends (never past the next line's start), is `edited`, and has no
+  `asrText` and no words. New lines get the next unused `u<n>` id.
 - **Assign a speaker to a person** (existing, or new by name) — the speaker becomes
   `confirmed`, and the bank gains that speaker's clip and embedding. This is the one correction
-  that teaches keeper a voice.
+  that teaches keeper a voice. The clip is cut from the assigned speaker's own lines. When
+  another speaker heard on the same track, with lines of its own, already names that person,
+  the two are one voice: the assigned speaker's lines move to it and it is the one confirmed,
+  so a person appears once in the legend. The microphone and the call stay two speakers even
+  when they name the same person. Confirming `ME` (and only `ME`, not another voice on the
+  microphone) marks the person as me when the bank has no one marked yet.
 
 Assignment needs a drive that keeps voices: the drive holding the media if it keeps voices,
 otherwise the first enabled one. With none, speakers stay unknown and assignment says why.

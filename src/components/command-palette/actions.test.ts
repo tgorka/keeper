@@ -147,6 +147,32 @@ describe("the tasks palette verb (Epic 57, FR-351, FR-352)", () => {
   });
 });
 
+describe("the Transcribe a File… verb", () => {
+  /**
+   * The registry entry and its handler are joined only by the id string, and
+   * the gate is the id's membership in `TRANSCRIPTION_ACTION_IDS` — the list
+   * `query` and `registry_sections` drop when the shell's transcription probe
+   * says no. keeper-core's tests prove that list is honoured on all three
+   * surfaces; this proves the id they gate is the one dispatched here.
+   */
+  it("is registered in the Rust registry, gated on transcription, and dispatched here", () => {
+    const palette = readFileSync(
+      resolve(import.meta.dirname, "../../../src-tauri/crates/keeper-core/src/palette.rs"),
+      "utf8",
+    );
+    expect(palette).toContain(
+      'pub const TRANSCRIPTION_TRANSCRIBE_FILE_ID: &str = "transcription-transcribe-file";',
+    );
+    expect(palette).toMatch(
+      /const TRANSCRIPTION_ACTION_IDS: &\[&str\] = &\[TRANSCRIPTION_TRANSCRIBE_FILE_ID\];/,
+    );
+    expect(
+      paletteActionHandlers["transcription-transcribe-file"],
+      "handler for transcription-transcribe-file",
+    ).toBeTypeOf("function");
+  });
+});
+
 describe("open-search on the phone tier (Story 66.1, DW-111)", () => {
   /** A viewport-only phone: matchMedia says narrow, the capabilities say nothing. */
   function mockViewport(phone: boolean) {

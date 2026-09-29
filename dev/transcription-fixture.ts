@@ -6,7 +6,19 @@ import type {
   TranscriptionStatusVm,
   TranscriptVm,
 } from "@/lib/ipc/client";
+import type { Word } from "@/lib/ipc/gen/Word";
 
+/** A line's words spread evenly over its time, as the recognizer would time them. */
+function timed(text: string, start: number, end: number): Word[] {
+  const tokens = text.split(/\s+/).filter(Boolean);
+  const step = (end - start) / tokens.length;
+  return tokens.map((token, i) => ({
+    text: token,
+    start: start + i * step,
+    end: start + (i + 1) * step,
+    confidence: 0.9,
+  }));
+}
 export const TRANSCRIPT_FIXTURE: TranscriptVm = {
   path: "/Volumes/merope/tgdrive/meeting.mov.transcript.json",
   people: [
@@ -88,7 +100,7 @@ export const TRANSCRIPT_FIXTURE: TranscriptVm = {
         text: "Kowalsky will join us today.",
         asrText: "Kowalsky will join us today.",
         edited: false,
-        words: [],
+        words: timed("Kowalsky will join us today.", 0, 5),
       },
       {
         id: "u2",
@@ -99,7 +111,7 @@ export const TRANSCRIPT_FIXTURE: TranscriptVm = {
         text: "Let’s review the keeper release and the dictionary.",
         asrText: "Let’s review the keeper release and the dictionary.",
         edited: false,
-        words: [],
+        words: timed("Let’s review the keeper release and the dictionary.", 6, 14),
       },
       {
         id: "u3",
@@ -110,7 +122,7 @@ export const TRANSCRIPT_FIXTURE: TranscriptVm = {
         text: "The recordings and voices stay in our drive.",
         asrText: "The recordings and voices stay in our drive.",
         edited: false,
-        words: [],
+        words: timed("The recordings and voices stay in our drive.", 15, 24),
       },
     ],
     dictionaryApplied: [],
@@ -214,6 +226,9 @@ export function transcriptionMockHandlers(
         "A line heard on your microphone cannot move to a voice from the call, or back.",
       );
   };
+  // `u<highest numeric suffix + 1>`, as Rust numbers them, so an id is never reused.
+  const nextUtteranceId = (vm: TranscriptVm) =>
+    `u${Math.max(0, ...vm.transcript.utterances.map((u) => Number(u.id.slice(1)) || 0)) + 1}`;
   return {
     transcription_status: () => {
       status.voicesDrives = params.has("noVoices")
@@ -304,6 +319,7 @@ export function transcriptionMockHandlers(
       const before = u?.text ?? "";
       if (u) {
         u.text = String(p.text);
+        u.words = timed(u.text, u.start, u.end);
         u.edited = true;
         vm.transcript.corrected = true;
       }
@@ -325,6 +341,65 @@ export function transcriptionMockHandlers(
         u.speaker = String(p.speakerId);
         vm.transcript.corrected = true;
       }
+      return structuredClone(vm);
+    },
+    transcript_split_utterance: (p) => {
+      const vm = read(p);
+      const utterances = vm.transcript.utterances;
+      const at = utterances.findIndex((u) => u.id === p.utteranceId);
+      const u = utterances[at];
+      if (!u) throw new Error(`That line is no longer in the transcript (${p.utteranceId}).`);
+      const index = Number(p.wordIndex);
+      if (!Number.isInteger(index) || index < 1 || index >= u.words.length)
+        throw new Error("A line splits between two of its words.");
+      const head = u.words.slice(0, index);
+      const tail = u.words.slice(index);
+      const join = (words: Word[]) => words.map((w) => w.text).join(" ");
+      const asr = u.asrText.split(/\s+/).filter(Boolean);
+      const second = {
+        ...u,
+        id: nextUtteranceId(vm),
+        start: tail[0].start,
+        end: tail[tail.length - 1].end,
+        text: join(tail),
+        asrText: u.edited ? join(tail) : asr.slice(index).join(" "),
+        words: tail,
+      };
+      Object.assign(u, {
+        end: head[head.length - 1].end,
+        text: join(head),
+        asrText: u.edited ? u.asrText : asr.slice(0, index).join(" "),
+        words: head,
+      });
+      utterances.splice(at + 1, 0, second);
+      vm.transcript.corrected = true;
+      return structuredClone(vm);
+    },
+    transcript_insert_utterance: (p) => {
+      const vm = read(p);
+      const utterances = vm.transcript.utterances;
+      const at = utterances.findIndex((u) => u.id === p.afterId);
+      const after = utterances[at];
+      if (!after) throw new Error(`That line is no longer in the transcript (${p.afterId}).`);
+      const speaker = vm.transcript.speakers.find((s) => s.id === p.speakerId);
+      if (!speaker)
+        throw new Error(`That speaker is no longer in the transcript (${p.speakerId}).`);
+      const text = String(p.text).trim();
+      if (!text) throw new Error("A line cannot be emptied; reassign it instead.");
+      const next = utterances[at + 1];
+      const time = next ? Math.min(after.end, next.start) : after.end;
+      utterances.splice(at + 1, 0, {
+        id: nextUtteranceId(vm),
+        speaker: speaker.id,
+        origin: speaker.origin,
+        start: time,
+        end: time,
+        text,
+        asrText: "",
+        edited: true,
+        words: [],
+      });
+      vm.transcript.corrected = true;
       return structuredClone(vm);
     },
     transcript_rename_speaker: (p) => {
@@ -363,11 +438,25 @@ export function transcriptionMockHandlers(
       }
       const speaker = vm.transcript.speakers.find((s) => s.id === p.speakerId);
       if (speaker && person) {
-        speaker.personId = person.id;
-        speaker.name = person.name;
-        speaker.status = "confirmed";
         vm.transcript.corrected = true;
         person.samples++;
+        // One person on one track is one speaker: a same-origin speaker that
+        // already carries them and has lines takes this one's lines, and this
+        // one stays behind, lineless and unchanged, so the move can be undone.
+        const into = vm.transcript.speakers.find(
+          (s) =>
+            s !== speaker &&
+            s.personId === person.id &&
+            s.origin === speaker.origin &&
+            vm.transcript.utterances.some((u) => u.speaker === s.id),
+        );
+        const confirmed = into ?? speaker;
+        confirmed.personId = person.id;
+        confirmed.name = person.name;
+        confirmed.status = "confirmed";
+        if (into)
+          for (const u of vm.transcript.utterances)
+            if (u.speaker === speaker.id) u.speaker = into.id;
       }
       vm.people = structuredClone(people);
       return structuredClone(vm);

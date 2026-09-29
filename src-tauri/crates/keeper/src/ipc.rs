@@ -4208,13 +4208,26 @@ pub async fn palette_query(
     // desktop build with folder sync off still has a Bots pane. The voice gate
     // is `voice_availability`'s one answer, read as the tray reads it
     // (AD-179), so a listening toggle is never offered where nothing listens.
+    // The transcription gate is the probe `capabilities` fills
+    // `transcription` from, so "Transcribe a File…" exists only where the
+    // speech engine runs.
     let recording = crate::macos_version::recording_supported();
     let notes = notes_available(&state);
     let bots = cfg!(desktop) || cfg!(mobile);
     let voice = crate::voice_ipc::port_present();
+    let transcription = crate::transcribe_ipc::transcription_supported();
     Ok(state
         .accounts
-        .palette_query(&query, mode, open_chat, recording, notes, bots, voice)
+        .palette_query(
+            &query,
+            mode,
+            open_chat,
+            recording,
+            notes,
+            bots,
+            voice,
+            transcription,
+        )
         .await)
 }
 
@@ -4234,12 +4247,13 @@ pub fn cheat_sheet_sections(state: State<'_, AppState>) -> Result<Vec<MenuSectio
     // reach the palette, the ⌘? sheet, the native menu bar and the tray, so the
     // four cannot drift (UX-DR42). The bots gate is its own (Epic 61, FR-384) and
     // is spelled the way `capabilities` spells it; the voice gate is the tray's
-    // (Epic 68, AD-218).
+    // (Epic 68, AD-218); the transcription gate is `capabilities`' own probe.
     Ok(keeper_core::palette::registry_sections(
         crate::macos_version::recording_supported(),
         notes_available(&state),
         cfg!(desktop) || cfg!(mobile),
         crate::voice_ipc::port_present(),
+        crate::transcribe_ipc::transcription_supported(),
     ))
 }
 

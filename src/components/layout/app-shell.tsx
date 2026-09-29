@@ -24,6 +24,7 @@ import { SearchOverlay } from "@/components/search/search-overlay";
 import { SessionsPane } from "@/components/sessions/sessions-pane";
 import { DeviceVerificationDialog } from "@/components/settings/device-verification-dialog";
 import { KeyBackupDialog } from "@/components/settings/key-backup-dialog";
+import { TranscribeAFileHost } from "@/components/transcription/transcribe-a-file";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAccountStatuses } from "@/hooks/use-account-statuses";
@@ -512,6 +513,7 @@ export function AppShell() {
       <SearchOverlay />
       <ExportDialog />
       <NewChatDialog />
+      <TranscribeAFileHost />
       <CommandPalette />
       {nativeMenuBar && <CheatSheetOverlay />}
 

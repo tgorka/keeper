@@ -8,9 +8,9 @@
 use super::assemble::refresh_clips;
 use super::bank::Person;
 use super::dictionary::{suggestions, DictionarySuggestion};
-use super::model::{MatchStatus, Transcript};
+use super::model::{MatchStatus, Transcript, Utterance};
 use super::plan::TrackOrigin;
-use super::words::Word;
+use super::words::{join_words, Word};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CorrectionError {
@@ -24,6 +24,8 @@ pub enum CorrectionError {
     EmptyText,
     #[error("A line heard on your microphone cannot move to a voice from the call, or back.")]
     CrossOrigin,
+    #[error("A line splits between two of its words.")]
+    SplitPoint,
 }
 
 fn utterance_index(t: &Transcript, id: &str) -> Result<usize, CorrectionError> {
@@ -134,14 +136,34 @@ pub fn merge_speakers(
     Ok(t)
 }
 
-/// A person confirmed who a speaker is.
+/// A person confirmed who a speaker is. When another speaker heard on the
+/// same track, with lines of its own, already names that person, the two
+/// are one voice: this speaker's lines move to that one
+/// ([`merge_speakers`]) and that one is confirmed. A voice from the
+/// microphone and one from the call stay two speakers even when they name
+/// the same person.
 pub fn assign_speaker(
     mut t: Transcript,
     speaker: &str,
     person: &Person,
 ) -> Result<Transcript, CorrectionError> {
     let index = speaker_index(&t, speaker)?;
-    let entry = &mut t.speakers[index];
+    let origin = t.speakers[index].origin;
+    let same_person = t.speakers.iter().position(|other| {
+        other.id != speaker
+            && other.origin == origin
+            && other.person_id.as_deref() == Some(person.id.as_str())
+            && t.utterances.iter().any(|u| u.speaker == other.id)
+    });
+    let target = match same_person {
+        Some(target) => {
+            let into = t.speakers[target].id.clone();
+            t = merge_speakers(t, speaker, &into)?;
+            target
+        }
+        None => index,
+    };
+    let entry = &mut t.speakers[target];
     entry.person_id = Some(person.id.clone());
     entry.name = Some(person.name.clone());
     entry.status = MatchStatus::Confirmed;
@@ -161,6 +183,113 @@ pub fn rename_speaker_label(
     t.speakers[index].name = (!name.is_empty()).then(|| name.to_owned());
     t.corrected = true;
     Ok(t)
+}
+
+/// Cut a line in two before its `word_index`th word: the words before stay,
+/// the rest become a new line right after it — same speaker, same track.
+/// Each half takes its times from its words and its text from its words
+/// re-joined. An untouched line's `asrText` is cut at the same word when
+/// the recognizer's words are the line's words one for one; otherwise (an
+/// edit, or a dictionary term that joined words) the whole `asrText` stays
+/// on the first half and the second half's is its own text. Answers the
+/// new line's id.
+pub fn split_utterance(
+    mut t: Transcript,
+    utterance_id: &str,
+    word_index: usize,
+) -> Result<(Transcript, String), CorrectionError> {
+    let index = utterance_index(&t, utterance_id)?;
+    let id = next_utterance_id(&t);
+    let first = &mut t.utterances[index];
+    if word_index == 0 || word_index >= first.words.len() {
+        return Err(CorrectionError::SplitPoint);
+    }
+    let words = first.words.split_off(word_index);
+    let text = join_words(&words);
+    let asr_split = {
+        let tokens: Vec<&str> = first.asr_text.split_whitespace().collect();
+        (!first.edited && tokens.len() == word_index + words.len()).then(|| {
+            (
+                tokens[..word_index].join(" "),
+                tokens[word_index..].join(" "),
+            )
+        })
+    };
+    let asr_text = match asr_split {
+        Some((kept, moved)) => {
+            first.asr_text = kept;
+            moved
+        }
+        None => text.clone(),
+    };
+    first.start = first.words[0].start;
+    first.end = first.words[word_index - 1].end;
+    first.text = join_words(&first.words);
+    let second = Utterance {
+        id: id.clone(),
+        speaker: first.speaker.clone(),
+        origin: first.origin,
+        start: words[0].start,
+        end: words[words.len() - 1].end,
+        text,
+        asr_text,
+        edited: first.edited,
+        words,
+    };
+    t.utterances.insert(index + 1, second);
+    settle(&mut t);
+    Ok((t, id))
+}
+
+/// A line the recognizer missed, said by `speaker_id`, right after
+/// `after_id`: it starts and ends where that line ends (never past the start
+/// of the line after it) and has no words and no `asrText` — nothing was
+/// heard. Answers the new line's id.
+pub fn insert_utterance_after(
+    mut t: Transcript,
+    after_id: &str,
+    speaker_id: &str,
+    text: &str,
+) -> Result<(Transcript, String), CorrectionError> {
+    let index = utterance_index(&t, after_id)?;
+    let speaker = speaker_index(&t, speaker_id)?;
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Err(CorrectionError::EmptyText);
+    }
+    let at = t
+        .utterances
+        .get(index + 1)
+        .map_or(t.utterances[index].end, |next| {
+            t.utterances[index].end.min(next.start)
+        });
+    let line = Utterance {
+        id: next_utterance_id(&t),
+        speaker: speaker_id.to_owned(),
+        origin: t.speakers[speaker].origin,
+        start: at,
+        end: at,
+        text: tokens.join(" "),
+        asr_text: String::new(),
+        edited: true,
+        words: Vec::new(),
+    };
+    let id = line.id.clone();
+    t.utterances.insert(index + 1, line);
+    settle(&mut t);
+    Ok((t, id))
+}
+
+/// `u<n>` one past the highest `u<n>` in the transcript, so an id is never
+/// given to two lines.
+fn next_utterance_id(t: &Transcript) -> String {
+    let highest = t
+        .utterances
+        .iter()
+        .filter_map(|utterance| utterance.id.strip_prefix('u')?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("u{}", highest + 1)
 }
 
 /// After lines moved: re-pick every clip — the lines a clip came from may
@@ -283,7 +412,7 @@ mod tests {
         let fresh = transcript();
         assert!(!fresh.corrected);
         let ada = person("A", "Ada", false, "");
-        let corrections: [Transcript; 5] = [
+        let corrections: [Transcript; 7] = [
             edit_utterance(fresh.clone(), "u1", "hello")
                 .expect("edit")
                 .0,
@@ -291,6 +420,10 @@ mod tests {
             merge_speakers(fresh.clone(), "S2", "S1").expect("merge"),
             assign_speaker(fresh.clone(), "S1", &ada).expect("assign"),
             rename_speaker_label(fresh.clone(), "S1", "Bo").expect("rename"),
+            split_utterance(fresh.clone(), "u1", 1).expect("split").0,
+            insert_utterance_after(fresh.clone(), "u1", "S1", "hm")
+                .expect("insert")
+                .0,
         ];
         for (index, t) in corrections.iter().enumerate() {
             assert!(t.corrected, "correction {index}");
@@ -406,5 +539,178 @@ mod tests {
             .speaker("S2")
             .and_then(|s| s.embedding.clone())
             .is_some());
+    }
+
+    #[test]
+    fn confirming_a_second_voice_as_a_person_already_named_merges_it() {
+        let ada = person("A", "Ada", false, "");
+        let t = assign_speaker(transcript(), "S1", &ada).expect("assign S1");
+        let t = assign_speaker(t, "S2", &ada).expect("assign S2");
+        assert!(
+            t.utterances.iter().all(|u| u.speaker == "S1"),
+            "S2's lines joined S1"
+        );
+        let s1 = t.speaker("S1").expect("S1 survives");
+        assert_eq!(
+            (s1.status, s1.person_id.as_deref()),
+            (MatchStatus::Confirmed, Some("A"))
+        );
+        assert!(
+            t.speaker("S2").is_some(),
+            "kept, lineless, so it can be undone"
+        );
+        let md = crate::transcription::render::markdown(&t);
+        assert!(!md.contains("(S2,"), "one legend row for Ada: {md}");
+
+        // A lineless speaker naming the same person does not take the lines.
+        let mut t = t;
+        t.speakers
+            .iter_mut()
+            .find(|s| s.id == "S2")
+            .expect("S2")
+            .person_id = Some("A".to_owned());
+        let t = assign_speaker(t, "S1", &ada).expect("again");
+        assert!(t.utterances.iter().all(|u| u.speaker == "S1"));
+    }
+
+    #[test]
+    fn the_microphone_and_the_call_stay_two_speakers_for_one_person() {
+        let ada = person("A", "Ada", false, "");
+        let t = assign_speaker(call_and_mic(), "ME", &ada).expect("assign ME");
+        let t = assign_speaker(t, "S1", &ada).expect("assign S1");
+        assert!(t.utterances.iter().any(|u| u.speaker == "ME"));
+        assert!(t.utterances.iter().any(|u| u.speaker == "S1"));
+        assert_eq!(
+            t.speaker("S1").map(|s| s.status),
+            Some(MatchStatus::Confirmed)
+        );
+    }
+
+    #[test]
+    fn a_split_cuts_words_times_and_what_was_heard_at_one_word() {
+        let (t, id) = split_utterance(transcript(), "u1", 2).expect("split");
+        assert_eq!(id, "u3", "one past the highest id");
+        let (first, second) = (&t.utterances[0], &t.utterances[1]);
+        assert_eq!((first.id.as_str(), first.text.as_str()), ("u1", "we met"));
+        assert_eq!(first.asr_text, "we met");
+        assert_eq!((first.start, first.end), (0.0, 0.9));
+        assert_eq!(
+            (second.id.as_str(), second.speaker.as_str(), second.origin),
+            ("u3", "S1", first.origin)
+        );
+        assert_eq!(second.text, "tom gorker today");
+        assert_eq!(second.asr_text, "tom gorker today");
+        assert_eq!((second.start, second.end), (1.0, 2.4));
+        assert_eq!(second.words.len(), 3);
+        assert!(!second.edited && t.corrected);
+        assert_eq!(t.utterances[2].id, "u2", "the new line sits right after");
+
+        let (t, id) = split_utterance(t, "u3", 1).expect("again");
+        assert_eq!(id, "u4", "an id is never given twice");
+        assert_eq!(
+            split_utterance(t, "u9", 1),
+            Err(CorrectionError::UnknownUtterance("u9".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_split_happens_only_between_two_words() {
+        let t = transcript();
+        let words = t.utterances[0].words.len();
+        assert_eq!(
+            split_utterance(t.clone(), "u1", 0),
+            Err(CorrectionError::SplitPoint)
+        );
+        assert_eq!(
+            split_utterance(t.clone(), "u1", words),
+            Err(CorrectionError::SplitPoint)
+        );
+        let (t, _) = split_utterance(t, "u1", words - 1).expect("before the last word");
+        assert_eq!(t.utterances[1].text, "today");
+    }
+
+    #[test]
+    fn a_split_keeps_what_was_heard_whole_when_words_no_longer_match_it() {
+        let (edited, _) =
+            edit_utterance(transcript(), "u1", "We met Tom Gorka today.").expect("edit");
+        let (t, _) = split_utterance(edited, "u1", 2).expect("split");
+        assert_eq!(t.utterances[0].text, "We met");
+        assert_eq!(t.utterances[0].asr_text, "we met tom gorker today");
+        assert_eq!(t.utterances[1].text, "Tom Gorka today.");
+        assert_eq!(t.utterances[1].asr_text, "Tom Gorka today.");
+        assert!(t.utterances[1].edited);
+
+        // The dictionary joined two heard words into one: the counts differ.
+        let term = crate::transcription::bank::DictionaryTerm {
+            version: 1,
+            id: "T".to_owned(),
+            text: "Tom Gorka".to_owned(),
+            aliases: vec!["tom gorker".to_owned()],
+            created_at: String::new(),
+        };
+        let joined = assemble(
+            &[PartResult {
+                offset: 0.0,
+                origin: TrackOrigin::Mixed,
+                asr: asr("we met tom gorker today", 0.0, 0.5),
+                diar: None,
+            }],
+            None,
+            &[term],
+            ctx(&[]),
+        );
+        assert_eq!(joined.utterances[0].text, "we met Tom Gorka today");
+        let (t, _) = split_utterance(joined, "u1", 3).expect("split");
+        assert_eq!(t.utterances[0].text, "we met Tom Gorka");
+        assert_eq!(t.utterances[0].asr_text, "we met tom gorker today");
+        assert_eq!(t.utterances[1].asr_text, "today");
+    }
+
+    #[test]
+    fn an_added_line_sits_after_its_neighbour_and_was_never_heard() {
+        let (t, id) =
+            insert_utterance_after(transcript(), "u1", "S2", "  sorry,  go on ").expect("insert");
+        assert_eq!(id, "u3");
+        let line = &t.utterances[1];
+        assert_eq!(line.id, "u3");
+        assert_eq!(
+            (line.speaker.as_str(), line.text.as_str()),
+            ("S2", "sorry, go on")
+        );
+        assert_eq!((line.start, line.end), (2.4, 2.4));
+        assert!(line.edited && line.asr_text.is_empty() && line.words.is_empty());
+        assert!(t.corrected);
+
+        let mut overlapping = transcript();
+        overlapping.utterances[0].end = 6.0;
+        let (t, _) = insert_utterance_after(overlapping, "u1", "S1", "hm").expect("insert");
+        assert_eq!(
+            t.utterances[1].start, 5.0,
+            "never past the next line's start"
+        );
+        let (t, _) = insert_utterance_after(t, "u2", "S1", "bye").expect("at the end");
+        assert_eq!(
+            t.utterances.last().map(|u| (u.start, u.end)),
+            Some((7.4, 7.4))
+        );
+
+        let (t, id) = insert_utterance_after(call_and_mic(), "u1", "ME", "right").expect("mic");
+        assert_eq!(
+            t.utterances.iter().find(|u| u.id == id).map(|u| u.origin),
+            Some(TrackOrigin::Microphone),
+            "the line takes its speaker's track"
+        );
+        assert_eq!(
+            insert_utterance_after(t.clone(), "u1", "ME", " "),
+            Err(CorrectionError::EmptyText)
+        );
+        assert_eq!(
+            insert_utterance_after(t.clone(), "u1", "S9", "x"),
+            Err(CorrectionError::UnknownSpeaker("S9".to_owned()))
+        );
+        assert_eq!(
+            insert_utterance_after(t, "u99", "ME", "x"),
+            Err(CorrectionError::UnknownUtterance("u99".to_owned()))
+        );
     }
 }

@@ -588,6 +588,24 @@ The coordinator wrote these into `deferred-work.md`, which is their source of tr
 - **DW-344. Model hydration reads the config clone outside the account gate.** A pointer torn by a concurrent hard reset would be copied as a plain file. The completion marker would then disagree with the clone, so readiness stays false until the next fetch repairs it: one failed load, never a wrong model. Revisit if a torn read is ever logged: snapshot the pointers under the gate.
 - **DW-345. A Mac on macOS 11–13 that auto-updates receives a bundle it cannot open.** The updater feed has no OS gate. The owner's Macs run macOS 26–27. Revisit before a release reaches someone on 11–13: keep a last 11.0-floor build in the feed, or load the engine lazily so the floor can return to 11.0.
 
+## Field report 2026-09-29
+
+The owner used the build on hesperia (verbatim): "W wypowiedzi Kelly zmieniłem s1 i s2 jako Kelly ale nie wszędzie jest zmergowame np w md pliku. Nie widzę też opcji rozdzielenia wypowiedzi na więcej albo dodanie po. Nie widzę też opcji w opcjach głównych do translacji z dowolnego pliku albo z pliku w drivie. Gdzie są zapisywane informacje o osobach do identyfikacji. Przy ścieżce z mikrofonu czasami zdarza się że są 2 osoby a jeszcze zadziej więcej niż 2."
+
+**Evidence.** `tgdrive/40-media/recordings/2026/2026-09-23 17.29 kelly-sync/transcript.json`: S1 and S2 both `confirmed`, one `personId` (Kelly Chang); every Kelly line on S1, none on S2; `transcript.md`'s legend still listed "Kelly Chang (S1)" and "Kelly Chang (S2)".
+
+The coordinator froze seven amendments (`local://epic87-followup.md`), built as story 87.8:
+
+| # | The finding | What was built |
+| --- | --- | --- |
+| B1 | Two speakers confirmed as one person stay two. | `corrections::assign_speaker`: when another speaker heard on the same track, with lines, already names that person, the assigned speaker's lines move to it (a merge) and it is the one confirmed. The microphone and the call stay two speakers. The bank sample is still cut from the assigned speaker's own clip, before the merge. |
+| B2 | The markdown legend lists a lineless speaker. | `render::markdown`'s legend lists only speakers with at least one line, as the viewer does. |
+| B3 | No way to split a line. | `corrections::split_utterance` and `transcript_split_utterance({path, utteranceId, wordIndex})`; the viewer's *Split…*. |
+| B4 | No way to add a line after another. | `corrections::insert_utterance_after` and `transcript_insert_utterance({path, afterId, speakerId, text})`; the viewer's *Add a line after*. New ids are `u<highest + 1>`, never reused. |
+| B5 | Two (rarely more) people share the microphone. | The job diarizes the microphone track too. In `assemble`, a diarized microphone part's voice that matches the bank's self person (cosine ≥ `SUGGEST`) is `ME`, else its longest talker; every other microphone voice is a numbered speaker with origin `microphone`, matched against the bank. `ME` carries its voice's embedding. Echo dedupe covers every microphone line. Confirming a microphone voice other than `ME` never marks anyone as me. |
+| B6 | No main-menu way to transcribe any file. | One registry verb, *Transcribe a File…* (`transcription-transcribe-file`), in Recording: menu bar, ⌘K and ⌘?, gated by id on the shell's transcription probe (`TRANSCRIPTION_ACTION_IDS`, a fifth gate on `registry_sections` and a sixth on `PaletteIndex::query`). It opens Settings › Transcription's picker; the job's progress is a toast with *Open transcript*. |
+| B7 | "Where is what identifies people kept?" | `docs/transcription.md` says it: `<drive>/<voices subfolder>/` — `people/`, `clips/`, `embeddings/<model>/`, `dictionary/`, `tombstones/`; plus split, add, microphone diarization, the same-person merge and the menu verb. |
+
 ## Stories
 
 Every story names its rung in the four-rung stack (*Stack*, below).
@@ -847,6 +865,28 @@ AD-350, NFR-105.
 - *Unchanged:* `keeper_rec_sidecar_sources_are_network_free` and `voice_on_device`.
 
 **binds:** NFR-105, AD-350
+
+### 87.8 — The field report
+**Intent:** the owner's field report of 2026-09-29 (*Field report 2026-09-29*). **Rung:** the core half on **epic87-core**, the shell and front halves on **epic87-surface**.
+
+AD-345, AD-347, AD-27.
+**Files:**
+- `keeper-core/src/transcription/{corrections,render,assemble,mod}.rs`;
+- `keeper-core/src/palette.rs`, `keeper-core/src/account.rs` (the transcription gate);
+- `keeper/src/transcribe_ipc.rs` (the microphone diarized; the two commands; only `ME` marks me), `keeper/src/lib.rs` (registration), `keeper/src/ipc.rs` and `keeper/src/menu.rs` (the gate);
+- the viewer, the command-palette handler, client wrappers and mock shell under `src/**` and `dev/**`;
+- `docs/transcription.md`, `docs/recording.md`.
+
+**Acceptance:**
+- *B1* (mutation-proved): confirming a second speaker of one track as a person another speaker with lines already names leaves one speaker with every line, confirmed; the md legend has one row; a lineless namesake takes nothing; a microphone and a call speaker naming one person stay two.
+- *B2:* a speaker without a line is absent from the markdown legend.
+- *B3* (bounds mutation-proved): a split at word *k* keeps words `[..k]`, times and texts from the words, cuts an untouched line's `asrText` at *k* when the recogniser's words are the line's one for one, otherwise keeps it whole on the first half; refuses *k* = 0 and *k* ≥ the word count; the new id is one past the highest.
+- *B4:* an added line is `edited`, has no `asrText` and no words, starts and ends at the previous line's end clamped to the next line's start, takes its speaker's origin; empty text and an unknown speaker or line are refused.
+- *B5* (the `ME` choice mutation-proved): with no self person the longest talker on the microphone is `ME` and another voice is a numbered microphone speaker; with a self person its voice is `ME` even when it talks less, and the other voice is matched against the bank; a microphone voice whose every line was echo is no speaker; an undiarized microphone part is all `ME`.
+- *B6:* the verb is in the Recording section and found by ⌘K where transcription runs, absent where it does not, and the recording verbs are unaffected.
+- Every correction, split and insert included, marks the transcript `corrected`.
+
+**binds:** AD-345, AD-347, NFR-108
 
 ## What stays out
 

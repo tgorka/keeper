@@ -304,7 +304,10 @@ It runs in keeper itself, on this Mac; nothing is sent anywhere (D-29,
 - **The microphone track is you.** With both system audio and the microphone
   on, the microphone is transcribed on its own and attributed to the person
   marked as *me* in the voices bank ("You" until one is marked); system audio is
-  transcribed and split by speaker. A microphone line that repeats what the
+  transcribed and split by speaker. The microphone is split by speaker too:
+  when someone sits beside you, the voice that is *me* (or, with no *me* that
+  matches, the one talking most) stays you and each other voice becomes a
+  speaker of its own. A microphone line that repeats what the
   speakers played, mostly word for word and in order, is dropped as echo; a
   short reply over the far end is kept. A line heard on the microphone never
   moves to a voice from the call in a correction, or back. The camera's audio is

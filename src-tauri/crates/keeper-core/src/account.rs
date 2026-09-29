@@ -694,8 +694,8 @@ impl AccountManager {
     /// filter + ranking, and returns the grouped, bounded [`PaletteResultsVm`]. All
     /// ranking lives in `keeper_core::palette` — the frontend only renders and
     /// dispatches. Never fails (an empty index simply yields the global actions).
-    // Seven gates and a query: each is a capability the palette folds by (AD-137),
-    // and a struct would only move the same seven names one line down.
+    // A query, its mode and six gates: each gate is a capability the palette
+    // folds by (AD-137), and a struct would only move the same names one line down.
     #[allow(clippy::too_many_arguments)]
     pub async fn palette_query(
         &self,
@@ -706,9 +706,19 @@ impl AccountManager {
         notes: bool,
         bots: bool,
         voice: bool,
+        transcription: bool,
     ) -> PaletteResultsVm {
         let index = self.palette.lock().await;
-        index.query(query, mode, open_chat, recording, notes, bots, voice)
+        index.query(
+            query,
+            mode,
+            open_chat,
+            recording,
+            notes,
+            bots,
+            voice,
+            transcription,
+        )
     }
 
     /// Kick every live account's sync loop (Story 13.6: pull-to-refresh and the

@@ -1,4 +1,3 @@
-import { open as openFile } from "@tauri-apps/plugin-dialog";
 import { useEffect, useId, useState } from "react";
 import {
   TRANSCRIPTION_SELECT,
@@ -23,6 +22,7 @@ import {
 } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import {
+  pickFileToTranscribe,
   refreshTranscription,
   refreshVoicesDrive,
   saveTranscriptionSettings,
@@ -83,12 +83,8 @@ function TranscriptionSettings() {
   }, [status?.models.state]);
   const pick = async () => {
     try {
-      const picked = await openFile({
-        directory: false,
-        multiple: false,
-        title: "Transcribe a file",
-      });
-      if (typeof picked === "string") {
+      const picked = await pickFileToTranscribe();
+      if (picked) {
         setPath(picked);
         await startTranscription(picked);
       }

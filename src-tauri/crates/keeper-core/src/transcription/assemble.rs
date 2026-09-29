@@ -5,12 +5,14 @@
 //! it overlaps most (the nearest one when it overlaps none), and clusters are
 //! linked across parts by embedding so one voice keeps one id through a
 //! two-hour recording cut into segments. The microphone beside system audio
-//! is the person recording (`ME`); where it merely echoes the far end it is
-//! dropped. Then the dictionary, then the bank.
+//! is the person recording (`ME`) — when it was diarized, the one voice on it
+//! that is the bank's self person (or, failing that, talks most), with any
+//! other voice in the room a speaker of its own; where it merely echoes the
+//! far end it is dropped. Then the dictionary, then the bank.
 
 use std::collections::{HashMap, HashSet};
 
-use super::bank::{dot, normalized, Bank, DictionaryTerm};
+use super::bank::{dot, normalized, Bank, DictionaryTerm, SUGGEST};
 use super::dictionary;
 use super::engine::{AsrOutput, DiarOutput, DiarSegment, TranscriptionLanguage};
 use super::model::{
@@ -104,54 +106,69 @@ pub fn assemble(
 ) -> Transcript {
     let mut order: Vec<&PartResult> = parts.iter().collect();
     order.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+    let own_voice = bank.and_then(|bank| {
+        let me = bank.self_person()?;
+        bank.centroids(&ctx.engine.embedding)
+            .into_iter()
+            .find(|(id, _)| *id == me.id)
+            .map(|(_, centroid)| centroid)
+    });
 
     let mut clusters: Vec<Cluster> = Vec::new();
     let mut heard: Vec<Heard> = Vec::new();
+    let undiarized = DiarOutput::default();
+    // Sum of the unit embeddings of every microphone cluster taken as `ME`.
+    let mut me_sum: Option<Vec<f32>> = None;
     for part in order {
         let words = words_from_tokens(&part.asr.tokens);
-        if part.origin == TrackOrigin::Microphone {
-            heard.extend(words.into_iter().map(|word| Heard {
-                word: shifted(word, part.offset),
-                voice: Voice::Me,
-                part: part.offset,
-            }));
-            continue;
-        }
-        let segments = part
-            .diar
-            .as_ref()
-            .map_or(&[][..], |diar| &diar.segments[..]);
+        let microphone = part.origin == TrackOrigin::Microphone;
+        let diar = match &part.diar {
+            Some(diar) => diar,
+            // A microphone nobody diarized is the person recording, whole.
+            None if microphone => {
+                heard.extend(words.into_iter().map(|word| Heard {
+                    word: shifted(word, part.offset),
+                    voice: Voice::Me,
+                    part: part.offset,
+                }));
+                continue;
+            }
+            None => &undiarized,
+        };
         let labels: Vec<&str> = words
             .iter()
-            .map(|word| label_for(word.start, word.end, segments))
+            .map(|word| label_for(word.start, word.end, &diar.segments))
             .collect();
-        let linked = link_part(&mut clusters, part, &labels);
+        let me = microphone.then(|| self_label(&words, &labels, diar, own_voice.as_deref()));
+        if let Some(unit) = me.and_then(|me| cluster_unit(diar, me)) {
+            add_unit(&mut me_sum, unit);
+        }
+        let others: Vec<&str> = labels
+            .iter()
+            .copied()
+            .filter(|label| Some(*label) != me)
+            .collect();
+        let linked = link_part(&mut clusters, part, &others);
         heard.extend(words.into_iter().zip(&labels).map(|(word, label)| Heard {
             word: shifted(word, part.offset),
-            voice: Voice::Cluster(linked[label]),
+            voice: if Some(*label) == me {
+                Voice::Me
+            } else {
+                Voice::Cluster(linked[label])
+            },
             part: part.offset,
         }));
     }
 
-    // S1, S2… in order of first appearance on the whole timeline.
-    let mut firsts: HashMap<usize, f64> = HashMap::new();
-    for item in &heard {
-        if let Voice::Cluster(index) = item.voice {
-            let first = firsts.entry(index).or_insert(item.word.start);
-            *first = first.min(item.word.start);
-        }
-    }
-    let mut numbered: Vec<(usize, f64)> = firsts.into_iter().collect();
-    numbered.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
-    let ids: HashMap<Voice, String> = numbered
-        .iter()
-        .enumerate()
-        .map(|(rank, (index, _))| (Voice::Cluster(*index), format!("S{}", rank + 1)))
-        .chain(std::iter::once((Voice::Me, SELF_SPEAKER_ID.to_owned())))
-        .collect();
-
-    let (mine, theirs): (Vec<Heard>, Vec<Heard>) =
-        heard.into_iter().partition(|item| item.voice == Voice::Me);
+    let origin_of = |voice: Voice| match voice {
+        Voice::Me => TrackOrigin::Microphone,
+        Voice::Cluster(cluster) => clusters[cluster].origin,
+    };
+    // Every microphone line — the person recording or anyone beside them —
+    // is checked against the far end for echo.
+    let (mine, theirs): (Vec<Heard>, Vec<Heard>) = heard
+        .into_iter()
+        .partition(|item| origin_of(item.voice) == TrackOrigin::Microphone);
     let theirs = drafts(theirs);
     let mine: Vec<Draft> = drafts(mine)
         .into_iter()
@@ -163,6 +180,23 @@ pub fn assemble(
             .total_cmp(&b.start())
             .then(a.end().total_cmp(&b.end()))
     });
+
+    // S1, S2… in order of first appearance on the whole timeline; a voice
+    // whose every line was echo is no speaker.
+    let mut numbered: Vec<usize> = Vec::new();
+    for draft in &all {
+        if let Voice::Cluster(index) = draft.voice {
+            if !numbered.contains(&index) {
+                numbered.push(index);
+            }
+        }
+    }
+    let ids: HashMap<Voice, String> = numbered
+        .iter()
+        .enumerate()
+        .map(|(rank, index)| (Voice::Cluster(*index), format!("S{}", rank + 1)))
+        .chain(std::iter::once((Voice::Me, SELF_SPEAKER_ID.to_owned())))
+        .collect();
 
     let mut applied: Vec<AppliedTerm> = Vec::new();
     let utterances: Vec<Utterance> = all
@@ -183,10 +217,7 @@ pub fn assemble(
             Utterance {
                 id: format!("u{}", index + 1),
                 speaker: ids[&draft.voice].clone(),
-                origin: match draft.voice {
-                    Voice::Me => TrackOrigin::Microphone,
-                    Voice::Cluster(cluster) => clusters[cluster].origin,
-                },
+                origin: origin_of(draft.voice),
                 start: draft.start(),
                 end: draft.end(),
                 text: join_words(&words),
@@ -208,11 +239,11 @@ pub fn assemble(
             status: MatchStatus::Me,
             score: None,
             candidates: Vec::new(),
-            embedding: None,
+            embedding: me_sum.as_deref().and_then(normalized),
             clip: None,
         });
     }
-    for (index, _) in &numbered {
+    for index in &numbered {
         let cluster = &clusters[*index];
         let embedding = cluster.sum.as_deref().and_then(normalized);
         let matched = match (bank, &embedding) {
@@ -328,6 +359,62 @@ fn label_for(start: f64, end: f64, segments: &[DiarSegment]) -> &str {
         .map_or("", |segment| segment.speaker.as_str())
 }
 
+/// The label of the person recording among a diarized microphone part's
+/// clusters: the one closest to the bank's self person at or above
+/// [`SUGGEST`], else the one heard for the longest (the earliest on a tie).
+fn self_label<'a>(
+    words: &[Word],
+    labels: &[&'a str],
+    diar: &DiarOutput,
+    own_voice: Option<&[f32]>,
+) -> &'a str {
+    let mut spoken: Vec<(&'a str, f64)> = Vec::new();
+    for (word, label) in words.iter().zip(labels) {
+        match spoken.iter_mut().find(|(seen, _)| *seen == *label) {
+            Some(entry) => entry.1 += word.end - word.start,
+            None => spoken.push((*label, word.end - word.start)),
+        }
+    }
+    let recognized = own_voice.and_then(|own| {
+        spoken
+            .iter()
+            .filter_map(|(label, _)| {
+                let unit = cluster_unit(diar, label)?;
+                (unit.len() == own.len()).then(|| (dot(&unit, own), *label))
+            })
+            .filter(|(cosine, _)| *cosine >= SUGGEST)
+            .reduce(|best, next| if next.0 > best.0 { next } else { best })
+    });
+    if let Some((_, label)) = recognized {
+        return label;
+    }
+    spoken
+        .into_iter()
+        .reduce(|best, next| if next.1 > best.1 { next } else { best })
+        .map_or("", |(label, _)| label)
+}
+
+/// A diarization cluster's unit embedding.
+fn cluster_unit(diar: &DiarOutput, label: &str) -> Option<Vec<f32>> {
+    diar.speakers
+        .iter()
+        .find(|speaker| speaker.speaker == label)
+        .and_then(|speaker| normalized(&speaker.embedding))
+}
+
+/// Add a unit embedding to a running sum; one of another length is ignored.
+fn add_unit(sum: &mut Option<Vec<f32>>, unit: Vec<f32>) {
+    match sum {
+        Some(sum) if sum.len() == unit.len() => {
+            for (total, value) in sum.iter_mut().zip(&unit) {
+                *total += value;
+            }
+        }
+        Some(_) => {}
+        None => *sum = Some(unit),
+    }
+}
+
 /// Map a part's local cluster labels onto global clusters: each local
 /// cluster joins the most similar earlier cluster at or above [`LINK`]
 /// (one-to-one within a part, best pairs first), or starts a new one.
@@ -342,15 +429,10 @@ fn link_part<'a>(
             locals.push(label);
         }
     }
-    let embedding = |label: &str| {
-        part.diar
-            .as_ref()?
-            .speakers
-            .iter()
-            .find(|speaker| speaker.speaker == label)
-            .and_then(|speaker| normalized(&speaker.embedding))
-    };
-    let units: Vec<Option<Vec<f32>>> = locals.iter().map(|label| embedding(label)).collect();
+    let units: Vec<Option<Vec<f32>>> = locals
+        .iter()
+        .map(|label| cluster_unit(part.diar.as_ref()?, label))
+        .collect();
 
     let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
     for (local, unit) in units.iter().enumerate() {
@@ -393,16 +475,7 @@ fn link_part<'a>(
             }
         };
         if let Some(unit) = unit {
-            let cluster = &mut clusters[index];
-            match &mut cluster.sum {
-                Some(sum) if sum.len() == unit.len() => {
-                    for (total, value) in sum.iter_mut().zip(&unit) {
-                        *total += value;
-                    }
-                }
-                Some(_) => {}
-                None => cluster.sum = Some(unit),
-            }
+            add_unit(&mut clusters[index].sum, unit);
         }
         mapping.insert(*label, index);
     }
@@ -893,15 +966,11 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn the_bank_names_speakers_and_the_mic_is_its_self_person() {
-        let root = scratch();
+    /// A bank at `root` with one `m1` sample per `(id, name, is_self, vector)`.
+    fn bank_of(root: &std::path::Path, people: &[(&str, &str, bool, Vec<f32>)]) -> Bank {
         let mut plan = BankPlan::default();
-        for (id, name, is_self, vector) in [
-            ("A", "Ada", false, vec![1.0, 0.0]),
-            ("M", "Me Myself", true, vec![0.0, 1.0]),
-        ] {
-            let p = person(id, name, is_self, "2026-09-01T00:00:00Z");
+        for (id, name, is_self, vector) in people {
+            let p = person(id, name, *is_self, "2026-09-01T00:00:00Z");
             plan.writes.push(BankWrite {
                 rel_path: format!("people/{id}.json"),
                 bytes: serde_json::to_vec(&p).expect("json"),
@@ -909,9 +978,9 @@ pub(crate) mod tests {
             let sample = EmbeddingSample {
                 version: 1,
                 model: "m1".to_owned(),
-                person: id.to_owned(),
+                person: (*id).to_owned(),
                 clip: "C".to_owned(),
-                vector,
+                vector: vector.clone(),
                 source: SampleSource::default(),
                 added_at: String::new(),
             };
@@ -920,8 +989,20 @@ pub(crate) mod tests {
                 bytes: serde_json::to_vec(&sample).expect("json"),
             });
         }
-        apply(&root, &plan);
-        let bank = Bank::load(&root);
+        apply(root, &plan);
+        Bank::load(root)
+    }
+
+    #[test]
+    fn the_bank_names_speakers_and_the_mic_is_its_self_person() {
+        let root = scratch();
+        let bank = bank_of(
+            &root,
+            &[
+                ("A", "Ada", false, vec![1.0, 0.0]),
+                ("M", "Me Myself", true, vec![0.0, 1.0]),
+            ],
+        );
         let parts = [
             part(
                 0.0,
@@ -961,6 +1042,145 @@ pub(crate) mod tests {
         assert_eq!((s1.status, &s1.person_id), (MatchStatus::Unknown, &None));
         assert_eq!(unbanked.speaker("ME").and_then(|me| me.name.clone()), None);
         std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// The far end (x) at 0 s, then two voices on the microphone: `b` says
+    /// two words first, `a` talks longer after it.
+    fn a_room_on_the_mic() -> [PartResult; 2] {
+        [
+            part(
+                0.0,
+                TrackOrigin::System,
+                asr("hello from the far end", 0.0, 0.5),
+                Some(diar(&[("x", 0.0, 3.0)], &[("x", vec![1.0, 0.0, 0.0])])),
+            ),
+            part(
+                0.0,
+                TrackOrigin::Microphone,
+                AsrOutput {
+                    tokens: asr("me too", 4.0, 0.5)
+                        .tokens
+                        .into_iter()
+                        .chain(asr("yes I am here and listening now", 6.0, 0.5).tokens)
+                        .collect(),
+                    ..AsrOutput::default()
+                },
+                Some(diar(
+                    &[("b", 4.0, 5.0), ("a", 6.0, 10.0)],
+                    &[("a", vec![0.0, 1.0, 0.0]), ("b", vec![0.0, 0.0, 1.0])],
+                )),
+            ),
+        ]
+    }
+
+    #[test]
+    fn without_a_self_person_the_voice_that_talks_most_on_the_mic_is_me() {
+        let t = assemble(
+            &a_room_on_the_mic(),
+            None,
+            &[],
+            ctx(&[("screen-0000.mov", 0.0, 30.0, SYSTEM_AND_MIC)]),
+        );
+        assert_eq!(
+            said(&t),
+            [
+                ("S1", "hello from the far end"),
+                ("S2", "me too"),
+                ("ME", "yes I am here and listening now"),
+            ],
+            "the other voice in the room is numbered with the call's"
+        );
+        let s2 = t.speaker("S2").expect("S2");
+        assert_eq!(s2.origin, TrackOrigin::Microphone);
+        assert_eq!(t.utterances[1].origin, TrackOrigin::Microphone);
+        assert_eq!(
+            t.speaker("ME").and_then(|me| me.embedding.clone()),
+            Some(vec![0.0, 1.0, 0.0]),
+            "ME carries its cluster's embedding"
+        );
+    }
+
+    #[test]
+    fn the_mic_voice_that_is_the_self_person_is_me_and_the_others_are_matched() {
+        let root = scratch();
+        let bank = bank_of(
+            &root,
+            &[
+                ("A", "Ada", false, vec![0.0, 1.0, 0.0]),
+                ("M", "Me Myself", true, vec![0.0, 0.1, 1.0]),
+            ],
+        );
+        let t = assemble(
+            &a_room_on_the_mic(),
+            Some(&bank),
+            &[],
+            ctx(&[("screen-0000.mov", 0.0, 30.0, SYSTEM_AND_MIC)]),
+        );
+        assert_eq!(
+            said(&t),
+            [
+                ("S1", "hello from the far end"),
+                ("ME", "me too"),
+                ("S2", "yes I am here and listening now"),
+            ],
+            "the bank's me beats who talks most"
+        );
+        let me = t.speaker("ME").expect("ME");
+        assert_eq!(
+            (me.status, me.person_id.as_deref()),
+            (MatchStatus::Me, Some("M"))
+        );
+        let s2 = t.speaker("S2").expect("S2");
+        assert_eq!(
+            (s2.status, s2.name.as_deref(), s2.origin),
+            (MatchStatus::Auto, Some("Ada"), TrackOrigin::Microphone)
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn another_voice_on_the_mic_that_only_echoes_the_far_end_is_no_speaker() {
+        let t = assemble(
+            &[
+                part(
+                    0.0,
+                    TrackOrigin::System,
+                    asr("can you see my screen now", 0.0, 0.4),
+                    Some(diar(&[("x", 0.0, 3.0)], &[("x", vec![1.0, 0.0])])),
+                ),
+                part(
+                    0.0,
+                    TrackOrigin::Microphone,
+                    AsrOutput {
+                        tokens: asr("can you see my screen", 0.05, 0.4)
+                            .tokens
+                            .into_iter()
+                            .chain(asr("yes it looks fine to me thanks", 4.0, 0.4).tokens)
+                            .collect(),
+                        ..AsrOutput::default()
+                    },
+                    Some(diar(
+                        &[("b", 0.0, 2.5), ("a", 4.0, 7.0)],
+                        &[("a", vec![0.0, 1.0]), ("b", vec![0.6, 0.8])],
+                    )),
+                ),
+            ],
+            None,
+            &[],
+            ctx(&[]),
+        );
+        assert_eq!(
+            said(&t),
+            [
+                ("S1", "can you see my screen now"),
+                ("ME", "yes it looks fine to me thanks")
+            ]
+        );
+        assert_eq!(
+            t.speakers.len(),
+            2,
+            "no speaker for a voice left with no line"
+        );
     }
 
     #[test]

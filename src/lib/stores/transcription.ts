@@ -1,3 +1,4 @@
+import { open as openFile } from "@tauri-apps/plugin-dialog";
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
 import {
@@ -78,6 +79,18 @@ export async function refreshVoicesDrive(profileId: string): Promise<void> {
 }
 export function transcriptionRunning(job: TranscriptionProgressVm | undefined): boolean {
   return job !== undefined && !["done", "failed", "cancelled"].includes(job.phase);
+}
+/** What a job is doing, in the words the job strip and the menu verb's toast both show. */
+export function transcriptionJobLine(job: TranscriptionProgressVm): string {
+  return `${job.message ?? job.phase}${job.parts > 0 ? ` · Part ${job.part} of ${job.parts}` : ""}`;
+}
+/**
+ * The native picker Settings › Transcription and the Transcribe a File… verb
+ * both open. Resolves with the chosen path, or null when the person cancelled.
+ */
+export async function pickFileToTranscribe(): Promise<string | null> {
+  const picked = await openFile({ directory: false, multiple: false, title: "Transcribe a file" });
+  return typeof picked === "string" ? picked : null;
 }
 /** Jobs outlive the surface that started them. The generation rejects a late batch from an older attempt. */
 const generations = new Map<string, number>();

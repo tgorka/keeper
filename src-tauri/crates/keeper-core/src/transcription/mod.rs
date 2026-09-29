@@ -15,7 +15,9 @@
 //!   per fact there, embeddings under a per-model prefix, clips model-free.
 //! - AD-344: `transcript.json` (+ `.md`) beside the media.
 //! - AD-345: beside system audio the microphone is the person recording;
-//!   its echo of the far end is dropped.
+//!   its echo of the far end is dropped. It is diarized too: the voice that
+//!   is the bank's self person (or, failing that, talks most) is `ME`, any
+//!   other voice in the room is a numbered speaker of its own.
 //! - AD-346: speakers match people by centroid cosine ([`AUTO_MATCH`],
 //!   [`SUGGEST`]); clusters link across parts at [`LINK`].
 //! - AD-347: only a person's confirmation writes to the bank; edits only
@@ -41,8 +43,8 @@ pub use bank::{
     EmbeddingSample, MatchResult, Person, SampleSource, Tombstone, AUTO_MATCH, SUGGEST,
 };
 pub use corrections::{
-    assign_speaker, edit_utterance, merge_speakers, reassign_utterance, rename_speaker_label,
-    CorrectionError,
+    assign_speaker, edit_utterance, insert_utterance_after, merge_speakers, reassign_utterance,
+    rename_speaker_label, split_utterance, CorrectionError,
 };
 pub use dictionary::DictionarySuggestion;
 pub use engine::{

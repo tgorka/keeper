@@ -46,6 +46,7 @@ use keeper_core::registry;
 use keeper_core::transcription::dictionary::{
     plan_accept_suggestion, plan_delete_term, plan_save_term,
 };
+use keeper_core::transcription::model::SELF_SPEAKER_ID;
 use keeper_core::transcription::models::{self as model_files, MODELS_TOML};
 use keeper_core::transcription::render;
 use keeper_core::transcription::vm::{
@@ -53,12 +54,12 @@ use keeper_core::transcription::vm::{
     TranscriptionPhase, TranscriptionProgressVm, TranscriptionStatusVm, VoicesDriveVm,
 };
 use keeper_core::transcription::{
-    assemble, assign_speaker, edit_utterance, merge_speakers, plan_for_file, plan_for_session,
-    reassign_utterance, rename_speaker_label, wav_bytes, wav_samples, AsrOutput, AssembleContext,
-    AudioTrackInfo, Bank, BankError, BankPlan, DiarOutput, EngineError, EngineStamp,
-    EngineUnavailable, ModelSet, PartResult, PartTrack, Person, SampleSource, SourceKind,
-    SourcePart, SpeechEngine, TrackOrigin, TrackSelect, Transcript, TranscriptSource,
-    TranscriptionLanguage, TranscriptionPlan,
+    assemble, assign_speaker, edit_utterance, insert_utterance_after, merge_speakers,
+    plan_for_file, plan_for_session, reassign_utterance, rename_speaker_label, split_utterance,
+    wav_bytes, wav_samples, AsrOutput, AssembleContext, AudioTrackInfo, Bank, BankError, BankPlan,
+    DiarOutput, EngineError, EngineStamp, EngineUnavailable, ModelSet, PartResult, PartTrack,
+    Person, SampleSource, SourceKind, SourcePart, SpeechEngine, TrackSelect, Transcript,
+    TranscriptSource, TranscriptionLanguage, TranscriptionPlan,
 };
 use keeper_core::vm::{IpcError, IpcErrorCode};
 use keeper_sync::SyncProfile;
@@ -824,15 +825,11 @@ fn transcribe(job: &Job) -> Result<PathBuf, Stop> {
             job.check()?;
             job.report(TranscriptionPhase::Transcribing, number, parts, None, None);
             let asr = engine.transcribe(&samples, language)?;
-            // The microphone beside system audio is the person recording
-            // (AD-345): nothing to diarize.
-            let diar = if *origin == TrackOrigin::Microphone {
-                None
-            } else {
-                job.check()?;
-                job.report(TranscriptionPhase::Diarizing, number, parts, None, None);
-                Some(engine.diarize(&samples)?)
-            };
+            // The microphone is diarized too: someone beside the person
+            // recording is a voice of their own (AD-345).
+            job.check()?;
+            job.report(TranscriptionPhase::Diarizing, number, parts, None, None);
+            let diar = Some(engine.diarize(&samples)?);
             heard.push(PartResult {
                 offset,
                 origin: *origin,
@@ -1182,6 +1179,47 @@ pub async fn transcript_rename_speaker(
     .await
 }
 
+/// Cut a line in two before its `word_index`th word; the words from there
+/// on become a new line right after it.
+#[tauri::command]
+pub async fn transcript_split_utterance(
+    state: State<'_, AppState>,
+    path: String,
+    utterance_id: String,
+    word_index: usize,
+) -> Result<TranscriptVm, IpcError> {
+    let platform = Arc::clone(&state.platform);
+    off_main(move || {
+        correct_only(&platform, Path::new(&path), |t| {
+            split_utterance(t, &utterance_id, word_index)
+                .map(|(t, _)| t)
+                .map_err(|error| error.to_string())
+        })
+    })
+    .await
+}
+
+/// Add a line the recognizer missed, said by `speaker_id`, right after
+/// `after_id`.
+#[tauri::command]
+pub async fn transcript_insert_utterance(
+    state: State<'_, AppState>,
+    path: String,
+    after_id: String,
+    speaker_id: String,
+    text: String,
+) -> Result<TranscriptVm, IpcError> {
+    let platform = Arc::clone(&state.platform);
+    off_main(move || {
+        correct_only(&platform, Path::new(&path), |t| {
+            insert_utterance_after(t, &after_id, &speaker_id, &text)
+                .map(|(t, _)| t)
+                .map_err(|error| error.to_string())
+        })
+    })
+    .await
+}
+
 /// The transcript's heading: a session's folder name, or the file's name.
 fn plan_title(plan: &TranscriptionPlan) -> Option<String> {
     let named = match plan.source {
@@ -1239,7 +1277,7 @@ fn assign(
         naming,
         sample,
         &snapshot.engine.embedding,
-        speaker.origin == TrackOrigin::Microphone,
+        speaker.id == SELF_SPEAKER_ID,
     )?;
     let assigned = commit_assignment(path, speaker_id, &person, &drive.root, &plan)?;
     Ok(transcript_vm(platform, path, assigned))
@@ -1257,8 +1295,9 @@ struct CutSample {
 /// The one bank edit an assign makes: the person (made, when new) and the
 /// sample, planned together so they land together. A sample the bank
 /// refuses is logged and left out; the person still lands. Confirming the
-/// microphone's speaker names the person recording, so when the bank has no
-/// one marked as me yet, that person becomes me in the same plan.
+/// microphone's own speaker (`ME`, not another voice in the room) names the
+/// person recording, so when the bank has no one marked as me yet, that
+/// person becomes me in the same plan.
 fn plan_assignment(
     mut bank: Bank,
     naming: Naming,

@@ -4,6 +4,7 @@ import { transcriptionCancel } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import {
   startTranscription,
+  transcriptionJobLine,
   transcriptionRunning,
   useTranscriptionStore,
 } from "@/lib/stores/transcription";
@@ -21,8 +22,7 @@ export function TranscriptionJob({
   return (
     <div className="flex flex-wrap items-center gap-2 text-sm">
       <p role="status" className="min-w-0 break-words">
-        {job.message ?? job.phase}
-        {job.parts > 0 && ` · Part ${job.part} of ${job.parts}`}
+        {transcriptionJobLine(job)}
       </p>
       {transcriptionRunning(job) && (
         <Button
