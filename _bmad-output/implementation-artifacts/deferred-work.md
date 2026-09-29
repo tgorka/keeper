@@ -6935,3 +6935,59 @@ origin: story 87.10 (field report 3, R7), 2026-09-29
 location: `src/components/transcription/**` (the player's video elements), `primeFirstFrame` in `src/components/notes/editor/media-playback.ts` (as `src/components/viewers/media-viewer.tsx` uses it)
 reason: On hesperia the player in the Files side panel stayed an empty grey box at 0:00 until played — WKWebView leaves a `<video>` at readyState 1 with no frame painted. Story 87.10 primes the first frame after `loadedmetadata` on every player video and gives the player an aspect-ratio box, and vitest proves the call policy; the painted frame itself can only be seen in WKWebView, which the Linux build containers do not have. Revisit at the next Mac gate on hesperia: open a recording's transcript in the Files panel and confirm a frame shows before play; if not, reopen R7.
 status: open
+
+### DW-347: No Obsidian plugin draws a keeper-meeting block; Obsidian shows it as TOML.
+
+origin: epic 88's plan, 2026-09-29 (AD-351, AD-356)
+location: `_bmad-output/planning-artifacts/epic-88-a-meeting-you-can-play-inside-a-note.md` (the grammar), `docs/decisions.md` (D-30, the contract a renderer would read)
+reason: keeper draws the block; Obsidian, which reads the same vault, shows it as an unhighlighted code block — the title, the window and the markers legible, a session id meaningless — and shows a clip's words as a collapsed callout. The owner asked for the embed inside keeper and pointed at Obsidian as the model, not as a place the meeting must play. Obsidian's API has the exact hook, `registerMarkdownCodeBlockProcessor("keeper-meeting", …)`, and D-30 is the contract such a plugin would implement; it would still need keeper's resolution — a recordings index for `session`, the drive's root for paths — which only keeper has. Revisit when the owner wants to watch meetings in Obsidian: an Obsidian plugin that resolves `transcript` and `[[part]]` against the vault's adapter and shows `session` blocks as a link into keeper.
+status: open
+
+### DW-348: A block names files only in the drive that holds the note.
+
+origin: epic 88's plan, 2026-09-29 (AD-353)
+location: `src-tauri/crates/keeper-core/src/notes/meeting_block.rs` (resolution), `src-tauri/crates/keeper-sync/src/browse.rs` (`resolve`, the one join)
+reason: `transcript`, `[[part]]` and `src` paths are relative to the root of the note's drive and joined by `browse::resolve`, so a note in neuradrive cannot name a transcript in tgdrive by path. A `session` block is the exception — it names an identity the recordings index resolves wherever the recording lives — so every automatic note and every clip of a recording works across drives. A path-named transcript (a file's transcript, a hand-written `[[part]]` list) does not. Revisit when the owner pastes such a clip into another drive's note: a `drive = "<name>"` key resolved through the account's `drives.toml`, still joined by `browse::resolve` under that drive's root.
+status: open
+
+### DW-349: A playing block stops when the editor stops drawing it; there is no docked player.
+
+origin: epic 88's plan, 2026-09-29 (AD-359)
+location: `src/components/notes/editor/meeting-block.ts` (`destroy`), `src/components/notes/editor/recording-transport.ts` (`releaseMediaElement`)
+reason: The house rule is that a widget that goes away gives its media back (`recording-embed.ts:50-56`), and CodeMirror destroys a block it stops drawing — in a long note, when the block scrolls out of the part of the note the editor draws (the view plus a margin), or when the text around it is cut. A person listening to a meeting while writing far below it hears it stop. Keeping it would mean a pane-level dock that adopts the playing elements from a widget being destroyed, the handover `recording-transport.ts`'s staging already does between hosts, lifted out of the editor. Revisit when the owner reports playback stopping while writing: a "now playing" strip under the note that holds the one playing block's media until Stop, the note closing, or another block playing.
+status: open
+
+### DW-350: Media Extended's timestamp links and embeds (`[[video.mp4#t=95]]`, `![[video.mp4#t=10,20]]`) are not honoured by keeper's ordinary links and embeds.
+
+origin: epic 88's plan, 2026-09-29 (research: W3C Media Fragments §4.2.1; Media Extended's timestamp format)
+location: `src-tauri/crates/keeper-core/src/notes/embed.rs` (`candidates` tries the target, fragment included, as a path), `src-tauri/crates/keeper-core/src/notes/links.rs` (`strip_anchor`), `src/components/notes/editor/vault-embed.ts`
+reason: Obsidian's Media Extended plugin writes timestamps as a link whose target carries a W3C temporal fragment, and clips as an embed with `#t=a,b`. keeper resolves `![[video.mp4#t=10,20]]` as a file literally named `video.mp4#t=10,20`, finds none, and shows the link; a `[[video.mp4#t=95]]` link is followed as a link to `video.mp4`, and the time is lost with the dropped anchor (`notes/index.rs:916-919`). The meeting block does not need either — it seeks in code, across parts, with its own `from`/`to` — so this epic leaves them. Revisit when the owner opens notes written with Media Extended in keeper: split a `#t=` fragment off media targets in `candidates`, parse it with the block's NPT parser, and start the element there (the schemes already discard the fragment, `file_asset.rs:264-274`).
+status: open
+
+### DW-351: No keeper:// link opens a marker from outside keeper.
+
+origin: epic 88's plan, 2026-09-29 (AD-354)
+location: `src-tauri/crates/keeper/src/voice_reach.rs` (`install_deep_link`, the one handler), `src-tauri/crates/keeper/tauri.conf.json` (`plugins.deep-link`)
+reason: A marker is reached from a note, by `[[note#name]]`. From a browser, a chat or Obsidian there is no link: keeper's deep-link handler routes `keeper://voice/…`, `keeper://setup` and OAuth callbacks only. A `keeper://note/<vault>/<note>#<marker>` route would need a vault-and-note identity that is stable across devices and a decision about what opening a note from outside does to the window the person is in. Revisit when the owner wants to send a moment of a meeting to someone or to another app: add the route to the one handler and compose the link in Rust.
+status: open
+
+### DW-352: The words under a copied clip are a snapshot; corrections and a redo do not reach them.
+
+origin: epic 88's plan, 2026-09-29 (AD-356)
+location: `src-tauri/crates/keeper-core/src/notes/meeting_block.rs` (`clip`, the `[!transcript]` callout), `src-tauri/crates/keeper-core/src/transcription/render.rs` (the line format)
+reason: A clip copied with its words carries the window's lines as they were at the moment of copying, for readers without keeper. keeper hides them inside the block and draws the live lines instead, so a keeper reader never sees them go stale — but an Obsidian reader of the same note does, after any correction or a *Transcribe again*. keeper does not rewrite them, because a note is written by its person and a refresh keeper decided on is a write they did not make. Revisit if the owner finds stale quotes in Obsidian: a *Refresh the words* action on the block that re-renders the callout from the current transcript, on the person's press.
+status: open
+
+### DW-353: A marker belongs to one note; there is no meeting-wide list of markers.
+
+origin: epic 88's plan, 2026-09-29 (AD-354)
+location: `src-tauri/crates/keeper-core/src/notes/meeting_block.rs` (`[[marker]]` tables live in the note's block)
+reason: A marker is written into the block of the note it was made in, for the reason a gallery pin is: two notes about one meeting care about different moments, and a marker filed with the meeting would be one note editing every other note's view of it. So a moment marked in the automatic note is not in the weekly summary that also embeds that meeting, unless copied there as a clip. A shared list would have to live beside the transcript, one file per marker so two devices never conflict (AD-343's shape), and survive a redo. Revisit when the owner wants to mark a moment once and see it in every note: `markers/<ulid>.toml` in the session folder, shown beside each block's own markers.
+status: open
+
+### DW-354: A meeting block is read-only; corrections and Transcribe again happen in the transcript viewer.
+
+origin: epic 88's plan, 2026-09-29 (AD-358)
+location: `src/components/transcription/meeting-panel.tsx` (no correction controls), `src/components/transcription/transcript-viewer.tsx` (every correction)
+reason: The block plays, follows and marks; editing a line, changing a speaker, splitting, adding a line and *Transcribe again* stay in the viewer, which the block opens at its current time. Inside the note editor a widget with text fields fights the editor for the caret and the keys, and every block would be one more correction surface over the same `transcript.json`. The corrections still reach every open block through `keeper://transcript-written`. Revisit if the owner asks to fix a word without leaving the note: a per-line ⋯ menu in the block that opens the viewer's line editor in a popover, writing through the same commands.
+status: open

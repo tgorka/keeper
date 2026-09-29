@@ -1503,3 +1503,34 @@ anyone but the person's own organisation.
 - **Status / owner:** decided by the owner on 2026-09-28. Owner is the architect. Epic 87
   implements it: `keeper_core::transcription`, keeper-sync's voices role and model hydration, the
   vendored `tools/fluidaudio-rs`, and the shell's `transcribe_macos` and `transcribe_ipc`.
+
+## D-30 — A meeting in a note is a `keeper-meeting` fence, and its grammar is a contract
+
+The owner asked for the transcript view — the player and the transcript's lines — inside a
+note, in the notes keeper writes after a recording and in any note, configured by references
+only ("tylko referencje do wlasciwych plikow"), as a named code block with a TOML- or
+JSON-like body or a link to such a file in the drive; with named moments and windows to jump
+to; and with a way to copy the block into another note for part of the time (2026-09-29).
+keeper's other blocks in a note are Obsidian callouts, by a rule written down in
+`docs/notes.md` § *Widgets in a note*. This entry records why this one is a fence, and fixes
+the grammar so notes written today still play in every later keeper.
+
+keeper will **not** write a block the person did not ask for into an existing note, rewrite
+one by itself, put an absolute path in one, or let anything but Rust read one.
+
+- **What it is:** a CommonMark fenced code block whose info string's first word is
+  `keeper-meeting`, with a TOML body (version 1). Exactly one source: `session` (a recording's
+  identity, the one its note's `session:` carries), `transcript` (a transcript file's path),
+  one or more `[[part]]` tables (`file`, optional `camera`, `offset`, `system`, `microphone`),
+  or `src` (a `.toml` file in the drive holding the same grammar). Optional `title`, `from`
+  and `to` (a half-open window, W3C Media Fragments' temporal rules), `picture`, `sound`,
+  `version`, and `[[marker]]` tables (`name`, then `at`, or `from` and `to`). Times are W3C
+  Normal Play Time strings or seconds, on the meeting's own clock; keeper writes `"hh:mm:ss"`.
+  Paths are relative to the drive that holds the note. Any other key is refused with a
+  sentence, and a version above 1 is shown as source. (AD-351…AD-353; FR-759…FR-761; Epic 88)
+- **Why a fence here and callouts elsewhere:** a callout keeps a block legible in Obsidian when
+  its content is prose or links — a query, a list of pinned files — and that is the rule's
+  purpose. A meeting's content is configuration: an ordered list of files, offsets, track roles
+  and timed markers. In a callout it would still be TOML, behind `> ` on every line, with
+  nothing in it a working link. A fence is also the hook Obsidian gives plugins for exactly
+  this (`registerMarkdownCodeBlockProcessor`), the form of its own ` 
