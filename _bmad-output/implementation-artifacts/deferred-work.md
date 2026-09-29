@@ -6840,9 +6840,10 @@ status: open
 ### DW-333: The speaker-matching thresholds are uncalibrated.
 
 origin: epic 87's plan, 2026-09-28 (AD-346)
-location: `src-tauri/crates/keeper-core/src/transcription/bank.rs` and `assemble.rs` (`AUTO_MATCH = 0.70`, `SUGGEST = 0.50`, `LINK = 0.60`)
+location: `src-tauri/crates/keeper-core/src/transcription/bank.rs` and `assemble.rs` (`AUTO_MATCH = 0.70`, `SUGGEST = 0.50`, `LINK = 0.60`, `SAME_VOICE = 0.45`)
 reason: No source read for this epic calibrates cosine thresholds for pyannote community-1's 256-d embeddings on meeting audio, so the three constants are starting values, not measurements. A threshold set too low assigns the wrong person automatically. A threshold set too high leaves known people unknown, or splits one speaker in two across segment files. The first costs one click to correct, and nothing reaches the bank without a person's confirmation (AD-347). Revisit after the owner has confirmed people in about twenty meetings: compute the same-person and different-person cosine distributions from the bank's own confirmed samples, and set the constants from them.
 status: open
+note: 2026-09-29 (story 87.9, field report 2) — a fourth constant joins the list: `SAME_VOICE = 0.45`, the cosine at or above which two clusters of one part and track are one voice. It rests on one measurement, not a distribution: on hesperia's mounica-sync transcript one remote person came out as S1 and S2 at 0.526, while two different people (Kelly's bank voice against S1) sat at 0.369. A value too low merges two people on one track into one speaker (a reassign and an *Add speaker* undo it); too high leaves one voice split. Calibrate it with the other three.
 
 ### DW-334: A session that finished while keeper was quitting, or before the models arrived, is not transcribed later by itself.
 

@@ -110,7 +110,16 @@ export async function startTranscription(path: string, onDone?: () => void): Pro
     transcriptionStore.setState((s) => ({ jobs: { ...s.jobs, [path]: progress } }));
     if (progress.phase === "done") followUps.get(path)?.();
   };
-  put({ jobId: "", phase: "queued", part: 0, parts: 0, message: null, transcriptPath: null });
+  put({
+    jobId: "",
+    phase: "queued",
+    part: 0,
+    parts: 0,
+    message: null,
+    transcriptPath: null,
+    fraction: null,
+    elapsedMs: 0,
+  });
   try {
     const jobId = await transcriptionStart(path, put);
     const current = transcriptionStore.getState().jobs[path];
@@ -124,6 +133,8 @@ export async function startTranscription(path: string, onDone?: () => void): Pro
       parts: 0,
       message: syncErrorMessage(cause),
       transcriptPath: null,
+      fraction: null,
+      elapsedMs: 0,
     });
   }
 }

@@ -2045,6 +2045,8 @@ describe("FilesPane — what it is and how big", () => {
           parts: 1,
           message: null,
           transcriptPath: null,
+          fraction: null,
+          elapsedMs: 0,
         },
       },
     });

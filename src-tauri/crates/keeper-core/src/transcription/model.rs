@@ -204,7 +204,8 @@ pub enum TranscriptFormatError {
 
 impl Transcript {
     /// Parse a transcript file, refusing a version this build does not know.
-    /// A line written without its origin takes its speaker's.
+    /// A line written without its origin takes its speaker's, and a speaker
+    /// an earlier merge left behind is dropped ([`Self::drop_absorbed`]).
     pub fn from_json(raw: &str) -> Result<Self, TranscriptFormatError> {
         let mut value: serde_json::Value = serde_json::from_str(raw)?;
         let version = value
@@ -215,7 +216,34 @@ impl Transcript {
             return Err(TranscriptFormatError::NewerVersion(version));
         }
         fill_utterance_origins(&mut value);
-        Ok(serde_json::from_value(value)?)
+        let mut transcript: Self = serde_json::from_value(value)?;
+        transcript.drop_absorbed();
+        Ok(transcript)
+    }
+
+    /// Drop every speaker without a line whose person another speaker heard
+    /// on the same track carries, with lines — what a same-person merge left
+    /// behind before merges removed it. A lineless speaker nobody else
+    /// stands for (unnamed, or the only one naming its person) stays.
+    fn drop_absorbed(&mut self) {
+        let speaks = |id: &str| self.utterances.iter().any(|u| u.speaker == id);
+        let absorbed: Vec<String> = self
+            .speakers
+            .iter()
+            .filter(|speaker| {
+                speaker.person_id.is_some()
+                    && !speaks(&speaker.id)
+                    && self.speakers.iter().any(|other| {
+                        other.id != speaker.id
+                            && other.origin == speaker.origin
+                            && other.person_id == speaker.person_id
+                            && speaks(&other.id)
+                    })
+            })
+            .map(|speaker| speaker.id.clone())
+            .collect();
+        self.speakers
+            .retain(|speaker| !absorbed.contains(&speaker.id));
     }
 
     /// Whether a person has changed this transcript: the flag every
@@ -341,5 +369,39 @@ mod tests {
         let confirmed =
             Transcript::from_json(&raw.replacen("\"unknown\"", "\"confirmed\"", 1)).expect("reads");
         assert!(confirmed.is_corrected(), "a confirmation counts");
+    }
+
+    #[test]
+    fn a_lineless_speaker_whose_person_another_voice_on_its_track_carries_is_dropped_on_read() {
+        let speaker = |id: &str, origin: &str, person: &str| {
+            let person = if person.is_empty() {
+                "null".to_owned()
+            } else {
+                format!("\"{person}\"")
+            };
+            format!(
+                r#"{{"id":"{id}","origin":"{origin}","personId":{person},"name":null,"status":"confirmed","score":null,"candidates":[],"embedding":null,"clip":null}}"#
+            )
+        };
+        let speakers = [
+            speaker("S1", "system", "KELLY"),
+            // What the kelly-sync file held: Kelly again, with no line.
+            speaker("S2", "system", "KELLY"),
+            // Kelly on the microphone, lineless: another track, kept.
+            speaker("S3", "microphone", "KELLY"),
+            // Unnamed and lineless, and a person nobody else carries: kept.
+            speaker("S4", "system", ""),
+            speaker("S5", "system", "BO"),
+        ]
+        .join(",");
+        let raw = format!(
+            r#"{{"version":1,"source":{{"kind":"recording","files":[]}},"createdAt":"","engine":{{"asr":"","diarizer":"","embedding":""}},"language":"auto","duration":2,
+            "speakers":[{speakers}],
+            "utterances":[{{"id":"u1","speaker":"S1","start":0,"end":1,"text":"hi","asrText":"hi","edited":false,"words":[]}}],
+            "dictionaryApplied":[]}}"#
+        );
+        let t = Transcript::from_json(&raw).expect("reads");
+        let ids: Vec<&str> = t.speakers.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["S1", "S3", "S4", "S5"]);
     }
 }

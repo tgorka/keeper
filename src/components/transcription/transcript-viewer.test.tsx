@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { StrictMode } from "react";
+import { beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import {
   TranscriptFileViewer,
   TranscriptViewer,
@@ -8,10 +9,12 @@ import {
 import * as ipc from "@/lib/ipc/client";
 import { transcriptionStore } from "@/lib/stores/transcription";
 import { resolveViewer } from "@/lib/viewers/registry";
-import { TRANSCRIPT_FIXTURE } from "../../../dev/transcription-fixture";
+import { SESSION_TRANSCRIPT_FIXTURE, TRANSCRIPT_FIXTURE } from "../../../dev/transcription-fixture";
 
 vi.mock("@/lib/ipc/client", () => ({
   transcriptRead: vi.fn(),
+  transcriptMedia: vi.fn(),
+  transcriptAddSpeaker: vi.fn(),
   transcriptEditUtterance: vi.fn(),
   transcriptAssignSpeaker: vi.fn(),
   transcriptReassignUtterance: vi.fn(),
@@ -25,11 +28,31 @@ vi.mock("@/lib/ipc/client", () => ({
 vi.mock("@/components/viewers/text-file-viewer", () => ({
   TextFileViewer: ({ entry }: { entry: { format: string } }) => <p>Text viewer: {entry.format}</p>,
 }));
+vi.mock("@/components/viewers/text-viewer", () => ({
+  TextEditorSurface: ({
+    content,
+    language,
+    readOnly,
+  }: {
+    content: string;
+    language: string | null;
+    readOnly?: boolean;
+  }) => (
+    <pre data-language={language} data-readonly={readOnly ? "" : undefined}>
+      {content}
+    </pre>
+  ),
+}));
 const path = TRANSCRIPT_FIXTURE.path;
 beforeEach(() => {
   vi.resetAllMocks();
   transcriptionStore.setState({ status: null, error: null, jobs: {}, people: {}, dictionary: {} });
   vi.mocked(ipc.transcriptRead).mockResolvedValue(structuredClone(TRANSCRIPT_FIXTURE));
+  vi.mocked(ipc.transcriptMedia).mockResolvedValue({
+    parts: [],
+    hasCamera: false,
+    hasScreen: false,
+  });
   vi.mocked(ipc.transcriptionStatus).mockResolvedValue({
     available: true,
     reason: null,
@@ -309,6 +332,245 @@ describe("Transcript corrections", () => {
     });
     expect(screen.queryByRole("textbox", { name: "Text of the line after u3" })).toBeNull();
     expect(ipc.transcriptInsertUtterance).not.toHaveBeenCalled();
+  });
+});
+describe("Speakers", () => {
+  it("adds a speaker on the chosen track with its label and offers it to every line", async () => {
+    const added = structuredClone(TRANSCRIPT_FIXTURE);
+    added.transcript.speakers.push({
+      ...added.transcript.speakers[2],
+      id: "S3",
+      origin: "microphone",
+      name: "Guest",
+    });
+    vi.mocked(ipc.transcriptAddSpeaker).mockResolvedValue(added);
+    render(<TranscriptViewer path={path} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Add speaker" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "Heard on" }), {
+      target: { value: "microphone" },
+    });
+    fireEvent.change(screen.getByRole("textbox", { name: "New speaker label" }), {
+      target: { value: "  Guest " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("Guest added.");
+    expect(ipc.transcriptAddSpeaker).toHaveBeenCalledWith(path, "microphone", "Guest");
+    expect(screen.queryByRole("form", { name: "Add speaker" })).toBeNull();
+    const reassign = screen.getByRole("combobox", { name: "Speaker for u1" });
+    expect(within(reassign).getByRole("option", { name: "Guest" })).toBeInTheDocument();
+  });
+  it("asks for no track when the transcript heard only one, and keeps a refused entry", async () => {
+    const mixed = structuredClone(TRANSCRIPT_FIXTURE);
+    mixed.transcript.source.parts[0].tracks = [{ track: null, origin: "mixed" }];
+    mixed.transcript.speakers = mixed.transcript.speakers.map((s) => ({ ...s, origin: "mixed" }));
+    vi.mocked(ipc.transcriptRead).mockResolvedValue(mixed);
+    vi.mocked(ipc.transcriptAddSpeaker).mockRejectedValue({
+      code: "refused",
+      message: "The transcript changed on disk.",
+    });
+    render(<TranscriptViewer path={path} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Add speaker" }));
+    expect(screen.queryByRole("combobox", { name: "Heard on" })).toBeNull();
+    fireEvent.change(screen.getByRole("textbox", { name: "New speaker label" }), {
+      target: { value: "Guest" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("The transcript changed on disk.");
+    expect(ipc.transcriptAddSpeaker).toHaveBeenCalledWith(path, "mixed", "Guest");
+    expect(screen.getByRole("textbox", { name: "New speaker label" })).toHaveValue("Guest");
+  });
+  it("lists each person once on a line, and still offers a lineless voice nobody else is", async () => {
+    const twice = structuredClone(TRANSCRIPT_FIXTURE);
+    const [, s1, s2] = twice.transcript.speakers;
+    Object.assign(s1, { personId: "p-anna", name: "Anna Kowalski", status: "confirmed" });
+    // A lineless voice that names Anna again: the file the owner opened.
+    Object.assign(s2, { personId: "p-anna", name: "Anna Kowalski", status: "confirmed" });
+    twice.transcript.speakers.push({ ...s2, id: "S3", personId: null, name: null });
+    twice.transcript.speakers.push({ ...s2, id: "S4", personId: "p-jo", name: "Jo" });
+    vi.mocked(ipc.transcriptRead).mockResolvedValue(twice);
+    render(<TranscriptViewer path={path} />);
+    const reassign = await screen.findByRole("combobox", { name: "Speaker for u2" });
+    expect(
+      within(reassign)
+        .getAllByRole("option")
+        .map((o) => o.textContent),
+    ).toEqual(["Alex", "Anna Kowalski", "Speaker 3", "Jo"]);
+  });
+});
+describe("Source", () => {
+  it("shows the transcript's JSON read-only, laid out as keeper writes the file", async () => {
+    render(<TranscriptViewer path={path} />);
+    fireEvent.mouseDown(await screen.findByRole("tab", { name: "Source" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Source" }));
+    const source = await screen.findByText((_, element) => element?.tagName === "PRE");
+    expect(source.textContent).toBe(`${JSON.stringify(TRANSCRIPT_FIXTURE.transcript, null, 2)}\n`);
+    expect(source).toHaveAttribute("data-language", "json");
+    expect(source).toHaveAttribute("data-readonly");
+    expect(screen.queryByRole("list", { name: "Utterances" })).toBeNull();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Transcript" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Transcript" }));
+    expect(await screen.findByRole("list", { name: "Utterances" })).toBeInTheDocument();
+  });
+});
+/** A two-part session with a camera beside each screen segment and two sound tracks. */
+const SESSION_MEDIA: ipc.TranscriptMediaVm = {
+  hasCamera: true,
+  hasScreen: true,
+  parts: [0, 1].map((index) => ({
+    file: `screen-000${index}.mov`,
+    offset: index * 21,
+    duration: 21,
+    screen: { profileId: "p1", relativePath: `rec/screen-000${index}.mov`, kind: "video" as const },
+    camera: { profileId: "p1", relativePath: `rec/camera-000${index}.mov`, kind: "video" as const },
+    audioTracks: [
+      { index: 0, origin: "system" as const },
+      { index: 1, origin: "microphone" as const },
+    ],
+  })),
+};
+const sessionPath = SESSION_TRANSCRIPT_FIXTURE.path;
+const row = (id: string) =>
+  screen.getByRole("button", { name: new RegExp(`^Edit ${id}:`) }).closest("li");
+const partLine = (text: string) =>
+  screen.getByText((_, element) => element?.tagName === "P" && element.textContent === text);
+describe("Player", () => {
+  let play: MockInstance<HTMLMediaElement["play"]>;
+  beforeEach(() => {
+    vi.mocked(ipc.transcriptRead).mockResolvedValue(structuredClone(SESSION_TRANSCRIPT_FIXTURE));
+    vi.mocked(ipc.transcriptMedia).mockResolvedValue(structuredClone(SESSION_MEDIA));
+    play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+  });
+  it("highlights the line being spoken as the player plays, and not with Follow off", async () => {
+    render(<TranscriptViewer path={sessionPath} />);
+    const main = (await screen.findByLabelText("screen-0000.mov")) as HTMLMediaElement;
+    main.currentTime = 7;
+    fireEvent.timeUpdate(main);
+    expect(row("u2")).toHaveAttribute("aria-current", "true");
+    expect(row("u1")).not.toHaveAttribute("aria-current");
+    fireEvent.click(screen.getByRole("button", { name: "Follow the transcript" }));
+    expect(row("u2")).not.toHaveAttribute("aria-current");
+  });
+  it("plays from a line in the next part: that part loads and starts at the line", async () => {
+    render(<TranscriptViewer path={sessionPath} />);
+    const first = (await screen.findByLabelText("screen-0000.mov")) as HTMLMediaElement;
+    expect(partLine("Part 1 of 2 · screen-0000.mov")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Play from here u4" }));
+    expect(partLine("Part 2 of 2 · screen-0001.mov")).toBeInTheDocument();
+    // The first part's file is let go, not left decoding behind the second.
+    expect(first).not.toHaveAttribute("src");
+    const second = screen.getByLabelText("screen-0001.mov") as HTMLMediaElement;
+    fireEvent.loadedMetadata(second);
+    expect(second.currentTime).toBeCloseTo(0.5);
+    expect(play.mock.contexts).toContain(second);
+    expect(row("u4")).toHaveAttribute("aria-current", "true");
+  });
+  it("carries on into the next part when one ends", async () => {
+    render(<TranscriptViewer path={sessionPath} />);
+    const first = (await screen.findByLabelText("screen-0000.mov")) as HTMLMediaElement;
+    fireEvent.ended(first);
+    const second = screen.getByLabelText("screen-0001.mov") as HTMLMediaElement;
+    fireEvent.loadedMetadata(second);
+    expect(second.currentTime).toBe(0);
+    expect(play.mock.contexts).toContain(second);
+    expect(partLine("Part 2 of 2 · screen-0001.mov")).toBeInTheDocument();
+  });
+  it("offers the picture and sound choices only when there are two of each", async () => {
+    const { unmount } = render(<TranscriptViewer path={sessionPath} />);
+    expect(await screen.findByRole("combobox", { name: "Picture" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Sound" })).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox", { name: "Picture" }), {
+      target: { value: "screen" },
+    });
+    expect(screen.queryByLabelText("camera-0000.mov")).toBeNull();
+    unmount();
+    vi.mocked(ipc.transcriptRead).mockResolvedValue(structuredClone(TRANSCRIPT_FIXTURE));
+    vi.mocked(ipc.transcriptMedia).mockResolvedValue({
+      hasCamera: false,
+      hasScreen: false,
+      parts: [{ ...SESSION_MEDIA.parts[0], file: "memo.m4a", camera: null, audioTracks: [] }],
+    });
+    render(<TranscriptViewer path={path} />);
+    expect(await screen.findByLabelText("memo.m4a")).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Picture" })).toBeNull();
+    expect(screen.queryByRole("combobox", { name: "Sound" })).toBeNull();
+    expect(partLine("memo.m4a")).toBeInTheDocument();
+  });
+  it("still has its files after Strict Mode hands the elements back", async () => {
+    render(
+      <StrictMode>
+        <TranscriptViewer path={sessionPath} />
+      </StrictMode>,
+    );
+    expect(await screen.findByLabelText("screen-0000.mov")).toHaveAttribute(
+      "src",
+      "keeper-file://p1/rec/screen-0000.mov",
+    );
+    expect(screen.getByLabelText("camera-0000.mov")).toHaveAttribute(
+      "src",
+      "keeper-file://p1/rec/camera-0000.mov",
+    );
+  });
+  it("keeps its place while the reader looks at the Source", async () => {
+    render(<TranscriptViewer path={sessionPath} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Play from here u4" }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Source" }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Transcript" }));
+    expect(partLine("Part 2 of 2 · screen-0001.mov")).toBeInTheDocument();
+    expect(screen.getByLabelText("screen-0001.mov")).toHaveAttribute("src");
+  });
+  it("lets go of every media element when the viewer closes", async () => {
+    const { unmount } = render(<TranscriptViewer path={sessionPath} />);
+    const main = await screen.findByLabelText("screen-0000.mov");
+    const camera = screen.getByLabelText("camera-0000.mov");
+    unmount();
+    expect(main).not.toHaveAttribute("src");
+    expect(camera).not.toHaveAttribute("src");
+  });
+});
+describe("Search", () => {
+  beforeEach(() => {
+    vi.mocked(ipc.transcriptRead).mockResolvedValue(structuredClone(SESSION_TRANSCRIPT_FIXTURE));
+    vi.mocked(ipc.transcriptMedia).mockResolvedValue(structuredClone(SESSION_MEDIA));
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+  });
+  it("counts matches, steps both ways round, and moves the player with Follow on", async () => {
+    render(<TranscriptViewer path={sessionPath} />);
+    await screen.findByLabelText("screen-0000.mov");
+    const search = screen.getByRole("searchbox", { name: "Search the transcript" });
+    fireEvent.keyDown(screen.getByRole("region", { name: "Transcript viewer" }), {
+      key: "f",
+      metaKey: true,
+    });
+    expect(search).toHaveFocus();
+    fireEvent.change(search, { target: { value: "KEEPER" } });
+    expect(screen.getByText("2 matches")).toBeInTheDocument();
+    expect([...document.querySelectorAll("mark")].map((m) => m.textContent)).toEqual([
+      "keeper",
+      "keeper",
+    ]);
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(screen.getByText("1 of 2")).toBeInTheDocument();
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(screen.getByText("2 of 2")).toBeInTheDocument();
+    // u6 is in the second part, and Follow takes the player there.
+    expect(partLine("Part 2 of 2 · screen-0001.mov")).toBeInTheDocument();
+    fireEvent.keyDown(search, { key: "Enter", shiftKey: true });
+    expect(screen.getByText("1 of 2")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Previous match" }));
+    expect(screen.getByText("2 of 2")).toBeInTheDocument();
+  });
+  it("finds a speaker by name, and says when nothing matches", async () => {
+    render(<TranscriptViewer path={sessionPath} />);
+    const search = await screen.findByRole("searchbox", { name: "Search the transcript" });
+    fireEvent.change(search, { target: { value: "alex" } });
+    expect(screen.getByText("3 matches")).toBeInTheDocument();
+    fireEvent.change(search, { target: { value: "zebra" } });
+    expect(screen.getByText("No matches")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Next match" })).toBeDisabled();
   });
 });
 describe("Transcript files", () => {

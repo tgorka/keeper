@@ -32,18 +32,22 @@ import type { TelemetryEventReq } from "./gen/TelemetryEventReq";
 import type { TelemetryRemoteConfigVm } from "./gen/TelemetryRemoteConfigVm";
 import type { TelemetryStatusVm } from "./gen/TelemetryStatusVm";
 import type { TextFileVm } from "./gen/TextFileVm";
+import type { TrackOrigin } from "./gen/TrackOrigin";
 import type { TranscriptionLanguage } from "./gen/TranscriptionLanguage";
 import type { TranscriptionProgressVm } from "./gen/TranscriptionProgressVm";
 import type { TranscriptionStatusVm } from "./gen/TranscriptionStatusVm";
+import type { TranscriptMediaVm } from "./gen/TranscriptMediaVm";
 import type { TranscriptVm } from "./gen/TranscriptVm";
 
 export type {
   CorrectionResultVm,
   DictionaryTermVm,
   PersonVm,
+  TrackOrigin,
   TranscriptionLanguage,
   TranscriptionProgressVm,
   TranscriptionStatusVm,
+  TranscriptMediaVm,
   TranscriptVm,
 };
 
@@ -117,6 +121,18 @@ export function transcriptAssignSpeaker(
   newName: string | null,
 ): Promise<TranscriptVm> {
   return invoke("transcript_assign_speaker", { path, speakerId, personId, newName });
+}
+/** A speaker nobody heard yet, on one track, to move lines to. */
+export function transcriptAddSpeaker(
+  path: string,
+  origin: TrackOrigin,
+  label: string | null,
+): Promise<TranscriptVm> {
+  return invoke("transcript_add_speaker", { path, origin, label });
+}
+/** What the transcript's player plays: each part's files, where they sit, and their tracks. */
+export function transcriptMedia(path: string): Promise<TranscriptMediaVm> {
+  return invoke("transcript_media", { path });
 }
 export function voicesPeople(profileId: string): Promise<PersonVm[]> {
   return invoke("voices_people", { profileId });

@@ -2,6 +2,7 @@ import { open as openFile } from "@tauri-apps/plugin-dialog";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TranscribeAFileHost, transcribeAFile } from "@/components/transcription/transcribe-a-file";
+import { TRANSCRIPTION_PROGRESS_LABEL } from "@/components/transcription/transcription-progress";
 import { Toaster } from "@/components/ui/sonner";
 import * as ipc from "@/lib/ipc/client";
 import { transcriptionStore } from "@/lib/stores/transcription";
@@ -13,6 +14,7 @@ vi.mock("@/lib/ipc/client", () => ({
   transcriptionCancel: vi.fn(),
   transcriptionStatus: vi.fn(),
   transcriptRead: vi.fn(),
+  transcriptMedia: vi.fn(),
 }));
 
 const file = "/Users/alice/call.m4a";
@@ -26,6 +28,8 @@ const send = (phase: ipc.TranscriptionProgressVm["phase"], extra: object = {}) =
       parts: 1,
       message: null,
       transcriptPath: null,
+      fraction: null,
+      elapsedMs: 0,
       ...extra,
     }),
   );
@@ -41,6 +45,11 @@ beforeEach(() => {
   vi.mocked(ipc.transcriptionCancel).mockResolvedValue(undefined);
   vi.mocked(ipc.transcriptionStatus).mockRejectedValue(new Error("not needed here"));
   vi.mocked(ipc.transcriptRead).mockResolvedValue(structuredClone(TRANSCRIPT_FIXTURE));
+  vi.mocked(ipc.transcriptMedia).mockResolvedValue({
+    parts: [],
+    hasCamera: false,
+    hasScreen: false,
+  });
 });
 
 describe("Transcribe a File…", () => {
@@ -61,6 +70,17 @@ describe("Transcribe a File…", () => {
     expect(ipc.transcriptionStart).toHaveBeenCalledWith(file, expect.any(Function));
     await send("transcribing");
     expect(await screen.findByText("transcribing · Part 1 of 1")).toBeInTheDocument();
+    // No estimate yet: the bar is indeterminate, never a guessed zero.
+    expect(
+      screen.getByRole("progressbar", { name: TRANSCRIPTION_PROGRESS_LABEL }),
+    ).not.toHaveAttribute("aria-valuenow");
+    await send("transcribing", { fraction: 0.375, elapsedMs: 65_000 });
+    // Sonner re-renders an updated toast on its own tick.
+    expect(await screen.findByText("1:05")).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: TRANSCRIPTION_PROGRESS_LABEL })).toHaveAttribute(
+      "aria-valuenow",
+      "38",
+    );
     expect(screen.queryByRole("button", { name: "Open transcript" })).toBeNull();
     await send("done", { transcriptPath: `${file}.transcript.json` });
     expect(await screen.findByText("The transcript is ready.")).toBeInTheDocument();

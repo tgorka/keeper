@@ -39,6 +39,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use keeper_core::platform::Platform;
 use keeper_core::recording::SessionManifest;
@@ -46,20 +47,24 @@ use keeper_core::registry;
 use keeper_core::transcription::dictionary::{
     plan_accept_suggestion, plan_delete_term, plan_save_term,
 };
+use keeper_core::transcription::media::transcript_media as media_of;
 use keeper_core::transcription::model::SELF_SPEAKER_ID;
 use keeper_core::transcription::models::{self as model_files, MODELS_TOML};
+use keeper_core::transcription::progress::{Estimate, PartLoad};
 use keeper_core::transcription::render;
 use keeper_core::transcription::vm::{
-    CorrectionResultVm, DictionaryTermVm, ModelsState, ModelsStateVm, PersonVm, TranscriptVm,
-    TranscriptionPhase, TranscriptionProgressVm, TranscriptionStatusVm, VoicesDriveVm,
+    CorrectionResultVm, DictionaryTermVm, ModelsState, ModelsStateVm, PersonVm, TranscriptMediaVm,
+    TranscriptVm, TranscriptionPhase, TranscriptionProgressVm, TranscriptionStatusVm,
+    VoicesDriveVm,
 };
 use keeper_core::transcription::{
-    assemble, assign_speaker, edit_utterance, insert_utterance_after, merge_speakers,
+    add_speaker, assemble, assign_speaker, edit_utterance, insert_utterance_after, merge_speakers,
     plan_for_file, plan_for_session, reassign_utterance, rename_speaker_label, split_utterance,
     wav_bytes, wav_samples, AsrOutput, AssembleContext, AudioTrackInfo, Bank, BankError, BankPlan,
-    DiarOutput, EngineError, EngineStamp, EngineUnavailable, ModelSet, PartResult, PartTrack,
-    Person, SampleSource, SourceKind, SourcePart, SpeechEngine, TrackSelect, Transcript,
-    TranscriptSource, TranscriptionLanguage, TranscriptionPlan,
+    DiarOutput, EngineError, EngineStamp, EngineUnavailable, ModelSet, Naming, PartResult,
+    PartTrack, Person, SampleSource, SourceKind, SourcePart, SpeechEngine, TrackOrigin,
+    TrackSelect, Transcript, TranscriptSource, TranscriptionLanguage, TranscriptionPlan,
+    VoiceSample,
 };
 use keeper_core::vm::{IpcError, IpcErrorCode};
 use keeper_sync::SyncProfile;
@@ -564,6 +569,54 @@ struct Job {
     channel: Option<Channel<TranscriptionProgressVm>>,
     cancel: Arc<AtomicBool>,
     platform: Arc<dyn Platform>,
+    progress: Mutex<Progress>,
+}
+
+/// Between a running job's own batches, a batch this often, so a surface
+/// sees the bar move and the time pass during a long step.
+const HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// Where a job is, for its batches and the heartbeats between them.
+struct Progress {
+    /// When the job started running (not when it was queued).
+    started: Instant,
+    phase: TranscriptionPhase,
+    part: u32,
+    parts: u32,
+    /// 0-based track of the part being heard.
+    track: usize,
+    phase_started: Instant,
+    /// Known once every part's audio has been probed.
+    estimate: Option<Estimate>,
+}
+
+impl Progress {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            phase: TranscriptionPhase::Queued,
+            part: 0,
+            parts: 0,
+            track: 0,
+            phase_started: now,
+            estimate: None,
+        }
+    }
+
+    /// How much of the job is done, never less than before.
+    fn fraction(&mut self) -> Option<f32> {
+        let elapsed = self.phase_started.elapsed().as_secs_f64();
+        let part = usize::try_from(self.part.saturating_sub(1)).unwrap_or(usize::MAX);
+        match &mut self.estimate {
+            Some(estimate) => Some(estimate.at(self.phase, part, self.track, elapsed)),
+            None => (self.phase == TranscriptionPhase::Done).then_some(1.0),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
 }
 
 struct Jobs {
@@ -624,6 +677,7 @@ fn enqueue(
         channel,
         cancel,
         platform,
+        progress: Mutex::new(Progress::new()),
     };
     job.report(TranscriptionPhase::Queued, 0, 0, None, None);
     if jobs.queue.send(job).is_err() {
@@ -652,6 +706,20 @@ impl From<EngineError> for Stop {
 }
 
 impl Job {
+    /// A running step: `track` (0-based) of `part` (1-based) of `parts`.
+    /// Every step starts its own clock, even in the phase before it.
+    fn step(&self, phase: TranscriptionPhase, part: u32, parts: u32, track: usize) {
+        {
+            let mut progress = lock(&self.progress);
+            progress.track = track;
+            progress.phase = phase;
+            progress.phase_started = Instant::now();
+        }
+        self.report(phase, part, parts, None, None);
+    }
+
+    /// One batch. A non-terminal phase is where the job now is; a terminal
+    /// one keeps the part it stopped in for the estimate.
     fn report(
         &self,
         phase: TranscriptionPhase,
@@ -669,17 +737,59 @@ impl Job {
             message = message.as_deref().unwrap_or(""),
             "transcription: progress"
         );
+        let (fraction, elapsed_ms) = {
+            let mut progress = lock(&self.progress);
+            if progress.phase != phase {
+                progress.phase_started = Instant::now();
+            }
+            progress.phase = phase;
+            if !is_terminal(phase) {
+                progress.part = part;
+                progress.parts = parts;
+            }
+            (progress.fraction(), progress.elapsed_ms())
+        };
+        self.send(TranscriptionProgressVm {
+            job_id: self.id.clone(),
+            phase,
+            part,
+            parts,
+            message,
+            transcript_path,
+            fraction,
+            elapsed_ms,
+        });
+    }
+
+    /// The batch between two steps: where the job is, and how far that is by
+    /// now. Not logged — the steps are.
+    fn heartbeat(&self) {
+        let batch = {
+            let mut progress = lock(&self.progress);
+            TranscriptionProgressVm {
+                job_id: self.id.clone(),
+                phase: progress.phase,
+                part: progress.part,
+                parts: progress.parts,
+                message: None,
+                transcript_path: None,
+                fraction: progress.fraction(),
+                elapsed_ms: progress.elapsed_ms(),
+            }
+        };
+        self.send(batch);
+    }
+
+    fn send(&self, batch: TranscriptionProgressVm) {
         if let Some(channel) = &self.channel {
             // A closed channel is a surface that went away; the job goes on.
-            let _ = channel.send(TranscriptionProgressVm {
-                job_id: self.id.clone(),
-                phase,
-                part,
-                parts,
-                message,
-                transcript_path,
-            });
+            let _ = channel.send(batch);
         }
+    }
+
+    /// Every part's length is known: from here on the fraction is estimated.
+    fn estimate(&self, parts: &[PartLoad]) {
+        lock(&self.progress).estimate = Some(Estimate::new(parts));
     }
 
     fn check(&self) -> Result<(), Stop> {
@@ -691,9 +801,36 @@ impl Job {
     }
 }
 
-/// Run one job to its one terminal batch.
+fn is_terminal(phase: TranscriptionPhase) -> bool {
+    matches!(
+        phase,
+        TranscriptionPhase::Done | TranscriptionPhase::Failed | TranscriptionPhase::Cancelled
+    )
+}
+
+/// Run one job to its one terminal batch. While it runs, a surface that
+/// watches it gets a heartbeat every [`HEARTBEAT`]; the heartbeats stop
+/// before the terminal batch is sent, so that batch is the last.
 fn run_job(job: &Job) {
-    match transcribe(job) {
+    {
+        let mut progress = lock(&job.progress);
+        progress.started = Instant::now();
+        progress.phase_started = progress.started;
+    }
+    let outcome = std::thread::scope(|scope| {
+        let (stop, beats) = mpsc::channel::<()>();
+        if job.channel.is_some() {
+            scope.spawn(move || {
+                while beats.recv_timeout(HEARTBEAT) == Err(mpsc::RecvTimeoutError::Timeout) {
+                    job.heartbeat();
+                }
+            });
+        }
+        let outcome = transcribe(job);
+        drop(stop);
+        outcome
+    });
+    match outcome {
         Ok(path) => job.report(
             TranscriptionPhase::Done,
             0,
@@ -806,29 +943,45 @@ fn transcribe(job: &Job) -> Result<PathBuf, Stop> {
     let set = load_models(engine.as_ref(), &data_dir)?;
     let language = registry::get_transcription_language(&data_dir).unwrap_or_default();
 
-    let mut heard: Vec<PartResult> = Vec::new();
-    let mut source_parts: Vec<SourcePart> = Vec::with_capacity(plan.parts.len());
-    let mut offset = 0.0_f64;
-    for (index, part) in plan.parts.iter().enumerate() {
-        let number = u32::try_from(index + 1).unwrap_or(u32::MAX);
+    // Every part's tracks and length first — a metadata read per file — so
+    // the progress bar knows the whole job before the first step.
+    job.step(TranscriptionPhase::Decoding, 1, parts, 0);
+    let mut probed_parts = Vec::with_capacity(plan.parts.len());
+    for part in &plan.parts {
         job.check()?;
-        job.report(TranscriptionPhase::Decoding, number, parts, None, None);
         let probed = engine.audio_tracks(&part.file)?;
         let duration = probed
             .iter()
             .map(|track| track.duration_s)
             .fold(0.0_f64, f64::max);
-        let roles = part.resolve(&probed);
-        for (track, origin) in &roles {
+        probed_parts.push((duration, part.resolve(&probed)));
+    }
+    job.estimate(
+        &probed_parts
+            .iter()
+            .map(|(duration, roles)| PartLoad {
+                duration: *duration,
+                tracks: roles.len(),
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let mut heard: Vec<PartResult> = Vec::new();
+    let mut source_parts: Vec<SourcePart> = Vec::with_capacity(plan.parts.len());
+    let mut offset = 0.0_f64;
+    for (index, (part, (duration, roles))) in plan.parts.iter().zip(probed_parts).enumerate() {
+        let number = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        for (heard_track, (track, origin)) in roles.iter().enumerate() {
             job.check()?;
+            job.step(TranscriptionPhase::Decoding, number, parts, heard_track);
             let samples = engine.decode(&part.file, *track, None)?;
             job.check()?;
-            job.report(TranscriptionPhase::Transcribing, number, parts, None, None);
+            job.step(TranscriptionPhase::Transcribing, number, parts, heard_track);
             let asr = engine.transcribe(&samples, language)?;
             // The microphone is diarized too: someone beside the person
             // recording is a voice of their own (AD-345).
             job.check()?;
-            job.report(TranscriptionPhase::Diarizing, number, parts, None, None);
+            job.step(TranscriptionPhase::Diarizing, number, parts, heard_track);
             let diar = Some(engine.diarize(&samples)?);
             heard.push(PartResult {
                 offset,
@@ -1220,6 +1373,65 @@ pub async fn transcript_insert_utterance(
     .await
 }
 
+/// A speaker the diarizer did not tell apart, heard on `origin`; lines move
+/// to it by [`transcript_reassign_utterance`].
+#[tauri::command]
+pub async fn transcript_add_speaker(
+    state: State<'_, AppState>,
+    path: String,
+    origin: TrackOrigin,
+    label: Option<String>,
+) -> Result<TranscriptVm, IpcError> {
+    let platform = Arc::clone(&state.platform);
+    off_main(move || {
+        correct_only(&platform, Path::new(&path), |t| {
+            Ok(add_speaker(t, origin, label.as_deref()).0)
+        })
+    })
+    .await
+}
+
+/// What the viewer's player plays for the transcript at `path`: its media,
+/// part by part, located in the synced folders `keeper-file://` serves.
+#[tauri::command]
+pub async fn transcript_media(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<TranscriptMediaVm, IpcError> {
+    let platform = Arc::clone(&state.platform);
+    off_main(move || {
+        let path = PathBuf::from(path);
+        let transcript = read_transcript(&path).map_err(refused)?;
+        let dir = path.parent().unwrap_or_else(|| Path::new(""));
+        let manifest = (transcript.source.kind == SourceKind::Recording)
+            .then(|| SessionManifest::load(dir).ok())
+            .flatten();
+        Ok(media_of(
+            &transcript,
+            dir,
+            manifest.as_ref(),
+            &synced_folders(&platform),
+        ))
+    })
+    .await
+}
+
+/// Every enabled synced folder, `(profile id, local path)`.
+fn synced_folders(platform: &Arc<dyn Platform>) -> Vec<(String, PathBuf)> {
+    let profiles = crate::sync::engine(Arc::clone(platform))
+        .map_err(|error| error.to_string())
+        .and_then(|engine| engine.list_profiles().map_err(|error| error.to_string()))
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "transcription: the synced folders could not be listed");
+            Vec::new()
+        });
+    profiles
+        .into_iter()
+        .filter(|profile| profile.enabled)
+        .map(|profile| (profile.id, profile.local_path))
+        .collect()
+}
+
 /// The transcript's heading: a session's folder name, or the file's name.
 fn plan_title(plan: &TranscriptionPlan) -> Option<String> {
     let named = match plan.source {
@@ -1227,12 +1439,6 @@ fn plan_title(plan: &TranscriptionPlan) -> Option<String> {
         SourceKind::File => plan.parts.first()?.file.file_name(),
     };
     named.map(|name| name.to_string_lossy().into_owned())
-}
-
-/// Who a confirmed speaker is: a person already in the bank, or one to make.
-enum Naming {
-    Existing(String),
-    New(String),
 }
 
 /// A person confirmed who a speaker is (AD-347): an existing person
@@ -1283,72 +1489,23 @@ fn assign(
     Ok(transcript_vm(platform, path, assigned))
 }
 
-/// A speaker's voice, cut from its media before the bank is touched.
-struct CutSample {
-    wav: Vec<u8>,
-    /// `None` while a transcription job holds the engine: the clip is kept
-    /// alone and the next job's re-embed (Q5) gives it its embedding.
-    embedding: Option<Vec<f32>>,
-    source: SampleSource,
-}
-
-/// The one bank edit an assign makes: the person (made, when new) and the
-/// sample, planned together so they land together. A sample the bank
-/// refuses is logged and left out; the person still lands. Confirming the
-/// microphone's own speaker (`ME`, not another voice in the room) names the
-/// person recording, so when the bank has no one marked as me yet, that
-/// person becomes me in the same plan.
+/// The one bank edit an assign makes ([`Bank::plan_confirmation`]):
+/// confirming the microphone's own speaker (`ME`) makes that person self.
+/// What the plan left out is logged; the person still lands.
 fn plan_assignment(
-    mut bank: Bank,
+    bank: Bank,
     naming: Naming,
-    sample: Option<CutSample>,
+    sample: Option<VoiceSample>,
     model: &str,
-    microphone: bool,
+    me: bool,
 ) -> Result<(Person, BankPlan), IpcError> {
-    let (person, mut plan) = match naming {
-        Naming::New(name) => {
-            let (person, plan) = bank
-                .create_person(&name)
-                .map_err(|error| refused(error.to_string()))?;
-            // The sample is planned for the person before its file exists.
-            bank.people.push(person.clone());
-            (person, plan)
-        }
-        Naming::Existing(id) => {
-            let person = bank
-                .person(&id)
-                .cloned()
-                .ok_or_else(|| refused(format!("Nobody with id {id} is in the voices bank.")))?;
-            (person, BankPlan::default())
-        }
-    };
-    if let Some(sample) = sample {
-        let planned = match sample.embedding {
-            Some(vector) => bank.add_sample(&person.id, sample.wav, vector, model, sample.source),
-            None => bank.add_clip_only(&person.id, sample.wav, sample.source),
-        };
-        match planned {
-            Ok((_, sample_plan)) => {
-                plan.writes.extend(sample_plan.writes);
-                plan.deletes.extend(sample_plan.deletes);
-            }
-            Err(error) => {
-                tracing::warn!(%error, person = %person.id, "transcription: the voice sample was not stored");
-            }
-        }
+    let confirmation = bank
+        .plan_confirmation(naming, sample, model, me)
+        .map_err(|error| refused(error.to_string()))?;
+    for reason in &confirmation.left_out {
+        tracing::warn!(person = %confirmation.person.id, %reason, "transcription: part of a confirmation was not stored");
     }
-    if microphone && !bank.people.iter().any(|someone| someone.is_self) {
-        match bank.set_self(&person.id) {
-            Ok(self_plan) => {
-                plan.writes.extend(self_plan.writes);
-                plan.deletes.extend(self_plan.deletes);
-            }
-            Err(error) => {
-                tracing::warn!(%error, person = %person.id, "transcription: the person was not marked as me");
-            }
-        }
-    }
-    Ok((person, plan))
+    Ok((confirmation.person, confirmation.plan))
 }
 
 /// The transcript half of an assign, under [`TRANSCRIPT_WRITES`]: the
@@ -1386,7 +1543,7 @@ fn cut_sample(
     drive: &VoicesDrive,
     transcript_path: &Path,
     speaker: &keeper_core::transcription::Speaker,
-) -> Option<CutSample> {
+) -> Option<VoiceSample> {
     let Some(clip) = speaker.clip.as_ref() else {
         tracing::info!(speaker = %speaker.id, "transcription: no clip long enough to keep for this speaker");
         return None;
@@ -1427,7 +1584,7 @@ fn cut_sample(
             }
         },
     };
-    Some(CutSample {
+    Some(VoiceSample {
         wav: wav_bytes(&samples),
         embedding,
         source: SampleSource {
@@ -1801,8 +1958,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn sample(start: f64, embedding: Option<Vec<f32>>) -> CutSample {
-        CutSample {
+    fn sample(start: f64, embedding: Option<Vec<f32>>) -> VoiceSample {
+        VoiceSample {
             wav: wav_bytes(&[0.1; 1600]),
             embedding,
             source: SampleSource {
@@ -1871,56 +2028,6 @@ mod tests {
             false
         )
         .is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn confirming_the_microphone_speaker_marks_that_person_as_me_once() {
-        let dir = std::env::temp_dir().join(format!("keeper-assign-self-{}", ulid::Ulid::new()));
-        let root = dir.join("voices");
-        std::fs::create_dir_all(&root).expect("root");
-
-        let (me, plan) = plan_assignment(
-            Bank::load(&root),
-            Naming::New("Tomasz".to_owned()),
-            None,
-            "m",
-            true,
-        )
-        .expect("plan");
-        execute_plan(&root, &plan).expect("execute");
-        assert!(Bank::load(&root).person(&me.id).is_some_and(|p| p.is_self));
-
-        // A second person confirmed on a microphone (another Mac's owner)
-        // does not take "me" away from the first.
-        let (other, plan) = plan_assignment(
-            Bank::load(&root),
-            Naming::New("Marta".to_owned()),
-            None,
-            "m",
-            true,
-        )
-        .expect("plan");
-        execute_plan(&root, &plan).expect("execute");
-        let bank = Bank::load(&root);
-        assert!(bank.person(&me.id).is_some_and(|p| p.is_self));
-        assert!(bank.person(&other.id).is_some_and(|p| !p.is_self));
-
-        // A speaker from the call never becomes me.
-        let dir2 = dir.join("second");
-        std::fs::create_dir_all(&dir2).expect("root2");
-        let (them, plan) = plan_assignment(
-            Bank::load(&dir2),
-            Naming::New("Kelly".to_owned()),
-            None,
-            "m",
-            false,
-        )
-        .expect("plan");
-        execute_plan(&dir2, &plan).expect("execute");
-        assert!(Bank::load(&dir2)
-            .person(&them.id)
-            .is_some_and(|p| !p.is_self));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

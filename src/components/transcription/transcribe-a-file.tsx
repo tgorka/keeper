@@ -1,18 +1,19 @@
 /**
- * Transcribe a File… from the menu bar and the palette.
+ * Transcribe a File… from the menu bar, the palette and the recording panes.
  *
  * The verb starts the same job the Settings button does, from wherever the
  * person is, so there is no pane on screen to hold the job strip. What a
  * background job started outside its pane shows in keeper is a toast (the
  * export's pattern): one Sonner toast per file, updated in place as the job
- * moves, with Cancel while it runs, Try again when it fails and Open transcript
- * when it is done. The transcript opens in the one dialog this module mounts
- * with the shell.
+ * moves — the progress bar, the phase and the elapsed time — with Cancel while
+ * it runs, Try again when it fails and Open transcript when it is done. The
+ * transcript opens in the one dialog this module mounts with the shell.
  */
 import { toast } from "sonner";
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
 import { TranscriptDialog } from "@/components/transcription/transcript-viewer";
+import { TranscriptionProgress } from "@/components/transcription/transcription-progress";
 import { transcriptionCancel } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import {
@@ -22,6 +23,9 @@ import {
   transcriptionRunning,
   transcriptionStore,
 } from "@/lib/stores/transcription";
+
+/** The button the Recordings and Recording panes carry for the verb. */
+export const TRANSCRIBE_A_FILE_LABEL = "Transcribe a file…";
 
 /** The transcript the verb's toast opened, if any. */
 const openTranscriptStore = createStore<{ path: string | null }>()(() => ({ path: null }));
@@ -36,7 +40,7 @@ async function transcribeWithToast(path: string): Promise<void> {
     if (transcriptionRunning(job)) {
       toast.loading(name, {
         id,
-        description: transcriptionJobLine(job),
+        description: <TranscriptionProgress job={job} className="mt-1 w-full" />,
         action: job.jobId
           ? {
               label: "Cancel transcription",

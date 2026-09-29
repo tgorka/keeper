@@ -606,6 +606,27 @@ The coordinator froze seven amendments (`local://epic87-followup.md`), built as 
 | B6 | No main-menu way to transcribe any file. | One registry verb, *Transcribe a File…* (`transcription-transcribe-file`), in Recording: menu bar, ⌘K and ⌘?, gated by id on the shell's transcription probe (`TRANSCRIPTION_ACTION_IDS`, a fifth gate on `registry_sections` and a sixth on `PaletteIndex::query`). It opens Settings › Transcription's picker; the job's progress is a toast with *Open transcript*. |
 | B7 | "Where is what identifies people kept?" | `docs/transcription.md` says it: `<drive>/<voices subfolder>/` — `people/`, `clips/`, `embeddings/<model>/`, `dictionary/`, `tombstones/`; plus split, add, microphone diarization, the same-person merge and the menu verb. |
 
+## Field report 2 (2026-09-29)
+
+The owner used the 87.8 build on hesperia (verbatim, Polish): "nie widze jak dodac speakerow · jak rozwine liste speakerow to wciaz sam tam tacy jacy juz byli zmergowani · w json jezeli otwieram to chcialbym miec tab zeby widziec source (podobnie jak w notatkach) · jest opcja recordings > trancribe a file ale nie ma w menu recordings buttona (tez w liscie recordingow nie ma opcji granscribe a file ani show transcriptions · gdy widze transcriptions chcialbym tez widziec audio/video (z mozliwoscia pinu …) · podczas puszczania video chcialbym zeby lecialo aktualne transcription (chyba ze odznaczona bedzie ta opcja) · video ma byc cale nawet jak bedzie sie skladac z segmentow · jak przewijam video to powinny sie tez przewijac napisy · mozna miec wybor camery video … tak samo jak track audio · chce tez miec w tym widoku wyszukiwanie tekstu · jak idzie transcribe nie widze zadnego paska postepu · zrobilem druga transkrypcje i mnie (you) nie rozpoznal automatycznie · druga transkrypcja znow ma s1, s1, you a powinno byc tylko you i s1".
+
+**Evidence (hesperia, mounica-sync).** ME (microphone), S1 (system, 50 lines), S2 (system, 189 lines). S1·S2 = 0.526 — one remote person over-split; ME·S1 = −0.006; ME·S2 = 0.044; Kelly's bank voice · S1 = 0.369, · S2 = 0.223 (another person, rightly unmatched). Tomasz's bank voice · this ME = 0.873, but ME was never matched against the bank — only the `self` flag named it, and the bank had **Kelly** `self: true`: confirming ME as Kelly by mistake had made her self while nobody was, and re-confirming ME as Tomasz moved the clip but not the flag. The coordinator repaired the bank by hand. The kelly-sync transcript still held a lineless S2 carrying Kelly's `personId`, so the per-line speaker list offered Kelly twice.
+
+The coordinator froze the amendments (`local://epic87-fr2.md`), built as story 87.9:
+
+| # | The finding | What was built |
+| --- | --- | --- |
+| C1 | "You" was not recognised from the bank. | `assemble`: a diarized microphone's `ME` is matched like any speaker (`me_identity`). The `self` person names it when its voice reaches `SUGGEST`; otherwise a person at `AUTO_MATCH` names it (`auto`), else `suggested`/`unknown` with candidates. An undiarized microphone, or a `self` person without a voice for the model, keeps the flag's answer. |
+| C2 | Confirming ME as someone else did not move `self`. | `Bank::plan_confirmation` (moved from the shell's `plan_assignment`, which now calls it): confirming `ME` always makes that person self, unmarking every other claimant. |
+| C3 | One remote voice came out as S1 and S2. | `assemble::same_voice_merged`: within one part and track, clusters at cosine ≥ `SAME_VOICE = 0.45` are one (single linkage, union-find) before numbering; the label is the longest talker's and the embedding the speech-time-weighted sum, normalised. Added to DW-333. |
+| C4 | A merged-away speaker still offered Kelly twice. | The same-person merge (`assign_speaker`'s B1 path, and `merge_speakers` into a speaker naming the same person) removes the absorbed speaker; `Transcript::from_json` drops a lineless speaker whose person another speaker on its track carries with lines. A lineless speaker with an identity of its own stays. |
+| C5 | No way to add a speaker. | `corrections::add_speaker(t, origin, label)` → `S<max+1>`, `unknown`; `transcript_add_speaker({path, origin, label}) → TranscriptVm`. |
+| C6 | No visible progress. | `TranscriptionProgressVm.fraction` (0..1, never backwards) and `elapsedMs`; `progress::Estimate` weighs parts by audio time × tracks and steps by fixed shares, in-step from elapsed time against RTF constants, capped at 95 % of a step; the shell probes every part first and sends a heartbeat every second. |
+| C7 | The player needs the media. | `transcript_media({path}) → TranscriptMediaVm` (`media::transcript_media`): per part its offset, duration, main file and the camera segment of the same manifest index as `MediaRef {profileId, relativePath, kind}` — the Files media viewer's `keeper-file://` coordinates — and its audio tracks with origins. |
+| C8 | The Recordings list knew nothing of transcripts. | `RecordingHitVm.transcript` and `.transcribable`, filled per row by `plan::session_facts` (the Files row's rule, now shared). |
+| menu | "Transcribe a File…" missing from the menu. | The native menu's Recording section already projects the verb (`registry_sections`, gated on the transcription probe); what the owner lacked is the Recordings pane and Recording pane buttons (F6). |
+| F1–F8 | Front: add-speaker, deduped speaker list, Source tab, the player with pin/follow/play-from-here, search, progress bars, Recordings row actions, mock shell and browser proof. | Lanes Player88/Lists88. |
+
 ## Stories
 
 Every story names its rung in the four-rung stack (*Stack*, below).
@@ -887,6 +908,28 @@ AD-345, AD-347, AD-27.
 - Every correction, split and insert included, marks the transcript `corrected`.
 
 **binds:** AD-345, AD-347, NFR-108
+
+### 87.9 — Field report 2
+**Intent:** the owner's second field report of 2026-09-29 (*Field report 2 (2026-09-29)*). **Rung:** the core half on **epic87-core**, the shell and front halves on **epic87-surface**.
+
+AD-345, AD-346, AD-347, AD-74.
+**Files:**
+- `keeper-core/src/transcription/{assemble,bank,corrections,model,mod,plan,vm}.rs`, `media.rs` and `progress.rs` (new); `keeper-core/src/archive/recordings_fts.rs`, `keeper-core/src/vm.rs` (`RecordingHitVm`), `keeper-core/src/recording.rs` (the camera prefix, crate-visible);
+- `keeper/src/transcribe_ipc.rs` (heartbeat and progress, the two commands, C2 through the core), `keeper/src/lib.rs` (registration), `keeper/src/sync_ipc.rs` (the shared session facts);
+- the viewer, player, search, Recordings rows, progress bars, client wrappers and mock shell under `src/**` and `dev/**`;
+- `docs/transcription.md`.
+
+**Acceptance:**
+- *C1* (mutation-proved): with Kelly marked self and Tomasz's voice at 0.873, a diarized `ME` is Tomasz (`auto`); an undiarized `ME` is still the flag's person; a self person heard at ≥ 0.50 wins; with nobody close and nobody self `ME` is `unknown`.
+- *C2* (mutation-proved): confirming `ME` as Kelly, then as Tomasz, leaves Tomasz the only self; confirming `ME` as Kelly again moves it back; a call speaker never becomes self.
+- *C3* (mutation-proved): two clusters of one track at 0.526 are one speaker with the time-weighted embedding; at 0.37 they stay two.
+- *C4* (mutation-proved): reading a transcript with a lineless duplicate of a person on the same track drops it; a lineless speaker on another track, an unnamed one and one naming a person nobody else carries stay; a merge into a same-person speaker removes the absorbed one, into another person keeps it.
+- *C5:* an added speaker is `S<max+1>`, `unknown`, labelled or not, and takes only lines of its own side.
+- *C6:* the estimate splits parts by audio time and tracks, caps an overrunning step, and never goes backwards.
+- *C7:* a session pairs each screen part with the manifest's camera of the same index, located in the innermost synced folder; a plain audio file is one audio part; a file outside every synced folder has no reference.
+- *C8:* each Recordings row carries its transcript path and whether it can be transcribed.
+
+**binds:** AD-345, AD-346, AD-347, NFR-108
 
 ## What stays out
 

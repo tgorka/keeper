@@ -95,4 +95,14 @@ tags: Array<string>,
  * written, so there is nothing to play, and the surface omits the action
  * rather than opening the folder and calling that playback.
  */
-playablePath: string | null, };
+playablePath: string | null, 
+/**
+ * The absolute path of the session's `transcript.json`, when one has
+ * been written — the row's Show transcript.
+ */
+transcript: string | null, 
+/**
+ * Whether the session can be transcribed now: it has stopped recording
+ * and every audio segment is on this machine (none is a pointer).
+ */
+transcribable: boolean, };

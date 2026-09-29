@@ -94,6 +94,7 @@ import type {
   OrgAccountVm,
   PacedWorkVm,
   RecordingCaptureSourcesVm,
+  RecordingSearchVm,
   RecordingSettingsVm,
   SessionSpaceFilesVm,
   SessionSpaceFileVm,
@@ -4298,6 +4299,46 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     firstRunSetupSkipped = payload.skipped === true;
     return null;
   },
+  // --- Recordings browser -----------------------------------------------------
+  //
+  // Two sessions: one already transcribed (Show transcript), one with media and
+  // no transcript yet (Transcribe, whose job the transcription mock drives).
+  search_recordings: () =>
+    ({
+      rows: [
+        {
+          sessionId: "01JREC0000000000000000KELLY",
+          relativePath: "2026/kelly-sync",
+          absolutePath: "/Users/alice/Movies/keeper/2026/kelly-sync",
+          title: "Kelly sync",
+          startedTs: 1_790_000_000_000,
+          endedTs: 1_790_001_800_000,
+          durationMs: 1_800_000,
+          totalBytes: 812_000_000,
+          durability: "pushed",
+          tags: ["work/sync"],
+          playablePath: "/Users/alice/Movies/keeper/2026/kelly-sync/screen-0001.mov",
+          transcript: "/Users/alice/Movies/keeper/2026/kelly-sync/transcript.json",
+          transcribable: true,
+        },
+        {
+          sessionId: "01JREC00000000000000MOUNICA",
+          relativePath: "2026/mounica-sync",
+          absolutePath: "/Users/alice/Movies/keeper/2026/mounica-sync",
+          title: "Mounica sync",
+          startedTs: 1_790_090_000_000,
+          endedTs: 1_790_092_400_000,
+          durationMs: 2_400_000,
+          totalBytes: 1_290_000_000,
+          durability: "local",
+          tags: [],
+          playablePath: "/Users/alice/Movies/keeper/2026/mounica-sync/screen-0001.mov",
+          transcript: null,
+          transcribable: true,
+        },
+      ],
+      total: 2,
+    }) satisfies RecordingSearchVm,
   // --- Recording settings ---------------------------------------------------
   //
   // Handlers over a module-level object rather than an `ANSWERS` row, so a write

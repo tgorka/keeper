@@ -262,6 +262,18 @@ pub fn existing_transcript(path: &Path) -> Option<PathBuf> {
     json.is_file().then_some(json)
 }
 
+/// A recording session folder's transcription facts: whether it can be
+/// transcribed now — its manifest loads and the core could plan it (stopped
+/// recording, every audio segment here and none a pointer) — and the
+/// `transcript.json` already written in it. A manifest read and a head read
+/// per audio segment.
+pub fn session_facts(folder: &Path) -> (bool, Option<PathBuf>) {
+    let transcribable = SessionManifest::load(folder)
+        .is_ok_and(|manifest| plan_for_session(folder, &manifest).is_ok());
+    let (json, _) = transcript_paths_for(folder, true);
+    (transcribable, json.is_file().then_some(json))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

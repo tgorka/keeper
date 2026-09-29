@@ -1098,7 +1098,7 @@ pub(crate) const SEGMENT_STEM_PREFIX: &str = "screen-";
 /// FR-70/FR-73): the optional webcam's own separate per-segment file, sharing
 /// the session folder and the segment index space with `screen-####` —
 /// disambiguated in the ledger by `track`, never by index alone.
-const CAMERA_SEGMENT_STEM_PREFIX: &str = "camera-";
+pub(crate) const CAMERA_SEGMENT_STEM_PREFIX: &str = "camera-";
 
 /// Audio-only-track segment files are named `audio-####.m4a` (Story 21.3).
 pub(crate) const AUDIO_SEGMENT_STEM_PREFIX: &str = "audio-";

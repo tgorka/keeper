@@ -855,12 +855,19 @@ pub fn search_recording_vms(
             .map_err(|e| {
                 ArchiveError::Sqlite(format!("could not read a session's first segment: {e}"))
             })?;
-        vms.push(recording_hit_vm(
+        let mut vm = recording_hit_vm(
             hit,
             destination_root,
             total_bytes,
             playable_relative.as_deref(),
-        ));
+        );
+        // The folder as it is on this machine now: a manifest read and a
+        // head read per audio segment, only for the page being shown.
+        let (transcribable, transcript) =
+            crate::transcription::plan::session_facts(Path::new(&vm.absolute_path));
+        vm.transcribable = transcribable;
+        vm.transcript = transcript.map(|json| path_string(&json));
+        vms.push(vm);
     }
     Ok(RecordingSearchVm { rows: vms, total })
 }
@@ -914,6 +921,8 @@ fn recording_hit_vm(
         total_bytes,
         durability: hit.durability,
         tags,
+        transcript: None,
+        transcribable: false,
     }
 }
 

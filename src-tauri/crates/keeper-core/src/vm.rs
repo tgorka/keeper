@@ -3782,6 +3782,12 @@ pub struct RecordingHitVm {
     /// written, so there is nothing to play, and the surface omits the action
     /// rather than opening the folder and calling that playback.
     pub playable_path: Option<String>,
+    /// The absolute path of the session's `transcript.json`, when one has
+    /// been written — the row's Show transcript.
+    pub transcript: Option<String>,
+    /// Whether the session can be transcribed now: it has stopped recording
+    /// and every audio segment is on this machine (none is a pointer).
+    pub transcribable: bool,
 }
 
 /// One page of the Recordings browser, with the count behind it (Story 44.11,

@@ -6,6 +6,9 @@ import type {
   TranscriptionStatusVm,
   TranscriptVm,
 } from "@/lib/ipc/client";
+import type { MediaRef } from "@/lib/ipc/gen/MediaRef";
+import type { TrackOrigin } from "@/lib/ipc/gen/TrackOrigin";
+import type { TranscriptMediaVm } from "@/lib/ipc/gen/TranscriptMediaVm";
 import type { Word } from "@/lib/ipc/gen/Word";
 
 /** A line's words spread evenly over its time, as the recognizer would time them. */
@@ -129,6 +132,39 @@ export const TRANSCRIPT_FIXTURE: TranscriptVm = {
     corrected: false,
   },
 };
+/** A two-part recording session with a camera beside each screen segment. */
+export const SESSION_TRANSCRIPT_FIXTURE: TranscriptVm = (() => {
+  const vm = structuredClone(TRANSCRIPT_FIXTURE);
+  vm.path = "/Volumes/merope/tgdrive/recordings/2026-09-28 standup/transcript.json";
+  const tracks = TRANSCRIPT_FIXTURE.transcript.source.parts[0].tracks;
+  vm.transcript.source = {
+    kind: "recording",
+    files: ["screen-0000.mov", "screen-0001.mov"],
+    title: "2026-09-28 standup",
+    parts: [
+      { file: "screen-0000.mov", offset: 0, duration: 21, tracks },
+      { file: "screen-0001.mov", offset: 21, duration: 21, tracks },
+    ],
+  };
+  const line = (id: string, speaker: string, start: number, end: number, text: string) => ({
+    id,
+    speaker,
+    origin: speaker === "ME" ? ("microphone" as const) : ("system" as const),
+    start,
+    end,
+    text,
+    asrText: text,
+    edited: false,
+    words: timed(text, start, end),
+  });
+  vm.transcript.utterances = [
+    ...vm.transcript.utterances,
+    line("u4", "S1", 21.5, 27, "The second segment starts here, after the pause."),
+    line("u5", "ME", 28, 33, "Then we keep the camera on for the demo."),
+    line("u6", "S1", 34, 40, "Search should find the keeper release again."),
+  ];
+  return vm;
+})();
 export const DICTIONARY_FIXTURE: DictionaryTermVm[] = [
   { id: "d1", text: "keeper", aliases: ["keaper"] },
   { id: "d2", text: "CoreML", aliases: ["core ml"] },
@@ -189,7 +225,11 @@ export function transcriptionMockHandlers(
     const path = String(payload.path);
     let vm = transcripts.get(path);
     if (!vm) {
-      vm = structuredClone(TRANSCRIPT_FIXTURE);
+      // A recording session's transcript sits in the session folder as
+      // `transcript.json`; a file's beside it as `<file>.transcript.json`.
+      vm = structuredClone(
+        path.endsWith("/transcript.json") ? SESSION_TRANSCRIPT_FIXTURE : TRANSCRIPT_FIXTURE,
+      );
       vm.path = path;
       const speakerStatus = params.get("speakerStatus");
       if (
@@ -261,8 +301,13 @@ export function transcriptionMockHandlers(
       const jobId = crypto.randomUUID();
       const channel = p.channel as { onmessage: (progress: TranscriptionProgressVm) => void };
       const path = String(p.path);
-      let stopped = false;
-      const send = (phase: TranscriptionProgressVm["phase"], message: string | null = null) =>
+      const started = Date.now();
+      let timer = 0;
+      const send = (
+        phase: TranscriptionProgressVm["phase"],
+        fraction: number | null,
+        message: string | null = null,
+      ) =>
         channel.onmessage({
           jobId,
           phase,
@@ -275,40 +320,57 @@ export function transcriptionMockHandlers(
                 ? `${path}.transcript.json`
                 : `${path}/transcript.json`
               : null,
+          fraction,
+          elapsedMs: Date.now() - started,
         });
-      jobs.set(jobId, () => {
-        stopped = true;
-        send("cancelled");
+      const stop = () => {
+        window.clearInterval(timer);
         jobs.delete(jobId);
+      };
+      jobs.set(jobId, () => {
+        stop();
+        send("cancelled", null);
       });
-      send("queued");
-      const phases: TranscriptionProgressVm["phase"][] = [
-        "decoding",
-        "transcribing",
-        "diarizing",
-        "matching",
-        "writing",
-        "done",
+      send("queued", null);
+      // The shell's phase weights (decode 5 %, recognition 60 %, speakers 25 %,
+      // matching and writing 10 %) over a job that takes eight seconds here, with
+      // a heartbeat twice a second so a bar can be watched filling.
+      const phases: [TranscriptionProgressVm["phase"], number][] = [
+        ["decoding", 0.05],
+        ["transcribing", 0.6],
+        ["diarizing", 0.25],
+        ["matching", 0.05],
+        ["writing", 0.05],
       ];
-      phases.forEach((phase, i) => {
-        window.setTimeout(
-          () => {
-            if (stopped) return;
-            if (
-              i === 0 &&
-              (params.has("transcriptionFailure") || path.includes("master-2026-04"))
-            ) {
-              stopped = true;
-              send("failed", "The media is not here yet. Fetch this file before transcribing it.");
-              jobs.delete(jobId);
-              return;
-            }
-            send(phase);
-            if (phase === "done") jobs.delete(jobId);
-          },
-          (i + 1) * 600,
-        );
-      });
+      const JOB_MS = 8_000;
+      const tick = () => {
+        const fraction = Math.min(1, (Date.now() - started) / JOB_MS);
+        if (params.has("transcriptionFailure") || path.includes("master-2026-04")) {
+          stop();
+          send(
+            "failed",
+            null,
+            "The media is not here yet. Fetch this file before transcribing it.",
+          );
+          return;
+        }
+        if (fraction >= 1) {
+          stop();
+          send("done", 1);
+          return;
+        }
+        let phase: TranscriptionProgressVm["phase"] = "writing";
+        let reached = 0;
+        for (const [name, weight] of phases) {
+          reached += weight;
+          if (reached > fraction) {
+            phase = name;
+            break;
+          }
+        }
+        send(phase, fraction);
+      };
+      timer = window.setInterval(tick, 500);
       return jobId;
     },
     transcription_cancel: (p) => jobs.get(String(p.jobId))?.(),
@@ -442,7 +504,7 @@ export function transcriptionMockHandlers(
         person.samples++;
         // One person on one track is one speaker: a same-origin speaker that
         // already carries them and has lines takes this one's lines, and this
-        // one stays behind, lineless and unchanged, so the move can be undone.
+        // one is removed rather than left behind naming the person twice.
         const into = vm.transcript.speakers.find(
           (s) =>
             s !== speaker &&
@@ -454,12 +516,61 @@ export function transcriptionMockHandlers(
         confirmed.personId = person.id;
         confirmed.name = person.name;
         confirmed.status = "confirmed";
-        if (into)
+        if (into) {
           for (const u of vm.transcript.utterances)
             if (u.speaker === speaker.id) u.speaker = into.id;
+          vm.transcript.speakers = vm.transcript.speakers.filter((s) => s !== speaker);
+        }
       }
       vm.people = structuredClone(people);
       return structuredClone(vm);
+    },
+    transcript_add_speaker: (p) => {
+      const vm = read(p);
+      const next =
+        Math.max(0, ...vm.transcript.speakers.map((s) => Number(s.id.slice(1)) || 0)) + 1;
+      const label = String(p.label ?? "").trim();
+      vm.transcript.speakers.push({
+        id: `S${next}`,
+        origin: p.origin as TrackOrigin,
+        personId: null,
+        name: label || null,
+        status: "unknown",
+        score: null,
+        candidates: [],
+        embedding: null,
+        clip: null,
+      });
+      vm.transcript.corrected = true;
+      return structuredClone(vm);
+    },
+    transcript_media: (p): TranscriptMediaVm => {
+      const vm = read(p);
+      const folder = String(p.path)
+        .replace(/\/[^/]*$/, "")
+        .replace(/^\/Volumes\/merope\/tgdrive\/?|^\//, "");
+      const ref = (file: string, kind: MediaRef["kind"]): MediaRef => ({
+        profileId: "p1",
+        relativePath: folder ? `${folder}/${file}` : file,
+        kind,
+      });
+      const session =
+        vm.transcript.source.kind === "recording" && vm.transcript.source.parts.length > 1;
+      const parts = vm.transcript.source.parts.map((part) => ({
+        file: part.file,
+        offset: part.offset,
+        duration: part.duration,
+        screen: ref(part.file, /\.(m4a|wav|mp3)$/.test(part.file) ? "audio" : "video"),
+        camera: session ? ref(part.file.replace(/^screen-/, "camera-"), "video") : null,
+        audioTracks: part.tracks.flatMap((track) =>
+          track.track === null ? [] : [{ index: track.track, origin: track.origin }],
+        ),
+      }));
+      return {
+        parts,
+        hasCamera: parts.some((part) => part.camera !== null),
+        hasScreen: parts.some((part) => part.screen.kind === "video"),
+      };
     },
     voices_people: () => structuredClone(people),
     voices_person_rename: (p) => editPerson(p, (person) => ({ ...person, name: String(p.name) })),

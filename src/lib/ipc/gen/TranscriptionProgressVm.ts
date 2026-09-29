@@ -2,7 +2,8 @@
 import type { TranscriptionPhase } from "./TranscriptionPhase";
 
 /**
- * One batch of a transcription job's progress.
+ * One batch of a transcription job's progress. A running job sends one every
+ * second; `fraction` never goes backwards within a job.
  */
 export type TranscriptionProgressVm = { jobId: string, phase: TranscriptionPhase, 
 /**
@@ -12,4 +13,14 @@ part: number, parts: number, message: string | null,
 /**
  * Set on `done`.
  */
-transcriptPath: string | null, };
+transcriptPath: string | null, 
+/**
+ * How much of the job is done, 0..=1 — an estimate from the audio's
+ * length ([`super::progress::Estimate`]); `null` before the job knows
+ * what it will hear.
+ */
+fraction: number | null, 
+/**
+ * Milliseconds since the job started running.
+ */
+elapsedMs: number, };

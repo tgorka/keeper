@@ -18,8 +18,9 @@
 //!   its echo of the far end is dropped. It is diarized too: the voice that
 //!   is the bank's self person (or, failing that, talks most) is `ME`, any
 //!   other voice in the room is a numbered speaker of its own.
-//! - AD-346: speakers match people by centroid cosine ([`AUTO_MATCH`],
-//!   [`SUGGEST`]); clusters link across parts at [`LINK`].
+//! - AD-346: speakers — `ME` included, when its voice is known — match people
+//!   by centroid cosine ([`AUTO_MATCH`], [`SUGGEST`]); clusters of one track
+//!   are one voice at [`SAME_VOICE`] and link across parts at [`LINK`].
 //! - AD-347: only a person's confirmation writes to the bank; edits only
 //!   suggest dictionary terms.
 //! - AD-348/350: transcription after recording is on by default and happens
@@ -30,21 +31,24 @@ pub mod bank;
 pub mod corrections;
 pub mod dictionary;
 pub mod engine;
+pub mod media;
 pub mod model;
 pub mod models;
 pub mod plan;
+pub mod progress;
 pub mod render;
 pub mod vm;
 pub mod words;
 
-pub use assemble::{assemble, best_clip, AssembleContext, PartResult, LINK};
+pub use assemble::{assemble, best_clip, AssembleContext, PartResult, LINK, SAME_VOICE};
 pub use bank::{
-    wav_bytes, wav_samples, Bank, BankDelete, BankError, BankPlan, BankWrite, DictionaryTerm,
-    EmbeddingSample, MatchResult, Person, SampleSource, Tombstone, AUTO_MATCH, SUGGEST,
+    wav_bytes, wav_samples, Bank, BankDelete, BankError, BankPlan, BankWrite, Confirmation,
+    DictionaryTerm, EmbeddingSample, MatchResult, Naming, Person, SampleSource, Tombstone,
+    VoiceSample, AUTO_MATCH, SUGGEST,
 };
 pub use corrections::{
-    assign_speaker, edit_utterance, insert_utterance_after, merge_speakers, reassign_utterance,
-    rename_speaker_label, split_utterance, CorrectionError,
+    add_speaker, assign_speaker, edit_utterance, insert_utterance_after, merge_speakers,
+    reassign_utterance, rename_speaker_label, split_utterance, CorrectionError,
 };
 pub use dictionary::DictionarySuggestion;
 pub use engine::{

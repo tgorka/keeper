@@ -109,6 +109,10 @@ import { SyncStatusMark } from "@/components/layout/sync-status-mark";
 import { ATTACH_TO_NOTE_LABEL, AttachToNoteDialog } from "@/components/notes/attach-to-note-dialog";
 import { TranscriptDialog } from "@/components/transcription/transcript-viewer";
 import { TranscriptionJob } from "@/components/transcription/transcription-job";
+import {
+  TranscriptionProgressRing,
+  transcriptionShortLine,
+} from "@/components/transcription/transcription-progress";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -1037,6 +1041,10 @@ interface FilesRowAction {
   readonly label: string;
   /** The glyph the promoted control draws. */
   readonly icon: LucideIcon;
+  /** A job this verb started is still running: its fraction (0..1, or null
+   *  while the shell has no estimate yet), drawn as a ring round the promoted
+   *  control. Absent when nothing is running. */
+  readonly ring?: number | null;
   /** What the control and the menu item both do. One handler, so they cannot
    *  drift — the rule `PriorityAction` states and this borrows.
    *
@@ -2442,6 +2450,8 @@ export function FilesPane() {
     // menu's items and the row's own click gestures must be about the same
     // target or the two gestures mean different things on the same row.
     const target = rowTarget(node);
+    const rowJob = entry === null ? undefined : transcriptionJobs[entry.absolutePath];
+    const rowJobRunning = rowJob !== undefined && transcriptionRunning(rowJob);
     /**
      * Every verb this row has, in the order it matters.
      *
@@ -2613,11 +2623,10 @@ export function FilesPane() {
               ? [
                   {
                     id: "transcribe",
-                    label: transcriptionRunning(transcriptionJobs[entry.absolutePath])
-                      ? `Transcription: ${transcriptionJobs[entry.absolutePath]?.phase}`
-                      : "Transcribe",
+                    label: rowJobRunning ? transcriptionShortLine(rowJob) : "Transcribe",
                     icon: AudioLines,
-                    disabled: transcriptionRunning(transcriptionJobs[entry.absolutePath]),
+                    disabled: rowJobRunning,
+                    ring: rowJobRunning ? rowJob.fraction : undefined,
                     onSelect: () => {
                       setTranscriptionPath(entry.absolutePath);
                       // The new transcript's row (and this row's Open transcript)
@@ -2990,24 +2999,28 @@ export function FilesPane() {
             no children still spends the row's gap. */}
         {actions.length > 0 && promoted > 0 && (
           <span className="flex shrink-0 items-center gap-1">
-            {actions.slice(0, promoted).map(({ id, label, icon: Icon, onSelect, disabled }) => (
-              <IconHint key={id} label={label}>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-sm"
-                  tabIndex={actionTabIndex}
-                  disabled={disabled}
-                  // The whole visible word as the name rather than a description of
-                  // it, so speech input can ask for what the menu spells even
-                  // though the eye reads a picture (WCAG 2.5.3).
-                  aria-label={label}
-                  onClick={onSelect}
-                >
-                  <Icon aria-hidden="true" />
-                </Button>
-              </IconHint>
-            ))}
+            {actions
+              .slice(0, promoted)
+              .map(({ id, label, icon: Icon, onSelect, disabled, ring }) => (
+                <IconHint key={id} label={label}>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    tabIndex={actionTabIndex}
+                    disabled={disabled}
+                    // The whole visible word as the name rather than a description of
+                    // it, so speech input can ask for what the menu spells even
+                    // though the eye reads a picture (WCAG 2.5.3).
+                    aria-label={label}
+                    onClick={onSelect}
+                    className={ring === undefined ? undefined : "relative"}
+                  >
+                    <Icon aria-hidden="true" />
+                    {ring !== undefined && <TranscriptionProgressRing fraction={ring} />}
+                  </Button>
+                </IconHint>
+              ))}
           </span>
         )}
       </div>

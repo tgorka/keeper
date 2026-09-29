@@ -149,6 +149,42 @@ pub struct BankPlan {
     pub deletes: Vec<BankDelete>,
 }
 
+impl BankPlan {
+    /// `other`'s writes after this plan's, and its deletes after this plan's.
+    pub fn extend(&mut self, other: Self) {
+        self.writes.extend(other.writes);
+        self.deletes.extend(other.deletes);
+    }
+}
+
+/// Who a confirmed speaker is: a person already in the bank, or one to make.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Naming {
+    Existing(String),
+    New(String),
+}
+
+/// A confirmed speaker's voice, cut from its media before the bank is
+/// touched.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VoiceSample {
+    /// 16 kHz mono PCM16 WAV bytes.
+    pub wav: Vec<u8>,
+    /// `None` while a transcription job holds the engine: the clip is kept
+    /// alone and the next job's re-embed gives it its embedding.
+    pub embedding: Option<Vec<f32>>,
+    pub source: SampleSource,
+}
+
+/// [`Bank::plan_confirmation`]'s answer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Confirmation {
+    pub person: Person,
+    pub plan: BankPlan,
+    /// What the plan leaves out and why, for the log.
+    pub left_out: Vec<String>,
+}
+
 /// The bank's answer for one speaker embedding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchResult {
@@ -733,6 +769,56 @@ impl Bank {
                 Ok((clip, self.guarded(plan)?))
             }
         }
+    }
+
+    /// The one bank edit a confirmation makes (AD-347): the person (made,
+    /// when new) and the speaker's voice sample, planned together so they
+    /// land together. A sample the bank refuses is left out, with the reason
+    /// in [`Confirmation::left_out`]; the person still lands. Confirming the
+    /// microphone's own speaker (`ME`) says who the person recording is, so
+    /// that person becomes self in the same plan — every other claimant
+    /// unmarked — whoever was self before: re-confirming ME as someone else
+    /// is how a wrong self is corrected.
+    pub fn plan_confirmation(
+        mut self,
+        naming: Naming,
+        sample: Option<VoiceSample>,
+        model: &str,
+        me: bool,
+    ) -> Result<Confirmation, BankError> {
+        let (person, mut plan) = match naming {
+            Naming::New(name) => {
+                let (person, plan) = self.create_person(&name)?;
+                // The sample is planned for the person before its file exists.
+                self.people.push(person.clone());
+                (person, plan)
+            }
+            Naming::Existing(id) => (self.live_person(&id)?.clone(), BankPlan::default()),
+        };
+        let mut left_out = Vec::new();
+        if let Some(sample) = sample {
+            let planned = match sample.embedding {
+                Some(vector) => {
+                    self.add_sample(&person.id, sample.wav, vector, model, sample.source)
+                }
+                None => self.add_clip_only(&person.id, sample.wav, sample.source),
+            };
+            match planned {
+                Ok((_, sample_plan)) => plan.extend(sample_plan),
+                Err(error) => left_out.push(format!("the voice sample was not stored: {error}")),
+            }
+        }
+        if me {
+            match self.set_self(&person.id) {
+                Ok(self_plan) => plan.extend(self_plan),
+                Err(error) => left_out.push(format!("the person was not marked as you: {error}")),
+            }
+        }
+        Ok(Confirmation {
+            person,
+            plan,
+            left_out,
+        })
     }
 
     /// The embedding of an existing clip under `model` — how a model change
@@ -1790,6 +1876,65 @@ pub(crate) mod tests {
         }
         let bank = Bank::load(&root);
         assert!(bank.people.is_empty() && bank.samples.is_empty() && bank.clips.is_empty());
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// The field report: confirming ME as Kelly by mistake made her self;
+    /// confirming ME as Tomasz afterwards must move self to him.
+    #[test]
+    fn confirming_me_moves_self_to_that_person_and_a_call_voice_never_does() {
+        let root = scratch();
+        let confirm = |naming: Naming, me: bool| {
+            let confirmation = Bank::load(&root)
+                .plan_confirmation(naming, None, "m1", me)
+                .expect("plan");
+            assert!(
+                confirmation.left_out.is_empty(),
+                "{:?}",
+                confirmation.left_out
+            );
+            apply(&root, &confirmation.plan);
+            confirmation.person
+        };
+        let selves = || -> Vec<String> {
+            Bank::load(&root)
+                .people
+                .iter()
+                .filter(|p| p.is_self)
+                .map(|p| p.name.clone())
+                .collect()
+        };
+
+        let kelly = confirm(Naming::New("Kelly".to_owned()), true);
+        assert_eq!(selves(), ["Kelly"]);
+        let tomasz = confirm(Naming::New("Tomasz".to_owned()), true);
+        assert_eq!(selves(), ["Tomasz"], "self moved, Kelly unmarked");
+        confirm(Naming::Existing(kelly.id.clone()), true);
+        assert_eq!(selves(), ["Kelly"], "and moves again");
+        confirm(Naming::Existing(tomasz.id.clone()), false);
+        assert_eq!(selves(), ["Kelly"], "a voice from the call is not you");
+        confirm(Naming::New("Bo".to_owned()), false);
+        assert_eq!(selves(), ["Kelly"]);
+
+        let sample = VoiceSample {
+            wav: wav_bytes(&[0.1; 1600]),
+            embedding: Some(vec![1.0, 0.0]),
+            source: SampleSource {
+                transcript: "t.json".to_owned(),
+                start: 1.0,
+                end: 4.0,
+            },
+        };
+        let confirmation = Bank::load(&root)
+            .plan_confirmation(Naming::New("Ana".to_owned()), Some(sample), "m1", false)
+            .expect("plan");
+        apply(&root, &confirmation.plan);
+        let bank = Bank::load(&root);
+        assert_eq!(bank.sample_facts(&confirmation.person.id, "m1"), (1, true));
+        assert!(matches!(
+            bank.plan_confirmation(Naming::Existing("01NOBODY".to_owned()), None, "m1", true),
+            Err(BankError::UnknownPerson(_))
+        ));
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

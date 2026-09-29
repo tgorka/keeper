@@ -35,18 +35,26 @@
  * make is not a surface, it is a puzzle. Nothing here sniffs the platform; the
  * flag is Rust's answer, mirrored in the capabilities store.
  *
- * This surface reads. There is no write path of any kind, no media player (Play
- * hands the file to the system handler and stops caring), and no tag
+ * This surface reads, and starts one job: Transcribe on a row (and the
+ * header's Transcribe a file…) hands a path to the transcription engine on this
+ * Mac and follows it, the way the Files pane does. There is no other write
+ * path, no media player (Play hands the file to the system handler and stops caring), and no tag
  * normalisation — Story 42.5 put that in Rust, at the boundary where a
  * recording's tags enter the index, so what arrives here is already the one
  * vocabulary and re-shaping it would only be a way to disagree with the tree.
  */
+import { AudioLines } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { RecordingRow } from "@/components/recordings/recording-row";
 import {
   type RecordingsEmptyKind,
   RecordingsEmptyState,
 } from "@/components/recordings/recordings-empty-state";
+import {
+  TRANSCRIBE_A_FILE_LABEL,
+  transcribeAFile,
+} from "@/components/transcription/transcribe-a-file";
+import { TranscriptDialog } from "@/components/transcription/transcript-viewer";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -62,6 +70,7 @@ import type { IpcError, RecordingFilterVm, RecordingHitVm } from "@/lib/ipc/clie
 import { recordingOpenPath, revealPath, searchRecordings } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { startTranscription, useTranscriptionStore } from "@/lib/stores/transcription";
 
 /** Debounce (ms) before a filter change fires `searchRecordings`. */
 const DEBOUNCE_MS = 200;
@@ -124,6 +133,9 @@ export function RecordingsPane() {
   // A platform with no user-visible file manager gets no Reveal affordance —
   // the row renders the path as inert text instead (Story 42.3 matrix).
   const canReveal = useCapabilitiesStore((s) => s.capabilities.revealInFileManager);
+  const canTranscribe = useCapabilitiesStore((s) => s.capabilities.transcription);
+  const transcriptionJobs = useTranscriptionStore((s) => s.jobs);
+  const [transcriptPath, setTranscriptPath] = useState<string | null>(null);
 
   const [query, setQuery] = useState("");
   const [tags, setTags] = useState<string[]>([]);
@@ -205,6 +217,11 @@ export function RecordingsPane() {
     return () => window.clearTimeout(handle);
   }, [filter, runSearch]);
 
+  // What a job's follow-up re-runs when it ends minutes later: the filter on
+  // screen then, not the one the job started under.
+  const filterRef = useRef(filter);
+  filterRef.current = filter;
+
   // Tag choices are seeded from the current result set, the way the message
   // search seeds its sender suggestions: the tags that co-occur with what is on
   // screen are exactly the tags that can narrow it further, and a global list
@@ -277,19 +294,31 @@ export function RecordingsPane() {
             </p>
           )}
         </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="shrink-0"
-          // An explicit press asks now, undebounced: a session recorded while
-          // this pane was open lands in `archive.db` without telling anyone, and
-          // every query opens a fresh read-only connection — so re-asking is the
-          // whole of "it appears without a restart".
-          onClick={() => runSearch(filter)}
-        >
-          {RECORDINGS_REFRESH_LABEL}
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          {canTranscribe && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void transcribeAFile()}
+            >
+              <AudioLines aria-hidden="true" />
+              {TRANSCRIBE_A_FILE_LABEL}
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            // An explicit press asks now, undebounced: a session recorded while
+            // this pane was open lands in `archive.db` without telling anyone, and
+            // every query opens a fresh read-only connection — so re-asking is the
+            // whole of "it appears without a restart".
+            onClick={() => runSearch(filter)}
+          >
+            {RECORDINGS_REFRESH_LABEL}
+          </Button>
+        </div>
       </header>
 
       <div className="flex shrink-0 flex-col gap-2 border-border border-b px-6 py-3">
@@ -460,6 +489,15 @@ export function RecordingsPane() {
                         }
                         void recordingOpenPath(h.playablePath).catch(() => {});
                       }}
+                      canTranscribe={canTranscribe}
+                      job={transcriptionJobs[hit.absolutePath]}
+                      onTranscribe={(h) => {
+                        // The session folder, which the engine reads as one
+                        // timeline across its segments. The row's transcript
+                        // only exists once the archive is asked again.
+                        void startTranscription(h.absolutePath, () => runSearch(filterRef.current));
+                      }}
+                      onShowTranscript={setTranscriptPath}
                     />
                   </li>
                 );
@@ -468,6 +506,7 @@ export function RecordingsPane() {
           )}
         </div>
       </div>
+      <TranscriptDialog path={transcriptPath} onClose={() => setTranscriptPath(null)} />
     </section>
   );
 }

@@ -11,6 +11,7 @@ vi.mock("@/lib/ipc/client", () => ({
   transcriptionStatus: vi.fn(),
   transcriptionStart: vi.fn(),
   transcriptRead: vi.fn(),
+  transcriptMedia: vi.fn(),
   voicesPeople: vi.fn(),
   dictionaryTerms: vi.fn(),
   dictionaryTermSave: vi.fn(),
@@ -39,6 +40,11 @@ beforeEach(() => {
   vi.mocked(ipc.voicesPeople).mockResolvedValue(structuredClone(TRANSCRIPT_FIXTURE.people));
   vi.mocked(ipc.dictionaryTerms).mockResolvedValue([]);
   vi.mocked(ipc.transcriptRead).mockResolvedValue(structuredClone(TRANSCRIPT_FIXTURE));
+  vi.mocked(ipc.transcriptMedia).mockResolvedValue({
+    parts: [],
+    hasCamera: false,
+    hasScreen: false,
+  });
 });
 
 describe("Transcription settings", () => {
@@ -83,6 +89,8 @@ describe("Transcription settings", () => {
         parts: 1,
         message: null,
         transcriptPath: "/Users/alice/call.m4a.transcript.json",
+        fraction: 1,
+        elapsedMs: 1_000,
       }),
     );
     expect(screen.queryByRole("dialog")).toBeNull();

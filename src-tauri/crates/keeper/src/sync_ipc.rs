@@ -3854,18 +3854,19 @@ fn transcription_facts(
     name: &str,
     is_dir: bool,
 ) -> (bool, bool, Option<String>) {
-    use keeper_core::recording::SessionManifest;
     use keeper_core::transcription::plan;
     let session_folder = is_dir && absolute.join("manifest.json").is_file();
-    if !session_folder && (is_dir || !plan::is_media_file(name)) {
+    if session_folder {
+        let (media_here, transcript) = plan::session_facts(absolute);
+        let transcript = transcript.map(|json| json.to_string_lossy().into_owned());
+        return (true, media_here, transcript);
+    }
+    if is_dir || !plan::is_media_file(name) {
         return (false, true, None);
     }
-    let media_here = !session_folder
-        || SessionManifest::load(absolute)
-            .is_ok_and(|manifest| plan::plan_for_session(absolute, &manifest).is_ok());
-    let (json, _) = plan::transcript_paths_for(absolute, session_folder);
+    let (json, _) = plan::transcript_paths_for(absolute, false);
     let transcript = json.is_file().then(|| json.to_string_lossy().into_owned());
-    (session_folder, media_here, transcript)
+    (false, true, transcript)
 }
 
 /// Word one entry's sync state (Story 44.17, FR-173).

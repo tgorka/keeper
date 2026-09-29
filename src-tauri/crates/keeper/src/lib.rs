@@ -1065,6 +1065,8 @@ pub fn run() {
                 transcribe_ipc::transcript_assign_speaker,
                 transcribe_ipc::transcript_split_utterance,
                 transcribe_ipc::transcript_insert_utterance,
+                transcribe_ipc::transcript_add_speaker,
+                transcribe_ipc::transcript_media,
                 transcribe_ipc::voices_people,
                 transcribe_ipc::voices_person_rename,
                 transcribe_ipc::voices_person_delete,

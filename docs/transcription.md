@@ -50,10 +50,47 @@ leaves it for this, there is no transcription server, no NAS option and no cloud
   viewer instead.
 - **Recording:** see `docs/recording.md` § *Transcription* — after-recording transcription,
   and the microphone track as you.
-- **The transcript viewer:** speakers with how each was matched and the candidates; assign a
-  speaker to a person (existing or new), rename or merge speakers; each line editable,
-  reassignable to another speaker, splittable in two, and followed by a line you add;
-  dictionary suggestions after an edit; progress while a job runs.
+- **Recordings:** each session row offers *Transcribe* when its audio is all on this Mac and it
+  has stopped recording, and *Show transcript* when it has one; the pane header and the
+  Recording pane offer *Transcribe a file…*.
+- **Progress:** a running job reports a determinate bar — every second, the share of the job
+  done (an estimate, never going backwards) and the time it has run — wherever it was started:
+  the job strip, the *Transcribe a file…* toast, the Files row and the Recordings row. The
+  estimate weighs each part by its audio time (times its tracks) and each step by a fixed share
+  (decoding 5 %, speech 60 %, speakers 25 %, matching and writing 10 %); how far into a step a
+  job is comes from the time it has spent there against the time that much audio is expected to
+  take on an M-series Mac (decoding 0.001 s, speech 0.02 s, speakers 0.006 s per second of
+  audio), and a step never claims more than 95 % of itself until it ends.
+- **The transcript viewer:**
+  - *Transcript* and *Source* tabs. Source shows the file's JSON read-only in the Files text
+    editor, laid out as keeper writes it; the transcript stays mounted underneath, so playback
+    goes on.
+  - **Speakers** with how each was matched and the candidates; assign a speaker to a person
+    (existing or new), rename or merge speakers. *Add speaker* in the legend adds a voice the
+    diarizer did not tell apart, with an optional label; a track choice (call or microphone)
+    appears only when the transcript heard both. Lines then move to it by reassigning them. The
+    legend lists only speakers with lines; the per-line and add-a-line speaker menus list each
+    person once (a lineless speaker whose person another speaker with lines carries is not
+    offered; an unnamed or unique lineless one is).
+  - Each line editable, reassignable to another speaker, splittable in two, and followed by a
+    line you add; dictionary suggestions after an edit.
+  - A **player**, when the transcript's media can be served, plays it as one timeline across a
+    session's segments: scrubbing, ±10 s and seeks map the transcript's time to a part and a
+    time in it, the next part starts where one ends, and a line under the player says
+    "Part 2 of 3 · screen-0001.mov". Screen and camera play side by side, with a *Picture*
+    choice only when the session filmed both; a *Sound* choice (call and microphone, call,
+    microphone) appears only when a part has two audio tracks. Media is served over
+    `keeper-file://` from the synced folder that holds it; a part in no synced folder says
+    keeper cannot play it here. Media elements are released on a part change and on close.
+  - *Keep the player on top* (on by default) pins the player to the top of the viewer while the
+    lines scroll. Each line has ▶ *Play from here*. *Follow the transcript* (on by default)
+    highlights the line being said and scrolls it into view while playing and on every seek;
+    scrolling by hand pauses the follow-scroll until the next play or seek; clicking a line's
+    text seeks the player (and opens it for editing).
+  - **Search** (⌘F / Ctrl+F in the viewer) finds text in lines and speaker names, ignoring
+    case: matches are marked, a count reads "N matches", "2 of 7" or "No matches", Enter and
+    Shift+Enter (or the ↑/↓ buttons) go to the next and previous match and wrap, and a jump
+    seeks the player when Follow is on.
 
 ## Models live in the config repository
 
@@ -247,9 +284,13 @@ In the viewer:
 - **Reassign a line** to another speaker, **merge** two speakers, or **rename** a speaker for
   this transcript only — the transcript changes, the bank does not. A speaker left with no lines
   stays in the transcript, hidden from the legend and still offered as a target, so the move
-  can be undone. A line heard on your microphone cannot move to a voice from the call, or back,
-  and those two speakers cannot be merged; voices on the microphone can be merged and lines
-  moved among them.
+  can be undone — unless another speaker on its track carries the same person: merging into a
+  speaker that names the same person removes the absorbed one, and a file that still holds such
+  a lineless duplicate (from before this rule) loses it when it is read. A line heard on your
+  microphone cannot move to a voice from the call, or back, and those two speakers cannot be
+  merged; voices on the microphone can be merged and lines moved among them.
+- **Add a speaker** on the microphone or the call, with an optional label: it gets the next
+  `S<n>`, is `unknown`, and has no embedding or clip until lines move to it and it is assigned.
 - **Split a line** before one of its words — the words before stay, the rest become a new line
   right after it, same speaker and track, each half timed and worded from its words. An
   untouched line's `asrText` is cut at the same word; an edited one (or one where the dictionary
@@ -262,10 +303,12 @@ In the viewer:
   `confirmed`, and the bank gains that speaker's clip and embedding. This is the one correction
   that teaches keeper a voice. The clip is cut from the assigned speaker's own lines. When
   another speaker heard on the same track, with lines of its own, already names that person,
-  the two are one voice: the assigned speaker's lines move to it and it is the one confirmed,
-  so a person appears once in the legend. The microphone and the call stay two speakers even
-  when they name the same person. Confirming `ME` (and only `ME`, not another voice on the
-  microphone) marks the person as me when the bank has no one marked yet.
+  the two are one voice: the assigned speaker's lines move to it, it is the one confirmed, and
+  the assigned speaker is removed, so a person appears once in the legend and in each line's
+  speaker list. The microphone and the call stay two speakers even when they name the same
+  person. Confirming `ME` (and only `ME`, not another voice on the microphone) marks that
+  person as me and unmarks whoever was before: confirming `ME` as someone else moves it again,
+  which is how a wrong *me* is corrected.
 
 Assignment needs a drive that keeps voices: the drive holding the media if it keeps voices,
 otherwise the first enabled one. With none, speakers stay unknown and assignment says why.
@@ -281,8 +324,18 @@ of their vectors for the current embedding model:
 - below — `unknown`.
 
 Speakers in different segment files of one recording are the same speaker when their centroids
-reach **0.60**. These values are starting points, not measurements (DW-333): a wrong automatic
-match costs a click, and nothing reaches the bank without confirmation.
+reach **0.60**. Within one file and track, two voices the diarizer split are one speaker when
+their embeddings reach **0.45** (`SAME_VOICE`; measured: 0.526 between two halves of one remote
+voice, 0.37 between two people): they are joined before speakers are numbered, and the joined
+voice's embedding is the two weighted by how long each spoke. These values are starting
+points, not measurements (DW-333): a wrong automatic match costs a click, and nothing reaches
+the bank without confirmation.
+
+`ME` is matched too when the microphone was diarized: the bank's `self` person names it when
+its voice reaches 0.50; otherwise a person matched at 0.70 names it (`auto`), and below that it
+is `suggested` or `unknown` with its candidates — a wrong `self` flag does not name the person
+recording. An undiarized microphone, or a `self` person with no voice for the current model,
+leaves `ME` to the `self` flag as before.
 
 ## Known limits
 
@@ -310,3 +363,10 @@ match costs a click, and nothing reaches the bank without confirmation.
 - Voice prints are personal data; consent and GDPR handling are deferred by the owner
   (DW-342).
 - No translation.
+- The player plays only media inside a synced folder: a transcript of a file elsewhere on the
+  Mac shows no player, and a recordings destination that is not a synced folder is not played
+  (`keeper-recording://` is not used for it).
+- The progress estimate's speeds were measured on one M-series Mac; on a slower one the bar
+  waits near the end of a step until the step ends.
+- The *Sound* choice switches audio tracks through `HTMLMediaElement.audioTracks`, which only
+  WebKit (the macOS app's webview) implements.

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { TranscriptionProgress } from "@/components/transcription/transcription-progress";
 import { Button } from "@/components/ui/button";
 import { transcriptionCancel } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
@@ -19,12 +20,19 @@ export function TranscriptionJob({
   const job = useTranscriptionStore((s) => s.jobs[path]);
   const [error, setError] = useState<string | null>(null);
   if (!job) return null;
+  const running = transcriptionRunning(job);
   return (
     <div className="flex flex-wrap items-center gap-2 text-sm">
-      <p role="status" className="min-w-0 break-words">
-        {transcriptionJobLine(job)}
-      </p>
-      {transcriptionRunning(job) && (
+      {running ? (
+        <div className="min-w-48 flex-1">
+          <TranscriptionProgress job={job} announce />
+        </div>
+      ) : (
+        <p role="status" className="min-w-0 break-words">
+          {transcriptionJobLine(job)}
+        </p>
+      )}
+      {running && (
         <Button
           size="sm"
           variant="outline"

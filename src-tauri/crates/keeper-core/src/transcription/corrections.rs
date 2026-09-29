@@ -8,7 +8,7 @@
 use super::assemble::refresh_clips;
 use super::bank::Person;
 use super::dictionary::{suggestions, DictionarySuggestion};
-use super::model::{MatchStatus, Transcript, Utterance};
+use super::model::{MatchStatus, Speaker, Transcript, Utterance};
 use super::plan::TrackOrigin;
 use super::words::{join_words, Word};
 
@@ -111,7 +111,10 @@ pub fn reassign_utterance(
 /// Two speakers are one voice: every line of `from` becomes `into`'s. A
 /// voice from the microphone and one from the call are never one
 /// ([`CorrectionError::CrossOrigin`]), and `into` only takes `from`'s
-/// embedding when it has none and both were heard on the same track.
+/// embedding when it has none and both were heard on the same track. When
+/// both name the same person, `from` is gone afterwards — it has nothing
+/// left that `into` does not carry; otherwise it stays, lineless, so the
+/// merge can be undone.
 pub fn merge_speakers(
     mut t: Transcript,
     from: &str,
@@ -132,6 +135,10 @@ pub fn merge_speakers(
     for utterance in t.utterances.iter_mut().filter(|u| u.speaker == from) {
         into.clone_into(&mut utterance.speaker);
     }
+    let person = t.speakers[source].person_id.as_deref();
+    if person.is_some() && person == t.speakers[target].person_id.as_deref() {
+        t.speakers.remove(source);
+    }
     settle(&mut t);
     Ok(t)
 }
@@ -139,9 +146,9 @@ pub fn merge_speakers(
 /// A person confirmed who a speaker is. When another speaker heard on the
 /// same track, with lines of its own, already names that person, the two
 /// are one voice: this speaker's lines move to that one
-/// ([`merge_speakers`]) and that one is confirmed. A voice from the
-/// microphone and one from the call stay two speakers even when they name
-/// the same person.
+/// ([`merge_speakers`]), this speaker is gone and that one is confirmed. A
+/// voice from the microphone and one from the call stay two speakers even
+/// when they name the same person.
 pub fn assign_speaker(
     mut t: Transcript,
     speaker: &str,
@@ -159,7 +166,8 @@ pub fn assign_speaker(
         Some(target) => {
             let into = t.speakers[target].id.clone();
             t = merge_speakers(t, speaker, &into)?;
-            target
+            t.speakers.retain(|absorbed| absorbed.id != speaker);
+            speaker_index(&t, &into)?
         }
         None => index,
     };
@@ -183,6 +191,40 @@ pub fn rename_speaker_label(
     t.speakers[index].name = (!name.is_empty()).then(|| name.to_owned());
     t.corrected = true;
     Ok(t)
+}
+
+/// A voice the diarizer did not tell apart: a new speaker heard on `origin`,
+/// `S<n>` one past the highest `S<n>`, with no lines, person, embedding or
+/// clip yet — lines move to it by [`reassign_utterance`], on its own side of
+/// the call only. An empty label is none. Answers the new speaker's id.
+pub fn add_speaker(
+    mut t: Transcript,
+    origin: TrackOrigin,
+    label: Option<&str>,
+) -> (Transcript, String) {
+    let highest = t
+        .speakers
+        .iter()
+        .filter_map(|speaker| speaker.id.strip_prefix('S')?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    let id = format!("S{}", highest + 1);
+    t.speakers.push(Speaker {
+        id: id.clone(),
+        origin,
+        person_id: None,
+        name: label
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_owned),
+        status: MatchStatus::Unknown,
+        score: None,
+        candidates: Vec::new(),
+        embedding: None,
+        clip: None,
+    });
+    t.corrected = true;
+    (t, id)
 }
 
 /// Cut a line in two before its `word_index`th word: the words before stay,
@@ -542,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn confirming_a_second_voice_as_a_person_already_named_merges_it() {
+    fn confirming_a_second_voice_as_a_person_already_named_merges_it_away() {
         let ada = person("A", "Ada", false, "");
         let t = assign_speaker(transcript(), "S1", &ada).expect("assign S1");
         let t = assign_speaker(t, "S2", &ada).expect("assign S2");
@@ -555,22 +597,59 @@ mod tests {
             (s1.status, s1.person_id.as_deref()),
             (MatchStatus::Confirmed, Some("A"))
         );
-        assert!(
-            t.speaker("S2").is_some(),
-            "kept, lineless, so it can be undone"
-        );
+        assert!(t.speaker("S2").is_none(), "the absorbed speaker is gone");
         let md = crate::transcription::render::markdown(&t);
         assert!(!md.contains("(S2,"), "one legend row for Ada: {md}");
+    }
 
-        // A lineless speaker naming the same person does not take the lines.
-        let mut t = t;
-        t.speakers
-            .iter_mut()
-            .find(|s| s.id == "S2")
-            .expect("S2")
-            .person_id = Some("A".to_owned());
-        let t = assign_speaker(t, "S1", &ada).expect("again");
-        assert!(t.utterances.iter().all(|u| u.speaker == "S1"));
+    #[test]
+    fn a_merge_into_the_same_person_drops_the_absorbed_speaker_and_any_other_keeps_it() {
+        let ada = person("A", "Ada", false, "");
+        let bo = person("B", "Bo", false, "");
+        let named = |second: &Person| {
+            let t = assign_speaker(transcript(), "S1", &ada).expect("S1");
+            let mut t = assign_speaker(t, "S2", &bo).expect("S2");
+            let s2 = t.speakers.iter_mut().find(|s| s.id == "S2").expect("S2");
+            s2.person_id = Some(second.id.clone());
+            t
+        };
+        let same = merge_speakers(named(&ada), "S2", "S1").expect("merge");
+        assert!(same.speaker("S2").is_none(), "Ada twice is one speaker");
+        let other = merge_speakers(named(&bo), "S2", "S1").expect("merge");
+        assert!(
+            other.speaker("S2").is_some(),
+            "Bo's speaker stays, lineless, so the merge can be undone"
+        );
+    }
+
+    #[test]
+    fn an_added_speaker_is_the_next_number_on_its_track_and_takes_only_its_tracks_lines() {
+        let t = call_and_mic();
+        let (t, id) = add_speaker(t, TrackOrigin::Microphone, Some("  Guest "));
+        assert_eq!(id, "S2", "one past S1");
+        let added = t.speaker(&id).expect("added");
+        assert_eq!(
+            (added.origin, added.name.as_deref(), added.status),
+            (TrackOrigin::Microphone, Some("Guest"), MatchStatus::Unknown)
+        );
+        assert!(added.embedding.is_none() && added.clip.is_none() && added.person_id.is_none());
+        assert!(t.corrected);
+        let mic_line = t
+            .utterances
+            .iter()
+            .find(|u| u.speaker == "ME")
+            .map(|u| u.id.clone())
+            .expect("a mic line");
+        let moved = reassign_utterance(t.clone(), &mic_line, &id).expect("a mic line moves");
+        assert!(moved.utterances.iter().any(|u| u.speaker == id));
+        assert_eq!(
+            reassign_utterance(t.clone(), "u1", &id),
+            Err(CorrectionError::CrossOrigin),
+            "a call line never goes to a microphone speaker"
+        );
+        let (t, next) = add_speaker(t, TrackOrigin::System, Some(" "));
+        assert_eq!(next, "S3");
+        assert_eq!(t.speaker(&next).and_then(|s| s.name.clone()), None);
     }
 
     #[test]

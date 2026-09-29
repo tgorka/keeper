@@ -40,12 +40,16 @@ function Harness({
   pinnedIndex,
   rowHeight = ROW_PX,
   revealTo,
+  scrollMargin,
+  stickyInset,
 }: {
   count: number;
   pinnedIndex?: number;
   rowHeight?: number;
   /** Rendered as a button, so a test can ask for a row from outside. */
   revealTo?: number;
+  scrollMargin?: number;
+  stickyInset?: number;
 }) {
   const rows = useRef(new Map<number, HTMLButtonElement>());
   const getKey = useCallback((index: number) => `note-${index}`, []);
@@ -56,6 +60,8 @@ function Harness({
     overscan: OVERSCAN,
     pinnedIndex,
     onReveal: (index) => rows.current.get(index)?.focus(),
+    scrollMargin,
+    stickyInset,
   });
 
   return (
@@ -148,6 +154,25 @@ describe("useWindowedRows", () => {
     const target = screen.getByText("Row 3000");
     expect(target).toBeInTheDocument();
     expect(document.activeElement).toBe(target);
+  });
+
+  it("counts the content above the list, so only the rows that fit under it mount", () => {
+    geometry = withListGeometry({ viewport: VIEWPORT_PX, row: ROW_PX });
+    // 100 px of heading leaves room for five rows, plus the overscan below.
+    render(<Harness count={5000} scrollMargin={100} />);
+    expect(mounted()).toEqual([0, 1, 2, 3, 4, 5, 6]);
+  });
+
+  it("reveals a row just below a sticky header rather than under it", () => {
+    geometry = withListGeometry({ viewport: VIEWPORT_PX, row: ROW_PX });
+    render(<Harness count={5000} revealTo={50} scrollMargin={100} stickyInset={40} />);
+    act(() => geometry?.scrollTo(viewport(), 2000));
+    act(() => {
+      screen.getByRole("button", { name: "Go" }).click();
+    });
+    // Row 50 starts 50 × 20 + 100 = 1100 px down; 40 px of it are covered.
+    expect(viewport().scrollTop).toBe(1060);
+    expect(screen.getByText("Row 50")).toBeInTheDocument();
   });
 
   it("keeps the pinned row mounted however far away it is scrolled", () => {

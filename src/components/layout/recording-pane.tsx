@@ -19,7 +19,7 @@
  * UX-DR29 — centers its content at content-max-width (`mx-auto w-full
  * max-w-[720px]`, the conversation-pane realization) rather than going full-bleed.
  */
-import { NotebookText } from "lucide-react";
+import { AudioLines, NotebookText } from "lucide-react";
 import { useEffect } from "react";
 import { RecordingSummaryCard } from "@/components/layout/recording-summary-card";
 import { ActiveRecordingBanner } from "@/components/recording/active-recording-banner";
@@ -39,6 +39,10 @@ import {
 import { RecordingSourcePicker } from "@/components/recording/recording-source-picker";
 import { RecordingWebcamControls } from "@/components/recording/recording-webcam-controls";
 import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
+import {
+  TRANSCRIBE_A_FILE_LABEL,
+  transcribeAFile,
+} from "@/components/transcription/transcribe-a-file";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -48,6 +52,7 @@ import { isLiveRecording, useRecordingSession } from "@/hooks/use-recording-sess
 import { useRecoveredSessions } from "@/hooks/use-recovered-sessions";
 import type { RecordingPermissionVm } from "@/lib/ipc/client";
 import { openRecordingsSpace, useRecordingsSpace } from "@/lib/recordings-space";
+import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { systemAudioEnabled, useSystemAudioEnabled } from "@/lib/stores/recording-audio";
 import { consumeRecordingMeta } from "@/lib/stores/recording-meta";
 import { micDeviceId, micEnabled, useMicEnabled } from "@/lib/stores/recording-mic";
@@ -137,6 +142,9 @@ export function RecordingPane() {
   const live = isLiveRecording(status);
   // The Recordings space in Notes, when the vault has one (Story 45.19).
   const recordingsSpace = useRecordingsSpace();
+  // A recording made elsewhere can be transcribed from here too (the menu's
+  // Transcribe a File…, one step closer); only on a Mac that can transcribe.
+  const canTranscribe = useCapabilitiesStore((s) => s.capabilities.transcription);
   // The completion (finalized) and in-app recovery (recovered) terminals both
   // render the summary card from the on-disk manifest for the session folder
   // (Story 20.3): fetch it once the terminal settles with a folder.
@@ -222,6 +230,18 @@ export function RecordingPane() {
             >
               <NotebookText className="size-4" aria-hidden="true" />
               {recordingsSpaceLabel(recordingsSpace.name)}
+            </Button>
+          )}
+          {canTranscribe && (
+            <Button
+              type="button"
+              size="xs"
+              variant="ghost"
+              className="-ml-2"
+              onClick={() => void transcribeAFile()}
+            >
+              <AudioLines className="size-4" aria-hidden="true" />
+              {TRANSCRIBE_A_FILE_LABEL}
             </Button>
           )}
         </div>

@@ -68,6 +68,10 @@ import { OFFLINE_PILL_TEXT } from "@/components/layout/sidebar-pane";
 import { FILES_SYNC_MARK_LABEL, SyncStatusMark } from "@/components/layout/sync-status-mark";
 import { TranscriptDialog } from "@/components/transcription/transcript-viewer";
 import { TranscriptionJob } from "@/components/transcription/transcription-job";
+import {
+  TranscriptionProgressRing,
+  transcriptionShortLine,
+} from "@/components/transcription/transcription-progress";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -555,6 +559,8 @@ export function FilesPhonePane() {
                   const icon = folder
                     ? VIEWER_ICON.folder
                     : VIEWER_ICON[resolveViewer({ name: entry.name, kind: entry.kind }).icon];
+                  const job = jobs[entry.absolutePath];
+                  const running = job !== undefined && transcriptionRunning(job);
                   return (
                     <Row
                       key={entry.relativePath}
@@ -570,15 +576,13 @@ export function FilesPhonePane() {
                           <>
                             {canTranscribe && entry.transcribable && (
                               <ContextMenuItem
-                                disabled={transcriptionRunning(jobs[entry.absolutePath])}
+                                disabled={running}
                                 onSelect={() => {
                                   setJobPath(entry.absolutePath);
                                   void startTranscription(entry.absolutePath, rereadCurrentFolder);
                                 }}
                               >
-                                {transcriptionRunning(jobs[entry.absolutePath])
-                                  ? `Transcription: ${jobs[entry.absolutePath]?.phase}`
-                                  : "Transcribe"}
+                                {running ? transcriptionShortLine(job) : "Transcribe"}
                               </ContextMenuItem>
                             )}
                             {entry.transcript && (
@@ -593,6 +597,15 @@ export function FilesPhonePane() {
                       trailing={
                         <>
                           {!folder && <SyncStatusMark sync={entry.sync} />}
+                          {running && (
+                            <span
+                              role="img"
+                              aria-label={transcriptionShortLine(job)}
+                              className="relative size-5 shrink-0"
+                            >
+                              <TranscriptionProgressRing fraction={job.fraction} />
+                            </span>
+                          )}
                           {entry.size !== null && (
                             <span className="shrink-0 text-muted-foreground text-xs tabular-nums">
                               {entry.size.label}
