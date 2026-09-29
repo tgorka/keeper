@@ -15,6 +15,7 @@ vi.mock("@/lib/ipc/client", () => ({
   transcriptionStatus: vi.fn(),
   transcriptRead: vi.fn(),
   transcriptMedia: vi.fn(),
+  listenTranscriptWritten: vi.fn(() => Promise.resolve(() => {})),
 }));
 
 const file = "/Users/alice/call.m4a";

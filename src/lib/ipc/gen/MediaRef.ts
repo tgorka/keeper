@@ -2,12 +2,15 @@
 import type { MediaRefKind } from "./MediaRefKind";
 
 /**
- * Where the webview is served one media file from: a synced folder and the
- * path inside it — the coordinates the Files media viewer turns into a
- * `keeper-file://` URL (`fileAssetUrl`).
+ * Where the webview is served one media file from.
  */
-export type MediaRef = { profileId: string, 
+export type MediaRef = { "via": "file", profileId: string, 
 /**
  * `/`-separated, relative to the profile's folder.
+ */
+relativePath: string, kind: MediaRefKind, } | { "via": "recording", sessionId: string, 
+/**
+ * `/`-separated, relative to the recordings destination root — the
+ * frame `recording_note_targets` answers in.
  */
 relativePath: string, kind: MediaRefKind, };

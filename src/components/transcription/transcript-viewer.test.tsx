@@ -5,11 +5,12 @@ import {
   BACK_LABEL,
   FRAME_PRIME_SECONDS,
   SCRUB_LABEL,
-} from "@/components/notes/editor/recording-transport";
+} from "@/components/notes/editor/media-playback";
 import {
   TRANSCRIBE_AGAIN_BODY,
   TRANSCRIBE_AGAIN_LABEL,
 } from "@/components/transcription/transcribe-again";
+import { PART_NOT_HERE_SENTENCE } from "@/components/transcription/transcript-player";
 import {
   TranscriptFileViewer,
   TranscriptViewer,
@@ -36,6 +37,8 @@ vi.mock("@/lib/ipc/client", () => ({
   transcriptionStatus: vi.fn(),
   transcriptionStart: vi.fn(),
   transcriptionCancel: vi.fn(),
+  transcriptClip: vi.fn(),
+  listenTranscriptWritten: vi.fn(),
 }));
 vi.mock("@/components/viewers/text-file-viewer", () => ({
   TextFileViewer: ({ entry }: { entry: { format: string } }) => <p>Text viewer: {entry.format}</p>,
@@ -66,6 +69,7 @@ beforeEach(() => {
     hasScreen: false,
   });
   vi.mocked(ipc.transcriptionStart).mockResolvedValue("job");
+  vi.mocked(ipc.listenTranscriptWritten).mockResolvedValue(() => {});
   vi.mocked(ipc.transcriptionStatus).mockResolvedValue({
     available: true,
     reason: null,
@@ -173,7 +177,14 @@ describe("Transcript corrections", () => {
       within(menu)
         .getAllByRole("menuitem")
         .map((item) => item.textContent),
-    ).toEqual(["Play from here", "Edit text", "Change speaker", "Split…", "Add a line after"]);
+    ).toEqual([
+      "Play from here",
+      "Copy clip from here…",
+      "Edit text",
+      "Change speaker",
+      "Split…",
+      "Add a line after",
+    ]);
   });
   it.each([
     false,
@@ -601,12 +612,23 @@ const SESSION_MEDIA: ipc.TranscriptMediaVm = {
     file: `screen-000${index}.mov`,
     offset: index * 21,
     duration: 21,
-    screen: { profileId: "p1", relativePath: `rec/screen-000${index}.mov`, kind: "video" as const },
-    camera: { profileId: "p1", relativePath: `rec/camera-000${index}.mov`, kind: "video" as const },
+    screen: {
+      via: "file" as const,
+      profileId: "p1",
+      relativePath: `rec/screen-000${index}.mov`,
+      kind: "video" as const,
+    },
+    camera: {
+      via: "file" as const,
+      profileId: "p1",
+      relativePath: `rec/camera-000${index}.mov`,
+      kind: "video" as const,
+    },
     audioTracks: [
       { index: 0, origin: "system" as const },
       { index: 1, origin: "microphone" as const },
     ],
+    here: true,
   })),
 };
 const sessionPath = SESSION_TRANSCRIPT_FIXTURE.path;
@@ -775,6 +797,107 @@ describe("Player", () => {
     expect(main).not.toHaveAttribute("src");
     expect(camera).not.toHaveAttribute("src");
   });
+  it("plays from a line's speaker square, and a time click only moves the player", async () => {
+    render(<TranscriptViewer path={sessionPath} />);
+    await screen.findByLabelText("screen-0000.mov");
+    expect(
+      within(row("u4")).getByText((_, element) => element?.textContent === "00:00:21 · 6 s"),
+    ).toBeInTheDocument();
+    fireEvent.click(within(row("u4")).getByRole("button", { name: "Play from 00:00:21" }));
+    const second = screen.getByLabelText("screen-0001.mov") as HTMLMediaElement;
+    Object.defineProperty(second, "readyState", { configurable: true, get: () => 1 });
+    fireEvent.loadedMetadata(second);
+    expect(second.currentTime).toBeCloseTo(0.5);
+    expect(play.mock.contexts).toContain(second);
+    play.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Go to 00:00:28, u5" }));
+    expect(second.currentTime).toBeCloseTo(7);
+    expect(row("u5")).toHaveAttribute("aria-current", "true");
+  });
+  it("says each toggle's state in its tooltip as well as in aria-pressed", async () => {
+    render(<TranscriptViewer path={sessionPath} />);
+    const follow = await screen.findByRole("button", { name: "Follow the transcript" });
+    fireEvent.focus(follow);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Follow the transcript: on");
+    fireEvent.click(follow);
+    expect(follow).toHaveAttribute("aria-pressed", "false");
+    fireEvent.blur(follow);
+    fireEvent.focus(follow);
+    await waitFor(() =>
+      expect(screen.getByRole("tooltip")).toHaveTextContent("Follow the transcript: off"),
+    );
+  });
+  it("takes the reader to a speaker's line nearest the player, leaving it paused", async () => {
+    render(<TranscriptViewer path={sessionPath} />);
+    const first = (await screen.findByLabelText("screen-0000.mov")) as HTMLMediaElement;
+    fireEvent.loadedMetadata(first);
+    Object.defineProperty(first, "readyState", { configurable: true, get: () => 1 });
+    first.currentTime = 16;
+    fireEvent.timeUpdate(first);
+    // Speaker 1 speaks 6–14 and 21.5–27: at 16 the first is two seconds away.
+    fireEvent.click(
+      within(await chipMenu("Speaker 1")).getByRole("menuitem", {
+        name: "Go to their nearest line",
+      }),
+    );
+    expect(first.currentTime).toBeCloseTo(6);
+    expect(row("u2")).toHaveAttribute("aria-current", "true");
+    expect(play).not.toHaveBeenCalled();
+  });
+  it("opens at the time it was asked for, paused", async () => {
+    render(<TranscriptViewer path={sessionPath} at={30} />);
+    await screen.findByLabelText("screen-0001.mov");
+    expect(row("u5")).toHaveAttribute("aria-current", "true");
+    fireEvent.loadedMetadata(screen.getByLabelText("screen-0001.mov"));
+    expect((screen.getByLabelText("screen-0001.mov") as HTMLMediaElement).currentTime).toBeCloseTo(
+      9,
+    );
+    expect(play).not.toHaveBeenCalled();
+  });
+  it("never hands a part that is not on this Mac to a video", async () => {
+    const media = structuredClone(SESSION_MEDIA);
+    media.parts[0].here = false;
+    vi.mocked(ipc.transcriptMedia).mockResolvedValue(media);
+    render(<TranscriptViewer path={sessionPath} />);
+    expect(await screen.findByText(PART_NOT_HERE_SENTENCE)).toBeInTheDocument();
+    expect(screen.queryByLabelText("screen-0000.mov")).toBeNull();
+    expect(screen.queryByLabelText("camera-0000.mov")).toBeNull();
+    // The next part is here, and plays.
+    await lineAction("u4", "Play from here");
+    expect(screen.getByLabelText("screen-0001.mov")).toHaveAttribute(
+      "src",
+      "keeper-file://p1/rec/screen-0001.mov",
+    );
+  });
+  it("takes a part's length from its file when Rust could not tell it", async () => {
+    const media = structuredClone(SESSION_MEDIA);
+    for (const part of media.parts) {
+      part.offset = 0;
+      part.duration = 0;
+    }
+    vi.mocked(ipc.transcriptMedia).mockResolvedValue(media);
+    render(<TranscriptViewer path={sessionPath} />);
+    const first = (await screen.findByLabelText("screen-0000.mov")) as HTMLMediaElement;
+    Object.defineProperty(first, "duration", { configurable: true, get: () => 21 });
+    fireEvent.loadedMetadata(first);
+    expect(screen.getByText("0:00 / 0:21")).toBeInTheDocument();
+    expect(screen.getByRole("slider", { name: SCRUB_LABEL })).toHaveAttribute("max", "21");
+  });
+  it("plays a session outside every synced folder from its recording", async () => {
+    const media = structuredClone(SESSION_MEDIA);
+    media.parts[0].screen = {
+      via: "recording",
+      sessionId: "01J8A-01J8B",
+      relativePath: "2026-09-28 standup/screen-0000.mov",
+      kind: "video",
+    };
+    vi.mocked(ipc.transcriptMedia).mockResolvedValue(media);
+    render(<TranscriptViewer path={sessionPath} />);
+    expect(await screen.findByLabelText("screen-0000.mov")).toHaveAttribute(
+      "src",
+      "keeper-recording://01J8A-01J8B/2026-09-28%20standup/screen-0000.mov",
+    );
+  });
 });
 describe("Search", () => {
   beforeEach(() => {
@@ -818,6 +941,83 @@ describe("Search", () => {
     fireEvent.change(search, { target: { value: "zebra" } });
     expect(screen.getByText("No matches")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Next match" })).toBeDisabled();
+  });
+});
+describe("Copying a clip", () => {
+  const clip = { markdown: '```keeper-media\nsession = "s"\n```\n', lines: 1 };
+  beforeEach(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: vi.fn(() => Promise.resolve()) },
+      configurable: true,
+    });
+  });
+  it("copies Rust's composition of a line's window, words included unless unticked", async () => {
+    vi.mocked(ipc.transcriptClip).mockResolvedValue(clip);
+    render(<TranscriptViewer path={path} />);
+    await lineAction("u2", "Copy clip from here…");
+    const dialog = await screen.findByRole("dialog", { name: "Copy a clip" });
+    expect(within(dialog).getByRole("textbox", { name: "From" })).toHaveValue("00:00:06");
+    expect(within(dialog).getByRole("textbox", { name: "To" })).toHaveValue("00:00:14");
+    expect(await within(dialog).findByText("1 line")).toBeInTheDocument();
+    expect(ipc.transcriptClip).toHaveBeenLastCalledWith(path, "00:00:06", "00:00:14", true);
+    fireEvent.click(
+      within(dialog).getByRole("checkbox", {
+        name: "Include the words, for Obsidian and other apps",
+      }),
+    );
+    await waitFor(() =>
+      expect(ipc.transcriptClip).toHaveBeenLastCalledWith(path, "00:00:06", "00:00:14", false),
+    );
+    const copy = within(dialog).getByRole("button", { name: "Copy" });
+    await waitFor(() => expect(copy).toBeEnabled());
+    fireEvent.click(copy);
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(clip.markdown);
+    expect(await within(dialog).findByRole("status")).toHaveTextContent(
+      "Copied. Paste it into any note.",
+    );
+  });
+  it("shows Rust's refusal of a time and keeps Copy unavailable", async () => {
+    vi.mocked(ipc.transcriptClip).mockImplementation(async (_, from) => {
+      if (from === "00:00:6") throw { code: "invalid", message: "From is not a time." };
+      return clip;
+    });
+    render(<TranscriptViewer path={path} />);
+    await lineAction("u2", "Copy clip from here…");
+    const dialog = await screen.findByRole("dialog", { name: "Copy a clip" });
+    await within(dialog).findByText("1 line");
+    fireEvent.change(within(dialog).getByRole("textbox", { name: "From" }), {
+      target: { value: "00:00:6" },
+    });
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("From is not a time.");
+    expect(within(dialog).getByRole("button", { name: "Copy" })).toBeDisabled();
+  });
+  it("copies the whole transcript as a note embed from the header menu", async () => {
+    vi.mocked(ipc.transcriptClip).mockResolvedValue(clip);
+    render(<TranscriptViewer path={path} />);
+    const menu = await openMenu(await screen.findByRole("button", { name: "Transcript actions" }));
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "Copy as note embed" }));
+    const dialog = await screen.findByRole("dialog", { name: "Copy a clip" });
+    expect(within(dialog).getByRole("textbox", { name: "From" })).toHaveValue("");
+    await waitFor(() => expect(ipc.transcriptClip).toHaveBeenCalledWith(path, null, null, true));
+  });
+});
+describe("A transcript written elsewhere", () => {
+  it("reads its own transcript again, and no other", async () => {
+    let written: (path: string) => void = () => {};
+    vi.mocked(ipc.listenTranscriptWritten).mockImplementation(async (handler) => {
+      written = handler;
+      return () => {};
+    });
+    render(<TranscriptViewer path={path} />);
+    await screen.findByRole("list", { name: "Utterances" });
+    await waitFor(() => expect(ipc.listenTranscriptWritten).toHaveBeenCalled());
+    const corrected = structuredClone(TRANSCRIPT_FIXTURE);
+    corrected.transcript.utterances[0].text = "Corrected in another window.";
+    vi.mocked(ipc.transcriptRead).mockResolvedValue(corrected);
+    act(() => written("/Volumes/merope/tgdrive/other.transcript.json"));
+    expect(ipc.transcriptRead).toHaveBeenCalledTimes(1);
+    act(() => written(path));
+    expect(await within(row("u1")).findByText("Corrected in another window.")).toBeVisible();
   });
 });
 describe("Transcript files", () => {

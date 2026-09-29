@@ -8,6 +8,7 @@ use super::dictionary::DictionarySuggestion;
 use super::engine::TranscriptionLanguage;
 use super::model::Transcript;
 use super::plan::TrackOrigin;
+use crate::notes::media_block::{MediaPicture, MediaSound};
 
 /// Settings → Transcription.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -176,6 +177,17 @@ pub struct CorrectionResultVm {
     pub suggestions: Vec<DictionarySuggestion>,
 }
 
+/// `keeper://transcript-written`'s payload (AD-357): a transcript file was
+/// written — a job's result, a correction, or a redo's fresh file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TranscriptWrittenVm {
+    /// The transcript's absolute path, as `TranscriptVm.path` and
+    /// `MediaBlockVm.transcriptPath` spell it.
+    pub path: String,
+}
+
 /// What the transcript viewer's player plays: the transcript's media, part
 /// by part, on the transcript's one timeline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -194,34 +206,61 @@ pub struct TranscriptMediaVm {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct TranscriptMediaPartVm {
-    /// Relative to the transcript's directory, as in `source.parts`.
+    /// Relative to the transcript's directory, as in `source.parts` — or,
+    /// for a media block's `[[part]]`, the path the block names.
     pub file: String,
     /// Seconds from the transcript's start to this part's start.
     pub offset: f64,
-    /// Seconds.
+    /// Seconds. `0` when nothing has measured the file yet — a recording
+    /// not transcribed whose manifest has no sample bounds, or a `[[part]]`
+    /// with no transcript — and the player reads it off the media.
     pub duration: f64,
     /// The part's own file — the screen video, or the audio when nothing was
-    /// filmed (`kind` says which). `null` when no synced folder holds it, so
-    /// the webview cannot be served it.
+    /// filmed (`kind` says which). `null` when neither a synced folder nor
+    /// the recordings index serves it, so the webview cannot be served it.
     pub screen: Option<MediaRef>,
     /// The session's camera segment with this part's index, when there is one.
     pub camera: Option<MediaRef>,
     /// The part file's audio tracks and what each was heard as; empty for a
     /// file whose tracks were heard mixed.
     pub audio_tracks: Vec<MediaAudioTrackVm>,
+    /// Whether the part's bytes are on this device. `false` for a pointer
+    /// the sync has not downloaded: the player says so and never hands it to
+    /// a `<video>` (88.1).
+    pub here: bool,
 }
 
-/// Where the webview is served one media file from: a synced folder and the
-/// path inside it — the coordinates the Files media viewer turns into a
-/// `keeper-file://` URL (`fileAssetUrl`).
+/// Where the webview is served one media file from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[serde(tag = "via", rename_all = "camelCase", rename_all_fields = "camelCase")]
 #[ts(export)]
-pub struct MediaRef {
-    pub profile_id: String,
-    /// `/`-separated, relative to the profile's folder.
-    pub relative_path: String,
-    pub kind: MediaRefKind,
+pub enum MediaRef {
+    /// A synced folder and the path inside it — the coordinates the Files
+    /// media viewer turns into a `keeper-file://` URL (`fileAssetUrl`).
+    File {
+        profile_id: String,
+        /// `/`-separated, relative to the profile's folder.
+        relative_path: String,
+        kind: MediaRefKind,
+    },
+    /// A file of an indexed recording outside every synced folder, served
+    /// over `keeper-recording://` by the recording's identity, as a
+    /// recording note's embeds always were (AD-353).
+    Recording {
+        session_id: String,
+        /// `/`-separated, relative to the recordings destination root — the
+        /// frame `recording_note_targets` answers in.
+        relative_path: String,
+        kind: MediaRefKind,
+    },
+}
+
+impl MediaRef {
+    pub fn kind(&self) -> MediaRefKind {
+        match self {
+            Self::File { kind, .. } | Self::Recording { kind, .. } => *kind,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -240,4 +279,76 @@ pub enum MediaRefKind {
 pub struct MediaAudioTrackVm {
     pub index: u32,
     pub origin: TrackOrigin,
+}
+
+/// A media block in a note, resolved (AD-353, AD-359): what it plays, the
+/// transcript's lines inside its window, and its markers. Text only — no
+/// word timings, embeddings or candidates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MediaBlockVm {
+    /// The block's `title`, else the recording's or the transcript's.
+    pub title: Option<String>,
+    /// The recording the block plays, when it plays one.
+    pub session_id: Option<String>,
+    /// The transcript's absolute path — the one `keeper://transcript-written`
+    /// carries — and, before it is written, where it will be. `null` for
+    /// media no single transcript belongs to.
+    pub transcript_path: Option<String>,
+    /// Whether that transcript exists.
+    pub transcribed: bool,
+    /// What `transcription_start` takes to transcribe this, when it has no
+    /// transcript yet and can have one; `null` otherwise.
+    pub transcribe_path: Option<String>,
+    /// Seconds on the source's clock; `0` when not known yet.
+    pub duration: f64,
+    pub window: MediaWindowVm,
+    pub picture: Option<MediaPicture>,
+    pub sound: Option<MediaSound>,
+    pub media: TranscriptMediaVm,
+    /// The transcript's lines overlapping the window, in order.
+    pub lines: Vec<MediaLineVm>,
+    pub speakers: Vec<MediaSpeakerVm>,
+    pub markers: Vec<MediaMarkerVm>,
+}
+
+/// `[from, to)` in seconds; `to` is `null` for the end.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MediaWindowVm {
+    pub from: f64,
+    pub to: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MediaLineVm {
+    pub id: String,
+    pub speaker: String,
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MediaSpeakerVm {
+    pub id: String,
+    /// The name a person reads: a name, "You", or "Speaker N".
+    pub name: String,
+    pub origin: TrackOrigin,
+}
+
+/// A named moment (`to` is `null`) or a named window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MediaMarkerVm {
+    pub name: String,
+    pub from: f64,
+    pub to: Option<f64>,
 }

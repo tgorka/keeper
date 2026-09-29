@@ -1,5 +1,6 @@
 import type {
   DictionaryTermVm,
+  MediaClipVm,
   PersonVm,
   SyncProfileVm,
   TranscriptionProgressVm,
@@ -576,6 +577,7 @@ export function transcriptionMockHandlers(
         .replace(/\/[^/]*$/, "")
         .replace(/^\/Volumes\/merope\/tgdrive\/?|^\//, "");
       const ref = (file: string, kind: MediaRef["kind"]): MediaRef => ({
+        via: "file",
         profileId: "p1",
         relativePath: folder ? `${folder}/${file}` : file,
         kind,
@@ -588,6 +590,7 @@ export function transcriptionMockHandlers(
         duration: part.duration,
         screen: ref(part.file, /\.(m4a|wav|mp3)$/.test(part.file) ? "audio" : "video"),
         camera: session ? ref(part.file.replace(/^screen-/, "camera-"), "video") : null,
+        here: true,
         audioTracks: part.tracks.flatMap((track) =>
           track.track === null ? [] : [{ index: track.track, origin: track.origin }],
         ),
@@ -597,6 +600,51 @@ export function transcriptionMockHandlers(
         hasCamera: parts.some((part) => part.camera !== null),
         hasScreen: parts.some((part) => part.screen.kind === "video"),
       };
+    },
+    transcript_clip: (p): MediaClipVm => {
+      const vm = read(p);
+      // Rust's refusal reaches the webview as the IpcError envelope, its sentence the message.
+      const refuse = (message: string): never => {
+        throw { code: "invalidInput", message, accountId: null, retriable: false };
+      };
+      const seconds = (value: unknown, name: string): number | null => {
+        if (value === null || value === undefined) return null;
+        const match = /^(\d{2}):([0-5]\d):([0-5]\d)$/.exec(String(value));
+        if (!match) return refuse(`${name} is not a time keeper can read. Write it as hh:mm:ss.`);
+        return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+      };
+      const duration = vm.transcript.duration;
+      const from = seconds(p.from, "From");
+      const to = seconds(p.to, "To");
+      if (from !== null && to !== null && from >= to) refuse("A clip ends after it starts.");
+      if ((from ?? 0) > duration || (to ?? 0) > duration)
+        refuse("That time is past the end of the meeting.");
+      const lo = from ?? 0;
+      const hi = to ?? duration;
+      const lines = vm.transcript.utterances.filter((u) => u.end > lo && u.start < hi);
+      const clock = (s: number) =>
+        [Math.floor(s / 3600), Math.floor((s / 60) % 60), Math.floor(s % 60)]
+          .map((n) => String(n).padStart(2, "0"))
+          .join(":");
+      const source =
+        vm.transcript.source.kind === "recording"
+          ? 'session = "01J8MOCKSESSION-01J8MOCKSESSION"'
+          : `transcript = "${String(p.path).replace(/^\/Volumes\/merope\/tgdrive\//, "")}"`;
+      const fence = [
+        "```keeper-media",
+        source,
+        ...(from !== null ? [`from = "${clock(from)}"`] : []),
+        ...(to !== null ? [`to = "${clock(to)}"`] : []),
+        "```",
+      ];
+      const names = new Map(vm.transcript.speakers.map((s) => [s.id, s.name ?? s.id]));
+      const words = p.words
+        ? [
+            `> [!transcript]- ${vm.transcript.source.title ?? vm.transcript.source.files[0]} · ${clock(lo)}–${clock(hi)}`,
+            ...lines.map((u) => `> **${names.get(u.speaker)}** ${clock(u.start)} ${u.text}`),
+          ]
+        : [];
+      return { markdown: `${[...fence, ...words].join("\n")}\n`, lines: lines.length };
     },
     voices_people: () => structuredClone(people),
     voices_person_rename: (p) => editPerson(p, (person) => ({ ...person, name: String(p.name) })),

@@ -18266,15 +18266,16 @@ mod tests {
         // embedded, in the ledger's order, BELOW the heading — `manifest.json`
         // is in `files:` and is not embedded. Asserted here as well as in the
         // composer's own tests because this is the seam that decides what the
-        // paths actually look like: they are whatever `stub_files` made
-        // relative to the anchor, and nothing joined a root back onto them.
+        // body actually carries: one keeper-media block naming the session
+        // (Epic 88, AD-357), never a path joined onto a root.
         assert_eq!(
             &source[body..],
             concat!(
                 "\n# Weekly sync\n",
                 "\n",
-                "![[keeper-rec session/screen-0000.mov]]\n",
-                "![[keeper-rec session/screen-0001.mov]]\n",
+                "```keeper-media\n",
+                "session = \"01JQDEVICE0000000000000000-01JQSTUBAAAA00000000000000\"\n",
+                "```\n",
                 "\n",
             ),
             "the WHOLE body, so nothing can be reordered without failing here: the body \
@@ -18493,7 +18494,7 @@ mod tests {
         // here because `drive_synthetic_session` closes a real `.mov`.
         assert_eq!(
             &source[body..],
-            "\n# 2026-01-02\n\n![[keeper-rec 2026-01-02 10.00.00/screen-0000.mov]]\n\n"
+            "\n# 2026-01-02\n\n```keeper-media\nsession = \"01JQDEVICE0000000000000000-01JQSTUBAAAA00000000000000\"\n```\n\n"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -18603,7 +18604,8 @@ mod tests {
         // why the sentence appended below goes UNDER the recording rather than
         // shoving it down the page.
         assert_eq!(
-            body, "# Weekly sync\n\n![[keeper-rec session/screen-0000.mov]]\n\n",
+            body,
+            "# Weekly sync\n\n```keeper-media\nsession = \"01JQDEVICE0000000000000000-01JQSTUBAAAA00000000000000\"\n```\n\n",
             "the WHOLE body: heading first, then the recording, then the blank line the \
              caret lands on. An embed above the heading would become the note's title"
         );

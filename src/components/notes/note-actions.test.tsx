@@ -50,6 +50,7 @@ import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
 import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { withRangeRects } from "@/test/layout";
+import { ADOPT_MEDIA_BLOCKS_LABEL } from "./adopt-media-blocks";
 import { ATTACH_FILE_LABEL } from "./attach-file-button";
 import { ATTACHMENTS_LABEL } from "./attachments-panel";
 import {
@@ -302,6 +303,7 @@ describe("finding the destructive verb", () => {
     expect(items.map((item) => item.textContent)).toEqual([
       ATTACHMENTS_LABEL,
       NOTE_HISTORY_LABEL,
+      ADOPT_MEDIA_BLOCKS_LABEL,
       EXPORT_NOTE_LABEL,
       NOTE_DELETE_LABEL,
     ]);

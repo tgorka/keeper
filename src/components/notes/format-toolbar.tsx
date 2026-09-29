@@ -23,6 +23,7 @@
  * say. There is no new dependency here and there is not going to be one.
  */
 import {
+  Blocks,
   Bold,
   Code,
   Heading,
@@ -47,6 +48,7 @@ import { Input } from "@/components/ui/input";
 import { IconHint } from "@/components/ui/tooltip";
 import { type EmojiMatch, emojiFor, matchEmoji } from "@/lib/emoji/match";
 import { EMOJI_TABLE } from "@/lib/emoji/table";
+import { INSERT_WIDGET_LABEL, NOTE_WIDGETS, type NoteWidgetChoice } from "@/lib/notes/widgets";
 import { cn } from "@/lib/utils";
 import type { FormatAction } from "./editor/format-commands";
 
@@ -58,7 +60,7 @@ import type { FormatAction } from "./editor/format-commands";
 const EMOJI_CHOICE_CLASS = cn(buttonVariants({ variant: "ghost", size: "icon-sm" }));
 
 /** Which extra panel, if any, is open. Only ever one. */
-type Panel = "heading" | "table" | "emoji" | null;
+type Panel = "heading" | "table" | "emoji" | "widget" | null;
 
 /** How many emoji the picker shows at once.
  *
@@ -161,9 +163,15 @@ const DIRECT: readonly { action: FormatAction; label: string; Icon: typeof Bold 
 export interface FormatToolbarProps {
   /** Run the action against whatever the editor's selection is right now. */
   onAction: (action: FormatAction) => void;
+  /**
+   * Insert a note widget at the caret. Absent — a session log opened from
+   * Files, which has no drive for a media block — the *Insert widget* control
+   * is absent too (AD-27).
+   */
+  onInsertWidget?: (widget: NoteWidgetChoice) => void;
 }
 
-export function FormatToolbar({ onAction }: FormatToolbarProps) {
+export function FormatToolbar({ onAction, onInsertWidget }: FormatToolbarProps) {
   const [panel, setPanel] = useState<Panel>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   // The labels have to name their fields by id, and an editor pane is not
@@ -308,6 +316,45 @@ export function FormatToolbar({ onAction }: FormatToolbarProps) {
           <Smile aria-hidden="true" />
         </Button>
       </IconHint>
+
+      {onInsertWidget === undefined ? null : (
+        <IconHint label={INSERT_WIDGET_LABEL}>
+          <Button
+            type="button"
+            size="icon-sm"
+            variant="ghost"
+            aria-label={INSERT_WIDGET_LABEL}
+            aria-expanded={panel === "widget"}
+            onMouseDown={keepCaret}
+            onClick={() => openPanel("widget")}
+          >
+            <Blocks aria-hidden="true" />
+          </Button>
+        </IconHint>
+      )}
+
+      {panel === "widget" && onInsertWidget !== undefined ? (
+        <fieldset
+          aria-label="Widgets"
+          className="absolute top-full left-2 z-20 mt-1 flex w-72 flex-col gap-0.5 rounded-md border bg-popover p-1 shadow-md"
+        >
+          {NOTE_WIDGETS.map((widget) => (
+            <button
+              key={widget.id}
+              type="button"
+              onMouseDown={keepCaret}
+              onClick={() => {
+                setPanel(null);
+                onInsertWidget(widget.id);
+              }}
+              className="flex flex-col items-start rounded-sm px-2 py-1.5 text-left hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring"
+            >
+              <span className="text-sm">{widget.label}</span>
+              <span className="text-meta text-muted-foreground">{widget.detail}</span>
+            </button>
+          ))}
+        </fieldset>
+      ) : null}
 
       {panel === "emoji" ? (
         <fieldset

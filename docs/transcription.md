@@ -62,21 +62,30 @@ leaves it for this, there is no transcription server, no NAS option and no cloud
   take on an M-series Mac (decoding 0.001 s, speech 0.02 s, speakers 0.006 s per second of
   audio), and a step never claims more than 95 % of itself until it ends.
 - **The transcript viewer** takes most of the window (in the Files panel, the whole panel); the
-  lines keep a reading column of about 80 characters, and the player may be wider.
+  lines are as wide as the player — one column, no reading-measure cap.
   - *Transcript* and *Source* tabs. Source shows the file's JSON read-only in the Files text
     editor, laid out as keeper writes it and inset by the pane's padding; the transcript stays
     mounted underneath, so playback goes on.
-  - **Read mode first.** The transcript reads as a document: each line's speaker (a coloured
-    dot and the name) and time as quiet text, the words large. The time is a button that moves
-    the player there; clicking the text only selects it. Editing stays out of the way: each
-    line's ⋯ menu — *Play from here* (when the media can play), *Edit text*, *Change speaker*
-    (a submenu of speakers to pick one from), *Split…*, *Add a line after* — shows when the
-    line is hovered or has focus, and the menu button is always in the tab order, so every
-    action is reachable from the keyboard.
+  - **Read mode first.** The transcript reads as a document. A line starts
+    "■▶ Name 00:02:12 · 21 s ⋯": the speaker's coloured square is a play button ("Play from
+    00:02:12") with a small ▶, faint until hovered or focused; the time is a button that moves
+    the player there without changing play or pause; the length is whole seconds, and from a
+    minute on "1 min 05 s"; the words follow, large, and clicking them only selects them.
+    Editing stays out of the way in the ⋯ right after the time — always visible, faint until
+    hovered or focused, and always in the tab order: *Play from here* (when the media can
+    play), *Copy clip from here…*, *Edit text*, *Change speaker* (a submenu of speakers to pick
+    one from), *Split…*, *Add a line after*.
+  - **Copy a clip.** A line's *Copy clip from here…* (prefilled with the line's start and end)
+    and the header's *Copy as note embed* (the whole transcript) open *Copy a clip*: *From* and
+    *To* as `hh:mm:ss`, checked as you type, the number of lines in the window, and *Include
+    the words, for Obsidian and other apps* (on by default). *Copy* puts a `keeper-media` block
+    on the clipboard and says "Copied. Paste it into any note." (§ *A transcript in a note*).
   - **Speakers** are a row of chips — name, a dot for how each was matched, and its line count.
-    A chip opens a menu: how it was matched (and its score), *This is…* (a submenu of people,
-    the candidates first with their scores, e.g. "suggested 0.63", then *New person…*),
-    *Rename label…* and *Merge into…*. *New person…* and *Rename label…* open a field under the
+    A chip opens a menu: how it was matched (and its score), *Go to their nearest line* (the
+    speaker's line nearest the player's time, the later one on a tie; it scrolls there and
+    seeks, and a paused player stays paused), *This is…* (a submenu of people, the candidates
+    first with their scores, e.g. "suggested 0.63", then *New person…*), *Rename label…* and
+    *Merge into…*. *New person…* and *Rename label…* open a field under the
     chip row. *Add speaker* at the row's end adds a voice the diarizer did not tell apart, with
     an optional label; a track choice (call or microphone) appears only when the transcript
     heard both. Lines then move to it with *Change speaker*. The row lists only speakers with
@@ -91,14 +100,22 @@ leaves it for this, there is no transcription server, no NAS option and no cloud
     a *Sound* choice (call, microphone, both) appears only when a part has two audio tracks.
     Every icon control names itself to a screen reader and in a tooltip. A video sits in a
     16:9 box (at most 30 % of the window's height) and shows its first frame before it plays.
-    Media is served over `keeper-file://` from the synced folder that holds it; a part in no
-    synced folder says keeper cannot play it here. Media elements are released on a part
+    Media is served over `keeper-file://` from the synced folder that holds it, or over
+    `keeper-recording://` for a recording this Mac's index knows outside every synced folder;
+    a part served by neither says "This part is in no synced folder and among no recordings, so
+    keeper cannot play it here.", and a part whose bytes are not here yet says "This part is not
+    on this Mac yet. Once the sync brings it, it plays here." and mounts no video. A part whose
+    length is not recorded takes it from the file. Media elements are released on a part
     change and on close.
   - *Pin* (on by default) keeps the player at the top of the viewer while the lines scroll.
     *Follow* (on by default) highlights the line being said and scrolls it into view while
     playing, while the scrub bar is dragged (not only when it is let go), on ±10 s and on
-    every seek; scrolling by hand pauses the follow-scroll until the next play or seek. Both
-    are icon buttons that show whether they are on.
+    every seek; scrolling by hand pauses the follow-scroll until the next play or seek. Every
+    player toggle — *Picture*, *Sound*, *Pin*, *Follow* — shows its state: on is accent ink
+    and edge on a lifted fill, off a quiet outline, and the tooltip says so ("Follow the
+    transcript: on").
+  - An open viewer reads its transcript again when `keeper://transcript-written` names it — a
+    job's result, or a correction made elsewhere.
   - **Transcribe again…** in the header replaces this transcript (below, *Transcript files*);
     when the job ends, the viewer reads the new transcript.
   - **Search** (⌘F / Ctrl+F in the viewer) finds text in lines and speaker names, ignoring
@@ -300,6 +317,26 @@ in the same order; a short reply, or one that reuses the far end's words in anot
 kept. A voice left with no line after that is no speaker. Other files mix every audio track and
 diarize them all.
 
+## A transcript in a note
+
+A note plays a recording or a transcript in a `keeper-media` block (`docs/notes.md` §
+*Media in a note*, D-30): the viewer's player and the lines, read-only. The block reads no
+engine, so it draws wherever keeper draws notes; only its *Transcribe* needs this Mac's
+transcription.
+
+- **`keeper://transcript-written`**, with `{path}` — the transcript's absolute path — follows
+  every transcript the shell writes: a job's result, every correction and assignment, and a
+  redo's fresh file. An open block or viewer showing that path reads it again; nothing else
+  does, and no note is rewritten.
+- **From the viewer.** *Copy as note embed* copies a block for the whole transcript; a line's
+  *Copy clip from here…* copies one for a window (`transcript_clip`). The block names the
+  recording by its identity when the transcript is a recording's; otherwise the transcript by
+  its path inside its synced folder; a transcript outside every synced folder cannot be named,
+  and the viewer says so. With *Include the words*, the window's lines follow as a folded
+  `[!transcript]` callout, in the `**[hh:mm:ss] Name:** text` format of `transcript.md`.
+- **Recordings outside a synced folder** play by their identity over `keeper-recording://`,
+  in the block and in the viewer, when this Mac's recordings index knows them.
+
 ## Corrections
 
 In the viewer:
@@ -389,9 +426,9 @@ leaves `ME` to the `self` flag as before.
 - Voice prints are personal data; consent and GDPR handling are deferred by the owner
   (DW-342).
 - No translation.
-- The player plays only media inside a synced folder: a transcript of a file elsewhere on the
-  Mac shows no player, and a recordings destination that is not a synced folder is not played
-  (`keeper-recording://` is not used for it).
+- The player plays media inside a synced folder, and a recording outside one only when this
+  Mac's recordings index knows it: a transcript of a file elsewhere on the Mac shows no player.
+- A part whose bytes are not on this Mac (a Git LFS pointer) says so and is not played.
 - The progress estimate's speeds were measured on one M-series Mac; on a slower one the bar
   waits near the end of a step until the step ends.
 - The player's first frame before play is proved by its call policy, not yet seen in the

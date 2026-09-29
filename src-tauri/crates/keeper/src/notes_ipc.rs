@@ -5760,7 +5760,7 @@ fn embed_path(vault: &Vault, target: &str) -> Result<(String, PathBuf), IpcError
 /// is no second resolver: a panel that decided for itself which file an embed
 /// names would list one file where the viewer opens another and the export
 /// carries a third.
-fn embed_path_opt(vault: &Vault, target: &str) -> Option<(String, PathBuf)> {
+pub(crate) fn embed_path_opt(vault: &Vault, target: &str) -> Option<(String, PathBuf)> {
     for rel in embed::candidates(target, ATTACHMENTS_DIR) {
         // `contained_read` is the whole containment check and it is stricter
         // than "inside the vault": it refuses `..`, canonicalises so a symlink
@@ -6188,6 +6188,7 @@ pub async fn notes_embed_paths(
                             .unwrap_or_else(|| rel.clone()),
                     ),
                     rel_path: rel,
+                    absolute_path: path.to_string_lossy().into_owned(),
                 })
             })
             .collect()

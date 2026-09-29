@@ -7,7 +7,8 @@ import type { MediaRef } from "./MediaRef";
  */
 export type TranscriptMediaPartVm = { 
 /**
- * Relative to the transcript's directory, as in `source.parts`.
+ * Relative to the transcript's directory, as in `source.parts` — or,
+ * for a media block's `[[part]]`, the path the block names.
  */
 file: string, 
 /**
@@ -15,13 +16,15 @@ file: string,
  */
 offset: number, 
 /**
- * Seconds.
+ * Seconds. `0` when nothing has measured the file yet — a recording
+ * not transcribed whose manifest has no sample bounds, or a `[[part]]`
+ * with no transcript — and the player reads it off the media.
  */
 duration: number, 
 /**
  * The part's own file — the screen video, or the audio when nothing was
- * filmed (`kind` says which). `null` when no synced folder holds it, so
- * the webview cannot be served it.
+ * filmed (`kind` says which). `null` when neither a synced folder nor
+ * the recordings index serves it, so the webview cannot be served it.
  */
 screen: MediaRef | null, 
 /**
@@ -32,4 +35,10 @@ camera: MediaRef | null,
  * The part file's audio tracks and what each was heard as; empty for a
  * file whose tracks were heard mixed.
  */
-audioTracks: Array<MediaAudioTrackVm>, };
+audioTracks: Array<MediaAudioTrackVm>, 
+/**
+ * Whether the part's bytes are on this device. `false` for a pointer
+ * the sync has not downloaded: the player says so and never hands it to
+ * a `<video>` (88.1).
+ */
+here: boolean, };

@@ -1,5 +1,8 @@
 import type { Utterance } from "@/lib/ipc/gen/Utterance";
 
+/** What a line needs to sit on the timeline; an `Utterance` and a block's line both are one. */
+export type TimedLine = Pick<Utterance, "speaker" | "start" | "end">;
+
 /** A part's place on the transcript's one timeline, in seconds. */
 export interface TimelinePart {
   offset: number;
@@ -37,7 +40,7 @@ export function locate(
  * it, so of two overlapping voices the one who spoke last is the one shown.
  * `-1` in silence.
  */
-export function currentUtterance(utterances: readonly Utterance[], seconds: number): number {
+export function currentUtterance(utterances: readonly TimedLine[], seconds: number): number {
   let found = -1;
   for (let index = 0; index < utterances.length; index += 1) {
     const utterance = utterances[index];
@@ -46,4 +49,25 @@ export function currentUtterance(utterances: readonly Utterance[], seconds: numb
       found = index;
   }
   return found;
+}
+
+/**
+ * The line of `speaker` nearest `seconds`: one whose span holds it, else the
+ * one whose start or end is closest. Of two equally near, the later one — the
+ * reader asked where the voice goes next. `-1` when the speaker has no lines.
+ */
+export function nearestLine(lines: readonly TimedLine[], speaker: string, seconds: number): number {
+  let best = -1;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.speaker !== speaker) continue;
+    const distance =
+      seconds < line.start ? line.start - seconds : seconds >= line.end ? seconds - line.end : 0;
+    if (distance <= bestDistance) {
+      best = index;
+      bestDistance = distance;
+    }
+  }
+  return best;
 }

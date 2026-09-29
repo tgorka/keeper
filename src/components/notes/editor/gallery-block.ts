@@ -67,8 +67,7 @@ import {
   windowSlice,
 } from "@/components/ui/window-list";
 import type { NoteGalleryItemVm, NoteGalleryVm } from "@/lib/ipc/client";
-import { releaseRecordingMedia } from "./recording-embed";
-import { primeFirstFrame } from "./recording-transport";
+import { primeFirstFrame, releaseMediaElement } from "./media-playback";
 import { WIKILINK_ATTR } from "./wikilink";
 
 /**
@@ -458,12 +457,11 @@ function mountGrid(
   let pinned = new Set<string>();
 
   const releaseRow = (row: HTMLElement): void => {
-    for (const figure of row.children) {
-      // The same release the note's own embeds get: a `<video>` holding a
-      // selected resource keeps an open range-request pipeline against a file
-      // that may live on a volume the reader then cannot eject, and removing
-      // the node does not hand it back.
-      releaseRecordingMedia(figure as HTMLElement);
+    // A `<video>` holding a selected resource keeps an open range-request
+    // pipeline against a file that may live on a volume the reader then cannot
+    // eject, and removing the node does not hand it back.
+    for (const player of row.querySelectorAll("video, audio")) {
+      releaseMediaElement(player as HTMLMediaElement);
     }
     row.remove();
   };

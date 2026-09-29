@@ -67,6 +67,26 @@ export function noSuchNoteSentence(target: string): string {
   return `No note in this vault answers to ${target}. Nothing has been written there yet.`;
 }
 
+/**
+ * A wikilink target split at its first `#`: the note it names and the anchor
+ * after it. `[[#name]]` names this note (`note` empty); a target with no `#`
+ * has no anchor (`name` null). The anchor may name a media block's marker
+ * (AD-354); the link graph still counts the link as a link to the note.
+ */
+export function splitMarkerLink(target: string): { note: string; name: string | null } {
+  const hash = target.indexOf("#");
+  if (hash < 0) {
+    return { note: target, name: null };
+  }
+  const name = target.slice(hash + 1).trim();
+  return { note: target.slice(0, hash).trim(), name: name === "" ? null : name };
+}
+
+/** What a marker link says when no media block in the note carries the name. */
+export function noMomentSentence(name: string): string {
+  return `No moment called ${name} in this note.`;
+}
+
 /** Either the note a wikilink names, or the sentence saying why there is none.
  *  Exactly one is non-null. */
 export interface LinkFollowResult {

@@ -1504,7 +1504,7 @@ anyone but the person's own organisation.
   implements it: `keeper_core::transcription`, keeper-sync's voices role and model hydration, the
   vendored `tools/fluidaudio-rs`, and the shell's `transcribe_macos` and `transcribe_ipc`.
 
-## D-30 — A meeting in a note is a `keeper-meeting` fence, and its grammar is a contract
+## D-30 — Media in a note is a `keeper-media` fence, and its grammar is a contract
 
 The owner asked for the transcript view — the player and the transcript's lines — inside a
 note, in the notes keeper writes after a recording and in any note, configured by references
@@ -1519,7 +1519,7 @@ keeper will **not** write a block the person did not ask for into an existing no
 one by itself, put an absolute path in one, or let anything but Rust read one.
 
 - **What it is:** a CommonMark fenced code block whose info string's first word is
-  `keeper-meeting`, with a TOML body (version 1). Exactly one source: `session` (a recording's
+  `keeper-media`, with a TOML body (version 1). Exactly one source: `session` (a recording's
   identity, the one its note's `session:` carries), `transcript` (a transcript file's path),
   one or more `[[part]]` tables (`file`, optional `camera`, `offset`, `system`, `microphone`),
   or `src` (a `.toml` file in the drive holding the same grammar). Optional `title`, `from`
@@ -1533,4 +1533,41 @@ one by itself, put an absolute path in one, or let anything but Rust read one.
   purpose. A meeting's content is configuration: an ordered list of files, offsets, track roles
   and timed markers. In a callout it would still be TOML, behind `> ` on every line, with
   nothing in it a working link. A fence is also the hook Obsidian gives plugins for exactly
-  this (`registerMarkdownCodeBlockProcessor`), the form of its own ` 
+  this (`registerMarkdownCodeBlockProcessor`), the form of its own ` ```base ` block and of
+  Dataview. The callout rule stands for widgets; this entry scopes it. (AD-351)
+- **What stays true: the note is the person's.** Rust resolves every name — a `session` through
+  the recordings index, so a retitle does not break it; a path through `browse::resolve` under
+  the drive's root (AD-65). keeper changes a block's bytes only when the person adds, renames or
+  removes a marker, and then only that marker's table, every comment kept. Markers live in the
+  note, not in the transcript, which a redo deletes. (AD-353, AD-354; NFR-111)
+- **What a reader without keeper sees:** Obsidian, GitHub and `cat` show the block as a code
+  block. A clip copied with its words carries them as a collapsed `[!transcript]` callout right
+  after the fence, a snapshot keeper never refreshes. The note keeper writes after a recording
+  carries a three-line `session` block and no transcript text, as D-29 requires; it replaces
+  the per-file video embeds for new notes. Notes already written keep theirs until the person
+  asks keeper to use the media player in them (the notes options menu), and then only a stub
+  whose embeds are still exactly what keeper wrote is rewritten, and every other byte stays.
+  (AD-356, AD-357)
+- **Why `keeper-media`:** the owner's own name for it, "bardziej uniwersalnie (autio, video,
+  meeting, podcast, video etc)". The block plays a recording, a transcript or any audio or video
+  file, so the name says what it holds rather than one occasion for it; the `keeper-` prefix
+  keeps it out of a plugin's namespace. It was planned as `keeper-meeting` and no note ever
+  carried that name.
+- **What it supersedes:** the stub's per-file `![[…]]` video embeds for notes written from Epic
+  88 on (`notes/recording_note.rs`), and `docs/recording.md`'s "the session's note stub stays
+  as it was". An embedded audio or video file no longer plays in the note at all: it is a chip
+  whose *Play in a player* replaces it with a block, so a note has one way to play media, not
+  two. It scopes, and does not revoke, `docs/notes.md`'s "callouts, not fenced blocks".
+- **What is deferred, not refused:** an Obsidian renderer for the block (DW-347), paths into
+  another drive (DW-348), a player that keeps playing when its block scrolls away (DW-349),
+  Media Extended's `#t=` links in ordinary embeds (DW-350), a `keeper://` link to a marker
+  (DW-351), refreshing a clip's words (DW-352), meeting-wide markers (DW-353), and corrections
+  inside a note (DW-354).
+- **Revisit triggers:** a grammar change is a new `version`, never a reinterpretation of version
+  1; a new source kind or key is added only with a version bump or as an optional key an older
+  keeper refuses by name. None reopens the second paragraph.
+- **Status / owner:** decided 2026-09-29; the owner is the architect, named the block and asked
+  for it to be built. Epic 88 implements it: `keeper_core::notes::media_block` and
+  `keeper_core::transcription::media::resolve_block`, the shell's `media_block_ipc` commands and
+  the `keeper://transcript-written` event, the note editor's `media-block.ts` and the media
+  block panel.

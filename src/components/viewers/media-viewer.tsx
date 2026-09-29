@@ -39,10 +39,7 @@
  * accumulate them against files on a volume they then cannot eject.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  primeFirstFrame,
-  releaseMediaElement,
-} from "@/components/notes/editor/recording-transport";
+import { primeFirstFrame, releaseMediaElement } from "@/components/notes/editor/media-playback";
 import { fileAssetUrl } from "@/lib/viewers/file-asset-url";
 import type { ViewerProps } from "@/lib/viewers/types";
 import { UnknownViewer } from "@/lib/viewers/unknown-viewer";

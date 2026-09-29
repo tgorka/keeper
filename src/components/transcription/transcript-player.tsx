@@ -30,6 +30,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -46,15 +47,16 @@ import {
   PLAY_LABEL,
   PLAY_REFUSED_LABEL,
   primeFirstFrame,
+  recordingAssetUrl,
   releaseMediaElement,
   SCRUB_LABEL,
   SKIP_SECONDS,
-} from "@/components/notes/editor/recording-transport";
+} from "@/components/notes/editor/media-playback";
 import { Button } from "@/components/ui/button";
 import { Toggle } from "@/components/ui/toggle";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { IconHint } from "@/components/ui/tooltip";
-import type { TranscriptMediaVm } from "@/lib/ipc/client";
+import type { MediaRef, TranscriptMediaVm } from "@/lib/ipc/client";
 import { fileAssetUrl } from "@/lib/viewers/file-asset-url";
 import { locate, sessionLength } from "./session-timeline";
 
@@ -64,15 +66,47 @@ export const SOUND_LABEL = "Sound";
 export const PIN_LABEL = "Keep the player on top";
 export const FOLLOW_LABEL = "Follow the transcript";
 export const PART_UNAVAILABLE_SENTENCE =
-  "This part is not in a synced folder, so keeper cannot play it here.";
+  "This part is in no synced folder and among no recordings, so keeper cannot play it here.";
+/** A part whose bytes the sync has not brought to this device yet (an LFS pointer). */
+export const PART_NOT_HERE_SENTENCE =
+  "This part is not on this Mac yet. Once the sync brings it, it plays here.";
 
 export interface TranscriptPlayerHandle {
   /** Move to `seconds` on the transcript's timeline; `play` starts it, absent keeps it as it was. */
   seek: (seconds: number, play?: boolean) => void;
+  pause: () => void;
 }
 
-type Picture = "screen" | "camera" | "both";
-type Sound = "system" | "microphone" | "both";
+/** A window of the timeline, in seconds: the player plays only inside it. */
+export interface PlayerWindow {
+  from: number;
+  to: number;
+}
+
+/** The URL a part's file is served on: from its synced folder, or from its recording by session. */
+function mediaUrl(ref: MediaRef): string {
+  return ref.via === "recording"
+    ? recordingAssetUrl(ref.sessionId, ref.relativePath)
+    : fileAssetUrl(ref.profileId, ref.relativePath);
+}
+/**
+ * An icon toggle's state must read at a glance: on wears the accent — its ink
+ * and its edge on the lifted fill — and off is a quiet outline. Keyed on ARIA,
+ * not `data-state`: the tooltip's trigger shares the element and writes its own
+ * `data-state` ("closed") over the toggle's, which left on and off alike.
+ */
+const TOGGLE_STATE =
+  "border-border aria-pressed:border-primary aria-pressed:bg-secondary aria-pressed:text-primary";
+/** A segment wears the same accent when chosen; the unchosen stay in the trough. */
+const SEGMENT_STATE =
+  "aria-checked:border-primary aria-checked:bg-background aria-checked:text-primary";
+/** The tooltip says the state in words, beside what the icon shows. */
+function stateHint(label: string, on: boolean): string {
+  return `${label}: ${on ? "on" : "off"}`;
+}
+
+export type Picture = "screen" | "camera" | "both";
+export type Sound = "system" | "microphone" | "both";
 
 /** One segment of a picture or sound choice: its value, its name, its glyph. */
 interface Choice<V extends string> {
@@ -117,8 +151,8 @@ function ChoiceGroup<V extends string>({
       }}
     >
       {choices.map((choice) => (
-        <IconHint key={choice.value} label={choice.label}>
-          <ToggleGroupItem value={choice.value} aria-label={choice.label}>
+        <IconHint key={choice.value} label={stateHint(choice.label, choice.value === value)}>
+          <ToggleGroupItem value={choice.value} aria-label={choice.label} className={SEGMENT_STATE}>
             {choice.icon}
           </ToggleGroupItem>
         </IconHint>
@@ -176,44 +210,72 @@ export function TranscriptPlayer({
   onFollowChange,
   onTime,
   onJump,
+  onPlayingChange,
+  window,
+  initialPicture = "both",
+  initialSound = "both",
   ref,
 }: {
   media: TranscriptMediaVm;
-  pinned: boolean;
-  onPinnedChange: (pinned: boolean) => void;
+  /** With `onPinnedChange`, offers Keep the player on top; a host that scrolls as a whole has neither. */
+  pinned?: boolean;
+  onPinnedChange?: (pinned: boolean) => void;
   follow: boolean;
   onFollowChange: (follow: boolean) => void;
   /** Where the timeline is, on every tick and every seek. */
   onTime: (seconds: number) => void;
   /** A play or a seek: the reader moved the player on purpose. */
   onJump: () => void;
+  onPlayingChange?: (playing: boolean) => void;
+  /** Plays only this stretch: the scrub spans it, the player starts at `from` and stops at `to`. */
+  window?: PlayerWindow;
+  /** What is shown and heard first; the person may change either. */
+  initialPicture?: Picture;
+  initialSound?: Sound;
   ref?: Ref<TranscriptPlayerHandle>;
 }) {
-  const parts = media.parts;
+  // A part whose length Rust could not tell (a session nobody transcribed yet)
+  // takes it from its file once loaded; the parts then lie end to end.
+  const [measured, setMeasured] = useState<Record<number, number>>({});
+  const parts = useMemo(() => {
+    if (media.parts.every((p) => p.duration > 0)) return media.parts;
+    let offset = 0;
+    return media.parts.map((p, i) => {
+      const duration = p.duration > 0 ? p.duration : (measured[i] ?? 0);
+      const placed = { ...p, offset, duration };
+      offset += duration;
+      return placed;
+    });
+  }, [media.parts, measured]);
   const total = sessionLength(parts);
-  const [index, setIndex] = useState(0);
-  const [time, setTime] = useState(0);
+  const lo = window?.from ?? 0;
+  const hi = window ? (total > 0 ? Math.min(window.to, total) : window.to) : total;
+  // Without a window it starts at the first part, whatever the lengths say — unknown
+  // lengths (all 0) would otherwise place time 0 past every part, in the last.
+  const [index, setIndex] = useState(() => (lo > 0 ? (locate(media.parts, lo)?.index ?? 0) : 0));
+  const [time, setTime] = useState(lo);
   const [playing, setPlaying] = useState(false);
   const [refused, setRefused] = useState<string | null>(null);
-  const [picture, setPicture] = useState<Picture>("both");
-  const [sound, setSound] = useState<Sound>("both");
+  const [picture, setPicture] = useState<Picture>(initialPicture);
+  const [sound, setSound] = useState<Sound>(initialSound);
   const part = parts[index];
-  const mainSrc = part?.screen
-    ? fileAssetUrl(part.screen.profileId, part.screen.relativePath)
-    : null;
+  // A part that is not here is never handed to a `<video>`: it would fetch a pointer file.
+  const here = part?.here !== false;
+  const mainSrc = here && part?.screen ? mediaUrl(part.screen) : null;
   const video = part?.screen?.kind === "video";
-  const cameraSrc =
-    part?.camera && picture !== "screen"
-      ? fileAssetUrl(part.camera.profileId, part.camera.relativePath)
-      : null;
+  const cameraSrc = here && part?.camera && picture !== "screen" ? mediaUrl(part.camera) : null;
   const [main, attachMain] = useMediaElement<HTMLMediaElement>(mainSrc);
   const [camera, attachCamera] = useMediaElement<HTMLVideoElement>(cameraSrc);
-  const pending = useRef<{ local: number; play: boolean } | null>(null);
-  const at = useRef({ index, playing, onTime, onJump });
-  at.current = { index, playing, onTime, onJump };
+  // A window's start is where the player first lands.
+  const pending = useRef<{ local: number; play: boolean } | null>(
+    lo > 0 ? { local: locate(media.parts, lo)?.local ?? 0, play: false } : null,
+  );
+  const at = useRef({ index, playing, onTime, onJump, onPlayingChange });
+  at.current = { index, playing, onTime, onJump, onPlayingChange };
   const showMain = video && (picture !== "camera" || cameraSrc === null);
   const choosePicture = media.hasCamera && media.hasScreen;
   const chooseSound = parts.some((p) => p.audioTracks.length > 1);
+  useEffect(() => at.current.onPlayingChange?.(playing), [playing]);
 
   const start = useCallback((element: HTMLMediaElement) => {
     setRefused(null);
@@ -242,7 +304,8 @@ export function TranscriptPlayer({
 
   const seek = useCallback(
     (seconds: number, play?: boolean) => {
-      const target = locate(parts, seconds);
+      // An end not known yet (no part's length measured) bounds nothing.
+      const target = locate(parts, Math.min(Math.max(seconds, lo), hi > 0 ? hi : seconds));
       if (!target) return;
       const keep = play ?? at.current.playing;
       at.current.onJump();
@@ -252,14 +315,16 @@ export function TranscriptPlayer({
         element.currentTime = target.local;
         if (camera.current) camera.current.currentTime = target.local;
         if (keep) start(element);
+        else element.pause();
         return;
       }
       pending.current = { local: target.local, play: keep };
       setIndex(target.index);
     },
-    [parts, report, start, main, camera],
+    [parts, lo, hi, report, start, main, camera],
   );
-  useImperativeHandle(ref, () => ({ seek }), [seek]);
+  const pause = useCallback(() => main.current?.pause(), [main]);
+  useImperativeHandle(ref, () => ({ seek, pause }), [seek, pause]);
 
   if (!part) return null;
   const partName = part.file.split("/").pop() ?? part.file;
@@ -272,6 +337,10 @@ export function TranscriptPlayer({
     onLoadedMetadata: (event: React.SyntheticEvent<HTMLMediaElement>) => {
       const element = event.currentTarget;
       applySound(element);
+      if (media.parts[index]?.duration === 0 && Number.isFinite(element.duration)) {
+        const length = element.duration;
+        setMeasured((known) => (known[index] === length ? known : { ...known, [index]: length }));
+      }
       const landing = pending.current;
       if (!landing) return;
       pending.current = null;
@@ -281,7 +350,10 @@ export function TranscriptPlayer({
     },
     onTimeUpdate: (event: React.SyntheticEvent<HTMLMediaElement>) => {
       const element = event.currentTarget;
-      report(part.offset + element.currentTime);
+      const now = part.offset + element.currentTime;
+      // A window ends where it says, not where the file does.
+      if (window && now >= hi && !element.paused) element.pause();
+      report(window ? Math.min(now, hi) : now);
       const follower = camera.current;
       if (follower && Math.abs(follower.currentTime - element.currentTime) > MAX_DRIFT_SECONDS)
         follower.currentTime = element.currentTime;
@@ -306,7 +378,9 @@ export function TranscriptPlayer({
   return (
     <section aria-label={PLAYER_LABEL} className="min-w-0 space-y-2">
       {mainSrc === null ? (
-        <p className="text-muted-foreground">{PART_UNAVAILABLE_SENTENCE}</p>
+        <p className="text-muted-foreground">
+          {here ? PART_UNAVAILABLE_SENTENCE : PART_NOT_HERE_SENTENCE}
+        </p>
       ) : (
         <div className="flex min-w-0 justify-center gap-2">
           {video ? (
@@ -344,6 +418,8 @@ export function TranscriptPlayer({
             const element = main.current;
             if (!element) return;
             if (playing) element.pause();
+            // Play at a window's end starts the window again.
+            else if (window && time >= hi) seek(lo, true);
             else {
               at.current.onJump();
               start(element);
@@ -357,7 +433,7 @@ export function TranscriptPlayer({
           variant="ghost"
           aria-label={BACK_LABEL}
           disabled={mainSrc === null}
-          onClick={() => seek(Math.max(0, time - SKIP_SECONDS))}
+          onClick={() => seek(Math.max(lo, time - SKIP_SECONDS))}
         >
           {BACK_GLYPH}
         </Button>
@@ -366,7 +442,7 @@ export function TranscriptPlayer({
           variant="ghost"
           aria-label={FORWARD_LABEL}
           disabled={mainSrc === null}
-          onClick={() => seek(Math.min(total, time + SKIP_SECONDS))}
+          onClick={() => seek(Math.min(hi, time + SKIP_SECONDS))}
         >
           {FORWARD_GLYPH}
         </Button>
@@ -377,14 +453,14 @@ export function TranscriptPlayer({
           type="range"
           aria-label={SCRUB_LABEL}
           className="min-w-24 flex-1 basis-40 accent-primary"
-          min={0}
-          max={total}
+          min={lo}
+          max={hi}
           step={0.1}
-          value={Math.min(time, total)}
+          value={Math.min(Math.max(time, lo), hi)}
           onChange={(event) => seek(Number(event.target.value))}
         />
         <span className="font-mono text-muted-foreground text-xs tabular-nums">
-          {clock(time)} / {clock(total)}
+          {clock(time)} / {clock(hi)}
         </span>
         <div className="ml-auto flex items-center gap-1">
           {choosePicture && (
@@ -403,13 +479,25 @@ export function TranscriptPlayer({
               onChange={setSound}
             />
           )}
-          <IconHint label={PIN_LABEL}>
-            <Toggle aria-label={PIN_LABEL} pressed={pinned} onPressedChange={onPinnedChange}>
-              {pinned ? <Pin aria-hidden="true" /> : <PinOff aria-hidden="true" />}
-            </Toggle>
-          </IconHint>
-          <IconHint label={FOLLOW_LABEL}>
-            <Toggle aria-label={FOLLOW_LABEL} pressed={follow} onPressedChange={onFollowChange}>
+          {pinned !== undefined && onPinnedChange && (
+            <IconHint label={stateHint(PIN_LABEL, pinned)}>
+              <Toggle
+                aria-label={PIN_LABEL}
+                className={TOGGLE_STATE}
+                pressed={pinned}
+                onPressedChange={onPinnedChange}
+              >
+                {pinned ? <Pin aria-hidden="true" /> : <PinOff aria-hidden="true" />}
+              </Toggle>
+            </IconHint>
+          )}
+          <IconHint label={stateHint(FOLLOW_LABEL, follow)}>
+            <Toggle
+              aria-label={FOLLOW_LABEL}
+              className={TOGGLE_STATE}
+              pressed={follow}
+              onPressedChange={onFollowChange}
+            >
               <Crosshair aria-hidden="true" />
             </Toggle>
           </IconHint>

@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use super::model::{MatchStatus, Transcript};
+use super::model::{MatchStatus, Transcript, Utterance};
 
 /// `hh:mm:ss` for a time in seconds.
 fn clock(seconds: f64) -> String {
@@ -65,15 +65,7 @@ pub fn markdown(t: &Transcript) -> String {
 
     out.push_str("\n## Transcript\n\n");
     for utterance in &t.utterances {
-        let name = t
-            .speaker(&utterance.speaker)
-            .map_or_else(|| utterance.speaker.clone(), Transcript::display_name);
-        let _ = writeln!(
-            out,
-            "**[{}] {name}:** {}\n",
-            clock(utterance.start),
-            utterance.text
-        );
+        let _ = writeln!(out, "{}\n", line(t, utterance));
     }
 
     let _ = writeln!(
@@ -82,6 +74,19 @@ pub fn markdown(t: &Transcript) -> String {
         t.engine.asr, t.engine.diarizer, t.engine.embedding
     );
     out
+}
+
+/// One utterance as the markdown twin writes it, `**[hh:mm:ss] Name:** text`
+/// — also the line format of a clip's words (AD-356).
+pub fn line(t: &Transcript, utterance: &Utterance) -> String {
+    let name = t
+        .speaker(&utterance.speaker)
+        .map_or_else(|| utterance.speaker.clone(), Transcript::display_name);
+    format!(
+        "**[{}] {name}:** {}",
+        clock(utterance.start),
+        utterance.text
+    )
 }
 
 #[cfg(test)]

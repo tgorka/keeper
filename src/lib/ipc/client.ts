@@ -23,6 +23,18 @@ import type { FilesDeleteReceiptVm } from "./gen/FilesDeleteReceiptVm";
 import type { FilesListingVm } from "./gen/FilesListingVm";
 import type { IpcError } from "./gen/IpcError";
 import type { LifecyclePhase } from "./gen/LifecyclePhase";
+import type { LineEditVm } from "./gen/LineEditVm";
+import type { MarkerEditReq } from "./gen/MarkerEditReq";
+import type { MediaAdoptionVm } from "./gen/MediaAdoptionVm";
+import type { MediaBlockVm } from "./gen/MediaBlockVm";
+import type { MediaClipVm } from "./gen/MediaClipVm";
+import type { MediaLineVm } from "./gen/MediaLineVm";
+import type { MediaMarkerHitVm } from "./gen/MediaMarkerHitVm";
+import type { MediaMarkerVm } from "./gen/MediaMarkerVm";
+import type { MediaPickReq } from "./gen/MediaPickReq";
+import type { MediaRef } from "./gen/MediaRef";
+import type { MediaSpeakerVm } from "./gen/MediaSpeakerVm";
+import type { MediaWindowVm } from "./gen/MediaWindowVm";
 import type { NavState } from "./gen/NavState";
 import type { NotificationPermission } from "./gen/NotificationPermission";
 import type { NotifyTarget } from "./gen/NotifyTarget";
@@ -38,10 +50,23 @@ import type { TranscriptionProgressVm } from "./gen/TranscriptionProgressVm";
 import type { TranscriptionStatusVm } from "./gen/TranscriptionStatusVm";
 import type { TranscriptMediaVm } from "./gen/TranscriptMediaVm";
 import type { TranscriptVm } from "./gen/TranscriptVm";
+import type { TranscriptWrittenVm } from "./gen/TranscriptWrittenVm";
 
 export type {
   CorrectionResultVm,
   DictionaryTermVm,
+  LineEditVm,
+  MarkerEditReq,
+  MediaAdoptionVm,
+  MediaBlockVm,
+  MediaClipVm,
+  MediaLineVm,
+  MediaMarkerHitVm,
+  MediaMarkerVm,
+  MediaPickReq,
+  MediaRef,
+  MediaSpeakerVm,
+  MediaWindowVm,
   PersonVm,
   TrackOrigin,
   TranscriptionLanguage,
@@ -49,6 +74,7 @@ export type {
   TranscriptionStatusVm,
   TranscriptMediaVm,
   TranscriptVm,
+  TranscriptWrittenVm,
 };
 
 export function transcriptionStatus(): Promise<TranscriptionStatusVm> {
@@ -139,6 +165,88 @@ export function transcriptAddSpeaker(
 /** What the transcript's player plays: each part's files, where they sit, and their tracks. */
 export function transcriptMedia(path: string): Promise<TranscriptMediaVm> {
   return invoke("transcript_media", { path });
+}
+/**
+ * A `keeper-media` block for the transcript, composed by Rust, for the
+ * clipboard: the whole meeting with `from` and `to` both null, else the window
+ * (`hh:mm:ss`), with its words as a folded callout when `words`. A refusal —
+ * a time Rust will not read, a window outside the meeting, a transcript no
+ * synced folder holds — is the error's sentence.
+ */
+export function transcriptClip(
+  path: string,
+  from: string | null,
+  to: string | null,
+  words: boolean,
+): Promise<MediaClipVm> {
+  return invoke("transcript_clip", { path, from, to, words });
+}
+/** The transcript Rust wrote or changed: a job's result, a correction, a redo's fresh file. */
+export const TRANSCRIPT_WRITTEN_EVENT = "keeper://transcript-written";
+/** Subscribe to {@link TRANSCRIPT_WRITTEN_EVENT}; `path` is the transcript's absolute path. */
+export async function listenTranscriptWritten(
+  onWritten: (path: string) => void,
+): Promise<() => void> {
+  return await listen<TranscriptWrittenVm>(TRANSCRIPT_WRITTEN_EVENT, (event) => {
+    onWritten(event.payload.path);
+  });
+}
+/**
+ * A `keeper-media` block's body, resolved: what it plays and the lines inside
+ * its window. `profileId` is the drive holding the note, `null` when there is
+ * none. A refusal's message is the sentence the block shows above its source.
+ */
+export function mediaBlockResolve(profileId: string | null, source: string): Promise<MediaBlockVm> {
+  return invoke("media_block_resolve", { profileId, source });
+}
+/** The block's body with one marker added, renamed or removed, every other byte as it was. */
+export function mediaBlockEdit(source: string, edit: MarkerEditReq): Promise<string> {
+  return invoke("media_block_edit", { source, edit });
+}
+/** A clip of the block `source` for `[from, to)` (`hh:mm:ss`, as typed), for the clipboard. */
+export function mediaBlockClip(
+  profileId: string | null,
+  source: string,
+  from: string | null,
+  to: string | null,
+  words: boolean,
+): Promise<MediaClipVm> {
+  return invoke("media_block_clip", { profileId, source, from, to, words });
+}
+/** The recordings the media blocks of a whole note's `body` name. */
+export function mediaBlockSources(body: string): Promise<string[]> {
+  return invoke("media_block_sources", { body });
+}
+/** Which media block of the note `body` holds a marker called `name`, and its time; `null` for none. */
+export function mediaBlockFindMarker(
+  profileId: string | null,
+  body: string,
+  name: string,
+): Promise<MediaMarkerHitVm | null> {
+  return invoke("media_block_find_marker", { profileId, body, name });
+}
+/** "Play in a player" on the embed of `target` at `line` of the note `body`: the edits, applied as one. */
+export function mediaBlockForEmbed(
+  profileId: string,
+  body: string,
+  line: number,
+  target: string,
+): Promise<LineEditVm[]> {
+  return invoke("media_block_for_embed", { profileId, body, line, target });
+}
+/** The block for what the person picked — a recording or a file in the drive — to insert at the caret. */
+export function mediaBlockCompose(profileId: string, pick: MediaPickReq): Promise<string> {
+  return invoke("media_block_compose", { profileId, pick });
+}
+/**
+ * Rewrite the vault's recording notes that still embed their recording file by
+ * file into the one media block; `dryRun` counts without writing.
+ */
+export function recordingNotesAdoptMediaBlock(
+  profileId: string,
+  dryRun: boolean,
+): Promise<MediaAdoptionVm> {
+  return invoke("recording_notes_adopt_media_block", { profileId, dryRun });
 }
 export function voicesPeople(profileId: string): Promise<PersonVm[]> {
   return invoke("voices_people", { profileId });

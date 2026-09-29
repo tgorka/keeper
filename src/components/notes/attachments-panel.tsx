@@ -89,6 +89,7 @@
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
+  mediaBlockSources,
   notesEmbedPaths,
   type RecordingNoteTargetVm,
   recordingNoteTargets,
@@ -233,6 +234,44 @@ export interface AttachmentsPanelProps {
  *  does not hand the plan a fresh map and re-render everything below it. */
 const NOTHING_RESOLVED: ReadonlyMap<string, string | null> = new Map();
 
+/** How long the body must rest before the panel asks Rust which sessions its
+ *  media blocks name: a question per keystroke would be a round trip per
+ *  keystroke for an answer that changes when a block is written. */
+const SOURCES_QUIET_MS = 300;
+
+/**
+ * The sessions the body's `keeper-media` blocks name, or `[]`.
+ *
+ * Rust reads the blocks (`media_block_sources`); the body is only checked for
+ * the fence's info word first, so a note with no media block asks nothing.
+ */
+function useMediaBlockSessions(body: string): readonly string[] {
+  const [sessions, setSessions] = useState<readonly string[]>([]);
+  const names = body.includes("keeper-media");
+  useEffect(() => {
+    if (!names) {
+      setSessions([]);
+      return;
+    }
+    let live = true;
+    const timer = setTimeout(() => {
+      void mediaBlockSources(body).then(
+        (found) => {
+          if (live) setSessions(found);
+        },
+        () => {
+          if (live) setSessions([]);
+        },
+      );
+    }, SOURCES_QUIET_MS);
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [body, names]);
+  return sessions;
+}
+
 export function AttachmentsPanel({ vaultId, frontmatter, body, onInsert }: AttachmentsPanelProps) {
   const parsed = readFrontmatter(frontmatter);
   const sessionId = recordingSessionId(parsed);
@@ -328,6 +367,12 @@ export function AttachmentsPanel({ vaultId, frontmatter, body, onInsert }: Attac
   // panel has no root for.
   const sessionFiles = sessionId === null ? [] : noteAttachments(parsed);
   const embedded = embeddedAttachmentNames(body);
+  // A media block naming this note's session plays every one of its files, so
+  // each is in the note — the stub keeper writes carries that block rather
+  // than an embed per file, and offering Insert for each would report a
+  // normal note as a fault (AD-357).
+  const blockSessions = useMediaBlockSessions(body);
+  const playedByBlock = sessionId !== null && blockSessions.includes(sessionId);
   // The other source (Story 46.2, AD-103), joined to what the vault said
   // (Story 46.11). `null` — the probe failed — is not "nothing is embedded": it
   // is every target still unanswered, which is what `NOTHING_RESOLVED` makes it.
@@ -404,7 +449,8 @@ export function AttachmentsPanel({ vaultId, frontmatter, body, onInsert }: Attac
               const kind = kindOf(targets, relativePath);
               // Folded, because {@link embeddedAttachmentNames} folds: APFS is
               // case-insensitive, so `Screen.MOV` in the note is this file.
-              const present = embedded.has(attachmentName(relativePath).toLowerCase());
+              const present =
+                playedByBlock || embedded.has(attachmentName(relativePath).toLowerCase());
               return (
                 <li key={relativePath} className="flex min-w-0 items-center gap-2">
                   {/* The name, with the note's own relative path as the tooltip.

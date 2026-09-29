@@ -1,7 +1,7 @@
 # Epic 88 — A meeting you can play inside a note
 
 created: '2026-09-29'
-status: plan only. The owner asked for this to be planned, not built; every story below is `backlog`.
+status: built 2026-09-29 with the owner's amendments (*Build amendments*, below); stories 88.1–88.5 are in `review`. Planned as `keeper-meeting`; the block is `keeper-media` everywhere below (N1).
 source: the owner's message of 2026-09-29, in Polish (its closing paragraph, verbatim below; the rest of that message is story 87.10). Other inputs:
 - the coordinator's scope, `local://epic87-fr3.md` § *Epic 88 — plan only* (binding: the design points to pin, the files to read, the ledgers to draft);
 - a reading of keeper's notes editor, its embeds and its recording note stub, and of the transcript viewer's player, with every claim below cited `path:line`;
@@ -22,6 +22,26 @@ see-also:
 - AD-27 (absent rather than disabled), AD-55/AD-56 (decisions in keeper-core, IO in the shell), AD-65 (Rust composes every path; `keeper-sync/src/browse.rs:722-746`), AD-74 (`keeper-file://` serves only synced folders), AD-343 (one file per fact, and why), AD-344 (a transcript is a file beside its media);
 - FR-109 (a note's file link may point anywhere in its drive), FR-121 (the vault is the person's), FR-145 (no absolute path in a synced file), NFR-27 (the editor's chunk is React-free), UX-DR44 (a block that cannot draw shows its source and the reason), UX-DR53 (one transport for one moment);
 - `docs/notes.md` § *Widgets in a note*, `docs/transcription.md` § *What you see*, `docs/recording.md` § *Transcription*.
+
+## Build amendments (2026-09-29)
+
+The owner asked for the plan to be built, in Polish, with these changes; the coordinator's rulings N1–N5 fix them (`local://epic88-build.md`). Where this document still describes the plan, these win.
+
+- **N1 — the name is `keeper-media`.** "keeper-meeting moze nie najlepsza nazwa moze keeper-media zeby bylo bardziej uniwersalnie (autio, video, meeting, podcast, video etc)". A block plays any recording, transcript or media file, so the name names the content, not one kind of it; the `keeper-` prefix still keeps it clear of plugins. Q1 is closed by it. The grammar is otherwise unchanged: a plain audio or video file is a `[[part]]` with no transcript, and the block plays it and offers *Transcribe* where that is possible. Code: `keeper_core::notes::media_block` (grammar, times, edits, clips, the stub's block, finding blocks, the old-stub rewrite) and `keeper_core::transcription::media::resolve_block` (resolution over facts the shell answers through `MediaLookup`); the shell's `media_block_ipc.rs`.
+- **N2 — the old media rendering goes.** "obecne renderowanie video - usun - zle dziala a nowy didget jest lepszy i bardziej intencjonalny". `![[x.mov]]` in a note no longer mounts a player: it is a chip with the file's name and kind, *Reveal*, *Copy path* and **Play in a player**, which asks Rust for the replacement (`media_block_for_embed`): in a recording note every embed of the recording's media collapses into one `session` block; any other media file becomes a one-part block naming it relative to the drive. The editor applies the line edits in one transaction. `NoteEmbedPathVm` gains `absolutePath` for the chip's actions.
+- **N3 — inserting a widget.** The notes toolbar's *Insert widget* menu and the `/` menu list keeper's note widgets, *Media player* first. Picking a recording or a file in the drive asks Rust for the block (`media_block_compose`): a recording by its identity; a transcript by its path, or by its recording when it is one; a recording's own file by the recording; any other media file as one part.
+- **N4 — a block before its transcript** plays the media under "Not transcribed yet.", with *Transcribe* and the job's progress, and shows the lines when `keeper://transcript-written` names its expected path (AD-357).
+- **N5 — old stubs, on request.** `recording_notes_adopt_media_block({profileId, dryRun})` rewrites every recording stub whose body still holds exactly the per-file embeds the stub composer wrote into the one block (`media_block::adopt`), leaves every other byte, is idempotent, and names the notes whose embeds were edited by hand and so were left alone. It is the person's action (the notes options menu, with a count and a confirmation) and the coordinator's migration on hesperia; keeper still rewrites nothing by itself (AD-357 holds).
+
+**Shapes, as built.** Commands: `media_block_resolve({profileId, source}) → MediaBlockVm`, `media_block_edit({source, edit: MarkerEditReq}) → string`, `media_block_clip({profileId, source, from, to, words}) → MediaClipVm`, `transcript_clip({path, from, to, words}) → MediaClipVm`, `media_block_sources({body}) → string[]`, `media_block_find_marker({profileId, body, name}) → MediaMarkerHitVm | null`, `media_block_for_embed({profileId, body, line, target}) → LineEditVm[]`, `media_block_compose({profileId, pick: MediaPickReq}) → string`, `recording_notes_adopt_media_block({profileId, dryRun}) → MediaAdoptionVm`. `source` is the fence's body, verbatim. Every refusal is the `IpcError`'s sentence. `MediaRef` is a union, `{via: "file", profileId, relativePath, kind} | {via: "recording", sessionId, relativePath, kind}`, and a part carries `here`. The event is `keeper://transcript-written` with `{path}`, emitted after every transcript JSON the shell writes.
+
+**Front, as built.** The editor layer `src/components/notes/editor/media-block.ts` and its mount `media-block-host.tsx`; the panel `src/components/notes/media-block-panel.tsx`, over the viewer's player and lines; the embed chip `editor/media-chip.ts` and the shared playback vocabulary `editor/media-playback.ts` (`recording-transport.ts` is gone); *Insert widget* in `format-toolbar.tsx` from `src/lib/notes/widgets.ts`, the picker `media-picker-dialog.tsx`, the `/` source `editor/widget-slash.ts`; the old-stub action `adopt-media-blocks.tsx`; marker links in `src/lib/notes/follow-link.ts` and `note-editor.tsx`. The viewer's *Copy as note embed* and *Copy clip from here…* call `transcript_clip`.
+
+**Deviations from the plan, as built.**
+- A part's `duration` is `0` when nothing measured it: a recording not transcribed yet takes each segment's length from its capture sample bounds (`ptsStart`/`ptsEnd`) when the manifest has them, and a `[[part]]` without a transcript has none; the player reads it off the media. A `[[part]]` with no `offset` after such a part starts where that part starts.
+- `media_block_sources` names the recordings of `session` blocks only; a block naming its recording through `src` is not read for the attachments panel (it would need the file).
+- A clip of a `src` block checks the new window against the block's own `from`/`to`, not the file's.
+- "Not here" is a Git LFS pointer standing in for the file, or a file that is missing; a virtual file the sync has not materialised reads as whatever is on disk.
 
 ## The owner's ask
 
@@ -45,7 +65,7 @@ The epic is a plan, so the verdict is what the plan does, not what exists.
 | 3 | "(tych autmatycznych notatek po renderowaniu)" | **planned** | The note keeper writes when a recording ends carries the block, naming the session by its identity. It plays at once, and shows the lines once the transcript is written, with no rewrite of the note. "po renderowaniu" is read as "after recording" (Q7). | AD-357; 88.5 |
 | 4 | "zebym mow widziec ten embeded widok i odtwarzac wideo wewnatrz notatki" | **planned** | The block plays the meeting in the note as one timeline across its segments, with the Picture and Sound choices. | AD-353, AD-359; 88.2 |
 | 5 | "w konfiguracji miec tylko referencje do wlasciwych plikow (jak wideo/audio liste po kolei, liste kamer/mikrofonow desktop/kamer)" | **planned** | The body holds references and nothing else. It is either a recording's identity, a transcript's path, or an ordered `[[part]]` list whose entries name the main file, the camera, and which audio track is the call and which the microphone. | AD-352 |
-| 6 | "nazwanego code block: ```NAZWA konfiguracyjny pseudo jezyk z parametrami jak toml lub json" | **planned: `keeper-meeting`, TOML** | TOML is keeper's configuration language. JSON is rejected (AD-352). | AD-351, AD-352; D-30 |
+| 6 | "nazwanego code block: ```NAZWA konfiguracyjny pseudo jezyk z parametrami jak toml lub json" | **planned: `keeper-media`, TOML** | TOML is keeper's configuration language. JSON is rejected (AD-352). | AD-351, AD-352; D-30 |
 | 7 | "albo link to takiego konfigu w drive" | **planned** | `src = "<path in the drive>.toml"` names a file holding the same grammar. | AD-352, AD-353 |
 | 8 | "zaznaczania znacznikow czasowych (i time-window) - nazwanych" | **planned** | `[[marker]]` tables in the block: a `name`, and either `at` or `from` with `to`. They are added, renamed and removed from the block. | AD-354, UX-DR125; 88.3 |
 | 9 | "tak zeby mozna bylo przewijac do tych momentu w notatce" | **planned** | A marker's chip seeks the block's player. `[[note#name]]`, or `[[#name]]` inside the same note, opens the note, brings the block into view and moves its player to the moment. | AD-354; 88.3 |
@@ -61,7 +81,7 @@ The epic is a plan, so the verdict is what the plan does, not what exists.
 | A recording played in a note | **present, one embed per file** | `![[…]]` in a recording note resolves by the session's identity (`recording-embed.ts:18-30`) and plays over `keeper-recording://` (`recording_protocol.rs:1-33`). The screen and camera of one session share one transport (`recording-transport.ts:1-37`). |
 | A transcript's parts played as one timeline, with its lines | **present, in the transcript viewer only** | `TranscriptPlayer` (`src/components/transcription/transcript-player.tsx`), `locate` and `currentUtterance` (`session-timeline.ts:14-49`), and `transcript_media` (`transcription/media.rs:17-75`). A part plays only from a synced folder (`media.rs:95-122`); anything else says "This part is not in a synced folder, so keeper cannot play it here." (`PART_UNAVAILABLE_SENTENCE`). |
 | The recording note stub | **present; embeds each video** | `compose` writes `# Title`, then one `![[<file>]]` per video, then a blank line (`recording_note.rs:301`, `:361-393`). Nothing else writes to a stub, and a re-finalize leaves an existing one alone (`ipc.rs:9117-9135`). |
-| Named moments or windows in a media timeline | **absent** | Searching `src`, `src-tauri/crates`, `docs` and `dev` for `keeper-meeting`, `[[marker]]`, "time marker" and `#t=` found only `#t=30` in two URL parsers' tests. Those tests assert that the fragment is discarded, not read as a path (`file_asset.rs:264-274`, `recording_protocol.rs:276-279`). |
+| Named moments or windows in a media timeline | **absent** | Searching `src`, `src-tauri/crates`, `docs` and `dev` for `keeper-media`, `[[marker]]`, "time marker" and `#t=` found only `#t=30` in two URL parsers' tests. Those tests assert that the fragment is discarded, not read as a path (`file_asset.rs:264-274`, `recording_protocol.rs:276-279`). |
 | Following `[[note#anchor]]` to a place in the note | **absent** | The link graph drops the anchor (`notes/links.rs:478-481`, `notes/index.rs:916-919`, `attach.ts:563-567`). A click opens the note it names and nothing more (`note-editor.tsx:481-499`, `follow-link.ts:92-109`). |
 | TOML in keeper-core | **present, read only** | `toml` (`keeper-core/Cargo.toml:76`; workspace `toml = "0.9"`, `src-tauri/Cargo.toml:304`). An edit that leaves every other byte alone needs `toml_edit`, which is in the lock at 0.25.12 only through `proc-macro-crate` (`Cargo.lock:8359-8360`). There is no YAML crate in the workspace. |
 | A signal that a transcript changed | **absent** | `transcriptionStore.jobs` holds only the jobs this window started (`src/lib/stores/transcription.ts:22`, `:107-119`). There is no `transcript-written` event anywhere. The after-recording job is started by the shell. |
@@ -69,7 +89,7 @@ The epic is a plan, so the verdict is what the plan does, not what exists.
 
 ## The one sentence
 
-**keeper can play a meeting and read it back in the transcript viewer, and can play a recording's files in its note, but a note cannot show the meeting, cannot remember a moment in it, and cannot hand a piece of it to another note.** The fix is one fenced block, ` ```keeper-meeting `, with five parts:
+**keeper can play a meeting and read it back in the transcript viewer, and can play a recording's files in its note, but a note cannot show the meeting, cannot remember a moment in it, and cannot hand a piece of it to another note.** The fix is one fenced block, ` ```keeper-media `, with five parts:
 - **The block.** Its TOML body names the meeting by reference: a recording's identity, a transcript, a list of parts, or a config file in the drive.
 - **Resolution.** Rust reads the body and resolves every name.
 - **The panel.** The note draws the viewer's player and the transcript's lines inside the block.
@@ -81,7 +101,7 @@ The epic is a plan, so the verdict is what the plan does, not what exists.
 | The earlier decision | What it said | What this epic needs | The amendment |
 | --- | --- | --- | --- |
 | **`docs/notes.md:141-144`**, `note-widget.ts:12-24` and `gallery-block.ts:11-30` | keeper's blocks are callouts, not fences, because a fence is "a wall of grey source everywhere but here" | A block whose content is configuration: an ordered list of parts, files, offsets and timed markers. The owner asked for a named code block. | **Scoped (AD-351, D-30).** The callout rule holds for a block whose content is prose or links a reader can use elsewhere. A block whose content is configuration is a fence. |
-| **`recording_note.rs:25-43`, `:361-393`** (Story 42.4, Story 43.5) | the stub's body embeds each video, `![[<file>]]`, below the heading | The meeting in the note, not one player per file | **Superseded for new stubs (AD-357).** The body carries one `keeper-meeting` block naming the session. `files:` and the heading rule stay. Stubs already written keep their embeds, untouched. |
+| **`recording_note.rs:25-43`, `:361-393`** (Story 42.4, Story 43.5) | the stub's body embeds each video, `![[<file>]]`, below the heading | The meeting in the note, not one player per file | **Superseded for new stubs (AD-357).** The body carries one `keeper-media` block naming the session. `files:` and the heading rule stay. Stubs already written keep their embeds, untouched. |
 | **`recording_note.rs:13-17`**, and D-29's last bullet | "No transcription, no summarisation, no inference"; the transcript is its own file | — | **Held.** The block names the session. The stub gains no transcript text. |
 | **`docs/recording.md:316-319`** | "The session's note stub stays as it was; the transcript is its own file." | The stub references the meeting | **Reworded (88.5).** The transcript is still its own file, and the stub's block plays it. |
 | **Epic 87's *What stays out*** (`epic-87-…:940`) | "A transcript in the session's note stub" is out | — | **Held.** A reference is not a transcript. |
@@ -93,24 +113,24 @@ The epic is a plan, so the verdict is what the plan does, not what exists.
 
 ## Decisions this epic takes
 
-- **AD-351: A meeting in a note is a fenced code block named `keeper-meeting`, and only Rust reads its body.**
+- **AD-351: A meeting in a note is a fenced code block named `keeper-media`, and only Rust reads its body.**
 
   **Binds:** FR-759, FR-760, FR-766; NFR-111; Stories 88.1, 88.2; D-30.
 
   **Decision:**
-  - **The block.** A CommonMark fenced code block whose info string's first word is `keeper-meeting`. Backticks or tildes, at any indent CommonMark allows, including inside a list item.
+  - **The block.** A CommonMark fenced code block whose info string's first word is `keeper-media`. Backticks or tildes, at any indent CommonMark allows, including inside a list item.
     - **How it is found.** From the parse tree's `FencedCode` and its `CodeInfo`, exactly as the mermaid fence is found, and for the reason written there (`mermaid-widget.ts:170-178`). It is replaced by a block widget supplied from a `StateField`, because a `ViewPlugin` cannot supply one (DW-165, `:210-229`). The layer is composed beside `mermaidLayer()` in `livePreview`'s extension list (`live-preview.ts:1843-1852`).
     - **Revealing the source.** With the caret inside the fence, the source comes back (`mermaid-widget.ts:226-228`).
   - **The body is handed to Rust verbatim.** TypeScript never reads a key, never splits a line and never joins a path. That is the widget rule, "Nothing here composes a query" (`note-widget.ts:33-37`), applied to a meeting.
   - **Why a fence when keeper's other blocks are callouts.**
     - **The callout rule protects what these blocks do not have.** `docs/notes.md:141-144`, `note-widget.ts:12-24` and `gallery-block.ts:21-30` chose callouts because their content is a query or a list of links, and those stay useful in Obsidian: a titled quote with working links. A meeting's content is configuration: an ordered list of parts, each with files, an offset and track roles, and markers with times. The owner asked for exactly that ("nazwanego code block … konfiguracyjny pseudo jezyk"). Put in a callout, the data is still TOML, now behind `> ` on every line, and none of it becomes a working link.
     - **The fence is Obsidian's own extension point for this job.** `registerMarkdownCodeBlockProcessor(language, handler)` "handles fenced code given a language" (`obsidian.d.ts:4993-5001`). Obsidian's first-party ` ```base ` (a YAML body) and Dataview's ` ```dataview ` are named fences. An Obsidian-side renderer (DW-347) can claim a fence. It cannot claim a callout.
-  - **The name is prefixed.** Code-block languages are one namespace in a vault: the Timestamp Notes plugin claims the bare `timestamp` and `timestamp-url` (its `main.ts:30`, `:58`). `keeper-meeting` cannot collide with a plugin that did not choose it.
+  - **The name is prefixed.** Code-block languages are one namespace in a vault: the Timestamp Notes plugin claims the bare `timestamp` and `timestamp-url` (its `main.ts:30`, `:58`). `keeper-media` cannot collide with a plugin that did not choose it.
 
   **Why not the obvious alternative:**
   - **A callout, `> [!meeting] …`, the house pattern.** It fits prose and links. This content is neither (above).
   - **`![[kelly-sync.meeting.toml]]`, an embed of a config file.** Every note, and every clip, would need a second file. Obsidian would show a link to a file it cannot draw, and copying a clip would create files. It remains available as `src` (AD-352), for a configuration a person wants to share between notes.
-  - **An HTML element, `<keeper-meeting …>`.** Obsidian and GitHub sanitise or hide unknown HTML, so the reader outside keeper would see nothing, which is worse than code.
+  - **An HTML element, `<keeper-media …>`.** Obsidian and GitHub sanitise or hide unknown HTML, so the reader outside keeper would see nothing, which is worse than code.
 
 - **AD-352: The body is TOML, version 1, and its grammar is closed.**
 
@@ -119,7 +139,7 @@ The epic is a plan, so the verdict is what the plan does, not what exists.
   **Decision:** the whole grammar of version 1:
 
   ````markdown
-  ```keeper-meeting
+  ```keeper-media
   # A comment is the person's, and keeper keeps it.
   session = "01J8…-01J8…"          # exactly one source: session | transcript | [[part]] | src
   title = "Pricing, with Kelly"    # optional
@@ -248,11 +268,11 @@ The epic is a plan, so the verdict is what the plan does, not what exists.
   **Binds:** FR-766; NFR-111; Stories 88.2, 88.4.
 
   **Decision:**
-  - **Without a plugin, Obsidian shows the fence as a code block,** unhighlighted, because Prism has no `keeper-meeting` language (Obsidian's *Basic formatting syntax*). The title, the window and the markers' names and times read plainly. A session id does not mean anything to a reader.
+  - **Without a plugin, Obsidian shows the fence as a code block,** unhighlighted, because Prism has no `keeper-media` language (Obsidian's *Basic formatting syntax*). The title, the window and the markers' names and times read plainly. A session id does not mean anything to a reader.
   - **The words of a clip,** when copied with them, are a callout on the line directly after the closing fence:
 
     ````markdown
-    ```keeper-meeting
+    ```keeper-media
     session = "01J8…-01J8…"
     from = "00:12:00"
     to = "00:15:30"
@@ -286,7 +306,7 @@ The epic is a plan, so the verdict is what the plan does, not what exists.
   - **The stub's body.** `recording_note::compose` writes, below the heading and in place of the per-file video embeds (`recording_note.rs:301`, `:361-393`), a fence of three lines:
 
     ````markdown
-    ```keeper-meeting
+    ```keeper-media
     session = "<session id>"
     ```
     ````
@@ -461,7 +481,7 @@ Graded as in epic 87: [SOURCE] is a public document read on 2026-09-29, [REPO] i
 
 | id | statement | story | AD |
 | --- | --- | --- | --- |
-| FR-759 | A fenced ` ```keeper-meeting ` block in a note draws the meeting it names, in the note editor and in the Files preview of a Markdown file inside a synced folder. It shows the meeting's media as one timeline across its parts, with the Picture and Sound choices, and the transcript's lines, read-only, following playback. With the caret inside, the block's text is shown and edited as text. Drawing needs no transcription capability. | 88.1, 88.2 | AD-351, AD-353, AD-358, UX-DR124 |
+| FR-759 | A fenced ` ```keeper-media ` block in a note draws the meeting it names, in the note editor and in the Files preview of a Markdown file inside a synced folder. It shows the meeting's media as one timeline across its parts, with the Picture and Sound choices, and the transcript's lines, read-only, following playback. With the caret inside, the block's text is shown and edited as text. Drawing needs no transcription capability. | 88.1, 88.2 | AD-351, AD-353, AD-358, UX-DR124 |
 | FR-760 | A block's body is TOML. It holds exactly one source, `session`, `transcript`, one or more `[[part]]`s, or `src`, plus optional `title`, `from`, `to`, `picture`, `sound`, `[[marker]]`s and `version`. Paths are relative to the drive holding the note. A body with an unknown key, two sources or none, a bad time, an absolute or escaping path, a `src` that names `src`, or a version above 1 shows its own text and a sentence naming what is wrong. | 88.1, 88.2 | AD-352, AD-353 |
 | FR-761 | With `from` and `to`, a block plays and lists only the window `[from, to)` of the meeting. Its scrub bar spans the window, and playback pauses at `to`. Times are `hh:mm:ss`, `mm:ss` or seconds, on the meeting's own clock. | 88.1, 88.2 | AD-352 |
 | FR-762 | From a block, a person can mark the current moment or a window with a name, and rename or remove a marker. Each marker is a `[[marker]]` table in the block. keeper changes only that table and leaves every other byte of the note as it was. Clicking a marker's chip moves the block's player to it; a window plays and pauses at its end. | 88.1, 88.3 | AD-354, UX-DR125 |
@@ -482,8 +502,8 @@ Graded as in epic 87: [SOURCE] is a public document read on 2026-09-29, [REPO] i
 Each has the reading this plan builds to, marked as such, so that no lane is blocked. None is resolved silently.
 
 - **Q1. The block's name.**
-  - **Gap.** The coordinator proposed `keeper-meeting`. The block also plays a lecture or any transcribed file.
-  - **Plan's reading:** `keeper-meeting`. It names what the owner thinks of, and the `keeper-` prefix avoids collisions. It becomes a contract with D-30, so it must be settled before any stub carries it.
+  - **Gap.** The coordinator proposed `keeper-media`. The block also plays a lecture or any transcribed file.
+  - **Plan's reading:** `keeper-media`. It names what the owner thinks of, and the `keeper-` prefix avoids collisions. It becomes a contract with D-30, so it must be settled before any stub carries it.
 - **Q2. The stub stops embedding its videos.**
   - **Gap.** An Obsidian vault whose root is the drive would lose the stub's native `![[…mov]]` players.
   - **Plan's reading:** replace them (AD-357, AD-356). The alternative is to keep them and have the block absorb the embeds of its own session, which is a second grammar in one block.
@@ -515,19 +535,19 @@ Every story names its rung in the stack (*Stack*, below).
 **Intent:** "nazwanego code block … jak toml lub json, albo link to takiego konfigu w drive"; "tylko referencje do wlasciwych plikow". **Rung:** the pure half on **epic88-core**; the commands and the event on **epic88-surface**. AD-352, AD-353, AD-354's edits, AD-355's composition, AD-357's event, AD-359's view model.
 
 **Files:**
-- `keeper-core/src/notes/meeting_block.rs` (new). It holds:
+- `keeper-core/src/notes/media_block.rs` (new). It holds:
   - the grammar's types and `parse`, and every refusal with its `sentence()`;
   - NPT time parsing and formatting;
   - `edit` (add, rename or remove a marker, through `toml_edit`);
   - `clip` (compose, with or without words);
-  - `stub_block(session_id)`;
+  - `session_block(session_id)`;
   - `find_marker(sources, name)`;
   - `resolve`, which composes the view model from facts the shell has read: the transcript, the manifest, the session's targets, the synced folders, and whether each part's bytes are here.
 - `keeper-core/src/notes/mod.rs`;
 - `keeper-core/src/transcription/media.rs` and `vm.rs` (`MediaRef`'s `keeper-recording://` alternative; the slim line and speaker view models);
 - `keeper-core/Cargo.toml` and `src-tauri/Cargo.toml` (`toml_edit`, workspace, at the locked 0.25.12);
 - `keeper/src/transcribe_ipc.rs`, beside `transcript_media`:
-  - the commands `meeting_block_resolve({profileId, source})`, `meeting_block_edit({source, edit})`, `meeting_block_clip({from: block | transcriptPath, window, words})`, `meeting_block_sources({body})` and `meeting_block_find_marker({sources, name})`;
+  - the commands `media_block_resolve({profileId, source})`, `media_block_edit({source, edit})`, `media_block_clip({from: block | transcriptPath, window, words})`, `media_block_sources({body})` and `media_block_find_marker({sources, name})`;
   - the emit of `keeper://transcript-written` under `TRANSCRIPT_WRITES`;
 - `keeper/src/lib.rs` (registration);
 - the new `src/lib/ipc/gen/*.ts` files.
@@ -580,9 +600,9 @@ Every story names its rung in the stack (*Stack*, below).
 **Intent:** "zeby moc wyrenderowac ten ekran dla notatek … widziec ten embeded widok i odtwarzac wideo wewnatrz notatki". **Rung:** **epic88-surface** (the front). AD-351, AD-356's absorption, AD-358, AD-359; UX-DR124.
 
 **Files:**
-- `src/components/notes/editor/meeting-block.ts` (new): the `StateField` layer. It finds fences by `CodeInfo` and takes an adjacent `[!transcript]` callout into the range. The widget has a fixed `estimatedHeight`, a dynamic import of the host, `ignoreEvent` inside the body, and a `destroy` that unmounts in a microtask and releases the media;
-- `src/components/notes/editor/meeting-block-host.tsx` (new, the mount);
-- `src/components/transcription/meeting-panel.tsx` (new): the React panel. It holds the read-only lines list, the chips (88.3) and the menu;
+- `src/components/notes/editor/media-block.ts` (new): the `StateField` layer. It finds fences by `CodeInfo` and takes an adjacent `[!transcript]` callout into the range. The widget has a fixed `estimatedHeight`, a dynamic import of the host, `ignoreEvent` inside the body, and a `destroy` that unmounts in a microtask and releases the media;
+- `src/components/notes/editor/media-block-host.tsx` (new, the mount);
+- `src/components/notes/media-block-panel.tsx` (new): the React panel. It holds the read-only lines list, the chips (88.3) and the menu;
 - `src/components/transcription/transcript-player.tsx`:
   - a `window` prop, spanning the scrub bar and pausing at `to`;
   - the one-plays-per-pane scope;
@@ -594,7 +614,7 @@ Every story names its rung in the stack (*Stack*, below).
 
 **Acceptance:**
 - **Detection.**
-  - A `keeper-meeting` fence is replaced by the block: with backticks, with tildes, indented, or in a list item.
+  - A `keeper-media` fence is replaced by the block: with backticks, with tildes, indented, or in a list item.
   - A `mermaid`, `toml` or unlabelled fence is untouched.
   - With the caret inside, the source is shown. Clicking inside the panel does not move the caret.
 - **The words callout.** An adjacent `> [!transcript]` callout is inside the block's range and is not drawn separately. One after a blank line is drawn as an ordinary callout.
@@ -622,7 +642,7 @@ Every story names its rung in the stack (*Stack*, below).
 
 **Intent:** "Daj mozliwosc zaznaczania znacznikow czasowych (i time-window) - nazwanych tak zeby mozna bylo przewijac do tych momentu w notatce." **Rung:** **epic88-surface** (the front and the link path); the core's edits and `find_marker` are 88.1's. AD-354; UX-DR125.
 
-**Files:** `meeting-panel.tsx` (the chips and the popovers), `meeting-block.ts` (the splice at the range found again), `note-editor.tsx` (`openWikilink` carries the fragment and asks where the marker is), `src/lib/notes/follow-link.ts` (`#name` alone means this note), `dev/mock-shell.ts`, and `docs/notes.md`.
+**Files:** `media-block-panel.tsx` (the chips and the popovers), `media-block.ts` (the splice at the range found again), `note-editor.tsx` (`openWikilink` carries the fragment and asks where the marker is), `src/lib/notes/follow-link.ts` (`#name` alone means this note), `dev/mock-shell.ts`, and `docs/notes.md`.
 
 **Acceptance:**
 - **Adding.**
@@ -644,7 +664,7 @@ Every story names its rung in the stack (*Stack*, below).
 
 **Intent:** "Daj mozliwosc przekopiowania tego oznaczenia pluginu do innej notatki z wysnaczona tylko (np ze znacznika) czasem - lub czescia czasu". **Rung:** **epic88-surface** (the front); the composition is 88.1's. AD-355, AD-356; UX-DR126.
 
-**Files:** `meeting-panel.tsx` (*Copy clip…* and the marker's *Copy clip*), `transcript-viewer.tsx` (*Copy as note embed* in the header menu, and *Copy clip from here…* in a line's ⋯ menu), `dev/mock-shell.ts`, `docs/transcription.md` (§ *A meeting in a note*) and `docs/notes.md`.
+**Files:** `media-block-panel.tsx` (*Copy clip…* and the marker's *Copy clip*), `transcript-viewer.tsx` (*Copy as note embed* in the header menu, and *Copy clip from here…* in a line's ⋯ menu), `dev/mock-shell.ts`, `docs/transcription.md` (§ *A meeting in a note*) and `docs/notes.md`.
 
 **Acceptance:**
 - **The clipboard** holds exactly Rust's composition. With *Include the words* on, which is the default, the callout follows the fence. With it off, the fence alone.
@@ -660,9 +680,9 @@ Every story names its rung in the stack (*Stack*, below).
 **Intent:** "zeby moc wyrenderowac ten ekran dla notatek (tych autmatycznych notatek po renderowaniu)". **Rung:** **epic88-surface**, core hunk included (*Stack*: a stub whose block nothing draws would be a regression on a rung merged alone). AD-357; UX-DR124's not-transcribed state.
 
 **Files:**
-- `keeper-core/src/notes/recording_note.rs`: `compose` writes `stub_block(session_id)` in place of `video_embeds`. The module's documentation and its body tests change with the behaviour;
-- `src/components/notes/attachments-panel.tsx`, through `meeting_block_sources`: a session file counts as in the note;
-- `meeting-panel.tsx`: not transcribed yet, *Transcribe*, and the job's progress;
+- `keeper-core/src/notes/recording_note.rs`: `compose` writes `session_block(session_id)` in place of `video_embeds`. The module's documentation and its body tests change with the behaviour;
+- `src/components/notes/attachments-panel.tsx`, through `media_block_sources`: a session file counts as in the note;
+- `media-block-panel.tsx`: not transcribed yet, *Transcribe*, and the job's progress;
 - `docs/recording.md` (§ *Transcription*, the stub), `docs/transcription.md`, and this document.
 
 **Acceptance:**
@@ -693,24 +713,24 @@ Every story names its rung in the stack (*Stack*, below).
 Deferred, with the ledger entries allocated here so a later planner finds them. The coordinator applies them to `_bmad-output/implementation-artifacts/deferred-work.md`, after DW-346, and that ledger is then the source of truth. The paste-ready copy is `local://epic88-ledger-blocks.md` (b).
 
 ```markdown
-### DW-347: No Obsidian plugin draws a keeper-meeting block; Obsidian shows it as TOML.
+### DW-347: No Obsidian plugin draws a keeper-media block; Obsidian shows it as TOML.
 
 origin: epic 88's plan, 2026-09-29 (AD-351, AD-356)
 location: `_bmad-output/planning-artifacts/epic-88-a-meeting-you-can-play-inside-a-note.md` (the grammar), `docs/decisions.md` (D-30, the contract a renderer would read)
-reason: keeper draws the block; Obsidian, which reads the same vault, shows it as an unhighlighted code block — the title, the window and the markers legible, a session id meaningless — and shows a clip's words as a collapsed callout. The owner asked for the embed inside keeper and pointed at Obsidian as the model, not as a place the meeting must play. Obsidian's API has the exact hook, `registerMarkdownCodeBlockProcessor("keeper-meeting", …)`, and D-30 is the contract such a plugin would implement; it would still need keeper's resolution — a recordings index for `session`, the drive's root for paths — which only keeper has. Revisit when the owner wants to watch meetings in Obsidian: an Obsidian plugin that resolves `transcript` and `[[part]]` against the vault's adapter and shows `session` blocks as a link into keeper.
+reason: keeper draws the block; Obsidian, which reads the same vault, shows it as an unhighlighted code block — the title, the window and the markers legible, a session id meaningless — and shows a clip's words as a collapsed callout. The owner asked for the embed inside keeper and pointed at Obsidian as the model, not as a place the meeting must play. Obsidian's API has the exact hook, `registerMarkdownCodeBlockProcessor("keeper-media", …)`, and D-30 is the contract such a plugin would implement; it would still need keeper's resolution — a recordings index for `session`, the drive's root for paths — which only keeper has. Revisit when the owner wants to watch meetings in Obsidian: an Obsidian plugin that resolves `transcript` and `[[part]]` against the vault's adapter and shows `session` blocks as a link into keeper.
 status: open
 
 ### DW-348: A block names files only in the drive that holds the note.
 
 origin: epic 88's plan, 2026-09-29 (AD-353)
-location: `src-tauri/crates/keeper-core/src/notes/meeting_block.rs` (resolution), `src-tauri/crates/keeper-sync/src/browse.rs` (`resolve`, the one join)
+location: `src-tauri/crates/keeper-core/src/notes/media_block.rs` (resolution), `src-tauri/crates/keeper-sync/src/browse.rs` (`resolve`, the one join)
 reason: `transcript`, `[[part]]` and `src` paths are relative to the root of the note's drive and joined by `browse::resolve`, so a note in neuradrive cannot name a transcript in tgdrive by path. A `session` block is the exception — it names an identity the recordings index resolves wherever the recording lives — so every automatic note and every clip of a recording works across drives. A path-named transcript (a file's transcript, a hand-written `[[part]]` list) does not. Revisit when the owner pastes such a clip into another drive's note: a `drive = "<name>"` key resolved through the account's `drives.toml`, still joined by `browse::resolve` under that drive's root.
 status: open
 
 ### DW-349: A playing block stops when the editor stops drawing it; there is no docked player.
 
 origin: epic 88's plan, 2026-09-29 (AD-359)
-location: `src/components/notes/editor/meeting-block.ts` (`destroy`), `src/components/notes/editor/recording-transport.ts` (`releaseMediaElement`)
+location: `src/components/notes/editor/media-block.ts` (`destroy`), `src/components/notes/editor/media-playback.ts` (`releaseMediaElement`)
 reason: The house rule is that a widget that goes away gives its media back (`recording-embed.ts:50-56`), and CodeMirror destroys a block it stops drawing — in a long note, when the block scrolls out of the part of the note the editor draws (the view plus a margin), or when the text around it is cut. A person listening to a meeting while writing far below it hears it stop. Keeping it would mean a pane-level dock that adopts the playing elements from a widget being destroyed, the handover `recording-transport.ts`'s staging already does between hosts, lifted out of the editor. Revisit when the owner reports playback stopping while writing: a "now playing" strip under the note that holds the one playing block's media until Stop, the note closing, or another block playing.
 status: open
 
@@ -731,21 +751,21 @@ status: open
 ### DW-352: The words under a copied clip are a snapshot; corrections and a redo do not reach them.
 
 origin: epic 88's plan, 2026-09-29 (AD-356)
-location: `src-tauri/crates/keeper-core/src/notes/meeting_block.rs` (`clip`, the `[!transcript]` callout), `src-tauri/crates/keeper-core/src/transcription/render.rs` (the line format)
+location: `src-tauri/crates/keeper-core/src/notes/media_block.rs` (`clip`, the `[!transcript]` callout), `src-tauri/crates/keeper-core/src/transcription/render.rs` (the line format)
 reason: A clip copied with its words carries the window's lines as they were at the moment of copying, for readers without keeper. keeper hides them inside the block and draws the live lines instead, so a keeper reader never sees them go stale — but an Obsidian reader of the same note does, after any correction or a *Transcribe again*. keeper does not rewrite them, because a note is written by its person and a refresh keeper decided on is a write they did not make. Revisit if the owner finds stale quotes in Obsidian: a *Refresh the words* action on the block that re-renders the callout from the current transcript, on the person's press.
 status: open
 
 ### DW-353: A marker belongs to one note; there is no meeting-wide list of markers.
 
 origin: epic 88's plan, 2026-09-29 (AD-354)
-location: `src-tauri/crates/keeper-core/src/notes/meeting_block.rs` (`[[marker]]` tables live in the note's block)
+location: `src-tauri/crates/keeper-core/src/notes/media_block.rs` (`[[marker]]` tables live in the note's block)
 reason: A marker is written into the block of the note it was made in, for the reason a gallery pin is: two notes about one meeting care about different moments, and a marker filed with the meeting would be one note editing every other note's view of it. So a moment marked in the automatic note is not in the weekly summary that also embeds that meeting, unless copied there as a clip. A shared list would have to live beside the transcript, one file per marker so two devices never conflict (AD-343's shape), and survive a redo. Revisit when the owner wants to mark a moment once and see it in every note: `markers/<ulid>.toml` in the session folder, shown beside each block's own markers.
 status: open
 
 ### DW-354: A meeting block is read-only; corrections and Transcribe again happen in the transcript viewer.
 
 origin: epic 88's plan, 2026-09-29 (AD-358)
-location: `src/components/transcription/meeting-panel.tsx` (no correction controls), `src/components/transcription/transcript-viewer.tsx` (every correction)
+location: `src/components/notes/media-block-panel.tsx` (no correction controls), `src/components/transcription/transcript-viewer.tsx` (every correction)
 reason: The block plays, follows and marks; editing a line, changing a speaker, splitting, adding a line and *Transcribe again* stay in the viewer, which the block opens at its current time. Inside the note editor a widget with text fields fights the editor for the caret and the keys, and every block would be one more correction surface over the same `transcript.json`. The corrections still reach every open block through `keeper://transcript-written`. Revisit if the owner asks to fix a word without leaving the note: a per-line ⋯ menu in the block that opens the viewer's line editor in a popover, writing through the same commands.
 status: open
 ```
@@ -782,7 +802,7 @@ The coordinator applies this under `development_status:`, above the epic-87 bloc
 
 ```yaml
   # Epic 88: the owner's message of 2026-09-29 (Polish, verbatim in the epic; its closing paragraph — the rest is story 87.10) — plan an embed ("plugin") for markdown notes, as in Obsidian, that renders the transcript view in a note (the automatic notes after recording) and plays the video inside the note; its configuration holds only references to the files (video/audio parts in order, cameras and microphones), as a named code block with a TOML/JSON-like body or a link to such a config in the drive; named time markers and time windows to scroll to in the note; copy the block to another note with only a marker's or a part of the time. PLAN ONLY — the owner asked for it to be planned.
-  # Stack rungs (planned): epic88-plan (the epic file, this entry, DW-347…DW-354, D-30 in docs/decisions.md) on top of epic87-reading; later epic88-core (keeper-core notes/meeting_block.rs: grammar, NPT times, toml_edit edits, clip, stub_block, find_marker, resolve; transcription/media.rs's keeper-recording MediaRef; bindings) and epic88-surface (transcribe_ipc.rs meeting_block_* commands and keeper://transcript-written; the meeting-block.ts layer and the meeting panel; the player's window, visibility mount and one-per-pane; markers and [[note#name]] links; Copy clip in the block and the viewer; recording_note.rs's stub block and the attachments panel, riding here so no rung writes a block nothing draws; docs/notes.md, docs/transcription.md, docs/recording.md).
+  # Stack rungs (planned): epic88-plan (the epic file, this entry, DW-347…DW-354, D-30 in docs/decisions.md) on top of epic87-reading; later epic88-core (keeper-core notes/media_block.rs: grammar, NPT times, toml_edit edits, clip, stub_block, find_marker, resolve; transcription/media.rs's keeper-recording MediaRef; bindings) and epic88-surface (transcribe_ipc.rs media_block_* commands and keeper://transcript-written; the media-block.ts layer and the meeting panel; the player's window, visibility mount and one-per-pane; markers and [[note#name]] links; Copy clip in the block and the viewer; recording_note.rs's stub block and the attachments panel, riding here so no rung writes a block nothing draws; docs/notes.md, docs/transcription.md, docs/recording.md).
   # Decisions: AD-351…AD-359, UX-DR124…UX-DR126, FR-759…FR-766, NFR-110…NFR-111. Open questions Q1–Q8 in the epic (the block's name; the stub drops its video embeds; a marker link seeks paused; the owner's Obsidian vault root; markers per note; words on by default in a clip; "po renderowaniu" read as after recording; track numbers count from 1).
   # Owed when built: a four-block note in a real WKWebView on hesperia (first frames, one player, release on scroll); a stub from a real recording drawing its block before and after the transcript lands; a clip pasted into a note in the other drive; the pasted clip opened in the owner's Obsidian.
   epic-88: backlog
@@ -800,7 +820,7 @@ The coordinator applies this under `development_status:`, above the epic-87 bloc
 The coordinator applies this to `docs/decisions.md` after D-29. The paste-ready copy is `local://epic88-ledger-blocks.md` (c). The grammar is a durable contract: every automatic note will carry it, clips copy it between notes and drives, and an Obsidian renderer (DW-347) would implement it. The question "why a fence, when keeper's widgets are callouts?" will be asked again, and this entry answers it.
 
 ```markdown
-## D-30 — A meeting in a note is a `keeper-meeting` fence, and its grammar is a contract
+## D-30 — A meeting in a note is a `keeper-media` fence, and its grammar is a contract
 
 The owner asked for the transcript view — the player and the transcript's lines — inside a
 note, in the notes keeper writes after a recording and in any note, configured by references
@@ -815,7 +835,7 @@ keeper will **not** write a block the person did not ask for into an existing no
 one by itself, put an absolute path in one, or let anything but Rust read one.
 
 - **What it is:** a CommonMark fenced code block whose info string's first word is
-  `keeper-meeting`, with a TOML body (version 1). Exactly one source: `session` (a recording's
+  `keeper-media`, with a TOML body (version 1). Exactly one source: `session` (a recording's
   identity, the one its note's `session:` carries), `transcript` (a transcript file's path),
   one or more `[[part]]` tables (`file`, optional `camera`, `offset`, `system`, `microphone`),
   or `src` (a `.toml` file in the drive holding the same grammar). Optional `title`, `from`
@@ -855,8 +875,8 @@ one by itself, put an absolute path in one, or let anything but Rust read one.
   keeper refuses by name. None reopens the second paragraph.
 - **Status / owner:** planned 2026-09-29 at the owner's request; the owner is the architect and
   decides Q1–Q8 in the epic before a stub carries the block. Epic 88 implements it:
-  `keeper_core::notes::meeting_block`, the shell's `meeting_block_*` commands and the
-  `keeper://transcript-written` event, the note editor's `meeting-block.ts` and the meeting
+  `keeper_core::notes::media_block`, the shell's `media_block_*` commands and the
+  `keeper://transcript-written` event, the note editor's `media-block.ts` and the meeting
   panel.
 ```
 
@@ -867,14 +887,14 @@ Rungs by layer, as in epics 80–87. Only the first is built now.
    - this document;
    - the ledgers: the sprint-status entry, `deferred-work.md` DW-347…DW-354, and D-30 in `docs/decisions.md`.
 2. **`epic88-core`**, later:
-   - keeper-core's `notes/meeting_block.rs` and `notes/mod.rs`;
+   - keeper-core's `notes/media_block.rs` and `notes/mod.rs`;
    - `transcription/media.rs` and `vm.rs` (the `keeper-recording://` reference and the slim view models);
    - `toml_edit` in `keeper-core/Cargo.toml` and the workspace;
    - the regenerated bindings.
 
    **Hunks from other layers that ride this rung,** because the new `MediaRef` alternative breaks existing code: every match or literal on `MediaRef` in `keeper/src/transcribe_ipc.rs`, and the TypeScript fixtures (`dev/transcription-fixture.ts`) and the player's URL choice, which must typecheck. `bindings:check` must be green on this rung alone.
 3. **`epic88-surface`**, later:
-   - the shell: `transcribe_ipc.rs`'s `meeting_block_*` commands, the `keeper://transcript-written` emit, and the registration in `lib.rs`;
-   - the front: `meeting-block.ts`, `meeting-block-host.tsx`, `meeting-panel.tsx`, the player's window, visibility and one-per-pane changes, the link path in `note-editor.tsx` and `follow-link.ts`, the Files preview's profile, the viewer's *Copy as note embed* and *Copy clip from here…*, the attachments panel, the client wrappers and the mock shell;
+   - the shell: `transcribe_ipc.rs`'s `media_block_*` commands, the `keeper://transcript-written` emit, and the registration in `lib.rs`;
+   - the front: `media-block.ts`, `media-block-host.tsx`, `media-block-panel.tsx`, the player's window, visibility and one-per-pane changes, the link path in `note-editor.tsx` and `follow-link.ts`, the Files preview's profile, the viewer's *Copy as note embed* and *Copy clip from here…*, the attachments panel, the client wrappers and the mock shell;
    - **`keeper-core/src/notes/recording_note.rs`'s stub change, by a stack-time decision.** It is core code, and it rides here with the renderer. A stub that writes a block nothing draws would be a regression on a rung merged alone (skill: prove each stack rung stands alone);
    - the docs: `docs/notes.md`, `docs/transcription.md` and `docs/recording.md`.

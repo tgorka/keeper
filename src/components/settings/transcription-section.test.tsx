@@ -12,6 +12,7 @@ vi.mock("@/lib/ipc/client", () => ({
   transcriptionStart: vi.fn(),
   transcriptRead: vi.fn(),
   transcriptMedia: vi.fn(),
+  listenTranscriptWritten: vi.fn(() => Promise.resolve(() => {})),
   voicesPeople: vi.fn(),
   dictionaryTerms: vi.fn(),
   dictionaryTermSave: vi.fn(),

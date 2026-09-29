@@ -141,10 +141,74 @@ surface uses.
 They are **callouts, not fenced blocks**. A note carrying one opens in Obsidian, on GitHub
 or in `cat` as a labelled quote — degraded, but still readable prose. A fence would have
 made it a wall of grey source everywhere but here, and a note that only makes sense inside
-keeper is a note keeper has taken hostage.
+keeper is a note keeper has taken hostage. That rule is for blocks whose content is prose or
+links; a block whose content is configuration is a fence — the media block below, and D-30
+says why.
 
 Sessions use all three, but nothing about them is session-specific: a board is a widget
 that happens to be useful in a session, not a session feature that leaked.
+
+*Insert widget* on the format toolbar, and the same entries in the `/` menu, put one in at
+the caret: *Media player…* first, then *Gallery*. The board, log and refs callouts are typed
+by hand.
+
+## Media in a note
+
+A recording, a transcript or any audio or video file plays inside a note as one block: the
+transcript viewer's player, and under it the transcript's lines, following playback.
+
+````markdown
+```keeper-media
+session = "01J8…-01J8…"          # exactly one of: session | transcript | [[part]] | src
+title = "Pricing, with Kelly"    # optional
+from = "00:12:00"                # optional window, [from, to), on the recording's own clock
+to = "00:15:30"
+picture = "both"                 # optional: screen | camera | both
+sound = "both"                   # optional: system | microphone | both
+
+[[marker]]
+name = "The price we agreed"
+at = "00:13:05"
+```
+````
+
+- **What it names.** `session` is a recording's identity — the one its note's `session:`
+  carries, which a retitle does not change. `transcript` is a transcript file; `[[part]]`
+  tables list media with no transcript, in play order (`file`, and optionally `camera`,
+  `offset`, and `system`/`microphone` track numbers counted from 1); `src` is a `.toml` file in
+  the drive holding the same grammar. Paths are relative to the drive that holds the note.
+- **Only keeper's Rust reads it.** The editor hands the body over as written and draws what
+  comes back (`media_block_resolve`); a key keeper does not know, two sources, a bad time or a
+  path outside the drive shows the block's own text with a sentence naming what is wrong.
+  `version = 2` says the block was written by a newer keeper.
+- **Reading, not correcting.** The block plays, follows, seeks and marks; corrections happen
+  in the transcript viewer, which *Open transcript* opens at the block's time. Every
+  correction there, and every transcript a job writes, reaches every open block through
+  `keeper://transcript-written`, with no rewrite of the note. A block before its transcript
+  plays the media under "Not transcribed yet.", with *Transcribe* where this Mac can.
+- **Markers.** *Mark this moment* and *Mark a window…* add a `[[marker]]` table; rename and
+  remove change only that table and keep every other byte, comments included
+  (`media_block_edit`). `[[Note#The price we agreed]]`, or `[[#…]]` in the same note, opens the
+  note, brings the block into view and moves its player there, paused.
+- **Clips.** *Copy clip…* puts a new block for the same recording on the clipboard, with the
+  window you chose and the markers inside it — and, unless you untick it, the window's lines
+  as a folded `[!transcript]` callout after the fence, for readers without keeper. keeper
+  hides that callout inside the block and never refreshes it.
+- **One player at a time.** Media mounts only near the screen, a block that scrolls away
+  gives its media back, and starting one block pauses the others in the pane.
+
+**Embedded audio and video no longer play by themselves.** `![[clip.mov]]` is a chip — the
+file's name and kind, *Reveal*, *Copy path* and *Play in a player*. That last one replaces the
+embed with a block: in a recording note every embed of the recording's media becomes one
+`session` block, and any other file a one-part block naming it. Images still draw inline.
+
+The note keeper writes when a recording ends carries a three-line `session` block. Notes
+written before it carry one embed per video; *Use the media player in recording notes…* in
+the notes options menu rewrites those — only a stub whose embeds are still exactly what keeper
+wrote, and nothing else in it — and names the ones left alone because somebody edited them.
+
+In Obsidian, on GitHub or in `cat` the block is a code block: the title, the window and the
+markers read plainly, and a clip's words read as a quote.
 
 ## The writing tools
 

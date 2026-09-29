@@ -12,7 +12,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteEmbedPathVm } from "@/lib/ipc/client";
 
 const notesEmbedPaths = vi.fn<(v: string, t: string[]) => Promise<(NoteEmbedPathVm | null)[]>>();
+const mediaBlockForEmbed = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
+  mediaBlockForEmbed: (...args: unknown[]) => mediaBlockForEmbed(...args),
   notesEmbedPaths: (v: string, t: string[]) => notesEmbedPaths(v, t),
   notesEmbedRead: vi.fn(),
   notesEmbedWrite: vi.fn(),
@@ -27,6 +29,7 @@ import { drawableFor, renderVaultEmbedInto, VAULT_EMBED_CLASS } from "./vault-em
 
 const resolved = (relPath: string, kind: NoteEmbedPathVm["kind"]): NoteEmbedPathVm => ({
   relPath,
+  absolutePath: `/Users/me/Drive/notes/${relPath}`,
   kind,
 });
 
@@ -44,10 +47,8 @@ function host(target: string): HTMLElement {
 const assetUrl = (relPath: string) => `keeper-note://v1/${relPath}`;
 
 describe("what a resolved file is drawn as", () => {
-  it("takes Rust's word for the three media kinds", () => {
+  it("takes Rust's word for an image", () => {
     expect(drawableFor(resolved("a.png", "image"))).toBe("image");
-    expect(drawableFor(resolved("a.mov", "video"))).toBe("video");
-    expect(drawableFor(resolved("a.m4a", "audio"))).toBe("audio");
   });
 
   it("refines a PDF inside the kind `file`, which is the registry's job", () => {
@@ -64,6 +65,9 @@ describe("what a resolved file is drawn as", () => {
       ["sheet.xlsx", "file"],
       ["people.csv", "file"],
       ["photos", "folder"],
+      // A video or an audio file is a chip, not an element (`media-chip.ts`).
+      ["a.mov", "video"],
+      ["a.m4a", "audio"],
     ] as const) {
       expect(drawableFor(resolved(name, kind))).toBeNull();
     }
@@ -85,6 +89,20 @@ describe("rendering into a note", () => {
     expect(image?.getAttribute("src")).toBe("keeper-note://v1/attachments/holiday.png");
     expect(image?.alt).toBe("holiday.png");
     expect(node.querySelector(".cm-lp-wikilink")).toBeNull();
+  });
+
+  it("makes a video a chip with the file's name, and fetches nothing", async () => {
+    const node = host("clip.mov");
+
+    await renderVaultEmbedInto(node, "v1", "clip.mov", {
+      resolve: async () => [resolved("attachments/clip.mov", "video")],
+      assetUrl,
+    });
+
+    expect(node.querySelector("video, audio, [src]")).toBeNull();
+    expect(node.querySelector(".cm-lp-media-chip-name")?.textContent).toBe("clip.mov");
+    // Without a view there is nothing to write a block into.
+    expect(node.querySelector('[aria-label^="Play in a player"]')).toBeNull();
   });
 
   it("leaves the link alone when the vault does not hold the file", async () => {
@@ -203,6 +221,9 @@ describe("in the renderer a note is actually drawn by", () => {
             assetUrl: (rel) => `keeper-note://v1/${rel}`,
             onOpenLink: () => {},
             recordingSession: () => sessionId,
+            // The block the edit writes is drawn by its own layer; its panel is
+            // not what these tests are about.
+            mountMedia: () => ({ unmount: () => {}, update: () => {} }),
           }),
         ],
       }),
@@ -235,6 +256,36 @@ describe("in the renderer a note is actually drawn by", () => {
       ?.querySelector("img.cm-lp-recording-image");
     expect(image?.getAttribute("src")).toBe("keeper-note://v1/attachments/holiday.png");
     expect(notesEmbedPaths).toHaveBeenCalledWith("v1", ["holiday.png"]);
+
+    view.destroy();
+  });
+
+  it("turns an ordinary note's video into a one-part block through Rust", async () => {
+    notesEmbedPaths.mockResolvedValue([resolved("attachments/clip.mov", "video")]);
+    mediaBlockForEmbed.mockResolvedValue([
+      {
+        firstLine: 3,
+        lastLine: 3,
+        text: '```keeper-media\n[[part]]\nfile = "notes/attachments/clip.mov"\n```',
+      },
+    ]);
+    const view = open("intro\n\n![[clip.mov]]\n\nafter\n", null);
+    await settle();
+
+    view.contentDOM
+      .querySelector<HTMLButtonElement>('[aria-label="Play in a player clip.mov"]')
+      ?.click();
+    await settle();
+
+    expect(mediaBlockForEmbed).toHaveBeenCalledWith(
+      "v1",
+      "intro\n\n![[clip.mov]]\n\nafter\n",
+      3,
+      "clip.mov",
+    );
+    expect(view.state.doc.toString()).toBe(
+      'intro\n\n```keeper-media\n[[part]]\nfile = "notes/attachments/clip.mov"\n```\n\nafter\n',
+    );
 
     view.destroy();
   });

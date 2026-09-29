@@ -119,6 +119,11 @@ import type {
   VoiceWakeVm,
 } from "@/lib/ipc/client";
 import { DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import {
+  MEDIA_BLOCK_NOTES,
+  markFreshTranscribed,
+  mediaBlockMockHandlers,
+} from "./media-block-fixture";
 import { transcriptionMockHandlers } from "./transcription-fixture";
 
 /** Roughly now, so relative timestamps read as "3 min ago" rather than 1970. */
@@ -198,6 +203,12 @@ const NOTES = [
     ago(3000),
     false,
   ],
+  // The media block's states: a whole meeting with markers, a clip with its
+  // words, one not transcribed yet, and an old note with a per-file embed and a
+  // refused block (`media-block-fixture.ts`).
+  ...MEDIA_BLOCK_NOTES.map(
+    ([id, title, body, tags]) => [id, title, body, tags, ago(20), false] as const,
+  ),
 ] as const;
 
 const noteRows = NOTES.map(([id, title, body, tags, modified, pinned], index) => ({
@@ -3795,6 +3806,7 @@ function later<T>(ms: number, answer: () => T): Promise<T> {
 
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   ...transcriptionMockHandlers(() => ANSWERS.sync_profiles as SyncProfileVm[]),
+  ...mediaBlockMockHandlers(),
   "plugin:dialog|open": (payload) => {
     const options = payload.options;
     return options && typeof options === "object" && "directory" in options && options.directory
@@ -5671,6 +5683,13 @@ export function installMockShell(): void {
   if (realShellPresent()) {
     return;
   }
+  // A job for the not-yet-transcribed session leaves a transcript behind, so
+  // the block that started it shows lines when the job ends.
+  const startJob = HANDLERS.transcription_start;
+  HANDLERS.transcription_start = (payload) => {
+    markFreshTranscribed(String(payload.path));
+    return startJob(payload);
+  };
   mockIPC((command, payload) => {
     const handler = HANDLERS[command];
     const answer =

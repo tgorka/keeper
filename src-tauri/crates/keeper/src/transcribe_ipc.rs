@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use keeper_core::platform::Platform;
@@ -54,8 +54,8 @@ use keeper_core::transcription::progress::{Estimate, PartLoad};
 use keeper_core::transcription::render;
 use keeper_core::transcription::vm::{
     CorrectionResultVm, DictionaryTermVm, ModelsState, ModelsStateVm, PersonVm, TranscriptMediaVm,
-    TranscriptVm, TranscriptionPhase, TranscriptionProgressVm, TranscriptionStatusVm,
-    VoicesDriveVm,
+    TranscriptVm, TranscriptWrittenVm, TranscriptionPhase, TranscriptionProgressVm,
+    TranscriptionStatusVm, VoicesDriveVm,
 };
 use keeper_core::transcription::{
     add_speaker, assemble, assign_speaker, edit_utterance, insert_utterance_after, merge_speakers,
@@ -69,7 +69,7 @@ use keeper_core::transcription::{
 use keeper_core::vm::{IpcError, IpcErrorCode};
 use keeper_sync::SyncProfile;
 use tauri::ipc::Channel;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::ipc::{to_ipc_error, AppState};
 
@@ -170,7 +170,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// A refusal whose sentence is the whole point, in the house envelope.
-fn refused(message: impl Into<String>) -> IpcError {
+pub(crate) fn refused(message: impl Into<String>) -> IpcError {
     IpcError {
         code: IpcErrorCode::Internal,
         message: message.into(),
@@ -295,7 +295,7 @@ fn execute_plan(root: &Path, plan: &BankPlan) -> Result<(), String> {
     Ok(())
 }
 
-fn read_transcript(path: &Path) -> Result<Transcript, String> {
+pub(crate) fn read_transcript(path: &Path) -> Result<Transcript, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|error| format!("{} could not be read: {error}", path.display()))?;
     Transcript::from_json(&raw).map_err(|error| error.to_string())
@@ -312,12 +312,43 @@ fn markdown_path(json: &Path) -> PathBuf {
 }
 
 /// JSON first — it is the source of truth — then the markdown re-rendered.
+/// Once the JSON has landed, every open block and viewer of it hears so.
 fn write_transcript(json: &Path, md: &Path, transcript: &Transcript) -> Result<(), String> {
     let body = transcript.to_json().map_err(|error| error.to_string())?;
     write_atomic(json, body.as_bytes())
         .map_err(|error| format!("{} could not be written: {error}", json.display()))?;
+    announce_written(json);
     write_atomic(md, render::markdown(transcript).as_bytes())
         .map_err(|error| format!("{} could not be written: {error}", md.display()))
+}
+
+/// The event every transcript write is announced on (AD-357), carrying the
+/// transcript's absolute path: the one key a media block or a viewer
+/// filters on, so a correction does not make every open block re-read a
+/// transcript it does not show.
+pub const TRANSCRIPT_WRITTEN_EVENT: &str = "keeper://transcript-written";
+
+/// The handle the event is emitted through, set once from `lib.rs`'s setup.
+static APP: OnceLock<AppHandle> = OnceLock::new();
+
+/// Keep the app handle (`lib.rs` setup). Write-once.
+pub fn install(app: &AppHandle) {
+    let _ = APP.set(app.clone());
+}
+
+/// Say that the transcript at `json` was written — a job's result, a
+/// correction, an assignment, or a redo's fresh file. Before setup there is
+/// no window to tell.
+fn announce_written(json: &Path) {
+    let Some(app) = APP.get() else {
+        return;
+    };
+    let written = TranscriptWrittenVm {
+        path: json.to_string_lossy().into_owned(),
+    };
+    if let Err(error) = app.emit(TRANSCRIPT_WRITTEN_EVENT, written) {
+        tracing::warn!(%error, "transcription: the write could not be announced");
+    }
 }
 
 fn now_stamp() -> String {
@@ -1476,18 +1507,25 @@ pub async fn transcript_media(
         let manifest = (transcript.source.kind == SourceKind::Recording)
             .then(|| SessionManifest::load(dir).ok())
             .flatten();
+        // A recording outside every synced folder still plays, by its
+        // identity, when the index knows where it is (AD-353).
+        let recording = manifest
+            .as_ref()
+            .and_then(|manifest| manifest.meta.as_ref()?.session_id.clone())
+            .and_then(|id| crate::media_block_ipc::recording_place(&platform, &id));
         Ok(media_of(
             &transcript,
             dir,
             manifest.as_ref(),
             &synced_folders(&platform),
+            recording.as_ref(),
         ))
     })
     .await
 }
 
 /// Every enabled synced folder, `(profile id, local path)`.
-fn synced_folders(platform: &Arc<dyn Platform>) -> Vec<(String, PathBuf)> {
+pub(crate) fn synced_folders(platform: &Arc<dyn Platform>) -> Vec<(String, PathBuf)> {
     let profiles = crate::sync::engine(Arc::clone(platform))
         .map_err(|error| error.to_string())
         .and_then(|engine| engine.list_profiles().map_err(|error| error.to_string()))

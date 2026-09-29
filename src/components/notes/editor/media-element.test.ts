@@ -20,22 +20,6 @@ describe("the element a file becomes", () => {
     expect(image.getAttribute("src")).toBe("keeper-note://v1/holiday.png");
   });
 
-  it("draws a video and an audio player, both metadata-only", () => {
-    for (const [kind, tag] of [
-      ["video", "VIDEO"],
-      ["audio", "AUDIO"],
-    ] as const) {
-      const node = mediaElementFor({ kind, name: `clip.${kind}`, url: "u" }, vi.fn());
-
-      expect(node.tagName).toBe(tag);
-      const player = node as HTMLMediaElement;
-      expect(player.controls).toBe(true);
-      // A note with ten videos must not fetch ten videos.
-      expect(player.preload).toBe("metadata");
-      expect(player.getAttribute("aria-label")).toBe(`clip.${kind}`);
-    }
-  });
-
   it("draws a PDF as the webview's own renderer", () => {
     const node = mediaElementFor({ kind: "pdf", name: "report.pdf", url: "u" }, vi.fn());
 

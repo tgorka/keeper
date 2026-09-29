@@ -10,9 +10,11 @@
  * own files and an ordinary note cannot name anything but the vault.
  *
  * So this is the vault's half: `notes_embed_paths` resolves the target through
- * the same candidates the viewer opens and the export carries, and the element
- * is `media-element.ts`'s, the same one the recording widget builds. Nothing
- * here classifies a file — Rust returns the `kind` with the path (AD-87).
+ * the same candidates the viewer opens and the export carries. An image or a
+ * PDF is `media-element.ts`'s element, the same one the recording widget
+ * builds; a video or an audio file is `media-chip.ts`'s chip, whose *Play in a
+ * player* turns the embed into a `keeper-media` block. Nothing here classifies
+ * a file — Rust returns the `kind` with the path (AD-87).
  *
  * # Order, and why this is asked last
  *
@@ -36,11 +38,11 @@
  * which is React-free, and it reaches `@/lib/viewers/registry` rather than the
  * barrel so the component table does not follow it in.
  */
-import { WidgetType } from "@codemirror/view";
+import { type EditorView, WidgetType } from "@codemirror/view";
 import { type NoteEmbedPathVm, notesEmbedPaths } from "@/lib/ipc/client";
 import { resolveViewer } from "@/lib/viewers/registry";
+import { mediaChip } from "./media-chip";
 import { type DrawableKind, fileNameOf, mediaElementFor } from "./media-element";
-import { releaseMediaElement } from "./recording-transport";
 import { WIKILINK_ATTR } from "./wikilink";
 
 /** How the widget reaches the resolver. Injected so the degrade paths — which
@@ -59,6 +61,8 @@ export interface VaultEmbedOptions {
   /** True once the widget has been destroyed: a render in flight must not
    *  touch a host CodeMirror has thrown away. */
   readonly cancelled?: () => boolean;
+  /** The view a video or audio chip's *Play in a player* writes into. */
+  readonly view?: EditorView;
 }
 
 /**
@@ -78,7 +82,7 @@ export interface VaultEmbedOptions {
  * is `null` and keeps its link.
  */
 export function drawableFor(resolved: NoteEmbedPathVm): DrawableKind | null {
-  if (resolved.kind === "image" || resolved.kind === "video" || resolved.kind === "audio") {
+  if (resolved.kind === "image") {
     return resolved.kind;
   }
   if (resolved.kind !== "file") {
@@ -140,6 +144,19 @@ export async function renderVaultEmbedInto(
   if (resolved === null || options.cancelled?.() === true) {
     return;
   }
+  if (resolved.kind === "video" || resolved.kind === "audio") {
+    host.replaceChildren(
+      mediaChip(
+        {
+          kind: resolved.kind,
+          relativePath: resolved.relPath,
+          absolutePath: resolved.absolutePath,
+        },
+        options.view === undefined ? null : { view: options.view, profileId: vaultId, target },
+      ),
+    );
+    return;
+  }
   const kind = drawableFor(resolved);
   if (kind === null) {
     return;
@@ -177,7 +194,7 @@ export class VaultEmbedWidget extends WidgetType {
     return other.vaultId === this.vaultId && other.target === this.target;
   }
 
-  toDOM(): HTMLElement {
+  toDOM(view: EditorView): HTMLElement {
     const host = document.createElement("span");
     host.className = VAULT_EMBED_CLASS;
     host.append(link(this.target));
@@ -187,27 +204,21 @@ export class VaultEmbedWidget extends WidgetType {
     // keystroke that rebuilds the decorations.
     void renderVaultEmbedInto(host, this.vaultId, this.target, {
       ...this.options,
+      view,
       cancelled: () => this.disposed || this.options.cancelled?.() === true,
     });
     return host;
   }
 
-  destroy(dom: HTMLElement): void {
+  destroy(): void {
     this.disposed = true;
-    const player = dom.querySelector("video, audio");
-    if (player instanceof HTMLMediaElement) {
-      // A `<video>` with a `src` holds a decoder and a buffer until the element
-      // is told to let go; dropping the node is not telling it.
-      releaseMediaElement(player);
-    }
-    dom.replaceChildren();
   }
 
   /** The same split `RecordingEmbedWidget` documents: a control keeps its
    *  events, because letting them through reveals the line and un-renders the
-   *  player mid-gesture; everything else behaves like the wikilink it stands
-   *  for. */
+   *  chip or the PDF mid-gesture; everything else behaves like the wikilink it
+   *  stands for. */
   ignoreEvent(event: Event): boolean {
-    return event.target instanceof Element && event.target.closest("video, audio, embed") !== null;
+    return event.target instanceof Element && event.target.closest("button, embed") !== null;
   }
 }

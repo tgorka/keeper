@@ -53,6 +53,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { HoverHint, IconHint } from "@/components/ui/tooltip";
 import { useNotesBody } from "@/hooks/use-notes-body";
 import {
+  mediaBlockFindMarker,
   type NoteWriteVm,
   notesBodyRead,
   notesGallery,
@@ -61,7 +62,13 @@ import {
   notesTagTree,
   type PanelTargetVm,
 } from "@/lib/ipc/client";
-import { followExternalUrl, resolveWikilink } from "@/lib/notes/follow-link";
+import {
+  followExternalUrl,
+  noMomentSentence,
+  resolveWikilink,
+  splitMarkerLink,
+} from "@/lib/notes/follow-link";
+import { GALLERY_HEAD, type NoteWidgetChoice } from "@/lib/notes/widgets";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import {
   consumeCaretHint,
@@ -74,12 +81,14 @@ import { notesFiltersStore } from "@/lib/stores/notes-filters";
 import { ensureNotesVaultsHydrated, useNotesVaultsStore } from "@/lib/stores/notes-vaults";
 import { type PanelHistoryEntry, panelsStore, usePanelsStore } from "@/lib/stores/panels";
 import { filePathForNote, SHOW_IN_FILES_LABEL, showNoteInFiles } from "@/lib/vault-link";
+import { ADOPT_MEDIA_BLOCKS_LABEL, AdoptMediaBlocksDialog } from "./adopt-media-blocks";
 import { AttachFileButton } from "./attach-file-button";
 import { ATTACHMENTS_LABEL, AttachmentsPanel } from "./attachments-panel";
 import { ConflictResolver } from "./conflict-resolver";
 import type { FormatAction } from "./editor/format-commands";
 import { FormatToolbar } from "./format-toolbar";
 import { LinksPanel } from "./links-panel";
+import { MediaPickerDialog } from "./media-picker-dialog";
 import { NoteActions } from "./note-actions";
 import { NoteDiffBar } from "./note-diff-bar";
 import { NOTE_HISTORY_LABEL, NoteHistoryPanel } from "./note-history-panel";
@@ -224,9 +233,27 @@ interface EditorRuntime {
    * job, and it is the only place that holds both the view and the commands.
    */
   runFormat: (action: FormatAction) => void;
+  /**
+   * Put a widget on a line of its own at `at`, or at the caret: a media block
+   * Rust composed, or a gallery head. The user's own edit, like
+   * `insertAtCursor`.
+   */
+  insertWidget: (text: string, at?: number) => void;
+  /** Bring the `ordinal`-th media block into view and move its player to
+   *  `seconds`, paused (a `[[note#marker]]` link). */
+  seekMediaBlock: (ordinal: number, seconds: number) => void;
+  /** The buffer as it is now. */
+  text: () => string;
   focus: () => void;
   destroy: () => void;
 }
+
+/**
+ * A marker a link asked for in a note that was not open yet, taken by the
+ * editor that opens it once the note's text is there (`[[note#marker]]`).
+ * Keyed by vault and note, because the note may open in another panel.
+ */
+const markerRequests = new Map<string, string>();
 
 /** The note's title: its first body line, `#` stripped (FR-98). Derived from
  *  the buffer rather than a list row so it tracks what is being typed — and the
@@ -470,12 +497,36 @@ export function NoteEditor({
   const runFormat = useCallback((action: FormatAction) => {
     runtimeRef.current?.runFormat(action);
   }, []);
+  // Where a media block goes once its picker has chosen: the `/` menu's
+  // position, or the caret (`undefined`) from the toolbar. `null` is closed.
+  const [mediaPick, setMediaPick] = useState<{ at: number | undefined } | null>(null);
+  const [adopting, setAdopting] = useState(false);
+  const insertWidget = useCallback((widget: NoteWidgetChoice) => {
+    if (widget === "gallery") {
+      runtimeRef.current?.insertWidget(GALLERY_HEAD);
+      return;
+    }
+    setMediaPick({ at: undefined });
+  }, []);
 
   // Refs, not effect dependencies: rebuilding the editor because a callback
   // identity changed would throw away the document, the undo stack and the
   // caret. Every one of these is read at the moment it fires.
-  const latest = useRef({ onEdit: body.onEdit, save: body.save, openHistory, toggleProperties });
-  latest.current = { onEdit: body.onEdit, save: body.save, openHistory, toggleProperties };
+  const pickMedia = useCallback((at: number) => setMediaPick({ at }), []);
+  const latest = useRef({
+    onEdit: body.onEdit,
+    save: body.save,
+    openHistory,
+    toggleProperties,
+    pickMedia,
+  });
+  latest.current = {
+    onEdit: body.onEdit,
+    save: body.save,
+    openHistory,
+    toggleProperties,
+    pickMedia,
+  };
   const pathRef = useRef(path);
   pathRef.current = path;
   // Story 45.18: following, at last. `onFollowLink` used to sit here, a prop no
@@ -484,19 +535,68 @@ export function NoteEditor({
   // the index's own (`notes_resolve_link`), and the note it names is opened
   // through the same `onOpenNote` a backlink row uses, so a link and a backlink
   // cannot land in different places.
-  const followers = useRef({ onOpenNote, setLinkNotice });
-  followers.current = { onOpenNote, setLinkNotice };
+  const followers = useRef({ onOpenNote, setLinkNotice, noteId });
+  followers.current = { onOpenNote, setLinkNotice, noteId };
+  // A marker in this note: Rust says which media block holds it and when, the
+  // editor scrolls there, and the block's player moves, paused (AD-354).
+  const followMarker = useCallback(
+    (name: string) => {
+      const runtime = runtimeRef.current;
+      if (runtime === null) {
+        return;
+      }
+      void mediaBlockFindMarker(vaultId, runtime.text(), name).then(
+        (hit) => {
+          if (hit === null) {
+            followers.current.setLinkNotice(noMomentSentence(name));
+            return;
+          }
+          followers.current.setLinkNotice(null);
+          runtimeRef.current?.seekMediaBlock(hit.block, hit.from);
+        },
+        () => followers.current.setLinkNotice(noMomentSentence(name)),
+      );
+    },
+    [vaultId],
+  );
   const openWikilink = useCallback(
     (target: string) => {
-      void resolveWikilink(vaultId, target).then((result) => {
+      const { note, name } = splitMarkerLink(target);
+      if (name !== null && note === "") {
+        followMarker(name);
+        return;
+      }
+      void resolveWikilink(vaultId, name === null ? target : note).then((result) => {
         followers.current.setLinkNotice(result.reason);
-        if (result.note !== null) {
+        if (result.note === null) {
+          return;
+        }
+        if (name === null) {
+          followers.current.onOpenNote?.(result.note.id);
+        } else if (result.note.id === followers.current.noteId) {
+          followMarker(name);
+        } else {
+          // Taken by whichever editor opens that note, once its text is in.
+          markerRequests.set(`${vaultId}\u0000${result.note.id}`, name);
           followers.current.onOpenNote?.(result.note.id);
         }
       });
     },
-    [vaultId],
+    [vaultId, followMarker],
   );
+  const takeMarkerRequest = useCallback(() => {
+    if (noteId === null) {
+      return;
+    }
+    const key = `${vaultId}\u0000${noteId}`;
+    const name = markerRequests.get(key);
+    if (name !== undefined) {
+      markerRequests.delete(key);
+      followMarker(name);
+    }
+  }, [vaultId, noteId, followMarker]);
+  const takeMarkerRef = useRef(takeMarkerRequest);
+  takeMarkerRef.current = takeMarkerRequest;
   const openExternal = useCallback((url: string) => {
     void followExternalUrl(url).then((refusal) => {
       followers.current.setLinkNotice(refusal);
@@ -533,6 +633,8 @@ export function NoteEditor({
         writing,
         find,
         marks,
+        media,
+        widgetSlash,
       ] = await Promise.all([
         import("@codemirror/state"),
         import("@codemirror/view"),
@@ -553,6 +655,11 @@ export function NoteEditor({
         // panel's React tree is in the editor chunk, not the main bundle.
         import("./editor/find-panel"),
         import("./editor/markdown-marks"),
+        // The media block's insertion and marker seek, and the widget rows of
+        // the `/` menu: note-only, because a media block needs the note's
+        // drive.
+        import("./editor/media-block"),
+        import("./editor/widget-slash"),
       ]);
       if (disposed) {
         return;
@@ -652,6 +759,7 @@ export function NoteEditor({
                 cachedTags ??= tags.tagPaths((await notesTagTree(vaultId)).nodes);
                 return cachedTags;
               }),
+              widgetSlash.widgetSlashSource((at) => latest.current.pickMedia(at)),
             ]),
             // Escape first closes Find, then simplifies a selection via the
             // default keymap; with neither present, it dismisses list marks.
@@ -670,6 +778,9 @@ export function NoteEditor({
               // resolves it against the vault root, so no path is composed
               // here (AD-65).
               listFolder: (folder) => notesGallery(vaultId, folder),
+              // `[[<this note>#<marker>]]`: the name a wikilink resolves, which
+              // is the file's name without its extension.
+              noteLink: () => pathRef.current?.split("/").pop()?.replace(/\.md$/i, "") ?? null,
             }),
             view.EditorView.updateListener.of((update) => {
               if (
@@ -846,6 +957,13 @@ export function NoteEditor({
         runFormat: (action: FormatAction) => {
           writing.runFormatAction(editorView, action);
         },
+        insertWidget: (text: string, at?: number) => {
+          media.insertOnOwnLine(editorView, text, at);
+        },
+        seekMediaBlock: (ordinal: number, seconds: number) => {
+          media.seekMediaBlock(editorView, ordinal, seconds);
+        },
+        text: () => editorView.state.doc.toString(),
         focus: () => editorView.focus(),
         destroy: () => {
           marksGeneration += 1;
@@ -865,6 +983,11 @@ export function NoteEditor({
       if (opening !== null) {
         runtimeRef.current.placeCaret(opening);
         consumeCaretHint(vaultId, noteId);
+      }
+      // A note already in the store when the chunk landed has no `Reset` still
+      // to come, so a marker a link asked for is taken now.
+      if (opened.text !== "") {
+        takeMarkerRef.current();
       }
     })();
 
@@ -900,6 +1023,7 @@ export function NoteEditor({
       runtime.placeCaret(document.cursor);
       consumeCaretHint(vaultId, noteId);
     }
+    takeMarkerRef.current();
   }, [vaultId, noteId, externalEdition]);
 
   useEffect(() => {
@@ -1280,6 +1404,12 @@ export function NoteEditor({
                     readings of one label, which is why there is no second label
                     and no host test here. */}
                 <CaptureNoteItem vaultId={vaultId} noteId={noteId} />
+                {/* A vault-wide act offered from the note, because this menu is
+                    the notes' options menu: the recording notes written before
+                    the media player still embed their files one by one. */}
+                <DropdownMenuItem onSelect={() => setAdopting(true)}>
+                  {ADOPT_MEDIA_BLOCKS_LABEL}
+                </DropdownMenuItem>
                 {/* Story 45.21: Export is a note-level act, and putting it here
                     rather than on the panel frame means a note open in a panel
                     has one Export and not two — the panel's could not flush this
@@ -1448,7 +1578,24 @@ export function NoteEditor({
       {/* Directly over the text it formats, and unmounted outside edit mode:
           in history or conflict mode there is no selection for a button to act
           on, and a toolbar that cannot do anything is a toolbar that lies. */}
-      {mode === "edit" ? <FormatToolbar onAction={runFormat} /> : null}
+      {mode === "edit" ? (
+        <FormatToolbar onAction={runFormat} onInsertWidget={insertWidget} />
+      ) : null}
+      <MediaPickerDialog
+        open={mediaPick !== null}
+        profileId={vaultId}
+        onClose={() => setMediaPick(null)}
+        onPicked={(block) => {
+          const at = mediaPick?.at;
+          setMediaPick(null);
+          runtimeRef.current?.insertWidget(block, at);
+        }}
+      />
+      <AdoptMediaBlocksDialog
+        vaultId={vaultId}
+        open={adopting}
+        onClose={() => setAdopting(false)}
+      />
 
       {/* Hidden rather than unmounted: the caret, the selection and the undo
           stack all have to survive a trip through history or conflict mode. */}

@@ -1,5 +1,7 @@
 import {
   ChevronRight,
+  Clipboard,
+  Crosshair,
   Ellipsis,
   ListPlus,
   Pencil,
@@ -9,7 +11,7 @@ import {
   UserPlus,
   UserRoundPen,
 } from "lucide-react";
-import { type ReactNode, type Ref, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, type Ref, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -42,16 +44,17 @@ import {
 } from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { useWindowedRows } from "@/components/ui/window-list";
 import { TextFileViewer } from "@/components/viewers/text-file-viewer";
 import { TextEditorSurface } from "@/components/viewers/text-viewer";
 import {
   dictionaryAcceptSuggestion,
+  listenTranscriptWritten,
   type TrackOrigin,
   type TranscriptMediaVm,
   type TranscriptVm,
   transcriptAddSpeaker,
   transcriptAssignSpeaker,
+  transcriptClip,
   transcriptEditUtterance,
   transcriptInsertUtterance,
   transcriptMedia,
@@ -77,8 +80,20 @@ import {
 import { cn } from "@/lib/utils";
 import { FILE_FORMATS } from "@/lib/viewers/registry";
 import type { ViewerProps } from "@/lib/viewers/types";
-import { currentUtterance } from "./session-timeline";
+import { type ClipRequest, CopyClipDialog } from "./copy-clip";
+import { currentUtterance, nearestLine } from "./session-timeline";
 import { TRANSCRIBE_AGAIN_LABEL, TranscribeAgainDialog } from "./transcribe-again";
+import {
+  COPY_CLIP_FROM_HERE,
+  LineMenuTrigger,
+  MENU_CONTENT,
+  PLAY_FROM_HERE,
+  speakerInks,
+  speakerName,
+  TranscriptLines,
+  timestamp,
+  useTranscriptRows,
+} from "./transcript-lines";
 import { TranscriptPlayer, type TranscriptPlayerHandle } from "./transcript-player";
 import { TranscriptionJob } from "./transcription-job";
 
@@ -102,31 +117,6 @@ const STATUS_LAMP: Record<Speaker["status"], LampState> = {
   suggested: "working",
   unknown: "idle",
 };
-/**
- * A speaker's ink, by their place in the transcript, from the bounded palette
- * the gate measures in both themes. Always drawn beside the name, never alone.
- * Literal class names, because Tailwind only generates what it can read.
- */
-const SPEAKER_INKS = [
-  "bg-bot-ink-lapis",
-  "bg-bot-ink-clay",
-  "bg-bot-ink-verdigris",
-  "bg-bot-ink-ochre",
-  "bg-bot-ink-steel",
-  "bg-bot-ink-madder",
-  "bg-bot-ink-olive",
-] as const;
-function speakerName(speaker: Speaker): string {
-  return speaker.name ?? (speaker.id === "ME" ? "You" : `Speaker ${speaker.id.replace(/^S/, "")}`);
-}
-function timestamp(seconds: number): string {
-  const n = Math.floor(seconds);
-  return `${Math.floor(n / 3600)
-    .toString()
-    .padStart(2, "0")}:${Math.floor((n / 60) % 60)
-    .toString()
-    .padStart(2, "0")}:${(n % 60).toString().padStart(2, "0")}`;
-}
 /**
  * The speakers a line can be given, each once: every speaker with lines, and a
  * lineless one only when it names somebody no other speaker does — an unnamed
@@ -183,6 +173,9 @@ export const SEARCH_LABEL = "Search the transcript";
 export const SOURCE_TAB = "Source";
 export const TRANSCRIPT_TAB = "Transcript";
 export const ADD_SPEAKER_LABEL = "Add speaker";
+export const TRANSCRIPT_ACTIONS_LABEL = "Transcript actions";
+export const COPY_AS_NOTE_EMBED = "Copy as note embed";
+export const NEAREST_LINE_LABEL = "Go to their nearest line";
 /** Keys that scroll a focused box; pressing one is the reader taking the scroll back. */
 const SCROLL_KEYS: Record<string, true> = {
   ArrowUp: true,
@@ -193,15 +186,6 @@ const SCROLL_KEYS: Record<string, true> = {
   End: true,
   " ": true,
 };
-/**
- * Hidden until the line is pointed at or holds focus, and always in the tab
- * order: the discreet way into a correction. Shown outright where nothing can
- * hover.
- */
-const REVEALED_ON_HOVER =
-  "opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 [@media(hover:none)]:opacity-100";
-/** A menu opened from an icon is as wide as its words, not as its trigger. */
-const MENU_CONTENT = "w-auto min-w-44";
 /**
  * The voices drive a transcript's corrections belong to: the one named, else
  * the drive whose folder holds the transcript, else the first (Rust's
@@ -253,10 +237,13 @@ export function TranscriptDialog({
   path,
   onClose,
   profileId = null,
+  at,
 }: {
   path: string | null;
   onClose: () => void;
   profileId?: string | null;
+  /** Seconds to open the player at, paused: where a note's block was. */
+  at?: number;
 }) {
   return (
     <Dialog
@@ -274,7 +261,7 @@ export function TranscriptDialog({
             Read and correct what was said. Recognition stays on this Mac.
           </DialogDescription>
         </DialogHeader>
-        {path && <TranscriptViewer key={path} path={path} profileId={profileId} />}
+        {path && <TranscriptViewer key={path} path={path} profileId={profileId} at={at} />}
       </DialogContent>
     </Dialog>
   );
@@ -283,11 +270,14 @@ export function TranscriptViewer({
   path,
   profileId = null,
   onUnreadable,
+  at,
 }: {
   path: string;
   profileId?: string | null;
   /** Called instead of showing the error when the file cannot be read as a transcript. */
   onUnreadable?: () => void;
+  /** Seconds the player is put at, paused, once it can play. */
+  at?: number;
 }) {
   const [vm, setVm] = useState<TranscriptVm | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -312,7 +302,10 @@ export function TranscriptViewer({
   const [replacing, setReplacing] = useState(false);
   /** Bumped when a Transcribe again has written the file anew, to read it again. */
   const [reads, setReads] = useState(0);
+  const [clip, setClip] = useState<ClipRequest | null>(null);
   const player = useRef<TranscriptPlayerHandle | null>(null);
+  /** The `at` still to be applied, once the transcript and its media are here. */
+  const landing = useRef(at);
   const search = useRef<HTMLInputElement | null>(null);
   const prelude = useRef<HTMLDivElement | null>(null);
   const playerBox = useRef<HTMLDivElement | null>(null);
@@ -363,6 +356,30 @@ export function TranscriptViewer({
       generation.current += 1;
     };
   }, [path, reads]);
+  // Rust wrote this transcript — a job, a correction here or in another window,
+  // a redo — so the lines are read again, keeping everything the reader holds.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let live = true;
+    void listenTranscriptWritten((written) => {
+      if (written !== path) return;
+      const mine = generation.current;
+      void transcriptRead(path)
+        .then((next) => {
+          if (generation.current === mine && next.path === path) setVm(next);
+        })
+        .catch(() => {});
+    })
+      .then((stop) => {
+        if (live) unlisten = stop;
+        else stop();
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+      unlisten?.();
+    };
+  }, [path]);
   const act = async (operation: () => Promise<TranscriptVm>) => {
     if (busy) return;
     const mine = generation.current;
@@ -403,21 +420,18 @@ export function TranscriptViewer({
     });
   };
   const utterances = vm?.transcript.utterances;
-  const getKey = useCallback(
-    (index: number) => utterances?.[index]?.id ?? String(index),
-    [utterances],
-  );
-  const list = useWindowedRows({
-    count: utterances?.length ?? 0,
-    getKey,
-    rowHeight: 84,
-    gap: 4,
+  const list = useTranscriptRows(utterances, {
     scrollMargin: geometry.margin,
     stickyInset: geometry.inset,
   });
   const reveal = list.reveal;
   const showsBody = vm !== null && tab === "transcript";
   const playable = media !== null && media.parts.length > 0;
+  useEffect(() => {
+    if (landing.current === undefined || !vm || !playable || !player.current) return;
+    player.current.seek(landing.current, false);
+    landing.current = undefined;
+  }, [vm, playable]);
   // The list starts below the heading, the legend and the player, all in the
   // one scroll box, and a pinned player covers the top of it.
   useEffect(() => {
@@ -455,6 +469,14 @@ export function TranscriptViewer({
   /** Play from a line, or put the player there when Follow ties the two together. */
   const seekTo = (utterance: Utterance, play?: boolean) =>
     player.current?.seek(utterance.start, play);
+  /** A speaker's line nearest the player, brought into view and the player put there, playing or not. */
+  const goToNearest = (speakerId: string) => {
+    if (!utterances) return;
+    const index = nearestLine(utterances, speakerId, time ?? 0);
+    if (index < 0) return;
+    reveal(index);
+    seekTo(utterances[index]);
+  };
   const jump = (step: 1 | -1) => {
     if (!vm || matches.length === 0) return;
     const next =
@@ -469,14 +491,10 @@ export function TranscriptViewer({
   };
   const offered = vm ? offeredSpeakers(vm.transcript) : [];
   const speakers = useMemo(() => {
+    const inks = speakerInks(vm?.transcript.speakers ?? []);
     const byId = new Map<string, { speaker: Speaker; ink: string; lines: number }>();
-    vm?.transcript.speakers.forEach((speaker, index) => {
-      byId.set(speaker.id, {
-        speaker,
-        ink: SPEAKER_INKS[index % SPEAKER_INKS.length],
-        lines: 0,
-      });
-    });
+    for (const speaker of vm?.transcript.speakers ?? [])
+      byId.set(speaker.id, { speaker, ink: inks.get(speaker.id) ?? "", lines: 0 });
     for (const utterance of vm?.transcript.utterances ?? []) {
       const entry = byId.get(utterance.speaker);
       if (entry) entry.lines += 1;
@@ -568,18 +586,32 @@ export function TranscriptViewer({
                 </Button>
               </div>
             )}
-            {canTranscribe && sourcePath && (
-              <Button
-                size="sm"
-                variant="ghost"
-                className="ml-auto"
-                disabled={transcriptionRunning(redoJob)}
-                onClick={() => setReplacing(true)}
-              >
-                <RotateCcw aria-hidden="true" />
-                {TRANSCRIBE_AGAIN_LABEL}…
-              </Button>
-            )}
+            <div className="ml-auto flex items-center gap-1">
+              {canTranscribe && sourcePath && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={transcriptionRunning(redoJob)}
+                  onClick={() => setReplacing(true)}
+                >
+                  <RotateCcw aria-hidden="true" />
+                  {TRANSCRIBE_AGAIN_LABEL}…
+                </Button>
+              )}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button size="icon-sm" variant="ghost" aria-label={TRANSCRIPT_ACTIONS_LABEL}>
+                    <Ellipsis aria-hidden="true" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className={MENU_CONTENT}>
+                  <DropdownMenuItem onSelect={() => setClip({ from: null, to: null })}>
+                    <Clipboard aria-hidden="true" />
+                    {COPY_AS_NOTE_EMBED}
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           </div>
           {sourcePath && redoJob && redoJob.phase !== "done" && (
             <TranscriptionJob path={sourcePath} onOpen={() => setReads((n) => n + 1)} />
@@ -611,7 +643,7 @@ export function TranscriptViewer({
                 setFollowScroll(false);
             }}
           >
-            <div ref={prelude} className="mx-auto min-w-0 max-w-4xl space-y-3 px-3 pb-3">
+            <div ref={prelude} className="min-w-0 space-y-3 px-3 pb-3">
               <header className="min-w-0 space-y-1">
                 <h2 className="break-words font-heading text-title">
                   {vm.transcript.source.files.join(", ")}
@@ -645,6 +677,7 @@ export function TranscriptViewer({
                         act={act}
                         onName={(mode) => setNaming({ speakerId: entry.speaker.id, mode })}
                         focusName={() => nameField.current?.focus()}
+                        onNearest={() => goToNearest(entry.speaker.id)}
                       />
                     </li>
                   ))}
@@ -770,145 +803,122 @@ export function TranscriptViewer({
             {vm.transcript.utterances.length === 0 && (
               <p className="p-3 text-muted-foreground">No speech was found in this file.</p>
             )}
-            <ol
-              ref={listBox}
-              aria-label="Utterances"
-              className="relative"
-              style={{ height: list.totalSize }}
-            >
-              {list.rows.map((row) => {
-                const utterance = vm.transcript.utterances[row.index];
-                if (!utterance) return null;
-                const speaking = row.index === current;
-                const who = speakers.get(utterance.speaker);
+            <TranscriptLines
+              lines={vm.transcript.utterances}
+              speakers={vm.transcript.speakers}
+              list={list}
+              listRef={listBox}
+              current={current}
+              playable={playable}
+              onSeek={(seconds, play) => player.current?.seek(seconds, play)}
+              matching={matching}
+              cardClassName={(index) =>
+                cn(
+                  matching.has(index) && "ring-1 ring-ring",
+                  active >= 0 && matches[active] === index && "ring-2 ring-primary",
+                )
+              }
+              menu={(_, index) => {
+                const utterance = vm.transcript.utterances[index];
                 return (
-                  <li
-                    key={row.key}
-                    {...list.rowProps(row)}
-                    aria-current={speaking ? "true" : undefined}
-                    data-match={matching.has(row.index) ? "" : undefined}
-                    className="group min-w-0 px-3"
-                  >
-                    <div
-                      className={cn(
-                        "mx-auto min-w-0 max-w-4xl rounded-md border border-transparent px-3 py-2",
-                        speaking && "border-primary bg-secondary",
-                        matching.has(row.index) && "ring-1 ring-ring",
-                        active >= 0 && matches[active] === row.index && "ring-2 ring-primary",
-                      )}
-                    >
-                      <div className="flex min-w-0 items-center gap-2 text-muted-foreground text-xs">
-                        <span
-                          aria-hidden="true"
-                          className={cn("size-2 shrink-0 rounded-[2px]", who?.ink)}
-                        />
-                        <span className="min-w-0 truncate font-medium">
-                          {who ? speakerName(who.speaker) : utterance.speaker}
-                        </span>
-                        {playable ? (
-                          <button
-                            type="button"
-                            className="rounded-sm font-mono tabular-nums hover:text-foreground focus-visible:outline focus-visible:outline-ring"
-                            aria-label={`Go to ${timestamp(utterance.start)}, ${utterance.id}`}
-                            onClick={() => seekTo(utterance)}
-                          >
-                            {timestamp(utterance.start)}
-                          </button>
-                        ) : (
-                          <span className="font-mono tabular-nums">
-                            {timestamp(utterance.start)}
-                          </span>
-                        )}
-                        {utterance.edited && utterance.asrText ? (
-                          <details className="min-w-0">
-                            <summary className="cursor-pointer">Edited · Recognised text</summary>
-                            <p className="whitespace-pre-wrap break-words">{utterance.asrText}</p>
-                          </details>
-                        ) : (
-                          utterance.edited && <span>Added by hand</span>
-                        )}
-                        <div className="ml-auto">
-                          <LineMenu
-                            utterance={utterance}
-                            offered={offered}
-                            playable={playable}
-                            busy={busy}
-                            onPlay={() => seekTo(utterance, true)}
-                            onEdit={() => {
-                              if (follow) seekTo(utterance);
-                              setEditing(utterance.id);
-                              setDraft(utterance.text);
-                            }}
-                            onReassign={(speakerId) =>
-                              void act(() =>
-                                transcriptReassignUtterance(path, utterance.id, speakerId),
-                              )
-                            }
-                            onPanel={(kind) =>
-                              setPanel((open) =>
-                                open?.id === utterance.id && open.kind === kind
-                                  ? null
-                                  : { id: utterance.id, kind },
-                              )
-                            }
-                            focusEdit={() => editField.current?.focus()}
-                          />
-                        </div>
-                      </div>
-                      {editing === utterance.id ? (
-                        <EditLine
-                          fieldRef={editField}
-                          utterance={utterance}
-                          draft={draft}
-                          busy={busy}
-                          onDraft={setDraft}
-                          onSave={() => void save(utterance.id)}
-                          onCancel={() => setEditing(null)}
-                        />
-                      ) : (
-                        <p className="mt-1 max-w-[80ch] whitespace-pre-wrap break-words font-normal text-foreground text-title leading-relaxed">
-                          {marked(utterance.text, needle)}
-                        </p>
-                      )}
-                      {panel?.id === utterance.id && panel.kind === "split" && (
-                        <SplitPanel
-                          utterance={utterance}
-                          busy={busy}
-                          onSplit={(wordIndex) =>
-                            void changeLines(() =>
-                              transcriptSplitUtterance(path, utterance.id, wordIndex),
-                            )
-                          }
-                          onCancel={() => setPanel(null)}
-                        />
-                      )}
-                      {panel?.id === utterance.id && panel.kind === "insert" && (
-                        <InsertPanel
-                          utterance={utterance}
-                          speakers={offered}
-                          busy={busy}
-                          onInsert={(speakerId, text) =>
-                            void changeLines(() =>
-                              transcriptInsertUtterance(path, utterance.id, speakerId, text),
-                            )
-                          }
-                          onCancel={() => setPanel(null)}
-                        />
-                      )}
-                    </div>
-                  </li>
+                  <LineMenu
+                    utterance={utterance}
+                    offered={offered}
+                    playable={playable}
+                    busy={busy}
+                    onPlay={() => seekTo(utterance, true)}
+                    onCopyClip={() => setClip({ from: utterance.start, to: utterance.end })}
+                    onEdit={() => {
+                      if (follow) seekTo(utterance);
+                      setEditing(utterance.id);
+                      setDraft(utterance.text);
+                    }}
+                    onReassign={(speakerId) =>
+                      void act(() => transcriptReassignUtterance(path, utterance.id, speakerId))
+                    }
+                    onPanel={(kind) =>
+                      setPanel((open) =>
+                        open?.id === utterance.id && open.kind === kind
+                          ? null
+                          : { id: utterance.id, kind },
+                      )
+                    }
+                    focusEdit={() => editField.current?.focus()}
+                  />
                 );
-              })}
-            </ol>
+              }}
+              note={(_, index) => {
+                const utterance = vm.transcript.utterances[index];
+                if (!utterance.edited) return null;
+                return utterance.asrText ? (
+                  <details className="min-w-0">
+                    <summary className="cursor-pointer">Edited · Recognised text</summary>
+                    <p className="whitespace-pre-wrap break-words">{utterance.asrText}</p>
+                  </details>
+                ) : (
+                  <span>Added by hand</span>
+                );
+              }}
+              body={(line, index) =>
+                editing === line.id ? (
+                  <EditLine
+                    fieldRef={editField}
+                    utterance={vm.transcript.utterances[index]}
+                    draft={draft}
+                    busy={busy}
+                    onDraft={setDraft}
+                    onSave={() => void save(line.id)}
+                    onCancel={() => setEditing(null)}
+                  />
+                ) : needle ? (
+                  <p className="mt-1 whitespace-pre-wrap break-words font-normal text-foreground text-title leading-relaxed">
+                    {marked(line.text, needle)}
+                  </p>
+                ) : undefined
+              }
+              after={(line, index) => {
+                if (panel?.id !== line.id) return null;
+                const utterance = vm.transcript.utterances[index];
+                return panel.kind === "split" ? (
+                  <SplitPanel
+                    utterance={utterance}
+                    busy={busy}
+                    onSplit={(wordIndex) =>
+                      void changeLines(() =>
+                        transcriptSplitUtterance(path, utterance.id, wordIndex),
+                      )
+                    }
+                    onCancel={() => setPanel(null)}
+                  />
+                ) : (
+                  <InsertPanel
+                    utterance={utterance}
+                    speakers={offered}
+                    busy={busy}
+                    onInsert={(speakerId, text) =>
+                      void changeLines(() =>
+                        transcriptInsertUtterance(path, utterance.id, speakerId, text),
+                      )
+                    }
+                    onCancel={() => setPanel(null)}
+                  />
+                );
+              }}
+            />
           </div>
+          <CopyClipDialog
+            request={clip}
+            onClose={() => setClip(null)}
+            compose={(from, to, words) => transcriptClip(path, from, to, words)}
+          />
         </>
       )}
     </section>
   );
 }
 /**
- * A line's corrections, behind one ⋯ button. The button is always in the tab
- * order; the pointer finds it on hover.
+ * A line's actions behind one ⋯ button, right after its time: playing and
+ * copying first, the corrections under them.
  */
 function LineMenu({
   utterance,
@@ -916,6 +926,7 @@ function LineMenu({
   playable,
   busy,
   onPlay,
+  onCopyClip,
   onEdit,
   onReassign,
   onPanel,
@@ -926,6 +937,7 @@ function LineMenu({
   playable: boolean;
   busy: boolean;
   onPlay: () => void;
+  onCopyClip: () => void;
   onEdit: () => void;
   onReassign: (speakerId: string) => void;
   onPanel: (kind: "split" | "insert") => void;
@@ -936,18 +948,9 @@ function LineMenu({
   const keepFocus = useRef(false);
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button
-          size="icon-xs"
-          variant="ghost"
-          aria-label={`Line actions ${utterance.id}`}
-          className={REVEALED_ON_HOVER}
-        >
-          <Ellipsis aria-hidden="true" />
-        </Button>
-      </DropdownMenuTrigger>
+      <LineMenuTrigger id={utterance.id} />
       <DropdownMenuContent
-        align="end"
+        align="start"
         className={MENU_CONTENT}
         onCloseAutoFocus={(event) => {
           if (!keepFocus.current) return;
@@ -961,9 +964,14 @@ function LineMenu({
         {playable && (
           <DropdownMenuItem onSelect={onPlay}>
             <Play aria-hidden="true" />
-            Play from here
+            {PLAY_FROM_HERE}
           </DropdownMenuItem>
         )}
+        <DropdownMenuItem onSelect={onCopyClip}>
+          <Clipboard aria-hidden="true" />
+          {COPY_CLIP_FROM_HERE}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
         <DropdownMenuItem
           disabled={busy}
           onSelect={() => {
@@ -1069,6 +1077,7 @@ function SpeakerChip({
   act,
   onName,
   focusName,
+  onNearest,
 }: {
   speaker: Speaker;
   ink: string;
@@ -1079,6 +1088,8 @@ function SpeakerChip({
   onName: (mode: "rename" | "new") => void;
   /** Focus the field Rename label… or New person… opened. */
   focusName: () => void;
+  /** Take the reader, and the player, to this speaker's line nearest the player. */
+  onNearest: () => void;
 }) {
   // The field an item opens keeps the focus, not the chip it came from.
   const keepFocus = useRef(false);
@@ -1125,6 +1136,11 @@ function SpeakerChip({
             <span className="font-mono"> · {speaker.score.toFixed(2)}</span>
           )}
         </DropdownMenuLabel>
+        <DropdownMenuItem onSelect={onNearest}>
+          <Crosshair aria-hidden="true" />
+          {NEAREST_LINE_LABEL}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
         <DropdownMenuSub>
           <DropdownMenuSubTrigger>
             <UserPlus aria-hidden="true" />

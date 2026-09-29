@@ -105,6 +105,7 @@ mod telemetry_ipc;
 // On-device transcription (Epic 87, AD-339): the engine's macOS port over
 // the vendored FluidAudio fork, and the command surface over the port —
 // ungated, like voice, so the command list is identical on every target.
+mod media_block_ipc;
 mod transcribe_ipc;
 #[cfg(target_os = "macos")]
 mod transcribe_macos;
@@ -635,6 +636,9 @@ pub fn run() {
             // request notification permission best-effort. A permission failure only
             // means the OS will drop notifications — it never blocks startup.
             ipc::set_notify_app_handle(app.handle().clone());
+            // Every transcript write is announced on `keeper://transcript-written`
+            // (AD-357), so open media blocks and viewers read it again.
+            transcribe_ipc::install(app.handle());
             #[cfg(target_os = "ios")]
             voice_notify::install(app.handle());
 
@@ -1076,6 +1080,19 @@ pub fn run() {
                 transcribe_ipc::dictionary_term_save,
                 transcribe_ipc::dictionary_term_delete,
                 transcribe_ipc::dictionary_accept_suggestion,
+                // A recording, a transcript or media playing inside a note
+                // (Epic 88): the `keeper-media` block's commands, beside
+                // transcription on every target — a block reads files and
+                // needs no engine (AD-358).
+                media_block_ipc::media_block_resolve,
+                media_block_ipc::media_block_edit,
+                media_block_ipc::media_block_clip,
+                media_block_ipc::media_block_sources,
+                media_block_ipc::media_block_find_marker,
+                media_block_ipc::media_block_for_embed,
+                media_block_ipc::media_block_compose,
+                media_block_ipc::transcript_clip,
+                media_block_ipc::recording_notes_adopt_media_block,
                 ipc::bridge_catalog,
                 ipc::bridge_discover,
                 ipc::bridge_login_start,

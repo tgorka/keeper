@@ -302,6 +302,11 @@ clap = { version = "4", features = ["derive", "env"] }
 # `keeper-syncd`'s on-disk profile configuration (Story 30.2). MIT OR
 # Apache-2.0 — passes `cargo deny check`.
 toml = "0.9"
+# Byte-preserving edits of a note's `keeper-media` block (Epic 88, AD-354):
+# a marker is added, renamed or removed and every other byte, comments
+# included, stays. Already in Cargo.lock at this version through
+# `proc-macro-crate`, so the tree gains no package. MIT OR Apache-2.0.
+toml_edit = "0.25.12"
 # Exact-length streaming request bodies for LFS uploads (Story 25.3). This is
 # not optional sugar: `reqwest::Body::wrap_stream` and `Body::from(File)` both
 # yield an unknown-size body and therefore `Transfer-Encoding: chunked`, which

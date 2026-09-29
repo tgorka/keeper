@@ -26,6 +26,7 @@ pub mod frontmatter;
 pub mod index;
 pub mod lifetime;
 pub mod links;
+pub mod media_block;
 pub mod merge;
 pub mod naming;
 pub mod okf;

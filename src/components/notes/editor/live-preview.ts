@@ -35,10 +35,10 @@ import type { NoteGalleryVm } from "@/lib/ipc/client";
 import { embedEntryFor, FileEmbedWidget } from "./file-embed";
 import { galleryLayer } from "./gallery-block";
 import { tableLayer } from "./markdown-table";
+import { type MediaBlockOptions, mediaBlockLayer } from "./media-block";
 import { mermaidLayer } from "./mermaid-widget";
 import { type NoteWidgetOptions, noteWidgetLayer } from "./note-widget";
 import { RecordingEmbedWidget } from "./recording-embed";
-import { transportFor } from "./recording-transport";
 import { VaultEmbedWidget } from "./vault-embed";
 import { LINK_ATTR, WIKILINK, WIKILINK_ATTR } from "./wikilink";
 
@@ -147,8 +147,8 @@ export interface LivePreviewOptions {
    * Read at decoration time rather than captured, because the editor is built
    * once and outlives the note in it. Its presence is the whole test for "this
    * is a recording note" (Story 42.4) — the same predicate the properties panel
-   * uses — and it is what turns an `![[…]]` embed into a player instead of a
-   * link. Absent, every embed stays the ordinary link it has always been, which
+   * uses — and it is what lets an `![[…]]` embed resolve among the session's
+   * files instead of the vault's. Absent, an embed resolves in the vault, which
    * is exactly right for somebody else's note that happens to contain one.
    */
   recordingSession?: () => string | null;
@@ -177,6 +177,14 @@ export interface LivePreviewOptions {
    * different one than an embed in the same note could not be right.
    */
   mountWidget?: NoteWidgetOptions["mount"];
+  /**
+   * The open note's own link target, for a media block's *Copy link*
+   * (`[[<note>#<marker>]]`). A getter for `recordingSession`'s reason: the
+   * editor outlives the note in it.
+   */
+  noteLink?: () => string | null;
+  /** Replace the dynamic import of the media block's panel — a test seam. */
+  mountMedia?: MediaBlockOptions["mount"];
 }
 
 /** An embedded image, or — when the file is not there — its alt text and the
@@ -792,9 +800,10 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
       to: visible.to,
       enter: (node) => {
         // A gallery block is decorated by `galleryLayer` below and not here,
-        // and a mermaid fence by `mermaidLayer`: both replace several lines
-        // with one element, and CodeMirror refuses both a block decoration and
-        // a line-break-spanning replace from a `ViewPlugin`. Nothing needs
+        // and a mermaid or `keeper-media` fence by its own layer: each
+        // replaces several lines with one element, and CodeMirror refuses both
+        // a block decoration and a line-break-spanning replace from a
+        // `ViewPlugin`. Nothing needs
         // excluding at this point — a field's replacement covers the whole
         // block, so the line classes and marks underneath it fall inside a
         // range nothing paints. (Supplying one from here anyway is what DW-165
@@ -1117,19 +1126,14 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
 
           // `![[…]]` in a note that carries a session id: an embed of one of
           // that recording's files. The widget renders this same link until the
-          // index confirms the path is a video, so the only thing decided here
+          // index confirms the path is one of the session's files, so the only thing decided here
           // is that the embed gets to try (Story 42.4).
           if (match[0].startsWith("!")) {
             const sessionId = options.recordingSession?.() ?? null;
             if (sessionId !== null) {
               decorations.push(
                 Decoration.replace({
-                  widget: new RecordingEmbedWidget(sessionId, target, label, {
-                    // Scoped to this view: two editors open on one note are two
-                    // readers, and one pressing play must not move the other's
-                    // video (Story 43.6).
-                    transport: transportFor(view, sessionId),
-                  }),
+                  widget: new RecordingEmbedWidget(sessionId, target, label, options.vaultId),
                 }).range(start, end),
               );
               continue;
@@ -1427,21 +1431,17 @@ const livePreviewTheme = EditorView.baseTheme({
   },
   ".cm-lp-image img": { maxWidth: "100%", borderRadius: "4px" },
   // The host stays inline so an unresolved embed sits in its sentence like the
-  // link it still is; a rendered video or image goes block, because either one
-  // wedged into a line of prose is neither readable nor watchable. Audio does
-  // too: a native transport bar is a couple of hundred pixels wide and its own
-  // paragraph either way (Story 42.4, widened by Story 43.5).
-  // Named for the recording embed that first needed them and now shared with an
-  // ordinary note's (Story 55.4): they say what the element IS, and an `<img>`
-  // is the same `<img>` whichever address space resolved it.
-  ".cm-lp-recording-player, .cm-lp-recording-image": {
+  // link it still is; a rendered image goes block, because an image wedged into
+  // a line of prose is not readable. Named for the recording embed that first
+  // needed it and shared with an ordinary note's (Story 55.4): it says what the
+  // element IS, whichever address space resolved it.
+  ".cm-lp-recording-image": {
     display: "block",
     maxWidth: "100%",
     maxHeight: "60vh",
     borderRadius: "4px",
     backgroundColor: "var(--muted)",
   },
-  ".cm-lp-recording-audio": { display: "block", width: "100%", maxWidth: "24rem" },
   // A PDF gets a page's worth of height rather than `maxHeight`: an `<embed>`
   // has no intrinsic size to cap, so without one it collapses to nothing.
   ".cm-lp-embed-pdf": {
@@ -1451,11 +1451,12 @@ const livePreviewTheme = EditorView.baseTheme({
     borderRadius: "4px",
     backgroundColor: "var(--muted)",
   },
-  // The chip stays INLINE, unlike the three that render: it is a reference to a
-  // file, closer to the link it replaced than to a player, and a block-level
-  // box for `manifest.json` would shout louder than the recording above it.
-  ".cm-lp-recording-chip": {
+  // The chips stay INLINE: each is a reference to a file, closer to the link it
+  // replaced than to a player. A video or audio embed is one too — the
+  // `keeper-media` block is where a recording plays (`media-chip.ts`).
+  ".cm-lp-recording-chip, .cm-lp-media-chip": {
     display: "inline-flex",
+    flexWrap: "wrap",
     alignItems: "center",
     gap: "0.375em",
     padding: "0.1em 0.5em",
@@ -1464,118 +1465,39 @@ const livePreviewTheme = EditorView.baseTheme({
     backgroundColor: "var(--muted)",
     fontSize: "0.9em",
   },
-  ".cm-lp-recording-chip-name": {
+  ".cm-lp-media-chip-icon": { flexShrink: "0", color: "var(--muted-foreground)" },
+  ".cm-lp-recording-chip-name, .cm-lp-media-chip-name": {
     fontFamily: "var(--font-mono, ui-monospace, monospace)",
   },
-  ".cm-lp-recording-chip-action": {
+  ".cm-lp-media-chip-action": {
     color: "var(--primary)",
     cursor: "pointer",
-    // The two actions are text, not icons: this module has no icon set that is
-    // not React, and a labelled control is legible to everyone anyway.
+    // Text, not icons: this module has no icon set that is not React, and a
+    // labelled control is legible to everyone anyway.
     textDecoration: "underline",
   },
-  // The grouped pair of a session's videos (Stories 43.6, 44.1). The stage is
-  // block-level and holds a row of track boxes with the one transport beneath,
-  // because the pair is one player and a clock floating beside one of two
-  // videos is read as that video's own controls.
-  ".cm-lp-recording-stage": {
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.25em",
-  },
-  // Fit two tracks side by side, and wrap rather than crush them: `12rem` is
-  // the width below which a video is no longer worth watching, so a pane too
-  // narrow for two stacks them instead of showing two useless slivers.
-  ".cm-lp-recording-tracks": {
-    display: "flex",
-    flexWrap: "wrap",
-    alignItems: "flex-start",
-    gap: "0.5em",
-  },
-  // The box is the answer to a mute slider that floated away from the track it
-  // governs: a border is a boundary, and a control inside one is unambiguously
-  // about what else is inside it.
-  ".cm-lp-recording-track": {
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.25em",
-    // `min-width: 0` because a flex item's default `min-width: auto` is its
-    // content's intrinsic width, and a 1440-wide screen recording would push
-    // the pair back out of the pane it was just fitted into.
-    flex: "1 1 12rem",
-    minWidth: "0",
-    padding: "0.25em",
+  // The primary action reads as one: the file is here to be played.
+  ".cm-lp-media-chip-play": { fontWeight: "600" },
+  ".cm-lp-media-chip-action:disabled": { opacity: "0.5", cursor: "default" },
+  ".cm-lp-media-chip-status": { color: "var(--destructive)" },
+  ".cm-lp-media-chip-status:empty": { display: "none" },
+  // The media block (`media-block.ts`). Until its panel arrives — and for good
+  // where it cannot draw — it is the fence's own text, which is what Obsidian
+  // shows too.
+  ".cm-media-block": { padding: "0.25em 0" },
+  ".cm-media-block-source": {
+    margin: "0",
+    padding: "0.5em",
     borderRadius: "4px",
-    border: "1px solid var(--border)",
-  },
-  // Inside a box the video fills the box rather than the pane, and gives up
-  // some height, because two of them are on screen at once. The lone video's
-  // rule above is untouched.
-  ".cm-lp-recording-track .cm-lp-recording-player": {
-    width: "100%",
-    height: "auto",
-    maxHeight: "40vh",
-  },
-  ".cm-lp-recording-transport": {
-    display: "flex",
-    flexDirection: "column",
-    fontSize: "0.9em",
-  },
-  // The row that must not break. `nowrap` is the belt; the glyph labels are
-  // the braces, and they are the part that actually holds — measured in a real
-  // WKWebView, the shipped sentence labels laid this row out over five rows at
-  // a 320 px pane whatever the wrapping rule said, because a button wider than
-  // its container breaks its own text.
-  ".cm-lp-recording-transport-row": {
-    display: "flex",
-    flexWrap: "nowrap",
-    alignItems: "center",
-    gap: "0.5em",
-    padding: "0.25em 0",
-  },
-  ".cm-lp-recording-transport-toggle, .cm-lp-recording-transport-skip": {
-    color: "var(--primary)",
-    cursor: "pointer",
-    // A control is a glyph and never a sentence, so it has no business
-    // reflowing; `nowrap` says that of the glyph pairs too.
-    whiteSpace: "nowrap",
-  },
-  ".cm-lp-recording-scrub": { flex: "1 1 4rem", minWidth: "3rem" },
-  ".cm-lp-recording-time": {
+    backgroundColor: "var(--muted)",
     fontFamily: "var(--font-mono, ui-monospace, monospace)",
-    color: "var(--muted-foreground)",
-    // Tabular figures would still reflow as the minutes tick over in a
-    // proportional fallback, and a readout that shifts the scrub bar sideways
-    // once a second is unusable.
-    fontVariantNumeric: "tabular-nums",
-    whiteSpace: "nowrap",
-  },
-  // Its own line, below the controls: it is the one real sentence here
-  // ("Playback was refused"), and a sentence on the control row is either a
-  // wrapped row or a truncated message. Gone entirely while empty, which is
-  // almost always, so the bar is one row high in the ordinary case.
-  ".cm-lp-recording-transport-status": {
-    color: "var(--muted-foreground)",
-    fontSize: "0.9em",
-  },
-  ".cm-lp-recording-transport-status:empty": { display: "none" },
-  // Volume and mute stay per track, so the mixer sits inside its own track's
-  // box rather than on the shared bar (UX-DR53).
-  ".cm-lp-recording-mix": {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.5em",
     fontSize: "0.85em",
+    whiteSpace: "pre-wrap",
   },
-  ".cm-lp-recording-mix-mute": { color: "var(--primary)", cursor: "pointer" },
-  // One glyph for both states: struck through is the muted one. Two symbols
-  // would be two things to learn, and `aria-pressed` already carries the truth
-  // for anyone not looking at it.
-  '.cm-lp-recording-mix-mute[aria-pressed="true"]': {
-    textDecoration: "line-through",
-    color: "var(--muted-foreground)",
-  },
-  ".cm-lp-recording-mix-volume": { flex: "1 1 3rem", minWidth: "3rem", width: "auto" },
+  ".cm-media-block-note": { margin: "0 0 0.25em", color: "var(--muted-foreground)" },
+  // The panel is a normal React surface: the editor's own line metrics must
+  // not reach into it.
+  ".cm-media-block-body": { whiteSpace: "normal", lineHeight: "normal", cursor: "auto" },
   // The gallery block (Story 44.15). The grid is the scroll container the
   // window measures, so its height is fixed here and its content is what
   // scrolls — a grid that grew with its folder would defeat the window it is
@@ -1850,6 +1772,13 @@ export function livePreview(options: LivePreviewOptions): Extension {
     // which is a feature present in the code and unreachable in the product.
     tableLayer({ vaultId: options.vaultId }),
     mermaidLayer(),
+    // The vault's id is its drive's profile id, which is what a media block
+    // resolves its names against (AD-353).
+    mediaBlockLayer({
+      profileId: options.vaultId,
+      noteLink: options.noteLink,
+      mount: options.mountMedia,
+    }),
     externalFlashField,
     livePreviewTheme,
   ];

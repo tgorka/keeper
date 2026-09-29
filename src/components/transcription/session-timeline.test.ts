@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   currentUtterance,
   locate,
+  nearestLine,
   sessionLength,
 } from "@/components/transcription/session-timeline";
 import { SESSION_TRANSCRIPT_FIXTURE } from "../../../dev/transcription-fixture";
@@ -39,5 +40,23 @@ describe("One timeline over a session's parts", () => {
     lines[0].end = 10;
     expect(lines[currentUtterance(lines, 8)].id).toBe("u2");
     expect(lines[currentUtterance(lines, 4)].id).toBe("u1");
+  });
+
+  it("finds a speaker's nearest line, the one being said first and the later on a tie", () => {
+    const lines = [
+      { id: "a", speaker: "S1", start: 0, end: 4 },
+      { id: "b", speaker: "S2", start: 4, end: 8 },
+      { id: "c", speaker: "S1", start: 12, end: 16 },
+    ];
+    const near = (speaker: string, seconds: number) =>
+      lines[nearestLine(lines, speaker, seconds)]?.id ?? null;
+    expect(near("S1", 2)).toBe("a");
+    expect(near("S1", 5)).toBe("a");
+    // Four seconds from a's end and from c's start: the next one.
+    expect(near("S1", 8)).toBe("c");
+    expect(near("S1", 11)).toBe("c");
+    expect(near("S1", 99)).toBe("c");
+    expect(near("S2", 0)).toBe("b");
+    expect(near("S3", 0)).toBeNull();
   });
 });

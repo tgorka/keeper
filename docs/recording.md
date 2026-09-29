@@ -216,9 +216,10 @@ merging them into one box that could only be right on one machine.
 
 **Changing the subfolder moves no files.** Sessions already recorded under the
 old one stay exactly where they are: they drop out of the recordings browser at
-the next archive rebuild, and the `![[recordings/…]]` embeds in their note stubs
-stop resolving. The card says so before you save, not after. Move them yourself
-first if you want to keep them listed.
+the next archive rebuild, and the `![[recordings/…]]` embeds in note stubs written
+before Epic 88 stop resolving (a stub's `keeper-media` block names the session by
+its identity, and plays wherever the index finds it). The card says so before you
+save, not after. Move them yourself first if you want to keep them listed.
 
 ### Every synced folder that holds recordings is indexed
 
@@ -315,8 +316,17 @@ It runs in keeper itself, on this Mac; nothing is sent anywhere (D-29,
   `keeper-rec` writes.
 - **Where transcripts land.** Beside the media, in the session folder:
   `transcript.json` (the source of truth) and `transcript.md` (re-rendered on
-  every save). They sync with the folder like any other file. The session's
-  note stub stays as it was; the transcript is its own file.
+  every save). They sync with the folder like any other file. The transcript is
+  its own file, and the session's note stub carries no word of it: its
+  `keeper-media` block names the session, plays the recording at once, says
+  "Not transcribed yet." until the transcript lands, and then shows its lines —
+  the note itself is never rewritten (`docs/notes.md` § *Media in a note*).
+
+The stub keeper writes when a recording ends is `# Title`, a blank line, and a
+three-line block naming the session by the identity its `session:` carries —
+one player for the meeting, where stubs before Epic 88 embedded each video.
+Those older stubs keep their embeds until you choose *Use the media player in
+recording notes…* in the notes options menu.
 
 Speakers are matched against the voices bank of the drive, and you correct
 words and people in the transcript viewer. How that works, and where the models
