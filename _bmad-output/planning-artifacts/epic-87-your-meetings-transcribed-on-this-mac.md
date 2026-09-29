@@ -7,7 +7,7 @@ source: the owner's two messages of 2026-09-28, in Polish (verbatim below). Othe
 - the coordinator's reading of NVIDIA's Nemotron 3 Diarization post and card, the Nemotron 3.5 ASR and Parakeet TDT v3 cards, NeMo Speech, NeMo-Speech.cpp, CodeSOTA's speech-to-text table and FluidAudio. These are synthesised, graded, in `research-transcription-2026-09-28.md`.
 
 The coordinator froze the model as `local://epic87-contract.md` before the build wave. The decisions below are that contract's AD drafts, written out. Line numbers are at `dfa843e3` (origin/main, PR #410), the commit the build wave started from, unless a line says otherwise.
-binds: FR-746…FR-758 and NFR-105…NFR-109 (allocated here); AD-339…AD-350; UX-DR121…UX-DR123; DW-331…DW-345 (DW-331…DW-342 allocated in *What stays out*; DW-343…DW-345 opened by the review wave, see *Review-wave amendments*); D-29 (drafted at the end, for `docs/decisions.md`).
+binds: FR-746…FR-758 and NFR-105…NFR-109 (allocated here); AD-339…AD-350; UX-DR121…UX-DR123; DW-331…DW-346 (DW-331…DW-342 allocated in *What stays out*; DW-343…DW-345 opened by the review wave, see *Review-wave amendments*; DW-346 opened by story 87.10, see *Field report 3*); D-29 (drafted at the end, for `docs/decisions.md`).
 - **The previous ceilings:**
   - FR-745, NFR-104, AD-338 and UX-DR120 (epic 86, its `binds:` line);
   - DW-330 (`deferred-work.md:6818`);
@@ -627,6 +627,24 @@ The coordinator froze the amendments (`local://epic87-fr2.md`), built as story 8
 | menu | "Transcribe a File…" missing from the menu. | The native menu's Recording section already projects the verb (`registry_sections`, gated on the transcription probe); what the owner lacked is the Recordings pane and Recording pane buttons (F6). |
 | F1–F8 | Front: add-speaker, deduped speaker list, Source tab, the player with pin/follow/play-from-here, search, progress bars, Recordings row actions, mock shell and browser proof. | Lanes Player88/Lists88. |
 
+## Field report 3 (2026-09-29)
+
+The owner used the 87.9 build on hesperia (verbatim, Polish; the rest of the message asks for Epic 88): "widok transkrypcji wyglada prawie idealnie: - okno trasnskrypcji moze na szerokosc zajmowac wiekszosc dostepnego miejsca - gdy przeciagam przy wideo suwakiem do innej minuty - transkrypcje tez moga sie przewijac do odpowiedniego miejsca - rzelaczniki moga byc ladniejszymi togglami z ikonami zamiast tekstu - popatrz tez czy ten widok nie moze byc ladniejszy z punktu widzenia UI (bardziej nowoczesne przyciski, dropdown) - bardziej przyjemne do read mode z dyskredniejsza opcja modyfikacji. - gdy otwieram w oknie json to brakuje margins z kazdej ze strony - gdy jest transkrypt - dodaj opcje re-do it (delete old one and create the new one instead of do it manually)"
+
+**Evidence (screenshots).** The dialog was about 920 px wide in a 1560 px window, its controls text selects and buttons, and every line carried a full-size speaker select, *Split…* and *Add a line after*. The Files job strip said "This transcript has corrections in it, so keeper will not overwrite it. Delete or rename the transcript to transcribe again." beside *Try again*. The Files side panel's player stayed an empty grey box at 0:00 / 53:15.
+
+The coordinator froze the amendments (`local://epic87-fr3.md`), built as story 87.10:
+
+| # | The finding | What was built |
+| --- | --- | --- |
+| R1 | The dialog is narrow. | The transcript dialog takes most of the window; the lines keep a reading column of about 80 characters, and the player may be wider. The Files panel already fills its panel. |
+| R2 | Scrubbing does not move the transcript. | While *Follow* is on, dragging the scrub bar (every input event, not only the release) and ±10 s bring the matching line into view; any seek from the player clears the manual-scroll pause. |
+| R3 | The switches are text. | *Picture* (Monitor, Video, Columns2) and *Sound* (Phone, Mic, Volume2) are icon radio groups; *Pin* (Pin/PinOff) and *Follow* (Crosshair) are pressed toggles. Every icon control has an `aria-label` and a tooltip. |
+| R4 | Editing crowds reading. | The transcript reads as a document: speaker (coloured dot) and time as quiet text, the line large; the time is a button that seeks, and clicking the text no longer opens the editor. Each line's ⋯ menu (*Play from here* when playable, *Edit text*, *Change speaker* as a radio submenu, *Split…*, *Add a line after*) shows on hover and focus and is always in the tab order. The speakers legend is a row of chips (name, status dot, line count), each opening a DropdownMenu: status and score, *This is…* (candidates first, e.g. "suggested 0.63", then *New person…*), *Rename label…*, *Merge into…*; *New person…* and *Rename label…* open an inline field under the row; *Add speaker* sits at the row's end. |
+| R5 | The Source tab has no margins. | The JSON view is inset by the pane's padding (12 px). |
+| R6 | Redoing a transcript is manual. | **Transcribe again…** on the Files row, the Recordings row, the viewer's header and the refusal strip, behind a confirmation ("Replace the transcript? Your corrections in it will be lost. The voices bank keeps everything you confirmed."). `transcription_start` gains `replace` (default false): a replace job skips the start-of-job refusal and deletes the old `.json` and `.md` under `TRANSCRIPT_WRITES` right before its own write, so a job that fails or is cancelled keeps the old transcript. The refusal is its own stop (`Stop::Kept`) and its failed batch carries `TranscriptionProgressVm.replaceable`, so the strip offers *Transcribe again…* without matching the sentence. `TranscriptVm.sourcePath` (`plan::transcript_source`, the inverse of `transcript_paths_for`) names the media file or session folder the viewer's header restarts, `null` when it is gone. The voices bank is untouched. |
+| R7 | The Files panel's player is blank before play. | `primeFirstFrame` on every player video after `loadedmetadata`, and a 16:9 box (at most 30 dvh) that never collapses. Seeing the frame needs WKWebView: DW-346. |
+
 ## Stories
 
 Every story names its rung in the four-rung stack (*Stack*, below).
@@ -930,6 +948,25 @@ AD-345, AD-346, AD-347, AD-74.
 - *C8:* each Recordings row carries its transcript path and whether it can be transcribed.
 
 **binds:** AD-345, AD-346, AD-347, NFR-108
+
+### 87.10 — Field report 3
+**Intent:** the owner's third field report of 2026-09-29 (*Field report 3 (2026-09-29)*). **Rung:** **epic87-reading** (rung 7).
+
+AD-344, AD-347, UX-DR123.
+**Files:**
+- `keeper-core/src/transcription/{mod,plan,vm}.rs` (`transcript_source`, `TranscriptVm.source_path`, `TranscriptionProgressVm.replaceable`) and the regenerated `src/lib/ipc/gen/{TranscriptVm,TranscriptionProgressVm}.ts`;
+- `keeper/src/transcribe_ipc.rs` (`transcription_start`'s `replace`, `Stop::Kept`, the replace write, `sourcePath`);
+- the viewer, player, rows, stores, client wrapper and mock shell under `src/**` and `dev/**`;
+- `docs/transcription.md`.
+
+**Acceptance:**
+- *R6, the shell:* a replace job over a corrected transcript writes the new one and re-renders its markdown; a replace job cancelled before its write leaves the old `.json` and `.md` byte for byte; an unreadable transcript is replaced when asked; without `replace` a corrected or unreadable transcript is kept and the failed batch is `replaceable`.
+- *R6, the core:* `transcript_source` gives the media file for `<name.ext>.transcript.json` and the session folder for `transcript.json` beside a `manifest.json`, and nothing when that source is gone.
+- *R6, the front:* confirming *Transcribe again…* starts the job with `replace: true`; cancelling the confirmation starts nothing; the refusal strip offers it only on a `replaceable` batch.
+- *R1–R5, R7* (vitest): scrub input moves the highlighted line and scrolls to it; the toggle groups set the picture and sound and expose their state; every line's actions are reachable by keyboard; `primeFirstFrame` is called on each player video.
+- *R7* in a real WKWebView is owed (DW-346).
+
+**binds:** AD-344, AD-347, UX-DR123
 
 ## What stays out
 

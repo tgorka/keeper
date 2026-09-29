@@ -100,7 +100,15 @@ const generations = new Map<string, number>();
  * Try again, which knows only the path, repeats it.
  */
 const followUps = new Map<string, () => void>();
-export async function startTranscription(path: string, onDone?: () => void): Promise<void> {
+/**
+ * Start (or queue) the job for `path`. `replace` is "Transcribe again", sent
+ * only after the person confirmed it ({@link TranscribeAgainDialog}).
+ */
+export async function startTranscription(
+  path: string,
+  onDone?: () => void,
+  replace = false,
+): Promise<void> {
   if (transcriptionRunning(transcriptionStore.getState().jobs[path])) return;
   if (onDone) followUps.set(path, onDone);
   const generation = (generations.get(path) ?? 0) + 1;
@@ -119,9 +127,10 @@ export async function startTranscription(path: string, onDone?: () => void): Pro
     transcriptPath: null,
     fraction: null,
     elapsedMs: 0,
+    replaceable: false,
   });
   try {
-    const jobId = await transcriptionStart(path, put);
+    const jobId = await transcriptionStart(path, put, replace);
     const current = transcriptionStore.getState().jobs[path];
     if (current && !current.jobId && generations.get(path) === generation)
       put({ ...current, jobId });
@@ -135,6 +144,7 @@ export async function startTranscription(path: string, onDone?: () => void): Pro
       transcriptPath: null,
       fraction: null,
       elapsedMs: 0,
+      replaceable: false,
     });
   }
 }

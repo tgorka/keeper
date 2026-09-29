@@ -23,4 +23,10 @@ fraction: number | null,
 /**
  * Milliseconds since the job started running.
  */
-elapsedMs: number, };
+elapsedMs: number, 
+/**
+ * Set on a `failed` batch that stopped at a transcript keeper will not
+ * overwrite on its own (corrected, or unreadable): starting the job
+ * again with `replace` gets past it.
+ */
+replaceable: boolean, };

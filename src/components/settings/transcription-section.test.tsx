@@ -91,6 +91,7 @@ describe("Transcription settings", () => {
         transcriptPath: "/Users/alice/call.m4a.transcript.json",
         fraction: 1,
         elapsedMs: 1_000,
+        replaceable: false,
       }),
     );
     expect(screen.queryByRole("dialog")).toBeNull();

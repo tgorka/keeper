@@ -66,6 +66,10 @@ import {
 } from "@/components/layout/files-pane";
 import { OFFLINE_PILL_TEXT } from "@/components/layout/sidebar-pane";
 import { FILES_SYNC_MARK_LABEL, SyncStatusMark } from "@/components/layout/sync-status-mark";
+import {
+  TRANSCRIBE_AGAIN_LABEL,
+  TranscribeAgainDialog,
+} from "@/components/transcription/transcribe-again";
 import { TranscriptDialog } from "@/components/transcription/transcript-viewer";
 import { TranscriptionJob } from "@/components/transcription/transcription-job";
 import {
@@ -227,6 +231,7 @@ export function FilesPhonePane() {
   const jobs = useTranscriptionStore((s) => s.jobs);
   const [transcriptPath, setTranscriptPath] = useState<string | null>(null);
   const [jobPath, setJobPath] = useState<string | null>(null);
+  const [replacing, setReplacing] = useState<string | null>(null);
   const offline = useShellOffline();
   const reduced = useIsReducedCapabilityPlatform();
 
@@ -578,11 +583,21 @@ export function FilesPhonePane() {
                               <ContextMenuItem
                                 disabled={running}
                                 onSelect={() => {
+                                  // Where a transcript exists the verb replaces
+                                  // it, and asks first.
+                                  if (entry.transcript) {
+                                    setReplacing(entry.absolutePath);
+                                    return;
+                                  }
                                   setJobPath(entry.absolutePath);
                                   void startTranscription(entry.absolutePath, rereadCurrentFolder);
                                 }}
                               >
-                                {running ? transcriptionShortLine(job) : "Transcribe"}
+                                {running
+                                  ? transcriptionShortLine(job)
+                                  : entry.transcript
+                                    ? `${TRANSCRIBE_AGAIN_LABEL}…`
+                                    : "Transcribe"}
                               </ContextMenuItem>
                             )}
                             {entry.transcript && (
@@ -716,6 +731,15 @@ export function FilesPhonePane() {
         path={transcriptPath}
         onClose={() => setTranscriptPath(null)}
         profileId={place.kind === "profiles" ? null : place.profileId}
+      />
+      <TranscribeAgainDialog
+        open={replacing !== null}
+        onClose={() => setReplacing(null)}
+        onConfirm={() => {
+          if (replacing === null) return;
+          setJobPath(replacing);
+          void startTranscription(replacing, rereadCurrentFolder, true);
+        }}
       />
       {reduced && offline && (
         <div

@@ -5,4 +5,10 @@ import type { Transcript } from "./Transcript";
 /**
  * The transcript viewer's model: the file, and the bank's people to assign.
  */
-export type TranscriptVm = { path: string, transcript: Transcript, people: Array<PersonVm>, };
+export type TranscriptVm = { path: string, 
+/**
+ * The media file or session folder to start a job on to transcribe
+ * this again (`transcription_start` with `replace`); `null` when it is
+ * no longer there.
+ */
+sourcePath: string | null, transcript: Transcript, people: Array<PersonVm>, };

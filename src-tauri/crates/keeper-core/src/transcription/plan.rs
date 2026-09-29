@@ -262,6 +262,23 @@ pub fn existing_transcript(path: &Path) -> Option<PathBuf> {
     json.is_file().then_some(json)
 }
 
+/// The session folder or media file a transcription job rewrites the
+/// transcript at `json` from — the inverse of [`transcript_paths_for`] —
+/// when it is still there: a session folder still holding its manifest, a
+/// media file beside its transcript.
+pub fn transcript_source(json: &Path) -> Option<PathBuf> {
+    let name = json.file_name()?.to_str()?;
+    let parent = json.parent()?;
+    if name == SESSION_TRANSCRIPT_JSON {
+        return parent
+            .join("manifest.json")
+            .is_file()
+            .then(|| parent.to_owned());
+    }
+    let media = parent.join(name.strip_suffix(FILE_TRANSCRIPT_JSON_SUFFIX)?);
+    media.is_file().then_some(media)
+}
+
 /// A recording session folder's transcription facts: whether it can be
 /// transcribed now — its manifest loads and the core could plan it (stopped
 /// recording, every audio segment here and none a pointer) — and the
@@ -466,6 +483,32 @@ mod tests {
             plan_for_file(&video).expect("plan").out_json,
             plan_for_file(&audio).expect("plan").out_json
         );
+        std::fs::remove_dir_all(&folder).expect("cleanup");
+    }
+
+    #[test]
+    fn a_transcript_leads_back_to_the_media_or_session_it_was_written_for() {
+        let folder = scratch();
+        let video = folder.join("meeting.mp4");
+        let (video_json, _) = transcript_paths_for(&video, false);
+        assert_eq!(transcript_source(&video_json), None, "the media is gone");
+        std::fs::write(&video, b"media").expect("write");
+        assert_eq!(transcript_source(&video_json), Some(video.clone()));
+        assert_eq!(
+            transcript_source(&folder.join(".transcript.json")),
+            None,
+            "a transcript of a nameless file has no source"
+        );
+        assert_eq!(transcript_source(&folder.join("meeting.mp4.md")), None);
+
+        let (session_json, _) = transcript_paths_for(&folder, true);
+        assert_eq!(
+            transcript_source(&session_json),
+            None,
+            "a folder without a manifest is no session"
+        );
+        std::fs::write(folder.join("manifest.json"), b"{}").expect("write");
+        assert_eq!(transcript_source(&session_json), Some(folder.clone()));
         std::fs::remove_dir_all(&folder).expect("cleanup");
     }
 

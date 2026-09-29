@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { RecordingHitVm, TranscriptionProgressVm } from "@/lib/ipc/client";
 import { transcriptionStore } from "@/lib/stores/transcription";
@@ -27,6 +27,10 @@ import {
   RECORDINGS_TRANSCRIBE_LABEL,
   RecordingRow,
 } from "@/components/recordings/recording-row";
+import {
+  TRANSCRIBE_AGAIN_BODY,
+  TRANSCRIBE_AGAIN_LABEL,
+} from "@/components/transcription/transcribe-again";
 import { TRANSCRIPTION_PROGRESS_LABEL } from "@/components/transcription/transcription-progress";
 
 const ROOT = "/Users/alice/Movies/keeper";
@@ -64,6 +68,7 @@ function job(p: Partial<TranscriptionProgressVm>): TranscriptionProgressVm {
     transcriptPath: null,
     fraction: null,
     elapsedMs: 0,
+    replaceable: false,
     ...p,
   };
 }
@@ -231,13 +236,14 @@ describe("RecordingRow", () => {
   describe("transcription", () => {
     const transcribe = { name: `${RECORDINGS_TRANSCRIBE_LABEL}: Standup` };
     const show = { name: `${RECORDINGS_SHOW_TRANSCRIPT_LABEL}: Standup` };
+    const again = { name: `${TRANSCRIBE_AGAIN_LABEL}…: Standup` };
 
     it("offers Transcribe only where the Mac can transcribe and the session has media", () => {
       const onTranscribe = vi.fn();
       const vm = hit({ sessionId: "s1", title: "Standup" });
       const { unmount } = renderRow(vm, { onTranscribe });
       fireEvent.click(screen.getByRole("button", transcribe));
-      expect(onTranscribe).toHaveBeenCalledWith(vm);
+      expect(onTranscribe).toHaveBeenCalledWith(vm, false);
       unmount();
 
       renderRow(vm, { canTranscribe: false }).unmount();
@@ -285,8 +291,34 @@ describe("RecordingRow", () => {
       expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", show));
       expect(onShowTranscript).toHaveBeenCalledWith(path);
-      // Done is not a lock: the session can be transcribed again.
-      expect(screen.getByRole("button", transcribe)).toBeInTheDocument();
+      // Done is not a lock: the session can be transcribed again — which now
+      // replaces the transcript it just wrote.
+      expect(screen.getByRole("button", again)).toBeInTheDocument();
+      expect(screen.queryByRole("button", transcribe)).not.toBeInTheDocument();
+    });
+
+    it("asks before Transcribe again replaces a transcript, and does nothing on Cancel", async () => {
+      const onTranscribe = vi.fn();
+      const vm = hit({
+        sessionId: "s1",
+        title: "Standup",
+        transcript: `${ROOT}/standup/transcript.json`,
+      });
+      renderRow(vm, { onTranscribe });
+      fireEvent.click(screen.getByRole("button", again));
+      const dialog = await screen.findByRole("alertdialog");
+      expect(dialog).toHaveTextContent(TRANSCRIBE_AGAIN_BODY);
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+      expect(onTranscribe).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole("button", again));
+      fireEvent.click(
+        within(await screen.findByRole("alertdialog")).getByRole("button", {
+          name: TRANSCRIBE_AGAIN_LABEL,
+        }),
+      );
+      expect(onTranscribe).toHaveBeenCalledWith(vm, true);
     });
 
     it("keeps a failure's sentence and Try again under the row, and no second Transcribe", () => {

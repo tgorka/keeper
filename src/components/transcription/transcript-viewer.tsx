@@ -1,5 +1,15 @@
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { PLAY_GLYPH } from "@/components/notes/editor/recording-transport";
+import {
+  ChevronRight,
+  Ellipsis,
+  ListPlus,
+  Pencil,
+  Play,
+  RotateCcw,
+  Split,
+  UserPlus,
+  UserRoundPen,
+} from "lucide-react";
+import { type ReactNode, type Ref, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -8,8 +18,30 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Lamp, type LampState } from "@/components/ui/lamp";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { useWindowedRows } from "@/components/ui/window-list";
 import { TextFileViewer } from "@/components/viewers/text-file-viewer";
 import { TextEditorSurface } from "@/components/viewers/text-viewer";
@@ -37,6 +69,8 @@ import type { VoicesDriveVm } from "@/lib/ipc/gen/VoicesDriveVm";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import {
   refreshTranscription,
+  startTranscription,
+  transcriptionRunning,
   transcriptionStore,
   useTranscriptionStore,
 } from "@/lib/stores/transcription";
@@ -44,7 +78,9 @@ import { cn } from "@/lib/utils";
 import { FILE_FORMATS } from "@/lib/viewers/registry";
 import type { ViewerProps } from "@/lib/viewers/types";
 import { currentUtterance } from "./session-timeline";
+import { TRANSCRIBE_AGAIN_LABEL, TranscribeAgainDialog } from "./transcribe-again";
 import { TranscriptPlayer, type TranscriptPlayerHandle } from "./transcript-player";
+import { TranscriptionJob } from "./transcription-job";
 
 export const TRANSCRIPTION_SELECT =
   "h-9 w-full min-w-0 rounded-md border border-input bg-background px-2 text-sm focus-visible:ring-2 focus-visible:ring-ring";
@@ -55,6 +91,31 @@ const STATUS = {
   unknown: "Unknown",
   self: "You",
 } as const;
+/**
+ * A speaker's status as a lamp: named by a person (or the one recording) is
+ * lit, a guess waiting for a yes is working, an unnamed voice is idle.
+ */
+const STATUS_LAMP: Record<Speaker["status"], LampState> = {
+  confirmed: "live",
+  self: "live",
+  auto: "working",
+  suggested: "working",
+  unknown: "idle",
+};
+/**
+ * A speaker's ink, by their place in the transcript, from the bounded palette
+ * the gate measures in both themes. Always drawn beside the name, never alone.
+ * Literal class names, because Tailwind only generates what it can read.
+ */
+const SPEAKER_INKS = [
+  "bg-bot-ink-lapis",
+  "bg-bot-ink-clay",
+  "bg-bot-ink-verdigris",
+  "bg-bot-ink-ochre",
+  "bg-bot-ink-steel",
+  "bg-bot-ink-madder",
+  "bg-bot-ink-olive",
+] as const;
 function speakerName(speaker: Speaker): string {
   return speaker.name ?? (speaker.id === "ME" ? "You" : `Speaker ${speaker.id.replace(/^S/, "")}`);
 }
@@ -133,6 +194,15 @@ const SCROLL_KEYS: Record<string, true> = {
   " ": true,
 };
 /**
+ * Hidden until the line is pointed at or holds focus, and always in the tab
+ * order: the discreet way into a correction. Shown outright where nothing can
+ * hover.
+ */
+const REVEALED_ON_HOVER =
+  "opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 [@media(hover:none)]:opacity-100";
+/** A menu opened from an icon is as wide as its words, not as its trigger. */
+const MENU_CONTENT = "w-auto min-w-44";
+/**
  * The voices drive a transcript's corrections belong to: the one named, else
  * the drive whose folder holds the transcript, else the first (Rust's
  * `drive_for_path` falls back the same way). The folder test is a whole-segment
@@ -195,7 +265,9 @@ export function TranscriptDialog({
         if (!open) onClose();
       }}
     >
-      <DialogContent className="flex h-[85dvh] min-w-0 flex-col sm:max-w-3xl">
+      {/* Most of the window: the player can use the width, and the lines keep
+          a reading measure of their own inside it. */}
+      <DialogContent className="flex h-[92dvh] w-[min(96vw,1600px)] min-w-0 max-w-none flex-col sm:max-w-none">
         <DialogHeader>
           <DialogTitle>Transcript</DialogTitle>
           <DialogDescription>
@@ -224,6 +296,7 @@ export function TranscriptViewer({
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [panel, setPanel] = useState<{ id: string; kind: "split" | "insert" } | null>(null);
+  const [naming, setNaming] = useState<{ speakerId: string; mode: "rename" | "new" } | null>(null);
   const [tab, setTab] = useState<"transcript" | "source">("transcript");
   const [media, setMedia] = useState<TranscriptMediaVm | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
@@ -236,23 +309,33 @@ export function TranscriptViewer({
   const [query, setQuery] = useState("");
   const [activeMatch, setActiveMatch] = useState(-1);
   const [added, setAdded] = useState<string | null>(null);
+  const [replacing, setReplacing] = useState(false);
+  /** Bumped when a Transcribe again has written the file anew, to read it again. */
+  const [reads, setReads] = useState(0);
   const player = useRef<TranscriptPlayerHandle | null>(null);
   const search = useRef<HTMLInputElement | null>(null);
   const prelude = useRef<HTMLDivElement | null>(null);
   const playerBox = useRef<HTMLDivElement | null>(null);
   const listBox = useRef<HTMLOListElement | null>(null);
+  const editField = useRef<HTMLTextAreaElement | null>(null);
+  const nameField = useRef<HTMLInputElement | null>(null);
   const [geometry, setGeometry] = useState({ margin: 0, inset: 0 });
   const generation = useRef(0);
   const drives = useTranscriptionStore((s) => s.status?.voicesDrives);
+  const canTranscribe = useTranscriptionStore((s) => s.status?.available === true);
+  const sourcePath = vm?.sourcePath ?? null;
+  const redoJob = useTranscriptionStore((s) => (sourcePath ? s.jobs[sourcePath] : undefined));
   const bank = voicesDriveFor(drives, path, profileId);
   const unreadable = useRef(onUnreadable);
   unreadable.current = onUnreadable;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `reads` is the request to read the same path again
   useEffect(() => {
     const mine = ++generation.current;
     setVm(null);
     setError(null);
     setEditing(null);
     setPanel(null);
+    setNaming(null);
     setBusy(false);
     setSuggestions([]);
     void refreshTranscription();
@@ -279,7 +362,7 @@ export function TranscriptViewer({
     return () => {
       generation.current += 1;
     };
-  }, [path]);
+  }, [path, reads]);
   const act = async (operation: () => Promise<TranscriptVm>) => {
     if (busy) return;
     const mine = generation.current;
@@ -327,8 +410,8 @@ export function TranscriptViewer({
   const list = useWindowedRows({
     count: utterances?.length ?? 0,
     getKey,
-    rowHeight: 116,
-    gap: 8,
+    rowHeight: 84,
+    gap: 4,
     scrollMargin: geometry.margin,
     stickyInset: geometry.inset,
   });
@@ -385,6 +468,22 @@ export function TranscriptViewer({
     if (follow) seekTo(vm.transcript.utterances[matches[next]]);
   };
   const offered = vm ? offeredSpeakers(vm.transcript) : [];
+  const speakers = useMemo(() => {
+    const byId = new Map<string, { speaker: Speaker; ink: string; lines: number }>();
+    vm?.transcript.speakers.forEach((speaker, index) => {
+      byId.set(speaker.id, {
+        speaker,
+        ink: SPEAKER_INKS[index % SPEAKER_INKS.length],
+        lines: 0,
+      });
+    });
+    for (const utterance of vm?.transcript.utterances ?? []) {
+      const entry = byId.get(utterance.speaker);
+      if (entry) entry.lines += 1;
+    }
+    return byId;
+  }, [vm]);
+  const named = naming ? speakers.get(naming.speakerId)?.speaker : undefined;
   return (
     <section
       aria-label="Transcript viewer"
@@ -423,7 +522,7 @@ export function TranscriptViewer({
                   type="search"
                   aria-label={SEARCH_LABEL}
                   placeholder="Search"
-                  className="min-w-0 flex-1 basis-40"
+                  className="min-w-0 max-w-96 flex-1 basis-40"
                   value={query}
                   onChange={(event) => {
                     setQuery(event.target.value);
@@ -469,7 +568,30 @@ export function TranscriptViewer({
                 </Button>
               </div>
             )}
+            {canTranscribe && sourcePath && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="ml-auto"
+                disabled={transcriptionRunning(redoJob)}
+                onClick={() => setReplacing(true)}
+              >
+                <RotateCcw aria-hidden="true" />
+                {TRANSCRIBE_AGAIN_LABEL}…
+              </Button>
+            )}
           </div>
+          {sourcePath && redoJob && redoJob.phase !== "done" && (
+            <TranscriptionJob path={sourcePath} onOpen={() => setReads((n) => n + 1)} />
+          )}
+          <TranscribeAgainDialog
+            open={replacing}
+            onClose={() => setReplacing(false)}
+            onConfirm={() => {
+              if (sourcePath)
+                void startTranscription(sourcePath, () => setReads((n) => n + 1), true);
+            }}
+          />
           {tab === "source" && <TranscriptSource vm={vm} />}
           {/* Hidden rather than unmounted under Source, so a playing player keeps
               playing and the reader comes back to where they were. */}
@@ -489,43 +611,44 @@ export function TranscriptViewer({
                 setFollowScroll(false);
             }}
           >
-            <div ref={prelude} className="min-w-0 space-y-3 pb-3">
-              <header className="min-w-0 border-b pb-2">
+            <div ref={prelude} className="mx-auto min-w-0 max-w-4xl space-y-3 px-3 pb-3">
+              <header className="min-w-0 space-y-1">
                 <h2 className="break-words font-heading text-title">
                   {vm.transcript.source.files.join(", ")}
                 </h2>
-                <p className="text-muted-foreground">
+                <p className="text-muted-foreground text-xs">
                   {new Date(vm.transcript.createdAt).toLocaleString()} ·{" "}
                   <span className="font-mono">{timestamp(vm.transcript.duration)}</span> ·{" "}
                   {vm.transcript.language === "auto"
                     ? "Automatic language"
                     : vm.transcript.language === "en"
                       ? "English"
-                      : "Polish"}
-                </p>
-                <p className="break-words text-muted-foreground text-xs">
-                  {vm.transcript.engine.asr} · {vm.transcript.engine.diarizer} ·{" "}
-                  {vm.transcript.engine.embedding}
+                      : "Polish"}{" "}
+                  ·{" "}
+                  <span className="break-words">
+                    {vm.transcript.engine.asr} · {vm.transcript.engine.diarizer} ·{" "}
+                    {vm.transcript.engine.embedding}
+                  </span>
                 </p>
               </header>
-              <details className="min-w-0" open>
-                <summary className="cursor-pointer font-medium">Speakers</summary>
-                <div className="max-h-64 space-y-2 overflow-auto py-2">
-                  {vm.transcript.speakers
-                    .filter((speaker) =>
-                      vm.transcript.utterances.some(
-                        (utterance) => utterance.speaker === speaker.id,
-                      ),
-                    )
-                    .map((speaker) => (
-                      <SpeakerRow
-                        key={speaker.id}
-                        speaker={speaker}
+              <ul aria-label="Speakers" className="flex min-w-0 flex-wrap items-center gap-1.5">
+                {[...speakers.values()]
+                  .filter((entry) => entry.lines > 0)
+                  .map((entry) => (
+                    <li key={entry.speaker.id}>
+                      <SpeakerChip
+                        speaker={entry.speaker}
+                        ink={entry.ink}
+                        lines={entry.lines}
                         vm={vm}
                         busy={busy}
                         act={act}
+                        onName={(mode) => setNaming({ speakerId: entry.speaker.id, mode })}
+                        focusName={() => nameField.current?.focus()}
                       />
-                    ))}
+                    </li>
+                  ))}
+                <li>
                   <AddSpeaker
                     transcript={vm.transcript}
                     busy={busy}
@@ -537,7 +660,7 @@ export function TranscriptViewer({
                         const fresh = next.transcript.speakers.find((s) => !known.has(s.id));
                         setAdded(
                           fresh
-                            ? `${speakerName(fresh)} added. Give it lines with each line’s speaker menu.`
+                            ? `${speakerName(fresh)} added. Give it lines from each line’s menu, under Change speaker.`
                             : null,
                         );
                         ok = true;
@@ -546,13 +669,33 @@ export function TranscriptViewer({
                       return ok;
                     }}
                   />
-                  {added && (
-                    <p role="status" className="break-words text-muted-foreground">
-                      {added}
-                    </p>
-                  )}
-                </div>
-              </details>
+                </li>
+              </ul>
+              {naming && named && (
+                <SpeakerNameForm
+                  fieldRef={nameField}
+                  key={`${naming.speakerId}:${naming.mode}`}
+                  speaker={named}
+                  mode={naming.mode}
+                  busy={busy}
+                  onCancel={() => setNaming(null)}
+                  onSave={(name) =>
+                    void act(async () => {
+                      const result =
+                        naming.mode === "new"
+                          ? await transcriptAssignSpeaker(vm.path, naming.speakerId, null, name)
+                          : await transcriptRenameSpeaker(vm.path, naming.speakerId, name);
+                      setNaming(null);
+                      return result;
+                    })
+                  }
+                />
+              )}
+              {added && (
+                <p role="status" className="break-words text-muted-foreground">
+                  {added}
+                </p>
+              )}
               {mediaError && (
                 <p className="break-words text-muted-foreground">
                   The recording cannot be played here: {mediaError}
@@ -608,7 +751,7 @@ export function TranscriptViewer({
               <div
                 ref={playerBox}
                 className={cn(
-                  "min-w-0 pb-3",
+                  "min-w-0 px-3 pb-3",
                   pinned && "sticky top-0 z-10 border-b bg-background pt-1",
                 )}
               >
@@ -637,153 +780,95 @@ export function TranscriptViewer({
                 const utterance = vm.transcript.utterances[row.index];
                 if (!utterance) return null;
                 const speaking = row.index === current;
+                const who = speakers.get(utterance.speaker);
                 return (
                   <li
                     key={row.key}
                     {...list.rowProps(row)}
                     aria-current={speaking ? "true" : undefined}
                     data-match={matching.has(row.index) ? "" : undefined}
-                    className="min-w-0"
+                    className="group min-w-0 px-3"
                   >
                     <div
                       className={cn(
-                        "min-w-0 rounded-md border p-3",
+                        "mx-auto min-w-0 max-w-4xl rounded-md border border-transparent px-3 py-2",
                         speaking && "border-primary bg-secondary",
                         matching.has(row.index) && "ring-1 ring-ring",
                         active >= 0 && matches[active] === row.index && "ring-2 ring-primary",
                       )}
                     >
-                      <div className="mb-2 flex flex-wrap items-center gap-2">
-                        <span className="font-mono text-xs">{timestamp(utterance.start)}</span>
-                        <select
-                          aria-label={`Speaker for ${utterance.id}`}
-                          className={`${TRANSCRIPTION_SELECT} max-w-48`}
-                          value={utterance.speaker}
-                          disabled={busy}
-                          onChange={(event) =>
-                            void act(() =>
-                              transcriptReassignUtterance(path, utterance.id, event.target.value),
-                            )
-                          }
-                        >
-                          {offered.map((s) => (
-                            <option key={s.id} value={s.id}>
-                              {speakerName(s)}
-                            </option>
-                          ))}
-                        </select>
+                      <div className="flex min-w-0 items-center gap-2 text-muted-foreground text-xs">
+                        <span
+                          aria-hidden="true"
+                          className={cn("size-2 shrink-0 rounded-[2px]", who?.ink)}
+                        />
+                        <span className="min-w-0 truncate font-medium">
+                          {who ? speakerName(who.speaker) : utterance.speaker}
+                        </span>
+                        {playable ? (
+                          <button
+                            type="button"
+                            className="rounded-sm font-mono tabular-nums hover:text-foreground focus-visible:outline focus-visible:outline-ring"
+                            aria-label={`Go to ${timestamp(utterance.start)}, ${utterance.id}`}
+                            onClick={() => seekTo(utterance)}
+                          >
+                            {timestamp(utterance.start)}
+                          </button>
+                        ) : (
+                          <span className="font-mono tabular-nums">
+                            {timestamp(utterance.start)}
+                          </span>
+                        )}
                         {utterance.edited && utterance.asrText ? (
-                          <details className="text-muted-foreground text-xs">
-                            <summary>Edited · Recognised text</summary>
+                          <details className="min-w-0">
+                            <summary className="cursor-pointer">Edited · Recognised text</summary>
                             <p className="whitespace-pre-wrap break-words">{utterance.asrText}</p>
                           </details>
                         ) : (
-                          utterance.edited && (
-                            <span className="text-muted-foreground text-xs">Added by hand</span>
-                          )
+                          utterance.edited && <span>Added by hand</span>
                         )}
-                        <div className="ml-auto flex flex-wrap gap-1">
-                          {playable && (
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              aria-label={`Play from here ${utterance.id}`}
-                              title="Play from here"
-                              onClick={() => seekTo(utterance, true)}
-                            >
-                              {PLAY_GLYPH}
-                            </Button>
-                          )}
-                          {utterance.words.length > 1 && (
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              aria-label={`Split… ${utterance.id}`}
-                              aria-expanded={panel?.id === utterance.id && panel.kind === "split"}
-                              disabled={busy}
-                              onClick={() =>
-                                setPanel((open) =>
-                                  open?.id === utterance.id && open.kind === "split"
-                                    ? null
-                                    : { id: utterance.id, kind: "split" },
-                                )
-                              }
-                            >
-                              Split…
-                            </Button>
-                          )}
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            aria-label={`Add a line after ${utterance.id}`}
-                            aria-expanded={panel?.id === utterance.id && panel.kind === "insert"}
-                            disabled={busy}
-                            onClick={() =>
-                              setPanel((open) =>
-                                open?.id === utterance.id && open.kind === "insert"
-                                  ? null
-                                  : { id: utterance.id, kind: "insert" },
+                        <div className="ml-auto">
+                          <LineMenu
+                            utterance={utterance}
+                            offered={offered}
+                            playable={playable}
+                            busy={busy}
+                            onPlay={() => seekTo(utterance, true)}
+                            onEdit={() => {
+                              if (follow) seekTo(utterance);
+                              setEditing(utterance.id);
+                              setDraft(utterance.text);
+                            }}
+                            onReassign={(speakerId) =>
+                              void act(() =>
+                                transcriptReassignUtterance(path, utterance.id, speakerId),
                               )
                             }
-                          >
-                            Add a line after
-                          </Button>
+                            onPanel={(kind) =>
+                              setPanel((open) =>
+                                open?.id === utterance.id && open.kind === kind
+                                  ? null
+                                  : { id: utterance.id, kind },
+                              )
+                            }
+                            focusEdit={() => editField.current?.focus()}
+                          />
                         </div>
                       </div>
                       {editing === utterance.id ? (
-                        <div className="space-y-2">
-                          <textarea
-                            aria-label={`Edit ${utterance.id}`}
-                            className="min-h-20 w-full rounded-md border bg-background p-2"
-                            value={draft}
-                            disabled={busy}
-                            onChange={(event) => setDraft(event.target.value)}
-                            onKeyDown={(event) => {
-                              if (event.key === "Escape") {
-                                event.preventDefault();
-                                setEditing(null);
-                              } else if (
-                                event.key === "Enter" &&
-                                !event.shiftKey &&
-                                !event.nativeEvent.isComposing
-                              ) {
-                                event.preventDefault();
-                                void save(utterance.id);
-                              }
-                            }}
-                          />
-                          <div className="flex gap-2">
-                            <Button
-                              size="sm"
-                              disabled={busy}
-                              onClick={() => void save(utterance.id)}
-                            >
-                              Save text
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              disabled={busy}
-                              onClick={() => setEditing(null)}
-                            >
-                              Cancel edit
-                            </Button>
-                          </div>
-                        </div>
+                        <EditLine
+                          fieldRef={editField}
+                          utterance={utterance}
+                          draft={draft}
+                          busy={busy}
+                          onDraft={setDraft}
+                          onSave={() => void save(utterance.id)}
+                          onCancel={() => setEditing(null)}
+                        />
                       ) : (
-                        <button
-                          type="button"
-                          className="w-full whitespace-pre-wrap break-words text-left focus-visible:outline focus-visible:outline-ring"
-                          aria-label={`Edit ${utterance.id}: ${utterance.text}`}
-                          disabled={busy}
-                          onClick={() => {
-                            if (follow) seekTo(utterance);
-                            setEditing(utterance.id);
-                            setDraft(utterance.text);
-                          }}
-                        >
+                        <p className="mt-1 max-w-[80ch] whitespace-pre-wrap break-words font-normal text-foreground text-title leading-relaxed">
                           {marked(utterance.text, needle)}
-                        </button>
+                        </p>
                       )}
                       {panel?.id === utterance.id && panel.kind === "split" && (
                         <SplitPanel
@@ -821,142 +906,339 @@ export function TranscriptViewer({
     </section>
   );
 }
-function SpeakerRow({
+/**
+ * A line's corrections, behind one ⋯ button. The button is always in the tab
+ * order; the pointer finds it on hover.
+ */
+function LineMenu({
+  utterance,
+  offered,
+  playable,
+  busy,
+  onPlay,
+  onEdit,
+  onReassign,
+  onPanel,
+  focusEdit,
+}: {
+  utterance: Utterance;
+  offered: readonly Speaker[];
+  playable: boolean;
+  busy: boolean;
+  onPlay: () => void;
+  onEdit: () => void;
+  onReassign: (speakerId: string) => void;
+  onPanel: (kind: "split" | "insert") => void;
+  /** Focus the edit field Edit text opened. */
+  focusEdit: () => void;
+}) {
+  // An item that opens a field keeps the focus there, not on the ⋯ it came from.
+  const keepFocus = useRef(false);
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          size="icon-xs"
+          variant="ghost"
+          aria-label={`Line actions ${utterance.id}`}
+          className={REVEALED_ON_HOVER}
+        >
+          <Ellipsis aria-hidden="true" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="end"
+        className={MENU_CONTENT}
+        onCloseAutoFocus={(event) => {
+          if (!keepFocus.current) return;
+          keepFocus.current = false;
+          // Only once the menu has let go: a field focused while its focus
+          // trap still stands is pulled back into the menu and dropped.
+          event.preventDefault();
+          focusEdit();
+        }}
+      >
+        {playable && (
+          <DropdownMenuItem onSelect={onPlay}>
+            <Play aria-hidden="true" />
+            Play from here
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuItem
+          disabled={busy}
+          onSelect={() => {
+            keepFocus.current = true;
+            onEdit();
+          }}
+        >
+          <Pencil aria-hidden="true" />
+          Edit text
+        </DropdownMenuItem>
+        <DropdownMenuSub>
+          <DropdownMenuSubTrigger disabled={busy}>
+            <UserRoundPen aria-hidden="true" />
+            Change speaker
+          </DropdownMenuSubTrigger>
+          <DropdownMenuSubContent>
+            <DropdownMenuRadioGroup
+              value={utterance.speaker}
+              onValueChange={(next) => {
+                if (next !== utterance.speaker) onReassign(next);
+              }}
+            >
+              {offered.map((s) => (
+                <DropdownMenuRadioItem key={s.id} value={s.id}>
+                  {speakerName(s)}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
+        <DropdownMenuSeparator />
+        {utterance.words.length > 1 && (
+          <DropdownMenuItem disabled={busy} onSelect={() => onPanel("split")}>
+            <Split aria-hidden="true" />
+            Split…
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuItem disabled={busy} onSelect={() => onPanel("insert")}>
+          <ListPlus aria-hidden="true" />
+          Add a line after
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+function EditLine({
+  utterance,
+  draft,
+  busy,
+  onDraft,
+  onSave,
+  onCancel,
+  fieldRef,
+}: {
+  utterance: Utterance;
+  draft: string;
+  busy: boolean;
+  onDraft: (draft: string) => void;
+  onSave: () => void;
+  onCancel: () => void;
+  fieldRef: Ref<HTMLTextAreaElement>;
+}) {
+  return (
+    <div className="mt-1 space-y-2">
+      <textarea
+        ref={fieldRef}
+        aria-label={`Edit ${utterance.id}`}
+        className="min-h-20 w-full max-w-[80ch] rounded-md border bg-background p-2 text-title font-normal leading-relaxed"
+        value={draft}
+        disabled={busy}
+        onChange={(event) => onDraft(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            onCancel();
+          } else if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+            event.preventDefault();
+            onSave();
+          }
+        }}
+      />
+      <div className="flex gap-2">
+        <Button size="sm" disabled={busy} onClick={onSave}>
+          Save text
+        </Button>
+        <Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>
+          Cancel edit
+        </Button>
+      </div>
+    </div>
+  );
+}
+/**
+ * One speaker in the legend: ink, name, status lamp and line count, with every
+ * change to the speaker behind it.
+ */
+function SpeakerChip({
   speaker,
+  ink,
+  lines,
   vm,
   busy,
   act,
+  onName,
+  focusName,
 }: {
   speaker: Speaker;
+  ink: string;
+  lines: number;
   vm: TranscriptVm;
   busy: boolean;
   act: (operation: () => Promise<TranscriptVm>) => Promise<void>;
+  onName: (mode: "rename" | "new") => void;
+  /** Focus the field Rename label… or New person… opened. */
+  focusName: () => void;
 }) {
-  const [mode, setMode] = useState<"rename" | "new" | null>(null);
-  const [name, setName] = useState("");
-  const candidates = new Set(speaker.candidates.map((c) => c.personId));
+  // The field an item opens keeps the focus, not the chip it came from.
+  const keepFocus = useRef(false);
+  const openNameField = (mode: "rename" | "new") => {
+    keepFocus.current = true;
+    onName(mode);
+  };
+  const candidates = new Map(speaker.candidates.map((c) => [c.personId, c.score]));
   const people = [
     ...vm.people.filter((p) => candidates.has(p.id)),
     ...vm.people.filter((p) => !candidates.has(p.id)),
   ];
+  const name = speakerName(speaker);
+  const status = STATUS[speaker.status];
+  const others = vm.transcript.speakers.filter((s) => s.id !== speaker.id);
   return (
-    <div className="min-w-0 space-y-2 rounded-md border p-2">
-      <div className="flex flex-wrap items-center gap-2">
-        <strong className="break-words">{speakerName(speaker)}</strong>
-        <span className="rounded border px-1.5 py-0.5 text-xs">{STATUS[speaker.status]}</span>
-        {speaker.score !== null && (
-          <span className="font-mono text-xs">{speaker.score.toFixed(2)}</span>
-        )}
-      </div>
-      {speaker.candidates.length > 0 && (
-        <p className="break-words text-muted-foreground text-xs">
-          Candidates:{" "}
-          {speaker.candidates.map((c) => `${c.name} (${c.score.toFixed(2)})`).join(", ")}
-        </p>
-      )}
-      <div className="flex flex-wrap gap-2">
-        <select
-          aria-label={`This is… ${speaker.id}`}
-          className={`${TRANSCRIPTION_SELECT} flex-1 basis-36`}
-          disabled={busy}
-          value=""
-          onChange={(event) => {
-            if (event.target.value === "new") {
-              setMode("new");
-              setName("");
-            } else
-              void act(() =>
-                transcriptAssignSpeaker(vm.path, speaker.id, event.target.value, null),
-              );
-          }}
-        >
-          <option value="" disabled>
-            This is…
-          </option>
-          {people.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name}
-              {candidates.has(p.id) ? " · suggested" : ""}
-            </option>
-          ))}
-          <option value="new">New person…</option>
-        </select>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
         <Button
-          variant="outline"
-          size="sm"
+          size="xs"
+          variant="ghost"
           disabled={busy}
-          onClick={() => {
-            setMode("rename");
-            setName(speakerName(speaker));
-          }}
+          aria-label={`${name}, ${status}, ${lines} ${lines === 1 ? "line" : "lines"}`}
+          className="gap-1.5 rounded-sm border-border"
         >
-          Rename label
+          <span aria-hidden="true" className={cn("size-2 shrink-0 rounded-[2px]", ink)} />
+          <span className="max-w-48 truncate">{name}</span>
+          <Lamp state={STATUS_LAMP[speaker.status]} label={null} />
+          <span className="font-mono text-muted-foreground tabular-nums">{lines}</span>
         </Button>
-        {vm.transcript.speakers.length > 1 && (
-          <select
-            aria-label={`Merge ${speaker.id} into`}
-            className={`${TRANSCRIPTION_SELECT} flex-1 basis-36`}
-            disabled={busy}
-            value=""
-            onChange={(event) =>
-              void act(() => transcriptMergeSpeakers(vm.path, speaker.id, event.target.value))
-            }
-          >
-            <option value="" disabled>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        className={MENU_CONTENT}
+        onCloseAutoFocus={(event) => {
+          if (!keepFocus.current) return;
+          keepFocus.current = false;
+          event.preventDefault();
+          focusName();
+        }}
+      >
+        <DropdownMenuLabel>
+          {status}
+          {speaker.score !== null && (
+            <span className="font-mono"> · {speaker.score.toFixed(2)}</span>
+          )}
+        </DropdownMenuLabel>
+        <DropdownMenuSub>
+          <DropdownMenuSubTrigger>
+            <UserPlus aria-hidden="true" />
+            This is…
+          </DropdownMenuSubTrigger>
+          <DropdownMenuSubContent className="max-h-80 overflow-y-auto">
+            {people.map((p) => {
+              const score = candidates.get(p.id);
+              return (
+                <DropdownMenuItem
+                  key={p.id}
+                  onSelect={() =>
+                    void act(() => transcriptAssignSpeaker(vm.path, speaker.id, p.id, null))
+                  }
+                >
+                  {p.name}
+                  {score !== undefined && (
+                    <span className="ml-auto font-mono text-muted-foreground text-xs">
+                      suggested {score.toFixed(2)}
+                    </span>
+                  )}
+                </DropdownMenuItem>
+              );
+            })}
+            {people.length > 0 && <DropdownMenuSeparator />}
+            <DropdownMenuItem onSelect={() => openNameField("new")}>New person…</DropdownMenuItem>
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
+        <DropdownMenuItem onSelect={() => openNameField("rename")}>
+          <Pencil aria-hidden="true" />
+          Rename label…
+        </DropdownMenuItem>
+        {others.length > 0 && (
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>
+              <ChevronRight aria-hidden="true" />
               Merge into…
-            </option>
-            {vm.transcript.speakers
-              .filter((s) => s.id !== speaker.id)
-              .map((s) => (
-                <option key={s.id} value={s.id}>
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="max-h-80 overflow-y-auto">
+              {others.map((s) => (
+                <DropdownMenuItem
+                  key={s.id}
+                  onSelect={() =>
+                    void act(() => transcriptMergeSpeakers(vm.path, speaker.id, s.id))
+                  }
+                >
                   {speakerName(s)}
-                </option>
+                </DropdownMenuItem>
               ))}
-          </select>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
         )}
-      </div>
-      {mode && (
-        <form
-          className="flex flex-wrap gap-2"
-          onSubmit={(event) => {
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+/** The field a speaker's new label, or the new person's name, is typed into. */
+function SpeakerNameForm({
+  speaker,
+  mode,
+  busy,
+  onSave,
+  onCancel,
+  fieldRef,
+}: {
+  speaker: Speaker;
+  mode: "rename" | "new";
+  busy: boolean;
+  onSave: (name: string) => void;
+  onCancel: () => void;
+  fieldRef: Ref<HTMLInputElement>;
+}) {
+  const [name, setName] = useState(mode === "rename" ? speakerName(speaker) : "");
+  return (
+    <form
+      className="flex min-w-0 flex-wrap items-center gap-2"
+      onSubmit={(event) => {
+        event.preventDefault();
+        onSave(name);
+      }}
+    >
+      <Input
+        ref={fieldRef}
+        aria-label={mode === "new" ? "New person name" : "Speaker label"}
+        className="min-w-0 max-w-80 flex-1 basis-36"
+        value={name}
+        onChange={(event) => setName(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
             event.preventDefault();
-            void act(async () => {
-              const result =
-                mode === "new"
-                  ? await transcriptAssignSpeaker(vm.path, speaker.id, null, name)
-                  : await transcriptRenameSpeaker(vm.path, speaker.id, name);
-              setMode(null);
-              return result;
-            });
-          }}
-        >
-          <Input
-            aria-label={mode === "new" ? "New person name" : "Speaker label"}
-            className="min-w-0 flex-1 basis-36"
-            value={name}
-            onChange={(event) => setName(event.target.value)}
-          />
-          <Button type="submit" size="sm" disabled={busy || (mode === "new" && !name.trim())}>
-            {mode === "new" ? "Create person" : "Save label"}
-          </Button>
-          <Button type="button" size="sm" variant="ghost" onClick={() => setMode(null)}>
-            Cancel
-          </Button>
-        </form>
-      )}
-    </div>
+            onCancel();
+          }
+        }}
+      />
+      <Button type="submit" size="sm" disabled={busy || (mode === "new" && !name.trim())}>
+        {mode === "new" ? "Create person" : "Save label"}
+      </Button>
+      <Button type="button" size="sm" variant="ghost" onClick={onCancel}>
+        Cancel
+      </Button>
+    </form>
   );
 }
 /**
  * The transcript's JSON, read-only, in the editor the Files panel opens a
  * `.json` in. Rust writes a transcript as two-space pretty JSON with a final
  * newline (`Transcript::to_json`), so the model laid out the same way is the
- * file's text as keeper wrote it.
+ * file's text as keeper wrote it. Inset by the pane pad, like the lines are,
+ * so the text never runs into the frame.
  */
 function TranscriptSource({ vm }: { vm: TranscriptVm }) {
   const content = useMemo(() => `${JSON.stringify(vm.transcript, null, 2)}\n`, [vm.transcript]);
   return (
-    <div className="min-h-0 min-w-0 flex-1 overflow-auto rounded-md border">
+    <div className="min-h-0 min-w-0 flex-1 overflow-auto rounded-md border p-3">
       <TextEditorSurface
         content={content}
         language={FILE_FORMATS.get("json")?.language ?? null}
@@ -987,14 +1269,15 @@ function AddSpeaker({
   const [label, setLabel] = useState("");
   if (!open)
     return (
-      <Button size="sm" variant="outline" disabled={busy} onClick={() => setOpen(true)}>
+      <Button size="xs" variant="ghost" disabled={busy} onClick={() => setOpen(true)}>
+        <UserPlus aria-hidden="true" />
         {ADD_SPEAKER_LABEL}
       </Button>
     );
   return (
     <form
       aria-label={ADD_SPEAKER_LABEL}
-      className="flex min-w-0 flex-wrap gap-2 rounded-md border p-2"
+      className="flex min-w-0 flex-wrap items-center gap-2"
       onSubmit={(event) => {
         event.preventDefault();
         void onAdd(origin, label.trim() || null).then((added) => {
@@ -1005,24 +1288,26 @@ function AddSpeaker({
       }}
     >
       {origins.length > 1 && (
-        <select
+        <ToggleGroup
+          type="single"
           aria-label="Heard on"
-          className={`${TRANSCRIPTION_SELECT} max-w-40`}
           value={origin}
           disabled={busy}
-          onChange={(event) => setOrigin(event.target.value as TrackOrigin)}
+          onValueChange={(next) => {
+            if (next) setOrigin(next as TrackOrigin);
+          }}
         >
           {origins.map((o) => (
-            <option key={o} value={o}>
+            <ToggleGroupItem key={o} value={o} className="px-2">
               {ORIGIN_NAME[o]}
-            </option>
+            </ToggleGroupItem>
           ))}
-        </select>
+        </ToggleGroup>
       )}
       <Input
         aria-label="New speaker label"
         placeholder="Label (optional)"
-        className="min-w-0 flex-1 basis-36"
+        className="h-8 min-w-0 max-w-60 flex-1 basis-36"
         value={label}
         disabled={busy}
         onChange={(event) => setLabel(event.target.value)}
@@ -1097,22 +1382,25 @@ function InsertPanel({
         if (text.trim()) onInsert(speakerId, text);
       }}
     >
-      <select
-        aria-label={`Speaker for the line after ${utterance.id}`}
-        className={`${TRANSCRIPTION_SELECT} max-w-48`}
-        value={speakerId}
-        disabled={busy}
-        onChange={(event) => setSpeakerId(event.target.value)}
-      >
-        {speakers.map((s) => (
-          <option key={s.id} value={s.id}>
-            {speakerName(s)}
-          </option>
-        ))}
-      </select>
+      <Select value={speakerId} disabled={busy} onValueChange={setSpeakerId}>
+        <SelectTrigger
+          size="sm"
+          aria-label={`Speaker for the line after ${utterance.id}`}
+          className="max-w-48"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {speakers.map((s) => (
+            <SelectItem key={s.id} value={s.id}>
+              {speakerName(s)}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
       <Input
         aria-label={`Text of the line after ${utterance.id}`}
-        className="min-w-0 flex-1 basis-48"
+        className="h-8 min-w-0 flex-1 basis-48"
         value={text}
         disabled={busy}
         onChange={(event) => setText(event.target.value)}

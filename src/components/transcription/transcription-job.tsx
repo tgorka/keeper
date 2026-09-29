@@ -1,4 +1,8 @@
 import { useState } from "react";
+import {
+  TRANSCRIBE_AGAIN_LABEL,
+  TranscribeAgainDialog,
+} from "@/components/transcription/transcribe-again";
 import { TranscriptionProgress } from "@/components/transcription/transcription-progress";
 import { Button } from "@/components/ui/button";
 import { transcriptionCancel } from "@/lib/ipc/client";
@@ -19,6 +23,7 @@ export function TranscriptionJob({
 }) {
   const job = useTranscriptionStore((s) => s.jobs[path]);
   const [error, setError] = useState<string | null>(null);
+  const [asking, setAsking] = useState(false);
   if (!job) return null;
   const running = transcriptionRunning(job);
   return (
@@ -46,11 +51,18 @@ export function TranscriptionJob({
           Cancel transcription
         </Button>
       )}
-      {job.phase === "failed" && (
-        <Button size="sm" variant="outline" onClick={() => void startTranscription(path)}>
-          Try again
-        </Button>
-      )}
+      {/* A job that stopped at a transcript keeper will not overwrite on its
+          own would only stop there again: the way on is to replace it. */}
+      {job.phase === "failed" &&
+        (job.replaceable ? (
+          <Button size="sm" variant="outline" onClick={() => setAsking(true)}>
+            {TRANSCRIBE_AGAIN_LABEL}…
+          </Button>
+        ) : (
+          <Button size="sm" variant="outline" onClick={() => void startTranscription(path)}>
+            Try again
+          </Button>
+        ))}
       {job.transcriptPath && (
         <Button
           size="sm"
@@ -67,6 +79,11 @@ export function TranscriptionJob({
           {error}
         </p>
       )}
+      <TranscribeAgainDialog
+        open={asking}
+        onClose={() => setAsking(false)}
+        onConfirm={() => void startTranscription(path, undefined, true)}
+      />
     </div>
   );
 }

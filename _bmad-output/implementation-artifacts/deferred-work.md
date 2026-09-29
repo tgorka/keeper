@@ -6928,3 +6928,10 @@ origin: epic 87's review wave, 2026-09-28 (AD-339)
 location: `src-tauri/crates/keeper/tauri.conf.json` (`bundle.macOS.minimumSystemVersion` 14.0), `tools/fluidaudio-rs/Package.swift` (`.macOS(.v14)`), the release's updater feed
 reason: FluidAudio's floor is macOS 14, and its static Swift library is linked into the app, so Epic 87 raised the bundle minimum from 11.0 to 14.0. keeper's updater feed has no OS gate, so an installed keeper on 11–13 would download an update that macOS refuses to launch. The owner's Macs run macOS 26–27. Revisit before the first release that reaches someone on 11–13: either keep a last 11.0-floor build in the feed for those systems, or load the engine lazily so the floor can return to 11.0.
 status: open
+
+### DW-346: The transcript player's first frame in the Files panel is not proved in a real WKWebView.
+
+origin: story 87.10 (field report 3, R7), 2026-09-29
+location: `src/components/transcription/**` (the player's video elements), `primeFirstFrame` in `src/components/notes/editor/media-playback.ts` (as `src/components/viewers/media-viewer.tsx` uses it)
+reason: On hesperia the player in the Files side panel stayed an empty grey box at 0:00 until played — WKWebView leaves a `<video>` at readyState 1 with no frame painted. Story 87.10 primes the first frame after `loadedmetadata` on every player video and gives the player an aspect-ratio box, and vitest proves the call policy; the painted frame itself can only be seen in WKWebView, which the Linux build containers do not have. Revisit at the next Mac gate on hesperia: open a recording's transcript in the Files panel and confirm a frame shows before play; if not, reopen R7.
+status: open

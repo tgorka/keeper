@@ -52,7 +52,8 @@ vi.mock("@/lib/ipc/client", () => ({
   notesAttachSources: (v: unknown, s: unknown) => notesAttachSources(v, s),
   notesBodyRead: (v: unknown, n: unknown) => notesBodyRead(v, n),
   notesBodyWrite: (v: unknown, n: unknown, t: unknown, r: unknown) => notesBodyWrite(v, n, t, r),
-  transcriptionStart: (path: unknown, onProgress: unknown) => transcriptionStart(path, onProgress),
+  transcriptionStart: (path: unknown, onProgress: unknown, replace: unknown) =>
+    transcriptionStart(path, onProgress, replace),
 }));
 
 import {
@@ -2024,9 +2025,12 @@ describe("FilesPane — what it is and how big", () => {
       fireEvent.contextMenu(screen.getByRole("treeitem", { name: "meeting" }));
     });
     const menu = await screen.findByRole("menu");
-    expect(within(menu).queryByRole("menuitem", { name: "Transcribe" }) !== null).toBe(
-      expectedTranscribe,
-    );
+    // With a transcript there the verb is Transcribe again…, which replaces it.
+    expect(
+      within(menu).queryByRole("menuitem", {
+        name: hasTranscript ? "Transcribe again…" : "Transcribe",
+      }) !== null,
+    ).toBe(expectedTranscribe);
     expect(within(menu).queryByRole("menuitem", { name: "Open transcript" }) !== null).toBe(
       expectedOpen,
     );
@@ -2047,6 +2051,7 @@ describe("FilesPane — what it is and how big", () => {
           transcriptPath: null,
           fraction: null,
           elapsedMs: 0,
+          replaceable: false,
         },
       },
     });
@@ -2124,6 +2129,37 @@ describe("FilesPane — what it is and how big", () => {
     expect(syncBrowse).toHaveBeenLastCalledWith("01VAULT", "");
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(screen.getByRole("button", { name: "Open transcript" })).toBeInTheDocument();
+  });
+
+  it("asks before Transcribe again replaces a row's transcript, and starts it with replace", async () => {
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true, transcription: true });
+    transcriptionStart.mockResolvedValue("job");
+    await expandVault([
+      entry("clip.mov", "video", undefined, undefined, {
+        transcribable: true,
+        transcript: "/Users/alice/Vault/clip.mov.transcript.json",
+      }),
+    ]);
+    const redo = async () => {
+      await act(async () => {
+        fireEvent.contextMenu(screen.getByRole("treeitem", { name: "clip.mov" }));
+      });
+      await click(await screen.findByRole("menuitem", { name: "Transcribe again…" }));
+      return screen.findByRole("alertdialog");
+    };
+    await click(within(await redo()).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(transcriptionStart).not.toHaveBeenCalled();
+    await click(within(await redo()).getByRole("button", { name: "Transcribe again" }));
+    await waitFor(() =>
+      expect(transcriptionStart).toHaveBeenCalledWith(
+        "/Users/alice/Vault/clip.mov",
+        expect.any(Function),
+        true,
+      ),
+    );
   });
 
   /**

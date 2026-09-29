@@ -11,7 +11,8 @@ vi.mock("@/lib/ipc/client", () => ({
   searchRecordings: (filter: unknown) => searchRecordings(filter),
   recordingOpenPath: (path: unknown) => recordingOpenPath(path),
   revealPath: (path: unknown) => revealPath(path),
-  transcriptionStart: (path: unknown, onProgress: unknown) => transcriptionStart(path, onProgress),
+  transcriptionStart: (path: unknown, onProgress: unknown, replace: unknown) =>
+    transcriptionStart(path, onProgress, replace),
   transcriptionCancel: () => Promise.resolve(),
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(() => Promise.resolve(null)) }));
@@ -321,7 +322,11 @@ describe("RecordingsPane", () => {
       fireEvent.click(
         await screen.findByRole("button", { name: `${RECORDINGS_TRANSCRIBE_LABEL}: Standup` }),
       );
-      expect(transcriptionStart).toHaveBeenCalledWith(session.absolutePath, expect.any(Function));
+      expect(transcriptionStart).toHaveBeenCalledWith(
+        session.absolutePath,
+        expect.any(Function),
+        false,
+      );
       const transcript = `${session.absolutePath}/transcript.json`;
       const reads = searchRecordings.mock.calls.length;
       searchRecordings.mockResolvedValue(found([{ ...session, transcript }]));
@@ -335,6 +340,7 @@ describe("RecordingsPane", () => {
           transcriptPath: transcript,
           fraction: 1,
           elapsedMs: 4_000,
+          replaceable: false,
         }),
       );
       await waitFor(() => expect(searchRecordings.mock.calls.length).toBeGreaterThan(reads));

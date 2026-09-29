@@ -58,6 +58,10 @@ import {
   DURABILITY_LOCAL_LABEL,
   DURABILITY_PUSHED_LABEL,
 } from "@/components/recording/active-recording-banner";
+import {
+  TRANSCRIBE_AGAIN_LABEL,
+  TranscribeAgainDialog,
+} from "@/components/transcription/transcribe-again";
 import { TranscriptionJob } from "@/components/transcription/transcription-job";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -116,8 +120,8 @@ export interface RecordingRowProps {
   canTranscribe: boolean;
   /** This session's transcription job, when one has run since launch. */
   job: TranscriptionProgressVm | undefined;
-  /** Start transcribing the session folder. */
-  onTranscribe: (hit: RecordingHitVm) => void;
+  /** Start transcribing the session folder; `replace` writes over its transcript. */
+  onTranscribe: (hit: RecordingHitVm, replace: boolean) => void;
   /** Open a transcript in the transcript dialog. */
   onShowTranscript: (path: string) => void;
 }
@@ -135,6 +139,7 @@ export function RecordingRow({
   // The transient copy confirmation, held here rather than in the pane so one
   // row's "Copied" cannot survive into the row that replaces it on a re-query.
   const [copied, setCopied] = useState(false);
+  const [asking, setAsking] = useState(false);
 
   const title = hit.title === null || hit.title.trim() === "" ? null : hit.title;
   const dateLabel =
@@ -237,16 +242,18 @@ export function RecordingRow({
               {RECORDINGS_SHOW_TRANSCRIPT_LABEL}
             </Button>
           )}
+          {/* Where a transcript exists the verb is to replace it, and that
+              asks first: the corrections in it are about to go. */}
           {offerTranscribe && (
             <Button
               type="button"
               variant="outline"
               size="sm"
-              aria-label={`${RECORDINGS_TRANSCRIBE_LABEL}: ${headline}`}
-              onClick={() => onTranscribe(hit)}
+              aria-label={`${transcript === null ? RECORDINGS_TRANSCRIBE_LABEL : `${TRANSCRIBE_AGAIN_LABEL}…`}: ${headline}`}
+              onClick={() => (transcript === null ? onTranscribe(hit, false) : setAsking(true))}
             >
               <AudioLines aria-hidden="true" />
-              {RECORDINGS_TRANSCRIBE_LABEL}
+              {transcript === null ? RECORDINGS_TRANSCRIBE_LABEL : `${TRANSCRIBE_AGAIN_LABEL}…`}
             </Button>
           )}
           {canReveal && (
@@ -282,6 +289,11 @@ export function RecordingRow({
         </div>
       </div>
       {jobShown && <TranscriptionJob path={hit.absolutePath} onOpen={onShowTranscript} />}
+      <TranscribeAgainDialog
+        open={asking}
+        onClose={() => setAsking(false)}
+        onConfirm={() => onTranscribe(hit, true)}
+      />
     </div>
   );
 }

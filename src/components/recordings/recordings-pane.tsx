@@ -491,11 +491,15 @@ export function RecordingsPane() {
                       }}
                       canTranscribe={canTranscribe}
                       job={transcriptionJobs[hit.absolutePath]}
-                      onTranscribe={(h) => {
+                      onTranscribe={(h, replace) => {
                         // The session folder, which the engine reads as one
                         // timeline across its segments. The row's transcript
                         // only exists once the archive is asked again.
-                        void startTranscription(h.absolutePath, () => runSearch(filterRef.current));
+                        void startTranscription(
+                          h.absolutePath,
+                          () => runSearch(filterRef.current),
+                          replace,
+                        );
                       }}
                       onShowTranscript={setTranscriptPath}
                     />

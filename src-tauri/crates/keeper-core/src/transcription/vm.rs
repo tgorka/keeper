@@ -78,6 +78,10 @@ pub struct TranscriptionProgressVm {
     /// Milliseconds since the job started running.
     #[ts(type = "number")]
     pub elapsed_ms: u64,
+    /// Set on a `failed` batch that stopped at a transcript keeper will not
+    /// overwrite on its own (corrected, or unreadable): starting the job
+    /// again with `replace` gets past it.
+    pub replaceable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -101,6 +105,10 @@ pub enum TranscriptionPhase {
 #[ts(export)]
 pub struct TranscriptVm {
     pub path: String,
+    /// The media file or session folder to start a job on to transcribe
+    /// this again (`transcription_start` with `replace`); `null` when it is
+    /// no longer there.
+    pub source_path: Option<String>,
     pub transcript: Transcript,
     pub people: Vec<PersonVm>,
 }

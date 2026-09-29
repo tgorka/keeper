@@ -24,6 +24,7 @@ function timed(text: string, start: number, end: number): Word[] {
 }
 export const TRANSCRIPT_FIXTURE: TranscriptVm = {
   path: "/Volumes/merope/tgdrive/meeting.mov.transcript.json",
+  sourcePath: "/Volumes/merope/tgdrive/meeting.mov",
   people: [
     { id: "p-me", name: "Alex", aliases: [], isSelf: true, samples: 3, hasEmbeddingForModel: true },
     {
@@ -136,6 +137,7 @@ export const TRANSCRIPT_FIXTURE: TranscriptVm = {
 export const SESSION_TRANSCRIPT_FIXTURE: TranscriptVm = (() => {
   const vm = structuredClone(TRANSCRIPT_FIXTURE);
   vm.path = "/Volumes/merope/tgdrive/recordings/2026-09-28 standup/transcript.json";
+  vm.sourcePath = "/Volumes/merope/tgdrive/recordings/2026-09-28 standup";
   const tracks = TRANSCRIPT_FIXTURE.transcript.source.parts[0].tracks;
   vm.transcript.source = {
     kind: "recording",
@@ -242,13 +244,23 @@ export function transcriptionMockHandlers(
         vm.transcript.speakers[1].score = speakerStatus === "unknown" ? null : 0.81;
       }
       if (params.has("emptyTranscript")) vm.transcript.utterances = [];
-      if (params.has("longTranscript"))
+      if (params.has("longTranscript")) {
         vm.transcript.utterances = Array.from({ length: 1000 }, (_, i) => ({
           ...TRANSCRIPT_FIXTURE.transcript.utterances[i % 3],
           id: `u${i + 1}`,
           start: i * 5,
           end: i * 5 + 4,
         }));
+        // The recording as long as its lines, so the scrub can reach them all.
+        const parts = vm.transcript.source.parts;
+        const each = 5000 / parts.length;
+        vm.transcript.source.parts = parts.map((part, i) => ({
+          ...part,
+          offset: i * each,
+          duration: each,
+        }));
+        vm.transcript.duration = 5000;
+      }
       transcripts.set(path, vm);
     }
     vm.people = structuredClone(people);
@@ -307,6 +319,7 @@ export function transcriptionMockHandlers(
         phase: TranscriptionProgressVm["phase"],
         fraction: number | null,
         message: string | null = null,
+        replaceable = false,
       ) =>
         channel.onmessage({
           jobId,
@@ -322,6 +335,7 @@ export function transcriptionMockHandlers(
               : null,
           fraction,
           elapsedMs: Date.now() - started,
+          replaceable,
         });
       const stop = () => {
         window.clearInterval(timer);
@@ -345,6 +359,18 @@ export function transcriptionMockHandlers(
       const JOB_MS = 8_000;
       const tick = () => {
         const fraction = Math.min(1, (Date.now() - started) / JOB_MS);
+        // `?correctedTranscript`: the transcript already there holds corrections,
+        // so only a Transcribe again (`replace`) gets past it, as in Rust.
+        if (params.has("correctedTranscript") && p.replace !== true) {
+          stop();
+          send(
+            "failed",
+            null,
+            "This transcript has corrections in it, so keeper will not overwrite it on its own. Transcribe again to replace it.",
+            true,
+          );
+          return;
+        }
         if (params.has("transcriptionFailure") || path.includes("master-2026-04")) {
           stop();
           send(

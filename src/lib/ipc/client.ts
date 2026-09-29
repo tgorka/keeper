@@ -57,13 +57,19 @@ export function transcriptionStatus(): Promise<TranscriptionStatusVm> {
 export function transcriptionModelsFetch(): Promise<TranscriptionStatusVm> {
   return invoke("transcription_models_fetch");
 }
+/**
+ * `replace` is "Transcribe again": the job writes over the transcript already
+ * there, corrections and all, where it would otherwise refuse. The surface
+ * asks the person before it sends `true`.
+ */
 export function transcriptionStart(
   path: string,
   onProgress: (progress: TranscriptionProgressVm) => void,
+  replace = false,
 ): Promise<string> {
   const channel = new Channel<TranscriptionProgressVm>();
   channel.onmessage = onProgress;
-  return invoke("transcription_start", { path, channel });
+  return invoke("transcription_start", { path, channel, replace });
 }
 export function transcriptionCancel(jobId: string): Promise<void> {
   return invoke("transcription_cancel", { jobId });

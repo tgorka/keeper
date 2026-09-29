@@ -107,6 +107,10 @@ import { planPriorityActions } from "@/components/layout/priority-actions";
 import { useSurfaceColumn } from "@/components/layout/surface-column";
 import { SyncStatusMark } from "@/components/layout/sync-status-mark";
 import { ATTACH_TO_NOTE_LABEL, AttachToNoteDialog } from "@/components/notes/attach-to-note-dialog";
+import {
+  TRANSCRIBE_AGAIN_LABEL,
+  TranscribeAgainDialog,
+} from "@/components/transcription/transcribe-again";
 import { TranscriptDialog } from "@/components/transcription/transcript-viewer";
 import { TranscriptionJob } from "@/components/transcription/transcription-job";
 import {
@@ -1156,6 +1160,8 @@ export function FilesPane() {
   const transcriptionJobs = useTranscriptionStore((s) => s.jobs);
   const [transcriptPath, setTranscriptPath] = useState<string | null>(null);
   const [transcriptionPath, setTranscriptionPath] = useState<string | null>(null);
+  /** The row "Transcribe again" is asking about, and what its job re-reads when done. */
+  const [replacing, setReplacing] = useState<{ path: string; reread: () => void } | null>(null);
   // The tree's own surface column is set up further down, once the selection and
   // the refresh it puts on its folded rail exist (Story 48.1).
 
@@ -2623,21 +2629,32 @@ export function FilesPane() {
               ? [
                   {
                     id: "transcribe",
-                    label: rowJobRunning ? transcriptionShortLine(rowJob) : "Transcribe",
+                    // Where a transcript exists the verb replaces it, and asks
+                    // first: the corrections in it are about to go.
+                    label: rowJobRunning
+                      ? transcriptionShortLine(rowJob)
+                      : entry.transcript
+                        ? `${TRANSCRIBE_AGAIN_LABEL}…`
+                        : "Transcribe",
                     icon: AudioLines,
                     disabled: rowJobRunning,
                     ring: rowJobRunning ? rowJob.fraction : undefined,
                     onSelect: () => {
-                      setTranscriptionPath(entry.absolutePath);
                       // The new transcript's row (and this row's Open transcript)
                       // only exist once the listing is read again.
-                      void startTranscription(entry.absolutePath, () => {
+                      const reread = () => {
                         load(
                           node.profileId,
                           nodeKeySubpath(node.parentKey ?? nodeKey(node.profileId, "")),
                         );
                         if (node.isFolder) load(node.profileId, nodeKeySubpath(node.key));
-                      });
+                      };
+                      if (entry.transcript) {
+                        setReplacing({ path: entry.absolutePath, reread });
+                        return;
+                      }
+                      setTranscriptionPath(entry.absolutePath);
+                      void startTranscription(entry.absolutePath, reread);
                     },
                   },
                 ]
@@ -3188,6 +3205,15 @@ export function FilesPane() {
           </div>
         )}
         <TranscriptDialog path={transcriptPath} onClose={() => setTranscriptPath(null)} />
+        <TranscribeAgainDialog
+          open={replacing !== null}
+          onClose={() => setReplacing(null)}
+          onConfirm={() => {
+            if (!replacing) return;
+            setTranscriptionPath(replacing.path);
+            void startTranscription(replacing.path, replacing.reread, true);
+          }}
+        />
         {/* The heading used to sit here, over the sentence. It is one row up
             now: every foldable surface names itself in its fold row (Story
             48.3), and this pane was the only one that already had a name to

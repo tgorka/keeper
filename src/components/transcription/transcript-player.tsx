@@ -13,7 +13,26 @@
  * started where it begins, and a seek to another part loads that part and lands
  * once the file knows its length.
  */
-import { type Ref, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import {
+  Columns2,
+  Crosshair,
+  Mic,
+  Monitor,
+  Phone,
+  Pin,
+  PinOff,
+  Video,
+  Volume2,
+} from "lucide-react";
+import {
+  type ReactNode,
+  type Ref,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from "react";
 import {
   BACK_GLYPH,
   BACK_LABEL,
@@ -26,16 +45,18 @@ import {
   PLAY_GLYPH,
   PLAY_LABEL,
   PLAY_REFUSED_LABEL,
+  primeFirstFrame,
   releaseMediaElement,
   SCRUB_LABEL,
   SKIP_SECONDS,
 } from "@/components/notes/editor/recording-transport";
 import { Button } from "@/components/ui/button";
+import { Toggle } from "@/components/ui/toggle";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { IconHint } from "@/components/ui/tooltip";
 import type { TranscriptMediaVm } from "@/lib/ipc/client";
-import { cn } from "@/lib/utils";
 import { fileAssetUrl } from "@/lib/viewers/file-asset-url";
 import { locate, sessionLength } from "./session-timeline";
-import { TRANSCRIPTION_SELECT } from "./transcript-viewer";
 
 export const PLAYER_LABEL = "Transcript player";
 export const PICTURE_LABEL = "Picture";
@@ -52,6 +73,66 @@ export interface TranscriptPlayerHandle {
 
 type Picture = "screen" | "camera" | "both";
 type Sound = "system" | "microphone" | "both";
+
+/** One segment of a picture or sound choice: its value, its name, its glyph. */
+interface Choice<V extends string> {
+  value: V;
+  label: string;
+  icon: ReactNode;
+}
+const PICTURE_CHOICES: readonly Choice<Picture>[] = [
+  { value: "screen", label: "Screen", icon: <Monitor aria-hidden="true" /> },
+  { value: "camera", label: "Camera", icon: <Video aria-hidden="true" /> },
+  { value: "both", label: "Screen and camera", icon: <Columns2 aria-hidden="true" /> },
+];
+const SOUND_CHOICES: readonly Choice<Sound>[] = [
+  { value: "system", label: "Call", icon: <Phone aria-hidden="true" /> },
+  { value: "microphone", label: "Microphone", icon: <Mic aria-hidden="true" /> },
+  { value: "both", label: "Call and microphone", icon: <Volume2 aria-hidden="true" /> },
+];
+
+/**
+ * A segmented icon choice. Radix makes it a radio group, so each segment's name
+ * is its `aria-label` and its tooltip says the same words; a click on the
+ * segment already chosen keeps it (Radix would otherwise answer "").
+ */
+function ChoiceGroup<V extends string>({
+  label,
+  value,
+  choices,
+  onChange,
+}: {
+  label: string;
+  value: V;
+  choices: readonly Choice<V>[];
+  onChange: (value: V) => void;
+}) {
+  return (
+    <ToggleGroup
+      type="single"
+      aria-label={label}
+      value={value}
+      onValueChange={(next) => {
+        if (next) onChange(next as V);
+      }}
+    >
+      {choices.map((choice) => (
+        <IconHint key={choice.value} label={choice.label}>
+          <ToggleGroupItem value={choice.value} aria-label={choice.label}>
+            {choice.icon}
+          </ToggleGroupItem>
+        </IconHint>
+      ))}
+    </ToggleGroup>
+  );
+}
+
+/**
+ * A video's box: 16:9 from its width, so an element that has not loaded its
+ * metadata yet (and has no size of its own) still holds the player's height
+ * instead of collapsing; `object-contain` letterboxes any other shape into it.
+ */
+const VIDEO_BOX = "aspect-video max-h-[30dvh] min-w-0 flex-1 rounded-md bg-muted object-contain";
 
 /** WebKit's `audioTracks`; absent from TypeScript's DOM library and from Chromium. */
 interface AudioTracks {
@@ -72,6 +153,10 @@ function useMediaElement<E extends HTMLMediaElement>(src: string | null) {
     (node: E | null) => {
       current.current = node;
       if (!node || src === null) return;
+      // `preload="metadata"` fetches no frame, so an unplayed video is a grey
+      // box; the prime buys the first one. Registered before `src`, which is
+      // what starts the load.
+      if (node instanceof HTMLVideoElement) primeFirstFrame(node);
       node.src = src;
       return () => {
         if (current.current === node) current.current = null;
@@ -183,9 +268,7 @@ export function TranscriptPlayer({
     preload: "metadata",
     playsInline: true,
     "aria-label": partName,
-    className: showMain
-      ? "max-h-[30dvh] min-w-0 flex-1 rounded-md bg-muted object-contain"
-      : "hidden",
+    className: showMain ? VIDEO_BOX : "hidden",
     onLoadedMetadata: (event: React.SyntheticEvent<HTMLMediaElement>) => {
       const element = event.currentTarget;
       applySound(element);
@@ -225,7 +308,7 @@ export function TranscriptPlayer({
       {mainSrc === null ? (
         <p className="text-muted-foreground">{PART_UNAVAILABLE_SENTENCE}</p>
       ) : (
-        <div className="flex min-w-0 gap-2">
+        <div className="flex min-w-0 justify-center gap-2">
           {video ? (
             <video key={`${index}:${mainSrc}`} {...mainElementProps} />
           ) : (
@@ -239,7 +322,7 @@ export function TranscriptPlayer({
               preload="metadata"
               playsInline
               aria-label={part.camera?.relativePath.split("/").pop()}
-              className="max-h-[30dvh] min-w-0 flex-1 rounded-md bg-muted object-contain"
+              className={VIDEO_BOX}
               onLoadedMetadata={(event) => {
                 const leader = main.current;
                 if (!leader) return;
@@ -251,7 +334,7 @@ export function TranscriptPlayer({
           )}
         </div>
       )}
-      <div className="flex min-w-0 flex-wrap items-center gap-1">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
         <Button
           size="sm"
           variant="outline"
@@ -287,61 +370,50 @@ export function TranscriptPlayer({
         >
           {FORWARD_GLYPH}
         </Button>
+        {/* React's `onChange` on a range is the `input` event, so the player —
+            and with Follow on, the transcript — moves while the thumb is
+            dragged, not only where it is let go. */}
         <input
           type="range"
           aria-label={SCRUB_LABEL}
-          className="min-w-24 flex-1 accent-primary"
+          className="min-w-24 flex-1 basis-40 accent-primary"
           min={0}
           max={total}
           step={0.1}
           value={Math.min(time, total)}
           onChange={(event) => seek(Number(event.target.value))}
         />
-        <span className="font-mono text-xs tabular-nums">
+        <span className="font-mono text-muted-foreground text-xs tabular-nums">
           {clock(time)} / {clock(total)}
         </span>
-      </div>
-      <div className="flex min-w-0 flex-wrap items-center gap-2">
-        {choosePicture && (
-          <select
-            aria-label={PICTURE_LABEL}
-            className={cn(TRANSCRIPTION_SELECT, "w-auto")}
-            value={picture}
-            onChange={(event) => setPicture(event.target.value as Picture)}
-          >
-            <option value="both">Screen and camera</option>
-            <option value="screen">Screen</option>
-            <option value="camera">Camera</option>
-          </select>
-        )}
-        {chooseSound && (
-          <select
-            aria-label={SOUND_LABEL}
-            className={cn(TRANSCRIPTION_SELECT, "w-auto")}
-            value={sound}
-            onChange={(event) => setSound(event.target.value as Sound)}
-          >
-            <option value="both">Call and microphone</option>
-            <option value="system">Call</option>
-            <option value="microphone">Microphone</option>
-          </select>
-        )}
-        <Button
-          size="sm"
-          variant={pinned ? "secondary" : "ghost"}
-          aria-pressed={pinned}
-          onClick={() => onPinnedChange(!pinned)}
-        >
-          {PIN_LABEL}
-        </Button>
-        <Button
-          size="sm"
-          variant={follow ? "secondary" : "ghost"}
-          aria-pressed={follow}
-          onClick={() => onFollowChange(!follow)}
-        >
-          {FOLLOW_LABEL}
-        </Button>
+        <div className="ml-auto flex items-center gap-1">
+          {choosePicture && (
+            <ChoiceGroup
+              label={PICTURE_LABEL}
+              value={picture}
+              choices={PICTURE_CHOICES}
+              onChange={setPicture}
+            />
+          )}
+          {chooseSound && (
+            <ChoiceGroup
+              label={SOUND_LABEL}
+              value={sound}
+              choices={SOUND_CHOICES}
+              onChange={setSound}
+            />
+          )}
+          <IconHint label={PIN_LABEL}>
+            <Toggle aria-label={PIN_LABEL} pressed={pinned} onPressedChange={onPinnedChange}>
+              {pinned ? <Pin aria-hidden="true" /> : <PinOff aria-hidden="true" />}
+            </Toggle>
+          </IconHint>
+          <IconHint label={FOLLOW_LABEL}>
+            <Toggle aria-label={FOLLOW_LABEL} pressed={follow} onPressedChange={onFollowChange}>
+              <Crosshair aria-hidden="true" />
+            </Toggle>
+          </IconHint>
+        </div>
       </div>
       <p className="min-w-0 break-words text-muted-foreground text-xs">
         {parts.length > 1 && `Part ${index + 1} of ${parts.length} · `}

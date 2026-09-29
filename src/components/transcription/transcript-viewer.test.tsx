@@ -2,10 +2,20 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { StrictMode } from "react";
 import { beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import {
+  BACK_LABEL,
+  FRAME_PRIME_SECONDS,
+  SCRUB_LABEL,
+} from "@/components/notes/editor/recording-transport";
+import {
+  TRANSCRIBE_AGAIN_BODY,
+  TRANSCRIBE_AGAIN_LABEL,
+} from "@/components/transcription/transcribe-again";
+import {
   TranscriptFileViewer,
   TranscriptViewer,
   voicesDriveFor,
 } from "@/components/transcription/transcript-viewer";
+import { TranscriptionJob } from "@/components/transcription/transcription-job";
 import * as ipc from "@/lib/ipc/client";
 import { transcriptionStore } from "@/lib/stores/transcription";
 import { resolveViewer } from "@/lib/viewers/registry";
@@ -24,6 +34,8 @@ vi.mock("@/lib/ipc/client", () => ({
   transcriptInsertUtterance: vi.fn(),
   dictionaryAcceptSuggestion: vi.fn(),
   transcriptionStatus: vi.fn(),
+  transcriptionStart: vi.fn(),
+  transcriptionCancel: vi.fn(),
 }));
 vi.mock("@/components/viewers/text-file-viewer", () => ({
   TextFileViewer: ({ entry }: { entry: { format: string } }) => <p>Text viewer: {entry.format}</p>,
@@ -53,6 +65,7 @@ beforeEach(() => {
     hasCamera: false,
     hasScreen: false,
   });
+  vi.mocked(ipc.transcriptionStart).mockResolvedValue("job");
   vi.mocked(ipc.transcriptionStatus).mockResolvedValue({
     available: true,
     reason: null,
@@ -70,6 +83,33 @@ beforeEach(() => {
     ],
   });
 });
+/** The line a ⋯ belongs to. */
+const row = (id: string) =>
+  screen.getByRole("button", { name: `Line actions ${id}` }).closest("li") as HTMLElement;
+/** Open a menu from the keyboard, the way every menu here must be reachable. */
+async function openMenu(trigger: HTMLElement): Promise<HTMLElement> {
+  fireEvent.keyDown(trigger, { key: "Enter" });
+  return screen.findByRole("menu");
+}
+async function lineMenu(id: string): Promise<HTMLElement> {
+  return openMenu(await screen.findByRole("button", { name: `Line actions ${id}` }));
+}
+async function lineAction(id: string, item: string): Promise<void> {
+  fireEvent.click(within(await lineMenu(id)).getByRole("menuitem", { name: item }));
+}
+/** A submenu of `menu`, opened with the arrow key. */
+async function submenu(menu: HTMLElement, name: string): Promise<HTMLElement> {
+  fireEvent.keyDown(within(menu).getByRole("menuitem", { name }), { key: "ArrowRight" });
+  await waitFor(() => expect(screen.getAllByRole("menu")).toHaveLength(2));
+  return screen.getAllByRole("menu")[1];
+}
+/** The line's "Change speaker" choices. */
+async function speakerChoices(id: string): Promise<HTMLElement> {
+  return submenu(await lineMenu(id), "Change speaker");
+}
+async function chipMenu(name: string): Promise<HTMLElement> {
+  return openMenu(await screen.findByRole("button", { name: new RegExp(`^${name},`) }));
+}
 describe("Transcript corrections", () => {
   it("preserves the recognised words, saves an edit on Enter and remembers only an accepted suggestion", async () => {
     const corrected = structuredClone(TRANSCRIPT_FIXTURE);
@@ -83,16 +123,15 @@ describe("Transcript corrections", () => {
       { id: "term", text: "Kowalski", aliases: ["Kowalsky"] },
     ]);
     render(<TranscriptViewer path={path} profileId="drive" />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Edit u1:/ }));
-    fireEvent.change(screen.getByRole("textbox", { name: "Edit u1" }), {
-      target: { value: "Kowalski will join us today." },
-    });
-    fireEvent.keyDown(screen.getByRole("textbox", { name: "Edit u1" }), { key: "Enter" });
+    await lineAction("u1", "Edit text");
+    const field = screen.getByRole("textbox", { name: "Edit u1" });
+    // Edit text lands the reader in the field, not back on the ⋯.
+    await waitFor(() => expect(field).toHaveFocus());
+    fireEvent.change(field, { target: { value: "Kowalski will join us today." } });
+    fireEvent.keyDown(field, { key: "Enter" });
     await screen.findByRole("button", { name: "Accept" });
-    expect(
-      screen.getByRole("button", { name: "Edit u1: Kowalski will join us today." }),
-    ).toBeVisible();
-    expect(screen.getByText("Kowalsky will join us today.")).toBeInTheDocument();
+    expect(within(row("u1")).getByText("Kowalski will join us today.")).toBeVisible();
+    expect(within(row("u1")).getByText("Kowalsky will join us today.")).toBeInTheDocument();
     expect(ipc.dictionaryAcceptSuggestion).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     await waitFor(() =>
@@ -110,53 +149,75 @@ describe("Transcript corrections", () => {
   });
   it("cancels a draft without persisting it", async () => {
     render(<TranscriptViewer path={path} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Edit u1:/ }));
+    await lineAction("u1", "Edit text");
     fireEvent.change(screen.getByRole("textbox", { name: "Edit u1" }), {
       target: { value: "Not saved" },
     });
     fireEvent.keyDown(screen.getByRole("textbox", { name: "Edit u1" }), { key: "Escape" });
-    expect(
-      screen.getByRole("button", { name: "Edit u1: Kowalsky will join us today." }),
-    ).toBeVisible();
+    expect(within(row("u1")).getByText("Kowalsky will join us today.")).toBeVisible();
+    expect(screen.queryByRole("textbox", { name: "Edit u1" })).toBeNull();
     expect(ipc.transcriptEditUtterance).not.toHaveBeenCalled();
+  });
+  it("reaches every line action from the keyboard, with the ⋯ in the tab order", async () => {
+    vi.mocked(ipc.transcriptMedia).mockResolvedValue({
+      hasCamera: false,
+      hasScreen: false,
+      parts: [{ ...SESSION_MEDIA.parts[0], file: "memo.m4a", camera: null, audioTracks: [] }],
+    });
+    render(<TranscriptViewer path={path} />);
+    await screen.findByLabelText("memo.m4a");
+    const trigger = screen.getByRole("button", { name: "Line actions u2" });
+    expect(trigger).not.toHaveAttribute("tabindex", "-1");
+    const menu = await openMenu(trigger);
+    expect(
+      within(menu)
+        .getAllByRole("menuitem")
+        .map((item) => item.textContent),
+    ).toEqual(["Play from here", "Edit text", "Change speaker", "Split…", "Add a line after"]);
   });
   it.each([
     false,
     true,
   ])("confirms an existing or newly named person in the returned transcript (new=%s)", async (create) => {
     const assigned = structuredClone(TRANSCRIPT_FIXTURE);
+    const name = create ? "Jo" : "Anna Kowalski";
     assigned.transcript.speakers[1] = {
       ...assigned.transcript.speakers[1],
-      name: create ? "Jo" : "Anna Kowalski",
+      name,
       status: "confirmed",
     };
     vi.mocked(ipc.transcriptAssignSpeaker).mockResolvedValue(assigned);
     render(<TranscriptViewer path={path} />);
-    const select = await screen.findByRole("combobox", { name: "This is… S1" });
-    fireEvent.change(select, { target: { value: create ? "new" : "p-anna" } });
+    const people = await submenu(await chipMenu("Speaker 1"), "This is…");
     if (create) {
+      fireEvent.click(within(people).getByRole("menuitem", { name: "New person…" }));
       fireEvent.change(screen.getByRole("textbox", { name: "New person name" }), {
         target: { value: "Jo" },
       });
       fireEvent.click(screen.getByRole("button", { name: "Create person" }));
+    } else {
+      // The candidate comes first, with the score it was suggested at.
+      const first = within(people).getAllByRole("menuitem")[0];
+      expect(first).toHaveTextContent("Anna Kowalskisuggested 0.63");
+      fireEvent.click(first);
     }
-    expect(await screen.findByText("Confirmed")).toBeVisible();
+    expect(
+      await screen.findByRole("button", { name: `${name}, Confirmed, 1 line` }),
+    ).toBeInTheDocument();
     expect(ipc.transcriptAssignSpeaker).toHaveBeenCalledWith(
       path,
       "S1",
       create ? null : "p-anna",
       create ? "Jo" : null,
     );
-    expect(screen.getByRole("combobox", { name: "Speaker for u2" })).toHaveDisplayValue(
-      create ? "Jo" : "Anna Kowalski",
-    );
+    expect(within(row("u2")).getByText(name)).toBeInTheDocument();
   });
   it("keeps a refused correction editable with the shell's sentence", async () => {
     vi.mocked(ipc.transcriptEditUtterance).mockRejectedValue(
       new Error("This transcript is read-only."),
     );
     render(<TranscriptViewer path={path} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Edit u1:/ }));
+    await lineAction("u1", "Edit text");
     fireEvent.change(screen.getByRole("textbox", { name: "Edit u1" }), {
       target: { value: "My correction" },
     });
@@ -185,10 +246,10 @@ describe("Transcript corrections", () => {
   });
   it("hides a speaker with no lines from the legend but offers it as a reassign target", async () => {
     render(<TranscriptViewer path={path} />);
-    await screen.findByRole("combobox", { name: "This is… S1" });
-    expect(screen.queryByRole("combobox", { name: "This is… S2" })).toBeNull();
-    const reassign = screen.getByRole("combobox", { name: "Speaker for u2" });
-    expect(within(reassign).getByRole("option", { name: "Speaker 2" })).toBeInTheDocument();
+    await screen.findByRole("button", { name: /^Speaker 1,/ });
+    expect(screen.queryByRole("button", { name: /^Speaker 2,/ })).toBeNull();
+    const choices = await speakerChoices("u2");
+    expect(within(choices).getByRole("menuitemradio", { name: "Speaker 2" })).toBeInTheDocument();
   });
   it("shows Rust's sentence when a line cannot cross between microphone and call", async () => {
     const sentence =
@@ -198,17 +259,24 @@ describe("Transcript corrections", () => {
       message: sentence,
     });
     render(<TranscriptViewer path={path} />);
-    const reassign = await screen.findByRole("combobox", { name: "Speaker for u1" });
-    fireEvent.change(reassign, { target: { value: "S2" } });
+    const choices = await speakerChoices("u1");
+    expect(within(choices).getByRole("menuitemradio", { name: "Alex" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.click(within(choices).getByRole("menuitemradio", { name: "Speaker 2" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(sentence);
-    expect(reassign).toHaveDisplayValue("Alex");
+    expect(ipc.transcriptReassignUtterance).toHaveBeenCalledWith(path, "u1", "S2");
+    expect(within(row("u1")).getByText("Alex")).toBeInTheDocument();
   });
   it("cancels a label without saving it", async () => {
     render(<TranscriptViewer path={path} />);
-    fireEvent.click((await screen.findAllByRole("button", { name: "Rename label" }))[1]);
-    fireEvent.change(screen.getByRole("textbox", { name: "Speaker label" }), {
-      target: { value: "Should not be saved" },
-    });
+    fireEvent.click(
+      within(await chipMenu("Speaker 1")).getByRole("menuitem", { name: "Rename label…" }),
+    );
+    const field = screen.getByRole("textbox", { name: "Speaker label" });
+    expect(field).toHaveValue("Speaker 1");
+    fireEvent.change(field, { target: { value: "Should not be saved" } });
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("textbox", { name: "Speaker label" })).toBeNull();
     expect(ipc.transcriptRenameSpeaker).not.toHaveBeenCalled();
@@ -220,9 +288,8 @@ describe("Transcript corrections", () => {
     vi.mocked(ipc.transcriptAssignSpeaker).mockResolvedValue(assigned);
     render(<TranscriptViewer path={path} />);
     await waitFor(() => expect(transcriptionStore.getState().status).not.toBeNull());
-    fireEvent.change(await screen.findByRole("combobox", { name: "This is… S1" }), {
-      target: { value: "new" },
-    });
+    const people = await submenu(await chipMenu("Speaker 1"), "This is…");
+    fireEvent.click(within(people).getByRole("menuitem", { name: "New person…" }));
     fireEvent.change(screen.getByRole("textbox", { name: "New person name" }), {
       target: { value: "Jo" },
     });
@@ -243,21 +310,25 @@ describe("Transcript corrections", () => {
     u2.words = u2.words.slice(0, 3);
     vi.mocked(ipc.transcriptSplitUtterance).mockResolvedValue(split);
     render(<TranscriptViewer path={path} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Split… u2" }));
+    await lineAction("u2", "Split…");
     // The first word cannot start the new line: nothing would be left on this one.
     expect(
       screen.getByRole("button", { name: "Start the new line at word 1, Let’s" }),
     ).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Start the new line at word 4, keeper" }));
-    expect(
-      await screen.findByRole("button", { name: "Edit u4: keeper release and the dictionary." }),
-    ).toBeVisible();
+    expect(await screen.findByRole("button", { name: "Line actions u4" })).toBeInTheDocument();
     expect(ipc.transcriptSplitUtterance).toHaveBeenCalledWith(path, "u2", 3);
-    expect(screen.getByRole("button", { name: "Edit u2: Let’s review the" })).toBeVisible();
+    expect(within(row("u2")).getByText("Let’s review the")).toBeVisible();
+    expect(within(row("u4")).getByText("keeper release and the dictionary.")).toBeVisible();
     const lines = within(screen.getByRole("list", { name: "Utterances" }))
-      .getAllByRole("button", { name: /^Edit u\d+:/ })
-      .map((line) => line.getAttribute("aria-label")?.split(":")[0]);
-    expect(lines).toEqual(["Edit u1", "Edit u2", "Edit u4", "Edit u3"]);
+      .getAllByRole("button", { name: /^Line actions u\d+$/ })
+      .map((line) => line.getAttribute("aria-label"));
+    expect(lines).toEqual([
+      "Line actions u1",
+      "Line actions u2",
+      "Line actions u4",
+      "Line actions u3",
+    ]);
     expect(screen.queryByRole("button", { name: /^Start the new line/ })).toBeNull();
   });
   it("keeps the split open with Rust's sentence when it is refused", async () => {
@@ -266,7 +337,7 @@ describe("Transcript corrections", () => {
       message: "A line splits between two of its words.",
     });
     render(<TranscriptViewer path={path} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Split… u1" }));
+    await lineAction("u1", "Split…");
     fireEvent.click(screen.getByRole("button", { name: "Start the new line at word 2, will" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "A line splits between two of its words.",
@@ -281,9 +352,16 @@ describe("Transcript corrections", () => {
     typed.transcript.utterances[1].words = typed.transcript.utterances[1].words.slice(0, 1);
     vi.mocked(ipc.transcriptRead).mockResolvedValue(typed);
     render(<TranscriptViewer path={path} />);
-    await screen.findByRole("button", { name: "Split… u3" });
-    expect(screen.queryByRole("button", { name: "Split… u1" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Split… u2" })).toBeNull();
+    for (const [id, offered] of [
+      ["u1", false],
+      ["u2", false],
+      ["u3", true],
+    ] as const) {
+      const menu = await lineMenu(id);
+      expect(within(menu).queryByRole("menuitem", { name: "Split…" }) !== null).toBe(offered);
+      fireEvent.keyDown(menu, { key: "Escape" });
+      await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    }
   });
   it("adds a typed line after another for the chosen speaker", async () => {
     const inserted = structuredClone(TRANSCRIPT_FIXTURE);
@@ -300,30 +378,31 @@ describe("Transcript corrections", () => {
     });
     vi.mocked(ipc.transcriptInsertUtterance).mockResolvedValue(inserted);
     render(<TranscriptViewer path={path} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Add a line after u1" }));
+    await lineAction("u1", "Add a line after");
     const speaker = screen.getByRole("combobox", { name: "Speaker for the line after u1" });
     // It starts on the line's own speaker, and every speaker is offered.
-    expect(speaker).toHaveDisplayValue("Alex");
-    expect(within(speaker).getAllByRole("option")).toHaveLength(3);
+    expect(speaker).toHaveTextContent("Alex");
     const text = screen.getByRole("textbox", { name: "Text of the line after u1" });
     fireEvent.change(text, { target: { value: "   " } });
     expect(screen.getByRole("button", { name: "Add line" })).toBeDisabled();
-    fireEvent.change(speaker, { target: { value: "S1" } });
+    fireEvent.keyDown(speaker, { key: "Enter" });
+    const options = await screen.findAllByRole("option");
+    expect(options.map((o) => o.textContent)).toEqual(["Alex", "Speaker 1", "Speaker 2"]);
+    fireEvent.click(options[1]);
+    await waitFor(() => expect(speaker).toHaveTextContent("Speaker 1"));
     fireEvent.change(text, { target: { value: "Sounds good." } });
     fireEvent.click(screen.getByRole("button", { name: "Add line" }));
-    expect(await screen.findByRole("button", { name: "Edit u4: Sounds good." })).toBeVisible();
+    expect(await screen.findByRole("button", { name: "Line actions u4" })).toBeInTheDocument();
     expect(ipc.transcriptInsertUtterance).toHaveBeenCalledWith(path, "u1", "S1", "Sounds good.");
-    expect(screen.getByRole("combobox", { name: "Speaker for u4" })).toHaveDisplayValue(
-      "Speaker 1",
-    );
+    expect(within(row("u4")).getByText("Speaker 1")).toBeInTheDocument();
     expect(screen.queryByRole("textbox", { name: "Text of the line after u1" })).toBeNull();
     // A typed line has no recognised text to reveal.
-    expect(screen.getByText("Added by hand")).toBeVisible();
+    expect(within(row("u4")).getByText("Added by hand")).toBeVisible();
     expect(screen.queryByText("Edited · Recognised text")).toBeNull();
   });
   it("cancels an added line without saving it", async () => {
     render(<TranscriptViewer path={path} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Add a line after u3" }));
+    await lineAction("u3", "Add a line after");
     fireEvent.change(screen.getByRole("textbox", { name: "Text of the line after u3" }), {
       target: { value: "Not saved" },
     });
@@ -346,9 +425,12 @@ describe("Speakers", () => {
     vi.mocked(ipc.transcriptAddSpeaker).mockResolvedValue(added);
     render(<TranscriptViewer path={path} />);
     fireEvent.click(await screen.findByRole("button", { name: "Add speaker" }));
-    fireEvent.change(screen.getByRole("combobox", { name: "Heard on" }), {
-      target: { value: "microphone" },
-    });
+    const heard = screen.getByRole("radiogroup", { name: "Heard on" });
+    fireEvent.click(within(heard).getByRole("radio", { name: "Microphone" }));
+    expect(within(heard).getByRole("radio", { name: "Microphone" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     fireEvent.change(screen.getByRole("textbox", { name: "New speaker label" }), {
       target: { value: "  Guest " },
     });
@@ -356,8 +438,8 @@ describe("Speakers", () => {
     expect(await screen.findByRole("status")).toHaveTextContent("Guest added.");
     expect(ipc.transcriptAddSpeaker).toHaveBeenCalledWith(path, "microphone", "Guest");
     expect(screen.queryByRole("form", { name: "Add speaker" })).toBeNull();
-    const reassign = screen.getByRole("combobox", { name: "Speaker for u1" });
-    expect(within(reassign).getByRole("option", { name: "Guest" })).toBeInTheDocument();
+    const choices = await speakerChoices("u1");
+    expect(within(choices).getByRole("menuitemradio", { name: "Guest" })).toBeInTheDocument();
   });
   it("asks for no track when the transcript heard only one, and keeps a refused entry", async () => {
     const mixed = structuredClone(TRANSCRIPT_FIXTURE);
@@ -370,7 +452,7 @@ describe("Speakers", () => {
     });
     render(<TranscriptViewer path={path} />);
     fireEvent.click(await screen.findByRole("button", { name: "Add speaker" }));
-    expect(screen.queryByRole("combobox", { name: "Heard on" })).toBeNull();
+    expect(screen.queryByRole("radiogroup", { name: "Heard on" })).toBeNull();
     fireEvent.change(screen.getByRole("textbox", { name: "New speaker label" }), {
       target: { value: "Guest" },
     });
@@ -389,12 +471,21 @@ describe("Speakers", () => {
     twice.transcript.speakers.push({ ...s2, id: "S4", personId: "p-jo", name: "Jo" });
     vi.mocked(ipc.transcriptRead).mockResolvedValue(twice);
     render(<TranscriptViewer path={path} />);
-    const reassign = await screen.findByRole("combobox", { name: "Speaker for u2" });
+    const choices = await speakerChoices("u2");
     expect(
-      within(reassign)
-        .getAllByRole("option")
+      within(choices)
+        .getAllByRole("menuitemradio")
         .map((o) => o.textContent),
     ).toEqual(["Alex", "Anna Kowalski", "Speaker 3", "Jo"]);
+  });
+  it("counts each speaker's lines on its chip, with its status in the name", async () => {
+    render(<TranscriptViewer path={path} />);
+    const legend = await screen.findByRole("list", { name: "Speakers" });
+    expect(
+      within(legend)
+        .getAllByRole("button", { name: /lines?$/ })
+        .map((chip) => chip.getAttribute("aria-label")),
+    ).toEqual(["Alex, You, 2 lines", "Speaker 1, Suggested, 1 line"]);
   });
 });
 describe("Source", () => {
@@ -410,6 +501,96 @@ describe("Source", () => {
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Transcript" }));
     fireEvent.click(screen.getByRole("tab", { name: "Transcript" }));
     expect(await screen.findByRole("list", { name: "Utterances" })).toBeInTheDocument();
+  });
+});
+describe("Transcribe again", () => {
+  it("asks first, then replaces the transcript from its source and reads the new one", async () => {
+    let progress: ((p: ipc.TranscriptionProgressVm) => void) | undefined;
+    vi.mocked(ipc.transcriptionStart).mockImplementation((_path, onProgress) => {
+      progress = onProgress;
+      return Promise.resolve("job");
+    });
+    render(<TranscriptViewer path={path} />);
+    const redo = await screen.findByRole("button", { name: `${TRANSCRIBE_AGAIN_LABEL}…` });
+    fireEvent.click(redo);
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog).toHaveTextContent(TRANSCRIBE_AGAIN_BODY);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(ipc.transcriptionStart).not.toHaveBeenCalled();
+
+    fireEvent.click(redo);
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: TRANSCRIBE_AGAIN_LABEL,
+      }),
+    );
+    await waitFor(() =>
+      expect(ipc.transcriptionStart).toHaveBeenCalledWith(
+        TRANSCRIPT_FIXTURE.sourcePath,
+        expect.any(Function),
+        true,
+      ),
+    );
+    const reads = vi.mocked(ipc.transcriptRead).mock.calls.length;
+    await act(async () =>
+      progress?.({
+        jobId: "job",
+        phase: "done",
+        part: 1,
+        parts: 1,
+        message: null,
+        transcriptPath: path,
+        fraction: 1,
+        elapsedMs: 1_000,
+        replaceable: false,
+      }),
+    );
+    await waitFor(() =>
+      expect(vi.mocked(ipc.transcriptRead).mock.calls.length).toBeGreaterThan(reads),
+    );
+  });
+  it("is not offered where the transcript's source is gone", async () => {
+    vi.mocked(ipc.transcriptRead).mockResolvedValue({
+      ...structuredClone(TRANSCRIPT_FIXTURE),
+      sourcePath: null,
+    });
+    render(<TranscriptViewer path={path} />);
+    await screen.findByRole("list", { name: "Utterances" });
+    await waitFor(() => expect(transcriptionStore.getState().status).not.toBeNull());
+    expect(screen.queryByRole("button", { name: `${TRANSCRIBE_AGAIN_LABEL}…` })).toBeNull();
+  });
+  it("turns the strip's Try again into Transcribe again… when a corrected transcript is in the way", async () => {
+    const media = "/Volumes/merope/tgdrive/meeting.mov";
+    const failed = (replaceable: boolean): ipc.TranscriptionProgressVm => ({
+      jobId: "job",
+      phase: "failed",
+      part: 0,
+      parts: 0,
+      message: "This transcript has corrections in it.",
+      transcriptPath: null,
+      fraction: null,
+      elapsedMs: 0,
+      replaceable,
+    });
+    transcriptionStore.setState({ jobs: { [media]: failed(false) } });
+    const { unmount } = render(<TranscriptionJob path={media} onOpen={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: `${TRANSCRIBE_AGAIN_LABEL}…` })).toBeNull();
+    unmount();
+
+    transcriptionStore.setState({ jobs: { [media]: failed(true) } });
+    render(<TranscriptionJob path={media} onOpen={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: `${TRANSCRIBE_AGAIN_LABEL}…` }));
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: TRANSCRIBE_AGAIN_LABEL,
+      }),
+    );
+    await waitFor(() =>
+      expect(ipc.transcriptionStart).toHaveBeenCalledWith(media, expect.any(Function), true),
+    );
   });
 });
 /** A two-part session with a camera beside each screen segment and two sound tracks. */
@@ -429,8 +610,6 @@ const SESSION_MEDIA: ipc.TranscriptMediaVm = {
   })),
 };
 const sessionPath = SESSION_TRANSCRIPT_FIXTURE.path;
-const row = (id: string) =>
-  screen.getByRole("button", { name: new RegExp(`^Edit ${id}:`) }).closest("li");
 const partLine = (text: string) =>
   screen.getByText((_, element) => element?.tagName === "P" && element.textContent === text);
 describe("Player", () => {
@@ -449,14 +628,41 @@ describe("Player", () => {
     fireEvent.timeUpdate(main);
     expect(row("u2")).toHaveAttribute("aria-current", "true");
     expect(row("u1")).not.toHaveAttribute("aria-current");
-    fireEvent.click(screen.getByRole("button", { name: "Follow the transcript" }));
+    const follow = screen.getByRole("button", { name: "Follow the transcript" });
+    expect(follow).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(follow);
+    expect(follow).toHaveAttribute("aria-pressed", "false");
     expect(row("u2")).not.toHaveAttribute("aria-current");
+  });
+  it("takes the transcript to the line under the scrub while it is dragged, even after the reader scrolled away", async () => {
+    render(<TranscriptViewer path={sessionPath} />);
+    await screen.findByLabelText("screen-0000.mov");
+    const box = screen.getByRole("list", { name: "Utterances" }).parentElement as HTMLElement;
+    const scrolled = vi.fn();
+    Object.defineProperty(box, "scrollTop", { configurable: true, get: () => 0, set: scrolled });
+    // jsdom lays nothing out: a viewport two lines tall, so the later lines are off-screen.
+    Object.defineProperty(box, "clientHeight", { configurable: true, get: () => 150 });
+    fireEvent.scroll(box);
+    // The reader's own scroll pauses following…
+    fireEvent.wheel(box);
+    // …and a drag of the scrub is a seek, which takes it back: `input`, not a release.
+    fireEvent.input(screen.getByRole("slider", { name: SCRUB_LABEL }), {
+      target: { value: "30" },
+    });
+    expect(row("u5")).toHaveAttribute("aria-current", "true");
+    expect(scrolled).toHaveBeenCalled();
+    expect(scrolled.mock.lastCall?.[0]).toBeGreaterThan(0);
+    // Back 10 seconds moves it too.
+    scrolled.mockClear();
+    fireEvent.wheel(box);
+    fireEvent.click(screen.getByRole("button", { name: BACK_LABEL }));
+    expect(row("u3")).toHaveAttribute("aria-current", "true");
   });
   it("plays from a line in the next part: that part loads and starts at the line", async () => {
     render(<TranscriptViewer path={sessionPath} />);
     const first = (await screen.findByLabelText("screen-0000.mov")) as HTMLMediaElement;
     expect(partLine("Part 1 of 2 · screen-0000.mov")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Play from here u4" }));
+    await lineAction("u4", "Play from here");
     expect(partLine("Part 2 of 2 · screen-0001.mov")).toBeInTheDocument();
     // The first part's file is let go, not left decoding behind the second.
     expect(first).not.toHaveAttribute("src");
@@ -472,18 +678,59 @@ describe("Player", () => {
     fireEvent.ended(first);
     const second = screen.getByLabelText("screen-0001.mov") as HTMLMediaElement;
     fireEvent.loadedMetadata(second);
-    expect(second.currentTime).toBe(0);
+    // At its start: the frame prime's millisecond is the only move it gets.
+    expect(second.currentTime).toBeLessThanOrEqual(FRAME_PRIME_SECONDS);
     expect(play.mock.contexts).toContain(second);
     expect(partLine("Part 2 of 2 · screen-0001.mov")).toBeInTheDocument();
   });
-  it("offers the picture and sound choices only when there are two of each", async () => {
+  it("asks every unplayed video for its first frame, and never moves one that was placed", async () => {
+    render(<TranscriptViewer path={sessionPath} />);
+    const screenVideo = (await screen.findByLabelText("screen-0000.mov")) as HTMLVideoElement;
+    const camera = screen.getByLabelText("camera-0000.mov") as HTMLVideoElement;
+    fireEvent.loadedMetadata(screenVideo);
+    fireEvent.loadedMetadata(camera);
+    expect(screenVideo.currentTime).toBe(FRAME_PRIME_SECONDS);
+    expect(camera.currentTime).toBe(FRAME_PRIME_SECONDS);
+    // A part loaded for a seek lands where it was sent, not a millisecond in.
+    await lineAction("u5", "Play from here");
+    const second = screen.getByLabelText("screen-0001.mov") as HTMLVideoElement;
+    fireEvent.loadedMetadata(second);
+    expect(second.currentTime).toBeCloseTo(7);
+  });
+  it("offers the picture and sound choices as icon groups only when there are two of each", async () => {
     const { unmount } = render(<TranscriptViewer path={sessionPath} />);
-    expect(await screen.findByRole("combobox", { name: "Picture" })).toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: "Sound" })).toBeInTheDocument();
-    fireEvent.change(screen.getByRole("combobox", { name: "Picture" }), {
-      target: { value: "screen" },
-    });
+    const picture = await screen.findByRole("radiogroup", { name: "Picture" });
+    const sound = screen.getByRole("radiogroup", { name: "Sound" });
+    expect(
+      within(picture)
+        .getAllByRole("radio")
+        .map((r) => [r.getAttribute("aria-label"), r.getAttribute("aria-checked")]),
+    ).toEqual([
+      ["Screen", "false"],
+      ["Camera", "false"],
+      ["Screen and camera", "true"],
+    ]);
+    expect(
+      within(sound)
+        .getAllByRole("radio")
+        .map((r) => r.getAttribute("aria-label")),
+    ).toEqual(["Call", "Microphone", "Call and microphone"]);
+    fireEvent.click(within(picture).getByRole("radio", { name: "Screen" }));
+    expect(within(picture).getByRole("radio", { name: "Screen" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     expect(screen.queryByLabelText("camera-0000.mov")).toBeNull();
+    // Choosing the segment already chosen keeps it rather than clearing the group.
+    fireEvent.click(within(picture).getByRole("radio", { name: "Screen" }));
+    expect(within(picture).getByRole("radio", { name: "Screen" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    const pin = screen.getByRole("button", { name: "Keep the player on top" });
+    expect(pin).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(pin);
+    expect(pin).toHaveAttribute("aria-pressed", "false");
     unmount();
     vi.mocked(ipc.transcriptRead).mockResolvedValue(structuredClone(TRANSCRIPT_FIXTURE));
     vi.mocked(ipc.transcriptMedia).mockResolvedValue({
@@ -493,8 +740,8 @@ describe("Player", () => {
     });
     render(<TranscriptViewer path={path} />);
     expect(await screen.findByLabelText("memo.m4a")).toBeInTheDocument();
-    expect(screen.queryByRole("combobox", { name: "Picture" })).toBeNull();
-    expect(screen.queryByRole("combobox", { name: "Sound" })).toBeNull();
+    expect(screen.queryByRole("radiogroup", { name: "Picture" })).toBeNull();
+    expect(screen.queryByRole("radiogroup", { name: "Sound" })).toBeNull();
     expect(partLine("memo.m4a")).toBeInTheDocument();
   });
   it("still has its files after Strict Mode hands the elements back", async () => {
@@ -514,7 +761,7 @@ describe("Player", () => {
   });
   it("keeps its place while the reader looks at the Source", async () => {
     render(<TranscriptViewer path={sessionPath} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Play from here u4" }));
+    await lineAction("u4", "Play from here");
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Source" }));
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Transcript" }));
     expect(partLine("Part 2 of 2 · screen-0001.mov")).toBeInTheDocument();

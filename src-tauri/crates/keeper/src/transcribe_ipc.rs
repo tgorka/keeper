@@ -60,9 +60,9 @@ use keeper_core::transcription::vm::{
 use keeper_core::transcription::{
     add_speaker, assemble, assign_speaker, edit_utterance, insert_utterance_after, merge_speakers,
     plan_for_file, plan_for_session, reassign_utterance, rename_speaker_label, split_utterance,
-    wav_bytes, wav_samples, AsrOutput, AssembleContext, AudioTrackInfo, Bank, BankError, BankPlan,
-    DiarOutput, EngineError, EngineStamp, EngineUnavailable, ModelSet, Naming, PartResult,
-    PartTrack, Person, SampleSource, SourceKind, SourcePart, SpeechEngine, TrackOrigin,
+    transcript_source, wav_bytes, wav_samples, AsrOutput, AssembleContext, AudioTrackInfo, Bank,
+    BankError, BankPlan, DiarOutput, EngineError, EngineStamp, EngineUnavailable, ModelSet, Naming,
+    PartResult, PartTrack, Person, SampleSource, SourceKind, SourcePart, SpeechEngine, TrackOrigin,
     TrackSelect, Transcript, TranscriptSource, TranscriptionLanguage, TranscriptionPlan,
     VoiceSample,
 };
@@ -567,6 +567,9 @@ struct Job {
     target: PathBuf,
     /// `None` for an automatic job: its progress is logged only.
     channel: Option<Channel<TranscriptionProgressVm>>,
+    /// The person asked to replace the transcript, corrections and all: the
+    /// job writes over it instead of refusing (see [`write_fresh_transcript`]).
+    replace: bool,
     cancel: Arc<AtomicBool>,
     platform: Arc<dyn Platform>,
     progress: Mutex<Progress>,
@@ -663,6 +666,7 @@ fn enqueue(
     platform: Arc<dyn Platform>,
     target: PathBuf,
     channel: Option<Channel<TranscriptionProgressVm>>,
+    replace: bool,
 ) -> Result<String, String> {
     let jobs = &*JOBS;
     let id = format!(
@@ -675,6 +679,7 @@ fn enqueue(
         id: id.clone(),
         target,
         channel,
+        replace,
         cancel,
         platform,
         progress: Mutex::new(Progress::new()),
@@ -691,6 +696,9 @@ fn enqueue(
 enum Stop {
     Cancelled,
     Failed(String),
+    /// The transcript already there is one keeper will not overwrite on its
+    /// own — corrected, or unreadable. A `replace` job gets past it.
+    Kept(String),
 }
 
 impl From<String> for Stop {
@@ -728,6 +736,19 @@ impl Job {
         message: Option<String>,
         transcript_path: Option<String>,
     ) {
+        let batch = self.batch(phase, part, parts, message, transcript_path);
+        self.send(batch);
+    }
+
+    /// The batch [`Job::report`] sends, logged and counted in the progress.
+    fn batch(
+        &self,
+        phase: TranscriptionPhase,
+        part: u32,
+        parts: u32,
+        message: Option<String>,
+        transcript_path: Option<String>,
+    ) -> TranscriptionProgressVm {
         tracing::info!(
             job = %self.id,
             target = %self.target.display(),
@@ -749,7 +770,7 @@ impl Job {
             }
             (progress.fraction(), progress.elapsed_ms())
         };
-        self.send(TranscriptionProgressVm {
+        TranscriptionProgressVm {
             job_id: self.id.clone(),
             phase,
             part,
@@ -758,7 +779,8 @@ impl Job {
             transcript_path,
             fraction,
             elapsed_ms,
-        });
+            replaceable: false,
+        }
     }
 
     /// The batch between two steps: where the job is, and how far that is by
@@ -775,6 +797,7 @@ impl Job {
                 transcript_path: None,
                 fraction: progress.fraction(),
                 elapsed_ms: progress.elapsed_ms(),
+                replaceable: false,
             }
         };
         self.send(batch);
@@ -843,6 +866,12 @@ fn run_job(job: &Job) {
             tracing::warn!(job = %job.id, %sentence, "transcription: the job failed");
             job.report(TranscriptionPhase::Failed, 0, 0, Some(sentence), None);
         }
+        Err(Stop::Kept(sentence)) => {
+            tracing::info!(job = %job.id, %sentence, "transcription: the transcript was kept");
+            let mut batch = job.batch(TranscriptionPhase::Failed, 0, 0, Some(sentence), None);
+            batch.replaceable = true;
+            job.send(batch);
+        }
     }
 }
 
@@ -858,15 +887,15 @@ fn refuse_overwrite(out_json: &Path) -> Result<(), Stop> {
         return Ok(());
     }
     let existing = read_transcript(out_json).map_err(|error| {
-        Stop::Failed(format!(
-            "{error} keeper will not overwrite a transcript it cannot read. Delete or rename \
-             the transcript to transcribe again."
+        Stop::Kept(format!(
+            "{error} keeper will not overwrite a transcript it cannot read on its own. \
+             Transcribe again to replace it."
         ))
     })?;
     if existing.is_corrected() {
-        return Err(Stop::Failed(
-            "This transcript has corrections in it, so keeper will not overwrite it. Delete or \
-             rename the transcript to transcribe again."
+        return Err(Stop::Kept(
+            "This transcript has corrections in it, so keeper will not overwrite it on its own. \
+             Transcribe again to replace it."
                 .to_owned(),
         ));
     }
@@ -935,7 +964,9 @@ fn transcribe(job: &Job) -> Result<PathBuf, Stop> {
         plan_for_file(&job.target)
     }
     .map_err(|refusal| Stop::Failed(refusal.to_string()))?;
-    refuse_overwrite(&plan.out_json)?;
+    if !job.replace {
+        refuse_overwrite(&plan.out_json)?;
+    }
     job.check()?;
 
     let parts = u32::try_from(plan.parts.len()).unwrap_or(u32::MAX);
@@ -1040,18 +1071,52 @@ fn transcribe(job: &Job) -> Result<PathBuf, Stop> {
         },
     );
 
-    job.check()?;
-    job.report(TranscriptionPhase::Writing, parts, parts, None, None);
-    write_fresh_transcript(&plan.out_json, &plan.out_md, &transcript)?;
+    finish(job, &plan.out_json, &plan.out_md, &transcript, parts)?;
     Ok(plan.out_json)
 }
 
-/// A job's write: under [`TRANSCRIPT_WRITES`], and only if nobody corrected
-/// the transcript while the job was hearing it — the check at the job's
-/// start is minutes old by now.
-fn write_fresh_transcript(json: &Path, md: &Path, transcript: &Transcript) -> Result<(), Stop> {
+/// The job's last step. A job cancelled by now writes nothing, so a
+/// cancelled "Transcribe again" keeps the transcript it would have replaced.
+fn finish(
+    job: &Job,
+    json: &Path,
+    md: &Path,
+    transcript: &Transcript,
+    parts: u32,
+) -> Result<(), Stop> {
+    job.check()?;
+    job.report(TranscriptionPhase::Writing, parts, parts, None, None);
+    write_fresh_transcript(json, md, transcript, job.replace)
+}
+
+/// A job's write, under [`TRANSCRIPT_WRITES`]. A plain job writes only if
+/// nobody corrected the transcript while the job was hearing it — the check
+/// at the job's start is minutes old by now. A `replace` job deletes the old
+/// transcript and its markdown here, at the write and not at the start, so a
+/// job that fails or is cancelled on the way leaves the old one in place.
+fn write_fresh_transcript(
+    json: &Path,
+    md: &Path,
+    transcript: &Transcript,
+    replace: bool,
+) -> Result<(), Stop> {
     let _writing = lock(&TRANSCRIPT_WRITES);
-    refuse_overwrite(json)?;
+    if replace {
+        for old in [json, md] {
+            match std::fs::remove_file(old) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(Stop::Failed(format!(
+                        "{} could not be removed: {error}",
+                        old.display()
+                    )));
+                }
+            }
+        }
+    } else {
+        refuse_overwrite(json)?;
+    }
     write_transcript(json, md, transcript).map_err(Stop::Failed)
 }
 
@@ -1100,7 +1165,7 @@ pub fn after_recording(platform: Arc<dyn Platform>, folder: PathBuf, profile_id:
             );
             return;
         }
-        match enqueue(Arc::clone(&platform), folder, None) {
+        match enqueue(Arc::clone(&platform), folder, None, false) {
             Ok(id) => tracing::info!(job = %id, "transcription: the finished session is queued"),
             Err(sentence) => tracing::warn!(%sentence, "transcription: the session was not queued"),
         }
@@ -1171,12 +1236,15 @@ pub async fn transcription_settings_set(
 
 /// Transcribe a media file or a recording session folder (absolute path).
 /// Answers the job id at once; everything after streams over `channel`,
-/// ending in exactly one terminal batch.
+/// ending in exactly one terminal batch. `replace` (default false) is
+/// "Transcribe again": the existing transcript is replaced even when it
+/// holds corrections — the surface asked the person first.
 #[tauri::command]
 pub fn transcription_start(
     state: State<'_, AppState>,
     path: String,
     channel: Channel<TranscriptionProgressVm>,
+    replace: Option<bool>,
 ) -> Result<String, IpcError> {
     if let Err(reason) = availability() {
         return Err(unsupported(reason));
@@ -1185,6 +1253,7 @@ pub fn transcription_start(
         Arc::clone(&state.platform),
         PathBuf::from(path),
         Some(channel),
+        replace.unwrap_or(false),
     )
     .map_err(refused)
 }
@@ -1215,6 +1284,7 @@ fn transcript_vm(
         .unwrap_or_default();
     TranscriptVm {
         path: path.to_string_lossy().into_owned(),
+        source_path: transcript_source(path).map(|source| source.to_string_lossy().into_owned()),
         transcript,
         people,
     }
@@ -1886,7 +1956,7 @@ mod tests {
         ] {
             std::fs::write(&json, corrected).expect("write");
             assert!(
-                matches!(refuse_overwrite(&json), Err(Stop::Failed(_))),
+                matches!(refuse_overwrite(&json), Err(Stop::Kept(_))),
                 "{why}"
             );
         }
@@ -1901,20 +1971,114 @@ mod tests {
         let json = dir.join("call.mov.transcript.json");
         let md = markdown_path(&json);
         let heard = Transcript::from_json(UNTOUCHED).expect("transcript");
-        assert!(write_fresh_transcript(&json, &md, &heard).is_ok());
+        assert!(write_fresh_transcript(&json, &md, &heard, false).is_ok());
 
         let (edited, _) =
             edit_utterance(read_transcript(&json).expect("read"), "u1", "hello there")
                 .expect("edit");
         write_transcript(&json, &md, &edited).expect("the correction lands mid-job");
         assert!(matches!(
-            write_fresh_transcript(&json, &md, &heard),
-            Err(Stop::Failed(_))
+            write_fresh_transcript(&json, &md, &heard, false),
+            Err(Stop::Kept(_))
         ));
         assert_eq!(
             read_transcript(&json).expect("read").utterances[0].text,
             "hello there",
             "the correction survives the job"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job's steps before its write never touch the platform.
+    struct NoPlatform;
+
+    impl Platform for NoPlatform {
+        fn data_dir(&self) -> Result<PathBuf, keeper_core::error::CoreError> {
+            unreachable!()
+        }
+        fn keychain_set(&self, _: &str, _: &str) -> Result<(), keeper_core::error::CoreError> {
+            unreachable!()
+        }
+        fn keychain_get(&self, _: &str) -> Result<Option<String>, keeper_core::error::CoreError> {
+            unreachable!()
+        }
+        fn keychain_delete(&self, _: &str) -> Result<(), keeper_core::error::CoreError> {
+            unreachable!()
+        }
+        fn open_url(&self, _: &str) -> Result<(), keeper_core::error::CoreError> {
+            unreachable!()
+        }
+        fn notify(
+            &self,
+            _: &str,
+            _: &str,
+            _: &keeper_core::vm::NotifyTarget,
+        ) -> Result<(), keeper_core::error::CoreError> {
+            unreachable!()
+        }
+        fn sidecar_path(&self, _: &str) -> Result<PathBuf, keeper_core::error::CoreError> {
+            unreachable!()
+        }
+        fn exclude_from_backup(&self, _: &Path) -> Result<(), keeper_core::error::CoreError> {
+            unreachable!()
+        }
+        fn set_badge_count(&self, _: Option<u32>) -> Result<(), keeper_core::error::CoreError> {
+            unreachable!()
+        }
+    }
+
+    fn replace_job(target: &Path, cancelled: bool) -> Job {
+        Job {
+            id: "transcribe-test".to_owned(),
+            target: target.to_owned(),
+            channel: None,
+            replace: true,
+            cancel: Arc::new(AtomicBool::new(cancelled)),
+            platform: Arc::new(NoPlatform),
+            progress: Mutex::new(Progress::new()),
+        }
+    }
+
+    /// "Transcribe again": the person's corrections are replaced only by a
+    /// job that reaches its write — one cancelled on the way leaves the old
+    /// transcript and its markdown exactly as they were.
+    #[test]
+    fn a_replace_job_writes_over_corrections_and_a_cancelled_one_keeps_them() {
+        let dir = scratch();
+        let json = dir.join("call.mov.transcript.json");
+        let md = markdown_path(&json);
+        let heard = Transcript::from_json(UNTOUCHED).expect("transcript");
+        let (edited, _) = edit_utterance(heard.clone(), "u1", "hello there").expect("edit");
+        write_transcript(&json, &md, &edited).expect("the corrected transcript");
+        let corrected_md = std::fs::read_to_string(&md).expect("md");
+
+        assert!(matches!(
+            finish(&replace_job(&json, true), &json, &md, &heard, 1),
+            Err(Stop::Cancelled)
+        ));
+        assert_eq!(
+            read_transcript(&json).expect("read").utterances[0].text,
+            "hello there"
+        );
+        assert_eq!(std::fs::read_to_string(&md).expect("md"), corrected_md);
+
+        assert!(finish(&replace_job(&json, false), &json, &md, &heard, 1).is_ok());
+        let replaced = read_transcript(&json).expect("read");
+        assert_eq!(replaced.utterances[0].text, "hi");
+        assert!(!replaced.is_corrected());
+        assert_eq!(
+            std::fs::read_to_string(&md).expect("md"),
+            render::markdown(&heard)
+        );
+
+        std::fs::write(&json, "not json").expect("unreadable");
+        assert!(
+            finish(&replace_job(&json, false), &json, &md, &heard, 1).is_ok(),
+            "an unreadable transcript is replaced when the person asks"
+        );
+        assert_eq!(
+            read_transcript(&json).expect("read").utterances[0].text,
+            "hi"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

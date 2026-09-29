@@ -30,6 +30,7 @@ const send = (phase: ipc.TranscriptionProgressVm["phase"], extra: object = {}) =
       transcriptPath: null,
       fraction: null,
       elapsedMs: 0,
+      replaceable: false,
       ...extra,
     }),
   );
@@ -67,7 +68,7 @@ describe("Transcribe a File…", () => {
       multiple: false,
       title: "Transcribe a file",
     });
-    expect(ipc.transcriptionStart).toHaveBeenCalledWith(file, expect.any(Function));
+    expect(ipc.transcriptionStart).toHaveBeenCalledWith(file, expect.any(Function), false);
     await send("transcribing");
     expect(await screen.findByText("transcribing · Part 1 of 1")).toBeInTheDocument();
     // No estimate yet: the bar is indeterminate, never a guessed zero.

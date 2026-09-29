@@ -61,6 +61,7 @@ pub use model::{
 };
 pub use models::{ModelSet, CONFIG_MODELS_DIR};
 pub use plan::{
-    plan_for_file, plan_for_session, PlanPart, PlanRefusal, TrackOrigin, TranscriptionPlan,
+    plan_for_file, plan_for_session, transcript_source, PlanPart, PlanRefusal, TrackOrigin,
+    TranscriptionPlan,
 };
 pub use words::Word;

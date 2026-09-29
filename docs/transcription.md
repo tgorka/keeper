@@ -61,32 +61,46 @@ leaves it for this, there is no transcription server, no NAS option and no cloud
   job is comes from the time it has spent there against the time that much audio is expected to
   take on an M-series Mac (decoding 0.001 s, speech 0.02 s, speakers 0.006 s per second of
   audio), and a step never claims more than 95 % of itself until it ends.
-- **The transcript viewer:**
+- **The transcript viewer** takes most of the window (in the Files panel, the whole panel); the
+  lines keep a reading column of about 80 characters, and the player may be wider.
   - *Transcript* and *Source* tabs. Source shows the file's JSON read-only in the Files text
-    editor, laid out as keeper writes it; the transcript stays mounted underneath, so playback
-    goes on.
-  - **Speakers** with how each was matched and the candidates; assign a speaker to a person
-    (existing or new), rename or merge speakers. *Add speaker* in the legend adds a voice the
-    diarizer did not tell apart, with an optional label; a track choice (call or microphone)
-    appears only when the transcript heard both. Lines then move to it by reassigning them. The
-    legend lists only speakers with lines; the per-line and add-a-line speaker menus list each
-    person once (a lineless speaker whose person another speaker with lines carries is not
-    offered; an unnamed or unique lineless one is).
-  - Each line editable, reassignable to another speaker, splittable in two, and followed by a
-    line you add; dictionary suggestions after an edit.
+    editor, laid out as keeper writes it and inset by the pane's padding; the transcript stays
+    mounted underneath, so playback goes on.
+  - **Read mode first.** The transcript reads as a document: each line's speaker (a coloured
+    dot and the name) and time as quiet text, the words large. The time is a button that moves
+    the player there; clicking the text only selects it. Editing stays out of the way: each
+    line's ⋯ menu — *Play from here* (when the media can play), *Edit text*, *Change speaker*
+    (a submenu of speakers to pick one from), *Split…*, *Add a line after* — shows when the
+    line is hovered or has focus, and the menu button is always in the tab order, so every
+    action is reachable from the keyboard.
+  - **Speakers** are a row of chips — name, a dot for how each was matched, and its line count.
+    A chip opens a menu: how it was matched (and its score), *This is…* (a submenu of people,
+    the candidates first with their scores, e.g. "suggested 0.63", then *New person…*),
+    *Rename label…* and *Merge into…*. *New person…* and *Rename label…* open a field under the
+    chip row. *Add speaker* at the row's end adds a voice the diarizer did not tell apart, with
+    an optional label; a track choice (call or microphone) appears only when the transcript
+    heard both. Lines then move to it with *Change speaker*. The row lists only speakers with
+    lines; the per-line and add-a-line speaker menus list each person once (a lineless speaker
+    whose person another speaker with lines carries is not offered; an unnamed or unique
+    lineless one is). Dictionary suggestions follow an edit.
   - A **player**, when the transcript's media can be served, plays it as one timeline across a
     session's segments: scrubbing, ±10 s and seeks map the transcript's time to a part and a
     time in it, the next part starts where one ends, and a line under the player says
     "Part 2 of 3 · screen-0001.mov". Screen and camera play side by side, with a *Picture*
-    choice only when the session filmed both; a *Sound* choice (call and microphone, call,
-    microphone) appears only when a part has two audio tracks. Media is served over
-    `keeper-file://` from the synced folder that holds it; a part in no synced folder says
-    keeper cannot play it here. Media elements are released on a part change and on close.
-  - *Keep the player on top* (on by default) pins the player to the top of the viewer while the
-    lines scroll. Each line has ▶ *Play from here*. *Follow the transcript* (on by default)
-    highlights the line being said and scrolls it into view while playing and on every seek;
-    scrolling by hand pauses the follow-scroll until the next play or seek; clicking a line's
-    text seeks the player (and opens it for editing).
+    choice of one icon out of three (screen, camera, both) only when the session filmed both;
+    a *Sound* choice (call, microphone, both) appears only when a part has two audio tracks.
+    Every icon control names itself to a screen reader and in a tooltip. A video sits in a
+    16:9 box (at most 30 % of the window's height) and shows its first frame before it plays.
+    Media is served over `keeper-file://` from the synced folder that holds it; a part in no
+    synced folder says keeper cannot play it here. Media elements are released on a part
+    change and on close.
+  - *Pin* (on by default) keeps the player at the top of the viewer while the lines scroll.
+    *Follow* (on by default) highlights the line being said and scrolls it into view while
+    playing, while the scrub bar is dragged (not only when it is let go), on ±10 s and on
+    every seek; scrolling by hand pauses the follow-scroll until the next play or seek. Both
+    are icon buttons that show whether they are on.
+  - **Transcribe again…** in the header replaces this transcript (below, *Transcript files*);
+    when the job ends, the viewer reads the new transcript.
   - **Search** (⌘F / Ctrl+F in the viewer) finds text in lines and speaker names, ignoring
     case: matches are marked, a count reads "N matches", "2 of 7" or "No matches", Enter and
     Shift+Enter (or the ↑/↓ buttons) go to the next and previous match and wrap, and a jump
@@ -243,9 +257,20 @@ the date and duration, a speaker legend (only the speakers with at least one lin
 viewer), one `**[hh:mm:ss] Name:** text` line per utterance, and a footer naming the models.
 Transcribing again over a transcript nobody has touched replaces it.
 Over one anyone has corrected — an edited line, a confirmed speaker, a reassigned line, a merge,
-a rename, a split or an added line — it is refused with a sentence: delete or rename the
-transcript first.
-The check runs again just before the job writes, so a correction made while it ran is kept.
+a rename, a split or an added line — or one keeper cannot read, the job stops with a sentence
+and keeper leaves the file alone; the check runs again just before the job writes, so a
+correction made while it ran is kept.
+
+**Transcribe again…** — on the Files row (the phone's too), the Recordings row, the viewer's
+header and the job strip that stopped at a corrected transcript — replaces it on purpose. It asks first: "Replace
+the transcript? Your corrections in it will be lost. The voices bank keeps everything you
+confirmed." Then the job runs with `replace` (`transcription_start`'s argument, false by
+default) and skips both checks: the old `.json` and `.md` are deleted right before the new ones
+are written, not when the job starts, so a job that fails or is cancelled keeps the old
+transcript. Nothing in the voices bank is touched. The viewer finds what to transcribe from the
+transcript's own name (`TranscriptVm.sourcePath`: the session folder beside `manifest.json`, or
+the media file); when that is gone, or this Mac cannot transcribe, the header does not offer
+*Transcribe again…*.
 
 The JSON (camelCase, pretty-printed, `version` 1; a file from a newer keeper is refused):
 
@@ -313,7 +338,8 @@ In the viewer:
 Assignment needs a drive that keeps voices: the drive holding the media if it keeps voices,
 otherwise the first enabled one. With none, speakers stay unknown and assignment says why.
 
-Every correction marks the transcript `corrected`, so a later transcription will not replace it.
+Every correction marks the transcript `corrected`, so a later transcription will not replace it
+unless you ask it to (*Transcribe again…*).
 
 ## Matching thresholds
 
@@ -368,5 +394,7 @@ leaves `ME` to the `self` flag as before.
   (`keeper-recording://` is not used for it).
 - The progress estimate's speeds were measured on one M-series Mac; on a slower one the bar
   waits near the end of a step until the step ends.
+- The player's first frame before play is proved by its call policy, not yet seen in the
+  macOS app's own webview (DW-346).
 - The *Sound* choice switches audio tracks through `HTMLMediaElement.audioTracks`, which only
   WebKit (the macOS app's webview) implements.
