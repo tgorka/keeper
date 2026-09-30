@@ -2934,6 +2934,32 @@ pub fn set_transcription_language(
     set_setting(data_dir, TRANSCRIPTION_LANGUAGE_KEY, language.as_wire())
 }
 
+/// The `settings` keys holding the speech and speaker model picked in
+/// Settings: a folder name under the hydrated models, or blank for the
+/// config repository's choice.
+const TRANSCRIPTION_ASR_MODEL_KEY: &str = "transcription.asr_model";
+const TRANSCRIPTION_DIARIZATION_MODEL_KEY: &str = "transcription.diarization_model";
+
+/// The picked speech and speaker model, each `""` when the config
+/// repository's choice stands. Surrounding whitespace is not part of a name.
+pub fn get_transcription_models(data_dir: &Path) -> Result<(String, String), CoreError> {
+    let name = |raw: Option<String>| raw.map(|raw| raw.trim().to_owned()).unwrap_or_default();
+    Ok((
+        name(get_setting(data_dir, TRANSCRIPTION_ASR_MODEL_KEY)?),
+        name(get_setting(data_dir, TRANSCRIPTION_DIARIZATION_MODEL_KEY)?),
+    ))
+}
+
+/// Write the picked speech model; `""` returns to the repository's choice.
+pub fn set_transcription_asr_model(data_dir: &Path, id: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, TRANSCRIPTION_ASR_MODEL_KEY, id.trim())
+}
+
+/// Write the picked speaker model; `""` returns to the repository's choice.
+pub fn set_transcription_diarization_model(data_dir: &Path, id: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, TRANSCRIPTION_DIARIZATION_MODEL_KEY, id.trim())
+}
+
 /// The `settings` key holding an explicit path to the `git` binary folder sync
 /// drives (Story 34.14). Stored as the raw absolute path string; absent / empty
 /// ⇒ automatic resolution, which is the default and what almost every install

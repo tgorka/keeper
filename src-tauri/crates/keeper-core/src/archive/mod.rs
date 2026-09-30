@@ -194,6 +194,16 @@ pub enum ArchiveMsg {
         /// The session folder's new path, relative to the destination root.
         relative_path: String,
     },
+    /// Forget one session's row, segments and search entry because a person
+    /// removed the recording. Answered on `done` — `true` when a row knew the
+    /// session — so the Recordings pane re-reads an index that no longer lists
+    /// it.
+    ForgetRecording {
+        /// The session being forgotten.
+        session_id: String,
+        /// Where the outcome is sent.
+        done: oneshot::Sender<Result<bool, ArchiveError>>,
+    },
     /// Re-derive every recording row by walking one recordings root, and
     /// reconcile that root's rows against what the walk found (Story 42.1; the
     /// archive follows every recordings root).
@@ -371,6 +381,30 @@ impl ArchiveHandle {
         }
     }
 
+    /// Forget a removed recording's row, segments and search entry through the
+    /// single writer, and await it: the removal answers only once the index no
+    /// longer lists the session. A writer that stopped, or ended before it
+    /// answered, is an error — the row may still be there.
+    pub async fn forget_recording(&self, session_id: &str) -> Result<bool, ArchiveError> {
+        let (done, rx) = oneshot::channel();
+        let msg = ArchiveMsg::ForgetRecording {
+            session_id: session_id.to_owned(),
+            done,
+        };
+        if let Err(e) = self.tx.send(msg) {
+            log_dropped(&e.0);
+            return Err(ArchiveError::Sqlite(
+                "archive writer stopped; the recording's row was not forgotten".to_owned(),
+            ));
+        }
+        rx.await.unwrap_or_else(|_| {
+            Err(ArchiveError::Sqlite(
+                "could not confirm the recording's row was forgotten (writer task ended)"
+                    .to_owned(),
+            ))
+        })
+    }
+
     /// Re-derive every recording row from the session folders under `root`,
     /// and forget the rows of this root that no folder under it carries any
     /// more (Story 42.1; the archive follows every recordings root).
@@ -462,6 +496,10 @@ fn log_dropped(msg: &ArchiveMsg) {
         ArchiveMsg::MoveRecording { session_id, .. } => tracing::warn!(
             session_id = %session_id,
             "archive: writer channel closed; dropping recording move"
+        ),
+        ArchiveMsg::ForgetRecording { session_id, .. } => tracing::warn!(
+            session_id = %session_id,
+            "archive: writer channel closed; a removed recording's row was not forgotten"
         ),
         ArchiveMsg::RebuildRecordings(request) => tracing::warn!(
             root = %request.root.display(),

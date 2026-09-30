@@ -49,9 +49,13 @@ export function refreshTranscription(): Promise<void> {
     });
   return hydration;
 }
+/** Write the settings `patch` names; a model id of `""` returns that role to
+ *  the config repository's choice. */
 export async function saveTranscriptionSettings(patch: {
   language?: TranscriptionLanguage;
   afterRecording?: boolean;
+  asrModel?: string;
+  diarizationModel?: string;
 }): Promise<void> {
   if (transcriptionStore.getState().saving) return;
   transcriptionStore.setState({ saving: true, error: null });
@@ -59,6 +63,8 @@ export async function saveTranscriptionSettings(patch: {
     const status = await transcriptionSettingsSet(
       patch.language ?? null,
       patch.afterRecording ?? null,
+      patch.asrModel ?? null,
+      patch.diarizationModel ?? null,
     );
     transcriptionStore.setState({ status });
   } catch (cause) {

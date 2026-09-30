@@ -118,6 +118,10 @@ pub struct StagedChange {
     /// key means no verdict was taken for that path (a repair batch, a test
     /// fixture), and the read is guarded by its own before/after `fstat` alone.
     pub samples: BTreeMap<PathBuf, FileSample>,
+    /// Folders keeper itself deleted (`Engine::declare_deletions`): a deletion
+    /// under one is keeper's own act, not a removable drive pulled mid-walk,
+    /// so the mass-deletion guard does not count it. Nothing else reads it.
+    pub declared: Vec<PathBuf>,
 }
 
 impl StagedChange {
@@ -156,6 +160,7 @@ impl StagedChange {
                 .filter(|(rela, _)| !skipped.contains(rela))
                 .map(|(rela, sample)| (rela.clone(), *sample))
                 .collect(),
+            declared: self.declared.clone(),
         }
     }
 }
@@ -349,15 +354,32 @@ fn stage_and_commit_inner(
     // deletion, and refusing it would refuse the user. Same placement as the
     // guard above, for the same reason — the index is written before the
     // commit, so this has to run before the staging loop. Two integers.
+    // A deletion under a folder keeper itself deleted is not counted: a
+    // recordings stick holding one session would otherwise refuse the removal
+    // of that session forever. Every other deletion still counts.
+    let undeclared = if changes.declared.is_empty() {
+        changes.deleted.len()
+    } else {
+        changes
+            .deleted
+            .iter()
+            .filter(|rela| {
+                !changes
+                    .declared
+                    .iter()
+                    .any(|folder| rela.starts_with(folder))
+            })
+            .count()
+    };
     if profile.removable
         && sorted_len > 0
-        && changes.deleted.len() as f64 / sorted_len as f64 > MASS_DELETION_FRACTION
+        && undeclared as f64 / sorted_len as f64 > MASS_DELETION_FRACTION
     {
         return Err(SyncError::Diverged {
             profile: profile.name.clone(),
             reason: format!(
                 "{MASS_DELETION_PREFIX} {} {MASS_DELETION_SENTENCE}",
-                changes.deleted.len()
+                undeclared
             ),
         });
     }

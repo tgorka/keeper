@@ -15,6 +15,7 @@ use toml_edit::Document;
 use crate::notes::frontmatter::{FieldValue, Frontmatter};
 use crate::notes::index::IndexEntry;
 use crate::notes::media_block::{self, BlockRefusal, Source};
+use crate::notes::recording_note;
 use crate::notes::tags;
 
 /// The tag every note that is recording carries.
@@ -168,6 +169,24 @@ pub fn tagged_on<'a>(
             .as_deref()
             .is_some_and(|wanted| entry.tags.iter().any(|tag| tag == wanted))
     })
+}
+
+/// The frontmatter keys keeper writes into a recording's note about the
+/// recording itself: its identity, its folder and its files.
+const SESSION_KEYS: [&str; 3] = [recording_note::SESSION_KEY, "recording", "files"];
+
+/// `note` without the keys naming the recording `session_id` — `session`,
+/// `recording` and `files` — once that recording is removed; `None` when the
+/// note's `session` is another recording's, or it has none. Every other key,
+/// and the body, stays byte for byte.
+pub fn without_session_keys(note: &str, session_id: &str) -> Option<String> {
+    let (front, _) = Frontmatter::parse(note);
+    if front.as_string(recording_note::SESSION_KEY).map(str::trim) != Some(session_id) {
+        return None;
+    }
+    Some(SESSION_KEYS.iter().fold(note.to_owned(), |text, key| {
+        Frontmatter::remove_in(&text, key)
+    }))
 }
 
 #[cfg(test)]
@@ -325,5 +344,19 @@ mod tests {
         let note = "---\ntags: !!set {a}\n---\n";
         assert_eq!(with_recording_tags(note, "d"), note);
         assert_eq!(without_recording_tags(note, "d"), note);
+    }
+
+    #[test]
+    fn a_removed_recordings_keys_leave_its_note_and_nobody_elses() {
+        let stub = format!(
+            "---\ntitle: Standup\nsession: {ID}\nrecording: 2026/standup\nfiles:\n  - 2026/standup/screen-0000.mov\ntags: [recordings]\n---\nWhat we said.\n"
+        );
+        assert_eq!(
+            without_session_keys(&stub, ID).as_deref(),
+            Some("---\ntitle: Standup\ntags: [recordings]\n---\nWhat we said.\n")
+        );
+        let other = "---\nsession: OTHER\nrecording: 2026/retro\n---\nRetro.\n";
+        assert_eq!(without_session_keys(other, ID), None);
+        assert_eq!(without_session_keys("Plain.\n", ID), None);
     }
 }

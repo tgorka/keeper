@@ -274,28 +274,145 @@ pub(crate) fn sweep_stale_tags(wait: Duration) {
 #[tauri::command]
 pub fn recording_linked_note() -> Option<RecordingLinkedNoteVm> {
     let held = active().clone()?;
-    let title = notes_vault::snapshot(&held.note.profile_id)
-        .and_then(|snapshot| {
-            snapshot
-                .by_path(&held.note.path)
-                .map(|entry| entry.title.clone())
-        })
-        .filter(|title| !title.trim().is_empty())
-        .unwrap_or_else(|| {
-            held.note
-                .path
-                .rsplit('/')
-                .next()
-                .unwrap_or(&held.note.path)
-                .trim_end_matches(".md")
-                .to_owned()
-        });
+    let indexed = notes_vault::snapshot(&held.note.profile_id).and_then(|snapshot| {
+        snapshot
+            .by_path(&held.note.path)
+            .map(|entry| entry.title.clone())
+    });
+    let title = note_title(indexed.as_deref(), &held.note.path);
     Some(RecordingLinkedNoteVm {
         profile_id: held.note.profile_id,
         path: held.note.path,
         session_id: held.session_id,
         title,
     })
+}
+
+/// A note's title as the notes index has it; its file name when the index
+/// has none.
+fn note_title(indexed: Option<&str>, path: &str) -> String {
+    indexed
+        .filter(|title| !title.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            path.rsplit('/')
+                .next()
+                .unwrap_or(path)
+                .trim_end_matches(".md")
+                .to_owned()
+        })
+}
+
+/// A note naming a recording, as the removal's dialog and answer list it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingNoteRefVm {
+    pub vault_id: String,
+    /// Relative to its vault.
+    pub path: String,
+    pub title: String,
+}
+
+/// A note keeper could not take a removed recording out of: it still names
+/// it, and the person is told which and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingNoteFailureVm {
+    pub vault_id: String,
+    pub path: String,
+    pub title: String,
+    pub error: String,
+}
+
+/// What forgetting a removed recording did to the notes in open vaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct NotesForgotten {
+    /// Notes keeper wrote: their recording keys, or their blocks.
+    pub changed: Vec<RecordingNoteRefVm>,
+    /// Notes a live editor has open, whose blocks that editor removes.
+    pub open: Vec<RecordingNoteRefVm>,
+    /// Notes that could not be changed and still name the recording.
+    pub failed: Vec<RecordingNoteFailureVm>,
+}
+
+/// Whether `note` names the recording `session_id`: its `session` key, or a
+/// media block.
+fn names_recording(note: &str, session_id: &str) -> bool {
+    note_recording::without_session_keys(note, session_id).is_some()
+        || media_block::session_ids(note)
+            .iter()
+            .any(|id| id.trim() == session_id)
+}
+
+/// Every note in an open vault naming the recording `session_id`, with its
+/// vault. Each note is read once; one that cannot be read names nothing.
+fn notes_naming_in(session_id: &str) -> Vec<(Vault, RecordingNoteRefVm)> {
+    let mut found = Vec::new();
+    for vault in notes_vault::vaults() {
+        let Some(snapshot) = notes_vault::snapshot(&vault.id) else {
+            continue;
+        };
+        for entry in snapshot.entries() {
+            let Ok(text) = notes_vault::read_note(&vault, &entry.path) else {
+                continue;
+            };
+            if text.contains(session_id) && names_recording(&text, session_id) {
+                found.push((
+                    vault.clone(),
+                    RecordingNoteRefVm {
+                        vault_id: vault.id.clone(),
+                        path: entry.path.clone(),
+                        title: note_title(Some(&entry.title), &entry.path),
+                    },
+                ));
+            }
+        }
+    }
+    found
+}
+
+/// The notes naming the recording `session_id`: what its removal's dialog
+/// says will lose the recording.
+#[cfg_attr(not(desktop), allow(dead_code))]
+pub(crate) fn notes_naming(session_id: &str) -> Vec<RecordingNoteRefVm> {
+    notes_naming_in(session_id)
+        .into_iter()
+        .map(|(_, note)| note)
+        .collect()
+}
+
+/// Take the removed recording `session_id` out of every note in an open
+/// vault ([`crate::notes_ipc::forget_session`]). A note that cannot be
+/// written is reported, and logged: the recording is already gone.
+#[cfg_attr(not(desktop), allow(dead_code))]
+pub(crate) fn forget_session(session_id: &str) -> NotesForgotten {
+    let mut forgotten = NotesForgotten::default();
+    for (vault, note) in notes_naming_in(session_id) {
+        match crate::notes_ipc::forget_session(&vault, &note.path, session_id) {
+            Ok(done) => {
+                if done.open {
+                    forgotten.open.push(note.clone());
+                }
+                if done.changed {
+                    forgotten.changed.push(note);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    profile = %vault.id,
+                    "recording removal: a note naming the removed recording could not be changed"
+                );
+                forgotten.failed.push(RecordingNoteFailureVm {
+                    vault_id: note.vault_id,
+                    path: note.path,
+                    title: note.title,
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+    forgotten
 }
 
 /// What a media block's body is, as far as recording goes: whether it
@@ -349,6 +466,15 @@ pub fn media_block_recording(
 pub fn media_block_record_started(source: String, session_id: String) -> Result<String, IpcError> {
     note_recording::finish_record_body(&source, &session_id)
         .map_err(|refusal| refused(refusal.to_string()))
+}
+
+/// The note body `text` without the media blocks naming the removed
+/// recording `session_id` (and the words under them), or `None` when none
+/// does: what an open note's buffer becomes when that recording is removed,
+/// whichever view it is in.
+#[tauri::command]
+pub fn media_block_without_session(text: String, session_id: String) -> Option<String> {
+    media_block::without_session_blocks(&text, &session_id)
 }
 
 #[cfg(test)]

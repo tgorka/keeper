@@ -12,6 +12,10 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { forwardRef, type ReactNode, useImperativeHandle } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  REMOVE_RECORDING_CONFIRM,
+  REMOVE_RECORDING_LABEL,
+} from "@/components/recordings/remove-recording-dialog";
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuTrigger,
@@ -38,6 +42,8 @@ const resolveBlock = vi.fn<typeof IpcClient.mediaBlockResolve>();
 const editBlock = vi.fn<typeof IpcClient.mediaBlockEdit>();
 const classify = vi.fn<typeof IpcClient.mediaBlockRecording>();
 const recordingStatus = vi.fn<typeof IpcClient.recordingStatus>();
+const removePreview = vi.fn<typeof IpcClient.recordingRemovePreview>();
+const removeRecording = vi.fn<typeof IpcClient.recordingRemove>();
 let written: ((path: string) => void) | null = null;
 
 vi.mock("@/lib/ipc/client", async (importOriginal) => ({
@@ -47,6 +53,8 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => ({
   mediaBlockRecording: (source: string, profileId: string, path: string | null) =>
     classify(source, profileId, path),
   recordingStatus: () => recordingStatus(),
+  recordingRemovePreview: (sessionId: string) => removePreview(sessionId),
+  recordingRemove: (sessionId: string) => removeRecording(sessionId),
   listenTranscriptWritten: async (on: (path: string) => void) => {
     written = on;
     return () => {
@@ -372,6 +380,76 @@ describe("the block's own verbs, from the menu and nowhere else", () => {
     await screen.findByRole("menu");
     expect(screen.queryByRole("menuitem", { name: EDIT_BLOCK_SOURCE_LABEL })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: REMOVE_WIDGET_LABEL })).toBeNull();
+  });
+});
+
+describe("removing the recording", () => {
+  const PLAN: IpcClient.RecordingRemovalPreviewVm = {
+    folder: "recordings/2026/kelly",
+    drive: "tgdrive",
+    bytes: 2_000_000,
+    files: 4,
+    durability: "pushed",
+    notes: [{ vaultId: "drive", path: "meetings/Kelly sync.md", title: "Kelly sync" }],
+  };
+
+  beforeEach(() => {
+    classify.mockResolvedValue({ records: false, session: "S1", live: false, here: false });
+    removePreview.mockReset();
+    removePreview.mockResolvedValue(PLAN);
+    removeRecording.mockReset();
+  });
+
+  async function confirmRemoval(): Promise<void> {
+    await openMenu("Transcript actions");
+    fireEvent.click(await screen.findByRole("menuitem", { name: REMOVE_RECORDING_LABEL }));
+    fireEvent.click(await screen.findByRole("button", { name: REMOVE_RECORDING_CONFIRM }));
+  }
+
+  it("removes its own widget and saves the note once the recording is gone", async () => {
+    resolveBlock.mockResolvedValue(vm());
+    removeRecording.mockResolvedValue({
+      folder: PLAN.folder,
+      bytes: PLAN.bytes,
+      files: PLAN.files,
+      notesChanged: [],
+      openNotes: PLAN.notes,
+      notesFailed: [],
+    });
+    const mounted = args();
+    render(<MediaBlockPanel {...mounted} />);
+
+    await confirmRemoval();
+
+    await waitFor(() => expect(mounted.remove).toHaveBeenCalledTimes(1));
+    expect(removeRecording).toHaveBeenCalledWith("S1");
+    expect(mounted.saveNote).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps its widget when the removal is refused, and says why", async () => {
+    resolveBlock.mockResolvedValue(vm());
+    removeRecording.mockRejectedValue({
+      code: "recordingSessionLive",
+      message: "This recording is still recording or being finished.",
+    });
+    const mounted = args();
+    render(<MediaBlockPanel {...mounted} />);
+
+    await confirmRemoval();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("still recording");
+    expect(mounted.remove).not.toHaveBeenCalled();
+    expect(mounted.saveNote).not.toHaveBeenCalled();
+  });
+
+  it("is not offered where the note cannot be written", async () => {
+    resolveBlock.mockResolvedValue(vm());
+    render(<MediaBlockPanel {...args({ editable: false })} />);
+
+    await openMenu("Transcript actions");
+
+    await screen.findByRole("menu");
+    expect(screen.queryByRole("menuitem", { name: REMOVE_RECORDING_LABEL })).toBeNull();
   });
 });
 

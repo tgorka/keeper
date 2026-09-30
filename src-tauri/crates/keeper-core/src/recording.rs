@@ -21,6 +21,7 @@
 //! sidecar can't be resolved.
 
 pub mod path_template;
+pub mod removal;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};

@@ -35,6 +35,10 @@ import {
   useRef,
   useState,
 } from "react";
+import {
+  REMOVE_RECORDING_LABEL,
+  RemoveRecordingDialog,
+} from "@/components/recordings/remove-recording-dialog";
 import { type ClipRequest, CopyClipDialog } from "@/components/transcription/copy-clip";
 import { currentUtterance } from "@/components/transcription/session-timeline";
 import { timestamp } from "@/components/transcription/transcript-lines";
@@ -167,6 +171,7 @@ export function MediaBlockPanel({
   const [naming, setNaming] = useState<Naming | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [viewer, setViewer] = useState<{ path: string; at: number } | null>(null);
+  const [removing, setRemoving] = useState<string | null>(null);
   // A state, not a ref: the panel's box exists only once the block has
   // resolved, and the observer has to start then, not on the first render.
   const [root, setRoot] = useState<HTMLElement | null>(null);
@@ -311,14 +316,33 @@ export function MediaBlockPanel({
 
   // The block's own verbs. A transcribed block appends them to the viewer's ⋯;
   // otherwise they are the block's only menu. A preview has none.
+  const session = recording?.session ?? null;
   const editItems = (
     <>
       <DropdownMenuItem onSelect={editSource}>{EDIT_BLOCK_SOURCE_LABEL}</DropdownMenuItem>
       <DropdownMenuItem variant="destructive" onSelect={remove}>
         {REMOVE_WIDGET_LABEL}
       </DropdownMenuItem>
+      {session !== null && (
+        <DropdownMenuItem variant="destructive" onSelect={() => setRemoving(session)}>
+          {REMOVE_RECORDING_LABEL}
+        </DropdownMenuItem>
+      )}
     </>
   );
+  // The recording is gone from the drive: this widget goes too, saved at
+  // once as ⌘S would — the note is open here, so Rust left its body alone.
+  const removeDialog =
+    removing === null ? null : (
+      <RemoveRecordingDialog
+        sessionId={removing}
+        onClose={() => setRemoving(null)}
+        onRemoved={() => {
+          remove();
+          saveNote();
+        }}
+      />
+    );
   const blockItems = (
     <>
       {vm?.transcribed && vm.transcriptPath !== null && (
@@ -407,6 +431,7 @@ export function MediaBlockPanel({
         <pre className="overflow-auto whitespace-pre-wrap rounded-md bg-muted p-2 font-mono text-xs">
           {source}
         </pre>
+        {removeDialog}
       </section>
     );
   }
@@ -556,6 +581,7 @@ export function MediaBlockPanel({
         profileId={profileId}
         onClose={() => setViewer(null)}
       />
+      {removeDialog}
     </section>
   );
 }

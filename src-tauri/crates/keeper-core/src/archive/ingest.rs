@@ -54,6 +54,10 @@ pub(super) async fn run(mut rx: UnboundedReceiver<ArchiveMsg>, conn: Connection)
                 session_id,
                 relative_path,
             } => move_recording(&conn, &session_id, &relative_path),
+            ArchiveMsg::ForgetRecording { session_id, done } => {
+                // Nobody awaiting the answer is not the writer's concern.
+                let _ = done.send(recordings::forget_session(&conn, &session_id));
+            }
             ArchiveMsg::RebuildRecordings(request) => {
                 if !blocking(|| rebuild_recordings(&conn, &request)) {
                     rebuild_failed = true;

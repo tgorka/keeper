@@ -14,4 +14,14 @@ available: boolean,
 /**
  * Why not, as a sentence.
  */
-reason: string | null, models: ModelsStateVm, language: TranscriptionLanguage, afterRecording: boolean, voicesDrives: Array<VoicesDriveVm>, };
+reason: string | null, models: ModelsStateVm, language: TranscriptionLanguage, afterRecording: boolean, 
+/**
+ * The speech model picked in Settings (`transcription.asr_model`);
+ * `""` is the config repository's choice.
+ */
+asrModel: string, 
+/**
+ * The speaker model picked in Settings
+ * (`transcription.diarization_model`); `""` is the repository's choice.
+ */
+diarizationModel: string, voicesDrives: Array<VoicesDriveVm>, };

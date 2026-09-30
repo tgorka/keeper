@@ -320,8 +320,14 @@ export function AppShell() {
                             (52px back bar, 37px state line, 102px composer;
                             bottom edge at 430 = inside the viewport)
             rotated either way, after: still the phone tier, the same
-                            conversation level still open, 79.6% ⇄ 55.8% */}
-      <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
+            conversation level still open, 79.6% ⇄ 55.8%
+
+          `overflow-clip`, not `overflow-hidden`: a `hidden` box still scrolls
+          when code asks it to — CodeMirror's caret reveal, `scrollIntoView`,
+          `focus()` all walk up and scroll it — and it is the whole app. The owner
+          saw exactly that on 2026-09-30: every pane shifted ~200px up with an
+          empty band below it. A `clip` box has no scroll position at all. */}
+      <div className="flex h-dvh flex-col overflow-clip bg-background text-foreground">
         {/* One drag band, painted per column (AD-34-2, AD-34-3). It is the single
             element that both makes the window movable and clears the floating
             window controls, which is why no pane reserves an inset of its own. The

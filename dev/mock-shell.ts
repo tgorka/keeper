@@ -45,6 +45,7 @@
  */
 
 import { mockIPC } from "@tauri-apps/api/mocks";
+import { IDLE_RECORDING_STATUS } from "@/hooks/use-recording-session";
 import { remoteOnSourceHost } from "@/lib/forge-repos";
 import type {
   AccountDeviceVm,
@@ -95,6 +96,8 @@ import type {
   OrgAccountVm,
   PacedWorkVm,
   RecordingCaptureSourcesVm,
+  RecordingRemovalPreviewVm,
+  RecordingRemovedVm,
   RecordingSearchVm,
   RecordingSettingsVm,
   SessionSpaceFilesVm,
@@ -2944,6 +2947,9 @@ let botMessageDetails = false;
  */
 let firstRunSetupSkipped = false;
 
+/** Session ids removed in this page's life: the Recordings pane stops listing them. */
+const removedRecordings = new Set<string>();
+
 /**
  * The effective recording settings, held in a `let` so a write lands somewhere.
  * Not a disk: a page reload starts from these values again.
@@ -3131,6 +3137,7 @@ const ACCOUNT_THIS_DEVICE: AccountDeviceVm = {
   name: "hesperia",
   class: "desktop",
   platform: "macos",
+  version: "0.8.33",
   thisDevice: true,
 };
 
@@ -3255,6 +3262,7 @@ function signedInAccount(state: AccountStateVm, device = ACCOUNT_THIS_DEVICE): O
             name: "iphone-3f2a",
             class: "mobile",
             platform: "ios",
+            version: "0.8.31",
             thisDevice: false,
           },
           {
@@ -3262,6 +3270,7 @@ function signedInAccount(state: AccountStateVm, device = ACCOUNT_THIS_DEVICE): O
             name: "ipad-91c0",
             class: "tablet",
             platform: "ios",
+            version: null,
             thisDevice: false,
           },
         ],
@@ -3986,6 +3995,17 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     active: false,
     conflict: null,
   }),
+  // Nothing records in the browser. Without an answer the session hook adopted
+  // `null` and every surface that reads the snapshot — a note's New recording
+  // widget among them — threw on `status.outputPath`.
+  recording_status: () => IDLE_RECORDING_STATUS,
+  // Granted, so the browser shows the setup a person with permissions sees.
+  recording_permission: () => ({
+    screenRecording: "granted",
+    microphone: "granted",
+    camera: "granted",
+    canStart: true,
+  }),
   voice_hotkey_get: (): HotkeyVm => ({
     accelerator: "",
     isDefault: true,
@@ -4317,42 +4337,63 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   //
   // Two sessions: one already transcribed (Show transcript), one with media and
   // no transcript yet (Transcribe, whose job the transcription mock drives).
-  search_recordings: () =>
+  search_recordings: () => {
+    const rows: RecordingSearchVm["rows"] = [
+      {
+        sessionId: "01JREC0000000000000000KELLY",
+        relativePath: "2026/kelly-sync",
+        absolutePath: "/Users/alice/Movies/keeper/2026/kelly-sync",
+        title: "Kelly sync",
+        startedTs: 1_790_000_000_000,
+        endedTs: 1_790_001_800_000,
+        durationMs: 1_800_000,
+        totalBytes: 812_000_000,
+        durability: "pushed",
+        tags: ["work/sync"],
+        playablePath: "/Users/alice/Movies/keeper/2026/kelly-sync/screen-0001.mov",
+        transcript: "/Users/alice/Movies/keeper/2026/kelly-sync/transcript.json",
+        transcribable: true,
+      },
+      {
+        sessionId: "01JREC00000000000000MOUNICA",
+        relativePath: "2026/mounica-sync",
+        absolutePath: "/Users/alice/Movies/keeper/2026/mounica-sync",
+        title: "Mounica sync",
+        startedTs: 1_790_090_000_000,
+        endedTs: 1_790_092_400_000,
+        durationMs: 2_400_000,
+        totalBytes: 1_290_000_000,
+        durability: "local",
+        tags: [],
+        playablePath: "/Users/alice/Movies/keeper/2026/mounica-sync/screen-0001.mov",
+        transcript: null,
+        transcribable: true,
+      },
+    ].filter((row) => !removedRecordings.has(row.sessionId));
+    return { rows, total: rows.length } satisfies RecordingSearchVm;
+  },
+  // Removing a recording: the plan the confirmation words, then the removal,
+  // which the pane's next search reflects.
+  recording_remove_preview: (payload) =>
     ({
-      rows: [
-        {
-          sessionId: "01JREC0000000000000000KELLY",
-          relativePath: "2026/kelly-sync",
-          absolutePath: "/Users/alice/Movies/keeper/2026/kelly-sync",
-          title: "Kelly sync",
-          startedTs: 1_790_000_000_000,
-          endedTs: 1_790_001_800_000,
-          durationMs: 1_800_000,
-          totalBytes: 812_000_000,
-          durability: "pushed",
-          tags: ["work/sync"],
-          playablePath: "/Users/alice/Movies/keeper/2026/kelly-sync/screen-0001.mov",
-          transcript: "/Users/alice/Movies/keeper/2026/kelly-sync/transcript.json",
-          transcribable: true,
-        },
-        {
-          sessionId: "01JREC00000000000000MOUNICA",
-          relativePath: "2026/mounica-sync",
-          absolutePath: "/Users/alice/Movies/keeper/2026/mounica-sync",
-          title: "Mounica sync",
-          startedTs: 1_790_090_000_000,
-          endedTs: 1_790_092_400_000,
-          durationMs: 2_400_000,
-          totalBytes: 1_290_000_000,
-          durability: "local",
-          tags: [],
-          playablePath: "/Users/alice/Movies/keeper/2026/mounica-sync/screen-0001.mov",
-          transcript: null,
-          transcribable: true,
-        },
-      ],
-      total: 2,
-    }) satisfies RecordingSearchVm,
+      folder: `recordings/2026/${String(payload.sessionId).slice(-8).toLowerCase()}`,
+      drive: "tgdrive",
+      bytes: 812_000_000,
+      files: 6,
+      durability: "pushed",
+      notes: [{ vaultId: "vault-mind", path: "meetings/Kelly sync.md", title: "Kelly sync" }],
+    }) satisfies RecordingRemovalPreviewVm,
+  recording_remove: (payload) => {
+    removedRecordings.add(String(payload.sessionId));
+    return {
+      folder: `recordings/2026/${String(payload.sessionId).slice(-8).toLowerCase()}`,
+      bytes: 812_000_000,
+      files: 6,
+      notesChanged: [],
+      openNotes: [{ vaultId: "vault-mind", path: "meetings/Kelly sync.md", title: "Kelly sync" }],
+      notesFailed: [],
+    } satisfies RecordingRemovedVm;
+  },
   // --- Recording settings ---------------------------------------------------
   //
   // Handlers over a module-level object rather than an `ANSWERS` row, so a write
@@ -5241,6 +5282,22 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       cursor: null,
     } satisfies NoteBodyBatch);
     return `sub-mock-note-${String(payload.noteId)}`;
+  },
+  // A save answers what Rust would: the new revision and the block it kept.
+  // Without it every autosave threw on `write.frontmatter`, and so did the save
+  // a New recording widget makes when Start names its session.
+  notes_save: (payload) => {
+    const id = String(payload.subscriptionId ?? "").replace("sub-mock-note-", "");
+    const row = NOTES.find(([each]) => each === id);
+    return {
+      rev: `rev-mock-${Date.now()}`,
+      path: `${row?.[1] ?? "Untitled"}.md`,
+      frontmatter:
+        typeof payload.frontmatter === "string"
+          ? payload.frontmatter
+          : (MEDIA_BLOCK_FRONTMATTER[id] ?? ""),
+      conflictCopy: null,
+    };
   },
   notes_body_read: (payload) => {
     const row = NOTES.find(([id]) => id === payload.noteId);

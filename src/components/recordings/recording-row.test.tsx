@@ -83,6 +83,7 @@ function renderRow(
     job?: TranscriptionProgressVm;
     onTranscribe?: () => void;
     onShowTranscript?: (path: string) => void;
+    onRemove?: (hit: RecordingHitVm) => void;
   } = {},
 ) {
   // The job strip under the row reads the store, as it does in the pane.
@@ -101,6 +102,7 @@ function renderRow(
         job={overrides.job}
         onTranscribe={overrides.onTranscribe ?? vi.fn()}
         onShowTranscript={overrides.onShowTranscript ?? vi.fn()}
+        onRemove={overrides.onRemove ?? vi.fn()}
       />
     </ul>,
   );

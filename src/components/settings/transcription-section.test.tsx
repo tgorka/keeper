@@ -17,6 +17,8 @@ vi.mock("@/lib/ipc/client", () => ({
   dictionaryTerms: vi.fn(),
   dictionaryTermSave: vi.fn(),
   voicesPersonRename: vi.fn(),
+  transcriptionModelsAvailable: vi.fn(),
+  transcriptionSettingsSet: vi.fn(),
 }));
 
 beforeEach(() => {
@@ -28,6 +30,8 @@ beforeEach(() => {
     models: { state: "ready", sentence: "Ready", missing: [] },
     afterRecording: false,
     language: "auto",
+    asrModel: "",
+    diarizationModel: "",
     voicesDrives: [
       {
         profileId: "drive",
@@ -45,6 +49,15 @@ beforeEach(() => {
     parts: [],
     hasCamera: false,
     hasScreen: false,
+  });
+  vi.mocked(ipc.transcriptionModelsAvailable).mockResolvedValue({
+    asr: [
+      { id: "parakeet-tdt-0.6b-v3", complete: true },
+      { id: "parakeet-tdt-0.6b-v4", complete: true },
+      { id: "parakeet-half", complete: false },
+    ],
+    diarization: [{ id: "speaker-diarization", complete: true }],
+    defaults: { asr: "parakeet-tdt-0.6b-v3", diarization: "speaker-diarization" },
   });
 });
 
@@ -107,5 +120,55 @@ describe("Transcription settings", () => {
       expect(screen.getAllByRole("button", { name: "Rename person" })).toHaveLength(3),
     );
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+});
+
+describe("Transcription models", () => {
+  it("offers the repository's choice first, disables incomplete ones and writes the key", async () => {
+    const status = await ipc.transcriptionStatus();
+    vi.mocked(ipc.transcriptionSettingsSet).mockResolvedValue({
+      ...status,
+      asrModel: "parakeet-tdt-0.6b-v4",
+    });
+    render(<TranscriptionSection open />);
+    const speech = (await screen.findByLabelText("Speech model")) as HTMLSelectElement;
+    const options = [...speech.options].map((option) => [option.text, option.disabled]);
+    expect(options).toEqual([
+      ["From the config repository (parakeet-tdt-0.6b-v3)", false],
+      ["parakeet-tdt-0.6b-v3", false],
+      ["parakeet-tdt-0.6b-v4", false],
+      ["parakeet-half (incomplete)", true],
+    ]);
+    expect(speech.value).toBe("");
+
+    fireEvent.change(speech, { target: { value: "parakeet-tdt-0.6b-v4" } });
+    await waitFor(() =>
+      expect(ipc.transcriptionSettingsSet).toHaveBeenCalledWith(
+        null,
+        null,
+        "parakeet-tdt-0.6b-v4",
+        null,
+      ),
+    );
+    await waitFor(() => expect(speech.value).toBe("parakeet-tdt-0.6b-v4"));
+
+    const speaker = screen.getByLabelText("Speaker model") as HTMLSelectElement;
+    fireEvent.change(speaker, { target: { value: "" } });
+    await waitFor(() =>
+      expect(ipc.transcriptionSettingsSet).toHaveBeenLastCalledWith(null, null, null, ""),
+    );
+  });
+
+  it("keeps a pick that is no longer on this Mac visible", async () => {
+    const status = await ipc.transcriptionStatus();
+    vi.mocked(ipc.transcriptionStatus).mockResolvedValue({
+      ...status,
+      diarizationModel: "diarizer-gone",
+    });
+    render(<TranscriptionSection open />);
+    const speaker = (await screen.findByLabelText("Speaker model")) as HTMLSelectElement;
+    await waitFor(() => expect(speaker.value).toBe("diarizer-gone"));
+    expect(speaker.selectedOptions[0]?.text).toBe("diarizer-gone (not on this Mac)");
+    expect(speaker.selectedOptions[0]?.disabled).toBe(true);
   });
 });

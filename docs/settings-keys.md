@@ -110,6 +110,10 @@ file-controlled instead, and says which file.
 | | | | | Whether keeper keeps a menu-bar (tray) presence. |
 | `transcription.after_recording` | user-global | boolean (`1`/`0`) | `1` | `"transcription.after_recording" = false` |
 | | | | | Whether a finished Recording Session saved to a drive that keeps voices is transcribed on this Mac. |
+| `transcription.asr_model` | user-global | text | *(absent)* | `"transcription.asr_model" = "parakeet-tdt-0.6b-v3"` |
+| | | | | The speech model transcription loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`_models/models.toml`); a model that is missing or incomplete on this Mac is refused, never replaced. |
+| `transcription.diarization_model` | user-global | text | *(absent)* | `"transcription.diarization_model" = "speaker-diarization"` |
+| | | | | The speaker model transcription loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`_models/models.toml`); a model that is missing or incomplete on this Mac is refused, never replaced. |
 | `transcription.language` | user-global | one of `auto`, `en`, `pl` | `auto` | `"transcription.language" = "pl"` |
 | | | | | The spoken language transcription expects; `auto` lets the model decide. |
 | `undo_send.window` | user-global | integer 0..=60 | `10` | `"undo_send.window" = 10` |

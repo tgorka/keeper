@@ -2707,6 +2707,339 @@ pub(crate) fn recording_note_targets_in(
         .map_err(to_ipc_error)
 }
 
+// ---- Removing a recording --------------------------------------------------
+
+/// The event a removal emits once the recording is gone: every open editor
+/// removes the blocks naming it, which keeper never does in a body someone
+/// has open.
+#[cfg(desktop)]
+const RECORDING_REMOVED_EVENT: &str = "keeper://recording-removed";
+
+/// The payload of [`RECORDING_REMOVED_EVENT`].
+#[cfg(desktop)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordingRemovedEvent {
+    session_id: String,
+}
+
+/// What removing a recording would delete, for its confirmation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingRemovalPreviewVm {
+    /// The session folder as its drive names it — or, in a plain folder, as
+    /// the recordings index stores it.
+    pub folder: String,
+    /// The synced folder it is in, by name; `None` for a plain folder on this
+    /// Mac, which no other device has.
+    pub drive: Option<String>,
+    pub bytes: u64,
+    pub files: u64,
+    /// How far the recording has travelled, as the recordings index says:
+    /// `local`, `committed`, `pushed` or `verified`. Only a pushed one is in
+    /// the drive's history; anything less is deleted for good.
+    pub durability: String,
+    /// The notes whose widget — or recording keys — go with it.
+    pub notes: Vec<crate::note_recording_ipc::RecordingNoteRefVm>,
+}
+
+/// What removing a recording did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingRemovedVm {
+    pub folder: String,
+    pub bytes: u64,
+    pub files: u64,
+    /// Notes keeper changed on disk: their recording keys, or their blocks.
+    pub notes_changed: Vec<crate::note_recording_ipc::RecordingNoteRefVm>,
+    /// Notes a live editor has open: their blocks go in that editor.
+    pub open_notes: Vec<crate::note_recording_ipc::RecordingNoteRefVm>,
+    /// Notes keeper could not change: they still name the removed recording.
+    pub notes_failed: Vec<crate::note_recording_ipc::RecordingNoteFailureVm>,
+}
+
+/// A removable session: its checked folder, the folder as a person reads it,
+/// and the synced folder it is in, by name.
+#[cfg(desktop)]
+struct RemovableSession {
+    session: keeper_core::recording::removal::SessionFolder,
+    display: String,
+    drive: Option<String>,
+}
+
+/// The folder of `session_id`, through the recordings index, under a root
+/// the archive follows right now (`recordings_roots`) — refused outside one,
+/// and for the root itself.
+#[cfg(desktop)]
+fn removable_session(
+    platform: &Arc<dyn Platform>,
+    data_dir: &Path,
+    session_id: &str,
+) -> Result<RemovableSession, IpcError> {
+    use keeper_core::recording::removal::{session_folder, RemovalRefusal};
+
+    let refusal = |refusal: RemovalRefusal| crate::transcribe_ipc::refused(refusal.to_string());
+    if !keeper_core::archive::db::db_path(data_dir).exists() {
+        return Err(refusal(RemovalRefusal::Unknown));
+    }
+    let conn = keeper_core::archive::db::open_readonly_archive_db(data_dir)
+        .map_err(CoreError::from)
+        .map_err(to_ipc_error)?;
+    let table = destination_profile_table(platform, ProfileTableNeed::Chosen);
+    let destination = effective_recording_destination(data_dir, &|_need| table.clone());
+    let roots: Vec<keeper_core::archive::KnownRoot> = recordings_roots(&destination, &table)
+        .iter()
+        .map(RecordingsRootPlan::known)
+        .collect();
+    let session = session_folder(&conn, session_id, &roots).map_err(refusal)?;
+    let profile = session.root.profile_id.as_deref().and_then(|profile_id| {
+        table
+            .as_ref()
+            .ok()?
+            .iter()
+            .find(|row| row.id == profile_id)
+            .cloned()
+    });
+    let display = profile
+        .as_ref()
+        .and_then(|row| {
+            let drive = row.local_path.canonicalize().ok()?;
+            let inside = session.folder.strip_prefix(drive).ok()?;
+            Some(
+                inside
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            )
+        })
+        .unwrap_or_else(|| session.relative_path.clone());
+    Ok(RemovableSession {
+        session,
+        display,
+        drive: profile.map(|row| row.name),
+    })
+}
+
+/// What removing the recording `session_id` would delete: its folder, its
+/// size, its drive and the notes naming it — what the confirmation says.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recording_remove_preview(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<RecordingRemovalPreviewVm, IpcError> {
+    let platform = Arc::clone(&state.platform);
+    off_async_runtime(move || -> Result<RecordingRemovalPreviewVm, IpcError> {
+        let data_dir = platform.data_dir().map_err(to_ipc_error)?;
+        let removable = removable_session(&platform, &data_dir, &session_id)?;
+        let size = keeper_core::recording::removal::measure(&removable.session.folder);
+        Ok(RecordingRemovalPreviewVm {
+            folder: removable.display,
+            drive: removable.drive,
+            bytes: size.bytes,
+            files: size.files,
+            durability: removable.session.durability,
+            notes: crate::note_recording_ipc::notes_naming(&session_id),
+        })
+    })
+    .await?
+}
+
+/// Remove the recording `session_id`: delete its folder — segments, audio,
+/// manifest, transcript, log — from the drive, forget its index row, and take
+/// it out of every note in an open vault (keys through the open-editor-safe
+/// amendment; blocks on disk only in notes nobody has open, and
+/// [`RECORDING_REMOVED_EVENT`] for the editors that have one).
+///
+/// Refused while the session records or is being finished (its folder is in
+/// the live-reservation set, which this claims for the whole deletion), while
+/// a transcription reads it, for a folder outside every recordings root and
+/// for one whose manifest does not name this session. The deletion is
+/// declared to the sync engine first — keeper's own, never a pulled drive —
+/// and reaches the drive's other devices through the sync asked for at once;
+/// only a recording that was already pushed is still in the drive's history.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recording_remove(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<RecordingRemovedVm, IpcError> {
+    use tauri::Emitter;
+
+    let platform = Arc::clone(&state.platform);
+    let reserved = Arc::clone(&state.reserved_recording_folders);
+    let resolving = Arc::clone(&platform);
+    let id = session_id.clone();
+    let (removable, size) = off_async_runtime(move || -> Result<_, IpcError> {
+        let data_dir = resolving.data_dir().map_err(to_ipc_error)?;
+        let removable = removable_session(&resolving, &data_dir, &id)?;
+        let claim = claim_for_removal(&reserved, &removable.session.folder, &id)?;
+        // Before the deletion, so no commit can meet it undeclared: on a
+        // removable drive a session that is most of the folder would read as
+        // the drive pulled mid-walk, and the profile would stop.
+        declare_removal(&resolving, &removable.session.path);
+        let size = keeper_core::recording::removal::remove(&removable.session)
+            .map_err(|refusal| crate::transcribe_ipc::refused(refusal.to_string()))?;
+        drop(claim);
+        Ok((removable, size))
+    })
+    .await??;
+
+    // The folder is gone; what follows only makes everything else agree.
+    if let Some(archive) = state.accounts.archive() {
+        if let Err(error) = archive.forget_recording(&session_id).await {
+            tracing::warn!(
+                %error,
+                session_id = %session_id,
+                "recording removal: the index row could not be forgotten; the next reconcile drops it"
+            );
+        }
+    }
+    let id = session_id.clone();
+    let notes = off_async_runtime(move || crate::note_recording_ipc::forget_session(&id)).await?;
+    let _ = app.emit(
+        RECORDING_REMOVED_EVENT,
+        RecordingRemovedEvent {
+            session_id: session_id.clone(),
+        },
+    );
+    tracing::info!(
+        session_id = %session_id,
+        folder = %removable.display,
+        bytes = size.bytes,
+        files = size.files,
+        notes_changed = notes.changed.len(),
+        open_notes = notes.open.len(),
+        notes_failed = notes.failed.len(),
+        "recording removal: the recording's folder is deleted and its notes no longer name it"
+    );
+    let folder = removable.session.path.clone();
+    tauri::async_runtime::spawn(async move { sync_removed_session(platform, folder).await });
+    Ok(RecordingRemovedVm {
+        folder: removable.display,
+        bytes: size.bytes,
+        files: size.files,
+        notes_changed: notes.changed,
+        open_notes: notes.open,
+        notes_failed: notes.failed,
+    })
+}
+
+/// Tell the sync engine the folder about to be deleted is keeper's own
+/// deletion (`Engine::declare_deletions`). Best-effort:
+/// a plain folder no profile holds has nothing to tell, and an engine that
+/// cannot open is a log line — the removal still happens.
+#[cfg(desktop)]
+fn declare_removal(platform: &Arc<dyn Platform>, folder: &Path) {
+    let engine = match crate::sync::engine(Arc::clone(platform)) {
+        Ok(engine) => engine,
+        Err(error) => {
+            tracing::warn!(%error, "recording removal: no sync engine to tell of the deletion");
+            return;
+        }
+    };
+    match crate::sync::profile_for_path(engine.as_ref(), folder) {
+        Ok(Some(profile)) => {
+            if let Err(error) = engine.declare_deletions(&profile.id, folder) {
+                tracing::warn!(%error, profile = %profile.id, "recording removal: the deletion could not be declared");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "recording removal: the sync profiles could not be read")
+        }
+    }
+}
+
+/// Claim a session folder for its removal, held until the folder is gone —
+/// or refuse: while the session records or is being finished (its folder,
+/// under any spelling, is in the live-reservation set, or it is the session
+/// recording from a note), and while a transcription reads it.
+#[cfg(desktop)]
+fn claim_for_removal(
+    reserved: &Arc<Mutex<HashSet<PathBuf>>>,
+    folder: &Path,
+    session_id: &str,
+) -> Result<LiveFolderReservation, IpcError> {
+    let claim = LiveFolderReservation::reserve(reserved, folder.to_path_buf());
+    let live = !claim.owned
+        || plain_lock(reserved)
+            .iter()
+            .any(|held| held != folder && is_same_directory(held, folder))
+        || crate::note_recording_ipc::recording_linked_note()
+            .is_some_and(|linked| linked.session_id == session_id);
+    if live {
+        return Err(IpcError {
+            code: IpcErrorCode::RecordingSessionLive,
+            message: "This recording is still recording or being finished. Stop it, and remove it once it has finished.".to_owned(),
+            account_id: None,
+            retriable: false,
+        });
+    }
+    if crate::transcribe_ipc::job_touches(folder) {
+        return Err(crate::transcribe_ipc::refused(
+            "A transcription of this recording is running. Cancel it, or let it finish, before removing the recording.",
+        ));
+    }
+    Ok(claim)
+}
+
+/// Hand a removed session's deletion to its drive's sync now — best-effort:
+/// the folder is already gone, and the next scheduled sync commits the
+/// deletion anyway.
+#[cfg(desktop)]
+async fn sync_removed_session(platform: Arc<dyn Platform>, folder: PathBuf) {
+    let engine = match crate::sync::engine(platform) {
+        Ok(engine) => engine,
+        Err(error) => {
+            tracing::warn!(%error, "recording removal: no sync engine; the deletion syncs later");
+            return;
+        }
+    };
+    let profile = match crate::sync::profile_for_path(engine.as_ref(), &folder) {
+        Ok(Some(profile)) => profile,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, "recording removal: the sync profiles could not be read");
+            return;
+        }
+    };
+    if let Err(error) = engine
+        .sync_once(&profile.id, keeper_sync::provenance::SyncSource::Manual)
+        .await
+    {
+        tracing::warn!(
+            %error,
+            profile = %profile.id,
+            "recording removal: the deletion did not sync now; the next sync carries it"
+        );
+    }
+}
+
+/// Mobile twin of [`recording_remove_preview`]: recording is desktop-only.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn recording_remove_preview(
+    session_id: String,
+) -> Result<RecordingRemovalPreviewVm, IpcError> {
+    let _ = session_id;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "removing a recording is desktop-only".to_owned(),
+    )))
+}
+
+/// Mobile twin of [`recording_remove`]: recording is desktop-only.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn recording_remove(session_id: String) -> Result<RecordingRemovedVm, IpcError> {
+    let _ = session_id;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "removing a recording is desktop-only".to_owned(),
+    )))
+}
+
 /// Start a background archive export (Story 5.5, FR-35, AD-11).
 ///
 /// Registers a cancel flag, returns the `exportId` immediately, and spawns a
@@ -17048,6 +17381,54 @@ mod tests {
         drop(borrowed);
         drop(held);
         assert!(plain_lock(&reserved).is_empty());
+    }
+
+    /// A recording is never removed while it records or is being finished:
+    /// its folder is in the live set — under the spelling the recorder used,
+    /// which may be a symlinked one — and the removal is refused until the
+    /// recorder lets it go.
+    #[cfg(desktop)]
+    #[test]
+    fn a_live_sessions_folder_is_not_claimed_for_removal() {
+        let base = std::env::temp_dir().join(format!(
+            "keeper-removal-claim-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let folder = base.join("recordings/2026/standup");
+        std::fs::create_dir_all(&folder).expect("session folder");
+        let folder = folder.canonicalize().expect("canonical");
+        let reserved = reserved_set();
+
+        let recording = LiveFolderReservation::reserve(&reserved, folder.clone());
+        let refused = claim_for_removal(&reserved, &folder, "S1").expect_err("live");
+        assert_eq!(refused.code, IpcErrorCode::RecordingSessionLive);
+        assert!(
+            plain_lock(&reserved).contains(&folder),
+            "the refusal must not release the recorder's claim"
+        );
+        drop(recording);
+
+        #[cfg(unix)]
+        {
+            let alias = base.join("alias");
+            std::os::unix::fs::symlink(&folder, &alias).expect("symlink");
+            let recording = LiveFolderReservation::reserve(&reserved, alias);
+            assert!(
+                claim_for_removal(&reserved, &folder, "S1").is_err(),
+                "the same folder under another spelling is still the live one"
+            );
+            drop(recording);
+        }
+
+        let claim = claim_for_removal(&reserved, &folder, "S1").expect("finished, so removable");
+        assert!(
+            plain_lock(&reserved).contains(&folder),
+            "held while it is deleted"
+        );
+        drop(claim);
+        assert!(plain_lock(&reserved).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Story 40.4: the lexical `strip_prefix` behind the "inside the destination

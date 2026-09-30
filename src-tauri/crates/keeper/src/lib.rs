@@ -1067,6 +1067,7 @@ pub fn run() {
                 // never special-cases the call.
                 transcribe_ipc::transcription_status,
                 transcribe_ipc::transcription_models_fetch,
+                transcribe_ipc::transcription_models_available,
                 transcribe_ipc::transcription_start,
                 transcribe_ipc::transcription_cancel,
                 transcribe_ipc::transcription_settings_set,
@@ -1107,6 +1108,9 @@ pub fn run() {
                 note_recording_ipc::recording_linked_note,
                 note_recording_ipc::media_block_recording,
                 note_recording_ipc::media_block_record_started,
+                note_recording_ipc::media_block_without_session,
+                ipc::recording_remove_preview,
+                ipc::recording_remove,
                 ipc::bridge_catalog,
                 ipc::bridge_discover,
                 ipc::bridge_login_start,

@@ -4888,6 +4888,81 @@ pub(crate) fn live_texts(vault_id: &str, rel: &str) -> Vec<String> {
     texts
 }
 
+/// Whether a live editor has the note `rel` of vault `vault_id` open.
+fn has_editor(vault_id: &str, rel: &str) -> bool {
+    let editors: Vec<Arc<BodySub>> = subscriptions()
+        .values()
+        .filter_map(|sub| sub.body.clone())
+        .filter(|sub| sub.vault_id == vault_id)
+        .collect();
+    editors
+        .iter()
+        .any(|sub| !*lock_released(sub) && lock_body(sub).rel == rel)
+}
+
+/// What forgetting a removed recording did to one note.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SessionForgotten {
+    /// keeper wrote the note: its recording keys, or its blocks.
+    pub changed: bool,
+    /// A live editor has the note open, so its blocks naming the recording
+    /// are that editor's to remove (`keeper://recording-removed`).
+    pub open: bool,
+}
+
+/// Take the removed recording `session_id` out of the note `rel`: its
+/// `session`/`recording`/`files` keys through [`amend_block`], safe under an
+/// open editor, and — only when no editor has the note open — every block
+/// naming it, on disk, after a re-read check. keeper never edits the body of
+/// a note someone has open; that editor removes the blocks itself.
+#[cfg_attr(not(desktop), allow(dead_code))]
+pub(crate) fn forget_session(
+    vault: &Vault,
+    rel: &str,
+    session_id: &str,
+) -> Result<SessionForgotten, NotesError> {
+    use keeper_core::notes::{media_block, note_recording};
+
+    let keys = amend_block(vault, rel, |text| {
+        note_recording::without_session_keys(text, session_id)
+    })?;
+    if has_editor(&vault.id, rel) {
+        return Ok(SessionForgotten {
+            changed: keys,
+            open: true,
+        });
+    }
+    for _ in 0..AMEND_ATTEMPTS {
+        let disk = notes_vault::read_note(vault, rel)?;
+        let Some(next) = media_block::without_session_blocks(&disk, session_id) else {
+            return Ok(SessionForgotten {
+                changed: keys,
+                open: false,
+            });
+        };
+        let disk_rev = notes_vault::content_rev(&disk);
+        if notes_vault::content_rev(&notes_vault::read_note(vault, rel)?) != disk_rev {
+            continue;
+        }
+        // An editor that opened meanwhile read the note before this write,
+        // and would hold the blocks back: its own listener removes them.
+        if has_editor(&vault.id, rel) {
+            return Ok(SessionForgotten {
+                changed: keys,
+                open: true,
+            });
+        }
+        notes_vault::write_note(vault, rel, &next)?;
+        return Ok(SessionForgotten {
+            changed: true,
+            open: false,
+        });
+    }
+    Err(NotesError::Name(format!(
+        "{rel} kept changing while keeper wrote to it"
+    )))
+}
+
 // ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------
@@ -7866,6 +7941,73 @@ mod tests {
         assert!(disk.contains("recording/hesperia"), "{disk}");
         assert_eq!(split_note(&disk).1, "Agenda.\n");
         assert!(amend_block(&vault, rel, |text| Some(format!("{text}More.\n"))).is_err());
+        std::fs::remove_dir_all(&vault.root).ok();
+    }
+
+    const REMOVED: &str = "01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KYDM0000000000000000000A";
+
+    /// A recording's note naming `REMOVED` in its keys and in a block, with
+    /// another recording's block beside it.
+    fn naming_removed() -> String {
+        format!(
+            "---\ntitle: Standup\nsession: {REMOVED}\nrecording: 2026/standup\nfiles:\n  - 2026/standup/screen-0000.mov\n---\nAgenda.\n\n```keeper-media\nsession = \"{REMOVED}\"\n```\n\n```keeper-media\nsession = \"OTHER\"\n```\n"
+        )
+    }
+
+    #[test]
+    fn a_removed_recording_leaves_a_closed_note_keys_and_blocks_and_all() {
+        let vault = test_vault("forget-closed");
+        let rel = "forget-closed-standup.md";
+        std::fs::write(vault.root.join(rel), naming_removed()).expect("note");
+
+        let forgotten = forget_session(&vault, rel, REMOVED).expect("forgotten");
+
+        assert_eq!(
+            forgotten,
+            SessionForgotten {
+                changed: true,
+                open: false
+            }
+        );
+        assert_eq!(
+            notes_vault::read_note(&vault, rel).expect("note"),
+            "---\ntitle: Standup\n---\nAgenda.\n\n\n```keeper-media\nsession = \"OTHER\"\n```\n"
+        );
+        assert_eq!(
+            forget_session(&vault, rel, REMOVED).expect("again"),
+            SessionForgotten::default(),
+            "a second removal finds nothing to change"
+        );
+        std::fs::remove_dir_all(&vault.root).ok();
+    }
+
+    #[test]
+    fn a_removed_recording_leaves_an_open_notes_body_to_its_editor() {
+        let vault = test_vault("forget-open");
+        let rel = "forget-open-standup.md";
+        std::fs::write(vault.root.join(rel), naming_removed()).expect("note");
+        let editor = open_on(&vault, "forget-open", rel);
+
+        let forgotten = forget_session(&vault, rel, REMOVED).expect("forgotten");
+
+        assert_eq!(
+            forgotten,
+            SessionForgotten {
+                changed: true,
+                open: true
+            }
+        );
+        let disk = notes_vault::read_note(&vault, rel).expect("note");
+        assert!(
+            !disk.contains("recording: 2026/standup"),
+            "the keys went: {disk}"
+        );
+        assert_eq!(
+            split_note(&disk).1,
+            split_note(&naming_removed()).1,
+            "the body is the editor's: keeper wrote none of it"
+        );
+        unregister(&editor);
         std::fs::remove_dir_all(&vault.root).ok();
     }
 

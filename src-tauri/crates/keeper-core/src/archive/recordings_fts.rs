@@ -936,7 +936,7 @@ fn recording_hit_vm(
 /// for the same user, and the writer heals it the next time anything records.
 /// One `sqlite_master` probe per query, against a b-tree the connection has
 /// already opened.
-fn recordings_indexed(conn: &Connection) -> Result<bool, ArchiveError> {
+pub(crate) fn recordings_indexed(conn: &Connection) -> Result<bool, ArchiveError> {
     conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recordings'",
         [],

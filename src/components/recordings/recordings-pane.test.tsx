@@ -8,6 +8,8 @@ const recordingOpenPath = vi.fn();
 const revealPath = vi.fn();
 const transcriptionStart = vi.fn();
 const recordingsReconcileNow = vi.fn();
+const recordingRemovePreview = vi.fn();
+const recordingRemove = vi.fn();
 // The shell's "the index landed" event: captured so a test can fire it.
 let reconciled: (() => void) | undefined;
 vi.mock("@/lib/ipc/client", () => ({
@@ -18,6 +20,8 @@ vi.mock("@/lib/ipc/client", () => ({
     transcriptionStart(path, onProgress, replace),
   transcriptionCancel: () => Promise.resolve(),
   recordingsReconcileNow: () => recordingsReconcileNow(),
+  recordingRemovePreview: (sessionId: unknown) => recordingRemovePreview(sessionId),
+  recordingRemove: (sessionId: unknown) => recordingRemove(sessionId),
   listenRecordingsReconciled: (onReconciled: () => void) => {
     reconciled = onReconciled;
     return Promise.resolve(() => {
@@ -33,8 +37,10 @@ vi.mock("@/components/transcription/transcript-viewer", () => ({
 }));
 
 import { open as openFile } from "@tauri-apps/plugin-dialog";
-import { RECORDINGS_TRANSCRIBE_LABEL } from "@/components/recordings/recording-row";
-
+import {
+  RECORDINGS_ROW_ACTIONS_LABEL,
+  RECORDINGS_TRANSCRIBE_LABEL,
+} from "@/components/recordings/recording-row";
 import {
   RECORDINGS_COUNT_SLOT,
   RECORDINGS_LIST_LABEL,
@@ -45,6 +51,10 @@ import {
   RECORDINGS_REFRESH_LABEL,
   RecordingsPane,
 } from "@/components/recordings/recordings-pane";
+import {
+  REMOVE_RECORDING_CONFIRM,
+  REMOVE_RECORDING_LABEL,
+} from "@/components/recordings/remove-recording-dialog";
 import { TRANSCRIBE_A_FILE_LABEL } from "@/components/transcription/transcribe-a-file";
 import { WINDOW_ROW_ATTR, WINDOW_VIEWPORT_ATTR } from "@/components/ui/window-list";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
@@ -398,6 +408,41 @@ describe("RecordingsPane", () => {
       fireEvent.click(screen.getByRole("button", { name: "Show transcript: Standup" }));
       expect(screen.getByRole("dialog")).toHaveTextContent(transcript);
     });
+  });
+
+  it("removes a recording from its row's ⋯ after the confirmation, and the row goes", async () => {
+    const session = hit({ sessionId: "s1", title: "Standup" });
+    searchRecordings.mockResolvedValue(found([session]));
+    recordingRemovePreview.mockResolvedValue({
+      folder: "recordings/keeper-rec s1",
+      drive: "tgdrive",
+      bytes: 412_000_000,
+      files: 5,
+      durability: "local",
+      notes: [],
+    });
+    recordingRemove.mockResolvedValue({
+      folder: "recordings/keeper-rec s1",
+      bytes: 412_000_000,
+      files: 5,
+      notesChanged: [],
+      openNotes: [],
+      notesFailed: [],
+    });
+    render(<RecordingsPane />);
+    const trigger = await screen.findByRole("button", {
+      name: `${RECORDINGS_ROW_ACTIONS_LABEL}: Standup`,
+    });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    fireEvent.click(await screen.findByRole("menuitem", { name: REMOVE_RECORDING_LABEL }));
+    expect(recordingRemovePreview).toHaveBeenCalledWith("s1");
+    searchRecordings.mockResolvedValue(found([]));
+
+    fireEvent.click(await screen.findByRole("button", { name: REMOVE_RECORDING_CONFIRM }));
+
+    expect(recordingRemove).toHaveBeenCalledWith("s1");
+    await waitFor(() => expect(screen.queryByText("Standup")).toBeNull());
+    expect(screen.queryByRole("alertdialog")).toBeNull();
   });
 });
 

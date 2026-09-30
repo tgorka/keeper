@@ -880,3 +880,31 @@ fn record_new_is_a_source_of_its_own() {
         Ok(Source::Record)
     );
 }
+
+// --- A removed recording --------------------------------------------------
+
+#[test]
+fn a_removed_recordings_blocks_go_whole_with_their_words_and_every_other_block_stays() {
+    let gone = format!("```keeper-media\n# mine\nsession = \"{ID}\"\n```\n");
+    let indented = format!("  ```keeper-media\n  session = \"{ID}\"\n  ```\n");
+    let kept = "```keeper-media\nsession = \"OTHER\"\n```\n";
+    let note = format!(
+        "---\ntitle: Standup\n---\nAgenda.\n\n{gone}> [!transcript] 00:01\n> Ala: hello\n\nAfter.\n\n{indented}{kept}\n~~~markdown\n{gone}~~~\nEnd.\n"
+    );
+
+    let without = without_session_blocks(&note, ID).expect("the note named the session");
+
+    assert_eq!(
+        without,
+        format!("---\ntitle: Standup\n---\nAgenda.\n\n\nAfter.\n\n{kept}\n~~~markdown\n{gone}~~~\nEnd.\n"),
+        "both blocks and the words under the first go; another session's block and a quoted example stay"
+    );
+    assert_eq!(without_session_blocks(&without, ID), None);
+    assert_eq!(without_session_blocks(kept, ID), None);
+}
+
+#[test]
+fn a_block_ending_the_note_takes_the_line_break_before_it() {
+    let note = format!("Intro.\n```keeper-media\nsession = \"{ID}\"\n```");
+    assert_eq!(without_session_blocks(&note, ID).as_deref(), Some("Intro."));
+}

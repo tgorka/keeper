@@ -1427,6 +1427,8 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
                 platform: std::env::consts::OS,
                 machine: machine.as_deref(),
                 now_rfc3339: &now,
+                version: KEEPER_VERSION,
+                commit: KEEPER_COMMIT,
             },
         )
         .into_iter()
@@ -1483,6 +1485,12 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
         author: &author,
         oauth,
     };
+    // 6a. Which keeper this device runs, so the repository shows whether
+    //     every device updated: its record's version keys, when they differ.
+    let problem = match problem {
+        None => publish_version(platform.as_ref(), &leg, &mut auth, &identity.login, &device).await,
+        problem => problem,
+    };
     let settings_problem =
         sync_settings(Arc::clone(&platform), &leg, &mut auth, &identity, &device).await;
     let problem = problem.or(settings_problem);
@@ -1519,6 +1527,85 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
         }
         inner.phase = AccountPhase::Idle;
     });
+}
+
+/// The keeper release this build is, and the source it was built from, as
+/// `build_identity`'s banner names them.
+const KEEPER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const KEEPER_COMMIT: &str = env!("KEEPER_BUILD_SHA");
+
+/// Bring this device's `devices/<slug>.toml` up to the running keeper,
+/// as `"{login}: {device} runs keeper {version}"`. Checked against the clone
+/// the registration just refreshed first, so a sync where nothing changed
+/// costs no fetch and makes no commit.
+async fn publish_version(
+    platform: &dyn Platform,
+    leg: &RepoLeg<'_>,
+    auth: &mut RepoAuth,
+    login: &str,
+    device: &str,
+) -> Option<AccountProblem> {
+    let plan = {
+        let (login, device) = (login.to_owned(), device.to_owned());
+        move |root: &Path| -> Vec<Write> {
+            let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            layout::plan_version(
+                &WorktreeFiles(root),
+                &login,
+                &device,
+                KEEPER_VERSION,
+                KEEPER_COMMIT,
+                &now,
+            )
+            .into_iter()
+            // The staging guard: only this device's own record is replaced;
+            // every other device's stays create-only.
+            .filter(|write| layout::is_own_record(&login, &device, &write.rel))
+            .map(|write| Write {
+                rel: PathBuf::from(write.rel),
+                bytes: write.bytes,
+                replace: true,
+            })
+            .collect()
+        }
+    };
+    let due = {
+        let (plan, dir) = (plan.clone(), leg.spec.dir.clone());
+        on_blocking_pool(move || !plan(&dir).is_empty())
+            .await
+            .unwrap_or(false)
+    };
+    if !due {
+        return None;
+    }
+    let message = format!("{login}: {device} runs keeper {KEEPER_VERSION}");
+    let http = leg.http;
+    let pushed = with_forge_retry(platform, http, leg.d, auth, |auth| {
+        let (spec, author, message, plan, interrupt) = (
+            leg.spec.clone(),
+            leg.author.clone(),
+            message.clone(),
+            plan.clone(),
+            interrupt(),
+        );
+        off_runtime(move || async move {
+            config_repo::commit_and_push(http, &spec, &auth, &author, &message, plan, &interrupt)
+                .await
+        })
+    })
+    .await;
+    match pushed {
+        Ok(Ok(PushResult::Pushed { head })) => {
+            tracing::info!(%head, version = KEEPER_VERSION, "account: published which keeper this device runs");
+            None
+        }
+        Ok(Ok(PushResult::NothingToDo)) => None,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "account: which keeper this device runs could not be published");
+            repo_problem(&error, leg.oauth)
+        }
+        Err(sentence) => Some(AccountProblem::Failed(sentence)),
+    }
 }
 
 /// What every push to the config repository in one run shares.
@@ -3801,8 +3888,8 @@ mod tests {
         );
     }
 
-    /// A file that needed writing and could not be — outside the five of
-    /// AD-324, or not renderable — is reported dropped, so its base keeps
+    /// A file that needed writing and could not be — outside the files keeper
+    /// may replace, or not renderable — is reported dropped, so its base keeps
     /// this device's changes to push; nothing is written for it.
     #[test]
     fn a_write_that_cannot_happen_is_dropped() {
@@ -3810,6 +3897,7 @@ mod tests {
             "tgorka/keeper.toml",
             "tgorka/user.toml",
             "tgorka/devices/mac.toml",
+            "alice/devices/mac.toml",
             "someone/settings.toml",
             "_template/settings.toml",
         ] {

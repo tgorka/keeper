@@ -541,6 +541,17 @@ export function mediaBlockMockHandlers(): Record<
         /^(\s*)record(\s*=\s*)"new"/m,
         `$1session$2"${String(p.sessionId)}"`,
       ),
+    // A removed recording's fences, read the way `without_session_blocks` does
+    // for the plain shape the fixture notes use.
+    media_block_without_session: (p): string | null => {
+      const text = String(p.text);
+      const fence = new RegExp(
+        `\`\`\`keeper-media\\n[^\`]*session\\s*=\\s*"${String(p.sessionId)}"[^\`]*\`\`\`\\n?`,
+        "g",
+      );
+      const next = text.replace(fence, "");
+      return next === text ? null : next;
+    },
     // Nothing records in this shell, so no note is linked to a session.
     recording_linked_note: (): RecordingLinkedNoteVm | null => null,
     // The daily reconcile's manual trigger: accepted, as with nothing recording.

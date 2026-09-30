@@ -507,8 +507,10 @@ export function TranscriptPlayer({
           </IconHint>
         </div>
       </div>
+      {/* The part first (owner, 2026-09-30): it is the one fact that changes while
+          the recording plays, so it must not be what the ellipsis cuts. */}
       <MetaLine
-        text={[meta, parts.length > 1 ? `Part ${index + 1} of ${parts.length}` : null, partName]
+        text={[parts.length > 1 ? `Part ${index + 1} of ${parts.length}` : null, partName, meta]
           .filter((piece) => piece)
           .join(" · ")}
       />

@@ -80,6 +80,8 @@ beforeEach(() => {
     models: { state: "ready", sentence: "Ready", missing: [] },
     afterRecording: true,
     language: "auto",
+    asrModel: "",
+    diarizationModel: "",
     voicesDrives: [
       {
         profileId: "drive",
@@ -637,12 +639,12 @@ const SESSION_MEDIA: ipc.TranscriptMediaVm = {
   })),
 };
 const sessionPath = SESSION_TRANSCRIPT_FIXTURE.path;
-/** The meta row under the controls, which ends with the part that plays. */
+/** The meta row under the controls, which starts with the part that plays. */
 const partLine = (text: string) =>
   screen.getByText(
     (_, element) =>
       element?.tagName === "P" &&
-      (element.textContent === text || (element.textContent?.endsWith(` · ${text}`) ?? false)),
+      (element.textContent === text || (element.textContent?.startsWith(`${text} · `) ?? false)),
   );
 describe("Player", () => {
   let play: MockInstance<HTMLMediaElement["play"]>;
@@ -864,15 +866,19 @@ describe("Player", () => {
     );
     expect(play).not.toHaveBeenCalled();
   });
-  it("says what the recording is on one row, the part it plays last, whole in its tooltip", async () => {
+  it("says what the recording is on one row, the part it plays first, whole in its tooltip", async () => {
     render(<TranscriptViewer path={sessionPath} />);
     await screen.findByLabelText("screen-0000.mov");
     const { transcript } = SESSION_TRANSCRIPT_FIXTURE;
     const facts = partLine("Part 1 of 2 · screen-0000.mov");
-    // One element: the date, the engines and the part are a single cut-off row.
-    expect(facts.textContent?.startsWith(new Date(transcript.createdAt).toLocaleString())).toBe(
-      true,
-    );
+    // One element: the part, the date and the engines are a single cut-off row.
+    // The part leads (owner, 2026-09-30): it changes as the recording plays, so
+    // it is the fact the ellipsis must never cut; it was last until then.
+    expect(
+      facts.textContent?.startsWith(
+        `Part 1 of 2 · screen-0000.mov · ${new Date(transcript.createdAt).toLocaleString()}`,
+      ),
+    ).toBe(true);
     expect(facts.textContent).toContain(` · ${transcript.engine.asr} · `);
     expect(facts).toHaveClass("truncate");
     expect(facts).not.toHaveClass("font-mono");

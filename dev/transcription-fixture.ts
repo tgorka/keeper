@@ -192,6 +192,8 @@ export function transcriptionMockHandlers(
     },
     language: "auto",
     afterRecording: true,
+    asrModel: "",
+    diarizationModel: "",
     voicesDrives: [
       {
         profileId: "p1",
@@ -309,8 +311,18 @@ export function transcriptionMockHandlers(
     transcription_settings_set: (p) => {
       if (p.language != null) status.language = p.language as TranscriptionStatusVm["language"];
       if (p.afterRecording != null) status.afterRecording = Boolean(p.afterRecording);
+      if (p.asrModel != null) status.asrModel = String(p.asrModel);
+      if (p.diarizationModel != null) status.diarizationModel = String(p.diarizationModel);
       return structuredClone(status);
     },
+    transcription_models_available: () => ({
+      asr: [
+        { id: "parakeet-tdt-0.6b-v3", complete: true },
+        { id: "parakeet-tdt-0.6b-v4", complete: false },
+      ],
+      diarization: [{ id: "speaker-diarization", complete: true }],
+      defaults: { asr: "parakeet-tdt-0.6b-v3", diarization: "speaker-diarization" },
+    }),
     transcription_start: (p) => {
       const jobId = crypto.randomUUID();
       const channel = p.channel as { onmessage: (progress: TranscriptionProgressVm) => void };

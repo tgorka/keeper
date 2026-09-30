@@ -28,8 +28,9 @@ leaves it for this, there is no transcription server, no NAS option and no cloud
 
 - **Settings › Transcription:** the models' state and *Fetch models*; the language (*Auto*,
   English, Polish — `transcription.language`); *Transcribe after recording*
-  (`transcription.after_recording`, on by default); for each drive that keeps voices, its people
-  (rename, mark as me, merge, delete) and its dictionary; and *Transcribe a file…*.
+  (`transcription.after_recording`, on by default); *Speech model* and *Speaker model* (see
+  *Choosing the models*); for each drive that keeps voices, its people (rename, mark as me,
+  merge, delete) and its dictionary; and *Transcribe a file…*.
 - **Recording › Transcribe a File…** in the menu bar, the ⌘K palette and the ⌘? cheat sheet
   (registry id `transcription-transcribe-file`): the same native file picker as Settings ›
   Transcription, for any media file on this Mac. It exists only where transcription runs (the
@@ -215,6 +216,35 @@ Each value must be one plain folder name (no `/`, `..` or `:`). An unknown key i
 
 Keep the diarizer and the embedding id together: the speaker embeddings come from the
 diarizer's own `Embedding.mlmodelc`, so a diarizer change is an embedding-model change.
+
+### Choosing the models
+
+`models.toml` is the organisation's choice. A person can pick another model folder for either
+role in Settings › Transcription, to try a new model before it becomes the set or to keep an
+older one:
+
+- **Speech model** (`transcription.asr_model`) and **Speaker model**
+  (`transcription.diarization_model`) are text settings, user-global, so they travel through
+  the account's `settings.toml` to every device (`docs/settings-keys.md`). Blank, the default,
+  is *From the config repository (<the folder models.toml names>)*.
+- **The choices** are the folders under the hydrated `<data_dir>/models/` that hold files of
+  that role (`transcription_models_available`). A folder holding all of them is offered; one
+  holding only some is listed as *(incomplete)* and cannot be picked. A pick that is no longer
+  on this Mac stays in the list as *(not on this Mac)* so it can be changed.
+- **No silent fallback.** A picked model that is missing or incomplete is refused with a
+  sentence naming it and Settings › Transcription, e.g. "The speech model “parakeet-next”
+  chosen in Settings → Transcription is not on this Mac. Choose another speech model there,
+  or “From the config repository”." The sentence is the models' state in Settings and the
+  job's failure; an automatic job after a recording logs it and does not run. keeper never
+  loads the repository's model in its place.
+- **The transcript says which ran.** `engine.asr` and `engine.diarizer` in `transcript.json`
+  are the folder names loaded, and the viewer's meta line shows them.
+- **A speaker model other than the repository's** keys the voices bank by its own folder name
+  (`embeddings/<folder>/`), because its embeddings need not be comparable with the
+  repository's embedding model; the bank re-embeds from clips as for any embedding change.
+  Picking the repository's own speaker model keeps `[embedding] id`. A picked speaker model
+  that is not here refuses the drive's people list with the same sentence rather than
+  showing the bank under the repository's embedding model.
 
 ## The voices bank
 

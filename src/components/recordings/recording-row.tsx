@@ -46,6 +46,7 @@ import {
   AudioLines,
   CloudCheck,
   Copy,
+  Ellipsis,
   FileText,
   FolderOpen,
   GitCommitHorizontal,
@@ -58,6 +59,7 @@ import {
   DURABILITY_LOCAL_LABEL,
   DURABILITY_PUSHED_LABEL,
 } from "@/components/recording/active-recording-banner";
+import { REMOVE_RECORDING_LABEL } from "@/components/recordings/remove-recording-dialog";
 import {
   TRANSCRIBE_AGAIN_LABEL,
   TranscribeAgainDialog,
@@ -65,6 +67,13 @@ import {
 import { TranscriptionJob } from "@/components/transcription/transcription-job";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { IconHint } from "@/components/ui/tooltip";
 import { formatElapsed } from "@/hooks/use-recording-session";
 import type { RecordingHitVm, TranscriptionProgressVm } from "@/lib/ipc/client";
 import { formatSize } from "@/lib/recording-format";
@@ -98,6 +107,9 @@ export const RECORDINGS_NO_DATE_LABEL = "Date unknown";
  * the visible part is an icon and the word beside it is `sr-only`. */
 export const RECORDINGS_ROW_DURABILITY_TESTID = "recording-row-durability";
 
+/** The row's ⋯, which holds its destructive action. */
+export const RECORDINGS_ROW_ACTIONS_LABEL = "More actions";
+
 /** What one durability word looks like: epic 41's word, and a glyph for it. */
 const DURABILITY_GLYPH: Record<string, { label: string; Icon: LucideIcon }> = {
   local: { label: DURABILITY_LOCAL_LABEL, Icon: HardDrive },
@@ -124,6 +136,8 @@ export interface RecordingRowProps {
   onTranscribe: (hit: RecordingHitVm, replace: boolean) => void;
   /** Open a transcript in the transcript dialog. */
   onShowTranscript: (path: string) => void;
+  /** Ask to remove the recording (the confirmation is the pane's). */
+  onRemove: (hit: RecordingHitVm) => void;
 }
 
 export function RecordingRow({
@@ -135,6 +149,7 @@ export function RecordingRow({
   job,
   onTranscribe,
   onShowTranscript,
+  onRemove,
 }: RecordingRowProps) {
   // The transient copy confirmation, held here rather than in the pane so one
   // row's "Copied" cannot survive into the row that replaces it on a re-query.
@@ -286,6 +301,26 @@ export function RecordingRow({
             <Copy aria-hidden="true" />
             {copied ? RECORDINGS_COPIED_LABEL : RECORDINGS_COPY_ID_LABEL}
           </Button>
+          <DropdownMenu>
+            <IconHint label={`${RECORDINGS_ROW_ACTIONS_LABEL}: ${headline}`}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-8"
+                  aria-label={`${RECORDINGS_ROW_ACTIONS_LABEL}: ${headline}`}
+                >
+                  <Ellipsis aria-hidden="true" />
+                </Button>
+              </DropdownMenuTrigger>
+            </IconHint>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem variant="destructive" onSelect={() => onRemove(hit)}>
+                {REMOVE_RECORDING_LABEL}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </div>
       {jobShown && <TranscriptionJob path={hit.absolutePath} onOpen={onShowTranscript} />}

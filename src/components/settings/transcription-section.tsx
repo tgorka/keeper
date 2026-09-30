@@ -12,8 +12,11 @@ import {
   type DictionaryTermVm,
   dictionaryTermDelete,
   dictionaryTermSave,
+  type ModelChoiceVm,
   type PersonVm,
   type TranscriptionLanguage,
+  type TranscriptionModelsVm,
+  transcriptionModelsAvailable,
   transcriptionModelsFetch,
   voicesPeopleMerge,
   voicesPersonDelete,
@@ -73,6 +76,7 @@ function TranscriptionSettings() {
   const [fetching, setFetching] = useState(false);
   const [path, setPath] = useState<string | null>(null);
   const [view, setView] = useState<string | null>(null);
+  const [models, setModels] = useState<TranscriptionModelsVm | null>(null);
   useEffect(() => {
     void refreshTranscription();
   }, []);
@@ -81,6 +85,18 @@ function TranscriptionSettings() {
     const timer = window.setInterval(() => void refreshTranscription(), 1500);
     return () => window.clearInterval(timer);
   }, [status?.models.state]);
+  // A fetch that lands changes which model folders are here.
+  const modelsState = status?.models.state;
+  useEffect(() => {
+    if (modelsState === undefined || modelsState === "fetching") return;
+    let live = true;
+    void transcriptionModelsAvailable()
+      .then((next) => live && setModels(next))
+      .catch((cause: unknown) => live && setError(syncErrorMessage(cause)));
+    return () => {
+      live = false;
+    };
+  }, [modelsState]);
   const pick = async () => {
     try {
       const picked = await pickFileToTranscribe();
@@ -176,6 +192,30 @@ function TranscriptionSettings() {
             <option value="pl">Polish</option>
           </select>
           <AfterRecordingSwitch />
+          {models && (
+            <>
+              <ModelSelect
+                id={`${id}-asr-model`}
+                label="Speech model"
+                value={status.asrModel}
+                fallback={models.defaults.asr}
+                choices={models.asr}
+                disabled={saving}
+                onChange={(asrModel) => void saveTranscriptionSettings({ asrModel })}
+              />
+              <ModelSelect
+                id={`${id}-diarization-model`}
+                label="Speaker model"
+                value={status.diarizationModel}
+                fallback={models.defaults.diarization}
+                choices={models.diarization}
+                disabled={saving}
+                onChange={(diarizationModel) =>
+                  void saveTranscriptionSettings({ diarizationModel })
+                }
+              />
+            </>
+          )}
           {status.voicesDrives.length === 0 && (
             <p className="text-muted-foreground">
               Choose a folder that keeps voices in Settings → Sync to keep people and a dictionary.
@@ -207,6 +247,55 @@ function TranscriptionSettings() {
         }}
       />
     </section>
+  );
+}
+/**
+ * One role's model: the config repository's choice first, then every model
+ * folder on this Mac for that role. An incomplete one is shown but cannot be
+ * picked; a pick that is no longer here stays visible, so the refusal the
+ * status line gives has something to point at.
+ */
+function ModelSelect({
+  id,
+  label,
+  value,
+  fallback,
+  choices,
+  disabled,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  fallback: string;
+  choices: ModelChoiceVm[];
+  disabled: boolean;
+  onChange: (id: string) => void;
+}) {
+  const gone = value !== "" && !choices.some((choice) => choice.id === value);
+  return (
+    <>
+      <Label htmlFor={id}>{label}</Label>
+      <select
+        id={id}
+        className={TRANSCRIPTION_SELECT}
+        disabled={disabled}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+      >
+        <option value="">From the config repository ({fallback})</option>
+        {choices.map((choice) => (
+          <option key={choice.id} value={choice.id} disabled={!choice.complete}>
+            {choice.complete ? choice.id : `${choice.id} (incomplete)`}
+          </option>
+        ))}
+        {gone && (
+          <option value={value} disabled>
+            {value} (not on this Mac)
+          </option>
+        )}
+      </select>
+    </>
   );
 }
 function VoicesDrive({

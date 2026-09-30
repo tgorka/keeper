@@ -53,9 +53,10 @@ use keeper_core::transcription::models::{self as model_files, MODELS_TOML};
 use keeper_core::transcription::progress::{Estimate, PartLoad};
 use keeper_core::transcription::render;
 use keeper_core::transcription::vm::{
-    CorrectionResultVm, DictionaryTermVm, ModelsState, ModelsStateVm, PersonVm, TranscriptMediaVm,
-    TranscriptVm, TranscriptWrittenVm, TranscriptionPhase, TranscriptionProgressVm,
-    TranscriptionStatusVm, VoicesDriveVm,
+    CorrectionResultVm, DictionaryTermVm, ModelChoiceVm, ModelDefaultsVm, ModelsState,
+    ModelsStateVm, PersonVm, TranscriptMediaVm, TranscriptVm, TranscriptWrittenVm,
+    TranscriptionModelsVm, TranscriptionPhase, TranscriptionProgressVm, TranscriptionStatusVm,
+    VoicesDriveVm,
 };
 use keeper_core::transcription::{
     add_speaker, assemble, assign_speaker, edit_utterance, insert_utterance_after, merge_speakers,
@@ -198,7 +199,7 @@ fn models_root(data_dir: &Path) -> PathBuf {
 
 /// The model set the hydrated `models.toml` names, or the default set when
 /// there is none yet. A file that does not parse is refused, not guessed at.
-fn model_set(models_root: &Path) -> Result<ModelSet, String> {
+fn repo_model_set(models_root: &Path) -> Result<ModelSet, String> {
     match std::fs::read_to_string(models_root.join(MODELS_TOML)) {
         Ok(raw) => ModelSet::from_toml(&raw).map_err(|error| error.to_string()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ModelSet::default()),
@@ -206,11 +207,26 @@ fn model_set(models_root: &Path) -> Result<ModelSet, String> {
     }
 }
 
-/// The embedding model the bank is read under right now.
-fn embedding_model(data_dir: &Path) -> String {
-    model_set(&models_root(data_dir))
-        .unwrap_or_default()
-        .embedding_model
+/// The set transcription loads: the repository's, with the models picked in
+/// Settings in place. A pick that is not complete here is refused with its
+/// sentence, never swapped for the repository's.
+fn model_set(data_dir: &Path) -> Result<ModelSet, String> {
+    let root = models_root(data_dir);
+    let repo = repo_model_set(&root)?;
+    let (asr, diarizer) =
+        registry::get_transcription_models(data_dir).map_err(|error| error.to_string())?;
+    model_files::choose(&root, repo, &asr, &diarizer).map_err(|refused| refused.0)
+}
+
+/// The embedding model the bank is read under right now. A speaker model
+/// picked in Settings that is not here is refused with its sentence, never
+/// read as the repository's bank.
+fn embedding_model(data_dir: &Path) -> Result<String, String> {
+    let root = models_root(data_dir);
+    let (_, diarizer) =
+        registry::get_transcription_models(data_dir).map_err(|error| error.to_string())?;
+    model_files::bank_embedding(&root, repo_model_set(&root).unwrap_or_default(), &diarizer)
+        .map_err(|refused| refused.0)
 }
 
 /// Load the models into the engine, refusing a set that is not all here or
@@ -218,7 +234,7 @@ fn embedding_model(data_dir: &Path) -> String {
 /// marker before its first change and writes it back last).
 fn load_models(engine: &dyn SpeechEngine, data_dir: &Path) -> Result<ModelSet, String> {
     let root = models_root(data_dir);
-    let set = model_set(&root)?;
+    let set = model_set(data_dir)?;
     let missing = model_files::missing(&root, &set);
     if !missing.is_empty() {
         return Err(EngineUnavailable::ModelsMissing { missing }.sentence());
@@ -236,7 +252,7 @@ fn load_models(engine: &dyn SpeechEngine, data_dir: &Path) -> Result<ModelSet, S
 /// account's clone names now.
 fn models_ready(data_dir: &Path) -> bool {
     let root = models_root(data_dir);
-    model_set(&root).is_ok_and(|set| model_files::missing(&root, &set).is_empty())
+    model_set(data_dir).is_ok_and(|set| model_files::missing(&root, &set).is_empty())
         && crate::account_ipc::models_current(data_dir, &root)
 }
 
@@ -450,7 +466,7 @@ const MODELS_UPDATING: &str = "The transcription models on this Mac are not the 
 
 fn models_vm(data_dir: &Path) -> ModelsStateVm {
     let root = models_root(data_dir);
-    let missing = match model_set(&root) {
+    let missing = match model_set(data_dir) {
         Ok(set) => model_files::missing(&root, &set),
         Err(sentence) => {
             return ModelsStateVm {
@@ -570,12 +586,16 @@ fn status_vm(platform: &Arc<dyn Platform>) -> Result<TranscriptionStatusVm, IpcE
         .as_ref()
         .err()
         .map(EngineUnavailable::sentence);
+    let (asr_model, diarization_model) =
+        registry::get_transcription_models(&dir).map_err(to_ipc_error)?;
     Ok(TranscriptionStatusVm {
         available: reason.is_none(),
         reason,
         models: models_vm(&dir),
         language: registry::get_transcription_language(&dir).map_err(to_ipc_error)?,
         after_recording: registry::get_transcription_after_recording(&dir).map_err(to_ipc_error)?,
+        asr_model,
+        diarization_model,
         voices_drives: voices_drives(platform)
             .into_iter()
             .map(|drive| VoicesDriveVm {
@@ -655,8 +675,9 @@ impl Progress {
 
 struct Jobs {
     next_id: AtomicU64,
-    /// Every job queued or running, by id — what a cancel finds.
-    cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Every job queued or running, by id — what a cancel finds — with what
+    /// it transcribes, so a recording being read is not removed under it.
+    cancels: Mutex<HashMap<String, (Arc<AtomicBool>, PathBuf)>>,
     queue: mpsc::Sender<Job>,
 }
 
@@ -705,7 +726,7 @@ fn enqueue(
         jobs.next_id.fetch_add(1, Ordering::Relaxed)
     );
     let cancel = Arc::new(AtomicBool::new(false));
-    lock(&jobs.cancels).insert(id.clone(), Arc::clone(&cancel));
+    lock(&jobs.cancels).insert(id.clone(), (Arc::clone(&cancel), target.clone()));
     let job = Job {
         id: id.clone(),
         target,
@@ -723,6 +744,18 @@ fn enqueue(
     Ok(id)
 }
 
+/// Whether a queued or running job transcribes `folder` or a file inside it.
+/// `folder` is canonical; a job's target is compared as given and resolved.
+#[cfg_attr(not(desktop), allow(dead_code))]
+pub(crate) fn job_touches(folder: &Path) -> bool {
+    lock(&JOBS.cancels).values().any(|(_, target)| {
+        target.starts_with(folder)
+            || target
+                .canonicalize()
+                .is_ok_and(|resolved| resolved.starts_with(folder))
+    })
+}
+
 /// How a job stopped short.
 enum Stop {
     Cancelled,
@@ -730,6 +763,9 @@ enum Stop {
     /// The transcript already there is one keeper will not overwrite on its
     /// own — corrected, or unreadable. A `replace` job gets past it.
     Kept(String),
+    /// What the job was to transcribe is gone — a recording removed before
+    /// its queued job ran. Nothing failed; the job ends quietly.
+    Gone,
 }
 
 impl From<String> for Stop {
@@ -893,6 +929,10 @@ fn run_job(job: &Job) {
             Some(path.to_string_lossy().into_owned()),
         ),
         Err(Stop::Cancelled) => job.report(TranscriptionPhase::Cancelled, 0, 0, None, None),
+        Err(Stop::Gone) => {
+            tracing::info!(job = %job.id, "transcription: what the job was to transcribe is gone");
+            job.report(TranscriptionPhase::Cancelled, 0, 0, None, None);
+        }
         Err(Stop::Failed(sentence)) => {
             tracing::warn!(job = %job.id, %sentence, "transcription: the job failed");
             job.report(TranscriptionPhase::Failed, 0, 0, Some(sentence), None);
@@ -977,6 +1017,9 @@ fn only_absent(root: &Path, mut plan: BankPlan) -> BankPlan {
 
 /// The job itself: plan, load, hear every part, match, assemble, write.
 fn transcribe(job: &Job) -> Result<PathBuf, Stop> {
+    if !job.target.exists() {
+        return Err(Stop::Gone);
+    }
     let engine = platform_engine();
     if let Err(reason) = availability() {
         return Err(Stop::Failed(reason.sentence()));
@@ -1190,6 +1233,12 @@ pub fn after_recording(platform: Arc<dyn Platform>, folder: PathBuf, profile_id:
             );
             return;
         }
+        // A model picked in Settings that is not here says so in its own
+        // words; the automatic job has no surface but the log.
+        if let Err(sentence) = model_set(&dir) {
+            tracing::warn!(%sentence, "transcription: the session is not transcribed");
+            return;
+        }
         if !models_ready(&dir) {
             tracing::info!(
                 "transcription: the models are not on this Mac, so the session is not transcribed"
@@ -1243,13 +1292,47 @@ pub async fn transcription_models_fetch(
     off_main(move || status_vm(&platform)).await
 }
 
-/// Write the two transcription settings through the registry, where the
-/// account's settings sync observes them. `None` leaves a setting alone.
+/// The models Settings may pick per role, and what the config repository
+/// names — the choice a blank setting keeps.
+#[tauri::command]
+pub async fn transcription_models_available(
+    state: State<'_, AppState>,
+) -> Result<TranscriptionModelsVm, IpcError> {
+    let platform = Arc::clone(&state.platform);
+    off_main(move || {
+        let root = models_root(&data_dir(platform.as_ref())?);
+        let defaults = repo_model_set(&root).unwrap_or_default();
+        let (asr, diarization) = model_files::available(&root);
+        let choices = |dirs: Vec<model_files::ModelDir>| {
+            dirs.into_iter()
+                .map(|dir| ModelChoiceVm {
+                    id: dir.id,
+                    complete: dir.complete,
+                })
+                .collect()
+        };
+        Ok(TranscriptionModelsVm {
+            asr: choices(asr),
+            diarization: choices(diarization),
+            defaults: ModelDefaultsVm {
+                asr: defaults.asr_dir,
+                diarization: defaults.diarizer_dir,
+            },
+        })
+    })
+    .await
+}
+
+/// Write the transcription settings through the registry, where the
+/// account's settings sync observes them. `None` leaves a setting alone; a
+/// model id of `""` returns that role to the config repository's choice.
 #[tauri::command]
 pub async fn transcription_settings_set(
     state: State<'_, AppState>,
     language: Option<TranscriptionLanguage>,
     after_recording: Option<bool>,
+    asr_model: Option<String>,
+    diarization_model: Option<String>,
 ) -> Result<TranscriptionStatusVm, IpcError> {
     let platform = Arc::clone(&state.platform);
     off_main(move || {
@@ -1259,6 +1342,12 @@ pub async fn transcription_settings_set(
         }
         if let Some(enabled) = after_recording {
             registry::set_transcription_after_recording(&dir, enabled).map_err(to_ipc_error)?;
+        }
+        if let Some(id) = asr_model {
+            registry::set_transcription_asr_model(&dir, &id).map_err(to_ipc_error)?;
+        }
+        if let Some(id) = diarization_model {
+            registry::set_transcription_diarization_model(&dir, &id).map_err(to_ipc_error)?;
         }
         status_vm(&platform)
     })
@@ -1293,7 +1382,7 @@ pub fn transcription_start(
 /// the surface can race a cancel against the job's own end.
 #[tauri::command]
 pub fn transcription_cancel(job_id: String) -> Result<(), IpcError> {
-    if let Some(cancel) = lock(&JOBS.cancels).get(&job_id) {
+    if let Some((cancel, _)) = lock(&JOBS.cancels).get(&job_id) {
         cancel.store(true, Ordering::SeqCst);
     }
     Ok(())
@@ -1734,7 +1823,7 @@ fn drive_relative(local_path: &Path, path: &Path) -> String {
 // ---------------------------------------------------------------------------
 
 fn people(platform: &Arc<dyn Platform>, drive: &VoicesDrive) -> Result<Vec<PersonVm>, IpcError> {
-    let model = embedding_model(&data_dir(platform.as_ref())?);
+    let model = embedding_model(&data_dir(platform.as_ref())?).map_err(refused)?;
     Ok(PersonVm::list(&Bank::load(&drive.root), &model))
 }
 
@@ -2119,6 +2208,17 @@ mod tests {
             "hi"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An after-recording job queued for a recording removed before it ran
+    /// ends quietly: gone, not failed.
+    #[test]
+    fn a_job_whose_recording_was_removed_ends_quietly() {
+        let missing = scratch().join("removed-session");
+        assert!(matches!(
+            transcribe(&replace_job(&missing, false)),
+            Err(Stop::Gone)
+        ));
     }
 
     /// An assign cuts its clip from a snapshot, then records the person on

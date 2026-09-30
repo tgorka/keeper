@@ -34,7 +34,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
 
 use crate::error::ArchiveError;
@@ -1756,6 +1756,26 @@ fn delete_session(conn: &Connection, session_id: &str) -> Result<(), ArchiveErro
     )
     .map_err(|e| ArchiveError::Sqlite(format!("could not delete a recording row: {e}")))?;
     Ok(())
+}
+
+/// Forget one session — its row, its segment rows and its search entry — in
+/// one transaction, because a person removed the recording and its folder is
+/// gone. `Ok(false)` when no row knew it: the index is a cache of the folders,
+/// and a removal of a session it never saw is still a removal.
+pub fn forget_session(conn: &Connection, session_id: &str) -> Result<bool, ArchiveError> {
+    in_transaction(conn, "recording removal", || {
+        let known = conn
+            .query_row(
+                "SELECT 1 FROM recordings WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| ArchiveError::Sqlite(format!("could not look up a recording row: {e}")))?
+            .is_some();
+        delete_session(conn, session_id)?;
+        Ok(known)
+    })
 }
 
 /// The `(index, track)` keys stored for a session that its manifest's ledger no
@@ -4107,6 +4127,46 @@ mod tests {
             "and so does the segment that did land — no half-written session is ever visible"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_removed_recording_leaves_the_index_with_its_segments_and_search_entry_and_nothing_else() {
+        let conn = memory_db();
+        let segment = |session_id: &str| RecordingSegmentRow {
+            session_id: session_id.to_owned(),
+            index: 0,
+            track: "screen".to_owned(),
+            relative_path: format!("2026/{session_id}/screen-0000.mov"),
+            bytes: 100,
+            pts_start: None,
+            pts_end: None,
+            closed_ts: None,
+        };
+        for id in ["01DEVICE-01GONE", "01DEVICE-02KEPT"] {
+            upsert_recording(&conn, &start_row(id)).expect("row");
+            upsert_segment(&conn, &segment(id)).expect("segment");
+        }
+        assert_eq!(fts_entries(&conn), (2, 2));
+
+        assert!(forget_session(&conn, "01DEVICE-01GONE").expect("forget"));
+
+        assert_eq!(count(&conn, "recordings"), 1);
+        assert_eq!(count(&conn, "recording_segments"), 1);
+        assert_eq!(
+            fts_entries(&conn),
+            (1, 1),
+            "the search entry went with the row"
+        );
+        let kept: String = conn
+            .query_row("SELECT session_id FROM recording_segments", [], |r| {
+                r.get(0)
+            })
+            .expect("the other segment");
+        assert_eq!(kept, "01DEVICE-02KEPT");
+        assert!(
+            !forget_session(&conn, "01DEVICE-01GONE").expect("again"),
+            "a session no row knows is forgotten already"
+        );
     }
 
     #[test]

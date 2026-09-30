@@ -50,6 +50,7 @@ import {
   type RecordingsEmptyKind,
   RecordingsEmptyState,
 } from "@/components/recordings/recordings-empty-state";
+import { RemoveRecordingDialog } from "@/components/recordings/remove-recording-dialog";
 import {
   TRANSCRIBE_A_FILE_LABEL,
   transcribeAFile,
@@ -155,6 +156,7 @@ export function RecordingsPane() {
   const canTranscribe = useCapabilitiesStore((s) => s.capabilities.transcription);
   const transcriptionJobs = useTranscriptionStore((s) => s.jobs);
   const [transcriptPath, setTranscriptPath] = useState<string | null>(null);
+  const [removing, setRemoving] = useState<string | null>(null);
 
   const [query, setQuery] = useState("");
   const [tags, setTags] = useState<string[]>([]);
@@ -582,6 +584,7 @@ export function RecordingsPane() {
                         );
                       }}
                       onShowTranscript={setTranscriptPath}
+                      onRemove={(h) => setRemoving(h.sessionId)}
                     />
                   </li>
                 );
@@ -591,6 +594,14 @@ export function RecordingsPane() {
         </div>
       </div>
       <TranscriptDialog path={transcriptPath} onClose={() => setTranscriptPath(null)} />
+      {removing !== null && (
+        <RemoveRecordingDialog
+          sessionId={removing}
+          onClose={() => setRemoving(null)}
+          // The folder and its row are gone: ask again, with the filter on screen.
+          onRemoved={() => runSearch(filterRef.current)}
+        />
+      )}
     </section>
   );
 }

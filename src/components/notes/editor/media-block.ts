@@ -492,13 +492,10 @@ export class MediaBlockWidget extends WidgetType {
         if (fence === undefined) {
           return;
         }
-        // With its line break, so no blank line is left where the block was.
-        const doc = view.state.doc;
-        const after = fence.to < doc.length ? 1 : 0;
-        const before = after === 0 && fence.from > 0 ? 1 : 0;
+        const cut = removalOf(view.state, fence);
         view.dispatch({
-          changes: { from: fence.from - before, to: fence.to + after },
-          selection: { anchor: fence.from - before },
+          changes: cut,
+          selection: { anchor: cut.from },
           userEvent: "delete.media-block",
         });
         view.focus();
@@ -629,6 +626,14 @@ export function mediaBlockLayer(options: MediaBlockOptions = {}): Extension {
     ],
   });
   return [revealedField, layer, guardEdges(layer)];
+}
+
+/** What removing `fence` deletes: the block with its line break, so no blank
+ *  line is left where it was — the one before it when it ends the note. */
+function removalOf(state: EditorState, fence: MediaFence): { from: number; to: number } {
+  const after = fence.to < state.doc.length ? 1 : 0;
+  const before = after === 0 && fence.from > 0 ? 1 : 0;
+  return { from: fence.from - before, to: fence.to + after };
 }
 
 /**

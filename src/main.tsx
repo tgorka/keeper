@@ -4,9 +4,11 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import { AppCrashBoundary } from "./components/app-crash-boundary";
 import { installGlobalErrorReporting, reportFrontendError } from "./lib/crash-report";
+import { pinViewport } from "./lib/viewport-pin";
 import "./index.css";
 
 installGlobalErrorReporting();
+pinViewport();
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement, {
   // Only reached when the boundary itself fails; the boundary reports its own.

@@ -22,7 +22,43 @@ pub struct TranscriptionStatusVm {
     pub models: ModelsStateVm,
     pub language: TranscriptionLanguage,
     pub after_recording: bool,
+    /// The speech model picked in Settings (`transcription.asr_model`);
+    /// `""` is the config repository's choice.
+    pub asr_model: String,
+    /// The speaker model picked in Settings
+    /// (`transcription.diarization_model`); `""` is the repository's choice.
+    pub diarization_model: String,
     pub voices_drives: Vec<VoicesDriveVm>,
+}
+
+/// The models Settings may pick for each role: the directories under the
+/// hydrated models holding that role's files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TranscriptionModelsVm {
+    pub asr: Vec<ModelChoiceVm>,
+    pub diarization: Vec<ModelChoiceVm>,
+    /// What `_models/models.toml` names: the choice a blank setting keeps.
+    pub defaults: ModelDefaultsVm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ModelChoiceVm {
+    /// The folder name under the hydrated models.
+    pub id: String,
+    /// Every file the role needs is here; an incomplete one cannot be picked.
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ModelDefaultsVm {
+    pub asr: String,
+    pub diarization: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

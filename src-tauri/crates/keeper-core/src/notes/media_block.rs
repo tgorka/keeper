@@ -1220,6 +1220,78 @@ fn spanned_blocks(note: &str) -> Vec<((usize, usize), FoundBlock)> {
         .collect()
 }
 
+/// `note` without every media block naming `session_id` — each whole fence
+/// and the `> [!transcript]` words callout riding directly under it, with the
+/// line break that ends them, as the editor's *Remove widget* takes a block
+/// — or `None` when no block names it. A removed recording's blocks would
+/// only ever say it is gone.
+pub fn without_session_blocks(note: &str, session_id: &str) -> Option<String> {
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    for ((start, end), block) in spanned_blocks(note) {
+        let names = matches!(
+            parse(&block.body),
+            Ok(Block { source: Source::Session(id), .. }) if id.trim() == session_id
+        );
+        if !names {
+            continue;
+        }
+        let mut end = end;
+        let mut words = false;
+        while end < note.len() {
+            let from = end + 1;
+            let to = note[from..].find('\n').map_or(note.len(), |at| from + at);
+            let text = note[from..to].trim_end_matches('\r');
+            let indent = text.len() - text.trim_start_matches(' ').len();
+            let quoted = indent <= 3 && text[indent..].starts_with('>');
+            if !quoted || (!words && !is_words_head(text)) {
+                break;
+            }
+            words = true;
+            end = to;
+        }
+        cuts.push((start, end));
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(note.len());
+    let mut kept_from = 0;
+    for (start, end) in cuts {
+        if end < note.len() {
+            out.push_str(&note[kept_from..start]);
+            kept_from = end + 1;
+        } else {
+            // The note ends with the block: its line break before goes instead.
+            out.push_str(
+                note[kept_from..start]
+                    .strip_suffix('\n')
+                    .unwrap_or(&note[kept_from..start]),
+            );
+            kept_from = note.len();
+        }
+    }
+    out.push_str(&note[kept_from..]);
+    Some(out)
+}
+
+/// A `> [!transcript]` callout head, case-insensitive as Obsidian's callouts
+/// are: the words a clip carried under its block.
+fn is_words_head(line: &str) -> bool {
+    let Some(rest) = line.trim_start_matches(' ').strip_prefix('>') else {
+        return false;
+    };
+    let rest = rest.strip_prefix([' ', '\t']).unwrap_or(rest);
+    let Some(rest) = rest
+        .get(..13)
+        .filter(|head| head.eq_ignore_ascii_case("[!transcript]"))
+        .map(|_| &rest[13..])
+    else {
+        return false;
+    };
+    let rest = rest.strip_prefix(['-', '+']).unwrap_or(rest);
+    rest.is_empty() || rest.starts_with([' ', '\t'])
+}
+
 /// What a recording note's frontmatter says about its own recording: how a
 /// block naming that recording is told apart in the notes list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

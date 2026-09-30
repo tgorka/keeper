@@ -304,6 +304,54 @@ the mount path, so a stick that comes back on a different mount point is still
 the same drive. If a *different* volume is mounted where yours belongs, that is
 refused too, with its own sentence — adopting it would sync a stranger's disk.
 
+## Removing a recording
+
+*Remove recording…* — in a note widget's ⋯ (the note itself, not Preview or
+the Files preview) and in a Recordings row's ⋯ — deletes a finished session
+after a confirmation that names its folder, its size and file count, the notes
+whose widget goes with it, and what is left once it is gone. That last
+sentence follows the recording's durability in the index: only a recording
+that reached the drive's remote (`pushed`, `verified`) is "deleted from
+*drive* on every device. The drive's history still has it."; one committed
+here but not pushed "has not left this Mac yet — removing it deletes the only
+copy"; one not even committed "has not reached *drive*'s history yet —
+removing it deletes the only copy". A plain folder on this Mac is "the only
+place it is". keeper deletes; it does not move the folder to a trash.
+
+- **What goes.** The whole session folder — segments, audio, `manifest.json`,
+  `transcript.json`/`.md`, `events.log` — found through the recordings index
+  under a recordings root keeper follows now. Refused outside one, for a root
+  itself, for a stored path with an empty, `.` or `..` component (refused, not
+  dropped), when — every symlink resolved on both sides — the folder is not
+  inside its root, and when its `manifest.json` is missing or names another
+  session (a stale row never aims a deletion at whatever now sits at its path).
+  The index row, its segments and its search entry go too, before the command
+  answers, so the Recordings pane's re-read no longer lists it.
+- **The drive.** Before deleting, keeper declares the folder to the sync
+  engine as its own deletion (`Engine::declare_deletions`), so the removable
+  drive's mass-deletion guard — which refuses a change set deleting more than
+  half a removable profile's index as a drive pulled mid-walk — does not
+  count it: a recordings stick holding one or two sessions can lose one. Every
+  other deletion still counts, and the declaration is spent by the commit that
+  records it (it lives in this process only). A sync pass is then asked for;
+  the deletion reaches other devices with it.
+- **Refused** while the session records or is being finished (its folder is in
+  the live set, under any spelling, and the removal holds that claim until the
+  folder is gone), and while a transcription job targets it. A transcription
+  queued after the recording stopped whose folder is gone by the time it runs
+  ends quietly (cancelled, logged), not as a failed job.
+- **The notes.** Every note in an open vault whose `session` is the removed
+  one loses `session`, `recording` and `files` (through the open-editor-safe
+  frontmatter amendment). A `keeper-media` block naming it — with the
+  `> [!transcript]` words under it — is removed on disk in a note nobody has
+  open. keeper never edits the body of a note open in an editor: it emits
+  `keeper://recording-removed { sessionId }`, and the webview takes the blocks
+  out of every open note's buffer, whichever view it is in (Note, Source or
+  Preview) — Rust composes the body without them
+  (`media_block_without_session`), the buffer takes it, and the note saves as
+  ⌘S does. A note that could not be changed is listed in the dialog after the
+  removal, with why, because it still names the recording.
+
 ## Transcription
 
 On an Apple Silicon Mac with macOS 15 or later, with the models fetched (Settings

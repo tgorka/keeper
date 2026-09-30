@@ -295,8 +295,15 @@ export function dictionaryAcceptSuggestion(
 export function transcriptionSettingsSet(
   language: TranscriptionLanguage | null,
   afterRecording: boolean | null,
+  asrModel: string | null = null,
+  diarizationModel: string | null = null,
 ): Promise<TranscriptionStatusVm> {
-  return invoke("transcription_settings_set", { language, afterRecording });
+  return invoke("transcription_settings_set", {
+    language,
+    afterRecording,
+    asrModel,
+    diarizationModel,
+  });
 }
 
 export function telemetryStatus(): Promise<TelemetryStatusVm> {
@@ -8351,4 +8358,92 @@ export function mediaBlockRecording(
  *  the block that pressed Start splices over itself once the start answers. */
 export function mediaBlockRecordStarted(source: string, sessionId: string): Promise<string> {
   return invoke("media_block_record_started", { source, sessionId });
+}
+
+// ---- VersionModels (88.10): choosing the transcription models --------------
+
+import type { ModelChoiceVm } from "./gen/ModelChoiceVm";
+import type { TranscriptionModelsVm } from "./gen/TranscriptionModelsVm";
+
+export type { ModelChoiceVm, TranscriptionModelsVm };
+
+/** The model directories Settings may pick per role, and what the config
+ *  repository's `_models/models.toml` names — the choice a blank keeps. */
+export function transcriptionModelsAvailable(): Promise<TranscriptionModelsVm> {
+  return invoke("transcription_models_available");
+}
+
+// ---- RemoveRec (88.10): removing a recording --------------------------------
+
+/** A note naming a recording, as its removal lists it. */
+export interface RecordingNoteRefVm {
+  vaultId: string;
+  /** Relative to its vault. */
+  path: string;
+  title: string;
+}
+
+/** A note keeper could not take a removed recording out of: it still names it. */
+export interface RecordingNoteFailureVm extends RecordingNoteRefVm {
+  error: string;
+}
+
+/** What removing a recording would delete, for its confirmation. */
+export interface RecordingRemovalPreviewVm {
+  /** The session folder as its drive names it (or as the index stores it). */
+  folder: string;
+  /** The synced folder it is in, by name; `null` for a plain folder on this Mac. */
+  drive: string | null;
+  bytes: number;
+  files: number;
+  /**
+   * How far the recording has travelled (`local`, `committed`, `pushed`,
+   * `verified`): only a pushed one is still in the drive's history once removed.
+   */
+  durability: string;
+  /** The notes whose widget — or recording keys — go with it. */
+  notes: RecordingNoteRefVm[];
+}
+
+/** What removing a recording did. */
+export interface RecordingRemovedVm {
+  folder: string;
+  bytes: number;
+  files: number;
+  /** Notes keeper changed on disk. */
+  notesChanged: RecordingNoteRefVm[];
+  /** Notes open in an editor: their widgets go through {@link RECORDING_REMOVED_EVENT}. */
+  openNotes: RecordingNoteRefVm[];
+  /** Notes that could not be changed: they still name the removed recording. */
+  notesFailed: RecordingNoteFailureVm[];
+}
+
+/** What removing the recording `sessionId` would delete. */
+export function recordingRemovePreview(sessionId: string): Promise<RecordingRemovalPreviewVm> {
+  return invoke("recording_remove_preview", { sessionId });
+}
+
+/** Delete the recording `sessionId` from its drive and take it out of every note. */
+export function recordingRemove(sessionId: string): Promise<RecordingRemovedVm> {
+  return invoke("recording_remove", { sessionId });
+}
+
+/**
+ * The Tauri event a removal emits once the recording is gone: every open note
+ * loses the widgets naming it, in its buffer (Rust never edits an open note's body).
+ */
+export const RECORDING_REMOVED_EVENT = "keeper://recording-removed";
+
+/** Subscribe to {@link RECORDING_REMOVED_EVENT}. Resolves with an unlisten function. */
+export async function listenRecordingRemoved(
+  onRemoved: (sessionId: string) => void,
+): Promise<() => void> {
+  return await listen<{ sessionId: string }>(RECORDING_REMOVED_EVENT, (event) => {
+    onRemoved(event.payload.sessionId);
+  });
+}
+
+/** The note body `text` without the widgets naming `sessionId`; `null` when none does. */
+export function mediaBlockWithoutSession(text: string, sessionId: string): Promise<string | null> {
+  return invoke("media_block_without_session", { text, sessionId });
 }

@@ -114,6 +114,17 @@ describe("MediaRecorderPanel", () => {
     expect(linkedNote).not.toHaveBeenCalled();
   });
 
+  it("puts Start above the setup, so recording needs no scrolling", async () => {
+    render(<MediaRecorderPanel {...props()} />);
+    const startButton = await screen.findByRole("button", { name: START_RECORDING_LABEL });
+    for (const card of ["source", "audio", "webcam"]) {
+      expect(
+        startButton.compareDocumentPosition(screen.getByTestId(card)) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    }
+  });
+
   it("names the session in its own fence once Start answers, and writes the note", async () => {
     render(<MediaRecorderPanel {...props()} />);
     linkedNote.mockResolvedValue({

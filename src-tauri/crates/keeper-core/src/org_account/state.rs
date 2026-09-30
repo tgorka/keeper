@@ -176,6 +176,8 @@ pub struct AccountDeviceVm {
     pub name: String,
     pub class: Option<DeviceClass>,
     pub platform: Option<String>,
+    /// The keeper release the device last published it runs.
+    pub version: Option<String>,
     pub this_device: bool,
 }
 
@@ -288,6 +290,7 @@ pub fn vm(facts: &AccountFacts) -> AccountVm {
             name: entry.name.clone(),
             class: entry.class,
             platform: entry.platform.clone(),
+            version: entry.version.clone(),
             this_device: facts.this_device.as_deref() == Some(entry.slug.as_str()),
         })
         .collect();
@@ -634,6 +637,7 @@ mod tests {
                 name: slug.to_owned(),
                 class: Some(DeviceClass::Desktop),
                 platform: None,
+                version: None,
             })
             .to_vec();
         facts.this_device = Some("work-mac".to_owned());

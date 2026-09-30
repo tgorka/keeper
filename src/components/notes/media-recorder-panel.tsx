@@ -304,6 +304,10 @@ function RecorderControls({
     ) : null;
 
   let body: ReactNode;
+  // Start leads the widget (owner, 2026-09-30): the setup below it is three cards
+  // tall, and a person who opens a note to record should not scroll to find the
+  // one button the widget is for. It shares the top row with the block's ⋯.
+  let startRow: ReactNode = null;
   if (live && unnamed) {
     body = <p className="text-muted-foreground text-sm">{RECORDING_UNNAMED_SENTENCE}</p>;
   } else if (live) {
@@ -330,32 +334,32 @@ function RecorderControls({
     body = <p className="text-muted-foreground text-sm">{NO_NOTE_SENTENCE}</p>;
   } else {
     const place = settings?.destinationProfileName ?? settings?.destinationDir ?? null;
+    startRow = (
+      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-1">
+        <Button
+          type="button"
+          disabled={!canStart}
+          onClick={() => {
+            void begin();
+          }}
+        >
+          {START_RECORDING_LABEL}
+        </Button>
+        {place !== null && (
+          <p className="min-w-0 truncate text-muted-foreground text-xs" title={place}>
+            {destinationSentence(place)}
+          </p>
+        )}
+        {blockedBy !== null && (
+          <p className="basis-full text-muted-foreground text-xs">{startBlockedNote(blockedBy)}</p>
+        )}
+      </div>
+    );
     body = (
       <div className="flex flex-col gap-4">
         <RecordingSourcePicker active screenRecording={permission.screenRecording} />
         <RecordingAudioControls active onPermissionSettled={refresh} />
         <RecordingWebcamControls active onPermissionSettled={refresh} />
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          {place !== null && (
-            <p className="min-w-0 truncate text-muted-foreground text-xs" title={place}>
-              {destinationSentence(place)}
-            </p>
-          )}
-          <div className="flex flex-col items-end gap-1">
-            <Button
-              type="button"
-              disabled={!canStart}
-              onClick={() => {
-                void begin();
-              }}
-            >
-              {START_RECORDING_LABEL}
-            </Button>
-            {blockedBy !== null && (
-              <p className="text-muted-foreground text-xs">{startBlockedNote(blockedBy)}</p>
-            )}
-          </div>
-        </div>
       </div>
     );
   }
@@ -365,7 +369,12 @@ function RecorderControls({
       aria-label="New recording"
       className="flex flex-col gap-3 rounded-md border border-border p-3"
     >
-      {menu !== undefined && <div className="flex justify-end">{menu}</div>}
+      {(startRow !== null || menu !== undefined) && (
+        <div className="flex items-start gap-2">
+          {startRow ?? <div className="flex-1" />}
+          {menu}
+        </div>
+      )}
       {banner}
       {body}
     </section>
