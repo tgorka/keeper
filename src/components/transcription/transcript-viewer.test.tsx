@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { StrictMode } from "react";
+import { createRef, StrictMode } from "react";
 import { beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import {
   BACK_LABEL,
@@ -14,12 +14,16 @@ import { PART_NOT_HERE_SENTENCE } from "@/components/transcription/transcript-pl
 import {
   TranscriptFileViewer,
   TranscriptViewer,
+  type TranscriptViewerHandle,
   voicesDriveFor,
 } from "@/components/transcription/transcript-viewer";
 import { TranscriptionJob } from "@/components/transcription/transcription-job";
+import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import { WINDOW_ROW_ATTR, WINDOW_VIEWPORT_ATTR } from "@/components/ui/window-list";
 import * as ipc from "@/lib/ipc/client";
 import { transcriptionStore } from "@/lib/stores/transcription";
 import { resolveViewer } from "@/lib/viewers/registry";
+import { withListGeometry } from "@/test/layout";
 import { SESSION_TRANSCRIPT_FIXTURE, TRANSCRIPT_FIXTURE } from "../../../dev/transcription-fixture";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -247,6 +251,7 @@ describe("Transcript corrections", () => {
     const next = structuredClone(TRANSCRIPT_FIXTURE);
     next.path = "/other.transcript.json";
     next.transcript.source.files = ["other.wav"];
+    next.transcript.source.title = "other.wav";
     vi.mocked(ipc.transcriptRead).mockResolvedValueOnce(next);
     const view = render(<TranscriptViewer path={path} />);
     view.rerender(<TranscriptViewer path={next.path} />);
@@ -844,6 +849,23 @@ describe("Player", () => {
     expect(row("u2")).toHaveAttribute("aria-current", "true");
     expect(play).not.toHaveBeenCalled();
   });
+  it("takes the reader to a speaker's next line after the player, leaving it paused", async () => {
+    render(<TranscriptViewer path={sessionPath} />);
+    const first = (await screen.findByLabelText("screen-0000.mov")) as HTMLMediaElement;
+    fireEvent.loadedMetadata(first);
+    Object.defineProperty(first, "readyState", { configurable: true, get: () => 1 });
+    first.currentTime = 16;
+    fireEvent.timeUpdate(first);
+    // Speaker 1's line 6–14 is the nearer; the next one starts at 21.5, in part 2.
+    fireEvent.click(
+      within(await chipMenu("Speaker 1")).getByRole("menuitem", {
+        name: "Go to their next line",
+      }),
+    );
+    expect(row("u4")).toHaveAttribute("aria-current", "true");
+    expect(partLine("Part 2 of 2 · screen-0001.mov")).toBeInTheDocument();
+    expect(play).not.toHaveBeenCalled();
+  });
   it("opens at the time it was asked for, paused", async () => {
     render(<TranscriptViewer path={sessionPath} at={30} />);
     await screen.findByLabelText("screen-0001.mov");
@@ -1062,5 +1084,135 @@ describe("Transcript files", () => {
       "work",
     );
     expect(voicesDriveFor(drives, "/Volumes/work2/x", "work")?.profileId).toBe("work");
+  });
+});
+describe("In a note", () => {
+  beforeEach(() => {
+    vi.mocked(ipc.transcriptRead).mockResolvedValue(structuredClone(SESSION_TRANSCRIPT_FIXTURE));
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+  });
+  it("shows only its window's lines and speakers, plays the block's media, and adds the block's actions", async () => {
+    const scroller = document.createElement("div");
+    const onRemove = vi.fn();
+    render(
+      <TranscriptViewer
+        path={sessionPath}
+        scroller={scroller}
+        window={{ from: 20, to: 30 }}
+        title={null}
+        media={structuredClone(SESSION_MEDIA)}
+        menuItems={<DropdownMenuItem onSelect={onRemove}>Remove widget</DropdownMenuItem>}
+      />,
+    );
+    await screen.findByLabelText("screen-0000.mov");
+    expect(ipc.transcriptMedia).not.toHaveBeenCalled();
+    // No dialog chrome: no heading, no Source tab.
+    expect(screen.queryByRole("heading")).toBeNull();
+    expect(screen.queryByRole("tab")).toBeNull();
+    const ids = within(screen.getByRole("list", { name: "Utterances" }))
+      .getAllByRole("listitem")
+      .map((item) =>
+        item.querySelector("[aria-label^='Line actions']")?.getAttribute("aria-label"),
+      );
+    // [20, 30) overlaps u3 (15–24), u4 (21.5–27) and u5 (28–33), and nothing else.
+    expect(ids).toEqual(["Line actions u3", "Line actions u4", "Line actions u5"]);
+    expect(screen.getByRole("button", { name: /^Alex,/ })).toHaveAccessibleName(/2 lines$/);
+    expect(screen.getByRole("button", { name: /^Speaker 1,/ })).toHaveAccessibleName(/1 line$/);
+    // The player's scrub spans the window only.
+    const scrub = screen.getByRole("slider", { name: SCRUB_LABEL });
+    expect(scrub).toHaveAttribute("min", "20");
+    expect(scrub).toHaveAttribute("max", "30");
+    const menu = await openMenu(screen.getByRole("button", { name: "Transcript actions" }));
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "Remove widget" }));
+    expect(onRemove).toHaveBeenCalled();
+  });
+  it("windows a long meeting against the note's scroller, and a scroll of the note stops following", async () => {
+    const long = structuredClone(SESSION_TRANSCRIPT_FIXTURE);
+    const template = long.transcript.utterances[0];
+    long.transcript.utterances = Array.from({ length: 300 }, (_, index) => ({
+      ...template,
+      id: `l${index}`,
+      start: index * 0.1,
+      end: index * 0.1 + 0.1,
+    }));
+    vi.mocked(ipc.transcriptRead).mockResolvedValue(long);
+    const geometry = withListGeometry({ viewport: 600, row: 90 });
+    try {
+      const scroller = document.createElement("div");
+      // The test geometry answers the viewport's height by this mark.
+      scroller.setAttribute(WINDOW_VIEWPORT_ATTR, "");
+      document.body.append(scroller);
+      render(
+        <TranscriptViewer
+          path={sessionPath}
+          scroller={scroller}
+          media={structuredClone(SESSION_MEDIA)}
+        />,
+        { container: scroller.appendChild(document.createElement("div")) },
+      );
+      const list = await screen.findByRole("list", { name: "Utterances" });
+      // The lines start 200px down the note, wherever it is scrolled.
+      Object.defineProperty(list, "getBoundingClientRect", {
+        configurable: true,
+        value: () => ({ top: 200 - scroller.scrollTop }) as DOMRect,
+      });
+      geometry.scrollTo(scroller, 0);
+      const mounted = () => scroller.querySelectorAll(`[${WINDOW_ROW_ATTR}]`).length;
+      expect(mounted()).toBeLessThan(30);
+      geometry.scrollTo(scroller, 200 + 150 * 90);
+      await waitFor(() => expect(row("l150")).toBeInTheDocument());
+      expect(mounted()).toBeLessThan(30);
+      // A seek follows: the note is scrolled to the line being said…
+      geometry.scrollTo(scroller, 0);
+      fireEvent.input(screen.getByRole("slider", { name: SCRUB_LABEL }), {
+        target: { value: "20" },
+      });
+      await waitFor(() => expect(scroller.scrollTop).toBeGreaterThan(200 + 150 * 90));
+      // …until the reader scrolls the note themself.
+      geometry.scrollTo(scroller, 0);
+      fireEvent.wheel(scroller);
+      const main = screen.getByLabelText("screen-0000.mov") as HTMLMediaElement;
+      main.currentTime = 25;
+      fireEvent.timeUpdate(main);
+      expect(scroller.scrollTop).toBe(0);
+      // The line being said is there when the reader scrolls to it.
+      geometry.scrollTo(scroller, 200 + 250 * 90 - 300);
+      await waitFor(() => expect(row("l250")).toHaveAttribute("aria-current", "true"));
+      scroller.remove();
+    } finally {
+      geometry.undo();
+    }
+  });
+  it("holds a seek asked before the player is awake and lands it when it wakes", async () => {
+    const viewer = createRef<TranscriptViewerHandle>();
+    const view = render(
+      <TranscriptViewer
+        ref={viewer}
+        path={sessionPath}
+        scroller={null}
+        media={structuredClone(SESSION_MEDIA)}
+        playerAwake={false}
+        asleepText="The player starts when this block is on screen."
+      />,
+    );
+    expect(
+      await screen.findByText("The player starts when this block is on screen."),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("screen-0000.mov")).toBeNull();
+    act(() => viewer.current?.seek(30));
+    view.rerender(
+      <TranscriptViewer
+        ref={viewer}
+        path={sessionPath}
+        scroller={null}
+        media={structuredClone(SESSION_MEDIA)}
+      />,
+    );
+    const second = (await screen.findByLabelText("screen-0001.mov")) as HTMLMediaElement;
+    fireEvent.loadedMetadata(second);
+    expect(second.currentTime).toBeCloseTo(9);
+    expect(row("u5")).toHaveAttribute("aria-current", "true");
   });
 });

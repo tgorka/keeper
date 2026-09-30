@@ -2,24 +2,33 @@
  * The media block's panel: what it shows in each state, what it asks Rust,
  * and what it hands back to the editor.
  *
- * The player and the lines are the viewer's components with tests of their
- * own; here they are stand-ins that record what the panel hands them and let a
- * test say "the player is at 13 s" or "the player started".
+ * The transcript viewer and the player have tests of their own; here they are
+ * stand-ins that record what the panel hands them and let a test say "the
+ * player is at 13 s" or "the player started". The viewer's stand-in draws the
+ * two slots the block fills — its markers and its ⋯ items — because those are
+ * the block's.
  */
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { forwardRef, useImperativeHandle } from "react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { forwardRef, type ReactNode, useImperativeHandle } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import type * as IpcClient from "@/lib/ipc/client";
 import type { MediaBlockVm } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { transcriptionStore } from "@/lib/stores/transcription";
 import type { MediaBlockMountArgs } from "./editor/media-block";
 import {
+  EDIT_BLOCK_SOURCE_LABEL,
   MARK_MOMENT_LABEL,
   MARKER_REMOVE,
   MEDIA_BLOCK_MENU_LABEL,
   MediaBlockPanel,
   NOT_TRANSCRIBED_SENTENCE,
+  REMOVE_WIDGET_LABEL,
   TRANSCRIBE_LABEL,
 } from "./media-block-panel";
 
@@ -39,6 +48,7 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => ({
   },
 }));
 
+/** The untranscribed block's own player. */
 const player = { seek: vi.fn(), pause: vi.fn() };
 let playerProps: Record<string, unknown> | null = null;
 vi.mock("@/components/transcription/transcript-player", () => ({
@@ -48,21 +58,26 @@ vi.mock("@/components/transcription/transcript-player", () => ({
     return <div data-testid="player" />;
   }),
 }));
-vi.mock("@/components/transcription/transcript-lines", async (importOriginal) => ({
-  ...(await importOriginal<object>()),
-  TranscriptLinesBox: (props: { lines: { id: string; text: string }[]; current: number }) => (
-    <ol aria-label="Lines">
-      {props.lines.map((line, index) => (
-        <li key={line.id} aria-current={index === props.current ? "true" : undefined}>
-          {line.text}
-        </li>
-      ))}
-    </ol>
-  ),
-}));
+
+/** The embedded viewer, whose handle is the transcribed block's player. */
+const viewer = { seek: vi.fn(), pause: vi.fn() };
+let viewerProps: Record<string, unknown> | null = null;
 vi.mock("@/components/transcription/transcript-viewer", () => ({
   TranscriptDialog: ({ path, at }: { path: string | null; at?: number }) =>
     path === null ? null : <div role="dialog">{`${path} at ${at}`}</div>,
+  TranscriptViewer: forwardRef((props: Record<string, unknown>, ref) => {
+    viewerProps = props;
+    useImperativeHandle(ref, () => viewer);
+    return (
+      <div data-testid="viewer">
+        {props.markers as ReactNode}
+        <DropdownMenu>
+          <DropdownMenuTrigger aria-label="Transcript actions">⋯</DropdownMenuTrigger>
+          <DropdownMenuContent>{props.menuItems as ReactNode}</DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+    );
+  }),
 }));
 
 const TRANSCRIPT = "/Volumes/d/recordings/kelly/transcript.json";
@@ -92,6 +107,8 @@ function vm(over: Partial<MediaBlockVm> = {}): MediaBlockVm {
   };
 }
 
+const SCROLLER = document.createElement("div");
+
 function args(over: Partial<MediaBlockMountArgs> = {}): MediaBlockMountArgs {
   return {
     profileId: "drive",
@@ -101,16 +118,27 @@ function args(over: Partial<MediaBlockMountArgs> = {}): MediaBlockMountArgs {
     noteLink: "Kelly sync",
     register: vi.fn(() => () => {}),
     claimPlayback: vi.fn(() => () => {}),
+    scroller: SCROLLER,
+    editSource: vi.fn(),
+    remove: vi.fn(),
     ...over,
   };
+}
+
+/** Radix opens a menu on a primary pointer-down, not on a click. */
+async function openMenu(name: string): Promise<void> {
+  fireEvent.pointerDown(await screen.findByRole("button", { name }), { button: 0, ctrlKey: false });
 }
 
 beforeEach(() => {
   resolveBlock.mockReset();
   editBlock.mockReset();
-  player.seek.mockReset();
-  player.pause.mockReset();
+  for (const each of [player, viewer]) {
+    each.seek.mockReset();
+    each.pause.mockReset();
+  }
   playerProps = null;
+  viewerProps = null;
   Object.assign(navigator, { clipboard: { writeText: vi.fn(() => Promise.resolve()) } });
 });
 
@@ -129,36 +157,32 @@ describe("what the block shows", () => {
     expect(screen.getByText('form = "00:12:00"')).toBeInTheDocument();
   });
 
-  it("draws the player and the lines of what it resolved", async () => {
-    resolveBlock.mockResolvedValue(vm());
-
-    render(<MediaBlockPanel {...args()} />);
-
-    expect(await screen.findByRole("heading", { name: "Kelly sync" })).toBeInTheDocument();
-    expect(resolveBlock).toHaveBeenCalledWith("drive", 'session = "S1"');
-    expect(await screen.findByTestId("player")).toBeInTheDocument();
-    expect(
-      within(screen.getByRole("list", { name: "Lines" })).getAllByRole("listitem"),
-    ).toHaveLength(2);
-  });
-
-  it("spans only its window, and says which stretch of the meeting that is", async () => {
+  it("is the transcript viewer, embedded in the note's scroller, over the block's window", async () => {
     resolveBlock.mockResolvedValue(vm({ window: { from: 10, to: 20 } }));
 
     render(<MediaBlockPanel {...args()} />);
 
-    expect(await screen.findByText("0:10–0:20 of 1:00")).toBeInTheDocument();
-    expect(playerProps?.window).toEqual({ from: 10, to: 20 });
+    await screen.findByTestId("viewer");
+    expect(resolveBlock).toHaveBeenCalledWith("drive", 'session = "S1"');
+    expect(viewerProps).toMatchObject({
+      path: TRANSCRIPT,
+      profileId: "drive",
+      // Given, so the viewer grows in the note and has no scroll box of its own.
+      scroller: SCROLLER,
+      window: { from: 10, to: 20 },
+      title: "Kelly sync",
+    });
+    // The read-only list of lines is gone: the viewer is the only one.
+    expect(screen.queryByTestId("player")).toBeNull();
   });
 
-  it("highlights the line being said as the player moves", async () => {
-    resolveBlock.mockResolvedValue(vm());
+  it("says no title where the block names none, rather than the files it plays", async () => {
+    resolveBlock.mockResolvedValue(vm({ title: null }));
+
     render(<MediaBlockPanel {...args()} />);
-    await screen.findByTestId("player");
 
-    act(() => (playerProps?.onTime as (s: number) => void)(13));
-
-    expect(screen.getByText("The price is 40 a seat.")).toHaveAttribute("aria-current", "true");
+    await screen.findByTestId("viewer");
+    expect(viewerProps?.title).toBeNull();
   });
 });
 
@@ -201,8 +225,68 @@ describe("before the transcript exists", () => {
     resolveBlock.mockResolvedValue(vm());
     act(() => written?.(TRANSCRIPT));
 
-    expect(await screen.findByText("Hello there, Kelly.")).toBeInTheDocument();
+    expect(await screen.findByTestId("viewer")).toBeInTheDocument();
     expect(resolveBlock).toHaveBeenCalledTimes(2);
+  });
+
+  it("plays only its window before there are lines to bound it", async () => {
+    resolveBlock.mockResolvedValue(
+      vm({ transcribed: false, lines: [], window: { from: 10, to: 20 } }),
+    );
+
+    render(<MediaBlockPanel {...args()} />);
+
+    await screen.findByTestId("player");
+    expect(playerProps?.window).toEqual({ from: 10, to: 20 });
+  });
+});
+
+describe("the block's own verbs, from the menu and nowhere else", () => {
+  it("offers Edit block source and Remove widget under the viewer's ⋯", async () => {
+    resolveBlock.mockResolvedValue(vm());
+    const mounted = args();
+    render(<MediaBlockPanel {...mounted} />);
+
+    await openMenu("Transcript actions");
+    fireEvent.click(await screen.findByRole("menuitem", { name: EDIT_BLOCK_SOURCE_LABEL }));
+    expect(mounted.editSource).toHaveBeenCalledTimes(1);
+
+    await openMenu("Transcript actions");
+    fireEvent.click(await screen.findByRole("menuitem", { name: REMOVE_WIDGET_LABEL }));
+    expect(mounted.remove).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers them on a block that is not transcribed yet, which has a menu of its own", async () => {
+    resolveBlock.mockResolvedValue(vm({ transcribed: false, lines: [] }));
+    const mounted = args();
+    render(<MediaBlockPanel {...mounted} />);
+
+    await openMenu(MEDIA_BLOCK_MENU_LABEL);
+    fireEvent.click(await screen.findByRole("menuitem", { name: REMOVE_WIDGET_LABEL }));
+
+    expect(mounted.remove).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers them beside Rust's refusal, where the source is the thing to fix", async () => {
+    resolveBlock.mockRejectedValue({ code: "notesInvalid", message: "Unknown key form." });
+    const mounted = args();
+    render(<MediaBlockPanel {...mounted} />);
+
+    await openMenu(MEDIA_BLOCK_MENU_LABEL);
+    fireEvent.click(await screen.findByRole("menuitem", { name: EDIT_BLOCK_SOURCE_LABEL }));
+
+    expect(mounted.editSource).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers neither where the note cannot be written", async () => {
+    resolveBlock.mockResolvedValue(vm());
+    render(<MediaBlockPanel {...args({ editable: false })} />);
+
+    await openMenu("Transcript actions");
+
+    await screen.findByRole("menu");
+    expect(screen.queryByRole("menuitem", { name: EDIT_BLOCK_SOURCE_LABEL })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: REMOVE_WIDGET_LABEL })).toBeNull();
   });
 });
 
@@ -220,7 +304,7 @@ describe("markers", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Go to Deal, 0:12" }));
 
-    expect(player.seek).toHaveBeenCalledWith(12, undefined);
+    expect(viewer.seek).toHaveBeenCalledWith(12, undefined);
   });
 
   it("plays a window from its start and pauses at its end", async () => {
@@ -228,12 +312,12 @@ describe("markers", () => {
     render(<MediaBlockPanel {...args()} />);
 
     fireEvent.click(await screen.findByRole("button", { name: "Play Demo, 0:30–0:40" }));
-    expect(player.seek).toHaveBeenCalledWith(30, true);
+    expect(viewer.seek).toHaveBeenCalledWith(30, true);
 
-    act(() => (playerProps?.onTime as (s: number) => void)(39));
-    expect(player.pause).not.toHaveBeenCalled();
-    act(() => (playerProps?.onTime as (s: number) => void)(40));
-    expect(player.pause).toHaveBeenCalledTimes(1);
+    act(() => (viewerProps?.onTime as (s: number) => void)(39));
+    expect(viewer.pause).not.toHaveBeenCalled();
+    act(() => (viewerProps?.onTime as (s: number) => void)(40));
+    expect(viewer.pause).toHaveBeenCalledTimes(1);
   });
 
   it("marks the moment the player is at, with Rust's body spliced into the note", async () => {
@@ -241,13 +325,10 @@ describe("markers", () => {
     editBlock.mockResolvedValue("NEW BODY");
     const mounted = args();
     render(<MediaBlockPanel {...mounted} />);
-    await screen.findByTestId("player");
-    act(() => (playerProps?.onTime as (s: number) => void)(13.8));
+    await screen.findByTestId("viewer");
+    act(() => (viewerProps?.onTime as (s: number) => void)(13.8));
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: MEDIA_BLOCK_MENU_LABEL }), {
-      button: 0,
-      ctrlKey: false,
-    });
+    await openMenu("Transcript actions");
     fireEvent.click(await screen.findByRole("menuitem", { name: MARK_MOMENT_LABEL }));
     const name = await screen.findByRole("textbox", { name: "Name" });
     // Prefilled from the line being said, cleaned of what a name cannot carry.
@@ -270,12 +351,9 @@ describe("markers", () => {
     editBlock.mockRejectedValue({ code: "notesInvalid", message: "This block already has Deal." });
     const mounted = args();
     render(<MediaBlockPanel {...mounted} />);
-    await screen.findByTestId("player");
+    await screen.findByTestId("viewer");
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: MEDIA_BLOCK_MENU_LABEL }), {
-      button: 0,
-      ctrlKey: false,
-    });
+    await openMenu("Transcript actions");
     fireEvent.click(await screen.findByRole("menuitem", { name: MARK_MOMENT_LABEL }));
     fireEvent.change(await screen.findByRole("textbox", { name: "Name" }), {
       target: { value: "deal" },
@@ -292,10 +370,7 @@ describe("markers", () => {
     const mounted = args();
     render(<MediaBlockPanel {...mounted} />);
 
-    fireEvent.pointerDown(await screen.findByRole("button", { name: "Marker actions Deal" }), {
-      button: 0,
-      ctrlKey: false,
-    });
+    await openMenu("Marker actions Deal");
     fireEvent.click(await screen.findByRole("menuitem", { name: MARKER_REMOVE }));
 
     await waitFor(() => expect(mounted.replaceSource).toHaveBeenCalledWith('session = "S1"'));
@@ -306,10 +381,7 @@ describe("markers", () => {
     resolveBlock.mockResolvedValue(MARKED);
     render(<MediaBlockPanel {...args({ editable: false })} />);
 
-    fireEvent.pointerDown(await screen.findByRole("button", { name: "Marker actions Deal" }), {
-      button: 0,
-      ctrlKey: false,
-    });
+    await openMenu("Marker actions Deal");
 
     expect(await screen.findByRole("menuitem", { name: "Copy link" })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: MARKER_REMOVE })).toBeNull();
@@ -319,10 +391,7 @@ describe("markers", () => {
     resolveBlock.mockResolvedValue(MARKED);
     render(<MediaBlockPanel {...args()} />);
 
-    fireEvent.pointerDown(await screen.findByRole("button", { name: "Marker actions Deal" }), {
-      button: 0,
-      ctrlKey: false,
-    });
+    await openMenu("Marker actions Deal");
     fireEvent.click(await screen.findByRole("menuitem", { name: "Copy link" }));
 
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith("[[Kelly sync#Deal]]");
@@ -335,15 +404,15 @@ describe("one player per pane", () => {
     const release = vi.fn();
     const mounted = args({ claimPlayback: vi.fn(() => release) });
     render(<MediaBlockPanel {...mounted} />);
-    await screen.findByTestId("player");
+    await screen.findByTestId("viewer");
 
-    act(() => (playerProps?.onPlayingChange as (p: boolean) => void)(true));
+    act(() => (viewerProps?.onPlayingChange as (p: boolean) => void)(true));
     expect(mounted.claimPlayback).toHaveBeenCalledTimes(1);
     // The pause the layer calls when another block starts is this player's.
     (vi.mocked(mounted.claimPlayback).mock.calls[0][0] as () => void)();
-    expect(player.pause).toHaveBeenCalled();
+    expect(viewer.pause).toHaveBeenCalled();
 
-    act(() => (playerProps?.onPlayingChange as (p: boolean) => void)(false));
+    act(() => (viewerProps?.onPlayingChange as (p: boolean) => void)(false));
     expect(release).toHaveBeenCalled();
   });
 
@@ -351,13 +420,13 @@ describe("one player per pane", () => {
     resolveBlock.mockResolvedValue(vm());
     const mounted = args();
     render(<MediaBlockPanel {...mounted} />);
-    await screen.findByTestId("player");
+    await screen.findByTestId("viewer");
 
     const calls = vi.mocked(mounted.register).mock.calls;
     const handle = calls[calls.length - 1]?.[0];
     act(() => handle?.seekTo(12));
 
-    expect(player.seek).toHaveBeenCalledWith(12, false);
+    expect(viewer.seek).toHaveBeenCalledWith(12, false);
   });
 });
 
@@ -382,27 +451,27 @@ describe("near the screen", () => {
     observed = null;
   });
 
-  it("mounts the player only when the block comes near, and lets it go when it leaves", async () => {
+  it("wakes the player only when the block comes near, and lets it go when it leaves", async () => {
     resolveBlock.mockResolvedValue(vm());
     render(<MediaBlockPanel {...args()} />);
-    await screen.findByRole("heading", { name: "Kelly sync" });
+    await screen.findByTestId("viewer");
 
-    expect(screen.queryByTestId("player")).toBeNull();
+    expect(viewerProps?.playerAwake).toBe(false);
     act(() => observed?.([{ isIntersecting: true }]));
-    expect(screen.getByTestId("player")).toBeInTheDocument();
+    expect(viewerProps?.playerAwake).toBe(true);
     act(() => observed?.([{ isIntersecting: false }]));
-    expect(screen.queryByTestId("player")).toBeNull();
+    expect(viewerProps?.playerAwake).toBe(false);
   });
 
   it("keeps a playing block's player when it scrolls away", async () => {
     resolveBlock.mockResolvedValue(vm());
     render(<MediaBlockPanel {...args()} />);
-    await screen.findByRole("heading", { name: "Kelly sync" });
+    await screen.findByTestId("viewer");
     act(() => observed?.([{ isIntersecting: true }]));
-    act(() => (playerProps?.onPlayingChange as (p: boolean) => void)(true));
+    act(() => (viewerProps?.onPlayingChange as (p: boolean) => void)(true));
 
     act(() => observed?.([{ isIntersecting: false }]));
 
-    expect(screen.getByTestId("player")).toBeInTheDocument();
+    expect(viewerProps?.playerAwake).toBe(true);
   });
 });

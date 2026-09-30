@@ -1537,17 +1537,20 @@ one by itself, put an absolute path in one, or let anything but Rust read one.
   Dataview. The callout rule stands for widgets; this entry scopes it. (AD-351)
 - **What stays true: the note is the person's.** Rust resolves every name — a `session` through
   the recordings index, so a retitle does not break it; a path through `browse::resolve` under
-  the drive's root (AD-65). keeper changes a block's bytes only when the person adds, renames or
-  removes a marker, and then only that marker's table, every comment kept. Markers live in the
-  note, not in the transcript, which a redo deletes. (AD-353, AD-354; NFR-111)
+  the drive's root (AD-65). keeper changes a block's bytes only on the person's action — adding,
+  renaming or removing a marker, when only that marker's table changes and every comment is
+  kept; *Edit block source*; *Remove widget* — and never by itself. Markers live in the note,
+  not in the transcript, which a redo deletes. (AD-353, AD-354; NFR-111)
 - **What a reader without keeper sees:** Obsidian, GitHub and `cat` show the block as a code
   block. A clip copied with its words carries them as a collapsed `[!transcript]` callout right
-  after the fence, a snapshot keeper never refreshes. The note keeper writes after a recording
-  carries a three-line `session` block and no transcript text, as D-29 requires; it replaces
-  the per-file video embeds for new notes. Notes already written keep theirs until the person
-  asks keeper to use the media player in them (the notes options menu), and then only a stub
-  whose embeds are still exactly what keeper wrote is rewritten, and every other byte stays.
-  (AD-356, AD-357)
+  after the fence, a snapshot keeper never refreshes. Every block keeper writes lists the
+  optional keys it does not set as comments after its keys, and the sources a block may name
+  last, so a person writing one by hand in any editor sees the grammar. The note keeper writes
+  after a recording carries such a `session` block and no transcript text, as D-29 requires; it
+  replaces the per-file video embeds for new notes. Notes already written keep theirs until
+  the person asks keeper to use the media player in them (the notes options menu), and then
+  only a stub whose embeds, or whose bare three-line block, are still exactly what keeper wrote
+  is rewritten, and every other byte stays. (AD-356, AD-357)
 - **Why `keeper-media`:** the owner's own name for it, "bardziej uniwersalnie (autio, video,
   meeting, podcast, video etc)". The block plays a recording, a transcript or any audio or video
   file, so the name says what it holds rather than one occasion for it; the `keeper-` prefix
@@ -1561,8 +1564,8 @@ one by itself, put an absolute path in one, or let anything but Rust read one.
 - **What is deferred, not refused:** an Obsidian renderer for the block (DW-347), paths into
   another drive (DW-348), a player that keeps playing when its block scrolls away (DW-349),
   Media Extended's `#t=` links in ordinary embeds (DW-350), a `keeper://` link to a marker
-  (DW-351), refreshing a clip's words (DW-352), meeting-wide markers (DW-353), and corrections
-  inside a note (DW-354).
+  (DW-351), refreshing a clip's words (DW-352) and meeting-wide markers (DW-353). Corrections
+  inside a note (DW-354) arrived with story 88.6: the block is the transcript viewer itself.
 - **Revisit triggers:** a grammar change is a new `version`, never a reinterpretation of version
   1; a new source kind or key is added only with a version bump or as an optional key an older
   keeper refuses by name. None reopens the second paragraph.

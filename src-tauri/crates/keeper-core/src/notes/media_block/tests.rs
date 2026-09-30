@@ -7,6 +7,13 @@ use crate::transcription::plan::TrackOrigin;
 
 const ID: &str = "01K0DEVICE0000000000000000-01K0SESSION00000000000000";
 
+/// The optional root keys every block keeper writes lists when it does not
+/// set them, spelt out here rather than read off the module's constants.
+const HINTS: &str = "# title = \"\"\n# from = \"00:00:00\"\n# to = \"\"\n# picture = \"both\"      # screen | camera | both\n# sound = \"both\"        # system | microphone | both\n";
+const MARKER_SHAPE: &str = "# [[marker]]\n# name = \"\"\n# at = \"00:00:00\"\n";
+const SOURCES: &str =
+    "# sources: session | transcript | [[part]] file/camera/offset/system/microphone | src\n";
+
 fn refused(body: &str) -> BlockRefusal {
     parse(body).expect_err("the body is refused")
 }
@@ -491,7 +498,7 @@ fn a_clip_keeps_the_source_the_choices_and_the_markers_wholly_inside() {
     let clip = clip_block(CLIPPABLE, window("00:12:00", "00:15:30"), None, false).expect("clip");
     assert_eq!(
         clip.markdown,
-        "```keeper-media\nsession = \"01A-01B\"\ntitle = \"Pricing\"\nfrom = \"00:12:00\"\nto = \"00:15:30\"\npicture = \"screen\"\n\n[[marker]]\nname = \"Inside\"\nat = \"00:12:30\"\n\n[[marker]]\nname = \"Window\"\nfrom = \"00:12:10\"\nto = \"00:15:00\"\n```\n"
+        "```keeper-media\nsession = \"01A-01B\"\ntitle = \"Pricing\"\nfrom = \"00:12:00\"\nto = \"00:15:30\"\npicture = \"screen\"\n# sound = \"both\"        # system | microphone | both\n\n[[marker]]\nname = \"Inside\"\nat = \"00:12:30\"\n\n[[marker]]\nname = \"Window\"\nfrom = \"00:12:10\"\nto = \"00:15:00\"\n\n# sources: session | transcript | [[part]] file/camera/offset/system/microphone | src\n```\n"
     );
     assert_eq!(clip.lines, 0, "no transcript, no lines to count");
 }
@@ -505,7 +512,9 @@ fn a_clip_keeps_a_transcript_or_src_source_verbatim() {
         let clip = clip_block(source, window("10", "20"), None, false).expect("clip");
         assert_eq!(
             clip.markdown,
-            format!("```keeper-media\n{source}\nfrom = \"00:00:10\"\nto = \"00:00:20\"\n```\n")
+            format!(
+                "```keeper-media\n{source}\nfrom = \"00:00:10\"\nto = \"00:00:20\"\n# title = \"\"\n# picture = \"both\"      # screen | camera | both\n# sound = \"both\"        # system | microphone | both\n{MARKER_SHAPE}{SOURCES}```\n"
+            )
         );
     }
     let parts = clip_block(
@@ -580,7 +589,7 @@ fn a_clip_from_the_viewer_names_the_session_or_the_transcript() {
     );
     assert_eq!(
         path.markdown,
-        "```keeper-media\ntranscript = \"talks/a.mp4.transcript.json\"\nfrom = \"00:12:00\"\nto = \"00:12:15\"\n```\n"
+        format!("```keeper-media\ntranscript = \"talks/a.mp4.transcript.json\"\nfrom = \"00:12:00\"\nto = \"00:12:15\"\n# title = \"\"\n# picture = \"both\"      # screen | camera | both\n# sound = \"both\"        # system | microphone | both\n{MARKER_SHAPE}{SOURCES}```\n")
     );
     assert_eq!(path.lines, 3, "a line that ends inside the window counts");
 }
@@ -607,14 +616,60 @@ fn a_clip_window_is_checked_as_typed() {
 // --- Blocks in a note ----------------------------------------------------
 
 #[test]
-fn the_stubs_block_is_three_lines_naming_the_session() {
+fn the_stubs_block_names_the_session_and_lists_what_else_it_may_say() {
     let block = session_block(ID);
-    assert_eq!(block, format!("```keeper-media\nsession = \"{ID}\"\n```\n"));
-    let found = blocks(&block);
     assert_eq!(
-        parse(&found[0].body).expect("reads").source,
-        Source::Session(ID.to_owned())
+        block,
+        format!("```keeper-media\nsession = \"{ID}\"\n{HINTS}{MARKER_SHAPE}{SOURCES}```\n")
     );
+    let found = blocks(&block);
+    let read = parse(&found[0].body).expect("reads");
+    assert_eq!(read.source, Source::Session(ID.to_owned()));
+    assert_eq!(
+        (
+            read.title,
+            read.from,
+            read.to,
+            read.picture,
+            read.markers.len()
+        ),
+        (None, None, None, None, 0),
+        "a hint is a comment, never a key"
+    );
+}
+
+/// Uncommenting a hint, and filling what it leaves blank, must give a body
+/// that reads: a hint naming a key the grammar refuses, or sitting where
+/// TOML files it under `[[part]]`, would teach the person a mistake.
+#[test]
+fn every_hint_uncommented_is_a_key_the_block_reads() {
+    fn uncommented(block: &str) -> String {
+        blocks(block)[0]
+            .body
+            .lines()
+            .filter(|line| !line.starts_with("# sources:"))
+            .map(|line| line.strip_prefix("# ").unwrap_or(line))
+            .map(|line| match line {
+                "to = \"\"" => "to = \"00:01:00\"",
+                "name = \"\"" => "name = \"Start\"",
+                line => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    for block in [
+        session_block(ID),
+        transcript_block("talks/a.mp4.transcript.json"),
+        part_block("notes/clip.mp4"),
+    ] {
+        let read =
+            parse(&uncommented(&block)).unwrap_or_else(|refusal| panic!("{refusal}: {block}"));
+        assert_eq!(read.title.as_deref(), Some(""));
+        assert_eq!((read.from, read.to), (Some(0.0), Some(60.0)));
+        assert_eq!(read.picture, Some(MediaPicture::Both));
+        assert_eq!(read.sound, Some(MediaSound::Both));
+        assert_eq!(read.markers.len(), 1);
+    }
 }
 
 #[test]
@@ -625,6 +680,24 @@ fn a_block_is_found_with_backticks_tildes_indented_or_in_a_list() {
     assert_eq!(bodies, ["session = \"a\"\n", "session = \"b\"\n"]);
     assert_eq!((found[0].first_line, found[0].last_line), (3, 5));
     assert_eq!(session_ids(note), ["a", "b"]);
+}
+
+#[test]
+fn a_search_excerpt_reads_each_block_as_its_summary_and_keeps_every_other_byte() {
+    let text = "before\n```keeper-media\nsession = \"a\"\ntitle = \"Kelly sync\"\n```\nmid ✓\n  ~~~keeper-media\n  form = \"x\"\n  ~~~\n```toml\nsession = \"b\"\n```";
+    assert_eq!(
+        summarised_blocks(text),
+        "before\n▶ Media · Kelly sync\nmid ✓\n▶ Media\n```toml\nsession = \"b\"\n```"
+    );
+    assert!(matches!(
+        summarised_blocks("no block"),
+        Cow::Borrowed("no block")
+    ));
+    assert_eq!(
+        summarised_blocks("```keeper-media\n[[part]]\nfile = \"a.mov\""),
+        "▶ Media",
+        "a block the chunk never closes runs to its end"
+    );
 }
 
 #[test]
@@ -688,12 +761,12 @@ fn a_plain_media_embed_becomes_a_one_part_block_on_its_own_lines() {
         Some(LineEditVm {
             first_line: 3,
             last_line: 3,
-            text: Some("```keeper-media\n[[part]]\nfile = \"notes/clip.mp4\"\n```".to_owned())
+            text: Some(format!("```keeper-media\n{HINTS}\n[[part]]\nfile = \"notes/clip.mp4\"\n\n{MARKER_SHAPE}{SOURCES}```"))
         })
     );
     assert_eq!(
         file_embed_to_block(note, 2, "clip.mp4", "notes/clip.mp4").and_then(|edit| edit.text),
-        Some("see  here\n```keeper-media\n[[part]]\nfile = \"notes/clip.mp4\"\n```".to_owned())
+        Some(format!("see  here\n```keeper-media\n{HINTS}\n[[part]]\nfile = \"notes/clip.mp4\"\n\n{MARKER_SHAPE}{SOURCES}```"))
     );
     assert_eq!(file_embed_to_block(note, 1, "clip.mp4", "x"), None);
 }
@@ -711,7 +784,7 @@ fn an_old_stub_becomes_one_block_and_every_other_byte_stays() {
         adopted,
         OLD_STUB.replace(
             "![[2026/kelly/screen-0000.mov]]\n![[2026/kelly/camera-0000.mov]]\n",
-            "```keeper-media\nsession = \"01A-01B\"\n```\n"
+            &format!("```keeper-media\nsession = \"01A-01B\"\n{HINTS}{MARKER_SHAPE}{SOURCES}```\n")
         )
     );
     assert_eq!(adopt(&adopted), Adoption::Untouched, "idempotent");
@@ -739,4 +812,35 @@ fn a_note_that_is_not_a_recording_stub_is_untouched() {
         "",
     );
     assert_eq!(adopt(&no_embeds), Adoption::Untouched);
+}
+
+#[test]
+fn a_stubs_bare_block_gains_its_hints_and_nothing_else_does() {
+    let bare = OLD_STUB.replace(
+        "![[2026/kelly/screen-0000.mov]]\n![[2026/kelly/camera-0000.mov]]\n",
+        "```keeper-media\nsession = \"01A-01B\"\n```\n",
+    );
+    let Adoption::Changed(described) = adopt(&bare) else {
+        panic!("a stub's bare block is described");
+    };
+    assert_eq!(
+        described,
+        bare.replace(
+            "session = \"01A-01B\"\n```",
+            &format!("session = \"01A-01B\"\n{HINTS}{MARKER_SHAPE}{SOURCES}```")
+        )
+    );
+    assert_eq!(adopt(&described), Adoption::Untouched, "idempotent");
+    for kept in [
+        bare.replace("```\n\nWhat", "title = \"Mine\"\n```\n\nWhat"),
+        bare.replace("01A-01B\"", "01X-01Y\""),
+        bare.replace("```keeper-media\n", "~~~keeper-media\n")
+            .replace("```\n\nWhat", "~~~\n\nWhat"),
+        bare.replace(
+            "```keeper-media\nsession = \"01A-01B\"\n```\n",
+            "````markdown\n```keeper-media\nsession = \"01A-01B\"\n```\n````\n",
+        ),
+    ] {
+        assert_eq!(adopt(&kept), Adoption::Untouched, "{kept}");
+    }
 }

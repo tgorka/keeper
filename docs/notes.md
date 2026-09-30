@@ -155,7 +155,7 @@ by hand.
 ## Media in a note
 
 A recording, a transcript or any audio or video file plays inside a note as one block: the
-transcript viewer's player, and under it the transcript's lines, following playback.
+transcript viewer itself, its player and under it the transcript's lines, following playback.
 
 ````markdown
 ```keeper-media
@@ -181,11 +181,24 @@ at = "00:13:05"
   comes back (`media_block_resolve`); a key keeper does not know, two sources, a bad time or a
   path outside the drive shows the block's own text with a sentence naming what is wrong.
   `version = 2` says the block was written by a newer keeper.
-- **Reading, not correcting.** The block plays, follows, seeks and marks; corrections happen
-  in the transcript viewer, which *Open transcript* opens at the block's time. Every
-  correction there, and every transcript a job writes, reaches every open block through
+- **The transcript viewer, in the note.** The block is the viewer's own component, not a
+  read-only copy of it: each line's ⋯ (*Edit text*, *Split…*, *Add a line after*, *Change
+  speaker*), the speakers' chips (*This is…*, *Rename label…*, *Merge into…*, *Add speaker*,
+  *Go to their nearest line*, *Go to their next line*), search, *Transcribe again…* and *Copy
+  clip*. It differs only in showing the block's window and its markers, and in having no
+  dialog chrome (`docs/transcription.md` § *A transcript in a note*). Every correction, here
+  or in the viewer, and every transcript a job writes, reaches every open block through
   `keeper://transcript-written`, with no rewrite of the note. A block before its transcript
   plays the media under "Not transcribed yet.", with *Transcribe* where this Mac can.
+- **One scrollbar.** The block has no height of its own and no scroll box: it grows with its
+  lines and the note's editor is the only thing that scrolls. Its lines are windowed against
+  the editor's scroller, so a 300-line meeting does not mount 300 rows, and the pinned player
+  sticks to the top of the note's scroll area. It has no card behind it — the note's
+  background shows through, and only its controls keep their own surfaces.
+- **Editing the block's text.** A click on the block does not open its source. Its ⋯ has
+  *Edit block source*, which shows the fence's text with the caret inside it, and *Remove
+  widget*, which deletes the fence and a `[!transcript]` callout attached to it; ⌘Z brings
+  both back.
 - **Markers.** *Mark this moment* and *Mark a window…* add a `[[marker]]` table; rename and
   remove change only that table and keep every other byte, comments included
   (`media_block_edit`). `[[Note#The price we agreed]]`, or `[[#…]]` in the same note, opens the
@@ -196,16 +209,46 @@ at = "00:13:05"
   hides that callout inside the block and never refreshes it.
 - **One player at a time.** Media mounts only near the screen, a block that scrolls away
   gives its media back, and starting one block pauses the others in the pane.
+- **In the notes list.** A row's preview and a search result read a block as one line —
+  "▶ Media · Kelly sync · 45:57" — never as its source. The title is the block's `title`,
+  else, in a recording note, its recording's title when the block names that recording; the
+  length is the block's window, else that recording's `duration:`. What the list cannot say
+  without opening a file is left out, and a block that does not read is "▶ Media".
+
+**Every block keeper writes says what else it may say.** The stub's block, *Insert widget*,
+*Play in a player* and a copied clip carry the keys they set, then each optional key they do
+not set, commented out, then a marker's shape and the list of sources:
+
+````markdown
+```keeper-media
+session = "01J8…-01J8…"
+# title = ""
+# from = "00:00:00"
+# to = ""
+# picture = "both"      # screen | camera | both
+# sound = "both"        # system | microphone | both
+# [[marker]]
+# name = ""
+# at = "00:00:00"
+# sources: session | transcript | [[part]] file/camera/offset/system/microphone | src
+```
+````
+
+Uncommenting a line, and filling in what it leaves empty, gives a key the block reads; the
+parser skips comments. A one-part block lists the optional keys above its `[[part]]`, because
+a key below it belongs to the part.
 
 **Embedded audio and video no longer play by themselves.** `![[clip.mov]]` is a chip — the
 file's name and kind, *Reveal*, *Copy path* and *Play in a player*. That last one replaces the
 embed with a block: in a recording note every embed of the recording's media becomes one
 `session` block, and any other file a one-part block naming it. Images still draw inline.
 
-The note keeper writes when a recording ends carries a three-line `session` block. Notes
-written before it carry one embed per video; *Use the media player in recording notes…* in
-the notes options menu rewrites those — only a stub whose embeds are still exactly what keeper
-wrote, and nothing else in it — and names the ones left alone because somebody edited them.
+The note keeper writes when a recording ends carries a `session` block, below its heading.
+Older notes carry one embed per video, or a three-line block with no comments;
+*Use the media player in recording notes…* in the notes options menu rewrites both — a stub
+whose embeds are still exactly what keeper wrote, or whose block is still exactly those three
+lines naming its own recording, and nothing else in it — and names the ones left alone because
+somebody edited their embeds.
 
 In Obsidian, on GitHub or in `cat` the block is a code block: the title, the window and the
 markers read plainly, and a clip's words read as a quote.
@@ -235,6 +278,14 @@ and in a session exactly as in a note. The distinction the old sentence was prot
 intact, because it was never about the renderer — a note saves itself, and Note mode over
 a file writes when you press `⌘S` or Save and at no other moment. One renderer, two save
 contracts, and neither surface borrowed the other's.
+
+**Preview, Note and Source over a note, too.** The note's header has the same three views a
+markdown file has in Files, as one segmented control ("Show the note as"): *Preview* is the
+Files markdown preview — rendered and read-only, its widgets live, no caret; *Note* is the
+live-preview editor above, and the default; *Source* is the same editor with every widget and
+decoration taken away, the raw markdown, still autosaving with its caret and undo. The choice
+is one for every note, remembered in the viewers' cookie (`keeper_viewer_modes`, key
+`keeper-note`) beside the Files viewers' own; it has no shortcut.
 
 ## Finding text
 

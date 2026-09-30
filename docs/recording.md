@@ -323,10 +323,11 @@ It runs in keeper itself, on this Mac; nothing is sent anywhere (D-29,
   the note itself is never rewritten (`docs/notes.md` § *Media in a note*).
 
 The stub keeper writes when a recording ends is `# Title`, a blank line, and a
-three-line block naming the session by the identity its `session:` carries —
-one player for the meeting, where stubs before Epic 88 embedded each video.
-Those older stubs keep their embeds until you choose *Use the media player in
-recording notes…* in the notes options menu.
+block naming the session by the identity its `session:` carries, with the keys
+it could also say listed as comments — one player for the meeting, where stubs
+before Epic 88 embedded each video. Those older stubs keep their embeds, and
+stubs from before the comments keep their three-line block, until you choose
+*Use the media player in recording notes…* in the notes options menu.
 
 Speakers are matched against the voices bank of the drive, and you correct
 words and people in the transcript viewer. How that works, and where the models

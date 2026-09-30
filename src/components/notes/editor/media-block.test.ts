@@ -7,6 +7,7 @@
  * The React panel is replaced by a spy mount: what is asserted here is what
  * the layer hands it and what it does with the panel's answers.
  */
+import { history, undo } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -59,7 +60,7 @@ afterEach(() => {
 
 function open(
   doc: string,
-  over: { vaultId?: string; mount?: MountSpy; readOnly?: boolean } = {},
+  over: { vaultId?: string; mount?: MountSpy; readOnly?: boolean; history?: boolean } = {},
 ): EditorView {
   const parent = document.createElement("div");
   document.body.append(parent);
@@ -77,6 +78,7 @@ function open(
           mountMedia: over.mount,
         }),
         ...(over.readOnly ? [EditorState.readOnly.of(true)] : []),
+        ...(over.history ? [history()] : []),
       ],
     }),
   });
@@ -206,14 +208,23 @@ describe("the block in the note", () => {
     expect(mounted[0]?.unmount).toHaveBeenCalled();
   });
 
-  it("keeps a click inside the panel away from the caret, and gives the rest up", async () => {
+  it("reveals nothing on a click anywhere on a mounted block — the menu does that", async () => {
+    const widget = new MediaBlockWidget("", "", {});
+    // Before the panel arrives (its import still in flight) the fence's text
+    // has no menu, so a click on it reveals the source like any fence.
+    const loading = open(`intro\n\n${BLOCK}\n`, { mount: undefined });
+    const fenceText = loading.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS} pre`);
+    expect(widget.ignoreEvent({ target: fenceText } as unknown as Event)).toBe(false);
+
     const { mount } = mountSpy();
     const view = open(`intro\n\n${BLOCK}\n`, { mount });
     await settle();
-    const body = view.contentDOM.querySelector(`.${MEDIA_BLOCK_BODY_CLASS}`) as HTMLElement;
-    const widget = new MediaBlockWidget("", "", {});
+    const host = view.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS}`) as HTMLElement;
+    const body = host.querySelector(`.${MEDIA_BLOCK_BODY_CLASS}`) as HTMLElement;
 
     expect(widget.ignoreEvent({ target: body } as unknown as Event)).toBe(true);
+    // The block's own edge, outside the panel: its head used to reveal here.
+    expect(widget.ignoreEvent({ target: host } as unknown as Event)).toBe(true);
     expect(widget.ignoreEvent({ target: view.contentDOM } as unknown as Event)).toBe(false);
   });
 
@@ -242,6 +253,87 @@ describe("the block in the note", () => {
     await settle();
 
     expect(mount).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * The owner's hang: a transcribed recording note, Properties unfolded above
+   * the editor, keeper stops answering. What a fold does to the editor is
+   * geometry — its box resizes, CodeMirror measures again — and the transactions
+   * that ride along carry no change to the block: effects, a caret elsewhere, the
+   * store handing back the same text. If any of those re-created the widget, or
+   * handed the panel a "new" body, the panel would mount a player, resolve and
+   * re-measure — and the measure that follows is the next turn of the same loop.
+   * So each turn is counted: across many of them the panel is mounted once,
+   * never updated, never unmounted, and the block keeps its DOM.
+   */
+  it("mounts its panel once and keeps it across a fold opening and closing above the note", async () => {
+    const { mount, mounted } = mountSpy();
+    const view = open(`# Kelly sync\n\n${BLOCK}\n\nFollow-ups: send the quote.\n`, { mount });
+    await settle();
+    const host = view.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS}`);
+    const parent = view.dom.parentElement as HTMLElement;
+
+    for (let turn = 0; turn < 40; turn += 1) {
+      parent.style.height = turn % 2 === 0 ? "300px" : "900px";
+      view.requestMeasure();
+      view.dispatch({});
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+      view.dispatch({ selection: { anchor: 0 } });
+      await settle();
+    }
+
+    expect(mount).toHaveBeenCalledTimes(1);
+    expect(mounted[0]?.update).not.toHaveBeenCalled();
+    expect(mounted[0]?.unmount).not.toHaveBeenCalled();
+    expect(view.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS}`)).toBe(host);
+  });
+});
+
+describe("the block's menu verbs", () => {
+  const WORDS = "> [!transcript]- Kelly sync · 00:00:06–00:00:24\n> **[00:00:06] Alex:** So.";
+
+  it("removes the block and the words riding with it, and one undo brings both back", async () => {
+    const { mount, mounted } = mountSpy();
+    const doc = `intro\n\n${BLOCK}\n${WORDS}\n\nafter\n`;
+    const view = open(doc, { mount, history: true });
+    await settle();
+
+    mounted[0]?.args.remove();
+
+    expect(view.state.doc.toString()).toBe("intro\n\n\nafter\n");
+    undo(view);
+    expect(view.state.doc.toString()).toBe(doc);
+  });
+
+  it("removes a block that ends the note without leaving its line behind", async () => {
+    const { mount, mounted } = mountSpy();
+    const view = open(`intro\n${BLOCK}`, { mount });
+    await settle();
+
+    mounted[0]?.args.remove();
+
+    expect(view.state.doc.toString()).toBe("intro");
+  });
+
+  it("shows the fence's text with the caret inside it on Edit block source", async () => {
+    const { mount, mounted } = mountSpy();
+    const view = open(`intro\n\n${BLOCK}\n\nafter\n`, { mount });
+    await settle();
+
+    mounted[0]?.args.editSource();
+    await settle();
+
+    expect(view.state.selection.main.head).toBe(view.state.doc.toString().indexOf("session"));
+    expect(view.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS}`)).toBeNull();
+    expect(view.contentDOM.textContent).toContain(`session = "${SESSION}"`);
+  });
+
+  it("hands the panel the editor's own scroller to grow in", async () => {
+    const { mount, mounted } = mountSpy();
+    const view = open(`intro\n\n${BLOCK}\n`, { mount });
+    await settle();
+
+    expect(mounted[0]?.args.scroller).toBe(view.scrollDOM);
   });
 });
 

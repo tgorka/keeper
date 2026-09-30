@@ -123,6 +123,14 @@ export interface WindowedRowsOptions<K> {
    * brings a row out from under it rather than to the viewport's edge.
    */
   stickyInset?: number;
+  /**
+   * A scroll container the list does not own — a note editor's scroller the
+   * list grows inside. The window reads it and `reveal` scrolls it; the
+   * caller spreads no {@link WindowedRows.viewportProps} then, and says in
+   * `scrollMargin` where the list starts inside it. `undefined` means the
+   * caller's own element carries `viewportProps`.
+   */
+  scroller?: HTMLElement | null;
 }
 
 export interface WindowedRows<K> {
@@ -253,6 +261,7 @@ export function useWindowedRows<K>({
   onReveal,
   scrollMargin = 0,
   stickyInset = 0,
+  scroller,
 }: WindowedRowsOptions<K>): WindowedRows<K> {
   const viewport = useRef<HTMLElement | null>(null);
   const measured = useRef(new Map<K, number>());
@@ -302,11 +311,8 @@ export function useWindowedRows<K>({
     [],
   );
 
-  const attachViewport = useCallback<RefCallback<HTMLElement>>((element) => {
+  const follow = useCallback((element: HTMLElement) => {
     viewport.current = element;
-    if (element === null) {
-      return;
-    }
     const sync = () => {
       const height = element.clientHeight;
       const next = {
@@ -322,9 +328,18 @@ export function useWindowedRows<K>({
     return () => {
       element.removeEventListener("scroll", sync);
       resizes.disconnect();
-      viewport.current = null;
+      if (viewport.current === element) {
+        viewport.current = null;
+      }
     };
   }, []);
+
+  const attachViewport = useCallback<RefCallback<HTMLElement>>(
+    (element) => (element === null ? undefined : follow(element)),
+    [follow],
+  );
+
+  useEffect(() => (scroller ? follow(scroller) : undefined), [scroller, follow]);
 
   const box = rowHeight + gap;
 

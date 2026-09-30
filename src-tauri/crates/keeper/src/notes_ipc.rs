@@ -1093,11 +1093,15 @@ async fn project_list(
                 } else if score.why == MatchWhy::Meaning {
                     (keeper_core::notes::snippet::prose(&chunk, 240), Vec::new())
                 } else {
-                    let marks = search_index::marks(&chunk, &text);
+                    // Excerpted over the chunk with each media block read as
+                    // its summary, like the row: a hit near one never shows
+                    // its source.
+                    let shown = keeper_core::notes::media_block::summarised_blocks(&chunk);
+                    let marks = search_index::marks(&shown, &text);
                     if marks.is_empty() {
                         (keeper_core::notes::snippet::prose(&chunk, 240), Vec::new())
                     } else {
-                        let (snippet, ranges) = search_index::excerpt(&chunk, &marks, 240);
+                        let (snippet, ranges) = search_index::excerpt(&shown, &marks, 240);
                         let marks = search_index::utf16_ranges(&snippet, &ranges);
                         (snippet, marks)
                     }

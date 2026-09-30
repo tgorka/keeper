@@ -49,10 +49,9 @@ export const MEDIA_BLOCK_CLASS = "cm-media-block";
 export const MEDIA_BLOCK_BODY_CLASS = "cm-media-block-body";
 
 /**
- * What CodeMirror assumes the block is tall, and what the panel holds itself
- * to: a player, a row of chips and a fixed box of about twelve lines. A block
- * whose height followed its transcript would stretch the note and shift the
- * height map on every resolve.
+ * What CodeMirror assumes a block is tall before it has measured one: a
+ * player and a few lines. Only a guess — the panel grows with its transcript,
+ * and CodeMirror takes the real height from the DOM once it is drawn.
  */
 export const MEDIA_BLOCK_ESTIMATED_HEIGHT_PX = 720;
 
@@ -77,6 +76,16 @@ export interface MediaBlockMountArgs {
   register: (handle: MediaBlockHandle) => () => void;
   /** Report that this block started playing, and pause any other that is. */
   claimPlayback: (pause: () => void) => () => void;
+  /**
+   * The element the note scrolls in — the editor's own scroller. The panel
+   * has no scroll box of its own: it grows with its lines, windows them
+   * against this element and pins its player to the top of it.
+   */
+  scroller: HTMLElement;
+  /** Show the fence's text with the caret inside it. */
+  editSource: () => void;
+  /** Delete the block and the words callout riding with it, as one undoable edit. */
+  remove: () => void;
 }
 
 /** What the layer can ask of a mounted panel. */
@@ -344,6 +353,38 @@ export class MediaBlockWidget extends WidgetType {
           }
         };
       },
+      scroller: view.scrollDOM,
+      editSource: () => {
+        const pos = safePos(view, host);
+        const fence = pos === null ? undefined : fenceAt(view, pos);
+        if (fence === undefined) {
+          return;
+        }
+        // A caret inside the range is what reveals a fence (`paint` below).
+        view.dispatch({
+          selection: { anchor: fence.bodyFrom },
+          scrollIntoView: true,
+          userEvent: "select.media-block",
+        });
+        view.focus();
+      },
+      remove: () => {
+        const pos = safePos(view, host);
+        const fence = pos === null ? undefined : fenceAt(view, pos);
+        if (fence === undefined) {
+          return;
+        }
+        // With its line break, so no blank line is left where the block was.
+        const doc = view.state.doc;
+        const after = fence.to < doc.length ? 1 : 0;
+        const before = after === 0 && fence.from > 0 ? 1 : 0;
+        view.dispatch({
+          changes: { from: fence.from - before, to: fence.to + after },
+          selection: { anchor: fence.from - before },
+          userEvent: "delete.media-block",
+        });
+        view.focus();
+      },
     };
   }
 
@@ -392,14 +433,15 @@ export class MediaBlockWidget extends WidgetType {
     });
   }
 
-  /** Events inside the panel stay in the panel: letting a click through would
-   *  put the caret in the fence, and a revealed fence drops the player. The
-   *  fence text shown before the panel arrives gives its events up, so a click
-   *  there reveals the source like any fence. */
+  /** Once the panel is there, no click on the block reveals its source — the
+   *  panel's ⋯ has *Edit block source* for that, and a click that put the
+   *  caret in the fence would drop the player under the hand that pressed it.
+   *  The fence text shown before the panel arrives, and the no-drive note,
+   *  have no menu, so a click there reveals the source like any fence. */
   ignoreEvent(event: Event): boolean {
-    return (
-      event.target instanceof Element && event.target.closest(`.${MEDIA_BLOCK_BODY_CLASS}`) !== null
-    );
+    const host =
+      event.target instanceof Element ? event.target.closest(`.${MEDIA_BLOCK_CLASS}`) : null;
+    return host?.querySelector(`:scope > .${MEDIA_BLOCK_BODY_CLASS}`) != null;
   }
 }
 

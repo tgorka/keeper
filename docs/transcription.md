@@ -62,7 +62,15 @@ leaves it for this, there is no transcription server, no NAS option and no cloud
   take on an M-series Mac (decoding 0.001 s, speech 0.02 s, speakers 0.006 s per second of
   audio), and a step never claims more than 95 % of itself until it ends.
 - **The transcript viewer** takes most of the window (in the Files panel, the whole panel); the
-  lines are as wide as the player — one column, no reading-measure cap.
+  lines are exactly as wide as the player — one content column with a 12 px gutter, no inset
+  of the lines' own beyond the speaker's square, and no reading-measure cap anywhere (an
+  edited line's field included).
+  - **The header** is the transcript's `source.title` (the session folder or the file's
+    name), or nothing; the list of media files is not a title. Search, *Transcribe again…*
+    and the ⋯ menu sit above the scroll area. Inside it, in order: the player with its
+    controls; one row under them, wrapping on a narrow window, with the date · length ·
+    language · engine on the left and "Part 1 of 2 · screen-0000.mov" on the right; the
+    speakers' chips; then the lines.
   - *Transcript* and *Source* tabs. Source shows the file's JSON read-only in the Files text
     editor, laid out as keeper writes it and inset by the pane's padding; the transcript stays
     mounted underneath, so playback goes on.
@@ -83,7 +91,9 @@ leaves it for this, there is no transcription server, no NAS option and no cloud
   - **Speakers** are a row of chips — name, a dot for how each was matched, and its line count.
     A chip opens a menu: how it was matched (and its score), *Go to their nearest line* (the
     speaker's line nearest the player's time, the later one on a tie; it scrolls there and
-    seeks, and a paused player stays paused), *This is…* (a submenu of people, the candidates
+    seeks, and a paused player stays paused), *Go to their next line* (their first line
+    starting after the player's time, wrapping to their first; the same scroll and seek),
+    *This is…* (a submenu of people, the candidates
     first with their scores, e.g. "suggested 0.63", then *New person…*), *Rename label…* and
     *Merge into…*. *New person…* and *Rename label…* open a field under the
     chip row. *Add speaker* at the row's end adds a voice the diarizer did not tell apart, with
@@ -94,8 +104,8 @@ leaves it for this, there is no transcription server, no NAS option and no cloud
     lineless one is). Dictionary suggestions follow an edit.
   - A **player**, when the transcript's media can be served, plays it as one timeline across a
     session's segments: scrubbing, ±10 s and seeks map the transcript's time to a part and a
-    time in it, the next part starts where one ends, and a line under the player says
-    "Part 2 of 3 · screen-0001.mov". Screen and camera play side by side, with a *Picture*
+    time in it, and the next part starts where one ends; the row under the controls names
+    the part ("Part 2 of 3 · screen-0001.mov"). Screen and camera play side by side, with a *Picture*
     choice of one icon out of three (screen, camera, both) only when the session filmed both;
     a *Sound* choice (call, microphone, both) appears only when a part has two audio tracks.
     Every icon control names itself to a screen reader and in a tooltip. A video sits in a
@@ -107,7 +117,8 @@ leaves it for this, there is no transcription server, no NAS option and no cloud
     on this Mac yet. Once the sync brings it, it plays here." and mounts no video. A part whose
     length is not recorded takes it from the file. Media elements are released on a part
     change and on close.
-  - *Pin* (on by default) keeps the player at the top of the viewer while the lines scroll.
+  - *Pin* (on by default) keeps the player, its row and the speakers' chips at the top of the
+    scroll area while the lines scroll.
     *Follow* (on by default) highlights the line being said and scrolls it into view while
     playing, while the scrub bar is dragged (not only when it is let go), on ±10 s and on
     every seek; scrolling by hand pauses the follow-scroll until the next play or seek. Every
@@ -320,8 +331,13 @@ diarize them all.
 ## A transcript in a note
 
 A note plays a recording or a transcript in a `keeper-media` block (`docs/notes.md` §
-*Media in a note*, D-30): the viewer's player and the lines, read-only. The block reads no
-engine, so it draws wherever keeper draws notes; only its *Transcribe* needs this Mac's
+*Media in a note*, D-30), and the block is this viewer — the same component, with every
+correction, the speakers' menus, search, *Transcribe again…* and *Copy clip*. What differs:
+it shows only the block's window (`from`/`to`) and its markers, it has no dialog chrome and
+no *Transcript*/*Source* tabs, its heading is the block's `title` or nothing, and it has no
+scroll box of its own: the note's editor scrolls it, the lines are windowed against that
+scroller, and the pinned player sticks to the top of the note's scroll area. Reading needs
+no engine, so it draws wherever keeper draws notes; *Transcribe* needs this Mac's
 transcription.
 
 - **`keeper://transcript-written`**, with `{path}` — the transcript's absolute path — follows
@@ -334,12 +350,14 @@ transcription.
   its path inside its synced folder; a transcript outside every synced folder cannot be named,
   and the viewer says so. With *Include the words*, the window's lines follow as a folded
   `[!transcript]` callout, in the `**[hh:mm:ss] Name:** text` format of `transcript.md`.
+  Like every block keeper writes, the copied one lists the optional keys it does not set as
+  comments after the ones it does (`docs/notes.md` § *Media in a note*).
 - **Recordings outside a synced folder** play by their identity over `keeper-recording://`,
   in the block and in the viewer, when this Mac's recordings index knows them.
 
 ## Corrections
 
-In the viewer:
+In the viewer, and in a note's block, which is the same viewer:
 - **Edit a line** — the text changes and `edited` is set; `asrText` keeps the original. Word
   timings are spread over the old span when the word count changes. Offers dictionary
   suggestions (above); never touches the bank.

@@ -214,6 +214,7 @@ export function TranscriptPlayer({
   window,
   initialPicture = "both",
   initialSound = "both",
+  meta,
   ref,
 }: {
   media: TranscriptMediaVm;
@@ -232,6 +233,8 @@ export function TranscriptPlayer({
   /** What is shown and heard first; the person may change either. */
   initialPicture?: Picture;
   initialSound?: Sound;
+  /** Said on the row under the controls, beside which part is playing. */
+  meta?: ReactNode;
   ref?: Ref<TranscriptPlayerHandle>;
 }) {
   // A part whose length Rust could not tell (a session nobody transcribed yet)
@@ -503,10 +506,13 @@ export function TranscriptPlayer({
           </IconHint>
         </div>
       </div>
-      <p className="min-w-0 break-words text-muted-foreground text-xs">
-        {parts.length > 1 && `Part ${index + 1} of ${parts.length} · `}
-        <span className="font-mono">{partName}</span>
-      </p>
+      <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1 text-muted-foreground text-xs">
+        {meta}
+        <p className="ml-auto min-w-0 break-words">
+          {parts.length > 1 && `Part ${index + 1} of ${parts.length} · `}
+          <span className="font-mono">{partName}</span>
+        </p>
+      </div>
       {refused && (
         <p role="alert" className="break-words text-destructive" title={refused}>
           {PLAY_REFUSED_LABEL}

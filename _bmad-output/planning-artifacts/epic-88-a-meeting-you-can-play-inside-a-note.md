@@ -1,7 +1,7 @@
 # Epic 88 — A meeting you can play inside a note
 
 created: '2026-09-29'
-status: built 2026-09-29 with the owner's amendments (*Build amendments*, below); stories 88.1–88.5 are in `review`. Planned as `keeper-meeting`; the block is `keeper-media` everywhere below (N1).
+status: built 2026-09-29 with the owner's amendments (*Build amendments*, below); stories 88.1–88.5 are in `review`. Story 88.6, the owner's field report of 2026-09-30, is built and in `review` (§ *88.6*). Planned as `keeper-meeting`; the block is `keeper-media` everywhere below (N1).
 source: the owner's message of 2026-09-29, in Polish (its closing paragraph, verbatim below; the rest of that message is story 87.10). Other inputs:
 - the coordinator's scope, `local://epic87-fr3.md` § *Epic 88 — plan only* (binding: the design points to pin, the files to read, the ledgers to draft);
 - a reading of keeper's notes editor, its embeds and its recording note stub, and of the transcript viewer's player, with every claim below cited `path:line`;
@@ -702,9 +702,34 @@ Every story names its rung in the stack (*Stack*, below).
 
 **binds:** FR-765, NFR-111, AD-357, UX-DR124
 
+### 88.6 — Field report: the same viewer in the note, one scrollbar, a block that describes itself
+
+**Intent:** the owner's field report of 2026-09-30 on the built epic, verbatim (Polish/English) in `local://epic88-fr2.md`: "wersja w widget w notes wyglada jak tylko do odczytu - chce miec ta sama jak w recordings"; "widget w notatkach ma sztywna wysokosc, przez to sa podwojne scrollbary"; "zrob widget zeby mial przezroczysty background"; "w podgladzie w liscie notatek widze session... - dodaj tylko informacje o keeper-media"; "jak jest widget w notatce i robie unfold properties to keeper sie zawiesza"; "toggle w notatkach preview … note … source"; the viewer's header, meta row and speaker row; "go to the next"; "widget configuration … zebym wiedzial co mam do wyboru jak chce pisac recznie"; "the head to click to edit - but add it only to the options menu and also option to remove it"; "the transcripts are still not covering full weight". The coordinator's amendments W1–W11 fix them. Lanes: MediaNote88 (W1–W3 widget side, W5, W6, W10), Viewer88b (W1–W2 viewer side, W7, W8, W11), Rust88b (W4, W9, the docs, this section, the sprint entry).
+
+**As built:**
+- **W1 — the same viewer.** The block renders `TranscriptViewer` itself, with an external scroller, a window (`from`/`to`, lines overlapping `[from, to)`, the player bounded), a markers slot, and no dialog chrome: every correction, the speakers' menus, search, *Transcribe again* and *Copy clip*. `TranscriptLinesBox` and its read-only line menu are deleted. AD-358's "reading, not correcting" is superseded, and DW-354 is closed.
+- **W2 — one scrollbar.** The block has no fixed height and no scroll box. The note editor fills its host and its `scrollDOM` is the note's one scroller; the viewer's lines are windowed against it, and the pinned block (player, meta row, markers, speakers) sticks to its top. In the dialog the same component scrolls the dialog body. NFR-110's "its height is fixed" is superseded; "its lines are windowed" holds.
+- **W3 — transparent.** No card background behind the block; its controls keep their own surfaces.
+- **W4 — the notes list.** `snippet::prose` reads every `keeper-media` fence as `media_block::summary`: "▶ Media", the title (the block's `title`, else — in a recording note, for a block naming the note's own recording — the frontmatter's `title`), and the length (the window's `to − from` as `m:ss`/`h:mm:ss`, else that recording's `duration:` as the stub wrote it). A block that does not read, or that the note never closes, is "▶ Media". A search excerpt is cut from the chunk with each block replaced by its summary (`media_block::summarised_blocks`). `INDEX_SCHEMA` 6 → 7 so cached raw previews are rebuilt once.
+- **W5 — the hang on unfolding Properties.** Not reproducible outside the owner's WKWebView, and the panel it involved is gone; the layer is pinned by a regression test that a Properties fold (resize, measure, unrelated transactions) mounts the panel once and never re-renders or remounts it (it fails with 80 re-renders when the widget's `eq()` is identity-based).
+- **W6 — Preview | Note | Source.** A segmented control in the note's header ("Show the note as"): Preview is Files' markdown preview renderer, read-only with live widgets; Note is the live-preview editor; Source is the same editor with the decoration layer removed. Remembered globally in the viewers' cookie `keeper_viewer_modes` under `keeper-note` (`rendered`/`note`/`raw`, default `note`); no shortcut.
+- **W7 — the viewer's header.** The heading is `source.title` in the dialog, the block's `title` or nothing in a note; the file list is no title. In the scroll area: the pinned block — the player and its controls, one wrapping row with "date · length · language · engine" on the left and "Part 1 of 2 · file" on the right, the markers (in a note), the speakers' chips — then the lines.
+- **W8 — "Go to their next line"** in a speaker chip's menu, under "Go to their nearest line": the speaker's first line starting after the player's time, wrapping to their first; it seeks and keeps play or pause.
+- **W9 — the block describes itself.** Every block keeper writes — `session_block` (the stub, a picked recording, *Play in a player* in a recording note, the old-stub rewrite), `transcript_block`, `part_block`, `clip_block` and `clip_transcript` — writes its keys, then each optional root key it does not set commented out (`# title = ""`, `# from = "00:00:00"`, `# to = ""`, `# picture = "both"      # screen | camera | both`, `# sound = "both"        # system | microphone | both`), then `# [[marker]]` / `# name = ""` / `# at = "00:00:00"` when it keeps no marker, then `# sources: session | transcript | [[part]] file/camera/offset/system/microphone | src`. A one-part block lists the root hints above its `[[part]]`, where uncommenting them gives root keys. `adopt` (N5) also rewrites a stub's bare three-line block naming its own recording, found as a fence (never one quoted inside another), into this shape; idempotent, and a block anybody wrote a key into is left alone.
+- **W10 — edit and remove from the menu.** A click on a drawn block reveals nothing; its ⋯ has *Edit block source* (the caret inside the fence) and *Remove widget* (the fence and an attached `[!transcript]` callout, one undo restores both).
+- **W11 — full width.** One content column with a 12 px gutter shared by the player and the lines; no inset of the lines' own beyond the speaker's square and no max-width anywhere (the edit field's 80ch cap removed).
+
+**Deviations:**
+- W4 names a recording's title and duration only for the note's own recording, from its frontmatter. The index is built per note with no recordings index at hand, so a block naming another recording, a transcript or parts shows its own `title` and window or nothing; reading a transcript's `source.title` would open a file per note on every scan.
+- W9's hints `# to = ""` and a marker's `# name = ""`, uncommented as they stand, are refused ("`` is not a time for `to`…", "A moment's name is 1 to 80 characters."): they are placeholders to fill, as the owner's example wrote them. The test `every_hint_uncommented_is_a_key_the_block_reads` fills those two and proves every other hint reads as written.
+
+**Owed:** the coordinator rewrites the 13 tgdrive stubs after install (`recording_notes_adopt_media_block`, dry run first); the shell (`notes_vault.rs`, `notes_ipc.rs`, `ipc.rs` tests) is by inspection and awaits CI's macOS job; the front lanes' browser measurements (W2 one scroller, W11 right edges, W5 no hang) are theirs.
+
+**binds:** FR-759, FR-764, FR-765, NFR-110, NFR-111, AD-351, AD-355, AD-357, AD-358, AD-359, UX-DR124; closes DW-354
+
 ## What stays out
 
-- **Correcting a transcript inside a note** (AD-358). DW-354.
+- **Correcting a transcript inside a note** (AD-358). DW-354 — reversed by 88.6 (W1): the block is the viewer.
 - **Searching inside a block.** ⌘F searches the transcript in the viewer, and *Open transcript* is one press away.
 - **A `speakers` filter** (*Alternatives this plan rejected*).
 - **A new setting.** Nothing in this epic is configured. The words' default is per copy (Q6).

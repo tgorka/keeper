@@ -18270,13 +18270,11 @@ mod tests {
         // (Epic 88, AD-357), never a path joined onto a root.
         assert_eq!(
             &source[body..],
-            concat!(
-                "\n# Weekly sync\n",
-                "\n",
-                "```keeper-media\n",
-                "session = \"01JQDEVICE0000000000000000-01JQSTUBAAAA00000000000000\"\n",
-                "```\n",
-                "\n",
+            format!(
+                "\n# Weekly sync\n\n{}\n",
+                keeper_core::notes::media_block::session_block(
+                    "01JQDEVICE0000000000000000-01JQSTUBAAAA00000000000000"
+                )
             ),
             "the WHOLE body, so nothing can be reordered without failing here: the body \
              offset is exact, the prose is byte-identical, and the heading is still the \
@@ -18494,7 +18492,12 @@ mod tests {
         // here because `drive_synthetic_session` closes a real `.mov`.
         assert_eq!(
             &source[body..],
-            "\n# 2026-01-02\n\n```keeper-media\nsession = \"01JQDEVICE0000000000000000-01JQSTUBAAAA00000000000000\"\n```\n\n"
+            format!(
+                "\n# 2026-01-02\n\n{}\n",
+                keeper_core::notes::media_block::session_block(
+                    "01JQDEVICE0000000000000000-01JQSTUBAAAA00000000000000"
+                )
+            )
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -18605,7 +18608,12 @@ mod tests {
         // shoving it down the page.
         assert_eq!(
             body,
-            "# Weekly sync\n\n```keeper-media\nsession = \"01JQDEVICE0000000000000000-01JQSTUBAAAA00000000000000\"\n```\n\n",
+            format!(
+                "# Weekly sync\n\n{}\n",
+                keeper_core::notes::media_block::session_block(
+                    "01JQDEVICE0000000000000000-01JQSTUBAAAA00000000000000"
+                )
+            ),
             "the WHOLE body: heading first, then the recording, then the blank line the \
              caret lands on. An embed above the heading would become the note's title"
         );

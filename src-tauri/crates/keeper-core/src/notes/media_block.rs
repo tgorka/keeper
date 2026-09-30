@@ -24,6 +24,7 @@
 //! or removed through `toml_edit`, and every other byte of the body — its
 //! comments, its blank lines, its spelling of times — stays (AD-354).
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
@@ -585,20 +586,76 @@ pub fn fenced(body: &str) -> String {
     out
 }
 
+/// The optional root keys a block keeper writes lists, commented out, when
+/// it does not set them: the grammar's own reference, where a person who
+/// opens the block to write it by hand is looking. The parser skips them.
+const KEY_HINTS: [(&str, &str); 5] = [
+    ("title", "# title = \"\""),
+    ("from", "# from = \"00:00:00\""),
+    ("to", "# to = \"\""),
+    (
+        "picture",
+        "# picture = \"both\"      # screen | camera | both",
+    ),
+    (
+        "sound",
+        "# sound = \"both\"        # system | microphone | both",
+    ),
+];
+
+/// A marker's shape, for a block that has none.
+const MARKER_HINT: &str = "# [[marker]]\n# name = \"\"\n# at = \"00:00:00\"\n";
+
+/// What else a block may play, last in every block keeper writes.
+const SOURCES_HINT: &str =
+    "# sources: session | transcript | [[part]] file/camera/offset/system/microphone | src\n";
+
+/// A block keeper writes: `keys` as `key = value` lines, each optional root
+/// key it does not set commented out, then `tables` — its `[[part]]` and
+/// `[[marker]]` tables, each opening with a blank line — then a marker's
+/// shape when `markers` is false, and the sources. The hints sit above the
+/// tables because a key under `[[part]]` belongs to the part: uncommented
+/// there, `title` would be refused.
+fn described(keys: &[(&str, String)], tables: &str, markers: bool) -> String {
+    let mut out = String::new();
+    for (key, value) in keys {
+        let _ = writeln!(out, "{key} = {value}");
+    }
+    for (key, hint) in KEY_HINTS {
+        if !keys.iter().any(|(set, _)| *set == key) {
+            out.push_str(hint);
+            out.push('\n');
+        }
+    }
+    if !tables.is_empty() {
+        out.push_str(tables);
+        out.push('\n');
+    }
+    if !markers {
+        out.push_str(MARKER_HINT);
+    }
+    out.push_str(SOURCES_HINT);
+    fenced(&out)
+}
+
 /// A block naming a recording by its identity: what the stub of a
 /// recording carries, and what a picked recording inserts (AD-357).
 pub fn session_block(session_id: &str) -> String {
-    fenced(&format!("session = {}", quoted(session_id)))
+    described(&[("session", quoted(session_id))], "", false)
 }
 
 /// A block naming a transcript file, relative to the drive.
 pub fn transcript_block(relative_path: &str) -> String {
-    fenced(&format!("transcript = {}", quoted(relative_path)))
+    described(&[("transcript", quoted(relative_path))], "", false)
 }
 
 /// A block of one media file with no transcript, relative to the drive.
 pub fn part_block(relative_path: &str) -> String {
-    fenced(&format!("[[part]]\nfile = {}", quoted(relative_path)))
+    described(
+        &[],
+        &format!("\n[[part]]\nfile = {}\n", quoted(relative_path)),
+        false,
+    )
 }
 
 /// What the person picked to play: a recording from the recordings index,
@@ -840,27 +897,28 @@ pub fn clip_block(
     }
     check_window(from, to)?;
 
-    let mut out = String::new();
+    let mut keys: Vec<(&str, String)> = Vec::new();
     for key in ["session", "transcript", "src", "title"] {
         if let Some(value) = document.get(key).and_then(Item::as_value) {
-            let _ = writeln!(out, "{key} = {}", bare(value));
+            keys.push((key, bare(value)));
         }
     }
     let from = from.unwrap_or(0.0);
-    let _ = writeln!(out, "from = {}", quoted(&format_time(from)));
+    keys.push(("from", quoted(&format_time(from))));
     if let Some(to) = to {
-        let _ = writeln!(out, "to = {}", quoted(&format_time_up(to)));
+        keys.push(("to", quoted(&format_time_up(to))));
     }
     for key in ["picture", "sound"] {
         if let Some(value) = document.get(key).and_then(Item::as_value) {
-            let _ = writeln!(out, "{key} = {}", bare(value));
+            keys.push((key, bare(value)));
         }
     }
+    let mut tables = String::new();
     if let Some(parts) = document.get("part") {
         for part in tables_of(parts) {
-            out.push_str("\n[[part]]\n");
+            tables.push_str("\n[[part]]\n");
             for (key, value) in part {
-                let _ = writeln!(out, "{key} = {}", bare(value));
+                let _ = writeln!(tables, "{key} = {}", bare(value));
             }
         }
     }
@@ -871,19 +929,28 @@ pub fn clip_block(
                 Some(end) => end <= to,
             })
     };
-    if let Some(markers) = document.get("marker") {
-        for (marker, table) in block.markers.iter().zip(tables_of(markers)) {
+    let mut kept_markers = false;
+    if let Some(items) = document.get("marker") {
+        for (marker, table) in block.markers.iter().zip(tables_of(items)) {
             if !inside(marker) {
                 continue;
             }
-            out.push_str("\n[[marker]]\n");
+            kept_markers = true;
+            tables.push_str("\n[[marker]]\n");
             for (key, value) in table {
-                let _ = writeln!(out, "{key} = {}", bare(value));
+                let _ = writeln!(tables, "{key} = {}", bare(value));
             }
         }
     }
     let title = block.title.as_deref();
-    Ok(with_words(fenced(&out), title, from, to, transcript, words))
+    Ok(with_words(
+        described(&keys, &tables, kept_markers),
+        title,
+        from,
+        to,
+        transcript,
+        words,
+    ))
 }
 
 /// What a clip from the transcript viewer names its meeting by (AD-355): the
@@ -902,18 +969,18 @@ pub fn clip_transcript(
     transcript: &Transcript,
     words: bool,
 ) -> MediaClipVm {
-    let mut out = match source {
-        ClipSource::Session(id) => format!("session = {}\n", quoted(id)),
-        ClipSource::Transcript(path) => format!("transcript = {}\n", quoted(path)),
-    };
+    let mut keys = vec![match source {
+        ClipSource::Session(id) => ("session", quoted(id)),
+        ClipSource::Transcript(path) => ("transcript", quoted(path)),
+    }];
     if let Some(from) = window.from {
-        let _ = writeln!(out, "from = {}", quoted(&format_time(from)));
+        keys.push(("from", quoted(&format_time(from))));
     }
     if let Some(to) = window.to {
-        let _ = writeln!(out, "to = {}", quoted(&format_time_up(to)));
+        keys.push(("to", quoted(&format_time_up(to))));
     }
     with_words(
-        fenced(&out),
+        described(&keys, "", false),
         None,
         window.from.unwrap_or(0.0),
         window.to,
@@ -1105,6 +1172,113 @@ pub fn session_ids(note: &str) -> Vec<String> {
     ids
 }
 
+/// Each media block of `note` with its byte range, from its opening fence's
+/// first byte to its closing fence's last, without the line break after it.
+fn spanned_blocks(note: &str) -> Vec<((usize, usize), FoundBlock)> {
+    let starts: Vec<usize> = std::iter::once(0)
+        .chain(note.match_indices('\n').map(|(at, _)| at + 1))
+        .collect();
+    let end_of = |line: usize| {
+        let start = starts[line - 1];
+        start + note[start..].find('\n').unwrap_or(note.len() - start)
+    };
+    blocks(note)
+        .into_iter()
+        .map(|block| {
+            (
+                (starts[block.first_line - 1], end_of(block.last_line)),
+                block,
+            )
+        })
+        .collect()
+}
+
+/// What a recording note's frontmatter says about its own recording: how a
+/// block naming that recording is told apart in the notes list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnRecording<'a> {
+    pub session: &'a str,
+    pub title: Option<&'a str>,
+    /// The stub's `duration:`, as it wrote it.
+    pub duration: Option<&'a str>,
+}
+
+impl<'a> OwnRecording<'a> {
+    /// The recording `front` is about, or `None` for a note about none.
+    pub fn of(front: &'a Frontmatter) -> Option<Self> {
+        let fact = |key: &str| {
+            front
+                .as_string(key)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
+        Some(Self {
+            session: fact(SESSION_KEY)?,
+            title: fact("title"),
+            duration: fact("duration"),
+        })
+    }
+}
+
+/// The one line a block reads as in the notes list and search results,
+/// never its source: `▶ Media`, the title — the block's own, else its
+/// note's recording's when it names that recording — and how long it plays:
+/// its window, else that recording's duration. A body that does not read is
+/// `▶ Media` alone.
+pub fn summary(body: &str, own: Option<OwnRecording<'_>>) -> String {
+    let mut out = String::from("▶ Media");
+    let Ok(block) = parse(body) else {
+        return out;
+    };
+    let own =
+        own.filter(|own| matches!(&block.source, Source::Session(id) if id.trim() == own.session));
+    let title = block
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .or(own.and_then(|own| own.title));
+    let length = match (block.from, block.to) {
+        (from, Some(to)) => Some(span_text(to - from.unwrap_or(0.0))),
+        (None, None) => own.and_then(|own| own.duration).map(str::to_owned),
+        (Some(_), None) => None,
+    };
+    for fact in title.into_iter().chain(length.as_deref()) {
+        out.push_str(" · ");
+        out.push_str(fact);
+    }
+    out
+}
+
+/// A length as a player shows it: `m:ss`, or `h:mm:ss` from an hour.
+fn span_text(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as u64;
+    let (hours, minutes, seconds) = (total / 3_600, total % 3_600 / 60, total % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// `text` with each media block in it replaced by its [`summary`]: what a
+/// search excerpt is cut from, so a hit near a block never shows its source.
+pub fn summarised_blocks(text: &str) -> Cow<'_, str> {
+    let found = spanned_blocks(text);
+    if found.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for ((start, end), block) in found {
+        out.push_str(&text[cursor..start]);
+        out.push_str(&summary(&block.body, None));
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    Cow::Owned(out)
+}
+
 /// Where a marker link lands: the ordinal of the media block holding the
 /// marker among the note's media blocks, and the marker's times.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -1286,11 +1460,11 @@ fn around(rest: &str, block: &str) -> String {
 /// What the rewrite of one old recording stub decided (N5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Adoption {
-    /// Not a recording note, or none of its own embeds is left: nothing to
-    /// do, and nothing written.
+    /// Not a recording note, or none of its own embeds and no bare block of
+    /// its own is left: nothing to do, and nothing written.
     Untouched,
-    /// The stub's run of per-file embeds became one block; the note's new
-    /// text.
+    /// The stub's run of per-file embeds, or its bare block, became the
+    /// block a stub carries now; the note's new text.
     Changed(String),
     /// The note embeds its recording's files, but not in the shape keeper
     /// wrote: somebody edited them, and keeper leaves them alone.
@@ -1311,8 +1485,10 @@ pub struct MediaAdoptionVm {
 /// A recording stub's per-file embeds of its own recording, rewritten into
 /// the one block a stub carries now (N5, AD-357). Only the exact run the
 /// stub composer wrote is replaced — the videos of `files:`, one embed per
-/// line, in that order — and every other byte stays. Run again, it finds no
-/// embed of its own and leaves the note alone.
+/// line, in that order — and every other byte stays. A stub with no embed
+/// of its own has its bare block — the three lines stubs carried before a
+/// block listed its optional keys — rewritten into [`session_block`]'s
+/// shape instead. Run again, it finds neither and leaves the note alone.
 pub fn adopt(note: &str) -> Adoption {
     let (front, body_offset) = Frontmatter::parse(note);
     if !recording_note::is_recording_note(&front) {
@@ -1328,7 +1504,7 @@ pub fn adopt(note: &str) -> Adoption {
         .filter(|link| link.embed && files.contains(&link.target))
         .count();
     if own == 0 {
-        return Adoption::Untouched;
+        return describe_bare_blocks(note, body_offset, session_id);
     }
     let names: Vec<&str> = files.iter().map(|file| file.trim()).collect();
     let run = recording_note::video_embeds(&names);
@@ -1348,6 +1524,34 @@ pub fn adopt(note: &str) -> Adoption {
     out.push_str(&note[..at]);
     out.push_str(session_block(session_id).trim_end_matches('\n'));
     out.push_str(&note[at + run.len()..]);
+    Adoption::Changed(out)
+}
+
+/// Every fence of `note`'s body that is exactly the bare block keeper once
+/// wrote for `session_id`, rewritten as [`session_block`]; a block anybody
+/// wrote a key into is not one, nor is one quoted inside another fence.
+fn describe_bare_blocks(note: &str, body_offset: usize, session_id: &str) -> Adoption {
+    let bare = format!("```{INFO_WORD}\nsession = {}\n```", quoted(session_id));
+    let body = &note[body_offset..];
+    let spans: Vec<(usize, usize)> = spanned_blocks(body)
+        .into_iter()
+        .map(|(span, _)| span)
+        .filter(|(start, end)| body[*start..*end] == bare)
+        .collect();
+    if spans.is_empty() {
+        return Adoption::Untouched;
+    }
+    let block = session_block(session_id);
+    let block = block.trim_end_matches('\n');
+    let mut out = String::with_capacity(note.len() + spans.len() * block.len());
+    out.push_str(&note[..body_offset]);
+    let mut cursor = 0;
+    for (start, end) in spans {
+        out.push_str(&body[cursor..start]);
+        out.push_str(block);
+        cursor = end;
+    }
+    out.push_str(&body[cursor..]);
     Adoption::Changed(out)
 }
 

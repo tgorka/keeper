@@ -45,6 +45,7 @@ export const TRANSCRIPT_FIXTURE: TranscriptVm = {
     source: {
       kind: "recording",
       files: ["meeting.mov"],
+      title: "meeting.mov",
       parts: [
         {
           file: "meeting.mov",

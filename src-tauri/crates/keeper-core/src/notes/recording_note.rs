@@ -509,12 +509,15 @@ mod tests {
 
         assert_eq!(
             &source[body..],
-            format!("\n# Quarterly review\n\n```keeper-media\nsession = \"{ID}\"\n```\n\n"),
+            format!(
+                "\n# Quarterly review\n\n{}\n",
+                media_block::session_block(ID)
+            ),
             "the body offset is exact and the prose survives byte-identically"
         );
         assert_eq!(
             &source[stub.body_offset..],
-            format!("# Quarterly review\n\n```keeper-media\nsession = \"{ID}\"\n```\n\n"),
+            format!("# Quarterly review\n\n{}\n", media_block::session_block(ID)),
             "the stub's own offset skips the separator line and lands on the prose"
         );
     }
@@ -611,7 +614,7 @@ mod tests {
 
         assert_eq!(
             &stub.contents[stub.body_offset..],
-            format!("# Quarterly review\n\n```keeper-media\nsession = \"{ID}\"\n```\n\n")
+            format!("# Quarterly review\n\n{}\n", media_block::session_block(ID))
         );
     }
 
@@ -703,7 +706,7 @@ mod tests {
         let expected = bare.contents[bare.body_offset..].to_owned();
         assert_eq!(
             expected,
-            format!("# Quarterly review\n\n```keeper-media\nsession = \"{ID}\"\n```\n\n")
+            format!("# Quarterly review\n\n{}\n", media_block::session_block(ID))
         );
 
         let audio_only = [
@@ -913,7 +916,7 @@ mod tests {
         assert_eq!(fm.as_string("title"), Some("2026-08-08"));
         assert_eq!(
             &stub.contents[body..],
-            format!("\n# 2026-08-08\n\n```keeper-media\nsession = \"{ID}\"\n```\n\n")
+            format!("\n# 2026-08-08\n\n{}\n", media_block::session_block(ID))
         );
         assert_eq!(
             stub.filename, "2026-08-08-untitled.md",
@@ -1217,7 +1220,7 @@ mod tests {
         assert_eq!(fm.as_string("title"), Some(hostile));
         assert_eq!(
             &stub.contents[body..],
-            format!("\n# {hostile}\n\n```keeper-media\nsession = \"{ID}\"\n```\n\n")
+            format!("\n# {hostile}\n\n{}\n", media_block::session_block(ID))
         );
         assert_eq!(
             stub.filename, "2026-08-08-re-budget-2-draft-50-done.md",
@@ -1239,7 +1242,7 @@ mod tests {
         );
         assert_eq!(
             &stub.contents[stub.body_offset..],
-            format!("# Café résumé\n\n```keeper-media\nsession = \"{ID}\"\n```\n\n")
+            format!("# Café résumé\n\n{}\n", media_block::session_block(ID))
         );
         assert!(stub.contents[..stub.body_offset].ends_with("---\n\n"));
     }

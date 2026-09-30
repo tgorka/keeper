@@ -91,6 +91,7 @@ import type {
   ForgeSourceVm,
   GrantScope,
   HotkeyVm,
+  NoteBodyBatch,
   OrgAccountVm,
   PacedWorkVm,
   RecordingCaptureSourcesVm,
@@ -120,6 +121,7 @@ import type {
 } from "@/lib/ipc/client";
 import { DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import {
+  MEDIA_BLOCK_FRONTMATTER,
   MEDIA_BLOCK_NOTES,
   markFreshTranscribed,
   mediaBlockMockHandlers,
@@ -5220,6 +5222,25 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     const inSession =
       String(payload.vaultId ?? "") === SESSION_VAULT_ID && relDir === SESSION_ZONE_DIR;
     return { relDir, dirs: [], notes: inSession ? sessionNotes() : [] };
+  },
+  // The open note's body channel. Without it every note opens empty, and the
+  // editor — its widgets, its Properties disclosure — cannot be looked at here.
+  notes_open: (payload) => {
+    const id = String(payload.noteId);
+    const row = NOTES.find(([each]) => each === id);
+    const text = row === undefined ? "" : String(row[2]);
+    const tags = row === undefined ? [] : [...row[3]];
+    const tagBlock =
+      tags.length > 0 ? `---\ntags:\n${tags.map((tag) => `  - ${tag}\n`).join("")}---\n` : "";
+    (payload.channel as MockChannel<unknown>).onmessage?.({
+      kind: "reset",
+      rev: "rev-mock",
+      path: `${row?.[1] ?? "Untitled"}.md`,
+      frontmatter: MEDIA_BLOCK_FRONTMATTER[id] ?? tagBlock,
+      text,
+      cursor: null,
+    } satisfies NoteBodyBatch);
+    return `sub-mock-note-${String(payload.noteId)}`;
   },
   notes_body_read: (payload) => {
     const row = NOTES.find(([id]) => id === payload.noteId);

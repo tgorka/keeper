@@ -2,18 +2,13 @@
  * A transcript's lines, read: one row per line with the speaker's square — a
  * play button — the name, the start and the length, the line's ⋯ and the words.
  *
- * The transcript viewer draws them with its corrections behind the ⋯; a note's
- * media block draws them read-only in a box of its own (`TranscriptLinesBox`).
+ * The transcript viewer draws them — in its dialog and in a note's media block
+ * alike — with its corrections behind the ⋯.
  */
-import { Clipboard, Ellipsis, ExternalLink, Play } from "lucide-react";
-import { type ReactNode, type Ref, useCallback, useEffect } from "react";
+import { Ellipsis, Play } from "lucide-react";
+import { type ReactNode, type Ref, useCallback } from "react";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { useWindowedRows, type WindowedRows } from "@/components/ui/window-list";
 import type { Speaker } from "@/lib/ipc/gen/Speaker";
 import type { Utterance } from "@/lib/ipc/gen/Utterance";
@@ -69,7 +64,6 @@ export function lineLength(seconds: number): string {
 export const MENU_CONTENT = "w-auto min-w-44";
 export const PLAY_FROM_HERE = "Play from here";
 export const COPY_CLIP_FROM_HERE = "Copy clip from here…";
-export const OPEN_IN_VIEWER = "Open in viewer";
 /** A line's rows are assumed this tall until measured. */
 const ROW_HEIGHT = 84;
 const ROW_GAP = 4;
@@ -183,12 +177,14 @@ export function TranscriptLines({
         if (!line) return null;
         const speaking = row.index === current;
         return (
+          // No inset of its own: the card's edge is the column's edge, so the
+          // words run as wide as the player above them.
           <li
             key={row.key}
             {...list.rowProps(row)}
             aria-current={speaking ? "true" : undefined}
             data-match={matching?.has(row.index) ? "" : undefined}
-            className="group min-w-0 px-3"
+            className="group min-w-0"
           >
             <div
               className={cn(
@@ -242,7 +238,7 @@ export function TranscriptLines({
 /** The windowed rows over `lines`, keyed by line id. */
 export function useTranscriptRows(
   lines: readonly LineVm[] | undefined,
-  options: { scrollMargin?: number; stickyInset?: number } = {},
+  options: { scrollMargin?: number; stickyInset?: number; scroller?: HTMLElement | null } = {},
 ): WindowedRows<string> {
   const getKey = useCallback((index: number) => lines?.[index]?.id ?? String(index), [lines]);
   return useWindowedRows({
@@ -252,110 +248,6 @@ export function useTranscriptRows(
     gap: ROW_GAP,
     scrollMargin: options.scrollMargin ?? 0,
     stickyInset: options.stickyInset ?? 0,
+    scroller: options.scroller,
   });
-}
-
-export interface TranscriptLinesBoxProps {
-  lines: readonly LineVm[];
-  /** In the transcript's order, which is what gives each its ink. */
-  speakers: readonly LineSpeakerVm[];
-  /** The index of the line being said, or -1 (`currentUtterance`). */
-  current: number;
-  playable: boolean;
-  onSeek: (seconds: number, play?: boolean) => void;
-  onCopyClip?: (line: LineVm) => void;
-  onOpenInViewer?: (line: LineVm) => void;
-  /** Keep the line being said in view. */
-  follow?: boolean;
-  /** The reader scrolled the box: the caller stops following until the next seek. */
-  onReaderScroll?: () => void;
-  /** The box's height; about twelve lines unless given. */
-  className?: string;
-}
-
-/**
- * The lines read-only, in a box of fixed height that scrolls inside itself: a
- * long meeting neither stretches its host nor moves anything around it.
- */
-export function TranscriptLinesBox({
-  lines,
-  speakers,
-  current,
-  playable,
-  onSeek,
-  onCopyClip,
-  onOpenInViewer,
-  follow = true,
-  onReaderScroll,
-  className,
-}: TranscriptLinesBoxProps) {
-  const list = useTranscriptRows(lines);
-  const reveal = list.reveal;
-  useEffect(() => {
-    if (follow && current >= 0) reveal(current);
-  }, [follow, current, reveal]);
-  return (
-    <div
-      {...list.viewportProps}
-      className={cn("relative h-[30rem] min-h-0 overflow-auto", className)}
-      onWheel={onReaderScroll}
-      onTouchMove={onReaderScroll}
-    >
-      <TranscriptLines
-        lines={lines}
-        speakers={speakers}
-        list={list}
-        current={current}
-        playable={playable}
-        onSeek={onSeek}
-        menu={(line) => (
-          <ReadOnlyLineMenu
-            line={line}
-            onPlay={playable ? () => onSeek(line.start, true) : undefined}
-            onCopyClip={onCopyClip && (() => onCopyClip(line))}
-            onOpenInViewer={onOpenInViewer && (() => onOpenInViewer(line))}
-          />
-        )}
-      />
-    </div>
-  );
-}
-
-function ReadOnlyLineMenu({
-  line,
-  onPlay,
-  onCopyClip,
-  onOpenInViewer,
-}: {
-  line: LineVm;
-  onPlay?: () => void;
-  onCopyClip?: () => void;
-  onOpenInViewer?: () => void;
-}) {
-  if (!onPlay && !onCopyClip && !onOpenInViewer) return null;
-  return (
-    <DropdownMenu>
-      <LineMenuTrigger id={line.id} />
-      <DropdownMenuContent align="start" className={MENU_CONTENT}>
-        {onPlay && (
-          <DropdownMenuItem onSelect={onPlay}>
-            <Play aria-hidden="true" />
-            {PLAY_FROM_HERE}
-          </DropdownMenuItem>
-        )}
-        {onCopyClip && (
-          <DropdownMenuItem onSelect={onCopyClip}>
-            <Clipboard aria-hidden="true" />
-            {COPY_CLIP_FROM_HERE}
-          </DropdownMenuItem>
-        )}
-        {onOpenInViewer && (
-          <DropdownMenuItem onSelect={onOpenInViewer}>
-            <ExternalLink aria-hidden="true" />
-            {OPEN_IN_VIEWER}
-          </DropdownMenuItem>
-        )}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
 }

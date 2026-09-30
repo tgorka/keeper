@@ -1495,9 +1495,17 @@ const livePreviewTheme = EditorView.baseTheme({
     whiteSpace: "pre-wrap",
   },
   ".cm-media-block-note": { margin: "0 0 0.25em", color: "var(--muted-foreground)" },
-  // The panel is a normal React surface: the editor's own line metrics must
-  // not reach into it.
-  ".cm-media-block-body": { whiteSpace: "normal", lineHeight: "normal", cursor: "auto" },
+  // The panel is the transcript viewer, drawn as it is in Recordings: the
+  // editor's own line metrics and note font must not reach into it, and it has
+  // no surface of its own — the note shows through, and its controls keep
+  // theirs.
+  ".cm-media-block-body": {
+    whiteSpace: "normal",
+    lineHeight: "normal",
+    cursor: "auto",
+    fontFamily: "var(--font-sans)",
+    backgroundColor: "transparent",
+  },
   // The gallery block (Story 44.15). The grid is the scroll container the
   // window measures, so its height is fixed here and its content is what
   // scrolls — a grid that grew with its folder would defeat the window it is

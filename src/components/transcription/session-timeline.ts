@@ -71,3 +71,18 @@ export function nearestLine(lines: readonly TimedLine[], speaker: string, second
   }
   return best;
 }
+
+/**
+ * The line of `speaker` that starts next after `seconds`; past their last line,
+ * their first again. `-1` when the speaker has no lines.
+ */
+export function nextLine(lines: readonly TimedLine[], speaker: string, seconds: number): number {
+  let first = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.speaker !== speaker) continue;
+    if (line.start > seconds) return index;
+    if (first < 0) first = index;
+  }
+  return first;
+}

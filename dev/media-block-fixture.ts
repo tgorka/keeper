@@ -104,6 +104,16 @@ export const MEDIA_BLOCK_NOTES = [
   ],
 ] as const;
 
+/**
+ * The frontmatter keeper writes on a recording note, for the notes above that
+ * are one — so Properties opens on a recording note with its block mounted,
+ * which is how the owner's notes are.
+ */
+export const MEDIA_BLOCK_FRONTMATTER: Record<string, string> = {
+  n11: `---\nsession: ${KELLY_SESSION}\nrecording: 60-sessions/recordings/2026/09/28 Kelly sync\nfiles:\n  - screen-0000.mov\n  - screen-0001.mov\n  - camera-0000.mov\ntags:\n  - recordings\n  - meetings\n---\n`,
+  n13: `---\nsession: ${FRESH_SESSION}\nrecording: 60-sessions/recordings/2026/09/29 standup\ntags:\n  - recordings\n---\n`,
+};
+
 /** Whether the fresh session has been transcribed in this page's lifetime. */
 let freshTranscribed = false;
 
@@ -419,11 +429,23 @@ export function mediaBlockMockHandlers(): Record<
       const pick = p.pick as
         | { kind: "session"; sessionId: string }
         | { kind: "file"; relativePath: string };
+      // The optional keys, commented, as Rust writes them (`docs/notes.md`).
+      const hints = [
+        '# title = ""',
+        '# from = "00:00:00"',
+        '# to = ""',
+        '# picture = "both"      # screen | camera | both',
+        '# sound = "both"        # system | microphone | both',
+        "# [[marker]]",
+        '# name = ""',
+        '# at = "00:00:00"',
+        "# sources: session | transcript | [[part]] file/camera/offset/system/microphone | src",
+      ].join("\n");
       if (pick.kind === "session")
-        return `\`\`\`keeper-media\nsession = "${pick.sessionId}"\n\`\`\`\n`;
+        return `\`\`\`keeper-media\nsession = "${pick.sessionId}"\n${hints}\n\`\`\`\n`;
       return pick.relativePath.endsWith(".json")
-        ? `\`\`\`keeper-media\ntranscript = "${pick.relativePath}"\n\`\`\`\n`
-        : `\`\`\`keeper-media\n[[part]]\nfile = "${pick.relativePath}"\n\`\`\`\n`;
+        ? `\`\`\`keeper-media\ntranscript = "${pick.relativePath}"\n${hints}\n\`\`\`\n`
+        : `\`\`\`keeper-media\n${hints}\n[[part]]\nfile = "${pick.relativePath}"\n\`\`\`\n`;
     },
     recording_notes_adopt_media_block: (p): MediaAdoptionVm => ({
       changed: p.dryRun ? 3 : 3,

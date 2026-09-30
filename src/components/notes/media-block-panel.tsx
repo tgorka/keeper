@@ -1,16 +1,20 @@
 /**
  * The panel a ` ```keeper-media ` block becomes in a note (UX-DR124, UX-DR125).
  *
- * It reads; the transcript viewer corrects (AD-358). The block plays the media
- * as one timeline, follows the transcript's lines, lets a person name a moment
- * or a window, and copies a clip — and nothing it does edits a line. *Open
- * transcript* is one press away for that.
+ * **The transcript viewer itself, embedded.** A transcribed block is
+ * `TranscriptViewer` with everything the dialog offers — edit, split, add a
+ * line, change a speaker, rename and merge speakers, search, transcribe again,
+ * copy a clip. What the block adds is its window (only the lines inside
+ * `from`/`to`), its markers, and its own verbs appended to the viewer's ⋯. The
+ * viewer has no scroll box of its own here: it grows with its lines inside the
+ * note, windows them against the editor's scroller and pins its player to the
+ * top of it, so the note has one scrollbar.
  *
- * **Everything it knows came from Rust.** `media_block_resolve` reads the body
- * and answers with the lines inside the block's window, the speakers, the
- * media references and the markers; a refusal is Rust's sentence, shown above
- * the block's own text (UX-DR44). A marker edit is `media_block_edit`'s new
- * body, spliced by the editor over the block's range as it is at that moment.
+ * **Everything the block knows came from Rust.** `media_block_resolve` reads the
+ * body and answers with the window, the media references and the markers; a
+ * refusal is Rust's sentence, shown above the block's own text (UX-DR44). A
+ * marker edit is `media_block_edit`'s new body, spliced by the editor over the
+ * block's range as it is at that moment.
  *
  * **One player at a time, and only near the screen (AD-359).** The player —
  * and so every `<video>` — mounts when an observer with one screen of margin
@@ -22,19 +26,23 @@
  * expected one, before the first transcript exists — the block resolves again.
  */
 import { Ellipsis, MoveHorizontal } from "lucide-react";
-import { type FormEvent, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  type FormEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
 import { type ClipRequest, CopyClipDialog } from "@/components/transcription/copy-clip";
 import { currentUtterance } from "@/components/transcription/session-timeline";
-import {
-  type LineVm,
-  TranscriptLinesBox,
-  timestamp,
-} from "@/components/transcription/transcript-lines";
+import { timestamp } from "@/components/transcription/transcript-lines";
 import {
   TranscriptPlayer,
   type TranscriptPlayerHandle,
 } from "@/components/transcription/transcript-player";
-import { TranscriptDialog } from "@/components/transcription/transcript-viewer";
+import { TranscriptDialog, TranscriptViewer } from "@/components/transcription/transcript-viewer";
 import { TranscriptionJob } from "@/components/transcription/transcription-job";
 import { Button } from "@/components/ui/button";
 import {
@@ -78,6 +86,8 @@ export const OPEN_TRANSCRIPT_LABEL = "Open transcript";
 export const COPY_CLIP_LABEL = "Copy clip…";
 export const MARK_MOMENT_LABEL = "Mark this moment";
 export const MARK_WINDOW_LABEL = "Mark a window…";
+export const EDIT_BLOCK_SOURCE_LABEL = "Edit block source";
+export const REMOVE_WIDGET_LABEL = "Remove widget";
 export const NOT_TRANSCRIBED_SENTENCE = "Not transcribed yet.";
 export const TRANSCRIBE_LABEL = "Transcribe";
 export const MARKER_COPY_LINK = "Copy link";
@@ -119,6 +129,9 @@ type Naming =
   | { mode: "window"; name: string; from: string; to: string }
   | { mode: "rename"; name: string; marker: string };
 
+/** Whichever player is mounted: the viewer's, or the untranscribed block's own. */
+type Seekable = Pick<TranscriptPlayerHandle, "seek" | "pause">;
+
 export function MediaBlockPanel({
   profileId,
   source,
@@ -127,6 +140,9 @@ export function MediaBlockPanel({
   noteLink,
   register,
   claimPlayback,
+  scroller,
+  editSource,
+  remove,
 }: MediaBlockMountArgs) {
   const [vm, setVm] = useState<MediaBlockVm | null>(null);
   const [refusal, setRefusal] = useState<string | null>(null);
@@ -136,16 +152,15 @@ export function MediaBlockPanel({
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState<number | null>(null);
   const [follow, setFollow] = useState(true);
-  const [followScroll, setFollowScroll] = useState(true);
   const [clip, setClip] = useState<ClipRequest | null>(null);
   const [naming, setNaming] = useState<Naming | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [viewer, setViewer] = useState<{ path: string; at: number } | null>(null);
-  // A state, not a ref: the card mounts only once the block has resolved, and
-  // the observer has to start then, not on the first render.
+  // A state, not a ref: the panel's box exists only once the block has
+  // resolved, and the observer has to start then, not on the first render.
   const [root, setRoot] = useState<HTMLElement | null>(null);
-  const player = useRef<TranscriptPlayerHandle | null>(null);
-  /** A seek asked before the player was mounted, taken when it is. */
+  const player = useRef<Seekable | null>(null);
+  /** A seek asked before anything that plays was mounted, taken when it is. */
   const pendingSeek = useRef<number | null>(null);
   /** Where a window chip's playback pauses. */
   const stopAt = useRef<number | null>(null);
@@ -214,7 +229,6 @@ export function MediaBlockPanel({
 
   const seekTo = useCallback((seconds: number, play?: boolean) => {
     setTime(seconds);
-    setFollowScroll(true);
     if (player.current === null) {
       pendingSeek.current = seconds;
       return;
@@ -224,7 +238,7 @@ export function MediaBlockPanel({
 
   useEffect(() => register({ seekTo: (seconds) => seekTo(seconds, false) }), [register, seekTo]);
 
-  const attachPlayer = useCallback((handle: TranscriptPlayerHandle | null) => {
+  const attachPlayer = useCallback((handle: Seekable | null) => {
     player.current = handle;
     if (handle !== null && pendingSeek.current !== null) {
       handle.seek(pendingSeek.current, false);
@@ -251,16 +265,19 @@ export function MediaBlockPanel({
     }
   }, []);
 
+  const composeClip = useCallback(
+    (from: string | null, to: string | null, words: boolean) =>
+      mediaBlockClip(profileId, source, from, to, words),
+    [profileId, source],
+  );
+
   const lines = vm?.lines ?? [];
   const current = time === null ? -1 : currentUtterance(lines, time);
   const at = time ?? vm?.window.from ?? 0;
-  const range = useMemo(
-    () =>
-      vm === null || (vm.window.from === 0 && vm.window.to === null)
-        ? undefined
-        : { from: vm.window.from, to: vm.window.to ?? vm.duration },
-    [vm],
-  );
+  const range =
+    vm === null || (vm.window.from === 0 && vm.window.to === null)
+      ? undefined
+      : { from: vm.window.from, to: vm.window.to ?? vm.duration };
 
   async function edit(change: MarkerEditReq): Promise<boolean> {
     try {
@@ -277,12 +294,72 @@ export function MediaBlockPanel({
     }
   }
 
+  // The block's own verbs. A transcribed block appends them to the viewer's ⋯;
+  // otherwise they are the block's only menu.
+  const blockItems = (
+    <>
+      {vm?.transcribed && vm.transcriptPath !== null && (
+        <DropdownMenuItem onSelect={() => setViewer({ path: vm.transcriptPath ?? "", at })}>
+          {OPEN_TRANSCRIPT_LABEL}
+        </DropdownMenuItem>
+      )}
+      {vm !== null && !vm.transcribed && (
+        <DropdownMenuItem
+          onSelect={() =>
+            setClip({ from: range?.from ?? null, to: range === undefined ? null : range.to })
+          }
+        >
+          {COPY_CLIP_LABEL}
+        </DropdownMenuItem>
+      )}
+      {editable && vm !== null && (
+        <>
+          <DropdownMenuItem
+            onSelect={() =>
+              setNaming({
+                mode: "moment",
+                name: nameFrom(lines[current]?.text),
+                at: Math.floor(at),
+              })
+            }
+          >
+            {MARK_MOMENT_LABEL}
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onSelect={() => {
+              const line = lines[current];
+              setNaming({
+                mode: "window",
+                name: nameFrom(line?.text),
+                from: timestamp(line?.start ?? at),
+                to: timestamp(Math.ceil(line?.end ?? at + 30)),
+              });
+            }}
+          >
+            {MARK_WINDOW_LABEL}
+          </DropdownMenuItem>
+        </>
+      )}
+      {editable && (
+        <>
+          <DropdownMenuItem onSelect={editSource}>{EDIT_BLOCK_SOURCE_LABEL}</DropdownMenuItem>
+          <DropdownMenuItem variant="destructive" onSelect={remove}>
+            {REMOVE_WIDGET_LABEL}
+          </DropdownMenuItem>
+        </>
+      )}
+    </>
+  );
+
   if (refusal !== null) {
     return (
-      <section aria-label="Media block" className="flex flex-col gap-2 p-3 text-sm">
-        <p role="alert" className="text-destructive">
-          {refusal}
-        </p>
+      <section aria-label="Media block" className="flex flex-col gap-2 text-sm">
+        <div className="flex items-start gap-2">
+          <p role="alert" className="min-w-0 flex-1 text-destructive">
+            {refusal}
+          </p>
+          <BlockMenu>{blockItems}</BlockMenu>
+        </div>
         <pre className="overflow-auto whitespace-pre-wrap rounded-md bg-muted p-2 font-mono text-xs">
           {source}
         </pre>
@@ -297,186 +374,120 @@ export function MediaBlockPanel({
     );
   }
 
-  const title = vm.title ?? "Media";
-  const span =
-    range === undefined
-      ? vm.duration > 0
-        ? clock(vm.duration)
-        : ""
-      : `${clock(range.from)}–${clock(range.to)} of ${clock(vm.duration)}`;
   const mountPlayer = near || playing;
   const running = transcriptionRunning(job);
   const link = (name: string) => `[[${noteLink ?? ""}#${name}]]`;
+  const markers =
+    vm.markers.length === 0 ? null : (
+      <ul aria-label="Markers" className="flex flex-wrap gap-1.5">
+        {vm.markers.map((marker) => (
+          <MarkerChip
+            key={marker.name}
+            marker={marker}
+            editable={editable}
+            onSeek={() => {
+              if (marker.to === null) {
+                // A moment keeps the player as it was: playing stays playing.
+                seekTo(marker.from);
+              } else {
+                seekTo(marker.from, true);
+                stopAt.current = marker.to;
+              }
+            }}
+            onCopyLink={() => {
+              void navigator.clipboard?.writeText(link(marker.name)).catch(() => {});
+            }}
+            onCopyClip={() => setClip({ from: marker.from, to: marker.to ?? marker.from + 1 })}
+            onRename={() => setNaming({ mode: "rename", name: marker.name, marker: marker.name })}
+            onRemove={() => void edit({ op: "remove", name: marker.name })}
+          />
+        ))}
+      </ul>
+    );
+  const problemLine =
+    problem !== null && naming === null ? (
+      <p role="alert" className="text-destructive text-xs">
+        {problem}
+      </p>
+    ) : null;
 
   return (
     <section
       ref={setRoot}
-      aria-label={title}
-      className="flex min-w-0 flex-col gap-2 rounded-lg border bg-card p-3 text-sm"
+      aria-label={vm.title ?? "Media"}
+      className="flex min-w-0 flex-col gap-2 text-sm"
     >
-      <header className="flex min-w-0 items-center gap-2">
-        <h3 className="min-w-0 flex-1 truncate font-medium">{title}</h3>
-        {span !== "" && (
-          <span className="figures shrink-0 text-meta text-muted-foreground">{span}</span>
-        )}
-        <DropdownMenu>
-          <IconHint label={MEDIA_BLOCK_MENU_LABEL}>
-            <DropdownMenuTrigger asChild>
-              <Button
-                size="icon"
-                variant="ghost"
-                className="size-7"
-                aria-label={MEDIA_BLOCK_MENU_LABEL}
-              >
-                <Ellipsis aria-hidden="true" />
-              </Button>
-            </DropdownMenuTrigger>
-          </IconHint>
-          <DropdownMenuContent align="end" className="w-auto min-w-44">
-            {vm.transcribed && vm.transcriptPath !== null && (
-              <DropdownMenuItem onSelect={() => setViewer({ path: vm.transcriptPath ?? "", at })}>
-                {OPEN_TRANSCRIPT_LABEL}
-              </DropdownMenuItem>
-            )}
-            <DropdownMenuItem
-              onSelect={() =>
-                setClip({ from: range?.from ?? null, to: range === undefined ? null : range.to })
-              }
-            >
-              {COPY_CLIP_LABEL}
-            </DropdownMenuItem>
-            {editable && (
-              <>
-                <DropdownMenuItem
-                  onSelect={() =>
-                    setNaming({
-                      mode: "moment",
-                      name: nameFrom(lines[current]?.text),
-                      at: Math.floor(at),
-                    })
+      {vm.transcribed && vm.transcriptPath !== null ? (
+        <>
+          {problemLine}
+          <TranscriptViewer
+            ref={attachPlayer}
+            path={vm.transcriptPath}
+            profileId={profileId}
+            scroller={scroller}
+            window={vm.window}
+            title={vm.title}
+            media={vm.media}
+            initialPicture={vm.picture ?? undefined}
+            initialSound={vm.sound ?? undefined}
+            playerAwake={mountPlayer}
+            asleepText={PLAYER_ASLEEP}
+            markers={markers}
+            menuItems={blockItems}
+            composeClip={composeClip}
+            onTime={onTime}
+            onPlayingChange={onPlayingChange}
+          />
+        </>
+      ) : (
+        <>
+          <header className="flex min-w-0 items-center gap-2">
+            <h3 className="min-w-0 flex-1 truncate font-medium">{vm.title}</h3>
+            <BlockMenu>{blockItems}</BlockMenu>
+          </header>
+          {mountPlayer ? (
+            <TranscriptPlayer
+              ref={attachPlayer}
+              media={vm.media}
+              window={range}
+              initialPicture={vm.picture ?? undefined}
+              initialSound={vm.sound ?? undefined}
+              follow={follow}
+              onFollowChange={setFollow}
+              onTime={onTime}
+              onJump={() => {}}
+              onPlayingChange={onPlayingChange}
+            />
+          ) : (
+            <div className="flex aspect-video max-h-[30dvh] w-full items-center justify-center rounded-md bg-muted text-muted-foreground text-xs">
+              {PLAYER_ASLEEP}
+            </div>
+          )}
+          {markers}
+          {problemLine}
+          <div className="flex flex-col gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-muted-foreground">{NOT_TRANSCRIBED_SENTENCE}</p>
+              {canTranscribe && transcribePath !== null && !running && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    void startTranscription(transcribePath, () => setReads((n) => n + 1))
                   }
                 >
-                  {MARK_MOMENT_LABEL}
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onSelect={() => {
-                    const line = lines[current];
-                    setNaming({
-                      mode: "window",
-                      name: nameFrom(line?.text),
-                      from: timestamp(line?.start ?? at),
-                      to: timestamp(Math.ceil(line?.end ?? at + 30)),
-                    });
-                  }}
-                >
-                  {MARK_WINDOW_LABEL}
-                </DropdownMenuItem>
-              </>
-            )}
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </header>
-
-      {mountPlayer ? (
-        <TranscriptPlayer
-          ref={attachPlayer}
-          media={vm.media}
-          window={range}
-          initialPicture={vm.picture ?? undefined}
-          initialSound={vm.sound ?? undefined}
-          follow={follow}
-          onFollowChange={setFollow}
-          onTime={onTime}
-          onJump={() => setFollowScroll(true)}
-          onPlayingChange={onPlayingChange}
-        />
-      ) : (
-        <div className="flex aspect-video w-full items-center justify-center rounded-md bg-muted text-muted-foreground text-xs">
-          {PLAYER_ASLEEP}
-        </div>
-      )}
-
-      {vm.markers.length > 0 && (
-        <ul aria-label="Markers" className="flex flex-wrap gap-1.5">
-          {vm.markers.map((marker) => (
-            <MarkerChip
-              key={marker.name}
-              marker={marker}
-              editable={editable}
-              onSeek={() => {
-                if (marker.to === null) {
-                  // A moment keeps the player as it was: playing stays playing.
-                  seekTo(marker.from);
-                } else {
-                  seekTo(marker.from, true);
-                  stopAt.current = marker.to;
-                }
-              }}
-              onCopyLink={() => {
-                void navigator.clipboard?.writeText(link(marker.name)).catch(() => {});
-              }}
-              onCopyClip={() => setClip({ from: marker.from, to: marker.to ?? marker.from + 1 })}
-              onRename={() => setNaming({ mode: "rename", name: marker.name, marker: marker.name })}
-              onRemove={() => void edit({ op: "remove", name: marker.name })}
-            />
-          ))}
-        </ul>
-      )}
-
-      {problem !== null && naming === null && (
-        <p role="alert" className="text-destructive text-xs">
-          {problem}
-        </p>
-      )}
-
-      {vm.transcribed ? (
-        lines.length === 0 ? (
-          <p className="text-muted-foreground text-xs">Nothing was said in this stretch.</p>
-        ) : (
-          <TranscriptLinesBox
-            lines={lines}
-            speakers={vm.speakers}
-            current={current}
-            playable={vm.media.parts.length > 0}
-            follow={follow && followScroll}
-            onReaderScroll={() => setFollowScroll(false)}
-            onSeek={(seconds, play) => seekTo(seconds, play)}
-            onCopyClip={(line: LineVm) => setClip({ from: line.start, to: line.end })}
-            onOpenInViewer={
-              vm.transcriptPath === null
-                ? undefined
-                : (line: LineVm) => setViewer({ path: vm.transcriptPath ?? "", at: line.start })
-            }
-            className="h-80"
-          />
-        )
-      ) : (
-        <div className="flex flex-col gap-2">
-          <div className="flex flex-wrap items-center gap-2">
-            <p className="text-muted-foreground">{NOT_TRANSCRIBED_SENTENCE}</p>
-            {canTranscribe && transcribePath !== null && !running && (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() =>
-                  void startTranscription(transcribePath, () => setReads((n) => n + 1))
-                }
-              >
-                {TRANSCRIBE_LABEL}
-              </Button>
+                  {TRANSCRIBE_LABEL}
+                </Button>
+              )}
+            </div>
+            {transcribePath !== null && (
+              <TranscriptionJob path={transcribePath} onOpen={() => setReads((n) => n + 1)} />
             )}
           </div>
-          {transcribePath !== null && (
-            <TranscriptionJob path={transcribePath} onOpen={() => setReads((n) => n + 1)} />
-          )}
-        </div>
+        </>
       )}
 
-      <CopyClipDialog
-        request={clip}
-        compose={(from, to, words) => mediaBlockClip(profileId, source, from, to, words)}
-        onClose={() => setClip(null)}
-      />
+      <CopyClipDialog request={clip} compose={composeClip} onClose={() => setClip(null)} />
       <NamingDialog
         naming={naming}
         problem={problem}
@@ -507,6 +518,29 @@ export function MediaBlockPanel({
         onClose={() => setViewer(null)}
       />
     </section>
+  );
+}
+
+/** The block's ⋯ where there is no viewer to append its verbs to. */
+function BlockMenu({ children }: { children: ReactNode }) {
+  return (
+    <DropdownMenu>
+      <IconHint label={MEDIA_BLOCK_MENU_LABEL}>
+        <DropdownMenuTrigger asChild>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-7 shrink-0"
+            aria-label={MEDIA_BLOCK_MENU_LABEL}
+          >
+            <Ellipsis aria-hidden="true" />
+          </Button>
+        </DropdownMenuTrigger>
+      </IconHint>
+      <DropdownMenuContent align="end" className="w-auto min-w-44">
+        {children}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 

@@ -65,7 +65,7 @@ import {
   NOTE_DELETE_NO_PLAN,
   NOTE_DELETE_TESTID,
 } from "./note-delete-dialog";
-import { NoteEditor } from "./note-editor";
+import { NOTE_VIEW_LABEL, NOTE_VIEW_LABELS, NoteEditor } from "./note-editor";
 import { NOTE_HISTORY_LABEL } from "./note-history-panel";
 import { PROPERTIES_LABEL } from "./properties-panel";
 
@@ -248,7 +248,7 @@ describe("finding the destructive verb", () => {
     expect(spoken).toContain("Standup");
   });
 
-  it("leaves three controls in the header, so its last one is not the one off the screen", async () => {
+  it("leaves four controls in the header, so its last one is not the one off the screen", async () => {
     openOn("# Standup\n");
     render(<NoteEditor vaultId="v1" noteId="note-7" />);
     await screen.findByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_LABEL}`) });
@@ -270,11 +270,17 @@ describe("finding the destructive verb", () => {
     const labels = Array.from((actions as HTMLElement).querySelectorAll("button"), (button) =>
       button.getAttribute("aria-label"),
     );
-    // Three now, not two: Properties joined the leading group, because a
-    // disclosure control that falls into the menu takes the region it discloses
-    // out of reach — there is nothing left on screen saying the region exists.
-    // The menu is still the group's last child, which is the claim here.
-    expect(labels).toEqual([ATTACH_FILE_LABEL, PROPERTIES_LABEL, `${NOTE_ACTIONS_LABEL} Standup`]);
+    // Four now: Properties joined the leading group, because a disclosure
+    // control that falls into the menu takes the region it discloses out of
+    // reach, and the view control (Preview | Note | Source) leads it as one
+    // glyph, for the same reason and at the same cost. The menu is still the
+    // group's last child, which is the claim here.
+    expect(labels).toEqual([
+      `${NOTE_VIEW_LABEL}: ${NOTE_VIEW_LABELS.note}`,
+      ATTACH_FILE_LABEL,
+      PROPERTIES_LABEL,
+      `${NOTE_ACTIONS_LABEL} Standup`,
+    ]);
   });
 
   it("still offers every verb the header used to carry, by name, from that one menu", async () => {

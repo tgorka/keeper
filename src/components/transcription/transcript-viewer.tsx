@@ -7,11 +7,21 @@ import {
   Pencil,
   Play,
   RotateCcw,
+  SkipForward,
   Split,
   UserPlus,
   UserRoundPen,
 } from "lucide-react";
-import { type ReactNode, type Ref, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ReactNode,
+  type Ref,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -49,6 +59,8 @@ import { TextEditorSurface } from "@/components/viewers/text-viewer";
 import {
   dictionaryAcceptSuggestion,
   listenTranscriptWritten,
+  type MediaClipVm,
+  type MediaWindowVm,
   type TrackOrigin,
   type TranscriptMediaVm,
   type TranscriptVm,
@@ -81,7 +93,7 @@ import { cn } from "@/lib/utils";
 import { FILE_FORMATS } from "@/lib/viewers/registry";
 import type { ViewerProps } from "@/lib/viewers/types";
 import { type ClipRequest, CopyClipDialog } from "./copy-clip";
-import { currentUtterance, nearestLine } from "./session-timeline";
+import { currentUtterance, nearestLine, nextLine } from "./session-timeline";
 import { TRANSCRIBE_AGAIN_LABEL, TranscribeAgainDialog } from "./transcribe-again";
 import {
   COPY_CLIP_FROM_HERE,
@@ -94,7 +106,13 @@ import {
   timestamp,
   useTranscriptRows,
 } from "./transcript-lines";
-import { TranscriptPlayer, type TranscriptPlayerHandle } from "./transcript-player";
+import {
+  type Picture,
+  type PlayerWindow,
+  type Sound,
+  TranscriptPlayer,
+  type TranscriptPlayerHandle,
+} from "./transcript-player";
 import { TranscriptionJob } from "./transcription-job";
 
 export const TRANSCRIPTION_SELECT =
@@ -176,6 +194,7 @@ export const ADD_SPEAKER_LABEL = "Add speaker";
 export const TRANSCRIPT_ACTIONS_LABEL = "Transcript actions";
 export const COPY_AS_NOTE_EMBED = "Copy as note embed";
 export const NEAREST_LINE_LABEL = "Go to their nearest line";
+export const NEXT_LINE_LABEL = "Go to their next line";
 /** Keys that scroll a focused box; pressing one is the reader taking the scroll back. */
 const SCROLL_KEYS: Record<string, true> = {
   ArrowUp: true,
@@ -252,8 +271,8 @@ export function TranscriptDialog({
         if (!open) onClose();
       }}
     >
-      {/* Most of the window: the player can use the width, and the lines keep
-          a reading measure of their own inside it. */}
+      {/* Most of the window: the player can use the width, and the lines run
+          as wide as it. */}
       <DialogContent className="flex h-[92dvh] w-[min(96vw,1600px)] min-w-0 max-w-none flex-col sm:max-w-none">
         <DialogHeader>
           <DialogTitle>Transcript</DialogTitle>
@@ -266,19 +285,68 @@ export function TranscriptDialog({
     </Dialog>
   );
 }
-export function TranscriptViewer({
-  path,
-  profileId = null,
-  onUnreadable,
-  at,
-}: {
+/** What a host holding the viewer can ask of its player. */
+export interface TranscriptViewerHandle {
+  /** Move to `seconds`; `play` starts it, absent keeps it as it was. Held until the player is there. */
+  seek: (seconds: number, play?: boolean) => void;
+  pause: () => void;
+}
+export interface TranscriptViewerProps {
   path: string;
   profileId?: string | null;
   /** Called instead of showing the error when the file cannot be read as a transcript. */
   onUnreadable?: () => void;
   /** Seconds the player is put at, paused, once it can play. */
   at?: number;
-}) {
+  /**
+   * The element that scrolls the viewer when it is not its own — a note
+   * editor's scroller. Given (even `null`, not known yet), the viewer grows
+   * with its lines inside the host's flow and has no scroll box, no Source tab:
+   * the lines window against this scroller and the pinned block sticks to it.
+   */
+  scroller?: HTMLElement | null;
+  /** Only the lines overlapping `[from, to)`, and a player that plays only there. */
+  window?: MediaWindowVm;
+  /** The heading: absent is what the transcript is of, `null` none. */
+  title?: string | null;
+  /** What to play, instead of asking for the transcript's own media. */
+  media?: TranscriptMediaVm;
+  initialPicture?: Picture;
+  initialSound?: Sound;
+  /** `false` keeps every `<video>` unmounted; `asleepText` holds the player's place. */
+  playerAwake?: boolean;
+  asleepText?: string;
+  /** Under the player's own rows, above the speakers: a note block's markers. */
+  markers?: ReactNode;
+  /** More `DropdownMenuItem`s at the end of the viewer's ⋯. */
+  menuItems?: ReactNode;
+  /** What a Copy clip composes; the transcript's own clip unless given. */
+  composeClip?: (from: string | null, to: string | null, words: boolean) => Promise<MediaClipVm>;
+  onTime?: (seconds: number) => void;
+  onPlayingChange?: (playing: boolean) => void;
+  ref?: Ref<TranscriptViewerHandle>;
+}
+export function TranscriptViewer({
+  path,
+  profileId = null,
+  onUnreadable,
+  at,
+  scroller,
+  window,
+  title,
+  media: givenMedia,
+  initialPicture,
+  initialSound,
+  playerAwake = true,
+  asleepText,
+  markers,
+  menuItems,
+  composeClip,
+  onTime,
+  onPlayingChange,
+  ref,
+}: TranscriptViewerProps) {
+  const embedded = scroller !== undefined;
   const [vm, setVm] = useState<TranscriptVm | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -288,7 +356,7 @@ export function TranscriptViewer({
   const [panel, setPanel] = useState<{ id: string; kind: "split" | "insert" } | null>(null);
   const [naming, setNaming] = useState<{ speakerId: string; mode: "rename" | "new" } | null>(null);
   const [tab, setTab] = useState<"transcript" | "source">("transcript");
-  const [media, setMedia] = useState<TranscriptMediaVm | null>(null);
+  const [fetchedMedia, setFetchedMedia] = useState<TranscriptMediaVm | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [pinned, setPinned] = useState(true);
   const [follow, setFollow] = useState(true);
@@ -304,12 +372,15 @@ export function TranscriptViewer({
   const [reads, setReads] = useState(0);
   const [clip, setClip] = useState<ClipRequest | null>(null);
   const player = useRef<TranscriptPlayerHandle | null>(null);
-  /** The `at` still to be applied, once the transcript and its media are here. */
-  const landing = useRef(at);
+  /** The seek still to be applied, once the transcript and its player are here. */
+  const landing = useRef<{ at: number; play: boolean } | undefined>(
+    at === undefined ? undefined : { at, play: false },
+  );
   const search = useRef<HTMLInputElement | null>(null);
   const prelude = useRef<HTMLDivElement | null>(null);
-  const playerBox = useRef<HTMLDivElement | null>(null);
+  const pinnedBox = useRef<HTMLDivElement | null>(null);
   const listBox = useRef<HTMLOListElement | null>(null);
+  const ownBox = useRef<HTMLDivElement | null>(null);
   const editField = useRef<HTMLTextAreaElement | null>(null);
   const nameField = useRef<HTMLInputElement | null>(null);
   const [geometry, setGeometry] = useState({ margin: 0, inset: 0 });
@@ -321,6 +392,8 @@ export function TranscriptViewer({
   const bank = voicesDriveFor(drives, path, profileId);
   const unreadable = useRef(onUnreadable);
   unreadable.current = onUnreadable;
+  const hooks = useRef({ onTime, onPlayingChange });
+  hooks.current = { onTime, onPlayingChange };
   // biome-ignore lint/correctness/useExhaustiveDependencies: `reads` is the request to read the same path again
   useEffect(() => {
     const mine = ++generation.current;
@@ -341,21 +414,33 @@ export function TranscriptViewer({
         if (unreadable.current) unreadable.current();
         else setError(syncErrorMessage(cause));
       });
-    setMedia(null);
-    setMediaError(null);
     setTime(null);
     setAdded(null);
-    void transcriptMedia(path)
-      .then((next) => {
-        if (generation.current === mine) setMedia(next);
-      })
-      .catch((cause: unknown) => {
-        if (generation.current === mine) setMediaError(syncErrorMessage(cause));
-      });
     return () => {
       generation.current += 1;
     };
   }, [path, reads]);
+  // A host that knows what to play (a note's block) says so; otherwise the
+  // transcript's own media is asked for.
+  const ownMedia = givenMedia === undefined;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `reads` is the request to read the same path again
+  useEffect(() => {
+    setFetchedMedia(null);
+    setMediaError(null);
+    if (!ownMedia) return;
+    let live = true;
+    void transcriptMedia(path)
+      .then((next) => {
+        if (live) setFetchedMedia(next);
+      })
+      .catch((cause: unknown) => {
+        if (live) setMediaError(syncErrorMessage(cause));
+      });
+    return () => {
+      live = false;
+    };
+  }, [path, reads, ownMedia]);
+  const media = givenMedia ?? fetchedMedia;
   // Rust wrote this transcript — a job, a correction here or in another window,
   // a redo — so the lines are read again, keeping everything the reader holds.
   useEffect(() => {
@@ -419,66 +504,140 @@ export function TranscriptViewer({
       return next;
     });
   };
-  const utterances = vm?.transcript.utterances;
+  const windowFrom = window?.from ?? 0;
+  const windowTo = window?.to ?? null;
+  const whole = windowFrom === 0 && windowTo === null;
+  /**
+   * The lines shown: all of them, or those overlapping a block's window
+   * `[from, to)` as Rust's `overlaps` reads it. Every index below is into this.
+   */
+  const utterances = useMemo(() => {
+    const all = vm?.transcript.utterances;
+    if (!all || whole) return all;
+    return all.filter((u) => u.end > windowFrom && (windowTo === null || u.start < windowTo));
+  }, [vm, whole, windowFrom, windowTo]);
+  const duration = vm?.transcript.duration ?? 0;
+  const playerWindow = useMemo<PlayerWindow | undefined>(
+    () => (whole ? undefined : { from: windowFrom, to: windowTo ?? duration }),
+    [whole, windowFrom, windowTo, duration],
+  );
   const list = useTranscriptRows(utterances, {
     scrollMargin: geometry.margin,
     stickyInset: geometry.inset,
+    scroller: embedded ? scroller : undefined,
   });
   const reveal = list.reveal;
+  const viewportRef = list.viewportProps.ref;
+  const attachOwnBox = useCallback(
+    (element: HTMLDivElement | null) => {
+      ownBox.current = element;
+      return viewportRef(element);
+    },
+    [viewportRef],
+  );
   const showsBody = vm !== null && tab === "transcript";
   const playable = media !== null && media.parts.length > 0;
+  const awake = playable && playerAwake;
+  const sticks = pinned && playable;
+  useImperativeHandle(
+    ref,
+    () => ({
+      seek: (seconds, play) => {
+        if (player.current) player.current.seek(seconds, play);
+        else landing.current = { at: seconds, play: play ?? false };
+      },
+      pause: () => player.current?.pause(),
+    }),
+    [],
+  );
   useEffect(() => {
-    if (landing.current === undefined || !vm || !playable || !player.current) return;
-    player.current.seek(landing.current, false);
+    if (landing.current === undefined || !vm || !awake || !player.current) return;
+    player.current.seek(landing.current.at, landing.current.play);
     landing.current = undefined;
-  }, [vm, playable]);
-  // The list starts below the heading, the legend and the player, all in the
-  // one scroll box, and a pinned player covers the top of it.
+  }, [vm, awake]);
+  // The list starts below the heading and the pinned block, all in the one
+  // scroll box — the viewer's own, or the note's — and a pinned block covers
+  // the top of it. Only where the list sits is read, never set: nothing these
+  // numbers change resizes what is observed, so a resize cannot feed itself.
   useEffect(() => {
-    if (!showsBody) return;
+    const box = embedded ? scroller : ownBox.current;
+    if (!showsBody || !box) return;
     const measure = () => {
-      const margin = listBox.current?.offsetTop ?? 0;
-      const inset = pinned && playable ? (playerBox.current?.offsetHeight ?? 0) : 0;
+      const listTop = listBox.current?.getBoundingClientRect().top;
+      const margin =
+        listTop === undefined
+          ? 0
+          : listTop - box.getBoundingClientRect().top - box.clientTop + box.scrollTop;
+      const inset = sticks ? (pinnedBox.current?.offsetHeight ?? 0) : 0;
       setGeometry((prev) =>
         prev.margin === margin && prev.inset === inset ? prev : { margin, inset },
       );
     };
     measure();
     const observer = new ResizeObserver(measure);
-    for (const box of [prelude.current, playerBox.current]) if (box) observer.observe(box);
-    return () => observer.disconnect();
-  }, [showsBody, pinned, playable]);
+    for (const watched of [prelude.current, pinnedBox.current, box, ...box.children])
+      if (watched) observer.observe(watched);
+    // What a note holds above the viewer moves it without resizing anything
+    // observed here; the next scroll finds it where it is.
+    if (embedded) box.addEventListener("scroll", measure, { passive: true });
+    return () => {
+      observer.disconnect();
+      box.removeEventListener("scroll", measure);
+    };
+  }, [showsBody, sticks, embedded, scroller]);
+  // In a note the reader scrolls the note, not the viewer: that is the reader
+  // taking the scroll back, as a scroll of the viewer's own box is.
+  useEffect(() => {
+    if (!embedded || !scroller) return;
+    const release = () => setFollowScroll(false);
+    const pressed = (event: Event) => {
+      if (event.target === scroller) release();
+    };
+    const keyed = (event: KeyboardEvent) => {
+      if (event.target === scroller && SCROLL_KEYS[event.key]) release();
+    };
+    scroller.addEventListener("wheel", release, { passive: true });
+    scroller.addEventListener("touchmove", release, { passive: true });
+    scroller.addEventListener("pointerdown", pressed);
+    scroller.addEventListener("keydown", keyed);
+    return () => {
+      scroller.removeEventListener("wheel", release);
+      scroller.removeEventListener("touchmove", release);
+      scroller.removeEventListener("pointerdown", pressed);
+      scroller.removeEventListener("keydown", keyed);
+    };
+  }, [embedded, scroller]);
   const current = follow && time !== null && utterances ? currentUtterance(utterances, time) : -1;
   useEffect(() => {
     if (current >= 0 && followScroll && editing === null) reveal(current);
   }, [current, followScroll, editing, reveal]);
   const needle = query.trim().toLocaleLowerCase();
   const matches = useMemo(() => {
-    if (!vm || !needle) return [];
+    if (!vm || !utterances || !needle) return [];
     const names = new Map(
       vm.transcript.speakers.map((s) => [s.id, speakerName(s).toLocaleLowerCase()]),
     );
-    return vm.transcript.utterances.flatMap((u, index) =>
+    return utterances.flatMap((u, index) =>
       u.text.toLocaleLowerCase().includes(needle) || names.get(u.speaker)?.includes(needle)
         ? [index]
         : [],
     );
-  }, [vm, needle]);
+  }, [vm, utterances, needle]);
   const matching = useMemo(() => new Set(matches), [matches]);
   const active = activeMatch < matches.length ? activeMatch : -1;
   /** Play from a line, or put the player there when Follow ties the two together. */
   const seekTo = (utterance: Utterance, play?: boolean) =>
     player.current?.seek(utterance.start, play);
-  /** A speaker's line nearest the player, brought into view and the player put there, playing or not. */
-  const goToNearest = (speakerId: string) => {
+  /** A speaker's line found from the player's time, brought into view and the player put there, playing or not. */
+  const goToLine = (speakerId: string, find: typeof nearestLine) => {
     if (!utterances) return;
-    const index = nearestLine(utterances, speakerId, time ?? 0);
+    const index = find(utterances, speakerId, time ?? windowFrom);
     if (index < 0) return;
     reveal(index);
     seekTo(utterances[index]);
   };
   const jump = (step: 1 | -1) => {
-    if (!vm || matches.length === 0) return;
+    if (!utterances || matches.length === 0) return;
     const next =
       active < 0
         ? step > 0
@@ -487,7 +646,7 @@ export function TranscriptViewer({
         : (active + step + matches.length) % matches.length;
     setActiveMatch(next);
     reveal(matches[next]);
-    if (follow) seekTo(vm.transcript.utterances[matches[next]]);
+    if (follow) seekTo(utterances[matches[next]]);
   };
   const offered = vm ? offeredSpeakers(vm.transcript) : [];
   const speakers = useMemo(() => {
@@ -495,17 +654,32 @@ export function TranscriptViewer({
     const byId = new Map<string, { speaker: Speaker; ink: string; lines: number }>();
     for (const speaker of vm?.transcript.speakers ?? [])
       byId.set(speaker.id, { speaker, ink: inks.get(speaker.id) ?? "", lines: 0 });
-    for (const utterance of vm?.transcript.utterances ?? []) {
+    for (const utterance of utterances ?? []) {
       const entry = byId.get(utterance.speaker);
       if (entry) entry.lines += 1;
     }
     return byId;
-  }, [vm]);
+  }, [vm, utterances]);
   const named = naming ? speakers.get(naming.speakerId)?.speaker : undefined;
+  const heading = title === undefined ? (vm?.transcript.source.title ?? null) : title;
+  const lines = utterances ?? [];
+  const meta = vm && (
+    <p className="min-w-0 break-words">
+      {new Date(vm.transcript.createdAt).toLocaleString()} ·{" "}
+      <span className="font-mono">{timestamp(vm.transcript.duration)}</span> ·{" "}
+      {vm.transcript.language === "auto"
+        ? "Automatic language"
+        : vm.transcript.language === "en"
+          ? "English"
+          : "Polish"}{" "}
+      · {vm.transcript.engine.asr} · {vm.transcript.engine.diarizer} ·{" "}
+      {vm.transcript.engine.embedding}
+    </p>
+  );
   return (
     <section
       aria-label="Transcript viewer"
-      className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 text-sm"
+      className={cn("flex min-w-0 flex-col gap-3 text-sm", !embedded && "min-h-0 flex-1")}
       onKeyDown={(event) => {
         if (
           tab === "transcript" &&
@@ -527,12 +701,14 @@ export function TranscriptViewer({
       {vm && (
         <>
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <Tabs value={tab} onValueChange={(next) => setTab(next as "transcript" | "source")}>
-              <TabsList aria-label="Transcript view">
-                <TabsTrigger value="transcript">{TRANSCRIPT_TAB}</TabsTrigger>
-                <TabsTrigger value="source">{SOURCE_TAB}</TabsTrigger>
-              </TabsList>
-            </Tabs>
+            {!embedded && (
+              <Tabs value={tab} onValueChange={(next) => setTab(next as "transcript" | "source")}>
+                <TabsList aria-label="Transcript view">
+                  <TabsTrigger value="transcript">{TRANSCRIPT_TAB}</TabsTrigger>
+                  <TabsTrigger value="source">{SOURCE_TAB}</TabsTrigger>
+                </TabsList>
+              </Tabs>
+            )}
             {tab === "transcript" && (
               <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
                 <Input
@@ -605,10 +781,18 @@ export function TranscriptViewer({
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className={MENU_CONTENT}>
-                  <DropdownMenuItem onSelect={() => setClip({ from: null, to: null })}>
+                  <DropdownMenuItem
+                    onSelect={() => setClip(playerWindow ?? { from: null, to: null })}
+                  >
                     <Clipboard aria-hidden="true" />
                     {COPY_AS_NOTE_EMBED}
                   </DropdownMenuItem>
+                  {menuItems && (
+                    <>
+                      <DropdownMenuSeparator />
+                      {menuItems}
+                    </>
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
@@ -626,109 +810,27 @@ export function TranscriptViewer({
           />
           {tab === "source" && <TranscriptSource vm={vm} />}
           {/* Hidden rather than unmounted under Source, so a playing player keeps
-              playing and the reader comes back to where they were. */}
+              playing and the reader comes back to where they were. In a note
+              the note scrolls: this is plain flow that grows with its lines. */}
           {/* biome-ignore lint/a11y/noStaticElementInteractions: listens for the reader's own scrolling, which is not an action on this box */}
           <div
-            {...list.viewportProps}
+            {...(embedded ? {} : list.viewportProps)}
+            ref={embedded ? undefined : attachOwnBox}
             hidden={tab === "source"}
-            className="relative min-h-0 flex-1 overflow-auto"
-            onWheel={() => setFollowScroll(false)}
-            onTouchMove={() => setFollowScroll(false)}
+            className={cn("relative min-w-0", !embedded && "min-h-0 flex-1 overflow-auto")}
+            onWheel={embedded ? undefined : () => setFollowScroll(false)}
+            onTouchMove={embedded ? undefined : () => setFollowScroll(false)}
             onPointerDown={(event) => {
               // The scrollbar is the box itself; a press on a row is not a scroll.
-              if (event.target === event.currentTarget) setFollowScroll(false);
+              if (!embedded && event.target === event.currentTarget) setFollowScroll(false);
             }}
             onKeyDown={(event) => {
-              if (event.target === event.currentTarget && SCROLL_KEYS[event.key])
+              if (!embedded && event.target === event.currentTarget && SCROLL_KEYS[event.key])
                 setFollowScroll(false);
             }}
           >
-            <div ref={prelude} className="min-w-0 space-y-3 px-3 pb-3">
-              <header className="min-w-0 space-y-1">
-                <h2 className="break-words font-heading text-title">
-                  {vm.transcript.source.files.join(", ")}
-                </h2>
-                <p className="text-muted-foreground text-xs">
-                  {new Date(vm.transcript.createdAt).toLocaleString()} ·{" "}
-                  <span className="font-mono">{timestamp(vm.transcript.duration)}</span> ·{" "}
-                  {vm.transcript.language === "auto"
-                    ? "Automatic language"
-                    : vm.transcript.language === "en"
-                      ? "English"
-                      : "Polish"}{" "}
-                  ·{" "}
-                  <span className="break-words">
-                    {vm.transcript.engine.asr} · {vm.transcript.engine.diarizer} ·{" "}
-                    {vm.transcript.engine.embedding}
-                  </span>
-                </p>
-              </header>
-              <ul aria-label="Speakers" className="flex min-w-0 flex-wrap items-center gap-1.5">
-                {[...speakers.values()]
-                  .filter((entry) => entry.lines > 0)
-                  .map((entry) => (
-                    <li key={entry.speaker.id}>
-                      <SpeakerChip
-                        speaker={entry.speaker}
-                        ink={entry.ink}
-                        lines={entry.lines}
-                        vm={vm}
-                        busy={busy}
-                        act={act}
-                        onName={(mode) => setNaming({ speakerId: entry.speaker.id, mode })}
-                        focusName={() => nameField.current?.focus()}
-                        onNearest={() => goToNearest(entry.speaker.id)}
-                      />
-                    </li>
-                  ))}
-                <li>
-                  <AddSpeaker
-                    transcript={vm.transcript}
-                    busy={busy}
-                    onAdd={async (origin, label) => {
-                      let ok = false;
-                      await act(async () => {
-                        const next = await transcriptAddSpeaker(path, origin, label);
-                        const known = new Set(vm.transcript.speakers.map((s) => s.id));
-                        const fresh = next.transcript.speakers.find((s) => !known.has(s.id));
-                        setAdded(
-                          fresh
-                            ? `${speakerName(fresh)} added. Give it lines from each line’s menu, under Change speaker.`
-                            : null,
-                        );
-                        ok = true;
-                        return next;
-                      });
-                      return ok;
-                    }}
-                  />
-                </li>
-              </ul>
-              {naming && named && (
-                <SpeakerNameForm
-                  fieldRef={nameField}
-                  key={`${naming.speakerId}:${naming.mode}`}
-                  speaker={named}
-                  mode={naming.mode}
-                  busy={busy}
-                  onCancel={() => setNaming(null)}
-                  onSave={(name) =>
-                    void act(async () => {
-                      const result =
-                        naming.mode === "new"
-                          ? await transcriptAssignSpeaker(vm.path, naming.speakerId, null, name)
-                          : await transcriptRenameSpeaker(vm.path, naming.speakerId, name);
-                      setNaming(null);
-                      return result;
-                    })
-                  }
-                />
-              )}
-              {added && (
-                <p role="status" className="break-words text-muted-foreground">
-                  {added}
-                </p>
-              )}
+            <div ref={prelude} className="min-w-0 space-y-3 px-3 empty:hidden">
+              {heading && <h2 className="break-words font-heading text-title">{heading}</h2>}
               {mediaError && (
                 <p className="break-words text-muted-foreground">
                   The recording cannot be played here: {mediaError}
@@ -780,31 +882,122 @@ export function TranscriptViewer({
                 </div>
               ))}
             </div>
-            {media && playable && (
-              <div
-                ref={playerBox}
-                className={cn(
-                  "min-w-0 px-3 pb-3",
-                  pinned && "sticky top-0 z-10 border-b bg-background pt-1",
-                )}
-              >
+            {/* The player, what it plays and who speaks: pinned, the whole block
+                stays at the top of the scroll area while the lines go by. */}
+            <div
+              ref={pinnedBox}
+              className={cn(
+                "min-w-0 space-y-3 px-3 py-3",
+                sticks && "sticky top-0 z-10 border-b bg-background",
+              )}
+            >
+              {media && awake ? (
                 <TranscriptPlayer
                   ref={player}
                   media={media}
+                  window={playerWindow}
+                  initialPicture={initialPicture}
+                  initialSound={initialSound}
                   pinned={pinned}
                   onPinnedChange={setPinned}
                   follow={follow}
                   onFollowChange={setFollow}
-                  onTime={setTime}
+                  onTime={(seconds) => {
+                    setTime(seconds);
+                    hooks.current.onTime?.(seconds);
+                  }}
                   onJump={() => setFollowScroll(true)}
+                  onPlayingChange={(playing) => hooks.current.onPlayingChange?.(playing)}
+                  meta={meta}
                 />
-              </div>
-            )}
-            {vm.transcript.utterances.length === 0 && (
-              <p className="p-3 text-muted-foreground">No speech was found in this file.</p>
+              ) : (
+                <>
+                  {playable && (
+                    <div className="flex aspect-video max-h-[30dvh] w-full items-center justify-center rounded-md bg-muted text-muted-foreground text-xs">
+                      {asleepText}
+                    </div>
+                  )}
+                  <div className="text-muted-foreground text-xs">{meta}</div>
+                </>
+              )}
+              {markers}
+              <ul aria-label="Speakers" className="flex min-w-0 flex-wrap items-center gap-1.5">
+                {[...speakers.values()]
+                  .filter((entry) => entry.lines > 0)
+                  .map((entry) => (
+                    <li key={entry.speaker.id}>
+                      <SpeakerChip
+                        speaker={entry.speaker}
+                        ink={entry.ink}
+                        lines={entry.lines}
+                        vm={vm}
+                        busy={busy}
+                        act={act}
+                        onName={(mode) => setNaming({ speakerId: entry.speaker.id, mode })}
+                        focusName={() => nameField.current?.focus()}
+                        onNearest={() => goToLine(entry.speaker.id, nearestLine)}
+                        onNext={() => goToLine(entry.speaker.id, nextLine)}
+                      />
+                    </li>
+                  ))}
+                <li>
+                  <AddSpeaker
+                    transcript={vm.transcript}
+                    busy={busy}
+                    onAdd={async (origin, label) => {
+                      let ok = false;
+                      await act(async () => {
+                        const next = await transcriptAddSpeaker(path, origin, label);
+                        const known = new Set(vm.transcript.speakers.map((s) => s.id));
+                        const fresh = next.transcript.speakers.find((s) => !known.has(s.id));
+                        setAdded(
+                          fresh
+                            ? `${speakerName(fresh)} added. Give it lines from each line’s menu, under Change speaker.`
+                            : null,
+                        );
+                        ok = true;
+                        return next;
+                      });
+                      return ok;
+                    }}
+                  />
+                </li>
+              </ul>
+              {naming && named && (
+                <SpeakerNameForm
+                  fieldRef={nameField}
+                  key={`${naming.speakerId}:${naming.mode}`}
+                  speaker={named}
+                  mode={naming.mode}
+                  busy={busy}
+                  onCancel={() => setNaming(null)}
+                  onSave={(name) =>
+                    void act(async () => {
+                      const result =
+                        naming.mode === "new"
+                          ? await transcriptAssignSpeaker(vm.path, naming.speakerId, null, name)
+                          : await transcriptRenameSpeaker(vm.path, naming.speakerId, name);
+                      setNaming(null);
+                      return result;
+                    })
+                  }
+                />
+              )}
+              {added && (
+                <p role="status" className="break-words text-muted-foreground">
+                  {added}
+                </p>
+              )}
+            </div>
+            {lines.length === 0 && (
+              <p className="p-3 text-muted-foreground">
+                {vm.transcript.utterances.length === 0
+                  ? "No speech was found in this file."
+                  : "Nothing was said in this stretch."}
+              </p>
             )}
             <TranscriptLines
-              lines={vm.transcript.utterances}
+              lines={lines}
               speakers={vm.transcript.speakers}
               list={list}
               listRef={listBox}
@@ -819,7 +1012,7 @@ export function TranscriptViewer({
                 )
               }
               menu={(_, index) => {
-                const utterance = vm.transcript.utterances[index];
+                const utterance = lines[index];
                 return (
                   <LineMenu
                     utterance={utterance}
@@ -848,7 +1041,7 @@ export function TranscriptViewer({
                 );
               }}
               note={(_, index) => {
-                const utterance = vm.transcript.utterances[index];
+                const utterance = lines[index];
                 if (!utterance.edited) return null;
                 return utterance.asrText ? (
                   <details className="min-w-0">
@@ -863,7 +1056,7 @@ export function TranscriptViewer({
                 editing === line.id ? (
                   <EditLine
                     fieldRef={editField}
-                    utterance={vm.transcript.utterances[index]}
+                    utterance={lines[index]}
                     draft={draft}
                     busy={busy}
                     onDraft={setDraft}
@@ -878,7 +1071,7 @@ export function TranscriptViewer({
               }
               after={(line, index) => {
                 if (panel?.id !== line.id) return null;
-                const utterance = vm.transcript.utterances[index];
+                const utterance = lines[index];
                 return panel.kind === "split" ? (
                   <SplitPanel
                     utterance={utterance}
@@ -909,7 +1102,7 @@ export function TranscriptViewer({
           <CopyClipDialog
             request={clip}
             onClose={() => setClip(null)}
-            compose={(from, to, words) => transcriptClip(path, from, to, words)}
+            compose={composeClip ?? ((from, to, words) => transcriptClip(path, from, to, words))}
           />
         </>
       )}
@@ -1039,7 +1232,7 @@ function EditLine({
       <textarea
         ref={fieldRef}
         aria-label={`Edit ${utterance.id}`}
-        className="min-h-20 w-full max-w-[80ch] rounded-md border bg-background p-2 text-title font-normal leading-relaxed"
+        className="min-h-20 w-full rounded-md border bg-background p-2 text-title font-normal leading-relaxed"
         value={draft}
         disabled={busy}
         onChange={(event) => onDraft(event.target.value)}
@@ -1078,6 +1271,7 @@ function SpeakerChip({
   onName,
   focusName,
   onNearest,
+  onNext,
 }: {
   speaker: Speaker;
   ink: string;
@@ -1090,6 +1284,8 @@ function SpeakerChip({
   focusName: () => void;
   /** Take the reader, and the player, to this speaker's line nearest the player. */
   onNearest: () => void;
+  /** The same, to this speaker's next line after the player, from their first past the last. */
+  onNext: () => void;
 }) {
   // The field an item opens keeps the focus, not the chip it came from.
   const keepFocus = useRef(false);
@@ -1139,6 +1335,10 @@ function SpeakerChip({
         <DropdownMenuItem onSelect={onNearest}>
           <Crosshair aria-hidden="true" />
           {NEAREST_LINE_LABEL}
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={onNext}>
+          <SkipForward aria-hidden="true" />
+          {NEXT_LINE_LABEL}
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuSub>
