@@ -16,6 +16,7 @@ import {
   DropdownMenuContent,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { IDLE_RECORDING_STATUS } from "@/hooks/use-recording-session";
 import type * as IpcClient from "@/lib/ipc/client";
 import type { MediaBlockVm } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
@@ -31,15 +32,21 @@ import {
   REMOVE_WIDGET_LABEL,
   TRANSCRIBE_LABEL,
 } from "./media-block-panel";
+import { RECORDING_NOW_SENTENCE } from "./media-recorder-panel";
 
 const resolveBlock = vi.fn<typeof IpcClient.mediaBlockResolve>();
 const editBlock = vi.fn<typeof IpcClient.mediaBlockEdit>();
+const classify = vi.fn<typeof IpcClient.mediaBlockRecording>();
+const recordingStatus = vi.fn<typeof IpcClient.recordingStatus>();
 let written: ((path: string) => void) | null = null;
 
 vi.mock("@/lib/ipc/client", async (importOriginal) => ({
   ...(await importOriginal<typeof IpcClient>()),
   mediaBlockResolve: (profileId: string, source: string) => resolveBlock(profileId, source),
   mediaBlockEdit: (source: string, edit: IpcClient.MarkerEditReq) => editBlock(source, edit),
+  mediaBlockRecording: (source: string, profileId: string, path: string | null) =>
+    classify(source, profileId, path),
+  recordingStatus: () => recordingStatus(),
   listenTranscriptWritten: async (on: (path: string) => void) => {
     written = on;
     return () => {
@@ -114,8 +121,11 @@ function args(over: Partial<MediaBlockMountArgs> = {}): MediaBlockMountArgs {
     profileId: "drive",
     source: 'session = "S1"',
     editable: true,
+    interactive: true,
     replaceSource: vi.fn(() => true),
     noteLink: "Kelly sync",
+    notePath: () => "meetings/Kelly sync.md",
+    saveNote: vi.fn(),
     register: vi.fn(() => () => {}),
     claimPlayback: vi.fn(() => () => {}),
     scroller: SCROLLER,
@@ -133,6 +143,12 @@ async function openMenu(name: string): Promise<void> {
 beforeEach(() => {
   resolveBlock.mockReset();
   editBlock.mockReset();
+  // No block is a `record = "new"` one, and none names a live session, unless
+  // a test says so; the recorder has tests of its own.
+  classify.mockReset();
+  classify.mockResolvedValue({ records: false, session: null, live: false, here: false });
+  recordingStatus.mockReset();
+  recordingStatus.mockResolvedValue(IDLE_RECORDING_STATUS);
   for (const each of [player, viewer]) {
     each.seek.mockReset();
     each.pause.mockReset();
@@ -170,19 +186,88 @@ describe("what the block shows", () => {
       // Given, so the viewer grows in the note and has no scroll box of its own.
       scroller: SCROLLER,
       window: { from: 10, to: 20 },
-      title: "Kelly sync",
+      // No heading above the player: the note around the block says what it is.
+      title: null,
+      readOnly: false,
     });
     // The read-only list of lines is gone: the viewer is the only one.
     expect(screen.queryByTestId("player")).toBeNull();
   });
+});
 
-  it("says no title where the block names none, rather than the files it plays", async () => {
-    resolveBlock.mockResolvedValue(vm({ title: null }));
+describe("while a session records", () => {
+  const LIVE = { ...IDLE_RECORDING_STATUS, state: "recording" as const, startedAtEpochMs: 1 };
+  const naming = (live: boolean, here: boolean) => ({
+    records: false,
+    session: "S1",
+    live,
+    here,
+  });
+
+  beforeEach(() => {
+    resolveBlock.mockResolvedValue(vm());
+    recordingStatus.mockResolvedValue(LIVE);
+  });
+
+  it("asks Rust once, with the note it is in, what the block is", async () => {
+    render(<MediaBlockPanel {...args()} />);
+
+    await screen.findByTestId("viewer");
+    expect(classify).toHaveBeenCalledTimes(1);
+    expect(classify).toHaveBeenCalledWith('session = "S1"', "drive", "meetings/Kelly sync.md");
+  });
+
+  it("is the live banner with Stop when it names the session recording in this note", async () => {
+    classify.mockResolvedValue(naming(true, true));
+
+    render(<MediaBlockPanel {...args()} />);
+
+    expect(await screen.findByRole("button", { name: /^stop$/i })).toBeInTheDocument();
+    expect(screen.queryByTestId("viewer")).toBeNull();
+  });
+
+  it("is its player when the session it names is not the one recording", async () => {
+    classify.mockResolvedValue(naming(false, false));
 
     render(<MediaBlockPanel {...args()} />);
 
     await screen.findByTestId("viewer");
-    expect(viewerProps?.title).toBeNull();
+    expect(screen.queryByRole("button", { name: /^stop$/i })).toBeNull();
+  });
+
+  it("in a preview says only that it is recording, never the refusal or its source", async () => {
+    classify.mockResolvedValue(naming(true, true));
+    resolveBlock.mockRejectedValue({ code: "notesInvalid", message: "Not recorded yet." });
+
+    render(<MediaBlockPanel {...args({ interactive: false, editable: false })} />);
+
+    expect(await screen.findByText(RECORDING_NOW_SENTENCE)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText('session = "S1"')).toBeNull();
+    expect(screen.queryByRole("button", { name: /^stop$/i })).toBeNull();
+  });
+
+  it("in another note says only that it is recording", async () => {
+    classify.mockResolvedValue(naming(true, false));
+
+    render(<MediaBlockPanel {...args()} />);
+
+    expect(await screen.findByText(RECORDING_NOW_SENTENCE)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^stop$/i })).toBeNull();
+  });
+});
+
+describe("before Rust has said what the block is", () => {
+  it("draws none of the block's source", async () => {
+    classify.mockReturnValue(new Promise(() => {}));
+    resolveBlock.mockResolvedValue(vm());
+
+    const { container } = render(<MediaBlockPanel {...args()} />);
+    await waitFor(() => expect(resolveBlock).toHaveBeenCalled());
+    await act(async () => {});
+
+    expect(container).toBeEmptyDOMElement();
+    expect(screen.queryByText('session = "S1"')).toBeNull();
   });
 });
 
@@ -287,6 +372,44 @@ describe("the block's own verbs, from the menu and nowhere else", () => {
     await screen.findByRole("menu");
     expect(screen.queryByRole("menuitem", { name: EDIT_BLOCK_SOURCE_LABEL })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: REMOVE_WIDGET_LABEL })).toBeNull();
+  });
+});
+
+describe("a preview's block", () => {
+  const MARKED = vm({ markers: [{ name: "Deal", from: 12, to: null }] });
+
+  it("hands the viewer a read-only view and no block verbs", async () => {
+    resolveBlock.mockResolvedValue(MARKED);
+    render(<MediaBlockPanel {...args({ interactive: false, editable: false })} />);
+
+    await screen.findByTestId("viewer");
+
+    expect(viewerProps?.readOnly).toBe(true);
+    expect(screen.queryByRole("button", { name: "Marker actions Deal" })).toBeNull();
+    // The chip still takes the player to its moment.
+    fireEvent.click(screen.getByRole("button", { name: /^Go to Deal/ }));
+    expect(viewer.seek).toHaveBeenCalledWith(12, undefined);
+  });
+
+  it("plays an untranscribed block with no menu and no Transcribe", async () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, transcription: true });
+    resolveBlock.mockResolvedValue(
+      vm({ transcribed: false, lines: [], transcribePath: "/Volumes/d/recordings/kelly" }),
+    );
+    render(<MediaBlockPanel {...args({ interactive: false, editable: false })} />);
+
+    expect(await screen.findByTestId("player")).toBeInTheDocument();
+    expect(screen.getByText(NOT_TRANSCRIBED_SENTENCE)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: TRANSCRIBE_LABEL })).toBeNull();
+    expect(screen.queryByRole("button", { name: MEDIA_BLOCK_MENU_LABEL })).toBeNull();
+  });
+
+  it("says Rust's refusal with no menu to edit the source from", async () => {
+    resolveBlock.mockRejectedValue({ code: "notesInvalid", message: "Unknown key form." });
+    render(<MediaBlockPanel {...args({ interactive: false, editable: false })} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Unknown key form.");
+    expect(screen.queryByRole("button", { name: MEDIA_BLOCK_MENU_LABEL })).toBeNull();
   });
 });
 

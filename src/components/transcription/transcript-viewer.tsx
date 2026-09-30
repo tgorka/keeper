@@ -7,7 +7,6 @@ import {
   Pencil,
   Play,
   RotateCcw,
-  SkipForward,
   Split,
   UserPlus,
   UserRoundPen,
@@ -22,14 +21,9 @@ import {
   useRef,
   useState,
 } from "react";
+import { clock } from "@/components/notes/editor/media-playback";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -93,7 +87,7 @@ import { cn } from "@/lib/utils";
 import { FILE_FORMATS } from "@/lib/viewers/registry";
 import type { ViewerProps } from "@/lib/viewers/types";
 import { type ClipRequest, CopyClipDialog } from "./copy-clip";
-import { currentUtterance, nearestLine, nextLine } from "./session-timeline";
+import { currentUtterance, nearestLine } from "./session-timeline";
 import { TRANSCRIBE_AGAIN_LABEL, TranscribeAgainDialog } from "./transcribe-again";
 import {
   COPY_CLIP_FROM_HERE,
@@ -103,10 +97,10 @@ import {
   speakerInks,
   speakerName,
   TranscriptLines,
-  timestamp,
   useTranscriptRows,
 } from "./transcript-lines";
 import {
+  MetaLine,
   type Picture,
   type PlayerWindow,
   type Sound,
@@ -194,7 +188,6 @@ export const ADD_SPEAKER_LABEL = "Add speaker";
 export const TRANSCRIPT_ACTIONS_LABEL = "Transcript actions";
 export const COPY_AS_NOTE_EMBED = "Copy as note embed";
 export const NEAREST_LINE_LABEL = "Go to their nearest line";
-export const NEXT_LINE_LABEL = "Go to their next line";
 /** Keys that scroll a focused box; pressing one is the reader taking the scroll back. */
 const SCROLL_KEYS: Record<string, true> = {
   ArrowUp: true,
@@ -273,12 +266,12 @@ export function TranscriptDialog({
     >
       {/* Most of the window: the player can use the width, and the lines run
           as wide as it. */}
-      <DialogContent className="flex h-[92dvh] w-[min(96vw,1600px)] min-w-0 max-w-none flex-col sm:max-w-none">
+      <DialogContent
+        aria-describedby={undefined}
+        className="flex h-[92dvh] w-[min(96vw,1600px)] min-w-0 max-w-none flex-col sm:max-w-none"
+      >
         <DialogHeader>
           <DialogTitle>Transcript</DialogTitle>
-          <DialogDescription>
-            Read and correct what was said. Recognition stays on this Mac.
-          </DialogDescription>
         </DialogHeader>
         {path && <TranscriptViewer key={path} path={path} profileId={profileId} at={at} />}
       </DialogContent>
@@ -320,6 +313,12 @@ export interface TranscriptViewerProps {
   markers?: ReactNode;
   /** More `DropdownMenuItem`s at the end of the viewer's ⋯. */
   menuItems?: ReactNode;
+  /**
+   * A preview's viewer: the player, the lines and search, and nothing that
+   * changes the transcript — no ⋯, no Transcribe again, speakers by name only,
+   * no Add speaker, and a line's ⋯ holding only Play and Copy clip.
+   */
+  readOnly?: boolean;
   /** What a Copy clip composes; the transcript's own clip unless given. */
   composeClip?: (from: string | null, to: string | null, words: boolean) => Promise<MediaClipVm>;
   onTime?: (seconds: number) => void;
@@ -341,6 +340,7 @@ export function TranscriptViewer({
   asleepText,
   markers,
   menuItems,
+  readOnly = false,
   composeClip,
   onTime,
   onPlayingChange,
@@ -663,19 +663,20 @@ export function TranscriptViewer({
   const named = naming ? speakers.get(naming.speakerId)?.speaker : undefined;
   const heading = title === undefined ? (vm?.transcript.source.title ?? null) : title;
   const lines = utterances ?? [];
-  const meta = vm && (
-    <p className="min-w-0 break-words">
-      {new Date(vm.transcript.createdAt).toLocaleString()} ·{" "}
-      <span className="font-mono">{timestamp(vm.transcript.duration)}</span> ·{" "}
-      {vm.transcript.language === "auto"
+  const meta =
+    vm &&
+    [
+      new Date(vm.transcript.createdAt).toLocaleString(),
+      clock(vm.transcript.duration),
+      vm.transcript.language === "auto"
         ? "Automatic language"
         : vm.transcript.language === "en"
           ? "English"
-          : "Polish"}{" "}
-      · {vm.transcript.engine.asr} · {vm.transcript.engine.diarizer} ·{" "}
-      {vm.transcript.engine.embedding}
-    </p>
-  );
+          : "Polish",
+      vm.transcript.engine.asr,
+      vm.transcript.engine.diarizer,
+      vm.transcript.engine.embedding,
+    ].join(" · ");
   return (
     <section
       aria-label="Transcript viewer"
@@ -762,40 +763,42 @@ export function TranscriptViewer({
                 </Button>
               </div>
             )}
-            <div className="ml-auto flex items-center gap-1">
-              {canTranscribe && sourcePath && (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={transcriptionRunning(redoJob)}
-                  onClick={() => setReplacing(true)}
-                >
-                  <RotateCcw aria-hidden="true" />
-                  {TRANSCRIBE_AGAIN_LABEL}…
-                </Button>
-              )}
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button size="icon-sm" variant="ghost" aria-label={TRANSCRIPT_ACTIONS_LABEL}>
-                    <Ellipsis aria-hidden="true" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className={MENU_CONTENT}>
-                  <DropdownMenuItem
-                    onSelect={() => setClip(playerWindow ?? { from: null, to: null })}
+            {!readOnly && (
+              <div className="ml-auto flex items-center gap-1">
+                {canTranscribe && sourcePath && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={transcriptionRunning(redoJob)}
+                    onClick={() => setReplacing(true)}
                   >
-                    <Clipboard aria-hidden="true" />
-                    {COPY_AS_NOTE_EMBED}
-                  </DropdownMenuItem>
-                  {menuItems && (
-                    <>
-                      <DropdownMenuSeparator />
-                      {menuItems}
-                    </>
-                  )}
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
+                    <RotateCcw aria-hidden="true" />
+                    {TRANSCRIBE_AGAIN_LABEL}…
+                  </Button>
+                )}
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button size="icon-sm" variant="ghost" aria-label={TRANSCRIPT_ACTIONS_LABEL}>
+                      <Ellipsis aria-hidden="true" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className={MENU_CONTENT}>
+                    <DropdownMenuItem
+                      onSelect={() => setClip(playerWindow ?? { from: null, to: null })}
+                    >
+                      <Clipboard aria-hidden="true" />
+                      {COPY_AS_NOTE_EMBED}
+                    </DropdownMenuItem>
+                    {menuItems && (
+                      <>
+                        <DropdownMenuSeparator />
+                        {menuItems}
+                      </>
+                    )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+            )}
           </div>
           {sourcePath && redoJob && redoJob.phase !== "done" && (
             <TranscriptionJob path={sourcePath} onOpen={() => setReads((n) => n + 1)} />
@@ -908,7 +911,7 @@ export function TranscriptViewer({
                   }}
                   onJump={() => setFollowScroll(true)}
                   onPlayingChange={(playing) => hooks.current.onPlayingChange?.(playing)}
-                  meta={meta}
+                  meta={meta ?? undefined}
                 />
               ) : (
                 <>
@@ -917,7 +920,7 @@ export function TranscriptViewer({
                       {asleepText}
                     </div>
                   )}
-                  <div className="text-muted-foreground text-xs">{meta}</div>
+                  {meta && <MetaLine text={meta} />}
                 </>
               )}
               {markers}
@@ -926,42 +929,47 @@ export function TranscriptViewer({
                   .filter((entry) => entry.lines > 0)
                   .map((entry) => (
                     <li key={entry.speaker.id}>
-                      <SpeakerChip
-                        speaker={entry.speaker}
-                        ink={entry.ink}
-                        lines={entry.lines}
-                        vm={vm}
-                        busy={busy}
-                        act={act}
-                        onName={(mode) => setNaming({ speakerId: entry.speaker.id, mode })}
-                        focusName={() => nameField.current?.focus()}
-                        onNearest={() => goToLine(entry.speaker.id, nearestLine)}
-                        onNext={() => goToLine(entry.speaker.id, nextLine)}
-                      />
+                      {readOnly ? (
+                        <SpeakerName speaker={entry.speaker} ink={entry.ink} />
+                      ) : (
+                        <SpeakerChip
+                          speaker={entry.speaker}
+                          ink={entry.ink}
+                          lines={entry.lines}
+                          vm={vm}
+                          busy={busy}
+                          act={act}
+                          onName={(mode) => setNaming({ speakerId: entry.speaker.id, mode })}
+                          focusName={() => nameField.current?.focus()}
+                          onNearest={() => goToLine(entry.speaker.id, nearestLine)}
+                        />
+                      )}
                     </li>
                   ))}
-                <li>
-                  <AddSpeaker
-                    transcript={vm.transcript}
-                    busy={busy}
-                    onAdd={async (origin, label) => {
-                      let ok = false;
-                      await act(async () => {
-                        const next = await transcriptAddSpeaker(path, origin, label);
-                        const known = new Set(vm.transcript.speakers.map((s) => s.id));
-                        const fresh = next.transcript.speakers.find((s) => !known.has(s.id));
-                        setAdded(
-                          fresh
-                            ? `${speakerName(fresh)} added. Give it lines from each line’s menu, under Change speaker.`
-                            : null,
-                        );
-                        ok = true;
-                        return next;
-                      });
-                      return ok;
-                    }}
-                  />
-                </li>
+                {!readOnly && (
+                  <li>
+                    <AddSpeaker
+                      transcript={vm.transcript}
+                      busy={busy}
+                      onAdd={async (origin, label) => {
+                        let ok = false;
+                        await act(async () => {
+                          const next = await transcriptAddSpeaker(path, origin, label);
+                          const known = new Set(vm.transcript.speakers.map((s) => s.id));
+                          const fresh = next.transcript.speakers.find((s) => !known.has(s.id));
+                          setAdded(
+                            fresh
+                              ? `${speakerName(fresh)} added. Give it lines from each line’s menu, under Change speaker.`
+                              : null,
+                          );
+                          ok = true;
+                          return next;
+                        });
+                        return ok;
+                      }}
+                    />
+                  </li>
+                )}
               </ul>
               {naming && named && (
                 <SpeakerNameForm
@@ -1015,6 +1023,7 @@ export function TranscriptViewer({
                 const utterance = lines[index];
                 return (
                   <LineMenu
+                    readOnly={readOnly}
                     utterance={utterance}
                     offered={offered}
                     playable={playable}
@@ -1114,6 +1123,7 @@ export function TranscriptViewer({
  * copying first, the corrections under them.
  */
 function LineMenu({
+  readOnly,
   utterance,
   offered,
   playable,
@@ -1125,6 +1135,8 @@ function LineMenu({
   onPanel,
   focusEdit,
 }: {
+  /** Only Play and Copy clip: a preview changes nothing. */
+  readOnly: boolean;
   utterance: Utterance;
   offered: readonly Speaker[];
   playable: boolean;
@@ -1164,48 +1176,52 @@ function LineMenu({
           <Clipboard aria-hidden="true" />
           {COPY_CLIP_FROM_HERE}
         </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem
-          disabled={busy}
-          onSelect={() => {
-            keepFocus.current = true;
-            onEdit();
-          }}
-        >
-          <Pencil aria-hidden="true" />
-          Edit text
-        </DropdownMenuItem>
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger disabled={busy}>
-            <UserRoundPen aria-hidden="true" />
-            Change speaker
-          </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent>
-            <DropdownMenuRadioGroup
-              value={utterance.speaker}
-              onValueChange={(next) => {
-                if (next !== utterance.speaker) onReassign(next);
+        {!readOnly && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              disabled={busy}
+              onSelect={() => {
+                keepFocus.current = true;
+                onEdit();
               }}
             >
-              {offered.map((s) => (
-                <DropdownMenuRadioItem key={s.id} value={s.id}>
-                  {speakerName(s)}
-                </DropdownMenuRadioItem>
-              ))}
-            </DropdownMenuRadioGroup>
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
-        <DropdownMenuSeparator />
-        {utterance.words.length > 1 && (
-          <DropdownMenuItem disabled={busy} onSelect={() => onPanel("split")}>
-            <Split aria-hidden="true" />
-            Split…
-          </DropdownMenuItem>
+              <Pencil aria-hidden="true" />
+              Edit text
+            </DropdownMenuItem>
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger disabled={busy}>
+                <UserRoundPen aria-hidden="true" />
+                Change speaker
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent>
+                <DropdownMenuRadioGroup
+                  value={utterance.speaker}
+                  onValueChange={(next) => {
+                    if (next !== utterance.speaker) onReassign(next);
+                  }}
+                >
+                  {offered.map((s) => (
+                    <DropdownMenuRadioItem key={s.id} value={s.id}>
+                      {speakerName(s)}
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+            <DropdownMenuSeparator />
+            {utterance.words.length > 1 && (
+              <DropdownMenuItem disabled={busy} onSelect={() => onPanel("split")}>
+                <Split aria-hidden="true" />
+                Split…
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuItem disabled={busy} onSelect={() => onPanel("insert")}>
+              <ListPlus aria-hidden="true" />
+              Add a line after
+            </DropdownMenuItem>
+          </>
         )}
-        <DropdownMenuItem disabled={busy} onSelect={() => onPanel("insert")}>
-          <ListPlus aria-hidden="true" />
-          Add a line after
-        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -1257,6 +1273,15 @@ function EditLine({
     </div>
   );
 }
+/** A speaker in a preview's legend: ink and name, and nothing to change. */
+function SpeakerName({ speaker, ink }: { speaker: Speaker; ink: string }) {
+  return (
+    <span className="flex items-center gap-1.5 rounded-sm px-2 py-0.5 text-xs">
+      <span aria-hidden="true" className={cn("size-2 shrink-0 rounded-[2px]", ink)} />
+      <span className="max-w-48 truncate">{speakerName(speaker)}</span>
+    </span>
+  );
+}
 /**
  * One speaker in the legend: ink, name, status lamp and line count, with every
  * change to the speaker behind it.
@@ -1271,7 +1296,6 @@ function SpeakerChip({
   onName,
   focusName,
   onNearest,
-  onNext,
 }: {
   speaker: Speaker;
   ink: string;
@@ -1284,8 +1308,6 @@ function SpeakerChip({
   focusName: () => void;
   /** Take the reader, and the player, to this speaker's line nearest the player. */
   onNearest: () => void;
-  /** The same, to this speaker's next line after the player, from their first past the last. */
-  onNext: () => void;
 }) {
   // The field an item opens keeps the focus, not the chip it came from.
   const keepFocus = useRef(false);
@@ -1335,10 +1357,6 @@ function SpeakerChip({
         <DropdownMenuItem onSelect={onNearest}>
           <Crosshair aria-hidden="true" />
           {NEAREST_LINE_LABEL}
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={onNext}>
-          <SkipForward aria-hidden="true" />
-          {NEXT_LINE_LABEL}
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuSub>

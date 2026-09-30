@@ -844,3 +844,39 @@ fn a_stubs_bare_block_gains_its_hints_and_nothing_else_does() {
         assert_eq!(adopt(&kept), Adoption::Untouched, "{kept}");
     }
 }
+
+#[test]
+fn record_new_is_a_source_of_its_own() {
+    let block = parse("record = \"new\"\ntitle = \"Standup\"\nsound = \"both\"").expect("records");
+    assert_eq!(block.source, Source::Record);
+    assert_eq!(block.title.as_deref(), Some("Standup"));
+    assert_eq!(
+        refused("record = \"S1\""),
+        BlockRefusal::WrongType {
+            key: "record".to_owned(),
+            expected: "\"new\""
+        }
+    );
+    for other in [
+        "session = \"S\"",
+        "transcript = \"t.json\"",
+        "src = \"a.toml\"",
+        "[[part]]\nfile = \"a.mov\"",
+    ] {
+        assert!(
+            matches!(
+                refused(&format!("record = \"new\"\n{other}")),
+                BlockRefusal::TwoSources { .. }
+            ),
+            "record with {other}"
+        );
+    }
+    assert_eq!(
+        parse_src("record = \"new\""),
+        Err(BlockRefusal::RecordInSrc)
+    );
+    assert_eq!(
+        parse(&record_block()[16..record_block().len() - 4]).map(|b| b.source),
+        Ok(Source::Record)
+    );
+}

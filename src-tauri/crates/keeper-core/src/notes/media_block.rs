@@ -69,7 +69,7 @@ pub enum BlockRefusal {
     #[error("This block was written by a newer keeper.")]
     NewerVersion,
     #[error(
-        "This block names nothing to play: give it one of session, transcript, [[part]] or src."
+        "This block names nothing to play: give it one of session, transcript, [[part]], src or record."
     )]
     NoSource,
     #[error("This block names both {first} and {second}; a block plays exactly one of them.")]
@@ -79,6 +79,8 @@ pub enum BlockRefusal {
     },
     #[error("The file named by src names src itself; it must name what to play.")]
     NestedSrc,
+    #[error("The file named by src cannot record; record = \"new\" belongs in the note.")]
+    RecordInSrc,
     #[error("`{key}` must be {expected}.")]
     WrongType { key: String, expected: &'static str },
     #[error("`{text}` is not a time for `{key}`: write hh:mm:ss, mm:ss or seconds.")]
@@ -151,6 +153,9 @@ pub enum Source {
     Parts(Vec<Part>),
     /// A `.toml` file in the drive holding a body of this grammar.
     Src(String),
+    /// `record = "new"`: nothing recorded yet. The block's widget records a
+    /// new session, and keeper rewrites this to `session` when it stops.
+    Record,
 }
 
 /// One `[[part]]`.
@@ -191,7 +196,7 @@ pub struct Marker {
     pub to: Option<f64>,
 }
 
-const ROOT_KEYS: [&str; 11] = [
+const ROOT_KEYS: [&str; 12] = [
     "version",
     "session",
     "transcript",
@@ -203,10 +208,14 @@ const ROOT_KEYS: [&str; 11] = [
     "picture",
     "sound",
     "marker",
+    "record",
 ];
 const PART_KEYS: [&str; 5] = ["file", "camera", "offset", "system", "microphone"];
 const MARKER_KEYS: [&str; 4] = ["name", "at", "from", "to"];
-const SOURCE_KEYS: [&str; 4] = ["session", "transcript", "part", "src"];
+const SOURCE_KEYS: [&str; 5] = ["session", "transcript", "part", "src", "record"];
+
+/// The one value `record` takes: the block has not recorded yet.
+pub const RECORD_NEW: &str = "new";
 
 /// Read a body.
 pub fn parse(body: &str) -> Result<Block, BlockRefusal> {
@@ -240,6 +249,15 @@ pub fn parse(body: &str) -> Result<Block, BlockRefusal> {
         ["session"] => Source::Session(text(&table, "session")?),
         ["transcript"] => Source::Transcript(text(&table, "transcript")?),
         ["src"] => Source::Src(text(&table, "src")?),
+        ["record"] => {
+            if text(&table, "record")? != RECORD_NEW {
+                return Err(BlockRefusal::WrongType {
+                    key: "record".to_owned(),
+                    expected: "\"new\"",
+                });
+            }
+            Source::Record
+        }
         _ => Source::Parts(parts(&table)?),
     };
     let block = Block {
@@ -280,10 +298,11 @@ pub fn parse(body: &str) -> Result<Block, BlockRefusal> {
 /// itself.
 pub fn parse_src(body: &str) -> Result<Block, BlockRefusal> {
     let block = parse(body)?;
-    if matches!(block.source, Source::Src(_)) {
-        return Err(BlockRefusal::NestedSrc);
+    match block.source {
+        Source::Src(_) => Err(BlockRefusal::NestedSrc),
+        Source::Record => Err(BlockRefusal::RecordInSrc),
+        _ => Ok(block),
     }
-    Ok(block)
 }
 
 impl Block {
@@ -658,6 +677,12 @@ pub fn part_block(relative_path: &str) -> String {
     )
 }
 
+/// A block that records here (`record = "new"`): its widget starts a new
+/// session, and keeper rewrites the block to name it when it stops.
+pub fn record_block() -> String {
+    described(&[("record", quoted(RECORD_NEW))], "", true)
+}
+
 /// What the person picked to play: a recording from the recordings index,
 /// or a file in the note's drive (N3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -675,6 +700,8 @@ pub enum MediaPickReq {
     File {
         relative_path: String,
     },
+    /// Nothing yet: a block that records a new session (`record = "new"`).
+    NewRecording,
 }
 
 /// An add, a rename or a removal of one marker, as the note's editor asks
@@ -1563,6 +1590,12 @@ pub fn is_playable(name: &str) -> bool {
         RecordingNoteTargetKind::Video | RecordingNoteTargetKind::Audio
     )
 }
+
+mod hints;
+pub use hints::{
+    check, schema, MediaBlockProblemVm, MediaBlockSchemaVm, MediaKeyPlace, MediaKeyVm,
+    MediaValueKind,
+};
 
 #[cfg(test)]
 mod tests;

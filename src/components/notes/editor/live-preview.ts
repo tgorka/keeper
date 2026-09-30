@@ -183,6 +183,17 @@ export interface LivePreviewOptions {
    * editor outlives the note in it.
    */
   noteLink?: () => string | null;
+  /** The open note's vault-relative path, for a block that records into it. */
+  notePath?: () => string | null;
+  /** Write the open note now, as ⌘S does: a record block's session name
+   *  must reach the disk at once. */
+  saveNote?: () => void;
+  /**
+   * Whether a media block is the note's own, with every verb (the default),
+   * or a preview's: the player, its lines and search, and nothing that
+   * changes the transcript or the note.
+   */
+  mediaInteractive?: boolean;
   /** Replace the dynamic import of the media block's panel — a test seam. */
   mountMedia?: MediaBlockOptions["mount"];
 }
@@ -1484,7 +1495,10 @@ const livePreviewTheme = EditorView.baseTheme({
   // The media block (`media-block.ts`). Until its panel arrives — and for good
   // where it cannot draw — it is the fence's own text, which is what Obsidian
   // shows too.
-  ".cm-media-block": { padding: "0.25em 0" },
+  ".cm-media-block": { padding: "0.25em 0", borderRadius: "6px" },
+  // Selected as a whole — the caret keys and a shift-selection take the block
+  // as one piece, and a block has no text to paint a selection on.
+  ".cm-media-block-selected": { outline: "2px solid var(--ring)", outlineOffset: "2px" },
   ".cm-media-block-source": {
     margin: "0",
     padding: "0.5em",
@@ -1785,6 +1799,9 @@ export function livePreview(options: LivePreviewOptions): Extension {
     mediaBlockLayer({
       profileId: options.vaultId,
       noteLink: options.noteLink,
+      notePath: options.notePath,
+      saveNote: options.saveNote,
+      interactive: options.mediaInteractive,
       mount: options.mountMedia,
     }),
     externalFlashField,

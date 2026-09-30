@@ -43,7 +43,7 @@
  * recording's tags enter the index, so what arrives here is already the one
  * vocabulary and re-shaping it would only be a way to disagree with the tree.
  */
-import { AudioLines } from "lucide-react";
+import { AudioLines, MoreHorizontal } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { RecordingRow } from "@/components/recordings/recording-row";
 import {
@@ -64,10 +64,17 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
+import { IconHint } from "@/components/ui/tooltip";
 import { useWindowedRows } from "@/components/ui/window-list";
 import { countLabel, SESSIONS } from "@/lib/count-label";
 import type { IpcError, RecordingFilterVm, RecordingHitVm } from "@/lib/ipc/client";
-import { recordingOpenPath, revealPath, searchRecordings } from "@/lib/ipc/client";
+import {
+  listenRecordingsReconciled,
+  recordingOpenPath,
+  recordingsReconcileNow,
+  revealPath,
+  searchRecordings,
+} from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { startTranscription, useTranscriptionStore } from "@/lib/stores/transcription";
@@ -99,6 +106,18 @@ export const RECORDINGS_LIST_LABEL = "Recording sessions";
 
 /** The header control that re-runs the current query against the archive. */
 export const RECORDINGS_REFRESH_LABEL = "Refresh";
+
+/** The header ⋯ that holds the pane's less frequent actions. */
+export const RECORDINGS_MORE_ACTIONS_LABEL = "More recordings actions";
+
+/**
+ * The ⋯ item that rebuilds the index from every recordings folder now — what
+ * keeper otherwise does once a day on its own.
+ */
+export const RECORDINGS_RECONCILE_LABEL = "Reconcile now";
+
+/** What the header says when a recording in progress holds the reconcile. */
+export const RECORDINGS_RECONCILE_WAITING = "Reconcile waits for the recording in progress to end.";
 
 /**
  * Test id for the line that says how many sessions the filter found (Story
@@ -222,6 +241,43 @@ export function RecordingsPane() {
   const filterRef = useRef(filter);
   filterRef.current = filter;
 
+  // What Rust says the reconcile is doing, when it is not simply done: held by
+  // a recording, or refused. Cleared the moment an index refresh lands.
+  const [reconcileNote, setReconcileNote] = useState<string | null>(null);
+
+  // A refresh of every recordings folder landed in the index — the daily
+  // reconcile, "Reconcile now", a start, a synced folder saved — so the list
+  // on screen may be stale: ask again, with the filter on screen now.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let alive = true;
+    void listenRecordingsReconciled(() => {
+      setReconcileNote(null);
+      runSearch(filterRef.current);
+    }).then(
+      (stop) => {
+        if (alive) {
+          unlisten = stop;
+        } else {
+          stop();
+        }
+      },
+      // No event channel (a test's shell, a torn-down window): the list is
+      // still refreshed by every search the reader makes.
+      () => {},
+    );
+    return () => {
+      alive = false;
+      unlisten?.();
+    };
+  }, [runSearch]);
+
+  const reconcileNow = useCallback(() => {
+    recordingsReconcileNow()
+      .then((started) => setReconcileNote(started ? null : RECORDINGS_RECONCILE_WAITING))
+      .catch((e: unknown) => setReconcileNote(isIpcError(e) ? e.message : String(e)));
+  }, []);
+
   // Tag choices are seeded from the current result set, the way the message
   // search seeds its sender suggestions: the tags that co-occur with what is on
   // screen are exactly the tags that can narrow it further, and a global list
@@ -293,6 +349,11 @@ export function RecordingsPane() {
               {countLabel(total, SESSIONS)}
             </p>
           )}
+          {reconcileNote !== null && (
+            <p aria-live="polite" className="text-muted-foreground text-xs">
+              {reconcileNote}
+            </p>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {canTranscribe && (
@@ -318,6 +379,25 @@ export function RecordingsPane() {
           >
             {RECORDINGS_REFRESH_LABEL}
           </Button>
+          <DropdownMenu>
+            <IconHint label={RECORDINGS_MORE_ACTIONS_LABEL}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={RECORDINGS_MORE_ACTIONS_LABEL}
+                >
+                  <MoreHorizontal aria-hidden="true" />
+                </Button>
+              </DropdownMenuTrigger>
+            </IconHint>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={reconcileNow}>
+                {RECORDINGS_RECONCILE_LABEL}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </header>
 

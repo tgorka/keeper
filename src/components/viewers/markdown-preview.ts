@@ -365,6 +365,9 @@ export async function mountMarkdownPreview(
         onOpenUrl: options.onOpenUrl,
         listFolder: options.listFolder,
         mountWidget: options.mountWidget,
+        // A preview — the Files pane's, and a note's Preview view, which is
+        // this renderer — plays a media block and changes nothing through it.
+        mediaInteractive: false,
       }),
       // Line endings are the file's, not the editor's — `text-editor-host.ts`'s
       // facet and its reason: without it CodeMirror hands back "\n" for every
@@ -420,8 +423,7 @@ export async function mountMarkdownPreview(
     // so what the reader sees is the raw view and not a fragment of a render.
     host.replaceChildren();
     return {
-      failure:
-        "keeper could not draw this document, so the source is below, unchanged: " + reason(error),
+      failure: `keeper could not draw this document, so the source is below, unchanged: ${reason(error)}`,
       // Nothing to adopt into, so nothing can fail: the host is showing the raw
       // view, which holds the same buffer this would have received.
       setContent: () => null,

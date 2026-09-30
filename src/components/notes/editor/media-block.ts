@@ -32,11 +32,27 @@
  * its `CodeInfo`, so a tilde fence, an indented one and one inside a list item
  * are all found.
  *
+ * **Its source shows only when asked for.** A click or a key inside the
+ * panel is the panel's, and a caret moved onto the block by the arrow keys
+ * takes it whole — an atomic range, selected as one piece. The fence's text
+ * comes back only from the panel's *Edit block source*, and goes again when
+ * the caret leaves it. While it is hidden, typing at its edge goes on a line
+ * of its own and a key that would join a line onto its fence does not, so no
+ * keystroke made without seeing the text can leave a fence Markdown no longer
+ * reads as one.
+ *
  * **This module imports no React** (NFR-27): the panel arrives through a
  * dynamic `import()` after the fence's own text is already on screen.
  */
 import { syntaxTree } from "@codemirror/language";
-import { type EditorState, type Extension, StateField } from "@codemirror/state";
+import {
+  EditorState,
+  type Extension,
+  StateEffect,
+  StateField,
+  Transaction,
+  type TransactionSpec,
+} from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, WidgetType } from "@codemirror/view";
 
 /** The fence's info word. Prefixed, so no Obsidian plugin can claim it. */
@@ -45,8 +61,11 @@ export const MEDIA_BLOCK_INFO = "keeper-media";
 /** The block host CodeMirror replaces the fence with. */
 export const MEDIA_BLOCK_CLASS = "cm-media-block";
 
-/** The panel inside it once React has arrived; events inside stay there. */
+/** The panel inside it once React has arrived. */
 export const MEDIA_BLOCK_BODY_CLASS = "cm-media-block-body";
+
+/** The block while a selection holds all of it. */
+export const MEDIA_BLOCK_SELECTED_CLASS = "cm-media-block-selected";
 
 /**
  * What CodeMirror assumes a block is tall before it has measured one: a
@@ -65,13 +84,21 @@ export interface MediaBlockMountArgs {
   /** The fence's body, verbatim. */
   source: string;
   /** Whether a marker edit can be written here (AD-27): absent controls, not
-   *  refusing ones, in a read-only preview. */
+   *  refusing ones, in a read-only editor. */
   editable: boolean;
+  /** The note's own block with every verb, or a preview's: the player, its
+   *  lines and search, and nothing that changes the transcript or the note. */
+  interactive: boolean;
   /** Replace this block's body with `next`. Resolves false when the block is
    *  no longer where it was, or no longer holds `source`. */
   replaceSource: (next: string) => boolean;
   /** The link target of the note holding the block, for *Copy link*. */
   noteLink: string | null;
+  /** The note's vault-relative path, read when asked: the editor outlives the note in it. */
+  notePath: () => string | null;
+  /** Write the note now, as ⌘S does — after an edit that must reach the disk
+   *  at once (a record block naming the session it started). */
+  saveNote: () => void;
   /** Register the panel's seek, so a `[[note#marker]]` can move it. */
   register: (handle: MediaBlockHandle) => () => void;
   /** Report that this block started playing, and pause any other that is. */
@@ -82,7 +109,7 @@ export interface MediaBlockMountArgs {
    * against this element and pins its player to the top of it.
    */
   scroller: HTMLElement;
-  /** Show the fence's text with the caret inside it. */
+  /** Show the fence's text with the caret inside it, until the caret leaves. */
   editSource: () => void;
   /** Delete the block and the words callout riding with it, as one undoable edit. */
   remove: () => void;
@@ -92,6 +119,8 @@ export interface MediaBlockMountArgs {
 export interface MediaBlockHandle {
   /** Move the player to `seconds`, paused. */
   seekTo: (seconds: number) => void;
+  /** Where the player is, or null before anything has played or moved it. */
+  currentTime: () => number | null;
 }
 
 export interface MediaBlockOptions {
@@ -99,6 +128,12 @@ export interface MediaBlockOptions {
   profileId?: string;
   /** The note's own link target, read when a panel mounts. */
   noteLink?: () => string | null;
+  /** The note's own vault-relative path, read when a panel asks. */
+  notePath?: () => string | null;
+  /** Write the note now, as ⌘S does; absent where there is nothing to save. */
+  saveNote?: () => void;
+  /** False in a preview: see {@link MediaBlockMountArgs.interactive}. */
+  interactive?: boolean;
   /** Replace the dynamic import of the React panel. */
   mount?: (container: HTMLElement, args: MediaBlockMountArgs) => MountedMediaBlock;
 }
@@ -241,6 +276,86 @@ function fenceAt(view: EditorView, pos: number): MediaFence | undefined {
   return mediaFences(view.state).find((fence) => fence.from <= pos && pos <= fence.to);
 }
 
+/** A block whose source *Edit block source* showed, and where its player was then. */
+interface Revealed {
+  from: number;
+  to: number;
+  seconds: number | null;
+}
+
+/** *Edit block source*: show this fence's text until the caret leaves it. */
+const revealSource = StateEffect.define<Revealed>({
+  map: (value, changes) => ({
+    ...value,
+    from: changes.mapPos(value.from, 1),
+    to: changes.mapPos(value.to, 1),
+  }),
+});
+
+/**
+ * The fences shown as text on request. Each stays shown while any selection
+ * range touches it and is dropped the moment none does — so the caret leaving
+ * is what hides it again, and nothing else ever shows it.
+ */
+const revealedField = StateField.define<readonly Revealed[]>({
+  create: () => [],
+  update(value, transaction) {
+    let next = transaction.docChanged
+      ? value.map((shown) => ({
+          ...shown,
+          // Forward, so text typed at the fence's own start stays outside it.
+          from: transaction.changes.mapPos(shown.from, 1),
+          to: transaction.changes.mapPos(shown.to, 1),
+        }))
+      : value;
+    for (const effect of transaction.effects) {
+      if (effect.is(revealSource)) {
+        next = [...next.filter((shown) => shown.from !== effect.value.from), effect.value];
+      }
+    }
+    if (next.length === 0) {
+      return next;
+    }
+    const ranges = transaction.state.selection.ranges;
+    const kept = next.filter((shown) =>
+      ranges.some((range) => range.from <= shown.to && range.to >= shown.from),
+    );
+    return kept.length === next.length && next === value ? value : kept;
+  },
+});
+
+/**
+ * Where the player of the block starting at `fenceFrom` was when *Edit block
+ * source* showed its text — the time a hint while editing it can offer — or
+ * null when that block is not shown on request or its player had no time.
+ */
+export function lastPlayerTime(view: EditorView, fenceFrom: number): number | null {
+  return (
+    view.state.field(revealedField, false)?.find((shown) => shown.from === fenceFrom)?.seconds ??
+    null
+  );
+}
+
+/** Show the fence holding the widget at `host` as text, the caret in its body. */
+function showSource(view: EditorView, host: HTMLElement): void {
+  const pos = safePos(view, host);
+  const fence = pos === null ? undefined : fenceAt(view, pos);
+  if (fence === undefined) {
+    return;
+  }
+  view.dispatch({
+    selection: { anchor: fence.bodyFrom },
+    effects: revealSource.of({
+      from: fence.from,
+      to: fence.to,
+      seconds: handles.get(view)?.get(host)?.currentTime() ?? null,
+    }),
+    scrollIntoView: true,
+    userEvent: "select.media-block",
+  });
+  view.focus();
+}
+
 /** What a mounted panel is, so a changed body can be handed to it. */
 export interface MountedMediaBlock {
   unmount: () => void;
@@ -261,12 +376,18 @@ export class MediaBlockWidget extends WidgetType {
     /** The fence as written, shown until the panel arrives. */
     private readonly text: string,
     private readonly options: MediaBlockOptions,
+    /** Whether a selection holds the whole block: drawn, never re-mounted. */
+    private readonly selected: boolean,
   ) {
     super();
   }
 
   eq(other: MediaBlockWidget): boolean {
-    return other.source === this.source && other.options.profileId === this.options.profileId;
+    return (
+      other.source === this.source &&
+      other.options.profileId === this.options.profileId &&
+      other.selected === this.selected
+    );
   }
 
   get estimatedHeight(): number {
@@ -276,6 +397,7 @@ export class MediaBlockWidget extends WidgetType {
   toDOM(view: EditorView): HTMLElement {
     const host = document.createElement("div");
     host.className = MEDIA_BLOCK_CLASS;
+    host.classList.toggle(MEDIA_BLOCK_SELECTED_CLASS, this.selected);
     // The fence's own text is the resolving state (UX-DR124): what Obsidian
     // shows, and never an empty box.
     const pre = document.createElement("pre");
@@ -290,13 +412,19 @@ export class MediaBlockWidget extends WidgetType {
    * A marker edit changes the body, and a changed body would otherwise be a
    * new widget: a new panel, a new player, playback stopped under the hand
    * that pressed *Mark this moment*. The mounted panel takes the new body
-   * instead and resolves it in place.
+   * instead and resolves it in place. A selection taking the block or leaving
+   * it only redraws its outline.
    */
-  updateDOM(dom: HTMLElement, view: EditorView): boolean {
+  updateDOM(dom: HTMLElement, view: EditorView, from: MediaBlockWidget): boolean {
+    if (from.source === this.source && from.options.profileId === this.options.profileId) {
+      dom.classList.toggle(MEDIA_BLOCK_SELECTED_CLASS, this.selected);
+      return true;
+    }
     const panel = panels.get(dom);
     if (panel === undefined || this.profileId() === "") {
       return false;
     }
+    dom.classList.toggle(MEDIA_BLOCK_SELECTED_CLASS, this.selected);
     panel.update(this.args(view, dom));
     return true;
   }
@@ -310,8 +438,11 @@ export class MediaBlockWidget extends WidgetType {
     return {
       profileId: this.profileId(),
       source,
-      editable: !view.state.readOnly,
+      editable: this.options.interactive !== false && !view.state.readOnly,
+      interactive: this.options.interactive !== false,
       noteLink: this.options.noteLink?.() ?? null,
+      notePath: () => this.options.notePath?.() ?? null,
+      saveNote: () => this.options.saveNote?.(),
       replaceSource: (next) => {
         const pos = safePos(view, host);
         const fence = pos === null ? undefined : fenceAt(view, pos);
@@ -354,20 +485,7 @@ export class MediaBlockWidget extends WidgetType {
         };
       },
       scroller: view.scrollDOM,
-      editSource: () => {
-        const pos = safePos(view, host);
-        const fence = pos === null ? undefined : fenceAt(view, pos);
-        if (fence === undefined) {
-          return;
-        }
-        // A caret inside the range is what reveals a fence (`paint` below).
-        view.dispatch({
-          selection: { anchor: fence.bodyFrom },
-          scrollIntoView: true,
-          userEvent: "select.media-block",
-        });
-        view.focus();
-      },
+      editSource: () => showSource(view, host),
       remove: () => {
         const pos = safePos(view, host);
         const fence = pos === null ? undefined : fenceAt(view, pos);
@@ -394,6 +512,7 @@ export class MediaBlockWidget extends WidgetType {
       note.className = "cm-media-block-note";
       note.textContent = MEDIA_BLOCK_NO_DRIVE;
       host.prepend(note);
+      pressToShow(view, host);
       return;
     }
     let mount = this.options.mount;
@@ -405,6 +524,7 @@ export class MediaBlockWidget extends WidgetType {
       } catch {
         // The fence's text stays on screen: the block cannot draw, and says
         // what it is.
+        pressToShow(view, host);
         return;
       }
     }
@@ -433,60 +553,151 @@ export class MediaBlockWidget extends WidgetType {
     });
   }
 
-  /** Once the panel is there, no click on the block reveals its source — the
-   *  panel's ⋯ has *Edit block source* for that, and a click that put the
-   *  caret in the fence would drop the player under the hand that pressed it.
-   *  The fence text shown before the panel arrives, and the no-drive note,
-   *  have no menu, so a click there reveals the source like any fence. */
-  ignoreEvent(event: Event): boolean {
-    const host =
-      event.target instanceof Element ? event.target.closest(`.${MEDIA_BLOCK_CLASS}`) : null;
-    return host?.querySelector(`:scope > .${MEDIA_BLOCK_BODY_CLASS}`) != null;
+  /** Every event inside the block is the block's: no click and no key there
+   *  moves the caret into the fence, so none shows its source — the panel's
+   *  *Edit block source* does, and a block that could not draw a panel shows
+   *  it on a press ({@link pressToShow}). */
+  ignoreEvent(): boolean {
+    return true;
   }
 }
 
+/** A block with no panel has no *Edit block source*: a press on it is that request. */
+function pressToShow(view: EditorView, host: HTMLElement): void {
+  host.addEventListener("mousedown", (event) => {
+    event.preventDefault();
+    showSource(view, host);
+  });
+}
+
+/** What the layer holds: every fence, the ones drawn as a block, and their decorations. */
+interface MediaLayerValue {
+  fences: MediaFence[];
+  hidden: MediaFence[];
+  decorations: DecorationSet;
+}
+
 /**
- * The media layer. Scan and reveal are separated as `mermaidLayer` separates
- * them: moving the caret rebuilds the decorations from the fences already
- * found, and only an edit — or the parser reaching further — re-scans.
+ * The media layer. Scan and paint are separated as `mermaidLayer` separates
+ * them: moving the caret repaints from the fences already found, and only an
+ * edit — or the parser reaching further — re-scans.
  */
 export function mediaBlockLayer(options: MediaBlockOptions = {}): Extension {
-  const paint = (fences: readonly MediaFence[], state: EditorState): DecorationSet =>
-    Decoration.set(
-      fences
-        .filter(
-          (fence) =>
-            !state.selection.ranges.some(
-              (range) => range.from <= fence.to && range.to >= fence.from,
+  const paint = (fences: MediaFence[], state: EditorState): MediaLayerValue => {
+    const shown = state.field(revealedField);
+    const hidden = fences.filter((fence) => !shown.some((open) => open.from === fence.from));
+    const decorations = Decoration.set(
+      hidden.map((fence) =>
+        Decoration.replace({
+          widget: new MediaBlockWidget(
+            fence.source,
+            state.doc.sliceString(fence.from, fence.to),
+            options,
+            state.selection.ranges.some(
+              (range) => !range.empty && range.from <= fence.from && range.to >= fence.to,
             ),
-        )
-        .map((fence) =>
-          Decoration.replace({
-            widget: new MediaBlockWidget(
-              fence.source,
-              state.doc.sliceString(fence.from, fence.to),
-              options,
-            ),
-            block: true,
-          }).range(fence.from, fence.to),
-        ),
+          ),
+          block: true,
+        }).range(fence.from, fence.to),
+      ),
       true,
     );
-  return StateField.define<{ fences: MediaFence[]; decorations: DecorationSet }>({
-    create(state) {
-      const fences = mediaFences(state);
-      return { fences, decorations: paint(fences, state) };
-    },
+    return { fences, hidden, decorations };
+  };
+  const layer = StateField.define<MediaLayerValue>({
+    create: (state) => paint(mediaFences(state), state),
     update(value, transaction) {
       const rescan =
         transaction.docChanged ||
         syntaxTree(transaction.startState) !== syntaxTree(transaction.state);
-      if (!rescan && transaction.selection === undefined) {
+      // The start state lacks the field when a reconfigure (the note's Source
+      // view handing back to Note) has just added this layer.
+      if (
+        !rescan &&
+        transaction.selection === undefined &&
+        transaction.startState.field(revealedField, false) ===
+          transaction.state.field(revealedField)
+      ) {
         return value;
       }
-      const fences = rescan ? mediaFences(transaction.state) : value.fences;
-      return { fences, decorations: paint(fences, transaction.state) };
+      return paint(rescan ? mediaFences(transaction.state) : value.fences, transaction.state);
     },
-    provide: (field) => EditorView.decorations.from(field, (value) => value.decorations),
+    provide: (field) => [
+      EditorView.decorations.from(field, (value) => value.decorations),
+      // The caret keys step over a drawn block, and a shift-selection takes it whole.
+      EditorView.atomicRanges.of((view) => view.state.field(field).decorations),
+    ],
+  });
+  return [revealedField, layer, guardEdges(layer)];
+}
+
+/**
+ * Keep a drawn block's fence a fence under keys pressed beside it. The caret
+ * can rest on a hidden block's first or last position, where nothing of the
+ * fence is visible: text typed or pasted there goes on a line of its own, and
+ * a Backspace or Delete that would join a line of text onto the fence line
+ * moves the caret over the line break instead. Either edit would otherwise
+ * leave a fence Markdown no longer reads — and the block would vanish into
+ * its source under a hand that never saw it.
+ */
+function guardEdges(layer: StateField<MediaLayerValue>): Extension {
+  return EditorState.transactionFilter.of((transaction) => {
+    if (
+      !transaction.docChanged ||
+      transaction.isUserEvent("input.media-block") ||
+      transaction.isUserEvent("delete.media-block") ||
+      !(transaction.isUserEvent("input") || transaction.isUserEvent("delete"))
+    ) {
+      return transaction;
+    }
+    const hidden = transaction.startState.field(layer, false)?.hidden ?? [];
+    const edits: { from: number; to: number; text: string }[] = [];
+    transaction.changes.iterChanges((from, to, _fromB, _toB, inserted) => {
+      edits.push({ from, to, text: inserted.toString() });
+    });
+    if (hidden.length === 0 || edits.length !== 1) {
+      return transaction;
+    }
+    const [edit] = edits;
+    const doc = transaction.startState.doc;
+    const userEvent = transaction.annotation(Transaction.userEvent);
+    if (edit.from === edit.to && edit.text !== "") {
+      if (hidden.some((fence) => fence.from === edit.from)) {
+        return {
+          changes: { from: edit.from, insert: `${edit.text}\n` },
+          selection: { anchor: edit.from + edit.text.length },
+          userEvent,
+          scrollIntoView: true,
+        } satisfies TransactionSpec;
+      }
+      if (hidden.some((fence) => fence.to === edit.from)) {
+        return {
+          changes: { from: edit.from, insert: `\n${edit.text}` },
+          selection: { anchor: edit.from + 1 + edit.text.length },
+          userEvent,
+          scrollIntoView: true,
+        } satisfies TransactionSpec;
+      }
+      return transaction;
+    }
+    if (
+      edit.text === "" &&
+      edit.to === edit.from + 1 &&
+      doc.sliceString(edit.from, edit.to) === "\n"
+    ) {
+      // Backspace at a block's start: the line above would join its opening fence.
+      const joinsAbove = hidden.some(
+        (fence) => fence.from === edit.to && doc.lineAt(edit.from).text.trim() !== "",
+      );
+      // Delete at a block's end: the line below would join its closing fence.
+      const joinsBelow = hidden.some(
+        (fence) => fence.to === edit.from && doc.lineAt(edit.to).text.trim() !== "",
+      );
+      if (joinsAbove || joinsBelow) {
+        const head = transaction.startState.selection.main.head;
+        return { selection: { anchor: head === edit.to ? edit.from : edit.to } };
+      }
+    }
+    return transaction;
   });
 }

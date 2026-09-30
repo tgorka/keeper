@@ -38,6 +38,7 @@ use keeper_core::notes::default_spaces;
 use keeper_core::notes::embed::{self, NoteEmbedPathVm, NoteEmbedVm};
 use keeper_core::notes::frontmatter::{FieldValue, Frontmatter};
 use keeper_core::notes::index::{IndexEntry, IndexSnapshot, TagTerms};
+use keeper_core::notes::live_editor::{self, split_note, LiveEditor, SaveBase};
 use keeper_core::notes::search_index::{self, MatchWhy, SearchIndex, SEARCH_DB_FILE};
 use keeper_core::notes::template_update::{
     self, TemplateUpdateAppliedVm, TemplateUpdateApplyReq, TemplateUpdateOfferVm,
@@ -220,7 +221,7 @@ struct BodySub {
     vault_id: String,
     note_id: String,
     channel: Channel<NoteBodyBatch>,
-    state: Mutex<BodyState>,
+    state: Mutex<LiveEditor>,
     /// Held across every write through this subscription, and `true` once
     /// `notes_close` has let it go: a save that finds it `true` writes nothing,
     /// so no save can land after the release decided (AD-304).
@@ -234,55 +235,12 @@ fn lock_released(sub: &BodySub) -> MutexGuard<'_, bool> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Split a note into its frontmatter block and its body.
-///
-/// The block is `source[..body_offset]` — fences, any byte-order mark and the
-/// newline after the closing fence included — so the two halves concatenated are
-/// the source again, byte for byte. An empty block means the note has none.
-fn split_note(source: &str) -> (&str, &str) {
-    let (_, body_offset) = Frontmatter::parse(source);
-    source.split_at(body_offset)
-}
-
 /// Put a document back together from a block and a body.
 fn join_note(frontmatter: &str, body: &str) -> String {
     let mut out = String::with_capacity(frontmatter.len() + body.len());
     out.push_str(frontmatter);
     out.push_str(body);
     out
-}
-
-/// What Rust holds for a live editor.
-///
-/// `base` is the exact bytes keeper last wrote or last delivered — the whole
-/// document, block included — and is **never re-read from disk**, which is what
-/// makes it a true common ancestor and what makes the clean/dirty distinction
-/// meaningful (AD-58). `mine` is the editor's buffer, which is the **body alone**,
-/// kept current by `notes_buffer_report`. `written` is the revision THIS
-/// subscription last wrote, and nothing else moves it — `base` and `rev` also
-/// follow external edits — so it is what tells our own autosave apart from
-/// somebody else's write.
-struct BodyState {
-    rel: String,
-    base: String,
-    rev: String,
-    mine: Option<String>,
-    written: Option<String>,
-}
-
-impl BodyState {
-    /// The block and the body of `base`.
-    fn split(&self) -> (&str, &str) {
-        split_note(&self.base)
-    }
-
-    /// Whether the editor has unsaved edits. Body against body: the block is not
-    /// the editor's to change, so it can never be what makes a buffer dirty.
-    fn is_dirty(&self) -> bool {
-        self.mine
-            .as_ref()
-            .is_some_and(|mine| mine.as_str() != self.split().1)
-    }
 }
 
 static SUBSCRIPTIONS: LazyLock<Mutex<HashMap<String, Subscription>>> =
@@ -4423,13 +4381,7 @@ pub async fn notes_open(
         vault_id: vault_id.clone(),
         note_id: note_id.clone(),
         channel,
-        state: Mutex::new(BodyState {
-            rel: entry.path.clone(),
-            base: text,
-            rev,
-            mine: None,
-            written: None,
-        }),
+        state: Mutex::new(LiveEditor::opened(entry.path.clone(), text, rev)),
         released: Mutex::new(false),
     });
     let watcher = Arc::clone(&sub);
@@ -4518,7 +4470,7 @@ async fn watch_body(sub: Arc<BodySub>) {
     }
 }
 
-fn lock_body(sub: &BodySub) -> MutexGuard<'_, BodyState> {
+fn lock_body(sub: &BodySub) -> MutexGuard<'_, LiveEditor> {
     sub.state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4665,13 +4617,9 @@ pub async fn notes_buffer_report(
     rev: String,
 ) -> Result<(), IpcError> {
     let sub = body_sub(&subscription_id)?;
-    let mut state = lock_body(&sub);
-    // A report against a revision we have moved past is stale — the editor sent
-    // it before it applied an external change — so it must not resurrect the old
-    // buffer as "mine".
-    if state.rev == rev {
-        state.mine = Some(text);
-    }
+    // A report against a revision we have moved past is stale; one only a
+    // keeper block change replaced is not (`LiveEditor::report`).
+    lock_body(&sub).report(text, &rev);
     Ok(())
 }
 
@@ -4809,6 +4757,11 @@ fn save_gated(
 
 /// One write through a subscription. The caller holds `sub.released` and has
 /// checked it is `false`.
+///
+/// A save whose base only keeper's own block change has moved past
+/// (`SaveBase::Amended`) keeps that block when it brings none — the autosave —
+/// and is refused when it brings its own: the properties panel composed that
+/// block before keeper's change reached it, and writing it would undo keeper's.
 fn write_through(
     sub: &BodySub,
     vault: &Vault,
@@ -4820,10 +4773,17 @@ fn write_through(
 
     let disk = notes_vault::read_note(vault, &rel).unwrap_or_default();
     let disk_rev = notes_vault::content_rev(&disk);
-    let conflict_copy = if disk_rev == base_rev || disk.is_empty() {
-        None
+    let base = if disk.is_empty() {
+        SaveBase::Current
     } else {
+        lock_body(sub)
+            .admit_save(base_rev, &disk_rev, frontmatter.is_some())
+            .map_err(notes_error)?
+    };
+    let conflict_copy = if base == SaveBase::Stale {
         notes_vault::write_conflict_copy(vault, &rel, &disk)
+    } else {
+        None
     };
 
     let stamped = {
@@ -4833,19 +4793,99 @@ fn write_through(
     notes_vault::write_note(vault, &rel, &stamped).map_err(notes_error)?;
     let rev = notes_vault::content_rev(&stamped);
     let block = split_note(&stamped).0.to_owned();
-    {
-        let mut state = lock_body(sub);
-        state.base = stamped;
-        state.rev = rev.clone();
-        state.mine = None;
-        state.written = Some(rev.clone());
-    }
+    lock_body(sub).saved(stamped, rev.clone());
     Ok(NoteWriteVm {
         rev,
         path: rel,
         frontmatter: block,
         conflict_copy,
     })
+}
+
+/// How many times a keeper block change re-reads a note that changed under it.
+const AMEND_ATTEMPTS: usize = 3;
+
+/// Change the frontmatter block of the note `rel` in `vault` through `amend`,
+/// safely under any editor that has it open (story 88.9's recording tags).
+/// `Ok(false)` when `amend` declined or changed nothing; refused when it would
+/// change the body.
+///
+/// Every live editor on the note is held for the whole operation — its
+/// `released` gate, so no save of its interleaves, then its state — and the
+/// note is read, amended, read again to check nothing moved, and written. An
+/// editor whose base body is the disk's then adopts the new block and revision
+/// and is sent [`NoteBodyBatch::Block`]; a save it already composed against the
+/// revision before counts as current (`LiveEditor::save_base`), so the tags
+/// survive its next autosave and no conflict copy is written. An editor with
+/// an external change pending gets nothing extra: the watcher's usual answer
+/// covers keeper's write too.
+///
+/// Lock order: the gates, then the states, each in address order, and
+/// `SUBSCRIPTIONS` only to list the editors, never while holding either.
+pub(crate) fn amend_block(
+    vault: &Vault,
+    rel: &str,
+    amend: impl Fn(&str) -> Option<String>,
+) -> Result<bool, NotesError> {
+    let mut editors: Vec<Arc<BodySub>> = subscriptions()
+        .values()
+        .filter_map(|sub| sub.body.clone())
+        .filter(|sub| sub.vault_id == vault.id)
+        .collect();
+    editors.retain(|sub| lock_body(sub).rel == rel);
+    editors.sort_by_key(|sub| Arc::as_ptr(sub) as usize);
+    let gates: Vec<MutexGuard<'_, bool>> = editors.iter().map(|sub| lock_released(sub)).collect();
+    let mut open: Vec<(&BodySub, MutexGuard<'_, LiveEditor>)> = editors
+        .iter()
+        .zip(&gates)
+        .filter(|(_, released)| !***released)
+        .map(|(sub, _)| (sub.as_ref(), lock_body(sub)))
+        .collect();
+    for _ in 0..AMEND_ATTEMPTS {
+        let disk = notes_vault::read_note(vault, rel)?;
+        let Some(next) = live_editor::amend_block(&disk, &amend)? else {
+            return Ok(false);
+        };
+        let disk_rev = notes_vault::content_rev(&disk);
+        if notes_vault::content_rev(&notes_vault::read_note(vault, rel)?) != disk_rev {
+            continue;
+        }
+        notes_vault::write_note(vault, rel, &next)?;
+        let next_rev = notes_vault::content_rev(&next);
+        let block = split_note(&next).0;
+        for (sub, state) in &mut open {
+            if state.adopt_amendment(&disk, next.clone(), next_rev.clone()) {
+                let _ = sub.channel.send(NoteBodyBatch::Block {
+                    rev: next_rev.clone(),
+                    frontmatter: block.to_owned(),
+                });
+            }
+        }
+        return Ok(true);
+    }
+    Err(NotesError::Name(format!(
+        "{rel} kept changing while keeper wrote to it"
+    )))
+}
+
+/// What the live editors on the note `rel` in vault `vault_id` hold: each
+/// one's base (the whole document) and its last-reported buffer (the body).
+/// Words typed but not yet saved are the note too.
+pub(crate) fn live_texts(vault_id: &str, rel: &str) -> Vec<String> {
+    let editors: Vec<Arc<BodySub>> = subscriptions()
+        .values()
+        .filter_map(|sub| sub.body.clone())
+        .filter(|sub| sub.vault_id == vault_id)
+        .collect();
+    let mut texts = Vec::new();
+    for sub in editors {
+        let state = lock_body(&sub);
+        if state.rel == rel {
+            texts.push(state.base.clone());
+            texts.extend(state.mine.clone());
+        }
+    }
+    texts
 }
 
 // ---------------------------------------------------------------------------
@@ -7726,22 +7766,107 @@ mod tests {
 
     /// What `notes_open` registers, minus the index wait and the watcher.
     fn open_editor(vault: &Vault, note: &NoteRefVm) -> String {
-        let text = notes_vault::read_note(vault, &note.path).expect("read the note");
+        open_on(vault, &note.id, &note.path)
+    }
+
+    /// An editor on the note `rel`, registered as `notes_open` would.
+    fn open_on(vault: &Vault, note_id: &str, rel: &str) -> String {
+        let text = notes_vault::read_note(vault, rel).expect("read the note");
         let rev = notes_vault::content_rev(&text);
         let sub = Arc::new(BodySub {
             vault_id: vault.id.clone(),
-            note_id: note.id.clone(),
+            note_id: note_id.to_owned(),
             channel: Channel::new(|_| Ok(())),
-            state: Mutex::new(BodyState {
-                rel: note.path.clone(),
-                base: text,
-                rev,
-                mine: None,
-                written: None,
-            }),
+            state: Mutex::new(LiveEditor::opened(rel.to_owned(), text, rev)),
             released: Mutex::new(false),
         });
         register(Some(sub), tauri::async_runtime::spawn(async {}))
+    }
+
+    #[test]
+    fn a_dirty_editor_saves_over_keepers_tags_and_keeps_them_without_a_conflict_copy() {
+        let vault = test_vault("amend-dirty");
+        let rel = "amend-dirty-standup.md";
+        std::fs::write(vault.root.join(rel), "---\ntitle: Standup\n---\nAgenda.\n").expect("note");
+        let editor = open_on(&vault, "amend-dirty", rel);
+        let opened = rev_of(&editor);
+        let typed = "Agenda.\nTyped while it records.\n";
+        lock_body(&body_sub(&editor).expect("live")).report(typed.to_owned(), &opened);
+
+        assert!(amend_block(&vault, rel, |text| {
+            Some(keeper_core::notes::note_recording::with_recording_tags(
+                text, "hesperia",
+            ))
+        })
+        .expect("tagged"));
+        // The autosave the editor composed before it heard of the tags.
+        let written = save(&vault, &editor, typed, &opened);
+
+        let disk = notes_vault::read_note(&vault, rel).expect("note");
+        assert_eq!(split_note(&disk).1, typed, "the typed words landed");
+        assert!(
+            disk.contains("recording/hesperia"),
+            "and the tags stayed: {disk}"
+        );
+        assert_eq!(written.conflict_copy, None);
+        assert_eq!(
+            conflict_copies(&vault),
+            0,
+            "keeper's own tags are not a conflict"
+        );
+        unregister(&editor);
+        std::fs::remove_dir_all(&vault.root).ok();
+    }
+
+    #[test]
+    fn a_property_edit_composed_before_keepers_tags_is_refused() {
+        let vault = test_vault("amend-props");
+        let rel = "amend-props-standup.md";
+        std::fs::write(vault.root.join(rel), "---\ntitle: Standup\n---\nAgenda.\n").expect("note");
+        let editor = open_on(&vault, "amend-props", rel);
+        let opened = rev_of(&editor);
+
+        assert!(amend_block(&vault, rel, |text| {
+            Some(keeper_core::notes::note_recording::with_recording_tags(
+                text, "hesperia",
+            ))
+        })
+        .expect("tagged"));
+        let sub = body_sub(&editor).expect("live");
+        let refused = save_gated(
+            &editor,
+            &sub,
+            &vault,
+            "Agenda.\n",
+            &opened,
+            Some("---\ntitle: Weekly\n---\n"),
+        );
+
+        assert!(refused.is_err(), "the pre-tag block is not written");
+        let disk = notes_vault::read_note(&vault, rel).expect("note");
+        assert!(disk.contains("recording/hesperia"), "{disk}");
+        assert_eq!(conflict_copies(&vault), 0);
+        unregister(&editor);
+        std::fs::remove_dir_all(&vault.root).ok();
+    }
+
+    #[test]
+    fn a_note_nobody_has_open_is_amended_on_disk() {
+        let vault = test_vault("amend-closed");
+        let rel = "amend-closed-standup.md";
+        std::fs::write(vault.root.join(rel), "---\ntitle: Standup\n---\nAgenda.\n").expect("note");
+
+        assert!(amend_block(&vault, rel, |text| {
+            Some(keeper_core::notes::note_recording::with_recording_tags(
+                text, "hesperia",
+            ))
+        })
+        .expect("tagged"));
+        let disk = notes_vault::read_note(&vault, rel).expect("note");
+        assert!(disk.contains("recording/hesperia"), "{disk}");
+        assert_eq!(split_note(&disk).1, "Agenda.\n");
+        assert!(amend_block(&vault, rel, |text| Some(format!("{text}More.\n"))).is_err());
+        std::fs::remove_dir_all(&vault.root).ok();
     }
 
     /// An editor's save, as `notes_save` makes it once it has resolved the
@@ -8689,33 +8814,6 @@ mod tests {
         assert_eq!(space_icon(""), None);
         assert_eq!(space_icon("   "), None);
         assert_eq!(space_icon(&"x".repeat(MAX_ICON_BYTES + 1)), None);
-    }
-
-    /// Dirtiness is a body-against-body question. `base` is the whole document,
-    /// `mine` is the editor's buffer, and the block between them is not the editor's
-    /// to change — so a buffer holding exactly the delivered body is clean, block or
-    /// no block.
-    #[test]
-    fn a_dirty_buffer_is_the_one_that_differs_from_what_we_delivered() {
-        let mut state = BodyState {
-            rel: "a.md".to_owned(),
-            base: "---\nid: 01AAA\n---\nhello".to_owned(),
-            rev: "5-x".to_owned(),
-            mine: None,
-            written: None,
-        };
-        assert!(!state.is_dirty(), "no report yet is not dirty");
-        state.mine = Some("hello".to_owned());
-        assert!(
-            !state.is_dirty(),
-            "a buffer identical to the body we delivered is not dirty"
-        );
-        // The whole document is NOT what the editor holds: a buffer that somehow
-        // carried the block would be a buffer that had diverged.
-        state.mine = Some(state.base.clone());
-        assert!(state.is_dirty());
-        state.mine = Some("hello world".to_owned());
-        assert!(state.is_dirty());
     }
 }
 

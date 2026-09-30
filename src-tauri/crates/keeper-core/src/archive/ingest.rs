@@ -30,6 +30,9 @@ use super::{db, fts, recordings, ArchiveEvent, ArchiveMsg};
 /// task never dies, so the sync/messaging path is never blocked. Ends when every
 /// [`super::ArchiveHandle`] sender is dropped.
 pub(super) async fn run(mut rx: UnboundedReceiver<ArchiveMsg>, conn: Connection) {
+    // Whether a recordings rebuild failed since the last `Settled` barrier:
+    // a refresh that could not walk a root has not matched the index to it.
+    let mut rebuild_failed = false;
     while let Some(msg) = rx.recv().await {
         match msg {
             ArchiveMsg::Insert(ev) => insert_event(&conn, &ev),
@@ -52,12 +55,18 @@ pub(super) async fn run(mut rx: UnboundedReceiver<ArchiveMsg>, conn: Connection)
                 relative_path,
             } => move_recording(&conn, &session_id, &relative_path),
             ArchiveMsg::RebuildRecordings(request) => {
-                blocking(|| rebuild_recordings(&conn, &request))
+                if !blocking(|| rebuild_recordings(&conn, &request)) {
+                    rebuild_failed = true;
+                }
             }
             ArchiveMsg::ForgetRecordingsRoot {
                 root_kind,
                 profile_id,
             } => forget_recordings_root(&conn, &root_kind, profile_id.as_deref()),
+            // Nobody listening any more is not the writer's concern.
+            ArchiveMsg::Settled(done) => {
+                let _ = done.send(!std::mem::take(&mut rebuild_failed));
+            }
         }
     }
     tracing::info!("archive writer task ended (all senders dropped)");
@@ -149,31 +158,38 @@ fn move_recording(conn: &Connection, session_id: &str, relative_path: &str) {
 /// and removed nothing says nothing.
 ///
 /// Best-effort like every other recording write: a walk that cannot finish is
-/// logged and the writer carries on. Nothing upstream is waiting on the count.
-fn rebuild_recordings(conn: &Connection, request: &recordings::RebuildRequest) {
+/// logged and the writer carries on. `false` then, so the next barrier can
+/// say the refresh did not reach every root.
+fn rebuild_recordings(conn: &Connection, request: &recordings::RebuildRequest) -> bool {
     let profile_id = request.profile_id.as_deref().unwrap_or("-");
     match recordings::rebuild_from_disk(conn, request) {
         Ok(recordings::RebuildOutcome {
             written: 0,
             removed: 0,
             ..
-        }) => {}
-        Ok(outcome) => tracing::info!(
-            written = outcome.written,
-            removed = outcome.removed,
-            found = outcome.found.len(),
-            root_kind = %request.root_kind,
-            profile_id,
-            root = %request.root.display(),
-            "archive: rebuilt the recordings index from the session folders"
-        ),
-        Err(e) => tracing::warn!(
-            root = %request.root.display(),
-            root_kind = %request.root_kind,
-            profile_id,
-            error = %e,
-            "archive: could not rebuild the recordings index"
-        ),
+        }) => true,
+        Ok(outcome) => {
+            tracing::info!(
+                written = outcome.written,
+                removed = outcome.removed,
+                found = outcome.found.len(),
+                root_kind = %request.root_kind,
+                profile_id,
+                root = %request.root.display(),
+                "archive: rebuilt the recordings index from the session folders"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                root = %request.root.display(),
+                root_kind = %request.root_kind,
+                profile_id,
+                error = %e,
+                "archive: could not rebuild the recordings index"
+            );
+            false
+        }
     }
 }
 
@@ -210,7 +226,7 @@ fn forget_recordings_root(conn: &Connection, root_kind: &str, profile_id: Option
 /// worker's other tasks to another thread first. On the fallback
 /// current-thread runtime (the writer's own OS thread) there is nothing to
 /// hand over and `block_in_place` would panic, so the body simply runs.
-fn blocking(body: impl FnOnce()) {
+fn blocking<T>(body: impl FnOnce() -> T) -> T {
     let multi_thread = tokio::runtime::Handle::try_current().is_ok_and(|handle| {
         matches!(
             handle.runtime_flavor(),
@@ -218,9 +234,9 @@ fn blocking(body: impl FnOnce()) {
         )
     });
     if multi_thread {
-        tokio::task::block_in_place(body);
+        tokio::task::block_in_place(body)
     } else {
-        body();
+        body()
     }
 }
 
@@ -862,6 +878,50 @@ mod tests {
             "the write that failed left nothing behind"
         );
         drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The barrier after a refresh says whether every root was rebuilt: a
+    /// rebuild that could not run answers `false` once, and the next refresh
+    /// that works answers `true` again — what the daily reconcile stamps on.
+    #[tokio::test]
+    async fn the_barrier_says_whether_every_rebuild_since_the_last_one_succeeded() {
+        use tokio::sync::mpsc;
+        let dir = temp_dir();
+        let root = dir.join("recordings");
+        std::fs::create_dir_all(&root).expect("root");
+        let conn = open_archive_db(&dir).expect("open");
+        conn.execute("DROP TABLE recordings", [])
+            .expect("drop recordings table");
+        let (tx, rx) = mpsc::unbounded_channel::<ArchiveMsg>();
+        let task = tokio::spawn(run(rx, conn));
+        let rebuild = || {
+            ArchiveMsg::RebuildRecordings(recordings::RebuildRequest::new(
+                root.clone(),
+                "folder",
+                None,
+            ))
+        };
+        let barrier = |tx: &mpsc::UnboundedSender<ArchiveMsg>| {
+            let (done, answer) = tokio::sync::oneshot::channel();
+            tx.send(ArchiveMsg::Settled(done)).expect("send barrier");
+            answer
+        };
+
+        tx.send(rebuild()).expect("send doomed rebuild");
+        tx.send(rebuild()).expect("send a second rebuild");
+        assert!(
+            !barrier(&tx).await.expect("writer answers"),
+            "a rebuild that failed is not a whole refresh"
+        );
+        drop(open_archive_db(&dir).expect("second open restores the recordings schema"));
+        tx.send(rebuild()).expect("send rebuild after restore");
+        assert!(
+            barrier(&tx).await.expect("writer answers"),
+            "the failure was the last refresh's, not this one's"
+        );
+        drop(tx);
+        task.await.expect("writer task joins");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

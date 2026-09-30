@@ -837,6 +837,23 @@ pub fn add_recovered_session_acknowledged(data_dir: &Path, key: &str) -> Result<
     set_setting(data_dir, UI_RECOVERED_SESSIONS_ACKNOWLEDGED_KEY, &json)
 }
 
+/// The `settings` key holding when the recordings index last finished a
+/// refresh of every recordings root, in ms since the Unix epoch — what the
+/// daily reconcile measures its day from. keeper's own record, never a
+/// preference.
+const RECORDINGS_LAST_RECONCILE_MS_KEY: &str = "recordings.last_reconcile_ms";
+
+/// When the recordings index last finished a whole refresh. Absent or
+/// unparsable ⇒ `None` (never, as far as this install knows).
+pub fn get_recordings_last_reconcile_ms(data_dir: &Path) -> Result<Option<i64>, CoreError> {
+    Ok(get_setting(data_dir, RECORDINGS_LAST_RECONCILE_MS_KEY)?.and_then(|raw| raw.parse().ok()))
+}
+
+/// Record that the recordings index finished a whole refresh at `ms`.
+pub fn set_recordings_last_reconcile_ms(data_dir: &Path, ms: i64) -> Result<(), CoreError> {
+    set_setting(data_dir, RECORDINGS_LAST_RECONCILE_MS_KEY, &ms.to_string())
+}
+
 /// The `settings` key holding the opt-in menu-bar (tray) presence toggle (Story 10.3).
 /// Stored as `"1"`/`"0"`; absent = off (no tray by default).
 const SYSTEM_MENU_BAR_PRESENCE_KEY: &str = "system.menu_bar_presence";

@@ -3,7 +3,6 @@ import {
   currentUtterance,
   locate,
   nearestLine,
-  nextLine,
   sessionLength,
 } from "@/components/transcription/session-timeline";
 import { SESSION_TRANSCRIPT_FIXTURE } from "../../../dev/transcription-fixture";
@@ -59,22 +58,5 @@ describe("One timeline over a session's parts", () => {
     expect(near("S1", 99)).toBe("c");
     expect(near("S2", 0)).toBe("b");
     expect(near("S3", 0)).toBeNull();
-  });
-
-  it("finds a speaker's next line after the player, wrapping to their first past the last", () => {
-    const lines = [
-      { id: "a", speaker: "S1", start: 0, end: 4 },
-      { id: "b", speaker: "S2", start: 4, end: 8 },
-      { id: "c", speaker: "S1", start: 12, end: 16 },
-    ];
-    const next = (speaker: string, seconds: number) =>
-      lines[nextLine(lines, speaker, seconds)]?.id ?? null;
-    // Inside a's span, and exactly at its start, the next one is c, not a again.
-    expect(next("S1", 2)).toBe("c");
-    expect(next("S1", 0)).toBe("c");
-    expect(next("S1", 11.9)).toBe("c");
-    expect(next("S1", 12)).toBe("a");
-    expect(next("S2", 4)).toBe("b");
-    expect(next("S3", 0)).toBeNull();
   });
 });

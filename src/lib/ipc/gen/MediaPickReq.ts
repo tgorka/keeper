@@ -4,4 +4,4 @@
  * What the person picked to play: a recording from the recordings index,
  * or a file in the note's drive (N3).
  */
-export type MediaPickReq = { "kind": "session", sessionId: string, } | { "kind": "file", relativePath: string, };
+export type MediaPickReq = { "kind": "session", sessionId: string, } | { "kind": "file", relativePath: string, } | { "kind": "newRecording" };

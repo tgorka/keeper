@@ -159,7 +159,7 @@ transcript viewer itself, its player and under it the transcript's lines, follow
 
 ````markdown
 ```keeper-media
-session = "01J8…-01J8…"          # exactly one of: session | transcript | [[part]] | src
+session = "01J8…-01J8…"          # exactly one of: session | transcript | [[part]] | src | record
 title = "Pricing, with Kelly"    # optional
 from = "00:12:00"                # optional window, [from, to), on the recording's own clock
 to = "00:15:30"
@@ -199,6 +199,16 @@ at = "00:13:05"
   *Edit block source*, which shows the fence's text with the caret inside it, and *Remove
   widget*, which deletes the fence and a `[!transcript]` callout attached to it; ⌘Z brings
   both back.
+- **Hints while you write it.** With the source open, completion offers the keys that may
+  stand on the caret's line — the root's, or a `[[part]]`'s or a `[[marker]]`'s under that
+  header — each with a line saying what it does, never one already written in that table and
+  never a second source. After `=` it offers the key's values: `picture`/`sound`/`record`'s
+  words, the player's time when the block was playing before its source was opened and
+  `"00:00:00"`, recent recordings as *title · date* writing the identity, and the note's
+  drive folder by folder, only the files the key takes (`transcript`, audio or video for
+  `file`, video for `camera`, `.toml` for `src`). A body that does not read is underlined on
+  the key or line Rust refused, the refusal's sentence on hover. The catalogue is Rust's
+  (`media_block_schema`) and so is the check (`media_block_check`).
 - **Markers.** *Mark this moment* and *Mark a window…* add a `[[marker]]` table; rename and
   remove change only that table and keep every other byte, comments included
   (`media_block_edit`). `[[Note#The price we agreed]]`, or `[[#…]]` in the same note, opens the
@@ -249,6 +259,61 @@ Older notes carry one embed per video, or a three-line block with no comments;
 whose embeds are still exactly what keeper wrote, or whose block is still exactly those three
 lines naming its own recording, and nothing else in it — and names the ones left alone because
 somebody edited their embeds.
+
+**Recording from a note.** *Insert widget → Media player… → New recording* (on a Mac that
+records) inserts a block that has not recorded yet — with the commented optional keys every
+block keeper writes carries:
+
+````markdown
+```keeper-media
+record = "new"
+```
+````
+
+`record` takes only `"new"` and is a source of its own, so it cannot sit beside `session`,
+`transcript`, `[[part]]` or `src` (nor in a `src` file). The block draws the Recording pane's
+setup — what to capture, system audio, microphone and camera, where it saves — and *Start
+recording*. Start records a session linked to this note (`linkedNote` in its `manifest.json`:
+the vault and the note's path in it). The moment the start answers, the block that pressed it
+names the session: its own body becomes `session = "<id>"` (Rust composes it — `record` turns
+into `session` in place, every other byte of the block stays), as an ordinary edit, and the
+note is written at once as ⌘S writes it. If the block moved or was removed within that round
+trip it keeps `record = "new"` and says "Recording — this block could not take its name; stop
+it in the Recording pane." While it records:
+
+- the note's `tags` gain `recording` and `recording/<this Mac's host name, slugged>`;
+- the block naming the live session shows the live banner with *Stop*; in Preview, in the
+  Files preview or in another note, a block naming it says only "Recording…";
+- every `record = "new"` block, in this note or another, shows "Recording in *note title*",
+  a link to it, and no Start — keeper records one session at a time.
+
+What a block is — a record block, the session it names, and whether that session is recording
+into this note — is one question to Rust per block.
+
+**keeper never edits the note's body for a recording** — only its tags, so typing in the note
+while it records cannot race keeper. A tag change goes through the notes writer's block
+amendment: with the note open in an editor, that editor's saves are held while keeper reads,
+changes the frontmatter alone and writes; the editor adopts the new block and revision
+(a `block` batch on its channel) and keeps every word typed, and a body save it had already sent
+against the older revision is not a conflict — the disk differs only by keeper's own block
+change. A properties edit composed before the new block arrived is refused rather than written
+(it would undo the tags): the panel says so and the edit is made again. With no editor open it
+is a plain re-read-and-write. An editor's saves go one at a time per note — blur, the idle
+autosave and a block's own save wait for the one in flight and then write what is still
+unsaved — so two of them never carry the same revision.
+
+When it stops the tags go — `recording/<this Mac>`, and `recording` unless another Mac's
+`recording/<x>` is still there. A session started in the same note while the last one's stop
+is still being handled keeps its tags. The block becomes the player, transcription after
+recording runs as it does for any recording, and no separate recording note is written while
+the note still names the session — in a block on disk, or, while the note exists, in an open
+editor's unsaved words; a failed session's too. A note deleted, or whose block was removed or
+never got the name, gets the ordinary recording note instead. After a quit or a crash
+mid-recording, the recovery pass at the next launch (or the next Start) does the same. Tags a
+crash left behind are swept: whenever nothing records here — at launch once the vaults are
+indexed, before each Start and after each stop — every note in an open vault tagged
+`recording/<this Mac>` loses it (and `recording`, on the same rule), and another Mac's tag is
+left for that Mac. In Preview a `record = "new"` block says only "Not recorded yet.".
 
 In Obsidian, on GitHub or in `cat` the block is a code block: the title, the window and the
 markers read plainly, and a clip's words read as a quote.

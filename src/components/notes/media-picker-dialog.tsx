@@ -1,6 +1,7 @@
 /**
  * What a new media block plays: a recording, or a media or transcript file in
- * the note's drive (the *Media player…* row of *Insert widget* and of `/`).
+ * the note's drive — or a recording not made yet, a block that records here
+ * (the *Media player…* row of *Insert widget* and of `/`).
  *
  * The dialog chooses and Rust composes: the pick goes to `media_block_compose`
  * as a session id or a drive-relative path the listing itself answered with,
@@ -33,10 +34,13 @@ import {
   searchRecordings,
   syncBrowse,
 } from "@/lib/ipc/client";
+import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { clock } from "./editor/media-playback";
 
 export const MEDIA_PICKER_TITLE = "Insert a media player";
+/** The tab, and its button, that insert a block which records here. */
+export const NEW_RECORDING_LABEL = "New recording";
 const SEARCH_DELAY_MS = 200;
 const RECORDINGS_SHOWN = 50;
 
@@ -64,6 +68,9 @@ export function MediaPickerDialog({
   onPicked: (block: string) => void;
 }) {
   const [problem, setProblem] = useState<string | null>(null);
+  // Recording is a Mac's (desktop macOS ≥ 13): elsewhere there is nothing to
+  // start, so no block that records is offered.
+  const canRecord = useCapabilitiesStore((s) => s.capabilities.recording);
   const [busy, setBusy] = useState(false);
   async function compose(pick: MediaPickReq) {
     setBusy(true);
@@ -99,6 +106,7 @@ export function MediaPickerDialog({
           <TabsList>
             <TabsTrigger value="recordings">Recordings</TabsTrigger>
             <TabsTrigger value="files">Files in this drive</TabsTrigger>
+            {canRecord && <TabsTrigger value="new">{NEW_RECORDING_LABEL}</TabsTrigger>}
           </TabsList>
           <TabsContent value="recordings" className="flex min-h-0 flex-1 flex-col">
             {open && (
@@ -117,6 +125,21 @@ export function MediaPickerDialog({
               />
             )}
           </TabsContent>
+          {canRecord && (
+            <TabsContent value="new" className="flex flex-col items-start gap-3">
+              <p className="text-muted-foreground text-sm">
+                A block that records here: press Start in it, and when you stop, it plays the
+                recording.
+              </p>
+              <Button
+                type="button"
+                disabled={busy}
+                onClick={() => void compose({ kind: "newRecording" })}
+              >
+                {NEW_RECORDING_LABEL}
+              </Button>
+            </TabsContent>
+          )}
         </Tabs>
         {problem !== null && (
           <p role="alert" className="text-destructive text-sm">

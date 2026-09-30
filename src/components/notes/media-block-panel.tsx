@@ -78,8 +78,10 @@ import {
   transcriptionRunning,
   useTranscriptionStore,
 } from "@/lib/stores/transcription";
+import { cn } from "@/lib/utils";
 import type { MediaBlockMountArgs } from "./editor/media-block";
 import { clock } from "./editor/media-playback";
+import { LiveRecordingBlock, MediaRecorderPanel, useBlockRecording } from "./media-recorder-panel";
 
 export const MEDIA_BLOCK_MENU_LABEL = "Media block actions";
 export const OPEN_TRANSCRIPT_LABEL = "Open transcript";
@@ -136,14 +138,20 @@ export function MediaBlockPanel({
   profileId,
   source,
   editable,
+  interactive,
   replaceSource,
   noteLink,
+  notePath,
+  saveNote,
   register,
   claimPlayback,
   scroller,
   editSource,
   remove,
 }: MediaBlockMountArgs) {
+  /** What Rust says the body is — in one round trip: a `record = "new"` block
+   *  draws its recorder, and the block naming the live session its live view. */
+  const { kind: recording, ended: recordingEnded } = useBlockRecording(source, profileId, notePath);
   const [vm, setVm] = useState<MediaBlockVm | null>(null);
   const [refusal, setRefusal] = useState<string | null>(null);
   /** Bumped by a transcript write, to resolve the same body again. */
@@ -151,6 +159,9 @@ export function MediaBlockPanel({
   const [near, setNear] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState<number | null>(null);
+  /** `time` for the layer, which asks outside any render. */
+  const timeNow = useRef<number | null>(null);
+  timeNow.current = time;
   const [follow, setFollow] = useState(true);
   const [clip, setClip] = useState<ClipRequest | null>(null);
   const [naming, setNaming] = useState<Naming | null>(null);
@@ -236,7 +247,11 @@ export function MediaBlockPanel({
     player.current.seek(seconds, play);
   }, []);
 
-  useEffect(() => register({ seekTo: (seconds) => seekTo(seconds, false) }), [register, seekTo]);
+  useEffect(
+    () =>
+      register({ seekTo: (seconds) => seekTo(seconds, false), currentTime: () => timeNow.current }),
+    [register, seekTo],
+  );
 
   const attachPlayer = useCallback((handle: Seekable | null) => {
     player.current = handle;
@@ -295,7 +310,15 @@ export function MediaBlockPanel({
   }
 
   // The block's own verbs. A transcribed block appends them to the viewer's ⋯;
-  // otherwise they are the block's only menu.
+  // otherwise they are the block's only menu. A preview has none.
+  const editItems = (
+    <>
+      <DropdownMenuItem onSelect={editSource}>{EDIT_BLOCK_SOURCE_LABEL}</DropdownMenuItem>
+      <DropdownMenuItem variant="destructive" onSelect={remove}>
+        {REMOVE_WIDGET_LABEL}
+      </DropdownMenuItem>
+    </>
+  );
   const blockItems = (
     <>
       {vm?.transcribed && vm.transcriptPath !== null && (
@@ -340,16 +363,37 @@ export function MediaBlockPanel({
           </DropdownMenuItem>
         </>
       )}
-      {editable && (
-        <>
-          <DropdownMenuItem onSelect={editSource}>{EDIT_BLOCK_SOURCE_LABEL}</DropdownMenuItem>
-          <DropdownMenuItem variant="destructive" onSelect={remove}>
-            {REMOVE_WIDGET_LABEL}
-          </DropdownMenuItem>
-        </>
-      )}
+      {editable && editItems}
     </>
   );
+  const blockMenu = interactive ? <BlockMenu>{blockItems}</BlockMenu> : null;
+
+  // Nothing of the body is drawn before Rust has said what it is: the fence's
+  // text is the source view's, never a block's face.
+  if (recording === null) {
+    return null;
+  }
+  if (recording.records) {
+    // Rust refuses to resolve a block that has not recorded yet, so its
+    // refusal is never the block's face.
+    return (
+      <MediaRecorderPanel
+        profileId={profileId}
+        source={source}
+        notePath={notePath}
+        noteLink={noteLink}
+        preview={!interactive || !editable}
+        replaceSource={replaceSource}
+        saveNote={saveNote}
+        menu={editable ? <BlockMenu>{editItems}</BlockMenu> : undefined}
+      />
+    );
+  }
+  if (recording.live) {
+    // The session is still recording, so there is nothing to play yet: the
+    // banner where it records, a line anywhere else.
+    return <LiveRecordingBlock controls={recording.here && interactive} onEnded={recordingEnded} />;
+  }
 
   if (refusal !== null) {
     return (
@@ -358,7 +402,7 @@ export function MediaBlockPanel({
           <p role="alert" className="min-w-0 flex-1 text-destructive">
             {refusal}
           </p>
-          <BlockMenu>{blockItems}</BlockMenu>
+          {blockMenu}
         </div>
         <pre className="overflow-auto whitespace-pre-wrap rounded-md bg-muted p-2 font-mono text-xs">
           {source}
@@ -367,11 +411,7 @@ export function MediaBlockPanel({
     );
   }
   if (vm === null) {
-    return (
-      <pre className="overflow-auto whitespace-pre-wrap rounded-md bg-muted p-2 font-mono text-xs">
-        {source}
-      </pre>
-    );
+    return null;
   }
 
   const mountPlayer = near || playing;
@@ -385,6 +425,7 @@ export function MediaBlockPanel({
             key={marker.name}
             marker={marker}
             editable={editable}
+            menu={interactive}
             onSeek={() => {
               if (marker.to === null) {
                 // A moment keeps the player as it was: playing stays playing.
@@ -426,7 +467,7 @@ export function MediaBlockPanel({
             profileId={profileId}
             scroller={scroller}
             window={vm.window}
-            title={vm.title}
+            title={null}
             media={vm.media}
             initialPicture={vm.picture ?? undefined}
             initialSound={vm.sound ?? undefined}
@@ -434,6 +475,7 @@ export function MediaBlockPanel({
             asleepText={PLAYER_ASLEEP}
             markers={markers}
             menuItems={blockItems}
+            readOnly={!interactive}
             composeClip={composeClip}
             onTime={onTime}
             onPlayingChange={onPlayingChange}
@@ -441,10 +483,6 @@ export function MediaBlockPanel({
         </>
       ) : (
         <>
-          <header className="flex min-w-0 items-center gap-2">
-            <h3 className="min-w-0 flex-1 truncate font-medium">{vm.title}</h3>
-            <BlockMenu>{blockItems}</BlockMenu>
-          </header>
           {mountPlayer ? (
             <TranscriptPlayer
               ref={attachPlayer}
@@ -468,7 +506,7 @@ export function MediaBlockPanel({
           <div className="flex flex-col gap-2">
             <div className="flex flex-wrap items-center gap-2">
               <p className="text-muted-foreground">{NOT_TRANSCRIBED_SENTENCE}</p>
-              {canTranscribe && transcribePath !== null && !running && (
+              {interactive && canTranscribe && transcribePath !== null && !running && (
                 <Button
                   size="sm"
                   variant="outline"
@@ -479,6 +517,7 @@ export function MediaBlockPanel({
                   {TRANSCRIBE_LABEL}
                 </Button>
               )}
+              {blockMenu && <div className="ml-auto">{blockMenu}</div>}
             </div>
             {transcribePath !== null && (
               <TranscriptionJob path={transcribePath} onOpen={() => setReads((n) => n + 1)} />
@@ -547,6 +586,7 @@ function BlockMenu({ children }: { children: ReactNode }) {
 function MarkerChip({
   marker,
   editable,
+  menu,
   onSeek,
   onCopyLink,
   onCopyClip,
@@ -555,6 +595,8 @@ function MarkerChip({
 }: {
   marker: MediaMarkerVm;
   editable: boolean;
+  /** The chip's ⋯; a preview's chip only seeks. */
+  menu: boolean;
   onSeek: () => void;
   onCopyLink: () => void;
   onCopyClip: () => void;
@@ -569,33 +611,38 @@ function MarkerChip({
         type="button"
         onClick={onSeek}
         aria-label={`${marker.to === null ? "Go to" : "Play"} ${marker.name}, ${when}`}
-        className="flex items-center gap-1 rounded-l-full py-0.5 pr-1 pl-2.5 hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring"
+        className={cn(
+          "flex items-center gap-1 py-0.5 pl-2.5 hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring",
+          menu ? "rounded-l-full pr-1" : "rounded-full pr-2.5",
+        )}
       >
         {marker.to !== null && <MoveHorizontal aria-hidden="true" className="size-3" />}
         <span className="max-w-48 truncate">{marker.name}</span>
         <span className="figures text-muted-foreground">· {when}</span>
       </button>
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <button
-            type="button"
-            aria-label={`Marker actions ${marker.name}`}
-            className="rounded-r-full py-0.5 pr-2 pl-1 text-muted-foreground hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring"
-          >
-            <Ellipsis aria-hidden="true" className="size-3" />
-          </button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="w-auto min-w-40">
-          <DropdownMenuItem onSelect={onCopyLink}>{MARKER_COPY_LINK}</DropdownMenuItem>
-          <DropdownMenuItem onSelect={onCopyClip}>{MARKER_COPY_CLIP}</DropdownMenuItem>
-          {editable && (
-            <>
-              <DropdownMenuItem onSelect={onRename}>{MARKER_RENAME}</DropdownMenuItem>
-              <DropdownMenuItem onSelect={onRemove}>{MARKER_REMOVE}</DropdownMenuItem>
-            </>
-          )}
-        </DropdownMenuContent>
-      </DropdownMenu>
+      {menu && (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              aria-label={`Marker actions ${marker.name}`}
+              className="rounded-r-full py-0.5 pr-2 pl-1 text-muted-foreground hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring"
+            >
+              <Ellipsis aria-hidden="true" className="size-3" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start" className="w-auto min-w-40">
+            <DropdownMenuItem onSelect={onCopyLink}>{MARKER_COPY_LINK}</DropdownMenuItem>
+            <DropdownMenuItem onSelect={onCopyClip}>{MARKER_COPY_CLIP}</DropdownMenuItem>
+            {editable && (
+              <>
+                <DropdownMenuItem onSelect={onRename}>{MARKER_RENAME}</DropdownMenuItem>
+                <DropdownMenuItem onSelect={onRemove}>{MARKER_REMOVE}</DropdownMenuItem>
+              </>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
     </li>
   );
 }

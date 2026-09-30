@@ -11,11 +11,15 @@
 import type {
   LineEditVm,
   MediaAdoptionVm,
+  MediaBlockProblemVm,
+  MediaBlockRecordingVm,
+  MediaBlockSchemaVm,
   MediaBlockVm,
   MediaClipVm,
   MediaMarkerHitVm,
   MediaMarkerVm,
   NoteEmbedPathVm,
+  RecordingLinkedNoteVm,
   TranscriptVm,
 } from "@/lib/ipc/client";
 import type { MediaRef } from "@/lib/ipc/gen/MediaRef";
@@ -293,6 +297,56 @@ function markerRange(source: string, name: string): [number, number] | null {
 
 const FORBIDDEN = /[[\]|#^\n]/;
 
+/** `media_block_schema`'s answer, as Rust's `media_block::hints` gives it. */
+const MOCK_SCHEMA: MediaBlockSchemaVm = {
+  keys: (
+    [
+      ["session", "root", "session", [], true, "The recording to play, by its identity."],
+      ["transcript", "root", "transcript", [], true, "A transcript file in this drive."],
+      ["part", "root", "tables", [], true, "A media file to play with no transcript."],
+      ["src", "root", "config", [], true, "A .toml file in this drive holding these keys."],
+      ["record", "root", "choice", ["new"], true, "A block that records here."],
+      ["title", "root", "text", [], false, "The block's own title."],
+      ["from", "root", "time", [], false, "Where the block starts on the source's clock."],
+      ["to", "root", "time", [], false, "Where the block stops on the source's clock."],
+      [
+        "picture",
+        "root",
+        "choice",
+        ["screen", "camera", "both"],
+        false,
+        "Which pictures the player shows.",
+      ],
+      [
+        "sound",
+        "root",
+        "choice",
+        ["system", "microphone", "both"],
+        false,
+        "Which sounds the player plays.",
+      ],
+      ["marker", "root", "tables", [], false, "A named moment or window."],
+      ["version", "root", "version", [], false, "The grammar version; 1."],
+      ["file", "part", "media", [], false, "The part's audio or video file."],
+      ["camera", "part", "video", [], false, "A video filmed beside the file."],
+      ["offset", "part", "time", [], false, "Where the part starts on the block's clock."],
+      ["system", "part", "track", [], false, "The call's audio track, from 1."],
+      ["microphone", "part", "track", [], false, "The microphone's audio track, from 1."],
+      ["name", "marker", "text", [], false, "The moment's name."],
+      ["at", "marker", "time", [], false, "When the moment is."],
+      ["from", "marker", "time", [], false, "Where the moment's window starts."],
+      ["to", "marker", "time", [], false, "Where the moment's window ends."],
+    ] as const
+  ).map(([key, place, value, values, source, doc]) => ({
+    key,
+    place,
+    value,
+    values: [...values],
+    source,
+    doc,
+  })),
+};
+
 export function mediaBlockMockHandlers(): Record<
   string,
   (payload: Record<string, unknown>) => unknown
@@ -393,6 +447,26 @@ export function mediaBlockMockHandlers(): Record<
         : [];
       return { markdown: `${[...fence, ...words].join("\n")}\n`, lines: lines.length };
     },
+    media_block_schema: (): MediaBlockSchemaVm => MOCK_SCHEMA,
+    // The fixture's check refuses only an unknown root key, the refusal a
+    // person typing a block meets first; Rust's own is `media_block::check`.
+    media_block_check: (p): MediaBlockProblemVm | null => {
+      const lines = String(p.source).split("\n");
+      const root = MOCK_SCHEMA.keys.filter((key) => key.place === "root").map((key) => key.key);
+      for (const [index, line] of lines.entries()) {
+        if (/^\s*\[/.test(line)) return null;
+        const key = /^(\s*)([A-Za-z0-9_-]+)\s*=/.exec(line);
+        if (key !== null && !root.includes(key[2])) {
+          return {
+            message: `This block has \`${key[2]}\`, which is not a keeper-media key.`,
+            line: index + 1,
+            from: key[1].length,
+            to: key[1].length + key[2].length,
+          };
+        }
+      }
+      return null;
+    },
     media_block_sources: (p): string[] =>
       fenceBodies(String(p.body)).flatMap((body) => {
         const match = /^session = "([^"]+)"$/m.exec(body);
@@ -428,7 +502,8 @@ export function mediaBlockMockHandlers(): Record<
     media_block_compose: (p): string => {
       const pick = p.pick as
         | { kind: "session"; sessionId: string }
-        | { kind: "file"; relativePath: string };
+        | { kind: "file"; relativePath: string }
+        | { kind: "newRecording" };
       // The optional keys, commented, as Rust writes them (`docs/notes.md`).
       const hints = [
         '# title = ""',
@@ -441,12 +516,35 @@ export function mediaBlockMockHandlers(): Record<
         '# at = "00:00:00"',
         "# sources: session | transcript | [[part]] file/camera/offset/system/microphone | src",
       ].join("\n");
+      if (pick.kind === "newRecording") {
+        // No marker's shape: a block that has recorded nothing has no moments.
+        const lines = hints.split("\n");
+        const kept = [...lines.slice(0, 5), lines[lines.length - 1]].join("\n");
+        return `\`\`\`keeper-media\nrecord = "new"\n${kept}\n\`\`\`\n`;
+      }
       if (pick.kind === "session")
         return `\`\`\`keeper-media\nsession = "${pick.sessionId}"\n${hints}\n\`\`\`\n`;
       return pick.relativePath.endsWith(".json")
         ? `\`\`\`keeper-media\ntranscript = "${pick.relativePath}"\n${hints}\n\`\`\`\n`
         : `\`\`\`keeper-media\n${hints}\n[[part]]\nfile = "${pick.relativePath}"\n\`\`\`\n`;
     },
+    // Rust's answers, read the way `media_block::parse` reads the one key.
+    media_block_recording: (p): MediaBlockRecordingVm => {
+      const source = String(p.source);
+      const session = /^\s*session\s*=\s*"([^"]*)"/m.exec(source)?.[1] ?? null;
+      // Nothing records in this shell, so no block names the live session.
+      const records = /^\s*record\s*=\s*"new"\s*$/m.test(source);
+      return { records, session, live: false, here: false };
+    },
+    media_block_record_started: (p): string =>
+      String(p.source).replace(
+        /^(\s*)record(\s*=\s*)"new"/m,
+        `$1session$2"${String(p.sessionId)}"`,
+      ),
+    // Nothing records in this shell, so no note is linked to a session.
+    recording_linked_note: (): RecordingLinkedNoteVm | null => null,
+    // The daily reconcile's manual trigger: accepted, as with nothing recording.
+    recordings_reconcile_now: (): boolean => true,
     recording_notes_adopt_media_block: (p): MediaAdoptionVm => ({
       changed: p.dryRun ? 3 : 3,
       skipped: ["recordings/2026-08-08 pricing call.md"],

@@ -285,6 +285,10 @@ pub trait MediaLookup {
 /// for it.
 pub const UNKNOWN_RECORDING_SENTENCE: &str = "keeper does not know this recording on this Mac.";
 
+/// What a `record = "new"` block says where only a player could be drawn:
+/// there is nothing recorded to play yet.
+pub const NOT_RECORDED_SENTENCE: &str = "Not recorded yet.";
+
 /// The body of a media block, resolved into what its player plays and the
 /// transcript's lines inside its window (AD-353, AD-359). Every refusal is a
 /// sentence the block shows above its source.
@@ -420,6 +424,7 @@ pub fn resolve_block(body: &str, lookup: &dyn MediaLookup) -> Result<MediaBlockV
             )
         }
         Source::Src(_) => return Err(BlockRefusal::NestedSrc.to_string()),
+        Source::Record => return Err(NOT_RECORDED_SENTENCE.to_owned()),
     };
 
     let duration = transcript.as_ref().map_or_else(

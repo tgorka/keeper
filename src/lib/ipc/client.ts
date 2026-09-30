@@ -2619,6 +2619,7 @@ export async function recordingStart(
     tags?: string;
     custom?: { name: string; value: string }[];
   },
+  note?: RecordingNoteLink,
 ): Promise<RecordingStatusVm> {
   // Story 19.1: the picker's selected source/target (a display or an
   // application). Omitted (`undefined`) preserves the 16.6 main-display default.
@@ -2645,6 +2646,9 @@ export async function recordingStart(
     metaNote: meta?.note ?? null,
     metaTags: meta?.tags ?? null,
     metaCustom: meta?.custom ?? null,
+    // Story 88.9: the note whose `record = "new"` block pressed Start; sent
+    // only then, so every other start is the call it always was.
+    ...(note === undefined ? {} : { note }),
   });
 }
 
@@ -3252,13 +3256,29 @@ export async function startWindowDragging(): Promise<void> {
 /**
  * Record one stage of an app-driven title-bar drag in the app log (Story 34.3).
  *
- * Diagnostic-only, and the only frontend path into `~/Library/Logs/keeper/keeper.log`:
- * Rust authors the log text, `detail` carries a refusal message. Rejects with the
+ * Diagnostic-only: Rust authors the log text, `detail` carries a refusal message.
+ * One of two frontend paths into `~/Library/Logs/keeper/keeper.log`; the other is
+ * {@link frontendErrorReport}. Rejects with the
  * {@link IpcError} envelope; callers swallow it — a report must never be the thing
  * that breaks a drag.
  */
 export async function titlebarDragReport(stage: TitlebarDragStage, detail?: string): Promise<void> {
   await invoke<void>("titlebar_drag_report", { stage, detail: detail ?? null });
+}
+
+/**
+ * Write an error the webview could not handle to the app log, at `ERROR`, so a
+ * release build's blank-window failure leaves its message behind. Called only by
+ * `@/lib/crash-report`, which caps and de-duplicates; rejects with the
+ * {@link IpcError} envelope and the caller drops it.
+ */
+export async function frontendErrorReport(
+  source: string,
+  message: string,
+  stack: string | null,
+  componentStack: string | null,
+): Promise<void> {
+  await invoke<void>("frontend_error_report", { source, message, stack, componentStack });
 }
 
 export async function menuBarPresenceGet(): Promise<boolean> {
@@ -8236,4 +8256,99 @@ export async function listenAccountSetup(onLink: (link: string) => void): Promis
   return await listen<string>(ACCOUNT_SETUP_EVENT, (event) => {
     onLink(event.payload);
   });
+}
+
+// ---- Daily89: the recordings index's daily reconcile -----------------------
+
+/**
+ * The Tauri event the shell emits when a refresh of every recordings root has
+ * landed in the index — the daily reconcile, "Reconcile now", a start, a
+ * synced folder saved. No payload: the Recordings pane re-runs its query.
+ */
+export const RECORDINGS_RECONCILED_EVENT = "keeper://recordings-reconciled";
+
+/** Subscribe to {@link RECORDINGS_RECONCILED_EVENT}. Resolves with an unlisten function. */
+export async function listenRecordingsReconciled(onReconciled: () => void): Promise<() => void> {
+  return await listen<null>(RECORDINGS_RECONCILED_EVENT, () => {
+    onReconciled();
+  });
+}
+
+/**
+ * Rebuild the recordings index from every recordings root now, as the daily
+ * reconcile does. Resolves `true` when it started, `false` when a recording
+ * in progress holds it until the session ends; either way
+ * {@link RECORDINGS_RECONCILED_EVENT} follows when it lands.
+ */
+export async function recordingsReconcileNow(): Promise<boolean> {
+  return await invoke<boolean>("recordings_reconcile_now");
+}
+
+// ---- Hints89: completion and diagnostics while a media block is written ----
+
+import type { MediaBlockProblemVm } from "./gen/MediaBlockProblemVm";
+import type { MediaBlockSchemaVm } from "./gen/MediaBlockSchemaVm";
+
+export type { MediaBlockProblemVm } from "./gen/MediaBlockProblemVm";
+export type { MediaBlockSchemaVm } from "./gen/MediaBlockSchemaVm";
+export type { MediaKeyPlace } from "./gen/MediaKeyPlace";
+export type { MediaKeyVm } from "./gen/MediaKeyVm";
+export type { MediaValueKind } from "./gen/MediaValueKind";
+
+/** The `keeper-media` grammar's keys: where each may stand, what its value is and what it does. */
+export function mediaBlockSchema(): Promise<MediaBlockSchemaVm> {
+  return invoke("media_block_schema");
+}
+/** Why the block body `source` does not read, placed on its key or line; `null` when it reads. */
+export function mediaBlockCheck(source: string): Promise<MediaBlockProblemVm | null> {
+  return invoke("media_block_check", { source });
+}
+
+// ---- Rec89: recording from a note ------------------------------------------
+
+/**
+ * The note a session is started from: its vault (a profile id) and its path
+ * relative to the vault. The wire twin of Rust's `LinkedNote`.
+ */
+export interface RecordingNoteLink {
+  profileId: string;
+  path: string;
+}
+
+/** The note the live session is recording in, as a media block shows it. */
+export interface RecordingLinkedNoteVm extends RecordingNoteLink {
+  /** The session recording into it: the block naming it is the live one. */
+  sessionId: string;
+  /** The note's title from the notes index; its file name when the index has none. */
+  title: string;
+}
+
+/** The note the live session was started from, or `null` when none is. */
+export function recordingLinkedNote(): Promise<RecordingLinkedNoteVm | null> {
+  return invoke("recording_linked_note");
+}
+
+/** What a media block body is for recording: whether it records here
+ *  (`record = "new"`), the session it names, whether that session is the one
+ *  recording now (`live`), and whether into this very note (`here`) — Rust
+ *  reads the keys and knows the live session. */
+export interface MediaBlockRecordingVm {
+  records: boolean;
+  session: string | null;
+  live: boolean;
+  here: boolean;
+}
+
+export function mediaBlockRecording(
+  source: string,
+  profileId: string,
+  path: string | null,
+): Promise<MediaBlockRecordingVm> {
+  return invoke("media_block_recording", { source, profileId, path });
+}
+
+/** The body of the `record = "new"` block `source`, naming `sessionId`: what
+ *  the block that pressed Start splices over itself once the start answers. */
+export function mediaBlockRecordStarted(source: string, sessionId: string): Promise<string> {
+  return invoke("media_block_record_started", { source, sessionId });
 }

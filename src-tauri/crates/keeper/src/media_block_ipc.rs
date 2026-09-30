@@ -139,6 +139,7 @@ fn transcript_of(
             _ => None,
         },
         Source::Src(_) => return Err(BlockRefusal::NestedSrc.to_string()),
+        Source::Record => None,
     };
     json.filter(|json| json.is_file())
         .map(|json| read_transcript(&json))
@@ -235,6 +236,20 @@ pub async fn transcript_clip(
 #[tauri::command]
 pub fn media_block_sources(body: String) -> Vec<String> {
     media_block::session_ids(&body)
+}
+
+/// The grammar's keys, where each may stand, what its value is and what it
+/// does: what the editor offers while a person writes a block by hand.
+#[tauri::command]
+pub fn media_block_schema() -> media_block::MediaBlockSchemaVm {
+    media_block::schema()
+}
+
+/// Why the block body `source` does not read, placed on the key or line it
+/// is about; `None` when it reads.
+#[tauri::command]
+pub fn media_block_check(source: String) -> Option<media_block::MediaBlockProblemVm> {
+    media_block::check(&source)
 }
 
 /// Where `[[note#name]]` lands in the note `body`: the media block holding a
@@ -396,6 +411,7 @@ pub async fn media_block_compose(
                 "{name} is not a recording, a transcript or an audio or video file."
             )))
         }
+        MediaPickReq::NewRecording => Ok(media_block::record_block()),
     })
     .await?
 }

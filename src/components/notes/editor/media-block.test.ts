@@ -7,7 +7,15 @@
  * The React panel is replaced by a spy mount: what is asserted here is what
  * the layer hands it and what it does with the panel's answers.
  */
-import { history, undo } from "@codemirror/commands";
+import {
+  cursorCharLeft,
+  cursorCharRight,
+  deleteCharBackward,
+  deleteCharForward,
+  history,
+  selectCharRight,
+  undo,
+} from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -15,11 +23,11 @@ import { afterEach, describe, expect, it, type Mock, vi } from "vitest";
 import { livePreview } from "./live-preview";
 import {
   insertOnOwnLine,
-  MEDIA_BLOCK_BODY_CLASS,
+  lastPlayerTime,
   MEDIA_BLOCK_CLASS,
   MEDIA_BLOCK_NO_DRIVE,
+  MEDIA_BLOCK_SELECTED_CLASS,
   type MediaBlockMountArgs,
-  MediaBlockWidget,
   type MountedMediaBlock,
   mediaFences,
   seekMediaBlock,
@@ -60,7 +68,13 @@ afterEach(() => {
 
 function open(
   doc: string,
-  over: { vaultId?: string; mount?: MountSpy; readOnly?: boolean; history?: boolean } = {},
+  over: {
+    vaultId?: string;
+    mount?: MountSpy;
+    readOnly?: boolean;
+    history?: boolean;
+    interactive?: boolean;
+  } = {},
 ): EditorView {
   const parent = document.createElement("div");
   document.body.append(parent);
@@ -76,6 +90,7 @@ function open(
           onOpenLink: () => {},
           noteLink: () => "Kelly sync",
           mountMedia: over.mount,
+          mediaInteractive: over.interactive,
         }),
         ...(over.readOnly ? [EditorState.readOnly.of(true)] : []),
         ...(over.history ? [history()] : []),
@@ -195,37 +210,65 @@ describe("the block in the note", () => {
     expect(mount).not.toHaveBeenCalled();
   });
 
-  it("gives its source back when the caret enters it, and unmounts the panel", async () => {
+  it("keeps the panel when the caret is put inside the fence — only Edit block source shows it", async () => {
     const { mount, mounted } = mountSpy();
     const view = open(`intro\n\n${BLOCK}\n\nafter\n`, { mount });
     await settle();
+    const host = view.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS}`);
 
     view.dispatch({ selection: { anchor: view.state.doc.line(4).from } });
     await settle();
 
-    expect(view.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS}`)).toBeNull();
-    expect(view.contentDOM.textContent).toContain(`session = "${SESSION}"`);
-    expect(mounted[0]?.unmount).toHaveBeenCalled();
+    expect(view.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS}`)).toBe(host);
+    expect(mounted[0]?.unmount).not.toHaveBeenCalled();
   });
 
-  it("reveals nothing on a click anywhere on a mounted block — the menu does that", async () => {
-    const widget = new MediaBlockWidget("", "", {});
-    // Before the panel arrives (its import still in flight) the fence's text
-    // has no menu, so a click on it reveals the source like any fence.
-    const loading = open(`intro\n\n${BLOCK}\n`, { mount: undefined });
-    const fenceText = loading.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS} pre`);
-    expect(widget.ignoreEvent({ target: fenceText } as unknown as Event)).toBe(false);
-
+  it("steps the caret keys over the block as one piece, both ways", async () => {
     const { mount } = mountSpy();
-    const view = open(`intro\n\n${BLOCK}\n`, { mount });
+    const view = open(`intro\n${BLOCK}\nafter\n`, { mount });
     await settle();
-    const host = view.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS}`) as HTMLElement;
-    const body = host.querySelector(`.${MEDIA_BLOCK_BODY_CLASS}`) as HTMLElement;
+    const [fence] = mediaFences(view.state);
 
-    expect(widget.ignoreEvent({ target: body } as unknown as Event)).toBe(true);
-    // The block's own edge, outside the panel: its head used to reveal here.
-    expect(widget.ignoreEvent({ target: host } as unknown as Event)).toBe(true);
-    expect(widget.ignoreEvent({ target: view.contentDOM } as unknown as Event)).toBe(false);
+    view.dispatch({ selection: { anchor: fence.from } });
+    cursorCharRight(view);
+    expect(view.state.selection.main.head).toBe(fence.to);
+    cursorCharLeft(view);
+    expect(view.state.selection.main.head).toBe(fence.from);
+    expect(view.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS}`)).not.toBeNull();
+  });
+
+  it("is selected whole by a shift-selection, and says so without a new panel", async () => {
+    const { mount } = mountSpy();
+    const view = open(`intro\n${BLOCK}\nafter\n`, { mount });
+    await settle();
+    const [fence] = mediaFences(view.state);
+    const host = view.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS}`);
+
+    view.dispatch({ selection: { anchor: fence.from } });
+    selectCharRight(view);
+    await settle();
+
+    expect(view.state.selection.main.from).toBe(fence.from);
+    expect(view.state.selection.main.to).toBe(fence.to);
+    expect(view.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS}`)).toBe(host);
+    expect(host?.classList.contains(MEDIA_BLOCK_SELECTED_CLASS)).toBe(true);
+    expect(mount).toHaveBeenCalledTimes(1);
+
+    view.dispatch({ selection: { anchor: 0 } });
+    expect(host?.classList.contains(MEDIA_BLOCK_SELECTED_CLASS)).toBe(false);
+  });
+
+  it("shows the source on a press where the block has no panel and so no menu", async () => {
+    const { mount } = mountSpy();
+    const view = open(`intro\n\n${BLOCK}\n`, { vaultId: "", mount });
+    await settle();
+
+    view.contentDOM
+      .querySelector(`.${MEDIA_BLOCK_CLASS}`)
+      ?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+
+    expect(view.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS}`)).toBeNull();
+    expect(view.state.selection.main.head).toBe(view.state.doc.toString().indexOf("session"));
   });
 
   it("offers no marker edits where the text cannot be written", async () => {
@@ -233,6 +276,16 @@ describe("the block in the note", () => {
     open(`intro\n\n${BLOCK}\n`, { mount, readOnly: true });
     await settle();
 
+    expect(mounted[0]?.args.editable).toBe(false);
+    expect(mounted[0]?.args.interactive).toBe(true);
+  });
+
+  it("draws a preview's block with nothing that changes it", async () => {
+    const { mount, mounted } = mountSpy();
+    open(`intro\n\n${BLOCK}\n`, { mount, interactive: false });
+    await settle();
+
+    expect(mounted[0]?.args.interactive).toBe(false);
     expect(mounted[0]?.args.editable).toBe(false);
   });
 
@@ -335,6 +388,115 @@ describe("the block's menu verbs", () => {
 
     expect(mounted[0]?.args.scroller).toBe(view.scrollDOM);
   });
+
+  it("draws the block again once the caret leaves the text Edit block source showed", async () => {
+    const { mount, mounted } = mountSpy();
+    const view = open(`intro\n\n${BLOCK}\n\nafter\n`, { mount });
+    await settle();
+
+    mounted[0]?.args.editSource();
+    await settle();
+    // Moving and typing inside the shown fence keeps it shown.
+    const inside = view.state.doc.toString().indexOf(SESSION);
+    view.dispatch({ changes: { from: inside, insert: "X" }, selection: { anchor: inside + 1 } });
+    await settle();
+    expect(view.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS}`)).toBeNull();
+
+    view.dispatch({ selection: { anchor: view.state.doc.length } });
+    await settle();
+    expect(view.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS}`)).not.toBeNull();
+
+    // And the caret coming back does not show it: only the menu does.
+    view.dispatch({ selection: { anchor: inside } });
+    await settle();
+    expect(view.contentDOM.querySelector(`.${MEDIA_BLOCK_CLASS}`)).not.toBeNull();
+  });
+
+  it("remembers where the player was when its source was shown, for that block only", async () => {
+    const { mount, mounted } = mountSpy();
+    const view = open(`intro\n\n${BLOCK}\n\nafter\n`, { mount });
+    await settle();
+    mounted[0]?.args.register({ seekTo: vi.fn(), currentTime: () => 785.5 });
+    const [fence] = mediaFences(view.state);
+    expect(lastPlayerTime(view, fence.from)).toBeNull();
+
+    mounted[0]?.args.editSource();
+
+    expect(lastPlayerTime(view, fence.from)).toBe(785.5);
+    expect(lastPlayerTime(view, fence.from + 1)).toBeNull();
+    // A paragraph written above moves the block, and the time goes with it.
+    view.dispatch({ changes: { from: 0, insert: "above\n" } });
+    expect(lastPlayerTime(view, fence.from + 6)).toBe(785.5);
+  });
+});
+
+describe("keys pressed beside a drawn block", () => {
+  function beside(doc: string, where: "start" | "end") {
+    const { mount } = mountSpy();
+    const view = open(doc, { mount });
+    const [fence] = mediaFences(view.state);
+    view.dispatch({ selection: { anchor: where === "start" ? fence.from : fence.to } });
+    return { view, fence };
+  }
+  /** A keystroke as CodeMirror's input dispatches one: the text, and the caret after it. */
+  const type = (view: EditorView, text: string) => {
+    const at = view.state.selection.main.head;
+    view.dispatch({
+      changes: { from: at, insert: text },
+      selection: { anchor: at + text.length },
+      userEvent: "input.type",
+    });
+  };
+
+  it("puts text typed at the block's start on a line of its own above it", () => {
+    const { view } = beside(`intro\n${BLOCK}\nafter`, "start");
+
+    type(view, "x");
+    type(view, "y");
+
+    // The second keystroke continues the new line: the caret left the edge.
+    expect(view.state.doc.toString()).toBe(`intro\nxy\n${BLOCK}\nafter`);
+    expect(view.state.selection.main.head).toBe("intro\nxy".length);
+  });
+
+  it("puts text typed at the block's end on a line of its own below it", () => {
+    const { view } = beside(`intro\n${BLOCK}\nafter`, "end");
+
+    type(view, "xy");
+
+    expect(view.state.doc.toString()).toBe(`intro\n${BLOCK}\nxy\nafter`);
+    expect(view.state.selection.main.head).toBe(view.state.doc.toString().indexOf("xy") + 2);
+  });
+
+  it("does not join the line above onto the opening fence", () => {
+    const { view, fence } = beside(`intro\n${BLOCK}\nafter`, "start");
+    const doc = view.state.doc.toString();
+
+    deleteCharBackward(view);
+
+    expect(view.state.doc.toString()).toBe(doc);
+    expect(view.state.selection.main.head).toBe(fence.from - 1);
+  });
+
+  it("does not join the line below onto the closing fence", () => {
+    const { view, fence } = beside(`intro\n${BLOCK}\nafter`, "end");
+    const doc = view.state.doc.toString();
+
+    deleteCharForward(view);
+
+    expect(view.state.doc.toString()).toBe(doc);
+    expect(view.state.selection.main.head).toBe(fence.to + 1);
+  });
+
+  it("lets a blank line beside it go, and takes the whole block on a delete into it", () => {
+    const { view } = beside(`intro\n\n${BLOCK}\nafter`, "start");
+
+    deleteCharBackward(view);
+    expect(view.state.doc.toString()).toBe(`intro\n${BLOCK}\nafter`);
+
+    deleteCharForward(view);
+    expect(view.state.doc.toString()).toBe("intro\n\nafter");
+  });
 });
 
 describe("writing a marker", () => {
@@ -425,7 +587,7 @@ describe("one player at a time, and a marker link's seek", () => {
     });
     await settle();
     const first = vi.fn();
-    mounted[0]?.args.register({ seekTo: first });
+    mounted[0]?.args.register({ seekTo: first, currentTime: () => null });
 
     // The second block is not drawn yet (it is below the viewport): its seek
     // waits for it, and the first block is not moved.
@@ -443,7 +605,7 @@ describe("one player at a time, and a marker link's seek", () => {
 
     seekMediaBlock(view, 0, 42);
     const seek = vi.fn();
-    mounted[0]?.args.register({ seekTo: seek });
+    mounted[0]?.args.register({ seekTo: seek, currentTime: () => null });
 
     expect(seek).toHaveBeenCalledWith(42);
   });

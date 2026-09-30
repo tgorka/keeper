@@ -7,6 +7,9 @@ const searchRecordings = vi.fn();
 const recordingOpenPath = vi.fn();
 const revealPath = vi.fn();
 const transcriptionStart = vi.fn();
+const recordingsReconcileNow = vi.fn();
+// The shell's "the index landed" event: captured so a test can fire it.
+let reconciled: (() => void) | undefined;
 vi.mock("@/lib/ipc/client", () => ({
   searchRecordings: (filter: unknown) => searchRecordings(filter),
   recordingOpenPath: (path: unknown) => recordingOpenPath(path),
@@ -14,6 +17,13 @@ vi.mock("@/lib/ipc/client", () => ({
   transcriptionStart: (path: unknown, onProgress: unknown, replace: unknown) =>
     transcriptionStart(path, onProgress, replace),
   transcriptionCancel: () => Promise.resolve(),
+  recordingsReconcileNow: () => recordingsReconcileNow(),
+  listenRecordingsReconciled: (onReconciled: () => void) => {
+    reconciled = onReconciled;
+    return Promise.resolve(() => {
+      reconciled = undefined;
+    });
+  },
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(() => Promise.resolve(null)) }));
 // The viewer is its own lane's surface; what the pane owes it is the path.
@@ -28,7 +38,10 @@ import { RECORDINGS_TRANSCRIBE_LABEL } from "@/components/recordings/recording-r
 import {
   RECORDINGS_COUNT_SLOT,
   RECORDINGS_LIST_LABEL,
+  RECORDINGS_MORE_ACTIONS_LABEL,
   RECORDINGS_PANE_TITLE,
+  RECORDINGS_RECONCILE_LABEL,
+  RECORDINGS_RECONCILE_WAITING,
   RECORDINGS_REFRESH_LABEL,
   RecordingsPane,
 } from "@/components/recordings/recordings-pane";
@@ -82,6 +95,8 @@ beforeEach(() => {
   recordingOpenPath.mockResolvedValue(undefined);
   revealPath.mockReset();
   revealPath.mockResolvedValue(undefined);
+  recordingsReconcileNow.mockReset();
+  recordingsReconcileNow.mockResolvedValue(true);
   // The pane only ever renders where recording is on; Reveal is its own flag.
   capabilitiesStore.getState().applySnapshot({
     ...DEFAULT_CAPABILITIES,
@@ -108,6 +123,41 @@ describe("RecordingsPane", () => {
     expect(screen.getByLabelText("Participant")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Durability" })).toBeInTheDocument();
     await waitFor(() => expect(searchRecordings).toHaveBeenCalled());
+  });
+
+  it("reads the archive again, with the filter on screen, when a reconcile lands", async () => {
+    render(<RecordingsPane />);
+    await waitFor(() => expect(searchRecordings).toHaveBeenCalledTimes(1));
+    fireEvent.change(screen.getByLabelText("Search recordings"), { target: { value: "standup" } });
+    await waitFor(() => expect(searchRecordings).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(reconciled).toBeDefined());
+
+    act(() => reconciled?.());
+    await waitFor(() => expect(searchRecordings).toHaveBeenCalledTimes(3));
+    expect(searchRecordings).toHaveBeenLastCalledWith(
+      expect.objectContaining({ query: "standup" }),
+    );
+  });
+
+  it("says a reconcile asked for during a recording waits, until the index lands", async () => {
+    recordingsReconcileNow.mockResolvedValue(false);
+    render(<RecordingsPane />);
+    const trigger = screen.getByRole("button", { name: RECORDINGS_MORE_ACTIONS_LABEL });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    fireEvent.pointerUp(trigger, { button: 0 });
+    const menu = await screen.findByRole("menu");
+    fireEvent.click(within(menu).getByRole("menuitem", { name: RECORDINGS_RECONCILE_LABEL }));
+
+    expect(recordingsReconcileNow).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText(RECORDINGS_RECONCILE_WAITING)).toBeInTheDocument();
+
+    // The recording ended and the held refresh landed: the sentence is no
+    // longer true, so it goes.
+    await waitFor(() => expect(reconciled).toBeDefined());
+    act(() => reconciled?.());
+    await waitFor(() =>
+      expect(screen.queryByText(RECORDINGS_RECONCILE_WAITING)).not.toBeInTheDocument(),
+    );
   });
 
   it("fires one search for a burst of keystrokes, not one per keystroke", async () => {

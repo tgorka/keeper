@@ -1318,6 +1318,7 @@ mod tests {
                     name: "room".to_owned(),
                     value: "Kensington 3B".to_owned(),
                 }]),
+                linked_note: None,
             }),
             Some("2026-08-08T09:00:00+02:00".to_owned()),
         )

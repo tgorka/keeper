@@ -845,6 +845,21 @@ pub const KEYS: &[KeySpec] = &[
         summary: "Whether the next Recording Session records the camera; the camera itself is chosen per session.",
         example: "false",
     },
+    // ---- recordings ------------------------------------------------------
+    KeySpec {
+        key: "recordings.last_reconcile_ms",
+        family: false,
+        scope: Scope::SessionState,
+        settable: Settable::Never(
+            "it is this install's record of when its recordings index last matched the folders, \
+             and a file setting it would hold the daily reconcile off, or run it every second",
+        ),
+        shape: Shape::Text,
+        default: "",
+        summary: "When the recordings index last finished a refresh of every recordings root, in \
+                  ms since the Unix epoch; the daily reconcile runs a day after it.",
+        example: "",
+    },
     // ---- sessions --------------------------------------------------------
     KeySpec {
         key: "sessions.spaces_folded",
@@ -1734,6 +1749,7 @@ mod tests {
             "ui.first_run_setup_skipped",
             "ui.ios_sync_disclosure_shown",
             "ui.recovered_sessions_acknowledged",
+            "recordings.last_reconcile_ms",
             "notes.capture_draft.draft",
             "notes.capture_placement.draft",
             "notes.read.01ABC",

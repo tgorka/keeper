@@ -637,8 +637,13 @@ const SESSION_MEDIA: ipc.TranscriptMediaVm = {
   })),
 };
 const sessionPath = SESSION_TRANSCRIPT_FIXTURE.path;
+/** The meta row under the controls, which ends with the part that plays. */
 const partLine = (text: string) =>
-  screen.getByText((_, element) => element?.tagName === "P" && element.textContent === text);
+  screen.getByText(
+    (_, element) =>
+      element?.tagName === "P" &&
+      (element.textContent === text || (element.textContent?.endsWith(` · ${text}`) ?? false)),
+  );
 describe("Player", () => {
   let play: MockInstance<HTMLMediaElement["play"]>;
   beforeEach(() => {
@@ -849,23 +854,6 @@ describe("Player", () => {
     expect(row("u2")).toHaveAttribute("aria-current", "true");
     expect(play).not.toHaveBeenCalled();
   });
-  it("takes the reader to a speaker's next line after the player, leaving it paused", async () => {
-    render(<TranscriptViewer path={sessionPath} />);
-    const first = (await screen.findByLabelText("screen-0000.mov")) as HTMLMediaElement;
-    fireEvent.loadedMetadata(first);
-    Object.defineProperty(first, "readyState", { configurable: true, get: () => 1 });
-    first.currentTime = 16;
-    fireEvent.timeUpdate(first);
-    // Speaker 1's line 6–14 is the nearer; the next one starts at 21.5, in part 2.
-    fireEvent.click(
-      within(await chipMenu("Speaker 1")).getByRole("menuitem", {
-        name: "Go to their next line",
-      }),
-    );
-    expect(row("u4")).toHaveAttribute("aria-current", "true");
-    expect(partLine("Part 2 of 2 · screen-0001.mov")).toBeInTheDocument();
-    expect(play).not.toHaveBeenCalled();
-  });
   it("opens at the time it was asked for, paused", async () => {
     render(<TranscriptViewer path={sessionPath} at={30} />);
     await screen.findByLabelText("screen-0001.mov");
@@ -875,6 +863,21 @@ describe("Player", () => {
       9,
     );
     expect(play).not.toHaveBeenCalled();
+  });
+  it("says what the recording is on one row, the part it plays last, whole in its tooltip", async () => {
+    render(<TranscriptViewer path={sessionPath} />);
+    await screen.findByLabelText("screen-0000.mov");
+    const { transcript } = SESSION_TRANSCRIPT_FIXTURE;
+    const facts = partLine("Part 1 of 2 · screen-0000.mov");
+    // One element: the date, the engines and the part are a single cut-off row.
+    expect(facts.textContent?.startsWith(new Date(transcript.createdAt).toLocaleString())).toBe(
+      true,
+    );
+    expect(facts.textContent).toContain(` · ${transcript.engine.asr} · `);
+    expect(facts).toHaveClass("truncate");
+    expect(facts).not.toHaveClass("font-mono");
+    fireEvent.focus(facts);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(facts.textContent ?? "");
   });
   it("never hands a part that is not on this Mac to a video", async () => {
     const media = structuredClone(SESSION_MEDIA);
@@ -1214,5 +1217,30 @@ describe("In a note", () => {
     fireEvent.loadedMetadata(second);
     expect(second.currentTime).toBeCloseTo(9);
     expect(row("u5")).toHaveAttribute("aria-current", "true");
+  });
+  it("offers a preview only what plays and finds: no verb that changes the transcript", async () => {
+    render(
+      <TranscriptViewer
+        path={sessionPath}
+        scroller={document.createElement("div")}
+        media={structuredClone(SESSION_MEDIA)}
+        readOnly
+      />,
+    );
+    await screen.findByLabelText("screen-0000.mov");
+    // Transcription can run here, so only the preview keeps Transcribe again away.
+    await waitFor(() => expect(transcriptionStore.getState().status?.available).toBe(true));
+    expect(screen.queryByRole("button", { name: "Transcript actions" })).toBeNull();
+    expect(screen.queryByRole("button", { name: new RegExp(TRANSCRIBE_AGAIN_LABEL) })).toBeNull();
+    // Speakers by name, with nothing behind them and none to add.
+    const legend = screen.getByRole("list", { name: "Speakers" });
+    expect(within(legend).getByText("Alex")).toBeInTheDocument();
+    expect(within(legend).queryAllByRole("button")).toEqual([]);
+    expect(screen.getByRole("searchbox", { name: "Search the transcript" })).toBeInTheDocument();
+    // A line's ⋯ plays and copies, and nothing else.
+    const items = within(await lineMenu("u3"))
+      .getAllByRole("menuitem")
+      .map((item) => item.textContent);
+    expect(items).toEqual(["Play from here", "Copy clip from here…"]);
   });
 });

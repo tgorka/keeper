@@ -1393,6 +1393,23 @@ pub struct SessionMeta {
     /// Repeatable custom name/value pairs (Story 22.3).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub custom: Option<Vec<SessionMetaField>>,
+    /// The note whose media block started this session (story 88.9). Set by
+    /// the shell at start, never by the form: the note is tagged while it
+    /// records, and names this session in that block. Named apart from
+    /// [`Self::note`], which is the user's free text.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub linked_note: Option<LinkedNote>,
+}
+
+/// Where a session started from a note came from (story 88.9). Relative to
+/// its vault, never absolute: the manifest syncs (FR-145).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedNote {
+    /// The synced folder whose vault holds the note.
+    pub profile_id: String,
+    /// The note, relative to its vault.
+    pub path: String,
 }
 
 /// One custom name/value metadata pair (Story 22.3) — both free text.
@@ -1482,6 +1499,7 @@ impl SessionMeta {
             note: clean_field(input.note),
             tags,
             custom: (!custom.is_empty()).then_some(custom),
+            linked_note: None,
         }
     }
 
@@ -1659,8 +1677,12 @@ impl SessionManifest {
         // edit from clearing a title the folder name is derived from.
         let title = self.meta.as_ref().and_then(|meta| meta.title.clone());
         let session_id = self.meta.as_ref().and_then(|meta| meta.session_id.clone());
+        // Like the identity, the note a session was started from is not the
+        // form's to change.
+        let linked_note = self.meta.as_ref().and_then(|meta| meta.linked_note.clone());
         let edited = SessionMeta {
             title,
+            linked_note,
             ..SessionMeta::from_input(session_id, input)
         };
         if self.meta.is_some() || edited != SessionMeta::default() {
@@ -4993,6 +5015,7 @@ mod tests {
                     name: "Ticket".to_owned(),
                     value: "KPR-1".to_owned(),
                 }]),
+                linked_note: None,
             }),
             None,
         )
@@ -5051,6 +5074,7 @@ mod tests {
                         value: String::new(),
                     },
                 ]),
+                linked_note: None,
             }),
             "every edited field lands, a nameless custom row is dropped, and a \
              blank custom VALUE is kept"

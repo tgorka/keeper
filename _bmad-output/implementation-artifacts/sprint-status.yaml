@@ -61,6 +61,12 @@ development_status:
   88-5-the-automatic-note-carries-its-meeting: review
   # Story 88.6 (the owner's field report of 2026-09-30, Polish/English, verbatim in local://epic88-fr2.md; the epic's § 88.6): W1 the note's block is the transcript viewer itself (TranscriptLinesBox deleted, DW-354 closed); W2 one scrollbar (lines windowed against the editor's scrollDOM, pinned player sticky to it); W3 transparent block; W4 a keeper-media fence reads "▶ Media · title · length" in the notes list and search (INDEX_SCHEMA 7); W5 the Properties-fold hang pinned by a no-remount test; W6 Preview | Note | Source in the note header (global, keeper_viewer_modes); W7 the viewer's header/meta row/pinned block; W8 "Go to their next line"; W9 every block keeper writes lists its optional keys commented out, and adopt rewrites a stub's bare block; W10 Edit block source / Remove widget in the block's ⋯; W11 lines exactly as wide as the player.
   88-6-field-report: review
+  # Story 88.7 (the owner's third field report of 2026-09-30, Polish/English, verbatim in local://epic88-fr3.md; the epic's § 88.7): M1 the empty window on unfolding Properties reproduced in WebKit and fixed; M2 clicks never reveal a block's source (only ⋯ Edit block source); M3 "Go to their next line" removed; M4 Preview is the minimal widget; M5 no header above the video; M6 the "Read and correct…" sentence removed; M7 the meta row one line in the UI font; M8 hints while writing a keeper-media block (media_block_schema / media_block_check).
+  88-7-field-report-3: review
+  # Story 88.8 (fr3 M9; the epic's § 88.8): the recordings index rebuilt from every recordings root once a day on the tray tick after account_ipc::daily_tick (recordings.last_reconcile_ms, reconcile_due, ArchiveHandle::settled()), the launch rebuild counting as a run; one session under two roots keeps the newest manifest.json; keeper://recordings-reconciled refreshes the Recordings pane; its header ⋯ Reconcile now (recordings_reconcile_now).
+  88-8-daily-reconcile: review
+  # Story 88.9 (fr3 M10; the epic's § 88.9): `record = "new"` (Source::Record) records from a note — Insert widget's New recording tab, media-recorder-panel.tsx, recording_start's note link (meta.linkedNote), the note tagged recording + recording/<host> while it records, the block rewritten to `session = "<id>"` and the tags removed at finalize and in recovery, no stub unless the note or its block is gone. Owed: a real note-started recording on hesperia and a quit mid-recording finished at the next launch.
+  88-9-record-from-a-note: review
   # DW-347…DW-354 are opened by this plan.
 
   # Epic 87: the owner's two messages of 2026-09-28 (Polish, verbatim in the epic) — transcribe recordings (optionally automatically after a meeting) and any audio/video file, into segmented transcripts with speaker ids; a bank of voice embeddings synced in a drive to recognise people in later meetings; correct words and speaker matches, and a confirmed match updates the bank; inside keeper's Rust; English and maybe Polish; mostly Zoom/Meet video; offline. Second message: no sidecar, fluidaudio-rs on the Mac; a voices folder chosen per drive like recordings, embeddings under a model prefix; a Files glyph for it and a place in tgdrive and neuradrive (70-comms/voices); on by default where possible; use the microphone track; privacy/RODO not now; a dictionary kept like voices; change the "recording transcribes nothing" promise; models from the config repo unless they must be compiled (they are precompiled .mlmodelc); no NAS option; keep voice clips; a gh stack, ready to merge.
@@ -68,13 +74,13 @@ development_status:
   # Contract: local://epic87-contract.md (AD-339…AD-350 pinned by the coordinator). Open questions Q1–Q6 are in the epic (Files' Transcribe on a session folder; replacing an edited transcript; a source scan enforcing NFR-105; one media-extension list; the re-embed call site; "traslacji" read as transcription).
   # Owed on hesperia: the fork builds and links into the app; the owner's config repo gets _models/ (LFS, models.toml, licence files) and hydration reads ready; tgdrive and neuradrive get [folder.voices] subfolder = "70-comms/voices"; a recorded Meet call transcribes after recording with the owner as You; a Polish file transcribes; a confirmed speaker's clip and embedding reach the other clone; first-load time and peak memory recorded; LFS object addresses stay on electra. Front's real-browser proof of the viewer and Settings › Transcription is owed too.
   epic-87: in-progress
-  87-1-the-transcript-format-and-the-pure-pipeline: review
-  87-2-the-voices-bank-and-the-dictionary: review
-  87-3-models-from-the-config-repository: review
-  87-4-the-on-device-engine: review
-  87-5-transcription-jobs-commands-and-the-after-recording-hook: review
-  87-6-the-surfaces: review
-  87-7-the-promise-changes: review
+  87-1-the-transcript-format-and-the-pure-pipeline: in-progress
+  87-2-the-voices-bank-and-the-dictionary: in-progress
+  87-3-models-from-the-config-repository: in-progress
+  87-4-the-on-device-engine: in-progress
+  87-5-transcription-jobs-commands-and-the-after-recording-hook: in-progress
+  87-6-the-surfaces: in-progress
+  87-7-the-promise-changes: in-progress
   # DW-331…DW-342 are opened by this plan.
   # Review wave (2026-09-28): A1–A14, S1–S3, H1–H12 and F1–F10 from three reviews are implemented (the epic's § Review-wave amendments); Q1–Q6 ruled; the macOS minimumSystemVersion rises 11.0 → 14.0 with an rpath to /usr/lib/swift; DW-343…DW-345 opened.
   # Field report 2026-09-29 (the owner on hesperia's kelly-sync transcript; local://epic87-followup.md): B1 one person = one speaker per track, B2 the md legend lists only speakers with lines, B3 split a line, B4 add a line after, B5 the microphone is diarized (ME = the self person's voice, else the longest talker; other mic voices are numbered speakers), B6 "Transcribe a File…" in Recording (menu, palette, cheat sheet), B7 docs. Story 87.8 in the epic.

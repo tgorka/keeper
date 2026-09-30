@@ -108,6 +108,47 @@ export function startBlockedNote(permissionName: string): string {
   return `Start needs the ${permissionName} permission.`;
 }
 
+/**
+ * Whether Start may be pressed, and which permission it waits for when not
+ * (Story 20.2, 21.3). Shared by this pane and a note's record block, so the
+ * two cannot disagree about what a start needs.
+ *
+ * Video sessions take the Rust-aggregated `canStart`. An audio-only session
+ * re-derives the gate from the legs the MODE actually needs — Screen
+ * Recording only while system audio is on, the mic leg only while the mic is
+ * on; a mic-only session never demands the screen grant at all.
+ */
+export function startGate(
+  permission: RecordingPermissionVm,
+  audioOnly: boolean,
+  systemAudio: boolean,
+  mic: boolean,
+): { canStart: boolean; blockedBy: string | null } {
+  if (!audioOnly) {
+    return {
+      canStart: permission.canStart,
+      // `?? SCREEN_RECORDING_PERMISSION_NAME`: a disabled Start must always
+      // tell the user what to fix, should the name and `canStart` ever drift.
+      blockedBy: permission.canStart
+        ? null
+        : (blockingPermissionName(permission) ?? SCREEN_RECORDING_PERMISSION_NAME),
+    };
+  }
+  const screenOk = !systemAudio || permission.screenRecording === "granted";
+  const micOk = !mic || permission.microphone == null || permission.microphone === "granted";
+  const anySource = systemAudio || mic;
+  const canStart = screenOk && micOk && anySource;
+  return {
+    canStart,
+    blockedBy:
+      canStart || !anySource
+        ? null
+        : !screenOk
+          ? SCREEN_RECORDING_PERMISSION_NAME
+          : MICROPHONE_PERMISSION_NAME,
+  };
+}
+
 /** Placeholder copy for each not-yet-built setup card (recording voice). */
 const PLACEHOLDER_COPY = "Configured in a later update.";
 
@@ -168,36 +209,14 @@ export function RecordingPane() {
     }
   }, [status.state, refreshRecovered]);
   // The disabled-Start note names the highest-priority blocker (Story 20.2):
-  // Screen Recording → Microphone → Camera. Both this name and `can_start` are
-  // projected from the same three-leg VM, so today they always agree; the
-  // `?? SCREEN_RECORDING_PERMISSION_NAME` fallback guarantees a disabled Start is
-  // never left with no note (Screen Recording is always required) should the two
-  // ever drift — Start must always tell the user what to fix.
-  // Story 21.3: an audio-only session re-derives the gate from the legs the
-  // MODE actually needs — Screen Recording only while system audio is on, the
-  // mic leg only while the mic is on; a mic-only session never demands the
-  // screen grant at all. Video sessions keep the Rust-aggregated `canStart`.
-  const audioOnlySelected = useSelectedRecordingTarget().kind === "audioOnly";
-  const audioOnlySystemAudio = useSystemAudioEnabled();
-  const audioOnlyMic = useMicEnabled();
-  let effectiveCanStart = permission.canStart;
-  let blockedBy = permission.canStart
-    ? null
-    : (blockingPermissionName(permission) ?? SCREEN_RECORDING_PERMISSION_NAME);
-  if (audioOnlySelected) {
-    const screenOk = !audioOnlySystemAudio || permission.screenRecording === "granted";
-    const micOk =
-      !audioOnlyMic || permission.microphone == null || permission.microphone === "granted";
-    const anySource = audioOnlySystemAudio || audioOnlyMic;
-    effectiveCanStart = screenOk && micOk && anySource;
-    blockedBy = effectiveCanStart
-      ? null
-      : !anySource
-        ? null
-        : !screenOk
-          ? SCREEN_RECORDING_PERMISSION_NAME
-          : MICROPHONE_PERMISSION_NAME;
-  }
+  // Screen Recording → Microphone → Camera, or the legs an audio-only session
+  // actually needs (Story 21.3) — see `startGate`.
+  const { canStart: effectiveCanStart, blockedBy } = startGate(
+    permission,
+    useSelectedRecordingTarget().kind === "audioOnly",
+    useSystemAudioEnabled(),
+    useMicEnabled(),
+  );
 
   return (
     <section

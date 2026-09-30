@@ -981,7 +981,8 @@ pub struct RebuildRequest {
     pub skip: HashSet<PathBuf>,
     /// Every root the archive follows right now — this one may be among them.
     /// A session whose row names one of these, and whose folder is still
-    /// there, is not re-homed by this rebuild (see [`rebuild_from_disk`]).
+    /// there, is re-homed only when this root's copy wins over it (see
+    /// [`rebuild_from_disk`]).
     pub followed_roots: Vec<KnownRoot>,
 }
 
@@ -1032,6 +1033,36 @@ pub struct RebuildOutcome {
     /// folders' rows first, then the walk's in the order it found them — the
     /// set the removal above was taken against.
     pub found: Vec<String>,
+}
+
+/// How long the recordings index may go without a whole refresh before the
+/// daily reconcile asks for one: a day. Every trigger the shell already has —
+/// a start, a synced folder saved, the destination saved — answers a change
+/// keeper saw; this one answers the changes it did not (a folder moved by
+/// hand, a copy that arrived by pull), and a day is how stale the owner said
+/// the list may be.
+pub const RECONCILE_EVERY_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Whether the daily reconcile is due at `now`: a day since the last refresh
+/// that reached every root (`last_ms`, the stored `recordings.last_reconcile_ms`)
+/// AND a day since a refresh was last asked for (`asked_ms`) — so a refresh
+/// that is put off (a recording in progress holds it until the session ends)
+/// or one whose time could not be stored is not asked for again on every
+/// tick. Neither instant known is due at once. A stored time AFTER `now` is
+/// a clock that was set back since it was written, and says nothing: it is
+/// ignored rather than allowed to hold the reconcile off until that date.
+///
+/// The shell seeds `asked_ms` with its launch, because every launch already
+/// refreshes every root: that pass IS the launch reconcile, and a second
+/// walk a second later would repeat it.
+///
+/// Pure, and the whole of the policy: the shell's 1 Hz tick hands it the
+/// clock and the two instants and does what it says.
+pub fn reconcile_due(last_ms: Option<i64>, asked_ms: Option<i64>, now: i64) -> bool {
+    match last_ms.filter(|&last| last <= now).max(asked_ms) {
+        Some(since) => now.saturating_sub(since) >= RECONCILE_EVERY_MS,
+        None => true,
+    }
 }
 
 /// Re-derive every row from the session folders under the request's root, and
@@ -1094,9 +1125,13 @@ pub struct RebuildOutcome {
 /// repository committed says nothing about where the bytes are now. The one
 /// exception: when the root the row names is among `followed_roots` and the
 /// folder the row points at is STILL THERE, the session has been copied, not
-/// moved, and the row stays with the first copy — "one session id under two
-/// roots; keeping the first" — so a copied folder does not change roots on
-/// every rebuild.
+/// moved — one session id under two roots — and the row goes to the copy
+/// whose `manifest.json` changed last, an equal time to the folder whose
+/// absolute path sorts first ([`RootCopy::wins_over`]). The rule depends on
+/// the two copies alone, never on which one the row named or which root was
+/// walked first, so every rebuild lands the row on the same copy and a copied
+/// folder does not change roots back and forth. The warn names both copies,
+/// with both times, whichever wins.
 ///
 /// **A rename inside one root is not a move between roots.** The same
 /// `(root_kind, profile_id)` with a different path is a folder relocated
@@ -1350,7 +1385,7 @@ enum SessionWrite {
 /// run already claimed the session id (the first one keeps it — see
 /// [`rebuild_from_disk`] on duplicates), or when the row on file names a root
 /// among the request's `followed_roots` where the session's folder still
-/// stands (a copy, not a move — the first root keeps it).
+/// stands and that copy wins over this one ([`RootCopy::wins_over`]).
 /// [`SessionWrite::Unplaceable`] when the folder cannot be expressed relative
 /// to the root, which would force an absolute path into the row (the one
 /// thing no column may hold) — the walk is then incomplete, so the row that
@@ -1415,34 +1450,58 @@ fn write_rebuilt_session(
                     .followed_roots
                     .iter()
                     .find(|known| known.is(&stored.root_kind, stored.profile_id.as_deref()))
-                    .is_some_and(|known| {
-                        known
-                            .folder(&stored.relative_path)
-                            .join("manifest.json")
-                            .is_file()
-                    });
-                if standing {
+                    .map(|known| known.folder(&stored.relative_path))
+                    .filter(|standing| standing.join("manifest.json").is_file());
+                if let Some(standing) = standing {
+                    let here = RootCopy {
+                        root_kind: &row.root_kind,
+                        profile_id: row.profile_id.as_deref(),
+                        relative: &relative,
+                        folder,
+                        manifest_ms: manifest_modified_ms(folder),
+                    };
+                    let there = RootCopy {
+                        root_kind: &stored.root_kind,
+                        profile_id: stored.profile_id.as_deref(),
+                        relative: &stored.relative_path,
+                        folder: &standing,
+                        manifest_ms: manifest_modified_ms(&standing),
+                    };
+                    let this_wins = here.wins_over(&there);
+                    let (kept, skipped) = if this_wins {
+                        (&here, &there)
+                    } else {
+                        (&there, &here)
+                    };
                     tracing::warn!(
                         session_id = %row.session_id,
-                        kept_root_kind = %stored.root_kind,
-                        kept_profile_id = stored.profile_id.as_deref().unwrap_or("-"),
-                        kept = %stored.relative_path,
-                        skipped_root_kind = %row.root_kind,
-                        skipped_profile_id = row.profile_id.as_deref().unwrap_or("-"),
-                        skipped = %relative,
-                        "archive rebuild: one session id under two roots; keeping the first"
+                        kept_root_kind = kept.root_kind,
+                        kept_profile_id = kept.profile_id.unwrap_or("-"),
+                        kept = kept.relative,
+                        kept_manifest_ms = kept.manifest_ms.unwrap_or(-1),
+                        skipped_root_kind = skipped.root_kind,
+                        skipped_profile_id = skipped.profile_id.unwrap_or("-"),
+                        skipped = skipped.relative,
+                        skipped_manifest_ms = skipped.manifest_ms.unwrap_or(-1),
+                        "archive rebuild: one session id under two roots; keeping the newest manifest"
                     );
-                    return Ok(SessionWrite::Kept);
+                    if !this_wins {
+                        return Ok(SessionWrite::Kept);
+                    }
+                    // The other copy stands, so this is not a move — but the
+                    // row changes repository all the same, so the answer for
+                    // THIS folder is its word exactly, as a move takes it.
+                } else {
+                    tracing::info!(
+                        session_id = %row.session_id,
+                        from_root_kind = %stored.root_kind,
+                        from_profile_id = stored.profile_id.as_deref().unwrap_or("-"),
+                        to_root_kind = %row.root_kind,
+                        to_profile_id = row.profile_id.as_deref().unwrap_or("-"),
+                        durability = %row.durability,
+                        "archive rebuild: a session moved between roots; re-homing its row"
+                    );
                 }
-                tracing::info!(
-                    session_id = %row.session_id,
-                    from_root_kind = %stored.root_kind,
-                    from_profile_id = stored.profile_id.as_deref().unwrap_or("-"),
-                    to_root_kind = %row.root_kind,
-                    to_profile_id = row.profile_id.as_deref().unwrap_or("-"),
-                    durability = %row.durability,
-                    "archive rebuild: a session moved between roots; re-homing its row"
-                );
                 row.durability.clone()
             }
             Some(stored) if stored.relative_path != relative && answer.is_some() => {
@@ -1480,6 +1539,50 @@ fn write_rebuilt_session(
         written_ids.insert(row.session_id, relative);
     }
     Ok(outcome)
+}
+
+/// One of two standing copies of a session, each under a different root, as
+/// the rule that picks between them sees it (see [`rebuild_from_disk`]).
+struct RootCopy<'a> {
+    root_kind: &'a str,
+    profile_id: Option<&'a str>,
+    /// Root-relative, for the log line.
+    relative: &'a str,
+    /// Absolute, for the tie-break.
+    folder: &'a Path,
+    /// When its `manifest.json` last changed, in ms since the Unix epoch;
+    /// `None` when that could not be read.
+    manifest_ms: Option<i64>,
+}
+
+impl RootCopy<'_> {
+    /// Whether this copy is the session rather than `other`: the newer
+    /// manifest wins — the recorder, a recovery pass and a retitle all
+    /// rewrite it, so the newest is the copy something last worked on — and
+    /// two equal times go to the folder whose absolute path sorts first.
+    ///
+    /// A total order over the two copies, never a question of which one the
+    /// row happens to name, so every rebuild of either root, in either order,
+    /// lands the row on the same copy and it cannot flap between them. A time
+    /// that cannot be read is no evidence at all, so an unreadable manifest
+    /// never takes the row from a copy that is standing.
+    fn wins_over(&self, other: &RootCopy<'_>) -> bool {
+        match (self.manifest_ms, other.manifest_ms) {
+            (Some(here), Some(there)) if here != there => here > there,
+            (Some(_), Some(_)) => self.folder < other.folder,
+            _ => false,
+        }
+    }
+}
+
+/// When `folder/manifest.json` last changed, in ms since the Unix epoch, or
+/// `None` when the filesystem will not say.
+fn manifest_modified_ms(folder: &Path) -> Option<i64> {
+    let modified = std::fs::metadata(folder.join("manifest.json"))
+        .and_then(|meta| meta.modified())
+        .ok()?;
+    let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(since.as_millis()).ok()
 }
 
 /// What a session's row on file says about where it lives and how safe it is.
@@ -2518,6 +2621,7 @@ mod tests {
                 name: "room".to_owned(),
                 value: "3B".to_owned(),
             }]),
+            linked_note: None,
         });
         let mut manifest = SessionManifest::create_with_meta(
             folder.clone(),
@@ -3224,12 +3328,29 @@ mod tests {
         }
     }
 
-    /// A session folder COPIED into a second root, with the first copy still
-    /// standing, is not a move: the row stays with the first root, on every
-    /// rebuild of either, so it cannot flap between them. Once the first copy
-    /// is gone, the second is the session, and the row follows it.
-    #[test]
-    fn a_session_id_under_two_roots_keeps_the_first_until_the_first_is_gone() {
+    /// Set a session folder's `manifest.json` modification time, in ms since
+    /// the Unix epoch — the fact the two-roots rule decides on.
+    fn set_manifest_ms(folder: &Path, ms: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(folder.join("manifest.json"))
+            .expect("open the manifest")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
+            .expect("set the manifest's time");
+    }
+
+    /// One session standing under two roots at once: the original under
+    /// `tgdrive` (whose repository says `pushed`) and a copy under
+    /// `neuradrive` (whose says `local`), their manifests stamped `first_ms`
+    /// and `second_ms`. Rebuilt for three rounds in the order given, the row
+    /// read back after each; the index, the tree and the original are handed
+    /// back for what the test does next.
+    fn two_roots(
+        first_ms: u64,
+        second_ms: u64,
+        first_walked_first: bool,
+        mut after_round: impl FnMut(usize, &Connection, (&RebuildOutcome, &RebuildOutcome)),
+    ) -> (PathBuf, PathBuf, Connection) {
         let dir = temp_dir();
         let first_root = dir.join("tgdrive");
         let second_root = dir.join("neuradrive");
@@ -3241,50 +3362,132 @@ mod tests {
             Some("2026-08-08T12:00:00+02:00"),
             &[(0, "screen", 100)],
         );
-        let conn = memory_db();
+        let copy = second_root.join("2026").join("talk");
+        copy_dir(&original, &copy);
+        set_manifest_ms(&original, first_ms);
+        set_manifest_ms(&copy, second_ms);
         let roots = [
             known(&first_root, "profile", Some("tgdrive")),
             known(&second_root, "profile", Some("neuradrive")),
         ];
-        let first = || {
-            request(&first_root, "profile", Some("tgdrive"))
-                .with_probe(probe(RecordingDurabilityState::Pushed))
-                .beside(roots.clone())
-        };
-        let second = || {
-            request(&second_root, "profile", Some("neuradrive"))
-                .with_probe(probe(RecordingDurabilityState::Local))
-                .beside(roots.clone())
-        };
-        assert_eq!(
-            rebuild_from_disk(&conn, &first()).expect("index").written,
-            1
-        );
-        let copy = second_root.join("2026").join("talk");
-        copy_dir(&original, &copy);
-
+        let first = request(&first_root, "profile", Some("tgdrive"))
+            .with_probe(probe(RecordingDurabilityState::Pushed))
+            .beside(roots.clone());
+        let second = request(&second_root, "profile", Some("neuradrive"))
+            .with_probe(probe(RecordingDurabilityState::Local))
+            .beside(roots.clone());
+        let conn = memory_db();
         for round in 0..3 {
-            let outcome = rebuild_from_disk(&conn, &second()).expect("rebuild the second root");
-            assert_eq!((outcome.written, outcome.removed), (0, 0), "round {round}");
-            let outcome = rebuild_from_disk(&conn, &first()).expect("rebuild the first root");
-            assert_eq!((outcome.written, outcome.removed), (1, 0), "round {round}");
-            assert_eq!(
-                place_of(&conn, "01DEVICE-01TALK"),
-                Some((
-                    "profile".to_owned(),
-                    Some("tgdrive".to_owned()),
-                    "2026/talk".to_owned(),
-                    "pushed".to_owned()
-                )),
-                "round {round}: the first root keeps it"
-            );
+            let (a, b) = if first_walked_first {
+                (&first, &second)
+            } else {
+                (&second, &first)
+            };
+            let a = rebuild_from_disk(&conn, a).expect("rebuild one root");
+            let b = rebuild_from_disk(&conn, b).expect("rebuild the other");
+            let (first_outcome, second_outcome) = if first_walked_first { (a, b) } else { (b, a) };
+            after_round(round, &conn, (&first_outcome, &second_outcome));
         }
-        assert_eq!(count(&conn, "recordings"), 1);
+        (dir, original, conn)
+    }
 
-        // The original goes: the copy is the session now.
-        std::fs::remove_dir_all(&original).expect("delete the original");
-        let outcome = rebuild_from_disk(&conn, &second()).expect("rebuild the second root");
+    /// A session folder COPIED into a second root, with the first copy still
+    /// standing, is not a move: the row goes to the copy whose manifest
+    /// changed last — whichever root holds it, whichever root is walked
+    /// first, and on every round after, so it cannot flap between them. Both
+    /// copies are named in the log either way.
+    #[test]
+    fn a_session_id_under_two_roots_goes_to_the_newest_manifest_in_either_walk_order() {
+        let older = 1_790_000_000_000;
+        let newer = older + 60_000;
+        for (first_ms, second_ms, winner) in [
+            (newer, older, ("tgdrive", "pushed")),
+            (older, newer, ("neuradrive", "local")),
+        ] {
+            for first_walked_first in [true, false] {
+                let case = format!("{} newer, tgdrive first {first_walked_first}", winner.0);
+                let (dir, _, _) = two_roots(
+                    first_ms,
+                    second_ms,
+                    first_walked_first,
+                    |round, conn, (first, second)| {
+                        assert_eq!(
+                            place_of(conn, "01DEVICE-01TALK"),
+                            Some((
+                                "profile".to_owned(),
+                                Some(winner.0.to_owned()),
+                                "2026/talk".to_owned(),
+                                winner.1.to_owned()
+                            )),
+                            "{case}, round {round}"
+                        );
+                        assert_eq!(count(conn, "recordings"), 1, "{case}, round {round}");
+                        assert_eq!(fts_entries(conn), (1, 1), "{case}, round {round}");
+                        if round > 0 {
+                            // Settled: the winner's walk rewrites its own row in
+                            // place, the loser's leaves it alone.
+                            let (won, lost) = if winner.0 == "tgdrive" {
+                                (first, second)
+                            } else {
+                                (second, first)
+                            };
+                            assert_eq!((won.written, won.removed), (1, 0), "{case}, round {round}");
+                            assert_eq!(
+                                (lost.written, lost.removed),
+                                (0, 0),
+                                "{case}, round {round}"
+                            );
+                        }
+                    },
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
+    /// Two manifests stamped the same instant are decided by the folders
+    /// themselves: the absolute path that sorts first keeps the row
+    /// (`…/neuradrive/…` before `…/tgdrive/…`), in either walk order — never
+    /// by which root the row happened to name.
+    #[test]
+    fn a_tie_between_two_roots_goes_to_the_folder_that_sorts_first() {
+        let at = 1_790_000_000_000;
+        for first_walked_first in [true, false] {
+            let (dir, _, _) = two_roots(at, at, first_walked_first, |round, conn, _| {
+                assert_eq!(
+                    place_of(conn, "01DEVICE-01TALK").map(|place| place.1),
+                    Some(Some("neuradrive".to_owned())),
+                    "tgdrive first {first_walked_first}, round {round}"
+                );
+            });
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Once the copy holding the row is gone, the other one is the session,
+    /// and the next rebuild of its root re-homes the row there.
+    #[test]
+    fn when_the_winning_copy_is_gone_the_row_follows_the_other() {
+        let older = 1_790_000_000_000;
+        let (dir, original, conn) = two_roots(older + 60_000, older, true, |_, _, _| {});
+        assert_eq!(
+            place_of(&conn, "01DEVICE-01TALK").map(|place| place.1),
+            Some(Some("tgdrive".to_owned()))
+        );
+        std::fs::remove_dir_all(&original).expect("delete the newer copy");
+        let second_root = dir.join("neuradrive");
+        let outcome = rebuild_from_disk(
+            &conn,
+            &request(&second_root, "profile", Some("neuradrive"))
+                .with_probe(probe(RecordingDurabilityState::Local))
+                .beside([
+                    known(&dir.join("tgdrive"), "profile", Some("tgdrive")),
+                    known(&second_root, "profile", Some("neuradrive")),
+                ]),
+        )
+        .expect("rebuild the remaining root");
         assert_eq!(outcome.written, 1);
+        assert_eq!(outcome.removed, 0);
         assert_eq!(
             place_of(&conn, "01DEVICE-01TALK"),
             Some((
@@ -3292,11 +3495,41 @@ mod tests {
                 Some("neuradrive".to_owned()),
                 "2026/talk".to_owned(),
                 "local".to_owned()
-            )),
-            "with the first copy gone the row follows the second"
+            ))
         );
         assert_eq!(count(&conn, "recordings"), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The daily reconcile's due-check at its boundaries: a day since the
+    /// later of the last whole refresh and the last ask, to the millisecond;
+    /// the launch seed holding it off for the day the launch pass already
+    /// covered; a refresh that was asked for and put off (a recording) not
+    /// asked for again on the next tick; and a stored time from a clock that
+    /// was set back ignored rather than obeyed.
+    #[test]
+    fn the_daily_reconcile_is_due_a_day_after_the_later_of_the_last_run_and_the_last_ask() {
+        let day = RECONCILE_EVERY_MS;
+        let t = 1_790_000_000_000;
+        // Nothing known: due at once.
+        assert!(reconcile_due(None, None, t));
+        // A run a day ago, to the millisecond.
+        assert!(!reconcile_due(Some(t - day + 1), None, t));
+        assert!(reconcile_due(Some(t - day), None, t));
+        // Launched a second ago with a stale stored run: the launch pass is
+        // the reconcile, so nothing more is due for a day after the launch.
+        assert!(!reconcile_due(Some(t - 3 * day), Some(t - 1_000), t));
+        assert!(reconcile_due(Some(t - 3 * day), Some(t - day), t));
+        // Asked an hour ago and put off, the last run two days old: not asked
+        // again every second while it waits.
+        assert!(!reconcile_due(Some(t - 2 * day), Some(t - 3_600_000), t));
+        // A run newer than the ask counts from the run.
+        assert!(!reconcile_due(Some(t - 1_000), Some(t - 2 * day), t));
+        // A stored time in the future is a clock set back: ignored, so the
+        // last ask decides.
+        assert!(reconcile_due(Some(t + 10 * day), Some(t - day), t));
+        assert!(!reconcile_due(Some(t + 10 * day), Some(t - 1_000), t));
+        assert!(reconcile_due(Some(t + 10 * day), None, t));
     }
 
     /// The "durability re-derived" row: in place, the probe's answer is
@@ -4021,6 +4254,7 @@ mod tests {
                 note: None,
                 tags: Some(typed.clone()),
                 custom: None,
+                linked_note: None,
             }),
             Some("2026-08-08T10:00:00+01:00".to_owned()),
         )
@@ -4073,6 +4307,7 @@ mod tests {
                 note: None,
                 tags: Some(vec!["  ".to_owned(), "///".to_owned(), "#---".to_owned()]),
                 custom: None,
+                linked_note: None,
             }),
             None,
         )

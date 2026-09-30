@@ -55,7 +55,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Toggle } from "@/components/ui/toggle";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { IconHint } from "@/components/ui/tooltip";
+import { HoverHint, IconHint } from "@/components/ui/tooltip";
 import type { MediaRef, TranscriptMediaVm } from "@/lib/ipc/client";
 import { fileAssetUrl } from "@/lib/viewers/file-asset-url";
 import { locate, sessionLength } from "./session-timeline";
@@ -233,8 +233,9 @@ export function TranscriptPlayer({
   /** What is shown and heard first; the person may change either. */
   initialPicture?: Picture;
   initialSound?: Sound;
-  /** Said on the row under the controls, beside which part is playing. */
-  meta?: ReactNode;
+  /** What the recording is — its date, length, language, engines — said first
+   *  on the one row under the controls, before which part is playing. */
+  meta?: string;
   ref?: Ref<TranscriptPlayerHandle>;
 }) {
   // A part whose length Rust could not tell (a session nobody transcribed yet)
@@ -506,18 +507,28 @@ export function TranscriptPlayer({
           </IconHint>
         </div>
       </div>
-      <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1 text-muted-foreground text-xs">
-        {meta}
-        <p className="ml-auto min-w-0 break-words">
-          {parts.length > 1 && `Part ${index + 1} of ${parts.length} · `}
-          <span className="font-mono">{partName}</span>
-        </p>
-      </div>
+      <MetaLine
+        text={[meta, parts.length > 1 ? `Part ${index + 1} of ${parts.length}` : null, partName]
+          .filter((piece) => piece)
+          .join(" · ")}
+      />
       {refused && (
         <p role="alert" className="break-words text-destructive" title={refused}>
           {PLAY_REFUSED_LABEL}
         </p>
       )}
     </section>
+  );
+}
+
+/**
+ * The facts about a recording, on one row in the UI's own font: cut with an
+ * ellipsis when the row is narrower than they are, whole in the tooltip.
+ */
+export function MetaLine({ text }: { text: string }) {
+  return (
+    <HoverHint label={text}>
+      <p className="min-w-0 truncate text-muted-foreground text-xs">{text}</p>
+    </HoverHint>
   );
 }

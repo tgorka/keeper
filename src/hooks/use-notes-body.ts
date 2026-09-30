@@ -67,6 +67,7 @@ import {
   adoptBodySubscription,
   applyBodyBatch,
   beginSave,
+  documentKey,
   dropNoteDocument,
   editBuffer,
   markSaved,
@@ -163,8 +164,34 @@ function release(vaultId: string, noteId: string, subscriptionId: string, reques
  * `dirty` clears and that release does not re-send the same text against a
  * revision the first write has already superseded — which Rust would read as
  * somebody else's edit and answer with a conflict copy.
+ *
+ * **One write per note at a time.** Blur, the idle autosave, ⌘S and a block's
+ * own forced save (a record block naming its session) can all fire within one
+ * round trip, and each would read the same revision out of the store: the
+ * second to land would then carry a revision the first has already moved past
+ * and leave a conflict copy of the note's own words. So a write that finds
+ * another in flight for the same note waits for it, then reads the document
+ * again and writes only what is still unsaved, against the revision the first
+ * one landed.
  */
-export async function saveNote(vaultId: string, noteId: string): Promise<boolean> {
+export function saveNote(vaultId: string, noteId: string): Promise<boolean> {
+  const key = documentKey(vaultId, noteId);
+  const before = savesInFlight.get(key);
+  const write =
+    before === undefined
+      ? writeNote(vaultId, noteId)
+      : before.then(() => writeNote(vaultId, noteId));
+  savesInFlight.set(key, write);
+  void write.finally(() => {
+    if (savesInFlight.get(key) === write) savesInFlight.delete(key);
+  });
+  return write;
+}
+
+/** The last write queued per note ({@link saveNote}), by document key. */
+const savesInFlight = new Map<string, Promise<boolean>>();
+
+async function writeNote(vaultId: string, noteId: string): Promise<boolean> {
   const document = readNoteDocument(vaultId, noteId);
   if (document.subscriptionId === null || !document.dirty) {
     // Nothing to write is not a failure: the bytes the caller cares about are

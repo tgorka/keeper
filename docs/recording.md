@@ -224,19 +224,36 @@ save, not after. Move them yourself first if you want to keep them listed.
 ### Every synced folder that holds recordings is indexed
 
 The recordings browser and its search read an index (`archive.db`) that keeper
-rebuilds from the session folders themselves, at startup and whenever a synced
-folder is added, removed, paused, resumed or edited, or the destination is
-saved. Every synced folder that declares a recordings subfolder is walked —
-not only the one recordings land in today — so a second folder's meetings are
-searchable and each session is listed under the folder it is actually in.
+rebuilds from the session folders themselves, at startup, whenever a synced
+folder is added, removed, paused, resumed or edited or the destination is
+saved, and **once a day** on its own. Every synced folder that declares a
+recordings subfolder is walked — not only the one recordings land in today —
+so a second folder's meetings are searchable and each session is listed under
+the folder it is actually in.
+
+The daily pass is what catches what keeper did not see happen: a session moved
+by hand, a copy that arrived by pull, a drive plugged in after keeper started.
+It runs a day after the last rebuild of every folder finished (the startup one
+counts, so a launch never walks twice); a Mac that was asleep through the day
+runs it on the first tick after it wakes. The Recordings pane re-reads its list
+whenever a rebuild lands, and its header ⋯ → **Reconcile now** runs the same
+pass at once. The time of the last one is `recordings.last_reconcile_ms`
+(keeper's own record, not a setting you can put in a file); a refresh that
+found no recordings folder to walk, or could not rebuild one of them, is not
+recorded as one.
 
 The index follows the folders, not the other way round. A session you move by
 hand from one recordings root into another is re-homed on the next rebuild:
 one entry, under the folder it now sits in, and its durability is what *that*
 folder's repository says about it — `local` until that folder has committed
 it, whatever the old folder had already pushed. A session you *copy* into a
-second root, with the first copy still there, stays listed under the first
-one (the log names both). A session whose folder is gone from every root
+second root, with the first copy still there, is listed once, under the copy
+whose `manifest.json` changed last (the one something last worked on — a
+recording, a recovery, a retitle); two copies changed at the same instant go
+to the folder whose path sorts first. The choice depends on the two copies
+alone, never on which folder happened to be walked first, so the entry does
+not jump between them from one rebuild to the next, and the log names both,
+with both times. A session whose folder is gone from every root
 drops out of the browser and the search. A folder keeper cannot read whole —
 a drive that is unplugged, a paused folder — is left exactly as it was:
 nothing is forgotten because keeper could not look, and a folder that is
@@ -246,17 +263,18 @@ that has not synced yet) is not believed either.
 Plainly, what triggers a rebuild and what each change does to the index:
 
 - A `[folder.recordings]` block that arrives by pull or by hand edit is
-  picked up at the next save in Settings → Sync or the next start of keeper,
-  not the moment it lands.
-- A drive plugged in after keeper started is indexed at the next save or the
-  next start, for the same reason.
+  picked up at the next save in Settings → Sync, the next start of keeper or
+  the next daily pass, not the moment it lands.
+- A drive plugged in after keeper started is indexed at the next save, start
+  or daily pass, for the same reason — or now, with **Reconcile now**.
 - Removing a synced folder removes its recordings from the index — keeper no
   longer knows that folder, so it cannot list what is in it. Pausing one does
   not: a paused folder's recordings stay listed as they were, waiting for it.
 - On a machine without `git` there is no repository to ask, so every session
   in a synced folder reads `local` — which is exactly what is true there.
 - A rebuild waits for a recording in progress. A change made while a session
-  records is remembered and the rebuild runs the moment the session ends; a
+  records — or the daily pass, or **Reconcile now** (the pane says it is
+  waiting) — is remembered and the rebuild runs the moment the session ends; a
   rebuild already under way leaves the live session's folder alone.
 
 Recordings never live at the profile root, and that is not an oversight: eight
@@ -328,6 +346,22 @@ it could also say listed as comments — one player for the meeting, where stubs
 before Epic 88 embedded each video. Those older stubs keep their embeds, and
 stubs from before the comments keep their three-line block, until you choose
 *Use the media player in recording notes…* in the notes options menu.
+
+**A recording started from a note has that note, not a stub.** A note's
+`record = "new"` block records like the Recording pane, from the same setup, and
+its session's `manifest.json` carries `meta.linkedNote` — the vault and the
+note's path in it, never an absolute path. The block names the session
+(`session = "<id>"`) the moment the start answers, as an edit in the note's
+editor, saved at once. While it records the note is tagged `recording` and
+`recording/<host>`; when it stops (or, after a quit or a crash, when the
+recovery pass salvages it), keeper removes this Mac's tag — and `recording`,
+unless another Mac's is still there — and writes no stub while the note still
+names the session, on disk or, while the note exists, in an open editor — a
+failed session's too. keeper never edits the note's body for this, only its tags,
+through a block amendment that is safe under an open editor. A note deleted,
+or whose block was removed, gets the ordinary stub instead. Tags a crash left
+are swept at launch, before each start and after each stop, whenever nothing
+records on this Mac. Details in `docs/notes.md` § *Media in a note*.
 
 Speakers are matched against the voices bank of the drive, and you correct
 words and people in the transcript viewer. How that works, and where the models

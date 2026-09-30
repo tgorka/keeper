@@ -106,6 +106,10 @@ mod telemetry_ipc;
 // the vendored FluidAudio fork, and the command surface over the port —
 // ungated, like voice, so the command list is identical on every target.
 mod media_block_ipc;
+// Recording from a note (story 88.9): the note a `record = "new"` block
+// started a session from, and its tags while it records. Every target, so
+// the command list is identical everywhere.
+mod note_recording_ipc;
 mod transcribe_ipc;
 #[cfg(target_os = "macos")]
 mod transcribe_macos;
@@ -713,6 +717,9 @@ pub fn run() {
                         // The account's daily pull rides the same clock (AD-332):
                         // a due-check here, the pull itself spawned off the tick.
                         account_ipc::daily_tick();
+                        // The recordings index's daily reconcile, the same
+                        // way: a due-check here, the refresh on its own thread.
+                        ipc::recordings_reconcile_tick(&handle);
                         // Voice rides the same clock (Story 63.5, FR-421): the
                         // tray's status line and verb follow Rust's own turn —
                         // `voice_snapshot`, not the webview's mirror — so the
@@ -768,6 +775,8 @@ pub fn run() {
             // seconds after boot. A failure is logged only, never fatal.
             {
                 let handle = app.handle().clone();
+                // Before the launch pass, so its landing reaches the pane.
+                ipc::install_recordings_index_announcer(&handle);
                 std::thread::spawn(move || {
                     let state = handle.state::<ipc::AppState>();
                     ipc::recover_orphaned_recordings(state.inner());
@@ -1088,11 +1097,16 @@ pub fn run() {
                 media_block_ipc::media_block_edit,
                 media_block_ipc::media_block_clip,
                 media_block_ipc::media_block_sources,
+                media_block_ipc::media_block_schema,
+                media_block_ipc::media_block_check,
                 media_block_ipc::media_block_find_marker,
                 media_block_ipc::media_block_for_embed,
                 media_block_ipc::media_block_compose,
                 media_block_ipc::transcript_clip,
                 media_block_ipc::recording_notes_adopt_media_block,
+                note_recording_ipc::recording_linked_note,
+                note_recording_ipc::media_block_recording,
+                note_recording_ipc::media_block_record_started,
                 ipc::bridge_catalog,
                 ipc::bridge_discover,
                 ipc::bridge_login_start,
@@ -1258,6 +1272,7 @@ pub fn run() {
                 ipc::debug_log_tail,
                 ipc::debug_log_path,
                 ipc::titlebar_drag_report,
+                ipc::frontend_error_report,
                 ipc::recording_permission,
                 ipc::request_screen_recording_permission,
                 ipc::request_microphone_permission,
@@ -1568,6 +1583,9 @@ pub fn run() {
         // itself — a phone has no folder chooser to pick a destination from,
         // and the control is absent there rather than a twin that refuses.
         notes_ipc::notes_export,
+        // The Recordings pane's "Reconcile now": the pane itself is
+        // desktop-only (the `recording` capability), so there is no twin.
+        ipc::recordings_reconcile_now,
     );
     // The commands that touch a window or a file manager have `Unsupported`
     // twins so the handler list is identical on every target and

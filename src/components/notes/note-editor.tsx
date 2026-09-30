@@ -64,7 +64,9 @@ import type { MarkdownPreview } from "@/components/viewers/markdown-preview";
 import { type ViewMode, viewModeCookie, viewModeFor } from "@/components/viewers/view-mode";
 import { useNotesBody } from "@/hooks/use-notes-body";
 import {
+  mediaBlockCheck,
   mediaBlockFindMarker,
+  mediaBlockSchema,
   type NoteWriteVm,
   notesBodyRead,
   notesGallery,
@@ -72,6 +74,8 @@ import {
   notesRename,
   notesTagTree,
   type PanelTargetVm,
+  searchRecordings,
+  syncBrowse,
 } from "@/lib/ipc/client";
 import {
   followExternalUrl,
@@ -699,6 +703,7 @@ export function NoteEditor({
         marks,
         media,
         widgetSlash,
+        mediaHints,
       ] = await Promise.all([
         import("@codemirror/state"),
         import("@codemirror/view"),
@@ -724,6 +729,8 @@ export function NoteEditor({
         // drive.
         import("./editor/media-block"),
         import("./editor/widget-slash"),
+        // Keys, values and refusals while a media block's source is open.
+        import("./editor/media-hints"),
       ]);
       if (disposed) {
         return;
@@ -754,6 +761,10 @@ export function NoteEditor({
         // `[[<this note>#<marker>]]`: the name a wikilink resolves, which is the
         // file's name without its extension.
         noteLink: () => pathRef.current?.split("/").pop()?.replace(/\.md$/i, "") ?? null,
+        notePath: () => pathRef.current ?? null,
+        saveNote: () => {
+          void latest.current.save();
+        },
       });
       const editorView = new view.EditorView({
         parent: host,
@@ -841,6 +852,24 @@ export function NoteEditor({
               extensions: [...marks.MARKDOWN_MARKS],
             }),
             writing.markdownWritingTools([
+              // Each call reaches the client only when a media block asks.
+              mediaHints.mediaBlockCompleteSource({
+                schema: () => mediaBlockSchema(),
+                recordings: async (query) =>
+                  (
+                    await searchRecordings({
+                      query,
+                      tags: [],
+                      participant: null,
+                      startTs: null,
+                      endTs: null,
+                      durability: null,
+                      profileId: null,
+                      limit: 20,
+                    })
+                  ).rows,
+                files: (subpath) => syncBrowse(vaultId, subpath),
+              }),
               wikilink.wikilinkSource(vaultId),
               tags.tagCompleteSource(async () => {
                 cachedTags ??= tags.tagPaths((await notesTagTree(vaultId)).nodes);
@@ -848,6 +877,7 @@ export function NoteEditor({
               }),
               widgetSlash.widgetSlashSource((at) => latest.current.pickMedia(at)),
             ]),
+            mediaHints.mediaBlockDiagnostics((source) => mediaBlockCheck(source)),
             // Escape first closes Find, then simplifies a selection via the
             // default keymap; with neither present, it dismisses list marks.
             preview.searchMarks(),

@@ -5980,10 +5980,20 @@ impl RecordingSink {
         // in this method the session does not depend on. Best-effort throughout:
         // see `write_recording_note_stub` for why a note that cannot be written
         // is never a recording failure.
-        note_stub_at_finalize(
-            &self.manifest,
-            self.sync.as_ref().map(|sync| sync.profile_id.as_str()),
-        );
+        //
+        // Story 88.9: a session started from a note loses the note's tags, and
+        // that note is its note while a block in it names the session — on
+        // disk or in an open editor; otherwise, a failed session's too, it
+        // gets the ordinary stub. Then any tags a crash left are swept.
+        if crate::note_recording_ipc::finish(&self.manifest, false)
+            != crate::note_recording_ipc::NoteFinish::Done
+        {
+            note_stub_at_finalize(
+                &self.manifest,
+                self.sync.as_ref().map(|sync| sync.profile_id.as_str()),
+            );
+        }
+        crate::note_recording_ipc::sweep_stale_tags(Duration::ZERO);
         // AD-348: a finished session on a drive that keeps voices is queued
         // for transcription on this Mac. After everything else and off this
         // task: the hook only checks and enqueues, on the blocking pool, and
@@ -6543,7 +6553,18 @@ pub async fn recording_start(
     // decided what a tag is; both now happen once, in `tags::split_list`.
     meta_tags: Option<String>,
     meta_custom: Option<Vec<keeper_core::recording::SessionMetaField>>,
+    // Story 88.9: the note whose `record = "new"` block pressed Start. The
+    // session is linked to it and the note is tagged while it records; the
+    // block names the session itself, from the webview, once this answers.
+    note: Option<keeper_core::recording::LinkedNote>,
 ) -> Result<RecordingStatusVm, IpcError> {
+    // Tags a crash or a failed stop left behind go first, while nothing that
+    // could be tagged is recording; a live session keeps its own.
+    crate::note_recording_ipc::sweep_stale_tags(Duration::ZERO);
+    // A note that cannot be reached is refused before anything is created.
+    if let Some(note) = note.as_ref() {
+        crate::note_recording_ipc::check_start(note)?;
+    }
     // Story 19.2/19.3/20.1 + the spec *Recording remembers which sources are on*:
     // which sources this session captures is resolved further down, beside the
     // other persisted settings — `None` (no explicit choice reached the command)
@@ -6598,7 +6619,7 @@ pub async fn recording_start(
     // invariant: the slot is never held across blocking `read_dir`/`stat`). The
     // new session's own folder does not exist yet, so the scan cannot see it; a
     // recovery failure is logged in the core pass and must NEVER fail the start.
-    {
+    let recovered = {
         let _scan = plain_lock(&state.recovery_scan);
         let is_active =
             |folder: &Path| plain_lock(&state.reserved_recording_folders).contains(folder);
@@ -6609,7 +6630,9 @@ pub async fn recording_start(
                 "pre-record recovery marked orphaned session(s) recovered"
             );
         }
-    }
+        recovered
+    };
+    finish_recovered_notes(&recovered, false);
 
     let mut guard = slot_lock(&state.recording_run);
     if let Some(run) = guard.as_ref() {
@@ -6760,21 +6783,24 @@ pub async fn recording_start(
     // blank" and "where does one tag end" is how a field starts round-tripping
     // differently depending on which surface last saved it.
     let session_id = mint_session_id(&data_dir)?;
-    let session_meta = keeper_core::recording::SessionMeta::from_input(
-        Some(session_id.clone()),
-        &keeper_core::recording::SessionMetaInput {
-            title: meta_title.as_deref(),
-            participants: meta_participants.as_deref(),
-            note: meta_note.as_deref(),
-            // Story 42.5: one tokenisation, in the tag module, for the one field
-            // whose separator is a comma. What lands in `manifest.json` is still
-            // the user's own text — the canonical form is applied later, by
-            // `RecordingRow::from_manifest`, on the way into the index. The
-            // manifest says what they typed; the row says what it means.
-            tags: meta_tags.as_deref(),
-            custom: meta_custom.as_deref().unwrap_or(&[]),
-        },
-    );
+    let session_meta = keeper_core::recording::SessionMeta {
+        linked_note: note.clone(),
+        ..keeper_core::recording::SessionMeta::from_input(
+            Some(session_id.clone()),
+            &keeper_core::recording::SessionMetaInput {
+                title: meta_title.as_deref(),
+                participants: meta_participants.as_deref(),
+                note: meta_note.as_deref(),
+                // Story 42.5: one tokenisation, in the tag module, for the one field
+                // whose separator is a comma. What lands in `manifest.json` is still
+                // the user's own text — the canonical form is applied later, by
+                // `RecordingRow::from_manifest`, on the way into the index. The
+                // manifest says what they typed; the row says what it means.
+                tags: meta_tags.as_deref(),
+                custom: meta_custom.as_deref().unwrap_or(&[]),
+            },
+        )
+    };
     let title = session_meta.title.clone();
     let devices = SessionDevices {
         system_audio,
@@ -6921,6 +6947,11 @@ pub async fn recording_start(
     // trigger deferred while this session recorded (the archive follows every
     // recordings root) — cloned out now, because the task outlives this call.
     let index_handles = RecordingsIndexHandles::of(state.inner());
+    // Story 88.9: nothing below can fail the start, and the driver's finalize
+    // clears what this holds, so the note is linked before the driver exists.
+    if let Some(note) = note {
+        crate::note_recording_ipc::started(note, session_id);
+    }
     // The handle is stored into the run slot below (Story 18.2): aborting it is
     // the quit kill-timeout's force-kill lever (see `RecordingRun::driver`).
     let driver = tauri::async_runtime::spawn(async move {
@@ -8106,6 +8137,7 @@ pub(crate) fn recover_orphaned_recordings(state: &AppState) {
     let Some(plans) = recordings_index_plans(&handles.platform) else {
         return;
     };
+    let mut recovered_all = Vec::new();
     {
         let _scan = plain_lock(&state.recovery_scan);
         let is_active =
@@ -8120,6 +8152,7 @@ pub(crate) fn recover_orphaned_recordings(state: &AppState) {
                     "startup recovery marked orphaned session(s) recovered"
                 );
             }
+            recovered_all.extend(recovered);
         }
     }
     // Story 42.1: the same pass, for the index — and since the archive followed
@@ -8132,6 +8165,12 @@ pub(crate) fn recover_orphaned_recordings(state: &AppState) {
     // skip set exactly as a triggered one does, and goes through the same
     // gate, so a settings save that lands during boot coalesces with it.
     run_recordings_index_rebuild(&handles, RecordingsIndexTrigger::because("keeper started"));
+    // Story 88.9: last, because it may wait for the notes registry to list a
+    // recovered session's note — the index must not wait with it. Then every
+    // open vault is swept of tags a crash left, once the registry has listed
+    // and indexed them.
+    finish_recovered_notes(&recovered_all, true);
+    crate::note_recording_ipc::sweep_stale_tags(crate::note_recording_ipc::VAULT_WAIT);
 }
 
 /// One recordings root the archive must follow: where it is, which kind of
@@ -8414,9 +8453,13 @@ fn recordings_index_plans(platform: &Arc<dyn Platform>) -> Option<Vec<Recordings
 /// root as its neighbours.
 ///
 /// Sent, not called: the writer owns the one connection to `archive.db`, and a
-/// rebuild is exactly the operation that must not open a second. Nothing waits
-/// on it — a boot that cannot index is a boot whose folders are still the
-/// truth.
+/// rebuild is exactly the operation that must not open a second. This thread
+/// then waits for the writer to reach the end of what it sent
+/// ([`keeper_core::archive::ArchiveHandle::settled`]) — still under the gate,
+/// so one refresh is one refresh on disk too — and only then records the time
+/// (`recordings.last_reconcile_ms`, what the daily reconcile counts its day
+/// from) and tells the Recordings pane to read again. A writer that has
+/// stopped records nothing and announces nothing: the index did not change.
 ///
 /// **The skip set is a snapshot, and that is enough.** The reserved set is
 /// read once here and every rebuild in this refresh carries it. A session
@@ -8443,6 +8486,10 @@ fn run_recordings_index_rebuild(handles: &RecordingsIndexHandles, trigger: Recor
         let skip: HashSet<PathBuf> = plain_lock(&handles.reserved).clone();
         let followed: Vec<keeper_core::archive::KnownRoot> =
             plans.iter().map(RecordingsRootPlan::known).collect();
+        // A refresh that walked no root, or could not rebuild one, has not
+        // matched the index to the folders, so it must not count as the day's
+        // reconcile.
+        let walked = !plans.is_empty();
         let sink = |step: RecordingsIndexStep| match step {
             RecordingsIndexStep::Rebuild { plan, probe } => {
                 let mut request = keeper_core::archive::RebuildRequest::new(
@@ -8465,7 +8512,142 @@ fn run_recordings_index_rebuild(handles: &RecordingsIndexHandles, trigger: Recor
             &|profile_id| durability_probe(&handles.platform, profile_id),
             &sink,
         );
+        let Ok(every_root) = archive.settled().blocking_recv() else {
+            return;
+        };
+        recordings_index_reconciled(&handles.platform, (walked && every_root).then(now_ms));
     });
+}
+
+/// A refresh has landed in the index: when it walked and rebuilt every root
+/// (`reconciled` is when), remember that in the registry for the next launch
+/// and in [`RECONCILE_CLOCK`] for this one; either way tell the webview, as a
+/// forget or the roots that did rebuild may have changed the index.
+fn recordings_index_reconciled(platform: &Arc<dyn Platform>, reconciled: Option<i64>) {
+    use tauri::Emitter;
+
+    if let Some(now) = reconciled {
+        stamp_recordings_reconcile(platform, now);
+    } else {
+        tracing::info!(
+            "archive rebuild: not every recordings root was rebuilt, so the daily reconcile is not counted"
+        );
+    }
+    let Some(app) = RECORDINGS_INDEX_APP.get() else {
+        return;
+    };
+    if let Err(error) = app.emit(RECORDINGS_RECONCILED_EVENT, ()) {
+        tracing::warn!(%error, "archive rebuild: the Recordings pane could not be told to read again");
+    }
+}
+
+/// Record that every recordings root was walked at `now`.
+fn stamp_recordings_reconcile(platform: &Arc<dyn Platform>, now: i64) {
+    plain_lock(&RECONCILE_CLOCK).last_ms = Some(now);
+    match platform.data_dir() {
+        Ok(data_dir) => {
+            if let Err(error) =
+                keeper_core::registry::set_recordings_last_reconcile_ms(&data_dir, now)
+            {
+                tracing::warn!(%error, "archive rebuild: could not record when the index last matched the folders");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "archive rebuild: could not resolve the data dir to record the reconcile (non-fatal)");
+        }
+    }
+}
+
+/// The event the webview hears when a refresh of every recordings root has
+/// landed in the index; the Recordings pane re-runs its query on it.
+pub const RECORDINGS_RECONCILED_EVENT: &str = "keeper://recordings-reconciled";
+
+/// The handle [`RECORDINGS_RECONCILED_EVENT`] is emitted through, set once
+/// from `lib.rs`'s setup, before the launch pass starts.
+static RECORDINGS_INDEX_APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+/// Keep the app handle the index announces itself through. Write-once.
+pub(crate) fn install_recordings_index_announcer(app: &tauri::AppHandle) {
+    let _ = RECORDINGS_INDEX_APP.set(app.clone());
+}
+
+/// What the daily reconcile knows about time, in this process: when the
+/// index last matched the folders (loaded from the registry on the first
+/// tick, then kept by [`recordings_index_reconciled`]) and when a refresh was
+/// last asked for by the tick. Only the desktop's tick reads it.
+#[cfg_attr(not(desktop), allow(dead_code))]
+struct ReconcileClock {
+    loaded: bool,
+    last_ms: Option<i64>,
+    asked_ms: Option<i64>,
+}
+
+static RECONCILE_CLOCK: Mutex<ReconcileClock> = Mutex::new(ReconcileClock {
+    loaded: false,
+    last_ms: None,
+    asked_ms: None,
+});
+
+/// The daily reconcile, a due-check on the tray's 1 Hz tick (AD-62: no clock
+/// of its own), like `account_ipc::daily_tick`: once a day since the index
+/// last matched the folders, one refresh of every recordings root — the same
+/// [`spawn_recordings_index_rebuild`] every other trigger takes, so it defers
+/// while a session records and folds into a refresh already running. The
+/// policy is [`keeper_core::archive::reconcile_due`].
+///
+/// The first tick seeds the last ask with now: this launch's own pass
+/// ([`recover_orphaned_recordings`]) is the launch reconcile, whatever the
+/// stored time says. The registry is read once, on that tick, and never
+/// again — every later refresh updates the clock in memory as it lands.
+#[cfg(desktop)]
+pub(crate) fn recordings_reconcile_tick(app: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    let now = now_ms();
+    let state = app.state::<AppState>();
+    {
+        let mut clock = plain_lock(&RECONCILE_CLOCK);
+        if !clock.loaded {
+            clock.loaded = true;
+            clock.asked_ms = clock.asked_ms.max(Some(now));
+            let stored = state
+                .platform
+                .data_dir()
+                .ok()
+                .and_then(|data_dir| {
+                    keeper_core::registry::get_recordings_last_reconcile_ms(&data_dir).ok()
+                })
+                .flatten();
+            clock.last_ms = clock.last_ms.max(stored);
+        }
+        if !keeper_core::archive::reconcile_due(clock.last_ms, clock.asked_ms, now) {
+            return;
+        }
+        clock.asked_ms = Some(now);
+    }
+    spawn_recordings_index_rebuild(
+        state.inner(),
+        RecordingsIndexTrigger::because(
+            "a day since the recordings index last matched the folders",
+        ),
+    );
+}
+
+/// The Recordings pane's "Reconcile now": the daily reconcile, asked for by
+/// hand — one refresh of every recordings root, through the same gate. `true`
+/// when it started now, `false` when a recording in progress holds it until
+/// the session ends; either way the pane hears
+/// [`RECORDINGS_RECONCILED_EVENT`] when it lands.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recordings_reconcile_now(state: State<'_, AppState>) -> Result<bool, IpcError> {
+    let recording =
+        live_snapshot(&state.recording_run).is_some_and(|(snapshot, ..)| snapshot.state.is_live());
+    spawn_recordings_index_rebuild(
+        state.inner(),
+        RecordingsIndexTrigger::because("reconcile asked for in the Recordings pane"),
+    );
+    Ok(!recording)
 }
 
 /// The one-at-a-time guard around the index refresh (the archive follows
@@ -9173,6 +9355,30 @@ fn note_stub_at_finalize(manifest: &SessionManifest, profile_id: Option<&str>) {
 #[cfg(not(desktop))]
 fn note_stub_at_finalize(manifest: &SessionManifest, profile_id: Option<&str>) {
     let _ = (manifest, profile_id);
+}
+
+/// Story 88.9: each session a recovery pass just salvaged that was started
+/// from a note finishes that note as a stop would — its tags go — and gets
+/// the stub a stop would have written unless the note still names it. A
+/// session not started from a note is left as it was.
+#[cfg(desktop)]
+fn finish_recovered_notes(recovered: &[PathBuf], wait_for_vault: bool) {
+    for folder in recovered {
+        let Ok(manifest) = SessionManifest::load(folder) else {
+            continue;
+        };
+        if crate::note_recording_ipc::finish(&manifest, wait_for_vault)
+            == crate::note_recording_ipc::NoteFinish::Stub
+        {
+            note_stub_at_finalize(&manifest, stub_profile_id(folder).as_deref());
+        }
+    }
+}
+
+/// iOS records nothing, so nothing is ever recovered.
+#[cfg(not(desktop))]
+fn finish_recovered_notes(recovered: &[PathBuf], wait_for_vault: bool) {
+    let _ = (recovered, wait_for_vault);
 }
 
 /// Everything the three stub commands resolve before they can do anything.
@@ -11294,6 +11500,42 @@ pub fn titlebar_drag_report(stage: String, detail: Option<String>) {
             "titlebar drag: unrecognised stage reported by the webview"
         ),
     }
+}
+
+/// Record an error the webview could not handle in the app log.
+///
+/// Without it a render error in the React tree is invisible on a user's
+/// machine: React unmounts the root, the window goes blank, and a release
+/// build has no inspector to read the console from. That is exactly how the
+/// owner's "unfold Properties and keeper hangs on an empty window" report
+/// (epic 88, field reports 2 and 3) stayed undiagnosed for two builds: the
+/// process was idle, the page was simply gone. The frontend's crash screen and
+/// its global `error`/`unhandledrejection` listeners report here.
+///
+/// `ERROR` for the same reason [`titlebar_drag_report`] uses `WARN`: the file
+/// leg of the app log keeps it whatever the debug-mode toggle says. The line's
+/// wording is authored here; only the capped texts cross from the webview.
+#[tauri::command]
+pub fn frontend_error_report(
+    source: String,
+    message: String,
+    stack: Option<String>,
+    component_stack: Option<String>,
+) {
+    const MAX_MESSAGE_CHARS: usize = 500;
+    const MAX_STACK_CHARS: usize = 4_000;
+    let cap = |text: String, max: usize| -> String { text.chars().take(max).collect() };
+    let source = cap(source, 40);
+    let message = cap(message, MAX_MESSAGE_CHARS);
+    let stack = cap(stack.unwrap_or_default(), MAX_STACK_CHARS);
+    let component_stack = cap(component_stack.unwrap_or_default(), MAX_STACK_CHARS);
+    tracing::error!(
+        %source,
+        %message,
+        %stack,
+        %component_stack,
+        "frontend error: the webview reported an error it could not handle"
+    );
 }
 
 /// Read the menu-bar (tray) presence toggle (Story 10.3, FR-53). Reads the persisted
@@ -17745,6 +17987,7 @@ mod tests {
                 name: "room".to_owned(),
                 value: "Blue".to_owned(),
             }]),
+            linked_note: None,
         }
     }
 
@@ -18159,6 +18402,7 @@ mod tests {
                 note: None,
                 tags: Some(vec!["standup".to_owned(), "eng".to_owned()]),
                 custom: None,
+                linked_note: None,
             }),
             Some(INDEXED_STARTED_AT.to_owned()),
         )
