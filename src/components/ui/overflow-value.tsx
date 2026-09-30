@@ -188,17 +188,31 @@ interface OverflowValueProps extends FullValuePanelProps {
  * "Show all of…" label. A screen reader walking the panel has to hear the
  * values, not a column of identical verbs — the popup is announced by
  * `aria-haspopup`, which Radix sets.
+ *
+ * **The measured element is the same `span` in both branches**, and the button
+ * only wraps it at full width. It used to be the button itself, and in WebKit
+ * (the shipped app's engine) a `display: block` button sizes to its content, not
+ * to its column: measured on 2026-09-30, a 120px column held a 574px-wide button
+ * reading `scrollWidth === clientWidth`. So the span overflowed, became the
+ * button, the button "fit", it became the span again, and every commit flipped
+ * it back until React gave up (error #185) and unmounted the whole window. That
+ * was the owner's "unfold Properties on a recording note and keeper hangs on an
+ * empty window": the note's `files:` paths are the longest values in the panel.
  */
 export function OverflowValue({ name, value, monospace, className }: OverflowValueProps) {
   const { ref, overflowing } = useOverflowing();
-  const text = cn("block min-w-0 truncate", monospace === true && "font-mono", className);
+  const text = (
+    <span
+      ref={ref}
+      data-slot={overflowing ? "overflow-text" : "overflow-value"}
+      className={cn("block min-w-0 truncate", monospace === true && "font-mono", className)}
+    >
+      {value}
+    </span>
+  );
 
   if (!overflowing) {
-    return (
-      <span ref={ref} data-slot="overflow-value" className={text}>
-        {value}
-      </span>
-    );
+    return text;
   }
 
   return (
@@ -206,12 +220,14 @@ export function OverflowValue({ name, value, monospace, className }: OverflowVal
       <PopoverTrigger asChild>
         <button
           type="button"
-          ref={ref}
           data-slot="overflow-value"
           data-overflowing="true"
-          className={cn(text, "cursor-pointer text-left outline-none hover:underline", FOCUS_RING)}
+          className={cn(
+            "block w-full min-w-0 cursor-pointer text-left outline-none hover:underline",
+            FOCUS_RING,
+          )}
         >
-          {value}
+          {text}
         </button>
       </PopoverTrigger>
       <PopoverContent align="start" className="w-80 gap-1">

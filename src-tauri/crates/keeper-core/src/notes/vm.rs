@@ -762,6 +762,11 @@ pub enum NoteBodyBatch {
         /// The body now on disk.
         theirs: String,
     },
+    /// keeper changed the note's frontmatter block alone — a recording's tags
+    /// (story 88.9) — and the body under the editor is unchanged. The editor
+    /// adopts the block and the revision and nothing else: its buffer, dirty
+    /// or not, still descends from what is on disk.
+    Block { rev: String, frontmatter: String },
     /// The note moved. Its id is unchanged, so the editor retargets rather than
     /// closing.
     Renamed { path: String },

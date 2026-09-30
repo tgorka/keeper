@@ -1,27 +1,65 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RecordingHitVm, RecordingSearchVm } from "@/lib/ipc/client";
+import type { RecordingHitVm, RecordingSearchVm, TranscriptionProgressVm } from "@/lib/ipc/client";
 
 // Mock the typed IPC client so the pane never touches Tauri.
 const searchRecordings = vi.fn();
 const recordingOpenPath = vi.fn();
 const revealPath = vi.fn();
+const transcriptionStart = vi.fn();
+const recordingsReconcileNow = vi.fn();
+const recordingRemovePreview = vi.fn();
+const recordingRemove = vi.fn();
+// The shell's "the index landed" event: captured so a test can fire it.
+let reconciled: (() => void) | undefined;
 vi.mock("@/lib/ipc/client", () => ({
   searchRecordings: (filter: unknown) => searchRecordings(filter),
   recordingOpenPath: (path: unknown) => recordingOpenPath(path),
   revealPath: (path: unknown) => revealPath(path),
+  transcriptionStart: (path: unknown, onProgress: unknown, replace: unknown) =>
+    transcriptionStart(path, onProgress, replace),
+  transcriptionCancel: () => Promise.resolve(),
+  recordingsReconcileNow: () => recordingsReconcileNow(),
+  recordingRemovePreview: (sessionId: unknown) => recordingRemovePreview(sessionId),
+  recordingRemove: (sessionId: unknown) => recordingRemove(sessionId),
+  listenRecordingsReconciled: (onReconciled: () => void) => {
+    reconciled = onReconciled;
+    return Promise.resolve(() => {
+      reconciled = undefined;
+    });
+  },
+}));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(() => Promise.resolve(null)) }));
+// The viewer is its own lane's surface; what the pane owes it is the path.
+vi.mock("@/components/transcription/transcript-viewer", () => ({
+  TranscriptDialog: ({ path }: { path: string | null }) =>
+    path === null ? null : <div role="dialog">{path}</div>,
 }));
 
+import { open as openFile } from "@tauri-apps/plugin-dialog";
+import {
+  RECORDINGS_ROW_ACTIONS_LABEL,
+  RECORDINGS_TRANSCRIBE_LABEL,
+} from "@/components/recordings/recording-row";
 import {
   RECORDINGS_COUNT_SLOT,
   RECORDINGS_LIST_LABEL,
+  RECORDINGS_MORE_ACTIONS_LABEL,
   RECORDINGS_PANE_TITLE,
+  RECORDINGS_RECONCILE_LABEL,
+  RECORDINGS_RECONCILE_WAITING,
   RECORDINGS_REFRESH_LABEL,
   RecordingsPane,
 } from "@/components/recordings/recordings-pane";
+import {
+  REMOVE_RECORDING_CONFIRM,
+  REMOVE_RECORDING_LABEL,
+} from "@/components/recordings/remove-recording-dialog";
+import { TRANSCRIBE_A_FILE_LABEL } from "@/components/transcription/transcribe-a-file";
 import { WINDOW_ROW_ATTR, WINDOW_VIEWPORT_ATTR } from "@/components/ui/window-list";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { transcriptionStore } from "@/lib/stores/transcription";
 import { type ListGeometry, withListGeometry } from "@/test/layout";
 
 /** The two empty-state sentences, verbatim — they are the assertion. */
@@ -45,6 +83,8 @@ function hit(p: Partial<RecordingHitVm> & Pick<RecordingHitVm, "sessionId">): Re
     tags: p.tags ?? [],
     playablePath:
       p.playablePath === undefined ? `${ROOT}/${relativePath}/screen-0001.mp4` : p.playablePath,
+    transcript: p.transcript === undefined ? null : p.transcript,
+    transcribable: p.transcribable ?? false,
   };
 }
 
@@ -65,6 +105,8 @@ beforeEach(() => {
   recordingOpenPath.mockResolvedValue(undefined);
   revealPath.mockReset();
   revealPath.mockResolvedValue(undefined);
+  recordingsReconcileNow.mockReset();
+  recordingsReconcileNow.mockResolvedValue(true);
   // The pane only ever renders where recording is on; Reveal is its own flag.
   capabilitiesStore.getState().applySnapshot({
     ...DEFAULT_CAPABILITIES,
@@ -91,6 +133,41 @@ describe("RecordingsPane", () => {
     expect(screen.getByLabelText("Participant")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Durability" })).toBeInTheDocument();
     await waitFor(() => expect(searchRecordings).toHaveBeenCalled());
+  });
+
+  it("reads the archive again, with the filter on screen, when a reconcile lands", async () => {
+    render(<RecordingsPane />);
+    await waitFor(() => expect(searchRecordings).toHaveBeenCalledTimes(1));
+    fireEvent.change(screen.getByLabelText("Search recordings"), { target: { value: "standup" } });
+    await waitFor(() => expect(searchRecordings).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(reconciled).toBeDefined());
+
+    act(() => reconciled?.());
+    await waitFor(() => expect(searchRecordings).toHaveBeenCalledTimes(3));
+    expect(searchRecordings).toHaveBeenLastCalledWith(
+      expect.objectContaining({ query: "standup" }),
+    );
+  });
+
+  it("says a reconcile asked for during a recording waits, until the index lands", async () => {
+    recordingsReconcileNow.mockResolvedValue(false);
+    render(<RecordingsPane />);
+    const trigger = screen.getByRole("button", { name: RECORDINGS_MORE_ACTIONS_LABEL });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    fireEvent.pointerUp(trigger, { button: 0 });
+    const menu = await screen.findByRole("menu");
+    fireEvent.click(within(menu).getByRole("menuitem", { name: RECORDINGS_RECONCILE_LABEL }));
+
+    expect(recordingsReconcileNow).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText(RECORDINGS_RECONCILE_WAITING)).toBeInTheDocument();
+
+    // The recording ended and the held refresh landed: the sentence is no
+    // longer true, so it goes.
+    await waitFor(() => expect(reconciled).toBeDefined());
+    act(() => reconciled?.());
+    await waitFor(() =>
+      expect(screen.queryByText(RECORDINGS_RECONCILE_WAITING)).not.toBeInTheDocument(),
+    );
   });
 
   it("fires one search for a burst of keystrokes, not one per keystroke", async () => {
@@ -265,6 +342,107 @@ describe("RecordingsPane", () => {
     expect(alert).toHaveTextContent("archive.db is locked");
     // A failure is not the same fact as an empty archive.
     expect(screen.queryByText(NOTHING_RECORDED)).not.toBeInTheDocument();
+  });
+
+  describe("transcription", () => {
+    beforeEach(() => {
+      transcriptionStore.setState({ jobs: {} });
+      capabilitiesStore.getState().applySnapshot({
+        ...DEFAULT_CAPABILITIES,
+        recording: true,
+        revealInFileManager: true,
+        transcription: true,
+      });
+    });
+
+    it("carries Transcribe a file… in the header only where the Mac can transcribe", async () => {
+      const { unmount } = render(<RecordingsPane />);
+      fireEvent.click(screen.getByRole("button", { name: TRANSCRIBE_A_FILE_LABEL }));
+      await waitFor(() => expect(openFile).toHaveBeenCalledTimes(1));
+      unmount();
+
+      capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, recording: true });
+      render(<RecordingsPane />);
+      await waitFor(() => expect(searchRecordings).toHaveBeenCalled());
+      expect(screen.queryByRole("button", { name: TRANSCRIBE_A_FILE_LABEL })).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: new RegExp(RECORDINGS_TRANSCRIBE_LABEL) }),
+      ).toBeNull();
+    });
+
+    it("transcribes the session folder, re-reads the archive when it is done and opens the transcript", async () => {
+      let progress: ((p: TranscriptionProgressVm) => void) | undefined;
+      transcriptionStart.mockImplementation((_path, onProgress) => {
+        progress = onProgress;
+        return Promise.resolve("job");
+      });
+      const session = hit({ sessionId: "s1", title: "Standup", transcribable: true });
+      searchRecordings.mockResolvedValue(found([session]));
+      render(<RecordingsPane />);
+      fireEvent.click(
+        await screen.findByRole("button", { name: `${RECORDINGS_TRANSCRIBE_LABEL}: Standup` }),
+      );
+      expect(transcriptionStart).toHaveBeenCalledWith(
+        session.absolutePath,
+        expect.any(Function),
+        false,
+      );
+      const transcript = `${session.absolutePath}/transcript.json`;
+      const reads = searchRecordings.mock.calls.length;
+      searchRecordings.mockResolvedValue(found([{ ...session, transcript }]));
+      await act(async () =>
+        progress?.({
+          jobId: "job",
+          phase: "done",
+          part: 1,
+          parts: 1,
+          message: null,
+          transcriptPath: transcript,
+          fraction: 1,
+          elapsedMs: 4_000,
+          replaceable: false,
+        }),
+      );
+      await waitFor(() => expect(searchRecordings.mock.calls.length).toBeGreaterThan(reads));
+      expect(screen.queryByRole("dialog")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Show transcript: Standup" }));
+      expect(screen.getByRole("dialog")).toHaveTextContent(transcript);
+    });
+  });
+
+  it("removes a recording from its row's ⋯ after the confirmation, and the row goes", async () => {
+    const session = hit({ sessionId: "s1", title: "Standup" });
+    searchRecordings.mockResolvedValue(found([session]));
+    recordingRemovePreview.mockResolvedValue({
+      folder: "recordings/keeper-rec s1",
+      drive: "tgdrive",
+      bytes: 412_000_000,
+      files: 5,
+      durability: "local",
+      notes: [],
+    });
+    recordingRemove.mockResolvedValue({
+      folder: "recordings/keeper-rec s1",
+      bytes: 412_000_000,
+      files: 5,
+      notesChanged: [],
+      openNotes: [],
+      notesFailed: [],
+    });
+    render(<RecordingsPane />);
+    const trigger = await screen.findByRole("button", {
+      name: `${RECORDINGS_ROW_ACTIONS_LABEL}: Standup`,
+    });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    fireEvent.click(await screen.findByRole("menuitem", { name: REMOVE_RECORDING_LABEL }));
+    expect(recordingRemovePreview).toHaveBeenCalledWith("s1");
+    searchRecordings.mockResolvedValue(found([]));
+
+    fireEvent.click(await screen.findByRole("button", { name: REMOVE_RECORDING_CONFIRM }));
+
+    expect(recordingRemove).toHaveBeenCalledWith("s1");
+    await waitFor(() => expect(screen.queryByText("Standup")).toBeNull());
+    expect(screen.queryByRole("alertdialog")).toBeNull();
   });
 });
 

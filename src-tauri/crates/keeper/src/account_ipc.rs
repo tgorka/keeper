@@ -171,6 +171,9 @@ struct Runtime {
     daily_kicked_ms: Mutex<Option<i64>>,
     #[cfg(desktop)]
     daily_running: AtomicBool,
+    /// Stops the models hydration in flight (AD-341); its own flag, because
+    /// it runs beside syncs rather than inside one.
+    models_interrupt: Mutex<Arc<AtomicBool>>,
 }
 
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(Runtime::default);
@@ -201,6 +204,100 @@ fn now_ms() -> i64 {
 /// The account's HTTP client, for the bots and drive credential paths too.
 pub fn http() -> Result<&'static reqwest::Client, String> {
     HTTP.as_ref().map_err(Clone::clone)
+}
+
+/// The client the models move through (AD-341): keeper-sync's transfer
+/// client, whose guard is silence rather than duration — the account client's
+/// sixty-second ceiling would end a multi-hundred-megabyte model mid-object.
+static MODELS_HTTP: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
+    keeper_sync::http::transfer_client(keeper_sync::AGENT).map_err(|error| error.to_string())
+});
+
+/// Why the models could not be hydrated.
+pub enum ModelsFetchError {
+    /// No account, or one that has never fetched its repository.
+    NoAccount,
+    /// The sentence to show.
+    Failed(String),
+}
+
+/// Hydrate the config repository's `_models/` into `dest` (AD-341) with the
+/// repository's own credential, from the clone the last sync left. Only the
+/// config repository's host is reached; nothing else is asked for models.
+pub async fn hydrate_models(
+    platform: Arc<dyn Platform>,
+    dest: PathBuf,
+) -> Result<config_repo::HydrateReport, ModelsFetchError> {
+    let Some(d) = descriptor() else {
+        return Err(ModelsFetchError::NoAccount);
+    };
+    let data_dir = platform
+        .data_dir()
+        .map_err(|error| ModelsFetchError::Failed(error.to_string()))?;
+    let clone = clone_dir(&data_dir, &d.id);
+    if !clone.join(".git").exists() {
+        return Err(ModelsFetchError::NoAccount);
+    }
+    let http = http().map_err(ModelsFetchError::Failed)?;
+    let transfer: &'static reqwest::Client = MODELS_HTTP
+        .as_ref()
+        .map_err(|error| ModelsFetchError::Failed(error.clone()))?;
+    let mut auth = repo_credential(platform.as_ref(), http, &d)
+        .await
+        .map_err(|error| ModelsFetchError::Failed(error.to_string()))?;
+    let interrupt = Arc::new(AtomicBool::new(false));
+    *lock(&RUNTIME.models_interrupt) = Arc::clone(&interrupt);
+    // Not `off_runtime`: that counts in `RUNTIME.blocking`, and every sync's
+    // end waits on it while holding the gate — a first download of hundreds
+    // of megabytes would hold every sync and settings push for its length.
+    // Only `models_interrupt` stops this one.
+    let hydrated = with_forge_retry(platform.as_ref(), http, &d, &mut auth, |auth| {
+        let (clone, dest, url, interrupt) = (
+            clone.clone(),
+            dest.clone(),
+            d.config.url.clone(),
+            Arc::clone(&interrupt),
+        );
+        let handle = tokio::runtime::Handle::current();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                handle.block_on(async move {
+                    config_repo::hydrate_lfs_dir(
+                        transfer,
+                        &clone,
+                        keeper_core::transcription::CONFIG_MODELS_DIR,
+                        &url,
+                        &auth,
+                        &dest,
+                        &interrupt,
+                    )
+                    .await
+                })
+            })
+            .await
+            .map_err(|error| format!("the models task ended unexpectedly: {error}"))
+        }
+    })
+    .await;
+    match hydrated {
+        Ok(Ok(report)) => Ok(report),
+        Ok(Err(error)) => Err(ModelsFetchError::Failed(error.to_string())),
+        Err(sentence) => Err(ModelsFetchError::Failed(sentence)),
+    }
+}
+
+/// Whether `dest` holds exactly what the account's clone names for the
+/// models (S2): the last hydration finished and the clone has not moved on
+/// since. No account, or no clone, is never current. Blocking: it hashes
+/// the set's non-pointer files in the clone.
+pub fn models_current(data_dir: &Path, dest: &Path) -> bool {
+    descriptor().is_some_and(|d| {
+        config_repo::hydration_is_current(
+            &clone_dir(data_dir, &d.id),
+            keeper_core::transcription::CONFIG_MODELS_DIR,
+            dest,
+        )
+    })
 }
 
 /// The configured account, if any — for the credential paths that may use it.
@@ -929,6 +1026,7 @@ fn interrupt_all() {
     RUNTIME.epoch.fetch_add(1, Ordering::SeqCst);
     RUNTIME.cancel.notify_waiters();
     lock(&RUNTIME.interrupt).store(true, Ordering::SeqCst);
+    lock(&RUNTIME.models_interrupt).store(true, Ordering::SeqCst);
     // Only the account's sheets: a Matrix sign-in beside it is not ours.
     if let Some(app) = RUNTIME.app.get() {
         use tauri::Manager;
@@ -1329,6 +1427,8 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
                 platform: std::env::consts::OS,
                 machine: machine.as_deref(),
                 now_rfc3339: &now,
+                version: KEEPER_VERSION,
+                commit: KEEPER_COMMIT,
             },
         )
         .into_iter()
@@ -1385,6 +1485,12 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
         author: &author,
         oauth,
     };
+    // 6a. Which keeper this device runs, so the repository shows whether
+    //     every device updated: its record's version keys, when they differ.
+    let problem = match problem {
+        None => publish_version(platform.as_ref(), &leg, &mut auth, &identity.login, &device).await,
+        problem => problem,
+    };
     let settings_problem =
         sync_settings(Arc::clone(&platform), &leg, &mut auth, &identity, &device).await;
     let problem = problem.or(settings_problem);
@@ -1402,6 +1508,11 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
             }
         }
     }
+    // AD-341: the clone as it now stands may carry newer models; bring the
+    // hydrated copy up to date beside it, in the background.
+    if problem.is_none() {
+        crate::transcribe_ipc::spawn_models_fetch(Arc::clone(&platform));
+    }
     update(|inner| {
         apply_clone(inner, &spec.dir, &d, &identity, &device);
         if problem.is_none() {
@@ -1416,6 +1527,85 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
         }
         inner.phase = AccountPhase::Idle;
     });
+}
+
+/// The keeper release this build is, and the source it was built from, as
+/// `build_identity`'s banner names them.
+const KEEPER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const KEEPER_COMMIT: &str = env!("KEEPER_BUILD_SHA");
+
+/// Bring this device's `devices/<slug>.toml` up to the running keeper,
+/// as `"{login}: {device} runs keeper {version}"`. Checked against the clone
+/// the registration just refreshed first, so a sync where nothing changed
+/// costs no fetch and makes no commit.
+async fn publish_version(
+    platform: &dyn Platform,
+    leg: &RepoLeg<'_>,
+    auth: &mut RepoAuth,
+    login: &str,
+    device: &str,
+) -> Option<AccountProblem> {
+    let plan = {
+        let (login, device) = (login.to_owned(), device.to_owned());
+        move |root: &Path| -> Vec<Write> {
+            let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            layout::plan_version(
+                &WorktreeFiles(root),
+                &login,
+                &device,
+                KEEPER_VERSION,
+                KEEPER_COMMIT,
+                &now,
+            )
+            .into_iter()
+            // The staging guard: only this device's own record is replaced;
+            // every other device's stays create-only.
+            .filter(|write| layout::is_own_record(&login, &device, &write.rel))
+            .map(|write| Write {
+                rel: PathBuf::from(write.rel),
+                bytes: write.bytes,
+                replace: true,
+            })
+            .collect()
+        }
+    };
+    let due = {
+        let (plan, dir) = (plan.clone(), leg.spec.dir.clone());
+        on_blocking_pool(move || !plan(&dir).is_empty())
+            .await
+            .unwrap_or(false)
+    };
+    if !due {
+        return None;
+    }
+    let message = format!("{login}: {device} runs keeper {KEEPER_VERSION}");
+    let http = leg.http;
+    let pushed = with_forge_retry(platform, http, leg.d, auth, |auth| {
+        let (spec, author, message, plan, interrupt) = (
+            leg.spec.clone(),
+            leg.author.clone(),
+            message.clone(),
+            plan.clone(),
+            interrupt(),
+        );
+        off_runtime(move || async move {
+            config_repo::commit_and_push(http, &spec, &auth, &author, &message, plan, &interrupt)
+                .await
+        })
+    })
+    .await;
+    match pushed {
+        Ok(Ok(PushResult::Pushed { head })) => {
+            tracing::info!(%head, version = KEEPER_VERSION, "account: published which keeper this device runs");
+            None
+        }
+        Ok(Ok(PushResult::NothingToDo)) => None,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "account: which keeper this device runs could not be published");
+            repo_problem(&error, leg.oauth)
+        }
+        Err(sentence) => Some(AccountProblem::Failed(sentence)),
+    }
 }
 
 /// What every push to the config repository in one run shares.
@@ -3698,8 +3888,8 @@ mod tests {
         );
     }
 
-    /// A file that needed writing and could not be — outside the five of
-    /// AD-324, or not renderable — is reported dropped, so its base keeps
+    /// A file that needed writing and could not be — outside the files keeper
+    /// may replace, or not renderable — is reported dropped, so its base keeps
     /// this device's changes to push; nothing is written for it.
     #[test]
     fn a_write_that_cannot_happen_is_dropped() {
@@ -3707,6 +3897,7 @@ mod tests {
             "tgorka/keeper.toml",
             "tgorka/user.toml",
             "tgorka/devices/mac.toml",
+            "alice/devices/mac.toml",
             "someone/settings.toml",
             "_template/settings.toml",
         ] {

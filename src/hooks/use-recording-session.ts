@@ -17,7 +17,12 @@
  * not flicker the UI back to idle mid-recording).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm } from "@/lib/ipc/client";
+import type {
+  RecordingNoteLink,
+  RecordingStatusVm,
+  RecordingSummaryVm,
+  RecordingTargetVm,
+} from "@/lib/ipc/client";
 import {
   recordingAcknowledge,
   recordingStart,
@@ -111,7 +116,9 @@ export interface UseRecordingSession {
    * default-on path — the Audio card's mic selection (Story 19.3); omit
    * for the mic-off default (`micDeviceId` null = system default input) —
    * and the Webcam card's camera selection (Story 20.1); omit for the
-   * camera-off default (`cameraDeviceId` null = system default camera). */
+   * camera-off default (`cameraDeviceId` null = system default camera).
+   * `note` links the session to the note whose record block started it.
+   * Resolves `true` when Rust started the session, `false` when it refused. */
   start: (
     target?: RecordingTargetVm,
     systemAudio?: boolean,
@@ -120,7 +127,8 @@ export interface UseRecordingSession {
     cameraEnabled?: boolean,
     cameraDeviceId?: string | null,
     meta?: RecordingMetaWire,
-  ) => Promise<void>;
+    note?: RecordingNoteLink,
+  ) => Promise<boolean>;
   /** Request the graceful stop-and-finalize (idempotent). */
   stop: () => Promise<void>;
   /** Acknowledge (dismiss) a terminal session's outcome via
@@ -231,6 +239,7 @@ export function useRecordingSession(): UseRecordingSession {
       cameraEnabled?: boolean,
       cameraDeviceId?: string | null,
       meta?: RecordingMetaWire,
+      note?: RecordingNoteLink,
     ) => {
       // A new session owns its own folder — the previous session's rename is
       // no longer anything a snapshot needs projecting through.
@@ -244,10 +253,14 @@ export function useRecordingSession(): UseRecordingSession {
           cameraEnabled,
           cameraDeviceId,
           meta,
+          // Only a start from a note carries one, so every other start is
+          // the call it always was.
+          ...((note === undefined ? [] : [note]) as [] | [RecordingNoteLink]),
         );
         if (mounted.current) {
           setStatus(vm);
         }
+        return true;
       } catch (raw) {
         // An honest failed snapshot — never a crash, never a silent no-op.
         if (mounted.current) {
@@ -261,6 +274,7 @@ export function useRecordingSession(): UseRecordingSession {
             error: message,
           });
         }
+        return false;
       }
     },
     [],

@@ -35,18 +35,27 @@
  * make is not a surface, it is a puzzle. Nothing here sniffs the platform; the
  * flag is Rust's answer, mirrored in the capabilities store.
  *
- * This surface reads. There is no write path of any kind, no media player (Play
- * hands the file to the system handler and stops caring), and no tag
+ * This surface reads, and starts one job: Transcribe on a row (and the
+ * header's Transcribe a file…) hands a path to the transcription engine on this
+ * Mac and follows it, the way the Files pane does. There is no other write
+ * path, no media player (Play hands the file to the system handler and stops caring), and no tag
  * normalisation — Story 42.5 put that in Rust, at the boundary where a
  * recording's tags enter the index, so what arrives here is already the one
  * vocabulary and re-shaping it would only be a way to disagree with the tree.
  */
+import { AudioLines, MoreHorizontal } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { RecordingRow } from "@/components/recordings/recording-row";
 import {
   type RecordingsEmptyKind,
   RecordingsEmptyState,
 } from "@/components/recordings/recordings-empty-state";
+import { RemoveRecordingDialog } from "@/components/recordings/remove-recording-dialog";
+import {
+  TRANSCRIBE_A_FILE_LABEL,
+  transcribeAFile,
+} from "@/components/transcription/transcribe-a-file";
+import { TranscriptDialog } from "@/components/transcription/transcript-viewer";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -56,12 +65,20 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
+import { IconHint } from "@/components/ui/tooltip";
 import { useWindowedRows } from "@/components/ui/window-list";
 import { countLabel, SESSIONS } from "@/lib/count-label";
 import type { IpcError, RecordingFilterVm, RecordingHitVm } from "@/lib/ipc/client";
-import { recordingOpenPath, revealPath, searchRecordings } from "@/lib/ipc/client";
+import {
+  listenRecordingsReconciled,
+  recordingOpenPath,
+  recordingsReconcileNow,
+  revealPath,
+  searchRecordings,
+} from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { startTranscription, useTranscriptionStore } from "@/lib/stores/transcription";
 
 /** Debounce (ms) before a filter change fires `searchRecordings`. */
 const DEBOUNCE_MS = 200;
@@ -90,6 +107,18 @@ export const RECORDINGS_LIST_LABEL = "Recording sessions";
 
 /** The header control that re-runs the current query against the archive. */
 export const RECORDINGS_REFRESH_LABEL = "Refresh";
+
+/** The header ⋯ that holds the pane's less frequent actions. */
+export const RECORDINGS_MORE_ACTIONS_LABEL = "More recordings actions";
+
+/**
+ * The ⋯ item that rebuilds the index from every recordings folder now — what
+ * keeper otherwise does once a day on its own.
+ */
+export const RECORDINGS_RECONCILE_LABEL = "Reconcile now";
+
+/** What the header says when a recording in progress holds the reconcile. */
+export const RECORDINGS_RECONCILE_WAITING = "Reconcile waits for the recording in progress to end.";
 
 /**
  * Test id for the line that says how many sessions the filter found (Story
@@ -124,6 +153,10 @@ export function RecordingsPane() {
   // A platform with no user-visible file manager gets no Reveal affordance —
   // the row renders the path as inert text instead (Story 42.3 matrix).
   const canReveal = useCapabilitiesStore((s) => s.capabilities.revealInFileManager);
+  const canTranscribe = useCapabilitiesStore((s) => s.capabilities.transcription);
+  const transcriptionJobs = useTranscriptionStore((s) => s.jobs);
+  const [transcriptPath, setTranscriptPath] = useState<string | null>(null);
+  const [removing, setRemoving] = useState<string | null>(null);
 
   const [query, setQuery] = useState("");
   const [tags, setTags] = useState<string[]>([]);
@@ -205,6 +238,48 @@ export function RecordingsPane() {
     return () => window.clearTimeout(handle);
   }, [filter, runSearch]);
 
+  // What a job's follow-up re-runs when it ends minutes later: the filter on
+  // screen then, not the one the job started under.
+  const filterRef = useRef(filter);
+  filterRef.current = filter;
+
+  // What Rust says the reconcile is doing, when it is not simply done: held by
+  // a recording, or refused. Cleared the moment an index refresh lands.
+  const [reconcileNote, setReconcileNote] = useState<string | null>(null);
+
+  // A refresh of every recordings folder landed in the index — the daily
+  // reconcile, "Reconcile now", a start, a synced folder saved — so the list
+  // on screen may be stale: ask again, with the filter on screen now.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let alive = true;
+    void listenRecordingsReconciled(() => {
+      setReconcileNote(null);
+      runSearch(filterRef.current);
+    }).then(
+      (stop) => {
+        if (alive) {
+          unlisten = stop;
+        } else {
+          stop();
+        }
+      },
+      // No event channel (a test's shell, a torn-down window): the list is
+      // still refreshed by every search the reader makes.
+      () => {},
+    );
+    return () => {
+      alive = false;
+      unlisten?.();
+    };
+  }, [runSearch]);
+
+  const reconcileNow = useCallback(() => {
+    recordingsReconcileNow()
+      .then((started) => setReconcileNote(started ? null : RECORDINGS_RECONCILE_WAITING))
+      .catch((e: unknown) => setReconcileNote(isIpcError(e) ? e.message : String(e)));
+  }, []);
+
   // Tag choices are seeded from the current result set, the way the message
   // search seeds its sender suggestions: the tags that co-occur with what is on
   // screen are exactly the tags that can narrow it further, and a global list
@@ -276,20 +351,56 @@ export function RecordingsPane() {
               {countLabel(total, SESSIONS)}
             </p>
           )}
+          {reconcileNote !== null && (
+            <p aria-live="polite" className="text-muted-foreground text-xs">
+              {reconcileNote}
+            </p>
+          )}
         </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="shrink-0"
-          // An explicit press asks now, undebounced: a session recorded while
-          // this pane was open lands in `archive.db` without telling anyone, and
-          // every query opens a fresh read-only connection — so re-asking is the
-          // whole of "it appears without a restart".
-          onClick={() => runSearch(filter)}
-        >
-          {RECORDINGS_REFRESH_LABEL}
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          {canTranscribe && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void transcribeAFile()}
+            >
+              <AudioLines aria-hidden="true" />
+              {TRANSCRIBE_A_FILE_LABEL}
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            // An explicit press asks now, undebounced: a session recorded while
+            // this pane was open lands in `archive.db` without telling anyone, and
+            // every query opens a fresh read-only connection — so re-asking is the
+            // whole of "it appears without a restart".
+            onClick={() => runSearch(filter)}
+          >
+            {RECORDINGS_REFRESH_LABEL}
+          </Button>
+          <DropdownMenu>
+            <IconHint label={RECORDINGS_MORE_ACTIONS_LABEL}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={RECORDINGS_MORE_ACTIONS_LABEL}
+                >
+                  <MoreHorizontal aria-hidden="true" />
+                </Button>
+              </DropdownMenuTrigger>
+            </IconHint>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={reconcileNow}>
+                {RECORDINGS_RECONCILE_LABEL}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
       </header>
 
       <div className="flex shrink-0 flex-col gap-2 border-border border-b px-6 py-3">
@@ -460,6 +571,20 @@ export function RecordingsPane() {
                         }
                         void recordingOpenPath(h.playablePath).catch(() => {});
                       }}
+                      canTranscribe={canTranscribe}
+                      job={transcriptionJobs[hit.absolutePath]}
+                      onTranscribe={(h, replace) => {
+                        // The session folder, which the engine reads as one
+                        // timeline across its segments. The row's transcript
+                        // only exists once the archive is asked again.
+                        void startTranscription(
+                          h.absolutePath,
+                          () => runSearch(filterRef.current),
+                          replace,
+                        );
+                      }}
+                      onShowTranscript={setTranscriptPath}
+                      onRemove={(h) => setRemoving(h.sessionId)}
                     />
                   </li>
                 );
@@ -468,6 +593,15 @@ export function RecordingsPane() {
           )}
         </div>
       </div>
+      <TranscriptDialog path={transcriptPath} onClose={() => setTranscriptPath(null)} />
+      {removing !== null && (
+        <RemoveRecordingDialog
+          sessionId={removing}
+          onClose={() => setRemoving(null)}
+          // The folder and its row are gone: ask again, with the filter on screen.
+          onRemoved={() => runSearch(filterRef.current)}
+        />
+      )}
     </section>
   );
 }

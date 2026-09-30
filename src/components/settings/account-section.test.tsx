@@ -20,6 +20,7 @@ vi.mock("@/lib/ipc/client", () => ({
 
 import { SETUP_LINK_LABEL } from "@/components/account/account-setup-sheet";
 import {
+  ACCOUNT_DEVICES_LABEL,
   ACCOUNT_FORGET_LABEL,
   ACCOUNT_LISTENING_KEEP_OFF_LABEL,
   ACCOUNT_LISTENING_OFF_SENTENCE,
@@ -260,6 +261,15 @@ describe("AccountSection signed in", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(accountRenameDevice).toHaveBeenCalledWith("studio"));
     expect(toggle).toHaveFocus();
+  });
+
+  it("shows which keeper each device runs, and nothing for one that never said", () => {
+    render(<AccountSection open />);
+    const [hesperia, iphone] = within(
+      screen.getByRole("list", { name: ACCOUNT_DEVICES_LABEL }),
+    ).getAllByRole("listitem");
+    expect(hesperia).toHaveTextContent("macos · keeper 0.8.33");
+    expect(iphone).not.toHaveTextContent("keeper");
   });
 
   it("keeps a newer pushed snapshot over an older answer to the open-time read", async () => {

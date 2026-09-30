@@ -102,7 +102,7 @@ import {
   syncSetCredential,
 } from "@/lib/ipc/client";
 import { accountUsable, useAccountStore } from "@/lib/stores/account";
-import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
+import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { useForgesStore } from "@/lib/stores/forges";
 import {
   ensureNotesVaultsHydrated,
@@ -129,6 +129,7 @@ import {
   syncErrorMessage,
 } from "@/lib/stores/sync";
 import { refreshSyncDetail } from "@/lib/stores/sync-detail";
+import { refreshTranscription } from "@/lib/stores/transcription";
 import { cn } from "@/lib/utils";
 
 /**
@@ -765,6 +766,8 @@ interface SyncFormValues {
    * name, which is the answer rather than an obstacle to route around.
    */
   recordingsSubfolder: string;
+  voices: boolean;
+  voicesSubfolder: string;
   /**
    * Whether this folder holds a sessions zone (FR-222, AD-107). Like the
    * recordings pair above it IS part of `SyncProfileReq`, so it rides the
@@ -812,6 +815,8 @@ const EMPTY_FORM: SyncFormValues = {
   // profile to have resolved it yet. The empty box is how this form says
   // "keeper picks", exactly as the two numeric knobs above do.
   recordingsSubfolder: "",
+  voices: false,
+  voicesSubfolder: "",
   sessions: false,
   // Empty for the recordings reason directly above.
   sessionsSubfolder: "",
@@ -869,6 +874,8 @@ function formValuesFor(profile: SyncProfileVm): SyncFormValues {
     // there is no `SYNC_RECORDINGS_DEFAULT_SUBFOLDER` beside the notes one.
     recordings: profile.recordings,
     recordingsSubfolder: profile.recordingsSubfolder,
+    voices: profile.voices,
+    voicesSubfolder: profile.voicesSubfolder,
     // Straight off the profile, exactly as recordings above: the VM carries the
     // flag and the subfolder that would be in force (AD-34-8).
     sessions: profile.sessions,
@@ -937,6 +944,8 @@ function formValuesForOffer(offer: AddFolderPrefill, reduced: boolean): SyncForm
     notesSubfolder: offer.notes ?? EMPTY_FORM.notesSubfolder,
     recordings: !reduced && offer.recordings !== null,
     recordingsSubfolder: reduced ? "" : (offer.recordings ?? ""),
+    voices: !reduced && offer.voices !== null,
+    voicesSubfolder: reduced ? "" : (offer.voices ?? ""),
     sessions: !reduced && offer.sessions !== null,
     sessionsSubfolder: reduced ? "" : (offer.sessions ?? ""),
     tasks: offer.tasks !== null,
@@ -1301,6 +1310,7 @@ export function AddFolderForm({
    * this tier does not show.
    */
   const reducedCapability = useIsReducedCapabilityPlatform();
+  const canTranscribe = useCapabilitiesStore((s) => s.capabilities.transcription);
   // Seeded once, deliberately (see `profile` above), and kept: what the form
   // opened with is the baseline its pristine report compares against.
   const [initialForm] = useState<SyncFormValues>(() => {
@@ -1848,6 +1858,14 @@ export function AddFolderForm({
           folderOwned.has("recordings") || !recordings || (recordingsSubfolder === "" && !editing)
             ? null
             : recordingsSubfolder,
+        voices: reducedCapability || folderOwned.has("voices") ? null : form.voices,
+        voicesSubfolder:
+          reducedCapability ||
+          folderOwned.has("voices") ||
+          !form.voices ||
+          (!editing && !form.voicesSubfolder.trim())
+            ? null
+            : form.voicesSubfolder.trim(),
         // The sessions flag, on the recordings block's exact terms (AD-107):
         // `false` REMOVES the block, and the subfolder follows the recordings
         // empty-box rules.
@@ -1863,6 +1881,11 @@ export function AddFolderForm({
       // Remember the created profile before the folder-file leg, so a retry
       // cannot create another profile if that write is refused.
       if (!editing) setCreatedId(saved.id);
+      if (
+        canTranscribe &&
+        (saved.voices !== profile?.voices || saved.voicesSubfolder !== profile?.voicesSubfolder)
+      )
+        void refreshTranscription();
       // Where the credential comes from, when that changed — FIRST, straight
       // after the save that gave the folder its id. Saving a profile can start
       // its first pass at once, and a pass that runs before this row lands
@@ -2271,6 +2294,39 @@ export function AddFolderForm({
                 </p>
               )}
             </>
+          )}
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-voices`}>This folder keeps voices</Label>
+            <Switch
+              id={`${fieldId}-voices`}
+              checked={form.voices}
+              disabled={disabled || saving || folderOwned.has("voices")}
+              onCheckedChange={(voices) => setForm((live) => ({ ...live, voices }))}
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">
+            People, voice clips and the dictionary travel with this folder.
+          </p>
+          {folderOwned.has("voices") && (
+            <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("voices")}</p>
+          )}
+          {form.voices && (
+            <div className="flex min-w-0 flex-col gap-2">
+              <Label htmlFor={`${fieldId}-voices-subfolder`}>Voices subfolder</Label>
+              <Input
+                id={`${fieldId}-voices-subfolder`}
+                value={form.voicesSubfolder}
+                disabled={disabled || saving || folderOwned.has("voices")}
+                onChange={(event) =>
+                  setForm((live) => ({ ...live, voicesSubfolder: event.target.value }))
+                }
+              />
+              {!editing && (
+                <p className="text-muted-foreground text-xs">
+                  Left empty, keeper picks the subfolder itself.
+                </p>
+              )}
+            </div>
           )}
           {/* The sessions flag (FR-222, AD-107). Third in the "this folder also
               holds X" row, on the recordings control's exact shape. */}

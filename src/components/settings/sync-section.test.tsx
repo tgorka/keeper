@@ -187,6 +187,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     notesSubfolder: null,
     recordings: false,
     recordingsSubfolder: "recordings",
+    voices: false,
+    voicesSubfolder: "voices",
     sessions: false,
     sessionsSubfolder: "60-sessions",
     tasks: false,
@@ -725,6 +727,8 @@ describe("SyncSection add-profile form", () => {
         // sessions switch follows the same rule (FR-222).
         recordings: false,
         recordingsSubfolder: null,
+        voices: false,
+        voicesSubfolder: null,
         sessions: false,
         sessionsSubfolder: null,
         tasks: false,

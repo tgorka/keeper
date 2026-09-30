@@ -2144,7 +2144,12 @@ fn parse_note(
         flags.push("private".to_owned());
     }
     let title = note_title(&fm, body, rel);
-    let preview = keeper_core::notes::snippet::prose_after_title(body, &title, SNIPPET_CHARS);
+    let preview = keeper_core::notes::snippet::prose_after_title(
+        body,
+        &title,
+        SNIPPET_CHARS,
+        keeper_core::notes::media_block::OwnRecording::of(&fm),
+    );
 
     IndexEntry {
         id,

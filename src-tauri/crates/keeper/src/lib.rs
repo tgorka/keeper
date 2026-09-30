@@ -102,6 +102,17 @@ mod share_ios;
 mod sync;
 mod sync_ipc;
 mod telemetry_ipc;
+// On-device transcription (Epic 87, AD-339): the engine's macOS port over
+// the vendored FluidAudio fork, and the command surface over the port —
+// ungated, like voice, so the command list is identical on every target.
+mod media_block_ipc;
+// Recording from a note (story 88.9): the note a `record = "new"` block
+// started a session from, and its tags while it records. Every target, so
+// the command list is identical everywhere.
+mod note_recording_ipc;
+mod transcribe_ipc;
+#[cfg(target_os = "macos")]
+mod transcribe_macos;
 #[cfg(desktop)]
 mod tray;
 // The voice port's platform implementations: iOS (Story 62.4, AD-165–AD-167)
@@ -629,6 +640,9 @@ pub fn run() {
             // request notification permission best-effort. A permission failure only
             // means the OS will drop notifications — it never blocks startup.
             ipc::set_notify_app_handle(app.handle().clone());
+            // Every transcript write is announced on `keeper://transcript-written`
+            // (AD-357), so open media blocks and viewers read it again.
+            transcribe_ipc::install(app.handle());
             #[cfg(target_os = "ios")]
             voice_notify::install(app.handle());
 
@@ -703,6 +717,9 @@ pub fn run() {
                         // The account's daily pull rides the same clock (AD-332):
                         // a due-check here, the pull itself spawned off the tick.
                         account_ipc::daily_tick();
+                        // The recordings index's daily reconcile, the same
+                        // way: a due-check here, the refresh on its own thread.
+                        ipc::recordings_reconcile_tick(&handle);
                         // Voice rides the same clock (Story 63.5, FR-421): the
                         // tray's status line and verb follow Rust's own turn —
                         // `voice_snapshot`, not the webview's mirror — so the
@@ -758,6 +775,8 @@ pub fn run() {
             // seconds after boot. A failure is logged only, never fatal.
             {
                 let handle = app.handle().clone();
+                // Before the launch pass, so its landing reaches the pane.
+                ipc::install_recordings_index_announcer(&handle);
                 std::thread::spawn(move || {
                     let state = handle.state::<ipc::AppState>();
                     ipc::recover_orphaned_recordings(state.inner());
@@ -1042,6 +1061,56 @@ pub fn run() {
                 forge_ipc::sync_drive_folder_get,
                 forge_ipc::sync_drive_folder_set,
                 forge_ipc::sync_credential_choices,
+                // On-device transcription (Epic 87, AD-339): every target in
+                // the shared body, the engine port decides — a Mac answers for
+                // real, everything else says `Unsupported` — so the frontend
+                // never special-cases the call.
+                transcribe_ipc::transcription_status,
+                transcribe_ipc::transcription_models_fetch,
+                transcribe_ipc::transcription_models_available,
+                transcribe_ipc::transcription_start,
+                transcribe_ipc::transcription_cancel,
+                transcribe_ipc::transcription_settings_set,
+                transcribe_ipc::transcript_read,
+                transcribe_ipc::transcript_edit_utterance,
+                transcribe_ipc::transcript_reassign_utterance,
+                transcribe_ipc::transcript_merge_speakers,
+                transcribe_ipc::transcript_rename_speaker,
+                transcribe_ipc::transcript_assign_speaker,
+                transcribe_ipc::transcript_split_utterance,
+                transcribe_ipc::transcript_insert_utterance,
+                transcribe_ipc::transcript_add_speaker,
+                transcribe_ipc::transcript_media,
+                transcribe_ipc::voices_people,
+                transcribe_ipc::voices_person_rename,
+                transcribe_ipc::voices_person_delete,
+                transcribe_ipc::voices_person_set_self,
+                transcribe_ipc::voices_people_merge,
+                transcribe_ipc::dictionary_terms,
+                transcribe_ipc::dictionary_term_save,
+                transcribe_ipc::dictionary_term_delete,
+                transcribe_ipc::dictionary_accept_suggestion,
+                // A recording, a transcript or media playing inside a note
+                // (Epic 88): the `keeper-media` block's commands, beside
+                // transcription on every target — a block reads files and
+                // needs no engine (AD-358).
+                media_block_ipc::media_block_resolve,
+                media_block_ipc::media_block_edit,
+                media_block_ipc::media_block_clip,
+                media_block_ipc::media_block_sources,
+                media_block_ipc::media_block_schema,
+                media_block_ipc::media_block_check,
+                media_block_ipc::media_block_find_marker,
+                media_block_ipc::media_block_for_embed,
+                media_block_ipc::media_block_compose,
+                media_block_ipc::transcript_clip,
+                media_block_ipc::recording_notes_adopt_media_block,
+                note_recording_ipc::recording_linked_note,
+                note_recording_ipc::media_block_recording,
+                note_recording_ipc::media_block_record_started,
+                note_recording_ipc::media_block_without_session,
+                ipc::recording_remove_preview,
+                ipc::recording_remove,
                 ipc::bridge_catalog,
                 ipc::bridge_discover,
                 ipc::bridge_login_start,
@@ -1207,6 +1276,7 @@ pub fn run() {
                 ipc::debug_log_tail,
                 ipc::debug_log_path,
                 ipc::titlebar_drag_report,
+                ipc::frontend_error_report,
                 ipc::recording_permission,
                 ipc::request_screen_recording_permission,
                 ipc::request_microphone_permission,
@@ -1517,6 +1587,9 @@ pub fn run() {
         // itself — a phone has no folder chooser to pick a destination from,
         // and the control is absent there rather than a twin that refuses.
         notes_ipc::notes_export,
+        // The Recordings pane's "Reconcile now": the pane itself is
+        // desktop-only (the `recording` capability), so there is no twin.
+        ipc::recordings_reconcile_now,
     );
     // The commands that touch a window or a file manager have `Unsupported`
     // twins so the handler list is identical on every target and

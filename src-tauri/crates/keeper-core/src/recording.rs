@@ -21,6 +21,7 @@
 //! sidecar can't be resolved.
 
 pub mod path_template;
+pub mod removal;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -1092,16 +1093,16 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// reconcile ingests only the session's own stem prefixes (this one and
 /// [`CAMERA_SEGMENT_STEM_PREFIX`], Story 20.1), so a stray `*.mov` (a user
 /// drop) with a trailing digit run never pollutes the authoritative ledger.
-const SEGMENT_STEM_PREFIX: &str = "screen-";
+pub(crate) const SEGMENT_STEM_PREFIX: &str = "screen-";
 
 /// Camera-track segment files are named `camera-####.mov` (Story 20.1,
 /// FR-70/FR-73): the optional webcam's own separate per-segment file, sharing
 /// the session folder and the segment index space with `screen-####` —
 /// disambiguated in the ledger by `track`, never by index alone.
-const CAMERA_SEGMENT_STEM_PREFIX: &str = "camera-";
+pub(crate) const CAMERA_SEGMENT_STEM_PREFIX: &str = "camera-";
 
 /// Audio-only-track segment files are named `audio-####.m4a` (Story 21.3).
-const AUDIO_SEGMENT_STEM_PREFIX: &str = "audio-";
+pub(crate) const AUDIO_SEGMENT_STEM_PREFIX: &str = "audio-";
 
 /// The suffix `keeper-rec` writes an UNFINISHED segment under (Story 41.3,
 /// FR-133, AD-69): the writer's output file is `<name>.<ext>.partial` for the
@@ -1163,7 +1164,7 @@ const LFS_POINTER_PROBE_BYTES: usize = 512;
 /// Total and cheap: an unreadable file, a short read, a missing or unparseable
 /// `size` line all yield `None`, which lands the caller on the ordinary
 /// filesystem answer. No allocation beyond the fixed probe buffer.
-fn lfs_pointer_media_size(path: &Path) -> Option<u64> {
+pub(crate) fn lfs_pointer_media_size(path: &Path) -> Option<u64> {
     use std::io::Read as _;
 
     let mut head = [0u8; LFS_POINTER_PROBE_BYTES];
@@ -1393,6 +1394,23 @@ pub struct SessionMeta {
     /// Repeatable custom name/value pairs (Story 22.3).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub custom: Option<Vec<SessionMetaField>>,
+    /// The note whose media block started this session (story 88.9). Set by
+    /// the shell at start, never by the form: the note is tagged while it
+    /// records, and names this session in that block. Named apart from
+    /// [`Self::note`], which is the user's free text.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub linked_note: Option<LinkedNote>,
+}
+
+/// Where a session started from a note came from (story 88.9). Relative to
+/// its vault, never absolute: the manifest syncs (FR-145).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedNote {
+    /// The synced folder whose vault holds the note.
+    pub profile_id: String,
+    /// The note, relative to its vault.
+    pub path: String,
 }
 
 /// One custom name/value metadata pair (Story 22.3) — both free text.
@@ -1482,6 +1500,7 @@ impl SessionMeta {
             note: clean_field(input.note),
             tags,
             custom: (!custom.is_empty()).then_some(custom),
+            linked_note: None,
         }
     }
 
@@ -1659,8 +1678,12 @@ impl SessionManifest {
         // edit from clearing a title the folder name is derived from.
         let title = self.meta.as_ref().and_then(|meta| meta.title.clone());
         let session_id = self.meta.as_ref().and_then(|meta| meta.session_id.clone());
+        // Like the identity, the note a session was started from is not the
+        // form's to change.
+        let linked_note = self.meta.as_ref().and_then(|meta| meta.linked_note.clone());
         let edited = SessionMeta {
             title,
+            linked_note,
             ..SessionMeta::from_input(session_id, input)
         };
         if self.meta.is_some() || edited != SessionMeta::default() {
@@ -4993,6 +5016,7 @@ mod tests {
                     name: "Ticket".to_owned(),
                     value: "KPR-1".to_owned(),
                 }]),
+                linked_note: None,
             }),
             None,
         )
@@ -5051,6 +5075,7 @@ mod tests {
                         value: String::new(),
                     },
                 ]),
+                linked_note: None,
             }),
             "every edited field lands, a nameless custom row is dropped, and a \
              blank custom VALUE is kept"

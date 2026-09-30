@@ -16,6 +16,7 @@ import { useCapabilitiesHydrate } from "@/hooks/use-capabilities-hydrate";
 import { useNavStatePersistence } from "@/hooks/use-nav-state-persistence";
 import { useNotesOpenNote } from "@/hooks/use-notes-open-note";
 import { useNotifyNavigate } from "@/hooks/use-notify-navigate";
+import { useRecordingRemoved } from "@/hooks/use-recording-removed";
 import { useSessionRestore } from "@/hooks/use-session-restore";
 import { useTelemetryReadiness } from "@/hooks/use-telemetry";
 import { useWebviewGuard } from "@/hooks/use-webview-guard";
@@ -69,6 +70,9 @@ function App() {
   // on screen. Before this hook nothing listened, and the tray's New Note
   // created a note the user was never shown.
   useNotesOpenNote();
+  // A removed recording leaves every open note's buffer, whichever view the
+  // note is in: Rust never edits an open note's body.
+  useRecordingRemoved();
   // Drive the single Rust lifecycle entry from the webview `visibilitychange`
   // event on the reduced-capability (iOS) tier only (Epic 14-1): background
   // pauses each live sync loop gracefully, foreground routes through the same

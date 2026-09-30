@@ -17,6 +17,10 @@
  *
  * # What is NOT here
  *
+ * Video and audio. A note no longer mounts a player per embed: an embedded
+ * video or audio file is a chip (`media-chip.ts`) whose *Play in a player*
+ * makes it a `keeper-media` block, which is where a recording plays.
+ *
  * Resolution. This module is handed a kind and a URL and never asks what a file
  * is: a recording note resolves through the recordings index, an ordinary note
  * through the vault's embed candidates, and those are different address spaces
@@ -27,10 +31,8 @@
  * answers it with the link it already had. Neither is an element built from a
  * URL, so neither belongs to a function whose whole input is a URL.
  */
-import { primeFirstFrame } from "./recording-transport";
-
 /** The kinds this module can draw. Everything else is its caller's problem. */
-export type DrawableKind = "image" | "video" | "audio" | "pdf";
+export type DrawableKind = "image" | "pdf";
 
 export interface DrawableFile {
   readonly kind: DrawableKind;
@@ -65,42 +67,19 @@ export function mediaElementFor(file: DrawableFile, onFailedLoad: () => void): H
     return image;
   }
 
-  if (file.kind === "pdf") {
-    // `<embed>`, not `<iframe>`: `document-viewer.tsx` states the reason for the
-    // Files pane and it holds here — an iframe of a custom-scheme URL is a
-    // different navigation the engine treats differently. The renderer is the
-    // webview's own; keeper ships no PDF stack.
-    const view = document.createElement("embed");
-    view.className = "cm-lp-embed-pdf";
-    view.setAttribute("type", "application/pdf");
-    view.setAttribute("aria-label", file.name);
-    // `<embed>` fires no `error` event for a URL that does not resolve, so this
-    // is the one kind whose failure the caller must have ruled out before
-    // calling — which it has: the path came back from a resolver that stats.
-    view.setAttribute("src", file.url);
-    return view;
-  }
-
-  const player = document.createElement(file.kind === "video" ? "video" : "audio");
-  // The video class is the one Story 42.4 shipped and its rule — block, capped
-  // height — is right for an audio bar too.
-  player.className = file.kind === "video" ? "cm-lp-recording-player" : "cm-lp-recording-audio";
-  player.controls = true;
-  // Metadata only: a duration and a first frame, not half a gigabyte. The
-  // "and a first frame" half is not free and is not the platform's default —
-  // see {@link primeFirstFrame}, registered below.
-  player.preload = "metadata";
-  // The file name, so a screen reader hears which track this is.
-  player.setAttribute("aria-label", file.name);
-  player.addEventListener("error", onFailedLoad);
-  if (player instanceof HTMLVideoElement) {
-    // Audio has no frame to show, so it is asked for nothing it cannot use.
-    primeFirstFrame(player);
-  }
-  // Assigned last, because assigning `src` is what starts the load and every
-  // handler above must already be registered when it does.
-  player.src = file.url;
-  return player;
+  // The one other kind is a PDF. `<embed>`, not `<iframe>`: `document-viewer.tsx` states the reason for the
+  // Files pane and it holds here — an iframe of a custom-scheme URL is a
+  // different navigation the engine treats differently. The renderer is the
+  // webview's own; keeper ships no PDF stack.
+  const view = document.createElement("embed");
+  view.className = "cm-lp-embed-pdf";
+  view.setAttribute("type", "application/pdf");
+  view.setAttribute("aria-label", file.name);
+  // `<embed>` fires no `error` event for a URL that does not resolve, so this
+  // is the one kind whose failure the caller must have ruled out before
+  // calling — which it has: the path came back from a resolver that stats.
+  view.setAttribute("src", file.url);
+  return view;
 }
 
 /** The last `/`-separated component of a relative path. */

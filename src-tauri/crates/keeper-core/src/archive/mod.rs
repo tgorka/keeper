@@ -30,8 +30,8 @@ pub mod recordings_fts;
 
 pub use fts::{search, SearchFilter};
 pub use recordings::{
-    DurabilityProbe, DurabilityProbeFn, KnownRoot, RebuildOutcome, RebuildRequest, RecordingRow,
-    RecordingSegmentRow,
+    reconcile_due, DurabilityProbe, DurabilityProbeFn, KnownRoot, RebuildOutcome, RebuildRequest,
+    RecordingRow, RecordingSegmentRow,
 };
 pub use recordings_fts::{search_recordings, RecordingFilter, RecordingHit};
 
@@ -194,6 +194,16 @@ pub enum ArchiveMsg {
         /// The session folder's new path, relative to the destination root.
         relative_path: String,
     },
+    /// Forget one session's row, segments and search entry because a person
+    /// removed the recording. Answered on `done` — `true` when a row knew the
+    /// session — so the Recordings pane re-reads an index that no longer lists
+    /// it.
+    ForgetRecording {
+        /// The session being forgotten.
+        session_id: String,
+        /// Where the outcome is sent.
+        done: oneshot::Sender<Result<bool, ArchiveError>>,
+    },
     /// Re-derive every recording row by walking one recordings root, and
     /// reconcile that root's rows against what the walk found (Story 42.1; the
     /// archive follows every recordings root).
@@ -222,6 +232,11 @@ pub enum ArchiveMsg {
         /// The profile whose rows go.
         profile_id: Option<String>,
     },
+    /// Answer once every message queued before this one has been handled:
+    /// `true` when every recordings rebuild since the previous barrier walked
+    /// its root to the end, `false` when one could not. Carries no work: the
+    /// writer handles messages in order, so reaching this one is the answer.
+    Settled(oneshot::Sender<bool>),
 }
 
 /// The cloneable producer handle for archive ingestion (Story 5.1).
@@ -366,6 +381,30 @@ impl ArchiveHandle {
         }
     }
 
+    /// Forget a removed recording's row, segments and search entry through the
+    /// single writer, and await it: the removal answers only once the index no
+    /// longer lists the session. A writer that stopped, or ended before it
+    /// answered, is an error — the row may still be there.
+    pub async fn forget_recording(&self, session_id: &str) -> Result<bool, ArchiveError> {
+        let (done, rx) = oneshot::channel();
+        let msg = ArchiveMsg::ForgetRecording {
+            session_id: session_id.to_owned(),
+            done,
+        };
+        if let Err(e) = self.tx.send(msg) {
+            log_dropped(&e.0);
+            return Err(ArchiveError::Sqlite(
+                "archive writer stopped; the recording's row was not forgotten".to_owned(),
+            ));
+        }
+        rx.await.unwrap_or_else(|_| {
+            Err(ArchiveError::Sqlite(
+                "could not confirm the recording's row was forgotten (writer task ended)"
+                    .to_owned(),
+            ))
+        })
+    }
+
     /// Re-derive every recording row from the session folders under `root`,
     /// and forget the rows of this root that no folder under it carries any
     /// more (Story 42.1; the archive follows every recordings root).
@@ -381,8 +420,8 @@ impl ArchiveHandle {
     /// from it, never from the row it is about to replace. Its `skip` names
     /// the session folders a recording in progress holds, which the rebuild
     /// leaves alone, and its `followed_roots` every root the archive follows
-    /// right now, so a session copied between two of them stays with the
-    /// first.
+    /// right now, so a session copied between two of them is listed once,
+    /// under the copy whose manifest changed last.
     pub fn rebuild_recordings(&self, request: RebuildRequest) {
         if let Err(e) = self.tx.send(ArchiveMsg::RebuildRecordings(request)) {
             log_dropped(&e.0);
@@ -402,6 +441,20 @@ impl ArchiveHandle {
         if let Err(e) = self.tx.send(msg) {
             log_dropped(&e.0);
         }
+    }
+
+    /// A receiver that resolves once the writer has handled everything sent
+    /// before this call — the end of a refresh, for a caller that must know
+    /// the index now says what the folders say. It answers whether every
+    /// recordings rebuild since the previous barrier succeeded, and errors
+    /// instead when the writer has stopped, and then nothing sent before it
+    /// is known to have landed.
+    pub fn settled(&self) -> oneshot::Receiver<bool> {
+        let (done, rx) = oneshot::channel();
+        if let Err(e) = self.tx.send(ArchiveMsg::Settled(done)) {
+            log_dropped(&e.0);
+        }
+        rx
     }
 }
 
@@ -444,6 +497,10 @@ fn log_dropped(msg: &ArchiveMsg) {
             session_id = %session_id,
             "archive: writer channel closed; dropping recording move"
         ),
+        ArchiveMsg::ForgetRecording { session_id, .. } => tracing::warn!(
+            session_id = %session_id,
+            "archive: writer channel closed; a removed recording's row was not forgotten"
+        ),
         ArchiveMsg::RebuildRecordings(request) => tracing::warn!(
             root = %request.root.display(),
             "archive: writer channel closed; the recordings index was not rebuilt"
@@ -456,6 +513,9 @@ fn log_dropped(msg: &ArchiveMsg) {
             profile_id = profile_id.as_deref().unwrap_or("-"),
             "archive: writer channel closed; a removed root's recordings were not forgotten"
         ),
+        ArchiveMsg::Settled(_) => {
+            tracing::debug!("archive: writer channel closed; nothing to wait for")
+        }
     }
 }
 

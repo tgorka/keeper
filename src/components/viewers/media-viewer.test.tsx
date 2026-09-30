@@ -48,7 +48,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // and it will fail loudly in jsdom. That is the correct outcome: mock it in
 // that test, not for the whole file, or the property above stops being tested.
 
-import { FRAME_PRIME_SECONDS } from "@/components/notes/editor/recording-transport";
+import { FRAME_PRIME_SECONDS } from "@/components/notes/editor/media-playback";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import {
   resolveViewer,

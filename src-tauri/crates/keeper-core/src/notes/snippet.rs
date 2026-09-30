@@ -1,9 +1,12 @@
 //! A bounded plain-text preview, shared by note rows and their hover hints.
 
+use crate::notes::media_block::{self, OwnRecording};
 use crate::notes::naming::strip_atx_heading;
 
 /// Remove presentation markup, fold whitespace and retain at most `budget`
-/// Unicode scalar values. Malformed markup remains readable literal text.
+/// Unicode scalar values. Malformed markup remains readable literal text, and
+/// a `keeper-media` block reads as its one-line [`media_block::summary`],
+/// never as its source.
 ///
 /// `body` is a note's body with its frontmatter already removed, which is what
 /// every caller holds: the frontmatter fence is found once, by whoever read the
@@ -13,8 +16,16 @@ use crate::notes::naming::strip_atx_heading;
 /// would lose its opening prose from the row and from its hint.
 #[must_use]
 pub fn prose(body: &str, budget: usize) -> String {
+    summarised(body, budget, None)
+}
+
+/// [`prose`]'s work; `own` is the recording the note is about, which a
+/// block naming that recording is summarised by.
+fn summarised(body: &str, budget: usize, own: Option<OwnRecording<'_>>) -> String {
     let mut out = Preview::new(budget);
     let mut fence: Option<(char, usize)> = None;
+    // The body of the media block the fence holds, when it is one.
+    let mut media: Option<String> = None;
     for line in body.lines() {
         if out.remaining == 0 {
             break;
@@ -25,6 +36,12 @@ pub fn prose(body: &str, budget: usize) -> String {
                 && line.trim_start_matches(marker).trim().is_empty()
             {
                 fence = None;
+                if let Some(block) = media.take() {
+                    out.text(&media_block::summary(&block, own));
+                }
+            } else if let Some(block) = media.as_mut() {
+                block.push_str(line);
+                block.push('\n');
             } else {
                 out.text(line);
             }
@@ -44,6 +61,8 @@ pub fn prose(body: &str, budget: usize) -> String {
                 let width = line.chars().take_while(|c| *c == marker).count();
                 if width >= 3 {
                     fence = Some((marker, width));
+                    let info = line[width * marker.len_utf8()..].split_whitespace().next();
+                    media = (info == Some(media_block::INFO_WORD)).then(String::new);
                     out.space();
                     continue;
                 }
@@ -60,12 +79,22 @@ pub fn prose(body: &str, budget: usize) -> String {
         }
         out.space();
     }
+    // A block the note never closes runs to its end, as the editor draws it.
+    if let Some(block) = media {
+        out.text(&media_block::summary(&block, own));
+    }
     out.text
 }
 
 /// Row preview: omit only the leading H1 that already supplies the title.
+/// `own` is the recording a recording note is about.
 #[must_use]
-pub fn prose_after_title(body: &str, title: &str, budget: usize) -> String {
+pub fn prose_after_title(
+    body: &str,
+    title: &str,
+    budget: usize,
+    own: Option<OwnRecording<'_>>,
+) -> String {
     if budget == 0 {
         return String::new();
     }
@@ -76,9 +105,9 @@ pub fn prose_after_title(body: &str, title: &str, budget: usize) -> String {
         .is_some_and(|rest| rest.starts_with(char::is_whitespace))
         && folded_words(strip_atx_heading(first)).eq(folded_words(title))
     {
-        prose(leading.get(first.len()..).unwrap_or(""), budget)
+        summarised(leading.get(first.len()..).unwrap_or(""), budget, own)
     } else {
-        prose(body, budget)
+        summarised(body, budget, own)
     }
 }
 
@@ -277,29 +306,84 @@ mod tests {
     fn row_skips_only_its_own_leading_title_and_renders_wikilinks() {
         use super::prose_after_title;
         assert_eq!(
-            prose_after_title("# Taxes 2026\nWhat I owe", "Taxes 2026", 240),
+            prose_after_title("# Taxes 2026\nWhat I owe", "Taxes 2026", 240, None),
             "What I owe"
         );
         assert_eq!(
-            prose_after_title("# Overview\nWhat I owe", "Taxes 2026", 240),
+            prose_after_title("# Overview\nWhat I owe", "Taxes 2026", 240, None),
             "Overview What I owe"
         );
         assert_eq!(
-            prose_after_title("# Taxes 2026\n# Other\nbody", " taxes  2026 ", 240),
+            prose_after_title("# Taxes 2026\n# Other\nbody", " taxes  2026 ", 240, None),
             "Other body"
         );
         assert_eq!(
-            prose_after_title("---\nfirst\n---\nsecond", "first", 240),
+            prose_after_title("---\nfirst\n---\nsecond", "first", 240, None),
             "first second"
         );
-        assert_eq!(prose_after_title("# Taxes 2026", "Taxes 2026", 240), "");
-        assert_eq!(prose_after_title("# Ab c\nbody", "A bc", 240), "Ab c body");
+        assert_eq!(
+            prose_after_title("# Taxes 2026", "Taxes 2026", 240, None),
+            ""
+        );
+        assert_eq!(
+            prose_after_title("# Ab c\nbody", "A bc", 240, None),
+            "Ab c body"
+        );
         assert_eq!(
             prose(
                 "See [[Vault as a lens|the lens]] and [[Journal/Bali]] and ![[img.png]]",
                 100
             ),
             "See the lens and Bali and img.png"
+        );
+    }
+
+    #[test]
+    fn a_media_block_reads_as_one_line_never_as_its_source() {
+        use super::prose_after_title;
+        use crate::notes::media_block::{session_block, OwnRecording};
+        const ID: &str = "01A-01B";
+        let own = OwnRecording {
+            session: ID,
+            title: Some("Kelly sync"),
+            duration: Some("45m"),
+        };
+        let stub = format!("# Kelly sync\n\n{}\nWhat we agreed.\n", session_block(ID));
+        assert_eq!(
+            prose_after_title(&stub, "Kelly sync", 240, Some(own)),
+            "▶ Media · Kelly sync · 45m What we agreed."
+        );
+        // Another recording's block says only what it states itself: its
+        // title and the length of its window.
+        let other = OwnRecording {
+            session: "01X-01Y",
+            ..own
+        };
+        let windowed = "~~~keeper-media\nsession = \"01A-01B\"\ntitle = \"Pricing\"\nfrom = \"00:12:00\"\nto = \"00:57:57\"\n~~~\nafter";
+        assert_eq!(
+            prose_after_title(windowed, "x", 240, Some(other)),
+            "▶ Media · Pricing · 45:57 after"
+        );
+        assert_eq!(
+            prose(
+                "```keeper-media\nsession = \"01A-01B\"\nto = \"01:02:03\"\n```",
+                240
+            ),
+            "▶ Media · 1:02:03"
+        );
+        // A block that does not read, and one the note never closes, are
+        // still never their source; a toml fence still is.
+        assert_eq!(
+            prose("- ```keeper-media\n  form = \"00:12:00\"\n  ```\n", 240),
+            "▶ Media"
+        );
+        assert_eq!(
+            prose("```keeper-media title\n[[part]]\nfile = \"a.mov\"", 240),
+            "▶ Media"
+        );
+        assert_eq!(
+            prose("```toml\nsession = \"x\"\n```", 240),
+            "session = \"x\""
         );
     }
 

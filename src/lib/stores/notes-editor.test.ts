@@ -279,3 +279,31 @@ describe("a subscription that resolves late", () => {
     expect(notesEditorStore.getState().documents).toEqual({});
   });
 });
+
+describe("a block change keeper made under the editor", () => {
+  it("adopts the block and revision and keeps every typed word", () => {
+    open(ONE, "Agenda.\n");
+    editBuffer(VAULT, ONE, "Agenda.\nTyped while it records.\n");
+    const pending = {
+      kind: "external" as const,
+      rev: "rev-8",
+      text: "theirs\n",
+      frontmatter: "",
+    };
+    applyBodyBatch(VAULT, ONE, pending);
+
+    applyBodyBatch(VAULT, ONE, {
+      kind: "block",
+      rev: "rev-2",
+      frontmatter: "---\ntags: [recording, recording/hesperia]\n---\n",
+    });
+
+    const document = readNoteDocument(VAULT, ONE);
+    expect(document.frontmatter).toBe("---\ntags: [recording, recording/hesperia]\n---\n");
+    expect(document.rev).toBe("rev-2");
+    expect(document.text).toBe("Agenda.\nTyped while it records.\n");
+    expect(document.base).toBe("Agenda.\n");
+    expect(document.dirty).toBe(true);
+    expect(document.pending).toEqual(pending);
+  });
+});

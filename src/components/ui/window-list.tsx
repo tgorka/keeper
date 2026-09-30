@@ -112,6 +112,25 @@ export interface WindowedRowsOptions<K> {
   /** Runs after {@link WindowedRows.reveal}'s row is mounted. Where the caller
    * moves focus — focus policy stays with the list that owns the tab order. */
   onReveal?: (index: number) => void;
+  /**
+   * Pixels of other content above the list inside the same scroll container —
+   * a heading and a legend that scroll away with the rows. Offsets stay the
+   * list's own; the window and `reveal` shift by this much.
+   */
+  scrollMargin?: number;
+  /**
+   * Pixels at the top of the viewport covered by a sticky element. `reveal`
+   * brings a row out from under it rather than to the viewport's edge.
+   */
+  stickyInset?: number;
+  /**
+   * A scroll container the list does not own — a note editor's scroller the
+   * list grows inside. The window reads it and `reveal` scrolls it; the
+   * caller spreads no {@link WindowedRows.viewportProps} then, and says in
+   * `scrollMargin` where the list starts inside it. `undefined` means the
+   * caller's own element carries `viewportProps`.
+   */
+  scroller?: HTMLElement | null;
 }
 
 export interface WindowedRows<K> {
@@ -240,6 +259,9 @@ export function useWindowedRows<K>({
   overscan = DEFAULT_OVERSCAN,
   pinnedIndex,
   onReveal,
+  scrollMargin = 0,
+  stickyInset = 0,
+  scroller,
 }: WindowedRowsOptions<K>): WindowedRows<K> {
   const viewport = useRef<HTMLElement | null>(null);
   const measured = useRef(new Map<K, number>());
@@ -250,7 +272,13 @@ export function useWindowedRows<K>({
   const [anchor, setAnchor] = useState<{ index: number; token: number } | null>(null);
   const token = useRef(0);
   const reveals = useRef(onReveal);
-  const latest = useRef({ offsets: new Float64Array(1), count: 0, view });
+  const latest = useRef({
+    offsets: new Float64Array(1),
+    count: 0,
+    view,
+    scrollMargin,
+    stickyInset,
+  });
 
   useEffect(() => {
     reveals.current = onReveal;
@@ -283,11 +311,8 @@ export function useWindowedRows<K>({
     [],
   );
 
-  const attachViewport = useCallback<RefCallback<HTMLElement>>((element) => {
+  const follow = useCallback((element: HTMLElement) => {
     viewport.current = element;
-    if (element === null) {
-      return;
-    }
     const sync = () => {
       const height = element.clientHeight;
       const next = {
@@ -303,9 +328,18 @@ export function useWindowedRows<K>({
     return () => {
       element.removeEventListener("scroll", sync);
       resizes.disconnect();
-      viewport.current = null;
+      if (viewport.current === element) {
+        viewport.current = null;
+      }
     };
   }, []);
+
+  const attachViewport = useCallback<RefCallback<HTMLElement>>(
+    (element) => (element === null ? undefined : follow(element)),
+    [follow],
+  );
+
+  useEffect(() => (scroller ? follow(scroller) : undefined), [scroller, follow]);
 
   const box = rowHeight + gap;
 
@@ -320,26 +354,32 @@ export function useWindowedRows<K>({
   const totalSize = offsets[count];
 
   useEffect(() => {
-    latest.current = { offsets, count, view };
+    latest.current = { offsets, count, view, scrollMargin, stickyInset };
   });
 
   const reveal = useCallback((index: number) => {
-    const { offsets: current, count: total, view: seen } = latest.current;
+    const {
+      offsets: current,
+      count: total,
+      view: seen,
+      scrollMargin: margin,
+      stickyInset: inset,
+    } = latest.current;
     if (index < 0 || index >= total) {
       return;
     }
-    const top = current[index];
-    const bottom = current[index + 1];
+    const top = current[index] + margin;
+    const bottom = current[index + 1] + margin;
     let next = seen.top;
-    if (top < seen.top) {
-      next = top;
+    if (top < seen.top + inset) {
+      next = top - inset;
     } else if (bottom > seen.top + seen.height) {
       next = bottom - seen.height;
     }
     // Clamped here rather than trusted back from the element: jsdom's
     // `scrollTop` setter is a no-op and the browser silently clamps, so reading
     // the value back would give two different answers to the same request.
-    next = Math.min(Math.max(next, 0), Math.max(0, current[total] - seen.height));
+    next = Math.min(Math.max(next, 0), Math.max(0, current[total] + margin - seen.height));
     if (next !== seen.top) {
       setView((prev) => ({ ...prev, top: next }));
       if (viewport.current !== null) {
@@ -359,7 +399,7 @@ export function useWindowedRows<K>({
   }, [anchor]);
 
   const { rows, lastVisible } = useMemo(() => {
-    const slice = windowSlice(offsets, count, view.top, view.height, overscan, [
+    const slice = windowSlice(offsets, count, view.top - scrollMargin, view.height, overscan, [
       pinnedIndex,
       anchor?.index,
     ]);
@@ -367,7 +407,7 @@ export function useWindowedRows<K>({
       rows: slice.indices.map((index) => ({ index, key: getKey(index), start: offsets[index] })),
       lastVisible: slice.lastVisible,
     };
-  }, [anchor, count, getKey, offsets, overscan, pinnedIndex, view]);
+  }, [anchor, count, getKey, offsets, overscan, pinnedIndex, scrollMargin, view]);
 
   const rowProps = useCallback(
     (row: WindowedRow<K>): WindowedRowProps => ({

@@ -837,6 +837,23 @@ pub fn add_recovered_session_acknowledged(data_dir: &Path, key: &str) -> Result<
     set_setting(data_dir, UI_RECOVERED_SESSIONS_ACKNOWLEDGED_KEY, &json)
 }
 
+/// The `settings` key holding when the recordings index last finished a
+/// refresh of every recordings root, in ms since the Unix epoch — what the
+/// daily reconcile measures its day from. keeper's own record, never a
+/// preference.
+const RECORDINGS_LAST_RECONCILE_MS_KEY: &str = "recordings.last_reconcile_ms";
+
+/// When the recordings index last finished a whole refresh. Absent or
+/// unparsable ⇒ `None` (never, as far as this install knows).
+pub fn get_recordings_last_reconcile_ms(data_dir: &Path) -> Result<Option<i64>, CoreError> {
+    Ok(get_setting(data_dir, RECORDINGS_LAST_RECONCILE_MS_KEY)?.and_then(|raw| raw.parse().ok()))
+}
+
+/// Record that the recordings index finished a whole refresh at `ms`.
+pub fn set_recordings_last_reconcile_ms(data_dir: &Path, ms: i64) -> Result<(), CoreError> {
+    set_setting(data_dir, RECORDINGS_LAST_RECONCILE_MS_KEY, &ms.to_string())
+}
+
 /// The `settings` key holding the opt-in menu-bar (tray) presence toggle (Story 10.3).
 /// Stored as `"1"`/`"0"`; absent = off (no tray by default).
 const SYSTEM_MENU_BAR_PRESENCE_KEY: &str = "system.menu_bar_presence";
@@ -2862,6 +2879,85 @@ pub fn set_recording_camera(data_dir: &Path, enabled: bool) -> Result<(), CoreEr
         RECORDING_CAMERA_KEY,
         if enabled { "1" } else { "0" },
     )
+}
+
+/// The `settings` key holding whether a finished Recording Session is
+/// transcribed (AD-348). Stored with the registry's `"1"`/`"0"` convention;
+/// default **ON** — the owner asked for transcription "by default when it is
+/// possible", and whether it is possible (capability, models, a voices drive)
+/// is decided at finalize, not here.
+const TRANSCRIPTION_AFTER_RECORDING_KEY: &str = "transcription.after_recording";
+
+/// The default after-recording transcription state: ON (AD-348).
+pub const TRANSCRIPTION_AFTER_RECORDING_DEFAULT: bool = true;
+
+/// Read whether a finished session is transcribed (default ON). A default-ON
+/// flag reads its `"0"` explicitly, so turning it off sticks.
+pub fn get_transcription_after_recording(data_dir: &Path) -> Result<bool, CoreError> {
+    let stored = get_setting(data_dir, TRANSCRIPTION_AFTER_RECORDING_KEY)?;
+    Ok(capture_flag(
+        stored.as_deref(),
+        TRANSCRIPTION_AFTER_RECORDING_DEFAULT,
+    ))
+}
+
+/// Write whether a finished session is transcribed.
+pub fn set_transcription_after_recording(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        TRANSCRIPTION_AFTER_RECORDING_KEY,
+        if enabled { "1" } else { "0" },
+    )
+}
+
+/// The `settings` key holding the language transcription expects: `"auto"`,
+/// `"en"` or `"pl"`; absent or anything else ⇒ `auto`.
+const TRANSCRIPTION_LANGUAGE_KEY: &str = "transcription.language";
+
+/// Read the transcription language. Absent / unrecognized ⇒ `Auto`, so a
+/// hand-edited value degrades to the documented default instead of erroring.
+pub fn get_transcription_language(
+    data_dir: &Path,
+) -> Result<crate::transcription::TranscriptionLanguage, CoreError> {
+    let stored = get_setting(data_dir, TRANSCRIPTION_LANGUAGE_KEY)?;
+    Ok(stored
+        .as_deref()
+        .and_then(crate::transcription::TranscriptionLanguage::from_wire)
+        .unwrap_or_default())
+}
+
+/// Write the transcription language in its wire spelling.
+pub fn set_transcription_language(
+    data_dir: &Path,
+    language: crate::transcription::TranscriptionLanguage,
+) -> Result<(), CoreError> {
+    set_setting(data_dir, TRANSCRIPTION_LANGUAGE_KEY, language.as_wire())
+}
+
+/// The `settings` keys holding the speech and speaker model picked in
+/// Settings: a folder name under the hydrated models, or blank for the
+/// config repository's choice.
+const TRANSCRIPTION_ASR_MODEL_KEY: &str = "transcription.asr_model";
+const TRANSCRIPTION_DIARIZATION_MODEL_KEY: &str = "transcription.diarization_model";
+
+/// The picked speech and speaker model, each `""` when the config
+/// repository's choice stands. Surrounding whitespace is not part of a name.
+pub fn get_transcription_models(data_dir: &Path) -> Result<(String, String), CoreError> {
+    let name = |raw: Option<String>| raw.map(|raw| raw.trim().to_owned()).unwrap_or_default();
+    Ok((
+        name(get_setting(data_dir, TRANSCRIPTION_ASR_MODEL_KEY)?),
+        name(get_setting(data_dir, TRANSCRIPTION_DIARIZATION_MODEL_KEY)?),
+    ))
+}
+
+/// Write the picked speech model; `""` returns to the repository's choice.
+pub fn set_transcription_asr_model(data_dir: &Path, id: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, TRANSCRIPTION_ASR_MODEL_KEY, id.trim())
+}
+
+/// Write the picked speaker model; `""` returns to the repository's choice.
+pub fn set_transcription_diarization_model(data_dir: &Path, id: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, TRANSCRIPTION_DIARIZATION_MODEL_KEY, id.trim())
 }
 
 /// The `settings` key holding an explicit path to the `git` binary folder sync
@@ -4994,6 +5090,46 @@ mod tests {
                 "stored {garbage:?} must read as the default (on)"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcription_after_recording_defaults_on_and_remembers_off() {
+        let dir = temp_dir();
+        assert!(get_transcription_after_recording(&dir).expect("fresh install"));
+        set_transcription_after_recording(&dir, false).expect("turn off");
+        assert!(
+            !get_transcription_after_recording(&dir).expect("read off"),
+            "off must survive the next read, not fall back to the default"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcription_language_defaults_to_auto_and_degrades_to_it() {
+        use crate::transcription::TranscriptionLanguage;
+        let dir = temp_dir();
+        assert_eq!(
+            get_transcription_language(&dir).expect("fresh install"),
+            TranscriptionLanguage::Auto
+        );
+        set_transcription_language(&dir, TranscriptionLanguage::Polish).expect("choose pl");
+        assert_eq!(
+            get_setting(&dir, "transcription.language")
+                .expect("raw")
+                .as_deref(),
+            Some("pl"),
+            "stored in the spelling a keeper.toml layer uses"
+        );
+        assert_eq!(
+            get_transcription_language(&dir).expect("read pl"),
+            TranscriptionLanguage::Polish
+        );
+        set_setting(&dir, "transcription.language", "klingon").expect("garbage");
+        assert_eq!(
+            get_transcription_language(&dir).expect("read garbage"),
+            TranscriptionLanguage::Auto
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

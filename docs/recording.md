@@ -3,6 +3,8 @@
 keeper records your screen to a folder on this Mac. **Nothing uploads** — the
 recording feature adds zero network destinations (verified by an automated
 egress-diff gate in CI), has no telemetry, and writes only where you point it.
+A finished recording can be transcribed, **on this Mac only**: no audio or text
+leaves it for that (see *Transcription* below, and `docs/transcription.md`).
 
 ## What it records
 
@@ -214,26 +216,44 @@ merging them into one box that could only be right on one machine.
 
 **Changing the subfolder moves no files.** Sessions already recorded under the
 old one stay exactly where they are: they drop out of the recordings browser at
-the next archive rebuild, and the `![[recordings/…]]` embeds in their note stubs
-stop resolving. The card says so before you save, not after. Move them yourself
-first if you want to keep them listed.
+the next archive rebuild, and the `![[recordings/…]]` embeds in note stubs written
+before Epic 88 stop resolving (a stub's `keeper-media` block names the session by
+its identity, and plays wherever the index finds it). The card says so before you
+save, not after. Move them yourself first if you want to keep them listed.
 
 ### Every synced folder that holds recordings is indexed
 
 The recordings browser and its search read an index (`archive.db`) that keeper
-rebuilds from the session folders themselves, at startup and whenever a synced
-folder is added, removed, paused, resumed or edited, or the destination is
-saved. Every synced folder that declares a recordings subfolder is walked —
-not only the one recordings land in today — so a second folder's meetings are
-searchable and each session is listed under the folder it is actually in.
+rebuilds from the session folders themselves, at startup, whenever a synced
+folder is added, removed, paused, resumed or edited or the destination is
+saved, and **once a day** on its own. Every synced folder that declares a
+recordings subfolder is walked — not only the one recordings land in today —
+so a second folder's meetings are searchable and each session is listed under
+the folder it is actually in.
+
+The daily pass is what catches what keeper did not see happen: a session moved
+by hand, a copy that arrived by pull, a drive plugged in after keeper started.
+It runs a day after the last rebuild of every folder finished (the startup one
+counts, so a launch never walks twice); a Mac that was asleep through the day
+runs it on the first tick after it wakes. The Recordings pane re-reads its list
+whenever a rebuild lands, and its header ⋯ → **Reconcile now** runs the same
+pass at once. The time of the last one is `recordings.last_reconcile_ms`
+(keeper's own record, not a setting you can put in a file); a refresh that
+found no recordings folder to walk, or could not rebuild one of them, is not
+recorded as one.
 
 The index follows the folders, not the other way round. A session you move by
 hand from one recordings root into another is re-homed on the next rebuild:
 one entry, under the folder it now sits in, and its durability is what *that*
 folder's repository says about it — `local` until that folder has committed
 it, whatever the old folder had already pushed. A session you *copy* into a
-second root, with the first copy still there, stays listed under the first
-one (the log names both). A session whose folder is gone from every root
+second root, with the first copy still there, is listed once, under the copy
+whose `manifest.json` changed last (the one something last worked on — a
+recording, a recovery, a retitle); two copies changed at the same instant go
+to the folder whose path sorts first. The choice depends on the two copies
+alone, never on which folder happened to be walked first, so the entry does
+not jump between them from one rebuild to the next, and the log names both,
+with both times. A session whose folder is gone from every root
 drops out of the browser and the search. A folder keeper cannot read whole —
 a drive that is unplugged, a paused folder — is left exactly as it was:
 nothing is forgotten because keeper could not look, and a folder that is
@@ -243,17 +263,18 @@ that has not synced yet) is not believed either.
 Plainly, what triggers a rebuild and what each change does to the index:
 
 - A `[folder.recordings]` block that arrives by pull or by hand edit is
-  picked up at the next save in Settings → Sync or the next start of keeper,
-  not the moment it lands.
-- A drive plugged in after keeper started is indexed at the next save or the
-  next start, for the same reason.
+  picked up at the next save in Settings → Sync, the next start of keeper or
+  the next daily pass, not the moment it lands.
+- A drive plugged in after keeper started is indexed at the next save, start
+  or daily pass, for the same reason — or now, with **Reconcile now**.
 - Removing a synced folder removes its recordings from the index — keeper no
   longer knows that folder, so it cannot list what is in it. Pausing one does
   not: a paused folder's recordings stay listed as they were, waiting for it.
 - On a machine without `git` there is no repository to ask, so every session
   in a synced folder reads `local` — which is exactly what is true there.
 - A rebuild waits for a recording in progress. A change made while a session
-  records is remembered and the rebuild runs the moment the session ends; a
+  records — or the daily pass, or **Reconcile now** (the pane says it is
+  waiting) — is remembered and the rebuild runs the moment the session ends; a
   rebuild already under way leaves the live session's folder alone.
 
 Recordings never live at the profile root, and that is not an oversight: eight
@@ -282,6 +303,117 @@ keeper recognises the drive by the marker it wrote at the drive's root, not by
 the mount path, so a stick that comes back on a different mount point is still
 the same drive. If a *different* volume is mounted where yours belongs, that is
 refused too, with its own sentence — adopting it would sync a stranger's disk.
+
+## Removing a recording
+
+*Remove recording…* — in a note widget's ⋯ (the note itself, not Preview or
+the Files preview) and in a Recordings row's ⋯ — deletes a finished session
+after a confirmation that names its folder, its size and file count, the notes
+whose widget goes with it, and what is left once it is gone. That last
+sentence follows the recording's durability in the index: only a recording
+that reached the drive's remote (`pushed`, `verified`) is "deleted from
+*drive* on every device. The drive's history still has it."; one committed
+here but not pushed "has not left this Mac yet — removing it deletes the only
+copy"; one not even committed "has not reached *drive*'s history yet —
+removing it deletes the only copy". A plain folder on this Mac is "the only
+place it is". keeper deletes; it does not move the folder to a trash.
+
+- **What goes.** The whole session folder — segments, audio, `manifest.json`,
+  `transcript.json`/`.md`, `events.log` — found through the recordings index
+  under a recordings root keeper follows now. Refused outside one, for a root
+  itself, for a stored path with an empty, `.` or `..` component (refused, not
+  dropped), when — every symlink resolved on both sides — the folder is not
+  inside its root, and when its `manifest.json` is missing or names another
+  session (a stale row never aims a deletion at whatever now sits at its path).
+  The index row, its segments and its search entry go too, before the command
+  answers, so the Recordings pane's re-read no longer lists it.
+- **The drive.** Before deleting, keeper declares the folder to the sync
+  engine as its own deletion (`Engine::declare_deletions`), so the removable
+  drive's mass-deletion guard — which refuses a change set deleting more than
+  half a removable profile's index as a drive pulled mid-walk — does not
+  count it: a recordings stick holding one or two sessions can lose one. Every
+  other deletion still counts, and the declaration is spent by the commit that
+  records it (it lives in this process only). A sync pass is then asked for;
+  the deletion reaches other devices with it.
+- **Refused** while the session records or is being finished (its folder is in
+  the live set, under any spelling, and the removal holds that claim until the
+  folder is gone), and while a transcription job targets it. A transcription
+  queued after the recording stopped whose folder is gone by the time it runs
+  ends quietly (cancelled, logged), not as a failed job.
+- **The notes.** Every note in an open vault whose `session` is the removed
+  one loses `session`, `recording` and `files` (through the open-editor-safe
+  frontmatter amendment). A `keeper-media` block naming it — with the
+  `> [!transcript]` words under it — is removed on disk in a note nobody has
+  open. keeper never edits the body of a note open in an editor: it emits
+  `keeper://recording-removed { sessionId }`, and the webview takes the blocks
+  out of every open note's buffer, whichever view it is in (Note, Source or
+  Preview) — Rust composes the body without them
+  (`media_block_without_session`), the buffer takes it, and the note saves as
+  ⌘S does. A note that could not be changed is listed in the dialog after the
+  removal, with why, because it still names the recording.
+
+## Transcription
+
+On an Apple Silicon Mac with macOS 15 or later, with the models fetched (Settings
+→ Transcription), keeper can turn a recording into a transcript with speakers.
+It runs in keeper itself, on this Mac; nothing is sent anywhere (D-29,
+`docs/egress.md` § *Transcription adds no egress*).
+
+- **After recording.** When a session ends in a synced folder that **keeps
+  voices** (Settings → Sync, *This folder keeps voices*) and **Transcribe after
+  recording** is on — it is by default (`transcription.after_recording`) —
+  keeper transcribes the session in the background. The switch sits in Settings
+  → Transcription, and in the Recording pane when the destination keeps voices.
+  Finishing the session never waits for it. A session that ended while keeper
+  was quitting, or before the models arrived, is not picked up later by itself:
+  use **Transcribe** on its folder in Files, offered once the session's audio
+  segments are on this Mac (not LFS pointers or virtual files).
+- **The microphone track is you.** With both system audio and the microphone
+  on, the microphone is transcribed on its own and attributed to the person
+  marked as *me* in the voices bank ("You" until one is marked); system audio is
+  transcribed and split by speaker. The microphone is split by speaker too:
+  when someone sits beside you, the voice that is *me* (or, with no *me* that
+  matches, the one talking most) stays you and each other voice becomes a
+  speaker of its own. A microphone line that repeats what the
+  speakers played, mostly word for word and in order, is dropped as echo; a
+  short reply over the far end is kept. A line heard on the microphone never
+  moves to a voice from the call in a correction, or back. The camera's audio is
+  ignored. keeper finds the microphone as the second audio track, the order
+  `keeper-rec` writes.
+- **Where transcripts land.** Beside the media, in the session folder:
+  `transcript.json` (the source of truth) and `transcript.md` (re-rendered on
+  every save). They sync with the folder like any other file. The transcript is
+  its own file, and the session's note stub carries no word of it: its
+  `keeper-media` block names the session, plays the recording at once, says
+  "Not transcribed yet." until the transcript lands, and then shows its lines —
+  the note itself is never rewritten (`docs/notes.md` § *Media in a note*).
+
+The stub keeper writes when a recording ends is `# Title`, a blank line, and a
+block naming the session by the identity its `session:` carries, with the keys
+it could also say listed as comments — one player for the meeting, where stubs
+before Epic 88 embedded each video. Those older stubs keep their embeds, and
+stubs from before the comments keep their three-line block, until you choose
+*Use the media player in recording notes…* in the notes options menu.
+
+**A recording started from a note has that note, not a stub.** A note's
+`record = "new"` block records like the Recording pane, from the same setup, and
+its session's `manifest.json` carries `meta.linkedNote` — the vault and the
+note's path in it, never an absolute path. The block names the session
+(`session = "<id>"`) the moment the start answers, as an edit in the note's
+editor, saved at once. While it records the note is tagged `recording` and
+`recording/<host>`; when it stops (or, after a quit or a crash, when the
+recovery pass salvages it), keeper removes this Mac's tag — and `recording`,
+unless another Mac's is still there — and writes no stub while the note still
+names the session, on disk or, while the note exists, in an open editor — a
+failed session's too. keeper never edits the note's body for this, only its tags,
+through a block amendment that is safe under an open editor. A note deleted,
+or whose block was removed, gets the ordinary stub instead. Tags a crash left
+are swept at launch, before each start and after each stop, whenever nothing
+records on this Mac. Details in `docs/notes.md` § *Media in a note*.
+
+Speakers are matched against the voices bank of the drive, and you correct
+words and people in the transcript viewer. How that works, and where the models
+come from, is in `docs/transcription.md`.
 
 ## Debug mode (Settings → About)
 

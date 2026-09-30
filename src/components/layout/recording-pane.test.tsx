@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
   recordingPermission: vi.fn(),
+  // Settings' transcription switch reads status once the capability is on.
+  transcriptionStatus: vi.fn(() => new Promise(() => {})),
   requestScreenRecordingPermission: vi.fn(),
   openScreenRecordingSettings: vi.fn(),
   // The mic/camera pre-flight rows' deep links (Story 20.2).
@@ -91,6 +93,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(() => Promise.resolve(null)),
 }));
 
+import { open as openFile } from "@tauri-apps/plugin-dialog";
 import {
   RECORDINGS_SPACE_TESTID,
   RecordingPane,
@@ -143,6 +146,7 @@ import {
   DURATION_CAP_LABEL,
   SEGMENT_SIZE_LABEL,
 } from "@/components/settings/recording-settings-controls";
+import { TRANSCRIBE_A_FILE_LABEL } from "@/components/transcription/transcribe-a-file";
 import { clearRecordingSessionMove } from "@/hooks/use-recording-session";
 import type {
   NoteSpaceVm,
@@ -333,6 +337,25 @@ describe("RecordingPane", () => {
     expect(screen.getByRole("region", { name: "Recording" })).toBeInTheDocument();
     expect(screen.getByText("Recorded locally. Nothing uploads.")).toBeInTheDocument();
     await waitFor(() => expect(mockFetch).toHaveBeenCalled());
+  });
+
+  it("carries Transcribe a file… only where this Mac can transcribe", async () => {
+    const { unmount } = render(<RecordingPane />);
+    await waitFor(() => expect(mockFetch).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: TRANSCRIBE_A_FILE_LABEL })).toBeNull();
+    unmount();
+
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, recording: true, transcription: true });
+    render(<RecordingPane />);
+    fireEvent.click(screen.getByRole("button", { name: TRANSCRIBE_A_FILE_LABEL }));
+    // The menu verb's own picker, so the job reports in the verb's toast.
+    await waitFor(() =>
+      expect(openFile).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Transcribe a file" }),
+      ),
+    );
   });
 
   it("fills the pane while keeping the header and metadata field measures local (UX-DR93)", async () => {

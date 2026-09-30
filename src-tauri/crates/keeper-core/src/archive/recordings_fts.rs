@@ -855,12 +855,19 @@ pub fn search_recording_vms(
             .map_err(|e| {
                 ArchiveError::Sqlite(format!("could not read a session's first segment: {e}"))
             })?;
-        vms.push(recording_hit_vm(
+        let mut vm = recording_hit_vm(
             hit,
             destination_root,
             total_bytes,
             playable_relative.as_deref(),
-        ));
+        );
+        // The folder as it is on this machine now: a manifest read and a
+        // head read per audio segment, only for the page being shown.
+        let (transcribable, transcript) =
+            crate::transcription::plan::session_facts(Path::new(&vm.absolute_path));
+        vm.transcribable = transcribable;
+        vm.transcript = transcript.map(|json| path_string(&json));
+        vms.push(vm);
     }
     Ok(RecordingSearchVm { rows: vms, total })
 }
@@ -914,6 +921,8 @@ fn recording_hit_vm(
         total_bytes,
         durability: hit.durability,
         tags,
+        transcript: None,
+        transcribable: false,
     }
 }
 
@@ -927,7 +936,7 @@ fn recording_hit_vm(
 /// for the same user, and the writer heals it the next time anything records.
 /// One `sqlite_master` probe per query, against a b-tree the connection has
 /// already opened.
-fn recordings_indexed(conn: &Connection) -> Result<bool, ArchiveError> {
+pub(crate) fn recordings_indexed(conn: &Connection) -> Result<bool, ArchiveError> {
     conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recordings'",
         [],
@@ -1309,6 +1318,7 @@ mod tests {
                     name: "room".to_owned(),
                     value: "Kensington 3B".to_owned(),
                 }]),
+                linked_note: None,
             }),
             Some("2026-08-08T09:00:00+02:00".to_owned()),
         )

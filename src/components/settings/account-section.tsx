@@ -485,6 +485,9 @@ function DeviceList({
                 {device.platform !== null && (
                   <span className="text-muted-foreground"> · {device.platform}</span>
                 )}
+                {device.version !== null && (
+                  <span className="text-muted-foreground"> · keeper {device.version}</span>
+                )}
               </span>
               {device.thisDevice && (
                 <>

@@ -45,6 +45,7 @@
  */
 
 import { mockIPC } from "@tauri-apps/api/mocks";
+import { IDLE_RECORDING_STATUS } from "@/hooks/use-recording-session";
 import { remoteOnSourceHost } from "@/lib/forge-repos";
 import type {
   AccountDeviceVm,
@@ -91,9 +92,13 @@ import type {
   ForgeSourceVm,
   GrantScope,
   HotkeyVm,
+  NoteBodyBatch,
   OrgAccountVm,
   PacedWorkVm,
   RecordingCaptureSourcesVm,
+  RecordingRemovalPreviewVm,
+  RecordingRemovedVm,
+  RecordingSearchVm,
   RecordingSettingsVm,
   SessionSpaceFilesVm,
   SessionSpaceFileVm,
@@ -118,6 +123,13 @@ import type {
   VoiceWakeVm,
 } from "@/lib/ipc/client";
 import { DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import {
+  MEDIA_BLOCK_FRONTMATTER,
+  MEDIA_BLOCK_NOTES,
+  markFreshTranscribed,
+  mediaBlockMockHandlers,
+} from "./media-block-fixture";
+import { transcriptionMockHandlers } from "./transcription-fixture";
 
 /** Roughly now, so relative timestamps read as "3 min ago" rather than 1970. */
 const NOW = Date.now();
@@ -196,6 +208,12 @@ const NOTES = [
     ago(3000),
     false,
   ],
+  // The media block's states: a whole meeting with markers, a clip with its
+  // words, one not transcribed yet, and an old note with a per-file embed and a
+  // refused block (`media-block-fixture.ts`).
+  ...MEDIA_BLOCK_NOTES.map(
+    ([id, title, body, tags]) => [id, title, body, tags, ago(20), false] as const,
+  ),
 ] as const;
 
 const noteRows = NOTES.map(([id, title, body, tags, modified, pinned], index) => ({
@@ -319,6 +337,9 @@ function browseEntry(name: string, isDir: boolean, size: FileSizeVm | null): Fil
     sync: { status: "synced", detail: null },
     size: isDir ? null : size,
     folderRole: name === "10-notes" ? "notesVault" : null,
+    transcribable: !isDir && /\.(mov|wav|mp4|m4a)$/.test(name),
+    transcript:
+      name === "meeting.mov" ? "/Volumes/merope/tgdrive/meeting.mov.transcript.json" : null,
     // Story 56.2's two additions. `lfsOid` is null because none of these rows
     // is a virtual path, which is the statement that `size` came off a `stat`;
     // `mtimeMs` is a fixed instant so the harness renders identically on every
@@ -358,7 +379,9 @@ function lfsEntry(
   lfsOid: string | null,
   release: FilesReleaseVm | null = null,
 ): FilesEntryVm {
-  return { ...browseEntry(name, false, size), sync, lfsOid, release };
+  const row = browseEntry(name, false, size);
+  // Content that is not here cannot be transcribed, which Rust says on the row.
+  return { ...row, sync, lfsOid, release, transcribable: row.transcribable && lfsOid === null };
 }
 
 /** Verbatim from `sync_ipc::sync_mark`, for the reason {@link lfsEntry} gives. */
@@ -398,6 +421,9 @@ const ENTRIES: FilesEntryVm[] = [
   browseEntry("30-work", true, null),
   browseEntry("40-media", true, null),
   browseEntry("50-library", true, null),
+  { ...browseEntry("70-comms/voices", true, null), name: "voices", folderRole: "voices" },
+  { ...browseEntry("meeting.mov", false, { bytes: 4_200_000, label: "4.2 MB" }), kind: "video" },
+  browseEntry("meeting.mov.transcript.json", false, { bytes: 4_200, label: "4.2 kB" }),
   browseEntry(".gitattributes", false, { bytes: 16_384, label: "16.4 kB" }),
   browseEntry("AGENTS.md", false, { bytes: 4_812, label: "4.8 kB" }),
   browseEntry("README.md", false, { bytes: 3_380, label: "3.4 kB" }),
@@ -1161,6 +1187,7 @@ const ANSWERS: Record<string, unknown> = {
           // Story 66.3: the phone's reveal, and false on every desktop.
           shareOut: false,
           recording: true,
+          transcription: true,
           sync: true,
           notes: true,
           sessions: true,
@@ -1357,6 +1384,8 @@ const ANSWERS: Record<string, unknown> = {
       notesSubfolder: "notes",
       recordings: true,
       recordingsSubfolder: "recordings",
+      voices: true,
+      voicesSubfolder: "70-comms/voices",
       sessions: true,
       sessionsSubfolder: "60-sessions",
       tasks: true,
@@ -1395,6 +1424,8 @@ const ANSWERS: Record<string, unknown> = {
       notesSubfolder: null,
       recordings: false,
       recordingsSubfolder: "recordings",
+      voices: false,
+      voicesSubfolder: "voices",
       sessions: false,
       sessionsSubfolder: "60-sessions",
       tasks: false,
@@ -1435,6 +1466,8 @@ const ANSWERS: Record<string, unknown> = {
       notesSubfolder: null,
       recordings: false,
       recordingsSubfolder: "recordings",
+      voices: false,
+      voicesSubfolder: "voices",
       sessions: false,
       sessionsSubfolder: "60-sessions",
       tasks: false,
@@ -2914,6 +2947,9 @@ let botMessageDetails = false;
  */
 let firstRunSetupSkipped = false;
 
+/** Session ids removed in this page's life: the Recordings pane stops listing them. */
+const removedRecordings = new Set<string>();
+
 /**
  * The effective recording settings, held in a `let` so a write lands somewhere.
  * Not a disk: a page reload starts from these values again.
@@ -2925,9 +2961,9 @@ let recordingSettings: RecordingSettingsVm = {
   segmentMb: 250,
   durationCapMinutes: 60,
   destinationDir: "/Volumes/merope/tgdrive/recordings",
-  destinationKind: "folder",
-  destinationProfileId: null,
-  destinationProfileName: null,
+  destinationKind: "profile",
+  destinationProfileId: "p1",
+  destinationProfileName: "tgdrive",
   destinationVolume: null,
   pathTemplate: "{yyyy}/{yyyy}-{mm}-{dd} {HH}{MM} {slug}",
   echoCancellation: false,
@@ -3101,6 +3137,7 @@ const ACCOUNT_THIS_DEVICE: AccountDeviceVm = {
   name: "hesperia",
   class: "desktop",
   platform: "macos",
+  version: "0.8.33",
   thisDevice: true,
 };
 
@@ -3122,6 +3159,7 @@ let accountOffers: AccountOffersVm = {
       credential: "account",
       notes: "notes",
       recordings: null,
+      voices: null,
       sessions: null,
       tasks: "tasks",
       excludes: [".DS_Store", "*.tmp"],
@@ -3141,6 +3179,7 @@ let accountOffers: AccountOffersVm = {
       credential: "own",
       notes: null,
       recordings: "recordings",
+      voices: "70-comms/voices",
       sessions: null,
       tasks: null,
       excludes: [],
@@ -3223,6 +3262,7 @@ function signedInAccount(state: AccountStateVm, device = ACCOUNT_THIS_DEVICE): O
             name: "iphone-3f2a",
             class: "mobile",
             platform: "ios",
+            version: "0.8.31",
             thisDevice: false,
           },
           {
@@ -3230,6 +3270,7 @@ function signedInAccount(state: AccountStateVm, device = ACCOUNT_THIS_DEVICE): O
             name: "ipad-91c0",
             class: "tablet",
             platform: "ios",
+            version: null,
             thisDevice: false,
           },
         ],
@@ -3759,6 +3800,8 @@ function forgeAddedProfile(
     notesSubfolder: null,
     recordings: false,
     recordingsSubfolder: "recordings",
+    voices: false,
+    voicesSubfolder: "voices",
     sessions: false,
     sessionsSubfolder: "60-sessions",
     tasks: false,
@@ -3773,6 +3816,35 @@ function later<T>(ms: number, answer: () => T): Promise<T> {
 }
 
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  ...transcriptionMockHandlers(() => ANSWERS.sync_profiles as SyncProfileVm[]),
+  ...mediaBlockMockHandlers(),
+  "plugin:dialog|open": (payload) => {
+    const options = payload.options;
+    return options && typeof options === "object" && "directory" in options && options.directory
+      ? "/Users/tgorka/Documents"
+      : "/Volumes/merope/tgdrive/meeting.mov";
+  },
+  sync_folder_tasks_flag: (payload) => {
+    const profile = (ANSWERS.sync_profiles as SyncProfileVm[]).find(
+      (p) => p.id === payload.profileId,
+    );
+    const subfolder = payload.subfolder === null ? null : String(payload.subfolder);
+    if (profile) {
+      profile.tasks = subfolder !== null;
+      profile.tasksSubfolder = subfolder ?? "tasks";
+    }
+    return {
+      chosenProfileId: profile?.id ?? null,
+      resolvedProfileId: profile?.id ?? null,
+      resolvedProfileName: profile?.name ?? null,
+      root: profile && subfolder ? `${profile.localPath}/${subfolder}` : null,
+      subfolder: subfolder ?? "tasks",
+      subfolderSource: "folder-file",
+      writable: true,
+      exists: true,
+      notice: null,
+    };
+  },
   // One rail group per drive the search covers: the selection, or the active
   // drive when nothing is selected — `notes_spaces(vault_id, vault_ids)`.
   notes_spaces: (payload) => {
@@ -3922,6 +3994,17 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     isDefault: true,
     active: false,
     conflict: null,
+  }),
+  // Nothing records in the browser. Without an answer the session hook adopted
+  // `null` and every surface that reads the snapshot — a note's New recording
+  // widget among them — threw on `status.outputPath`.
+  recording_status: () => IDLE_RECORDING_STATUS,
+  // Granted, so the browser shows the setup a person with permissions sees.
+  recording_permission: () => ({
+    screenRecording: "granted",
+    microphone: "granted",
+    camera: "granted",
+    canStart: true,
   }),
   voice_hotkey_get: (): HotkeyVm => ({
     accelerator: "",
@@ -4249,6 +4332,67 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   first_run_setup_skipped_set: (payload) => {
     firstRunSetupSkipped = payload.skipped === true;
     return null;
+  },
+  // --- Recordings browser -----------------------------------------------------
+  //
+  // Two sessions: one already transcribed (Show transcript), one with media and
+  // no transcript yet (Transcribe, whose job the transcription mock drives).
+  search_recordings: () => {
+    const rows: RecordingSearchVm["rows"] = [
+      {
+        sessionId: "01JREC0000000000000000KELLY",
+        relativePath: "2026/kelly-sync",
+        absolutePath: "/Users/alice/Movies/keeper/2026/kelly-sync",
+        title: "Kelly sync",
+        startedTs: 1_790_000_000_000,
+        endedTs: 1_790_001_800_000,
+        durationMs: 1_800_000,
+        totalBytes: 812_000_000,
+        durability: "pushed",
+        tags: ["work/sync"],
+        playablePath: "/Users/alice/Movies/keeper/2026/kelly-sync/screen-0001.mov",
+        transcript: "/Users/alice/Movies/keeper/2026/kelly-sync/transcript.json",
+        transcribable: true,
+      },
+      {
+        sessionId: "01JREC00000000000000MOUNICA",
+        relativePath: "2026/mounica-sync",
+        absolutePath: "/Users/alice/Movies/keeper/2026/mounica-sync",
+        title: "Mounica sync",
+        startedTs: 1_790_090_000_000,
+        endedTs: 1_790_092_400_000,
+        durationMs: 2_400_000,
+        totalBytes: 1_290_000_000,
+        durability: "local",
+        tags: [],
+        playablePath: "/Users/alice/Movies/keeper/2026/mounica-sync/screen-0001.mov",
+        transcript: null,
+        transcribable: true,
+      },
+    ].filter((row) => !removedRecordings.has(row.sessionId));
+    return { rows, total: rows.length } satisfies RecordingSearchVm;
+  },
+  // Removing a recording: the plan the confirmation words, then the removal,
+  // which the pane's next search reflects.
+  recording_remove_preview: (payload) =>
+    ({
+      folder: `recordings/2026/${String(payload.sessionId).slice(-8).toLowerCase()}`,
+      drive: "tgdrive",
+      bytes: 812_000_000,
+      files: 6,
+      durability: "pushed",
+      notes: [{ vaultId: "vault-mind", path: "meetings/Kelly sync.md", title: "Kelly sync" }],
+    }) satisfies RecordingRemovalPreviewVm,
+  recording_remove: (payload) => {
+    removedRecordings.add(String(payload.sessionId));
+    return {
+      folder: `recordings/2026/${String(payload.sessionId).slice(-8).toLowerCase()}`,
+      bytes: 812_000_000,
+      files: 6,
+      notesChanged: [],
+      openNotes: [{ vaultId: "vault-mind", path: "meetings/Kelly sync.md", title: "Kelly sync" }],
+      notesFailed: [],
+    } satisfies RecordingRemovedVm;
   },
   // --- Recording settings ---------------------------------------------------
   //
@@ -4678,6 +4822,8 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       notesSubfolder: req.notesSubfolder ?? prior.notesSubfolder,
       recordings: req.recordings ?? prior.recordings,
       recordingsSubfolder: req.recordingsSubfolder ?? prior.recordingsSubfolder,
+      voices: req.voices ?? prior.voices,
+      voicesSubfolder: req.voicesSubfolder ?? prior.voicesSubfolder,
       sessions: req.sessions ?? prior.sessions,
       sessionsSubfolder: req.sessionsSubfolder ?? prior.sessionsSubfolder,
     };
@@ -5117,6 +5263,41 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     const inSession =
       String(payload.vaultId ?? "") === SESSION_VAULT_ID && relDir === SESSION_ZONE_DIR;
     return { relDir, dirs: [], notes: inSession ? sessionNotes() : [] };
+  },
+  // The open note's body channel. Without it every note opens empty, and the
+  // editor — its widgets, its Properties disclosure — cannot be looked at here.
+  notes_open: (payload) => {
+    const id = String(payload.noteId);
+    const row = NOTES.find(([each]) => each === id);
+    const text = row === undefined ? "" : String(row[2]);
+    const tags = row === undefined ? [] : [...row[3]];
+    const tagBlock =
+      tags.length > 0 ? `---\ntags:\n${tags.map((tag) => `  - ${tag}\n`).join("")}---\n` : "";
+    (payload.channel as MockChannel<unknown>).onmessage?.({
+      kind: "reset",
+      rev: "rev-mock",
+      path: `${row?.[1] ?? "Untitled"}.md`,
+      frontmatter: MEDIA_BLOCK_FRONTMATTER[id] ?? tagBlock,
+      text,
+      cursor: null,
+    } satisfies NoteBodyBatch);
+    return `sub-mock-note-${String(payload.noteId)}`;
+  },
+  // A save answers what Rust would: the new revision and the block it kept.
+  // Without it every autosave threw on `write.frontmatter`, and so did the save
+  // a New recording widget makes when Start names its session.
+  notes_save: (payload) => {
+    const id = String(payload.subscriptionId ?? "").replace("sub-mock-note-", "");
+    const row = NOTES.find(([each]) => each === id);
+    return {
+      rev: `rev-mock-${Date.now()}`,
+      path: `${row?.[1] ?? "Untitled"}.md`,
+      frontmatter:
+        typeof payload.frontmatter === "string"
+          ? payload.frontmatter
+          : (MEDIA_BLOCK_FRONTMATTER[id] ?? ""),
+      conflictCopy: null,
+    };
   },
   notes_body_read: (payload) => {
     const row = NOTES.find(([id]) => id === payload.noteId);
@@ -5580,6 +5761,13 @@ export function installMockShell(): void {
   if (realShellPresent()) {
     return;
   }
+  // A job for the not-yet-transcribed session leaves a transcript behind, so
+  // the block that started it shows lines when the job ends.
+  const startJob = HANDLERS.transcription_start;
+  HANDLERS.transcription_start = (payload) => {
+    markFreshTranscribed(String(payload.path));
+    return startJob(payload);
+  };
   mockIPC((command, payload) => {
     const handler = HANDLERS[command];
     const answer =

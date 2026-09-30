@@ -36,7 +36,15 @@ import type { RecordingNoteTargetKind } from "@/lib/ipc/client";
  * A format keeper cannot render still has a viewer; it names the file, states
  * the size and offers the two actions that leave keeper.
  */
-export type ViewerId = "video" | "image" | "audio" | "text" | "document" | "folder" | "unknown";
+export type ViewerId =
+  | "video"
+  | "image"
+  | "audio"
+  | "text"
+  | "document"
+  | "folder"
+  | "unknown"
+  | "transcript";
 
 /**
  * The format a row names, one per row, stable across releases.
@@ -67,6 +75,7 @@ export type ViewerFormat =
   | "markdown"
   | "csv"
   | "json"
+  | "transcript"
   | "jsonl"
   | "plain"
   | "source"

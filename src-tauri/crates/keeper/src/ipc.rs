@@ -1373,7 +1373,7 @@ pub(crate) fn to_ipc_error(err: CoreError) -> IpcError {
 ///
 /// A join failure means the body panicked or the runtime is shutting down; neither
 /// is retriable, so it funnels through [`to_ipc_error`] as `Internal`.
-async fn off_async_runtime<T, F>(body: F) -> Result<T, IpcError>
+pub(crate) async fn off_async_runtime<T, F>(body: F) -> Result<T, IpcError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -1533,6 +1533,10 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // Epic 66 flipped `notes_available` on for the phone (AD-201, AD-162):
         // the tools spawn and read a drive the phone does not have.
         bot_tools: mac_folder_capability_of(&git_report(&state), cfg!(desktop)),
+        // On-device transcription (AD-349): the engine's own availability
+        // probe — Apple silicon and macOS ≥ 15 on the Mac, `Unsupported`
+        // everywhere else. The models are a separate state.
+        transcription: crate::transcribe_ipc::transcription_supported(),
     })
 }
 
@@ -2701,6 +2705,339 @@ pub(crate) fn recording_note_targets_in(
     keeper_core::archive::recordings_fts::session_note_targets(&conn, session_id, destination_root)
         .map_err(CoreError::from)
         .map_err(to_ipc_error)
+}
+
+// ---- Removing a recording --------------------------------------------------
+
+/// The event a removal emits once the recording is gone: every open editor
+/// removes the blocks naming it, which keeper never does in a body someone
+/// has open.
+#[cfg(desktop)]
+const RECORDING_REMOVED_EVENT: &str = "keeper://recording-removed";
+
+/// The payload of [`RECORDING_REMOVED_EVENT`].
+#[cfg(desktop)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordingRemovedEvent {
+    session_id: String,
+}
+
+/// What removing a recording would delete, for its confirmation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingRemovalPreviewVm {
+    /// The session folder as its drive names it — or, in a plain folder, as
+    /// the recordings index stores it.
+    pub folder: String,
+    /// The synced folder it is in, by name; `None` for a plain folder on this
+    /// Mac, which no other device has.
+    pub drive: Option<String>,
+    pub bytes: u64,
+    pub files: u64,
+    /// How far the recording has travelled, as the recordings index says:
+    /// `local`, `committed`, `pushed` or `verified`. Only a pushed one is in
+    /// the drive's history; anything less is deleted for good.
+    pub durability: String,
+    /// The notes whose widget — or recording keys — go with it.
+    pub notes: Vec<crate::note_recording_ipc::RecordingNoteRefVm>,
+}
+
+/// What removing a recording did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingRemovedVm {
+    pub folder: String,
+    pub bytes: u64,
+    pub files: u64,
+    /// Notes keeper changed on disk: their recording keys, or their blocks.
+    pub notes_changed: Vec<crate::note_recording_ipc::RecordingNoteRefVm>,
+    /// Notes a live editor has open: their blocks go in that editor.
+    pub open_notes: Vec<crate::note_recording_ipc::RecordingNoteRefVm>,
+    /// Notes keeper could not change: they still name the removed recording.
+    pub notes_failed: Vec<crate::note_recording_ipc::RecordingNoteFailureVm>,
+}
+
+/// A removable session: its checked folder, the folder as a person reads it,
+/// and the synced folder it is in, by name.
+#[cfg(desktop)]
+struct RemovableSession {
+    session: keeper_core::recording::removal::SessionFolder,
+    display: String,
+    drive: Option<String>,
+}
+
+/// The folder of `session_id`, through the recordings index, under a root
+/// the archive follows right now (`recordings_roots`) — refused outside one,
+/// and for the root itself.
+#[cfg(desktop)]
+fn removable_session(
+    platform: &Arc<dyn Platform>,
+    data_dir: &Path,
+    session_id: &str,
+) -> Result<RemovableSession, IpcError> {
+    use keeper_core::recording::removal::{session_folder, RemovalRefusal};
+
+    let refusal = |refusal: RemovalRefusal| crate::transcribe_ipc::refused(refusal.to_string());
+    if !keeper_core::archive::db::db_path(data_dir).exists() {
+        return Err(refusal(RemovalRefusal::Unknown));
+    }
+    let conn = keeper_core::archive::db::open_readonly_archive_db(data_dir)
+        .map_err(CoreError::from)
+        .map_err(to_ipc_error)?;
+    let table = destination_profile_table(platform, ProfileTableNeed::Chosen);
+    let destination = effective_recording_destination(data_dir, &|_need| table.clone());
+    let roots: Vec<keeper_core::archive::KnownRoot> = recordings_roots(&destination, &table)
+        .iter()
+        .map(RecordingsRootPlan::known)
+        .collect();
+    let session = session_folder(&conn, session_id, &roots).map_err(refusal)?;
+    let profile = session.root.profile_id.as_deref().and_then(|profile_id| {
+        table
+            .as_ref()
+            .ok()?
+            .iter()
+            .find(|row| row.id == profile_id)
+            .cloned()
+    });
+    let display = profile
+        .as_ref()
+        .and_then(|row| {
+            let drive = row.local_path.canonicalize().ok()?;
+            let inside = session.folder.strip_prefix(drive).ok()?;
+            Some(
+                inside
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            )
+        })
+        .unwrap_or_else(|| session.relative_path.clone());
+    Ok(RemovableSession {
+        session,
+        display,
+        drive: profile.map(|row| row.name),
+    })
+}
+
+/// What removing the recording `session_id` would delete: its folder, its
+/// size, its drive and the notes naming it — what the confirmation says.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recording_remove_preview(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<RecordingRemovalPreviewVm, IpcError> {
+    let platform = Arc::clone(&state.platform);
+    off_async_runtime(move || -> Result<RecordingRemovalPreviewVm, IpcError> {
+        let data_dir = platform.data_dir().map_err(to_ipc_error)?;
+        let removable = removable_session(&platform, &data_dir, &session_id)?;
+        let size = keeper_core::recording::removal::measure(&removable.session.folder);
+        Ok(RecordingRemovalPreviewVm {
+            folder: removable.display,
+            drive: removable.drive,
+            bytes: size.bytes,
+            files: size.files,
+            durability: removable.session.durability,
+            notes: crate::note_recording_ipc::notes_naming(&session_id),
+        })
+    })
+    .await?
+}
+
+/// Remove the recording `session_id`: delete its folder — segments, audio,
+/// manifest, transcript, log — from the drive, forget its index row, and take
+/// it out of every note in an open vault (keys through the open-editor-safe
+/// amendment; blocks on disk only in notes nobody has open, and
+/// [`RECORDING_REMOVED_EVENT`] for the editors that have one).
+///
+/// Refused while the session records or is being finished (its folder is in
+/// the live-reservation set, which this claims for the whole deletion), while
+/// a transcription reads it, for a folder outside every recordings root and
+/// for one whose manifest does not name this session. The deletion is
+/// declared to the sync engine first — keeper's own, never a pulled drive —
+/// and reaches the drive's other devices through the sync asked for at once;
+/// only a recording that was already pushed is still in the drive's history.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recording_remove(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<RecordingRemovedVm, IpcError> {
+    use tauri::Emitter;
+
+    let platform = Arc::clone(&state.platform);
+    let reserved = Arc::clone(&state.reserved_recording_folders);
+    let resolving = Arc::clone(&platform);
+    let id = session_id.clone();
+    let (removable, size) = off_async_runtime(move || -> Result<_, IpcError> {
+        let data_dir = resolving.data_dir().map_err(to_ipc_error)?;
+        let removable = removable_session(&resolving, &data_dir, &id)?;
+        let claim = claim_for_removal(&reserved, &removable.session.folder, &id)?;
+        // Before the deletion, so no commit can meet it undeclared: on a
+        // removable drive a session that is most of the folder would read as
+        // the drive pulled mid-walk, and the profile would stop.
+        declare_removal(&resolving, &removable.session.path);
+        let size = keeper_core::recording::removal::remove(&removable.session)
+            .map_err(|refusal| crate::transcribe_ipc::refused(refusal.to_string()))?;
+        drop(claim);
+        Ok((removable, size))
+    })
+    .await??;
+
+    // The folder is gone; what follows only makes everything else agree.
+    if let Some(archive) = state.accounts.archive() {
+        if let Err(error) = archive.forget_recording(&session_id).await {
+            tracing::warn!(
+                %error,
+                session_id = %session_id,
+                "recording removal: the index row could not be forgotten; the next reconcile drops it"
+            );
+        }
+    }
+    let id = session_id.clone();
+    let notes = off_async_runtime(move || crate::note_recording_ipc::forget_session(&id)).await?;
+    let _ = app.emit(
+        RECORDING_REMOVED_EVENT,
+        RecordingRemovedEvent {
+            session_id: session_id.clone(),
+        },
+    );
+    tracing::info!(
+        session_id = %session_id,
+        folder = %removable.display,
+        bytes = size.bytes,
+        files = size.files,
+        notes_changed = notes.changed.len(),
+        open_notes = notes.open.len(),
+        notes_failed = notes.failed.len(),
+        "recording removal: the recording's folder is deleted and its notes no longer name it"
+    );
+    let folder = removable.session.path.clone();
+    tauri::async_runtime::spawn(async move { sync_removed_session(platform, folder).await });
+    Ok(RecordingRemovedVm {
+        folder: removable.display,
+        bytes: size.bytes,
+        files: size.files,
+        notes_changed: notes.changed,
+        open_notes: notes.open,
+        notes_failed: notes.failed,
+    })
+}
+
+/// Tell the sync engine the folder about to be deleted is keeper's own
+/// deletion (`Engine::declare_deletions`). Best-effort:
+/// a plain folder no profile holds has nothing to tell, and an engine that
+/// cannot open is a log line — the removal still happens.
+#[cfg(desktop)]
+fn declare_removal(platform: &Arc<dyn Platform>, folder: &Path) {
+    let engine = match crate::sync::engine(Arc::clone(platform)) {
+        Ok(engine) => engine,
+        Err(error) => {
+            tracing::warn!(%error, "recording removal: no sync engine to tell of the deletion");
+            return;
+        }
+    };
+    match crate::sync::profile_for_path(engine.as_ref(), folder) {
+        Ok(Some(profile)) => {
+            if let Err(error) = engine.declare_deletions(&profile.id, folder) {
+                tracing::warn!(%error, profile = %profile.id, "recording removal: the deletion could not be declared");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "recording removal: the sync profiles could not be read")
+        }
+    }
+}
+
+/// Claim a session folder for its removal, held until the folder is gone —
+/// or refuse: while the session records or is being finished (its folder,
+/// under any spelling, is in the live-reservation set, or it is the session
+/// recording from a note), and while a transcription reads it.
+#[cfg(desktop)]
+fn claim_for_removal(
+    reserved: &Arc<Mutex<HashSet<PathBuf>>>,
+    folder: &Path,
+    session_id: &str,
+) -> Result<LiveFolderReservation, IpcError> {
+    let claim = LiveFolderReservation::reserve(reserved, folder.to_path_buf());
+    let live = !claim.owned
+        || plain_lock(reserved)
+            .iter()
+            .any(|held| held != folder && is_same_directory(held, folder))
+        || crate::note_recording_ipc::recording_linked_note()
+            .is_some_and(|linked| linked.session_id == session_id);
+    if live {
+        return Err(IpcError {
+            code: IpcErrorCode::RecordingSessionLive,
+            message: "This recording is still recording or being finished. Stop it, and remove it once it has finished.".to_owned(),
+            account_id: None,
+            retriable: false,
+        });
+    }
+    if crate::transcribe_ipc::job_touches(folder) {
+        return Err(crate::transcribe_ipc::refused(
+            "A transcription of this recording is running. Cancel it, or let it finish, before removing the recording.",
+        ));
+    }
+    Ok(claim)
+}
+
+/// Hand a removed session's deletion to its drive's sync now — best-effort:
+/// the folder is already gone, and the next scheduled sync commits the
+/// deletion anyway.
+#[cfg(desktop)]
+async fn sync_removed_session(platform: Arc<dyn Platform>, folder: PathBuf) {
+    let engine = match crate::sync::engine(platform) {
+        Ok(engine) => engine,
+        Err(error) => {
+            tracing::warn!(%error, "recording removal: no sync engine; the deletion syncs later");
+            return;
+        }
+    };
+    let profile = match crate::sync::profile_for_path(engine.as_ref(), &folder) {
+        Ok(Some(profile)) => profile,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, "recording removal: the sync profiles could not be read");
+            return;
+        }
+    };
+    if let Err(error) = engine
+        .sync_once(&profile.id, keeper_sync::provenance::SyncSource::Manual)
+        .await
+    {
+        tracing::warn!(
+            %error,
+            profile = %profile.id,
+            "recording removal: the deletion did not sync now; the next sync carries it"
+        );
+    }
+}
+
+/// Mobile twin of [`recording_remove_preview`]: recording is desktop-only.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn recording_remove_preview(
+    session_id: String,
+) -> Result<RecordingRemovalPreviewVm, IpcError> {
+    let _ = session_id;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "removing a recording is desktop-only".to_owned(),
+    )))
+}
+
+/// Mobile twin of [`recording_remove`]: recording is desktop-only.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn recording_remove(session_id: String) -> Result<RecordingRemovedVm, IpcError> {
+    let _ = session_id;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "removing a recording is desktop-only".to_owned(),
+    )))
 }
 
 /// Start a background archive export (Story 5.5, FR-35, AD-11).
@@ -4204,13 +4541,26 @@ pub async fn palette_query(
     // desktop build with folder sync off still has a Bots pane. The voice gate
     // is `voice_availability`'s one answer, read as the tray reads it
     // (AD-179), so a listening toggle is never offered where nothing listens.
+    // The transcription gate is the probe `capabilities` fills
+    // `transcription` from, so "Transcribe a File…" exists only where the
+    // speech engine runs.
     let recording = crate::macos_version::recording_supported();
     let notes = notes_available(&state);
     let bots = cfg!(desktop) || cfg!(mobile);
     let voice = crate::voice_ipc::port_present();
+    let transcription = crate::transcribe_ipc::transcription_supported();
     Ok(state
         .accounts
-        .palette_query(&query, mode, open_chat, recording, notes, bots, voice)
+        .palette_query(
+            &query,
+            mode,
+            open_chat,
+            recording,
+            notes,
+            bots,
+            voice,
+            transcription,
+        )
         .await)
 }
 
@@ -4230,12 +4580,13 @@ pub fn cheat_sheet_sections(state: State<'_, AppState>) -> Result<Vec<MenuSectio
     // reach the palette, the ⌘? sheet, the native menu bar and the tray, so the
     // four cannot drift (UX-DR42). The bots gate is its own (Epic 61, FR-384) and
     // is spelled the way `capabilities` spells it; the voice gate is the tray's
-    // (Epic 68, AD-218).
+    // (Epic 68, AD-218); the transcription gate is `capabilities`' own probe.
     Ok(keeper_core::palette::registry_sections(
         crate::macos_version::recording_supported(),
         notes_available(&state),
         cfg!(desktop) || cfg!(mobile),
         crate::voice_ipc::port_present(),
+        crate::transcribe_ipc::transcription_supported(),
     ))
 }
 
@@ -5962,10 +6313,32 @@ impl RecordingSink {
         // in this method the session does not depend on. Best-effort throughout:
         // see `write_recording_note_stub` for why a note that cannot be written
         // is never a recording failure.
-        note_stub_at_finalize(
-            &self.manifest,
-            self.sync.as_ref().map(|sync| sync.profile_id.as_str()),
-        );
+        //
+        // Story 88.9: a session started from a note loses the note's tags, and
+        // that note is its note while a block in it names the session — on
+        // disk or in an open editor; otherwise, a failed session's too, it
+        // gets the ordinary stub. Then any tags a crash left are swept.
+        if crate::note_recording_ipc::finish(&self.manifest, false)
+            != crate::note_recording_ipc::NoteFinish::Done
+        {
+            note_stub_at_finalize(
+                &self.manifest,
+                self.sync.as_ref().map(|sync| sync.profile_id.as_str()),
+            );
+        }
+        crate::note_recording_ipc::sweep_stale_tags(Duration::ZERO);
+        // AD-348: a finished session on a drive that keeps voices is queued
+        // for transcription on this Mac. After everything else and off this
+        // task: the hook only checks and enqueues, on the blocking pool, and
+        // a session that cannot be transcribed is a log line, never a
+        // recording failure. A failed session holds nothing worth hearing.
+        if !matches!(self.machine.state(), SessionState::Failed) {
+            crate::transcribe_ipc::after_recording(
+                Arc::clone(&self.platform),
+                self.manifest.folder().to_path_buf(),
+                self.sync.as_ref().map(|sync| sync.profile_id.clone()),
+            );
+        }
     }
 }
 
@@ -6513,7 +6886,18 @@ pub async fn recording_start(
     // decided what a tag is; both now happen once, in `tags::split_list`.
     meta_tags: Option<String>,
     meta_custom: Option<Vec<keeper_core::recording::SessionMetaField>>,
+    // Story 88.9: the note whose `record = "new"` block pressed Start. The
+    // session is linked to it and the note is tagged while it records; the
+    // block names the session itself, from the webview, once this answers.
+    note: Option<keeper_core::recording::LinkedNote>,
 ) -> Result<RecordingStatusVm, IpcError> {
+    // Tags a crash or a failed stop left behind go first, while nothing that
+    // could be tagged is recording; a live session keeps its own.
+    crate::note_recording_ipc::sweep_stale_tags(Duration::ZERO);
+    // A note that cannot be reached is refused before anything is created.
+    if let Some(note) = note.as_ref() {
+        crate::note_recording_ipc::check_start(note)?;
+    }
     // Story 19.2/19.3/20.1 + the spec *Recording remembers which sources are on*:
     // which sources this session captures is resolved further down, beside the
     // other persisted settings — `None` (no explicit choice reached the command)
@@ -6568,7 +6952,7 @@ pub async fn recording_start(
     // invariant: the slot is never held across blocking `read_dir`/`stat`). The
     // new session's own folder does not exist yet, so the scan cannot see it; a
     // recovery failure is logged in the core pass and must NEVER fail the start.
-    {
+    let recovered = {
         let _scan = plain_lock(&state.recovery_scan);
         let is_active =
             |folder: &Path| plain_lock(&state.reserved_recording_folders).contains(folder);
@@ -6579,7 +6963,9 @@ pub async fn recording_start(
                 "pre-record recovery marked orphaned session(s) recovered"
             );
         }
-    }
+        recovered
+    };
+    finish_recovered_notes(&recovered, false);
 
     let mut guard = slot_lock(&state.recording_run);
     if let Some(run) = guard.as_ref() {
@@ -6730,21 +7116,24 @@ pub async fn recording_start(
     // blank" and "where does one tag end" is how a field starts round-tripping
     // differently depending on which surface last saved it.
     let session_id = mint_session_id(&data_dir)?;
-    let session_meta = keeper_core::recording::SessionMeta::from_input(
-        Some(session_id.clone()),
-        &keeper_core::recording::SessionMetaInput {
-            title: meta_title.as_deref(),
-            participants: meta_participants.as_deref(),
-            note: meta_note.as_deref(),
-            // Story 42.5: one tokenisation, in the tag module, for the one field
-            // whose separator is a comma. What lands in `manifest.json` is still
-            // the user's own text — the canonical form is applied later, by
-            // `RecordingRow::from_manifest`, on the way into the index. The
-            // manifest says what they typed; the row says what it means.
-            tags: meta_tags.as_deref(),
-            custom: meta_custom.as_deref().unwrap_or(&[]),
-        },
-    );
+    let session_meta = keeper_core::recording::SessionMeta {
+        linked_note: note.clone(),
+        ..keeper_core::recording::SessionMeta::from_input(
+            Some(session_id.clone()),
+            &keeper_core::recording::SessionMetaInput {
+                title: meta_title.as_deref(),
+                participants: meta_participants.as_deref(),
+                note: meta_note.as_deref(),
+                // Story 42.5: one tokenisation, in the tag module, for the one field
+                // whose separator is a comma. What lands in `manifest.json` is still
+                // the user's own text — the canonical form is applied later, by
+                // `RecordingRow::from_manifest`, on the way into the index. The
+                // manifest says what they typed; the row says what it means.
+                tags: meta_tags.as_deref(),
+                custom: meta_custom.as_deref().unwrap_or(&[]),
+            },
+        )
+    };
     let title = session_meta.title.clone();
     let devices = SessionDevices {
         system_audio,
@@ -6891,6 +7280,11 @@ pub async fn recording_start(
     // trigger deferred while this session recorded (the archive follows every
     // recordings root) — cloned out now, because the task outlives this call.
     let index_handles = RecordingsIndexHandles::of(state.inner());
+    // Story 88.9: nothing below can fail the start, and the driver's finalize
+    // clears what this holds, so the note is linked before the driver exists.
+    if let Some(note) = note {
+        crate::note_recording_ipc::started(note, session_id);
+    }
     // The handle is stored into the run slot below (Story 18.2): aborting it is
     // the quit kill-timeout's force-kill lever (see `RecordingRun::driver`).
     let driver = tauri::async_runtime::spawn(async move {
@@ -8076,6 +8470,7 @@ pub(crate) fn recover_orphaned_recordings(state: &AppState) {
     let Some(plans) = recordings_index_plans(&handles.platform) else {
         return;
     };
+    let mut recovered_all = Vec::new();
     {
         let _scan = plain_lock(&state.recovery_scan);
         let is_active =
@@ -8090,6 +8485,7 @@ pub(crate) fn recover_orphaned_recordings(state: &AppState) {
                     "startup recovery marked orphaned session(s) recovered"
                 );
             }
+            recovered_all.extend(recovered);
         }
     }
     // Story 42.1: the same pass, for the index — and since the archive followed
@@ -8102,6 +8498,12 @@ pub(crate) fn recover_orphaned_recordings(state: &AppState) {
     // skip set exactly as a triggered one does, and goes through the same
     // gate, so a settings save that lands during boot coalesces with it.
     run_recordings_index_rebuild(&handles, RecordingsIndexTrigger::because("keeper started"));
+    // Story 88.9: last, because it may wait for the notes registry to list a
+    // recovered session's note — the index must not wait with it. Then every
+    // open vault is swept of tags a crash left, once the registry has listed
+    // and indexed them.
+    finish_recovered_notes(&recovered_all, true);
+    crate::note_recording_ipc::sweep_stale_tags(crate::note_recording_ipc::VAULT_WAIT);
 }
 
 /// One recordings root the archive must follow: where it is, which kind of
@@ -8384,9 +8786,13 @@ fn recordings_index_plans(platform: &Arc<dyn Platform>) -> Option<Vec<Recordings
 /// root as its neighbours.
 ///
 /// Sent, not called: the writer owns the one connection to `archive.db`, and a
-/// rebuild is exactly the operation that must not open a second. Nothing waits
-/// on it — a boot that cannot index is a boot whose folders are still the
-/// truth.
+/// rebuild is exactly the operation that must not open a second. This thread
+/// then waits for the writer to reach the end of what it sent
+/// ([`keeper_core::archive::ArchiveHandle::settled`]) — still under the gate,
+/// so one refresh is one refresh on disk too — and only then records the time
+/// (`recordings.last_reconcile_ms`, what the daily reconcile counts its day
+/// from) and tells the Recordings pane to read again. A writer that has
+/// stopped records nothing and announces nothing: the index did not change.
 ///
 /// **The skip set is a snapshot, and that is enough.** The reserved set is
 /// read once here and every rebuild in this refresh carries it. A session
@@ -8413,6 +8819,10 @@ fn run_recordings_index_rebuild(handles: &RecordingsIndexHandles, trigger: Recor
         let skip: HashSet<PathBuf> = plain_lock(&handles.reserved).clone();
         let followed: Vec<keeper_core::archive::KnownRoot> =
             plans.iter().map(RecordingsRootPlan::known).collect();
+        // A refresh that walked no root, or could not rebuild one, has not
+        // matched the index to the folders, so it must not count as the day's
+        // reconcile.
+        let walked = !plans.is_empty();
         let sink = |step: RecordingsIndexStep| match step {
             RecordingsIndexStep::Rebuild { plan, probe } => {
                 let mut request = keeper_core::archive::RebuildRequest::new(
@@ -8435,7 +8845,142 @@ fn run_recordings_index_rebuild(handles: &RecordingsIndexHandles, trigger: Recor
             &|profile_id| durability_probe(&handles.platform, profile_id),
             &sink,
         );
+        let Ok(every_root) = archive.settled().blocking_recv() else {
+            return;
+        };
+        recordings_index_reconciled(&handles.platform, (walked && every_root).then(now_ms));
     });
+}
+
+/// A refresh has landed in the index: when it walked and rebuilt every root
+/// (`reconciled` is when), remember that in the registry for the next launch
+/// and in [`RECONCILE_CLOCK`] for this one; either way tell the webview, as a
+/// forget or the roots that did rebuild may have changed the index.
+fn recordings_index_reconciled(platform: &Arc<dyn Platform>, reconciled: Option<i64>) {
+    use tauri::Emitter;
+
+    if let Some(now) = reconciled {
+        stamp_recordings_reconcile(platform, now);
+    } else {
+        tracing::info!(
+            "archive rebuild: not every recordings root was rebuilt, so the daily reconcile is not counted"
+        );
+    }
+    let Some(app) = RECORDINGS_INDEX_APP.get() else {
+        return;
+    };
+    if let Err(error) = app.emit(RECORDINGS_RECONCILED_EVENT, ()) {
+        tracing::warn!(%error, "archive rebuild: the Recordings pane could not be told to read again");
+    }
+}
+
+/// Record that every recordings root was walked at `now`.
+fn stamp_recordings_reconcile(platform: &Arc<dyn Platform>, now: i64) {
+    plain_lock(&RECONCILE_CLOCK).last_ms = Some(now);
+    match platform.data_dir() {
+        Ok(data_dir) => {
+            if let Err(error) =
+                keeper_core::registry::set_recordings_last_reconcile_ms(&data_dir, now)
+            {
+                tracing::warn!(%error, "archive rebuild: could not record when the index last matched the folders");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "archive rebuild: could not resolve the data dir to record the reconcile (non-fatal)");
+        }
+    }
+}
+
+/// The event the webview hears when a refresh of every recordings root has
+/// landed in the index; the Recordings pane re-runs its query on it.
+pub const RECORDINGS_RECONCILED_EVENT: &str = "keeper://recordings-reconciled";
+
+/// The handle [`RECORDINGS_RECONCILED_EVENT`] is emitted through, set once
+/// from `lib.rs`'s setup, before the launch pass starts.
+static RECORDINGS_INDEX_APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+/// Keep the app handle the index announces itself through. Write-once.
+pub(crate) fn install_recordings_index_announcer(app: &tauri::AppHandle) {
+    let _ = RECORDINGS_INDEX_APP.set(app.clone());
+}
+
+/// What the daily reconcile knows about time, in this process: when the
+/// index last matched the folders (loaded from the registry on the first
+/// tick, then kept by [`recordings_index_reconciled`]) and when a refresh was
+/// last asked for by the tick. Only the desktop's tick reads it.
+#[cfg_attr(not(desktop), allow(dead_code))]
+struct ReconcileClock {
+    loaded: bool,
+    last_ms: Option<i64>,
+    asked_ms: Option<i64>,
+}
+
+static RECONCILE_CLOCK: Mutex<ReconcileClock> = Mutex::new(ReconcileClock {
+    loaded: false,
+    last_ms: None,
+    asked_ms: None,
+});
+
+/// The daily reconcile, a due-check on the tray's 1 Hz tick (AD-62: no clock
+/// of its own), like `account_ipc::daily_tick`: once a day since the index
+/// last matched the folders, one refresh of every recordings root — the same
+/// [`spawn_recordings_index_rebuild`] every other trigger takes, so it defers
+/// while a session records and folds into a refresh already running. The
+/// policy is [`keeper_core::archive::reconcile_due`].
+///
+/// The first tick seeds the last ask with now: this launch's own pass
+/// ([`recover_orphaned_recordings`]) is the launch reconcile, whatever the
+/// stored time says. The registry is read once, on that tick, and never
+/// again — every later refresh updates the clock in memory as it lands.
+#[cfg(desktop)]
+pub(crate) fn recordings_reconcile_tick(app: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    let now = now_ms();
+    let state = app.state::<AppState>();
+    {
+        let mut clock = plain_lock(&RECONCILE_CLOCK);
+        if !clock.loaded {
+            clock.loaded = true;
+            clock.asked_ms = clock.asked_ms.max(Some(now));
+            let stored = state
+                .platform
+                .data_dir()
+                .ok()
+                .and_then(|data_dir| {
+                    keeper_core::registry::get_recordings_last_reconcile_ms(&data_dir).ok()
+                })
+                .flatten();
+            clock.last_ms = clock.last_ms.max(stored);
+        }
+        if !keeper_core::archive::reconcile_due(clock.last_ms, clock.asked_ms, now) {
+            return;
+        }
+        clock.asked_ms = Some(now);
+    }
+    spawn_recordings_index_rebuild(
+        state.inner(),
+        RecordingsIndexTrigger::because(
+            "a day since the recordings index last matched the folders",
+        ),
+    );
+}
+
+/// The Recordings pane's "Reconcile now": the daily reconcile, asked for by
+/// hand — one refresh of every recordings root, through the same gate. `true`
+/// when it started now, `false` when a recording in progress holds it until
+/// the session ends; either way the pane hears
+/// [`RECORDINGS_RECONCILED_EVENT`] when it lands.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recordings_reconcile_now(state: State<'_, AppState>) -> Result<bool, IpcError> {
+    let recording =
+        live_snapshot(&state.recording_run).is_some_and(|(snapshot, ..)| snapshot.state.is_live());
+    spawn_recordings_index_rebuild(
+        state.inner(),
+        RecordingsIndexTrigger::because("reconcile asked for in the Recordings pane"),
+    );
+    Ok(!recording)
 }
 
 /// The one-at-a-time guard around the index refresh (the archive follows
@@ -9143,6 +9688,30 @@ fn note_stub_at_finalize(manifest: &SessionManifest, profile_id: Option<&str>) {
 #[cfg(not(desktop))]
 fn note_stub_at_finalize(manifest: &SessionManifest, profile_id: Option<&str>) {
     let _ = (manifest, profile_id);
+}
+
+/// Story 88.9: each session a recovery pass just salvaged that was started
+/// from a note finishes that note as a stop would — its tags go — and gets
+/// the stub a stop would have written unless the note still names it. A
+/// session not started from a note is left as it was.
+#[cfg(desktop)]
+fn finish_recovered_notes(recovered: &[PathBuf], wait_for_vault: bool) {
+    for folder in recovered {
+        let Ok(manifest) = SessionManifest::load(folder) else {
+            continue;
+        };
+        if crate::note_recording_ipc::finish(&manifest, wait_for_vault)
+            == crate::note_recording_ipc::NoteFinish::Stub
+        {
+            note_stub_at_finalize(&manifest, stub_profile_id(folder).as_deref());
+        }
+    }
+}
+
+/// iOS records nothing, so nothing is ever recovered.
+#[cfg(not(desktop))]
+fn finish_recovered_notes(recovered: &[PathBuf], wait_for_vault: bool) {
+    let _ = (recovered, wait_for_vault);
 }
 
 /// Everything the three stub commands resolve before they can do anything.
@@ -11264,6 +11833,42 @@ pub fn titlebar_drag_report(stage: String, detail: Option<String>) {
             "titlebar drag: unrecognised stage reported by the webview"
         ),
     }
+}
+
+/// Record an error the webview could not handle in the app log.
+///
+/// Without it a render error in the React tree is invisible on a user's
+/// machine: React unmounts the root, the window goes blank, and a release
+/// build has no inspector to read the console from. That is exactly how the
+/// owner's "unfold Properties and keeper hangs on an empty window" report
+/// (epic 88, field reports 2 and 3) stayed undiagnosed for two builds: the
+/// process was idle, the page was simply gone. The frontend's crash screen and
+/// its global `error`/`unhandledrejection` listeners report here.
+///
+/// `ERROR` for the same reason [`titlebar_drag_report`] uses `WARN`: the file
+/// leg of the app log keeps it whatever the debug-mode toggle says. The line's
+/// wording is authored here; only the capped texts cross from the webview.
+#[tauri::command]
+pub fn frontend_error_report(
+    source: String,
+    message: String,
+    stack: Option<String>,
+    component_stack: Option<String>,
+) {
+    const MAX_MESSAGE_CHARS: usize = 500;
+    const MAX_STACK_CHARS: usize = 4_000;
+    let cap = |text: String, max: usize| -> String { text.chars().take(max).collect() };
+    let source = cap(source, 40);
+    let message = cap(message, MAX_MESSAGE_CHARS);
+    let stack = cap(stack.unwrap_or_default(), MAX_STACK_CHARS);
+    let component_stack = cap(component_stack.unwrap_or_default(), MAX_STACK_CHARS);
+    tracing::error!(
+        %source,
+        %message,
+        %stack,
+        %component_stack,
+        "frontend error: the webview reported an error it could not handle"
+    );
 }
 
 /// Read the menu-bar (tray) presence toggle (Story 10.3, FR-53). Reads the persisted
@@ -16778,6 +17383,54 @@ mod tests {
         assert!(plain_lock(&reserved).is_empty());
     }
 
+    /// A recording is never removed while it records or is being finished:
+    /// its folder is in the live set — under the spelling the recorder used,
+    /// which may be a symlinked one — and the removal is refused until the
+    /// recorder lets it go.
+    #[cfg(desktop)]
+    #[test]
+    fn a_live_sessions_folder_is_not_claimed_for_removal() {
+        let base = std::env::temp_dir().join(format!(
+            "keeper-removal-claim-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let folder = base.join("recordings/2026/standup");
+        std::fs::create_dir_all(&folder).expect("session folder");
+        let folder = folder.canonicalize().expect("canonical");
+        let reserved = reserved_set();
+
+        let recording = LiveFolderReservation::reserve(&reserved, folder.clone());
+        let refused = claim_for_removal(&reserved, &folder, "S1").expect_err("live");
+        assert_eq!(refused.code, IpcErrorCode::RecordingSessionLive);
+        assert!(
+            plain_lock(&reserved).contains(&folder),
+            "the refusal must not release the recorder's claim"
+        );
+        drop(recording);
+
+        #[cfg(unix)]
+        {
+            let alias = base.join("alias");
+            std::os::unix::fs::symlink(&folder, &alias).expect("symlink");
+            let recording = LiveFolderReservation::reserve(&reserved, alias);
+            assert!(
+                claim_for_removal(&reserved, &folder, "S1").is_err(),
+                "the same folder under another spelling is still the live one"
+            );
+            drop(recording);
+        }
+
+        let claim = claim_for_removal(&reserved, &folder, "S1").expect("finished, so removable");
+        assert!(
+            plain_lock(&reserved).contains(&folder),
+            "held while it is deleted"
+        );
+        drop(claim);
+        assert!(plain_lock(&reserved).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Story 40.4: the lexical `strip_prefix` behind the "inside the destination
     /// root" guard preserves `..`, so a folder OUTSIDE the root would strip to a
     /// non-empty relative path and pass a `is_some()` containment check — and the
@@ -17715,6 +18368,7 @@ mod tests {
                 name: "room".to_owned(),
                 value: "Blue".to_owned(),
             }]),
+            linked_note: None,
         }
     }
 
@@ -18129,6 +18783,7 @@ mod tests {
                 note: None,
                 tags: Some(vec!["standup".to_owned(), "eng".to_owned()]),
                 custom: None,
+                linked_note: None,
             }),
             Some(INDEXED_STARTED_AT.to_owned()),
         )
@@ -18236,16 +18891,15 @@ mod tests {
         // embedded, in the ledger's order, BELOW the heading — `manifest.json`
         // is in `files:` and is not embedded. Asserted here as well as in the
         // composer's own tests because this is the seam that decides what the
-        // paths actually look like: they are whatever `stub_files` made
-        // relative to the anchor, and nothing joined a root back onto them.
+        // body actually carries: one keeper-media block naming the session
+        // (Epic 88, AD-357), never a path joined onto a root.
         assert_eq!(
             &source[body..],
-            concat!(
-                "\n# Weekly sync\n",
-                "\n",
-                "![[keeper-rec session/screen-0000.mov]]\n",
-                "![[keeper-rec session/screen-0001.mov]]\n",
-                "\n",
+            format!(
+                "\n# Weekly sync\n\n{}\n",
+                keeper_core::notes::media_block::session_block(
+                    "01JQDEVICE0000000000000000-01JQSTUBAAAA00000000000000"
+                )
             ),
             "the WHOLE body, so nothing can be reordered without failing here: the body \
              offset is exact, the prose is byte-identical, and the heading is still the \
@@ -18463,7 +19117,12 @@ mod tests {
         // here because `drive_synthetic_session` closes a real `.mov`.
         assert_eq!(
             &source[body..],
-            "\n# 2026-01-02\n\n![[keeper-rec 2026-01-02 10.00.00/screen-0000.mov]]\n\n"
+            format!(
+                "\n# 2026-01-02\n\n{}\n",
+                keeper_core::notes::media_block::session_block(
+                    "01JQDEVICE0000000000000000-01JQSTUBAAAA00000000000000"
+                )
+            )
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -18573,7 +19232,13 @@ mod tests {
         // why the sentence appended below goes UNDER the recording rather than
         // shoving it down the page.
         assert_eq!(
-            body, "# Weekly sync\n\n![[keeper-rec session/screen-0000.mov]]\n\n",
+            body,
+            format!(
+                "# Weekly sync\n\n{}\n",
+                keeper_core::notes::media_block::session_block(
+                    "01JQDEVICE0000000000000000-01JQSTUBAAAA00000000000000"
+                )
+            ),
             "the WHOLE body: heading first, then the recording, then the blank line the \
              caret lands on. An embed above the heading would become the note's title"
         );

@@ -86,6 +86,7 @@ import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { SHOW_IN_FILES_LABEL } from "@/lib/vault-link";
 import { withActionWidths, withHandFiredResize, withRangeRects } from "@/test/layout";
+import { ADOPT_MEDIA_BLOCKS_LABEL } from "./adopt-media-blocks";
 import { ATTACHMENTS_LABEL } from "./attachments-panel";
 import { NOTE_ACTIONS_LABEL, NOTE_DELETE_LABEL } from "./note-actions";
 import {
@@ -597,7 +598,12 @@ describe("the header shows the verbs it has room for", () => {
     // the header from the accessibility tree, so a control checked afterwards
     // would look absent whether it was there or not.
     expect(screen.getByRole("button", { name: PROPERTIES_LABEL })).toBeVisible();
-    expect(menuItems()).toEqual([SHOW_IN_FILES_LABEL, "Export…", NOTE_DELETE_LABEL]);
+    expect(menuItems()).toEqual([
+      SHOW_IN_FILES_LABEL,
+      ADOPT_MEDIA_BLOCKS_LABEL,
+      "Export…",
+      NOTE_DELETE_LABEL,
+    ]);
   });
 
   it("stays at 46.5's shape on a machine that never delivers an observation", async () => {
@@ -615,6 +621,7 @@ describe("the header shows the verbs it has room for", () => {
       ATTACHMENTS_LABEL,
       NOTE_HISTORY_LABEL,
       SHOW_IN_FILES_LABEL,
+      ADOPT_MEDIA_BLOCKS_LABEL,
       "Export…",
       NOTE_DELETE_LABEL,
     ]);

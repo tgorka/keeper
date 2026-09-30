@@ -77,6 +77,7 @@
 
 import type { LucideIcon } from "lucide-react";
 import {
+  AudioLines,
   Check,
   ChevronDown,
   ChevronRight,
@@ -106,6 +107,16 @@ import { planPriorityActions } from "@/components/layout/priority-actions";
 import { useSurfaceColumn } from "@/components/layout/surface-column";
 import { SyncStatusMark } from "@/components/layout/sync-status-mark";
 import { ATTACH_TO_NOTE_LABEL, AttachToNoteDialog } from "@/components/notes/attach-to-note-dialog";
+import {
+  TRANSCRIBE_AGAIN_LABEL,
+  TranscribeAgainDialog,
+} from "@/components/transcription/transcribe-again";
+import { TranscriptDialog } from "@/components/transcription/transcript-viewer";
+import { TranscriptionJob } from "@/components/transcription/transcription-job";
+import {
+  TranscriptionProgressRing,
+  transcriptionShortLine,
+} from "@/components/transcription/transcription-progress";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -171,6 +182,11 @@ import {
 } from "@/lib/stores/files-tree";
 import { useNotesVaultsStore } from "@/lib/stores/notes-vaults";
 import { panelsStore } from "@/lib/stores/panels";
+import {
+  startTranscription,
+  transcriptionRunning,
+  useTranscriptionStore,
+} from "@/lib/stores/transcription";
 import { cn } from "@/lib/utils";
 import { resolveViewer, VIEWER_ICON } from "@/lib/viewers";
 
@@ -196,7 +212,7 @@ export const FILES_PANE_TITLE = "Files";
 
 /** The one honest sentence under the heading: what this shows, and what it can change. */
 export const FILES_PANE_SUBTITLE =
-  "Everything in the folders keeper syncs. Files in a notes vault can be created and deleted here; everything else is read-only.";
+  "Everything in the folders keeper syncs. Files in a notes vault can be created and deleted here.";
 
 /**
  * The column the tree occupies (Story 48.1).
@@ -622,6 +638,7 @@ const FOLDER_ROLE_ICON: Record<FilesFolderRoleVm, LucideIcon> = {
   notesVault: NotebookPen,
   recordings: Clapperboard,
   tasks: ListChecks,
+  voices: AudioLines,
 };
 
 /** What a role-carrying folder's icon means, for the row's title. Two folders
@@ -630,6 +647,7 @@ const FOLDER_ROLE_TITLE: Record<FilesFolderRoleVm, string> = {
   notesVault: "Your notes vault",
   recordings: "Where recordings are saved",
   tasks: "Where task ledgers are written",
+  voices: "Where voices and the dictionary are kept",
 };
 
 /** One `treeitem`: a profile root, or one entry inside one. */
@@ -1022,10 +1040,15 @@ export function filesRowCellPlan(input: FilesRowCellInput): FilesRowCellPlan {
 interface FilesRowAction {
   /** Stable identity, so a promoted control keeps its place as labels change. */
   readonly id: string;
+  readonly disabled?: boolean;
   /** The accessible name, the tooltip, and the words in the menu item. */
   readonly label: string;
   /** The glyph the promoted control draws. */
   readonly icon: LucideIcon;
+  /** A job this verb started is still running: its fraction (0..1, or null
+   *  while the shell has no estimate yet), drawn as a ring round the promoted
+   *  control. Absent when nothing is running. */
+  readonly ring?: number | null;
   /** What the control and the menu item both do. One handler, so they cannot
    *  drift — the rule `PriorityAction` states and this borrows.
    *
@@ -1133,6 +1156,12 @@ export function FilesPane() {
   // the recordings row already use. A control that fails on activation is worse
   // than no control.
   const canReveal = useCapabilitiesStore((s) => s.capabilities.revealInFileManager);
+  const canTranscribe = useCapabilitiesStore((s) => s.capabilities.transcription);
+  const transcriptionJobs = useTranscriptionStore((s) => s.jobs);
+  const [transcriptPath, setTranscriptPath] = useState<string | null>(null);
+  const [transcriptionPath, setTranscriptionPath] = useState<string | null>(null);
+  /** The row "Transcribe again" is asking about, and what its job re-reads when done. */
+  const [replacing, setReplacing] = useState<{ path: string; reread: () => void } | null>(null);
   // The tree's own surface column is set up further down, once the selection and
   // the refresh it puts on its folded rail exist (Story 48.1).
 
@@ -2427,6 +2456,8 @@ export function FilesPane() {
     // menu's items and the row's own click gestures must be about the same
     // target or the two gestures mean different things on the same row.
     const target = rowTarget(node);
+    const rowJob = entry === null ? undefined : transcriptionJobs[entry.absolutePath];
+    const rowJobRunning = rowJob !== undefined && transcriptionRunning(rowJob);
     /**
      * Every verb this row has, in the order it matters.
      *
@@ -2586,6 +2617,55 @@ export function FilesPane() {
                       runRowVerb(node, () =>
                         syncPinEntry(node.profileId, entry.relativePath, true),
                       ),
+                  },
+                ]
+              : []),
+            // Transcription reads the bytes, so it sits with the state verbs'
+            // side of the list rather than ahead of Fetch: a pointer row is not
+            // `transcribable` (Rust says so), and a fetched one still promotes
+            // Open first. Open transcript reads a file that already exists, so
+            // it needs no models and is offered wherever one is.
+            ...(canTranscribe && entry.transcribable
+              ? [
+                  {
+                    id: "transcribe",
+                    // Where a transcript exists the verb replaces it, and asks
+                    // first: the corrections in it are about to go.
+                    label: rowJobRunning
+                      ? transcriptionShortLine(rowJob)
+                      : entry.transcript
+                        ? `${TRANSCRIBE_AGAIN_LABEL}…`
+                        : "Transcribe",
+                    icon: AudioLines,
+                    disabled: rowJobRunning,
+                    ring: rowJobRunning ? rowJob.fraction : undefined,
+                    onSelect: () => {
+                      // The new transcript's row (and this row's Open transcript)
+                      // only exist once the listing is read again.
+                      const reread = () => {
+                        load(
+                          node.profileId,
+                          nodeKeySubpath(node.parentKey ?? nodeKey(node.profileId, "")),
+                        );
+                        if (node.isFolder) load(node.profileId, nodeKeySubpath(node.key));
+                      };
+                      if (entry.transcript) {
+                        setReplacing({ path: entry.absolutePath, reread });
+                        return;
+                      }
+                      setTranscriptionPath(entry.absolutePath);
+                      void startTranscription(entry.absolutePath, reread);
+                    },
+                  },
+                ]
+              : []),
+            ...(entry.transcript
+              ? [
+                  {
+                    id: "open-transcript",
+                    label: "Open transcript",
+                    icon: AudioLines,
+                    onSelect: () => setTranscriptPath(entry.transcript),
                   },
                 ]
               : []),
@@ -2936,23 +3016,28 @@ export function FilesPane() {
             no children still spends the row's gap. */}
         {actions.length > 0 && promoted > 0 && (
           <span className="flex shrink-0 items-center gap-1">
-            {actions.slice(0, promoted).map(({ id, label, icon: Icon, onSelect }) => (
-              <IconHint key={id} label={label}>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-sm"
-                  tabIndex={actionTabIndex}
-                  // The whole visible word as the name rather than a description of
-                  // it, so speech input can ask for what the menu spells even
-                  // though the eye reads a picture (WCAG 2.5.3).
-                  aria-label={label}
-                  onClick={onSelect}
-                >
-                  <Icon aria-hidden="true" />
-                </Button>
-              </IconHint>
-            ))}
+            {actions
+              .slice(0, promoted)
+              .map(({ id, label, icon: Icon, onSelect, disabled, ring }) => (
+                <IconHint key={id} label={label}>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    tabIndex={actionTabIndex}
+                    disabled={disabled}
+                    // The whole visible word as the name rather than a description of
+                    // it, so speech input can ask for what the menu spells even
+                    // though the eye reads a picture (WCAG 2.5.3).
+                    aria-label={label}
+                    onClick={onSelect}
+                    className={ring === undefined ? undefined : "relative"}
+                  >
+                    <Icon aria-hidden="true" />
+                    {ring !== undefined && <TranscriptionProgressRing fraction={ring} />}
+                  </Button>
+                </IconHint>
+              ))}
           </span>
         )}
       </div>
@@ -3018,7 +3103,11 @@ export function FilesPane() {
               that raised the question. */}
           {actions.map((action) =>
             action.options === undefined ? (
-              <ContextMenuItem key={action.id} onSelect={action.onSelect}>
+              <ContextMenuItem
+                key={action.id}
+                onSelect={action.onSelect}
+                disabled={action.disabled}
+              >
                 {action.label}
               </ContextMenuItem>
             ) : (
@@ -3110,6 +3199,21 @@ export function FilesPane() {
     <>
       <section {...tree.rootProps} className={FILES_COLUMN_CLASS}>
         {tree.chrome}
+        {canTranscribe && transcriptionPath && (
+          <div className="p-2">
+            <TranscriptionJob path={transcriptionPath} onOpen={setTranscriptPath} />
+          </div>
+        )}
+        <TranscriptDialog path={transcriptPath} onClose={() => setTranscriptPath(null)} />
+        <TranscribeAgainDialog
+          open={replacing !== null}
+          onClose={() => setReplacing(null)}
+          onConfirm={() => {
+            if (!replacing) return;
+            setTranscriptionPath(replacing.path);
+            void startTranscription(replacing.path, replacing.reread, true);
+          }}
+        />
         {/* The heading used to sit here, over the sentence. It is one row up
             now: every foldable surface names itself in its fold row (Story
             48.3), and this pane was the only one that already had a name to

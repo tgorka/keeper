@@ -110,12 +110,16 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // words `capabilities` uses. This function only ever runs on desktop, which
     // is exactly why the literal is honest rather than a shortcut. The voice
     // gate (Epic 68, AD-218) is the port's one answer, as the tray reads it: a
-    // build whose port is `Unsupported` builds no listening toggle (AD-27).
+    // build whose port is `Unsupported` builds no listening toggle (AD-27). The
+    // transcription gate is the probe `capabilities` fills `transcription`
+    // from, so "Transcribe a File…" is in the Recording menu only where the
+    // speech engine runs.
     for section in registry_sections(
         crate::macos_version::recording_supported(),
         notes,
         cfg!(desktop),
         crate::voice_ipc::port_present(),
+        crate::transcribe_ipc::transcription_supported(),
     ) {
         // Each generated item's id IS its canonical registry dispatch id; no
         // accelerator is bound (the JS hooks own every binding).

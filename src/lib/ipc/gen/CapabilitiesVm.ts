@@ -143,4 +143,11 @@ botTools: boolean,
  * already owns. Those two config keys are the other half of this fact —
  * changing them means changing this flag with them.
  */
-overlayTitleBar: boolean, };
+overlayTitleBar: boolean, 
+/**
+ * On-device transcription (AD-349) can run here: `true` only on a Mac
+ * with Apple silicon and macOS ≥ 15 (the diarizer crashes on 14), probed
+ * at runtime in the shell like `recording`. Says nothing about the
+ * models; `transcription_status` does.
+ */
+transcription: boolean, };

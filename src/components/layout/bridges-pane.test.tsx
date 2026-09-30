@@ -81,6 +81,7 @@ const DESKTOP_CAPABILITIES = {
   bots: false,
   botTools: false,
   overlayTitleBar: false,
+  transcription: false,
 };
 
 function account(id: string, userId: string, hue = 0, provider: Provider = "password"): AccountVm {

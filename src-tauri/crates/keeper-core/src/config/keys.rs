@@ -845,6 +845,21 @@ pub const KEYS: &[KeySpec] = &[
         summary: "Whether the next Recording Session records the camera; the camera itself is chosen per session.",
         example: "false",
     },
+    // ---- recordings ------------------------------------------------------
+    KeySpec {
+        key: "recordings.last_reconcile_ms",
+        family: false,
+        scope: Scope::SessionState,
+        settable: Settable::Never(
+            "it is this install's record of when its recordings index last matched the folders, \
+             and a file setting it would hold the daily reconcile off, or run it every second",
+        ),
+        shape: Shape::Text,
+        default: "",
+        summary: "When the recordings index last finished a refresh of every recordings root, in \
+                  ms since the Unix epoch; the daily reconcile runs a day after it.",
+        example: "",
+    },
     // ---- sessions --------------------------------------------------------
     KeySpec {
         key: "sessions.spaces_folded",
@@ -932,6 +947,47 @@ pub const KEYS: &[KeySpec] = &[
         default: "0",
         summary: "Whether keeper keeps a menu-bar (tray) presence.",
         example: "true",
+    },
+    // ---- transcription ---------------------------------------------------
+    KeySpec {
+        key: "transcription.after_recording",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Flag01,
+        default: "1",
+        summary: "Whether a finished Recording Session saved to a drive that keeps voices is transcribed on this Mac.",
+        example: "false",
+    },
+    KeySpec {
+        key: "transcription.asr_model",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Text,
+        default: "",
+        summary: "The speech model transcription loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`_models/models.toml`); a model that is missing or incomplete on this Mac is refused, never replaced.",
+        example: "\"parakeet-tdt-0.6b-v3\"",
+    },
+    KeySpec {
+        key: "transcription.diarization_model",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Text,
+        default: "",
+        summary: "The speaker model transcription loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`_models/models.toml`); a model that is missing or incomplete on this Mac is refused, never replaced.",
+        example: "\"speaker-diarization\"",
+    },
+    KeySpec {
+        key: "transcription.language",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Choice(&["auto", "en", "pl"]),
+        default: "auto",
+        summary: "The spoken language transcription expects; `auto` lets the model decide.",
+        example: "\"pl\"",
     },
     // ---- ui --------------------------------------------------------------
     KeySpec {
@@ -1713,6 +1769,7 @@ mod tests {
             "ui.first_run_setup_skipped",
             "ui.ios_sync_disclosure_shown",
             "ui.recovered_sessions_acknowledged",
+            "recordings.last_reconcile_ms",
             "notes.capture_draft.draft",
             "notes.capture_placement.draft",
             "notes.read.01ABC",

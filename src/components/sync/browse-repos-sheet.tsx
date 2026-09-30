@@ -302,6 +302,7 @@ function repoPrefill(
     ...(localPath === null ? {} : { localPath }),
     notes: null,
     recordings: null,
+    voices: null,
     sessions: null,
     tasks: null,
     excludes: [],

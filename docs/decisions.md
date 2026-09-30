@@ -154,7 +154,9 @@ first proposed as a convenience, and the refusal has to be findable before the p
   pretrained keyword-spotting and ASR model weights carry dataset terms the code's Apache-2.0
   licence does not imply. The recording feature's promise that it transcribes nothing is stated in
   six places and enforced by a source scan, and a voice surface that borrowed the recording
-  pipeline would make that promise false. The direction is recorded so 62 does not re-research it.
+  pipeline would make that promise false (superseded by D-29: recording now transcribes on this
+  Mac, and still adds no network destination). The direction is recorded so 62 does not
+  re-research it.
   (Epic 61, *What stays out*; research §10)
 - **Revisit triggers:** a third provider kind with a real endpoint to read against (the enum stays
   closed at two until then, DW-214); the MCP threat model being written (DW-215); the model-weight
@@ -1423,3 +1425,152 @@ from, and what keeper does and does not run to get them.
 - **Status / owner:** decided. Owner is the architect. Epic 86 implements it:
   `keeper_core::forges`, the descriptor's `[[forges]]` and `[github_broker]`, and the
   shell's `forge_ipc`.
+
+## D-29 — A recording is transcribed on this Mac, and still reaches no new destination
+
+The owner asked keeper to transcribe meetings — a recording after it ends, by default, and any
+audio or video file on request — into segmented transcripts with speakers; to recognise people
+in later meetings from a voices bank kept in a drive; to let a person correct both the words and
+the people; and to do it offline, inside keeper, on the Mac. Until then keeper promised the
+opposite: the recording feature "transcribes nothing", a sentence restated in six places and
+enforced by a source scan (D-4, *Why voice and the wake word are Epic 62*). On 2026-09-28 the
+owner changed that promise ("Obietnica „recording nic nie transkrybuje" - zmien obietnice -
+zmiana decyzji"). This entry records the promise that replaces it, so the old one is not
+re-argued and the new one is not stretched.
+
+keeper will transcribe on this Mac, and it will **not** send audio, a transcript or a voice
+anywhere, run or call a transcription server, offer a NAS or cloud option, or fetch a model from
+anyone but the person's own organisation.
+
+- **What changes:** a finished recording whose drive keeps voices is transcribed after it ends,
+  while *Transcribe after recording* is on (the default) and the Mac can do it; any audio or
+  video file can be transcribed from Files or Settings. A session's transcript is
+  `transcript.json` and `transcript.md` in its folder; any other file's is
+  `<name.ext>.transcript.json` and `<name.ext>.transcript.md` beside it. Speakers are diarized
+  and matched against a voices bank — people, voice clips, and embeddings kept per model — and
+  names and jargon against a dictionary, both kept one file per fact in a drive the person marks
+  as keeping voices. A person's confirmed correction adds a voice sample to the bank; nothing
+  else writes to it. keeper's macOS minimum rises from 11.0 to 14.0, FluidAudio's platform
+  floor, below which its statically linked Swift library would stop keeper from launching (the
+  app also carries an rpath to the OS's `/usr/lib/swift` for that library's Swift runtime);
+  transcription itself needs macOS 15, where FluidAudio's community-1 diarizer no longer crashes
+  (upstream #878). (AD-339…AD-350; FR-746…FR-758; NFR-105…NFR-109; Epic 87)
+- **What stays true: recording adds no network destination.** The capture sidecar is untouched
+  and its network scan stays. The recording frontend's scan keeps every network token and its
+  `Upload`, `Share` and `Cloud` words, and loses only `transcri` (AD-350). Transcripts, clips,
+  embeddings and terms are files in the drive the person chose, and leave the Mac only as that
+  drive's sync already carries its files.
+- **Where the models come from:** the account's config repository, under `_models/`, tracked by
+  git LFS and fetched by keeper's own LFS client from the host `docs/egress.md` already lists
+  for the settings repository. The LFS endpoint is derived from that repository's URL alone; a
+  `.lfsconfig` in it is never read, so the credential goes to no host the repository names.
+  Each file is checked against its sha256 before use, and the engine loads only a complete set,
+  by path, and only when a completion marker written last says the set is the one the
+  repository names now. keeper makes no request to Hugging Face. D-5 holds: keeper's bundle
+  carries no weights, and the organisation that runs the account chooses to distribute them.
+  Without an account there are no models, and Settings says so. (AD-341)
+- **Why on this Mac, and not a NAS or the cloud:** the owner asked for offline processing and
+  refused a NAS option ("nie rob opcji nas skoro mozna miec wszystko lokalnie"). A NAS would make
+  keeper depend on a server the person runs, and add a destination; a cloud API would hand
+  meeting audio to a third party. keeper stays a client. (research-transcription-2026-09-28.md §3)
+- **Why in keeper's process, and not a sidecar:** the owner asked for no sidecar and for
+  `fluidaudio-rs`. The published crate cannot return word timings or speaker embeddings, or load
+  models from a directory, so keeper vendors a fork at `tools/fluidaudio-rs/` (MIT, attribution
+  kept) over FluidAudio 0.17.4. Its FFI stays in that dependency, and keeper's own code stays
+  free of `unsafe`. It runs on Apple Silicon with macOS 15 or later, and nowhere else yet.
+  (AD-339, AD-349; DW-335, DW-339)
+- **What it supersedes:** the sentence in D-4 that the recording feature transcribes nothing
+  (`docs/decisions.md:155-159`), and with it `docs/egress.md` § *Screen recording adds no
+  egress*, `AGENTS.md:144`'s "or a transcription", the `transcri` token in
+  `src/components/recording/zero-egress.test.ts`, and the comment in
+  `src/test/bots-surface-stays-out-of-recording.test.ts`. The planning records that restated the
+  old promise (the epic 16, 19 and 20 contexts, specs 20.3 and 20.4, epic 61) are records of
+  their time and stay as written; this entry is their pointer. The note stub keeper writes for a
+  session still carries no transcription (`notes/recording_note.rs`); the transcript is its own
+  file.
+- **What is deferred, not refused:** Nemotron 3 Diarization (DW-331), vocabulary boosting
+  (DW-332), calibrated matching (DW-333), a later pass over sessions the hook missed (DW-334), an
+  engine on the phone, Linux or Windows (DW-335), live transcription (DW-336), summaries
+  (DW-337), transcripts in search (DW-338), consent and GDPR handling for voice prints, which
+  the owner deferred (DW-342), the audio copied twice more on each engine call (DW-343), the
+  models' fetch reading the config clone outside the account gate (DW-344), and a Mac on macOS
+  11–13 that auto-updates into a bundle it cannot open (DW-345).
+- **Revisit triggers:** upstream `fluidaudio-rs` carrying token timings, embeddings and loading
+  by path (DW-339); a Nemotron 3 path that keeps the bank in one embedding space (DW-331); a
+  platform other than the Mac asking for transcription (DW-335). None of them reopens the second
+  paragraph: a transcription server, a NAS option or a cloud fallback is not a revisit, it is a
+  new row in `docs/egress.md` that this decision refuses to write.
+- **Status / owner:** decided by the owner on 2026-09-28. Owner is the architect. Epic 87
+  implements it: `keeper_core::transcription`, keeper-sync's voices role and model hydration, the
+  vendored `tools/fluidaudio-rs`, and the shell's `transcribe_macos` and `transcribe_ipc`.
+
+## D-30 — Media in a note is a `keeper-media` fence, and its grammar is a contract
+
+The owner asked for the transcript view — the player and the transcript's lines — inside a
+note, in the notes keeper writes after a recording and in any note, configured by references
+only ("tylko referencje do wlasciwych plikow"), as a named code block with a TOML- or
+JSON-like body or a link to such a file in the drive; with named moments and windows to jump
+to; and with a way to copy the block into another note for part of the time (2026-09-29).
+keeper's other blocks in a note are Obsidian callouts, by a rule written down in
+`docs/notes.md` § *Widgets in a note*. This entry records why this one is a fence, and fixes
+the grammar so notes written today still play in every later keeper.
+
+keeper will **not** write a block the person did not ask for into an existing note, rewrite
+one by itself, put an absolute path in one, or let anything but Rust read one.
+
+- **What it is:** a CommonMark fenced code block whose info string's first word is
+  `keeper-media`, with a TOML body (version 1). Exactly one source: `session` (a recording's
+  identity, the one its note's `session:` carries), `transcript` (a transcript file's path),
+  one or more `[[part]]` tables (`file`, optional `camera`, `offset`, `system`, `microphone`),
+  or `src` (a `.toml` file in the drive holding the same grammar). Optional `title`, `from`
+  and `to` (a half-open window, W3C Media Fragments' temporal rules), `picture`, `sound`,
+  `version`, and `[[marker]]` tables (`name`, then `at`, or `from` and `to`). Times are W3C
+  Normal Play Time strings or seconds, on the meeting's own clock; keeper writes `"hh:mm:ss"`.
+  Paths are relative to the drive that holds the note. Any other key is refused with a
+  sentence, and a version above 1 is shown as source. (AD-351…AD-353; FR-759…FR-761; Epic 88)
+- **Why a fence here and callouts elsewhere:** a callout keeps a block legible in Obsidian when
+  its content is prose or links — a query, a list of pinned files — and that is the rule's
+  purpose. A meeting's content is configuration: an ordered list of files, offsets, track roles
+  and timed markers. In a callout it would still be TOML, behind `> ` on every line, with
+  nothing in it a working link. A fence is also the hook Obsidian gives plugins for exactly
+  this (`registerMarkdownCodeBlockProcessor`), the form of its own ` ```base ` block and of
+  Dataview. The callout rule stands for widgets; this entry scopes it. (AD-351)
+- **What stays true: the note is the person's.** Rust resolves every name — a `session` through
+  the recordings index, so a retitle does not break it; a path through `browse::resolve` under
+  the drive's root (AD-65). keeper changes a block's bytes only on the person's action — adding,
+  renaming or removing a marker, when only that marker's table changes and every comment is
+  kept; *Edit block source*; *Remove widget* — and never by itself. Markers live in the note,
+  not in the transcript, which a redo deletes. (AD-353, AD-354; NFR-111)
+- **What a reader without keeper sees:** Obsidian, GitHub and `cat` show the block as a code
+  block. A clip copied with its words carries them as a collapsed `[!transcript]` callout right
+  after the fence, a snapshot keeper never refreshes. Every block keeper writes lists the
+  optional keys it does not set as comments after its keys, and the sources a block may name
+  last, so a person writing one by hand in any editor sees the grammar. The note keeper writes
+  after a recording carries such a `session` block and no transcript text, as D-29 requires; it
+  replaces the per-file video embeds for new notes. Notes already written keep theirs until
+  the person asks keeper to use the media player in them (the notes options menu), and then
+  only a stub whose embeds, or whose bare three-line block, are still exactly what keeper wrote
+  is rewritten, and every other byte stays. (AD-356, AD-357)
+- **Why `keeper-media`:** the owner's own name for it, "bardziej uniwersalnie (autio, video,
+  meeting, podcast, video etc)". The block plays a recording, a transcript or any audio or video
+  file, so the name says what it holds rather than one occasion for it; the `keeper-` prefix
+  keeps it out of a plugin's namespace. It was planned as `keeper-meeting` and no note ever
+  carried that name.
+- **What it supersedes:** the stub's per-file `![[…]]` video embeds for notes written from Epic
+  88 on (`notes/recording_note.rs`), and `docs/recording.md`'s "the session's note stub stays
+  as it was". An embedded audio or video file no longer plays in the note at all: it is a chip
+  whose *Play in a player* replaces it with a block, so a note has one way to play media, not
+  two. It scopes, and does not revoke, `docs/notes.md`'s "callouts, not fenced blocks".
+- **What is deferred, not refused:** an Obsidian renderer for the block (DW-347), paths into
+  another drive (DW-348), a player that keeps playing when its block scrolls away (DW-349),
+  Media Extended's `#t=` links in ordinary embeds (DW-350), a `keeper://` link to a marker
+  (DW-351), refreshing a clip's words (DW-352) and meeting-wide markers (DW-353). Corrections
+  inside a note (DW-354) arrived with story 88.6: the block is the transcript viewer itself.
+- **Revisit triggers:** a grammar change is a new `version`, never a reinterpretation of version
+  1; a new source kind or key is added only with a version bump or as an optional key an older
+  keeper refuses by name. None reopens the second paragraph.
+- **Status / owner:** decided 2026-09-29; the owner is the architect, named the block and asked
+  for it to be built. Epic 88 implements it: `keeper_core::notes::media_block` and
+  `keeper_core::transcription::media::resolve_block`, the shell's `media_block_ipc` commands and
+  the `keeper://transcript-written` event, the note editor's `media-block.ts` and the media
+  block panel.

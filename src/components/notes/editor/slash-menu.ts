@@ -16,6 +16,7 @@ import type {
   CompletionSource,
 } from "@codemirror/autocomplete";
 import type { EditorView } from "@codemirror/view";
+import { GALLERY_HEAD } from "@/lib/notes/widgets";
 import { gfmTable } from "./format-commands";
 
 /** A slash at the very start of an otherwise empty line, caret after it. */
@@ -91,7 +92,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   {
     label: "Gallery",
     detail: "> [!gallery] a folder of media",
-    text: () => "> [!gallery] ",
+    text: () => GALLERY_HEAD,
   },
 ];
 

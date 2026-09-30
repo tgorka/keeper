@@ -74,6 +74,9 @@ flate2 = { workspace = true }
 # Apache-2.0, and it drags in neither tauri nor gix, so `check:core-tauri-free`
 # and `check:core-sync-free` stay green.
 toml = { workspace = true }
+# The `keeper-media` block's marker edits (Epic 88, AD-354): `toml` reads a
+# body, `toml_edit` changes one `[[marker]]` table and keeps every other byte.
+toml_edit = { workspace = true }
 # The one `data:` URI this crate mints: a pasted image's bytes, base64'd at the
 # moment the outbound chat request is built, because Ollama's OpenAI layer
 # accepts an image only that way ("Image URL ✘ / Base64 encoded image ✔",

@@ -29,6 +29,7 @@
  */
 import { toggleVoiceListening } from "@/components/bots/bot-listening-toggle";
 import { toggleBotMessageDetails } from "@/components/bots/bot-message-meta";
+import { transcribeAFile } from "@/components/transcription/transcribe-a-file";
 import { createNote, openJournalToday, showCapture } from "@/hooks/use-notes-actions";
 import { logTodayInCurrentSession } from "@/hooks/use-sessions-shortcut";
 import { isPhoneTier } from "@/hooks/use-shell-layout";
@@ -116,6 +117,10 @@ export const paletteActionHandlers: Record<string, PaletteActionHandler> = {
       console.warn("command-palette: could not reveal the recordings folder", error);
     }
   },
+  // Transcribe a File…: registry-gated in Rust on the transcription
+  // capability, so it only reaches dispatch on a Mac that can transcribe. The
+  // same picker Settings › Transcription opens; the job reports in a toast.
+  "transcription-transcribe-file": () => transcribeAFile(),
 
   // --- Notes verbs (Epic 37, FR-117, UX-DR42) --- registry-gated on the
   // `notes` capability in Rust, so these ids only reach dispatch where a vault

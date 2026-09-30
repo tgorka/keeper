@@ -45,7 +45,13 @@ const notesEmbedPaths =
 /** The command answers with a path and the file's kind (Story 55.4). This panel
  *  reads only the path, so the kind is filled in plausibly and never asserted
  *  on — it is the note decoration that cares which it is. */
-const resolvedTo = (relPath: string): NoteEmbedPathVm => ({ relPath, kind: "file" });
+const resolvedTo = (relPath: string): NoteEmbedPathVm => ({
+  relPath,
+  absolutePath: `/Users/alice/Drive/notes/${relPath}`,
+  kind: "file",
+});
+/** Which sessions the body's `keeper-media` blocks name — Rust reads them. */
+const mediaBlockSources = vi.fn<(body: string) => Promise<string[]>>();
 const pickFiles = vi.fn<() => Promise<string[] | null>>();
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -77,6 +83,7 @@ vi.mock("@/lib/ipc/client", () => ({
   notesLinkTargets: vi.fn(async () => []),
   recordingOpenPath: vi.fn(async () => {}),
   revealPath: vi.fn(async () => {}),
+  mediaBlockSources: (body: string) => mediaBlockSources(body),
 }));
 
 import { readNoteDocument, resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
@@ -234,6 +241,32 @@ describe("the attachment panel", () => {
     expect(within(screenRow).getByText("In the note")).toBeInTheDocument();
     // The other one is untouched: this is a fact about one file, not a mode.
     expect(screen.getByRole("button", { name: `Insert ${MANIFEST}` })).toBeInTheDocument();
+  });
+
+  it("counts every session file as in the note when a media block names the session", async () => {
+    const SESSION = "01KYH5DXGP1XQRHTME8CJFVEJ6-01KZHS7EJB5QKR8T9CHXQ46RNS";
+    const body = `# Standup\n\n\`\`\`keeper-media\nsession = "${SESSION}"\n\`\`\`\n`;
+    mediaBlockSources.mockResolvedValue([SESSION]);
+
+    await panel(RECORDING_BLOCK, body);
+
+    // The stub keeper now writes plays the session through one block: every
+    // file is in the note, and offering Insert for each would call a normal
+    // note broken.
+    await waitFor(() => expect(screen.queryByRole("button", { name: /^Insert / })).toBeNull());
+    expect(mediaBlockSources).toHaveBeenCalledWith(body);
+    for (const row of screen.getAllByRole("listitem")) {
+      expect(within(row).getByText("In the note")).toBeInTheDocument();
+    }
+  });
+
+  it("leaves Insert on for a block that names another session", async () => {
+    mediaBlockSources.mockResolvedValue(["01OTHER-01OTHER"]);
+
+    await panel(RECORDING_BLOCK, '```keeper-media\nsession = "01OTHER-01OTHER"\n```\n');
+
+    await waitFor(() => expect(mediaBlockSources).toHaveBeenCalled());
+    expect(screen.getByRole("button", { name: `Insert ${SCREEN}` })).toBeInTheDocument();
   });
 
   it("counts an embed written under the folder's old name as the same attachment", async () => {

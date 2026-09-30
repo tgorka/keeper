@@ -1,0 +1,46 @@
+fluidaudio-rs — keeper fork
+===========================
+
+This directory is keeper's fork of fluidaudio-rs, the Rust bindings for
+FluidAudio by FluidInference:
+
+  upstream: https://github.com/FluidInference/fluidaudio-rs
+  forked from: main @ bd1f0f36cb7d43e8a564b38dc01eb365864b3b79 (2026-07-23,
+               crate version 0.14.8)
+  license: MIT (declared in the upstream Cargo.toml and README; upstream ships
+           no LICENSE file, so LICENSE here is the standard MIT text naming
+           FluidInference)
+
+It links FluidAudio (https://github.com/FluidInference/FluidAudio,
+Apache-2.0) at 0.17.4, revision 21493f8dac5a97e65742e6ff26f42f164c2fda0f,
+without its NemoTextProcessing trait.
+
+What keeper changed
+-------------------
+- FluidAudio 0.14.8 -> 0.17.4 (exact), SwiftPM tools 6.2, Swift 5 language
+  mode, the NeMo text-normalization binary target dropped (`traits: []`).
+- The Swift bridge was rewritten around keeper's needs:
+  - Parakeet TDT v3 (int8) loads from a caller-named directory through
+    `AsrModels.loadLocal`, and the pyannote community-1 offline diarizer is
+    built from `MLModel(contentsOf:)` per model plus the PLDA parameters.
+    Neither path reaches FluidAudio's download, prepare or purge helpers; the
+    Rust side refuses a directory with missing files before calling Swift.
+  - Recognition takes an optional language (Parakeet's token-language filter)
+    and returns token timings and confidences; diarization takes samples and
+    returns segments plus per-speaker embeddings; a single-clip embedding
+    call returns the dominant speaker's vector.
+  - Audio tracks are listed and decoded (one track or all mixed, optional time
+    range) to 16 kHz mono f32 with AVAssetReader, which reads `.mov` files
+    with video that AVAudioFile cannot open.
+  - Results cross the boundary as JSON strings freed by
+    `fluidaudio_free_string`; errors carry the Swift error text instead of
+    being printed.
+  - The engine handle is a retained object per `FluidAudio` value (no
+    process-global bridge); the Rust type is `Send` but not `Sync` and every
+    call takes `&mut self`, so one owner runs one model at a time.
+- Removed: VAD, streaming and sliding-window ASR, Qwen3-ASR, Sortformer,
+  Kokoro TTS, ITN, system-info calls, examples, tests fixtures, CI and
+  release workflows, feature flags.
+- build.rs builds only for a macOS target (the crate's pure-Rust part
+  compiles anywhere), passes `--arch`, and adds the Swift runtime search
+  paths.

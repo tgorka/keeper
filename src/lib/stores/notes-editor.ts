@@ -420,6 +420,10 @@ export function applyBodyBatch(vaultId: string, noteId: string, batch: NoteBodyB
             frontmatter: batch.frontmatter,
           },
         };
+      case "block":
+        // keeper changed the block alone (a recording's tags): the buffer,
+        // dirty or not, still descends from what is on disk.
+        return { frontmatter: batch.frontmatter, rev: batch.rev };
       case "renamed":
         return { path: batch.path };
       case "gone":

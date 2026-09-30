@@ -7,7 +7,7 @@
 //! <login>/user.toml                   who this directory belongs to
 //! <login>/keeper.toml                 the person's settings, every device
 //! <login>/keeper.<device>.toml        the person's settings, one device
-//! <login>/devices/<device>.toml       one registered device
+//! <login>/devices/<device>.toml       one registered device, and the keeper it runs
 //! <login>/settings.toml               synced preferences, every device
 //! <login>/settings.<device>.toml      synced preferences, one device
 //! <login>/{drives,bots,matrix}.toml   what the person uses, as offers
@@ -17,10 +17,12 @@
 //! Nothing here touches a file. `keeper-sync` hands the worktree in through
 //! [`RepoFiles`], writes what [`plan`] returns, and pushes; every writer filters
 //! through [`is_own_path`] first. Every plan is create-only: a file that exists
-//! is never rewritten, so a second run plans nothing. The synced files are the
-//! one exception, and [`is_rewritable`] names exactly them.
+//! is never rewritten, so a second run plans nothing. The synced files
+//! ([`is_rewritable`]) and this device's own record's three version keys
+//! ([`plan_version`], guarded by [`is_own_record`]) are the exceptions.
 
 use serde::{Deserialize, Serialize};
+use toml_edit::{DocumentMut, Item, Value};
 use ts_rs::TS;
 
 use super::AccountError;
@@ -166,6 +168,10 @@ pub struct PlanInput<'a> {
     /// where the OS has no stable id (iOS).
     pub machine: Option<&'a str>,
     pub now_rfc3339: &'a str,
+    /// The keeper this device runs: its release and the source it was built
+    /// from, as the build's log banner names them.
+    pub version: &'a str,
+    pub commit: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +216,11 @@ pub fn plan(files: &dyn RepoFiles, input: &PlanInput) -> Vec<PlannedWrite> {
             fields.push(("machine", machine));
         }
         fields.push(("created", input.now_rfc3339));
+        fields.extend([
+            ("version", input.version),
+            ("commit", input.commit),
+            ("updated", input.now_rfc3339),
+        ]);
         let record = toml_document(&fields);
         create(device_path(login, device), record.into_bytes());
         if let Some(template) =
@@ -219,6 +230,69 @@ pub fn plan(files: &dyn RepoFiles, input: &PlanInput) -> Vec<PlannedWrite> {
         }
     }
     writes
+}
+
+/// This device's record brought up to the keeper it runs: `version`,
+/// `commit` and `updated` set in place and every other byte kept, so the
+/// repository shows which release each device has. `None` — nothing to
+/// commit — when the record already names this version and, for a build
+/// from a clean commit, this commit ([`is_clean_commit`]); and when it is
+/// absent, not a regular file, or not TOML: a hand edit gone wrong is left
+/// for a person rather than flattened.
+pub fn plan_version(
+    files: &dyn RepoFiles,
+    login: &str,
+    device: &str,
+    version: &str,
+    commit: &str,
+    now_rfc3339: &str,
+) -> Option<PlannedWrite> {
+    let rel = device_path(login, device);
+    if !is_own_record(login, device, &rel) || files.is_non_regular(&rel) {
+        return None;
+    }
+    let text = String::from_utf8(files.read(&rel)?).ok()?;
+    let mut record: DocumentMut = text.parse().ok()?;
+    let says = |key: &str, value: &str| record.get(key).and_then(Item::as_str) == Some(value);
+    // A dev build of the release a machine also runs from a clean build
+    // would otherwise flip the commit back and forth on every sync.
+    if says("version", version) && (says("commit", commit) || !is_clean_commit(commit)) {
+        return None;
+    }
+    for (key, value) in [
+        ("version", version),
+        ("commit", commit),
+        ("updated", now_rfc3339),
+    ] {
+        match record.get_mut(key).and_then(Item::as_value_mut) {
+            // The value's own spacing and trailing comment stay with it.
+            Some(existing) => {
+                let decor = existing.decor().clone();
+                *existing = Value::from(value);
+                *existing.decor_mut() = decor;
+            }
+            None => {
+                record.insert(key, toml_edit::value(value));
+            }
+        }
+    }
+    Some(PlannedWrite {
+        rel,
+        bytes: record.to_string().into_bytes(),
+    })
+}
+
+/// Whether `commit` names exactly the source a build ran: not `unknown`
+/// (built without git) and not `-dirty` (built from a modified tree).
+pub fn is_clean_commit(commit: &str) -> bool {
+    !commit.is_empty() && commit != "unknown" && !commit.ends_with("-dirty")
+}
+
+/// Whether `rel` is `device`'s own record, `<login>/devices/<device>.toml` —
+/// the one record a device may rewrite, and only its version keys
+/// ([`plan_version`]). Every other device's record stays create-only.
+pub fn is_own_record(login: &str, device: &str, rel: &str) -> bool {
+    device_slug(device) == device && is_own_path(login, rel) && rel == device_path(login, device)
 }
 
 /// One sentence per file of this person and device that the repository holds
@@ -382,7 +456,7 @@ pub fn is_own_path(login: &str, rel: &str) -> bool {
 /// Whether keeper may replace `rel` when it already exists (AD-324, AD-328):
 /// only the synced preference files, the three offer manifests and the
 /// device state files directly inside `<login>/`. Everything else stays
-/// create-only.
+/// create-only; a device's own record is [`is_own_record`]'s.
 pub fn is_rewritable(login: &str, rel: &str) -> bool {
     if !is_own_path(login, rel) {
         return false;
@@ -436,6 +510,8 @@ pub struct DeviceEntry {
     pub name: String,
     pub class: Option<DeviceClass>,
     pub platform: Option<String>,
+    /// The keeper release the device last published it runs.
+    pub version: Option<String>,
 }
 
 /// The person's registered devices, sorted by slug. A record that cannot be
@@ -463,6 +539,7 @@ pub fn devices(files: &dyn RepoFiles, login: &str) -> Vec<DeviceEntry> {
                     .as_deref()
                     .and_then(DeviceClass::parse),
                 platform: string_field(&table, "platform"),
+                version: string_field(&table, "version"),
                 slug,
             }
         })
@@ -607,6 +684,8 @@ mod tests {
             platform: "macos",
             machine: Some("5eed"),
             now_rfc3339: "2026-09-23T10:12:00Z",
+            version: "0.8.33",
+            commit: "1a2b3c4",
         }
     }
 
@@ -718,6 +797,7 @@ mod tests {
                 name: "work-mac".to_owned(),
                 class: Some(DeviceClass::Desktop),
                 platform: Some("macos".to_owned()),
+                version: Some("0.8.33".to_owned()),
             }]
         );
         // After a reinstall, this machine's record is adopted; another
@@ -959,6 +1039,140 @@ mod tests {
             assert!(!is_rewritable("tgorka", rel), "{rel}");
         }
         assert!(!is_rewritable("_template", "_template/settings.toml"));
+    }
+
+    #[test]
+    fn only_this_devices_own_record_is_its_to_rewrite() {
+        assert!(is_own_record(
+            "tgorka",
+            "work-mac",
+            "tgorka/devices/work-mac.toml"
+        ));
+        for (device, rel) in [
+            ("work-mac", "tgorka/devices/home-mac.toml"),
+            ("work-mac", "alice/devices/work-mac.toml"),
+            ("work-mac", "tgorka/device.work-mac.toml"),
+            ("work-mac", "tgorka/devices/old/work-mac.toml"),
+            ("Work Mac", "tgorka/devices/Work Mac.toml"),
+            ("..", "tgorka/devices/...toml"),
+        ] {
+            assert!(!is_own_record("tgorka", device, rel), "{device}: {rel}");
+        }
+        // Another device's record is never stamped from here, however stale.
+        let tree = Tree::default()
+            .with(RECORD, "name = \"work-mac\"\n")
+            .with("tgorka/devices/home-mac.toml", "name = \"home-mac\"\n");
+        let write = stamp(&tree, "0.8.33", "1a2b3c4").expect("own record");
+        assert_eq!(write.rel, RECORD);
+    }
+
+    const RECORD: &str = "tgorka/devices/work-mac.toml";
+
+    fn stamp(tree: &Tree, version: &str, commit: &str) -> Option<PlannedWrite> {
+        plan_version(
+            tree,
+            "tgorka",
+            "work-mac",
+            version,
+            commit,
+            "2026-09-30T08:00:00Z",
+        )
+    }
+
+    #[test]
+    fn a_record_naming_the_running_keeper_is_left_alone() {
+        let user = user();
+        let mut tree = templates();
+        tree.apply(&plan(&tree, &input(&user, "sub")));
+        let record = tree.text(RECORD);
+        assert!(
+            record.contains(
+                "version = \"0.8.33\"\ncommit = \"1a2b3c4\"\nupdated = \"2026-09-23T10:12:00Z\"\n"
+            ),
+            "{record}"
+        );
+        assert_eq!(stamp(&tree, "0.8.33", "1a2b3c4"), None);
+    }
+
+    #[test]
+    fn another_release_or_build_rewrites_only_the_three_version_keys() {
+        let before = "# the studio Mac\nname = \"work-mac\"  # renamed in May\nclass = \"desktop\"\n\
+                      version = \"0.8.30\" # was\ncommit = \"0ld\"\nupdated = \"2026-09-01T00:00:00Z\"\n\
+                      created = \"2026-05-01T09:00:00Z\"\n";
+        let tree = Tree::default().with(RECORD, before);
+        let after = |version, commit| {
+            let write = stamp(&tree, version, commit).expect("rewritten");
+            assert_eq!(write.rel, RECORD);
+            String::from_utf8(write.bytes).expect("utf-8")
+        };
+        let expected = "# the studio Mac\nname = \"work-mac\"  # renamed in May\nclass = \"desktop\"\n\
+                        version = \"0.8.33\" # was\ncommit = \"1a2b3c4\"\nupdated = \"2026-09-30T08:00:00Z\"\n\
+                        created = \"2026-05-01T09:00:00Z\"\n";
+        assert_eq!(after("0.8.33", "1a2b3c4"), expected);
+        // A new clean build of the same release counts as well.
+        assert!(after("0.8.30", "1a2b3c4").contains("commit = \"1a2b3c4\""));
+    }
+
+    #[test]
+    fn a_dirty_or_unknown_build_of_the_recorded_release_does_not_churn() {
+        let tree = Tree::default().with(
+            RECORD,
+            "name = \"work-mac\"\nversion = \"0.8.33\"\ncommit = \"1a2b3c4\"\n",
+        );
+        for commit in ["1a2b3c4-dirty", "unknown", ""] {
+            assert_eq!(stamp(&tree, "0.8.33", commit), None, "{commit:?}");
+        }
+        // A new release is published whatever its build says.
+        let write = stamp(&tree, "0.8.34", "1a2b3c4-dirty").expect("new release");
+        let text = String::from_utf8(write.bytes).expect("utf-8");
+        assert!(
+            text.contains("version = \"0.8.34\"\ncommit = \"1a2b3c4-dirty\""),
+            "{text}"
+        );
+        // And a clean build replaces a dirty one's commit.
+        let dirty =
+            Tree::default().with(RECORD, "version = \"0.8.33\"\ncommit = \"1a2b3c4-dirty\"\n");
+        assert!(stamp(&dirty, "0.8.33", "1a2b3c4").is_some());
+        assert!(is_clean_commit("1a2b3c4"));
+    }
+
+    #[test]
+    fn a_record_from_before_versions_gains_them_after_its_own_lines() {
+        let before = "name = \"work-mac\"\nclass = \"desktop\"\nplatform = \"macos\"\n";
+        let tree = Tree::default().with(RECORD, before);
+        let write = stamp(&tree, "0.8.33", "1a2b3c4").expect("stamped");
+        assert_eq!(
+            String::from_utf8(write.bytes.clone()).expect("utf-8"),
+            format!(
+                "{before}version = \"0.8.33\"\ncommit = \"1a2b3c4\"\nupdated = \"2026-09-30T08:00:00Z\"\n"
+            )
+        );
+        let mut tree = tree;
+        tree.apply(&[write]);
+        assert_eq!(
+            devices(&tree, "tgorka")[0].version.as_deref(),
+            Some("0.8.33")
+        );
+    }
+
+    #[test]
+    fn an_absent_linked_or_unreadable_record_is_not_stamped() {
+        assert_eq!(stamp(&Tree::default(), "0.8.33", "1a2b3c4"), None);
+        let broken = Tree::default().with(RECORD, "name = ");
+        assert_eq!(stamp(&broken, "0.8.33", "1a2b3c4"), None);
+        let tree = Tree::default().with(RECORD, "name = \"work-mac\"\n");
+        let linked = Linked {
+            tree: &tree,
+            links: &[RECORD],
+        };
+        assert_eq!(
+            plan_version(&linked, "tgorka", "work-mac", "0.8.33", "1a2b3c4", "now"),
+            None
+        );
+        assert_eq!(
+            plan_version(&tree, "tgorka", "Work Mac", "0.8.33", "1a2b3c4", "now"),
+            None
+        );
     }
 
     /// A worktree whose `links` are symlinks (or folders) at those paths.

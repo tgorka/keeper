@@ -169,4 +169,22 @@ virtualChildren: number,
  * `number` for [`FileSizeVm::bytes`]'s reason: a folder of pointers is
  * bytes, not a bigint, and every other size on this wire is a number.
  */
-virtualBytes: number, };
+virtualBytes: number, 
+/**
+ * Whether keeper can transcribe this entry here, now (AD-344): a file
+ * whose extension is one of [`crate::transcription::plan::is_media_file`]'s
+ * and whose content is on this computer, or a folder holding a recording
+ * session's `manifest.json` whose audio segments are all here. A pointer
+ * would only be refused by the planner, so the verb is not offered.
+ * Decided here so the frontend never keeps its own list of media
+ * extensions.
+ */
+transcribable: boolean, 
+/**
+ * The ABSOLUTE path of the transcript already written for this entry —
+ * `<folder>/transcript.json` for a session folder, `<name.ext>.transcript.json`
+ * beside a media file — or `None` when there is none. An action argument,
+ * like [`Self::absolute_path`]: a session's transcript sits inside the
+ * folder and so is in no listing the row belongs to.
+ */
+transcript: string | null, };

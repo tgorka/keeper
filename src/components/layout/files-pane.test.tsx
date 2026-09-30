@@ -28,6 +28,7 @@ const notesAttachTargets = vi.fn();
 const notesAttachSources = vi.fn();
 const notesBodyRead = vi.fn();
 const notesBodyWrite = vi.fn();
+const transcriptionStart = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   syncProfiles: () => syncProfiles(),
   syncBrowse: (id: unknown, subpath: unknown) => syncBrowse(id, subpath),
@@ -51,6 +52,8 @@ vi.mock("@/lib/ipc/client", () => ({
   notesAttachSources: (v: unknown, s: unknown) => notesAttachSources(v, s),
   notesBodyRead: (v: unknown, n: unknown) => notesBodyRead(v, n),
   notesBodyWrite: (v: unknown, n: unknown, t: unknown, r: unknown) => notesBodyWrite(v, n, t, r),
+  transcriptionStart: (path: unknown, onProgress: unknown, replace: unknown) =>
+    transcriptionStart(path, onProgress, replace),
 }));
 
 import {
@@ -129,6 +132,7 @@ import {
 } from "@/lib/stores/files-tree";
 import { notesVaultsStore } from "@/lib/stores/notes-vaults";
 import { activePanel, panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
+import { transcriptionStore } from "@/lib/stores/transcription";
 import { type ListGeometry, withListGeometry, withTextLayout } from "@/test/layout";
 
 /** The exact sentence Rust composes for an unplugged profile. Verbatim, because
@@ -244,6 +248,8 @@ function entry(
     lfsOid: null,
     mtimeMs: FIXTURE_MTIME_MS,
     folderRole: null,
+    transcribable: false,
+    transcript: null,
     // Story 45.3's location verdict. The default is the ordinary case for the
     // fixtures in this file — a file inside a vault keeper may write — because
     // most tests are not about writing and would otherwise all have to opt in.
@@ -338,7 +344,9 @@ function notListed(
 }
 
 beforeEach(() => {
+  transcriptionStore.setState({ jobs: {} });
   syncProfiles.mockReset();
+  transcriptionStart.mockReset();
   syncProfiles.mockResolvedValue([]);
   syncBrowse.mockReset();
   syncBrowse.mockResolvedValue(listed("01VAULT", "", []));
@@ -1973,6 +1981,186 @@ describe("FilesPane — what it is and how big", () => {
     await click(expander(root));
     await screen.findByRole("treeitem", { name: entries[0].name });
   }
+
+  it.each([
+    {
+      capability: false,
+      transcribable: true,
+      hasTranscript: true,
+      expectedTranscribe: false,
+      // Reading a transcript needs no models: only Transcribe rides the capability.
+      expectedOpen: true,
+    },
+    {
+      capability: true,
+      transcribable: false,
+      hasTranscript: false,
+      expectedTranscribe: false,
+      expectedOpen: false,
+    },
+    {
+      capability: true,
+      transcribable: true,
+      hasTranscript: true,
+      expectedTranscribe: true,
+      expectedOpen: true,
+    },
+  ])("offers only the transcription actions Rust says can act: %j", async ({
+    capability,
+    transcribable,
+    hasTranscript,
+    expectedTranscribe,
+    expectedOpen,
+  }) => {
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true, transcription: capability });
+    await expandVault([
+      entry("meeting", "folder", "meeting", undefined, {
+        transcribable,
+        transcript: hasTranscript ? "/meeting/transcript.json" : null,
+      }),
+    ]);
+    await act(async () => {
+      fireEvent.contextMenu(screen.getByRole("treeitem", { name: "meeting" }));
+    });
+    const menu = await screen.findByRole("menu");
+    // With a transcript there the verb is Transcribe again…, which replaces it.
+    expect(
+      within(menu).queryByRole("menuitem", {
+        name: hasTranscript ? "Transcribe again…" : "Transcribe",
+      }) !== null,
+    ).toBe(expectedTranscribe);
+    expect(within(menu).queryByRole("menuitem", { name: "Open transcript" }) !== null).toBe(
+      expectedOpen,
+    );
+  });
+
+  it("shows a queued job instead of allowing a duplicate transcription", async () => {
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true, transcription: true });
+    transcriptionStore.setState({
+      jobs: {
+        "/Users/alice/Vault/clip.mov": {
+          jobId: "job",
+          phase: "queued",
+          part: 0,
+          parts: 1,
+          message: null,
+          transcriptPath: null,
+          fraction: null,
+          elapsedMs: 0,
+          replaceable: false,
+        },
+      },
+    });
+    await expandVault([entry("clip.mov", "video", undefined, undefined, { transcribable: true })]);
+    await act(async () => {
+      fireEvent.contextMenu(screen.getByRole("treeitem", { name: "clip.mov" }));
+    });
+    expect(await screen.findByRole("menuitem", { name: "Transcription: queued" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+  });
+
+  it("puts the transcription verbs after the state verbs and before the name verbs", async () => {
+    capabilitiesStore.getState().applySnapshot({
+      ...DEFAULT_CAPABILITIES,
+      sync: true,
+      transcription: true,
+      revealInFileManager: true,
+    });
+    await expandVault([
+      entry(
+        "clip.mov",
+        "video",
+        undefined,
+        { status: "materialized", detail: null },
+        { transcribable: true, transcript: "/Users/alice/Vault/clip.mov.transcript.json" },
+      ),
+    ]);
+    await act(async () => {
+      fireEvent.contextMenu(screen.getByRole("treeitem", { name: "clip.mov" }));
+    });
+    const names = within(await screen.findByRole("menu"))
+      .getAllByRole("menuitem")
+      .map((item) => item.textContent ?? "");
+    const at = (label: string) => {
+      const index = names.findIndex((name) => name.includes(label));
+      expect(index, label).toBeGreaterThanOrEqual(0);
+      return index;
+    };
+    expect(at(FILES_OPEN_LABEL)).toBeLessThan(at("Transcribe"));
+    expect(at(FILES_RELEASE_LABEL)).toBeLessThan(at("Transcribe"));
+    expect(at(FILES_PIN_LABEL)).toBeLessThan(at("Transcribe"));
+    expect(at("Transcribe")).toBeLessThan(at("Open transcript"));
+    expect(at("Open transcript")).toBeLessThan(at(FILES_REVEAL_LABEL));
+    expect(at(FILES_REVEAL_LABEL)).toBeLessThan(at(FILES_COPY_PATH_LABEL));
+  });
+
+  it("re-reads the listing when a job ends and leaves the transcript closed until asked", async () => {
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true, transcription: true });
+    let progress: ((p: unknown) => void) | undefined;
+    transcriptionStart.mockImplementation((_path: unknown, onProgress: (p: unknown) => void) => {
+      progress = onProgress;
+      return Promise.resolve("job");
+    });
+    await expandVault([entry("clip.mov", "video", undefined, undefined, { transcribable: true })]);
+    await act(async () => {
+      fireEvent.contextMenu(screen.getByRole("treeitem", { name: "clip.mov" }));
+    });
+    await click(await screen.findByRole("menuitem", { name: "Transcribe" }));
+    const reads = syncBrowse.mock.calls.length;
+    await act(async () => {
+      progress?.({
+        jobId: "job",
+        phase: "done",
+        part: 1,
+        parts: 1,
+        message: null,
+        transcriptPath: "/Users/alice/Vault/clip.mov.transcript.json",
+      });
+    });
+    await waitFor(() => expect(syncBrowse.mock.calls.length).toBeGreaterThan(reads));
+    expect(syncBrowse).toHaveBeenLastCalledWith("01VAULT", "");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByRole("button", { name: "Open transcript" })).toBeInTheDocument();
+  });
+
+  it("asks before Transcribe again replaces a row's transcript, and starts it with replace", async () => {
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true, transcription: true });
+    transcriptionStart.mockResolvedValue("job");
+    await expandVault([
+      entry("clip.mov", "video", undefined, undefined, {
+        transcribable: true,
+        transcript: "/Users/alice/Vault/clip.mov.transcript.json",
+      }),
+    ]);
+    const redo = async () => {
+      await act(async () => {
+        fireEvent.contextMenu(screen.getByRole("treeitem", { name: "clip.mov" }));
+      });
+      await click(await screen.findByRole("menuitem", { name: "Transcribe again…" }));
+      return screen.findByRole("alertdialog");
+    };
+    await click(within(await redo()).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(transcriptionStart).not.toHaveBeenCalled();
+    await click(within(await redo()).getByRole("button", { name: "Transcribe again" }));
+    await waitFor(() =>
+      expect(transcriptionStart).toHaveBeenCalledWith(
+        "/Users/alice/Vault/clip.mov",
+        expect.any(Function),
+        true,
+      ),
+    );
+  });
 
   /**
    * Every size on screen is the one Rust computed, at the boundaries that tell

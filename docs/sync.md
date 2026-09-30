@@ -3285,7 +3285,11 @@ free space, and exits non-zero when something is genuinely wrong.
 
 Enable **Settings → Advanced → Debug logging** for on-disk logs
 (`~/Library/Logs/keeper/keeper.log` on macOS, `$XDG_STATE_HOME/keeper/` on
-Linux).
+Linux). Warnings and errors reach that file whatever the toggle says, and that
+includes the main window's own: a render error the frontend could not handle shows
+*keeper hit an error and stopped drawing this window.* with **Reload the
+window**, and is written to the log as `frontend error:` with its stack and
+component stack (at most 20 distinct errors per window load).
 
 ---
 
@@ -3474,6 +3478,7 @@ than once an hour**, and the thorough passes run once a day.
 | **`verify` proposal** (a §14 task) | offer a remembered verification schedule | read-only verification of enabled folders when enabled, distinct from cleanup | one host-wide row offered disabled at **`every 7d`**, a proposal rather than a pre-existing engine cadence | the task's run line | `perform_verify_task`, `db::seed_clock_tasks` |
 | **notes cadence** | a note is committed soon after you stop typing and pushed soon after | `commit` asks the engine to look now (`wake_now`); `push` is one `sync_once` | commit **2 s** after the last edit (`commitIdleMs`); push **30 s** after the commit (`pushIntervalMs`), or at once on blur where `pushOnBlur` is set | `notes cadence: commit — …` / `notes cadence: push — …` | `notes_vault::dispatch_cadence` |
 | **recordings push** | a finished recording reaches the remote | one push pass, on the policy the folder carries | `sessionEnd` (or the policy's other triggers) | `published this folder's recordings` | `push_recordings_if_due` |
+| **recordings reconcile** | the recordings index says what the folders say, including what keeper did not see happen (a session moved or copied by hand, a copy that arrived by pull, a drive plugged in later) | one rebuild of every recordings root from its manifests (`archive.db` is a cache of them); a session id under two roots goes to the copy whose `manifest.json` changed last; the time it landed is stored as `recordings.last_reconcile_ms` and the Recordings pane re-reads | a due-check on the app's 1 Hz tray tick (`ipc::recordings_reconcile_tick`, beside `account_ipc::daily_tick`; no clock of its own): **24 h** (`RECONCILE_EVERY_MS`) after the later of the last whole rebuild and the last ask, the launch counting as one (every launch rebuilds); deferred while a session records and run when it ends; *Reconcile now* in the Recordings pane's ⋯ asks at once | `archive rebuild: following every recordings root reason="a day since the recordings index last matched the folders"` (`reason="keeper started"` at launch, `reason="reconcile asked for in the Recordings pane"` by hand); the two-roots choice is `one session id under two roots; keeping the newest manifest` | `reconcile_due`, `run_recordings_index_rebuild`, `rebuild_from_disk` |
 | **Pending list poll** (UI) | the Sync pane's *waiting* rows | an index-only walk, never the directories | at most once a **minute** while the pane is open (`POLL_WALK_MIN_INTERVAL`) | `status walk finished caller="poll"` | `Engine::pending` |
 | **transient retry** | a unit that failed for a passing reason | the same unit again | exponential backoff, 2 s → 10 min, full jitter, no ceiling | `sync retrying` (once per attempt at `debug`), `sync offline` / `sync reachable again` once per edge | `reschedule_after`, `backoff.rs` |
 

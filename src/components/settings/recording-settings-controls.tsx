@@ -11,8 +11,10 @@
  * next Recording Session only — a running session is never mutated.
  */
 import { useEffect, useId, useState } from "react";
+import { AfterRecordingSwitch } from "@/components/settings/transcription-section";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import {
   applyRecordingSettings,
   ensureRecordingSettingsHydrated,
@@ -23,6 +25,7 @@ import {
   recordingSettingsStore,
   useRecordingSettings,
 } from "@/lib/stores/recording-settings";
+import { refreshTranscription, useTranscriptionStore } from "@/lib/stores/transcription";
 
 /** Segment-size field label (recording voice: sentence case). */
 export const SEGMENT_SIZE_LABEL = "Segment size (MB)";
@@ -40,6 +43,15 @@ function clamp(value: number, min: number, max: number): number {
 
 export function RecordingSettingsControls() {
   const settings = useRecordingSettings();
+  const canTranscribe = useCapabilitiesStore((s) => s.capabilities.transcription);
+  const keepsVoices = useTranscriptionStore(
+    (s) =>
+      s.status?.voicesDrives.some((drive) => drive.profileId === settings?.destinationProfileId) ??
+      false,
+  );
+  useEffect(() => {
+    if (canTranscribe) void refreshTranscription();
+  }, [canTranscribe]);
   // Lazy shared hydration: whichever surface mounts first triggers the one
   // read; the other (and any remount) reuses the mirrored value.
   useEffect(() => {
@@ -141,6 +153,7 @@ export function RecordingSettingsControls() {
         />
       </div>
       <p className="text-muted-foreground">{NEXT_SESSION_NOTE}</p>
+      {canTranscribe && keepsVoices && <AfterRecordingSwitch />}
     </div>
   );
 }

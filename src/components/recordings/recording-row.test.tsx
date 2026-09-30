@@ -1,6 +1,7 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { RecordingHitVm } from "@/lib/ipc/client";
+import type { RecordingHitVm, TranscriptionProgressVm } from "@/lib/ipc/client";
+import { transcriptionStore } from "@/lib/stores/transcription";
 
 // The row never touches Tauri: it calls back into the pane, which owns the IPC.
 // The client is still mocked because the module graph reaches it.
@@ -8,6 +9,8 @@ vi.mock("@/lib/ipc/client", () => ({
   searchRecordings: vi.fn(),
   recordingOpenPath: vi.fn(),
   revealPath: vi.fn(),
+  transcriptionCancel: vi.fn(() => Promise.resolve()),
+  transcriptionStart: vi.fn(),
 }));
 
 import {
@@ -20,8 +23,15 @@ import {
   RECORDINGS_PLAY_LABEL,
   RECORDINGS_REVEAL_LABEL,
   RECORDINGS_ROW_DURABILITY_TESTID,
+  RECORDINGS_SHOW_TRANSCRIPT_LABEL,
+  RECORDINGS_TRANSCRIBE_LABEL,
   RecordingRow,
 } from "@/components/recordings/recording-row";
+import {
+  TRANSCRIBE_AGAIN_BODY,
+  TRANSCRIBE_AGAIN_LABEL,
+} from "@/components/transcription/transcribe-again";
+import { TRANSCRIPTION_PROGRESS_LABEL } from "@/components/transcription/transcription-progress";
 
 const ROOT = "/Users/alice/Movies/keeper";
 
@@ -43,13 +53,43 @@ function hit(p: Partial<RecordingHitVm> & Pick<RecordingHitVm, "sessionId">): Re
     tags: p.tags ?? [],
     playablePath:
       p.playablePath === undefined ? `${ROOT}/${relativePath}/screen-0001.mp4` : p.playablePath,
+    transcript: p.transcript === undefined ? null : p.transcript,
+    transcribable: p.transcribable ?? true,
+  };
+}
+
+function job(p: Partial<TranscriptionProgressVm>): TranscriptionProgressVm {
+  return {
+    jobId: "job",
+    phase: "transcribing",
+    part: 1,
+    parts: 2,
+    message: null,
+    transcriptPath: null,
+    fraction: null,
+    elapsedMs: 0,
+    replaceable: false,
+    ...p,
   };
 }
 
 function renderRow(
   vm: RecordingHitVm,
-  overrides: { canReveal?: boolean; onReveal?: () => void; onPlay?: () => void } = {},
+  overrides: {
+    canReveal?: boolean;
+    onReveal?: () => void;
+    onPlay?: () => void;
+    canTranscribe?: boolean;
+    job?: TranscriptionProgressVm;
+    onTranscribe?: () => void;
+    onShowTranscript?: (path: string) => void;
+    onRemove?: (hit: RecordingHitVm) => void;
+  } = {},
 ) {
+  // The job strip under the row reads the store, as it does in the pane.
+  transcriptionStore.setState({
+    jobs: overrides.job === undefined ? {} : { [vm.absolutePath]: overrides.job },
+  });
   // A row is an `<li>`; give it the list it belongs to so the DOM is legal.
   return render(
     <ul>
@@ -58,6 +98,11 @@ function renderRow(
         canReveal={overrides.canReveal ?? true}
         onReveal={overrides.onReveal ?? vi.fn()}
         onPlay={overrides.onPlay ?? vi.fn()}
+        canTranscribe={overrides.canTranscribe ?? true}
+        job={overrides.job}
+        onTranscribe={overrides.onTranscribe ?? vi.fn()}
+        onShowTranscript={overrides.onShowTranscript ?? vi.fn()}
+        onRemove={overrides.onRemove ?? vi.fn()}
       />
     </ul>,
   );
@@ -188,5 +233,103 @@ describe("RecordingRow", () => {
     // No confirmation, no alert — the id simply did not make it.
     expect(screen.queryByText(RECORDINGS_COPIED_LABEL)).not.toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  describe("transcription", () => {
+    const transcribe = { name: `${RECORDINGS_TRANSCRIBE_LABEL}: Standup` };
+    const show = { name: `${RECORDINGS_SHOW_TRANSCRIPT_LABEL}: Standup` };
+    const again = { name: `${TRANSCRIBE_AGAIN_LABEL}…: Standup` };
+
+    it("offers Transcribe only where the Mac can transcribe and the session has media", () => {
+      const onTranscribe = vi.fn();
+      const vm = hit({ sessionId: "s1", title: "Standup" });
+      const { unmount } = renderRow(vm, { onTranscribe });
+      fireEvent.click(screen.getByRole("button", transcribe));
+      expect(onTranscribe).toHaveBeenCalledWith(vm, false);
+      unmount();
+
+      renderRow(vm, { canTranscribe: false }).unmount();
+      expect(screen.queryByRole("button", transcribe)).not.toBeInTheDocument();
+
+      // Still recording, or no media: Rust says `transcribable: false`.
+      renderRow(hit({ sessionId: "s2", title: "Standup", transcribable: false }));
+      expect(screen.queryByRole("button", transcribe)).not.toBeInTheDocument();
+    });
+
+    it("offers Show transcript only where one exists, and even without the capability", () => {
+      const { unmount } = renderRow(hit({ sessionId: "s1", title: "Standup" }));
+      expect(screen.queryByRole("button", show)).not.toBeInTheDocument();
+      unmount();
+
+      const onShowTranscript = vi.fn();
+      const path = `${ROOT}/standup/transcript.json`;
+      renderRow(hit({ sessionId: "s1", title: "Standup", transcript: path }), {
+        canTranscribe: false,
+        onShowTranscript,
+      });
+      fireEvent.click(screen.getByRole("button", show));
+      expect(onShowTranscript).toHaveBeenCalledWith(path);
+    });
+
+    it("shows a running job's determinate bar in place of Transcribe", () => {
+      renderRow(hit({ sessionId: "s1", title: "Standup" }), {
+        job: job({ phase: "diarizing", fraction: 0.426, elapsedMs: 83_000 }),
+      });
+      const bar = screen.getByRole("progressbar", { name: TRANSCRIPTION_PROGRESS_LABEL });
+      expect(bar).toHaveAttribute("aria-valuenow", "43");
+      expect(screen.getByText("diarizing · Part 1 of 2")).toBeInTheDocument();
+      expect(screen.getByText("1:23")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Cancel transcription" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", transcribe)).not.toBeInTheDocument();
+    });
+
+    it("offers the transcript a job just wrote before the archive is read again", () => {
+      const onShowTranscript = vi.fn();
+      const path = `${ROOT}/standup/transcript.json`;
+      renderRow(hit({ sessionId: "s1", title: "Standup" }), {
+        job: job({ phase: "done", fraction: 1, transcriptPath: path }),
+        onShowTranscript,
+      });
+      expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", show));
+      expect(onShowTranscript).toHaveBeenCalledWith(path);
+      // Done is not a lock: the session can be transcribed again — which now
+      // replaces the transcript it just wrote.
+      expect(screen.getByRole("button", again)).toBeInTheDocument();
+      expect(screen.queryByRole("button", transcribe)).not.toBeInTheDocument();
+    });
+
+    it("asks before Transcribe again replaces a transcript, and does nothing on Cancel", async () => {
+      const onTranscribe = vi.fn();
+      const vm = hit({
+        sessionId: "s1",
+        title: "Standup",
+        transcript: `${ROOT}/standup/transcript.json`,
+      });
+      renderRow(vm, { onTranscribe });
+      fireEvent.click(screen.getByRole("button", again));
+      const dialog = await screen.findByRole("alertdialog");
+      expect(dialog).toHaveTextContent(TRANSCRIBE_AGAIN_BODY);
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+      expect(onTranscribe).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole("button", again));
+      fireEvent.click(
+        within(await screen.findByRole("alertdialog")).getByRole("button", {
+          name: TRANSCRIBE_AGAIN_LABEL,
+        }),
+      );
+      expect(onTranscribe).toHaveBeenCalledWith(vm, true);
+    });
+
+    it("keeps a failure's sentence and Try again under the row, and no second Transcribe", () => {
+      renderRow(hit({ sessionId: "s1", title: "Standup" }), {
+        job: job({ phase: "failed", message: "The transcription models are missing." }),
+      });
+      expect(screen.getByText(/The transcription models are missing\./)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", transcribe)).not.toBeInTheDocument();
+    });
   });
 });

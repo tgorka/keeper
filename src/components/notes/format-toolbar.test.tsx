@@ -23,6 +23,7 @@ import { withRangeRects } from "@/test/layout";
 
 const notesOpen =
   vi.fn<(v: string, n: string, on: (b: NoteBodyBatch) => void) => Promise<string>>();
+const mediaBlockCompose = vi.fn<(profileId: string, pick: unknown) => Promise<string>>();
 
 vi.mock("@/lib/ipc/client", () => ({
   notesOpen: (v: string, n: string, on: (b: NoteBodyBatch) => void) => notesOpen(v, n, on),
@@ -45,8 +46,31 @@ vi.mock("@/lib/ipc/client", () => ({
   recordingNoteTargets: vi.fn(async () => null),
   recordingOpenPath: vi.fn(async () => {}),
   revealPath: vi.fn(async () => {}),
+  searchRecordings: vi.fn(async () => ({
+    rows: [
+      {
+        sessionId: "01J8A-01J8B",
+        relativePath: "recordings/2026-09-29 kelly",
+        absolutePath: "/Rec/recordings/2026-09-29 kelly",
+        title: "Kelly sync",
+        startedTs: 0,
+        endedTs: 60_000,
+        durationMs: 60_000,
+        totalBytes: 1,
+        durability: "local",
+        tags: [],
+        playablePath: null,
+        transcript: null,
+        transcribable: true,
+      },
+    ],
+    total: 1,
+  })),
+  syncBrowse: vi.fn(async () => null),
+  mediaBlockCompose: (profileId: string, pick: unknown) => mediaBlockCompose(profileId, pick),
 }));
 
+import { GALLERY_HEAD, INSERT_WIDGET_LABEL } from "@/lib/notes/widgets";
 import { readNoteDocument, resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
 import { NOTE_ACTIONS_TEXT } from "./note-actions";
 import { NoteEditor } from "./note-editor";
@@ -502,6 +526,37 @@ describe("the formatting toolbar, in the editor the user actually types into", (
 
     await waitFor(() => {
       expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
+    });
+  });
+});
+
+describe("inserting a widget from the toolbar", () => {
+  it("writes a gallery head on a line of its own at the caret", async () => {
+    const view = await mounted();
+    view.dispatch({ selection: { anchor: 2 } });
+
+    fireEvent.click(screen.getByRole("button", { name: INSERT_WIDGET_LABEL }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Gallery/ }));
+
+    await waitFor(() =>
+      expect(readNoteDocument("v1", "n1").text).toBe(`al\n${GALLERY_HEAD}pha\nbeta\n`),
+    );
+  });
+
+  it("asks what to play, and writes the block Rust composed for the pick", async () => {
+    const block = '```keeper-media\nsession = "01J8A-01J8B"\n```\n';
+    mediaBlockCompose.mockResolvedValue(block);
+    const view = await mounted();
+    view.dispatch({ selection: { anchor: OPENED.indexOf("beta") } });
+
+    fireEvent.click(screen.getByRole("button", { name: INSERT_WIDGET_LABEL }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Media player/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Kelly sync/ }));
+
+    await waitFor(() => expect(readNoteDocument("v1", "n1").text).toBe(`alpha\n${block}beta\n`));
+    expect(mediaBlockCompose).toHaveBeenCalledWith("v1", {
+      kind: "session",
+      sessionId: "01J8A-01J8B",
     });
   });
 });

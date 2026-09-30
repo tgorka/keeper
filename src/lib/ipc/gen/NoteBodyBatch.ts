@@ -57,4 +57,4 @@ frontmatter: string,
 /**
  * The body now on disk.
  */
-theirs: string, } | { "kind": "renamed", path: string, } | { "kind": "gone" };
+theirs: string, } | { "kind": "block", rev: string, frontmatter: string, } | { "kind": "renamed", path: string, } | { "kind": "gone" };

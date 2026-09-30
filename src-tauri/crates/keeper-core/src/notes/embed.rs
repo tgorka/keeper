@@ -125,6 +125,10 @@ pub struct NoteEmbedPathVm {
     /// [`NoteEmbedVm::rel_path`]: a bare `photo.png` comes back as
     /// `attachments/photo.png` when that is where it is.
     pub rel_path: String,
+    /// The same file, absolute. Only ever the argument of an action — Reveal,
+    /// Copy path — never rendered as the note's text and never written into a
+    /// note (FR-145), the rule `FilesEntryVm`'s absolute path follows.
+    pub absolute_path: String,
     /// What keeper says this file is (`kind_for_file_name`), from the resolved
     /// file's own name.
     pub kind: RecordingNoteTargetKind,

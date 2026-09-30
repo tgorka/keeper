@@ -1207,15 +1207,20 @@ describe("PropertiesPanel — a nested value is shown, not described", () => {
     // panel does. Painted whole it is 520px of a 120px cell, and a sidebar that
     // grows to 520px is AD-83's failure with a URI instead of a ULID.
     const trigger = screen.getByRole("button", { name: prefix });
-    expect(trigger).toHaveClass("truncate");
     expect(trigger).toHaveAttribute("data-overflowing", "true");
+    // The text inside the trigger is what truncates, not the button: WebKit sizes
+    // a button to its content, and measuring the button there flipped the value
+    // between span and button until React unmounted the window (2026-09-30).
+    const text = screen.getByText(prefix);
+    expect(text).toHaveClass("truncate");
+    expect(trigger).toContainElement(text);
 
     // The floor that lets it truncate at all, checked against the real chain
     // rather than assumed: every flex item from the grid cell down to the text
     // has to be allowed below its content width, or `truncate` is never handed
     // a width smaller than the URI and there is nothing to truncate.
     const chain: HTMLElement[] = [];
-    for (let box = trigger.parentElement; box !== null; box = box.parentElement) {
+    for (let box = text.parentElement; box !== null; box = box.parentElement) {
       chain.push(box);
       if (box.className.includes("col-start-3")) {
         break;

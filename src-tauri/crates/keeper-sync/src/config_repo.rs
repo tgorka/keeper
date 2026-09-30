@@ -44,6 +44,19 @@
 //! gix refuses to send a Basic pair to a plain `http://` remote; the bearer
 //! header is sent as configured. Keeping secrets off clear-text remotes is the
 //! descriptor's validation (https only, loopback excepted), not this module's.
+//!
+//! # LFS
+//!
+//! The copy itself never runs an LFS filter: a file the repository tracks
+//! through LFS is its pointer in the working tree. [`hydrate_lfs_dir`]
+//! materialises one directory of such pointers somewhere else (AD-341).
+
+mod hydrate;
+
+pub use hydrate::{
+    completion_digest, hydrate_lfs_dir, hydration_is_current, HydrateReport,
+    COMPLETE_FILE as HYDRATE_COMPLETE_FILE, STATE_FILE as HYDRATE_STATE_FILE,
+};
 
 use std::{
     path::{Component, Path, PathBuf},
@@ -53,6 +66,8 @@ use std::{
     },
 };
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use gix::hash::ObjectId;
 
 use crate::{
@@ -120,6 +135,18 @@ impl RepoAuth {
             Self::None => None,
             Self::Basic { .. } => credential.map(HttpAuth::Basic),
             Self::Bearer(token) => Some(HttpAuth::Bearer(token)),
+        }
+    }
+
+    /// The `Authorization` value the LFS client sends for this repository.
+    fn lfs_authorization(&self) -> Option<String> {
+        match self {
+            Self::None => None,
+            Self::Basic { username, password } => Some(format!(
+                "Basic {}",
+                BASE64.encode(format!("{username}:{password}"))
+            )),
+            Self::Bearer(token) => Some(format!("Bearer {token}")),
         }
     }
 }

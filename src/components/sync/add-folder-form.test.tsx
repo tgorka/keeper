@@ -199,6 +199,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     // subfolder flagging it would use, and it is why the form keeps no copy of
     // keeper's default (Story 41.7).
     recordingsSubfolder: "recordings",
+    voices: false,
+    voicesSubfolder: "voices",
     sessions: false,
     sessionsSubfolder: "60-sessions",
     tasks: false,
@@ -662,6 +664,8 @@ describe("AddFolderForm editing an existing folder", () => {
         notesSubfolder: null,
         recordings: false,
         recordingsSubfolder: null,
+        voices: false,
+        voicesSubfolder: null,
         sessions: false,
         sessionsSubfolder: null,
         tasks: false,
@@ -1094,6 +1098,29 @@ describe("AddFolderForm fractional numbers (Story 52.9, FR-313)", () => {
           lfsThresholdBytes: 262_144,
         }),
       ),
+    );
+  });
+});
+
+describe("AddFolderForm voices", () => {
+  it("keeps a refused voices subfolder draft instead of silently correcting it", async () => {
+    mockSave.mockRejectedValue({
+      code: "internal",
+      message: "The voices subfolder must stay inside this folder.",
+    });
+    render(<AddFolderForm />);
+    await fillRequired();
+    fireEvent.click(screen.getByRole("switch", { name: "This folder keeps voices" }));
+    fireEvent.change(screen.getByLabelText("Voices subfolder"), {
+      target: { value: "../elsewhere" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+    expect(
+      await screen.findByText("The voices subfolder must stay inside this folder."),
+    ).toBeVisible();
+    expect(screen.getByLabelText("Voices subfolder")).toHaveValue("../elsewhere");
+    expect(mockSave).toHaveBeenCalledWith(
+      expect.objectContaining({ voices: true, voicesSubfolder: "../elsewhere" }),
     );
   });
 });
@@ -1880,6 +1907,7 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
       <AddFolderForm
         prefill={driveOffer({
           tasks: null,
+          voices: "70-comms/voices",
           lfsThresholdBytes: 8 * MiB,
           virtualPatterns: ["attachments/**", "*.psd"],
           virtualOverBytes: 64 * MiB,
@@ -1891,6 +1919,8 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
     );
     expect(await chooseFolderAndAdd()).toMatchObject({
       lfsThresholdBytes: 8 * MiB,
+      voices: true,
+      voicesSubfolder: "70-comms/voices",
       virtualPatterns: ["attachments/**", "*.psd"],
       virtualOverBytes: 64 * MiB,
       releaseTtlMs: 72 * 60 * 60 * 1000,
@@ -1917,7 +1947,12 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
     mockSave.mockResolvedValue(profileVm({ id: "p9" }));
     render(
       <AddFolderForm
-        prefill={driveOffer({ recordings: "recordings", sessions: "60-sessions", tasks: "ledger" })}
+        prefill={driveOffer({
+          recordings: "recordings",
+          voices: "voices",
+          sessions: "60-sessions",
+          tasks: "ledger",
+        })}
       />,
     );
     const submit = screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL });
@@ -1930,6 +1965,8 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
       notesSubfolder: "vault",
       recordings: false,
       recordingsSubfolder: null,
+      voices: null,
+      voicesSubfolder: null,
       sessions: false,
       sessionsSubfolder: null,
       tasks: null,

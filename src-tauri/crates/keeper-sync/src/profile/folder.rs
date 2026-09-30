@@ -271,6 +271,10 @@ const FOLDER_FIELD_RULES: &[(&str, FolderFieldRule)] = &[
     // machine-local in `tasks.ledger_vault`, because a profile id is minted
     // per machine.
     ("tasks", FolderFieldRule::Allowed),
+    // Where the voices bank lives is a fact about the repository's layout for
+    // the reason the ledger's is: a person recognised on one machine is only
+    // recognised on the other if both read the same folder (AD-342).
+    ("voices", FolderFieldRule::Allowed),
 ];
 
 /// What a folder file may do with one canonical profile key.
@@ -1422,6 +1426,66 @@ subfolder = "70-tasks"
             outcome.profile.tasks.is_none(),
             "a ledger inside the vault must not be stored"
         );
+    }
+
+    /// `[folder.voices]` is read exactly like `[folder.recordings]`: a folder
+    /// file may say where its bank lives, and every clone agrees (AD-342).
+    #[test]
+    fn a_folder_file_may_say_where_its_voices_bank_lives() {
+        let (_dir, outcome) = applied(
+            "[folder.recordings]\nsubfolder = \"70-comms/meetings\"\n\n\
+             [folder.voices]\nsubfolder = \"70-comms/voices\"\n",
+            &tier(),
+        );
+        assert!(outcome.faults.is_empty(), "{:?}", outcome.faults);
+        assert_eq!(
+            outcome.profile.voices.as_ref().expect("voices").subfolder,
+            "70-comms/voices"
+        );
+        assert_eq!(
+            outcome.profile.voices_root(),
+            Some(outcome.profile.local_path.join("70-comms/voices"))
+        );
+        assert!(outcome.owned.contains("voices"), "{:?}", outcome.owned);
+
+        // An empty table is "keeps voices, in the default folder".
+        let (_dir, outcome) = applied("[folder.voices]\n", &tier());
+        assert!(outcome.faults.is_empty(), "{:?}", outcome.faults);
+        assert_eq!(
+            outcome.profile.voices.as_ref().expect("voices").subfolder,
+            crate::profile::DEFAULT_VOICES_SUBFOLDER
+        );
+    }
+
+    /// A bad bank folder travels between clones like a bad ledger would, so it
+    /// is refused and not stored — including one that collides with the
+    /// recordings root the same file names.
+    #[test]
+    fn a_bad_voices_subfolder_is_refused_and_not_stored() {
+        for (text, named) in [
+            (
+                "[folder.voices]\nsubfolder = \"/Volumes/elsewhere\"\n",
+                "voices subfolder",
+            ),
+            (
+                "[folder.voices]\nsubfolder = \"../outside\"\n",
+                "voices subfolder",
+            ),
+            (
+                "[folder.recordings]\nsubfolder = \"media\"\n\n\
+                 [folder.voices]\nsubfolder = \"media/voices\"\n",
+                "overlaps recordings subfolder media",
+            ),
+        ] {
+            let (_dir, outcome) = applied(text, &tier());
+            let fault = only_fault(&outcome);
+            assert!(fault.message.contains(named), "{}", fault.message);
+            assert!(
+                outcome.profile.voices.is_none(),
+                "{text:?} must not store its voices block"
+            );
+            assert!(!outcome.owned.contains("voices"), "{:?}", outcome.owned);
+        }
     }
 
     /// The same, one level further in: an unknown commit-subject placeholder is

@@ -141,10 +141,182 @@ surface uses.
 They are **callouts, not fenced blocks**. A note carrying one opens in Obsidian, on GitHub
 or in `cat` as a labelled quote — degraded, but still readable prose. A fence would have
 made it a wall of grey source everywhere but here, and a note that only makes sense inside
-keeper is a note keeper has taken hostage.
+keeper is a note keeper has taken hostage. That rule is for blocks whose content is prose or
+links; a block whose content is configuration is a fence — the media block below, and D-30
+says why.
 
 Sessions use all three, but nothing about them is session-specific: a board is a widget
 that happens to be useful in a session, not a session feature that leaked.
+
+*Insert widget* on the format toolbar, and the same entries in the `/` menu, put one in at
+the caret: *Media player…* first, then *Gallery*. The board, log and refs callouts are typed
+by hand.
+
+## Media in a note
+
+A recording, a transcript or any audio or video file plays inside a note as one block: the
+transcript viewer itself, its player and under it the transcript's lines, following playback.
+
+````markdown
+```keeper-media
+session = "01J8…-01J8…"          # exactly one of: session | transcript | [[part]] | src | record
+title = "Pricing, with Kelly"    # optional
+from = "00:12:00"                # optional window, [from, to), on the recording's own clock
+to = "00:15:30"
+picture = "both"                 # optional: screen | camera | both
+sound = "both"                   # optional: system | microphone | both
+
+[[marker]]
+name = "The price we agreed"
+at = "00:13:05"
+```
+````
+
+- **What it names.** `session` is a recording's identity — the one its note's `session:`
+  carries, which a retitle does not change. `transcript` is a transcript file; `[[part]]`
+  tables list media with no transcript, in play order (`file`, and optionally `camera`,
+  `offset`, and `system`/`microphone` track numbers counted from 1); `src` is a `.toml` file in
+  the drive holding the same grammar. Paths are relative to the drive that holds the note.
+- **Only keeper's Rust reads it.** The editor hands the body over as written and draws what
+  comes back (`media_block_resolve`); a key keeper does not know, two sources, a bad time or a
+  path outside the drive shows the block's own text with a sentence naming what is wrong.
+  `version = 2` says the block was written by a newer keeper.
+- **The transcript viewer, in the note.** The block is the viewer's own component, not a
+  read-only copy of it: each line's ⋯ (*Edit text*, *Split…*, *Add a line after*, *Change
+  speaker*), the speakers' chips (*This is…*, *Rename label…*, *Merge into…*, *Add speaker*,
+  *Go to their nearest line*, *Go to their next line*), search, *Transcribe again…* and *Copy
+  clip*. It differs only in showing the block's window and its markers, and in having no
+  dialog chrome (`docs/transcription.md` § *A transcript in a note*). Every correction, here
+  or in the viewer, and every transcript a job writes, reaches every open block through
+  `keeper://transcript-written`, with no rewrite of the note. A block before its transcript
+  plays the media under "Not transcribed yet.", with *Transcribe* where this Mac can.
+- **One scrollbar.** The block has no height of its own and no scroll box: it grows with its
+  lines and the note's editor is the only thing that scrolls. Its lines are windowed against
+  the editor's scroller, so a 300-line meeting does not mount 300 rows, and the pinned player
+  sticks to the top of the note's scroll area. It has no card behind it — the note's
+  background shows through, and only its controls keep their own surfaces.
+- **Editing the block's text.** A click on the block does not open its source. Its ⋯ has
+  *Edit block source*, which shows the fence's text with the caret inside it, and *Remove
+  widget*, which deletes the fence and a `[!transcript]` callout attached to it; ⌘Z brings
+  both back.
+- **Hints while you write it.** With the source open, completion offers the keys that may
+  stand on the caret's line — the root's, or a `[[part]]`'s or a `[[marker]]`'s under that
+  header — each with a line saying what it does, never one already written in that table and
+  never a second source. After `=` it offers the key's values: `picture`/`sound`/`record`'s
+  words, the player's time when the block was playing before its source was opened and
+  `"00:00:00"`, recent recordings as *title · date* writing the identity, and the note's
+  drive folder by folder, only the files the key takes (`transcript`, audio or video for
+  `file`, video for `camera`, `.toml` for `src`). A body that does not read is underlined on
+  the key or line Rust refused, the refusal's sentence on hover. The catalogue is Rust's
+  (`media_block_schema`) and so is the check (`media_block_check`).
+- **Markers.** *Mark this moment* and *Mark a window…* add a `[[marker]]` table; rename and
+  remove change only that table and keep every other byte, comments included
+  (`media_block_edit`). `[[Note#The price we agreed]]`, or `[[#…]]` in the same note, opens the
+  note, brings the block into view and moves its player there, paused.
+- **Clips.** *Copy clip…* puts a new block for the same recording on the clipboard, with the
+  window you chose and the markers inside it — and, unless you untick it, the window's lines
+  as a folded `[!transcript]` callout after the fence, for readers without keeper. keeper
+  hides that callout inside the block and never refreshes it.
+- **One player at a time.** Media mounts only near the screen, a block that scrolls away
+  gives its media back, and starting one block pauses the others in the pane.
+- **In the notes list.** A row's preview and a search result read a block as one line —
+  "▶ Media · Kelly sync · 45:57" — never as its source. The title is the block's `title`,
+  else, in a recording note, its recording's title when the block names that recording; the
+  length is the block's window, else that recording's `duration:`. What the list cannot say
+  without opening a file is left out, and a block that does not read is "▶ Media".
+
+**Every block keeper writes says what else it may say.** The stub's block, *Insert widget*,
+*Play in a player* and a copied clip carry the keys they set, then each optional key they do
+not set, commented out, then a marker's shape and the list of sources:
+
+````markdown
+```keeper-media
+session = "01J8…-01J8…"
+# title = ""
+# from = "00:00:00"
+# to = ""
+# picture = "both"      # screen | camera | both
+# sound = "both"        # system | microphone | both
+# [[marker]]
+# name = ""
+# at = "00:00:00"
+# sources: session | transcript | [[part]] file/camera/offset/system/microphone | src
+```
+````
+
+Uncommenting a line, and filling in what it leaves empty, gives a key the block reads; the
+parser skips comments. A one-part block lists the optional keys above its `[[part]]`, because
+a key below it belongs to the part.
+
+**Embedded audio and video no longer play by themselves.** `![[clip.mov]]` is a chip — the
+file's name and kind, *Reveal*, *Copy path* and *Play in a player*. That last one replaces the
+embed with a block: in a recording note every embed of the recording's media becomes one
+`session` block, and any other file a one-part block naming it. Images still draw inline.
+
+The note keeper writes when a recording ends carries a `session` block, below its heading.
+Older notes carry one embed per video, or a three-line block with no comments;
+*Use the media player in recording notes…* in the notes options menu rewrites both — a stub
+whose embeds are still exactly what keeper wrote, or whose block is still exactly those three
+lines naming its own recording, and nothing else in it — and names the ones left alone because
+somebody edited their embeds.
+
+**Recording from a note.** *Insert widget → Media player… → New recording* (on a Mac that
+records) inserts a block that has not recorded yet — with the commented optional keys every
+block keeper writes carries:
+
+````markdown
+```keeper-media
+record = "new"
+```
+````
+
+`record` takes only `"new"` and is a source of its own, so it cannot sit beside `session`,
+`transcript`, `[[part]]` or `src` (nor in a `src` file). The block draws the Recording pane's
+setup — what to capture, system audio, microphone and camera, where it saves — and *Start
+recording*. Start records a session linked to this note (`linkedNote` in its `manifest.json`:
+the vault and the note's path in it). The moment the start answers, the block that pressed it
+names the session: its own body becomes `session = "<id>"` (Rust composes it — `record` turns
+into `session` in place, every other byte of the block stays), as an ordinary edit, and the
+note is written at once as ⌘S writes it. If the block moved or was removed within that round
+trip it keeps `record = "new"` and says "Recording — this block could not take its name; stop
+it in the Recording pane." While it records:
+
+- the note's `tags` gain `recording` and `recording/<this Mac's host name, slugged>`;
+- the block naming the live session shows the live banner with *Stop*; in Preview, in the
+  Files preview or in another note, a block naming it says only "Recording…";
+- every `record = "new"` block, in this note or another, shows "Recording in *note title*",
+  a link to it, and no Start — keeper records one session at a time.
+
+What a block is — a record block, the session it names, and whether that session is recording
+into this note — is one question to Rust per block.
+
+**keeper never edits the note's body for a recording** — only its tags, so typing in the note
+while it records cannot race keeper. A tag change goes through the notes writer's block
+amendment: with the note open in an editor, that editor's saves are held while keeper reads,
+changes the frontmatter alone and writes; the editor adopts the new block and revision
+(a `block` batch on its channel) and keeps every word typed, and a body save it had already sent
+against the older revision is not a conflict — the disk differs only by keeper's own block
+change. A properties edit composed before the new block arrived is refused rather than written
+(it would undo the tags): the panel says so and the edit is made again. With no editor open it
+is a plain re-read-and-write. An editor's saves go one at a time per note — blur, the idle
+autosave and a block's own save wait for the one in flight and then write what is still
+unsaved — so two of them never carry the same revision.
+
+When it stops the tags go — `recording/<this Mac>`, and `recording` unless another Mac's
+`recording/<x>` is still there. A session started in the same note while the last one's stop
+is still being handled keeps its tags. The block becomes the player, transcription after
+recording runs as it does for any recording, and no separate recording note is written while
+the note still names the session — in a block on disk, or, while the note exists, in an open
+editor's unsaved words; a failed session's too. A note deleted, or whose block was removed or
+never got the name, gets the ordinary recording note instead. After a quit or a crash
+mid-recording, the recovery pass at the next launch (or the next Start) does the same. Tags a
+crash left behind are swept: whenever nothing records here — at launch once the vaults are
+indexed, before each Start and after each stop — every note in an open vault tagged
+`recording/<this Mac>` loses it (and `recording`, on the same rule), and another Mac's tag is
+left for that Mac. In Preview a `record = "new"` block says only "Not recorded yet.".
+
+In Obsidian, on GitHub or in `cat` the block is a code block: the title, the window and the
+markers read plainly, and a clip's words read as a quote.
 
 ## The writing tools
 
@@ -171,6 +343,14 @@ and in a session exactly as in a note. The distinction the old sentence was prot
 intact, because it was never about the renderer — a note saves itself, and Note mode over
 a file writes when you press `⌘S` or Save and at no other moment. One renderer, two save
 contracts, and neither surface borrowed the other's.
+
+**Preview, Note and Source over a note, too.** The note's header has the same three views a
+markdown file has in Files, as one segmented control ("Show the note as"): *Preview* is the
+Files markdown preview — rendered and read-only, its widgets live, no caret; *Note* is the
+live-preview editor above, and the default; *Source* is the same editor with every widget and
+decoration taken away, the raw markdown, still autosaving with its caret and undo. The choice
+is one for every note, remembered in the viewers' cookie (`keeper_viewer_modes`, key
+`keeper-note`) beside the Files viewers' own; it has no shortcut.
 
 ## Finding text
 

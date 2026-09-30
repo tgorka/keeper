@@ -54,6 +54,7 @@
 import { WidgetType } from "@codemirror/view";
 import { resolveViewer } from "@/lib/viewers/registry";
 import type { ViewerEntry } from "@/lib/viewers/types";
+import { MEDIA_CHIP_ACTION_CLASS } from "./media-chip";
 import { renderRecordingEmbedInto } from "./recording-embed";
 
 /** The block host CodeMirror replaces the embed with. */
@@ -381,7 +382,7 @@ export class FileEmbedWidget extends WidgetType {
       event.target instanceof Element &&
       // The chip's Reveal and Copy path buttons, for a target the session
       // claimed, on exactly the rule `RecordingEmbedWidget` applies to them.
-      event.target.closest(`.${EMBED_BODY_CLASS}, .cm-lp-recording-chip-action`) !== null
+      event.target.closest(`.${EMBED_BODY_CLASS}, .${MEDIA_CHIP_ACTION_CLASS}`) !== null
     );
   }
 }

@@ -12,6 +12,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { AutoUpdateRestartVm } from "./gen/AutoUpdateRestartVm";
 import type { AutoUpdateVm } from "./gen/AutoUpdateVm";
 import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
+import type { CorrectionResultVm } from "./gen/CorrectionResultVm";
+import type { DictionaryTermVm } from "./gen/DictionaryTermVm";
 import type { DockBadgeMode } from "./gen/DockBadgeMode";
 import type { DocumentVm } from "./gen/DocumentVm";
 import type { EgressEndpointVm } from "./gen/EgressEndpointVm";
@@ -21,14 +23,288 @@ import type { FilesDeleteReceiptVm } from "./gen/FilesDeleteReceiptVm";
 import type { FilesListingVm } from "./gen/FilesListingVm";
 import type { IpcError } from "./gen/IpcError";
 import type { LifecyclePhase } from "./gen/LifecyclePhase";
+import type { LineEditVm } from "./gen/LineEditVm";
+import type { MarkerEditReq } from "./gen/MarkerEditReq";
+import type { MediaAdoptionVm } from "./gen/MediaAdoptionVm";
+import type { MediaBlockVm } from "./gen/MediaBlockVm";
+import type { MediaClipVm } from "./gen/MediaClipVm";
+import type { MediaLineVm } from "./gen/MediaLineVm";
+import type { MediaMarkerHitVm } from "./gen/MediaMarkerHitVm";
+import type { MediaMarkerVm } from "./gen/MediaMarkerVm";
+import type { MediaPickReq } from "./gen/MediaPickReq";
+import type { MediaRef } from "./gen/MediaRef";
+import type { MediaSpeakerVm } from "./gen/MediaSpeakerVm";
+import type { MediaWindowVm } from "./gen/MediaWindowVm";
 import type { NavState } from "./gen/NavState";
 import type { NotificationPermission } from "./gen/NotificationPermission";
 import type { NotifyTarget } from "./gen/NotifyTarget";
+import type { PersonVm } from "./gen/PersonVm";
 import type { TelemetryConsentVm } from "./gen/TelemetryConsentVm";
 import type { TelemetryEventReq } from "./gen/TelemetryEventReq";
 import type { TelemetryRemoteConfigVm } from "./gen/TelemetryRemoteConfigVm";
 import type { TelemetryStatusVm } from "./gen/TelemetryStatusVm";
 import type { TextFileVm } from "./gen/TextFileVm";
+import type { TrackOrigin } from "./gen/TrackOrigin";
+import type { TranscriptionLanguage } from "./gen/TranscriptionLanguage";
+import type { TranscriptionProgressVm } from "./gen/TranscriptionProgressVm";
+import type { TranscriptionStatusVm } from "./gen/TranscriptionStatusVm";
+import type { TranscriptMediaVm } from "./gen/TranscriptMediaVm";
+import type { TranscriptVm } from "./gen/TranscriptVm";
+import type { TranscriptWrittenVm } from "./gen/TranscriptWrittenVm";
+
+export type {
+  CorrectionResultVm,
+  DictionaryTermVm,
+  LineEditVm,
+  MarkerEditReq,
+  MediaAdoptionVm,
+  MediaBlockVm,
+  MediaClipVm,
+  MediaLineVm,
+  MediaMarkerHitVm,
+  MediaMarkerVm,
+  MediaPickReq,
+  MediaRef,
+  MediaSpeakerVm,
+  MediaWindowVm,
+  PersonVm,
+  TrackOrigin,
+  TranscriptionLanguage,
+  TranscriptionProgressVm,
+  TranscriptionStatusVm,
+  TranscriptMediaVm,
+  TranscriptVm,
+  TranscriptWrittenVm,
+};
+
+export function transcriptionStatus(): Promise<TranscriptionStatusVm> {
+  return invoke("transcription_status");
+}
+export function transcriptionModelsFetch(): Promise<TranscriptionStatusVm> {
+  return invoke("transcription_models_fetch");
+}
+/**
+ * `replace` is "Transcribe again": the job writes over the transcript already
+ * there, corrections and all, where it would otherwise refuse. The surface
+ * asks the person before it sends `true`.
+ */
+export function transcriptionStart(
+  path: string,
+  onProgress: (progress: TranscriptionProgressVm) => void,
+  replace = false,
+): Promise<string> {
+  const channel = new Channel<TranscriptionProgressVm>();
+  channel.onmessage = onProgress;
+  return invoke("transcription_start", { path, channel, replace });
+}
+export function transcriptionCancel(jobId: string): Promise<void> {
+  return invoke("transcription_cancel", { jobId });
+}
+export function transcriptRead(path: string): Promise<TranscriptVm> {
+  return invoke("transcript_read", { path });
+}
+export function transcriptEditUtterance(
+  path: string,
+  utteranceId: string,
+  text: string,
+): Promise<CorrectionResultVm> {
+  return invoke("transcript_edit_utterance", { path, utteranceId, text });
+}
+export function transcriptReassignUtterance(
+  path: string,
+  utteranceId: string,
+  speakerId: string,
+): Promise<TranscriptVm> {
+  return invoke("transcript_reassign_utterance", { path, utteranceId, speakerId });
+}
+export function transcriptSplitUtterance(
+  path: string,
+  utteranceId: string,
+  wordIndex: number,
+): Promise<TranscriptVm> {
+  return invoke("transcript_split_utterance", { path, utteranceId, wordIndex });
+}
+export function transcriptInsertUtterance(
+  path: string,
+  afterId: string,
+  speakerId: string,
+  text: string,
+): Promise<TranscriptVm> {
+  return invoke("transcript_insert_utterance", { path, afterId, speakerId, text });
+}
+export function transcriptMergeSpeakers(
+  path: string,
+  fromId: string,
+  intoId: string,
+): Promise<TranscriptVm> {
+  return invoke("transcript_merge_speakers", { path, fromId, intoId });
+}
+export function transcriptRenameSpeaker(
+  path: string,
+  speakerId: string,
+  label: string,
+): Promise<TranscriptVm> {
+  return invoke("transcript_rename_speaker", { path, speakerId, label });
+}
+export function transcriptAssignSpeaker(
+  path: string,
+  speakerId: string,
+  personId: string | null,
+  newName: string | null,
+): Promise<TranscriptVm> {
+  return invoke("transcript_assign_speaker", { path, speakerId, personId, newName });
+}
+/** A speaker nobody heard yet, on one track, to move lines to. */
+export function transcriptAddSpeaker(
+  path: string,
+  origin: TrackOrigin,
+  label: string | null,
+): Promise<TranscriptVm> {
+  return invoke("transcript_add_speaker", { path, origin, label });
+}
+/** What the transcript's player plays: each part's files, where they sit, and their tracks. */
+export function transcriptMedia(path: string): Promise<TranscriptMediaVm> {
+  return invoke("transcript_media", { path });
+}
+/**
+ * A `keeper-media` block for the transcript, composed by Rust, for the
+ * clipboard: the whole meeting with `from` and `to` both null, else the window
+ * (`hh:mm:ss`), with its words as a folded callout when `words`. A refusal —
+ * a time Rust will not read, a window outside the meeting, a transcript no
+ * synced folder holds — is the error's sentence.
+ */
+export function transcriptClip(
+  path: string,
+  from: string | null,
+  to: string | null,
+  words: boolean,
+): Promise<MediaClipVm> {
+  return invoke("transcript_clip", { path, from, to, words });
+}
+/** The transcript Rust wrote or changed: a job's result, a correction, a redo's fresh file. */
+export const TRANSCRIPT_WRITTEN_EVENT = "keeper://transcript-written";
+/** Subscribe to {@link TRANSCRIPT_WRITTEN_EVENT}; `path` is the transcript's absolute path. */
+export async function listenTranscriptWritten(
+  onWritten: (path: string) => void,
+): Promise<() => void> {
+  return await listen<TranscriptWrittenVm>(TRANSCRIPT_WRITTEN_EVENT, (event) => {
+    onWritten(event.payload.path);
+  });
+}
+/**
+ * A `keeper-media` block's body, resolved: what it plays and the lines inside
+ * its window. `profileId` is the drive holding the note, `null` when there is
+ * none. A refusal's message is the sentence the block shows above its source.
+ */
+export function mediaBlockResolve(profileId: string | null, source: string): Promise<MediaBlockVm> {
+  return invoke("media_block_resolve", { profileId, source });
+}
+/** The block's body with one marker added, renamed or removed, every other byte as it was. */
+export function mediaBlockEdit(source: string, edit: MarkerEditReq): Promise<string> {
+  return invoke("media_block_edit", { source, edit });
+}
+/** A clip of the block `source` for `[from, to)` (`hh:mm:ss`, as typed), for the clipboard. */
+export function mediaBlockClip(
+  profileId: string | null,
+  source: string,
+  from: string | null,
+  to: string | null,
+  words: boolean,
+): Promise<MediaClipVm> {
+  return invoke("media_block_clip", { profileId, source, from, to, words });
+}
+/** The recordings the media blocks of a whole note's `body` name. */
+export function mediaBlockSources(body: string): Promise<string[]> {
+  return invoke("media_block_sources", { body });
+}
+/** Which media block of the note `body` holds a marker called `name`, and its time; `null` for none. */
+export function mediaBlockFindMarker(
+  profileId: string | null,
+  body: string,
+  name: string,
+): Promise<MediaMarkerHitVm | null> {
+  return invoke("media_block_find_marker", { profileId, body, name });
+}
+/** "Play in a player" on the embed of `target` at `line` of the note `body`: the edits, applied as one. */
+export function mediaBlockForEmbed(
+  profileId: string,
+  body: string,
+  line: number,
+  target: string,
+): Promise<LineEditVm[]> {
+  return invoke("media_block_for_embed", { profileId, body, line, target });
+}
+/** The block for what the person picked — a recording or a file in the drive — to insert at the caret. */
+export function mediaBlockCompose(profileId: string, pick: MediaPickReq): Promise<string> {
+  return invoke("media_block_compose", { profileId, pick });
+}
+/**
+ * Rewrite the vault's recording notes that still embed their recording file by
+ * file into the one media block; `dryRun` counts without writing.
+ */
+export function recordingNotesAdoptMediaBlock(
+  profileId: string,
+  dryRun: boolean,
+): Promise<MediaAdoptionVm> {
+  return invoke("recording_notes_adopt_media_block", { profileId, dryRun });
+}
+export function voicesPeople(profileId: string): Promise<PersonVm[]> {
+  return invoke("voices_people", { profileId });
+}
+export function voicesPersonRename(
+  profileId: string,
+  personId: string,
+  name: string,
+): Promise<PersonVm[]> {
+  return invoke("voices_person_rename", { profileId, personId, name });
+}
+export function voicesPersonDelete(profileId: string, personId: string): Promise<PersonVm[]> {
+  return invoke("voices_person_delete", { profileId, personId });
+}
+export function voicesPersonSetSelf(profileId: string, personId: string): Promise<PersonVm[]> {
+  return invoke("voices_person_set_self", { profileId, personId });
+}
+export function voicesPeopleMerge(
+  profileId: string,
+  fromId: string,
+  intoId: string,
+): Promise<PersonVm[]> {
+  return invoke("voices_people_merge", { profileId, fromId, intoId });
+}
+export function dictionaryTerms(profileId: string): Promise<DictionaryTermVm[]> {
+  return invoke("dictionary_terms", { profileId });
+}
+export function dictionaryTermSave(
+  profileId: string,
+  id: string | null,
+  text: string,
+  aliases: string[],
+): Promise<DictionaryTermVm[]> {
+  return invoke("dictionary_term_save", { profileId, id, text, aliases });
+}
+export function dictionaryTermDelete(profileId: string, id: string): Promise<DictionaryTermVm[]> {
+  return invoke("dictionary_term_delete", { profileId, id });
+}
+export function dictionaryAcceptSuggestion(
+  profileId: string,
+  from: string,
+  to: string,
+): Promise<DictionaryTermVm[]> {
+  return invoke("dictionary_accept_suggestion", { profileId, from, to });
+}
+export function transcriptionSettingsSet(
+  language: TranscriptionLanguage | null,
+  afterRecording: boolean | null,
+  asrModel: string | null = null,
+  diarizationModel: string | null = null,
+): Promise<TranscriptionStatusVm> {
+  return invoke("transcription_settings_set", {
+    language,
+    afterRecording,
+    asrModel,
+    diarizationModel,
+  });
+}
 
 export function telemetryStatus(): Promise<TelemetryStatusVm> {
   return invoke("telemetry_status");
@@ -2350,6 +2626,7 @@ export async function recordingStart(
     tags?: string;
     custom?: { name: string; value: string }[];
   },
+  note?: RecordingNoteLink,
 ): Promise<RecordingStatusVm> {
   // Story 19.1: the picker's selected source/target (a display or an
   // application). Omitted (`undefined`) preserves the 16.6 main-display default.
@@ -2376,6 +2653,9 @@ export async function recordingStart(
     metaNote: meta?.note ?? null,
     metaTags: meta?.tags ?? null,
     metaCustom: meta?.custom ?? null,
+    // Story 88.9: the note whose `record = "new"` block pressed Start; sent
+    // only then, so every other start is the call it always was.
+    ...(note === undefined ? {} : { note }),
   });
 }
 
@@ -2983,13 +3263,29 @@ export async function startWindowDragging(): Promise<void> {
 /**
  * Record one stage of an app-driven title-bar drag in the app log (Story 34.3).
  *
- * Diagnostic-only, and the only frontend path into `~/Library/Logs/keeper/keeper.log`:
- * Rust authors the log text, `detail` carries a refusal message. Rejects with the
+ * Diagnostic-only: Rust authors the log text, `detail` carries a refusal message.
+ * One of two frontend paths into `~/Library/Logs/keeper/keeper.log`; the other is
+ * {@link frontendErrorReport}. Rejects with the
  * {@link IpcError} envelope; callers swallow it — a report must never be the thing
  * that breaks a drag.
  */
 export async function titlebarDragReport(stage: TitlebarDragStage, detail?: string): Promise<void> {
   await invoke<void>("titlebar_drag_report", { stage, detail: detail ?? null });
+}
+
+/**
+ * Write an error the webview could not handle to the app log, at `ERROR`, so a
+ * release build's blank-window failure leaves its message behind. Called only by
+ * `@/lib/crash-report`, which caps and de-duplicates; rejects with the
+ * {@link IpcError} envelope and the caller drops it.
+ */
+export async function frontendErrorReport(
+  source: string,
+  message: string,
+  stack: string | null,
+  componentStack: string | null,
+): Promise<void> {
+  await invoke<void>("frontend_error_report", { source, message, stack, componentStack });
 }
 
 export async function menuBarPresenceGet(): Promise<boolean> {
@@ -7967,4 +8263,187 @@ export async function listenAccountSetup(onLink: (link: string) => void): Promis
   return await listen<string>(ACCOUNT_SETUP_EVENT, (event) => {
     onLink(event.payload);
   });
+}
+
+// ---- Daily89: the recordings index's daily reconcile -----------------------
+
+/**
+ * The Tauri event the shell emits when a refresh of every recordings root has
+ * landed in the index — the daily reconcile, "Reconcile now", a start, a
+ * synced folder saved. No payload: the Recordings pane re-runs its query.
+ */
+export const RECORDINGS_RECONCILED_EVENT = "keeper://recordings-reconciled";
+
+/** Subscribe to {@link RECORDINGS_RECONCILED_EVENT}. Resolves with an unlisten function. */
+export async function listenRecordingsReconciled(onReconciled: () => void): Promise<() => void> {
+  return await listen<null>(RECORDINGS_RECONCILED_EVENT, () => {
+    onReconciled();
+  });
+}
+
+/**
+ * Rebuild the recordings index from every recordings root now, as the daily
+ * reconcile does. Resolves `true` when it started, `false` when a recording
+ * in progress holds it until the session ends; either way
+ * {@link RECORDINGS_RECONCILED_EVENT} follows when it lands.
+ */
+export async function recordingsReconcileNow(): Promise<boolean> {
+  return await invoke<boolean>("recordings_reconcile_now");
+}
+
+// ---- Hints89: completion and diagnostics while a media block is written ----
+
+import type { MediaBlockProblemVm } from "./gen/MediaBlockProblemVm";
+import type { MediaBlockSchemaVm } from "./gen/MediaBlockSchemaVm";
+
+export type { MediaBlockProblemVm } from "./gen/MediaBlockProblemVm";
+export type { MediaBlockSchemaVm } from "./gen/MediaBlockSchemaVm";
+export type { MediaKeyPlace } from "./gen/MediaKeyPlace";
+export type { MediaKeyVm } from "./gen/MediaKeyVm";
+export type { MediaValueKind } from "./gen/MediaValueKind";
+
+/** The `keeper-media` grammar's keys: where each may stand, what its value is and what it does. */
+export function mediaBlockSchema(): Promise<MediaBlockSchemaVm> {
+  return invoke("media_block_schema");
+}
+/** Why the block body `source` does not read, placed on its key or line; `null` when it reads. */
+export function mediaBlockCheck(source: string): Promise<MediaBlockProblemVm | null> {
+  return invoke("media_block_check", { source });
+}
+
+// ---- Rec89: recording from a note ------------------------------------------
+
+/**
+ * The note a session is started from: its vault (a profile id) and its path
+ * relative to the vault. The wire twin of Rust's `LinkedNote`.
+ */
+export interface RecordingNoteLink {
+  profileId: string;
+  path: string;
+}
+
+/** The note the live session is recording in, as a media block shows it. */
+export interface RecordingLinkedNoteVm extends RecordingNoteLink {
+  /** The session recording into it: the block naming it is the live one. */
+  sessionId: string;
+  /** The note's title from the notes index; its file name when the index has none. */
+  title: string;
+}
+
+/** The note the live session was started from, or `null` when none is. */
+export function recordingLinkedNote(): Promise<RecordingLinkedNoteVm | null> {
+  return invoke("recording_linked_note");
+}
+
+/** What a media block body is for recording: whether it records here
+ *  (`record = "new"`), the session it names, whether that session is the one
+ *  recording now (`live`), and whether into this very note (`here`) — Rust
+ *  reads the keys and knows the live session. */
+export interface MediaBlockRecordingVm {
+  records: boolean;
+  session: string | null;
+  live: boolean;
+  here: boolean;
+}
+
+export function mediaBlockRecording(
+  source: string,
+  profileId: string,
+  path: string | null,
+): Promise<MediaBlockRecordingVm> {
+  return invoke("media_block_recording", { source, profileId, path });
+}
+
+/** The body of the `record = "new"` block `source`, naming `sessionId`: what
+ *  the block that pressed Start splices over itself once the start answers. */
+export function mediaBlockRecordStarted(source: string, sessionId: string): Promise<string> {
+  return invoke("media_block_record_started", { source, sessionId });
+}
+
+// ---- VersionModels (88.10): choosing the transcription models --------------
+
+import type { ModelChoiceVm } from "./gen/ModelChoiceVm";
+import type { TranscriptionModelsVm } from "./gen/TranscriptionModelsVm";
+
+export type { ModelChoiceVm, TranscriptionModelsVm };
+
+/** The model directories Settings may pick per role, and what the config
+ *  repository's `_models/models.toml` names — the choice a blank keeps. */
+export function transcriptionModelsAvailable(): Promise<TranscriptionModelsVm> {
+  return invoke("transcription_models_available");
+}
+
+// ---- RemoveRec (88.10): removing a recording --------------------------------
+
+/** A note naming a recording, as its removal lists it. */
+export interface RecordingNoteRefVm {
+  vaultId: string;
+  /** Relative to its vault. */
+  path: string;
+  title: string;
+}
+
+/** A note keeper could not take a removed recording out of: it still names it. */
+export interface RecordingNoteFailureVm extends RecordingNoteRefVm {
+  error: string;
+}
+
+/** What removing a recording would delete, for its confirmation. */
+export interface RecordingRemovalPreviewVm {
+  /** The session folder as its drive names it (or as the index stores it). */
+  folder: string;
+  /** The synced folder it is in, by name; `null` for a plain folder on this Mac. */
+  drive: string | null;
+  bytes: number;
+  files: number;
+  /**
+   * How far the recording has travelled (`local`, `committed`, `pushed`,
+   * `verified`): only a pushed one is still in the drive's history once removed.
+   */
+  durability: string;
+  /** The notes whose widget — or recording keys — go with it. */
+  notes: RecordingNoteRefVm[];
+}
+
+/** What removing a recording did. */
+export interface RecordingRemovedVm {
+  folder: string;
+  bytes: number;
+  files: number;
+  /** Notes keeper changed on disk. */
+  notesChanged: RecordingNoteRefVm[];
+  /** Notes open in an editor: their widgets go through {@link RECORDING_REMOVED_EVENT}. */
+  openNotes: RecordingNoteRefVm[];
+  /** Notes that could not be changed: they still name the removed recording. */
+  notesFailed: RecordingNoteFailureVm[];
+}
+
+/** What removing the recording `sessionId` would delete. */
+export function recordingRemovePreview(sessionId: string): Promise<RecordingRemovalPreviewVm> {
+  return invoke("recording_remove_preview", { sessionId });
+}
+
+/** Delete the recording `sessionId` from its drive and take it out of every note. */
+export function recordingRemove(sessionId: string): Promise<RecordingRemovedVm> {
+  return invoke("recording_remove", { sessionId });
+}
+
+/**
+ * The Tauri event a removal emits once the recording is gone: every open note
+ * loses the widgets naming it, in its buffer (Rust never edits an open note's body).
+ */
+export const RECORDING_REMOVED_EVENT = "keeper://recording-removed";
+
+/** Subscribe to {@link RECORDING_REMOVED_EVENT}. Resolves with an unlisten function. */
+export async function listenRecordingRemoved(
+  onRemoved: (sessionId: string) => void,
+): Promise<() => void> {
+  return await listen<{ sessionId: string }>(RECORDING_REMOVED_EVENT, (event) => {
+    onRemoved(event.payload.sessionId);
+  });
+}
+
+/** The note body `text` without the widgets naming `sessionId`; `null` when none does. */
+export function mediaBlockWithoutSession(text: string, sessionId: string): Promise<string | null> {
+  return invoke("media_block_without_session", { text, sessionId });
 }

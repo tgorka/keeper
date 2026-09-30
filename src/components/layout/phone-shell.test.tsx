@@ -1174,6 +1174,7 @@ describe("PhoneShell persistent offline pill (Story 14.6)", () => {
     bots: false,
     botTools: false,
     overlayTitleBar: false,
+    transcription: false,
   };
 
   /** Hydrate the capabilities mirror as the reduced (iOS/phone) tier. */

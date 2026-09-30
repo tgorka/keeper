@@ -1,11 +1,14 @@
 /**
  * The note editor (Story 37.6, UX-DR40).
  *
- * CodeMirror 6 in **live-preview mode only**. There is no preview toggle as a
- * primary affordance, because a toggle asks the user to hold two mental models
- * of one document and to keep pressing a button to move between them. The
- * decoration layer in `editor/live-preview.ts` *is* the renderer; source is
- * revealed on the line under the caret and nowhere else.
+ * CodeMirror 6, and **live preview by default**. The decoration layer in
+ * `editor/live-preview.ts` *is* the renderer; in the editor, source is revealed
+ * on the line under the caret and nowhere else. The header also offers the two
+ * other ways of looking at the same text the Files pane offers for a markdown
+ * file: **Preview**, the Files pane's own rendered view (`markdown-preview.ts`)
+ * with no caret at all, and **Source**, the same editor with the decoration
+ * layer taken out. Which one a note opens in is remembered for every note, in
+ * the viewers' own view cookie (`view-mode.ts`).
  *
  * **Everything CodeMirror is behind one `import()`.** The editor packages plus
  * mermaid are several hundred kilobytes that a user who never opens a note
@@ -29,9 +32,12 @@ import {
   ArrowLeft,
   ArrowRight,
   ChevronDown,
+  Code,
+  Eye,
   Files,
   FolderSearch,
   History,
+  PencilLine,
   SlidersHorizontal,
 } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
@@ -40,19 +46,27 @@ import { ExportNoteItem } from "@/components/export/export-note-item";
 import { PaneHeader, type PaneHeaderTitleBar } from "@/components/layout/pane-header";
 import { type PriorityAction, PriorityActions } from "@/components/layout/priority-actions";
 import { Button } from "@/components/ui/button";
+import { writeCookie } from "@/components/ui/cookie-writer";
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { HoverHint, IconHint } from "@/components/ui/tooltip";
+import type { MarkdownPreview } from "@/components/viewers/markdown-preview";
+import { type ViewMode, viewModeCookie, viewModeFor } from "@/components/viewers/view-mode";
 import { useNotesBody } from "@/hooks/use-notes-body";
 import {
+  mediaBlockCheck,
+  mediaBlockFindMarker,
+  mediaBlockSchema,
   type NoteWriteVm,
   notesBodyRead,
   notesGallery,
@@ -60,8 +74,16 @@ import {
   notesRename,
   notesTagTree,
   type PanelTargetVm,
+  searchRecordings,
+  syncBrowse,
 } from "@/lib/ipc/client";
-import { followExternalUrl, resolveWikilink } from "@/lib/notes/follow-link";
+import {
+  followExternalUrl,
+  noMomentSentence,
+  resolveWikilink,
+  splitMarkerLink,
+} from "@/lib/notes/follow-link";
+import { GALLERY_HEAD, type NoteWidgetChoice } from "@/lib/notes/widgets";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import {
   consumeCaretHint,
@@ -74,12 +96,14 @@ import { notesFiltersStore } from "@/lib/stores/notes-filters";
 import { ensureNotesVaultsHydrated, useNotesVaultsStore } from "@/lib/stores/notes-vaults";
 import { type PanelHistoryEntry, panelsStore, usePanelsStore } from "@/lib/stores/panels";
 import { filePathForNote, SHOW_IN_FILES_LABEL, showNoteInFiles } from "@/lib/vault-link";
+import { ADOPT_MEDIA_BLOCKS_LABEL, AdoptMediaBlocksDialog } from "./adopt-media-blocks";
 import { AttachFileButton } from "./attach-file-button";
 import { ATTACHMENTS_LABEL, AttachmentsPanel } from "./attachments-panel";
 import { ConflictResolver } from "./conflict-resolver";
 import type { FormatAction } from "./editor/format-commands";
 import { FormatToolbar } from "./format-toolbar";
 import { LinksPanel } from "./links-panel";
+import { MediaPickerDialog } from "./media-picker-dialog";
 import { NoteActions } from "./note-actions";
 import { NoteDiffBar } from "./note-diff-bar";
 import { NOTE_HISTORY_LABEL, NoteHistoryPanel } from "./note-history-panel";
@@ -99,6 +123,35 @@ import { TemplateUpdateOffer } from "./template-update-offer";
  * other.
  */
 export const LINK_NOTICE_SLOT = "note-link-notice";
+
+/** The name the view toggle answers to, and its three segments' names. */
+export const NOTE_VIEW_LABEL = "Show the note as";
+export const NOTE_VIEW_LABELS: Record<ViewMode, string> = {
+  rendered: "Preview",
+  note: "Note",
+  raw: "Source",
+};
+
+/**
+ * The key a note's view is remembered under in the viewers' cookie. One answer
+ * for every note, like a file format's: the view is a way of reading notes the
+ * person chose, not a fact about one note.
+ */
+export const NOTE_VIEW_FORMAT = "keeper-note";
+
+/** The three segments, in the order the Files pane offers them for markdown. */
+const NOTE_VIEWS: readonly { mode: ViewMode; icon: ReactNode }[] = [
+  { mode: "rendered", icon: <Eye aria-hidden="true" /> },
+  { mode: "note", icon: <PencilLine aria-hidden="true" /> },
+  { mode: "raw", icon: <Code aria-hidden="true" /> },
+];
+
+/** The remembered view, or Note for somebody who never chose. */
+function rememberedNoteView(): ViewMode {
+  return viewModeFor(typeof document === "undefined" ? "" : document.cookie, NOTE_VIEW_FORMAT, {
+    note: true,
+  });
+}
 
 /**
  * Story 46.4's three-group header row, and where it lives now.
@@ -224,9 +277,29 @@ interface EditorRuntime {
    * job, and it is the only place that holds both the view and the commands.
    */
   runFormat: (action: FormatAction) => void;
+  /**
+   * Put a widget on a line of its own at `at`, or at the caret: a media block
+   * Rust composed, or a gallery head. The user's own edit, like
+   * `insertAtCursor`.
+   */
+  insertWidget: (text: string, at?: number) => void;
+  /** Bring the `ordinal`-th media block into view and move its player to
+   *  `seconds`, paused (a `[[note#marker]]` link). */
+  seekMediaBlock: (ordinal: number, seconds: number) => void;
+  /** Draw the note with the decoration layer, or as its plain source. */
+  setRendered: (on: boolean) => void;
+  /** The buffer as it is now. */
+  text: () => string;
   focus: () => void;
   destroy: () => void;
 }
+
+/**
+ * A marker a link asked for in a note that was not open yet, taken by the
+ * editor that opens it once the note's text is there (`[[note#marker]]`).
+ * Keyed by vault and note, because the note may open in another panel.
+ */
+const markerRequests = new Map<string, string>();
 
 /** The note's title: its first body line, `#` stripped (FR-98). Derived from
  *  the buffer rather than a list row so it tracks what is being typed — and the
@@ -437,6 +510,18 @@ export function NoteEditor({
   const hostRef = useRef<HTMLDivElement>(null);
   const runtimeRef = useRef<EditorRuntime | null>(null);
   const [mode, setMode] = useState<EditorMode>("edit");
+  const [noteView, setNoteView] = useState<ViewMode>(rememberedNoteView);
+  // Read by the editor's boot, which runs once and must start in the view the
+  // header shows.
+  const noteViewRef = useRef(noteView);
+  noteViewRef.current = noteView;
+  const chooseNoteView = useCallback((next: ViewMode) => {
+    setNoteView(next);
+    writeCookie(viewModeCookie(document.cookie, NOTE_VIEW_FORMAT, next));
+  }, []);
+  const previewRef = useRef<HTMLDivElement>(null);
+  const previewMount = useRef<MarkdownPreview | null>(null);
+  const [previewFailure, setPreviewFailure] = useState<string | null>(null);
   const [showProperties, setShowProperties] = useState(false);
   const [showAttachments, setShowAttachments] = useState(false);
   // The two disclosure regions the header's Properties and Attachments controls
@@ -470,33 +555,116 @@ export function NoteEditor({
   const runFormat = useCallback((action: FormatAction) => {
     runtimeRef.current?.runFormat(action);
   }, []);
+  // Where a media block goes once its picker has chosen: the `/` menu's
+  // position, or the caret (`undefined`) from the toolbar. `null` is closed.
+  const [mediaPick, setMediaPick] = useState<{ at: number | undefined } | null>(null);
+  const [adopting, setAdopting] = useState(false);
+  const insertWidget = useCallback((widget: NoteWidgetChoice) => {
+    if (widget === "gallery") {
+      runtimeRef.current?.insertWidget(GALLERY_HEAD);
+      return;
+    }
+    setMediaPick({ at: undefined });
+  }, []);
 
   // Refs, not effect dependencies: rebuilding the editor because a callback
   // identity changed would throw away the document, the undo stack and the
   // caret. Every one of these is read at the moment it fires.
-  const latest = useRef({ onEdit: body.onEdit, save: body.save, openHistory, toggleProperties });
-  latest.current = { onEdit: body.onEdit, save: body.save, openHistory, toggleProperties };
+  const pickMedia = useCallback((at: number) => setMediaPick({ at }), []);
+  const latest = useRef({
+    onEdit: body.onEdit,
+    save: body.save,
+    openHistory,
+    toggleProperties,
+    pickMedia,
+  });
+  latest.current = {
+    onEdit: body.onEdit,
+    save: body.save,
+    openHistory,
+    toggleProperties,
+    pickMedia,
+  };
   const pathRef = useRef(path);
   pathRef.current = path;
+  const assetUrl = useCallback(
+    (rel: string) =>
+      `keeper-note://${vaultId}/${vaultRelative(pathRef.current, rel)
+        .split("/")
+        .map(encodeURIComponent)
+        .join("/")}`,
+    [vaultId],
+  );
+  const assetUrlRef = useRef(assetUrl);
+  assetUrlRef.current = assetUrl;
   // Story 45.18: following, at last. `onFollowLink` used to sit here, a prop no
   // caller ever passed — so a wikilink click reached a `?.()` on `undefined`
   // and did nothing, for five stories, under a `cursor: pointer`. Resolution is
   // the index's own (`notes_resolve_link`), and the note it names is opened
   // through the same `onOpenNote` a backlink row uses, so a link and a backlink
   // cannot land in different places.
-  const followers = useRef({ onOpenNote, setLinkNotice });
-  followers.current = { onOpenNote, setLinkNotice };
+  const followers = useRef({ onOpenNote, setLinkNotice, noteId });
+  followers.current = { onOpenNote, setLinkNotice, noteId };
+  // A marker in this note: Rust says which media block holds it and when, the
+  // editor scrolls there, and the block's player moves, paused (AD-354).
+  const followMarker = useCallback(
+    (name: string) => {
+      const runtime = runtimeRef.current;
+      if (runtime === null) {
+        return;
+      }
+      void mediaBlockFindMarker(vaultId, runtime.text(), name).then(
+        (hit) => {
+          if (hit === null) {
+            followers.current.setLinkNotice(noMomentSentence(name));
+            return;
+          }
+          followers.current.setLinkNotice(null);
+          runtimeRef.current?.seekMediaBlock(hit.block, hit.from);
+        },
+        () => followers.current.setLinkNotice(noMomentSentence(name)),
+      );
+    },
+    [vaultId],
+  );
   const openWikilink = useCallback(
     (target: string) => {
-      void resolveWikilink(vaultId, target).then((result) => {
+      const { note, name } = splitMarkerLink(target);
+      if (name !== null && note === "") {
+        followMarker(name);
+        return;
+      }
+      void resolveWikilink(vaultId, name === null ? target : note).then((result) => {
         followers.current.setLinkNotice(result.reason);
-        if (result.note !== null) {
+        if (result.note === null) {
+          return;
+        }
+        if (name === null) {
+          followers.current.onOpenNote?.(result.note.id);
+        } else if (result.note.id === followers.current.noteId) {
+          followMarker(name);
+        } else {
+          // Taken by whichever editor opens that note, once its text is in.
+          markerRequests.set(`${vaultId}\u0000${result.note.id}`, name);
           followers.current.onOpenNote?.(result.note.id);
         }
       });
     },
-    [vaultId],
+    [vaultId, followMarker],
   );
+  const takeMarkerRequest = useCallback(() => {
+    if (noteId === null) {
+      return;
+    }
+    const key = `${vaultId}\u0000${noteId}`;
+    const name = markerRequests.get(key);
+    if (name !== undefined) {
+      markerRequests.delete(key);
+      followMarker(name);
+    }
+  }, [vaultId, noteId, followMarker]);
+  const takeMarkerRef = useRef(takeMarkerRequest);
+  takeMarkerRef.current = takeMarkerRequest;
   const openExternal = useCallback((url: string) => {
     void followExternalUrl(url).then((refusal) => {
       followers.current.setLinkNotice(refusal);
@@ -533,6 +701,9 @@ export function NoteEditor({
         writing,
         find,
         marks,
+        media,
+        widgetSlash,
+        mediaHints,
       ] = await Promise.all([
         import("@codemirror/state"),
         import("@codemirror/view"),
@@ -553,6 +724,13 @@ export function NoteEditor({
         // panel's React tree is in the editor chunk, not the main bundle.
         import("./editor/find-panel"),
         import("./editor/markdown-marks"),
+        // The media block's insertion and marker seek, and the widget rows of
+        // the `/` menu: note-only, because a media block needs the note's
+        // drive.
+        import("./editor/media-block"),
+        import("./editor/widget-slash"),
+        // Keys, values and refusals while a media block's source is open.
+        import("./editor/media-hints"),
       ]);
       if (disposed) {
         return;
@@ -566,6 +744,28 @@ export function NoteEditor({
       const opened = readNoteDocument(vaultId, noteId);
       let marksGeneration = 0;
       let dismissedQuery: string | null = null;
+      // The decoration layer, in a compartment: Source is this same editor —
+      // caret, undo and autosave intact — with the layer taken out, and Preview
+      // takes it out too while the Files renderer draws the note, so a block's
+      // player is mounted once and not twice.
+      const rendering = new state.Compartment();
+      const rendered = preview.livePreview({
+        vaultId,
+        assetUrl: (rel) => assetUrlRef.current(rel),
+        onOpenLink: openWikilink,
+        onOpenUrl: openExternal,
+        recordingSession: () => sessionRef.current,
+        // Handed the block's own folder text and nothing else: Rust resolves it
+        // against the vault root, so no path is composed here (AD-65).
+        listFolder: (folder) => notesGallery(vaultId, folder),
+        // `[[<this note>#<marker>]]`: the name a wikilink resolves, which is the
+        // file's name without its extension.
+        noteLink: () => pathRef.current?.split("/").pop()?.replace(/\.md$/i, "") ?? null,
+        notePath: () => pathRef.current ?? null,
+        saveNote: () => {
+          void latest.current.save();
+        },
+      });
       const editorView = new view.EditorView({
         parent: host,
         state: state.EditorState.create({
@@ -582,6 +782,11 @@ export function NoteEditor({
           },
           extensions: [
             view.EditorView.lineWrapping,
+            // The editor fills its host and scrolls itself, so `scrollDOM` is
+            // the note's one scroller: a media block pins its player to it and
+            // windows its transcript against it, and neither works against a
+            // scroller that never scrolls with the note's own box around it.
+            view.EditorView.theme({ "&": { height: "100%" } }),
             // CodeMirror gives its content `role="textbox"` and no accessible
             // name, so the editable region announced itself as an unlabelled
             // text box on every surface that mounts this editor.
@@ -647,30 +852,36 @@ export function NoteEditor({
               extensions: [...marks.MARKDOWN_MARKS],
             }),
             writing.markdownWritingTools([
+              // Each call reaches the client only when a media block asks.
+              mediaHints.mediaBlockCompleteSource({
+                schema: () => mediaBlockSchema(),
+                recordings: async (query) =>
+                  (
+                    await searchRecordings({
+                      query,
+                      tags: [],
+                      participant: null,
+                      startTs: null,
+                      endTs: null,
+                      durability: null,
+                      profileId: null,
+                      limit: 20,
+                    })
+                  ).rows,
+                files: (subpath) => syncBrowse(vaultId, subpath),
+              }),
               wikilink.wikilinkSource(vaultId),
               tags.tagCompleteSource(async () => {
                 cachedTags ??= tags.tagPaths((await notesTagTree(vaultId)).nodes);
                 return cachedTags;
               }),
+              widgetSlash.widgetSlashSource((at) => latest.current.pickMedia(at)),
             ]),
+            mediaHints.mediaBlockDiagnostics((source) => mediaBlockCheck(source)),
             // Escape first closes Find, then simplifies a selection via the
             // default keymap; with neither present, it dismisses list marks.
             preview.searchMarks(),
-            preview.livePreview({
-              vaultId,
-              assetUrl: (rel) =>
-                `keeper-note://${vaultId}/${vaultRelative(pathRef.current, rel)
-                  .split("/")
-                  .map(encodeURIComponent)
-                  .join("/")}`,
-              onOpenLink: openWikilink,
-              onOpenUrl: openExternal,
-              recordingSession: () => sessionRef.current,
-              // Handed the block's own folder text and nothing else: Rust
-              // resolves it against the vault root, so no path is composed
-              // here (AD-65).
-              listFolder: (folder) => notesGallery(vaultId, folder),
-            }),
+            rendering.of(noteViewRef.current === "note" ? rendered : []),
             view.EditorView.updateListener.of((update) => {
               if (
                 update.transactions.some(
@@ -846,6 +1057,16 @@ export function NoteEditor({
         runFormat: (action: FormatAction) => {
           writing.runFormatAction(editorView, action);
         },
+        insertWidget: (text: string, at?: number) => {
+          media.insertOnOwnLine(editorView, text, at);
+        },
+        seekMediaBlock: (ordinal: number, seconds: number) => {
+          media.seekMediaBlock(editorView, ordinal, seconds);
+        },
+        setRendered: (on: boolean) => {
+          editorView.dispatch({ effects: rendering.reconfigure(on ? rendered : []) });
+        },
+        text: () => editorView.state.doc.toString(),
         focus: () => editorView.focus(),
         destroy: () => {
           marksGeneration += 1;
@@ -866,6 +1087,11 @@ export function NoteEditor({
         runtimeRef.current.placeCaret(opening);
         consumeCaretHint(vaultId, noteId);
       }
+      // A note already in the store when the chunk landed has no `Reset` still
+      // to come, so a marker a link asked for is taken now.
+      if (opened.text !== "") {
+        takeMarkerRef.current();
+      }
     })();
 
     return () => {
@@ -877,6 +1103,55 @@ export function NoteEditor({
     // has only `vaultId`, which is already here — so naming them costs no extra
     // teardown of the editor and keeps the effect honest about what it closes over.
   }, [vaultId, noteId, openExternal, openWikilink]);
+
+  // Note draws the decoration layer; Source and Preview do not — Preview
+  // because the Files renderer below draws the note instead.
+  useEffect(() => {
+    runtimeRef.current?.setRendered(noteView === "note");
+  }, [noteView]);
+
+  // Preview: the Files pane's rendered view of a markdown file, over this
+  // note's buffer — read-only, no caret, its widgets live. Mounted only while
+  // it is shown; the editor stays alive behind it, as it does behind history.
+  const showsPreview = mode === "edit" && noteView === "rendered" && noteId !== null;
+  useEffect(() => {
+    const host = previewRef.current;
+    if (!showsPreview || host === null || noteId === null) {
+      return;
+    }
+    let live = true;
+    void import("@/components/viewers/markdown-preview")
+      .then(({ mountMarkdownPreview }) =>
+        mountMarkdownPreview(host, readNoteDocument(vaultId, noteId).text, {
+          vaultId,
+          assetUrl: (rel) => assetUrlRef.current(rel),
+          onOpenLink: openWikilink,
+          onOpenUrl: openExternal,
+          listFolder: (folder) => notesGallery(vaultId, folder),
+        }),
+      )
+      .then((mounted) => {
+        if (!live) {
+          mounted.destroy();
+          return;
+        }
+        previewMount.current = mounted;
+        setPreviewFailure(mounted.failure);
+      });
+    return () => {
+      live = false;
+      previewMount.current?.destroy();
+      previewMount.current = null;
+      setPreviewFailure(null);
+      host.replaceChildren();
+    };
+  }, [showsPreview, vaultId, noteId, openWikilink, openExternal]);
+  useEffect(() => {
+    const failure = previewMount.current?.setContent(body.text) ?? null;
+    if (failure !== null) {
+      setPreviewFailure(failure);
+    }
+  }, [body.text]);
 
   // Content that did not come from this editor — the opening `Reset`, which
   // usually lands AFTER the editor chunk, an external write applied live, an
@@ -900,6 +1175,7 @@ export function NoteEditor({
       runtime.placeCaret(document.cursor);
       consumeCaretHint(vaultId, noteId);
     }
+    takeMarkerRef.current();
   }, [vaultId, noteId, externalEdition]);
 
   useEffect(() => {
@@ -1186,6 +1462,43 @@ export function NoteEditor({
             // it out when it put everything else away.
             leading={
               <>
+                {/* Preview | Note | Source, the three ways the Files pane
+                    offers a markdown file. Leading, so it is on screen at every
+                    width; one control showing the current view rather than
+                    three segments, because this row also titles a 560px
+                    capture window and three more glyphs there would push the
+                    actions menu off its edge. */}
+                <DropdownMenu>
+                  <IconHint label={`${NOTE_VIEW_LABEL}: ${NOTE_VIEW_LABELS[noteView]}`}>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        type="button"
+                        size="icon-sm"
+                        variant="ghost"
+                        aria-label={`${NOTE_VIEW_LABEL}: ${NOTE_VIEW_LABELS[noteView]}`}
+                      >
+                        {NOTE_VIEWS.find((each) => each.mode === noteView)?.icon}
+                      </Button>
+                    </DropdownMenuTrigger>
+                  </IconHint>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuRadioGroup
+                      value={noteView}
+                      onValueChange={(next) => {
+                        if (next === "rendered" || next === "note" || next === "raw") {
+                          chooseNoteView(next);
+                        }
+                      }}
+                    >
+                      {NOTE_VIEWS.map(({ mode: each, icon }) => (
+                        <DropdownMenuRadioItem key={each} value={each}>
+                          {icon}
+                          {NOTE_VIEW_LABELS[each]}
+                        </DropdownMenuRadioItem>
+                      ))}
+                    </DropdownMenuRadioGroup>
+                  </DropdownMenuContent>
+                </DropdownMenu>
                 <AttachFileButton
                   vaultId={vaultId}
                   body={body.text}
@@ -1280,6 +1593,12 @@ export function NoteEditor({
                     readings of one label, which is why there is no second label
                     and no host test here. */}
                 <CaptureNoteItem vaultId={vaultId} noteId={noteId} />
+                {/* A vault-wide act offered from the note, because this menu is
+                    the notes' options menu: the recording notes written before
+                    the media player still embed their files one by one. */}
+                <DropdownMenuItem onSelect={() => setAdopting(true)}>
+                  {ADOPT_MEDIA_BLOCKS_LABEL}
+                </DropdownMenuItem>
                 {/* Story 45.21: Export is a note-level act, and putting it here
                     rather than on the panel frame means a note open in a panel
                     has one Export and not two — the panel's could not flush this
@@ -1448,7 +1767,24 @@ export function NoteEditor({
       {/* Directly over the text it formats, and unmounted outside edit mode:
           in history or conflict mode there is no selection for a button to act
           on, and a toolbar that cannot do anything is a toolbar that lies. */}
-      {mode === "edit" ? <FormatToolbar onAction={runFormat} /> : null}
+      {mode === "edit" && noteView !== "rendered" ? (
+        <FormatToolbar onAction={runFormat} onInsertWidget={insertWidget} />
+      ) : null}
+      <MediaPickerDialog
+        open={mediaPick !== null}
+        profileId={vaultId}
+        onClose={() => setMediaPick(null)}
+        onPicked={(block) => {
+          const at = mediaPick?.at;
+          setMediaPick(null);
+          runtimeRef.current?.insertWidget(block, at);
+        }}
+      />
+      <AdoptMediaBlocksDialog
+        vaultId={vaultId}
+        open={adopting}
+        onClose={() => setAdopting(false)}
+      />
 
       {/* Hidden rather than unmounted: the caret, the selection and the undo
           stack all have to survive a trip through history or conflict mode. */}
@@ -1459,7 +1795,22 @@ export function NoteEditor({
         // loses a race against the environment teardown. See
         // `src/test/note-editor-boot.ts`.
         data-slot="note-editor-host"
-        className={mode === "edit" ? "min-h-0 flex-1 overflow-auto" : "hidden"}
+        className={
+          mode === "edit" && noteView !== "rendered" ? "min-h-0 flex-1 overflow-hidden" : "hidden"
+        }
+      />
+
+      {/* Preview's own host. The rendered view fills it and scrolls itself, so
+          a media block's player pins to the one scroller here too. */}
+      {showsPreview && previewFailure !== null ? (
+        <p role="alert" className="shrink-0 border-b px-3 py-1.5 text-destructive text-xs">
+          {previewFailure}
+        </p>
+      ) : null}
+      <div
+        ref={previewRef}
+        data-slot="note-preview-host"
+        className={showsPreview ? "min-h-0 flex-1 overflow-hidden [&_.cm-editor]:h-full" : "hidden"}
       />
 
       {mode === "history" ? (

@@ -22,8 +22,18 @@ import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { livePreview } from "@/components/notes/editor/live-preview";
+import type { MediaBlockMountArgs } from "@/components/notes/editor/media-block";
 import { withRangeRects } from "@/test/layout";
 import { mermaidFenceLine, mountMarkdownPreview } from "./markdown-preview";
+
+/** What each media block's panel was handed; the panel itself has tests of its own. */
+const mediaPanels = vi.hoisted((): MediaBlockMountArgs[] => []);
+vi.mock("@/components/notes/editor/media-block-host", () => ({
+  mountMediaBlock: (_: HTMLElement, args: MediaBlockMountArgs) => {
+    mediaPanels.push(args);
+    return { unmount: () => {}, update: () => {} };
+  },
+}));
 
 /** What the note editor builds, minus the editing extensions: the grammar and
  *  the decoration layer, which is the pair DW-165 lives in. */
@@ -193,6 +203,21 @@ describe("mountMarkdownPreview", () => {
     // otherwise have to remember not to.
     expect(() => preview.destroy()).not.toThrow();
     expect(() => preview.setContent("# other\n")).not.toThrow();
+  });
+
+  it.each([
+    ["read-only", undefined],
+    ["editable", { label: "Note of log.md", onChange: () => {}, onSave: () => {} }],
+  ])("draws a media block as a preview's %s widget: it plays and changes nothing", async (_, editing) => {
+    mediaPanels.length = 0;
+    const host = document.createElement("div");
+    await mountMarkdownPreview(host, 'intro\n\n```keeper-media\nsession = "S1"\n```\n', {
+      vaultId: "vault-1",
+      editing,
+    });
+
+    await vi.waitFor(() => expect(mediaPanels).toHaveLength(1));
+    expect(mediaPanels[0]).toMatchObject({ interactive: false, editable: false });
   });
 });
 

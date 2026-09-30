@@ -108,6 +108,14 @@ file-controlled instead, and says which file.
 | | | | | Rows a folder card's lists show once unfolded. |
 | `system.menu_bar_presence` | user-global | boolean (`1`/`0`) | `0` | `"system.menu_bar_presence" = true` |
 | | | | | Whether keeper keeps a menu-bar (tray) presence. |
+| `transcription.after_recording` | user-global | boolean (`1`/`0`) | `1` | `"transcription.after_recording" = false` |
+| | | | | Whether a finished Recording Session saved to a drive that keeps voices is transcribed on this Mac. |
+| `transcription.asr_model` | user-global | text | *(absent)* | `"transcription.asr_model" = "parakeet-tdt-0.6b-v3"` |
+| | | | | The speech model transcription loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`_models/models.toml`); a model that is missing or incomplete on this Mac is refused, never replaced. |
+| `transcription.diarization_model` | user-global | text | *(absent)* | `"transcription.diarization_model" = "speaker-diarization"` |
+| | | | | The speaker model transcription loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`_models/models.toml`); a model that is missing or incomplete on this Mac is refused, never replaced. |
+| `transcription.language` | user-global | one of `auto`, `en`, `pl` | `auto` | `"transcription.language" = "pl"` |
+| | | | | The spoken language transcription expects; `auto` lets the model decide. |
 | `undo_send.window` | user-global | integer 0..=60 | `10` | `"undo_send.window" = 10` |
 | | | | | How long a sent message is held before it dispatches, in seconds. |
 | `update.auto` | user-global | boolean (`1`/`0`) | `1` | `"update.auto" = false` |
@@ -170,6 +178,7 @@ Not preferences. keeper writes these and reads them back, so a file entry would 
 | `notes.capture_placement.<…>` | text | Per capture window: its remembered position and size, whether it floats above other applications, and whether the lock is on. | it is what a person last did to one capture window — dragged it, resized it, pinned it above other applications or locked it — rewritten on every dismissal |
 | `notes.pristine.<…>` | JSON | Per notes drive: the new notes nobody has written in yet, and what creation put in each. | it lists the notes keeper created on this device that nobody has written in yet, so it can remove them when their editor closes or at the next start |
 | `notes.read.<…>` | text | Per note: the revision this device has acknowledged. | it is this device's record of which revision of a note it has already shown you, and it must never travel — that is what makes an edit from the other machine unread |
+| `recordings.last_reconcile_ms` | text | When the recordings index last finished a refresh of every recordings root, in ms since the Unix epoch; the daily reconcile runs a day after it. | it is this install's record of when its recordings index last matched the folders, and a file setting it would hold the daily reconcile off, or run it every second |
 | `sync.credential_source.<…>` | text | Per drive: `account:<account id>` authenticates with that organisation account's sign-in token while it is the configured account; `forge:<source id>` with that repository source's connection; absent uses the drive's own saved token. | it is the choice made in a drive's form, and a file flipping it would send the account's token to a remote the person never chose to give it to |
 | `ui.first_run_setup_skipped` | boolean (`1`/`0`) | Whether the person asked keeper not to open first-run setup at startup. | it is the answer somebody gave in the skip dialog, and pre-setting it in a file would hide setup from a person who was never offered it |
 | `ui.ios_sync_disclosure_shown` | boolean (`1`/`0`) | Whether the one-time iOS no-background-sync disclosure has been shown. | it is a one-time latch keeper sets after showing a disclosure, and pre-setting it in a file would suppress a card the person never saw |

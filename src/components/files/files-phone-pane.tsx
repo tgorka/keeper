@@ -46,7 +46,7 @@
  */
 
 import type { LucideIcon } from "lucide-react";
-import { ChevronLeft, ChevronRight, RefreshCw, Share, WifiOff } from "lucide-react";
+import { AudioLines, ChevronLeft, ChevronRight, RefreshCw, Share, WifiOff } from "lucide-react";
 import {
   type ReactNode,
   type PointerEvent as ReactPointerEvent,
@@ -66,8 +66,25 @@ import {
 } from "@/components/layout/files-pane";
 import { OFFLINE_PILL_TEXT } from "@/components/layout/sidebar-pane";
 import { FILES_SYNC_MARK_LABEL, SyncStatusMark } from "@/components/layout/sync-status-mark";
+import {
+  TRANSCRIBE_AGAIN_LABEL,
+  TranscribeAgainDialog,
+} from "@/components/transcription/transcribe-again";
+import { TranscriptDialog } from "@/components/transcription/transcript-viewer";
+import { TranscriptionJob } from "@/components/transcription/transcription-job";
+import {
+  TranscriptionProgressRing,
+  transcriptionShortLine,
+} from "@/components/transcription/transcription-progress";
 import { Button } from "@/components/ui/button";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import { IconHint } from "@/components/ui/tooltip";
+import { useLongPress } from "@/hooks/use-long-press";
 import type { FilesEntryVm, FilesListingVm, SyncProfileVm } from "@/lib/ipc/client";
 import {
   revealPath,
@@ -80,6 +97,11 @@ import {
 import { useShellOffline } from "@/lib/stores/account-status";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { syncErrorMessage } from "@/lib/stores/sync";
+import {
+  startTranscription,
+  transcriptionRunning,
+  useTranscriptionStore,
+} from "@/lib/stores/transcription";
 import { cn } from "@/lib/utils";
 import { resolveViewer, VIEWER_ICON, type ViewerFile, viewerComponentFor } from "@/lib/viewers";
 
@@ -162,25 +184,42 @@ function Row({
   trailing,
   testId,
   onPress,
+  menu,
+  title,
 }: {
   label: string;
   icon: LucideIcon;
   trailing?: ReactNode;
   testId?: string;
   onPress: () => void;
+  menu?: ReactNode;
+  title?: string;
 }) {
+  const longPress = useLongPress();
+  const button = (
+    <button
+      type="button"
+      data-testid={testId}
+      onClick={onPress}
+      title={title}
+      {...(menu ? longPress : {})}
+      className="flex min-h-11 w-full min-w-0 items-center gap-3 px-4 text-left text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      <Icon className="size-5 shrink-0 text-muted-foreground" aria-hidden />
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      {trailing}
+    </button>
+  );
   return (
     <li>
-      <button
-        type="button"
-        data-testid={testId}
-        onClick={onPress}
-        className="flex min-h-11 w-full min-w-0 items-center gap-3 px-4 text-left text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
-      >
-        <Icon className="size-5 shrink-0 text-muted-foreground" aria-hidden />
-        <span className="min-w-0 flex-1 truncate">{label}</span>
-        {trailing}
-      </button>
+      {menu ? (
+        <ContextMenu>
+          <ContextMenuTrigger asChild>{button}</ContextMenuTrigger>
+          <ContextMenuContent>{menu}</ContextMenuContent>
+        </ContextMenu>
+      ) : (
+        button
+      )}
     </li>
   );
 }
@@ -188,6 +227,11 @@ function Row({
 export function FilesPhonePane() {
   const canShare = useCapabilitiesStore((s) => s.capabilities.shareOut);
   const canReveal = useCapabilitiesStore((s) => s.capabilities.revealInFileManager);
+  const canTranscribe = useCapabilitiesStore((s) => s.capabilities.transcription);
+  const jobs = useTranscriptionStore((s) => s.jobs);
+  const [transcriptPath, setTranscriptPath] = useState<string | null>(null);
+  const [jobPath, setJobPath] = useState<string | null>(null);
+  const [replacing, setReplacing] = useState<string | null>(null);
   const offline = useShellOffline();
   const reduced = useIsReducedCapabilityPlatform();
 
@@ -273,6 +317,20 @@ export function FilesPhonePane() {
       void load(folderProfileId, folderSubpath);
     }
   }, [folderProfileId, folderSubpath, load]);
+
+  // A transcription can end minutes after it started, on whatever level the
+  // person is on by then, so its follow-up reads that level again (the new
+  // transcript and the row's Open transcript appear there) rather than the one
+  // the job started from, which would replace what they are looking at.
+  const currentFolder = useRef<{ profileId: string; subpath: string } | null>(null);
+  currentFolder.current =
+    folderProfileId === null || folderSubpath === null
+      ? null
+      : { profileId: folderProfileId, subpath: folderSubpath };
+  const rereadCurrentFolder = useCallback(() => {
+    const folder = currentFolder.current;
+    if (folder) void load(folder.profileId, folder.subpath);
+  }, [load]);
 
   const profileName = useCallback(
     (profileId: string) => profiles?.find((p) => p.id === profileId)?.name ?? FILES_PANE_TITLE,
@@ -506,15 +564,63 @@ export function FilesPhonePane() {
                   const icon = folder
                     ? VIEWER_ICON.folder
                     : VIEWER_ICON[resolveViewer({ name: entry.name, kind: entry.kind }).icon];
+                  const job = jobs[entry.absolutePath];
+                  const running = job !== undefined && transcriptionRunning(job);
                   return (
                     <Row
                       key={entry.relativePath}
                       label={entry.name}
-                      icon={icon}
+                      icon={entry.folderRole === "voices" ? AudioLines : icon}
+                      title={
+                        entry.folderRole === "voices"
+                          ? "Where voices and the dictionary are kept"
+                          : undefined
+                      }
+                      menu={
+                        (canTranscribe && entry.transcribable) || entry.transcript ? (
+                          <>
+                            {canTranscribe && entry.transcribable && (
+                              <ContextMenuItem
+                                disabled={running}
+                                onSelect={() => {
+                                  // Where a transcript exists the verb replaces
+                                  // it, and asks first.
+                                  if (entry.transcript) {
+                                    setReplacing(entry.absolutePath);
+                                    return;
+                                  }
+                                  setJobPath(entry.absolutePath);
+                                  void startTranscription(entry.absolutePath, rereadCurrentFolder);
+                                }}
+                              >
+                                {running
+                                  ? transcriptionShortLine(job)
+                                  : entry.transcript
+                                    ? `${TRANSCRIBE_AGAIN_LABEL}…`
+                                    : "Transcribe"}
+                              </ContextMenuItem>
+                            )}
+                            {entry.transcript && (
+                              <ContextMenuItem onSelect={() => setTranscriptPath(entry.transcript)}>
+                                Open transcript
+                              </ContextMenuItem>
+                            )}
+                          </>
+                        ) : undefined
+                      }
                       testId={`${FILES_PHONE_ROW_TESTID}-${entry.relativePath}`}
                       trailing={
                         <>
                           {!folder && <SyncStatusMark sync={entry.sync} />}
+                          {running && (
+                            <span
+                              role="img"
+                              aria-label={transcriptionShortLine(job)}
+                              className="relative size-5 shrink-0"
+                            >
+                              <TranscriptionProgressRing fraction={job.fraction} />
+                            </span>
+                          )}
                           {entry.size !== null && (
                             <span className="shrink-0 text-muted-foreground text-xs tabular-nums">
                               {entry.size.label}
@@ -616,6 +722,25 @@ export function FilesPhonePane() {
           </IconHint>
         )}
       </header>
+      {canTranscribe && jobPath && (
+        <div className="p-2">
+          <TranscriptionJob path={jobPath} onOpen={setTranscriptPath} />
+        </div>
+      )}
+      <TranscriptDialog
+        path={transcriptPath}
+        onClose={() => setTranscriptPath(null)}
+        profileId={place.kind === "profiles" ? null : place.profileId}
+      />
+      <TranscribeAgainDialog
+        open={replacing !== null}
+        onClose={() => setReplacing(null)}
+        onConfirm={() => {
+          if (replacing === null) return;
+          setJobPath(replacing);
+          void startTranscription(replacing, rereadCurrentFolder, true);
+        }}
+      />
       {reduced && offline && (
         <div
           role="status"

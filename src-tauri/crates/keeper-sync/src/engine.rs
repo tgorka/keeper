@@ -1297,6 +1297,11 @@ pub struct Engine {
     /// "reachable again" on every attempt against a remote that is not. The
     /// same shape as [`Engine::task_faults`], for the same reason.
     offline: Mutex<HashSet<String>>,
+    /// Folders keeper itself deleted, per profile id, repository-relative:
+    /// deletions under them are keeper's own and do not count toward the
+    /// removable drive's mass-deletion guard ([`Engine::declare_deletions`]).
+    /// Consumed by the commit that records them.
+    declared_deletions: Mutex<HashMap<String, Vec<PathBuf>>>,
     /// How long [`Engine::do_pull`] waits for a fetch, in milliseconds.
     ///
     /// [`git::fetch::FETCH_DEADLINE`] outside a test; an atomic rather than a
@@ -1969,6 +1974,7 @@ impl Engine {
             labels_backfilled: Mutex::new(HashSet::new()),
             transient_failures: Mutex::new(HashMap::new()),
             offline: Mutex::new(HashSet::new()),
+            declared_deletions: Mutex::new(HashMap::new()),
             fetch_deadline_ms: AtomicU64::new(git::fetch::FETCH_DEADLINE.as_millis() as u64),
             task_faults: Mutex::new(HashSet::new()),
             task_runs_in_flight: tokio::sync::watch::Sender::new(HashSet::new()),
@@ -6914,6 +6920,40 @@ impl Engine {
         Ok(primed)
     }
 
+    /// Declare that keeper itself deleted `folder` from this profile — a
+    /// person removed a recording — so the commit that records the deletion
+    /// does not read it as a removable drive pulled mid-walk. Only the
+    /// mass-deletion guard is told: the deletions under `folder` stop counting
+    /// toward its fraction, and every other deletion counts as before, so an
+    /// unplugged drive is still refused. The declaration is consumed by the
+    /// first commit that records a deletion under `folder`, and lives in this
+    /// process only. A folder outside the profile declares nothing (`false`).
+    pub fn declare_deletions(&self, profile_id: &str, folder: &Path) -> Result<bool> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
+            return Err(SyncError::Config(format!(
+                "no such sync profile: {profile_id}"
+            )));
+        };
+        // `folder` may be spelled through the profile's root or with every
+        // symlink resolved; it is gone, so only the root can be resolved.
+        let canonical = profile.local_path.canonicalize().ok();
+        let Some(relative) = folder.strip_prefix(&profile.local_path).ok().or_else(|| {
+            canonical
+                .as_deref()
+                .and_then(|root| folder.strip_prefix(root).ok())
+        }) else {
+            return Ok(false);
+        };
+        if relative.as_os_str().is_empty() {
+            return Ok(false);
+        }
+        Self::lock(&self.declared_deletions)
+            .entry(profile.id)
+            .or_default()
+            .push(relative.to_path_buf());
+        Ok(true)
+    }
+
     /// Declare every added, modified or untracked file in this profile's
     /// working tree settled, so the next commit pass stages it without the
     /// settle window (Epic 66, Story 66.4, AD-198).
@@ -10896,6 +10936,20 @@ impl Engine {
         // it governs, or a peer cloning that commit would not know the pointers
         // are pointers.
         let mut staged = staged.clone();
+        // The folders keeper itself deleted that this change set deletes
+        // under: carried for the mass-deletion guard, consumed below once the
+        // commit has recorded them.
+        let declared: Vec<PathBuf> = Self::lock(&self.declared_deletions)
+            .get(&profile.id)
+            .map(|folders| {
+                folders
+                    .iter()
+                    .filter(|folder| staged.deleted.iter().any(|rela| rela.starts_with(folder)))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        staged.declared.clone_from(&declared);
         if staging.attributes_changed {
             self.bump_counters(&profile.id, |counters| counters.attribute_writes += 1);
             let attributes = PathBuf::from(".gitattributes");
@@ -11020,6 +11074,11 @@ impl Engine {
                 &profile.name,
                 format!("{} {}", first.display(), git::commit::TORN_READ_SENTENCE),
             );
+        }
+        if !declared.is_empty() {
+            if let Some(folders) = Self::lock(&self.declared_deletions).get_mut(&profile.id) {
+                folders.retain(|folder| !declared.contains(folder));
+            }
         }
         let Some(id) = committed else {
             return Ok(());
@@ -28353,6 +28412,62 @@ mod tests {
                 .expect("a fixed disk deleting six files deleted six files"),
             6
         );
+    }
+
+    /// A recordings stick holding one session: keeper's own removal of that
+    /// session deletes most of the index, and must commit — declared, the
+    /// guard does not count it. The same deletions undeclared are still a
+    /// drive that may have been unplugged, and a declaration is spent by the
+    /// commit that records it.
+    #[test]
+    fn a_folder_keeper_declared_deleted_commits_on_a_removable_profile_and_nothing_else_does() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = removable_on(dir.path());
+        let session = p.local_path.join("recordings/2026/standup");
+        std::fs::create_dir_all(&session).expect("session folder");
+        for name in ["manifest.json", "screen-0000.mov", "transcript.json"] {
+            std::fs::write(session.join(name), name).expect("write");
+        }
+        std::fs::write(p.local_path.join("README.md"), "stick").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert!(engine.volume_ready(&p).expect("scan"));
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 4);
+
+        // Undeclared: three of four entries gone reads as a pulled drive.
+        std::fs::remove_dir_all(&session).expect("remove");
+        let before = head_id(&engine, &p);
+        let err = engine
+            .commit_local(&p, SyncSource::Watch, None)
+            .expect_err("undeclared, most of the index gone is refused");
+        assert!(
+            err.to_string()
+                .contains(git::commit::MASS_DELETION_SENTENCE),
+            "{err}"
+        );
+        assert_eq!(head_id(&engine, &p), before);
+
+        // Declared by keeper: the removal commits.
+        assert!(engine.declare_deletions(&p.id, &session).expect("declare"));
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("keeper's own removal commits"),
+            3
+        );
+        assert!(head_blob(&engine, &p, "recordings/2026/standup/manifest.json").is_none());
+        assert!(
+            Engine::lock(&engine.declared_deletions)
+                .get(&p.id)
+                .is_none_or(Vec::is_empty),
+            "the declaration is spent by the commit that recorded it"
+        );
+        assert!(!engine
+            .declare_deletions(&p.id, dir.path())
+            .expect("outside"));
     }
 
     /// F-GATE-7: a prime is an untracked arrival by definition, and the

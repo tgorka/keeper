@@ -465,6 +465,12 @@ keeper-config.git/
       desktop.toml               # optional: seeds settings.<device>.toml when no other desktop of yours has one
       tablet.toml                #   … iPad
       mobile.toml                #   … phone
+  .gitattributes                 # _models/** filter=lfs diff=lfs merge=lfs -text
+  _models/                       # optional: transcription models, git LFS (docs/transcription.md)
+    models.toml                  # names the set: [asr] dir, [diarizer] dir, [embedding] id
+    parakeet-tdt-0.6b-v3/        # speech recognition (precompiled .mlmodelc + vocabulary)
+    speaker-diarization/         # diarization and speaker embeddings
+    LICENSE, NOTICE              # the models' own licence files travel with them
   tgorka/                        # one directory per person, named by their login
     user.toml                    # who this directory belongs to
     keeper.toml                  # your pinned settings, every device
@@ -476,7 +482,7 @@ keeper-config.git/
     bots.toml                    # your bot providers and their bots
     matrix.toml                  # your Matrix accounts
     devices/
-      macbook.toml               # name, class, platform, created, machine (a fingerprint, below)
+      macbook.toml               # name, class, platform, created, machine (a fingerprint, below), version, commit, updated
       iphone-3f2a.toml
 ```
 
@@ -493,6 +499,22 @@ created = "2026-09-23T10:12:00Z"
 A repository whose `user.toml` records `zitadel_id` instead of `sub` works with
 `identity_field = "zitadel_id"`. keeper never rewrites an existing `user.toml` to migrate
 it.
+
+A device's record, as keeper writes it at registration:
+
+```toml
+name = "macbook"
+class = "desktop"
+platform = "macos"
+machine = "5eed…"
+created = "2026-09-23T10:12:00Z"
+version = "0.8.33"                # the keeper release this device runs
+commit = "1a2b3c4"                # the source it was built from, as its log banner names it
+updated = "2026-09-23T10:12:00Z"  # when keeper last changed version or commit
+```
+
+`version` and `commit` let you see in the repository whether every device has updated:
+Settings › Account shows *keeper 0.8.33* beside each device that records one.
 
 ### What keeper does there
 
@@ -512,15 +534,31 @@ it.
 6. **Every sync** merges your settings files and your lists of drives, bot providers and
    Matrix accounts, and describes this device in its own file. It rewrites and pushes them
    only when their content changed (see *Your settings, drives and accounts travel*).
+   When this device's own record names another `version` than the keeper running, or
+   another `commit` while the keeper running was built from a clean commit (not `-dirty`,
+   not `unknown`), keeper sets `version`, `commit` and `updated` in place, keeps every
+   other line, comment and spacing as it was, and pushes it as `<login>: <device> runs
+   keeper <version>`. A dev build of the release already recorded therefore commits
+   nothing, so a machine switching between it and the release build does not flip the
+   commit back and forth. A record from before these keys gains them the same way; a sync
+   that finds them current commits nothing, a record that does not read as TOML is left
+   alone, and another device's record is never rewritten from here.
+7. **Models, on a Mac that can transcribe:** after a sync, `_models/` is hydrated into
+   `<data_dir>/models/` through keeper's own LFS client, with the same credential, each
+   file checked against its sha256. The LFS endpoint is derived from the repository's URL
+   alone; a `.lfsconfig` in this repository is never read, so the credential goes to no
+   other host. keeper only reads `_models/`; it never writes there. See
+   `docs/transcription.md`.
 
 **The rules keeper keeps:**
-- **Create-only, except six files.** A file that already exists is never re-copied or
-  rewritten, apart from the six files keeper keeps in step, directly in your `<login>/`:
-  `settings.toml`, `settings.<device>.toml`, `drives.toml`, `bots.toml`, `matrix.toml`
-  and `device.<device>.toml`. Only the device a `device.<device>.toml` names ever writes
-  it. `user.toml`, `keeper.toml`, `keeper.<device>.toml` and `devices/*.toml` are never
-  rewritten. At one of the six names, a symbolic link, a folder, or a path under a file
-  is refused, never written through.
+- **Create-only, except six files and three keys.** A file that already exists is never
+  re-copied or rewritten, apart from the six files keeper keeps in step, directly in your
+  `<login>/`: `settings.toml`, `settings.<device>.toml`, `drives.toml`, `bots.toml`,
+  `matrix.toml` and `device.<device>.toml`, and this device's `devices/<device>.toml`,
+  where only `version`, `commit` and `updated` ever change. Only the device a
+  `device.<device>.toml` or `devices/<device>.toml` names ever writes it. `user.toml`,
+  `keeper.toml` and `keeper.<device>.toml` are never rewritten. At one of these names, a
+  symbolic link, a folder, or a path under a file is refused, never written through.
 - **Your directory only.** Only paths under your own `<login>/` are ever written or staged.
   Any other path, and any absolute path or path with `..`, is refused before it reaches
   git.
@@ -761,7 +799,7 @@ works the same way: it applies only when that folder exists on this device.
 
 Three more files list what you use, and on which devices:
 - **`drives.toml`:** each drive's name, remote URL and branch; its roles (notes,
-  recordings, sessions, tasks) and their subfolders; the policy a synced folder may carry
+  recordings, sessions, tasks, voices) and their subfolders; the policy a synced folder may carry
   (excludes, the LFS threshold, virtual-file patterns and size floor, the release time,
   tags, the commit subject); and whether it uses your account, its own token, or none.
   The local folder, the direction and the other per-device choices stay on each device.

@@ -105,6 +105,7 @@ const DESKTOP_CAPABILITIES = {
   bots: false,
   botTools: false,
   overlayTitleBar: false,
+  transcription: false,
 };
 
 const UPDATE_ENDPOINT = "https://github.com/tgorka/keeper/releases/latest/download/latest.json";
