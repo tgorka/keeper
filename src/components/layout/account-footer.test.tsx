@@ -16,12 +16,16 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
   return {
     ...actual,
     encryptionPosture: vi.fn(() => Promise.resolve(false)),
+    accountShare: vi.fn(() =>
+      Promise.resolve({ link: "keeper://setup?descriptor=x", qrSvg: "<svg></svg>" }),
+    ),
     // Global DND toggle (Story 10.2): default off, capture the set call.
     dndGetGlobal: vi.fn(() => Promise.resolve(false)),
     dndSetGlobal: vi.fn(() => Promise.resolve()),
   };
 });
 
+import { SHARE_QR_ALT, SHARE_SHEET_TITLE } from "@/components/account/account-share-sheet";
 import {
   CHANGE_KEEPER_ACCOUNT_TITLE,
   changeKeeperAccountDescription,
@@ -34,6 +38,7 @@ import {
   ADD_KEEPER_ACCOUNT_LABEL,
   ADD_MATRIX_ACCOUNT_LABEL,
   CHANGE_KEEPER_ACCOUNT_LABEL,
+  SHARE_KEEPER_ACCOUNT_LABEL,
 } from "@/components/layout/account-footer";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { dndGetGlobal, dndSetGlobal } from "@/lib/ipc/client";
@@ -155,6 +160,27 @@ describe("AccountFooter", () => {
     // The one entry field, not a second one.
     expect(within(dialog).getByLabelText("Paste a setup link")).toBeInTheDocument();
     expect(addAccountStore.getState().open).toBe(false);
+  });
+
+  it("signed in to a keeper account, shows its setup QR code from Add account", async () => {
+    accountStore.getState().setVm(accountVm({ name: "Acme" }));
+    renderFooter();
+    const menu = await openAddMenu();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: SHARE_KEEPER_ACCOUNT_LABEL }));
+
+    const sheet = await screen.findByRole("dialog", { name: SHARE_SHEET_TITLE });
+    expect(await within(sheet).findByRole("img", { name: SHARE_QR_ALT })).toBeInTheDocument();
+  });
+
+  it("offers no setup QR code without a signed-in keeper account", async () => {
+    // Configured but signed out: there is a link, but Settings does not offer
+    // it either, and the menu must not be the one place that does.
+    accountStore.getState().setVm(accountVm({ name: "Acme", identity: null }));
+    renderFooter();
+    const menu = await openAddMenu();
+    expect(
+      within(menu).queryByRole("menuitem", { name: SHARE_KEEPER_ACCOUNT_LABEL }),
+    ).not.toBeInTheDocument();
   });
 
   it("with a keeper account set up, offers to change it and says what that replaces", async () => {

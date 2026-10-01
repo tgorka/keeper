@@ -2,24 +2,27 @@
 //!
 //! `keeper_core::org_account::oidc` builds the authorization URL, registers
 //! its `state` in the [`OAuthFlowRegistry`] and asks the platform to show the
-//! URL through [`Platform::start_web_auth`]. On macOS and iOS that is
-//! `ASWebAuthenticationSession` (`web_auth_apple.rs`): a sheet that shares
-//! Safari's cookies, offers passkeys and password managers, and hands the
-//! callback URL straight back — no deep link has to make it through Launch
-//! Services, which on a phone is the difference between a sign-in that
-//! finishes and one that waits five minutes for nothing. Everywhere else the
-//! port's default opens the system browser and the `keeper://` deep link (or
-//! the loopback listener core binds itself) delivers the callback.
+//! URL through [`Platform::start_web_auth`]. On iOS that is
+//! `ASWebAuthenticationSession` (`web_auth_apple.rs`): a sheet inside the app
+//! that shares Safari's cookies, offers passkeys and password managers, and
+//! hands the callback URL straight back — no deep link has to make it through
+//! Launch Services, which on a phone is the difference between a sign-in that
+//! finishes and one that waits five minutes for nothing. Everywhere else,
+//! macOS included, the port's default opens the person's default browser and
+//! the `keeper://` deep link (or the loopback listener core binds itself)
+//! delivers the callback. On a Mac the sheet was a separate Safari window
+//! whatever the default browser was, so the browser the person signs in to —
+//! with its password manager and passkeys — is the better place.
 //!
 //! This file is the part of that relay that is not FFI: where the sheet's
 //! outcome goes. It compiles and is tested on every target; only
-//! [`start`] and [`cancel_all`] reach the Apple half.
+//! [`start`] and [`cancel_all`] reach the iOS half.
 //!
 //! [`Platform::start_web_auth`]: keeper_core::platform::Platform::start_web_auth
 
 // Off Apple nothing presents a sheet, so the routing below is reached only by
 // its tests there; it stays compiled so those tests run on every host.
-#![cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
+#![cfg_attr(not(target_os = "ios"), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -137,12 +140,12 @@ fn failure_url(state: &str, reason: &str) -> String {
 
 /// The window the sheet is presented over: keeper's main window, which is
 /// where every sign-in is started from.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_os = "ios")]
 const MAIN_WINDOW: &str = "main";
 
 /// Present `url` in `ASWebAuthenticationSession` over the main window, for
 /// an account sign-in (its flows are the registry [`install`] recorded).
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_os = "ios")]
 pub fn start(url: &str, callback_scheme: &str) -> Result<(), CoreError> {
     let (_, flows) = HOST.get().ok_or_else(not_up)?;
     start_in(url, callback_scheme, Arc::clone(flows))
@@ -157,7 +160,7 @@ pub fn start(url: &str, callback_scheme: &str) -> Result<(), CoreError> {
 /// through [`finish`], so the caller waits on its flow and nothing else.
 /// `with_webview` is the way in because its closure runs on the main thread
 /// (its whole contract) and is handed the native window the sheet anchors to.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_os = "ios")]
 pub fn start_in(
     url: &str,
     callback_scheme: &str,
@@ -188,7 +191,7 @@ pub fn start_in(
         .map_err(|error| CoreError::Internal(format!("could not reach the main window: {error}")))
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_os = "ios")]
 fn not_up() -> CoreError {
     CoreError::Unsupported("the sign-in sheet is not available before the app starts".to_owned())
 }
@@ -197,14 +200,14 @@ fn not_up() -> CoreError {
 /// already ended (cancelled or timed out), and a sheet left behind would
 /// answer nobody.
 pub fn close(state: &str) {
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(target_os = "ios")]
     if let Some((app, _)) = HOST.get() {
         let state = state.to_owned();
         if let Err(error) = app.run_on_main_thread(move || crate::web_auth_apple::cancel(&state)) {
             tracing::warn!(%error, "web auth: could not reach the main thread to close a sheet");
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     let _ = state;
 }
 
@@ -212,7 +215,7 @@ pub fn close(state: &str) {
 /// registry's open. Each one's completion then reports a cancel, which ends
 /// its flow through [`finish`].
 pub fn cancel_all(flows: &Arc<OAuthFlowRegistry>) {
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(target_os = "ios")]
     if let Some((app, _)) = HOST.get() {
         let flows = Arc::clone(flows);
         if let Err(error) =
@@ -221,18 +224,20 @@ pub fn cancel_all(flows: &Arc<OAuthFlowRegistry>) {
             tracing::warn!(%error, "web auth: could not reach the main thread to cancel");
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     let _ = flows;
 }
 
 /// The platform a Matrix single sign-on runs against (AD-331): the app's
-/// own, except that the authorization page opens in the sign-in sheet where
-/// the platform has one, so the identity provider's session from the
-/// account sign-in carries over and the person is not asked for a password
-/// again. Its ending goes to the Matrix registry the flow waits in; the
-/// redirect (`dev.tgorka.keeper:/oauth/callback`, `oauth::redirect_uri`) is
-/// core's. Elsewhere, and when the sheet cannot be reached, the system
-/// browser opens as before and the deep link delivers the callback.
+/// own, except that on iOS the authorization page opens in the sign-in
+/// sheet, so the identity provider's session from the account sign-in
+/// carries over and the person is not asked for a password again. Its ending
+/// goes to the Matrix registry the flow waits in; the redirect
+/// (`dev.tgorka.keeper:/oauth/callback`, `oauth::redirect_uri`) is core's.
+/// Elsewhere — macOS included, where the account signs in in the default
+/// browser too, so the session carries over there — and when the sheet
+/// cannot be reached, the default browser opens and the deep link delivers
+/// the callback.
 pub struct MatrixSignIn<'a> {
     inner: &'a dyn Platform,
     flows: Arc<OAuthFlowRegistry>,
@@ -277,7 +282,7 @@ impl Platform for MatrixSignIn<'_> {
         self.inner.keychain_delete(key)
     }
     fn open_url(&self, url: &str) -> Result<(), CoreError> {
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        #[cfg(target_os = "ios")]
         if let (Some(state), Ok(redirect)) = (state_of(url), keeper_core::oauth::redirect_uri()) {
             if sheet_can_deliver(redirect.scheme()) {
                 match start_in(url, redirect.scheme(), Arc::clone(&self.flows)) {

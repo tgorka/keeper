@@ -24,10 +24,12 @@ import {
   MoonStar,
   MoreVertical,
   Plus,
+  QrCode,
   Settings,
   VenetianMask,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { AccountShareSheet } from "@/components/account/account-share-sheet";
 import { BeeperCoverageDisclosure } from "@/components/auth/beeper-coverage-disclosure";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
 import {
@@ -770,17 +772,23 @@ function AccountRow({ account, collapsed }: { account: AccountVm; collapsed: boo
 export const ADD_MATRIX_ACCOUNT_LABEL = "Matrix account…";
 export const ADD_KEEPER_ACCOUNT_LABEL = "keeper account…";
 export const CHANGE_KEEPER_ACCOUNT_LABEL = "Change keeper account…";
+/** Settings › Account's "Add a device or a person", reachable from here too. */
+export const SHARE_KEEPER_ACCOUNT_LABEL = "Show setup QR code…";
 
 /**
  * Add account: which kind (AD-318). The trigger keeps its label and name in
  * both shapes, so the width the sidebar is measured against is unchanged; it
  * only opens a menu now instead of going straight to the Matrix login. The
  * keeper account is one per device, so once there is one the item says it
- * changes it rather than adding a second.
+ * changes it rather than adding a second. Signed in to one, the menu also
+ * shows its setup QR code, for a phone or another person to scan — the same
+ * sheet Settings › Account opens, under the same condition.
  */
 function AddAccountMenu({ collapsed }: { collapsed: boolean }) {
   const openAddAccount = useAddAccountStore((s) => s.openAddAccount);
   const keeperConfigured = useAccountStore((s) => s.vm.configured);
+  const keeperSignedIn = useAccountStore((s) => s.vm.identity !== null);
+  const [shareOpen, setShareOpen] = useState(false);
 
   const trigger = collapsed ? (
     // A narrow left rail when folded, so the hint opens to the right of it.
@@ -806,15 +814,27 @@ function AddAccountMenu({ collapsed }: { collapsed: boolean }) {
   );
 
   return (
-    <DropdownMenu>
-      {trigger}
-      <DropdownMenuContent side={collapsed ? "right" : "top"} align={collapsed ? "end" : "start"}>
-        <DropdownMenuItem onSelect={openAddAccount}>{ADD_MATRIX_ACCOUNT_LABEL}</DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => accountStore.getState().openEntry()}>
-          {keeperConfigured ? CHANGE_KEEPER_ACCOUNT_LABEL : ADD_KEEPER_ACCOUNT_LABEL}
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <>
+      <DropdownMenu>
+        {trigger}
+        <DropdownMenuContent side={collapsed ? "right" : "top"} align={collapsed ? "end" : "start"}>
+          <DropdownMenuItem onSelect={openAddAccount}>{ADD_MATRIX_ACCOUNT_LABEL}</DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => accountStore.getState().openEntry()}>
+            {keeperConfigured ? CHANGE_KEEPER_ACCOUNT_LABEL : ADD_KEEPER_ACCOUNT_LABEL}
+          </DropdownMenuItem>
+          {keeperSignedIn && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onSelect={() => setShareOpen(true)}>
+                <QrCode aria-hidden="true" />
+                {SHARE_KEEPER_ACCOUNT_LABEL}
+              </DropdownMenuItem>
+            </>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <AccountShareSheet open={shareOpen} onOpenChange={setShareOpen} />
+    </>
   );
 }
 

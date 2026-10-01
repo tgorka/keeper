@@ -161,13 +161,6 @@ objc2-avf-audio = { workspace = true }
 # Story 64.2, AD-182, AD-188): `NLLanguageRecognizer`, reached only from
 # `voice_macos.rs`'s audited `detect_language`. No network path.
 objc2-natural-language = { workspace = true }
-# The account sign-in sheet (Epic 82, AD-311): `ASWebAuthenticationSession`
-# with the main window's `NSWindow` as its anchor, reached only from
-# `web_auth_apple.rs`'s audited functions (docs/constraints-and-limitations.md).
-# The sheet shares Safari's cookies (non-ephemeral), so the identity provider's
-# session and a passkey manager's prompt both carry over.
-objc2-authentication-services = { workspace = true }
-objc2-app-kit = { workspace = true }
 # The on-device speech engine (Epic 87, AD-339): keeper's vendored fork of
 # fluidaudio-rs (MIT, FluidInference; LICENSE + NOTICE in the directory)
 # linking FluidAudio 0.17.4 (Apache-2.0) as a static Swift library — Parakeet
@@ -221,6 +214,10 @@ objc2-avf-audio = { workspace = true }
 # `voice_ios.rs`'s audited `detect_language`. No network path.
 objc2-natural-language = { workspace = true }
 block2 = { workspace = true }
-# The account sign-in sheet (Epic 82, AD-311): the same crate and module as the
-# macOS table above; the anchor is the main window's `UIWindow`.
+# The account sign-in sheet (Epic 82, AD-311): `ASWebAuthenticationSession`
+# with the main window's `UIWindow` as its anchor, reached only from
+# `web_auth_apple.rs`'s audited functions (docs/constraints-and-limitations.md).
+# The sheet shares Safari's cookies (non-ephemeral), so the identity provider's
+# session and a passkey manager's prompt both carry over. macOS signs in in
+# the default browser instead.
 objc2-authentication-services = { workspace = true }

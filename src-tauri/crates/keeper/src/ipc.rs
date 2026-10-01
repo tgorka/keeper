@@ -94,12 +94,12 @@ pub struct AppState {
     pub accounts: AccountManager,
     /// In-flight Matrix OIDC (OAuth 2.0 / MSC3861) callback registry (Story
     /// 2.2). The deep-link `on_open_url` handler resolves incoming
-    /// `dev.tgorka.keeper:/oauth/callback` URLs against it (the sign-in sheet
-    /// delivers there too); each `login_oidc` call
+    /// `dev.tgorka.keeper:/oauth/callback` URLs against it (iOS's sign-in
+    /// sheet delivers there too); each `login_oidc` call
     /// registers its pending flow here, and `cancel_oidc` aborts all pending
     /// flows — which is why the organisation account keeps its own.
     pub oauth_flows: Arc<OAuthFlowRegistry>,
-    /// In-flight organisation-account sign-ins (Epic 82): the sign-in sheet,
+    /// In-flight organisation-account sign-ins (Epic 82): iOS's sign-in sheet,
     /// the loopback listener and `keeper://oauth/<id>/…` deep links resolve
     /// here, so cancelling a Matrix sign-in never ends an account's.
     pub account_flows: Arc<OAuthFlowRegistry>,
@@ -718,20 +718,6 @@ impl Platform for DesktopPlatform {
         // by the OIDC flow to present the OAuth authorization URL for consent.
         tauri_plugin_opener::open_url(url, None::<&str>)
             .map_err(|e| CoreError::Internal(format!("could not open the system browser: {e}")))
-    }
-
-    /// The account sign-in (Epic 82, AD-311): `ASWebAuthenticationSession`
-    /// over the main window on macOS, whose callback comes straight back to
-    /// the flow registry; a redirect the sheet cannot match (a loopback
-    /// `http` one) opens the default browser as before. Linux and Windows
-    /// keep the port's default — the browser plus the `keeper://` deep link.
-    #[cfg(target_os = "macos")]
-    fn start_web_auth(&self, url: &str, callback_scheme: &str) -> Result<(), CoreError> {
-        if crate::web_auth::sheet_can_deliver(callback_scheme) {
-            crate::web_auth::start(url, callback_scheme)
-        } else {
-            self.open_url(url)
-        }
     }
 
     fn notify(&self, title: &str, body: &str, target: &NotifyTarget) -> Result<(), CoreError> {
@@ -2234,9 +2220,10 @@ pub async fn login_password(
 /// Runs the shared add-account flow with the OIDC mechanism: the whole browser
 /// round-trip (open the authorization page, await the `dev.tgorka.keeper:/oauth/callback`
 /// redirect, finish the token exchange) happens inside the core `authenticate`
-/// step. Where the platform has a sign-in sheet (Apple) the page opens there,
-/// so the identity provider's session from the account sign-in carries over
-/// (AD-331); elsewhere the system browser opens and the deep link returns.
+/// step. On iOS the page opens in the sign-in sheet, so the identity
+/// provider's session from the account sign-in carries over (AD-331);
+/// elsewhere the default browser opens — where the account signed in too, so
+/// the session carries over there — and the deep link returns.
 /// The pending flow is keyed by its OAuth `state` in the shared registry so the
 /// sheet or the deep-link `on_open_url` handler can route the callback back to
 /// it; a concurrent `cancel_oidc` aborts it. On success resolves to a non-secret

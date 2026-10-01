@@ -383,11 +383,14 @@ Progress and the outcome appear in the same sheet, as one sentence.
 
 ### Adding a device or a person
 
-On a signed-in device, open Settings › Account › *Add a device or a person*. It shows the
-setup link as a QR code on a white card, the link itself, and *Copy link*. The descriptor
-is the same for everyone. A new person scans it, signs in as themselves, and keeper creates
-**their** directory from the template. A new device of yours scans it, and keeper registers
-the device in your directory.
+On a signed-in device, open Settings › Account › *Add a device or a person*, or
+*Add account* › *Show setup QR code…* in the sidebar (the drawer on a phone). Both open the
+same sheet: the setup link as a QR code with the keeper mark in the middle, on a white card,
+the link itself, and *Copy link*. The code is encoded at error-correction level H, so it
+still scans with the mark covering its centre; a link too long for level H gets a plain
+code instead. The descriptor is the same for everyone. A new person scans it, signs in as
+themselves, and keeper creates **their** directory from the template. A new device of yours
+scans it, and keeper registers the device in your directory.
 
 The link carries no secret (see *Security notes*). Sharing it grants nothing: access is
 decided by the identity provider's sign-in and the forge's permissions.
@@ -400,11 +403,19 @@ whenever Settings opens.
 ## Signing in
 
 **The window.**
-- **macOS and iOS:** keeper uses the system's web authentication session
-  (ASWebAuthenticationSession), which shares your default browser's sign-in. If you are
-  already signed in to your organisation in the browser, you see the system's "keeper wants
-  to sign in" alert and little else. Passkeys, iCloud Keychain and 1Password work there as
-  they do in the browser. keeper never uses an embedded web view.
+- **macOS:** keeper opens the sign-in page in your default browser (Arc, Chrome, Safari…),
+  and the browser hands the result back through the `keeper://` link — the first time, the
+  browser may ask whether to open keeper. keeper then comes to the front, and the browser
+  tab shows "You're signed in" and can be closed — a page cannot close the tab itself.
+  Your browser's password manager, 1Password's
+  extension and its passkeys work there as on any site, and if you are already signed in to
+  your organisation in that browser you are not asked again. A Matrix single sign-on opens in
+  the same browser, so it rides on the same session.
+- **iOS:** keeper uses the system's web authentication session (ASWebAuthenticationSession),
+  a sheet inside keeper that shares Safari's sign-in. Passkeys, iCloud Keychain and
+  1Password work there as they do in the browser.
+- keeper never uses an embedded web view: a page inside keeper could not offer your
+  passkeys for the identity provider's site.
 - **Desktop, with a loopback redirect** (`redirect_uri = "http://127.0.0.1/callback"`, or a
   pinned port): keeper opens the default browser and listens on `127.0.0.1` for exactly one
   request.
