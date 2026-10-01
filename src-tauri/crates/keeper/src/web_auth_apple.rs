@@ -27,7 +27,7 @@
 //!
 //! Every objc2 call below that the bindings mark `unsafe` sits in one of this
 //! file's function-level `#[allow(unsafe_code)]` items — the `anchor` module
-//! (the class definition), [`window_of`], [`present`],
+//! (the class definition), [`window_of`], [`anchor_state`], [`present`],
 //! [`is_session_error`] and [`cancel_all`] — each with a `// SAFETY:`
 //! comment, and all are listed in the audit inventory in
 //! `docs/constraints-and-limitations.md`.
@@ -120,7 +120,9 @@ thread_local! {
 
 /// The main window's native window, as the anchor type the protocol returns.
 #[allow(unsafe_code)]
-fn window_of(webview: &tauri::webview::PlatformWebview) -> Result<Retained<NSObject>, String> {
+fn window_of(
+    webview: &tauri::webview::PlatformWebview,
+) -> Result<Retained<objc2_ui_kit::UIWindow>, String> {
     use objc2_ui_kit::UIViewController;
 
     let controller = webview.view_controller();
@@ -134,13 +136,62 @@ fn window_of(webview: &tauri::webview::PlatformWebview) -> Result<Retained<NSObj
     // inside `with_webview` on that window. Null-checked above; only borrowed
     // for the two reads below, which hand back retained objects.
     let controller: &UIViewController = unsafe { &*controller.cast::<UIViewController>() };
-    let window = controller
+    controller
         .view()
         .and_then(|view| view.window())
-        .ok_or("the main window is not on screen, so the sign-in sheet cannot open")?;
-    Ok(Retained::into_super(Retained::into_super(
-        Retained::into_super(window),
-    )))
+        .ok_or_else(|| {
+            "the main window is not on screen, so the sign-in sheet cannot open".to_owned()
+        })
+}
+
+/// What Apple's `start` checks the anchor against, read the same way: does
+/// the window have a scene, is that scene `foregroundActive` (0), is the
+/// window key. Logged when a sheet is refused, so a refusal names its cause.
+#[derive(Debug, Clone, Copy)]
+struct AnchorState {
+    scene: bool,
+    activation: isize,
+    key: bool,
+}
+
+impl AnchorState {
+    /// `UISceneActivationStateForegroundActive`.
+    const FOREGROUND_ACTIVE: isize = 0;
+
+    fn ready(self) -> bool {
+        self.scene && self.activation == Self::FOREGROUND_ACTIVE
+    }
+}
+
+#[allow(unsafe_code)]
+fn anchor_state(window: &objc2_ui_kit::UIWindow) -> AnchorState {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    // SAFETY: on the main thread (the caller is `present`), `windowScene`
+    // answers a `UIWindowScene` or nil, `activationState` is an `NSInteger`
+    // enum on that scene, and `isKeyWindow` a `BOOL` on the window; none
+    // retains or keeps anything beyond the call.
+    unsafe {
+        let scene: *mut AnyObject = msg_send![window, windowScene];
+        let activation: isize = if scene.is_null() {
+            -1
+        } else {
+            msg_send![scene, activationState]
+        };
+        AnchorState {
+            scene: !scene.is_null(),
+            activation,
+            key: msg_send![window, isKeyWindow],
+        }
+    }
+}
+
+/// Why [`present`] did not start a sheet.
+pub enum Refusal {
+    /// keeper's window is not the active one yet; try again shortly.
+    NotActive,
+    /// It will not start; the sentence is for the person.
+    Failed(String),
 }
 
 /// Start one sheet for `url`, whose callback comes back on `scheme`, and
@@ -156,13 +207,25 @@ pub fn present(
     scheme: &str,
     state: &str,
     flows: &Arc<OAuthFlowRegistry>,
-) -> Result<(), String> {
+) -> Result<(), Refusal> {
     let Some(main) = MainThreadMarker::new() else {
-        return Err("the sign-in sheet was asked for off the main thread".to_owned());
+        return Err(Refusal::Failed(
+            "the sign-in sheet was asked for off the main thread".to_owned(),
+        ));
     };
-    let window = window_of(webview)?;
-    let auth_url = NSURL::URLWithString(&NSString::from_str(url))
-        .ok_or("the identity provider's sign-in address is not a URL")?;
+    let window = window_of(webview).map_err(Refusal::Failed)?;
+    // The keyboard of a just-pasted setup link holds the window's attention;
+    // a sheet over it is refused. Dismissing it is what a tap elsewhere does.
+    let _ = window.endEditing(true);
+    let anchor_was = anchor_state(&window);
+    if !anchor_was.ready() {
+        return Err(Refusal::NotActive);
+    }
+    let window: Retained<NSObject> =
+        Retained::into_super(Retained::into_super(Retained::into_super(window)));
+    let auth_url = NSURL::URLWithString(&NSString::from_str(url)).ok_or_else(|| {
+        Refusal::Failed("the identity provider's sign-in address is not a URL".to_owned())
+    })?;
 
     let completion: RcBlock<dyn Fn(*mut NSURL, *mut NSError)> = {
         let flows = Arc::clone(flows);
@@ -244,7 +307,13 @@ pub fn present(
     let started = unsafe { session.start() };
     if !started {
         LIVE.with(|live| live.borrow_mut().remove(state));
-        return Err("the sign-in sheet could not start; try again with keeper in front".to_owned());
+        tracing::warn!(
+            ?anchor_was,
+            "web auth: Apple refused the sign-in sheet's window"
+        );
+        return Err(Refusal::Failed(
+            "the sign-in sheet could not start; try again with keeper in front".to_owned(),
+        ));
     }
     Ok(())
 }
