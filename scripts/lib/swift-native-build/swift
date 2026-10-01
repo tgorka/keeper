@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# `swift`, but `swift build` uses SwiftPM's native build system.
+#
+# Put on the front of PATH by scripts/install-ios.sh for the iOS build only.
+# Tauri's build script compiles its Swift bridge through swift-rs 1.0.7, which
+# runs `swift build --arch arm64` and passes the iOS SDK and target only through
+# `-Xswiftc`/`-Xcc`. Swift 6.4 (Xcode 27) made the Swift Build engine the
+# default, and that engine scans and links for the HOST: the bridge fails with
+# `ld: building for 'macOS', but linking in object file … aarch64-apple-ios`
+# and `'UIKit/NSAttributedString.h' file not found`. Measured on hesperia
+# 2026-10-01 with swift-rs's exact arguments: `--build-system native` builds,
+# the default does not. Delete this once swift-rs passes a real `--triple`.
+#
+# Every other `swift` invocation, and a `swift build` that names its own build
+# system, goes through untouched.
+set -euo pipefail
+if [ "${1:-}" = "build" ]; then
+  for arg in "$@"; do
+    case "$arg" in --build-system | --build-system=*) exec xcrun swift "$@" ;; esac
+  done
+  shift
+  exec xcrun swift build --build-system native "$@"
+fi
+exec xcrun swift "$@"
