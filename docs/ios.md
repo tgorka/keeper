@@ -122,7 +122,7 @@ takes the scene path only then, and with `false` it starts the app twice and abo
 
 In that lifecycle a `keeper://` link that **launches** keeper arrives only in the first
 scene's connection options, which upstream tao does not read. keeper builds tao from
-`tools/tao` (0.35.3 plus that one read; `tools/tao/NOTICE`), so scanning a setup code
+`tools/tao` (0.35.3 plus that read and a use-after-free fix on the same path; `tools/tao/NOTICE`), so scanning a setup code
 while keeper is closed still opens the setup confirmation. Check it after any tao bump:
 quit keeper, scan a setup QR with the Camera, and the confirmation must appear.
 

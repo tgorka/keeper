@@ -643,7 +643,12 @@ pub fn create_delegate_class() {
 
       // Dynamically set the delegate class name
       config.setDelegateClass(Some(super::scene::TaoSceneDelegate::class()));
-      Retained::as_ptr(&config) as _
+      // keeper: autoreleased, not `Retained::as_ptr(&config)`. That returned a
+      // pointer to an object `config`'s drop freed on the way out, and UIKit's
+      // `_connectUISceneFromFBSScene` then retained freed memory (SIGSEGV in
+      // `objc_retain`, kalypso, iOS 27.0). A method of the `none` family
+      // returns +0, which is exactly what autorelease gives.
+      Retained::autorelease_return(config) as _
     }
   }
 
