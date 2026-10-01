@@ -533,6 +533,10 @@ done
 # PlistBuddy prints an array as "Array {" / one indented item per line / "}".
 modes="\$(/usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "\$plist" 2>/dev/null | sed -n 's/^    //p' | paste -sd, -)"
 echo "  UIBackgroundModes:              \${modes:-(absent — an armed session would end when keeper leaves the front)}"
+# iOS 27 aborts an app without the UIScene lifecycle before its first frame,
+# and tao takes the scene path only with multiple scenes on (docs/ios.md).
+scenes="\$(/usr/libexec/PlistBuddy -c "Print :UIApplicationSceneManifest:UIApplicationSupportsMultipleScenes" "\$plist" 2>/dev/null || echo absent)"
+echo "  UIApplicationSceneManifest:     multiple scenes \$scenes\$([ "\$scenes" = true ] || echo ' — iOS 27 will not launch this build; check project.yml')"
 # The island (Story 65.5): the key, the extension and its point identifier,
 # each read off the bundle. An app with the key and no .appex has an
 # `Activity.request` that succeeds and a lock screen that draws nothing; an

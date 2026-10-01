@@ -109,6 +109,23 @@ identifier `dev.tgorka.keeper` is shared with the macOS build. Keeping the bundl
 stable matters for free signing: your on-device data is keyed to it, and it survives
 the weekly re-arm (see [The 7-day re-arm ritual](#the-7-day-re-arm-ritual)).
 
+### The UIScene lifecycle (iOS 27)
+
+iOS 27 does not launch an app that has not adopted the UIScene lifecycle: it stops it
+before the first frame with `EXC_BREAKPOINT` in
+`_UIApplicationEvaluateRuntimeIssueForNoSceneLifecycleAdoption` (kalypso, iOS 27.0,
+2026-10-01 — the icon opens and closes). `project.yml` therefore declares
+`UIApplicationSceneManifest` with `UIApplicationSupportsMultipleScenes: true` and no
+delegate class; tao answers with its own `TaoSceneDelegate`. The `true` is required: tao
+takes the scene path only then, and with `false` it starts the app twice and aborts.
+`install-ios.sh` prints the key from the installed bundle.
+
+In that lifecycle a `keeper://` link that **launches** keeper arrives only in the first
+scene's connection options, which upstream tao does not read. keeper builds tao from
+`tools/tao` (0.35.3 plus that one read; `tools/tao/NOTICE`), so scanning a setup code
+while keeper is closed still opens the setup confirmation. Check it after any tao bump:
+quit keeper, scan a setup QR with the Camera, and the confirmation must appear.
+
 ## Signing on a free Personal Team
 
 Any Apple ID — including a free one — automatically gets a **Personal Team**. That is
