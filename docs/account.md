@@ -383,11 +383,14 @@ Progress and the outcome appear in the same sheet, as one sentence.
 
 ### Adding a device or a person
 
-On a signed-in device, open Settings › Account › *Add a device or a person*. It shows the
-setup link as a QR code on a white card, the link itself, and *Copy link*. The descriptor
-is the same for everyone. A new person scans it, signs in as themselves, and keeper creates
-**their** directory from the template. A new device of yours scans it, and keeper registers
-the device in your directory.
+On a signed-in device, open Settings › Account › *Add a device or a person*, or
+*Add account* › *Show setup QR code…* in the sidebar (the drawer on a phone). Both open the
+same sheet: the setup link as a QR code with the keeper mark in the middle, on a white card,
+the link itself, and *Copy link*. The code is encoded at error-correction level H, so it
+still scans with the mark covering its centre; a link too long for level H gets a plain
+code instead. The descriptor is the same for everyone. A new person scans it, signs in as
+themselves, and keeper creates **their** directory from the template. A new device of yours
+scans it, and keeper registers the device in your directory.
 
 The link carries no secret (see *Security notes*). Sharing it grants nothing: access is
 decided by the identity provider's sign-in and the forge's permissions.

@@ -3262,7 +3262,8 @@ async fn rename_device(state: State<'_, AppState>, name: String) -> Result<Accou
     }))
 }
 
-/// The setup link for another device or another person, and its QR code.
+/// The setup link for another device or another person, and its QR code with
+/// the keeper mark in the middle.
 #[tauri::command]
 pub fn account_share() -> Result<AccountShareVm, IpcError> {
     let (d, source) = egress_inputs();
@@ -3270,7 +3271,7 @@ pub fn account_share() -> Result<AccountShareVm, IpcError> {
         return Err(refusal("No account is set up on this device."));
     };
     let link = descriptor::setup_link(&d, source.as_ref());
-    let qr_svg = keeper_core::bridges::login::qr_svg(&link);
+    let qr_svg = keeper_core::org_account::setup_qr::setup_qr_svg(&link);
     Ok(AccountShareVm { link, qr_svg })
 }
 
