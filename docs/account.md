@@ -405,7 +405,9 @@ whenever Settings opens.
 **The window.**
 - **macOS:** keeper opens the sign-in page in your default browser (Arc, Chrome, Safari…),
   and the browser hands the result back through the `keeper://` link — the first time, the
-  browser may ask whether to open keeper. Your browser's password manager, 1Password's
+  browser may ask whether to open keeper. keeper then comes to the front, and the browser
+  tab shows "You're signed in" and can be closed — a page cannot close the tab itself.
+  Your browser's password manager, 1Password's
   extension and its passkeys work there as on any site, and if you are already signed in to
   your organisation in that browser you are not asked again. A Matrix single sign-on opens in
   the same browser, so it rides on the same session.

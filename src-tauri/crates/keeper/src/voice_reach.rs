@@ -131,6 +131,13 @@ fn route_links(app: &AppHandle, urls: &[url::Url], oauth: &dyn Fn(&str) -> bool)
         }
         let handled = oauth(url.as_str());
         tracing::debug!(handled, "deep-link: received keeper:// URL");
+        // A sign-in that came back from the browser: bring keeper forward, so
+        // the person lands in the app rather than on the browser tab the
+        // identity provider left behind (a page cannot close that tab).
+        #[cfg(desktop)]
+        if handled {
+            crate::tray::show_main_window(app);
+        }
     }
 }
 
