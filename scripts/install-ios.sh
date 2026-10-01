@@ -504,6 +504,16 @@ if ! remote "$LAUNCH_CMD" 2>&1 | tee "$LAUNCH_LOG"; then
 fi
 rm -f "$LAUNCH_LOG"
 
+# A launch that devicectl accepted is not an app that runs: iOS 27 killed every
+# build without the UIScene lifecycle before its first frame, and this script
+# still said "running" (2026-10-01). So look again once it has had time to die.
+if [ -z "$LAUNCHED_BY_HAND" ]; then
+  sleep 8
+  if ! remote "xcrun devicectl device info processes --device $UDID 2>/dev/null | grep -q '/keeper.app/'"; then
+    fail "keeper started on $DEVICE_NAME and exited within seconds — a crash at launch. Its report: ssh $HOST 'mkdir -p /tmp/kcrash && xcrun devicectl device copy from --device $UDID --domain-type systemCrashLogs --source / --destination /tmp/kcrash && ls -t /tmp/kcrash | grep -i keeper | head -3' (docs/ios.md, The UIScene lifecycle)."
+  fi
+fi
+
 # --- 7. The proofs, from the bundle that was installed ----------------------------
 #
 # Each line below is read off the unpacked .app, not off this script's
