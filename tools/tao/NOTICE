@@ -27,7 +27,8 @@ The changes
 
 2. The launch URL. `src/platform_impl/ios/app_state.rs`, `connect_scene`: the
    first scene's `UISceneConnectionOptions.URLContexts` are emitted as
-   `Event::Opened`; `src/platform_impl/ios/scene.rs`: the parsing that
+   `Event::Opened` (read as optional: iOS 27.0 answers nil for a launch
+   without a URL, despite the nonnull header); `src/platform_impl/ios/scene.rs`: the parsing that
    `scene:openURLContexts:` already did moves into `urls_of`, shared by both.
    In the scene lifecycle a URL that launched the app arrives only there — not
    in `application:openURL:options:`, not in `scene:openURLContexts:` — and tao

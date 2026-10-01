@@ -537,7 +537,12 @@ pub unsafe fn connect_scene(scene: &UIScene, options: &UISceneConnectionOptions)
   // instead. Emitted after `on_app_ready()`, as that callback's was.
   // Later scenes keep theirs in the `SceneRequested` options above.
   if is_first_scene {
-    let urls = urls_of(&options.URLContexts());
+    // Optional on purpose: the header says nonnull, but iOS 27.0 answers nil
+    // for a launch without a URL, and objc2's non-optional binding then
+    // panics inside a UIKit callback, which is an abort (kalypso, 2026-10-01).
+    let contexts: Option<Retained<objc2_foundation::NSSet<objc2_ui_kit::UIOpenURLContext>>> =
+      objc2::msg_send![options, URLContexts];
+    let urls = contexts.map(|contexts| urls_of(&contexts)).unwrap_or_default();
     if !urls.is_empty() {
       handle_nonuser_event(EventWrapper::StaticEvent(Event::Opened { urls }));
     }
