@@ -147,7 +147,7 @@ fn window_of(
 /// What Apple's `start` checks the anchor against, read the same way: does
 /// the window have a scene, is that scene `foregroundActive` (0), is the
 /// window key. Logged when a sheet is refused, so a refusal names its cause.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct AnchorState {
     scene: bool,
     activation: isize,
@@ -308,7 +308,9 @@ pub fn present(
     if !started {
         LIVE.with(|live| live.borrow_mut().remove(state));
         tracing::warn!(
-            ?anchor_was,
+            scene = anchor_was.scene,
+            activation = anchor_was.activation,
+            key = anchor_was.key,
             "web auth: Apple refused the sign-in sheet's window"
         );
         return Err(Refusal::Failed(
