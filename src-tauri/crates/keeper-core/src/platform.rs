@@ -49,8 +49,9 @@ pub trait Platform: Send + Sync {
     fn open_url(&self, url: &str) -> Result<(), CoreError>;
 
     /// Present an authorization URL in the platform's auth session
-    /// (ASWebAuthenticationSession on Apple, non-ephemeral, so the identity
-    /// provider's cookies are shared with the default browser) (AD-311).
+    /// (ASWebAuthenticationSession on iOS, non-ephemeral, so the identity
+    /// provider's cookies are shared with Safari; the default browser on
+    /// every desktop, macOS included) (AD-311).
     ///
     /// `callback_scheme` is the redirect URI's scheme (`keeper` by default).
     /// The callback URL — or the person's cancellation — is delivered through

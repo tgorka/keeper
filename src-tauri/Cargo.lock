@@ -4231,7 +4231,6 @@ dependencies = [
  "keeper-sync",
  "keyring",
  "objc2",
- "objc2-app-kit",
  "objc2-authentication-services",
  "objc2-avf-audio",
  "objc2-foundation",

@@ -403,11 +403,17 @@ whenever Settings opens.
 ## Signing in
 
 **The window.**
-- **macOS and iOS:** keeper uses the system's web authentication session
-  (ASWebAuthenticationSession), which shares your default browser's sign-in. If you are
-  already signed in to your organisation in the browser, you see the system's "keeper wants
-  to sign in" alert and little else. Passkeys, iCloud Keychain and 1Password work there as
-  they do in the browser. keeper never uses an embedded web view.
+- **macOS:** keeper opens the sign-in page in your default browser (Arc, Chrome, Safari…),
+  and the browser hands the result back through the `keeper://` link — the first time, the
+  browser may ask whether to open keeper. Your browser's password manager, 1Password's
+  extension and its passkeys work there as on any site, and if you are already signed in to
+  your organisation in that browser you are not asked again. A Matrix single sign-on opens in
+  the same browser, so it rides on the same session.
+- **iOS:** keeper uses the system's web authentication session (ASWebAuthenticationSession),
+  a sheet inside keeper that shares Safari's sign-in. Passkeys, iCloud Keychain and
+  1Password work there as they do in the browser.
+- keeper never uses an embedded web view: a page inside keeper could not offer your
+  passkeys for the identity provider's site.
 - **Desktop, with a loopback redirect** (`redirect_uri = "http://127.0.0.1/callback"`, or a
   pinned port): keeper opens the default browser and listens on `127.0.0.1` for exactly one
   request.

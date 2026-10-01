@@ -157,9 +157,9 @@ mod voice_window;
 mod zero_egress;
 // The account sign-in's browser leg (Epic 82, AD-311): where a sheet's
 // outcome goes (every target, tested on Linux), and `ASWebAuthenticationSession`
-// itself on the two Apple targets.
+// itself on iOS. macOS signs in in the default browser (the port's default).
 mod web_auth;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_os = "ios")]
 mod web_auth_apple;
 
 #[cfg(desktop)]

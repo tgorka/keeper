@@ -1,9 +1,9 @@
-//! `ASWebAuthenticationSession`, macOS and iOS (Epic 82, AD-311).
+//! `ASWebAuthenticationSession`, iOS (Epic 82, AD-311).
 //!
-//! One module for both Apple targets: the class, its callback matcher and its
-//! presentation-anchor protocol are the same on each, and only the anchor
-//! differs — the main window's `NSWindow` on a Mac, its `UIWindow` on a
-//! phone. Everything here runs on the main thread: [`present`] is reached
+//! The sheet the account and Matrix sign-ins open over the main window's
+//! `UIWindow`. macOS used it too until the Mac moved to the default browser:
+//! there it was a separate Safari window whatever the person's browser was.
+//! Everything here runs on the main thread: [`present`] is reached
 //! from `with_webview`'s closure and [`cancel_all`] from `run_on_main_thread`,
 //! and the table of live sheets is a main-thread `thread_local` for that
 //! reason.
@@ -27,7 +27,7 @@
 //!
 //! Every objc2 call below that the bindings mark `unsafe` sits in one of this
 //! file's function-level `#[allow(unsafe_code)]` items — the `anchor` module
-//! (the class definition), [`window_of`] (one per target), [`present`],
+//! (the class definition), [`window_of`], [`present`],
 //! [`is_session_error`] and [`cancel_all`] — each with a `// SAFETY:`
 //! comment, and all are listed in the audit inventory in
 //! `docs/constraints-and-limitations.md`.
@@ -119,24 +119,6 @@ thread_local! {
 }
 
 /// The main window's native window, as the anchor type the protocol returns.
-#[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
-fn window_of(webview: &tauri::webview::PlatformWebview) -> Result<Retained<NSObject>, String> {
-    use objc2_app_kit::NSWindow;
-
-    let window = webview.ns_window();
-    // SAFETY: on macOS `ns_window()` is the `NSWindow` tao created for this
-    // webview's window, alive while the window is — and the caller is inside
-    // `with_webview` on that window. `retain` takes our own strong reference
-    // (and answers `None` for a null pointer), so the sheet's anchor outlives
-    // the borrow.
-    let window: Retained<NSWindow> = unsafe { Retained::retain(window.cast::<NSWindow>()) }
-        .ok_or("the main window has no native window to open the sign-in sheet over")?;
-    Ok(Retained::into_super(Retained::into_super(window)))
-}
-
-/// The main window's native window, as the anchor type the protocol returns.
-#[cfg(target_os = "ios")]
 #[allow(unsafe_code)]
 fn window_of(webview: &tauri::webview::PlatformWebview) -> Result<Retained<NSObject>, String> {
     use objc2_ui_kit::UIViewController;

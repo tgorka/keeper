@@ -129,25 +129,17 @@ objc2 = "0.6"
 objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKPDFConfiguration"] }
 block2 = "0.6"
 # The account sign-in sheet (Epic 82, AD-311): `ASWebAuthenticationSession`,
-# presented from `crates/keeper/src/web_auth_apple.rs` on macOS and iOS — the
-# only new crate of the epic's shell half. `Zlib OR Apache-2.0 OR MIT` (0.3.2),
-# passes the cargo-deny license firewall. No default features: the list names
-# exactly the session, its callback matcher and the presentation-anchor
-# protocol; on macOS it pulls `objc2-app-kit` (already in the tree) for the
-# `NSWindow` anchor, and nothing else.
+# presented from `crates/keeper/src/web_auth_apple.rs` on iOS (macOS signs in
+# in the default browser) — the only new crate of the epic's shell half.
+# `Zlib OR Apache-2.0 OR MIT` (0.3.2), passes the cargo-deny license firewall.
+# No default features: the list names exactly the session, its callback
+# matcher and the presentation-anchor protocol, and nothing else.
 objc2-authentication-services = { version = "0.3.2", default-features = false, features = [
     "std",
     "block2",
     "ASFoundation",
     "ASWebAuthenticationSession",
     "ASWebAuthenticationSessionCallback",
-] }
-# The macOS presentation anchor for that sheet: the main window's `NSWindow`.
-# Already in the tree through tao/muda; only the direct name is new.
-objc2-app-kit = { version = "0.3.2", default-features = false, features = [
-    "std",
-    "NSResponder",
-    "NSWindow",
 ] }
 objc2-foundation = { version = "0.3", features = [
     "NSURL",
