@@ -86,6 +86,11 @@ BUNDLE_ID="$(keeper_bundle_id)"
 # found` for exactly that reason, so the same PATH is exported inside the
 # dispatched payload below.
 REMOTE_ENV='export PATH="$HOME/.bun/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"'
+# First on PATH: a `swift` whose `swift build` uses SwiftPM's native build
+# system. Swift 6.4 (Xcode 27) defaults to the Swift Build engine, which links
+# Tauri's iOS bridge (built through swift-rs) for macOS and fails; the shim's
+# header has the measurement. It travels with the rsynced tree.
+REMOTE_ENV="$REMOTE_ENV && export PATH=\"\$HOME/$REMOTE_DIR/scripts/lib/swift-native-build:\$PATH\""
 # The commit the rsynced source came FROM, stated as a file inside the tree
 # before the rsync carries it over. Why a stamp and not a probe on the Mac, and
 # why a FILE rather than only the env (which does not survive every hop of the
