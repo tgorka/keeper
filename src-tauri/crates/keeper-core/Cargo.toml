@@ -93,6 +93,15 @@ base64 = { workspace = true }
 # it drags in neither tauri nor gix, so `check:core-tauri-free` and
 # `check:core-sync-free` stay green. MIT OR Apache-2.0.
 unicode-normalization = { workspace = true }
+# Upstream code rewritten in Rust (Epic 89, AD-396): BMAD's customization
+# merge feeds `agents::soul::soul_from_bmad`, agentskills' validator feeds
+# `agents::skills`. A pure path crate — no network, no runtime, no tauri.
+keeper-ported = { path = "../keeper-ported" }
+# Digests of an agent's composed prompt and memory snapshot, and the session
+# log's blob names (Epic 89, AD-363, AD-366). Both already resolved in
+# Cargo.lock for keeper-sync's LFS hashing, so the tree gains no package.
+sha2 = { workspace = true }
+hex = { workspace = true }
 # OTLP protobuf wire encoding for the closed consent-gated observability schema.
 # Already resolved via Matrix; no arbitrary tracing subscriber is exported.
 prost = "0.14"

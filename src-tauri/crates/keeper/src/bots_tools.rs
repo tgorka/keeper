@@ -430,7 +430,8 @@ fn write_through(
             .sessions
             .as_ref()
             .map(|sessions| sessions.subfolder.as_str()),
-    );
+    )
+    .with_agents(profile.agents.as_ref().map(|a| a.subfolder.as_str()));
 
     let route =
         match bots_fs::plan_write(&scope, vault.clone(), profile.local_path.as_path(), subpath) {
