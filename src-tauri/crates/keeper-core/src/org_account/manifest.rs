@@ -79,6 +79,8 @@ pub struct DriveRecord {
     pub tasks: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voices: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excludes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -490,6 +492,7 @@ pub fn offers(
                     sessions: drive.sessions.clone(),
                     tasks: drive.tasks.clone(),
                     voices: drive.voices.clone(),
+                    agents: drive.agents.clone(),
                     excludes: drive.excludes.clone(),
                     lfs_threshold_bytes: drive.lfs_threshold_bytes,
                     virtual_patterns: drive.virtual_patterns.clone(),

@@ -374,6 +374,7 @@ fn drive_record(profile: &SyncProfile, remote_url: String, credential: &str) -> 
         sessions: profile.sessions.as_ref().map(|role| role.subfolder.clone()),
         tasks: profile.tasks.as_ref().map(|role| role.subfolder.clone()),
         voices: profile.voices.as_ref().map(|role| role.subfolder.clone()),
+        agents: profile.agents.as_ref().map(|role| role.subfolder.clone()),
         excludes: profile.excludes.clone(),
         lfs_threshold_bytes: Some(profile.lfs_threshold_bytes),
         virtual_patterns: Some(profile.virtual_patterns.clone()),
@@ -721,7 +722,8 @@ mod tests {
             "commitSubjectTemplate": "",
             "notes": { "subfolder": "vault" },
             "tasks": { "subfolder": "ledger" },
-            "voices": { "subfolder": "people/voices" }
+            "voices": { "subfolder": "people/voices" },
+            "agents": { "subfolder": "80-agents" }
         }))
         .expect("profile");
         let remote = manifest::portable_remote(&profile.remote_url).expect("a network remote");
@@ -734,6 +736,7 @@ mod tests {
         assert_eq!(record.recordings, None);
         assert_eq!(record.sessions, None);
         assert_eq!(record.voices.as_deref(), Some("people/voices"));
+        assert_eq!(record.agents.as_deref(), Some("80-agents"));
         assert_eq!(record.excludes, vec!["*.tmp".to_owned()]);
         assert_eq!(record.commit_subject_template, None);
         assert!(record.devices.is_empty());

@@ -303,6 +303,7 @@ function repoPrefill(
     notes: null,
     recordings: null,
     voices: null,
+    agents: null,
     sessions: null,
     tasks: null,
     excludes: [],

@@ -1,0 +1,43 @@
+# The architecture's Nixi example (ARCHITECTURE-AGENTS.md, `<agent>/agent.toml`) with one change: [model].bot is bot:ollama:… rather than bot:openai:….
+version     = 1
+id          = "nixi"
+name        = "Nixi"
+kind        = "proxy"
+matrix_user = "@nixi:example.org"
+human       = "@tgorka:example.org"
+
+[model]
+bot        = "bot:ollama:http://electra.example.org:11434#qwen3:32b"
+local_only = false
+
+[tools]
+allow  = ["drive_list", "drive_read", "drive_glob", "drive_grep", "drive_stat", "drive_search",
+          "delegate", "reply", "surface_open", "surface_highlight", "surface_point",
+          "surface_scroll", "surface_propose_edit", "journal_append", "memory_propose",
+          "skills_list", "skill_view"]
+drives = ["tgdrive", "neuradrive"]
+mcp    = []
+skills = ["*"]
+
+[[menu]]
+code        = "TR"
+description = "Triage what came in today"
+workflow    = "triage"
+
+[host]
+needs            = []
+pin              = ""
+prefer_always_on = true
+
+[limits]
+rounds_per_turn        = 8
+tokens_per_turn        = 0
+tokens_per_delegation  = 200000
+hop_limit              = 3
+rounds_per_exchange    = 3
+max_concurrent_sessions = 4
+
+[memory]
+nudge_user_turns      = 10
+nudge_tool_iterations = 15
+promote               = true

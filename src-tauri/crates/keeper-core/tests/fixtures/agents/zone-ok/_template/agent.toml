@@ -1,0 +1,8 @@
+version     = 1
+id          = "{{id}}"
+name        = "{{name}}"
+kind        = "specialist"
+matrix_user = "@{{id}}:example.org"
+
+[model]
+bot = "bot:ollama:http://electra.example.org:11434#qwen3:32b"
