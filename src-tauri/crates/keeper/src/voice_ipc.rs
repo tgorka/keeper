@@ -297,8 +297,8 @@ fn transition(event: TurnEvent) {
 
 /// Whether the stream's events are this turn's to act on: it is waiting for
 /// the answer, or already reading it aloud while the rest streams (Epic 68,
-/// AD-214). A typed conversation's stream is never fed here (`bots_ipc`
-/// gates on `turn.spoken`), so no other turn can be in either state.
+/// AD-214). A typed conversation's stream is never fed here (`agent_ports`
+/// wraps only a spoken turn in its `SpokenSink`), so no other turn can be in either state.
 fn owns_answer(turn: &Turn) -> bool {
     turn.awaiting_send() || matches!(turn.state(), TurnState::Speaking)
 }
@@ -398,19 +398,12 @@ pub fn note_answer_chunk(after_ms: u64) {
     }
 }
 
-#[cfg(test)]
-pub(crate) static TEST_SPOKEN: Mutex<Option<String>> = Mutex::new(None);
-
 /// The language a send made right now is asked in, when it belongs to a
 /// voice turn (Epic 64, AD-182): the listening locale in force —
 /// `wake_vm`'s own expression — while `Turn::awaiting_send`, otherwise
 /// `None`. The bots adapter reads it to decide whether the per-turn
 /// instruction goes on the request; the rule is the turn's, read once.
 pub fn spoken_turn(data_dir: &std::path::Path) -> Option<String> {
-    #[cfg(test)]
-    if let Some(language) = TEST_SPOKEN.lock().ok().and_then(|held| held.clone()) {
-        return Some(language);
-    }
     let port = {
         let voice = voice();
         if !voice.turn.awaiting_send() {

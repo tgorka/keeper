@@ -1,12 +1,10 @@
-//! The shell's [`ToolHost`]: where the three halves of a drive tool call meet
+//! The drive [`ToolHost`]: where the three halves of a drive tool call meet
 //! (Story 61.11, FR-388, FR-389, NFR-47).
 //!
 //! # There is no decision in this file, by rule
 //!
-//! This crate does not build on a Linux developer machine, so anything decided
-//! here is decided somewhere nobody can test it until macOS (AD-55, AD-56).
-//! So every question a tool call raises is answered elsewhere and this module
-//! only sequences the answers:
+//! Every question a tool call raises is answered elsewhere and this module
+//! only sequences the answers (AD-55, AD-56):
 //!
 //! | question | answered by | crate |
 //! |---|---|---|
@@ -35,28 +33,187 @@
 //!
 //! # What the approval port is for
 //!
-//! `grant::check` can answer [`GrantVerdict::Ask`], and asking is a UI act this
+//! `grant::check` can answer [`GrantVerdict::Ask`], and asking is an act this
 //! crate cannot perform from inside a blocking tool call. So the ask is a
-//! **port**: [`DriveToolHost::approve`] is supplied by whoever built the host.
-//! `bots_ipc::approver` fills it in for a live turn — it sends the ask down the
-//! stream channel and blocks until `bots_approval_answer` names it — and Story
-//! 61.10's approval sheet is the other end. A host built with no approver
-//! declines every ask, which is the safe direction — a missing UI must never
-//! read as consent.
+//! **port**: [`DriveToolHost::approve`] is built from the host process's
+//! [`ApprovalPort`] — the app's is [`crate::approval::SinkApprover`], which
+//! sends the ask down the turn's own stream, typed or spoken, and blocks
+//! until the approval sheet answers. A host built with no approver
+//! refuses every ask with [`UNATTENDED_REFUSAL`], which is the safe direction
+//! — a missing person must never read as consent.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use keeper_core::bots::audit::{self, AuditIntent, AuditOutcome};
-use keeper_core::bots::context_files::{self, LoadedContext};
+use keeper_core::bots::chat::CancelSignal;
+use keeper_core::bots::context_files::{self, ContextBundle, LoadedContext};
 use keeper_core::bots::error::BotsError;
-use keeper_core::bots::grant::{self, GrantVerdict, ToolTarget};
+use keeper_core::bots::grant::{self, Grant, GrantVerdict, ToolTarget};
 use keeper_core::bots::tools::{
     self, EntryLine, ToolArgs, ToolCall, ToolHost, ToolName, ToolOutcome,
 };
+use keeper_core::vm::BotApprovalRequestVm;
 use keeper_sync::bots_fs::{self, FileRead, FsRefusal, Limits, LineRange};
 use keeper_sync::files_write::WriteRoute;
 use keeper_sync::SyncProfile;
+
+use crate::ports::{ApprovalPort, VaultWriter};
+use crate::turn::{new_id, now_ms, DrivePorts};
+
+/// What a tool call that needs a person's approval answers when there is no
+/// person to ask (F12). The model reads it, prefixed `Refused: `, as the
+/// call's result, and the audit row closes `refused`.
+pub const UNATTENDED_REFUSAL: &str = "This needs a person's approval, and there is no one here to ask, so keeper did not do it. Nothing was changed.";
+
+/// What the drive contributes to one turn, decided while arming it.
+pub struct ArmedDrive {
+    /// The profiles a tool call may name. Empty where there is no drive.
+    pub profiles: Vec<SyncProfile>,
+    /// The bundle the model is shown, when tools were offered and the drive
+    /// could read one. `None` is "keeper does not know", never "none".
+    pub context: Option<ContextBundle>,
+    /// How to build the host once the turn's task exists.
+    pub host: Box<dyn TurnHost>,
+}
+
+impl ArmedDrive {
+    /// The build without a drive: no profiles, no context, a refusing host.
+    pub fn none() -> Self {
+        Self {
+            profiles: Vec::new(),
+            context: None,
+            host: Box::new(NoDrive),
+        }
+    }
+}
+
+/// The ids a host's audit rows and approval sheet name.
+pub struct HostIds {
+    /// Where `keeper.db` lives.
+    pub data_dir: PathBuf,
+    /// The provider.
+    pub provider_id: String,
+    /// The bot.
+    pub bot_id: String,
+    /// The conversation, for the audit row.
+    pub session_id: String,
+    /// The assistant message these calls belong to, where there is one.
+    pub message_id: Option<String>,
+}
+
+/// How a turn makes the host its tool calls run against.
+///
+/// A method rather than a value on [`ArmedDrive`] because the cancel signal an
+/// approval waits on exists only inside the spawned task.
+pub trait TurnHost: Send + Sync {
+    /// Build the host over `profiles`.
+    fn host(
+        &self,
+        ids: HostIds,
+        profiles: Vec<SyncProfile>,
+        signal: CancelSignal,
+    ) -> Box<dyn ToolHost>;
+}
+
+/// The drive port on a host with no drive.
+///
+/// Holds no profiles, loads no context, and refuses every call by name —
+/// which `tools::offer_tools` makes unreachable in practice, since a grant
+/// cannot be created where `CapabilitiesVm.botTools` is false. The refusal
+/// exists so that a model which calls a tool anyway gets a sentence rather
+/// than a panic.
+pub struct NoDrive;
+
+impl TurnHost for NoDrive {
+    fn host(&self, _: HostIds, _: Vec<SyncProfile>, _: CancelSignal) -> Box<dyn ToolHost> {
+        Box::new(NoDrive)
+    }
+}
+
+impl ToolHost for NoDrive {
+    fn run(&self, call: &ToolCall) -> Result<ToolOutcome, BotsError> {
+        Ok(ToolOutcome::Refused {
+            reason: format!(
+                "{} needs the drive, and this build of keeper has none: the drive tools live on the Mac.",
+                call.name.as_wire()
+            ),
+        })
+    }
+}
+
+/// The drive port on a host with a drive: the vault writer and the approval
+/// port, held until the turn's task exists and the host can be built.
+pub struct DriveTurnHost {
+    vault: Option<Arc<dyn VaultWriter>>,
+    approval: Option<Arc<dyn ApprovalPort>>,
+}
+
+impl TurnHost for DriveTurnHost {
+    fn host(
+        &self,
+        ids: HostIds,
+        profiles: Vec<SyncProfile>,
+        signal: CancelSignal,
+    ) -> Box<dyn ToolHost> {
+        let approve = self.approval.as_ref().map(|port| {
+            approver(
+                Arc::clone(port),
+                signal,
+                ids.provider_id.clone(),
+                ids.bot_id.clone(),
+            )
+        });
+        Box::new(DriveToolHost {
+            data_dir: ids.data_dir,
+            provider_id: ids.provider_id,
+            bot_id: Some(ids.bot_id),
+            session_id: ids.session_id,
+            message_id: ids.message_id,
+            profiles,
+            vault: self.vault.clone(),
+            approve,
+        })
+    }
+}
+
+/// The approver one turn's host calls: compose the ask and hand it to the port.
+fn approver(
+    port: Arc<dyn ApprovalPort>,
+    signal: CancelSignal,
+    provider_id: String,
+    bot_id: String,
+) -> Arc<Approver> {
+    Arc::new(move |call: &ToolCall, reason: &str| -> bool {
+        let request =
+            BotApprovalRequestVm::compose(&new_id(), &provider_id, Some(&bot_id), call, reason);
+        port.ask(request, &signal)
+    })
+}
+
+/// Arm the drive half of one turn.
+///
+/// Two reads, and one decision that is `keeper-core`'s: the sync profiles,
+/// then — only when `offered` says tools went in the request — the context
+/// files [`context_files::context_targets`] picks from the live grants,
+/// loaded through [`load_context`] and merged into the bundle the model is
+/// shown.
+pub fn arm_drive(ports: &DrivePorts, grants: &[Grant], offered: bool) -> ArmedDrive {
+    let profiles = ports.profiles.profiles();
+    let context = offered.then(|| {
+        let profile_ids: Vec<&str> = profiles.iter().map(|profile| profile.id.as_str()).collect();
+        let targets = context_files::context_targets(grants, &profile_ids);
+        context_files::merge(load_context(&profiles, &targets))
+    });
+    ArmedDrive {
+        profiles,
+        context,
+        host: Box::new(DriveTurnHost {
+            vault: ports.vault.clone(),
+            approval: ports.approval.clone(),
+        }),
+    }
+}
 
 /// The caps, taken from `keeper-core` and never restated here.
 ///
@@ -77,7 +234,7 @@ fn limits() -> Limits {
 /// Asked when a grant says a write needs a person. `true` is consent.
 pub type Approver = dyn Fn(&ToolCall, &str) -> bool + Send + Sync;
 
-/// The shell's filesystem tool host for one conversation.
+/// The filesystem tool host for one conversation.
 ///
 /// Holds the profiles by value rather than an `Engine` handle for the same
 /// reason `browse` takes a `&SyncProfile`: a host that could reach the engine
@@ -95,7 +252,11 @@ pub struct DriveToolHost {
     pub message_id: Option<String>,
     /// The profiles a call may name.
     pub profiles: Vec<SyncProfile>,
-    /// The approval port. `None` declines every ask.
+    /// How a write inside a notes vault lands. `None` routes every write as
+    /// outside any vault.
+    pub vault: Option<Arc<dyn VaultWriter>>,
+    /// The approval port. `None` refuses every ask with
+    /// [`UNATTENDED_REFUSAL`].
     pub approve: Option<Arc<Approver>>,
 }
 
@@ -104,13 +265,6 @@ impl DriveToolHost {
         self.profiles
             .iter()
             .find(|profile| profile.id == profile_id)
-    }
-
-    /// Ask the person, or decline for want of anyone to ask.
-    fn ask(&self, call: &ToolCall, reason: &str) -> bool {
-        self.approve
-            .as_ref()
-            .is_some_and(|approve| approve(call, reason))
     }
 }
 
@@ -185,11 +339,16 @@ impl ToolHost for DriveToolHost {
         match &verdict {
             GrantVerdict::Allow { .. } => {}
             GrantVerdict::Ask { reason, .. } => {
-                if !self.ask(call, reason) {
+                // No one to ask is not a "no": the model is told there was
+                // nobody here, while a person's no keeps the grant's sentence.
+                let refusal = match &self.approve {
+                    None => Some(UNATTENDED_REFUSAL.to_owned()),
+                    Some(approve) if !approve(call, reason) => Some((*reason).to_owned()),
+                    Some(_) => None,
+                };
+                if let Some(reason) = refusal {
                     close(AuditOutcome::Refused, None, false);
-                    return Err(BotsError::GrantDenied {
-                        reason: (*reason).to_owned(),
-                    });
+                    return Err(BotsError::GrantDenied { reason });
                 }
             }
             GrantVerdict::Deny { reason } => {
@@ -202,7 +361,7 @@ impl ToolHost for DriveToolHost {
 
         // Step 4 — the effect. Every arm below is one `bots_fs` call plus the
         // projection into the vocabulary the model reads.
-        let outcome = perform(profile, call);
+        let outcome = perform(profile, self.vault.as_deref(), call);
 
         // Step 5 — the outcome, with the numbers.
         match &outcome {
@@ -228,7 +387,11 @@ impl ToolHost for DriveToolHost {
 }
 
 /// The dispatch. One arm per verb, each one call into `keeper-sync`.
-fn perform(profile: &SyncProfile, call: &ToolCall) -> Result<ToolOutcome, BotsError> {
+fn perform(
+    profile: &SyncProfile,
+    vault: Option<&dyn VaultWriter>,
+    call: &ToolCall,
+) -> Result<ToolOutcome, BotsError> {
     let root = profile.local_path.as_path();
     let subpath = call.target.subpath.as_str();
     let limits = limits();
@@ -384,7 +547,7 @@ fn perform(profile: &SyncProfile, call: &ToolCall) -> Result<ToolOutcome, BotsEr
                     reason: "drive_write needs a \"content\" argument.".to_owned(),
                 });
             };
-            write_through(profile, subpath, &content, &limits)
+            write_through(profile, vault, subpath, &content, &limits)
         }
         ToolName::Edit => {
             let (Some(old_text), Some(new_text)) = (old_text, new_text) else {
@@ -402,7 +565,7 @@ fn perform(profile: &SyncProfile, call: &ToolCall) -> Result<ToolOutcome, BotsEr
                 // One writer for both verbs: an edit is not a second way to
                 // put bytes on the drive, it is a way to compose the bytes a
                 // write puts there.
-                Ok(next) => write_through(profile, subpath, &next, &limits),
+                Ok(next) => write_through(profile, vault, subpath, &next, &limits),
                 Err(refusal) => refused(refusal),
             }
         }
@@ -410,9 +573,14 @@ fn perform(profile: &SyncProfile, call: &ToolCall) -> Result<ToolOutcome, BotsEr
 }
 
 /// The routed write: `WriteScope::route` picks the writer, and the vault arm
-/// carries the live vault so it cannot be reached without one (AD-102).
+/// is reachable only where the host's vault port names a live vault (AD-102).
+///
+/// The vault is looked up here, and again by [`VaultWriter::write`] when the
+/// bytes land: a vault unregistered in between fails the write rather than
+/// writing through a stale handle.
 fn write_through(
     profile: &SyncProfile,
+    vault: Option<&dyn VaultWriter>,
     subpath: &str,
     content: &str,
     limits: &Limits,
@@ -420,28 +588,25 @@ fn write_through(
     // The LIVE vault and the scope built from it, in one lookup — the same
     // rule `sync_ipc::vault_and_scope` states: a scope built from
     // `profile.notes` claims a writability the registry may not have.
-    let vault = crate::notes_vault::vault(&profile.id);
-    let scope = keeper_sync::files_write::WriteScope::new(
-        &profile.name,
-        vault.as_ref().map(|vault| vault.config.subfolder.as_str()),
-    )
-    .with_sessions(
-        profile
-            .sessions
-            .as_ref()
-            .map(|sessions| sessions.subfolder.as_str()),
-    )
-    .with_agents(profile.agents.as_ref().map(|a| a.subfolder.as_str()));
+    let subfolder = vault.and_then(|vault| vault.subfolder(&profile.id));
+    let scope = keeper_sync::files_write::WriteScope::new(&profile.name, subfolder.as_deref())
+        .with_sessions(
+            profile
+                .sessions
+                .as_ref()
+                .map(|sessions| sessions.subfolder.as_str()),
+        )
+        .with_agents(profile.agents.as_ref().map(|a| a.subfolder.as_str()));
 
-    let route =
-        match bots_fs::plan_write(&scope, vault.clone(), profile.local_path.as_path(), subpath) {
-            Ok(route) => route,
-            Err(refusal) => {
-                return Ok(ToolOutcome::Refused {
-                    reason: refusal.to_string(),
-                })
-            }
-        };
+    let live = subfolder.as_ref().and(vault);
+    let route = match bots_fs::plan_write(&scope, live, profile.local_path.as_path(), subpath) {
+        Ok(route) => route,
+        Err(refusal) => {
+            return Ok(ToolOutcome::Refused {
+                reason: refusal.to_string(),
+            })
+        }
+    };
 
     match route {
         WriteRoute::Vault { vault, path } => {
@@ -454,13 +619,9 @@ fn write_through(
                     ),
                 });
             }
-            crate::notes_vault::write_vault_file(&vault, path.as_str(), content).map_err(
-                |error| BotsError::Tool {
-                    detail: error.to_string(),
-                },
-            )?;
-            crate::notes_vault::touch(&vault.id, vec![path.as_str().to_owned()]);
-            crate::notes_vault::mark_dirty(&vault.id);
+            vault
+                .write(&profile.id, path.as_str(), content)
+                .map_err(|detail| BotsError::Tool { detail })?;
             Ok(ToolOutcome::Wrote {
                 subpath: subpath.to_owned(),
                 bytes,
@@ -520,14 +681,4 @@ pub fn load_context(profiles: &[SyncProfile], targets: &[ToolTarget]) -> Vec<Loa
             }
         })
         .collect()
-}
-
-/// Milliseconds since the Unix epoch. Falls back to zero rather than panicking:
-/// a clock before 1970 must not be what stops an audit row being written.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|since| i64::try_from(since.as_millis()).ok())
-        .unwrap_or_default()
 }

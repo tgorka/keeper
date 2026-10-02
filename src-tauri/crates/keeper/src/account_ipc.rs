@@ -3573,7 +3573,7 @@ pub fn account_offer_add_provider(state: State<'_, AppState>, key: String) -> Re
             .map_err(|error| refusal(format!("{}: {error}", bot.target)))?;
     }
     let provider = Provider {
-        id: crate::bots_ipc::new_id(),
+        id: keeper_agent::turn::new_id(),
         kind,
         name: record.name.clone(),
         base_url,

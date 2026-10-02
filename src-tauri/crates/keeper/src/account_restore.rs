@@ -724,7 +724,7 @@ fn add_provider_state(
         .map_err(|error| format!("{}: {error}", state.base_url))?
         .normalized;
     let provider = Provider {
-        id: crate::bots_ipc::new_id(),
+        id: keeper_agent::turn::new_id(),
         kind,
         name: state.name.clone(),
         base_url,
@@ -781,7 +781,7 @@ pub(crate) fn add_provider(
             store::insert_bot(
                 data_dir,
                 &Bot {
-                    id: crate::bots_ipc::new_id(),
+                    id: keeper_agent::turn::new_id(),
                     provider_id: provider.id.clone(),
                     target,
                     name,

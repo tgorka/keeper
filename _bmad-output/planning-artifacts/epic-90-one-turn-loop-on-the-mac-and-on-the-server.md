@@ -52,7 +52,7 @@ Round 2 (2026-10-01):
 | Need | Verdict | Evidence |
 | --- | --- | --- |
 | A turn loop outside the shell | **absent; in the shell, tauri-bound** | `open_turn`/`arm_turn`/`spawn_turn`/`drive`/`close` (`keeper/src/bots_ipc.rs:1132-1984`), `LiveStream` holding a tauri `JoinHandle` (`:931-933`), the tool host (`bots_tools.rs`, which "does not build on a Linux developer machine", `:6-7`), and a second copy of arming in the task runner (`bot_task.rs:109`; D1 §1, §12.1). |
-| Which turns are spoken | **decided inside `arm_turn` from voice state** | `crate::voice_ipc::spoken_turn(dir)` (`bots_ipc.rs:1173`, `voice_ipc.rs:406`) asks the voice turn whether it awaits a send, whatever the entry point. `TurnOrigin` has no code (AD-224; D1 §1). |
+| Which turns are spoken | **decided inside `arm_turn` from voice state** | `crate::voice_ipc::spoken_turn(dir)` (`bots_ipc.rs:1175`, `voice_ipc.rs:406`) asks the voice turn whether it awaits a send, whatever the entry point. `TurnOrigin` has no code (AD-224; D1 §1). |
 | A safe sessions runtime | **absent; two false claims** | `sessions_exec.rs:4-10` promises a per-zone `Mutex` and resume on registry start. Neither exists: `run` calls `resume()` of whatever journal it finds (`:46-60`), and nothing else calls `resume` (D2 §1). |
 | An idempotent create | **absent** | `sessions_create` mints its own ULID (`sessions_ipc.rs:873`). Rows come from a scan coalesced over `COALESCE_WINDOW` (400 ms, `sessions_root.rs:47`) in the scanner's loop (`spawn_scanner`, `:172-205`); `rescan` (`:316`) asks for one. |
 | XDG and secrets for a daemon | **present, in a bin crate** | `keeper-syncd/src/platform.rs:56-257`: `xdg_dir`, `home_dir`, `env_var_name`, `secret_file_name`, `trim_secret`, `check_secret_permissions`; `SECRET_ENV_PREFIX = "KEEPER_SYNC_SECRET_"` (`:38`), with secrets under `$XDG_CONFIG_HOME/keeper-sync/secrets/` (`:163-166`). |
@@ -146,7 +146,7 @@ Each is flagged for the coordinator; none is silent.
 
 - **C1 — `TurnOrigin` lands with three arms; `Agent` comes with its caller.**
   - 90.1 adds `TurnOrigin { Typed, Spoken { language }, Task }`, as D1 §4 lists. `Agent { session }` (AD-367's fourth arm) is added in 90.5 with its first caller: an unused arm in a no-behaviour-change rung is dead code. Epic 91–93 cites it as 90.5's.
-  - **The shell computes the origin at each entry from `voice_ipc::spoken_turn(dir)`.** That is exactly what `arm_turn` reads today (`bots_ipc.rs:1173`), because spokenness is the voice turn's answer, not the entry point's.
+  - **The shell computes the origin at each entry from `voice_ipc::spoken_turn(dir)`.** That is exactly what `arm_turn` reads today (`bots_ipc.rs:1175`), because spokenness is the voice turn's answer, not the entry point's. **As built (ruling D7):** the shell passes an `origin_of` closure that `arm_turn` calls at that same point, so the read keeps its timing (after the endpoint, the identity probe and the row writes).
 - **C2 — agent turns do not go through `open_turn`.**
   - `open_turn` stores and replays `keeper.db` rows (AD-154 kept for ⌘9).
   - An agent turn (90.5) uses `turn::arm_turn(origin: Agent{session})` and `run_tool_loop_reporting`, as the task runner does. Its lines go to the log.
@@ -216,7 +216,7 @@ Conventions as Epic 89's *Stories*:
     - `[lints] workspace = true`.
   - `src/lib.rs`.
   - **`src/ports.rs`**, with the ports exactly as D1 §4 prints them:
-    - `TurnSink { fn event(&self, e: BotStreamEvent) -> bool; fn request_sent(&self) {} fn ended(&self, end: TurnEnd) {} }`;
+    - `TurnSink { fn event(&self, e: BotStreamEvent) -> bool; fn request_sent(&self) {} fn answer_text(&self, text: &str) {} fn ended(&self, end: TurnEnd) {} }` — `answer_text` carries model prose only, so the round separator never reaches the spoken turn's segmenter (ruling D8);
     - `TurnEnd { Complete, Stopped, Failed(String) }`;
     - `ApprovalPort { fn ask(&self, req: BotApprovalRequestVm, signal: &CancelSignal) -> bool }`;
     - `VaultWriter { fn subfolder(&self, profile_id: &str) -> Option<String>; fn write(&self, profile_id: &str, rel: &str, text: &str) -> Result<(), String> }`;
@@ -243,7 +243,7 @@ Conventions as Epic 89's *Stories*:
     - `ChannelSink(Channel<BotStreamEvent>)`;
     - `SpokenSink`, holding a `Segmenter` and the voice calls now inline at `bots_ipc.rs:1764-1795` and `:1946-1957`;
     - `EventSink(AppHandle)`, for `send_spoken`, removing its serialise/deserialise round trip (`:1358-1370`);
-    - `ChannelApprover`, the existing `asks()`/`approver`, `bots_drive_ipc.rs:147-209`, unchanged, `block_in_place` included;
+    - `ChannelApprover`, the existing `asks()`/`approver`, `bots_drive_ipc.rs:147-209`, unchanged, `block_in_place` included. **As built:** it is `keeper_agent::approval::SinkApprover` over an `Arc<dyn TurnSink>`, with `approval::answer` behind `bots_approval_answer`; every entry point builds it over the sink its turn streams into, so a spoken turn's ask still goes down `SPOKEN_STREAM_EVENT` to the pane's sheet, as before the move;
     - `NotesVaultWriter`, over `notes_vault`;
     - `EngineProfiles`, over `sync::engine`.
   - **`bots_ipc.rs`**: `bots_chat_send`, `bots_message_retry`, `send_spoken`, `bots_chat_stop` and `bots_session_follow` call `keeper_agent`. Each computes `TurnOrigin` from `voice_ipc::spoken_turn(dir)` (C1). `bots_error` (`:149`) maps `AgentError`.
@@ -251,16 +251,16 @@ Conventions as Epic 89's *Stories*:
   - **`sync.rs:52-57`** installs `keeper_agent::task::TaskRunner` with the shell's ports.
 - **Gates and docs.**
   - `src-tauri/Cargo.toml:3` gains the `keeper-agent` member.
-  - `package.json` gains `check:agent-tauri-free` (`tree=$(cargo tree … -p keeper-agent -e normal,build --prefix none) && ! printf '%s' "$tree" | grep -qE '(^|[[:space:]])(tauri(-[a-z]+)*|wry|tao|gtk|glib-sys|webkit2gtk[a-z0-9-]*) v'`), appended to `check` (`:31`).
+  - `package.json` gains `check:agent-tauri-free` (`tree=$(cargo tree … -p keeper-agent -e normal,build --prefix none) && ! printf '%s' "$tree" | grep -qE '(^|[[:space:]])(tauri(-[a-z]+)*|wry|tao|gtk|glib-sys|webkit2gtk[a-z0-9-]*) v'`), appended to `check` (`:32`).
   - `lefthook.yml:47` gains `-p keeper-agent`.
   - `keeper-sync/src/platform.rs:391-398` says the runner is `keeper_agent::task` over `arm_turn(origin: Task)`, which is now true.
 
 **Acceptance:**
 1. **The crate is tauri-free, and the guard bites.** `bun run check:agent-tauri-free` passes. Mutation: adding `tauri` to `keeper-agent/Cargo.toml` fails it.
 2. **It builds and tests on Linux.** `cargo nextest run --manifest-path src-tauri/Cargo.toml -p keeper-agent` is green on this host. That settles research §14's "keeper-agent builds on Linux". The lefthook fallback lints it.
-3. **Moved tests keep their names and assertions.** Every test from `bot_task.rs` and `bots_tools.rs` runs in `keeper-agent` with an unchanged body (only `use` paths change), now on Linux. The PR lists them side by side.
+3. **Moved tests keep their names and assertions.** Every test from `bot_task.rs` (`bots_tools.rs` has none, ruling D6) and `bots_ipc.rs`'s `replay` test runs in `keeper-agent` with an unchanged body (only `use` paths change), now on Linux. The PR lists them side by side.
 4. **The origin changes nothing.**
-   - `a_spoken_origin_adds_the_answer_instruction_after_the_context_and_a_typed_one_adds_nothing`: the request's system message is the context prompt, then `speech::answer_instruction(language)` (`bots_ipc.rs:1177-1186`'s order), and `Typed` adds nothing.
+   - `a_spoken_origin_adds_the_answer_instruction_after_the_context_and_a_typed_one_adds_nothing`: the request's system message is the context prompt, then `speech::answer_instruction(language)` (`bots_ipc.rs:1179-1188`'s order), and `Typed` adds nothing.
    - The shell's three entry points pass `Spoken` exactly when `spoken_turn(dir)` answers `Some`, so a typed send while the voice turn awaits its send is still spoken, as today. (Shell, by inspection.)
 5. **Characterisation goldens from the code before the move.** The risk is a moved line that changes behaviour, and only hesperia runs the old code.
    - **How the goldens are captured.** The rung's first commit adds a throwaway shell test that drives three scenarios against a localhost OpenAI-shaped stub on hesperia:
@@ -282,7 +282,7 @@ Conventions as Epic 89's *Stories*:
    - then `sqlite3 keeper.db "select role, partial, finish_reason, tool_call_count from bot_messages order by rowid desc limit 6"` and `"select tool, effect, verdict, outcome from bot_audit order by id desc limit 3"`, and the task's `task_runs` row;
    - the two runs are identical modulo ids and times.
    - research §14's "`tokio::spawn` inside tauri commands" is settled by this run.
-10. **The one named change: the unattended sentence** (F12). This rung changes no behaviour but this, and its PR names it. `a_host_without_an_approver_refuses_an_ask_with_the_unattended_sentence` (keeper-agent, real fixture drive): a `drive_write` under a profile-wide write grant (an Ask, AD-158) on a host built with no approver gives the model a tool message whose content is exactly `UNATTENDED_REFUSAL`, changes no byte on disk, and closes its audit row `refused`; the same call on a host whose approver answers no gives the grant layer's sentence, unchanged. Mutation: returning the grant's sentence on the no-approver path fails it. None of acceptance 5's characterisation scenarios asks, so the goldens hold.
+10. **The one named change: the unattended sentence** (F12). This rung changes no behaviour but this, and its PR names it. `a_host_without_an_approver_refuses_an_ask_with_the_unattended_sentence` (keeper-agent, real fixture drive): a `drive_write` under a profile-wide write grant (an Ask, AD-158) on a host built with no approver gives the model a tool message whose content is exactly `"Refused: " + UNATTENDED_REFUSAL` (the tool loop's `render_result` prefix, `bots/tools.rs:1009`; ruling D9), changes no byte on disk, and closes its audit row `refused`; the same call on a host whose approver answers no gives the grant layer's sentence, unchanged. Mutation: returning the grant's sentence on the no-approver path fails it. None of acceptance 5's characterisation scenarios asks, so the goldens hold.
 
 **Shell crate:** yes, every call site. Awaiting CI's macOS job and `check:rust:macos`.
 

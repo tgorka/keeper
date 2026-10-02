@@ -51,8 +51,8 @@ impl ShellSyncPlatform {
 impl SyncPlatform for ShellSyncPlatform {
     #[cfg(desktop)]
     fn bot_task_runner(&self) -> Option<Arc<dyn keeper_sync::platform::BotTaskRunner>> {
-        Some(Arc::new(crate::bot_task::ShellBotTaskRunner::new(
-            Arc::clone(&self.platform),
+        Some(Arc::new(keeper_agent::task::TaskRunner::new(
+            crate::agent_ports::task_env(Arc::clone(&self.platform)),
         )))
     }
 

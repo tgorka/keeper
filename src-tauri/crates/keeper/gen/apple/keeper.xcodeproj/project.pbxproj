@@ -34,7 +34,6 @@
 		13BC5ABD703013B033C8CF32 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		1898BDFF117A8BE3E6A08FA3 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		1B1F8ACA5202F25B4576779E /* AVFAudio.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFAudio.framework; path = System/Library/Frameworks/AVFAudio.framework; sourceTree = SDKROOT; };
-		207B2B8E272316B8643CBDDE /* bots_tools.rs */ = {isa = PBXFileReference; path = bots_tools.rs; sourceTree = "<group>"; };
 		24504C7714DF7C30EFCE8055 /* bots_ipc.rs */ = {isa = PBXFileReference; path = bots_ipc.rs; sourceTree = "<group>"; };
 		2CF7EA17F06F107074A66866 /* bots_drive_ipc.rs */ = {isa = PBXFileReference; path = bots_drive_ipc.rs; sourceTree = "<group>"; };
 		2F492FEF24822213D226AA30 /* copy_ipc.rs */ = {isa = PBXFileReference; path = copy_ipc.rs; sourceTree = "<group>"; };
@@ -185,7 +184,6 @@
 			children = (
 				2CF7EA17F06F107074A66866 /* bots_drive_ipc.rs */,
 				24504C7714DF7C30EFCE8055 /* bots_ipc.rs */,
-				207B2B8E272316B8643CBDDE /* bots_tools.rs */,
 				3D9F4FD335F84C4CCBA60AAF /* build_identity.rs */,
 				2F492FEF24822213D226AA30 /* copy_ipc.rs */,
 				EAB7A9B0529555782466FA99 /* debug_log.rs */,

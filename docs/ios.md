@@ -465,7 +465,7 @@ linked it. The phone build now carries the sync engine, the `sync_*`, `copy_*`,
 schemes. What stays desktop-only, and why:
 
 - The five plugins above (tray, hotkey, autostart, updater, process): no iOS concept.
-- `bots_drive_ipc` / `bots_tools` (the drive half of Bots), `notes_window` (the
+- `bots_drive_ipc` and the drive half of `agent_ports` (the drive half of Bots), `notes_window` (the
   quick-capture window), `sessions_root` / `sessions_exec` (the sessions board and
   the tasks runner — AD-201: iOS spawns nothing), `hotkey`, `menu`, `tray`,
   `voice_window`, `recording_protocol`, `pdf_export` (macOS WebKit).
@@ -820,7 +820,7 @@ on the phone is a different feature (DW-239). The summon hotkey: `hotkey.rs` is
 because iOS has no global hotkey. The drive tools: Bots exists on the phone — endpoints
 and bots are added, tested, edited and removed there through the same `keeper-core`
 grammar the desktop uses, and a conversation streams the same way — but the drive half
-(grants, the audit, deliverable paths, image staging) is `bots_drive_ipc` / `bots_tools`,
+(grants, the audit, deliverable paths, image staging) is `bots_drive_ipc` / `agent_ports`,
 still `#[cfg(desktop)]` (`lib.rs:22-29`) and `botTools` still `notes_available`
 (`ipc.rs:1495`). Since Epic 66 that is a choice rather than a linking fact — the phone
 has the folder now — and DW-220 says what would flip it. On the phone those controls are
