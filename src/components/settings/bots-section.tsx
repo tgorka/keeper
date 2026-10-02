@@ -197,8 +197,8 @@ export function botsOfferUnknownKindSentence(kind: string): string {
   return `This version of keeper cannot talk to a ${kind} provider.`;
 }
 
-/** The two kinds, spelled as they are stored. */
-const KINDS: readonly ProviderKind[] = ["ollama", "hermes"];
+/** The three kinds, spelled as they are stored. */
+const KINDS: readonly ProviderKind[] = ["ollama", "hermes", "openai"];
 
 /**
  * How a probe reads, in the app's own reachability vocabulary.

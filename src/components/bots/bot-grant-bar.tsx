@@ -15,9 +15,10 @@
  *    needs no `git`, and the *grant* is gated on `botTools` because a file
  *    needs the drive. Absent, not disabled: the conversation goes on without
  *    it.
- * 2. **The provider must be Ollama.** Hermes executes its own tools on its own
- *    host under its own permission model, so the pane says that in one sentence
- *    and offers nothing.
+ * 2. **The provider must be one keeper runs tools for** — Ollama or an
+ *    OpenAI-compatible endpoint. Hermes executes its own tools on its own
+ *    host under its own permission model, so the pane says that in one
+ *    sentence and offers nothing.
  * 3. **The model must state that it takes tools.** `false` is a refusal keeper
  *    was told; `null` is one keeper could not read. Both mean no affordance —
  *    but they are different facts and get different sentences, and the unknown
@@ -146,8 +147,15 @@ export function botGrantOffer({
   if (!botTools || provider === null) {
     return { kind: "absent" };
   }
-  if (provider.kind === "hermes") {
-    return { kind: "refused", sentence: GRANT_HERMES_SENTENCE };
+  switch (provider.kind) {
+    case "hermes":
+      return { kind: "refused", sentence: GRANT_HERMES_SENTENCE };
+    case "ollama":
+    case "openai":
+      break;
+    default:
+      // A kind added in Rust fails to compile here until it is decided.
+      return provider.kind satisfies never;
   }
   // The one case that hides the affordance: the endpoint stated the refusal.
   if (model !== null && model.tools === false) {

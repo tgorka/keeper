@@ -1,9 +1,9 @@
-//! Where the two back ends disagree, as data (Story 61.2).
+//! Where the back ends disagree, as data (Story 61.2; AD-369).
 //!
 //! # The decision this file is
 //!
 //! The epic picked one wire — `POST /v1/chat/completions` with `stream: true`
-//! — for both provider kinds, and wrote down that the price is paid here:
+//! — for every provider kind, and wrote down that the price is paid here:
 //! *"Those become rows in a per-kind quirk table, not a second client."* So
 //! [`chat`](crate::bots::chat) contains **no** `if kind == Ollama` branch. It
 //! reads [`quirks`] once and shapes the request from the answer, which is the
@@ -67,6 +67,9 @@ pub struct Quirks {
     /// * Hermes — **Unknown**. The researched route table names no embeddings
     ///   route; that is not proof of absence on the configured server, so a
     ///   probe is allowed and a 404 becomes an explicit refusal.
+    /// * OpenAi — **Unknown**. CLIProxyAPI's route list has no
+    ///   `/v1/embeddings` (research §11.1), and another OpenAI-compatible
+    ///   endpoint may have one, so it is neither claimed nor refused (DW-360).
     pub embeddings: Support,
 
     /// Whether `tool_choice` reaches the model.
@@ -85,6 +88,8 @@ pub struct Quirks {
     ///   server-side and replays them as completed, never handing the client a
     ///   pending call (research §2.7), so the field is unlikely to matter
     ///   there at all.
+    /// * OpenAi — **Yes**. `tool_choice` is an OpenAI Chat Completions field,
+    ///   and an endpoint that claims the dialect honours it.
     pub tool_choice: Support,
 
     /// Whether an `http(s)` image URL is fetched by the endpoint.
@@ -95,6 +100,8 @@ pub struct Quirks {
     ///   sending one that will be dropped.
     /// * Hermes — **Yes**. "Remote `http(s)` and `data:image/...` both
     ///   supported" on Chat Completions (research §2.5).
+    /// * OpenAi — **Unknown**. Whether a remote URL is fetched depends on the
+    ///   model behind the endpoint, which the endpoint does not state.
     pub remote_image_url: Support,
 
     /// The shape of an image content part.
@@ -107,6 +114,7 @@ pub struct Quirks {
     ///   documented.
     /// * Hermes — [`ImagePartShape::Object`]: `{"type":"image_url",
     ///   "image_url":{"url":…,"detail":"high"}}` (research §2.5).
+    /// * OpenAi — [`ImagePartShape::Object`], OpenAI's own shape.
     pub image_part: ImagePartShape,
 
     /// Whether the context window can be set over the `/v1` layer.
@@ -120,6 +128,8 @@ pub struct Quirks {
     /// * Hermes — **No**. Its request-scoped `model_options` object carries
     ///   exactly `reasoning_effort` and `service_tier` (research §2.4); no
     ///   context-window knob exists on this door.
+    /// * OpenAi — **No**. OpenAI's Chat Completions has no context-window
+    ///   field.
     pub context_window_over_v1: Support,
 
     /// Whether the stream ends with the literal `data: [DONE]` sentinel.
@@ -127,10 +137,13 @@ pub struct Quirks {
     /// * Ollama — **Yes**. `middleware/openai.go:157` writes
     ///   `data: [DONE]\n\n` (research §5.4.1).
     /// * Hermes — **Yes**. "Terminator `data: [DONE]`" (research §2.6).
+    /// * OpenAi — **Unknown**. OpenAI's own stream ends with it, and CLIProxyAPI
+    ///   sent it in the live smoke (`tests/bots_openai_live.rs`, 2026-10-02),
+    ///   but one gateway does not establish it for every OpenAI-compatible
+    ///   endpoint.
     ///
-    /// Both being `Yes` is precisely why [`crate::bots::chat`] may treat a
-    /// stream that ends without it as truncated rather than as merely
-    /// finished.
+    /// Only a `Yes` row may let [`crate::bots::chat`] read a stream that ends
+    /// without it as truncated rather than as merely finished.
     pub done_sentinel: Support,
 
     /// Whether `stream_options.include_usage` produces a usage chunk.
@@ -143,6 +156,10 @@ pub struct Quirks {
     ///   frame (research §2.6). keeper therefore asks for it and records
     ///   absence as absence — Story 61.8's rule that a missing number renders
     ///   as missing and never as zero.
+    /// * OpenAi — **Yes**. OpenAI's stream documents the usage chunk, and
+    ///   CLIProxyAPI sent one, with `prompt_tokens`, in the live smoke
+    ///   (`tests/bots_openai_live.rs`, 2026-10-02). An endpoint that does not
+    ///   still renders as missing, never as zero.
     pub stream_usage: Support,
 
     /// The `delta` fields this kind may put reasoning tokens in.
@@ -161,6 +178,9 @@ pub struct Quirks {
     ///   precedence) and the field that arrives is the upstream's, not
     ///   Hermes'. `reasoning_content` is the DeepSeek-style spelling (research
     ///   §1.4).
+    /// * OpenAi — both, for Hermes' reason: CLIProxyAPI is a gateway in front
+    ///   of other providers (research §11.1), and the field that arrives is
+    ///   the upstream's.
     pub reasoning_fields: &'static [&'static str],
 
     /// The interval at which the server sends an SSE keep-alive comment, where
@@ -173,6 +193,7 @@ pub struct Quirks {
     ///   research §2.3).
     /// * Ollama — none documented; `middleware/openai.go` writes frames as the
     ///   model produces them (research §5.4.1).
+    /// * OpenAi — none documented.
     pub keepalive_secs: Option<u64>,
 
     /// Whether this kind multiplexes named events onto the chat stream.
@@ -183,6 +204,7 @@ pub struct Quirks {
     ///   `event:` field and ignores it, so this row is documentation of *why*
     ///   that path exists rather than a switch.
     /// * Ollama — **No**.
+    /// * OpenAi — **No**.
     pub named_events: Support,
 
     /// Whether this kind keeps a server-side conversation keeper can name
@@ -198,6 +220,8 @@ pub struct Quirks {
     ///   into a definite answer per endpoint.
     /// * Ollama — **No**. There is no server-side conversation at all, so no
     ///   probe is sent and everything stays in `keeper.db`.
+    /// * OpenAi — **No**. Chat Completions is stateless; the conversation is
+    ///   the request's `messages`.
     pub server_sessions: Support,
 }
 
@@ -233,6 +257,20 @@ pub const fn quirks(kind: ProviderKind) -> Quirks {
             named_events: Support::No,
             server_sessions: Support::No,
         },
+        // A gateway in front of other providers (CLIProxyAPI, research §11.1).
+        ProviderKind::OpenAi => Quirks {
+            embeddings: Support::Unknown,
+            tool_choice: Support::Yes,
+            remote_image_url: Support::Unknown,
+            image_part: ImagePartShape::Object,
+            context_window_over_v1: Support::No,
+            done_sentinel: Support::Unknown,
+            stream_usage: Support::Yes,
+            reasoning_fields: &["reasoning_content", "reasoning"],
+            keepalive_secs: None,
+            named_events: Support::No,
+            server_sessions: Support::No,
+        },
     }
 }
 
@@ -240,10 +278,17 @@ pub const fn quirks(kind: ProviderKind) -> Quirks {
 mod tests {
     use super::*;
 
+    const KINDS: [ProviderKind; 3] = [
+        ProviderKind::Hermes,
+        ProviderKind::Ollama,
+        ProviderKind::OpenAi,
+    ];
+
     #[test]
     fn embeddings_follow_documented_support_without_inventing_hermes_absence() {
         assert_eq!(quirks(ProviderKind::Ollama).embeddings, Support::Yes);
         assert_eq!(quirks(ProviderKind::Hermes).embeddings, Support::Unknown);
+        assert_eq!(quirks(ProviderKind::OpenAi).embeddings, Support::Unknown);
     }
 
     #[test]
@@ -269,18 +314,27 @@ mod tests {
     }
 
     #[test]
-    fn neither_kind_can_set_the_context_window_over_v1() {
-        for kind in [ProviderKind::Hermes, ProviderKind::Ollama] {
+    fn an_openai_endpoint_takes_tool_choice_and_openai_shaped_images() {
+        let openai = quirks(ProviderKind::OpenAi);
+        assert_eq!(openai.tool_choice, Support::Yes);
+        assert!(openai.remote_image_url.permitted());
+        assert_eq!(openai.image_part, ImagePartShape::Object);
+    }
+
+    #[test]
+    fn no_kind_can_set_the_context_window_over_v1() {
+        for kind in KINDS {
             assert_eq!(quirks(kind).context_window_over_v1, Support::No);
         }
     }
 
     #[test]
-    fn both_kinds_send_the_done_sentinel() {
-        // The premise for treating a missing `[DONE]` as truncation.
-        for kind in [ProviderKind::Hermes, ProviderKind::Ollama] {
-            assert_eq!(quirks(kind).done_sentinel, Support::Yes);
-        }
+    fn the_named_back_ends_send_the_done_sentinel_and_a_generic_endpoint_is_unknown() {
+        // `Yes` is what licenses treating a missing `[DONE]` as truncation;
+        // a generic OpenAI-compatible endpoint has not earned it.
+        assert_eq!(quirks(ProviderKind::Hermes).done_sentinel, Support::Yes);
+        assert_eq!(quirks(ProviderKind::Ollama).done_sentinel, Support::Yes);
+        assert_eq!(quirks(ProviderKind::OpenAi).done_sentinel, Support::Unknown);
     }
 
     #[test]
@@ -288,7 +342,7 @@ mod tests {
         // A silence budget under the server's own keep-alive interval would
         // kill healthy idle streams on a schedule.
         let budget = crate::bots::http::READ_TIMEOUT.as_secs();
-        for kind in [ProviderKind::Hermes, ProviderKind::Ollama] {
+        for kind in KINDS {
             if let Some(keepalive) = quirks(kind).keepalive_secs {
                 assert!(
                     budget > keepalive,

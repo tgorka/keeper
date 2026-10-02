@@ -825,8 +825,8 @@ still `#[cfg(desktop)]` (`lib.rs:22-29`) and `botTools` still `notes_available`
 (`ipc.rs:1495`). Since Epic 66 that is a choice rather than a linking fact — the phone
 has the folder now — and DW-220 says what would flip it. On the phone those controls are
 absent, not disabled: the pane says once, in its empty state, that the drive tools live
-on your Mac. The scope is Hermes because that is what was asked for; an Ollama endpoint
-a phone can reach is the same wire and is neither built for nor blocked (DW-221).
+on your Mac. The scope is Hermes because that is what was asked for; an Ollama or `openai`
+endpoint a phone can reach is the same wire and is neither built for nor blocked (DW-221).
 
 The sixth item is the [7-day re-arm ritual](#the-7-day-re-arm-ritual) above:
 "reinstalling keeper" is exactly the weekly `bun run tauri ios dev` re-sign (or an

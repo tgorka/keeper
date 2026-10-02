@@ -10,7 +10,7 @@ use keeper_core::bots::chat::{
 use keeper_core::bots::context_files;
 use keeper_core::bots::http;
 use keeper_core::bots::tools::{self, ToolLoop, ToolLoopEvent};
-use keeper_core::bots::{discover, store, Bot, Endpoint, ProviderKind};
+use keeper_core::bots::{discover, store, Bot, Endpoint};
 use keeper_core::platform::Platform;
 use keeper_sync::platform::{BotRunFuture, BotRunRecord, BotTaskRunner, BotTaskSpec};
 use keeper_sync::tasks::TaskOutcome;
@@ -131,15 +131,16 @@ async fn prepare(platform: Arc<dyn Platform>, spec: &BotTaskSpec) -> Result<Task
             tracing::warn!(%error, "bots: could not read the grants for this task");
             Vec::new()
         });
-    let tools_supported = if grants.is_empty() || row.provider.kind == ProviderKind::Hermes {
-        None
-    } else {
-        discover::models(&client, &endpoint)
-            .await
-            .ok()
-            .and_then(|models| models.into_iter().find(|candidate| candidate.id == model))
-            .and_then(|found| found.tools)
-    };
+    let tools_supported =
+        if grants.is_empty() || !discover::probes_model_capabilities(row.provider.kind) {
+            None
+        } else {
+            discover::models(&client, &endpoint)
+                .await
+                .ok()
+                .and_then(|models| models.into_iter().find(|candidate| candidate.id == model))
+                .and_then(|found| found.tools)
+        };
     let offer = tools::offer_tools(row.provider.kind, tools_supported, &grants);
     let profiles = crate::sync::engine(platform)
         .ok()
@@ -291,6 +292,7 @@ mod tests {
     use super::*;
     use keeper_core::bots::audit::{self, AuditOutcome, AuditVerdict};
     use keeper_core::bots::grant::{Grant, GrantMode, GrantScope};
+    use keeper_core::bots::ProviderKind;
     use keeper_core::error::CoreError;
     use std::io::{BufRead, BufReader, Read, Write};
 

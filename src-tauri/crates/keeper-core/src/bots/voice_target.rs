@@ -160,7 +160,7 @@ pub fn model_for(
 fn provider_default(kind: ProviderKind) -> Option<&'static str> {
     match kind {
         ProviderKind::Hermes => Some(HERMES_DEFAULT_MODEL),
-        ProviderKind::Ollama => None,
+        ProviderKind::Ollama | ProviderKind::OpenAi => None,
     }
 }
 
@@ -375,16 +375,24 @@ mod tests {
             model_for(&b, ProviderKind::Hermes, &[], &[]),
             Ok(HERMES_DEFAULT_MODEL.to_owned())
         );
-        // Ollama has none: the first offered that can chat.
-        assert_eq!(
-            model_for(
-                &b,
-                ProviderKind::Ollama,
-                &[],
-                &[model("qwen3"), model("llama4:8b")]
-            ),
-            Ok("qwen3".to_owned())
-        );
+        // Ollama and an OpenAI-compatible endpoint have none: the first
+        // offered that can chat.
+        for kind in [ProviderKind::Ollama, ProviderKind::OpenAi] {
+            assert_eq!(provider_default(kind), None);
+            assert_eq!(
+                model_for(
+                    &b,
+                    kind,
+                    &[],
+                    &[
+                        model("text-embedding-3-small"),
+                        model("gpt-5"),
+                        model("qwen3")
+                    ]
+                ),
+                Ok("gpt-5".to_owned())
+            );
+        }
     }
 
     #[test]

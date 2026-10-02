@@ -2377,12 +2377,14 @@ export function mockSchedulePreview(expression: string): TaskSchedulePreviewVm {
 // ---------------------------------------------------------------------------
 // Bots (Epic 61, Story 61.4)
 //
-// Two tenants of different kinds, because the divergences between them are the
-// whole design and a harness with one would hide half of it: the Ollama one is
-// loopback with no credential (legitimate — its `/v1` layer accepts and
-// discards any key) and the Hermes one is a LAN host that has a key stored.
-// The Hermes bot's pane is what shows the no-grant sentence, and the Ollama
-// one's is what shows the grant bar, so both are reachable in `bun run dev`.
+// Three tenants of different kinds, because the divergences between them are
+// the whole design and a harness with fewer would hide some of it: the Ollama
+// one is loopback with no credential (legitimate — its `/v1` layer accepts and
+// discards any key), the Hermes one is a LAN host that has a key stored, and
+// the openai one is a CLIProxyAPI on the tailnet whose `/v1/models` states no
+// capability. The Hermes bot's pane is what shows the no-grant sentence, the
+// Ollama one's is what shows the grant bar, and the openai one's shows the bar
+// with the unknown-tools warning, so all three are reachable in `bun run dev`.
 // ---------------------------------------------------------------------------
 
 const BOT_PROVIDERS: BotProviderVm[] = [
@@ -2414,6 +2416,20 @@ const BOT_PROVIDERS: BotProviderVm[] = [
     readTimeoutMs: null,
     hasToken: true,
   },
+  {
+    id: "01J8BOTPROVOPENAIAAAAAAAAA",
+    kind: "openai",
+    name: "CLIProxyAPI on electra",
+    baseUrl: "https://electra.example.ts.net:8452",
+    host: "electra.example.ts.net",
+    isPrivate: false,
+    createdMs: NOW - 86_400_000,
+    health: "reachable",
+    healthCheckedMs: NOW - 300_000,
+    healthDetail: null,
+    readTimeoutMs: null,
+    hasToken: true,
+  },
 ];
 
 const BOT_ROWS: BotVm[] = [
@@ -2440,6 +2456,17 @@ const BOT_ROWS: BotVm[] = [
     colour: null,
     mark: null,
     createdMs: NOW - 86_400_000 * 3,
+  },
+  {
+    id: "01J8BOTCCCCCCCCCCCCCCCCCCC",
+    providerId: "01J8BOTPROVOPENAIAAAAAAAAA",
+    target: "gpt-6-astra",
+    name: "Astra",
+    pinOrder: 2,
+    shape: null,
+    colour: null,
+    mark: null,
+    createdMs: NOW - 86_400_000,
   },
 ];
 
@@ -2520,6 +2547,24 @@ const BOT_MODELS: Record<string, BotModelVm[]> = {
       maxOutputTokens: 8_192,
       vision: null,
       tools: true,
+      reasoning: null,
+      embedding: null,
+      capabilities: [],
+    },
+  ],
+  // `/v1/models` names models and nothing else, so every capability of an
+  // OpenAI-compatible endpoint is unknown.
+  "gpt-6-astra": [
+    {
+      id: "gpt-6-astra",
+      family: null,
+      parameterSize: null,
+      quantization: null,
+      sizeBytes: null,
+      contextWindow: null,
+      maxOutputTokens: null,
+      vision: null,
+      tools: null,
       reasoning: null,
       embedding: null,
       capabilities: [],
@@ -5517,7 +5562,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
         "Your account is not ready on this device. Sign in to it, then add the provider.",
       );
     }
-    if (offer.kind !== "hermes" && offer.kind !== "ollama") {
+    if (offer.kind !== "hermes" && offer.kind !== "ollama" && offer.kind !== "openai") {
       return refuse(`This version of keeper cannot talk to a ${offer.kind} provider.`);
     }
     const id = `01J8OFFER${String(BOT_PROVIDERS.length).padStart(17, "0")}`;

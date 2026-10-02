@@ -899,6 +899,57 @@ mod tests {
         assert_eq!(back, expected);
     }
 
+    /// An `openai` provider travels in the device file as the word it is
+    /// stored as — the file holds the kind as an opaque string — and comes
+    /// back as an `openai` provider with its bots; a word this build does not
+    /// speak is still refused rather than read as another kind.
+    #[test]
+    fn an_openai_device_record_is_restored_as_an_openai_provider() {
+        let file = DeviceStateFile {
+            providers: vec![ProviderState {
+                kind: "openai".to_owned(),
+                name: "CLIProxyAPI".to_owned(),
+                base_url: "https://cliproxy.acme.dev:8452/".to_owned(),
+                credential: "own".to_owned(),
+                bots: vec![BotRecord {
+                    target: "gpt-6-astra".to_owned(),
+                    name: "Astra".to_owned(),
+                    ..BotRecord::default()
+                }],
+                ..ProviderState::default()
+            }],
+            ..DeviceStateFile::default()
+        };
+        let text = file.render().expect("renders");
+        let back = DeviceStateFile::parse(text.as_bytes()).expect("parses");
+        let state = back.providers.first().expect("the provider travelled");
+        assert_eq!(state.kind, "openai");
+
+        let dir = tempfile::tempdir().expect("data directory");
+        let id = add_provider_state(dir.path(), "acct", state).expect("restored");
+        let row = store::get_provider(dir.path(), &id)
+            .expect("reads")
+            .expect("present");
+        assert_eq!(row.provider.kind, ProviderKind::OpenAi);
+        assert_eq!(row.provider.base_url, "https://cliproxy.acme.dev:8452");
+        let bots = store::list_bots(dir.path()).expect("bots");
+        assert_eq!(
+            bots.iter()
+                .map(|bot| (bot.provider_id.as_str(), bot.target.as_str()))
+                .collect::<Vec<_>>(),
+            [(id.as_str(), "gpt-6-astra")]
+        );
+
+        let omp = ProviderState {
+            kind: "omp".to_owned(),
+            ..state.clone()
+        };
+        assert_eq!(
+            add_provider_state(dir.path(), "acct", &omp),
+            Err("this keeper cannot talk to a omp provider".to_owned())
+        );
+    }
+
     /// F9: only an `origin` URL identifies an existing clone.
     #[test]
     fn the_origin_url_is_read_from_its_own_section() {

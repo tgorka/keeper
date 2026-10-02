@@ -597,9 +597,10 @@ impl ToolOffer {
 /// The kind-and-capability half is [`grant_offer`]'s verdict, reused rather
 /// than restated so the pane's grant affordance and the request's `tools`
 /// array cannot disagree: a Hermes bot is offered nothing because Hermes runs
-/// its tools on its own host; an Ollama model that **states** it has no tools
-/// is offered nothing; one whose capability keeper could not read is offered
-/// them with [`TOOLS_CAPABILITY_UNKNOWN`] carried along.
+/// its tools on its own host; an Ollama or OpenAI-compatible model that
+/// **states** it has no tools is offered nothing; one whose capability keeper
+/// could not read is offered them with [`TOOLS_CAPABILITY_UNKNOWN`] carried
+/// along.
 ///
 /// The grant half: no live grant offers nothing, every live grant at
 /// [`GrantMode::None`] offers nothing, and otherwise the widest mode among the

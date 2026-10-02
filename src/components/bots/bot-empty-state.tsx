@@ -49,7 +49,7 @@ export const BOTS_EMPTY_COPY: Record<
   "no-bot": {
     message: "No bot pinned yet. Name one in Settings and keeper will check it exists.",
     detail:
-      "On Ollama a bot is a model tag; on Hermes it is a profile. keeper cannot list the profiles on a Hermes endpoint — the key you gave it opens the chat API, and that API has no route that names them.",
+      "On Ollama a bot is a model tag; on an OpenAI-compatible endpoint it is a model id; on Hermes it is a profile. keeper cannot list the profiles on a Hermes endpoint — the key you gave it opens the chat API, and that API has no route that names them.",
     action: "Go to Settings",
   },
   "no-conversation": {

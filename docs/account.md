@@ -1047,8 +1047,9 @@ the password form. The forge's token is only ever sent to the forge's host.
 **Bot providers** always get the sign-in token, as Bearer. The provider has to accept it:
 - a gateway behind your identity provider does;
 - Ollama has no authentication and ignores it;
-- a gateway with its own static key, such as Hermes in the owner's setup, keeps that key.
-  Choose the keychain for it (DW-308).
+- a gateway with its own static key, such as Hermes in the owner's setup, or an `openai`
+  provider such as CLIProxyAPI with its own API key, keeps that key. Choose the keychain for it
+  (DW-308).
 
 **Every service you point at the sign-in token must accept it.** The provider must
 therefore include that service in the token's audience, through `extra_scopes`. A token

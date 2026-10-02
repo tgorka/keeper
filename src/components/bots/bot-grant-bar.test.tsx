@@ -83,6 +83,15 @@ const OLLAMA: BotProviderVm = {
 
 const HERMES: BotProviderVm = { ...OLLAMA, id: "prov-2", kind: "hermes", name: "Hermes there" };
 
+const OPENAI: BotProviderVm = {
+  ...OLLAMA,
+  id: "prov-3",
+  kind: "openai",
+  name: "CLIProxyAPI",
+  baseUrl: "https://cliproxy.example.org:8452",
+  host: "cliproxy.example.org",
+};
+
 const MODEL: BotModelVm = {
   id: "llama4:8b",
   family: "llama4",
@@ -140,6 +149,20 @@ describe("botGrantOffer", () => {
       kind: "refused",
       sentence: GRANT_HERMES_SENTENCE,
     });
+  });
+
+  it("decides an openai bot by its model, as for Ollama", () => {
+    // `/v1/models` states no capability, so `null` is the live case.
+    expect(
+      botGrantOffer({ botTools: true, provider: OPENAI, model: { ...MODEL, tools: null } }),
+    ).toEqual({ kind: "offered", warning: GRANT_TOOLS_UNKNOWN_SENTENCE });
+    expect(botGrantOffer({ botTools: true, provider: OPENAI, model: MODEL })).toEqual({
+      kind: "offered",
+      warning: null,
+    });
+    expect(
+      botGrantOffer({ botTools: true, provider: OPENAI, model: { ...MODEL, tools: false } }),
+    ).toEqual({ kind: "refused", sentence: GRANT_NO_TOOLS_SENTENCE });
   });
 
   it("refuses a model that stated it cannot take tools", () => {
@@ -262,6 +285,22 @@ describe("BotGrantBar", () => {
     // worst rather than stranding an endpoint that never stated its
     // capabilities.
     expect(screen.getByRole("button", { name: GRANT_ADD_LABEL })).toBeInTheDocument();
+  });
+
+  it("offers an openai bot the grant with the unknown-tools warning, and Hermes still refuses", async () => {
+    const { unmount } = render(
+      <BotGrantBar botTools provider={OPENAI} botId="bot-1" model={{ ...MODEL, tools: null }} />,
+    );
+    expect(await screen.findByRole("status")).toHaveTextContent(GRANT_TOOLS_UNKNOWN_SENTENCE);
+    expect(screen.getByRole("button", { name: GRANT_ADD_LABEL })).toBeInTheDocument();
+    expect(screen.queryByText(GRANT_HERMES_SENTENCE)).toBeNull();
+    unmount();
+
+    render(
+      <BotGrantBar botTools provider={HERMES} botId="bot-1" model={{ ...MODEL, tools: null }} />,
+    );
+    expect(await screen.findByText(GRANT_HERMES_SENTENCE)).toBeInTheDocument();
+    expect(screen.queryByRole("button")).toBeNull();
   });
 
   it("shows no warning where the endpoint stated the capability", async () => {
