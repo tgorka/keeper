@@ -796,7 +796,7 @@ pub struct Rewrite {
 ///
 /// **[`PlanStep::MoveFile`] is last.** That is AD-111's rule, and here it is also
 /// the only order that resumes: a re-run guarded write meets its own output and
-/// returns `Ok` (`sessions_exec`'s idempotency-before-guard branch), so the move
+/// returns `Ok` (`keeper_agent::sessions::exec`'s idempotency-before-guard branch), so the move
 /// is the one step a resume has left to do. Moving first would leave a resumable
 /// prefix in which every remaining rewrite is addressed at a path that has gone.
 ///
@@ -805,7 +805,7 @@ pub struct Rewrite {
 /// a source that is no longer there. The tree is *consistent* in that window —
 /// fully renamed, pointers rewritten — and the resume reports the disk's error
 /// over it. Teaching `MoveFile` to read "source gone, target present" as "already
-/// done" would close it, and `sessions_exec` argues at length against exactly
+/// done" would close it, and `keeper_agent::sessions::exec` argues at length against exactly
 /// that: the same test is satisfied by a neighbour a rename must never be told it
 /// ate.
 ///

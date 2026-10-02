@@ -54,7 +54,6 @@
 		8142137CC496AE1CE3067230 /* sessions_ipc.rs */ = {isa = PBXFileReference; path = sessions_ipc.rs; sourceTree = "<group>"; };
 		8489C1600C9A4830D408FB5D /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
 		8990D3D56609D57DCCE828B3 /* sync.rs */ = {isa = PBXFileReference; path = sync.rs; sourceTree = "<group>"; };
-		8AC3D70396D29B0361CCD3FB /* sessions_exec.rs */ = {isa = PBXFileReference; path = sessions_exec.rs; sourceTree = "<group>"; };
 		93C6B2DE05186C0D1DC01C3C /* recording_protocol.rs */ = {isa = PBXFileReference; path = recording_protocol.rs; sourceTree = "<group>"; };
 		9846CEB018F013A13166AAD9 /* notes_ipc.rs */ = {isa = PBXFileReference; path = notes_ipc.rs; sourceTree = "<group>"; };
 		A04991D007EFA51112A5BBC7 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
@@ -203,7 +202,6 @@
 				CC37526693A5A27EEF4A56EC /* pdf_export.rs */,
 				56C00F821A30EE55E411033E /* recorder.rs */,
 				93C6B2DE05186C0D1DC01C3C /* recording_protocol.rs */,
-				8AC3D70396D29B0361CCD3FB /* sessions_exec.rs */,
 				8142137CC496AE1CE3067230 /* sessions_ipc.rs */,
 				64A870D0EBE34C3BAC062087 /* sessions_root.rs */,
 				B9E1017927667EDE1AC2C492 /* sync_ipc.rs */,

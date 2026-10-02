@@ -73,8 +73,6 @@ mod recorder;
 // embedded in notes a desktop syncs.
 #[cfg(desktop)]
 mod recording_protocol;
-#[cfg(desktop)]
-mod sessions_exec;
 mod sessions_ipc;
 #[cfg(desktop)]
 mod sessions_root;

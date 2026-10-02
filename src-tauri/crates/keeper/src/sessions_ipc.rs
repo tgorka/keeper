@@ -512,8 +512,8 @@ fn session_error(session_id: &str) -> IpcError {
 }
 
 #[cfg(desktop)]
-fn exec_error(error: crate::sessions_exec::ExecError) -> IpcError {
-    use crate::sessions_exec::ExecError;
+fn exec_error(error: keeper_agent::sessions::exec::ExecError) -> IpcError {
+    use keeper_agent::sessions::exec::ExecError;
     IpcError {
         code: IpcErrorCode::Internal,
         message: error.to_string(),
@@ -523,136 +523,19 @@ fn exec_error(error: crate::sessions_exec::ExecError) -> IpcError {
     }
 }
 
-/// The `(dir-relative path, is_dir)` facts a pattern copy needs — one walk,
-/// used for the zone's `_template/` and for a source session alike, because
-/// [`keeper_core::sessions::pattern::apply`] is what tells them apart.
+/// A session verb's refusal, worded as the commands always worded it.
 #[cfg(desktop)]
-fn pattern_files(dir: &std::path::Path) -> Vec<(String, bool)> {
-    fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<(String, bool)>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') && name != ".gitkeep" {
-                continue;
-            }
-            let rel = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{prefix}/{name}")
-            };
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                out.push((rel.clone(), true));
-                walk(&entry.path(), &rel, out);
-            } else {
-                out.push((rel, false));
-            }
-        }
+fn verb_error(error: keeper_agent::sessions::verbs::VerbError) -> IpcError {
+    use keeper_agent::sessions::verbs::VerbError;
+    match error {
+        VerbError::Exec(error) => exec_error(error),
+        other => IpcError {
+            code: IpcErrorCode::Internal,
+            message: other.to_string(),
+            account_id: None,
+            retriable: false,
+        },
     }
-    let mut out = Vec::new();
-    walk(dir, "", &mut out);
-    out
-}
-
-/// What each markdown file of a **flat** pattern declares itself to be
-/// (FR-268, AD-120).
-///
-/// The flat contract puts a file's kind in its frontmatter, so the question
-/// "does this file travel into a new session" cannot be answered from the path
-/// the way `prompts/**` answers it in the folder contract. The domain decides
-/// what each kind means; this only reads the bytes it needs to ask (AD-108).
-///
-/// **The reader's own rule about where markdown lives, asked rather than
-/// restated.** Every directory on the way to a file is put to
-/// [`crate::sessions_root::scans_markdown`] — the one list, which is
-/// [`crate::sessions_root::UNSCANNED_DIRS`] plus the dotted prefix. So a
-/// `ref`-tagged file in a `spaces/` the operator made is classified and travels,
-/// exactly as the pool, every space, References and the detail already list it
-/// (FR-285), while `artifacts/` and `workspace/` are still decided by path and
-/// never opened — which is what keeps "make a session like this one" from
-/// costing a walk of a folder holding a video render.
-///
-/// A second spelling of that rule here is how the create side and the read side
-/// come to disagree, silently: reading root markdown only left a byte-identical
-/// file travelling from the session root and staying behind from `spaces/`,
-/// classified `None` and therefore `SkipReason::Loose`. The suffix is folded for
-/// the same reason — the walk reads a `.MD` file, so this reads one too.
-///
-/// An unreadable file is simply absent from the map, and an absent kind is
-/// `Loose`: it stays behind, which is the safe direction.
-#[cfg(desktop)]
-fn flat_kinds(
-    dir: &std::path::Path,
-    files: &[(String, bool)],
-) -> std::collections::BTreeMap<String, keeper_core::sessions::shape::KindTag> {
-    use keeper_core::sessions::pool::{read_one, PoolFile};
-
-    files
-        .iter()
-        .filter(|(rel, is_dir)| {
-            !*is_dir
-                && rel.to_lowercase().ends_with(".md")
-                && rel
-                    .split('/')
-                    .rev()
-                    .skip(1)
-                    .all(crate::sessions_root::scans_markdown)
-        })
-        .filter_map(|(rel, _)| {
-            let text = std::fs::read_to_string(dir.join(rel)).ok()?;
-            let entry = read_one(PoolFile {
-                rel,
-                text: text.as_str(),
-            });
-            entry.kind.map(|kind| (rel.clone(), kind))
-        })
-        .collect()
-}
-
-/// The named templates a zone offers (FR-266): every `_template/<name>/` that
-/// holds a record file, in name order.
-///
-/// Named rather than counted: what makes a directory under `_template/` a
-/// template of its own and not a part of the skeleton is
-/// [`keeper_core::sessions::pattern::is_named_template`]'s question, asked
-/// against that directory's own top-level names. This reads them; the domain
-/// decides (AD-108).
-#[cfg(desktop)]
-fn named_templates(zone: &std::path::Path) -> Vec<String> {
-    use keeper_core::sessions::pattern;
-
-    let template_dir = zone.join(keeper_core::sessions::model::TEMPLATE_DIR);
-    let Ok(entries) = std::fs::read_dir(&template_dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<String> = entries
-        .flatten()
-        .filter(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
-            pattern::could_be_named_template(&name, is_dir)
-        })
-        .filter(|entry| {
-            let top_level: Vec<String> = std::fs::read_dir(entry.path())
-                .map(|inner| {
-                    inner
-                        .flatten()
-                        .map(|child| child.file_name().to_string_lossy().into_owned())
-                        .collect()
-                })
-                .unwrap_or_default();
-            pattern::is_named_template(&top_level)
-        })
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
-    // Sorted, because `read_dir` order is the filesystem's business and the
-    // picker's rows must not move between two reads of an unchanged zone.
-    out.sort();
-    out
 }
 
 /// Newest mtime under a directory, ms since epoch — what orders the picker.
@@ -698,7 +581,7 @@ fn pattern_vm(
     use keeper_core::sessions::pattern;
     use keeper_core::sessions::vm::{SessionPatternFileVm, SessionPatternSkipVm, SessionPatternVm};
 
-    let files = pattern::without_dirs(&pattern_files(dir), excluded);
+    let files = pattern::without_dirs(&keeper_agent::sessions::verbs::pattern_files(dir), excluded);
     let mtime_ms = newest_mtime_ms(dir, &files);
     // The same kinds the create path reads, for the same reason: the preview
     // and the plan are one value rendered twice, so a flat pattern previewed
@@ -706,7 +589,7 @@ fn pattern_vm(
     // copies. Whether it is flat is `apply_with_kinds`' own question; an empty
     // map for a folder-shaped pattern costs one `is_dir` scan and changes
     // nothing.
-    let kinds = flat_kinds(dir, &files);
+    let kinds = keeper_agent::sessions::verbs::flat_kinds(dir, &files);
     let outcome = pattern::apply_with_kinds(kind, &files, |rel| kinds.get(rel).copied());
     SessionPatternVm {
         id: id.to_owned(),
@@ -762,7 +645,7 @@ pub fn sessions_patterns(
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
     let mut out = Vec::new();
     let template_dir = zone.join(keeper_core::sessions::model::TEMPLATE_DIR);
-    let named = named_templates(&zone);
+    let named = keeper_agent::sessions::verbs::named_templates(&zone);
     if template_dir.is_dir() {
         out.push(pattern_vm(
             pattern::TEMPLATE_ID,
@@ -819,19 +702,6 @@ pub fn sessions_patterns(root_id: String) -> Result<Vec<()>, IpcError> {
     Err(unsupported())
 }
 
-/// The folder names already taken in `active/`, for the collision counter.
-#[cfg(desktop)]
-fn taken_names(zone: &std::path::Path) -> Vec<String> {
-    std::fs::read_dir(zone.join("active"))
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Create a session from a pattern (FR-238, FR-239, FR-253, AD-112, AD-116).
 ///
 /// Two questions in — the title, and what to shape it from — and one folder
@@ -853,297 +723,20 @@ pub async fn sessions_create(
     title: String,
     pattern_id: Option<String>,
 ) -> Result<keeper_core::sessions::vm::SessionRefVm, IpcError> {
-    use keeper_core::sessions::pattern::{self, PatternKind};
-    use keeper_core::sessions::{model, plan, spaces, template};
+    use keeper_agent::sessions::verbs::{self, CreateOutcome, CreateReq};
 
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
-    let title = title.trim().to_owned();
-    // **One clock read for the whole create**, and not [`today`] plus
-    // [`now_hhmm`], which are two. Two reads were harmless while the only
-    // consumers were a folder name and a frontmatter line: a create spanning
-    // midnight got a stamp from one day and a date from the next, in strings
-    // nobody compares. A template's `{{date}}` and `{{time}}` are read by a
-    // person, often in the same paragraph, so the two have to be one moment.
-    // The two helpers stay for the verbs that need only one of the three.
-    let now = chrono::Local::now();
-    let now_local = now.to_rfc3339();
-    let date = now.format("%Y-%m-%d").to_string();
-    let stamp = format!("{date}-{}", now.format("%H%M"));
-    let dir_name = model::session_dir_name(&title, &date, &taken_names(&zone));
-    let id = crate::sync_ipc::new_ulid();
-
-    // Which pattern, resolved to the one thing the plan needs: a zone-relative
-    // directory to copy out of, and the kind that decides what travels. The
-    // domain owns the id→source question (AD-108) — a `_template/<name>` id is
-    // a template, not a session path, and an id keeper cannot join onto the
-    // zone is refused here rather than reinterpreted downstream.
-    let resolved = pattern::resolve(pattern_id.as_deref()).ok_or_else(|| IpcError {
-        code: IpcErrorCode::Internal,
-        message: format!(
-            "no such template: {}",
-            pattern_id.as_deref().unwrap_or_default()
-        ),
-        account_id: None,
-        retriable: false,
-    })?;
-    let (kind, pattern_root, source) = match &resolved {
-        pattern::PatternSource::Template { root } => (PatternKind::Template, root.clone(), None),
-        pattern::PatternSource::Session { id: source_id } => {
-            let row =
-                crate::sessions_root::row_of(&root_id, source_id).ok_or_else(|| IpcError {
-                    code: IpcErrorCode::Internal,
-                    message: format!("no such session: {source_id}"),
-                    account_id: None,
-                    retriable: false,
-                })?;
-            (PatternKind::Session, row.path.clone(), Some(row))
-        }
+    // The id is minted here, by the caller, so a create retried with it finds
+    // the session the first attempt made (FR-778); the clock is read here
+    // once, for the folder name, the record and the template's placeholders.
+    let id = ulid::Ulid::new();
+    let req = CreateReq {
+        id,
+        title,
+        pattern_id,
+        now: chrono::Local::now(),
     };
-    let pattern_dir = zone.join(&pattern_root);
-    // The zone skeleton does not carry its own named templates into a session.
-    // Only the bare `_template` root can hold them, so nothing else pays for
-    // the read.
-    let excluded = if pattern_root == model::TEMPLATE_DIR {
-        named_templates(&zone)
-    } else {
-        Vec::new()
-    };
-
-    // Which contract the new session is born into: the pattern's own. A flat
-    // template begets a flat session and a folder-shaped one begets a folder —
-    // the shape is a property of the thing being copied, never a preference
-    // asked of the user, because a session whose files say one thing and whose
-    // shape says another is unreadable by both readers.
-    let pattern_files = pattern::without_dirs(&pattern_files(&pattern_dir), &excluded);
-    let pattern_top: Vec<String> = pattern_files
-        .iter()
-        .filter(|(rel, _)| !rel.contains('/'))
-        .map(|(rel, _)| rel.clone())
-        .collect();
-    let shape = keeper_core::sessions::shape::shape(&pattern_top);
-    let flat = shape == keeper_core::sessions::shape::Shape::Flat;
-
-    // The stamped record. The pattern's own headings, empty, with the title and
-    // date in place — a template record that grows a section grows it for every
-    // new session, and a continued session inherits the shape it earned. Falling
-    // back to the shipped default (FR-268) when the pattern has none to inherit
-    // from.
-    //
-    // **Both names are read, and `record_at` says which one is the record.**
-    // Story 52.1 made `README.md` the record's name under both contracts; it did
-    // not move anybody's files, so a pattern — a `_template/` or a source session
-    // — can still be keeping its record at `about.md` until
-    // `sessions_record_migrate` has swept the zone. The two reads answer two
-    // questions with one pair of bytes: the headings this create inherits, and
-    // (for a create-FROM, below) the file the lineage append is guarded on and
-    // written to. The choice is the domain's, because the sharp case is the
-    // half-migrated one where a name picked by order picks an old signpost.
-    let pattern_readme =
-        std::fs::read_to_string(pattern_dir.join(keeper_core::sessions::model::README)).ok();
-    let pattern_about =
-        std::fs::read_to_string(pattern_dir.join(keeper_core::sessions::shape::ABOUT)).ok();
-    let pattern_record = keeper_core::sessions::migrate::record_at(
-        pattern_readme.as_deref(),
-        pattern_about.as_deref(),
-    );
-    let body = match (pattern_record, flat) {
-        (Some((_, text)), _) => {
-            let (_, body_at) = keeper_core::notes::frontmatter::Frontmatter::parse(text);
-            plan::skeleton_from(&text[body_at..], &title, &date)
-        }
-        // No record to inherit: the default template's own record body, reached
-        // through the same renderer so the two cannot drift.
-        (None, true) => template::about_only(&title, &date),
-        (None, false) => plan::skeleton_from(
-            "# <session title>\n\n## Summary\n\n## Log\n\n## Promote\n\n| workspace | → artifacts | note |\n| --------- | ----------- | ---- |\n",
-            &title,
-            &date,
-        ),
-    };
-    // The record's own tag, so the About space finds it by what it declares
-    // rather than by its filename (AD-120). Only the flat contract has kinds.
-    let kind_line = if flat { "tags: [about]\n" } else { "" };
-    let readme = match &source {
-        // continues: baked into the new record's frontmatter at birth (AD-112).
-        Some(row) => format!(
-            "---\nid: {id}\ncreated: {date}\n{kind_line}keeper:\n  session-continues: [{}]\n---\n{body}",
-            row.id
-        ),
-        None => format!("---\nid: {id}\ncreated: {date}\n{kind_line}---\n{body}"),
-    };
-
-    // What travels. In the flat contract a file's kind is a tag inside it, so
-    // the decision needs the pool — read here, in the shell, because the domain
-    // opens nothing (AD-108). Bounded by the same walk the preview already
-    // pays for: root markdown only, and `artifacts/`/`workspace/` are decided
-    // by path without being read.
-    let kinds = if flat {
-        flat_kinds(&pattern_dir, &pattern_files)
-    } else {
-        std::collections::BTreeMap::new()
-    };
-    let outcome = pattern::apply_with_kinds(kind, &pattern_files, |rel| kinds.get(rel).copied());
-    let copies = outcome.copies;
-
-    // What keeper composes rather than copies. Folder-shaped: the record alone.
-    // Flat: the record, always the navigation contract, and — only for a
-    // session with nothing to inherit — the two seed files (FR-268).
-    //
-    // The split is the rule stated once: `AGENTS.md` is a *contract*, so a flat
-    // session without one is unreadable and keeper supplies it whenever the
-    // pattern did not. The seed log and seed prompt are *examples*, and a
-    // continuation is not short of examples — it was made from a session that
-    // has real ones. Seeding it anyway would put a "Nothing has happened yet"
-    // log at the top of a session continuing months of work.
-    let mut stamped = vec![(model::README.to_owned(), readme.clone())];
-    if flat {
-        let carried: std::collections::BTreeSet<&str> =
-            copies.iter().map(|(rel, _)| rel.as_str()).collect();
-        // What the pattern already supplies, by KIND — not by filename. A seed
-        // is named `YYYY-MM-DD-HHMM-opened.md`, so a template holding one and
-        // keeper composing another produce two different names for the same
-        // thing and a filename test never fires: the session lands with two
-        // "Opened" logs, one of them stamped with a minute that has nothing to
-        // do with it. The kind is what may not be duplicated, so the kind is
-        // what is compared.
-        let carried_kinds: std::collections::BTreeSet<keeper_core::sessions::shape::KindTag> =
-            copies
-                .iter()
-                .filter_map(|(rel, _)| kinds.get(rel).copied())
-                .collect();
-        let ulids: Vec<String> = (0..3).map(|_| crate::sync_ipc::new_ulid()).collect();
-        let seeds =
-            template::default_template(&title, &date, &stamp, [&ulids[0], &ulids[1], &ulids[2]]);
-        for file in seeds {
-            let is_contract = file.name == keeper_core::sessions::shape::AGENTS;
-            if file.name == model::README
-                || carried.contains(file.name.as_str())
-                || file.kind.is_some_and(|kind| carried_kinds.contains(&kind))
-                || (!is_contract && source.is_some())
-            {
-                continue;
-            }
-            stamped.push((file.name, file.content));
-        }
-    }
-
-    // The placeholders a template's markdown carries. This side reads the
-    // bytes and supplies the context — the clock and the ULID are the shell's
-    // (AD-56) — and `pattern::expansions` decides everything else (AD-108), so
-    // what a `{{title}}` becomes is provable on a host where this crate does
-    // not build.
-    //
-    // The `expands` test is applied here too, as an optimisation rather than a
-    // second rule: it is what stops a template's `.png` being read into memory
-    // at all. A file keeper cannot read as UTF-8 is simply not offered, and
-    // copies byte for byte as it always did.
-    let ctx = keeper_core::notes::templates::TemplateCtx {
-        title: title.clone(),
-        id: id.clone(),
-        now_local,
-    };
-    let markdown: Vec<(String, String)> = copies
-        .iter()
-        .filter(|(rel, is_dir)| !*is_dir && pattern::expands(rel))
-        .filter_map(|(rel, _)| {
-            Some((
-                rel.clone(),
-                std::fs::read_to_string(pattern_dir.join(rel)).ok()?,
-            ))
-        })
-        .collect();
-    let expanded = pattern::expansions(&markdown, &ctx);
-
-    let mut compiled = match &source {
-        None => plan::compile_create_shaped(&dir_name, &pattern_root, &copies, &expanded, &stamped),
-        Some(row) => {
-            // The SOURCE's record: which file it is, and the bytes in it. The
-            // lineage append is a `GuardedWrite`, so the two have to be the same
-            // read — `pattern_dir` IS this source session's directory (the
-            // `PatternSource::Session` arm above), and `record_at` picked the
-            // record out of the two names it can be under. A name assumed instead
-            // of read fails twice over on a zone nobody has swept yet: on an
-            // unmigrated source the guard reads a `README.md` that is not there
-            // and `sessions_exec` refuses with an errno *after* the new session is
-            // already on disk (a stray session and no lineage pair, AD-112's own
-            // loss), and on a half-migrated one the lengths agree and the lineage
-            // lands in an old signpost.
-            let (record_name, record_text) = pattern_record.unwrap_or((model::README, ""));
-            plan::compile_create_from_shaped(
-                &dir_name,
-                &row.path,
-                record_name,
-                record_text,
-                &id,
-                &copies,
-                &expanded,
-                &stamped,
-            )
-        }
-    };
-    // The spaces the template offers the ZONE (FR-291). Never the session:
-    // AD-121 refused a per-session copy of a query, and `pattern::apply` keeps
-    // these out of `copies` for that reason — `outcome.seeds` is non-empty only
-    // for a template.
-    //
-    // **Only into a `_spaces/` that already exists.** An absent one is the
-    // signal `sessions_spaces` reads to write the zone the defaults it was
-    // designed around ("the directory is the ledger"); a create that minted the
-    // directory to drop one template space into it would consume that signal,
-    // and the zone would never be offered the rest. So the create fills
-    // holes and `sessions_spaces` digs the well — and the one zone this can
-    // decline for says so rather than seeding nothing in silence.
-    let space_seeds = if outcome.seeds.is_empty() {
-        Vec::new()
-    } else {
-        let read = crate::sessions_root::zone_spaces(&root_id);
-        let seeded = read.as_ref().is_some_and(|read| read.seeded);
-        let existing = read.map(|read| read.spaces).unwrap_or_default();
-        if seeded {
-            let mut sources: Vec<(String, String)> = Vec::new();
-            for rel in &outcome.seeds {
-                match std::fs::read_to_string(pattern_dir.join(rel)) {
-                    Ok(text) => sources.push((rel.clone(), text)),
-                    // One space the zone does not gain, said out loud. Never a
-                    // refusal: a create must not fail over a file it was only
-                    // being offered.
-                    Err(error) => tracing::warn!("{rel} was not seeded: {error}"),
-                }
-            }
-            let borrowed: Vec<(&str, &str)> = sources
-                .iter()
-                .map(|(rel, text)| (rel.as_str(), text.as_str()))
-                .collect();
-            let planned = spaces::plan_template_spaces(&pattern_root, &borrowed, &existing);
-            for sentence in &planned.skipped {
-                tracing::warn!("{sentence}");
-            }
-            planned.seeds
-        } else {
-            tracing::warn!(
-                "this zone has no {}/ yet, so the template's spaces were not seeded — they are offered to a zone that already has its own",
-                spaces::SPACES_DIR
-            );
-            Vec::new()
-        }
-    };
-    // Appended after every write into the new session, because the seed lands
-    // OUTSIDE it: a crash before these steps leaves the zone exactly as it was
-    // and the new session still readable, through the spaces the zone already
-    // had. Inside the create's own plan rather than as a second `spaces-seed`
-    // verb, so one press is one journal row and a resume finishes what it began
-    // (AD-111).
-    compiled
-        .steps
-        .extend(spaces::template_seed_steps(&space_seeds));
-    compiled.verb = if source.is_some() {
-        "create-from".to_owned()
-    } else {
-        "create".to_owned()
-    };
-    let session_path = compiled.session.clone();
-
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, compiled))
+    let outcome = tauri::async_runtime::spawn_blocking(move || verbs::create(&zone, req))
         .await
         .map_err(|join| IpcError {
             code: IpcErrorCode::Internal,
@@ -1151,12 +744,13 @@ pub async fn sessions_create(
             account_id: None,
             retriable: false,
         })?
-        .map_err(exec_error)?;
+        .map_err(verb_error)?;
     crate::sessions_root::rescan(&root_id);
+    let (CreateOutcome::Created { path, title } | CreateOutcome::Existed { path, title }) = outcome;
     Ok(keeper_core::sessions::vm::SessionRefVm {
         root_id,
-        id,
-        path: session_path,
+        id: id.to_string(),
+        path,
         title,
     })
 }
@@ -1197,7 +791,7 @@ pub async fn sessions_log_today(
     if let Some((compiled, _caret)) = plan::compile_log_today(&row.path, &readme, &today()) {
         let zone_for_run = zone.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            crate::sessions_exec::run(&zone_for_run, compiled)
+            keeper_agent::sessions::exec::run(&zone_for_run, compiled)
         })
         .await
         .map_err(|join| IpcError {
@@ -1387,7 +981,7 @@ pub async fn sessions_migrate(root_id: String, session_id: String) -> Result<(),
 
     let zone_for_run = zone.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        crate::sessions_exec::run(&zone_for_run, compiled)
+        keeper_agent::sessions::exec::run(&zone_for_run, compiled)
     })
     .await
     .map_err(|join| IpcError {
@@ -1555,7 +1149,7 @@ pub async fn sessions_record_migrate(
         }
         let zone_for_run = zone.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            crate::sessions_exec::run(&zone_for_run, compiled)
+            keeper_agent::sessions::exec::run(&zone_for_run, compiled)
         })
         .await
         .map_err(|join| IpcError {
@@ -1649,41 +1243,19 @@ pub async fn sessions_archive(
     promotes: Vec<(String, String)>,
     empty_workspace: bool,
 ) -> Result<(), IpcError> {
-    use keeper_core::sessions::plan;
-
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
-    let row = crate::sessions_root::row_of(&root_id, &session_id).ok_or_else(|| IpcError {
+    let year = today()[..4].parse::<i32>().unwrap_or(1970);
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_agent::sessions::verbs::archive(&zone, &session_id, promotes, empty_workspace, year)
+    })
+    .await
+    .map_err(|join| IpcError {
         code: IpcErrorCode::Internal,
-        message: format!("no such session: {session_id}"),
+        message: format!("archive task failed: {join}"),
         account_id: None,
         retriable: false,
-    })?;
-    if row.status != "active" {
-        return Err(IpcError {
-            code: IpcErrorCode::Internal,
-            message: "only an active session can be archived".to_owned(),
-            account_id: None,
-            retriable: false,
-        });
-    }
-    let year = today()[..4].parse::<i32>().unwrap_or(1970);
-    let compiled = plan::compile_archive(
-        &row.path,
-        &plan::ArchiveDecision {
-            promotes,
-            empty_workspace,
-            year,
-        },
-    );
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("archive task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
+    })?
+    .map_err(verb_error)?;
     crate::sessions_root::rescan(&root_id);
     Ok(())
 }
@@ -1705,25 +1277,18 @@ pub fn sessions_archive(
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn sessions_delete(root_id: String, session_id: String) -> Result<(), IpcError> {
-    use keeper_core::sessions::plan;
-
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
-    let row = crate::sessions_root::row_of(&root_id, &session_id).ok_or_else(|| IpcError {
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_agent::sessions::verbs::delete(&zone, &session_id)
+    })
+    .await
+    .map_err(|join| IpcError {
         code: IpcErrorCode::Internal,
-        message: format!("no such session: {session_id}"),
+        message: format!("delete task failed: {join}"),
         account_id: None,
         retriable: false,
-    })?;
-    let compiled = plan::compile_delete(&row.path, &session_id);
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("delete task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
+    })?
+    .map_err(verb_error)?;
     crate::sessions_root::rescan(&root_id);
     Ok(())
 }
@@ -1740,33 +1305,18 @@ pub fn sessions_delete(root_id: String, session_id: String) -> Result<(), IpcErr
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn sessions_unarchive(root_id: String, session_id: String) -> Result<(), IpcError> {
-    use keeper_core::sessions::plan;
-
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
-    let row = crate::sessions_root::row_of(&root_id, &session_id).ok_or_else(|| IpcError {
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_agent::sessions::verbs::unarchive(&zone, &session_id)
+    })
+    .await
+    .map_err(|join| IpcError {
         code: IpcErrorCode::Internal,
-        message: format!("no such session: {session_id}"),
+        message: format!("unarchive task failed: {join}"),
         account_id: None,
         retriable: false,
-    })?;
-    if row.status != "archived" {
-        return Err(IpcError {
-            code: IpcErrorCode::Internal,
-            message: "only an archived session can be unarchived".to_owned(),
-            account_id: None,
-            retriable: false,
-        });
-    }
-    let compiled = plan::compile_unarchive(&row.path);
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("unarchive task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
+    })?
+    .map_err(verb_error)?;
     crate::sessions_root::rescan(&root_id);
     Ok(())
 }
@@ -1808,7 +1358,7 @@ pub async fn sessions_spaces(
         let compiled = spaces::compile_seed(&defaults, &ids, &today());
         let zone_for_run = zone.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            crate::sessions_exec::run(&zone_for_run, compiled)
+            keeper_agent::sessions::exec::run(&zone_for_run, compiled)
         })
         .await
         .map_err(|join| IpcError {
@@ -2112,15 +1662,17 @@ pub async fn sessions_space_save(
         &crate::sync_ipc::new_ulid(),
         &today(),
     );
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("space-save task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_agent::sessions::exec::run(&zone, compiled)
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("space-save task failed: {join}"),
+        account_id: None,
+        retriable: false,
+    })?
+    .map_err(exec_error)?;
     crate::sessions_root::rescan(&root_id);
     Ok(rel)
 }
@@ -2231,15 +1783,17 @@ pub async fn sessions_space_delete(root_id: String, space_id: String) -> Result<
     }
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
     let compiled = spaces::compile_delete(&space_id, &crate::sync_ipc::new_ulid());
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("space-delete task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_agent::sessions::exec::run(&zone, compiled)
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("space-delete task failed: {join}"),
+        account_id: None,
+        retriable: false,
+    })?
+    .map_err(exec_error)?;
     crate::sessions_root::rescan(&root_id);
     Ok(())
 }
@@ -2277,15 +1831,17 @@ pub async fn sessions_spaces_restore(
         .map(|_| crate::sync_ipc::new_ulid())
         .collect();
     let compiled = spaces::compile_seed(&missing, &ids, &today());
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("restore task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_agent::sessions::exec::run(&zone, compiled)
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("restore task failed: {join}"),
+        account_id: None,
+        retriable: false,
+    })?
+    .map_err(exec_error)?;
     crate::sessions_root::rescan(&root_id);
     Ok(SessionSpacesRestoredVm { names })
 }
@@ -2448,15 +2004,17 @@ pub async fn sessions_template_install(
         .unwrap_or_default();
     let compiled = template::compile_install(&dest, &files, &present, &crate::sync_ipc::new_ulid());
     let zone_root = zone.clone();
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("template-install task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_agent::sessions::exec::run(&zone_root, compiled)
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("template-install task failed: {join}"),
+        account_id: None,
+        retriable: false,
+    })?
+    .map_err(exec_error)?;
     crate::sessions_root::rescan(&root_id);
     Ok(dest)
 }
@@ -2557,11 +2115,14 @@ pub fn sessions_template_entries(
     // in Finder is still an empty room rather than an error banner.
     let dir = zone.join(&rel);
     let excluded = if rel == model::TEMPLATE_DIR {
-        named_templates(&zone)
+        keeper_agent::sessions::verbs::named_templates(&zone)
     } else {
         Vec::new()
     };
-    let files = pattern::without_dirs(&pattern_files(&dir), &excluded);
+    let files = pattern::without_dirs(
+        &keeper_agent::sessions::verbs::pattern_files(&dir),
+        &excluded,
+    );
     let mut out: Vec<SessionTemplateEntryVm> = files
         .iter()
         // A `.gitkeep` is not a row, for the picker's own reason: it holds an
@@ -2738,11 +2299,11 @@ pub async fn sessions_template_rename(
     // that normalises a name somebody typed by hand.
     //
     // The same predicate `MoveDir` guards itself with
-    // ([`crate::sessions_exec::same_directory`]), asked here so the operator
+    // ([`keeper_agent::sessions::exec::same_directory`]), asked here so the operator
     // reads a sentence rather than an executor refusal — and asked from the one
     // definition, because two of them would be two chances for the edge and the
     // executor to disagree about which moves this zone accepts.
-    if target.exists() && !crate::sessions_exec::same_directory(&target, &source) {
+    if target.exists() && !keeper_agent::sessions::exec::same_directory(&target, &source) {
         return Err(IpcError {
             code: IpcErrorCode::Internal,
             message: format!(
@@ -2755,15 +2316,17 @@ pub async fn sessions_template_rename(
     }
 
     let compiled = template::compile_rename(&from, &to);
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("template-rename task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_agent::sessions::exec::run(&zone, compiled)
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("template-rename task failed: {join}"),
+        account_id: None,
+        retriable: false,
+    })?
+    .map_err(exec_error)?;
     crate::sessions_root::rescan(&root_id);
     Ok(to)
 }
@@ -3008,7 +2571,7 @@ pub async fn sessions_template_file_new(
     }
     let subpath = template_subpath(&state, &root_id, &landed)?;
     let plan = compiled.plan;
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, plan))
+    tauri::async_runtime::spawn_blocking(move || keeper_agent::sessions::exec::run(&zone, plan))
         .await
         .map_err(|join| IpcError {
             code: IpcErrorCode::Internal,
@@ -3075,7 +2638,7 @@ pub async fn sessions_template_dir_new(
         return Err(entry_taken_error(&compiled.rel));
     }
     let plan = compiled.plan;
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, plan))
+    tauri::async_runtime::spawn_blocking(move || keeper_agent::sessions::exec::run(&zone, plan))
         .await
         .map_err(|join| IpcError {
             code: IpcErrorCode::Internal,
@@ -3156,15 +2719,15 @@ pub async fn sessions_template_rename_entry(
     }
     let target = zone.join(&landed);
     // The same predicate the plan step guards itself with
-    // ([`crate::sessions_exec::same_directory`]), asked here so the operator reads
+    // ([`keeper_agent::sessions::exec::same_directory`]), asked here so the operator reads
     // a sentence rather than an executor refusal, and asked from the one
     // definition so the two layers cannot disagree about which renames a template
     // accepts.
-    if target.exists() && !crate::sessions_exec::same_directory(&target, &source) {
+    if target.exists() && !keeper_agent::sessions::exec::same_directory(&target, &source) {
         return Err(entry_taken_error(&compiled.rel));
     }
     let plan = compiled.plan;
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, plan))
+    tauri::async_runtime::spawn_blocking(move || keeper_agent::sessions::exec::run(&zone, plan))
         .await
         .map_err(|join| IpcError {
             code: IpcErrorCode::Internal,
@@ -3225,7 +2788,7 @@ pub async fn sessions_template_delete_entry(
     let compiled = template::compile_entry_delete(&dir, &rel, kind, &crate::sync_ipc::new_ulid())
         .map_err(entry_error)?;
     let plan = compiled.plan;
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, plan))
+    tauri::async_runtime::spawn_blocking(move || keeper_agent::sessions::exec::run(&zone, plan))
         .await
         .map_err(|join| IpcError {
             code: IpcErrorCode::Internal,
@@ -3486,15 +3049,17 @@ pub async fn sessions_file_new(
         &today(),
     );
     let compiled = files::compile_new(&session_path, &rel, &content).map_err(file_verb_error)?;
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("file-new task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_agent::sessions::exec::run(&zone_root, compiled)
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("file-new task failed: {join}"),
+        account_id: None,
+        retriable: false,
+    })?
+    .map_err(exec_error)?;
     crate::sessions_root::rescan(&root_id);
     Ok(subpath)
 }
@@ -3571,15 +3136,17 @@ pub async fn sessions_dir_new(
     }
 
     let compiled = files::compile_dir_new(&row.path, &rel).map_err(file_verb_error)?;
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("dir-new task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_agent::sessions::exec::run(&zone_root, compiled)
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("dir-new task failed: {join}"),
+        account_id: None,
+        retriable: false,
+    })?
+    .map_err(exec_error)?;
     crate::sessions_root::rescan(&root_id);
     Ok(())
 }
@@ -3756,15 +3323,17 @@ pub async fn sessions_file_new_kind(
     // session whose `refs/` does not exist yet gets it created in the same
     // journaled plan rather than in a step somebody has to remember.
     let compiled = files::compile_new(&session_path, &rel, &content).map_err(file_verb_error)?;
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("file-new-kind task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_agent::sessions::exec::run(&zone_root, compiled)
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("file-new-kind task failed: {join}"),
+        account_id: None,
+        retriable: false,
+    })?
+    .map_err(exec_error)?;
     crate::sessions_root::rescan(&root_id);
     Ok(subpath)
 }
@@ -3801,15 +3370,17 @@ pub async fn sessions_file_delete(
         resolve_session_file(&state, &root_id, &session_id, &rel)?;
     let compiled = files::compile_delete(&session_path, &rel, &crate::sync_ipc::new_ulid())
         .map_err(file_verb_error)?;
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("file-delete task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_agent::sessions::exec::run(&zone_root, compiled)
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("file-delete task failed: {join}"),
+        account_id: None,
+        retriable: false,
+    })?
+    .map_err(exec_error)?;
     crate::sessions_root::rescan(&root_id);
     Ok(())
 }
@@ -3961,15 +3532,17 @@ pub async fn sessions_file_rename(
 
     let compiled =
         files::compile_rename(&session_path, &rel, &to, &rewrites).map_err(file_verb_error)?;
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("file-rename task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_agent::sessions::exec::run(&zone_root, compiled)
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("file-rename task failed: {join}"),
+        account_id: None,
+        retriable: false,
+    })?
+    .map_err(exec_error)?;
     crate::sessions_root::rescan(&root_id);
     Ok(new_subpath)
 }
@@ -4123,15 +3696,17 @@ pub async fn sessions_task_move(
     let compiled =
         tasks::compile_move(&pool_read.path, &rel, text, status, &column, index as usize)
             .map_err(file_verb_error)?;
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("task-move task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_agent::sessions::exec::run(&zone_root, compiled)
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("task-move task failed: {join}"),
+        account_id: None,
+        retriable: false,
+    })?
+    .map_err(exec_error)?;
     crate::sessions_root::rescan(&root_id);
     Ok(())
 }
@@ -4520,15 +4095,17 @@ pub async fn sessions_ref_add(
     )
     .map_err(add_ref_error)?;
 
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("ref-add task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_agent::sessions::exec::run(&zone_root, compiled)
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("ref-add task failed: {join}"),
+        account_id: None,
+        retriable: false,
+    })?
+    .map_err(exec_error)?;
     crate::sessions_root::rescan(&root_id);
 
     Ok(SessionRefAddedVm {
@@ -4781,7 +4358,7 @@ async fn run_zone_search(
 /// folder is the whole world it needs.
 #[cfg(all(test, desktop))]
 mod tests {
-    use super::{flat_kinds, pattern_files, template_at, template_mint};
+    use super::{template_at, template_mint};
 
     /// The create side classifies what the read side reads (FR-285). A
     /// `ref`-tagged file in a folder the operator made travels into a new
@@ -4810,7 +4387,10 @@ mod tests {
         write("artifacts/report.md", "---\ntags: [ref]\n---\n# Output\n");
         write("workspace/scratch.md", "---\ntags: [ref]\n---\n# Scratch\n");
 
-        let kinds = flat_kinds(source, &pattern_files(source));
+        let kinds = keeper_agent::sessions::verbs::flat_kinds(
+            source,
+            &keeper_agent::sessions::verbs::pattern_files(source),
+        );
         assert_eq!(
             kinds
                 .iter()

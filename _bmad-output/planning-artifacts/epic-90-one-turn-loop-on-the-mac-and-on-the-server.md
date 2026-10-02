@@ -310,10 +310,10 @@ Conventions as Epic 89's *Stories*:
 
 **The guarantees:**
 - **One plan at a time per zone.** `ZoneLock::acquire(zone)` takes a process-wide `Mutex`, keyed by the zone's canonical root, and an `fs4` exclusive lock on `<zone>/.keeper/sessions.lock`, so a second process on the machine waits.
-- **Resume at start.** `resume_all(zones)` runs before any verb, on both hosts.
+- **Resume at start.** `resume_all(zones)` runs before any verb, on both hosts. **As built:** every verb also finishes a pending journal as it takes the zone (`exec::hold`), before it reads anything, so a crash of the other host sharing the zone is finished by the next verb; the app runs its start-time `resume_all` on a blocking task outside the registry lock, best-effort. `resume` of a zone with no journal takes no lock and makes no lock file.
 - **The caller supplies the id.** `create(CreateReq { id: Ulid, … }) -> Created | Existed`, found by the README record's id in `active/` and `archive/`.
 - **A verb finds a session by id.** The `session_id` comes from the plan's result, not the 400 ms scan.
-- **Containment is canonical.** Every step's target is joined through `keeper_sync::browse::resolve` under the zone root as well as lexically (`rel()`, `exec.rs:303-314`).
+- **Containment is canonical.** Every step's target is joined through `keeper_sync::browse::resolve` under the zone root as well as lexically (`rel()`, `exec.rs:303-314`). **As built:** `exec.rs` does the canonical check itself (the deepest existing part must resolve inside the canonical zone) beside the existing lexical one; a step that moves or trashes a path acts on the link there, so only its parent must resolve inside, and every read or write through a path keeps the full check. A filesystem that cannot `flock` at all (`ENOTSUP`/`ENOLCK`) keeps the in-process gate and logs once.
 - **`session_write(session, rel, content)`** creates or replaces through the journaled executor:
   - under `artifacts/`, with `files::compile_new`'s extensions;
   - under `workspace/`, any extension;
@@ -324,9 +324,9 @@ Conventions as Epic 89's *Stories*:
 **Acceptance:**
 1. **Two plans never interleave.** `two_plans_on_one_zone_never_interleave`: two threads, each running a 40-step plan on one real zone, released by a barrier.
    - Neither journal ever names the other plan's steps, and the tree holds both results.
-   - It fails on today's code: the second `run` resumes the first plan (`exec.rs:49-52`). Mutation: removing the mutex fails it.
+   - It fails on today's code: the second `run` resumes the first plan (`exec.rs:49-52`). Mutation: removing the mutex fails it. **As built:** `flock` locks of two descriptors in one process conflict, so either layer alone passes this test and only removing both fails it; the gate alone is proved by `lock::tests::the_gate_alone_holds_a_second_thread_off_until_the_first_lets_go` (removing the gate's wait fails it).
 2. **A second process waits.** `a_second_process_waits_on_the_lock_file`: the test re-executes its own binary (`std::env::current_exe`, with an env flag) to hold the lock for 500 ms. The parent's plan starts only after the child's ends, by timestamps.
-3. **An interrupted plan resumes at start.** `an_interrupted_create_is_resumed_at_start`: a journal with `done = 2` of 5 is completed by `resume_all` and the journal cleared. The existing crash-resume tests move and pass.
+3. **An interrupted plan resumes at start.** `an_interrupted_create_is_resumed_at_start`: a journal with `done = 2` of 5 is completed by `resume_all` and the journal cleared. The existing crash-resume tests move and pass. **As built:** named `resume_all_finishes_an_interrupted_create_and_clears_its_journal`; the app's call from `sessions_root::refresh` is shell code, by inspection. `a_create_retried_after_a_crash_mid_create_finishes_the_first_and_makes_no_second` covers a journal left for a verb to find.
 4. **A retried create makes one session.** `a_create_retried_with_the_same_id_makes_one_session`:
    - two creates with one id give `Created`, then `Existed`;
    - there is one folder;

@@ -20,7 +20,12 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 ulid = { workspace = true }
 reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The zone lock's file half: an exclusive lock a second process waits on.
+fs4 = { workspace = true }
+# The caller's clock, handed to a create (AD-56).
+chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-serde_json = { workspace = true }

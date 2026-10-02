@@ -1,20 +1,32 @@
 //! The lifecycle executor: plans run with a journal beside them (AD-111,
-//! NFR-38).
+//! NFR-38, AD-368).
 //!
 //! `keeper_core::sessions::plan` compiles; this runs. One plan at a time per
-//! zone (a `Mutex` — lifecycle verbs are human-paced), each step idempotent,
-//! and the journal row in `<zone>/.keeper/sessions-journal.json` written
-//! BEFORE the first step and cleared AFTER the last — so a crash leaves a
-//! resumable record naming the verb, the plan and the completed prefix. On
-//! registry start, an incomplete journal resumes by re-running the remaining
-//! steps; idempotency is what makes "re-run" the whole recovery story.
+//! zone ([`ZoneLock`]: a process-wide mutex keyed by the zone's canonical root
+//! and a file lock a second process waits on), each step idempotent, and the
+//! journal row in `<zone>/.keeper/sessions-journal.json` written BEFORE the
+//! first step and cleared AFTER the last — so a crash leaves a resumable
+//! record naming the verb, the plan and the completed prefix. Whoever takes
+//! the zone next finishes that record first ([`hold`]), before it reads or
+//! plans anything, and an incomplete journal resumes by re-running the
+//! remaining steps; idempotency is what makes "re-run" the whole recovery
+//! story. At start a host also calls [`super::resume_all`], so a crash is
+//! finished without waiting for the next verb.
+//!
+//! Every step's path is zone-relative twice over: lexically, and on the disk —
+//! the deepest part of it that exists already must resolve inside the zone, so
+//! a symlinked folder cannot carry a write out of it. A step that moves or
+//! trashes a path acts on the link itself, so only the folder holding it has
+//! to be inside.
 //!
 //! Nothing here decides. A plan arrives compiled; refusals (`GuardedWrite`
-//! mismatch, a missing source) surface as errors the IPC layer sentences.
+//! mismatch, a missing source) surface as errors the caller sentences.
 
 use std::path::{Path, PathBuf};
 
 use keeper_core::sessions::plan::{Plan, PlanStep};
+
+use super::lock::ZoneLock;
 
 /// The journal file, zone-relative. Inside `.keeper/` so it never syncs.
 const JOURNAL_REL: &str = ".keeper/sessions-journal.json";
@@ -41,14 +53,36 @@ pub enum ExecError {
     },
 }
 
-/// Run a plan against a zone root, journaled. Synchronous — lifecycle verbs
-/// are single-digit file counts, and the callers run on blocking tasks.
+/// Run a plan against a zone root, journaled, holding the zone. Synchronous —
+/// lifecycle verbs are single-digit file counts, and the callers run on
+/// blocking tasks.
 pub fn run(zone: &Path, plan: Plan) -> Result<(), ExecError> {
+    let held = hold(zone)?;
+    run_held(plan, &held)
+}
+
+/// Hold a zone for one plan, waiting for whoever holds it now, and finish
+/// any plan a crash left in it — so a verb that holds the zone reads it as
+/// every finished plan left it, not halfway through one.
+pub fn hold(zone: &Path) -> Result<ZoneLock, ExecError> {
+    let held = ZoneLock::acquire(zone).map_err(|error| ExecError::Failed {
+        verb: "lock".to_owned(),
+        step: 0,
+        reason: format!("the sessions zone could not be locked: {error}"),
+    })?;
+    resume_held(held.zone())?;
+    Ok(held)
+}
+
+/// [`run`] for a caller that already holds the zone through [`hold`] — a verb
+/// whose own reads must see the zone as the plan will find it. The plan runs
+/// in the zone the lock holds.
+pub fn run_held(plan: Plan, held: &ZoneLock) -> Result<(), ExecError> {
+    let zone = held.zone();
     let journal = zone.join(JOURNAL_REL);
-    if journal.exists() {
-        // An unfinished earlier run: resume it first rather than interleave.
-        resume(zone)?;
-    }
+    // `hold` finished any earlier run; a lock taken with `ZoneLock::acquire`
+    // directly has not, and a journal written over is a crash never finished.
+    resume_held(zone)?;
     write_journal(
         &journal,
         &JournalRow {
@@ -59,10 +93,18 @@ pub fn run(zone: &Path, plan: Plan) -> Result<(), ExecError> {
     run_from(zone, &journal, plan, 0)
 }
 
-/// Resume the zone's journaled run, if one is pending. Called at registry
-/// start and before any new plan. A journal that cannot be read is renamed
-/// aside rather than deleted — evidence, not litter.
+/// Resume the zone's journaled run, if one is pending, holding the zone.
+/// A journal that cannot be read is renamed aside rather than deleted —
+/// evidence, not litter. A zone with no journal is only looked at: no lock
+/// file is made and nothing waits.
 pub fn resume(zone: &Path) -> Result<(), ExecError> {
+    if !zone.join(JOURNAL_REL).exists() {
+        return Ok(());
+    }
+    hold(zone).map(drop)
+}
+
+fn resume_held(zone: &Path) -> Result<(), ExecError> {
     let journal = zone.join(JOURNAL_REL);
     if !journal.exists() {
         return Ok(());
@@ -121,11 +163,11 @@ fn run_from(zone: &Path, journal: &Path, plan: Plan, from: usize) -> Result<(), 
 fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
     let failed = |reason: String| ExecError::Refused(reason);
     match step {
-        PlanStep::MkDir { path } => std::fs::create_dir_all(zone.join(rel(path)?))
+        PlanStep::MkDir { path } => std::fs::create_dir_all(rel(zone, path)?)
             .map_err(|e| failed(format!("mkdir {path}: {e}"))),
         PlanStep::CopyFile { from, to } => {
-            let source = zone.join(rel(from)?);
-            let target = zone.join(rel(to)?);
+            let source = rel(zone, from)?;
+            let target = rel(zone, to)?;
             if !source.exists() && target.exists() {
                 // The copy already happened and the source has since gone
                 // (an archive resume after its own EmptyDirKeep): complete.
@@ -138,14 +180,14 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
                 .map(|_| ())
                 .map_err(|e| failed(format!("copy {from} → {to}: {e}")))
         }
-        PlanStep::WriteFile { path, content } => atomic_write(&zone.join(rel(path)?), content)
+        PlanStep::WriteFile { path, content } => atomic_write(&rel(zone, path)?, content)
             .map_err(|e| failed(format!("write {path}: {e}"))),
         PlanStep::GuardedWrite {
             path,
             expect_len,
             content,
         } => {
-            let target = zone.join(rel(path)?);
+            let target = rel(zone, path)?;
             let current = std::fs::read_to_string(&target)
                 .map_err(|e| failed(format!("read {path}: {e}")))?;
             if current.len() != *expect_len {
@@ -161,8 +203,8 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
             atomic_write(&target, content).map_err(|e| failed(format!("write {path}: {e}")))
         }
         PlanStep::MoveDir { from, to } => {
-            let source = zone.join(rel(from)?);
-            let target = zone.join(rel(to)?);
+            let source = rel_link(zone, from)?;
+            let target = rel(zone, to)?;
             if !source.exists() && target.exists() {
                 return Ok(()); // already moved
             }
@@ -180,8 +222,8 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
                 .map_err(|e| failed(format!("move {from} → {to}: {e}")))
         }
         PlanStep::MoveFile { from, to } => {
-            let source = zone.join(rel(from)?);
-            let target = zone.join(rel(to)?);
+            let source = rel_link(zone, from)?;
+            let target = rel(zone, to)?;
             // **No already-moved short-circuit here, unlike `MoveDir` above.**
             // That one infers "this plan already ran" from a gone source and a
             // present target, and the inference holds where it lives: a resumed
@@ -215,7 +257,7 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
                 .map_err(|e| failed(format!("move {from} → {to}: {e}")))
         }
         PlanStep::TrashDir { path, trash_key } => {
-            let source = zone.join(rel(path)?);
+            let source = rel_link(zone, path)?;
             let trash = zone.join(".keeper/trash").join(trash_key);
             if !source.exists() && trash.exists() {
                 return Ok(()); // already trashed
@@ -226,7 +268,7 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
             std::fs::rename(&source, &trash).map_err(|e| failed(format!("trash {path}: {e}")))
         }
         PlanStep::TrashFile { path, trash_key } => {
-            let source = zone.join(rel(path)?);
+            let source = rel_link(zone, path)?;
             // The basename rides along, so what lands in the trash is
             // `.keeper/trash/<key>/tasks.md` — recoverable by looking at it.
             let name = source
@@ -242,7 +284,7 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
             std::fs::rename(&source, &target).map_err(|e| failed(format!("trash {path}: {e}")))
         }
         PlanStep::EmptyDirKeep { path } => {
-            let dir = zone.join(rel(path)?);
+            let dir = rel(zone, path)?;
             if !dir.exists() {
                 std::fs::create_dir_all(&dir).map_err(|e| failed(format!("mkdir {path}: {e}")))?;
             }
@@ -287,20 +329,47 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
 /// that is not there canonicalises to nothing and is never "the same", so an
 /// absent destination is not a collision either way.
 ///
-/// Shared with [`crate::sessions_ipc`], which makes the same distinction one
+/// Shared with the app's sessions commands, which make the same distinction one
 /// layer up so the operator gets a sentence instead of an executor refusal.
 /// Two copies of this would be two chances for the two layers to disagree about
 /// which moves a zone accepts.
-pub(crate) fn same_directory(left: &Path, right: &Path) -> bool {
+pub fn same_directory(left: &Path, right: &Path) -> bool {
     std::fs::canonicalize(left)
         .ok()
         .zip(std::fs::canonicalize(right).ok())
         .is_some_and(|(left, right)| left == right)
 }
 
-/// A zone-relative plan path, refused if it escapes — the executor's own
-/// containment, independent of who compiled the plan.
-fn rel(path: &str) -> Result<PathBuf, ExecError> {
+/// A zone-relative plan path joined onto the zone, refused if it escapes —
+/// the executor's own containment, independent of who compiled the plan — for
+/// a step that reads or writes **through** the path.
+///
+/// Lexically first (no `..`, no empty part, not absolute), then on the disk:
+/// the deepest part of the joined path that exists already (the whole path
+/// when it is there; an ancestor, for a file about to be written) must
+/// canonicalise inside the canonical zone. A target that is not there yet
+/// cannot be canonicalised, so its nearest existing ancestor is what a
+/// symlinked folder would redirect it through.
+fn rel(zone: &Path, path: &str) -> Result<PathBuf, ExecError> {
+    contained(zone, path, Reach::Through)
+}
+
+/// [`rel`] for a step that acts on the path **itself** — moves it, or moves it
+/// into the trash — so a link there is moved as a link and never followed.
+/// Only the folder holding it must resolve inside the zone: a session whose
+/// `workspace/` is a link to another disk can be trashed, and a dangling link
+/// can be too.
+fn rel_link(zone: &Path, path: &str) -> Result<PathBuf, ExecError> {
+    contained(zone, path, Reach::Link)
+}
+
+/// Whether a step follows its path or acts on the entry the path names.
+enum Reach {
+    Through,
+    Link,
+}
+
+fn contained(zone: &Path, path: &str, reach: Reach) -> Result<PathBuf, ExecError> {
     if path.is_empty()
         || Path::new(path).is_absolute()
         || path.split('/').any(|part| part == ".." || part.is_empty())
@@ -309,7 +378,36 @@ fn rel(path: &str) -> Result<PathBuf, ExecError> {
             "plan path {path} is not zone-relative"
         )));
     }
-    Ok(PathBuf::from(path))
+    let target = zone.join(path);
+    let escapes = || {
+        ExecError::Refused(format!(
+            "plan path {path} leaves the zone through a link; nothing was done"
+        ))
+    };
+    let canonical_zone = zone.canonicalize().map_err(|error| {
+        ExecError::Refused(format!(
+            "the sessions zone is not there any more ({error}); nothing was done"
+        ))
+    })?;
+    let from = match reach {
+        Reach::Through => target.as_path(),
+        Reach::Link => target.parent().unwrap_or(zone),
+    };
+    // The zone itself is an ancestor and exists, so this finds something; if
+    // it does not, nothing on the way can be vouched for.
+    let Some(existing) = from
+        .ancestors()
+        .find(|ancestor| ancestor.symlink_metadata().is_ok())
+    else {
+        return Err(escapes());
+    };
+    // There, yet not resolvable — a dangling link — or resolving outside the
+    // zone: either way a step through it would land somewhere this zone does
+    // not own.
+    match existing.canonicalize() {
+        Ok(resolved) if resolved.starts_with(&canonical_zone) => Ok(target),
+        _ => Err(escapes()),
+    }
 }
 
 /// Write bytes atomically: temp file beside the target, then rename.

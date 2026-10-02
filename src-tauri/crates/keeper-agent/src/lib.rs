@@ -10,6 +10,7 @@
 //! - [`drive`] runs it: the tool loop, the partial row, the stream.
 //! - [`host`] is the drive tool host every tool call goes through.
 //! - [`task`] is the scheduled bot task, over the same arming.
+//! - [`sessions`] is the sessions runtime: one plan at a time per zone.
 //! - [`ports`] is what a host process supplies.
 //! - [`approval`] is the ask-and-wait a host with a person at it plugs in.
 
@@ -17,5 +18,6 @@ pub mod approval;
 pub mod drive;
 pub mod host;
 pub mod ports;
+pub mod sessions;
 pub mod task;
 pub mod turn;
