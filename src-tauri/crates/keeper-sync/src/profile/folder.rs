@@ -275,6 +275,11 @@ const FOLDER_FIELD_RULES: &[(&str, FolderFieldRule)] = &[
     // the reason the ledger's is: a person recognised on one machine is only
     // recognised on the other if both read the same folder (AD-342).
     ("voices", FolderFieldRule::Allowed),
+    // Where the agents zone lives is a fact about the repository's layout for
+    // the reason the sessions zone's is: an agent's home, memory and journal
+    // are one tree every clone reads, and two machines that disagreed on the
+    // folder would host two different sets of agents from one drive (AD-361).
+    ("agents", FolderFieldRule::Allowed),
 ];
 
 /// What a folder file may do with one canonical profile key.
@@ -1485,6 +1490,67 @@ subfolder = "70-tasks"
                 "{text:?} must not store its voices block"
             );
             assert!(!outcome.owned.contains("voices"), "{:?}", outcome.owned);
+        }
+    }
+
+    /// `[folder.agents]` is read exactly like `[folder.voices]`, beside the
+    /// `[folder.sessions]` it needs: an empty table is "keeps agents, in the
+    /// default zone" (AD-361).
+    #[test]
+    fn an_empty_agents_table_turns_the_flag_on_with_its_default_subfolder() {
+        let (_dir, outcome) = applied("[folder.sessions]\n\n[folder.agents]\n", &tier());
+        assert!(outcome.faults.is_empty(), "{:?}", outcome.faults);
+        assert_eq!(
+            outcome.profile.agents.as_ref().expect("agents").subfolder,
+            crate::profile::DEFAULT_AGENTS_SUBFOLDER
+        );
+        assert_eq!(
+            outcome.profile.agents_root(),
+            Some(outcome.profile.local_path.join("80-agents"))
+        );
+        assert!(outcome.owned.contains("agents"), "{:?}", outcome.owned);
+
+        let (_dir, outcome) = applied(
+            "[folder.sessions]\nsubfolder = \"60-sessions\"\n\n\
+             [folder.agents]\nsubfolder = \"zones/agents\"\n",
+            &tier(),
+        );
+        assert!(outcome.faults.is_empty(), "{:?}", outcome.faults);
+        assert_eq!(
+            outcome.profile.agents.as_ref().expect("agents").subfolder,
+            "zones/agents"
+        );
+    }
+
+    /// A bad zone travels between clones like a bad bank would, so it is
+    /// refused and not stored — including a zone without the sessions zone it
+    /// needs, and one that collides with the sessions zone the same file names.
+    #[test]
+    fn a_bad_agents_subfolder_is_refused_and_not_stored() {
+        for (text, named) in [
+            (
+                "[folder.sessions]\n\n[folder.agents]\nsubfolder = \"/Volumes/elsewhere\"\n",
+                "agents subfolder",
+            ),
+            (
+                "[folder.sessions]\n\n[folder.agents]\nsubfolder = \"../outside\"\n",
+                "agents subfolder",
+            ),
+            (
+                "[folder.sessions]\nsubfolder = \"work\"\n\n\
+                 [folder.agents]\nsubfolder = \"work/agents\"\n",
+                "overlaps sessions subfolder work",
+            ),
+            ("[folder.agents]\n", "Add [folder.sessions]."),
+        ] {
+            let (_dir, outcome) = applied(text, &tier());
+            let fault = only_fault(&outcome);
+            assert!(fault.message.contains(named), "{}", fault.message);
+            assert!(
+                outcome.profile.agents.is_none(),
+                "{text:?} must not store its agents block"
+            );
+            assert!(!outcome.owned.contains("agents"), "{:?}", outcome.owned);
         }
     }
 

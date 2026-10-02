@@ -4178,6 +4178,8 @@ pub enum FilesFolderRoleVm {
     /// This folder keeps the drive's voices bank and dictionary
     /// (`voices.subfolder`, AD-342).
     Voices,
+    /// This folder is the drive's agents zone (`agents.subfolder`, AD-361).
+    Agents,
 }
 
 /// The configured folder roles of one profile, as [`FilesEntryVm::new`] needs
@@ -4198,6 +4200,8 @@ pub struct FilesFolderRoles<'a> {
     pub tasks_subfolder: Option<&'a str>,
     /// The profile's `voices.subfolder`, profile-relative, exactly as stored.
     pub voices_subfolder: Option<&'a str>,
+    /// The profile's `agents.subfolder`, profile-relative, exactly as stored.
+    pub agents_subfolder: Option<&'a str>,
 }
 
 impl FilesFolderRoles<'_> {
@@ -4237,6 +4241,8 @@ impl FilesFolderRoles<'_> {
             Some(FilesFolderRoleVm::Tasks)
         } else if matches(self.voices_subfolder) {
             Some(FilesFolderRoleVm::Voices)
+        } else if matches(self.agents_subfolder) {
+            Some(FilesFolderRoleVm::Agents)
         } else {
             None
         }
@@ -10300,6 +10306,7 @@ mod tests {
             recordings_subfolder: Some("Clips"),
             tasks_subfolder: Some("tasks"),
             voices_subfolder: Some("70-comms/voices"),
+            agents_subfolder: Some("80-agents"),
         };
         let role_of = |name: &str, is_dir: bool| {
             FilesEntryVm::new(FilesEntryFacts {
@@ -10332,6 +10339,17 @@ mod tests {
             Some(FilesFolderRoleVm::Voices)
         );
         assert_eq!(role_of("voices", true), None);
+        assert_eq!(role_of("80-agents", true), Some(FilesFolderRoleVm::Agents));
+        assert_eq!(
+            role_of("80-agents", false),
+            None,
+            "a FILE named like the zone is not the zone"
+        );
+        assert_eq!(
+            role_of("80-agents/nixi", true),
+            None,
+            "an agent's home inside the zone is an ordinary folder"
+        );
         assert_eq!(
             role_of("10-notes", true),
             None,
@@ -10383,6 +10401,7 @@ mod tests {
                 recordings_subfolder: None,
                 tasks_subfolder: None,
                 voices_subfolder: None,
+                agents_subfolder: None,
             }
             .role_of(path, true)
         };
@@ -10430,6 +10449,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&FilesFolderRoleVm::Voices).expect("serialize"),
             "\"voices\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FilesFolderRoleVm::Agents).expect("serialize"),
+            "\"agents\""
         );
     }
 

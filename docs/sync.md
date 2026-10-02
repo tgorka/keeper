@@ -83,6 +83,7 @@ reports names a profile. Profiles run concurrently and fail independently.
 | `releaseTtlMs` | How long content may stay after its release clock last moved; `0` disables (default 24 h) |
 | `settleMs` | Quiescence window (see §4) |
 | `tags` | Extra `Keeper-Tag:` provenance trailers |
+| `agents` | This folder keeps agents, and where: `{ subfolder }`, default `80-agents`. Needs `sessions` in the same profile; a folder file may set it as `[folder.agents]`. See `docs/agents.md` § *The agents zone* |
 
 ### State
 

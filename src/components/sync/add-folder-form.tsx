@@ -557,6 +557,7 @@ export const SYNC_SESSIONS_NOTE =
   "keeper lists LLM work sessions from a subfolder of this folder — one folder per session, with a README, promoted artifacts and reusable prompts. keeper adopts the layout that is there; it does not create one.";
 export const SYNC_SESSIONS_SUBFOLDER_LABEL = "Sessions subfolder";
 export const SYNC_SESSIONS_SUBFOLDER_NOTE = "Left empty, keeper picks the subfolder itself.";
+export const SYNC_AGENTS_LABEL = "This folder keeps agents";
 
 export const SYNC_TASKS_LABEL = "This folder holds task ledgers";
 export const SYNC_TASKS_SUBFOLDER_LABEL = "Task ledger subfolder";
@@ -782,6 +783,13 @@ interface SyncFormValues {
   sessionsSubfolder: string;
   tasks: boolean;
   tasksSubfolder: string;
+  /**
+   * Whether this folder keeps agents (AD-361), and where. On screen only while
+   * `sessions` is on, because an agent's sessions live in this folder's
+   * sessions zone; the subfolder follows the voices empty-box rules.
+   */
+  agents: boolean;
+  agentsSubfolder: string;
 }
 
 const EMPTY_FORM: SyncFormValues = {
@@ -817,6 +825,8 @@ const EMPTY_FORM: SyncFormValues = {
   recordingsSubfolder: "",
   voices: false,
   voicesSubfolder: "",
+  agents: false,
+  agentsSubfolder: "",
   sessions: false,
   // Empty for the recordings reason directly above.
   sessionsSubfolder: "",
@@ -882,6 +892,8 @@ function formValuesFor(profile: SyncProfileVm): SyncFormValues {
     sessionsSubfolder: profile.sessionsSubfolder,
     tasks: profile.tasks,
     tasksSubfolder: profile.tasksSubfolder,
+    agents: profile.agents,
+    agentsSubfolder: profile.agentsSubfolder,
   };
 }
 
@@ -950,6 +962,8 @@ function formValuesForOffer(offer: AddFolderPrefill, reduced: boolean): SyncForm
     sessionsSubfolder: reduced ? "" : (offer.sessions ?? ""),
     tasks: offer.tasks !== null,
     tasksSubfolder: offer.tasks ?? EMPTY_FORM.tasksSubfolder,
+    agents: !reduced && offer.agents !== null,
+    agentsSubfolder: reduced ? "" : (offer.agents ?? ""),
   };
 }
 
@@ -1877,6 +1891,18 @@ export function AddFolderForm({
         tasks: reducedCapability || folderOwned.has("tasks") ? null : form.tasks,
         tasksSubfolder:
           reducedCapability || folderOwned.has("tasks") || !form.tasks ? null : form.tasksSubfolder,
+        // The agents flag, on the voices block's exact terms (AD-361). Sent even
+        // while the sessions switch hides it: turning sessions off under a
+        // folder that keeps agents is then refused by Rust in its own sentence,
+        // rather than silently dropping the agents.
+        agents: reducedCapability || folderOwned.has("agents") ? null : form.agents,
+        agentsSubfolder:
+          reducedCapability ||
+          folderOwned.has("agents") ||
+          !form.agents ||
+          (!editing && !form.agentsSubfolder.trim())
+            ? null
+            : form.agentsSubfolder.trim(),
       });
       // Remember the created profile before the folder-file leg, so a retry
       // cannot create another profile if that write is refused.
@@ -2368,6 +2394,41 @@ export function AddFolderForm({
                 <p className="truncate font-mono text-muted-foreground text-xs">
                   {`${form.localPath}/${form.sessionsSubfolder.trim()}`}
                 </p>
+              )}
+              {/* The agents flag (AD-361, UX-DR127): absent, not disabled, while
+                  the folder holds no sessions zone, because agents work there. */}
+              <div className="flex items-center justify-between gap-2">
+                <Label htmlFor={`${fieldId}-agents`}>{SYNC_AGENTS_LABEL}</Label>
+                <Switch
+                  id={`${fieldId}-agents`}
+                  checked={form.agents}
+                  disabled={disabled || saving || folderOwned.has("agents")}
+                  onCheckedChange={(agents) => setForm((live) => ({ ...live, agents }))}
+                />
+              </div>
+              <p className="text-muted-foreground text-xs">
+                Agents' souls, memory and skills live in this folder, beside their sessions.
+              </p>
+              {folderOwned.has("agents") && (
+                <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("agents")}</p>
+              )}
+              {form.agents && (
+                <div className="flex min-w-0 flex-col gap-2">
+                  <Label htmlFor={`${fieldId}-agents-subfolder`}>Agents subfolder</Label>
+                  <Input
+                    id={`${fieldId}-agents-subfolder`}
+                    value={form.agentsSubfolder}
+                    disabled={disabled || saving || folderOwned.has("agents")}
+                    onChange={(event) =>
+                      setForm((live) => ({ ...live, agentsSubfolder: event.target.value }))
+                    }
+                  />
+                  {!editing && (
+                    <p className="text-muted-foreground text-xs">
+                      Left empty, keeper picks the subfolder itself.
+                    </p>
+                  )}
+                </div>
               )}
             </>
           )}

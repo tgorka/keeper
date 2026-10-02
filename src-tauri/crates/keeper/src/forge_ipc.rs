@@ -515,6 +515,8 @@ fn add_one(
         tasks_subfolder: None,
         voices: None,
         voices_subfolder: None,
+        agents: None,
+        agents_subfolder: None,
     };
     match sync_ipc::save_profile(app, state, req) {
         Ok(profile) => {

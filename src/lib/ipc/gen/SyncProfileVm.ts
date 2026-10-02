@@ -168,6 +168,18 @@ voices: boolean,
  */
 voicesSubfolder: string, 
 /**
+ * Whether this folder keeps agents — their homes, souls and memory, and
+ * the zone's `_drive.toml` (AD-361). Needs `sessions`: an agent's
+ * sessions live in this folder's sessions zone.
+ */
+agents: boolean, 
+/**
+ * The agents subfolder that would be **in force**: the stored one when
+ * this folder keeps agents, and `AgentsConfig`'s own default when it does
+ * not — `voices_subfolder`'s rule, so `80-agents` is spelled once, in Rust.
+ */
+agentsSubfolder: string, 
+/**
  * The canonical camelCase profile keys a `.keeper/keeper.toml` layer
  * currently sets for this folder, sorted (Story 56.12).
  *

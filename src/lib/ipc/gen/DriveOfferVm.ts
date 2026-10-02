@@ -12,7 +12,7 @@ credential: string,
 /**
  * Each role's subfolder; `Some` means the role is on.
  */
-notes: string | null, recordings: string | null, sessions: string | null, tasks: string | null, voices: string | null, excludes: Array<string>, lfsThresholdBytes: number | null, virtualPatterns: Array<string> | null, virtualOverBytes: number | null, releaseTtlMs: number | null, tags: Array<string>, commitSubjectTemplate: string | null, 
+notes: string | null, recordings: string | null, sessions: string | null, tasks: string | null, voices: string | null, agents: string | null, excludes: Array<string>, lfsThresholdBytes: number | null, virtualPatterns: Array<string> | null, virtualOverBytes: number | null, releaseTtlMs: number | null, tags: Array<string>, commitSubjectTemplate: string | null, 
 /**
  * The device slugs that use it.
  */

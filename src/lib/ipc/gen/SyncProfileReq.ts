@@ -132,4 +132,13 @@ voices: boolean | null,
 /**
  * The voices subfolder to pin; `recordings_subfolder`'s verbatim rule.
  */
-voicesSubfolder: string | null, };
+voicesSubfolder: string | null, 
+/**
+ * Flag or unflag this folder as keeping agents (AD-361). `None` leaves
+ * the flag alone under the rule `voices` follows.
+ */
+agents: boolean | null, 
+/**
+ * The agents subfolder to pin; `recordings_subfolder`'s verbatim rule.
+ */
+agentsSubfolder: string | null, };

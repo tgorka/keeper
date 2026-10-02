@@ -539,6 +539,8 @@ async function setProfileRoleSubfolder(
     recordingsSubfolder: role === "recordings" ? subfolder : null,
     voices: null,
     voicesSubfolder: role === "voices" ? subfolder : null,
+    agents: folderOwned.has("agents") ? null : stored.agents,
+    agentsSubfolder: folderOwned.has("agents") ? null : stored.agentsSubfolder,
     sessions: folderOwned.has("sessions") ? null : stored.sessions,
     sessionsSubfolder: folderOwned.has("sessions") ? null : stored.sessionsSubfolder,
     tasks: folderOwned.has("tasks") ? null : stored.tasks,

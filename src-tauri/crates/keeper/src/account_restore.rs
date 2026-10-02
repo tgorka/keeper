@@ -836,6 +836,8 @@ mod tests {
             },
             ..RecordingsConfig::default()
         });
+        p.sessions = Some(keeper_sync::profile::SessionsConfig::default());
+        p.agents = Some(keeper_sync::profile::AgentsConfig::default());
         p
     }
 
@@ -880,6 +882,7 @@ mod tests {
             table["recordings"]["push"]["quiet_from"].as_str(),
             Some("22:00")
         );
+        assert_eq!(table["agents"]["subfolder"].as_str(), Some("80-agents"));
         assert_eq!(
             local_path(&table),
             Some(PathBuf::from("/Users/t/tgdrive-light"))

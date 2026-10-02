@@ -1,0 +1,2 @@
+- Morning: read 00-inbox/ and say what came in, in three lines.
+- Never send anything to Marta from tgdrive.
