@@ -1,0 +1,3 @@
+{"v":1,"id":"01M3RRNJM00000000000000009","parent":null,"ts":"2026-09-30T09:00:00.000Z","host":"hesperia","epoch":2,"claim":"$c2","kind":"claim","matrix_event":null,"body":{"epoch":2,"action":"acquired","from_host":"electra","claim_event":"$c2","server_ts":"2026-09-30T09:00:00.000Z"}}
+{"v":1,"id":"01M3RRNMJG000000000000000A","parent":null,"ts":"2026-09-30T09:00:02.000Z","host":"hesperia","epoch":2,"claim":"$c2","kind":"scope","matrix_event":null,"body":{"drives":["tgdrive","neuradrive"],"set_by":"@tgorka:h"}}
+{"v":1,"id":"01M3RRNNHR000000000000000B","parent":null,"ts":"2026-09-30T09:00:03.000Z","host":"hesperia","epoch":2,"claim":"$c2","kind":"run","matrix_event":null,"body":{"state":"blocked","detail":"waiting for an approval"}}

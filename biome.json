@@ -17,7 +17,8 @@
       "!_bmad-output",
       "!skills",
       "!bun.lock",
-      "!src/index.css"
+      "!src/index.css",
+      "!src-tauri/crates/keeper-core/tests/fixtures/agents/sessions/**/log/blobs"
     ]
   },
   "formatter": {

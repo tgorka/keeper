@@ -1,0 +1,20 @@
+version = 1
+id = "01K6DQ1S8G6Y3N3QXW8ZB4M7RT"
+agent = "amelia"
+drive = "tgdrive"
+kind = "delegated"
+title = "Release notes for 0.9"
+requested_by = "@tola-grey:h"
+room = "!release:h"
+drives = ["tgdrive"]
+hop = 1
+created_at = "2026-09-30T08:00:00.000Z"
+
+[parent]
+drive = "tgdrive"
+session = "active/2026-09-29-triage"
+room = "!triage:h"
+
+[label]
+readers = ["@marta:h", "@tgorka:h"]
+integrity = "owner"

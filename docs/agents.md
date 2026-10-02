@@ -381,3 +381,197 @@ Run state, claims, presence and manifests carry no content, so they are not labe
 Keeping labelled content out of the wrong room, drive, memory file or model is the job of each
 place that sends it, which later releases add; what this release does is compute the label and
 say it.
+
+## A session an agent works in
+
+An agent works in an ordinary flat session of its home drive's sessions zone, with three more
+entries:
+
+```text
+60-sessions/active/2026-09-30-release-notes/
+  README.md, cards, notes   the flat session's own files (docs/sessions.md)
+  agent.toml                the session's opening record, written once
+  log/                      the session's record (The log, below)
+  approvals/<ulid>.json     pending actions, one file each
+```
+
+The session's `AGENTS.md` says that `log/` and `approvals/` are keeper's and never edited or
+deleted by hand: each file there has one writer, and a hand edit is a second writer whose change
+nobody can tell from the agent's. None of them is markdown, so none enters the session pool.
+
+```toml
+version = 1
+id = "01J9Z3K4M5N6P7Q8R9S0T1V2W3"
+agent = "amelia"
+drive = "tgdrive"
+kind = "delegated"
+title = "Release notes for 0.9"
+requested_by = "@tola-grey:h"
+room = "!sess:h"
+drives = ["tgdrive"]
+hop = 1
+workflow = "release-notes"
+created_at = "2026-09-30T08:15:03.120Z"
+
+[parent]
+drive = "tgdrive"
+session = "active/2026-09-30-triage"
+room = "!parent:h"
+
+[label]
+readers = ["@tgorka:h"]
+integrity = "peer"
+
+[limits]
+rounds_per_exchange = 8
+tokens = 200000
+```
+
+| key | default | rule |
+| --- | --- | --- |
+| `version` | required | `1` |
+| `id` | required | a ULID, chosen by the creator so a retried create is the same session |
+| `agent`, `drive` | required | the owning agent's id and its home drive's id |
+| `kind` | required | `main` (a proxy's DM), `conversation` (a proxy conversation the person started), `delegated`, `scheduled`, `workflow` or `gate` |
+| `title` | required | at most 120 characters |
+| `requested_by` | required | a Matrix user id: a person or an agent |
+| `room` | required | a Matrix room id (`!…:server`) |
+| `drives` | the home drive | drive ids in scope at opening |
+| `needs`, `pin` | the agent's | placement, as in the home's `[host]` |
+| `hop` | `0` | 0 to 3 |
+| `workflow` | none | a folder under `_workflows/` |
+| `created_at` | required | RFC 3339 |
+| `[parent]` | none | `drive`, `session` (its folder, zone-relative) and `room` of the delegating session |
+| `[label]` | required | `readers` (`"*"` or Matrix ids), `integrity`, optional `local_only` |
+| `[limits]` | the agent's | `rounds_per_exchange` and `tokens`, each at least 1 |
+
+An unknown key, at the top or inside a table, is refused by name, and every bound is refused one
+past its edge naming the key ("`hop` in the session's agent.toml is 4: a delegation is at most 3
+hops deep (0–3).").
+
+The file is never rewritten. What changes later (scope, label, run state, the claim) is a line of
+the log, and the zone's index carries the current value.
+
+## The log
+
+`log/` is the truth of the session: any host with the folder rebuilds what the model was sent
+from it, tool calls and their results included, and continues.
+
+**Files.** `log/<UTC date>.<host>.<n>.jsonl`, for example `2026-10-02.electra.1.jsonl`: the date
+of the chunk's first line, the writing host's slug (`[a-z0-9-]{1,32}`), and `n` counting from 1
+per date and host, compared as a number. Each host writes only its own chunks and reads everyone's.
+
+**Lines.** One JSON object per line, at most 64 KiB, keys in this order:
+
+| key | meaning |
+| --- | --- |
+| `v` | `1` |
+| `id` | a ULID, unique in the session |
+| `parent` | the line this one answers: a `tool_call`'s is its `assistant` line, a `tool_result`'s its `tool_call` |
+| `ts` | the writing host's clock, RFC 3339 UTC with milliseconds (`2026-10-02T08:15:03.120Z`) |
+| `host` | the writing host's slug |
+| `epoch` | the claim epoch the host held |
+| `claim` | the claim event the host held, or `null` |
+| `kind` | one of the kinds below |
+| `matrix_event` | the Matrix event the line received or sent, or `null` |
+| `body` | the kind's fields, or a blob reference |
+
+| kind | body |
+| --- | --- |
+| `open` | `agent, drive, kind, title, requested_by, label, drives, model, prompt_sha256, memory_sha256` |
+| `claim` | `epoch, action` (`acquired`, `renewed`, `released`, `lost`), `from_host, claim_event, server_ts` |
+| `user` | `sender, text, attachments` |
+| `peer` | `sender, text`, optional `ask {id, question}` and `artifacts` |
+| `assistant` | `text, model, finish, usage {prompt, completion}, ttft_ms, duration_ms, anchor_event` |
+| `tool_call` | `call_id, tool, args, tier`, optional `grant_id`; `args` is the string the model sent, verbatim |
+| `tool_result` | `call_id, outcome` (`ok`, `refused`, `failed`), `content`, optional `truncated {shown, total}`, `label` |
+| `approval` | `id, state` (`requested`, `decided`, `consumed`, `expired`), optional `decision, by, result` |
+| `delegate` | `id, to, room`, optional `child {drive, session}`, `state`, optional `reason` |
+| `label` | `readers, integrity`, optional `local_only`, `cause {kind, ref}` |
+| `scope` | `drives, set_by` |
+| `run` | `state` (`queued`, `running`, `blocked`, `review`, `failed`, `idle`), optional `detail` |
+| `surface` | `id, tool, device`, optional `outcome` |
+| `heard` | `assistant, heard_until, sentence, reason` (`barge_in`, `stop`) |
+| `memory` | `op` (`journal`, `proposal`), `ref` |
+| `compact` | `summary, replaces_through` |
+| `error` | `sentence, code` |
+| `close` | `reason` (`done`, `archived`, `failed`), `by` |
+
+A line of another version or an unknown kind, or one that does not parse, is skipped and named as
+a problem; it never stops the read.
+
+**Writing.** A chunk is opened for append and each line is written whole in one write ending in a
+newline; the writer `fsync`s at the end of every turn. A host that died mid-line finds half a line
+at the end of its own newest chunk when it reopens, of whatever date, and cuts it back to the last
+newline; it never
+touches another host's chunk, whose torn tail readers skip with a problem ("The chunk ends in half
+a line; it was skipped and left as it is."). A chunk is closed before it would reach
+`min(192 KiB, 3/4 × the folder's LFS threshold)` (192 KiB at the default 4 MiB threshold, 96 KiB at
+a 128 KiB one), and a new one starts at a UTC date change, so a chunk never becomes an LFS object.
+A bound under 32 KiB (an LFS threshold under about 43 KiB) is refused when the writer opens: a
+body small enough to stay in its line could not fit in such a chunk.
+A body over 16 KiB is stored as `log/blobs/<sha256>.json`, named by the hash of its bytes, written
+and `fsync`ed before the line, which then reads `{"blob":"<sha256>","bytes":<n>}`; the same body
+twice is one blob. A line still over 64 KiB is refused and nothing is written. A `log/` that is a
+symbolic link, or a chunk that is one, is refused; a reader names such a chunk as a problem and
+does not read it.
+
+**Secrets.** Before a line is written, every string in its body (a message, a tool call's
+arguments, a result, a summary, an error) is searched for secret shapes: Matrix access tokens (`syt_…`), Anthropic keys
+(`sk-ant-…`), OpenAI-style keys (`sk-…`), GitHub tokens (`ghp_…`, `gho_…`, `github_pat_…`), PEM
+private key blocks (a block cut before its END line is redacted to the end of the text), AWS access key ids (`AKIA…`), Slack tokens (`xoxb-…`, `xoxp-…`), JSON Web Tokens
+and PostHog keys (`phx_…`, `phc_…`). Each is replaced by `[REDACTED secret-like: sha256:<the first 12
+hex digits of the secret's SHA-256>]`, so the same secret seen twice reads the same. Anything
+outside those shapes is logged as written: a password in a sentence, a bearer token of another
+form, a database URL with its credentials, a secret split across two results (DW-430). A session
+folder is as sensitive as the drives it reads.
+
+**Reading.** Every chunk of every host is merged by `ts`, then `host`, then `id`. Once a host
+acquires epoch E at time T, a line of an older epoch written after T came from a host that lost
+the session and is dropped, with a problem naming its chunk and line. A `claim` line is never
+dropped this way: the loser's `lost` is written after the takeover by its nature. Two `claim` lines acquiring one epoch with
+different claim events mean two hosts both believed they held the session: the log is
+**conflicted**, and it does not replay until a person resolves it.
+
+**Replay.** Replay turns the merged lines back into the messages the model was sent: a person's
+and a peer's text as user messages, each answer with the tool calls it made, each result as a tool
+message, blobs read back and checked against their names. A `compact` line replaces every line up
+to the one it names with one system message headed "Summary of the earlier part of this
+session". Prefixed with the same system message, the replayed request is byte for byte what the
+model received, except where a secret was replaced. Replay runs when a session opens, moves to
+another host or restarts; a host serving a session keeps its history in memory and never reads
+its log on a turn.
+
+**The index.** `<sessions zone>/.keeper/agents.db` answers the session list and the board: each
+session's agent, kind, label, scope, run state, claim host and epoch, line count and last
+activity; each chunk's size; each card's agent fields (`run`, `assignee`, `host`, `requested_by`,
+`schedule`, `last_run`, `workflow`); and the Matrix events already logged. It is derived and
+disposable: deleted, or written by a keeper of another schema version, it is rebuilt from the
+session folders, and nothing in it is anywhere but in the files.
+
+## What a session costs the drive
+
+A chunk is appended to, so each commit of a turn stores that chunk again; git's loose objects
+grow with every commit until `git gc` packs them as deltas. Measured on 2026-10-02 (Linux 6.17,
+git 2.53.0, the default 4 MiB LFS threshold, so chunks rotate before 192 KiB): a 10 000-line
+session written through the log writer, one commit per 20-line turn (500 commits), with user
+messages of 120–420 characters, tool results of 200–6200 and answers of 600–3000.
+
+| | value |
+| --- | --- |
+| chunks | 94, the largest 196 491 bytes |
+| largest line | 6486 bytes |
+| log on disk | 18 148 800 bytes |
+| repository before | 3 loose objects, 12 KiB |
+| after 2500 / 5000 / 7500 / 10 000 lines, before `git gc` | 3.70 / 7.40 / 11.09 / 14.80 MiB loose |
+| after `git gc` | 528.62 KiB packed (3594 objects) |
+
+Before packing the cost grows in proportion to the log (3.7 MiB per 2500 lines), not with its
+square, because a chunk stops growing at 192 KiB and a commit re-stores only the chunk being
+written. The packed size flatters a real session: the test's text repeats, and git's deltas and
+compression thrive on that. An archived session keeps every committed version of its chunks in
+history (DW-359). Re-measure with:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core --test agents_log_growth -- --ignored --nocapture
+```
