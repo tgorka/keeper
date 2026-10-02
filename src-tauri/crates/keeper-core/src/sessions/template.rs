@@ -165,6 +165,13 @@ mistake the rule above exists to prevent. The two directories named here are the
 exception to the reading: neither is scanned, because one holds output and the
 other is scratch.
 
+## In a session an agent works in
+
+`log/` and `approvals/` are keeper's: the session's record and its pending
+actions. Never edit or delete them by hand. Each file in them has exactly one
+writer, and a hand edit is a second writer whose change nobody reading the
+record can tell from the agent's.
+
 ## Writing
 
 - **End every sitting with a log file.** Name it
@@ -1186,6 +1193,9 @@ mod tests {
             "not a new folder",
             // …and the half the amendment adds: keeper itself makes one now.
             "*New folder*",
+            // An agent's session: the files only keeper writes.
+            "`log/` and `approvals/` are keeper's",
+            "Never edit or delete them by hand.",
         ] {
             assert!(
                 AGENTS_MD.contains(required),

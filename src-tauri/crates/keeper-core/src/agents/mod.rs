@@ -9,9 +9,13 @@
 //! reader and the `.keeper/` index, which own their own files (AD-366).
 pub mod drive;
 pub mod home;
+pub mod index;
 pub mod label;
+pub mod log;
 pub mod memory;
 pub mod prompt;
+pub mod redact;
+pub mod session;
 pub mod skills;
 pub mod soul;
 pub mod zone;

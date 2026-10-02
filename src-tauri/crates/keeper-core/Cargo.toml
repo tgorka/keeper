@@ -102,6 +102,8 @@ keeper-ported = { path = "../keeper-ported" }
 # Cargo.lock for keeper-sync's LFS hashing, so the tree gains no package.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Secret redaction before an agent's log line is written (Epic 89, S-17).
+regex = { workspace = true }
 # OTLP protobuf wire encoding for the closed consent-gated observability schema.
 # Already resolved via Matrix; no arbitrary tracing subscriber is exported.
 prost = "0.14"

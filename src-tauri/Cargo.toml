@@ -277,6 +277,10 @@ notify-debouncer-full = "0.7"
 # plus per-profile excludes. `Unlicense OR MIT` — the MIT arm satisfies the
 # firewall. Already resolved in the lock transitively.
 globset = "0.4"
+# The session log's secret redaction (Epic 89, S-17): a closed pattern set over
+# what an agent logs. Already in Cargo.lock at 1.12 through globset/matrix-sdk,
+# so the tree gains no package. MIT OR Apache-2.0.
+regex = "1"
 # Content verification (Stories 25.1, 25.3, 26.5): SHA-256 for LFS object OIDs
 # and verify-on-read. Already resolved in the lock transitively via
 # vodozemac/matrix-sdk, so a direct dep pulls no new crate version. Hardware

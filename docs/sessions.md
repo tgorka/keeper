@@ -42,6 +42,7 @@ could desync, keeper does not store.
     archive/
       2025/2025-03-01-taxes/           # finished sessions, filed by close year
     .keeper/                           # keeper's own cache + journal + trash. NEVER synced.
+      agents.db                        # the agent sessions' index — derived, rebuilt from the logs
 ```
 
 ### The two shapes
@@ -59,6 +60,13 @@ migrates has to keep working.
   house-style.md            # a prompt — tagged `prompt`
   workspace/                # scratch — unversioned, unsynced, READ-ONLY to keeper
   artifacts/                # promoted output — versioned and synced
+
+2026-10-02-release-notes/  # FLAT, worked in by an agent — the same contract, plus:
+  agent.toml                # the opening record: agent, drive, kind, room, label. Written once.
+  log/                      # the session's record: append-only JSONL, one writer per file
+    2026-10-02.electra.1.jsonl  #   <UTC date>.<host>.<n>.jsonl, rotated before min(192 KiB, 3/4 × LFS threshold)
+    blobs/<sha256>.json     #   bodies over 16 KiB, immutable
+  approvals/<ulid>.json     # pending actions, immutable (Epic 93)
 
 2026-08-10-keeper/          # FOLDER — the original, still read exactly as before
   README.md                 # THE record: summary, decisions, log, promote table
@@ -84,6 +92,13 @@ for whoever, or whatever, is handed the folder with no other context.
 
 `artifacts/` and `workspace/` survive in both shapes because their difference is
 about *versioning*, not about kind, and no tag can replace that.
+
+**An agent's session is a flat session plus three agent files** — `agent.toml`, `log/`
+and `approvals/` — and its `AGENTS.md` says so: `log/` and `approvals/` are keeper's, never
+edited or deleted by hand. None of them is markdown, so none enters the pool or a space; the
+board reads an agent session's run state, label and claim from `.keeper/agents.db`, never
+from the log. The formats and the rules are in `docs/agents.md` (*A session an agent works
+in*, *The log*).
 
 **Markdown is found wherever it sits.** keeper reads a session's markdown in
 subdirectories too, so a `spaces/`, a `log/` or any folder you make is a real home: the
