@@ -28,7 +28,8 @@ oversight and not a purchase — recorded here because the deferral is load-bear
   its revisit triggers recorded — the blank-webview bug class proving unfixable across Tauri
   releases, or NSE work beginning. (PRD §13.8)
 - **Status / owner:** deferred. Revisit is owned by the PM/owner, when push demand is real.
-  (PRD §13.8, the paid-program-timing open question)
+  (PRD §13.8, the paid-program-timing open question) Reopened by D-35 (2026-10-02): the paid
+  program is assumed, and push rides a gateway the owner runs, never project infrastructure.
 
 ## D-2 — Virtual files are pointer files, not filesystem virtualization
 
@@ -111,26 +112,36 @@ is safe.
   it builds and ships there — it is deciding what a background daemon on macOS should own when the
   app is already a real background host. Until then the asymmetry is visible in the product, not
   hidden.
-- **Status / owner:** decided. Owner is the architect; Epic 57 implements it.
+- **Status / owner:** decided. Owner is the architect; Epic 57 implements it. D-33 (2026-10-02)
+  lets an *agent* run an argument list inside an OS sandbox behind an approval tier; it adds no
+  task kind and no shell string, so this entry's refusals stand.
 
 ## D-4 — The endpoint is yours, never keeper's
 
-keeper will talk to a model — a Hermes Agent profile or an Ollama model, over the OpenAI-compatible
-wire, from a surface of its own at ⌘9 — and it will **not** decide where that model lives. There is
+keeper will talk to a model — a Hermes Agent profile, an Ollama model or any OpenAI-compatible
+endpoint, over the OpenAI-compatible wire, from a surface of its own at ⌘9 — and it will **not**
+decide where that model lives. There is
 no default endpoint, no hosted model, no keeper-operated proxy, no telemetry about what you asked,
 and no opt-in scaffolding for any of them, because there is nothing to opt into (`docs/egress.md`,
 *The no-telemetry invariant*). Recorded here because a chat feature is where every one of those is
 first proposed as a convenience, and the refusal has to be findable before the proposal is made.
 
-- **What is built:** a provider is a record you create — a kind (`hermes` | `ollama`), a base URL,
-  a credential behind the keychain port — and a bot is (provider, model-or-profile, identity).
+- **What is built:** a provider is a record you create — a kind (`hermes` | `ollama` |
+  `openai`), a base URL, a credential behind the keychain port — and a bot is (provider,
+  model-or-profile, identity).
   Because keeper ships no endpoint, the base URL is **required, not defaulted**: a fresh install has
   no provider row, no egress row and no pane content beyond the sentence that says so, and typing
   the URL is the explicit act that creates the destination. Every configured provider then appears
   in Settings → About as a derived, host-only egress entry through the same reduction git remotes
   use, and a loopback or private-network host is accepted and disclosed rather than blocked, since
-  that is where both supported back ends live by default. (AD-146…AD-148, extending AD-53; Epic 61,
+  that is where Hermes and Ollama live by default. (AD-146…AD-148, extending AD-53; Epic 61,
   stories 61.1, 61.4, 61.13)
+- **The third kind, and why it is not a contradiction of the closed set:** AD-146 closed the
+  kinds at two and named its own revisit trigger — a third kind with a real endpoint to read
+  (DW-214). CLIProxyAPI met it, so `openai` speaks to any OpenAI-compatible endpoint:
+  bearer-authenticated, the model in the body, models listed from `/v1/models` with no stated
+  capability, keeper running the tools. The endpoint is still yours; there is no default base URL
+  for it either, and `omp` stays closed. (AD-369, FR-776, NFR-121; Epic 89, story 89.6)
 - **Why no default, no hosted model, no proxy:** each would make keeper a party to the
   conversation. A default endpoint is a destination the user did not choose; a hosted model or a
   keeper-operated relay is project infrastructure on the traffic path, which is the invariant D-1
@@ -141,7 +152,9 @@ first proposed as a convenience, and the refusal has to be findable before the p
   a client register a tool, and an api-server session defaults to `unattended_mode: deny`. A grant
   keeper offered there could never be exercised, and an affordance that cannot act is the lie AD-27
   forbids, so the Hermes pane offers none and says why in one sentence. The drive tools are offered
-  only where keeper is the thing that would run them: an Ollama bot whose model advertises `tools`.
+  only where keeper is the thing that would run them: an Ollama bot whose model advertises `tools`,
+  or an `openai` bot, whose endpoint states no capability and so is offered them with the
+  unknown-tools warning.
   (AD-151, AD-158, AD-159; Epic 61, coordinator correction to 61.10; research §2.6, §2.13)
 - **The honest route to that capability, deferred and not rejected:** keeper *serving* MCP. Hermes
   loads `mcp_servers:` from its own configuration over stdio or HTTP, so keeper could serve the same
@@ -164,7 +177,9 @@ first proposed as a convenience, and the refusal has to be findable before the p
   62). None of them reopens the first paragraph: a default endpoint is not a revisit, it is a
   different product.
 - **Status / owner:** decided. Owner is the architect; Epic 61 implements the provider, the surface
-  and the grant; Epic 62 owns talk mode.
+  and the grant; Epic 62 owns talk mode. The third provider kind this entry's revisit trigger
+  waited for is `openai` (AD-369, Epic 89 story 89.6), an endpoint the person configures; the first paragraph
+  stands.
 
 ## D-5 — Voice is the system's, on the device, armed by a person
 
@@ -249,7 +264,8 @@ reasoning has to be findable before it is re-argued.
   `docs/egress.md` that this decision refuses to write.
 - **Status / owner:** decided. Owner is the architect; Epic 62 implements the turn machine, the iOS
   port, the phrase and the surface; Epic 63 implements the platform vocabulary, the macOS port and
-  its reach (DW-219 collected).
+  its reach (DW-219 collected). Amended by D-36 (2026-10-02): turn-taking models from the
+  account's `_models/`, still on the device, nothing bundled or downloaded.
 
 ## D-6 — The Siri button stays Siri's; keeper's reach on the Mac is the hotkey, the tray and a Shortcut
 
@@ -1574,3 +1590,350 @@ one by itself, put an absolute path in one, or let anything but Rust read one.
   `keeper_core::transcription::media::resolve_block`, the shell's `media_block_ipc` commands and
   the `keeper://transcript-written` event, the note editor's `media-block.ts` and the media
   block panel.
+
+## D-31 — An agent lives in a drive, and its session's log is the truth
+
+The owner asked for agents with their own sessions, active and archived, that keep "all the data
+he needs, scripts he needs to use etc logs but also the message history and actions taken - so the
+session can be used after. - also after sync by drive the work can be continued on other device
+that will sync the data in sessions (data is all he needs) - but make sure its fast to operate"
+(2026-10-01), and for "memory, skills, soul, etc bot data" to "find a right place in the drives"
+(2026-10-02). Until now a conversation with a model was rows in a per-device `keeper.db` that
+never syncs (AD-154), and a turn kept only its text, not its tool calls. This entry records where
+an agent and its work live, and who may write them.
+
+keeper will keep an agent — its soul, its memory, its skills and its sessions — as files in the
+person's drives, and it will **not** keep an agent's work in a per-device database, let two hosts
+write one session, let a phone or a tablet write a session's log, or let an agent rewrite its own
+soul, tools or core memory.
+
+- **What changes:** a drive flagged `[folder.agents]` keeps its agents under `80-agents/`, with a
+  `_drive.toml` naming the drive, its principal, its owner and its readers by Matrix id. An agent
+  is a folder: `agent.toml` (machine configuration, validated key by key), `SOUL.md` (its
+  character, BMAD's persona fields, written by people only), `USER.md` and `MEMORY.md` (core
+  memory capped at 1375 and 2200 characters), a per-host journal and immutable proposals. A
+  session is the existing flat session in the same drive's sessions zone plus `agent.toml`, an
+  append-only log and its approvals. The log is JSONL in dated, per-host, numbered chunks that
+  never reach the LFS threshold, with large bodies as immutable blobs; anything the model saw is
+  in it, so any host with the folder continues the session. Only the host holding the session's
+  Matrix claim writes it, and every line names the epoch and the claim event it was written under,
+  so two hosts that both believed they held one epoch mark the session conflicted rather than
+  merge. Before a line is written, secret-shaped text in it is replaced by a marker naming its hash.
+  A rebuildable `.keeper/` index answers the board, and a served session's in-memory context the
+  next turn, without re-reading logs. (AD-360…AD-366, AD-378; FR-769…FR-775, FR-782, FR-783;
+  NFR-116, NFR-117, NFR-118, NFR-120; Epics 89, 90)
+- **Why files, and why the drive:** a session that is a folder needs nothing but the folder —
+  the owner's "data is all he needs" — and it carries git's history, the drive's sync, and a format
+  a person can open without keeper. Sessions already live in the drives as files ("files are the
+  truth", AD-110); agents join them rather than add a second store.
+- **Why a log of chunks with one writer, not markdown edited through the drive tools:** the drive
+  tools cannot append and rewrite a whole file per write, and two hosts editing one file leave
+  conflict copies. One writer per file, rotated before the LFS threshold, with a torn tail cut on
+  open, is the only shape that syncs at file granularity, never conflicts and never turns an
+  append into an LFS upload (ruling R3).
+- **What it costs, stated so it is chosen:** a session folder holds what its agent read and said,
+  so it is as sensitive as the drives it reads: it syncs to every device that syncs the drive, and
+  git keeps every committed version. keeper replaces secret-shaped text before a line is written —
+  a closed, tested set of token and key patterns — but text of any other shape stays as written
+  (DW-430). What a person would not put in a drive, they should not let an agent read into a
+  session of that drive (ruling R28 S-17).
+- **Why "agent" and not "bot":** `bots` already means keeper's provider models (`keeper-core`'s
+  `bots`, the device file's `[[provider.bot]]`). An agent *runs on* a bot; the zone, the flag, the
+  crates and the UI say *agent* (ruling R1). The owner's named personalities override the
+  brainstorm's "instruments, never characters" for character only; an agent is still drawn with
+  keeper's identity marks, never a face.
+- **What stays true:** ⌘9 conversations keep `keeper.db` as their truth (AD-154 is unchanged for
+  them). The notes are the person's: an agent writes its journal and proposals; core memory
+  changes only through consolidation or a person (D-34 governs who may read what).
+- **What it amends:** AD-154, for agent sessions only.
+- **What is deferred, not refused:** Naia (DW-355); run state kept outside the card file if
+  people and hosts collide on cards (DW-374); encrypted state events (DW-364).
+- **Revisit triggers:** story 89.5's measured repository growth for a 10 000-line session — its
+  `#[ignore]` test, run again — showing the chunk bound is wrong; card conflict copies measured in
+  use (DW-374); a secret of a shape the pattern set misses found in a session log (DW-430). None of
+  them reopens the second paragraph: a second writer on a session is not a revisit, it is the
+  failure this entry exists to prevent.
+- **Status / owner:** decided by the owner on 2026-10-01 and 2026-10-02 (rounds 1–3), pinned by
+  the coordinator (P1–P3, P6, rulings R1–R4, R19, R27; R28 S-05, S-17; R29 F2, F23; the rulings are
+  committed at `_bmad-output/planning-artifacts/agents-coordinator-decisions-2026-10-02.md`, which
+  D-32…D-36 cite too). Owner is the architect. Epics 89 and 90 implement it: `keeper_core::agents`
+  with the session log's file-level writer, `keeper-ported`, `keeper-agent`'s session runtime, which
+  wraps that writer, and the agents folder flag in `keeper-sync`.
+
+## D-32 — Matrix is the agents' only live channel; keeper runs no hub and opens no listening socket
+
+The owner wants the agents on the Mac, the iPhone and the Linux server ("I dont want sidecar. I
+want my mac, iphone, sever on linux to use it", 2026-10-01), talking to each other "instead of
+sub-agents … one point of true", and fast (2026-10-01). The research recommended Matrix for
+durable traffic plus a hub of keeper's own for token streaming, tool calls on the device and live
+audio (research §6.6). The coordinator reversed that (P4): the owner chose the private voice
+option, which sends only text, and a hub would be the first listening socket keeper ships. This
+entry records the wire, so the hub is not re-proposed as a convenience.
+
+keeper's agents will talk, stream, ask, decide and hand work to each other only through Matrix
+events on the person's own homeserver, and keeper will **not** run a hub, open a listening socket,
+serve MCP, or carry agent traffic over any channel the homeserver does not carry.
+
+- **What changes:** one Matrix room per session; a person's DM with their proxy agent is its main
+  session, and the person may post there and in the other sessions they start with it; one control
+  room per principal. Custom events `dev.keeper.agent.*` carry status, scope, surface requests and
+  results, approval requests, decisions and consumptions, doorbells and delegations; state events
+  carry claims, host manifests and presence, and never content or a provider's address (state is
+  not encrypted). An answer streams as one message edited no more often than every 400 ms —
+  coalesced, waiting when the homeserver asks, and closed by one final edit that is always
+  delivered; a final answer over 60 KiB is sent as its first 60 KiB plus a link to
+  `artifacts/answer-<ulid>.md`, with the full text in the log and that artifact (rulings R18, R23).
+  Each agent is a Matrix user and each of its hosts one device of it. The agents'
+  client is a lean module in `keeper-core` on matrix-sdk 0.18, beside the messenger. A doorbell
+  event makes a host fetch one drive at once. (AD-370…AD-374, AD-378, AD-388; FR-780…FR-784,
+  FR-793; NFR-112, NFR-113, NFR-122; Epics 90, 91, 92)
+- **Why no hub:** Matrix already gives addressed, queued, end-to-end-encrypted, pushable delivery
+  and multi-person membership; a hub would rebuild each of them and add the first port keeper
+  listens on, whose threat model (DW-215) is unwritten. With voice on the device, no media plane is
+  needed.
+- **What it costs, stated so it is chosen:** a streamed edit is a durable event; Synapse's default
+  rate limit would throttle it (tuwunel limits only logins), and no one has published Matrix
+  delivery latency for a self-hosted homeserver — so NFR-112 measures it and the number is
+  published, not assumed. In an encrypted room the server cannot tell an approval from a status,
+  so phones decide what to show after decrypting (D-35).
+- **What stays true:** D-4 — the homeserver is the person's, and keeper adds no infrastructure
+  of its own. D-1's constraint — push rides a gateway the owner runs (D-35).
+- **What is deferred, not refused:** MSC4471 event streams (DW-361); addressed to-device
+  wake-ups (DW-362); matrix-sdk 0.19 (DW-363); encrypted state events (DW-364); voice on a
+  server (DW-402). keeper serving MCP stays where D-4 left it (DW-215).
+- **Revisit triggers:** measured p95 Matrix delivery above 1 s on tuwunel; a decision to run voice
+  on a server. Either opens a new decision with its own threat model; neither turns a listening
+  socket into a default.
+- **Status / owner:** decided by the coordinator on 2026-10-02 from the owner's rounds (P4, P5,
+  rulings R6, R11, R18, R23, R25; R28 S-01, S-33; R29 F1, F5). Owner is the architect. Epics 90–92 implement it: `keeper_core::agents::matrix`,
+  `keeper-agent`'s Matrix sink and approver, `keeper-agentd`, and `Engine::pull_now`.
+
+## D-33 — An agent may run a command only inside an OS sandbox, behind an approval tier
+
+The owner asked for agents with different tools — "access to local drive or notes or use the
+keeper itself or the whole computer" — including "heavy bots (like language server, debugger tools
+for coding)", and for "connectors for dangerous actions before proceed (to review data in sessions
+to proceed after programaticly) - style like in Violoop" (2026-10-01). keeper has refused to run
+commands where D-3 is applied: a task kind names a verb keeper owns, never a shell string
+(`keeper-sync/src/tasks.rs:151-167`); ⌘9 bots have no shell tool (DW-213); and the scheduled-tasks
+architecture said arbitrary commands need "its own decision. Revisit only with a stated threat
+model" (`ARCHITECTURE-SCHEDULED-TASKS.md:366-369`). This entry is that decision, for agents only.
+
+keeper will let an agent run an argument list inside an operating-system sandbox, with its
+session's workspace writable, the drives readable only while the network is closed, and the
+network opened only by a person, for one run, with nothing but the workspace in reach — at the
+approval tier the command calls for — and it will **not** run a shell string, run anything outside
+a sandbox, add an exec kind to scheduled tasks, give ⌘9 bots a shell tool, or let an approval for
+an irreversible action stand for more than once.
+
+- **What changes:** a `run(argv)` tool, sandboxed on Linux by landlock and a seccomp filter
+  together and on the Mac by `sandbox-exec`, with a scratch home of its own and no way to read the
+  parent's environment or memory; a pure tier rule from T0 (observe) to T5 (forbidden, handed to
+  the person), one tier stricter when work is delegated, unattended, tainted by outside content or
+  sent through a KVM; a pending action as an immutable record in the session, bound by a digest to
+  the exact argv, directory, environment, executable and the files the command depends on; a run
+  that parks without holding anything and resumes on whichever host owns the session, consuming its
+  approval exactly once — announced on the homeserver before anything runs — and only if nothing it
+  relied on changed; a decision that counts only from a verified device of a person allowed to read
+  the session. (AD-392…AD-395, AD-405; FR-796…FR-799, FR-809; NFR-117; Epics 93, 96)
+- **The threat model the earlier deferral asked for:** what runs is an argv, never a shell; the
+  sandbox grants the session's `workspace/` and denies the person's home, the drives' `.git`,
+  `/proc` and everything else; no credential is passed, and the binaries' own configuration — the
+  workspace's dotfiles, a repository's hooks — is code the session holds, approved at T4; output
+  and time are bounded. A command that can reach the internet is a send to anyone, so it is a T3
+  approval per run: that approval configures its one destination, as a `docs/egress.md` row says,
+  and releases the workspace exactly as the person saw it — with the network open the sandbox
+  mounts no drive, so nothing the argv does not show can leave (rulings R24(15), R28 S-03). A
+  session tainted by outside content needs a person for anything consequential (D-34). The approval
+  binds what was shown to what runs; drift denies it.
+- **Why a sandbox and not a policy:** in-process guardrails do not hold against an adversarial
+  model — "the only security boundary against an adversarial LLM is the operating system" (the
+  operator's own lesson, research §3.9). A rule the model can talk past is not a boundary.
+- **Why approvals are files:** an approval that lives in memory dies with the process, and the
+  person decides from whichever device is in their hand. Violoop's split — prepare, then commit —
+  is the record, the park and the consume.
+- **What it costs, stated so it is chosen:** on the Mac, the app that hosts a run and the app a
+  person approves from are one process, so the identity keeper checks is held by the process that
+  asks. keeper therefore takes an irreversible (T4) decision only from another device — the phone,
+  or another of the person's keepers — and only from the person who asked; a notification never
+  approves it (rulings R28 S-10, S-22, S-28). Two things remain: a person with no other device
+  cannot decide a T4 action on a run the Mac hosts, which waits until they can or expires denied;
+  and a T2 or T3 decision may still be made on the Mac that hosts the run, so a compromised keeper
+  there could approve its own request, visible only on the person's other devices.
+- **What it amends:** D-3's application to agents, for agents only — the no-exec stance in
+  `TaskKind` and the scheduled-tasks deferral. DW-213's letter is kept (ruling R15): no tool executes
+  a shell string, `run` is never a `TaskKind`, and Epic 60 stays reserved and untaken. D-3's refusal
+  of scheduled self-update is untouched; ⌘9 bots stay without a shell.
+- **What is deferred, not refused:** another device for T2 and T3 decisions on a run the Mac hosts
+  (DW-418); a per-host network allow-list for `run` (DW-398); a Linux CI job for the sandbox tests
+  (DW-395); a macOS guest VM for risky GUI work (DW-394); computer use on a Linux desktop (DW-393).
+- **Revisit triggers:** Apple removing or breaking `sandbox-exec` (its status is unverified); a
+  restriction the threat model relies on that landlock and seccomp together cannot express — the
+  earlier trigger, landlock covering only TCP, is met and answered by seccomp (ruling R24(5)). None
+  reopens the second paragraph: a shell string, or a command scheduled as a task kind, is not a
+  revisit.
+- **Status / owner:** decided by the owner on 2026-10-01 (round 1), pinned by the coordinator
+  (P9, program map 96.1, rulings R15, R22, R24(5), R24(15), R25; R28 S-01, S-03, S-07, S-08, S-10,
+  S-22, S-28; R29 F9). Owner is the architect. Epics 93 and 96 implement it:
+  `keeper_core::agents::tier`, the approval record, `keeper-agent`'s park and resume, and the `run`
+  tool.
+
+## D-34 — A person's data never reaches an agent, a room or a model whose audience is wider than the people allowed to read it
+
+The owner asked for agents some of which are shared — "marta, tgorka - neruadrive" — and some
+private — "only for tgorka (nixi) or marta (dixi)" — and said: "i own the server infrastructure and
+tgrive is only for tgorka - make sure the sensitive part goes only to the private bots/drives (nixi
+needs to be told to use what drive context - but can multiple)" (2026-10-01). One server will host
+agents for several people. This entry records how keeper keeps their data apart.
+
+keeper will run each principal's agents in that principal's own process, give a tool nothing
+without a grant, and label every byte an agent reads with the people allowed to read it, and it
+will **not** let content from a drive reach a room, a drive, a memory, an MCP server, a KVM or a
+command whose audience is wider than that drive's readers, unless the person it belongs to allows
+that one flow, nor send content from a local-only drive to a model that is not local.
+
+- **What changes:** one `keeper-agentd` per principal under its own OS user (`agentd-tgorka`,
+  `agentd-marta`, `agentd-neuraffica`); a process mounts a drive only if every reader of its home
+  drives may read it, so the shared principal's process never mounts tgdrive; the readers a host
+  trusts are pinned in its own configuration from the forge's collaborators, never taken from a file
+  in the drive that any reader can edit; the Mac app hosts only its own person's agents. A label is
+  (readers, integrity, local-only): readers intersect, integrity (owner ⊐ peer ⊐ agent ⊐ untrusted)
+  takes the minimum, local-only sticks; a session's label is the join of everything it read and is
+  shown as a chip — only a person's DM with their proxy resets its integrity at each message the
+  person sends. What lands in a drive's inbox, messages or recordings, or cites the web, is outside
+  content whoever committed it. Every send, invite, status or scope update, delegation, drive write,
+  memory change, MCP call, KVM action and networked command is checked against its sink's audience,
+  and every model call against local-only; a block is lifted only by the owning person, through
+  their proxy, for one flow, recorded. A consequential action decided on outside content needs a
+  person, and a recipient or path taken from outside content is refused. Sensitive agents pin a
+  local model. (AD-377, AD-390, AD-391, AD-416; FR-773, FR-779, FR-795, FR-822; NFR-115; Epics 89,
+  90, 92, 99)
+- **Why three layers:** a label is enforced inside a process and is only as strong as the process.
+  OpenClaw is "**not** a hostile multi-tenant security boundary" and Hermes' profiles "do **not**
+  sandbox the agent" (research §9.6); the operator has already seen a shared surface leak across
+  people. So the wall between people is the operating system, the grant is the wall between a tool
+  and a drive, and the label is the check on each send inside one person's process.
+- **Why a model provider is a processor, not an audience:** the person chose the bot an agent runs
+  on, at an endpoint that is theirs (D-4), so that the agent can read their drives and answer; the
+  provider shows nothing to anyone. Treating it as an audience would need a readers list for every
+  provider that no one could check, and would forbid an agent to read the drives it exists to work
+  on. So a model call is a sink of its own with one rule: once a session has read anything from a
+  local-only drive or agent home, every model call it makes — a turn, an embedding, a review
+  layer's helper — goes to a local model or is refused. Which cloud provider may see which drive is
+  the person's choice when they pick the bot; local-only is how they refuse it (ruling R28 S-04).
+- **What it costs, stated so it is chosen:** a proxy's context carries its person's core memory, so
+  every hand-off from a proxy session to an agent with a wider audience is a declassification: the
+  brief is shown to the person and released with one tap, and the release is the recorded
+  declassification (ruling R25). A cloud provider the person chose sees what its agent reads,
+  unless the session is local-only. The claims, presence and host manifests that make the board
+  work are not labelled, so they say that work exists, and nothing more; status and scope updates
+  are checked like any send and carry counts, never paths.
+- **What stays true:** grants are re-checked at every call and only people change them, and a
+  first write still asks (AD-158); the endpoint is the person's (D-4). makistack's epic 22 refusals
+  — no drive, no read-write notes, no autonomous Paseo — were decided for the operator's Hermes
+  gateway and stay its record; keeper agents reach drives only through the three layers above
+  (ruling R16).
+- **What is deferred, not refused:** the quarantined-model pattern for outside content
+  (DW-414); signed, hash-pinned skills (DW-385); mapping a commit's device to a reader, so that a
+  person's own files read `owner` (until then a drive read is at most `agent`, DW-431).
+- **Revisit triggers:** a measured leak in any sink; a published information-flow scheme for
+  durable sessions between agents that improves on joining labels at the hand-off; a principal
+  whose readers are not people. None of them reopens the second paragraph: a convenience flow
+  that skips the check is not a revisit.
+- **Status / owner:** decided by the owner on 2026-10-01 (round 2), pinned by the coordinator (P5,
+  P8, rulings R7, R12, R16, R24(1), R25; R28 S-02, S-04, S-09, S-15, S-16, S-31; R29 F8). Owner is the architect. Epics 89, 90, 92 and 99 implement it:
+  `keeper_core::agents::label`, `keeper-agentd`'s per-principal deployment, and the sink checks in
+  `keeper-agent`.
+
+## D-35 — The phone gets push through the paid program and a gateway the owner runs, and keeper starts on Android
+
+D-1 deferred the paid Apple Developer Program until push became a product goal, and forbade push
+through project infrastructure. The agents make push a goal: an approval waits for a person
+wherever they are. The owner said "you can assume ios will have paid apple account in the future.
+also make sure it will be working on my android tablet" (2026-10-01). This entry ends D-1's
+deferral, keeps its constraint, and starts Android.
+
+keeper on iPhone will receive pushes through APNs and let a person approve or deny from the
+notification, and keeper will start on Android as a client on the owner's tablet, and it will
+**not** route a push through infrastructure keeper's project runs, give the push gateway a
+notification's content, host an agent on a phone or a tablet, or write a session's log from one.
+
+- **What changes:** with the paid program assumed, keeper on iPhone registers a pusher on the
+  homeserver pointing at a push gateway the owner runs (Sygnal, AGPL, as a separate service) with
+  keeper's APNs key; pushes carry only an event id; a notification service extension decrypts on
+  the phone, in the App Group container, through a slim library of keeper's own (`keeper-nse`), and
+  shows only approval requests and the proxy's answers; approval notifications carry *Deny* and,
+  when the whole payload fits on the notification and the action is not irreversible, *Approve
+  once*. The sessions board comes to the phone, read first, as DW-237 described. Android gets a
+  platform, a CI build and a sideloaded APK on the tablet, pushes through UnifiedPush with the
+  owner's ntfy, and voice through the platform's on-device recogniser in segmented sessions with
+  echo-cancelled capture; the turn models run where `ort` runs — the Mac and the iPhone — so Android
+  ends a turn by the pause rule (DW-413), and continuous duplex on Android is a documented
+  limitation, not a promise (ruling R20; D-36). What the phone and the tablet do is proved by device
+  runs recorded in `docs/agents.md` § Measured. (AD-412…AD-414; FR-817…FR-820; NFR-121; Epic 98)
+- **Why a gateway the owner runs:** APNs credentials belong to keeper's bundle, so a gateway must
+  hold keeper's key, and D-1's load-bearing constraint — push never rides project infrastructure —
+  leaves exactly one place for it: the owner's own servers, beside the homeserver. The gateway's
+  host joins the egress list like every other destination.
+- **What it amends:** D-1 — the deferral ends; the constraint stays. DW-237 is taken. D-5 stands
+  as D-36 amends it: voice stays on the device on every platform.
+- **What is deferred, not refused:** the notification filtering entitlement, if the extension
+  cannot otherwise keep a status from showing (DW-408); Android distribution beyond sideload
+  (DW-407).
+- **Revisit triggers:** the homeserver not suppressing pushes for edits (measured in 98.1), which
+  would move the filtering from the server to the phone (DW-408); the blank-webview class showing
+  on the tablet (Tauri #15671 and its kin), which is D-1's own Plan B trigger. Neither reopens the
+  second paragraph: a project-run gateway is not a revisit, it is the infrastructure D-1 and D-4
+  refuse.
+- **Status / owner:** decided by the owner on 2026-10-01 (round 2), pinned by the coordinator
+  (P15, rulings R20, R24(13), R24(14); R28 S-10; R29 F9, F14). Owner is the architect. Epic 98 implements it: the iPhone's pusher, notification service
+  extension and actions; the phone's sessions board; and keeper's Android platform, build and
+  push.
+
+## D-36 — keeper's voice may take its turns from models the person's organisation distributes, still on the device
+
+The owner chose the private voice option and kept D-5 ("**Private option** (keeps D-5 - yes for
+the option", 2026-10-02), and asked the agents to talk in turns that feel natural: ending when the
+sentence ends, not cut off by a "mhm", and knowing where the person stopped them (P13). D-5 says
+keeper will "not ship a model of its own"; deciding the end of a turn by meaning needs two small
+models, Silero VAD and Smart Turn v3. D-29 already lets transcription models come from the
+account's configuration repository under `_models/`. This entry amends D-5 the same way, so the
+turn models are not mistaken for a shipped model and the rest of D-5 is not stretched.
+
+keeper will load a voice activity model and an end-of-turn model from the person's own
+organisation's configuration repository and run them on the device, and it will **not** bundle
+them, download them from anyone else, send audio anywhere, or start the microphone by itself.
+
+- **What changes:** `_models/models.toml` gains two roles, `vad` (Silero VAD, MIT) and
+  `smart_turn` (Smart Turn v3, BSD-2-Clause), hydrated over keeper's own LFS client by role — the
+  phone fetches only these two — each file checked against its sha256 and loaded only as a complete
+  set, run through `ort` on the Mac and the iPhone. A spoken turn ends when the model says the
+  sentence is complete, with today's 1800 ms pause as the fallback. When the person starts
+  talking, speech pauses at once; a backchannel — a word from the list for the person's language,
+  or a sound too short to be a question — resumes it, the stop phrase ends the turn, and anything
+  else becomes the next question (AD-208 amended to pause-first, ruling R14); when the person stops
+  an answer, the agent is told the last sentence they heard. On Android, voice uses the platform's
+  on-device recogniser in segmented sessions with echo-cancelled capture and, where `ort` has no
+  runtime, no turn models (DW-413); continuous duplex on Android is a documented limitation, not a
+  promise. (AD-410, AD-411, AD-414; FR-814…FR-816, FR-820; NFR-114, NFR-119; Epics 97, 98)
+- **Why from `_models/` and not bundled:** D-5's reason still holds — a model's terms are not
+  keeper's to imply, and every byte keeper ships is keeper's. The organisation that runs the
+  account chooses to distribute the models, as D-29 records for transcription. Without an account
+  there are no turn models, and voice keeps its pause rule and says so.
+- **Why on the device:** the private option sends only text (D-32); a voice pipeline on a server
+  would be a new destination.
+- **What it amends:** D-5's "will not ship a model of its own", narrowed — as D-29 narrowed D-4's
+  sentence about transcription — to models keeper bundles or fetches from anyone but the person's
+  organisation. AD-208's barge-in order becomes pause-first (ruling R14). Everything else in D-5
+  stands: recognition on the device only, no server fallback, listening armed by a person, and the
+  wake phrase the person's own.
+- **What is deferred, not refused:** voice on a server (DW-402). Hosted speech-to-speech is
+  refused, not deferred.
+- **Revisit triggers:** a turn model's licence changing; an Android on-device recogniser that
+  supports continuous recognition. Neither reopens the second paragraph: a bundled model, a
+  download from a model hub, or audio sent to a server is not a revisit, it is a new row in
+  `docs/egress.md` that this decision refuses to write.
+- **Status / owner:** decided by the owner on 2026-10-02 (round 3), pinned by the coordinator
+  (P13, rulings R14, R20, R24(10), R24(11); R29 F9). Owner is the architect. Epic 97 implements it: the `vad` and
+  `smart_turn` model roles, `keeper-ported::smart_turn`, and the turn machine's pause-first
+  barge-in; Epic 98 brings voice to Android.
