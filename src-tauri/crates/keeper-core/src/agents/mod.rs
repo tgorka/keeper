@@ -8,4 +8,10 @@
 //! `keeper_sync::browse::resolve`, AD-65) — except the session log's writer and
 //! reader and the `.keeper/` index, which own their own files (AD-366).
 pub mod drive;
+pub mod home;
+pub mod label;
+pub mod memory;
+pub mod prompt;
+pub mod skills;
+pub mod soul;
 pub mod zone;
