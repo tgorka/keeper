@@ -162,7 +162,8 @@ export const BOT_SESSION_DEVICE_PHONE = "this phone";
  * says which door wrote it and when the gateway last saw it move — the label
  * AD-181 requires so two devices writing one conversation reads as the normal
  * state it is. On a `local` row that still holds an id, the endpoint keeps no
- * session API keeper can reach (an older Hermes, an edited provider), so the
+ * session API keeper can reach (an older Hermes, an edited provider; Ollama and
+ * an OpenAI-compatible endpoint keep no session at all), so the
  * older sentence stands: keeper replays its own copy, and the far side may
  * have compressed its copy into a renamed successor.
  */

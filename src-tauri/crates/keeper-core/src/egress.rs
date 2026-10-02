@@ -21,10 +21,12 @@
 //! and only its host: see [`remote_host`] for why the rest of the URL is dropped.
 //!
 //! AI providers (Story 61.1) go through the *same* [`remote_host`], not a second
-//! reduction of their own. A provider's base URL is usually loopback or a LAN
-//! address — both supported back ends bind `127.0.0.1` by default — so its row
-//! most often discloses that the bytes did not leave the machine, which is a
-//! claim worth making rather than leaving to inference. The credential is
+//! reduction of their own. A provider's base URL is often loopback or a LAN
+//! address — Hermes and Ollama bind `127.0.0.1` by default — so its row often
+//! discloses that the bytes did not leave the machine, which is a claim worth
+//! making rather than leaving to inference. An OpenAI-compatible gateway
+//! (CLIProxyAPI) is disclosed the same way, by its own host: what it forwards
+//! to is the gateway's configuration, not keeper's. The credential is
 //! nowhere near this list: the base-URL grammar refuses userinfo and the token
 //! lives behind the secret port, and reducing to a host is the third
 //! independent reason a screen the user shares cannot show one.
@@ -873,6 +875,39 @@ mod tests {
             ],
             "removing the provider must remove its entry and nothing else"
         );
+    }
+
+    /// An `openai` provider adds no destination the person did not configure
+    /// (NFR-121): its stored base URL — port and all, as the grammar keeps it —
+    /// discloses exactly one "AI provider" row for its host, and the rest of
+    /// the disclosure does not move.
+    #[test]
+    fn an_openai_provider_discloses_exactly_its_host_once() {
+        let base = crate::bots::parse_base_url("https://provider.example:8452/")
+            .expect("an OpenAI-compatible base URL is a base URL");
+        let provider = crate::bots::Provider {
+            id: "01JOPENAIPROVIDER0000000000".to_owned(),
+            kind: crate::bots::ProviderKind::OpenAi,
+            name: "CLIProxyAPI".to_owned(),
+            base_url: base.normalized,
+            created_ms: 1,
+        };
+        let accounts = one_account();
+        let without = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, UPDATE);
+        let with = compute_egress(&accounts, NO_REMOTES, &[provider.base_url], UPDATE);
+
+        let providers: Vec<(&str, &str)> = with
+            .iter()
+            .filter(|e| e.kind == EgressKind::BotProvider)
+            .map(|e| (e.url.as_str(), e.label.as_str()))
+            .collect();
+        assert_eq!(providers, vec![("provider.example", "AI provider")]);
+        let rest: Vec<_> = with
+            .iter()
+            .filter(|e| e.kind != EgressKind::BotProvider)
+            .cloned()
+            .collect();
+        assert_eq!(rest, without, "nothing but the provider's row is added");
     }
 
     /// NFR-11 exhaustiveness gate: every [`EgressKind`] this build can name is

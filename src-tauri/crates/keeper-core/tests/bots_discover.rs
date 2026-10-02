@@ -563,3 +563,190 @@ async fn discover_enumerate_bots_lists_ollama_tags_and_refuses_hermes_with_a_rea
          read the source of and knows is absent"
     );
 }
+
+/// A CLIProxyAPI `/v1/models` answer, in the shape it serves: OpenAI's list,
+/// each row an id with `object` and `owned_by`, and no capability anywhere.
+/// The duplicate and the empty id are there to be dropped.
+const OPENAI_MODELS: &str = r#"{"object":"list","data":[
+  {"id":"claude-opus-5-5","object":"model","created":1767225600,"owned_by":"anthropic"},
+  {"id":"gpt-6-astra","object":"model","created":1767225600,"owned_by":"openai"},
+  {"id":"gemini-3-pro","object":"model","created":1767225600,"owned_by":"google"},
+  {"id":"gpt-6-astra","object":"model","created":1767225600,"owned_by":"openai"},
+  {"id":"","object":"model","owned_by":"nobody"}]}"#;
+
+/// The sentence an OpenAI-compatible endpoint's refusal of keeper's key
+/// prints, at the status it answered.
+fn openai_refusal(status: u16) -> String {
+    format!(
+        "The endpoint refused keeper's key ({status}). Check the key this provider was saved with."
+    )
+}
+
+/// An `openai` endpoint addressing a bot, the way a turn builds one — the case
+/// where a Hermes endpoint would gain `/p/{bot}` and this one must not.
+fn openai_bot_endpoint(stub: &Stub, bot: &str) -> Endpoint {
+    Endpoint {
+        bot: Some(bot.to_owned()),
+        ..stub.endpoint(ProviderKind::OpenAi)
+    }
+}
+
+#[tokio::test]
+async fn discover_openai_health_is_one_get_of_v1_models() {
+    let stub = Stub::start(vec![
+        route("/v1/models", OPENAI_MODELS),
+        // Present so a regression that reached for another kind's health
+        // route would succeed and be caught by the request log.
+        route("/health", "{\"status\":\"ok\",\"version\":\"0.21.0\"}"),
+        route("/api/version", "{\"version\":\"0.33.2\"}"),
+    ]);
+    let probe = discover::health(&client(), &stub.endpoint(ProviderKind::OpenAi)).await;
+
+    assert_eq!(probe.reach, BotReach::Online);
+    assert_eq!(probe.status, Some(200));
+    assert_eq!(probe.version, None, "the dialect states no version");
+    assert_eq!(probe.reason, None);
+    assert_eq!(
+        discover::health_state(&probe),
+        keeper_core::bots::BotHealthState::Reachable
+    );
+    assert_eq!(stub.requests(), vec!["GET /v1/models".to_owned()]);
+}
+
+#[tokio::test]
+async fn discover_openai_models_are_the_listed_ids_with_capabilities_unknown() {
+    let stub = Stub::start(vec![
+        route("/v1/models", OPENAI_MODELS),
+        // Hermes' enrichment route, served with capabilities a regression
+        // would wrongly merge in.
+        route(
+            "/api/model/options",
+            r#"{"providers":[{"models":[{"id":"gpt-6-astra","capabilities":{"supports_tools":false}}]}]}"#,
+        ),
+    ]);
+    let models = discover::models(&client(), &stub.endpoint(ProviderKind::OpenAi))
+        .await
+        .expect("the model list parses");
+
+    let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["claude-opus-5-5", "gpt-6-astra", "gemini-3-pro"],
+        "the endpoint's order, each id once, and no empty id"
+    );
+    for model in &models {
+        assert_eq!(
+            (model.vision, model.tools, model.reasoning, model.embedding),
+            (None, None, None, None),
+            "{}: /v1/models states no capability, so none is known",
+            model.id
+        );
+        assert_eq!(model.context_window, None);
+    }
+    assert_eq!(stub.requests(), vec!["GET /v1/models".to_owned()]);
+}
+
+#[tokio::test]
+async fn discover_openai_bot_is_a_listed_model_and_no_path_gains_a_profile_prefix() {
+    let stub = Stub::start(vec![route("/v1/models", OPENAI_MODELS)]);
+    let client = client();
+
+    let present = discover::probe_bot(
+        &client,
+        &openai_bot_endpoint(&stub, "gpt-6-astra"),
+        "gpt-6-astra",
+    )
+    .await;
+    assert_eq!(present.presence, Some(BotPresence::Exists));
+    assert_eq!(present.reason, None);
+
+    let missing = discover::probe_bot(
+        &client,
+        &openai_bot_endpoint(&stub, "keeper-no-such-model"),
+        "keeper-no-such-model",
+    )
+    .await;
+    assert_eq!(
+        missing.presence,
+        Some(BotPresence::Absent),
+        "the list answered, and it does not name that model"
+    );
+    assert!(
+        missing
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("keeper-no-such-model")),
+        "the sentence names the model"
+    );
+
+    let addressed = openai_bot_endpoint(&stub, "gpt-6-astra");
+    discover::health(&client, &addressed).await;
+    discover::models(&client, &addressed)
+        .await
+        .expect("the model list parses");
+    assert_eq!(
+        addressed.url("/v1/chat/completions"),
+        format!("{}/v1/chat/completions", stub.base_url()),
+        "the chat route is the base URL's, the model goes in the body"
+    );
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests.iter().all(|line| line == "GET /v1/models"),
+        "no path gains a /p/ prefix: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn discover_openai_enumerates_its_models() {
+    let stub = Stub::start(vec![route("/v1/models", OPENAI_MODELS)]);
+    let roster = discover::enumerate_bots(&client(), &stub.endpoint(ProviderKind::OpenAi))
+        .await
+        .expect("the model list parses");
+    assert_eq!(
+        roster,
+        BotRoster::Enumerated(vec![
+            "claude-opus-5-5".to_owned(),
+            "gpt-6-astra".to_owned(),
+            "gemini-3-pro".to_owned(),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn discover_openai_refusing_the_key_is_unauthorized_with_its_own_sentence() {
+    let stub = Stub::start(vec![failing("/v1/models", 401)]);
+    let client = client();
+
+    let health = discover::health(&client, &stub.endpoint(ProviderKind::OpenAi)).await;
+    assert_eq!(health.reach, BotReach::Online);
+    assert_eq!(health.status, Some(401));
+    assert_eq!(
+        discover::health_state(&health),
+        keeper_core::bots::BotHealthState::Unauthorized
+    );
+    assert_eq!(health.reason, Some(openai_refusal(401)));
+
+    let probe = discover::probe_bot(
+        &client,
+        &openai_bot_endpoint(&stub, "gpt-6-astra"),
+        "gpt-6-astra",
+    )
+    .await;
+    assert_eq!(
+        probe.presence,
+        Some(BotPresence::Unknown),
+        "a refused key says nothing about the model"
+    );
+    assert_eq!(probe.reason, Some(openai_refusal(401)));
+
+    let err = discover::models(&client, &stub.endpoint(ProviderKind::OpenAi))
+        .await
+        .expect_err("a refused list is an error");
+    assert!(!err.to_string().contains(TOKEN), "{err}");
+    assert_eq!(
+        stub.requests(),
+        vec!["GET /v1/models".to_owned(); 3],
+        "every refusal came from /v1/models, never a prefixed path"
+    );
+}

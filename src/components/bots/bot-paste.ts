@@ -54,9 +54,11 @@ export const BOT_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
 /**
  * The most images one message may carry.
  *
- * Four, and the reason is the context window rather than the bytes: Ollama's
- * `/v1` layer cannot set `num_ctx`, so keeper cannot widen the window it is
- * about to fill. Mirrors `deliverable::MAX_IMAGES_PER_MESSAGE`.
+ * Four, and the reason is the context window rather than the bytes: no
+ * provider kind's `/v1` layer can set it (Ollama's cannot set `num_ctx`;
+ * Hermes and an OpenAI-compatible endpoint take no such field), so keeper
+ * cannot widen the window it is about to fill. Mirrors
+ * `deliverable::MAX_IMAGES_PER_MESSAGE`.
  */
 export const BOT_IMAGE_MAX_COUNT = 4;
 

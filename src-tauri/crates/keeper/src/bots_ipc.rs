@@ -1146,8 +1146,10 @@ async fn arm_turn(
     let kind = row.provider.kind;
     // The probe is a network round trip, spent only where its answer can
     // change the decision: `offer_tools` withholds for Hermes and for no
-    // grant whatever the capability says.
-    let tools_supported = if grants.is_empty() || kind == keeper_core::bots::ProviderKind::Hermes {
+    // grant whatever the capability says, and an OpenAI-compatible
+    // endpoint's `/v1/models` never states the capability — the unknown
+    // answer the skipped probe would have given.
+    let tools_supported = if grants.is_empty() || !discover::probes_model_capabilities(kind) {
         None
     } else {
         discovered_model(state, dir, bot, model)

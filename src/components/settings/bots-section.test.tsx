@@ -586,6 +586,62 @@ describe("BotsSection offers from the account (Epic 84, UX-DR118)", () => {
     expect(within(block).queryByRole("button")).not.toBeInTheDocument();
   });
 
+  it("adds an account endpoint of kind openai in one tap where the account is usable", async () => {
+    accountOfferAddProvider.mockResolvedValue(undefined);
+    const offer = providerOffer({
+      key: "provider:openai:https://cliproxy.acme.dev:8452",
+      kind: "openai",
+      name: "Acme CLIProxyAPI",
+      baseUrl: "https://cliproxy.acme.dev:8452",
+    });
+    accountStore
+      .getState()
+      .setVm(accountVm({ offers: { drives: [], providers: [offer], matrix: [] } }));
+    render(<BotsSection open />);
+
+    const block = await screen.findByRole("region", { name: ACCOUNT_OFFERS_TITLE });
+    expect(block).toHaveTextContent("Acme CLIProxyAPI — openai at cliproxy.acme.dev");
+    expect(block).not.toHaveTextContent("cannot talk to");
+    fireEvent.click(
+      within(block).getByRole("button", { name: `${BOTS_OFFER_ADD_LABEL} Acme CLIProxyAPI` }),
+    );
+    await waitFor(() => expect(accountOfferAddProvider).toHaveBeenCalledWith(offer.key));
+    expect(botsProviderSave).not.toHaveBeenCalled();
+  });
+
+  it("offers three kind toggles by their stored words, and saves openai as openai", async () => {
+    botsProvidersList.mockResolvedValue([]);
+    botsBotsList.mockResolvedValue([]);
+    render(<BotsSection open />);
+    fireEvent.click(screen.getByRole("button", { name: BOTS_ADD_PROVIDER_LABEL }));
+    for (const word of ["ollama", "hermes", "openai"]) {
+      expect(screen.getByRole("button", { name: word })).toBeInTheDocument();
+    }
+    fireEvent.click(screen.getByRole("button", { name: "openai" }));
+    expect(screen.getByRole("button", { name: "openai" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "ollama" })).toHaveAttribute("aria-pressed", "false");
+    fireEvent.change(screen.getByLabelText(BOTS_NAME_LABEL), {
+      target: { value: "CLIProxyAPI" },
+    });
+    fireEvent.change(screen.getByLabelText(BOTS_BASE_URL_LABEL), {
+      target: { value: "https://cliproxy.acme.dev:8452" },
+    });
+    fireEvent.change(screen.getByLabelText(BOTS_TOKEN_LABEL), {
+      target: { value: "proxy-key" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: BOTS_SAVE_LABEL }));
+
+    await waitFor(() => expect(botsProviderSave).toHaveBeenCalledTimes(1));
+    expect(botsProviderSave).toHaveBeenCalledWith({
+      id: null,
+      kind: "openai",
+      name: "CLIProxyAPI",
+      baseUrl: "https://cliproxy.acme.dev:8452",
+      token: "proxy-key",
+      clearToken: false,
+    } satisfies BotProviderSaveReq);
+  });
+
   it("never throws away an endpoint being added: it says so and keeps the draft", async () => {
     const first = providerOffer({ credential: "own" });
     const second = providerOffer({
@@ -650,7 +706,7 @@ describe("BotsSection on the phone (Story 62.3, FR-399)", () => {
     botsBotsList.mockResolvedValue([]);
     render(<BotsSection open />);
     fireEvent.click(screen.getByRole("button", { name: BOTS_ADD_PROVIDER_LABEL }));
-    // The kind picker offers both stored spellings — Ollama is neither built
+    // The kind picker offers every stored spelling — Ollama is neither built
     // for nor blocked on a phone (the epic's DW-221) — and the pick is the
     // stored word.
     expect(screen.getByRole("button", { name: "ollama" })).toBeInTheDocument();

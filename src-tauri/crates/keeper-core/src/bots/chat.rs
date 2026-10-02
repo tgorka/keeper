@@ -1526,7 +1526,7 @@ mod tests {
     }
 
     #[test]
-    fn ollama_drops_tool_choice_and_hermes_keeps_it() {
+    fn ollama_drops_tool_choice_and_hermes_and_openai_keep_it() {
         let request = ChatRequest {
             model: "m".to_owned(),
             messages: vec![ChatMessage::text(Role::User, "hi")],
@@ -1544,6 +1544,10 @@ mod tests {
 
         let hermes = build_body(ProviderKind::Hermes, &request).expect("body");
         assert_eq!(hermes.get("tool_choice"), Some(&json!("required")));
+
+        let openai = build_body(ProviderKind::OpenAi, &request).expect("body");
+        assert_eq!(openai.get("tool_choice"), Some(&json!("required")));
+        assert!(honours_tool_choice(ProviderKind::OpenAi));
     }
 
     #[test]
@@ -1587,6 +1591,14 @@ mod tests {
         );
         assert_eq!(part["image_url"]["detail"], json!("high"));
 
+        let openai = build_body(ProviderKind::OpenAi, &request).expect("body");
+        let part = &openai["messages"][0]["content"][1];
+        assert_eq!(part["type"], json!("image_url"));
+        assert_eq!(
+            part["image_url"],
+            json!({"url": "data:image/png;base64,AAAA", "detail": "high"})
+        );
+
         let ollama = build_body(ProviderKind::Ollama, &request).expect("body");
         let part = &ollama["messages"][0]["content"][1];
         assert_eq!(part["image_url"], json!("data:image/png;base64,AAAA"));
@@ -1611,6 +1623,8 @@ mod tests {
             Err(BotsError::Unsupported { .. })
         ));
         assert!(build_body(ProviderKind::Hermes, &request).is_ok());
+        // Unknown is permitted: the endpoint reports what it did with it.
+        assert!(build_body(ProviderKind::OpenAi, &request).is_ok());
     }
 
     #[test]

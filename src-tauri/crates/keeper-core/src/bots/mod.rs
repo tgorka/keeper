@@ -51,18 +51,20 @@ use ts_rs::TS;
 use crate::error::CoreError;
 use crate::platform::Platform;
 
-/// Which of the two OpenAI-compatible back ends a provider is (Story 61.1,
-/// FR-369).
+/// Which OpenAI-compatible back end a provider is (Story 61.1, FR-369;
+/// AD-369).
 ///
-/// A closed set of two, deliberately. A third kind (the owner named `omp`) is
-/// one row and one match arm on this foundation, and inventing an abstraction
-/// for it today — with no endpoint to read — is the mistake the epic refuses
-/// (DW-214). The kind is what decides how a *bot* is addressed, so every place
-/// that branches on it is a place where the two wire dialects genuinely differ.
+/// A closed set of three, deliberately. AD-146 closed it at two and named its
+/// own revisit trigger: a third kind with a real endpoint to read. CLIProxyAPI
+/// met it, so [`ProviderKind::OpenAi`] is one row and one match arm on this
+/// foundation; a kind designed against no endpoint (the owner named `omp`)
+/// stays out (DW-214). The kind is what decides how a *bot* is addressed, so
+/// every place that branches on it is a place where the wire dialects
+/// genuinely differ.
 ///
-/// Serializes to `"hermes" | "ollama"` — the frontend wire contract, and the
-/// same string the `bot_providers.kind` column stores, so there is one spelling
-/// of each kind across the product.
+/// Serializes to `"hermes" | "ollama" | "openai"` — the frontend wire
+/// contract, and the same string the `bot_providers.kind` column stores, so
+/// there is one spelling of each kind across the product.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -74,6 +76,11 @@ pub enum ProviderKind {
     /// no credential of its own — a token, when present, was added by a proxy in
     /// front of it (research §3.5).
     Ollama,
+    /// Any OpenAI-compatible endpoint (CLIProxyAPI, research §11.1):
+    /// bearer-authenticated, the model in the body, its models listed at
+    /// `/v1/models` with no capabilities.
+    #[serde(rename = "openai")]
+    OpenAi,
 }
 
 impl ProviderKind {
@@ -83,6 +90,7 @@ impl ProviderKind {
         match self {
             ProviderKind::Hermes => "hermes",
             ProviderKind::Ollama => "ollama",
+            ProviderKind::OpenAi => "openai",
         }
     }
 
@@ -98,6 +106,7 @@ impl ProviderKind {
         match value {
             "hermes" => Some(ProviderKind::Hermes),
             "ollama" => Some(ProviderKind::Ollama),
+            "openai" => Some(ProviderKind::OpenAi),
             _ => None,
         }
     }
@@ -341,10 +350,10 @@ impl Endpoint {
     /// **The prefix is the whole of "bot mode" on the wire.** Hermes registers
     /// every api-server route a second time at `/p/{profile}<path>` (research
     /// §2.2), so addressing a bot is a URL decision and nothing else — no
-    /// second client, no body field, no header. Ollama has no such concept: its
-    /// bot is the `model` in the request body, so `bot` is deliberately ignored
-    /// for routing there rather than silently prefixed onto a path its server
-    /// would 404.
+    /// second client, no body field, no header. Ollama and an OpenAI-compatible
+    /// endpoint have no such concept: their bot is the `model` in the request
+    /// body, so `bot` is deliberately ignored for routing there rather than
+    /// silently prefixed onto a path their server would 404.
     ///
     /// The base URL's trailing slash was already dropped by the grammar, but it
     /// is trimmed again here: this function is total over any base URL a caller
@@ -633,17 +642,26 @@ mod tests {
         );
     }
 
-    /// Both `kind` spellings round-trip, and an unknown one is refused rather
-    /// than defaulted — a row from a newer build must not be read as Hermes.
+    /// Every `kind` spelling round-trips — through the column and through the
+    /// IPC wire, which must be the same word — and an unknown one is refused
+    /// rather than defaulted: a row from a newer build must not be read as
+    /// Hermes, and `omp` stays closed (DW-214).
     #[test]
     fn a_provider_kind_round_trips_and_an_unknown_kind_is_refused() {
-        for kind in [ProviderKind::Hermes, ProviderKind::Ollama] {
-            assert_eq!(
-                ProviderKind::from_registry_str(kind.as_registry_str()),
-                Some(kind)
-            );
+        for (kind, word) in [
+            (ProviderKind::Hermes, "hermes"),
+            (ProviderKind::Ollama, "ollama"),
+            (ProviderKind::OpenAi, "openai"),
+        ] {
+            assert_eq!(kind.as_registry_str(), word);
+            assert_eq!(ProviderKind::from_registry_str(word), Some(kind));
+            let wire = serde_json::to_string(&kind).expect("a kind serializes");
+            assert_eq!(wire, format!("\"{word}\""));
+            let back: ProviderKind = serde_json::from_str(&wire).expect("a kind deserializes");
+            assert_eq!(back, kind);
         }
         assert_eq!(ProviderKind::from_registry_str("omp"), None);
+        assert_eq!(ProviderKind::from_registry_str("openAi"), None);
         assert_eq!(ProviderKind::from_registry_str(""), None);
     }
 

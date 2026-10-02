@@ -8,6 +8,7 @@
 //! here — one test per arm — and the shell is left with nothing to decide.
 
 use keeper_core::bots::context_files::{context_targets, OKF_DIGEST};
+use keeper_core::bots::discover;
 use keeper_core::bots::grant::{
     Grant, GrantMode, GrantScope, ToolTarget, GRANTS_ALL_NONE_NO_TOOLS, HERMES_RUNS_ITS_OWN_TOOLS,
     MODEL_HAS_NO_TOOLS, NO_GRANT_NO_TOOLS, TOOLS_CAPABILITY_UNKNOWN,
@@ -110,6 +111,51 @@ fn an_unknown_capability_is_offered_with_the_warning_not_refused() {
         }
         ToolOffer::Withheld { .. } => panic!("unknown is not false (AD-27): {offer:?}"),
     }
+}
+
+/// The decision the shell's two turn builders (`arm_turn`, the task runner's
+/// `prepare`) compose before a request goes out: probe the model's tool
+/// capability only where a grant exists **and** discovery can answer it. For
+/// an OpenAI-compatible endpoint it cannot — `/v1/models` states no
+/// capability — so no discovery request is sent, and the grant still offers
+/// the drive tools with the unknown-tools sentence. Hermes is skipped too, and
+/// still withheld; Ollama is the one kind that is probed.
+#[test]
+fn an_openai_turn_with_a_grant_sends_no_probe_and_is_offered_tools_with_the_warning() {
+    let grants = vec![profile("drive-1", GrantMode::Read)];
+    let arm = |kind: ProviderKind, stated: Option<bool>| {
+        let mut probes = 0;
+        let tools_supported = if grants.is_empty() || !discover::probes_model_capabilities(kind) {
+            None
+        } else {
+            probes += 1;
+            stated
+        };
+        (probes, offer_tools(kind, tools_supported, &grants))
+    };
+
+    // A regression that probed would see a model stating no tools here.
+    let (probes, offer) = arm(ProviderKind::OpenAi, Some(false));
+    assert_eq!(
+        probes, 0,
+        "no discovery request for an OpenAI-compatible bot"
+    );
+    match &offer {
+        ToolOffer::Offered { warning, mode, .. } => {
+            assert_eq!(*warning, Some(TOOLS_CAPABILITY_UNKNOWN));
+            assert_eq!(*mode, GrantMode::Read);
+        }
+        ToolOffer::Withheld { .. } => panic!("unknown is not false (AD-27): {offer:?}"),
+    }
+    assert!(names(&offer).contains(&"drive_read".to_owned()));
+
+    let (probes, offer) = arm(ProviderKind::Hermes, Some(true));
+    assert_eq!(probes, 0);
+    assert_eq!(withheld_reason(&offer), HERMES_RUNS_ITS_OWN_TOOLS);
+
+    let (probes, offer) = arm(ProviderKind::Ollama, Some(false));
+    assert_eq!(probes, 1, "Ollama states its capabilities, so it is asked");
+    assert_eq!(withheld_reason(&offer), MODEL_HAS_NO_TOOLS);
 }
 
 #[test]
