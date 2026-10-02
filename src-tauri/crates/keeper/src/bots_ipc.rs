@@ -2349,3 +2349,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[path = "characterisation_capture.rs"]
+mod characterisation_capture;

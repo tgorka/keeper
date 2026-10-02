@@ -398,12 +398,19 @@ pub fn note_answer_chunk(after_ms: u64) {
     }
 }
 
+#[cfg(test)]
+pub(crate) static TEST_SPOKEN: Mutex<Option<String>> = Mutex::new(None);
+
 /// The language a send made right now is asked in, when it belongs to a
 /// voice turn (Epic 64, AD-182): the listening locale in force —
 /// `wake_vm`'s own expression — while `Turn::awaiting_send`, otherwise
 /// `None`. The bots adapter reads it to decide whether the per-turn
 /// instruction goes on the request; the rule is the turn's, read once.
 pub fn spoken_turn(data_dir: &std::path::Path) -> Option<String> {
+    #[cfg(test)]
+    if let Some(language) = TEST_SPOKEN.lock().ok().and_then(|held| held.clone()) {
+        return Some(language);
+    }
     let port = {
         let voice = voice();
         if !voice.turn.awaiting_send() {
