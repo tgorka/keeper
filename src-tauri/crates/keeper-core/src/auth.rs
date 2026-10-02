@@ -439,7 +439,7 @@ pub fn set_encryption_posture(platform: &dyn Platform, enabled: bool) -> Result<
 /// 32 alphanumeric characters from a cryptographically-seeded thread RNG. The
 /// value is written **only** to the macOS Keychain — never returned over IPC,
 /// logged, or written to `keeper.db`/disk.
-fn generate_store_passphrase() -> String {
+pub(crate) fn generate_store_passphrase() -> String {
     use rand::distributions::Alphanumeric;
     use rand::Rng;
     rand::thread_rng()
