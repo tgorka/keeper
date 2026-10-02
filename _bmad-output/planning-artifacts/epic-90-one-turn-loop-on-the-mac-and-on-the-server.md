@@ -348,12 +348,12 @@ Conventions as Epic 89's *Stories*:
 
 **Files:**
 - **New `keeper-sync/src/xdg.rs`.**
-  - `XdgDirs { config, data, state }`, with `XdgDirs::resolve(app: &str) -> Result<XdgDirs>` and `with_dirs`. The rules move from `keeper-syncd/src/platform.rs:173-201`: an empty or relative `XDG_*` falls back to `$HOME`, and a missing `HOME` gets its sentence.
+  - `XdgDirs { config, data, state }`, with `XdgDirs::resolve(app: &str) -> Result<XdgDirs>` and `with_dirs`. The rules move from `keeper-syncd/src/platform.rs:180-201` (lines before 90.3): an empty or relative `XDG_*` falls back to `$HOME`, and a missing `HOME` gets its sentence.
   - `SecretStore { env_prefix: &'static str, credentials_dir: Option<PathBuf>, dir: PathBuf, strict_dir: bool }`, with `get`/`set`/`delete`.
     - **The lookup order** (S-07): with a credentials directory (agentd), `credentials_dir` first, then the environment, then the `0600` file; without one (syncd), the environment, then the file, as today.
     - **`strict_dir`** (agentd only, S-34): the secrets directory must be mode `0700`, owned by the process's effective uid and not a symlink, and a secret file that is a symlink is refused (opened with `O_NOFOLLOW`). The facts are checked by a pure `check_secrets_dir(DirFacts { mode, uid, is_symlink }, euid)` and read from the real directory.
     - `scrub_env(&self)` removes every variable starting with `env_prefix` from the process's environment, so no child the process starts later inherits one.
-  - `env_var_name`, `secret_file_name`, `trim_secret` and `check_secret_permissions` move verbatim (`:203-257`), with their tests.
+  - `env_var_name`, `secret_file_name`, `trim_secret` and `check_secret_permissions` move (`:203-260`), with their tests; `env_var_name` gains a `prefix` parameter, and `path_candidates`/`candidates_in` (`:259-284`) move too, for agentd's git search (ruling D15). The secret bodies were `:329-405`.
 - **`keeper-syncd/src/platform.rs`** uses them, with no behaviour change: app dir `keeper-sync`, prefix `KEEPER_SYNC_SECRET_`, secrets under `$XDG_CONFIG_HOME/keeper-sync/secrets/`, no credentials dir.
 - **New `keeper-core/src/agents/agentd.rs`**, the `agentd.toml` grammar of *Data formats*. `AgentdConfig::parse(text) -> Result<AgentdConfig, ConfigRefusal>`:
   - every credential is `secret:<name>`;
@@ -395,10 +395,10 @@ Conventions as Epic 89's *Stories*:
 - **Docs.** `docs/agents.md`, chapter *A Linux host*: the directories; the secret order, with systemd credentials (`LoadCredential=`) as the recommended way and environment variables as the fallback; that agentd scrubs its secret variables and is not dumpable; the secrets directory's rule; `agentd.toml`; the pins and the mount rule. It states plainly (S-26) that the Matrix store's passphrase protects a stolen data directory only when the secrets directory is not stolen with it, and that `LoadCredential=` keeps it outside agentd's own directories.
 
 **Acceptance:**
-1. **syncd is unchanged.** syncd's platform tests (`keeper-syncd/src/platform.rs:590-690`) pass. `check:syncd-lean` is green. The moved tests pass in `keeper_sync::xdg`.
+1. **syncd is unchanged.** syncd's platform tests (`keeper-syncd/src/platform.rs:558-683` before 90.3) pass. `check:syncd-lean` is green. The moved tests pass in `keeper_sync::xdg`.
 2. **Secrets.**
    - `systemd_credentials_win_then_the_environment_then_a_0600_file` (agentd's store, S-07). Precedence is tried with all three present, then two, then one. syncd's store, with no credentials directory, keeps environment-then-file, and its existing tests are unchanged.
-   - A `0644` file is refused with "it must be 0600 — run: chmod 0600 …" (`platform.rs:246-257`).
+   - A `0644` file is refused with "it must be 0600 — run: chmod 0600 …" (`platform.rs:246-260` before 90.3).
    - A `secret:<name>` with `..` cannot escape (`secret_file_name`).
    - The credentials dir is never read for syncd.
    - **The strict directory** (S-34): `a_secrets_directory_must_be_0700_owned_and_real` — on real files, a `0755` directory and a symlinked directory are refused naming the path and the reason, and a symlinked secret file is refused; over `check_secrets_dir`, a directory owned by another uid is refused. syncd's store, built without `strict_dir`, accepts the `0755` directory as today.

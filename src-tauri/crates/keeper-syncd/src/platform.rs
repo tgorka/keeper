@@ -18,13 +18,11 @@
 //!   so this compiles against `std::os::unix` unconditionally rather than
 //!   silently skipping the check on a platform that cannot express it.
 
-use std::ffi::{OsStr, OsString};
-use std::io::Write as _;
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use keeper_sync::{GitRequest, OpenFileState, Result, SyncError, SyncPlatform};
+use keeper_sync::xdg::{path_candidates, SecretStore, XdgDirs};
+use keeper_sync::{GitRequest, OpenFileState, Result, SyncPlatform};
 
 /// The per-application segment appended to each XDG base directory.
 pub const APP_DIR: &str = "keeper-sync";
@@ -56,9 +54,8 @@ pub const GIT_ADVICE: &str = "install git 2.42 or newer with `apt install git`, 
 /// `SyncPlatform` over the XDG base directories.
 #[derive(Debug, Clone)]
 pub struct LinuxPlatform {
-    config_dir: PathBuf,
-    data_dir: PathBuf,
-    state_dir: PathBuf,
+    dirs: XdgDirs,
+    secrets: SecretStore,
     host_label: String,
     /// `[daemon] gitPath`, when the operator named a binary. `None` searches
     /// `PATH`. Held on the platform rather than read from the config at each
@@ -73,35 +70,28 @@ impl LinuxPlatform {
     /// startup, naming the directory it could not create, instead of half way
     /// through a sync.
     pub fn new() -> Result<Self> {
-        let home = home_dir()?;
-        let platform = Self::with_dirs(
-            xdg_dir(std::env::var_os("XDG_CONFIG_HOME"), &home, ".config"),
-            xdg_dir(std::env::var_os("XDG_DATA_HOME"), &home, ".local/share"),
-            xdg_dir(std::env::var_os("XDG_STATE_HOME"), &home, ".local/state"),
-        );
-        for dir in [
-            &platform.config_dir,
-            &platform.data_dir,
-            &platform.state_dir,
-        ] {
-            std::fs::create_dir_all(dir)
-                .map_err(|err| SyncError::io("create daemon directory", dir, err))?;
-        }
-        Ok(platform)
+        Ok(Self::over(XdgDirs::resolve(APP_DIR)?))
     }
 
     /// Build against explicit directories, bypassing the environment.
     ///
-    /// Used by tests, and by an operator who points every path at one tree.
+    /// The tests' platform over a temporary tree.
+    #[cfg(test)]
     pub fn with_dirs(
         config_dir: impl Into<PathBuf>,
         data_dir: impl Into<PathBuf>,
         state_dir: impl Into<PathBuf>,
     ) -> Self {
+        Self::over(XdgDirs::with_dirs(config_dir, data_dir, state_dir))
+    }
+
+    /// Secrets under `<config>/secrets/`, environment first, no credentials
+    /// directory and no strict directory rule: syncd's store since Story 30.1.
+    fn over(dirs: XdgDirs) -> Self {
+        let secrets = SecretStore::new(SECRET_ENV_PREFIX, dirs.config.join(SECRETS_DIR));
         Self {
-            config_dir: config_dir.into(),
-            data_dir: data_dir.into(),
-            state_dir: state_dir.into(),
+            dirs,
+            secrets,
             host_label: read_host_label(),
             git_path: None,
         }
@@ -147,140 +137,28 @@ impl LinuxPlatform {
     }
 
     pub fn state_dir(&self) -> &Path {
-        &self.state_dir
+        &self.dirs.state
     }
 
     /// `$XDG_CONFIG_HOME/keeper-sync/config.toml`.
     pub fn config_path(&self) -> PathBuf {
-        self.config_dir.join(CONFIG_FILE)
+        self.dirs.config.join(CONFIG_FILE)
     }
 
     /// `$XDG_STATE_HOME/keeper-sync/keeper-syncd.log`.
     pub fn log_path(&self) -> PathBuf {
-        self.state_dir.join(LOG_FILE)
+        self.dirs.state.join(LOG_FILE)
     }
 
     /// `$XDG_CONFIG_HOME/keeper-sync/secrets/`.
     pub fn secrets_dir(&self) -> PathBuf {
-        self.config_dir.join(SECRETS_DIR)
+        self.secrets.dir().to_path_buf()
     }
 
+    #[cfg(test)]
     fn secret_path(&self, key: &str) -> PathBuf {
-        self.secrets_dir().join(secret_file_name(key))
+        self.secrets.path_of(key)
     }
-}
-
-/// Apply the XDG resolution rule to one base directory.
-///
-/// Per the XDG Base Directory specification an unset **or empty** variable
-/// falls back to the default, and a relative path "should be considered
-/// invalid and ignored" — a relative `XDG_DATA_HOME` would otherwise resolve
-/// `sync.db` against whatever directory systemd happened to start us in, so
-/// the daemon would silently use a different database per working directory.
-fn xdg_dir(explicit: Option<OsString>, home: &Path, fallback: &str) -> PathBuf {
-    let base = explicit
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| home.join(fallback));
-    base.join(APP_DIR)
-}
-
-fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            SyncError::Config(
-                "HOME is not set, so the XDG base directories cannot be resolved; \
-                 set HOME, or set XDG_CONFIG_HOME, XDG_DATA_HOME and XDG_STATE_HOME \
-                 to absolute paths"
-                    .to_owned(),
-            )
-        })
-}
-
-/// Environment-variable name carrying the secret for `key`.
-///
-/// Engine keys look like `sync/<ULID>/credential`, so folding every
-/// non-alphanumeric character to `_` is injective over the keys that actually
-/// occur; it is not injective in general, which is fine because the engine —
-/// not a user — chooses these.
-fn env_var_name(key: &str) -> String {
-    let mut name = String::with_capacity(SECRET_ENV_PREFIX.len() + key.len());
-    name.push_str(SECRET_ENV_PREFIX);
-    for ch in key.chars() {
-        name.push(if ch.is_ascii_alphanumeric() {
-            ch.to_ascii_uppercase()
-        } else {
-            '_'
-        });
-    }
-    name
-}
-
-/// File name carrying the secret for `key`.
-///
-/// The same fold, minus the case change. It also makes traversal impossible:
-/// `..` becomes `__`, so a key can never escape the secrets directory.
-fn secret_file_name(key: &str) -> String {
-    key.chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect()
-}
-
-/// Strip a trailing newline from a secret.
-///
-/// `echo token > secret` and a heredoc both append one, and a credential never
-/// legitimately ends in CR or LF — so this removes a near-universal footgun
-/// without touching any byte a token could actually contain.
-fn trim_secret(raw: &str) -> String {
-    raw.trim_end_matches(['\r', '\n']).to_owned()
-}
-
-/// Reject a secret file any account but the owner can read.
-///
-/// `mode & 0o077` is the group+other bits: this is the same test `ssh` applies
-/// to a private key, and for the same reason — a token readable by `nogroup`
-/// on a shared box is already leaked.
-fn check_secret_permissions(path: &Path, mode: u32) -> Result<()> {
-    if mode & 0o077 != 0 {
-        return Err(SyncError::Config(format!(
-            "secret file {} is readable by group or others (mode {:04o}); \
-             it must be 0600 — run: chmod 0600 {}",
-            path.display(),
-            mode & 0o7777,
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-/// Every `PATH` entry's `program`, in the order `PATH` lists them.
-///
-/// Candidates, not an answer: which of them is a *usable* git is decided by
-/// probing (`keeper_sync::git::resolve`). This used to be `find_executable`,
-/// which returned the first executable hit — and an executable file named `git`
-/// is not the same thing as a git this engine can drive, which is the whole of
-/// Story 34.14.
-///
-/// Written out rather than shelling out to `which`: resolving a hard
-/// prerequisite by spawning another process that might equally be missing is
-/// circular, and `which`'s exit codes differ between the shell builtin and the
-/// binary.
-fn path_candidates(program: &str) -> Vec<PathBuf> {
-    candidates_in(std::env::var_os("PATH").as_deref(), program)
-}
-
-/// [`path_candidates`] over an explicit `PATH`-shaped value, for tests.
-fn candidates_in(path_var: Option<&OsStr>, program: &str) -> Vec<PathBuf> {
-    let Some(path_var) = path_var else {
-        return Vec::new();
-    };
-    std::env::split_paths(path_var)
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .map(|dir| dir.join(program))
-        .collect()
 }
 
 /// Pick a host label from the two places a Linux box publishes one.
@@ -323,85 +201,22 @@ fn hostname_command() -> Option<String> {
 
 impl SyncPlatform for LinuxPlatform {
     fn data_dir(&self) -> Result<PathBuf> {
-        Ok(self.data_dir.clone())
+        Ok(self.dirs.data.clone())
     }
 
+    /// Environment first, then the `0600` file: how a container or a systemd
+    /// drop-in injects a token without ever writing it to a filesystem.
     fn secret_get(&self, key: &str) -> Result<Option<String>> {
-        // Environment first: it is how a container or a systemd
-        // `LoadCredential=` drop-in injects a token without ever writing it to
-        // a filesystem.
-        if let Some(value) = std::env::var(env_var_name(key))
-            .ok()
-            .filter(|value| !value.is_empty())
-        {
-            return Ok(Some(trim_secret(&value)));
-        }
-
-        let path = self.secret_path(key);
-        let meta = match std::fs::metadata(&path) {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(SyncError::io("stat secret file", &path, err)),
-        };
-        check_secret_permissions(&path, meta.permissions().mode())?;
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|err| SyncError::io("read secret file", &path, err))?;
-        Ok(Some(trim_secret(&raw)))
+        self.secrets.get(key)
     }
 
     fn secret_set(&self, key: &str, value: &str) -> Result<()> {
-        let dir = self.secrets_dir();
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)
-            .map_err(|err| SyncError::io("create secrets directory", &dir, err))?;
-
-        let path = self.secret_path(key);
-        // `mode` applies only when the file is created, so an existing file
-        // keeps whatever bits it had — hence the explicit chmod below. Creating
-        // it restricted first means there is never a window in which the
-        // credential exists on disk world-readable.
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|err| SyncError::io("create secret file", &path, err))?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|err| SyncError::io("restrict secret file", &path, err))?;
-        file.write_all(value.as_bytes())
-            .map_err(|err| SyncError::io("write secret file", &path, err))?;
-
-        if std::env::var_os(env_var_name(key)).is_some() {
-            // Reads prefer the environment, so this write would be invisible.
-            // Silence here is how an operator ends up debugging a rotated token
-            // that "did not take".
-            tracing::warn!(
-                variable = %env_var_name(key),
-                "a secret environment variable shadows the file just written; \
-                 reads will keep returning the environment value"
-            );
-        }
-        Ok(())
+        self.secrets.set(key, value)
     }
 
+    /// Removing an absent secret succeeds, per the port's contract.
     fn secret_delete(&self, key: &str) -> Result<()> {
-        let path = self.secret_path(key);
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            // Removing an absent secret succeeds, per the port's contract.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(SyncError::io("delete secret file", &path, err)),
-        }
-        if std::env::var_os(env_var_name(key)).is_some() {
-            tracing::warn!(
-                variable = %env_var_name(key),
-                "the secret file was removed but the environment still supplies this secret"
-            );
-        }
-        Ok(())
+        self.secrets.delete(key)
     }
 
     fn notify(&self, title: &str, body: &str) {
@@ -481,6 +296,9 @@ impl SyncPlatform for LinuxPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keeper_sync::xdg::candidates_in;
+    use keeper_sync::SyncError;
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn write_with_mode(path: &Path, contents: &str, mode: u32) {
         if let Some(parent) = path.parent() {
@@ -492,52 +310,6 @@ mod tests {
 
     fn platform_at(root: &Path) -> LinuxPlatform {
         LinuxPlatform::with_dirs(root.join("config"), root.join("data"), root.join("state"))
-    }
-
-    #[test]
-    fn xdg_falls_back_to_home_when_unset() {
-        let home = Path::new("/home/dev");
-        assert_eq!(
-            xdg_dir(None, home, ".config"),
-            PathBuf::from("/home/dev/.config/keeper-sync")
-        );
-        assert_eq!(
-            xdg_dir(None, home, ".local/share"),
-            PathBuf::from("/home/dev/.local/share/keeper-sync")
-        );
-        assert_eq!(
-            xdg_dir(None, home, ".local/state"),
-            PathBuf::from("/home/dev/.local/state/keeper-sync")
-        );
-    }
-
-    #[test]
-    fn xdg_honours_an_absolute_override() {
-        assert_eq!(
-            xdg_dir(
-                Some(OsString::from("/srv/keeper/cfg")),
-                Path::new("/home/dev"),
-                ".config"
-            ),
-            PathBuf::from("/srv/keeper/cfg/keeper-sync")
-        );
-    }
-
-    #[test]
-    fn xdg_ignores_an_empty_or_relative_override() {
-        let home = Path::new("/home/dev");
-        // The spec says empty means "unset"...
-        assert_eq!(
-            xdg_dir(Some(OsString::new()), home, ".config"),
-            PathBuf::from("/home/dev/.config/keeper-sync")
-        );
-        // ...and that a relative path is invalid. Honouring it would resolve
-        // sync.db against the process CWD, giving a different database per
-        // working directory.
-        assert_eq!(
-            xdg_dir(Some(OsString::from("relative/cfg")), home, ".config"),
-            PathBuf::from("/home/dev/.config/keeper-sync")
-        );
     }
 
     #[test]
@@ -657,47 +429,6 @@ mod tests {
             platform.secret_get(key).expect("get"),
             Some("rotated".to_owned())
         );
-    }
-
-    #[test]
-    fn a_secret_key_can_never_escape_the_secrets_directory() {
-        let root = tempfile::tempdir().expect("temp dir");
-        let platform = platform_at(root.path());
-
-        let path = platform.secret_path("../../etc/shadow");
-
-        assert_eq!(path.parent(), Some(platform.secrets_dir().as_path()));
-        assert_eq!(
-            path.file_name().and_then(OsStr::to_str),
-            Some("______etc_shadow")
-        );
-    }
-
-    #[test]
-    fn the_secret_environment_variable_name_is_derived_from_the_key() {
-        assert_eq!(
-            env_var_name("sync/01PROFILE/credential"),
-            "KEEPER_SYNC_SECRET_SYNC_01PROFILE_CREDENTIAL"
-        );
-    }
-
-    #[test]
-    fn path_candidates_are_every_path_entry_in_order() {
-        // Candidates, not an answer: a non-executable file of the right name is
-        // still offered to the prober, which is what turns "a stray `git` note
-        // shadows the real binary" from a silent substitution into a reported
-        // rejection.
-        let root = tempfile::tempdir().expect("temp dir");
-        let first = root.path().join("first");
-        let second = root.path().join("second");
-        let joined = std::env::join_paths([&first, &second]).expect("join paths");
-
-        assert_eq!(
-            candidates_in(Some(joined.as_os_str()), "git"),
-            vec![first.join("git"), second.join("git")]
-        );
-        // An unset PATH must be an empty list, not a panic or a bare-name spawn.
-        assert!(candidates_in(None, "git").is_empty());
     }
 
     #[test]

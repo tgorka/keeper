@@ -66,6 +66,8 @@ pub mod stability;
 pub mod tasks;
 pub mod volume;
 pub mod watch;
+#[cfg(unix)]
+pub mod xdg;
 
 pub use copy::{
     copy_verified, ContentSource, CopyEntry, CopyOptions, CopyOutcome, CopyProgress, CopyReport,
