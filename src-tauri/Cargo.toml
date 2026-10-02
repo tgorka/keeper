@@ -451,3 +451,13 @@ objc2-natural-language = { version = "0.3.2", default-features = false, features
     "NLLanguageRecognizer",
 ] }
 
+# tao, the window layer under Tauri, from `tools/tao`: 0.35.3 as crates.io serves
+# it plus one hunk in `ios/app_state.rs`'s `connect_scene`, so a URL that LAUNCHED
+# the app (a scanned `keeper://setup?…` code while keeper is closed) is still
+# delivered once the UIScene lifecycle is on. iOS 27 requires that lifecycle, and
+# in it the launch URL exists only in the first scene's connection options, which
+# upstream (through 0.37.1) never reads. See tools/tao/NOTICE. Retire it when
+# upstream reads them: delete this table and the directory.
+[patch.crates-io]
+tao = { path = "../tools/tao" }
+

@@ -160,32 +160,82 @@ pub fn start(url: &str, callback_scheme: &str) -> Result<(), CoreError> {
 /// through [`finish`], so the caller waits on its flow and nothing else.
 /// `with_webview` is the way in because its closure runs on the main thread
 /// (its whole contract) and is handed the native window the sheet anchors to.
+///
+/// A window that is not the active one yet — the keyboard still up from the
+/// pasted setup link, an alert, a return from another app — is waited for, up
+/// to three seconds ([`ACTIVE_TRIES`] × [`ACTIVE_POLL`]), rather than handed to Apple, which refuses it with
+/// `presentationContextInvalid` (kalypso, 2026-10-01).
 #[cfg(target_os = "ios")]
 pub fn start_in(
     url: &str,
     callback_scheme: &str,
     flows: Arc<OAuthFlowRegistry>,
 ) -> Result<(), CoreError> {
+    let state = state_of(url)
+        .ok_or_else(|| CoreError::Internal("the authorization URL carries no state".to_owned()))?;
+    attempt(
+        url.to_owned(),
+        callback_scheme.to_owned(),
+        state,
+        flows,
+        ACTIVE_TRIES,
+    )
+}
+
+/// How many more times a sign-in looks for keeper's window to be the active
+/// one before it gives up: three seconds at [`ACTIVE_POLL`].
+#[cfg(target_os = "ios")]
+const ACTIVE_TRIES: u64 = 12;
+/// How often it looks again meanwhile.
+#[cfg(target_os = "ios")]
+const ACTIVE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[cfg(target_os = "ios")]
+fn attempt(
+    url: String,
+    scheme: String,
+    state: String,
+    flows: Arc<OAuthFlowRegistry>,
+    tries_left: u64,
+) -> Result<(), CoreError> {
+    use crate::web_auth_apple::Refusal;
     use tauri::Manager;
 
     let (app, _) = HOST.get().ok_or_else(not_up)?;
-    let state = state_of(url)
-        .ok_or_else(|| CoreError::Internal("the authorization URL carries no state".to_owned()))?;
     let window = app.get_webview_window(MAIN_WINDOW).ok_or_else(|| {
         CoreError::Internal(
             "keeper's main window is gone, so the sign-in sheet has nothing to open over"
                 .to_owned(),
         )
     })?;
-    let url = url.to_owned();
-    let scheme = callback_scheme.to_owned();
     let app = app.clone();
     window
         .with_webview(move |webview| {
-            if let Err(reason) =
-                crate::web_auth_apple::present(&app, &webview, &url, &scheme, &state, &flows)
-            {
-                finish(&flows, &state, Ending::Failed(reason));
+            match crate::web_auth_apple::present(&app, &webview, &url, &scheme, &state, &flows) {
+                Ok(()) => {}
+                Err(Refusal::NotActive) if tries_left > 0 => {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(ACTIVE_POLL);
+                        if let Err(error) = attempt(
+                            url,
+                            scheme,
+                            state.clone(),
+                            Arc::clone(&flows),
+                            tries_left - 1,
+                        ) {
+                            finish(&flows, &state, Ending::Failed(error.to_string()));
+                        }
+                    });
+                }
+                Err(Refusal::NotActive) => finish(
+                    &flows,
+                    &state,
+                    Ending::Failed(
+                        "keeper was not in front, so the sign-in sheet could not open; try again"
+                            .to_owned(),
+                    ),
+                ),
+                Err(Refusal::Failed(reason)) => finish(&flows, &state, Ending::Failed(reason)),
             }
         })
         .map_err(|error| CoreError::Internal(format!("could not reach the main window: {error}")))

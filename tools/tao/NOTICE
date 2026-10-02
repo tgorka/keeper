@@ -1,0 +1,42 @@
+tao — keeper's patched copy
+===========================
+
+This directory is tao 0.35.3, the window and event-loop layer under Tauri, as
+crates.io serves it, with two changes, both on iOS's UIScene path. It is used
+through `[patch.crates-io]` in `src-tauri/Cargo.toml`.
+
+  upstream: https://github.com/tauri-apps/tao
+  copied from: the crates.io package tao 0.35.3 (checksum
+               d1c93047acf68669466a34690ac58cca7010bd1b201e1ec86f1fd0a75d3dd4a9)
+  license: Apache-2.0 (LICENSE and LICENSE.spdx, unchanged)
+
+Why the scene path at all: iOS 27 refuses to launch an app that has not adopted
+the UIScene lifecycle, so keeper declares a scene manifest (docs/ios.md). Only
+an app with that manifest reaches the code below, which is why both bugs went
+unnoticed upstream.
+
+The changes
+-----------
+
+1. A use-after-free. `src/platform_impl/ios/view.rs`,
+   `configuration_for_connecting_scene_session`, returned
+   `Retained::as_ptr(&config)` and then dropped `config`, so UIKit received a
+   freed `UISceneConfiguration` and crashed in `objc_retain` inside
+   `-[UIApplication _connectUISceneFromFBSScene:transitionContext:]` on every
+   launch (kalypso, iOS 27.0). It now returns `Retained::autorelease_return`.
+
+2. The launch URL. `src/platform_impl/ios/app_state.rs`, `connect_scene`: the
+   first scene's `UISceneConnectionOptions.URLContexts` are emitted as
+   `Event::Opened` (read as optional: iOS 27.0 answers nil for a launch
+   without a URL, despite the nonnull header); `src/platform_impl/ios/scene.rs`: the parsing that
+   `scene:openURLContexts:` already did moves into `urls_of`, shared by both.
+   In the scene lifecycle a URL that launched the app arrives only there — not
+   in `application:openURL:options:`, not in `scene:openURLContexts:` — and tao
+   through 0.37.1 never reads it, so a `keeper://setup?…` code scanned while
+   keeper was closed would open keeper and do nothing.
+
+Retiring it
+-----------
+
+When upstream tao fixes both, delete the `[patch.crates-io]` table and this
+directory, and re-run the cold-launch check in docs/ios.md.

@@ -273,7 +273,7 @@ safe binding. Current inventory:
   `ASWebAuthenticationSessionCallback` — the epic's one new crate), behind
   `keeper_core::platform::Platform::start_web_auth` — `crates/keeper/src/web_auth_apple.rs`:
   the `anchor` module (`#[allow(unsafe_code)]` on the module, because `define_class!` is
-  `unsafe impl`s by construction), `window_of` (`UIWindow` through `PlatformWebview::view_controller`), `present`, `is_session_error` and `cancel_all` —
+  `unsafe impl`s by construction), `window_of` (`UIWindow` through `PlatformWebview::view_controller`), `anchor_state` (three `msg_send!` reads — `windowScene`, `activationState`, `isKeyWindow` — so a window that is not the active one is waited for rather than refused by Apple), `present`, `is_session_error` and `cancel_all` —
   each function-level `#[allow(unsafe_code)]` with a `// SAFETY:` comment on every block.
   The session, the anchor (a weak property on the session) and the completion block are
   held together in a main-thread table keyed by the flow's `state` until the main

@@ -54,6 +54,16 @@ targets:
         # Do NOT add UIUserInterfaceStyle here — it would pin one appearance and reintroduce
         # a launch flash for users on the other system theme.
         UILaunchStoryboardName: LaunchScreen
+        # The UIScene lifecycle (iOS 27 refuses to launch an app without it:
+        # `_UIApplicationEvaluateRuntimeIssueForNoSceneLifecycleAdoption`, SIGTRAP
+        # before the first frame, measured on kalypso 2026-10-01). No delegate
+        # class here: tao answers `configurationForConnectingSceneSession` with its
+        # own `TaoSceneDelegate`. `UIApplicationSupportsMultipleScenes` MUST be
+        # true: tao takes the scene path only then (`scene::multiple_scenes_enabled`),
+        # and with false it runs `on_app_ready` twice and aborts. The launch URL
+        # that scene mode hides is the tools/tao patch (docs/ios.md).
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: true
         UIRequiredDeviceCapabilities: [arm64, metal]
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
