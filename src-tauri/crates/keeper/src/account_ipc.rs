@@ -2839,6 +2839,18 @@ pub(crate) fn drive_records(data_dir: &Path) -> (Vec<DriveRecord>, String) {
     (records, device.unwrap_or_else(default_device_name))
 }
 
+/// The signed-in person's login and this install's registered device name:
+/// the principal a desktop hosts agents for and its host slug (story 90.6,
+/// DW-367). Either is `None` until the account has it.
+#[cfg(desktop)]
+pub(crate) fn host_identity() -> (Option<String>, Option<String>) {
+    let inner = lock(&RUNTIME.inner);
+    (
+        inner.identity.as_ref().map(|i| i.login.clone()),
+        inner.this_device.clone(),
+    )
+}
+
 /// A drive's remote from [`DRIVE_REMOTES`]. On a miss the map is refilled off
 /// this thread from the open engine, and the caller is told to try later.
 fn drive_remote(profile: &str) -> Option<String> {

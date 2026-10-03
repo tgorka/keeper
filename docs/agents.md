@@ -979,7 +979,7 @@ Mac — and every copy is in the session's room. Exactly one host writes a sessi
 that holds its **claim**.
 
 **Each host's manifest.** Every host keeps `dev.keeper.agent.host` in its principal's control room,
-under its slug: its capabilities (`mcp:<name>`, `kvm:<id>`; the Mac adds `screen:mac`), its drives
+under its slug: its capabilities (`mcp:<name>`, `kvm:<id>`; the Mac offers none yet), its drives
 with whether each is checked out and how much of it is on disk (`full`, `partial`, `virtual`), the
 bots it resolves, the agents it hosts, `always_on`, and its version. It is renewed every 60 s and
 lapses 180 s after its last renewal by the homeserver's clock. A state event is not encrypted, so a
@@ -1056,3 +1056,47 @@ whose `epoch` is that epoch from its chunks (`log/<date>.<host>.<n>.jsonl`) — 
 and commit. The host reads a conflicted log again every 30 s, so the next read after the commit is
 clean and the session is served again. keeper has no resolve action yet.
 
+### This Mac as a host
+
+keeper on a Mac is a host like `keeper-agentd`, sharing its manifests, placement and claims, with
+the app's own facts in place of `agentd.toml`:
+
+- **Its name.** The host slug is the device name the organisation account registered for this Mac
+  (`<login>/device.<device>.toml`), so two Macs never claim one name. Without an account, or before
+  the account has registered the device, the Mac hosts nothing, and Settings › Agents says why
+  (DW-367). A flagged folder whose `_drive.toml` is missing or does not read hosts nothing either;
+  it has a row of its own with the parser's sentence.
+- **Whose agents.** Only the agents of a folder flagged for agents whose `_drive.toml` `principal`
+  is the account's login. A shared principal's agents are never hosted on a desktop.
+- **The pin.** Settings › Agents has one row per agent: *Sign in on this Mac* with the agent's
+  password, or *Signed in as nixi@hesperia*. The first sign-in for a drive shows its owner, readers
+  and local-only setting ("Local models only: yes/no") and pins exactly those in `keeper.db`
+  (`agent_pins`, `agent_pin_readers`; this Mac only, never synced, never a `keeper.toml` key); if
+  `_drive.toml` changed any of the three after it was shown, the sign-in is refused. When a pinned
+  drive's `_drive.toml` later differs, its zone hosts nothing here, and the drive names each
+  difference with *Review readers*, which shows the pinned and the new values — owner, readers and
+  local-only — side by side. Only *Pin owner, readers and local-only* pins again, and only what
+  those two columns showed: a re-pin that would lower local-only is one the person saw. The section
+  reads its rows again every 5 s while it is open.
+- **The copy.** A sign-in stores the copy's session and store passphrase in the keychain under
+  `agents/<user>/session` and `agents/<user>/sdk-passphrase`, displays the device as
+  `<agent>@<device>`, and reuses its device id on a later sign-in. A first sign-in that fails
+  leaves no store behind that a later one cannot open: with no passphrase in the keychain, a store
+  already on disk is removed before a new one is made (`keeper-agentd login` does the same). The
+  copy reaches its homeserver through the URL of a Matrix account signed in to keeper on the same
+  server; with none, the row says so. The people a pin names show by display name when the
+  person's own account can read one within 2 s, by Matrix id otherwise.
+- **What a copy may touch.** The same tools as on electra, and no notes-vault writer: a write a turn
+  on the Mac makes inside a vault lands unmanaged, as agentd's do, so placement may treat every host
+  alike.
+- **The control room.** The principal's room of type `dev.keeper.agent.control` that a copy has
+  joined or is invited to, created by one of the principal's agents; of several, the lowest room id.
+  Until a copy has found it, the Mac takes no session: it cannot see the other hosts' manifests or
+  calibrate its clock by its own manifest's read-back, and the agent's row says so.
+- **The clock.** The app's one 1 Hz interval ticks the host (AD-62); the facts above are read again
+  every 5 s. A tick still running makes the next one skip, and a tick that fails outright logs it and
+  lets the next one run. The Mac is never `always_on` and offers no capability, so a session that
+  needs one, or an agent that prefers an always-on host, goes back to electra when electra is live.
+  With no other host running, nothing takes over while the Mac sleeps.
+- **Quit.** Running turns get their final edits, the drives are committed and pushed, and then the
+  manifest is withdrawn and every claim released. Closing the window keeps hosting.

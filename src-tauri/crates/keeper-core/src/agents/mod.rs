@@ -9,6 +9,7 @@
 //! reader and the `.keeper/` index, which own their own files (AD-366).
 pub mod agentd;
 pub mod claim;
+pub mod copy;
 pub mod drive;
 pub mod events;
 pub mod home;
@@ -19,6 +20,7 @@ pub mod log;
 pub mod matrix;
 pub mod memory;
 pub mod mount;
+pub mod pins;
 pub mod placement;
 pub mod prompt;
 pub mod redact;

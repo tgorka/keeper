@@ -7,6 +7,7 @@ import { RecordingDestinationControls } from "@/components/recording/recording-d
 import { SessionsSettingsSection } from "@/components/sessions/sessions-settings";
 import { AboutSection } from "@/components/settings/about-section";
 import { AccountSection } from "@/components/settings/account-section";
+import { AgentsSection } from "@/components/settings/agents-section";
 import {
   SDK_STORE_ENCRYPTED_STATUS,
   SDK_STORE_STATUS_LOADING,
@@ -264,6 +265,10 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
           could name. `botTools` is strictly narrower than `bots` in Rust, so
           it is the one gate this section needs. */}
       {botTools && <BotGrantsSection open={open} />}
+      {/* Story 90.6: this Mac as a host for your agents. On `botTools` for the
+          grants' reason — a host reads drives, and a phone is never one — and
+          absent besides where no flagged folder holds an agent (AD-27). */}
+      {botTools && <AgentsSection open={open} />}
       {/* Folder sync needs a usable `git` (Epic 29): absent on every machine
               that has none, never a section whose every button would reject. */}
       {sync && <SyncSection open={open} />}

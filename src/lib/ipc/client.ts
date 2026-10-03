@@ -335,6 +335,11 @@ export type { AccountSetupVm } from "./gen/AccountSetupVm";
 export type { AccountShareVm } from "./gen/AccountShareVm";
 export type { AccountStateVm } from "./gen/AccountStateVm";
 export type { AccountVm } from "./gen/AccountVm";
+export type { AgentCopyVm } from "./gen/AgentCopyVm";
+export type { AgentPersonVm } from "./gen/AgentPersonVm";
+export type { AgentPinReq } from "./gen/AgentPinReq";
+export type { AgentPinState } from "./gen/AgentPinState";
+export type { AgentPinVm } from "./gen/AgentPinVm";
 export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 export type { AuditOutcome } from "./gen/AuditOutcome";
 export type { AuditVerdict } from "./gen/AuditVerdict";
@@ -701,6 +706,8 @@ export type { WordsVm } from "./gen/WordsVm";
 import type { AccountSetupVm } from "./gen/AccountSetupVm";
 import type { AccountShareVm } from "./gen/AccountShareVm";
 import type { AccountVm } from "./gen/AccountVm";
+import type { AgentCopyVm } from "./gen/AgentCopyVm";
+import type { AgentPinReq } from "./gen/AgentPinReq";
 import type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 import type { BackupStatus } from "./gen/BackupStatus";
 import type { BbctlAvailabilityVm } from "./gen/BbctlAvailabilityVm";
@@ -7221,6 +7228,57 @@ export async function syncPacedWork(): Promise<PacedWorkVm[]> {
  */
 export async function syncTaskSchedulePreview(expression: string): Promise<TaskSchedulePreviewVm> {
   return await invoke<TaskSchedulePreviewVm>("sync_task_schedule_preview", { expression });
+}
+
+// ---------------------------------------------------------------------------
+// Agents on this Mac (Story 90.6)
+//
+// Registered in the DESKTOP splice of the `invoke_handler` literal: a phone is
+// never an agents host. Settings renders the section only where
+// `CapabilitiesVm.botTools` is true, so nothing on a phone calls these.
+// ---------------------------------------------------------------------------
+
+/**
+ * One row per agent of this person's folders flagged for agents: whether its
+ * copy is signed in on this Mac, its drive's pin, and why it is not hosted
+ * here when it is not. Empty where no flagged folder has an agent.
+ *
+ * Rejects with: `internal`.
+ */
+export async function agentsCopies(): Promise<AgentCopyVm[]> {
+  return await invoke<AgentCopyVm[]>("agents_copies");
+}
+
+/**
+ * Sign `agent` of the folder `profileId` in on this Mac. The first sign-in for
+ * a drive pins `pin` — the owner, readers and local-only setting the person
+ * was shown — and Rust refuses when `_drive.toml` says something else by now.
+ * `pin` is `null` for a drive already pinned.
+ *
+ * Rejects with: `internal`, its message the sentence to show (a wrong password
+ * included).
+ */
+export async function agentsCopySignIn(
+  profileId: string,
+  agent: string,
+  password: string,
+  pin: AgentPinReq | null,
+): Promise<AgentCopyVm> {
+  return await invoke<AgentCopyVm>("agents_copy_sign_in", { profileId, agent, password, pin });
+}
+
+/**
+ * *Review readers*: pin what `_drive.toml` says now for the folder
+ * `profileId`, only when it is `pin` — what the person was shown. Nothing
+ * re-pins without this call. Answers every row again.
+ *
+ * Rejects with: `internal`.
+ */
+export async function agentsDriveRepin(
+  profileId: string,
+  pin: AgentPinReq,
+): Promise<AgentCopyVm[]> {
+  return await invoke<AgentCopyVm[]>("agents_drive_repin", { profileId, pin });
 }
 
 // ---------------------------------------------------------------------------

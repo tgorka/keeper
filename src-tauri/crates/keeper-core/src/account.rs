@@ -17,6 +17,7 @@
 //! (NFR-9).
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1950,6 +1951,36 @@ impl AccountManager {
                 )
                 .into()
             })
+    }
+
+    /// The display names of `users` as the first live account's homeserver
+    /// answers them (story 90.6: who a drive's pin names), asked all at once
+    /// and each awaited at most `within`, so a dead server a drive names
+    /// delays nothing past it. A user it cannot read in time is left out;
+    /// no live account answers nothing.
+    pub async fn display_names(
+        &self,
+        users: &[matrix_sdk::ruma::OwnedUserId],
+        within: std::time::Duration,
+    ) -> std::collections::BTreeMap<matrix_sdk::ruma::OwnedUserId, String> {
+        use matrix_sdk::ruma::api::client::profile::DisplayName;
+
+        let client = {
+            let accounts = self.accounts.lock().await;
+            accounts.values().next().map(|h| h.client.clone())
+        };
+        let Some(client) = client else {
+            return std::collections::BTreeMap::new();
+        };
+        names_within(users, within, |user| {
+            let account = client.account();
+            let user = user.clone();
+            async move {
+                let profile = account.fetch_user_profile_of(&user).await.ok()?;
+                profile.get_static::<DisplayName>().ok().flatten()
+            }
+        })
+        .await
     }
 
     /// Resolve the account's live `Client` for a bridge entry point, activating
@@ -4819,6 +4850,27 @@ impl AccountManager {
     }
 }
 
+/// `fetch` for every one of `users` at once, each answer awaited at most
+/// `within`: a user whose name is late or missing is left out.
+async fn names_within<F, Fut>(
+    users: &[matrix_sdk::ruma::OwnedUserId],
+    within: std::time::Duration,
+    fetch: F,
+) -> BTreeMap<matrix_sdk::ruma::OwnedUserId, String>
+where
+    F: Fn(&matrix_sdk::ruma::OwnedUserId) -> Fut,
+    Fut: Future<Output = Option<String>>,
+{
+    futures_util::future::join_all(users.iter().map(|user| {
+        let answer = tokio::time::timeout(within, fetch(user));
+        async move { Some((user.clone(), answer.await.ok().flatten()?)) }
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// Keychain key under which an account's saved base58 recovery key is stored
 /// (Story 3.3, FR-14) — the user's opt-in save after enabling key backup.
 /// Namespaced by account id so it is scoped exactly to one account. The stored
@@ -6171,6 +6223,41 @@ mod tests {
     use crate::platform::SecretCache;
     use matrix_sdk_ui::eyeball_im::Vector;
     use std::path::PathBuf;
+
+    /// Settings › Agents waits on these names before it renders: a server
+    /// that never answers costs `within` once, however many people it is
+    /// asked about, and the people who did answer keep their names.
+    #[tokio::test(start_paused = true)]
+    async fn display_names_wait_at_most_the_bound_for_everyone_together() {
+        use matrix_sdk::ruma::OwnedUserId;
+        let user = |id: &str| OwnedUserId::try_from(id).expect("user");
+        let users = [
+            user("@slow1:dead.example"),
+            user("@quick:example.org"),
+            user("@slow2:dead.example"),
+            user("@slow3:dead.example"),
+        ];
+        let within = std::time::Duration::from_secs(2);
+        let started = tokio::time::Instant::now();
+        let asked = names_within(&users, within, |user| {
+            let quick = user.server_name() == "example.org";
+            async move {
+                if quick {
+                    Some("Quick".to_owned())
+                } else {
+                    std::future::pending().await
+                }
+            }
+        });
+        let names = tokio::time::timeout(within * 10, asked)
+            .await
+            .expect("the names are answered within their bound");
+        assert_eq!(started.elapsed(), within);
+        assert_eq!(
+            names,
+            BTreeMap::from([(user("@quick:example.org"), "Quick".to_owned())])
+        );
+    }
 
     /// Fake platform with a fixed data dir, an in-memory keychain (so `activate`
     /// can read back a stored session), a **spy recorder** of every key passed to

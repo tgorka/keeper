@@ -220,6 +220,11 @@ vi.mock("@/lib/ipc/client", () => ({
   notesCaptureImpact: vi.fn(() => Promise.resolve([])),
   notesVaultSettingsSave: vi.fn(),
   capabilities: vi.fn(),
+  // Settings → Agents (Story 90.6) and Grants, mounted only under `botTools`.
+  agentsCopies: vi.fn(() => Promise.resolve([])),
+  botsGrantsList: vi.fn(() => Promise.resolve({ grants: [], unknown: [] })),
+  botsBotsList: vi.fn(() => Promise.resolve([])),
+  botsAuditList: vi.fn(() => Promise.resolve([])),
 }));
 
 // The About section (mounted by the dialog) imports the updater/process plugins
@@ -241,6 +246,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 }));
 
 import { CAPTURE_SECTION_TITLE } from "@/components/notes/capture-settings";
+import { AGENTS_SECTION_NOTE } from "@/components/settings/agents-section";
 import {
   SDK_STORE_ENCRYPTED_STATUS,
   SDK_STORE_UNENCRYPTED_STATUS,
@@ -259,6 +265,7 @@ import { SYNC_GIT_TITLE } from "@/components/settings/sync-git-row";
 import { SYNC_SECTION_SENTENCE, SYNC_SECTION_TITLE } from "@/components/settings/sync-section";
 import type { AccountVm } from "@/lib/ipc/client";
 import {
+  agentsCopies,
   dockBadgeModeSet,
   encryptionPosture,
   type HotkeyVm,
@@ -1089,6 +1096,48 @@ describe("SettingsDialog", () => {
     expect(await screen.findByText(SYNC_SECTION_TITLE)).toBeInTheDocument();
     expect(screen.getByText(SYNC_SECTION_SENTENCE)).toBeInTheDocument();
     await waitFor(() => expect(mockSyncProfiles).toHaveBeenCalled());
+  });
+
+  it("does not mount Settings › Agents where botTools is off: a phone is never a host", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    await screen.findByText(STORAGE_HONESTY_SENTENCE);
+
+    expect(screen.queryByText(AGENTS_SECTION_NOTE)).not.toBeInTheDocument();
+    expect(agentsCopies).not.toHaveBeenCalled();
+  });
+
+  it("mounts Settings › Agents where botTools is on, and shows it once a folder holds an agent", async () => {
+    vi.mocked(agentsCopies).mockResolvedValueOnce([
+      {
+        profileId: "p1",
+        drive: "tgdrive",
+        agent: "nixi",
+        name: "Nixi",
+        matrixUser: "@nixi:tgorka.org",
+        device: null,
+        host: "hesperia",
+        signedIn: false,
+        pin: {
+          state: "unpinned",
+          owner: { matrixId: "@tgorka:tgorka.org", displayName: null },
+          readers: [],
+          localOnly: false,
+          pinnedOwner: null,
+          pinnedReaders: [],
+          pinnedLocalOnly: null,
+          differences: [],
+        },
+        problem: null,
+      },
+    ]);
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot({ ...DESKTOP_CAPABILITIES, botTools: true });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText(AGENTS_SECTION_NOTE)).toBeInTheDocument();
+    expect(agentsCopies).toHaveBeenCalled();
   });
 });
 
