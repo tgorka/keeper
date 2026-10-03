@@ -707,3 +707,63 @@ virtual pattern would leave the agents or sessions zone as pointers: agentd must
 of them, and the sentence names the pattern. A `virtualOverBytes` floor counts only when it is
 below a log chunk's 192 KiB bound; above it, the only files it could leave as pointers are log
 blobs, which replay fetches when it needs them.
+
+## Matrix
+
+Every copy of an agent — one agent on one host — is its own Matrix device of the agent's user,
+displayed `<agent>@<host>`. It signs in with a password once; its session and its store passphrase
+are kept in the host's secret store under `agents/<user>/session` and `agents/<user>/sdk-passphrase`,
+its encrypted store at `<data>/agents/<user>/sdk`, and every later sign-in reuses its device id, so
+an agent's user never collects stale devices. The client (`keeper_core::agents::matrix`) is not the
+messenger's: it registers no archive, notification or draft handler, and syncs with a plain
+`/sync` loop.
+
+**Rooms.** A session room is created typed (`m.room.create` `type` `dev.keeper.agent.session`; a
+principal's control room is `dev.keeper.agent.control`) and encrypted. Its power levels: the
+creating agent 100, other agents 50, people 0, `events_default` and `state_default` 50. Because the
+room is encrypted, the homeserver sees every event a person sends as `m.room.encrypted` and cannot
+tell a decision from free text, so `m.room.encrypted` is allowed at 0 in every session room
+(ruling R30): a person may talk in their proxy's rooms (`main`, `conversation`) and may decide
+approvals everywhere, and writes no state anywhere.
+
+The same rule lets a person send *any* agent event type encrypted: a fake status, a scope, a turn
+or an edit of the agent's anchor reaches the room, and the server cannot tell. So the host checks
+the sender of **every** decrypted `dev.keeper.agent.*` event, and of every `m.replace`, against the
+room's power levels before acting on it: it acts only when the sender has power 50 or more or is
+one of the room's agents. The per-type rows (decisions, `heard`, surface results, and in a proxy's
+rooms `m.room.message` and the scope at 0) bind only a client that sends in clear. In a session
+room that is not a proxy's, the host also keeps a person's free text out of the agent's turns.
+
+**Sends.** Every send disables matrix-sdk's own retry, so a `M_LIMIT_EXCEEDED` reaches the caller
+with its `retry_after_ms` and the caller decides how to pace; a retried send reuses its
+transaction id so the server keeps one copy. State events (claims, host manifests) are not
+encrypted and carry no content — no title, no path, no text. A claim is read back from the server
+(`GET /rooms/{id}/state`), never from the client's cache, which can be a sync behind.
+
+**Run the live tests** against the Synapse test homeserver (its users and the secrets file are the
+operator's; the file holds `SERVER_NAME`, `ADMIN_TOKEN`, `NIXI_SMOKE_PASSWORD`,
+`NIXI_PACED_PASSWORD` and `TGORKA_SMOKE_PASSWORD`, mode `0600`):
+
+```sh
+KEEPER_AGENTS_SMOKE_HOMESERVER=http://100.101.101.23:8008 \
+KEEPER_AGENTS_SMOKE_SECRETS=$HOME/.config/keeper-smoke/synapse.env \
+cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core --test agents_matrix_live -- --ignored --nocapture --test-threads=1
+```
+
+`nixi-paced`'s limit is set to one message a second with a burst of five through Synapse's admin
+`override_ratelimit` by the test itself; the server's configuration is never changed.
+
+### Measured on Synapse
+
+On the Synapse test homeserver (v1.156.0 on delectra, reached over the tailnet from a Linux
+container), 2026-10-03, `p95_delivery_between_two_copies`: 1000 encrypted events sent by one copy
+at 20 a second, received by another copy's handler — p50 617 ms, p95 1.14 s, p99 1.20 s, every
+event delivered and decrypted. Synapse is the test homeserver; NFR-112's published figure is
+tuwunel's (the operator's run).
+
+A copy syncs with a timeline limit of 500 events per room. With the server's default, a room that
+received more events between two rounds came back cut, and the cut events never reached a handler:
+12% of the same 1000 were lost that way.
+
+`nixi-paced`, limited to one message a second with a burst of five, got eight `429`s in a burst of
+fifteen sends, each with `retry_after_ms` 1000.
