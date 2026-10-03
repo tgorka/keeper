@@ -385,7 +385,9 @@ impl ToolHost for DriveToolHost {
             Ok(ToolOutcome::Entries { truncated_at, .. }) => {
                 close(AuditOutcome::Ok, None, truncated_at.is_some());
             }
-            Ok(ToolOutcome::NotMaterialized { .. }) => close(AuditOutcome::Ok, None, false),
+            Ok(ToolOutcome::NotMaterialized { .. } | ToolOutcome::Answered { .. }) => {
+                close(AuditOutcome::Ok, None, false)
+            }
             Ok(ToolOutcome::Refused { .. }) => close(AuditOutcome::Refused, None, false),
             Err(_) => close(AuditOutcome::Failed, None, false),
         }

@@ -526,8 +526,10 @@ mod tests {
         // The dock's agent events (story 91.2) go out through `Room::send_raw`,
         // which takes any event type: exactly one call site may exist in
         // production `account.rs` — the private `send_agent_event`, whose input
-        // is the closed `AgentOutbound` (a scope or a request for a
-        // conversation). A second one would be an open door for any event type
+        // is the closed `AgentOutbound` (a scope, a request for a
+        // conversation, or the device's surface result — `agents::device`
+        // sends its `expired` answers through it too, so no other file holds
+        // a `send_raw`). A second one would be an open door for any event type
         // — a status, a claim, an approval decision — outside this airlock.
         let raw_calls = normalized.matches(".send_raw(").count();
         assert_eq!(

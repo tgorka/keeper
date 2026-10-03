@@ -281,17 +281,28 @@ struct World {
 const SOUL: &str = "---\nname: Nixi\ntitle: tgorka's proxy\nicon: \"*\"\nrole: Talks with tgorka.\nidentity: \"A quiet companion.\"\ncommunication_style: Short.\nprinciples:\n  - Ask first.\n---\n\nNixi answers from the drive.\n";
 
 fn world(kind: ProviderKind, allow: &[&str], script: Vec<Completion>) -> World {
+    world_read_by(&[TGORKA, MARTA], kind, allow, script)
+}
+
+/// The world with tgdrive read by `readers`.
+fn world_read_by(
+    readers: &[&str],
+    kind: ProviderKind,
+    allow: &[&str],
+    script: Vec<Completion>,
+) -> World {
     let root = tempfile::tempdir().expect("tempdir");
     let tgdrive = root.path().join("tgdrive");
     let private = root.path().join("private");
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).expect("data");
-    let tg_decl = decl("tgdrive", &[TGORKA, MARTA], false);
+    let tg_decl = decl("tgdrive", readers, false);
     let private_decl = decl("private", &[TGORKA], true);
+    let quoted: Vec<String> = readers.iter().map(|r| format!("\"{r}\"")).collect();
     write(
         &tgdrive,
         "80-agents/_drive.toml",
-        &format!("version = 1\nid = \"tgdrive\"\ntitle = \"tgdrive\"\nprincipal = \"tgorka\"\nowner = \"{TGORKA}\"\nreaders = [\"{TGORKA}\", \"{MARTA}\"]\n"),
+        &format!("version = 1\nid = \"tgdrive\"\ntitle = \"tgdrive\"\nprincipal = \"tgorka\"\nowner = \"{TGORKA}\"\nreaders = [{}]\n", quoted.join(", ")),
     );
     let allow: Vec<String> = allow.iter().map(|a| format!("\"{a}\"")).collect();
     write(
@@ -2180,4 +2191,242 @@ async fn a_new_conversation_says_its_status_again_once_its_person_joined() {
     assert_eq!(statuses[1]["title"], "Trip to Lisbon");
     tokio::time::sleep(JOIN_POLL * 5).await;
     assert_eq!(rooms.statuses().len(), 2, "once");
+}
+
+// ---------------------------------------------------------------------------
+// Story 91.3: the surface tools
+// ---------------------------------------------------------------------------
+
+const FIVE: [&str; 5] = [
+    "surface_open",
+    "surface_highlight",
+    "surface_point",
+    "surface_scroll",
+    "surface_propose_edit",
+];
+
+/// The agent homed in tgdrive's `folder` with `agent_toml`, beside Nixi:
+/// its own deps over the same drives and provider.
+fn deps_of(world: &World, folder: &str, agent_toml: &str) -> AgentDeps {
+    write(
+        &world.tgdrive,
+        &format!("80-agents/{folder}/agent.toml"),
+        agent_toml,
+    );
+    let name = agent_toml
+        .lines()
+        .find_map(|line| line.strip_prefix("name = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("a name");
+    write(
+        &world.tgdrive,
+        &format!("80-agents/{folder}/SOUL.md"),
+        &SOUL.replace("Nixi", name),
+    );
+    let tg_decl = world.deps.drives["tgdrive"].clone();
+    let zone = read_zone(
+        "tgdrive",
+        &profile("tgdrive", &world.tgdrive),
+        Some(&tg_decl),
+    );
+    let home = zone
+        .homes
+        .into_iter()
+        .find_map(|(found, home)| (found == folder).then_some(home))
+        .expect("the folder")
+        .expect("it reads");
+    AgentDeps {
+        home,
+        env: world.deps.env.clone(),
+        data_dir: world.deps.data_dir.clone(),
+        row: world.deps.row.clone(),
+        bot: world.deps.bot.clone(),
+        host: world.deps.host.clone(),
+        drives: world.deps.drives.clone(),
+        sessions_zone: world.deps.sessions_zone.clone(),
+        sessions_subfolder: world.deps.sessions_subfolder.clone(),
+        lfs_threshold_bytes: world.deps.lfs_threshold_bytes,
+    }
+}
+
+fn steward_toml(id: &str, name: &str, allow: &[&str]) -> String {
+    let allow: Vec<String> = allow.iter().map(|a| format!("\"{a}\"")).collect();
+    format!(
+        "version = 1\nid = \"{id}\"\nname = \"{name}\"\nkind = \"steward\"\nmatrix_user = \"@{id}:example.org\"\n\n[model]\nbot = \"bot:openai:http://127.0.0.1:9#model\"\n\n[tools]\nallow = [{}]\ndrives = [\"tgdrive\"]\n",
+        allow.join(", ")
+    )
+}
+
+/// The surface tools a turn of `deps`'s agent is offered, in a session of
+/// its own.
+async fn surface_offer(world: &World, deps: &AgentDeps) -> Vec<String> {
+    let id = deps.home.config.id.clone();
+    let path = format!("active/2026-10-03-{id}");
+    let tg_decl = world.deps.drives["tgdrive"].clone();
+    session_of(
+        &world.tgdrive,
+        &path,
+        &tg_decl,
+        &id,
+        SessionKind::Delegated,
+        "!offer:example.org",
+    );
+    let served = world.open_as(deps, &path);
+    arm_agent(&served.context, deps, Probe::Skip)
+        .await
+        .request
+        .tools
+        .into_iter()
+        .map(|spec| spec.name)
+        .filter(|name| name.starts_with("surface_"))
+        .collect()
+}
+
+/// 91.3 acceptance 8 (AD-383, Q10): Nixi (a proxy, audience {tgorka}) is
+/// offered all five; Dr Tola Grey (a steward of the same drive) none by
+/// default and all five when her `allow` names them; Dr Lucyna Novak, whose
+/// audience is {tgorka, Marta}, none even when her `allow` names them.
+#[tokio::test(flavor = "multi_thread")]
+async fn surface_tools_are_offered_only_to_the_persons_own_agent() {
+    let mut allow = vec!["drive_read"];
+    allow.extend(FIVE);
+    let mine = world_read_by(&[TGORKA], ProviderKind::OpenAi, &allow, vec![]);
+    assert_eq!(surface_offer(&mine, &mine.deps).await, FIVE);
+    let tola = deps_of(
+        &mine,
+        "tola",
+        &steward_toml("tola", "Dr Tola Grey", &["drive_read", "card_update"]),
+    );
+    assert!(surface_offer(&mine, &tola).await.is_empty());
+    let tola_allowed = deps_of(&mine, "tola", &steward_toml("tola", "Dr Tola Grey", &allow));
+    assert_eq!(surface_offer(&mine, &tola_allowed).await, FIVE);
+
+    let shared = world_read_by(&[TGORKA, MARTA], ProviderKind::OpenAi, &allow, vec![]);
+    let lucyna = deps_of(
+        &shared,
+        "lucyna",
+        &steward_toml("lucyna", "Dr Lucyna Novak", &allow),
+    );
+    assert!(surface_offer(&shared, &lucyna).await.is_empty());
+    assert!(
+        surface_offer(&shared, &shared.deps).await.is_empty(),
+        "a proxy whose drive Marta reads is not tgorka's alone"
+    );
+}
+
+/// The session room's side of a surface call: tgorka's iPhone in front, and
+/// a device that answers each request `done` — after Marta answers it too.
+struct Surface {
+    room: OwnedRoomId,
+    requests: Mutex<Vec<Value>>,
+}
+
+impl keeper_agent::surface::SurfacePort for Surface {
+    fn room(&self) -> &RoomId {
+        &self.room
+    }
+
+    fn presences(&self) -> keeper_agent::surface::PresenceFuture<'_> {
+        use keeper_core::agents::events::PresencePlatform;
+        use keeper_core::agents::presence::{presence_content, DevicePresence, Published};
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).expect("now");
+        let state = DevicePresence {
+            platform: PresencePlatform::Ios,
+            focused: true,
+            view: "notes".to_owned(),
+        };
+        let content = presence_content(&user(TGORKA), "KALYPSO", &state, now);
+        Box::pin(async move {
+            vec![Published {
+                state_key: "KALYPSO".to_owned(),
+                sender: user(TGORKA),
+                content: serde_json::to_value(content).expect("presence"),
+            }]
+        })
+    }
+
+    fn request(&self, content: Value) -> SendFuture<'_> {
+        self.requests.lock().expect("lock").push(content.clone());
+        let room = self.room.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let answer =
+                json!({"v": 1, "request": content["id"], "device": "KALYPSO", "outcome": "done"});
+            // Marta's answer to the same request is nobody's.
+            assert!(!keeper_agent::surface::deliver(
+                &room,
+                &user(MARTA),
+                true,
+                &answer
+            ));
+            assert!(keeper_agent::surface::deliver(
+                &room,
+                &user(TGORKA),
+                true,
+                &answer
+            ));
+        });
+        Box::pin(async { Ok(OwnedEventId::try_from("$request:example.org").expect("id")) })
+    }
+}
+
+/// 91.3: a surface call in a turn goes to the device in front, the turn
+/// waits for its answer and the model reads it; the log has the call at T1,
+/// its result, and the `surface` line naming the device.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surface_call_is_answered_by_the_device_and_logged() {
+    let script = vec![
+        calls(&[(
+            "c1",
+            "surface_highlight",
+            json!({"drive": "tgdrive", "path": "notes/hello.md", "range": {"from": 2, "to": 2}}),
+        )]),
+        prose("Highlighted."),
+    ];
+    let mut world = world_read_by(
+        &[TGORKA],
+        ProviderKind::OpenAi,
+        &["drive_read", "surface_highlight"],
+        script,
+    );
+    let mut served = world.open(SESSION);
+    let surface = Arc::new(Surface {
+        room: room_id(),
+        requests: Mutex::new(Vec::new()),
+    });
+    served.surface = Some(surface.clone());
+    report(world.ask(&mut served, "show me the second line").await);
+
+    let requests = surface.requests.lock().expect("lock").clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["device"], "KALYPSO");
+    assert_eq!(requests[0]["tool"], "highlight");
+    assert_eq!(requests[0]["args"]["range"], json!({"from": 2, "to": 2}));
+    // The model's second round reads the device's answer.
+    let second = &world.stub.requests()[1];
+    let told = second["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("a tool result")
+        .clone();
+    assert!(
+        told["content"] == "done" || told["content"][0]["text"] == "done",
+        "{told}"
+    );
+
+    let lines = world.lines(SESSION);
+    let call = kinds(&lines, LineKind::ToolCall);
+    let LineBody::ToolCall(call) = &call[0].body else {
+        panic!("a tool call");
+    };
+    assert_eq!((call.tool.as_str(), call.tier), ("surface_highlight", 1));
+    let surfaced = kinds(&lines, LineKind::Surface);
+    let LineBody::Surface(line) = &surfaced[0].body else {
+        panic!("a surface line");
+    };
+    assert_eq!(line.id, requests[0]["id"].as_str().expect("id"));
+    assert_eq!(line.device, "KALYPSO");
+    assert_eq!(line.outcome.as_deref(), Some("done"));
 }

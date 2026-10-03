@@ -1,19 +1,162 @@
-//! The person's proxy beside the notes view (story 91.2, AD-382): the dock's
-//! commands. On every target — the phone shows the proxy's rooms too (P5:
-//! it is never a host, which is `agents_host`'s, desktop only).
+//! The person's proxy beside the notes view (stories 91.2, 91.3; AD-382,
+//! AD-383): the dock's commands, the surface requests this device executes,
+//! and its presence. On every target — the phone shows the proxy's rooms and
+//! answers surface requests too (P5: it is never a host, which is
+//! `agents_host`'s, desktop only).
 //!
-//! It decides nothing: which rooms are the proxy's, what a scope or a focus
-//! event says and when it goes out are `keeper_core::agents::proxy`'s and
-//! `AccountManager`'s; which drive and path a note is, `keeper_agent::surface`'s.
+//! It decides nothing: which rooms are the proxy's, what a scope, a focus, a
+//! presence or a surface result says and when it goes out are
+//! `keeper_core::agents`' and `AccountManager`'s; which drive and path a note
+//! is, and which note or file a request names, `keeper_agent::surface`'s.
 
-use keeper_agent::surface::drive_of;
-use keeper_core::agents::events::Focus;
+use keeper_agent::surface::{drive_of, locate, Located};
+use keeper_core::agents::events::{Focus, PresencePlatform, SurfaceOutcome};
 use keeper_core::agents::proxy::{AgentFocusReq, ProxyRoomVm};
+use keeper_core::agents::surface::{SurfaceAnswerReq, SurfaceRequestArrived, SurfaceRequestVm};
 use keeper_core::notes::outline::{heading_at, heading_in};
+use keeper_core::panels::PanelTargetVm;
 use keeper_core::vm::IpcError;
-use tauri::State;
+use tauri::ipc::Channel;
+use tauri::{AppHandle, Manager, State};
 
 use crate::ipc::{to_ipc_error, AppState};
+
+/// The platform a presence names.
+#[cfg(target_os = "ios")]
+const PLATFORM: PresencePlatform = PresencePlatform::Ios;
+#[cfg(target_os = "android")]
+const PLATFORM: PresencePlatform = PresencePlatform::Android;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+const PLATFORM: PresencePlatform = PresencePlatform::Macos;
+
+/// keeper came to the front or left it: the main window's focus on the
+/// desktop, the app's lifecycle on the phone (`lib.rs`). Every live
+/// account's presence follows after a second of stillness.
+pub fn presence_focus(app: &AppHandle, focused: bool) {
+    app.state::<AppState>()
+        .accounts
+        .agent_presence_focus(PLATFORM, focused);
+}
+
+/// The primary view keeper shows now (`notes`, `chats`): a view id, never a
+/// note.
+#[tauri::command]
+pub fn agent_presence_view(state: State<'_, AppState>, view: String) -> Result<(), IpcError> {
+    state
+        .accounts
+        .agent_presence_view(&view)
+        .map_err(to_ipc_error)
+}
+
+/// Stream the surface requests this device admits into `channel`, each
+/// naming the note or file it is about. A request whose drive or path this
+/// device cannot name is answered `unavailable` with the reason, and not
+/// streamed. The relay ends when the channel closes.
+#[tauri::command]
+pub fn agent_surface_subscribe(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    channel: Channel<SurfaceRequestVm>,
+) -> Result<(), IpcError> {
+    let mut requests = state.accounts.surface_requests();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let arrived = match requests.recv().await {
+                Ok(arrived) => arrived,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            };
+            let platform = std::sync::Arc::clone(&app.state::<AppState>().platform);
+            let named = arrived.clone();
+            let target = tokio::task::spawn_blocking(move || name_target(platform, &named))
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
+            match target {
+                Ok(target) => {
+                    if channel
+                        .send(SurfaceRequestVm::new(&arrived, target))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(sentence) => {
+                    let answer = SurfaceAnswerReq {
+                        request_id: arrived.request.id.clone(),
+                        outcome: SurfaceOutcome::Unavailable,
+                        applied: None,
+                        detail: Some(sentence),
+                    };
+                    let sent = app
+                        .state::<AppState>()
+                        .accounts
+                        .agent_surface_result(&arrived.account_id, arrived.room_id.as_str(), answer)
+                        .await;
+                    if let Err(error) = sent {
+                        tracing::warn!(%error, "agents: a surface request this device cannot name could not be answered");
+                    }
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+/// The note or file `arrived` names on this device: a note of a vault by
+/// its id (the editor), any other file of a synced folder by its path (the
+/// Files preview). Blocking: the engine's profiles.
+fn name_target(
+    platform: std::sync::Arc<dyn keeper_core::platform::Platform>,
+    arrived: &SurfaceRequestArrived,
+) -> Result<PanelTargetVm, String> {
+    let profiles = crate::sync::engine(platform)
+        .map_err(|error| error.to_string())?
+        .list_profiles()
+        .map_err(|error| error.to_string())?;
+    let folders: Vec<_> = profiles
+        .into_iter()
+        .map(|profile| {
+            let vault =
+                crate::notes_vault::vault(&profile.id).map(|vault| vault.config.subfolder.clone());
+            (profile, vault)
+        })
+        .collect();
+    let args = &arrived.request.args;
+    match locate(&folders, &args.drive, &args.path)? {
+        Located::Note {
+            vault_id,
+            note_path,
+        } => {
+            let note_id = crate::notes_vault::snapshot(&vault_id)
+                .and_then(|index| index.by_path(&note_path).map(|entry| entry.id.clone()))
+                .ok_or_else(|| format!("{} is not in the notes vault's index yet.", args.path))?;
+            Ok(PanelTargetVm::Note { vault_id, note_id })
+        }
+        Located::File {
+            profile_id,
+            relative_path,
+        } => Ok(PanelTargetVm::File {
+            profile_id,
+            relative_path,
+        }),
+    }
+}
+
+/// The notes view's answer to the surface request it executed, sent into
+/// the room it came from — only for a request this device handed it.
+#[tauri::command]
+pub async fn agent_surface_result(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    answer: SurfaceAnswerReq,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .agent_surface_result(&account_id, &room_id, answer)
+        .await
+        .map_err(to_ipc_error)
+}
 
 /// The person's proxy conversations on `account_id`, the DM first; each with
 /// the drives its scope chip may offer where the proxy's agents zone is on

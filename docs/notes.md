@@ -414,6 +414,14 @@ What you get for free:
   origin, when.
 - **A conflict is a row in the list**, not litter you have to find on disk.
 
+Your own agent — the one whose drive only you read, Nixi beside your notes — also works on the
+note you are looking at without touching the file: it can open a note at a heading, highlight or
+point at lines and scroll, on the device you are using, and it can *propose* an edit, which shows
+as a strip beside the change bar with *Apply* and *Decline*. The agent proposes; you write.
+*Apply* is your own edit — one undoable change in the editor, saved as your typing is — and it
+applies only while the lines still read what the agent read; Rust never writes the note for it
+(`docs/agents.md` § *What Nixi can do in your note*).
+
 ## Cadence
 
 Notes vaults sync themselves. Per vault:
