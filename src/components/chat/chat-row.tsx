@@ -34,7 +34,7 @@
  * the section; it disappears once any favourite exists.
  */
 
-import { AtSign, BellOff, Pencil } from "lucide-react";
+import { AtSign, BellOff, Eye, Pencil } from "lucide-react";
 import { forwardRef, type MouseEvent as ReactMouseEvent } from "react";
 import { RoomAvatar } from "@/components/chat/RoomAvatar";
 import { Badge } from "@/components/ui/badge";
@@ -217,6 +217,18 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
   // replaced rather than appended. A room that cannot be reached has to say so
   // in the name, or the lamp is a picture and nothing else.
   const healthLabel = affectedHealth === null ? "" : `, ${BRIDGE_HEALTH_LABEL[affectedHealth]}`;
+  // An agent room says which kind it is (UX-DR132): a proxy conversation is one
+  // the person talks in; a session is one they watch and decide approvals in;
+  // a room whose kind keeper has not read yet claims neither. Only the session
+  // wears a visible mark — it is the exception in the window.
+  const agentLabel =
+    room.agentRoom === "proxy"
+      ? ", an agent conversation"
+      : room.agentRoom === "session"
+        ? ", an agent session you watch"
+        : room.agentRoom === "unknown"
+          ? ", an agent room"
+          : "";
 
   // ---- Phone touch idioms (Story 13.6) ------------------------------------
   // Long-press opens the identical ContextMenu above (the non-gesture duplicate
@@ -262,7 +274,7 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
       type="button"
       tabIndex={tabIndex}
       onClick={onRowClick}
-      aria-label={`Conversation with ${room.displayName}${unreadLabel}${healthLabel}`}
+      aria-label={`Conversation with ${room.displayName}${agentLabel}${unreadLabel}${healthLabel}`}
       aria-current={selected ? "true" : undefined}
       className={cn(
         "relative flex h-16 w-full shrink-0 items-center gap-3 py-0 pr-3 pl-4 text-left",
@@ -331,6 +343,15 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
               >
                 <Pencil aria-hidden="true" className="size-3" />
                 Draft
+              </span>
+            )}
+            {room.agentRoom === "session" && (
+              <span
+                data-testid="watching-marker"
+                className="inline-flex shrink-0 items-center gap-1"
+              >
+                <Eye aria-hidden="true" className="size-3" />
+                Watching
               </span>
             )}
             <span className="truncate">{room.lastMessage ?? ""}</span>

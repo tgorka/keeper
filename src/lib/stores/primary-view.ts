@@ -48,10 +48,14 @@ import { createStore } from "zustand/vanilla";
  * because it answers a question no other surface does — *ask something about
  * all of this* — and because a conversation you return to over days is a place
  * you go, not a panel you open.
+ *
+ * "agents" is the third chat-list window: the rooms agents speak in, kept out
+ * of the Inbox so a running agent's stream never buries a person's chats.
  */
 export type PrimaryView =
   | "inbox"
   | "archive"
+  | "agents"
   | "bridges"
   | "approval"
   | "recording"

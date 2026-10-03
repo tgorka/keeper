@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use crate::agents::room::AgentRoomKindVm;
 use crate::badge::{self, BadgeConfig};
 use crate::platform::Platform;
 use crate::vm::{
@@ -83,6 +84,9 @@ struct MergeState {
     /// Receives the Archive window
     /// (`!pinned && !is_favourite && is_archived && !is_unread`) (Story 4.2).
     archive_sink: InboxSink,
+    /// Receives the Agents window: every agent session room, recency order,
+    /// and nothing else (UX-DR132). Control rooms are in no window.
+    agents_sink: InboxSink,
     /// Keeper-local pin membership + order, keyed by `(account_id, room_id)` →
     /// `sort_order` (ascending). Reloaded from the registry and pushed in whole via
     /// [`InboxMerger::update_pins`] on every pin mutation (Story 4.3). A room in
@@ -146,8 +150,10 @@ impl InboxMerger {
     /// only in the Favorites window. `pins` seeds the initial pin map (from
     /// [`crate::registry::get_pins`]); it is replaced whole by [`Self::update_pins`]
     /// on every mutation. Favourite state is SDK-sourced (the `m.favourite` notable
-    /// tag), so it needs no seed and no out-of-band poke.
-    // The four inbox windows, the spaces/networks snapshots, the pin seed, and the
+    /// tag), so it needs no seed and no out-of-band poke. `agents_sink` receives
+    /// the Agents window: every agent session room, whatever its pin, favourite
+    /// or archive state, and only there (UX-DR132).
+    // The five inbox windows, the spaces/networks snapshots, the pin seed, and the
     // platform + badge config each cross a distinct concern; grouping them into a struct
     // would only obscure the one-to-one wiring the shell threads through.
     #[allow(clippy::too_many_arguments)]
@@ -156,6 +162,7 @@ impl InboxMerger {
         archive_sink: InboxSink,
         pins_sink: InboxSink,
         favourites_sink: InboxSink,
+        agents_sink: InboxSink,
         pins: HashMap<(String, String), i64>,
         spaces_sink: SpacesSink,
         networks_sink: NetworksSink,
@@ -169,6 +176,7 @@ impl InboxMerger {
                 favourites_sink,
                 inbox_sink,
                 archive_sink,
+                agents_sink,
                 pins,
                 spaces_sink,
                 account_spaces: HashMap::new(),
@@ -352,7 +360,7 @@ fn emit(state: &mut MergeState) -> bool {
     }
     // `merge` already drops `is_space` rooms (containers, never chats) so they
     // never appear in any of the four windows (Story 4.5).
-    let mut merged = merge(&state.accounts);
+    let merged = merge(&state.accounts);
     // Derive the distinct-Networks list from the *unfiltered* merged set (Story
     // 4.6), BEFORE any Space/Network retain, so the NETWORKS sidebar list stays
     // complete and stable regardless of the active filter (it is what the user can
@@ -387,6 +395,14 @@ fn emit(state: &mut MergeState) -> bool {
             state.selected_network = None;
         }
     }
+    // Agent session rooms live in the Agents window only (UX-DR132): split them
+    // off before the Space and Network filters, which narrow the chat windows
+    // only (an agent room has no Network, and the Agents window lists every
+    // agent the person has, whatever Space is selected), and before the
+    // pin/favourite/archive partition so no other window shows one.
+    let (agent_rooms, mut merged): (Vec<InboxRoomVm>, Vec<InboxRoomVm>) = merged
+        .into_iter()
+        .partition(|room| room.agent_room.is_some());
     // Apply the ephemeral Space filter *before* the pins/favorites/inbox/archive
     // partition (Story 4.5), so precedence (Pins > Favorites > Archive/Inbox) and
     // per-window recency order are preserved within the filtered subset and each
@@ -463,14 +479,21 @@ fn emit(state: &mut MergeState) -> bool {
             rooms: archive_rooms,
         }],
     };
-    // Emit all four windows; a close on any sink stops all future emissions.
+    let agents_batch = InboxBatch {
+        total: Some(agent_rooms.len() as u32),
+        ops: vec![InboxOp::Reset { rooms: agent_rooms }],
+    };
+    // Emit all five windows; a close on any sink stops all future emissions.
     let pins_ok = (state.pins_sink)(pins_batch);
     let favourites_ok = (state.favourites_sink)(favourites_batch);
     let inbox_ok = (state.inbox_sink)(inbox_batch);
     let archive_ok = (state.archive_sink)(archive_batch);
-    if !pins_ok || !favourites_ok || !inbox_ok || !archive_ok {
+    let agents_ok = (state.agents_sink)(agents_batch);
+    if !pins_ok || !favourites_ok || !inbox_ok || !archive_ok || !agents_ok {
         state.closed = true;
-        tracing::info!("pins/favorites/inbox/archive channel closed; stopping merged emissions");
+        tracing::info!(
+            "pins/favorites/inbox/archive/agents channel closed; stopping merged emissions"
+        );
         return false;
     }
     // Push the distinct-Networks snapshot LAST — after the four windows are emitted
@@ -561,9 +584,10 @@ fn merge(accounts: &HashMap<String, AccountSlot>) -> Vec<InboxRoomVm> {
         let slot = &accounts[id];
         for room in &slot.rooms {
             // Space rooms are containers, not chats — never in any chat window
-            // (Story 4.5). `is_space` lives only on `RoomVm`, so drop them here
+            // (Story 4.5) — and an agents' control room is in no window either
+            // (UX-DR132). Both flags live only on `RoomVm`, so drop them here
             // before projecting to `InboxRoomVm`.
-            if room.is_space {
+            if room.is_space || room.agent_room == Some(AgentRoomKindVm::Control) {
                 continue;
             }
             rows.push(to_inbox_room(id, slot.hue_index, room));
@@ -611,6 +635,8 @@ fn to_inbox_room(account_id: &str, hue_index: u8, room: &RoomVm) -> InboxRoomVm 
         // at projection time (Story 10.2), copied straight through — it drives the row
         // mute glyph and never gates the unread computation above.
         mute_state: room.mute_state,
+        // Proxy or watched session, read on the `RoomVm`; the merge routes on it.
+        agent_room: room.agent_room,
     }
 }
 
@@ -744,6 +770,7 @@ mod tests {
             network: None,
             network_id: None,
             mute_state: crate::vm::MuteState::None,
+            agent_room: None,
         }
     }
 
@@ -835,6 +862,7 @@ mod tests {
             network: Some("Telegram".to_owned()),
             network_id: Some("telegram".to_owned()),
             mute_state: crate::vm::MuteState::Muted,
+            agent_room: None,
         };
         let inbox_room = to_inbox_room("acctA", 4, &src);
         assert!(inbox_room.is_unread);
@@ -957,7 +985,7 @@ mod tests {
     /// The dock badge is wired to a discarded no-op platform in mode `All`; badge-
     /// asserting tests use [`badge_merger`] instead to hold the recording handle.
     fn capturing_merger_with_pins(pins: HashMap<(String, String), i64>) -> CapturingMerger {
-        let (merger, inbox, archive, pins_cap, favourites, spaces, networks, _platform) =
+        let (merger, inbox, archive, pins_cap, favourites, _agents, spaces, networks, _platform) =
             capturing_merger_with_pins_and_badge(pins, DockBadgeMode::All);
         (
             merger, inbox, archive, pins_cap, favourites, spaces, networks,
@@ -968,15 +996,33 @@ mod tests {
     /// test can assert the OS dock badge the merger pushes on each merged-state change
     /// (Story 10.3). Returns `(merger, recording_platform)`.
     fn badge_merger(mode: DockBadgeMode) -> (InboxMerger, Arc<BadgeRecordingPlatform>) {
-        let (merger, _inbox, _archive, _pins, _favourites, _spaces, _networks, platform) =
+        let (merger, _inbox, _archive, _pins, _favourites, _agents, _spaces, _networks, platform) =
             capturing_merger_with_pins_and_badge(HashMap::new(), mode);
         (merger, platform)
+    }
+
+    /// A merger seeded with `pins`, returning its five window captures:
+    /// `(merger, inbox, archive, pins, favourites, agents)`.
+    fn agents_merger(
+        pins: HashMap<(String, String), i64>,
+    ) -> (
+        InboxMerger,
+        Captured,
+        Captured,
+        Captured,
+        Captured,
+        Captured,
+    ) {
+        let (merger, inbox, archive, pins_cap, favourites, agents, _spaces, _networks, _platform) =
+            capturing_merger_with_pins_and_badge(pins, DockBadgeMode::All);
+        (merger, inbox, archive, pins_cap, favourites, agents)
     }
 
     /// The [`CapturingMerger`] captures plus the [`BadgeRecordingPlatform`] the merger
     /// pushes dock badges through.
     type CapturingMergerWithBadge = (
         InboxMerger,
+        Captured,
         Captured,
         Captured,
         Captured,
@@ -997,12 +1043,14 @@ mod tests {
         let archive: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let pins_cap: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
         let favourites: Arc<StdMutex<Vec<InboxBatch>>> = Arc::new(StdMutex::new(Vec::new()));
+        let agents: Captured = Arc::new(StdMutex::new(Vec::new()));
         let spaces: CapturedSpaces = Arc::new(StdMutex::new(Vec::new()));
         let networks: CapturedNetworks = Arc::new(StdMutex::new(Vec::new()));
         let inbox_store = inbox.clone();
         let archive_store = archive.clone();
         let pins_store = pins_cap.clone();
         let favourites_store = favourites.clone();
+        let agents_store = agents.clone();
         let spaces_store = spaces.clone();
         let networks_store = networks.clone();
         let platform = Arc::new(BadgeRecordingPlatform::default());
@@ -1025,6 +1073,10 @@ mod tests {
                 favourites_store.lock().expect("lock").push(batch);
                 true
             }),
+            Box::new(move |batch: InboxBatch| {
+                agents_store.lock().expect("lock").push(batch);
+                true
+            }),
             pins,
             Box::new(move |snapshot: SpacesSnapshot| {
                 spaces_store.lock().expect("lock").push(snapshot);
@@ -1038,7 +1090,7 @@ mod tests {
             badge,
         );
         (
-            merger, inbox, archive, pins_cap, favourites, spaces, networks, platform,
+            merger, inbox, archive, pins_cap, favourites, agents, spaces, networks, platform,
         )
     }
 
@@ -1543,6 +1595,132 @@ mod tests {
         assert_eq!(last_reset_ids(&archive), Vec::<String>::new());
         assert_eq!(last_reset_ids(&pins_cap), Vec::<String>::new());
         assert_eq!(last_reset_ids(&favourites), Vec::<String>::new());
+    }
+
+    /// A room of the agents' kind `agent_room`.
+    fn room_agent(id: &str, ts: Option<i64>, agent_room: AgentRoomKindVm) -> RoomVm {
+        RoomVm {
+            agent_room: Some(agent_room),
+            ..room(id, ts)
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_session_rooms_are_in_the_agents_window_only() {
+        // A proxy conversation, a watched session and a session room whose kind
+        // is not read yet go to the Agents window, in recency order, even when
+        // pinned, favourited, archived or unread.
+        let pins = pin_map(&[("acctA", "!pinned-agent", 0)]);
+        let (merger, inbox, archive, pins_cap, favourites, agents) = agents_merger(pins);
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_agent("!dm", Some(100), AgentRoomKindVm::Proxy),
+                            room_agent("!new", Some(50), AgentRoomKindVm::Unknown),
+                            room_flags("!chat", Some(400), false, false),
+                            room_agent("!pinned-agent", Some(500), AgentRoomKindVm::Session),
+                            RoomVm {
+                                agent_room: Some(AgentRoomKindVm::Session),
+                                ..room_fav("!fav-agent", Some(300), true, true)
+                            },
+                            RoomVm {
+                                agent_room: Some(AgentRoomKindVm::Proxy),
+                                ..room_flags("!archived-agent", Some(200), true, false)
+                            },
+                        ],
+                    }],
+                    total: Some(6),
+                },
+            )
+            .await;
+        assert_eq!(
+            last_reset_ids(&agents),
+            [
+                "!pinned-agent",
+                "!fav-agent",
+                "!archived-agent",
+                "!dm",
+                "!new"
+            ]
+        );
+        assert_eq!(last_reset_ids(&inbox), ["!chat"]);
+        assert_eq!(last_reset_ids(&archive), Vec::<String>::new());
+        assert_eq!(last_reset_ids(&pins_cap), Vec::<String>::new());
+        assert_eq!(last_reset_ids(&favourites), Vec::<String>::new());
+        let rows = agents.lock().expect("lock");
+        let InboxOp::Reset { rooms } = &rows.last().expect("a batch").ops[0] else {
+            panic!("expected Reset");
+        };
+        let dm = rooms.iter().find(|r| r.room_id == "!dm").expect("the dm");
+        assert_eq!(dm.agent_room, Some(AgentRoomKindVm::Proxy));
+    }
+
+    #[tokio::test]
+    async fn control_rooms_are_in_no_window() {
+        let pins = pin_map(&[("acctA", "!control", 0)]);
+        let (merger, inbox, archive, pins_cap, favourites, agents) = agents_merger(pins);
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_agent("!control", Some(500), AgentRoomKindVm::Control),
+                            RoomVm {
+                                agent_room: Some(AgentRoomKindVm::Control),
+                                ..room_fav("!fav-control", Some(400), true, true)
+                            },
+                            room_flags("!chat", Some(100), false, false),
+                        ],
+                    }],
+                    total: Some(3),
+                },
+            )
+            .await;
+        assert_eq!(last_reset_ids(&inbox), ["!chat"]);
+        for window in [&archive, &pins_cap, &favourites, &agents] {
+            assert_eq!(last_reset_ids(window), Vec::<String>::new());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_agents_window_is_not_narrowed_by_a_space_or_a_network() {
+        let (merger, inbox, _archive, _pins, _favourites, agents) = agents_merger(HashMap::new());
+        merger.register_account("acctA", 0).await;
+        merger
+            .apply_account_batch(
+                "acctA",
+                RoomListBatch {
+                    ops: vec![RoomListOp::Reset {
+                        rooms: vec![
+                            room_net("!tg", Some(400), "Telegram"),
+                            room_agent("!dm", Some(300), AgentRoomKindVm::Proxy),
+                            room_agent("!watched", Some(200), AgentRoomKindVm::Session),
+                        ],
+                    }],
+                    total: Some(3),
+                },
+            )
+            .await;
+        merger
+            .update_spaces(
+                "acctA",
+                vec![space_vm("acctA", "!s")],
+                membership(&[("!s", &["!tg"])]),
+            )
+            .await;
+        merger.set_network_filter(Some("Telegram".to_owned())).await;
+        assert_eq!(last_reset_ids(&inbox), ["!tg"]);
+        assert_eq!(last_reset_ids(&agents), ["!dm", "!watched"]);
+        merger
+            .set_space_filter(Some(("acctA".to_owned(), "!s".to_owned())))
+            .await;
+        assert_eq!(last_reset_ids(&agents), ["!dm", "!watched"]);
     }
 
     #[tokio::test]

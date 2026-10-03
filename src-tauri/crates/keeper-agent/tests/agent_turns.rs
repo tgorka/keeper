@@ -19,15 +19,14 @@ use keeper_agent::agent::{
 };
 use keeper_agent::claims::{blocked_status, conflict_line, conflict_of, Lease};
 use keeper_agent::host::UNATTENDED_REFUSAL;
-use keeper_agent::matrix_sink::{EditPort, SendFuture, FINAL_CUT_BYTES};
+use keeper_agent::matrix_sink::{EditPort, SendFuture};
 use keeper_agent::rooms::Arrival;
 use keeper_agent::runtime::Router;
 use keeper_agent::turn::{DrivePorts, TurnEnv};
 use keeper_agent::writer::WriterError;
 use keeper_agent::zone::{read_zone, AgentHome};
 use keeper_core::agents::drive::{self, DriveDecl};
-use keeper_core::agents::events::STATUS;
-use keeper_core::agents::events::{RunState, StatusContent};
+use keeper_core::agents::events::{RunState, StatusContent, FINAL_CUT_BYTES, STATUS};
 use keeper_core::agents::label::{Integrity, Label, Readers};
 use keeper_core::agents::log::reader::{hydrate_blob, read_session};
 use keeper_core::agents::log::replay::replay;

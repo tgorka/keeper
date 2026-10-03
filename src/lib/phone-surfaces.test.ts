@@ -17,11 +17,12 @@ function capabilityShapes(): CapabilitiesVm[] {
 }
 
 describe("phone surfaces (Story 66.1, AD-197, AD-27)", () => {
-  it("routes the two chat windows and every surface it names, and nothing else", () => {
+  it("routes the three chat windows and every surface it names, and nothing else", () => {
     const phone: CapabilitiesVm = { ...DEFAULT_CAPABILITIES, bots: true, sync: true };
     const routed: Record<PrimaryView, PhoneSurface | "level-0" | null> = {
       inbox: "level-0",
       archive: "level-0",
+      agents: "level-0",
       approval: "approval",
       bridges: "bridges",
       settings: "settings",
@@ -63,14 +64,14 @@ describe("phone surfaces (Story 66.1, AD-197, AD-27)", () => {
   });
 
   it("the drawer's phone filter leaves a row for every base entry on every capability shape", () => {
-    // The base entries — Chats, Archive, Approvals, Bridges, Settings — need no
+    // The base entries — Chats, Archive, Agents, Approvals, Bridges, Settings — need no
     // capability, so on no shape may the phone drop one of them (AD-27 cuts
     // both ways: no dead row, and no vanished row either).
     for (const shape of capabilityShapes()) {
       const kept = sidebarViews(shape).filter((entry) => phoneRoutesView(entry.view, shape));
       const labels = kept.map((entry) => entry.label);
       expect(labels).toEqual(
-        expect.arrayContaining(["Chats", "Archive", "Approvals", "Bridges", "Settings"]),
+        expect.arrayContaining(["Chats", "Archive", "Agents", "Approvals", "Bridges", "Settings"]),
       );
       // And every kept row is one the shell renders.
       for (const entry of kept) {

@@ -518,6 +518,7 @@ describe("SidebarPane as the phone drawer (Story 66.1, AD-197, AD-27)", () => {
     expect(labels).toEqual([
       "Chats",
       "Archive",
+      "Agents",
       "Approvals",
       "Bridges",
       "Sync",
@@ -678,13 +679,14 @@ describe("SidebarPane fold (Story 45.20, FR-198, UX-DR81)", () => {
     const list = document.getElementById("sidebar-views");
     expect(list).toBeInTheDocument();
     const buttons = [...(list?.querySelectorAll("button") ?? [])];
-    expect(buttons.length).toBe(10);
+    expect(buttons.length).toBe(11);
     for (const button of buttons) {
       expect(button).toHaveAccessibleName();
     }
     for (const name of [
       "Chats",
       "Archive",
+      "Agents",
       "Approvals",
       "Bridges",
       "Recording",

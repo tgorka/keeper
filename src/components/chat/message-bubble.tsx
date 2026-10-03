@@ -122,6 +122,12 @@ interface MessageBubbleProps {
    * When absent, no Cancel affordance renders.
    */
   onCancelSend?: (key: string) => void;
+  /**
+   * Whether this is an agent's answer still being written: the newest turn of
+   * an agent room whose run is `running`. Draws a caret after the text, and
+   * says so to a screen reader, until the run leaves `running`.
+   */
+  growing?: boolean;
 }
 
 /**
@@ -156,6 +162,7 @@ export function MessageBubble({
   onToggleReaction,
   onOpenPreview,
   onCancelSend,
+  growing = false,
 }: MessageBubbleProps) {
   const displayName = item.senderDisplayName ?? item.sender;
   const time = formatMessageTime(item.timestamp);
@@ -201,8 +208,22 @@ export function MessageBubble({
         </div>
       )}
       {/* Text/caption: rendered only when there is a body (a media message
-          may carry an empty caption). */}
-      {item.body !== "" && <p className="whitespace-pre-wrap break-words">{item.body}</p>}
+          may carry an empty caption) or an answer is still growing into one. */}
+      {(item.body !== "" || growing) && (
+        <p className="whitespace-pre-wrap break-words">
+          {item.body}
+          {growing && (
+            <>
+              <span
+                aria-hidden="true"
+                data-slot="growing-caret"
+                className="ml-0.5 inline-block h-[1em] w-0.5 bg-current align-text-bottom motion-safe:animate-pulse"
+              />
+              <span className="sr-only"> (still writing)</span>
+            </>
+          )}
+        </p>
+      )}
       <div className="mt-1 flex items-center justify-end gap-1">
         {item.isEdited && (
           <EditedCaption

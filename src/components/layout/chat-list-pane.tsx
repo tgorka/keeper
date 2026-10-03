@@ -45,6 +45,7 @@ import {
   unsubscribeInbox,
 } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
+import { agentRoomsStore, useAgentRoomsStore } from "@/lib/stores/agent-rooms";
 import { archiveRoomsStore, useArchiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { chatListFocusStore, useChatListFocusNonce } from "@/lib/stores/chat-list-focus";
 import { columnFoldStore } from "@/lib/stores/column-fold";
@@ -87,6 +88,7 @@ export function ChatListPane() {
   const view = usePrimaryView();
   const inboxRooms = useRoomsStore((s) => s.rooms);
   const archiveRooms = useArchiveRoomsStore((s) => s.rooms);
+  const agentRooms = useAgentRoomsStore((s) => s.rooms);
   const pinsRooms = usePinsRoomsStore((s) => s.rooms);
   const favoritesRooms = useFavoritesRoomsStore((s) => s.rooms);
   const selected = useRoomsStore((s) => s.selected);
@@ -130,6 +132,7 @@ export function ChatListPane() {
   // window delivers a batch.
   const [loadedInbox, setLoadedInbox] = useState(false);
   const [loadedArchive, setLoadedArchive] = useState(false);
+  const [loadedAgents, setLoadedAgents] = useState(false);
   // Roving keyboard focus over the main list (Story 9.2): the stable
   // `${accountId}:${roomId}` key of the row that carries the visible focus ring +
   // `tabIndex={0}`, or `null` when no row is keyboard-focused (the ring is cleared,
@@ -169,10 +172,12 @@ export function ChatListPane() {
     setErrored(false);
     setLoadedInbox(false);
     setLoadedArchive(false);
+    setLoadedAgents(false);
     // Establish clean state at mount so the newest mount always wins; clearing
     // in cleanup instead would race the next mount.
     roomsStore.getState().clear();
     archiveRoomsStore.getState().clear();
+    agentRoomsStore.getState().clear();
     pinsRoomsStore.getState().clear();
     favoritesRoomsStore.getState().clear();
     // The Space list is replaced wholesale by each snapshot, so reset only the
@@ -215,6 +220,14 @@ export function ChatListPane() {
         favoritesRoomsStore.getState().applyBatch(b);
       }
     };
+    // The Agents window: every agent session room, and no room of any other
+    // window. Rust decides membership; this only mirrors it.
+    const onAgents = (b: InboxBatch) => {
+      if (!cancelled) {
+        agentRoomsStore.getState().applyBatch(b);
+        setLoadedAgents(true);
+      }
+    };
     const onSpaces = (snapshot: SpacesSnapshot) => {
       if (!cancelled) {
         spacesStore.getState().applySnapshot(snapshot);
@@ -248,7 +261,7 @@ export function ChatListPane() {
         }
       }
     };
-    subscribeInbox(onInbox, onArchive, onPins, onFavourites, onSpaces, onNetworks)
+    subscribeInbox(onInbox, onArchive, onPins, onFavourites, onSpaces, onNetworks, onAgents)
       .then((id) => {
         if (cancelled) {
           // Unmounted before the id resolved — tear down immediately.
@@ -347,8 +360,10 @@ export function ChatListPane() {
   // Pick the active window's rows, then apply the account switcher filter as a
   // pure display filter (no re-sort, no mutation): when a filter is active, hide
   // rows not owned by that account.
-  const activeRooms = view === "archive" ? archiveRooms : inboxRooms;
-  const activeLoaded = view === "archive" ? loadedArchive : loadedInbox;
+  const activeRooms =
+    view === "archive" ? archiveRooms : view === "agents" ? agentRooms : inboxRooms;
+  const activeLoaded =
+    view === "archive" ? loadedArchive : view === "agents" ? loadedAgents : loadedInbox;
   const visibleRooms =
     filterAccountId === null
       ? activeRooms
@@ -606,6 +621,8 @@ export function ChatListPane() {
           glyph lines up with nothing. */}
       Nothing archived. <Kbd>E</Kbd> archives a chat and keeps it searchable.
     </>
+  ) : view === "agents" ? (
+    "No agent rooms yet."
   ) : (
     "No conversations yet."
   );

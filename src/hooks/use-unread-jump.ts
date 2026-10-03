@@ -3,7 +3,8 @@
  *
  * Wires `⌥⌘↓` → next unread and `⌥⌘↑` → previous unread (⌥⌃ for non-mac parity),
  * scanning the currently rendered, Rust-recency-ordered window (inbox when
- * `primaryView === "inbox"`, archive when `"archive"`, honoring the account-switcher
+ * `primaryView === "inbox"`, archive when `"archive"`, agents when `"agents"`,
+ * honoring the account-switcher
  * display filter) for the next/previous {@link effectiveIsUnread} row after/before
  * the current selection, wrapping. The matched row is selected + opened
  * (`selectRoom`) and focus lands in the composer (`composerStore.requestFocus`).
@@ -15,6 +16,7 @@
 import { useEffect } from "react";
 import { renderedWindowRooms } from "@/lib/rendered-window";
 import { accountsStore } from "@/lib/stores/accounts";
+import { agentRoomsStore } from "@/lib/stores/agent-rooms";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { composerStore } from "@/lib/stores/composer";
 import { primaryViewStore } from "@/lib/stores/primary-view";
@@ -34,8 +36,11 @@ export function useUnreadJump(): void {
       }
       const rooms = renderedWindowRooms(
         primaryViewStore.getState().view,
-        roomsStore.getState().rooms,
-        archiveRoomsStore.getState().rooms,
+        {
+          inbox: roomsStore.getState().rooms,
+          archive: archiveRoomsStore.getState().rooms,
+          agents: agentRoomsStore.getState().rooms,
+        },
         accountsStore.getState().filterAccountId,
       );
       if (rooms === null || rooms.length === 0) {

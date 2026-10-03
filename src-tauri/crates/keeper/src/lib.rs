@@ -797,7 +797,10 @@ pub fn run() {
                 sync::start_supervisor(std::sync::Arc::clone(&state.platform));
                 // The agents host, once the engine whose drives it reads is
                 // running; it hosts from the next tick's scan (story 90.6).
-                agents_host::start(std::sync::Arc::clone(&state.platform));
+                agents_host::start(
+                    std::sync::Arc::clone(&state.platform),
+                    state.accounts.agent_icons(),
+                );
             }
             #[cfg(not(desktop))]
             sync::phone_sync_all(app.handle(), "open");

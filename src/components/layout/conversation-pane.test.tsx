@@ -1,6 +1,12 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AccountVm, IpcError, TimelineBatch, TimelineItemVm } from "@/lib/ipc/client";
+import type {
+  AccountVm,
+  AgentRunVm,
+  IpcError,
+  TimelineBatch,
+  TimelineItemVm,
+} from "@/lib/ipc/client";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
 import { roomsStore } from "@/lib/stores/rooms";
@@ -1967,5 +1973,110 @@ describe("ConversationPane — safe areas & keyboard-avoiding composer (Story 13
     expect(footer.className).not.toContain("kb-inset");
     expect(footer.className).not.toContain("safe-bottom");
     expect(footer.className).toContain("border-t");
+  });
+});
+
+describe("ConversationPane — an agent room", () => {
+  const NIXI = "@nixi:example.org";
+  const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+
+  function agentHeader(
+    run: AgentRunVm,
+    caretKey: string | null,
+  ): NonNullable<TimelineBatch["header"]> {
+    return {
+      status: {
+        agent: NIXI,
+        agentName: "Nixi",
+        handle: "nixi@electra",
+        host: "electra",
+        title: "Nixi",
+        kind: "main",
+        run,
+        waiting: null,
+        detail: null,
+        unreadable: null,
+      },
+      scope: null,
+      label: null,
+      scopeUnreadable: null,
+      caretKey,
+    };
+  }
+
+  function open(props: { showHeader?: boolean } = {}) {
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!nixi:example.org" });
+    render(<ConversationPane {...noopProps()} {...props} />);
+  }
+
+  function push(batch: TimelineBatch) {
+    act(() => captured.onBatch?.(batch));
+  }
+
+  /** The message bubble (by its render key) that draws the growing caret, if any. */
+  function caretOwners(): string[] {
+    return Array.from(document.querySelectorAll('[data-slot="growing-caret"]')).map(
+      (caret) => caret.closest("[data-msg-key]")?.getAttribute("data-msg-key") ?? "",
+    );
+  }
+
+  const items = [
+    messageItem("question", "@alice:example.org", "What did I write?"),
+    messageItem("old-answer", NIXI, "Earlier answer"),
+    messageItem("answer", NIXI, "Synapse"),
+  ];
+
+  it("draws the caret on the named answer only while the run is running, then removes it", async () => {
+    open();
+    push({ ops: [{ op: "reset", items }], header: agentHeader("running", "answer") });
+    await screen.findByText("Earlier answer");
+    expect(caretOwners()).toEqual(["answer"]);
+    expect(screen.getByText("(still writing)")).toBeInTheDocument();
+
+    // The answer grows by `set`; the header did not change, so the batch has none.
+    push({ ops: [{ op: "set", index: 2, item: messageItem("answer", NIXI, "Synapse took it") }] });
+    expect(await screen.findByText(/Synapse took it/)).toBeInTheDocument();
+    expect(caretOwners()).toEqual(["answer"]);
+
+    push({ ops: [], header: agentHeader("done", null) });
+    await waitFor(() => expect(caretOwners()).toEqual([]));
+    expect(screen.queryByText("(still writing)")).not.toBeInTheDocument();
+  });
+
+  it("draws no caret once the run has left running, whatever key the header still names", async () => {
+    open();
+    push({ ops: [{ op: "reset", items }], header: agentHeader("blocked", "answer") });
+    await screen.findByText("Earlier answer");
+    expect(caretOwners()).toEqual([]);
+  });
+
+  it("keeps the header through batches that carry none", async () => {
+    open();
+    push({ ops: [{ op: "reset", items }], header: agentHeader("running", "answer") });
+    push({ ops: [{ op: "pushBack", item: messageItem("more", NIXI, "More") }] });
+    await screen.findByText("More");
+    const region = screen.getByRole("region", { name: "Agent status" });
+    expect(within(region).getByText("nixi@electra")).toBeInTheDocument();
+    expect(within(region).getByTestId("agent-run")).toHaveTextContent(/^run: running$/);
+  });
+
+  it("shows the header on the phone, where the pane's own header row is hidden", async () => {
+    open({ showHeader: false });
+    push({ ops: [{ op: "reset", items }], header: agentHeader("idle", null) });
+    const region = await screen.findByRole("region", { name: "Agent status" });
+    expect(within(region).getByTestId("agent-run")).toHaveTextContent(/^run: idle$/);
+    expect(screen.queryByRole("button", { name: "Toggle detail panel" })).not.toBeInTheDocument();
+  });
+
+  it("draws no header in a room whose stream carries none", async () => {
+    open();
+    push({ ops: [{ op: "reset", items }] });
+    await screen.findByText("Earlier answer");
+    expect(screen.queryByRole("region", { name: "Agent status" })).not.toBeInTheDocument();
+    expect(caretOwners()).toEqual([]);
   });
 });

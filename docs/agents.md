@@ -1092,8 +1092,9 @@ An answer is one Matrix message the host keeps editing, not a stream of tokens:
 - **Secrets are redacted in the room as in the log**: every edit, the final one included, goes
   through the log's secret scan, so a token the model quotes reads `[REDACTED secret-like: …]` in
   the room too.
-- **Tool progress** goes out as edits of the session's status anchor (`dev.keeper.agent.status`)
-  carrying counts only — "reading 2 files, 3 tool calls" — never a path, a title or a heading.
+- **Tool progress** goes out as status updates — each its own `dev.keeper.agent.status` event
+  naming the session's status anchor in `content.anchor`, not an edit of it — carrying counts
+  only — "reading 2 files, 3 tool calls" — never a path, a title or a heading.
 - **A long answer** is cut: past `FINAL_CUT_BYTES` the message is its first `FINAL_CUT_BYTES` (on a
   character boundary) and "The full answer is in artifacts/answer-<line>.md", written into the
   session; the log holds the whole text. When that file cannot be written, the message says
@@ -1119,6 +1120,49 @@ A served session's history is held in memory: it is read from the log once, when
 session or restarts, and every line the host writes is added to it. A turn reads no file under
 `log/`. Core memory (`USER.md`, `MEMORY.md`) is read at that same moment and not again while the
 session is served, so an edit lands in the next session, or after a restart.
+
+## An agent's room
+
+keeper shows an agent's room in its own timeline, on the Mac and on the iPhone alike.
+
+- **Which rooms.** A room created with the type `dev.keeper.agent.session` is an agent session
+  room; one created with `dev.keeper.agent.control` is a principal's control room. Nothing else
+  makes a room an agent's room — not its name, not its members.
+- **The room list.** Session rooms are in the **Agents** window (the menu's *Agents*, beside
+  *Archive*) and in no other, whatever their pin, favourite or archive state; the Space and
+  Network filters narrow the chat windows, never the Agents window. A room whose status says
+  `kind: main` or `kind: conversation` is a conversation with your proxy; every other session
+  room is a session you watch, and its row says *Watching*. A room whose kind keeper has not read
+  yet — no status among the events it holds — claims neither: no mark, and it is announced as
+  "an agent room". A control room is in no window.
+- **The header.** Above the timeline, on the iPhone as well as the Mac: the status line — the
+  agent's identity cell, `nixi@electra` (the agent and the host that answers), the run badge
+  (`idle`, `running`, `blocked`, `waiting`, `done`, `unreadable`), `waiting: hesperia` when the
+  session waits for a host, and the host's detail as it sent it (counts, never paths) — then the
+  scope chip (the drives in scope, in the order the scope event lists them, "no scope yet", or a
+  sentence when the newest scope is from a newer keeper or cannot be read — never dropped) and
+  the label chip (the readers by name, a reader keeper cannot name by user id, and the integrity
+  as a word). The identity cell's mark is the first letter of the handle, which for the seeded
+  agents is the one glyph their souls name (`N`, `T`, `L`).
+- **Whose status.** keeper reads status updates the way the host does: only from the agent the
+  status names, at power 50 or more, never from you; the newest by server time wins, so an update
+  arriving late never replaces a newer one. A status keeper cannot read — a run or kind it does
+  not know, or one written by a newer keeper — is shown as *unreadable* with a sentence saying
+  why, never hidden.
+- **Where the header comes from.** Status and scope events are not timeline items: keeper reads
+  them from the room's local event cache beside the timeline, and from the server's history,
+  newest first, when the cache holds no status — once per room while keeper runs, when that
+  history held none; a status sent later reaches the cache. The hosts' claim and manifest state,
+  renewed every minute, never become timeline items either. A change of the agent's mark (its
+  soul's icon) redraws an open header.
+- **The answer.** An answer is one message that grows in place and is never marked "Edited";
+  while the run is `running`, its newest answer carries the growing caret. It is drawn up to
+  `FINAL_CUT_BYTES` and the sentence naming the artifact, not cut at the 4096 characters an
+  ordinary message is. The `…` anchor does not notify; a notification when an answer completes
+  is 98.1's. Only the session's agent writes an answer: a message carrying the
+  `dev.keeper.agent.turn` marker counts as one only in a session room, from a sender at power 50
+  or more who is not you. Anyone else's marked message — in any room — is an ordinary message:
+  it notifies, shows "Edited" when edited, is cut at 4096 characters and never carries the caret.
 
 ## Which host answers
 

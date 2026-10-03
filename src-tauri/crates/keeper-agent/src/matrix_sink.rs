@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keeper_core::agents::events::{
-    self, RunState, StatusContent, TurnRef, CONTENT_VERSION, STATUS, TURN,
+    self, RunState, StatusContent, TurnRef, CONTENT_VERSION, FINAL_CUT_BYTES, STATUS, TURN,
 };
 use keeper_core::agents::matrix::{AgentClient, AgentMatrixError};
 use keeper_core::agents::redact::redact_secrets;
@@ -34,16 +34,6 @@ use crate::ports::TurnSink;
 
 /// No two edits of one anchor are closer than this (R18, NFR-113).
 pub const MIN_EDIT_GAP: Duration = Duration::from_millis(400);
-
-/// The longest final message, in bytes (R23). Longer answers are cut on a
-/// `char` boundary and point to an artifact holding the whole text.
-///
-/// Measured, not chosen (90.5 acceptance 14): the largest text whose
-/// encrypted final edit the Synapse test homeserver accepted was 47 061
-/// bytes (2026-10-03; the server's 64 KiB event cap after Megolm and base64),
-/// so R23's 60 KiB does not fit. This is that, less room for the artifact
-/// sentence, rounded down to 1 KiB (`docs/agents.md` § Measured).
-pub const FINAL_CUT_BYTES: usize = 45 * 1024;
 
 /// What an anchor says before the first edit.
 pub const PLACEHOLDER: &str = "…";

@@ -556,6 +556,89 @@ async fn an_event_handled_before_a_restart_is_not_handed_out_again() {
     );
 }
 
+/// The event-cache events of `room` on `client`, as JSON, decrypted where
+/// the cache holds them decrypted.
+async fn cached_events(client: &AgentClient, room: &RoomId) -> Vec<Value> {
+    let room = client.client().get_room(room).expect("room known");
+    let (cache, _handles) = room.event_cache().await.expect("event cache");
+    cache
+        .events()
+        .await
+        .expect("events")
+        .iter()
+        .filter_map(|event| event.raw().deserialize_as::<Value>().ok())
+        .collect()
+}
+
+/// Ruling R33's measurement: a person's device reads an agent room's header
+/// beside the timeline from the event cache, so the cache must hold the
+/// agent's status decrypted after the app restarts, before any sync.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn the_event_cache_holds_a_decrypted_status_after_a_restart() {
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let (nixi, person, room) = joined_pair(&smoke, SessionKind::Main, root.path()).await;
+    person
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    let person_session = StoredSession::from_client(person.client())
+        .expect("session")
+        .to_json()
+        .expect("json");
+    let status = nixi
+        .send(
+            &room,
+            events::STATUS,
+            json!({
+                "v": 1, "session": "sessions/nixi/main", "kind": "main", "title": "Nixi",
+                "agent": smoke.user("nixi-smoke"), "host": "electra", "epoch": 1, "run": "idle",
+            }),
+            None,
+        )
+        .await
+        .expect("status");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let events = cached_events(&person, &room).await;
+        if events.iter().any(|e| e["event_id"] == status.as_str()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the live cache never held the status"
+        );
+        person.sync_once().await.expect("sync");
+    }
+    drop(person);
+
+    let restored = AgentClient::open(
+        &smoke.homeserver,
+        &root.path().join("tgorka"),
+        "smoke-passphrase",
+    )
+    .await
+    .expect("reopen");
+    restored
+        .restore(StoredSession::from_json(&person_session).expect("session"))
+        .await
+        .expect("restore");
+    restored
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    let events = cached_events(&restored, &room).await;
+    let held = events
+        .iter()
+        .find(|e| e["event_id"] == status.as_str())
+        .unwrap_or_else(|| panic!("no status in the restored cache: {} events", events.len()));
+    assert_eq!(held["type"], events::STATUS, "held decrypted: {held}");
+    assert_eq!(held["content"]["kind"], "main");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live: Synapse on delectra"]
 async fn a_429_reaches_the_caller_with_its_retry_after() {
@@ -786,4 +869,219 @@ async fn a_second_agent_of_the_principal_writes_its_manifest_in_the_control_room
         Err(AgentMatrixError::Forbidden(_)) => {}
         other => panic!("a person writes no manifest: {other:?}"),
     }
+}
+
+/// 91.1 acceptance 7: an agent's room as a person's keeper reads it — one
+/// header line from a status anchor and five updates and a scope, one answer
+/// message grown by twelve edits and not marked edited, and the room in the
+/// Agents window; the principal's control room in none.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn an_agent_room_reads_as_one_header_and_one_growing_answer() {
+    use keeper_core::agents::room::{
+        room_kind_vm, AgentIcons, AgentKinds, AgentRoomKindVm, AgentRunVm,
+    };
+    use keeper_core::timeline;
+    use keeper_core::vm::{TimelineBatch, TimelineItemVm, TimelineOp};
+
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let (nixi, person, room) = joined_pair(&smoke, SessionKind::Main, root.path()).await;
+    person
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    let agent = smoke.user("nixi-smoke");
+    let status = |run: &str, detail: &str, anchor: Option<&OwnedEventId>| {
+        let mut content = json!({
+            "v": 1, "session": "sessions/nixi/main", "kind": "main", "title": "Nixi",
+            "agent": agent, "host": "electra", "epoch": 1, "run": run, "detail": detail,
+        });
+        if let Some(anchor) = anchor {
+            content["anchor"] = json!(anchor);
+        }
+        content
+    };
+    let anchor = nixi
+        .send(&room, events::STATUS, status("idle", "0", None), None)
+        .await
+        .expect("status anchor");
+    for n in 1..=5 {
+        let run = if n == 5 { "running" } else { "blocked" };
+        nixi.send(
+            &room,
+            events::STATUS,
+            status(run, &format!("{n} notes read"), Some(&anchor)),
+            None,
+        )
+        .await
+        .expect("status update");
+    }
+    nixi.send(
+        &room,
+        events::SCOPE,
+        json!({
+            "v": 1, "set_by": agent,
+            "drives": [{"id": "tgdrive", "title": "tgdrive"}, {"id": "neura", "title": "Neura"}],
+            "label": {"readers": [smoke.user("tgorka-smoke")], "integrity": "owner"},
+        }),
+        None,
+    )
+    .await
+    .expect("scope");
+    let answer = nixi
+        .send(
+            &room,
+            "m.room.message",
+            json!({
+                "msgtype": "m.text", "body": "…",
+                "dev.keeper.agent.turn": {"session": "sessions/nixi/main", "line": "01J"},
+            }),
+            None,
+        )
+        .await
+        .expect("answer anchor");
+    // The person writes the marker too, and edits it: a person's message,
+    // marked edited, and never the caret's (R30).
+    let forged = person
+        .send(
+            &room,
+            "m.room.message",
+            json!({
+                "msgtype": "m.text", "body": "not an answer",
+                "dev.keeper.agent.turn": {"session": "sessions/nixi/main", "line": "02J"},
+            }),
+            None,
+        )
+        .await
+        .expect("a person's marked message");
+    person
+        .send(
+            &room,
+            "m.room.message",
+            events::edit_content(&forged, "still not an answer"),
+            None,
+        )
+        .await
+        .expect("its edit");
+    for n in 1..=12 {
+        nixi.send(
+            &room,
+            "m.room.message",
+            events::edit_content(&answer, &format!("the answer, {n} of 12")),
+            None,
+        )
+        .await
+        .expect("answer edit");
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let events = cached_events(&person, &room).await;
+        if events
+            .iter()
+            .any(|e| e["content"]["m.new_content"]["body"] == "the answer, 12 of 12")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the answer never arrived");
+        person.sync_once().await.expect("sync");
+    }
+
+    let open = timeline::open_timeline(person.client(), &room, "acct")
+        .await
+        .expect("timeline");
+    let batches: Arc<Mutex<Vec<TimelineBatch>>> = Arc::default();
+    let sink = Arc::clone(&batches);
+    let kinds = Arc::new(AgentKinds::default());
+    let producer = tokio::spawn(timeline::forward_timeline(
+        open,
+        room.clone(),
+        Box::new(move |batch| {
+            sink.lock().expect("lock").push(batch);
+            true
+        }),
+        Arc::clone(&kinds),
+        Arc::new(AgentIcons::default()),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while batches.lock().expect("lock").is_empty() {
+        assert!(Instant::now() < deadline, "no first batch");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    producer.abort();
+    let first = batches.lock().expect("lock")[0].clone();
+    let TimelineOp::Reset { items } = &first.ops[0] else {
+        panic!("the first batch is a reset");
+    };
+    let answers: Vec<(&String, &String, bool)> = items
+        .iter()
+        .filter_map(|item| match item {
+            TimelineItemVm::Message {
+                key,
+                sender,
+                body,
+                is_edited,
+                ..
+            } if sender == agent.as_str() => Some((key, body, *is_edited)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        answers.len(),
+        1,
+        "one message item from the agent: {answers:?}"
+    );
+    let (answer_key, body, is_edited) = answers[0];
+    assert_eq!(body, "the answer, 12 of 12");
+    assert!(!is_edited, "a streamed answer is not marked edited");
+    let forged_edited = items.iter().find_map(|item| match item {
+        TimelineItemVm::Message {
+            body, is_edited, ..
+        } if body == "still not an answer" => Some(*is_edited),
+        _ => None,
+    });
+    assert_eq!(
+        forged_edited,
+        Some(true),
+        "a person's marked message is edited"
+    );
+    let header = first.header.expect("a header on the first batch");
+    let line = header.status.expect("a status");
+    assert_eq!(line.run, AgentRunVm::Running);
+    assert_eq!(line.detail.as_deref(), Some("5 notes read"));
+    assert_eq!(line.handle, "nixi-smoke@electra");
+    let drives: Vec<String> = header
+        .scope
+        .expect("scope")
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    assert_eq!(drives, ["tgdrive", "neura"]);
+    assert_eq!(header.label.expect("label").integrity, "owner");
+    assert_eq!(header.caret_key.as_ref(), Some(answer_key));
+
+    let joined = person.client().get_room(&room).expect("room");
+    assert_eq!(
+        room_kind_vm(&joined, &AgentKinds::default()).await,
+        Some(AgentRoomKindVm::Proxy)
+    );
+
+    let control = nixi
+        .create_room(
+            RoomKind::Control,
+            "nixi control",
+            vec![smoke.user("tgorka-smoke")],
+            &[],
+        )
+        .await
+        .expect("control room");
+    sync_until(&person, || person.client().get_room(&control).is_some()).await;
+    person.join(&control).await.expect("join control");
+    person.sync_once().await.expect("sync");
+    let control_room = person.client().get_room(&control).expect("control");
+    assert_eq!(
+        room_kind_vm(&control_room, &kinds).await,
+        Some(AgentRoomKindVm::Control)
+    );
 }

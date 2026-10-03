@@ -26,6 +26,7 @@ import {
   useState,
 } from "react";
 import { BridgeLoginSheet } from "@/components/bridges/bridge-login-sheet";
+import { AgentRoomHeader } from "@/components/chat/agent-room-header";
 import { Composer } from "@/components/chat/composer";
 import { DeleteMessageDialog } from "@/components/chat/delete-message-dialog";
 import { HistoryBoundary, type HistoryBoundaryState } from "@/components/chat/history-boundary";
@@ -517,6 +518,13 @@ export function ConversationPane({
   // render key, scrolled to, and tinted once the target room's timeline is loaded.
   const focusEvent = useRoomsStore((s) => s.focusEvent);
   const items = useTimelineStore((s) => s.items);
+  // An agent room's header (status line, scope and label chips), `null` in
+  // every other room. Drawn on the phone too: it sits outside `showHeader`.
+  const agentHeader = useTimelineStore((s) => s.header);
+  // The answer that draws the growing caret: Rust names it only while the run
+  // is `running`, and the run is checked here as well so a header that moved
+  // on to `done` can never leave a caret behind.
+  const caretKey = agentHeader?.status?.run === "running" ? agentHeader.caretKey : null;
   const pending = useComposerStore((s) => s.pending);
   const selectedKey = useComposerStore((s) => s.selectedKey);
   // The open conversation's account status drives the "Queued" caption. An empty
@@ -1539,6 +1547,7 @@ export function ConversationPane({
           the open room's (accountId, networkId) session is unhealthy → opens the login
           stepper for that exact bridge. Persistent until the session recovers. */}
       <ConversationHealthBanner accountId={accountId} networkId={selectedNetworkId} />
+      {selectedRoomId !== null && agentHeader !== null && <AgentRoomHeader header={agentHeader} />}
       {selectedRoomId === null ? (
         <div className="flex flex-1 items-center justify-center p-8">
           <p className="max-w-sm text-center text-muted-foreground text-sm">
@@ -1617,6 +1626,7 @@ export function ConversationPane({
                     onToggleReaction={onToggleReaction}
                     onOpenPreview={onOpenPreview}
                     onCancelSend={onCancelSend}
+                    growing={caretKey === row.item.key}
                   />
                 </li>
               ),

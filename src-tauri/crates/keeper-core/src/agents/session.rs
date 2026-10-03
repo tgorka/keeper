@@ -14,6 +14,7 @@ use std::str::FromStr;
 use chrono::{DateTime, SecondsFormat, Utc};
 use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 use ulid::Ulid;
 
 use crate::agents::label::{Integrity, Label, Readers};
@@ -54,8 +55,9 @@ const LABEL_KEYS: [&str; 3] = ["readers", "integrity", "local_only"];
 const LIMITS_KEYS: [&str; 2] = ["rounds_per_exchange", "tokens"];
 
 /// What a session is for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "lowercase")]
+#[ts(export)]
 pub enum SessionKind {
     /// A proxy's DM with its person.
     Main,

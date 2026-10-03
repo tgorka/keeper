@@ -340,6 +340,9 @@ export type { AgentPersonVm } from "./gen/AgentPersonVm";
 export type { AgentPinReq } from "./gen/AgentPinReq";
 export type { AgentPinState } from "./gen/AgentPinState";
 export type { AgentPinVm } from "./gen/AgentPinVm";
+export type { AgentRoomHeaderVm } from "./gen/AgentRoomHeaderVm";
+export type { AgentRoomKindVm } from "./gen/AgentRoomKindVm";
+export type { AgentRunVm } from "./gen/AgentRunVm";
 export type { AgentSeedAgentVm } from "./gen/AgentSeedAgentVm";
 export type { AgentSeedBotVm } from "./gen/AgentSeedBotVm";
 export type { AgentSeedFolderVm } from "./gen/AgentSeedFolderVm";
@@ -347,6 +350,7 @@ export type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
 export type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 export type { AgentSeedReq } from "./gen/AgentSeedReq";
 export type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
+export type { AgentStatusVm } from "./gen/AgentStatusVm";
 export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 export type { AuditOutcome } from "./gen/AuditOutcome";
 export type { AuditVerdict } from "./gen/AuditVerdict";
@@ -479,6 +483,7 @@ export type { IncognitoScope } from "./gen/IncognitoScope";
 export type { IncognitoVm } from "./gen/IncognitoVm";
 export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
+export type { LabelVm } from "./gen/LabelVm";
 export type { LifecyclePhase } from "./gen/LifecyclePhase";
 export type { LoginFieldVm } from "./gen/LoginFieldVm";
 export type { LoginFlowVm } from "./gen/LoginFlowVm";
@@ -606,12 +611,14 @@ export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
 export type { RoomVm } from "./gen/RoomVm";
 export type { SasEmojiVm } from "./gen/SasEmojiVm";
+export type { ScopeDriveVm } from "./gen/ScopeDriveVm";
 export type { ScreenRecordingAccess } from "./gen/ScreenRecordingAccess";
 export type { SearchFilterVm } from "./gen/SearchFilterVm";
 export type { SearchHitVm } from "./gen/SearchHitVm";
 export type { SendState } from "./gen/SendState";
 export type { SessionDetailVm } from "./gen/SessionDetailVm";
 export type { SessionEntryVm } from "./gen/SessionEntryVm";
+export type { SessionKind } from "./gen/SessionKind";
 export type { SessionLogEntryVm } from "./gen/SessionLogEntryVm";
 export type { SessionMigrationVm } from "./gen/SessionMigrationVm";
 export type { SessionPatternFileVm } from "./gen/SessionPatternFileVm";
@@ -1610,17 +1617,22 @@ export async function unsubscribeRoomList(accountId: string, id: number): Promis
  * Favorites window (favourited rooms, recency order) to `onFavourites` (each a
  * `Reset` window that updates as accounts sync or as archive/pin/favourite state
  * changes). Resolves with the inbox subscription id — one
- * {@link unsubscribeInbox} tears down all four. Ordering and the four-way split
+ * {@link unsubscribeInbox} tears down all of them. Ordering and the split
  * are computed in Rust — never re-derived here. Rejects with the {@link IpcError}
  * envelope (`code: "syncUnavailable"`) on a stream-start failure.
  *
  * All channels arm their `onmessage` before `invoke` (the ordering is
  * load-bearing per AD-8, so no batch sent by a spawned task is dropped). The Rust
  * command's params are `channel` (inbox), `archive`, `pins`, `favourites`,
- * `spaces`, and `networks`. The fifth channel (Story 4.5) delivers the aggregated
- * Space list as a whole {@link SpacesSnapshot}; the sixth (Story 4.6) delivers the
- * distinct-Networks list as a whole {@link NetworksSnapshot} (no diff protocol for
- * either — the frontend replaces its list).
+ * `agents`, `spaces`, and `networks`. The `spaces` channel (Story 4.5) delivers
+ * the aggregated Space list as a whole {@link SpacesSnapshot}; `networks` (Story
+ * 4.6) delivers the distinct-Networks list as a whole {@link NetworksSnapshot}
+ * (no diff protocol for either — the frontend replaces its list). `agents`
+ * delivers the Agents window to `onAgents`: every agent session room, in
+ * recency order, and only there, whatever Space or Network is selected — a
+ * row's `agentRoom` says `proxy`, `session` or `unknown` (no status read
+ * yet); an agents' control room is in no window (UX-DR132). Without
+ * `onAgents` the Agents window's batches are dropped.
  */
 export async function subscribeInbox(
   onInbox: (batch: InboxBatch) => void,
@@ -1629,17 +1641,20 @@ export async function subscribeInbox(
   onFavourites: (batch: InboxBatch) => void,
   onSpaces: (snapshot: SpacesSnapshot) => void,
   onNetworks: (snapshot: NetworksSnapshot) => void,
+  onAgents?: (batch: InboxBatch) => void,
 ): Promise<number> {
   const channel = new Channel<InboxBatch>();
   const archive = new Channel<InboxBatch>();
   const pins = new Channel<InboxBatch>();
   const favourites = new Channel<InboxBatch>();
+  const agents = new Channel<InboxBatch>();
   const spaces = new Channel<SpacesSnapshot>();
   const networks = new Channel<NetworksSnapshot>();
   channel.onmessage = onInbox;
   archive.onmessage = onArchive;
   pins.onmessage = onPins;
   favourites.onmessage = onFavourites;
+  agents.onmessage = onAgents ?? (() => {});
   spaces.onmessage = onSpaces;
   networks.onmessage = onNetworks;
   return await invoke<number>("inbox_subscribe", {
@@ -1647,6 +1662,7 @@ export async function subscribeInbox(
     archive,
     pins,
     favourites,
+    agents,
     spaces,
     networks,
   });

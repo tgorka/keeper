@@ -26,17 +26,24 @@ use std::sync::Arc;
 
 use futures_util::{Stream, StreamExt};
 use matrix_sdk::event_cache::PaginationStatus;
+use matrix_sdk::event_cache::{RoomEventCacheSubscriber, RoomEventCacheUpdate};
 use matrix_sdk::ruma::events::room::message::MessageType;
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
-use matrix_sdk::Client;
+use matrix_sdk::{Client, Room};
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::timeline::{
     EventSendState, MsgLikeKind, TimelineBuilder, TimelineDetails, TimelineItem,
     TimelineItemContent, TimelineItemKind, TimelineReadReceiptTracking,
 };
 use matrix_sdk_ui::Timeline;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::watch;
 
 use crate::account::{PaginationSink, TimelineSink};
+use crate::agents::events::FINAL_CUT_BYTES;
+use crate::agents::room::{
+    self, AgentIcons, AgentKinds, AgentRoomHeaderVm, AgentRoomKind, HeaderReader, TurnTrust,
+};
 use crate::error::TimelineError;
 use crate::media::{self, MediaVariant};
 use crate::vm::{
@@ -54,6 +61,24 @@ type ReplyIndex = HashMap<OwnedEventId, String>;
 
 /// Defensive upper bound on a decoded message body before it crosses IPC.
 const MAX_BODY_CHARS: usize = 4096;
+
+/// The bound on an agent's streamed answer (R42): its host cuts it at
+/// [`FINAL_CUT_BYTES`] and closes it with a sentence naming the artifact, for
+/// which 90.5's live measurement leaves 512 bytes.
+const MAX_TURN_BODY_CHARS: usize = FINAL_CUT_BYTES + 512;
+
+/// How a message is drawn: whether it shows "Edited", and the most characters
+/// of its body that cross IPC. An agent's streamed answer (`trusted_turn`,
+/// [`TurnTrust::is_turn`]) is one message growing by edits, never a
+/// correction, and is bounded by the host's cut, not the message cap (91.1
+/// acceptance 4, R42).
+fn message_shape(trusted_turn: bool, is_edited: bool) -> (bool, usize) {
+    if trusted_turn {
+        (false, MAX_TURN_BODY_CHARS)
+    } else {
+        (is_edited, MAX_BODY_CHARS)
+    }
+}
 
 /// Extract the plain-text body of a message when its msgtype is renderable text.
 ///
@@ -188,16 +213,16 @@ fn map_send_state(state: &EventSendState) -> SendState {
     }
 }
 
-/// Truncate a decoded body to [`MAX_BODY_CHARS`] characters (by `char`, so a
-/// multi-byte grapheme is never split mid-byte).
-fn truncate_body(body: String) -> String {
+/// Truncate a decoded body to `max` characters (by `char`, so a multi-byte
+/// grapheme is never split mid-byte).
+fn truncate_body(body: String, max: usize) -> String {
     // Fast path: a byte length within the char cap guarantees the char count is
     // too (bytes ≥ chars), so skip the full O(n) `chars().count()` scan that
     // would otherwise run for every message on the snapshot/diff hot path.
-    if body.len() <= MAX_BODY_CHARS || body.chars().count() <= MAX_BODY_CHARS {
+    if body.len() <= max || body.chars().count() <= max {
         body
     } else {
-        body.chars().take(MAX_BODY_CHARS).collect()
+        body.chars().take(max).collect()
     }
 }
 
@@ -241,7 +266,7 @@ fn reply_preview_from_details(
                 .content
                 .as_message()
                 .and_then(|m| text_body(m.msgtype()))
-                .map(truncate_body)
+                .map(|body| truncate_body(body, MAX_BODY_CHARS))
                 .unwrap_or_default();
             (sender, sender_display_name, body)
         }
@@ -355,14 +380,16 @@ fn readers_of<'a>(
 /// deletion shows an explicit "Message deleted" stub rather than a silent gap
 /// (Story 3.8). Everything else (non-text msgtype, other content kinds, and
 /// virtual items) becomes a [`TimelineItemVm::Other`] carrying only the stable
-/// opaque key, so diff indices stay aligned. All accessors are sync
-/// (`VectorDiff::map` is sync).
+/// opaque key, so diff indices stay aligned. A message `turns` trusts as an
+/// agent's streamed answer is shaped by [`message_shape`]. All accessors are
+/// sync (`VectorDiff::map` is sync).
 pub fn item_to_vm(
     item: &TimelineItem,
     index: &ReplyIndex,
     own_user_id: &UserId,
     account_id: &str,
     room_id: &str,
+    turns: TurnTrust<'_>,
 ) -> TimelineItemVm {
     let key = item.unique_id().0.clone();
     let TimelineItemKind::Event(ev) = item.kind() else {
@@ -392,15 +419,23 @@ pub fn item_to_vm(
                 // Neither media nor renderable text (e.g. location): render nothing.
                 (None, None) => return TimelineItemVm::Other { key },
             };
+            let (is_edited, max_body) = message_shape(
+                turns.is_turn(
+                    own_user_id,
+                    ev.sender(),
+                    ev.original_json().map(|raw| raw.json().get()),
+                ),
+                message.is_edited(),
+            );
             TimelineItemVm::Message {
                 key,
                 sender: ev.sender().to_string(),
                 sender_display_name,
-                body: truncate_body(body),
+                body: truncate_body(body, max_body),
                 timestamp: i64::from(ev.timestamp().0),
                 is_own: ev.is_own(),
                 send_state: ev.send_state().map(map_send_state),
-                is_edited: message.is_edited(),
+                is_edited,
                 reply: reply_preview(ev.content(), index),
                 reactions: reaction_groups(ev.content(), own_user_id),
                 media: media.map(Box::new),
@@ -491,6 +526,7 @@ fn map_diff_indexing(
     own_user_id: &UserId,
     account_id: &str,
     room_id: &str,
+    turns: TurnTrust<'_>,
 ) -> VectorDiff<TimelineItemVm> {
     match &diff {
         VectorDiff::Clear => index.clear(),
@@ -517,7 +553,7 @@ fn map_diff_indexing(
         | VectorDiff::Remove { .. }
         | VectorDiff::Truncate { .. } => {}
     }
-    diff.map(|item| item_to_vm(&item, index, own_user_id, account_id, room_id))
+    diff.map(|item| item_to_vm(&item, index, own_user_id, account_id, room_id, turns))
 }
 
 /// A boxed, `Send` timeline diff stream (the concrete `impl Stream` from
@@ -546,6 +582,10 @@ pub struct OpenTimeline {
     /// (Story 3.6, AD-4). Never a token or secret — the same opaque id the
     /// frontend already holds.
     account_id: String,
+    /// The room, for an agent session room's header reader.
+    room: Room,
+    /// The agent room this is, from its create type; `None` for every other.
+    agent: Option<AgentRoomKind>,
 }
 
 impl OpenTimeline {
@@ -585,8 +625,12 @@ pub async fn open_timeline(
     // exactly the items keeper renders — so each member's read position populates
     // the `readers` field of its latest-read message. Everything else about the
     // build (subscribe snapshot-then-diff, the shared `Arc<Timeline>`) is preserved.
+    // An agent room keeps the SDK's filter and drops the hosts' claim and host
+    // state (R33); every other room's filter is the SDK default exactly.
+    let agent = AgentRoomKind::of(room.room_type().as_ref());
     let timeline = TimelineBuilder::new(&room)
         .track_read_marker_and_receipts(TimelineReadReceiptTracking::MessageLikeEvents)
+        .event_filter(room::agent_event_filter(agent))
         .build()
         .await
         .map_err(|e| TimelineError::Build(e.to_string()))?;
@@ -597,27 +641,171 @@ pub async fn open_timeline(
         stream: Box::pin(stream),
         own_user_id,
         account_id: account_id.to_owned(),
+        room,
+        agent,
     })
+}
+
+/// The header beside an agent session room's timeline (R33): its reader,
+/// the newest answer anchor the caret may sit on, and the header last sent,
+/// so a batch carries one only when it changed.
+struct AgentHeader {
+    reader: HeaderReader,
+    own_user_id: OwnedUserId,
+    /// The newest answer anchor by origin time: `(ms, render key)`.
+    newest_turn: Option<(u64, String)>,
+    sent: Option<AgentRoomHeaderVm>,
+    kinds: Arc<AgentKinds>,
+    icons: Arc<AgentIcons>,
+}
+
+impl AgentHeader {
+    /// Who may stream an answer here: an agent of this session room, under
+    /// its power levels as the reader last read them.
+    fn turns(&self) -> TurnTrust<'_> {
+        TurnTrust {
+            kind: Some(AgentRoomKind::Session),
+            levels: self.reader.levels(),
+        }
+    }
+
+    /// Note the answer anchors among `items` (a snapshot when `reset`).
+    fn see(&mut self, items: &[&Arc<TimelineItem>], reset: bool) {
+        let held = if reset { None } else { self.newest_turn.take() };
+        let turns = self.turns();
+        let own = &self.own_user_id;
+        let seen = items.iter().filter_map(|item| {
+            let ev = item.as_event()?;
+            let json = ev.original_json().map(|raw| raw.json().get());
+            if !turns.is_turn(own, ev.sender(), json) {
+                return None;
+            }
+            Some((u64::from(ev.timestamp().0), item.unique_id().0.as_str()))
+        });
+        let newest = room::newest_turn(held, seen);
+        self.newest_turn = newest;
+    }
+
+    /// Note the answer anchors a diff carries.
+    fn see_diff(&mut self, diff: &VectorDiff<Arc<TimelineItem>>) {
+        match diff {
+            VectorDiff::Clear => self.newest_turn = None,
+            VectorDiff::Reset { values } => self.see(&values.iter().collect::<Vec<_>>(), true),
+            VectorDiff::Append { values } => self.see(&values.iter().collect::<Vec<_>>(), false),
+            VectorDiff::PushFront { value }
+            | VectorDiff::PushBack { value }
+            | VectorDiff::Insert { value, .. }
+            | VectorDiff::Set { value, .. } => self.see(&[value], false),
+            VectorDiff::PopFront
+            | VectorDiff::PopBack
+            | VectorDiff::Remove { .. }
+            | VectorDiff::Truncate { .. } => {}
+        }
+    }
+
+    /// The header when it differs from the one last sent.
+    async fn changed(&mut self) -> Option<AgentRoomHeaderVm> {
+        let header = self
+            .reader
+            .header(
+                &self.icons,
+                self.newest_turn.as_ref().map(|(_, key)| key.as_str()),
+            )
+            .await;
+        if self.sent.as_ref() == Some(&header) {
+            return None;
+        }
+        self.sent = Some(header.clone());
+        Some(header)
+    }
+}
+
+/// The next event-cache update, or never when there is no subscriber.
+async fn next_update(
+    updates: &mut Option<RoomEventCacheSubscriber>,
+) -> Result<RoomEventCacheUpdate, RecvError> {
+    match updates {
+        Some(updates) => updates.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The next change of the agents' marks, or never when there is no receiver.
+async fn next_mark_change(marks: &mut Option<watch::Receiver<u64>>) {
+    match marks {
+        Some(marks) => {
+            // The sender lives as long as the header holding the marks; a
+            // closed one has nothing more to say.
+            if marks.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// Emit the cached snapshot as a `Reset`, then forward each `VectorDiff` batch
 /// verbatim to `sink`.
 ///
+/// In an agent session room the header rides on the first batch, and on any
+/// later batch after it changed: a timeline diff that moves the caret, or an
+/// event-cache update carrying a status or scope, which the timeline never
+/// shows, or a change of the agents' marks, each sent as a batch with no ops
+/// (R33). `kinds` learns the session's kind for the room list; `icons` marks
+/// the agent with its soul's icon where its zone is on this device. A message
+/// is an agent's growing answer only from a sender with an agent's power
+/// under the room's levels as the header last read them.
+///
 /// The `Timeline` is kept alive for the whole loop — its drop handle cancels the
 /// SDK's background timeline tasks (AD-19). The producer breaks when the channel
 /// closes (`sink` returns `false`) or the stream ends.
-pub async fn forward_timeline(open: OpenTimeline, room_id: OwnedRoomId, sink: TimelineSink) {
+pub async fn forward_timeline(
+    open: OpenTimeline,
+    room_id: OwnedRoomId,
+    sink: TimelineSink,
+    kinds: Arc<AgentKinds>,
+    icons: Arc<AgentIcons>,
+) {
     let OpenTimeline {
         timeline,
         initial,
         mut stream,
         own_user_id,
         account_id,
+        room,
+        agent,
     } = open;
 
     // The room id string is stable for the whole producer; capture it once for the
     // media-URL coordinates threaded into every mapped item.
     let room_id_str = room_id.to_string();
+
+    // A session room's header, and the event-cache subscription that keeps it
+    // current. The subscriber is taken before the cache is read, so no update
+    // falls between the read and the first `recv`.
+    let (mut header, mut updates, mut marks, _cache_handles) =
+        if agent == Some(AgentRoomKind::Session) {
+            let (updates, handles) = match room.event_cache().await {
+                Ok((cache, handles)) => match cache.subscribe().await {
+                    Ok((_, updates)) => (Some(updates), Some(handles)),
+                    Err(_) => (None, Some(handles)),
+                },
+                Err(_) => (None, None),
+            };
+            let marks = icons.subscribe();
+            let reader = HeaderReader::open(room.clone(), &kinds).await;
+            let header = AgentHeader {
+                reader,
+                own_user_id: own_user_id.clone(),
+                newest_turn: None,
+                sent: None,
+                kinds,
+                icons,
+            };
+            (Some(header), updates, Some(marks), handles)
+        } else {
+            (None, None, None, None)
+        };
 
     // The producer-owned `event_id → unique_id` index. Built from the snapshot,
     // then kept current across each diff so a reply resolves an earlier-mapped
@@ -627,33 +815,103 @@ pub async fn forward_timeline(open: OpenTimeline, room_id: OwnedRoomId, sink: Ti
         index_item(&mut index, item);
     }
 
+    let turns = header
+        .as_ref()
+        .map_or_else(TurnTrust::default, AgentHeader::turns);
     let reset = TimelineOp::Reset {
         items: initial
             .iter()
-            .map(|i| item_to_vm(i, &index, &own_user_id, &account_id, &room_id_str))
+            .map(|i| item_to_vm(i, &index, &own_user_id, &account_id, &room_id_str, turns))
             .collect(),
     };
-    if !sink(TimelineBatch { ops: vec![reset] }) {
+    let first_header = match &mut header {
+        Some(header) => {
+            header.see(&initial.iter().collect::<Vec<_>>(), true);
+            header.changed().await
+        }
+        None => None,
+    };
+    if !sink(TimelineBatch {
+        ops: vec![reset],
+        header: first_header,
+    }) {
         tracing::info!(room_id = %room_id, "timeline channel closed before first batch");
         return;
     }
 
-    while let Some(diffs) = stream.next().await {
-        let ops = diffs
-            .into_iter()
-            .map(|d| {
-                timeline_diff_to_op(map_diff_indexing(
-                    d,
-                    &mut index,
-                    &own_user_id,
-                    &account_id,
-                    &room_id_str,
-                ))
-            })
-            .collect();
-        if !sink(TimelineBatch { ops }) {
-            tracing::info!(room_id = %room_id, "timeline channel closed, stopping producer");
-            break;
+    loop {
+        tokio::select! {
+            diffs = stream.next() => {
+                let Some(diffs) = diffs else {
+                    break;
+                };
+                if let Some(header) = &mut header {
+                    for diff in &diffs {
+                        header.see_diff(diff);
+                    }
+                }
+                let turns = header
+                    .as_ref()
+                    .map_or_else(TurnTrust::default, AgentHeader::turns);
+                let ops = diffs
+                    .into_iter()
+                    .map(|d| {
+                        timeline_diff_to_op(map_diff_indexing(
+                            d,
+                            &mut index,
+                            &own_user_id,
+                            &account_id,
+                            &room_id_str,
+                            turns,
+                        ))
+                    })
+                    .collect();
+                let changed = match &mut header {
+                    Some(header) => header.changed().await,
+                    None => None,
+                };
+                if !sink(TimelineBatch { ops, header: changed }) {
+                    tracing::info!(room_id = %room_id, "timeline channel closed, stopping producer");
+                    break;
+                }
+            }
+            update = next_update(&mut updates) => {
+                let Some(header) = &mut header else {
+                    continue;
+                };
+                match update {
+                    Ok(update) => {
+                        if !header.reader.update(&update, &header.kinds).await {
+                            continue;
+                        }
+                    }
+                    // Missed updates: read the header again from the cache.
+                    Err(RecvError::Lagged(_)) => {
+                        header.reader = HeaderReader::open(room.clone(), &header.kinds).await;
+                    }
+                    Err(RecvError::Closed) => {
+                        updates = None;
+                        continue;
+                    }
+                }
+                if let Some(changed) = header.changed().await {
+                    if !sink(TimelineBatch { ops: Vec::new(), header: Some(changed) }) {
+                        tracing::info!(room_id = %room_id, "timeline channel closed, stopping producer");
+                        break;
+                    }
+                }
+            }
+            () = next_mark_change(&mut marks) => {
+                let Some(header) = &mut header else {
+                    continue;
+                };
+                if let Some(changed) = header.changed().await {
+                    if !sink(TimelineBatch { ops: Vec::new(), header: Some(changed) }) {
+                        tracing::info!(room_id = %room_id, "timeline channel closed, stopping producer");
+                        break;
+                    }
+                }
+            }
         }
     }
     tracing::info!(room_id = %room_id, "timeline stream ended");
@@ -1159,14 +1417,89 @@ mod tests {
     #[test]
     fn truncate_body_caps_long_bodies_by_char() {
         let long = "é".repeat(MAX_BODY_CHARS + 100);
-        let out = truncate_body(long);
+        let out = truncate_body(long, MAX_BODY_CHARS);
         assert_eq!(out.chars().count(), MAX_BODY_CHARS);
         assert!(out.chars().all(|c| c == 'é'));
     }
 
     #[test]
     fn truncate_body_keeps_short_bodies() {
-        assert_eq!(truncate_body("hello".to_owned()), "hello");
+        assert_eq!(truncate_body("hello".to_owned(), MAX_BODY_CHARS), "hello");
+    }
+
+    fn turn_json() -> String {
+        serde_json::json!({
+            "type": "m.room.message", "sender": "@nixi:example.org",
+            "content": {
+                "msgtype": "m.text", "body": "…",
+                "dev.keeper.agent.turn": {"session": "s", "line": "l"},
+            },
+        })
+        .to_string()
+    }
+
+    /// A message's shape in an agent session room where Nixi holds an
+    /// agent's power and the own user 100: `(is_edited, cap)` of an edited
+    /// message from `sender` whose original is `json`.
+    fn shape_in_session(sender: &str, json: Option<&str>) -> (bool, usize) {
+        let levels = crate::agents::room::power_levels_for(&[
+            ("@nixi:example.org", 50),
+            ("@tgorka:example.org", 100),
+        ]);
+        let turns = TurnTrust {
+            kind: Some(AgentRoomKind::Session),
+            levels: Some(&levels),
+        };
+        let own = UserId::parse("@tgorka:example.org").expect("user");
+        let sender = UserId::parse(sender).expect("user");
+        message_shape(turns.is_turn(&own, &sender, json), true)
+    }
+
+    #[test]
+    fn an_agents_own_stream_is_not_marked_edited() {
+        let turn = turn_json();
+        let plain = r#"{"type":"m.room.message","content":{"msgtype":"m.text","body":"hi"}}"#;
+        // An answer's anchor from the agent: one message, however many edits.
+        assert_eq!(
+            shape_in_session("@nixi:example.org", Some(&turn)),
+            (false, MAX_TURN_BODY_CHARS)
+        );
+        // The agent's own edited message without the marker keeps its mark.
+        assert_eq!(
+            shape_in_session("@nixi:example.org", Some(plain)),
+            (true, MAX_BODY_CHARS)
+        );
+        // A person's marked message is a person's message: edited, and capped.
+        assert_eq!(
+            shape_in_session("@marta:example.org", Some(&turn)),
+            (true, MAX_BODY_CHARS)
+        );
+        assert_eq!(
+            shape_in_session("@tgorka:example.org", Some(&turn)),
+            (true, MAX_BODY_CHARS)
+        );
+        // Outside an agent session room the marker means nothing.
+        let own = UserId::parse("@tgorka:example.org").expect("user");
+        let nixi = UserId::parse("@nixi:example.org").expect("user");
+        let ordinary = TurnTrust::default().is_turn(&own, &nixi, Some(&turn));
+        assert_eq!(message_shape(ordinary, true), (true, MAX_BODY_CHARS));
+    }
+
+    #[test]
+    fn an_answer_is_cut_at_the_hosts_cut_not_the_message_cap() {
+        // The longest final answer a host sends: its cut and the artifact sentence.
+        let answer = format!(
+            "{}\n\nThe full answer is in artifacts/answer-01J.md",
+            "a".repeat(FINAL_CUT_BYTES)
+        );
+        let (_, turn_cap) = message_shape(true, true);
+        assert_eq!(truncate_body(answer.clone(), turn_cap), answer);
+        let (_, message_cap) = message_shape(false, false);
+        assert_eq!(message_cap, MAX_BODY_CHARS);
+        assert_eq!(
+            truncate_body(answer, message_cap).chars().count(),
+            MAX_BODY_CHARS
+        );
     }
 
     #[test]
