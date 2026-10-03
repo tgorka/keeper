@@ -6660,6 +6660,7 @@ impl BotToolCallVm {
                 vm.refusal = Some(reason.clone());
             }
             Some(ToolOutcome::Refused { .. }) => {}
+            Some(ToolOutcome::Answered { .. }) => {}
             None => {}
         }
         vm
@@ -6699,6 +6700,9 @@ impl BotToolOutcomeKind {
             ToolOutcome::NotMaterialized { .. } => Self::NotMaterialized,
             ToolOutcome::Wrote { .. } => Self::Wrote,
             ToolOutcome::Refused { .. } => Self::Refused,
+            // No ⌘9 row holds one (only an agent's host answers so); its
+            // words are text.
+            ToolOutcome::Answered { .. } => Self::Text,
         }
     }
 }

@@ -117,6 +117,8 @@ import type {
   SessionSpaceFileVm,
   SessionSpaceVm,
   SpacesSnapshot,
+  SurfaceAnswerReq,
+  SurfaceRequestVm,
   SyncFootprintVm,
   SyncProblemsVm,
   SyncProfileReq,
@@ -4497,6 +4499,104 @@ function mockConversationNew(payload: Record<string, unknown>): Promise<string> 
   return Promise.resolve(`$request-${n}:example.org`);
 }
 
+// ---------------------------------------------------------------------------
+// Surface requests (91.3, UX-DR131). `agent_surface_subscribe` streams the
+// requests `?surface=` names, comma-separated, 1.5 s apart, from Nixi's DM —
+// `open` (note n2 at "## Log", body lines 5–6), `highlight` (line 3),
+// `point` (line 5), `scroll` (to "## Carried forward", line 7), `propose`
+// (lines 3–4, `expected` as the note holds them), `stale` (a proposal whose
+// `expected` the buffer no longer holds: answer `unavailable`), `top` (an
+// open whose heading was not found: no range) and `file` (a file outside
+// every vault: the Files preview). Each expires 60 s after it is sent.
+// `agent_surface_result` keeps the answers in
+// `window.__keeperMockSurfaceResults`; `agent_presence_view` the views in
+// `window.__keeperMockPresenceViews`.
+// ---------------------------------------------------------------------------
+
+const MOCK_ACCOUNT = "01J8ACCOUNTMOCKAAAAAAAAAAA";
+const N2 = { kind: "note" as const, vaultId: "v1", noteId: "n2" };
+
+function surfaceRequest(name: string, n: number): SurfaceRequestVm | null {
+  const base = {
+    accountId: MOCK_ACCOUNT,
+    roomId: DM_ROOM,
+    requestId: `01JSURFACE${n}`,
+    target: N2,
+    heading: null,
+    range: null,
+    text: null,
+    expected: null,
+    expiresAtMs: Date.now() + 60_000,
+  };
+  switch (name) {
+    case "open":
+      return { ...base, tool: "open", heading: "Log", range: { from: 5, to: 6 } };
+    case "top":
+      return { ...base, tool: "open", heading: "Budget" };
+    case "highlight":
+      return { ...base, tool: "highlight", range: { from: 3, to: 3 } };
+    case "point":
+      return { ...base, tool: "point", range: { from: 5, to: 5 } };
+    case "scroll":
+      return { ...base, tool: "scroll", heading: "Carried forward", range: { from: 7, to: 7 } };
+    case "propose":
+      return {
+        ...base,
+        tool: "propose_edit",
+        range: { from: 3, to: 4 },
+        text: "## Focus\n\nShip the surface tools.",
+        expected: "## Focus\n",
+      };
+    case "stale":
+      return {
+        ...base,
+        tool: "propose_edit",
+        range: { from: 3, to: 4 },
+        text: "## Focus\n\nShip it.",
+        expected: "## Something the note no longer says\n",
+      };
+    case "file":
+      return {
+        ...base,
+        tool: "open",
+        target: { kind: "file", profileId: "p1", relativePath: "media/talk.txt" },
+      };
+    default:
+      return null;
+  }
+}
+
+const surfaceResults: Array<{ accountId: string; roomId: string; answer: SurfaceAnswerReq }> = [];
+const presenceViews: string[] = [];
+(
+  window as unknown as {
+    __keeperMockSurfaceResults: typeof surfaceResults;
+    __keeperMockPresenceViews: typeof presenceViews;
+  }
+).__keeperMockSurfaceResults = surfaceResults;
+(
+  window as unknown as { __keeperMockPresenceViews: typeof presenceViews }
+).__keeperMockPresenceViews = presenceViews;
+
+function mockSurfaceSubscribe(payload: Record<string, unknown>): null {
+  const channel = payload.channel as MockChannel<SurfaceRequestVm>;
+  const names = (new URLSearchParams(window.location.search).get("surface") ?? "")
+    .split(",")
+    .filter(Boolean);
+  names.forEach((name, index) => {
+    setTimeout(
+      () => {
+        const request = surfaceRequest(name, index + 1);
+        if (request) {
+          channel.onmessage?.({ ...request, expiresAtMs: Date.now() + 60_000 });
+        }
+      },
+      1500 * (index + 1),
+    );
+  });
+  return null;
+}
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   inbox_subscribe: subscribeMockInbox,
   agent_rooms_list: (payload) =>
@@ -4516,6 +4616,19 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       return null;
     }),
   agent_conversation_new: mockConversationNew,
+  agent_surface_subscribe: mockSurfaceSubscribe,
+  agent_surface_result: (payload) => {
+    surfaceResults.push({
+      accountId: String(payload.accountId),
+      roomId: String(payload.roomId),
+      answer: payload.answer as SurfaceAnswerReq,
+    });
+    return null;
+  },
+  agent_presence_view: (payload) => {
+    presenceViews.push(String(payload.view));
+    return null;
+  },
   timeline_subscribe: subscribeMockTimeline,
   timeline_unsubscribe: (payload) => {
     const id = Number(payload.subscriptionId);

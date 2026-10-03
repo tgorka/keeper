@@ -497,10 +497,12 @@ impl AgentDeps {
     }
 }
 
-/// A tool host that refuses any tool outside `[tools].allow`.
+/// A tool host that refuses any tool outside `[tools].allow`, and serves the
+/// agent's surface tools itself (R38: no ⌘9 host has them).
 struct AllowedTools {
     inner: Box<dyn ToolHost>,
     allow: Vec<String>,
+    surface: Option<crate::surface::SurfaceTools>,
 }
 
 impl ToolHost for AllowedTools {
@@ -513,6 +515,18 @@ impl ToolHost for AllowedTools {
         }
         self.inner.run(call)
     }
+
+    fn run_named(&self, wire: &chat::ToolCall) -> Option<ToolOutcome> {
+        if !crate::surface::is_surface(&wire.name) {
+            return None;
+        }
+        match &self.surface {
+            Some(surface) => surface.run(wire),
+            None => Some(ToolOutcome::Refused {
+                reason: format!("{} is not one of this agent's tools.", wire.name),
+            }),
+        }
+    }
 }
 
 /// One served session: its context and its writer.
@@ -522,6 +536,9 @@ pub struct ServedSession {
     /// Where a `main` session makes the conversations its person asks for
     /// (R36); `None` serves no such request.
     pub conversations: Option<Arc<dyn ConversationPort>>,
+    /// Where the session's surface calls go (AD-383); `None`: every one is
+    /// `unavailable`.
+    pub surface: Option<Arc<dyn crate::surface::SurfacePort>>,
 }
 
 /// A boxed room-creating future.
@@ -757,6 +774,7 @@ impl ServedSession {
             context,
             writer,
             conversations: None,
+            surface: None,
         })
     }
 
@@ -1213,6 +1231,7 @@ impl ServedSession {
             &sink,
             &board,
             stop,
+            self.surface.clone(),
         )
         .await;
         let stream_end = Instant::now();
@@ -1471,10 +1490,20 @@ pub async fn arm_agent(
         probe == Probe::Ask,
     )
     .await;
+    // Whether this model is offered tools at all: the surface tools ride on
+    // the same offer, and a model that cannot call tools is told of none.
+    let tools_offered = !armed.request.tools.is_empty();
     armed
         .request
         .tools
         .retain(|spec| config.allow.contains(&spec.name));
+    // The surface tools are the agent's own, never a drive verb's spec.
+    if tools_offered {
+        armed
+            .request
+            .tools
+            .extend(crate::surface::specs(&crate::surface::offered(config)));
+    }
     armed
 }
 
@@ -1509,6 +1538,7 @@ async fn run_agent_turn(
     sink: &MatrixSink,
     board: &StatusBoard,
     stop: CancelSignal,
+    surface_port: Option<Arc<dyn crate::surface::SurfacePort>>,
 ) -> Ran {
     let config = &deps.home.config;
     let local = deps.model_is_local();
@@ -1553,6 +1583,19 @@ async fn run_agent_turn(
         Ok(client) => client,
         Err(error) => return failed(error.to_string()),
     };
+    let offered = crate::surface::offered(config);
+    let surface = crate::surface::person(config)
+        .filter(|_| !offered.is_empty())
+        .map(|person| crate::surface::SurfaceTools {
+            port: surface_port,
+            person: person.clone(),
+            offered,
+            profiles: armed.profiles.clone(),
+            scope: context.scope.clone(),
+            stop: stop.clone(),
+            wait: keeper_core::agents::events::SURFACE_WAIT,
+            lines: Mutex::new(Vec::new()),
+        });
     let host = AllowedTools {
         inner: armed.drive.host(
             HostIds {
@@ -1566,6 +1609,7 @@ async fn run_agent_turn(
             stop.clone(),
         ),
         allow: config.allow.clone(),
+        surface,
     };
     let tool_loop = ToolLoop {
         client: &client,
@@ -1632,7 +1676,11 @@ async fn run_agent_turn(
                 call_id: wire.id.clone(),
                 tool: wire.name.clone(),
                 args: wire.arguments_raw.clone(),
-                tier: tier(record.name),
+                tier: if crate::surface::is_surface(&wire.name) {
+                    crate::surface::TIER
+                } else {
+                    tier(record.name)
+                },
                 grant_id: None,
             }),
         );
@@ -1665,6 +1713,14 @@ async fn run_agent_turn(
                 label: result_label,
             }),
         );
+        let surfaced = host
+            .surface
+            .as_ref()
+            .map(crate::surface::SurfaceTools::take_lines)
+            .unwrap_or_default();
+        for line in surfaced {
+            log.write(call_line, LineBody::Surface(line));
+        }
         if let Some((label, path)) = read {
             let joined = log.context.label.join(&label);
             if joined != log.context.label {

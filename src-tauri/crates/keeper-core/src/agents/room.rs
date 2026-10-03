@@ -399,6 +399,8 @@ pub struct AgentRoomState {
     own: OwnedUserId,
     status: Option<(u64, StatusRead)>,
     scope: Option<(u64, ScopeRead)>,
+    /// Who sent the newest scope.
+    scope_by: Option<OwnedUserId>,
 }
 
 impl AgentRoomState {
@@ -408,6 +410,7 @@ impl AgentRoomState {
             own,
             status: None,
             scope: None,
+            scope_by: None,
         }
     }
 
@@ -449,6 +452,7 @@ impl AgentRoomState {
             let read = ScopeRead::of(content);
             let changed = self.scope.as_ref().map(|(_, held)| held) != Some(&read);
             self.scope = Some((ts, read));
+            self.scope_by = Some(sender);
             changed
         }
     }
@@ -483,6 +487,18 @@ impl AgentRoomState {
     pub fn title(&self) -> Option<&str> {
         match &self.status {
             Some((_, StatusRead::Read(status))) => Some(&status.title),
+            _ => None,
+        }
+    }
+
+    /// The drives `agent`'s own newest scope names (its host's echo);
+    /// `None` when the newest scope is someone else's or unreadable, or none
+    /// was read — the device then knows nothing of the agent's drives.
+    pub fn scope_drives_of(&self, agent: &UserId) -> Option<Vec<String>> {
+        match (&self.scope, &self.scope_by) {
+            (Some((_, ScopeRead::Read { drives, .. })), Some(by)) if by == agent => {
+                Some(drives.iter().map(|drive| drive.id.clone()).collect())
+            }
             _ => None,
         }
     }
@@ -965,6 +981,48 @@ mod tests {
             content["anchor"] = json!(anchor);
         }
         content
+    }
+
+    /// A surface request is acted on only over the drives the room's proxy
+    /// declares; on a phone those are the proxy's own newest scope echo —
+    /// never a scope another agent at 50 in the room sent — and none before
+    /// one is read, which the device then cannot check.
+    #[test]
+    fn the_drives_a_proxy_declares_are_its_own_scopes() {
+        let nixi = user(NIXI);
+        let tola = user("@tola:example.org");
+        let mut state = AgentRoomState::new(own());
+        assert_eq!(state.scope_drives_of(&nixi), None, "nothing read yet");
+        let scope = |sender: &str, ts: u64, drives: Value| {
+            json!({
+                "type": SCOPE, "event_id": format!("$s{ts}"), "sender": sender,
+                "origin_server_ts": ts,
+                "content": {"v": 1, "drives": drives, "set_by": PERSON},
+            })
+        };
+        assert!(state.apply(
+            &scope(NIXI, 10, json!([{"id": "tgdrive", "title": "tgdrive"}])),
+            &agents
+        ));
+        assert_eq!(
+            state.scope_drives_of(&nixi),
+            Some(vec!["tgdrive".to_owned()])
+        );
+        // Tola, another agent of the principal, sends a newer scope: it is
+        // the newest, and it is not Nixi's word.
+        assert!(state.apply(
+            &scope(
+                "@tola:example.org",
+                20,
+                json!([{"id": "marta-diary", "title": "Diary"}])
+            ),
+            &agents
+        ));
+        assert_eq!(state.scope_drives_of(&nixi), None);
+        assert_eq!(
+            state.scope_drives_of(&tola),
+            Some(vec!["marta-diary".to_owned()])
+        );
     }
 
     fn header(state: &AgentRoomState) -> AgentRoomHeaderVm {

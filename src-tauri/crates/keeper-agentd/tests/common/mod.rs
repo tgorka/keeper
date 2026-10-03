@@ -212,6 +212,59 @@ pub fn stub(answer: &'static str, pieces: usize, over: Duration) -> Stub {
     Stub { url, requests }
 }
 
+/// A model that answers its first chat request with one call of the tool
+/// `name` with `args`, and every later one with `answer`.
+pub fn tool_then(name: &'static str, args: Value, answer: &'static str) -> Stub {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let requests = Arc::new(Mutex::new(0));
+    let counted = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        for socket in listener.incoming() {
+            let Ok(mut socket) = socket else { continue };
+            let counted = Arc::clone(&counted);
+            let args = args.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(socket.try_clone().expect("clone"));
+                let mut first = String::new();
+                let _ = reader.read_line(&mut first);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                if !first.contains("/chat/completions") {
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    return;
+                }
+                let n = {
+                    let mut count = counted.lock().expect("lock");
+                    *count += 1;
+                    *count
+                };
+                let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+                let frame = if n == 1 {
+                    json!({"model":"stub","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]})
+                } else {
+                    json!({"model":"stub","choices":[{"index":0,"delta":{"content":answer},"finish_reason":"stop"}]})
+                };
+                let _ = write!(socket, "data: {frame}\n\ndata: [DONE]\n\n");
+            });
+        }
+    });
+    Stub { url, requests }
+}
+
 // ---------------------------------------------------------------------------
 // The drive and the host
 // ---------------------------------------------------------------------------

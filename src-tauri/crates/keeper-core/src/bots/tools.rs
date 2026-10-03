@@ -474,6 +474,13 @@ pub enum ToolOutcome {
         /// Rendered verbatim. keeper adds no words of its own.
         reason: String,
     },
+    /// A tool outside the drive's vocabulary answered: its words, verbatim
+    /// (an agent's surface call, AD-383). Never produced for a ⌘9 bot, whose
+    /// hosts serve the drive verbs alone.
+    Answered {
+        /// What the model is told.
+        text: String,
+    },
 }
 
 /// The impure half.
@@ -495,6 +502,14 @@ pub enum ToolOutcome {
 pub trait ToolHost: Send + Sync {
     /// Run one call.
     fn run(&self, call: &ToolCall) -> Result<ToolOutcome, BotsError>;
+
+    /// Run a call to a tool outside the drive's seven verbs that this host
+    /// serves by its own name, before the loop parses it as a drive verb;
+    /// `None` for every name it does not serve. No ⌘9 host serves any, so
+    /// what a bot is offered and may call stays [`tool_specs`]' (R38).
+    fn run_named(&self, _wire: &WireToolCall) -> Option<ToolOutcome> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,6 +1022,7 @@ pub fn render_result(outcome: &ToolOutcome) -> String {
             format!("Wrote {bytes} bytes to \"{subpath}\". {note}")
         }
         ToolOutcome::Refused { reason } => format!("Refused: {reason}"),
+        ToolOutcome::Answered { text } => text.clone(),
     };
     clip_result(text)
 }
@@ -1402,6 +1418,28 @@ fn run_one(
     wire: &WireToolCall,
     sink: ToolLoopSink<'_>,
 ) -> (ToolCallRecord, ToolOutcome) {
+    if let Some(outcome) = host.run_named(wire) {
+        sink(ToolLoopEvent::ToolStarted {
+            id: wire.id.clone(),
+            name: None,
+            display_path: None,
+        });
+        let refusal = match &outcome {
+            ToolOutcome::Refused { reason } => Some(reason.clone()),
+            _ => None,
+        };
+        return (
+            ToolCallRecord {
+                id: wire.id.clone(),
+                requested_name: wire.name.clone(),
+                name: None,
+                display_path: None,
+                refusal,
+                grant_denied: false,
+            },
+            outcome,
+        );
+    }
     let call = match parse_call(default_profile_id, wire) {
         Ok(call) => call,
         Err(reason) => {
@@ -1506,6 +1544,74 @@ mod tests {
             tool_specs(GrantMode::None).is_empty(),
             "no grant means no tools, which is what makes a toolless pane consistent"
         );
+    }
+
+    /// A host that serves one tool by its own name, as an agent's host
+    /// serves its surface tools.
+    struct Named;
+
+    impl ToolHost for Named {
+        fn run(&self, _: &ToolCall) -> Result<ToolOutcome, BotsError> {
+            Ok(ToolOutcome::Refused {
+                reason: "no drive here".to_owned(),
+            })
+        }
+
+        fn run_named(&self, wire: &WireToolCall) -> Option<ToolOutcome> {
+            (wire.name == "surface_open").then(|| ToolOutcome::Answered {
+                text: "done".to_owned(),
+            })
+        }
+    }
+
+    /// A host that serves the drive verbs alone, as every ⌘9 host does.
+    struct DriveOnly;
+
+    impl ToolHost for DriveOnly {
+        fn run(&self, _: &ToolCall) -> Result<ToolOutcome, BotsError> {
+            Ok(ToolOutcome::Refused {
+                reason: "no drive here".to_owned(),
+            })
+        }
+    }
+
+    /// R38: a ⌘9 bot is offered the seven drive verbs and nothing else, and
+    /// a surface tool's name reaches no ⌘9 host; only a host that serves a
+    /// name answers it, verbatim.
+    #[test]
+    fn the_bots_vocabulary_is_the_drives_seven_verbs() {
+        let names: Vec<String> = tool_specs(GrantMode::Write)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "drive_list",
+                "drive_read",
+                "drive_glob",
+                "drive_grep",
+                "drive_stat",
+                "drive_write",
+                "drive_edit"
+            ]
+        );
+        let wire = WireToolCall {
+            id: "call_0".to_owned(),
+            name: "surface_open".to_owned(),
+            arguments_raw: "{}".to_owned(),
+            arguments: Some(json!({})),
+        };
+        let (record, outcome) = run_one(&DriveOnly, "folder", &wire, &mut |_| {});
+        assert!(
+            matches!(&outcome, ToolOutcome::Refused { reason } if reason.starts_with("There is no tool called \"surface_open\"")),
+            "{outcome:?}"
+        );
+        assert_eq!(record.name, None);
+        let (record, outcome) = run_one(&Named, "folder", &wire, &mut |_| {});
+        assert_eq!(render_result(&outcome), "done");
+        assert_eq!((record.name, record.refusal), (None, None));
+        assert_eq!(record.requested_name, "surface_open");
     }
 
     #[test]

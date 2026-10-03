@@ -42,12 +42,16 @@ use std::time::Duration;
 
 use keeper_core::agents::agentd::{AgentdConfig, DrivePin};
 use keeper_core::agents::drive::{self, DriveDecl};
-use keeper_core::agents::events::{APPROVAL_DECISION, CONVERSATION_REQUEST, SCOPE, TURN};
+use keeper_core::agents::events::{
+    presence_levels, PresenceLevels, APPROVAL_DECISION, CONTROL_ROOM_TYPE, CONVERSATION_REQUEST,
+    PRESENCE, SCOPE, SURFACE_REQUEST, SURFACE_RESULT, TURN,
+};
 use keeper_core::agents::index::Index;
 use keeper_core::agents::label::{Label, Readers};
 use keeper_core::agents::log::{ClaimAction, HostSlug};
 use keeper_core::agents::matrix::{self, AgentClient, RoomKind};
 use keeper_core::agents::mount;
+use keeper_core::agents::presence::Published;
 use keeper_core::agents::session::{SessionAgent, SessionKind};
 use keeper_core::auth::StoredSession;
 use keeper_core::bots::chat::{self, CancelSignal};
@@ -79,6 +83,7 @@ use crate::headless::{
 use crate::hosts::HostRuntime;
 use crate::matrix_sink::{EditPort, RoomPort, SendFuture};
 use crate::rooms::{self, Arrival, Invite, InviteDecision, Known, KnownAgent};
+use crate::surface::{self, PresenceFuture, SurfacePort};
 use crate::turn::{DrivePorts, TurnEnv};
 use crate::zone::{active_sessions, read_text, read_zone, AgentHome, FoundSession, ZoneRead};
 
@@ -779,6 +784,7 @@ pub async fn run(
     let mut reported: HashSet<String> = HashSet::new();
     let mut last_scan: Option<Instant> = None;
     let mut stopped_by_itself = false;
+    let mut control_checked = false;
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -840,6 +846,27 @@ pub async fn run(
             hosts.scanned();
         }
         hosts.tick(&stop_signal).await;
+        // Once a copy has synced, a control room made before presence
+        // existed is brought up to date (R37).
+        if !control_checked && copies.iter().any(|copy| *copy.syncs.borrow() > 0) {
+            control_checked = true;
+            if let Some(room) = &config.homeserver.control_room {
+                let mut settled = false;
+                for copy in copies.iter().filter(|copy| *copy.syncs.borrow() > 0) {
+                    let me = copy.deps.home.config.matrix_user.clone();
+                    if update_control_room(&copy.client, room, &me).await {
+                        settled = true;
+                        break;
+                    }
+                }
+                if !settled {
+                    tracing::warn!(
+                        %room,
+                        "agentd: the control room does not let people publish their presence, and no agent here may change it; its creator's host must, or surface calls find no device"
+                    );
+                }
+            }
+        }
         status.publish(&config, &agentd.engine, &copies, &shadowed, &hosts);
     }
 
@@ -940,6 +967,11 @@ async fn serve_session(
     let deps = &copy.deps;
     let me = &deps.home.config.matrix_user;
     served.conversations = Some(Arc::new(ClientRooms(copy.client.clone())));
+    served.surface = Some(Arc::new(ClientSurface {
+        client: copy.client.clone(),
+        room: room_id.clone(),
+        known: Arc::clone(&copy.known),
+    }));
     let port: Arc<dyn EditPort> = Arc::new(RoomPort::new(copy.client.clone(), room_id));
     let (events, mut backlog) = read_back(&room, &mut served, me).await;
     // A taker's log may not hold the last holder's lines yet: what another
@@ -1026,6 +1058,93 @@ impl ConversationPort for ClientRooms {
                 Ok(Some(member)) if *member.membership() == MembershipState::Join
             )
         })
+    }
+}
+
+/// The copy's own client, carrying a session's surface calls (AD-383): the
+/// presences of the principal's control room — one a known agent made — and
+/// the session room the requests go into.
+struct ClientSurface {
+    client: AgentClient,
+    room: OwnedRoomId,
+    known: Arc<RwLock<Arc<Known>>>,
+}
+
+impl SurfacePort for ClientSurface {
+    fn room(&self) -> &RoomId {
+        &self.room
+    }
+
+    fn presences(&self) -> PresenceFuture<'_> {
+        Box::pin(async move {
+            let known = Arc::clone(&self.known.read().unwrap_or_else(|p| p.into_inner()));
+            let controls: Vec<OwnedRoomId> = self
+                .client
+                .client()
+                .joined_rooms()
+                .into_iter()
+                .filter(|room| {
+                    room.room_type()
+                        .is_some_and(|kind| kind.to_string() == CONTROL_ROOM_TYPE)
+                        && room.creators().is_some_and(|creators| {
+                            creators.iter().any(|creator| {
+                                known
+                                    .agents
+                                    .iter()
+                                    .any(|agent| agent.matrix_user == *creator)
+                            })
+                        })
+                })
+                .map(|room| room.room_id().to_owned())
+                .collect();
+            let mut presences = Vec::new();
+            for room in controls {
+                for (state_key, state) in self.client.cached_states(&room, PRESENCE).await {
+                    presences.push(Published {
+                        state_key,
+                        sender: state.sender,
+                        content: state.content,
+                    });
+                }
+            }
+            presences
+        })
+    }
+
+    fn request(&self, content: Value) -> SendFuture<'_> {
+        Box::pin(self.client.send(&self.room, SURFACE_REQUEST, content, None))
+    }
+}
+
+/// Bring the control room `room` up to date with R37 — the person's
+/// devices publish their presence at 0 — when `me` may. Whether that is
+/// settled: `false` only when `me` may not change the room's power levels.
+async fn update_control_room(client: &AgentClient, room: &RoomId, me: &UserId) -> bool {
+    let levels = match client.server_state(room, "m.room.power_levels", "").await {
+        Ok(Some(state)) => state.content,
+        Ok(None) => return true,
+        Err(error) => {
+            tracing::warn!(%room, %error, "agentd: the control room's power levels could not be read");
+            return true;
+        }
+    };
+    match presence_levels(&levels, me) {
+        PresenceLevels::UpToDate => true,
+        PresenceLevels::Update(updated) => {
+            match client
+                .send_state(room, "m.room.power_levels", "", &updated)
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(%room, "agentd: the control room now takes the person's presence")
+                }
+                Err(error) => {
+                    tracing::warn!(%room, %error, "agentd: the control room's power levels could not be updated")
+                }
+            }
+            true
+        }
+        PresenceLevels::NoPower => false,
     }
 }
 
@@ -1173,6 +1292,24 @@ fn register_handlers(copy: &Arc<Copy>) {
                 let Ok(value) = event.deserialize_as::<Value>() else {
                     return;
                 };
+                // A device's answer to a surface call goes to the call
+                // waiting on it, never to the session's worker, which that
+                // call is holding (R39).
+                if value["type"] == SURFACE_RESULT {
+                    let sender = value["sender"].as_str().and_then(|s| UserId::parse(s).ok());
+                    let taken = sender.is_some_and(|sender| {
+                        surface::deliver(
+                            room.room_id(),
+                            &sender,
+                            owner_signed(encryption.as_ref()),
+                            &value["content"],
+                        )
+                    });
+                    if !taken {
+                        tracing::debug!(room = %room.room_id(), "agentd: a surface result no call waits for is ignored");
+                    }
+                    return;
+                }
                 let Some(arrived) = arrival_of(&value, encryption.as_ref(), received_at) else {
                     return;
                 };

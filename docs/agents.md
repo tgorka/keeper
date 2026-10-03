@@ -1221,6 +1221,73 @@ like any other). What keeper and the proxy's host do for it:
   Anyone else's, or one from a device its owner never signed, is ignored and logged as a note.
   These events are not messages: they are outside the Undo-Send hold and the two message triggers.
 
+## What Nixi can do in your note
+
+An agent whose home drive only you read — your proxy, or another agent of yours whose audience is
+exactly you — has five more tools, which a ⌘9 bot never has: `surface_open` (a note, at a heading
+if it names one), `surface_highlight`, `surface_point`, `surface_scroll` (to a heading or to
+lines) and `surface_propose_edit`. They are offered only when the agent's `[tools].allow` names
+them (a proxy's defaults do, a steward's do not). What happens:
+
+- **Which device.** Each of your keeper clients publishes `dev.keeper.agent.presence` in the
+  control rooms your own proxies made — never a shared principal's, whose room you merely belong
+  to — keyed by its Matrix device id: whether keeper is in front, the platform and the primary view
+  — never a note, a path or a title, because state events are not encrypted. It goes out a second
+  after keeper comes to the front or leaves it (any of the Mac's windows focused — the main
+  window, the draft window, the voice pill — and once at launch; the iPhone's foreground), and
+  again every minute; each counts for three minutes. A keeper that quits or signs out says
+  `focused: false` first, within a second, so a call is not routed to a Mac that is gone. A call
+  goes to the device in front that renewed last; with none, the agent is told `unavailable` and
+  nothing is sent. A control room made before presence existed is brought up to date by its
+  creator's `keeper-agentd` on start (ruling R37).
+- **Lines.** The agent names lines as `drive_read` numbers them. The host reads the note on its
+  own checkout and turns them into the editor's lines, which do not count the frontmatter; a
+  range inside the frontmatter, past the end, or starting after it ends is refused before
+  anything is sent. A heading is matched on its text or its trail (`Plans › Q3`), exactly first,
+  then ignoring case; `surface_open` with a heading the note lacks opens it at the top and tells
+  the agent "no such heading".
+- **The request.** `dev.keeper.agent.surface.request` goes into the session room naming one
+  device and expiring a minute later; a proposal carries the replacing text and the lines' text as
+  the agent read them (`expected`, ruling R40). Only the named device acts, and only in one of
+  your own proxy's conversations (the room its status names it in, which it made, encrypted; the
+  `main` one your DM with it), only on a request from that proxy itself — every agent of a
+  principal holds the same power in its session rooms, and you may be in rooms another
+  principal's agent made, so power alone is not asked — once per event, and only within the
+  minute counted from when the server received it, so two devices' clocks never disagree about it;
+  one already past that is answered `expired`. The device acts only over the drives it knows the
+  proxy to have: the zone's `[tools].drives` where the zone is on it, else the drives the proxy's
+  last scope echo names; a phone that has read neither cannot check and acts on the proxy's word.
+  Anything the device will not show — a drive the proxy does not declare, a path that is not a
+  file, a note not indexed yet — is answered `unavailable` with one fixed sentence, "This device
+  cannot show that."; the reason stays in the device's log, so an answer is never a list of what
+  the device keeps. A path outside the drive is refused on the host in `keeper_sync::browse`'s
+  words; a file outside every notes vault opens in the Files preview.
+- **The answer.** The device answers `dev.keeper.agent.surface.result`: `done` (with `applied`
+  for a proposal), `declined`, `expired` or `unavailable`. The host takes it before the session's
+  turn queue — the turn is the one waiting for it — and only from you, on a device your identity
+  signed, naming the device it asked (ruling R39); anyone else's is ignored. Unanswered after 60 s,
+  the call is `expired`. Each call that sent a request is a `surface` line in the log (its id, the
+  tool, the device, the outcome); its tool call is logged at tier 1. The device sends an answer
+  only for a request it was handed, once; an answer that did not leave (offline for a second) is
+  the device's to send again, so an *Apply* already in the note is never reported `expired`.
+- **What you see.** The request switches to Notes and opens the note — in the panel already
+  showing it, else in a panel beside the one you had (the phone shows the note over whatever was
+  on screen); *open* puts the caret on the heading's line — unless you are typing in that editor,
+  in which case it only scrolls: the caret is what you type with — and *scroll* only scrolls. A highlight is
+  a band in the ring colour with an edge on its left, under a strip that says which lines and has
+  *Dismiss*; it stays until you dismiss it or the agent highlights something else. A point is a
+  pulse over the lines that fades in about two seconds. Neither touches the text or the undo
+  history, and nothing takes focus. A file outside every vault opens in the Files preview on the
+  Mac; the phone answers `unavailable`.
+- **A proposal is yours to apply.** The proposal is a strip beside the note's change bar, with the
+  lines it would replace struck through above the lines it would write. *Decline* changes
+  nothing. *Apply* replaces the lines in the editor as one undoable edit of yours, saved as your
+  typing is, and only while those lines still read `expected`; otherwise the agent is told
+  `unavailable`. A proposal that no longer matches when it arrives never shows; one left open
+  until the request expires is withdrawn and answered `expired`, and for three seconds the strip
+  says the agent stopped waiting, so a diff you were reading does not simply vanish. Nothing in
+  Rust writes the note for it.
+
 ## Which host answers
 
 An agent can have a copy on several hosts — `nixi@electra` on the server, `nixi@hesperia` on the

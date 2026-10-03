@@ -16,7 +16,7 @@
 //! says whose proxy it is and which drives its `[tools].drives` allows
 //! ([`AgentProxies`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::RwLock;
 
 use matrix_sdk::ruma::{EventId, OwnedUserId, UserId};
@@ -26,7 +26,8 @@ use ts_rs::TS;
 use ulid::Ulid;
 
 use crate::agents::events::{
-    ConversationRequestContent, ScopeContent, CONVERSATION_REQUEST, SCOPE,
+    ConversationRequestContent, ScopeContent, SurfaceResultContent, CONVERSATION_REQUEST, SCOPE,
+    SURFACE_RESULT,
 };
 use crate::agents::room::ScopeDriveVm;
 use crate::agents::session::SessionKind;
@@ -133,6 +134,9 @@ pub struct ProxyRoomRow {
     pub encrypted: bool,
     /// Whom the person's `m.direct` names for this room.
     pub direct_to: Vec<OwnedUserId>,
+    /// The drives the agent's own newest scope names (its host's echo);
+    /// `None` before one is read.
+    pub scope: Option<Vec<String>>,
 }
 
 /// Why a room is not one of the person's proxy conversations.
@@ -195,14 +199,75 @@ pub fn admits<'a>(
     Ok(Admitted { kind, agent, facts })
 }
 
+/// The proxy whose conversation a room is, and the drives it declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomProxy {
+    pub agent: OwnedUserId,
+    /// The drives this device knows the proxy to have; `None` where it
+    /// knows none (a phone before the proxy's host echoed a scope), so a
+    /// request's drive cannot be checked.
+    pub drives: Option<Vec<String>>,
+}
+
+/// The proxy whose conversation `row` is, when [`admits`] admits it, with
+/// the drives it declares: where this device keeps the proxy's agents zone,
+/// its `[tools].drives`; elsewhere (the phone), the drives its own scope
+/// names — the ones its host resolves a surface call within — and `None`
+/// before its host echoed one. A surface request is acted on only from that
+/// agent, and only over those drives where they are known.
+pub fn room_proxy(
+    row: &ProxyRoomRow,
+    me: &UserId,
+    proxies: &BTreeMap<OwnedUserId, ProxyFacts>,
+) -> Option<RoomProxy> {
+    let admitted = admits(row, me, proxies).ok()?;
+    let drives = match admitted.facts {
+        Some(facts) => Some(facts.allowed.iter().map(|drive| drive.id.clone()).collect()),
+        None => row.scope.clone(),
+    };
+    Some(RoomProxy {
+        agent: admitted.agent.to_owned(),
+        drives,
+    })
+}
+
+/// The agents that are `me`'s own proxies: the agent of each of `rows`
+/// [`admits`] admits, and each proxy whose zone on this device names `me`
+/// its human. Presence goes only into control rooms one of them made.
+pub fn own_proxies(
+    rows: &[ProxyRoomRow],
+    me: &UserId,
+    proxies: &BTreeMap<OwnedUserId, ProxyFacts>,
+) -> BTreeSet<OwnedUserId> {
+    rows.iter()
+        .filter_map(|row| admits(row, me, proxies).ok())
+        .map(|admitted| admitted.agent.to_owned())
+        .chain(
+            proxies
+                .iter()
+                .filter(|(_, facts)| facts.human == me)
+                .map(|(agent, _)| agent.clone()),
+        )
+        .collect()
+}
+
+/// Whether a control room made by `creators` is one of `me`'s own
+/// proxies' (`own`, [`own_proxies`]): its only creator is one of them. A
+/// control room of a principal the person merely belongs to is not.
+pub fn is_own_control_room(creators: &[OwnedUserId], own: &BTreeSet<OwnedUserId>) -> bool {
+    matches!(creators, [creator] if own.contains(creator))
+}
+
 /// What the dock may send into a proxy room: a closed set, each with its
 /// fixed event type. A scope (with or without drives, with the focus or
-/// none) and a request for a conversation — never a status, a claim, a turn
-/// or an approval decision, which are the agent's or the reader's own.
+/// none), a request for a conversation, and a surface result for a request
+/// this device was handed (91.3) — never a status, a claim, a turn or an
+/// approval decision, which are the agent's or the reader's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentOutbound {
     Scope(ScopeContent),
     ConversationRequest(ConversationRequestContent),
+    SurfaceResult(SurfaceResultContent),
 }
 
 impl AgentOutbound {
@@ -211,6 +276,7 @@ impl AgentOutbound {
         match self {
             AgentOutbound::Scope(_) => SCOPE,
             AgentOutbound::ConversationRequest(_) => CONVERSATION_REQUEST,
+            AgentOutbound::SurfaceResult(_) => SURFACE_RESULT,
         }
     }
 
@@ -219,6 +285,7 @@ impl AgentOutbound {
         match self {
             AgentOutbound::Scope(content) => serde_json::to_value(content),
             AgentOutbound::ConversationRequest(content) => serde_json::to_value(content),
+            AgentOutbound::SurfaceResult(content) => serde_json::to_value(content),
         }
     }
 }
@@ -337,6 +404,7 @@ mod tests {
             } else {
                 Vec::new()
             },
+            scope: None,
         }
     }
 
@@ -500,6 +568,109 @@ mod tests {
             Err(Refusal::SomeoneElses)
         );
         assert!(proxy_rooms(&[clear, made_by_marta, shared, hers], &me, &none).is_empty());
+    }
+
+    /// A surface request names a drive: the device acts only over the
+    /// drives the room's own proxy declares — its zone's `[tools].drives`
+    /// where the zone is here, else its own scope's echo — never over every
+    /// folder this device happens to sync. Before the host echoed a scope
+    /// the phone knows none, and says so rather than guessing.
+    #[test]
+    fn a_proxy_declares_its_zones_drives_else_its_own_scope() {
+        let me = user("@tgorka:example.org");
+        let marta = user("@marta:example.org");
+        let nixi = user("@nixi:example.org");
+        let fresh = row("!dm", Some(SessionKind::Main), &nixi, 10);
+        let dm = ProxyRoomRow {
+            scope: Some(drives(&["tgdrive"])),
+            ..fresh.clone()
+        };
+
+        // The phone: no zone, the scope Nixi's host echoed — or none yet.
+        assert_eq!(
+            room_proxy(&dm, &me, &BTreeMap::new()),
+            Some(RoomProxy {
+                agent: nixi.clone(),
+                drives: Some(drives(&["tgdrive"])),
+            })
+        );
+        assert_eq!(
+            room_proxy(&fresh, &me, &BTreeMap::new()),
+            Some(RoomProxy {
+                agent: nixi.clone(),
+                drives: None,
+            })
+        );
+        // The Mac: the zone's `[tools].drives`, whatever the scope says.
+        let zone = |human: &OwnedUserId| {
+            BTreeMap::from([(
+                nixi.clone(),
+                ProxyFacts {
+                    human: human.clone(),
+                    allowed: vec![
+                        ScopeDriveVm {
+                            id: "tgdrive".to_owned(),
+                            title: "tgdrive".to_owned(),
+                        },
+                        ScopeDriveVm {
+                            id: "neuradrive".to_owned(),
+                            title: "Neura".to_owned(),
+                        },
+                    ],
+                },
+            )])
+        };
+        assert_eq!(
+            room_proxy(&dm, &me, &zone(&me)).map(|proxy| proxy.drives),
+            Some(Some(drives(&["tgdrive", "neuradrive"])))
+        );
+        // Someone else's proxy, or a room `admits` refuses: no proxy at all.
+        assert_eq!(room_proxy(&dm, &me, &zone(&marta)), None);
+        let made_by_marta = ProxyRoomRow {
+            creators: vec![marta],
+            ..dm
+        };
+        assert_eq!(room_proxy(&made_by_marta, &me, &BTreeMap::new()), None);
+    }
+
+    /// A presence says whether the person is at their keyboard: it goes into
+    /// their own proxies' control rooms, never a shared principal's.
+    #[test]
+    fn presence_goes_only_into_my_own_proxys_control_room() {
+        let me = user("@tgorka:example.org");
+        let marta = user("@marta:example.org");
+        let nixi = user("@nixi:example.org");
+        let tola = user("@tola:example.org");
+        let lucyna = user("@lucyna:example.org");
+        let zone = BTreeMap::from([
+            (
+                tola.clone(),
+                ProxyFacts {
+                    human: me.clone(),
+                    allowed: Vec::new(),
+                },
+            ),
+            (
+                lucyna.clone(),
+                ProxyFacts {
+                    human: marta.clone(),
+                    allowed: Vec::new(),
+                },
+            ),
+        ]);
+        // Nixi by its DM; Tola by its zone; Lucyna's room is Marta's proxy's.
+        let rows = [
+            row("!dm", Some(SessionKind::Main), &nixi, 10),
+            row("!lucyna", Some(SessionKind::Conversation), &lucyna, 9),
+        ];
+        let own = own_proxies(&rows, &me, &zone);
+        assert_eq!(own, BTreeSet::from([nixi.clone(), tola.clone()]));
+
+        assert!(is_own_control_room(std::slice::from_ref(&nixi), &own));
+        assert!(is_own_control_room(std::slice::from_ref(&tola), &own));
+        assert!(!is_own_control_room(std::slice::from_ref(&lucyna), &own));
+        assert!(!is_own_control_room(&[marta, nixi], &own));
+        assert!(!is_own_control_room(&[], &own));
     }
 
     #[test]
