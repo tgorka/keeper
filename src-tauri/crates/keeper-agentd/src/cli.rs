@@ -1,4 +1,4 @@
-//! The command line: `init`, `login`, `agents list`, `run`, `status`.
+//! The command line: `init`, `login`, `agents list|init|new`, `run`, `status`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -69,6 +69,53 @@ pub enum Command {
 pub enum AgentsCommand {
     /// Every zone and home with its verdict.
     List,
+    /// Seed a drive's agents zone: guide, rules, _drive.toml, template and
+    /// the chosen agents, never over a file; then make the proxy's DM.
+    Init {
+        /// The drive's id, as agentd.toml's [[drives]] names it.
+        drive: String,
+        /// Catalogue agents to seed: nixi, tola-grey, lucyna-novak.
+        #[arg(long, value_delimiter = ',')]
+        with: Vec<String>,
+        /// The drive's owner, one of its readers.
+        #[arg(long)]
+        owner: String,
+        /// A reader of the drive; repeat for each.
+        #[arg(long = "reader", required = true)]
+        readers: Vec<String>,
+        /// The bot the seeded agents run on, `bot:<kind>:<base URL>#<model>`.
+        /// Required: keeper never picks one.
+        #[arg(long)]
+        bot: Option<String>,
+        /// The drive's agents may use only models on your own machines
+        /// (`_drive.toml`'s `local_only`): the bot must then be `ollama`.
+        #[arg(long)]
+        local_only: bool,
+        /// The drive's principal; agentd.toml's when it is left out.
+        #[arg(long)]
+        principal: Option<String>,
+        /// Write the zone into this checkout instead of agentd's own, and
+        /// make no DM.
+        #[arg(long)]
+        into: Option<PathBuf>,
+    },
+    /// Make a new agent from the zone's `_template/`.
+    New {
+        /// The new agent's id: its folder.
+        id: String,
+        /// Which mounted drive; needed when this host mounts more than one.
+        #[arg(long)]
+        drive: Option<String>,
+        /// The agent's name; the id when it is left out.
+        #[arg(long)]
+        name: Option<String>,
+        /// Write the soul from this BMAD agent skill's merged customization.
+        #[arg(long)]
+        from_bmad: Option<PathBuf>,
+        /// Make it in this checkout instead of agentd's own.
+        #[arg(long)]
+        into: Option<PathBuf>,
+    },
 }
 
 /// Why a verb failed, with its exit code.
@@ -161,6 +208,50 @@ pub fn run(cli: Cli) -> u8 {
         Command::Agents {
             command: AgentsCommand::List,
         } => crate::report::agents_list(&host),
+        Command::Agents {
+            command:
+                AgentsCommand::Init {
+                    drive,
+                    with,
+                    owner,
+                    readers,
+                    bot,
+                    local_only,
+                    principal,
+                    into,
+                },
+        } => crate::seed::init(
+            &host,
+            &crate::seed::InitArgs {
+                drive: &drive,
+                with: &with,
+                owner: &owner,
+                readers: &readers,
+                bot: bot.as_deref(),
+                local_only,
+                principal: principal.as_deref(),
+                into: into.as_deref(),
+            },
+        ),
+        Command::Agents {
+            command:
+                AgentsCommand::New {
+                    id,
+                    drive,
+                    name,
+                    from_bmad,
+                    into,
+                },
+        } => crate::seed::new(
+            &host,
+            &crate::seed::NewArgs {
+                id: &id,
+                drive: drive.as_deref(),
+                name: name.as_deref(),
+                from_bmad: from_bmad.as_deref(),
+                into: into.as_deref(),
+            },
+        ),
         Command::Run => serve(&host),
         Command::Status { session, no_probe } => {
             crate::report::status(&host, session.as_deref(), !no_probe)
@@ -176,9 +267,17 @@ pub fn run(cli: Cli) -> u8 {
     }
 }
 
-/// `run`: serve until SIGTERM or SIGINT.
+/// `run`: serve until SIGTERM or SIGINT, holding the copies' lock.
 fn serve(host: &Host) -> Result<(), CliError> {
     let config = host.config()?;
+    let _lock = crate::host_lock::take(&host.dirs.data, &config.host)
+        .map_err(|error| CliError::Failure(format!("{} cannot be locked: {error}", crate::host_lock::path(&host.dirs.data).display())))?
+        .map_err(|holder| {
+            CliError::Config(format!(
+                "keeper-agentd is already serving {}'s agents here ({}): one process at a time holds their copies.",
+                config.principal, holder.0
+            ))
+        })?;
     let secrets = host.harden(&config)?;
     let dirs = XdgDirs {
         config: host.dirs.config.clone(),

@@ -288,9 +288,7 @@ impl AgentClient {
             .map_err(from_sdk)
     }
 
-    /// Create a typed, encrypted room, inviting `invite`, with `agents` at 50:
-    /// a session room's power levels from [`events::power_levels`], a control
-    /// room's from [`events::control_power_levels`].
+    /// Create a typed, encrypted room as [`create_room_request`] makes it.
     pub async fn create_room(
         &self,
         kind: RoomKind,
@@ -303,25 +301,8 @@ impl AgentClient {
             .user_id()
             .ok_or_else(|| AgentMatrixError::Other("not signed in".to_owned()))?
             .to_owned();
-        let mut request = create_room::v3::Request::new();
-        request.name = Some(name.to_owned());
-        request.invite = invite;
-        request.preset = Some(create_room::v3::RoomPreset::PrivateChat);
-        let room_type = match &kind {
-            RoomKind::Session(_) => SESSION_ROOM_TYPE,
-            RoomKind::Control => CONTROL_ROOM_TYPE,
-        };
-        request.creation_content = Some(raw(&json!({ "type": room_type }))?);
-        request.initial_state = vec![raw(&json!({
-            "type": "m.room.encryption",
-            "state_key": "",
-            "content": { "algorithm": "m.megolm.v1.aes-sha2" },
-        }))?];
-        let levels = match kind {
-            RoomKind::Session(session) => events::power_levels(session, &me, agents),
-            RoomKind::Control => events::control_power_levels(&me, agents),
-        };
-        request.power_level_content_override = Some(raw(&levels)?);
+        let request = create_room_request(&kind, name, invite, &me, agents)?;
+        // The SDK also records a direct room in the creator's `m.direct`.
         let room = self.client.create_room(request).await.map_err(from_sdk)?;
         Ok(room.room_id().to_owned())
     }
@@ -456,6 +437,41 @@ fn raw<T>(value: &Value) -> Result<Raw<T>, AgentMatrixError> {
         .map_err(|err| AgentMatrixError::Other(format!("could not encode the event: {err}")))
 }
 
+/// The `createRoom` request for a typed, encrypted room, inviting `invite`,
+/// with `creator` at 100 and `agents` at 50: a session room's power levels
+/// from [`events::power_levels`], a control room's from
+/// [`events::control_power_levels`]. A `main` session room is a proxy's DM
+/// with its person (AD-372), so it is `is_direct`; no other room is.
+pub fn create_room_request(
+    kind: &RoomKind,
+    name: &str,
+    invite: Vec<OwnedUserId>,
+    creator: &UserId,
+    agents: &[OwnedUserId],
+) -> Result<create_room::v3::Request, AgentMatrixError> {
+    let mut request = create_room::v3::Request::new();
+    request.name = Some(name.to_owned());
+    request.invite = invite;
+    request.preset = Some(create_room::v3::RoomPreset::PrivateChat);
+    request.is_direct = *kind == RoomKind::Session(SessionKind::Main);
+    let room_type = match kind {
+        RoomKind::Session(_) => SESSION_ROOM_TYPE,
+        RoomKind::Control => CONTROL_ROOM_TYPE,
+    };
+    request.creation_content = Some(raw(&json!({ "type": room_type }))?);
+    request.initial_state = vec![raw(&json!({
+        "type": "m.room.encryption",
+        "state_key": "",
+        "content": { "algorithm": "m.megolm.v1.aes-sha2" },
+    }))?];
+    let levels = match kind {
+        RoomKind::Session(session) => events::power_levels(*session, creator, agents),
+        RoomKind::Control => events::control_power_levels(creator, agents),
+    };
+    request.power_level_content_override = Some(raw(&levels)?);
+    Ok(request)
+}
+
 #[cfg(test)]
 mod tests {
     use matrix_sdk::ruma::api::error::Error as ClientApiError;
@@ -473,6 +489,68 @@ mod tests {
             .expect("response");
         let error = ClientApiError::from_http_response(response);
         classify(error.error_kind(), false, error.to_string())
+    }
+
+    /// The DM `agents init` makes and a room made for a delegated session,
+    /// through the one request builder (F1, R46): only the DM is direct, and
+    /// only the DM lets the person talk and set the scope in clear. A
+    /// person's state write is refused in both (`state_default` 50), which
+    /// the live test against Synapse proves.
+    #[test]
+    fn only_the_main_room_is_a_dm_where_the_person_talks() {
+        let nixi = UserId::parse("@nixi:example.org").expect("user");
+        let person = UserId::parse("@tgorka:example.org").expect("user");
+        let request = |kind: SessionKind| {
+            create_room_request(
+                &RoomKind::Session(kind),
+                "nixi",
+                vec![person.clone()],
+                &nixi,
+                &[],
+            )
+            .expect("request")
+        };
+        let content = |request: &create_room::v3::Request| -> Value {
+            serde_json::from_str(
+                request
+                    .power_level_content_override
+                    .as_ref()
+                    .expect("levels")
+                    .json()
+                    .get(),
+            )
+            .expect("json")
+        };
+
+        let dm = request(SessionKind::Main);
+        assert!(dm.is_direct);
+        assert_eq!(dm.invite, vec![person.clone()]);
+        let created: Value =
+            serde_json::from_str(dm.creation_content.as_ref().expect("create").json().get())
+                .expect("json");
+        assert_eq!(created["type"], SESSION_ROOM_TYPE);
+        let levels = content(&dm);
+        assert_eq!(levels["events"]["m.room.message"], 0);
+        assert_eq!(levels["events"][events::SCOPE], 0);
+        assert_eq!(levels["users"][nixi.as_str()], 100);
+        assert_eq!(levels["users_default"], 0);
+        assert_eq!(levels["state_default"], 50);
+
+        let delegated = request(SessionKind::Delegated);
+        assert!(!delegated.is_direct);
+        let levels = content(&delegated);
+        assert!(levels["events"].get("m.room.message").is_none());
+        assert!(levels["events"].get(events::SCOPE).is_none());
+        assert_eq!(levels["events"][events::APPROVAL_DECISION], 0);
+        assert_eq!(levels["state_default"], 50);
+
+        for kind in [SessionKind::Conversation, SessionKind::Scheduled] {
+            assert!(!request(kind).is_direct, "{kind}");
+        }
+        let control =
+            create_room_request(&RoomKind::Control, "c", vec![person.clone()], &nixi, &[])
+                .expect("control");
+        assert!(!control.is_direct);
     }
 
     #[test]

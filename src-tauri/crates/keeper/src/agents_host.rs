@@ -17,8 +17,12 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use keeper_agent::desktop::{self, DesktopFacts, DesktopHost, TickGate};
+use keeper_agent::seed as seeding;
 use keeper_core::agents::copy::{self, AgentCopyVm, AgentPinReq};
 use keeper_core::agents::pins;
+use keeper_core::agents::seed::{
+    self, AgentSeedOfferVm, AgentSeedPlanVm, AgentSeedReq, AgentSeedResultVm,
+};
 use keeper_core::bots::store;
 use keeper_core::platform::Platform;
 use keeper_core::registry;
@@ -362,6 +366,80 @@ pub async fn agents_drive_repin(
     .map_err(|error| refusal(error.to_string()))??;
     let facts = facts_now(&state).await?;
     rows(&state, facts).await
+}
+
+/// Settings › Agents › *Set up agents* (UX-DR133): every synced folder that
+/// keeps agents, with what its form starts from, the catalogue, and the
+/// person's own bots — none chosen for them (S-20).
+#[tauri::command]
+pub async fn agents_seed_offer(state: State<'_, AppState>) -> Result<AgentSeedOfferVm, IpcError> {
+    let facts = facts_now(&state).await?;
+    let dir = data_dir(platform_of(&state).as_ref())?;
+    tokio::task::spawn_blocking(move || {
+        let providers = store::list_providers(&dir)
+            .map(|l| l.rows)
+            .unwrap_or_default();
+        let bots = store::list_bots(&dir).unwrap_or_default();
+        let accounts: Vec<String> = facts
+            .homeservers
+            .iter()
+            .map(|(user, _)| user.clone())
+            .collect();
+        seeding::offer(
+            &facts.profiles,
+            &facts.pins,
+            &accounts,
+            facts.login.as_deref(),
+            seed::bot_choices(&providers, &bots),
+        )
+    })
+    .await
+    .map_err(|error| refusal(error.to_string()))
+}
+
+/// What `req` would write into its folder's agents zone and what it would
+/// leave; refused, with its sentence, when the zone would host nothing.
+#[tauri::command]
+pub async fn agents_seed_plan(
+    state: State<'_, AppState>,
+    req: AgentSeedReq,
+) -> Result<AgentSeedPlanVm, IpcError> {
+    let facts = facts_now(&state).await?;
+    tokio::task::spawn_blocking(move || {
+        let (choices, zone) = seeding::desktop_choices(
+            &facts.profiles,
+            facts.pins.get(&req.profile_id),
+            facts.login.as_deref(),
+            &req,
+        )
+        .map_err(refusal)?;
+        Ok(seeding::plan_vm(&seeding::plan_at(&choices, &zone)))
+    })
+    .await
+    .map_err(|error| refusal(error.to_string()))?
+}
+
+/// Write `req`'s seed, never over a file. It writes the zone only: each
+/// agent written signs in on its own Settings › Agents row.
+#[tauri::command]
+pub async fn agents_seed_apply(
+    state: State<'_, AppState>,
+    req: AgentSeedReq,
+) -> Result<AgentSeedResultVm, IpcError> {
+    let facts = facts_now(&state).await?;
+    tokio::task::spawn_blocking(move || {
+        let (choices, zone) = seeding::desktop_choices(
+            &facts.profiles,
+            facts.pins.get(&req.profile_id),
+            facts.login.as_deref(),
+            &req,
+        )
+        .map_err(refusal)?;
+        let applied = seeding::apply(seeding::plan_at(&choices, &zone), &zone).map_err(refusal)?;
+        Ok(seeding::result_vm(&req.profile_id, &choices, applied))
+    })
+    .await
+    .map_err(|error| refusal(error.to_string()))?
 }
 
 fn now_ms() -> i64 {

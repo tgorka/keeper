@@ -107,6 +107,48 @@ The two reviews of 2026-10-02 were accepted in full (rulings R28 and R29). Where
 
 Every other finding of the two reviews lands outside this epic.
 
+## Corrections against the code (2026-10-03)
+
+The plan was written on `agents-plan` before epics 89 and 90 were built. The coordinator's code map
+of 2026-10-03 (`agents-90-hosts`) found where it and the code disagree; rulings R31–R46
+(`agents-coordinator-decisions-2026-10-02.md`) settle them. Where a story below says otherwise, this
+table wins; 91.5's text is corrected in place.
+
+| # | the plan said | as built and ruled |
+| --- | --- | --- |
+| 1 | status edits are `m.replace`; "an edit whose `m.relates_to.event_id` names another anchor is ignored" (91.1 AC3) | each status update is its own `dev.keeper.agent.status` event carrying `content.anchor`; the reader groups by `content.anchor` else the event id, accepts only `content.agent` at power ≥ 50 and not the own user, the newest `origin_server_ts` wins, and an unknown `run`/`kind`/`v` is *unreadable*, never dropped (R32) |
+| 2 | Q1: status and scope "stay in the stream as invisible items" | the SDK filter drops them today and admits claim state; option B: keep the SDK filter, also drop `.claim`/`.host` state in agent rooms, read status and scope beside the stream from the event cache, deliver as `TimelineBatch.header?` (R33) |
+| 3 | UX-DR129 `run:` queued, running, blocked, waiting, review, failed, idle | the event's `RunState`: idle, running, blocked, waiting, done (R35) |
+| 4 | `events::power_levels(kind)` | `power_levels(kind, creator, agents)`; the creator is at 100 |
+| 5 | 91.2/91.4 `send_text_unheld` | the dock sends with `send_text` (ComposerSend); a spoken send is a third trigger `SendTrigger::SpokenToAgent`, legal only in the person's own `main`/`conversation` room, skipping the hold; AD-13's guards move to the new count (R31) |
+| 6 | the one-door rule in `runtime.rs` (90.6's `HostRuntime`), wired by the shell | built in `keeper-agent/src/rooms.rs` (`classify`, `invite_decision`) and shared through `start_copy`; `HostRuntime` is `hosts.rs`; nothing to wire in the shell |
+| 7 | the header admits scope only from the agent; the person sends scope | 91.2 adds the host's echo of the accepted scope and label; until then the chip reads "no scope yet"; `classify`'s test that ignores the person's scope changes in 91.2 |
+| 8 | *New conversation* created by the person's account | the person's device sends `dev.keeper.agent.conversation.request` in its DM; only the claim holder of the main session creates the room and the folder (`create_agent_session`) and invites the person (R36) |
+| 9 | presence published by the person into the control room | `control_power_levels` gains `dev.keeper.agent.presence: 0`; agentd updates existing control rooms when it is their creator (R37) |
+| 10 | 91.3's tools in `surface.rs` only | the tool loop is a closed seven-verb set; surface tools are agent-only, never offered to ⌘9 bots, by the narrowest mechanism, named in As built (R38) |
+| 11 | 91.3 waits for `surface.result` in the room | intercepted in `register_handlers` before routing, delivered through an approval-style map by request id (R39) |
+| 12 | Q5 lines "as `drive_read` numbers" | Rust translates file lines to body lines, refuses a range in the frontmatter, and the request carries the `expected` text; the device applies one undo-able transaction only while the buffer holds it (R40) |
+| 13 | 91.3's handler beside "`account.rs:5044-5127`" | notify `:4962`, archive `:5065`, redaction `:5102`, draft `:5144`; the activation tuple ripples to nine sites |
+| 14 | Settings → Voice → *Talk to* | the control is *Speak to* in Settings › Bots, the Bots pane and the phone's Bots sheet |
+| 15 | `voice_ipc.rs` hands the text to `agents_ipc.rs` | `voice_ipc` always calls `bots_ipc::send_spoken`, which resolves the target; the branch goes there |
+| 16 | "the stop phrase still cancels the turn" | it stops speech locally; a turn-cancel event is deferred work (R44) |
+| 17 | `keeper_core::agents::home::soul_from_bmad` | `keeper_core::agents::soul::soul_from_bmad` |
+| 18 | a new `create_session_room` in keeper-agent | `AgentClient::create_room` with `is_direct` for a `main` room |
+| 19 | 91.5 AC5: the person's message and scope in a delegated room → `M_FORBIDDEN` | the rooms are encrypted; AC5 asserts the power levels and `classify`, and only a person's state write is refused (R46) |
+| 20 | 91.5 "releases the claim at once" | no claim is taken: a session with no claim is acquirable |
+| 21 | 91.1's shell: "the header channel … and nothing else" | the Agents window also changes `inbox_subscribe` |
+| 22 | 91.1 AC1 "matrix-sdk-ui's own fixture set" | keeper-core has no `matrix-sdk-test`; events are built as JSON |
+| 23 | Q9 marks `Nx`, `TG`, `LN` | one glyph each, `N`, `T`, `L` (R43) |
+| 24 | an answer "grows as one message" | bodies were cut at 4096 characters; a message carrying `dev.keeper.agent.turn` is capped at `FINAL_CUT_BYTES` (R42) |
+| 25 | `docs/notes.md` § *The file is the API* (`:403-414`) | the heading is "Your agent writes here too" (`:402`) |
+| 26 | NFR-113's record in `docs/agents.md` § *Measured* | the section is "Measured on Synapse" |
+| 27 | line numbers taken on `agents-plan` | the code map's §9 row 27 gives the current ones (`send_text` `account.rs:2771-2803`, `open_timeline_for` `:4657-4678`, `room_item_to_vm` `:6021-6091`, …) |
+
+Notifications (R45): the notify handler does not notify for an agent's `…` anchor or its edits; a
+notification when an answer completes is deferred to 98.1. The rungs are five, one story each, in
+the order `agents-91-seed` (91.5), `agents-91-rooms` (91.1), `agents-91-dock` (91.2),
+`agents-91-surface` (91.3), `agents-91-voice` (91.4).
+
 ## Requirements
 
 Copied from ARCHITECTURE-AGENTS.md § *Requirements allocated here*, as amended after the reviews (2026-10-02); nothing is allocated here.
@@ -138,7 +180,7 @@ Each has the reading this plan builds to, marked as such, so no lane is blocked.
 - **Q6. Which anchor answers a spoken question.** **Plan's reading:** the first `dev.keeper.agent.turn` anchor from the proxy's user in that room after the device's own message event; a spoken send skips the Undo-Send hold, because the end of the utterance already confirmed it and the stop phrase still cancels the turn.
 - **Q7. Where the proxy's DM is made.** AD-372: "created by `agents init`", which is 91.5's (R25, R27). **Plan's reading:** `keeper-agentd agents init` makes it when it runs against agentd's own checkout; `--into <dir>` (the lane path, 91.5) writes the zone only, and a second `agents init` after the merge makes the DM (idempotent). The Mac's *Set up agents* writes the zone and says where the DM comes from.
 - **Q8. "via the keeper lane".** **Plan's reading:** makistack's review lane — a `push-only` + `lane: worktree` profile in its own directory, whose branch keeper pushes and `fj` turns into a pull request (`docs/runbooks/agent-drives.md:248-292`).
-- **Q9. The souls' marks.** The architecture's example gives Dr Tola Grey `icon: "🜂"`. **Plan's reading:** letters (`Nx`, `TG`, `LN`), the literal mark AD-155 draws; the owner may change them in the file.
+- **Q9. The souls' marks.** The architecture's example gives Dr Tola Grey `icon: "🜂"`. **Ruled (R43):** one glyph each (`N`, `T`, `L`), within the mark's bound and its 20 px cell (§9 #23); the owner may change them in the file.
 - **Q10. Who may use surface tools.** AD-397 says `surface_open` is "proxy only"; AD-383 offers surface tools to an agent of the person's principal "whose audience is exactly that person". **Plan's reading:** both: the tools are in the `proxy` kind's default set only, and the host offers them only when AD-383's audience rule also holds, so Dr Tola Grey (audience {tgorka}) gets them only if a person adds them to her `allow`.
 - **Q11. Turning the zone on for the desktop.** `[folder.agents]` belongs in each drive's `.keeper/keeper.toml`, which keeper never writes and which an older keeper refuses whole on an unknown key. **Plan's reading:** an operator edit, made only after every machine that loads the folder tier runs a keeper with story 89.2 (91.5's operator actions). `keeper-agentd` arms the flag itself (AD-376) and needs no edit.
 - **Q12. Every Nixi hand-off to Dr Lucyna Novak is a declassification.** **Settled by R25:** every Nixi→shared-agent hand-off is a declassification, because the proxy's context holds private core memory; the brief is shown to the person and released with one tap, and D-34 is corrected to match. A session's label starts at its home drive's readers and only narrows (AD-390), so every Nixi session is {tgorka} before it reads anything, and Dr Lucyna Novak's audience {tgorka, Marta} is wider. Epic 92 enforces it; this epic only states it in Nixi's soul, so she says so rather than trying.
@@ -275,8 +317,8 @@ Every story names its rung (*Stack rungs*, below).
 
 **Files:**
 - `keeper-core/src/agents/seed/` (new, pure): the zone's `README.md` (OKF frontmatter `type: Zone Guide`, the convention of `/workspace/tgdrive/README.md:1-4`) and `AGENTS.md`; `_drive.toml` rendered from flags, **with its `[integrity]` table written out** (S-02): `untrusted = ["00-inbox/**", "70-comms/**", "recordings/**"]`, the default 89.2 applies anyway, under a comment saying that what lands there is other people's words and is read as `untrusted` whoever synced it, so the person sees the zones and can change them; `_template/` (`agent.toml`, `SOUL.md`, `USER.md`, `MEMORY.md`, `journal/.keep`, `proposals/.keep`, tokens `{{id}}`, `{{name}}`, `{{date}}` only); the catalogue `nixi`, `tola-grey`, `lucyna-novak` with their `agent.toml`, `SOUL.md`, empty `USER.md`/`MEMORY.md`, `journal/.keep`, `proposals/.keep` (*The seeded souls*, below); `seed::plan(choices, existing) -> SeedPlan { write, left }` — every file that exists is in `left`, nothing is ever overwritten.
-- `keeper-agent/src/seed.rs` (new): `apply(plan, root)` with create-new semantics (`OpenOptions::create_new`), so a file appearing between plan and write is left, not replaced; reports `written` and `left`. `create_session_room(kind, person, agent)` makes a session room typed `dev.keeper.agent.session` with 90.4's `events::power_levels(kind)`, so a `main` room lets the person talk (F1).
-- `keeper-agentd`: `agents init <drive> --with <ids> --owner <@user> --reader <@user>… --bot <bot ref> [--into <dir>]` and `agents new <id> [--from-bmad <skill-dir>]` (copies `_template/`; with `--from-bmad`, 89.3's `keeper_core::agents::home::soul_from_bmad` over 89.1's merged layers writes the soul's frontmatter and lists what it did not import). **`--bot` is required and has no default** (S-20): the seeded agents run on the bot the person names, and nothing in keeper names CLIProxyAPI for them. Against agentd's own checkout (no `--into`), when the seed includes a proxy, `agents init` makes the proxy's DM with its `human` (`is_direct`, typed `dev.keeper.agent.session`, through `create_session_room(main, …)`, its status anchor saying `kind: "main"`, R25) and its `main` session folder with a caller-supplied id derived from (drive, agent, `main`), and releases the claim at once so placement chooses the holder (AD-378, AD-379); with `--into` it writes the zone only and prints the follow-up (Q7). The `--owner` and `--reader` flags must equal the host's pins for the drive (90.3's `[[drives]]`): `agents init` against agentd's own checkout refuses flags that differ from the pin, naming each difference, because the zone would host nothing (S-15).
+- `keeper-agent/src/seed.rs` (new): `apply(plan, root)` with create-new semantics (`OpenOptions::create_new`), so a file appearing between plan and write is left, not replaced; reports `written` and `left`. The DM is made with 90.4's existing `AgentClient::create_room(RoomKind::Session(Main), …)` (no new `create_session_room`, §9 #18), whose request builder `matrix::create_room_request` sets `is_direct` for a `main` room and takes `events::power_levels(kind, creator, agents)` (§9 #4), so a `main` room lets the person talk (F1). `create_agent_session` (keeper-agent `sessions::verbs`, shared with 91.2) writes a session folder and its `agent.toml` in one journaled plan, idempotent on the caller's id, under the zone lock.
+- `keeper-agentd`: `agents init <drive> --with <ids> --owner <@user> --reader <@user>… --bot <bot ref> [--into <dir>]` and `agents new <id> [--from-bmad <skill-dir>]` (copies `_template/`; with `--from-bmad`, 89.3's `keeper_core::agents::soul::soul_from_bmad` (§9 #17) over 89.1's merged layers writes the soul's frontmatter and lists what it did not import). **`--bot` is required and has no default** (S-20): the seeded agents run on the bot the person names, and nothing in keeper names CLIProxyAPI for them. Against agentd's own checkout (no `--into`), when the seed includes a proxy, `agents init` makes the proxy's DM with its `human` (`is_direct`, typed `dev.keeper.agent.session`, through `create_session_room(main, …)`, its status anchor saying `kind: "main"`, R25) and its `main` session folder with a caller-supplied id derived from (drive, agent, `main`), and takes no claim, so placement chooses the holder (AD-378, AD-379; §9 #20); with `--into` it writes the zone only and prints the follow-up (Q7). The `--owner` and `--reader` flags must equal the host's pins for the drive (90.3's `[[drives]]`): `agents init` against agentd's own checkout refuses flags that differ from the pin, naming each difference, because the zone would host nothing (S-15).
 - The shell and front: *Set up agents* in Settings › Agents, the surface 90.6 opens with its per-agent "Sign in on this Mac" row (`agents_copy_sign_in`, `AgentCopyVm`): one action per synced folder with `[folder.agents]`, showing the catalogue as checkboxes, the readers prefilled from the signed-in Matrix account, the bot the seeded agents run on, chosen by the person from their own providers with nothing preselected (FR-788, S-20), the files to write and the files left, then the written list (UX-DR133). It writes the zone only and then points at 90.6's sign-in row for each seeded agent, where the drive's readers are pinned on this Mac; it signs nothing in itself.
 - `docs/agents.md` § *Setting up the agents zone* (both paths and the operator steps below) and § *The provider* (the operator's record of operator action 0); `docs/sessions.md` gains nothing.
 
@@ -288,7 +330,7 @@ Every story names its rung (*Stack rungs*, below).
 ---
 name: Nixi
 title: tgorka's assistant, the one door
-icon: "Nx"
+icon: "N"
 role: The one I talk to every day, and the door between me and every other agent. You have no workflow of your own.
 identity: You are Nixi, my assistant. I come to you first, in our room, beside my notes, or by voice. What I want from the other agents goes through you, and what they need from me comes back through you. You are on every machine my sessions are on, and the copy that answers says where it runs (nixi@electra, nixi@hesperia).
 communication_style: Short and direct. Answer in the language I asked in, Polish or English. Say what you did, what happens next, and what you need from me. When something is in a note, open it there and point at it instead of describing where it is.
@@ -327,7 +369,7 @@ You are the quick, free conversation. When something needs a plan, a workflow or
 ---
 name: Dr Tola Grey
 title: Steward of tgdrive
-icon: "TG"
+icon: "T"
 role: Plans, decides and dispatches the work that lands in tgdrive, and keeps what that work teaches.
 identity: You keep tgdrive, my personal drive, which only I read. You read what came in, turn it into cards with an assignee and the name of who asked, hand each card to the agent whose work it is, and look at what a session learned when it closes. You decide how the work is done; I decide what is wanted. You reach me only through Nixi.
 communication_style: Calm, exact and brief. Write cards a stranger could pick up. When you hand work on, say what done looks like.
@@ -361,7 +403,7 @@ Keep the board honest: a card says who works it, where, and for whom.
 ---
 name: Dr Lucyna Novak
 title: Steward of neuradrive
-icon: "LN"
+icon: "L"
 role: Plans, decides and dispatches the work that lands in neuradrive, which Marta and I share, and keeps what that work teaches.
 identity: You keep neuradrive, neuraffica's drive, which Marta and I both read. You read what came in, turn it into cards, hand each to the agent whose work it is, and look at what a session learned when it closes. You never see tgdrive. Nothing private of mine or of Marta's comes to you unless the person it belongs to lets that one thing through. A question for a person goes to that person's own assistant, Nixi for me and Dixi for Marta.
 communication_style: Calm, exact and brief, and fair to both of us. Write cards either of us could pick up. Answer in the language you were asked in, Polish or English.
@@ -430,8 +472,8 @@ Reply with what it learned that the drive should keep, and where in the drive it
 4. **The catalogue is a choice** (keeper-agentd, CLI test): `--with nixi,tola-grey` on tgdrive writes those two and not `lucyna-novak`; an unknown id is refused naming the catalogue; `--with` absent writes the zone and no agent; `--owner` not among `--reader`s is refused (*Data formats*: the owner is a reader).
    - **No default bot** (S-20): `agents_init_requires_a_bot` — without `--bot`, `agents init` is refused naming the flag and writes nothing.
    - **The pin** (S-15): against a checkout whose `agentd.toml` pins tgdrive's readers `{@tgorka}`, `--reader @marta…` is refused naming the difference, and nothing is written.
-5. **The DM, and both power-level shapes** (F1; keeper-agent over 90.4's Synapse harness): `agents_init_makes_the_proxys_dm_once` — run against agentd's checkout, it creates one `is_direct` room typed `dev.keeper.agent.session` with the owner invited, one `main` session folder whose `agent.toml` names that room, a status anchor saying `kind: "main"`, releases the claim, and a second run makes no second room or folder; with `--into` it makes neither and prints the follow-up.
-   - `the_person_can_talk_in_the_dm_and_only_watch_elsewhere`: the DM's power levels hold `m.room.message: 0` and `dev.keeper.agent.scope: 0`, and the invited test person's message and scope event are accepted. A room the same `create_session_room` makes for a `delegated` session has neither entry: there the person's message and scope event are refused by the server (`M_FORBIDDEN`), and the person's `dev.keeper.agent.approval.decision` is accepted. Mutation: creating the DM with the `delegated` shape fails it.
+5. **The DM, and both power-level shapes** (F1; keeper-agent over 90.4's Synapse harness): `agents_init_makes_the_proxys_dm_once` — run against agentd's checkout, it creates one `is_direct` room typed `dev.keeper.agent.session` with the owner invited, one `main` session folder whose `agent.toml` names that room, a status anchor saying `kind: "main"`, takes no claim (a session with no claim event is acquirable, AD-378; §9 #20), and a second run makes no second room or folder; with `--into` it makes neither and prints the follow-up.
+   - `the_person_can_talk_in_the_dm_and_only_watch_elsewhere`: the DM's power levels hold `m.room.message: 0` and `dev.keeper.agent.scope: 0`, and the invited test person's message and scope event are accepted. A room the same `create_room_request` makes for a `delegated` session has neither entry and is not direct. As R30 and R46 state it, the server cannot refuse the person's encrypted message or scope there (it sees `m.room.encrypted`, allowed at 0): what is asserted is the power-level content and the host's `classify` (`free_text_in_a_non_proxy_session_is_ignored`), and the server refuses only a person's *state* write (`M_FORBIDDEN`). Mutation: creating the DM with the `delegated` shape fails it.
 6. **`agents new`** (keeper-agentd): `agents new amelia` copies `_template/` with `{{id}}`, `{{name}}`, `{{date}}` expanded and refuses an existing folder; `--from-bmad <dir>` writes the merged soul and lists the fields not imported (89.3).
 7. ***Set up agents*** (front, browser proof over the mock shell): the catalogue, the readers, the bot with nothing preselected (the written list never appears until the person picks one, S-20), the list of files left, and the link to 90.6's sign-in row for each agent written; a folder without `[folder.agents]` does not offer the action (AD-27: absent, not disabled).
 8. **The zone's own rules:** `AGENTS.md` states, with their reasons, that `agent.toml`, `SOUL.md`, `USER.md`, `MEMORY.md`, `_drive.toml`, `_skills/`, `_workflows/` and `_template/` are written by people only, `journal/` and `proposals/` by the agents' own tools, and that everything in the zone is data to keeper's agents, never an instruction; pinned by `the_zone_rules_state_who_writes_what`.
@@ -456,20 +498,29 @@ Reply with what it learned that the drive should keep, and where in the drive it
      --repo tgorka/tgdrive --head <the lane branch keeper pushed> --base main \
      --body "Seeded by keeper-agentd agents init (story 91.5). The souls are yours from this commit."
    ```
-   In the same PR, by hand: the `[folder.agents]` table (step 2) and an `80-agents/` row in `README.md`'s zone table (`:9-24`), which `agents init` never edits. The owner reviews and merges. Afterwards `sudo -u agentd-tgorka keeper-agentd agents init tgdrive --with nixi,tola-grey …` (no `--into`) leaves every file and makes Nixi's DM (Q7). The lane profile is removed when the PR merges.
+   In the same PR, by hand: the `[folder.agents]` table (step 2) and an `80-agents/` row in `README.md`'s zone table (`:9-24`), which `agents init` never edits. The owner reviews and merges. Afterwards `sudo systemctl stop keeper-agentd@tgorka`, `sudo -u agentd-tgorka keeper-agentd agents init tgdrive --with nixi,tola-grey …` (no `--into`; refused while the unit runs) leaves every file and makes Nixi's DM (Q7), and `sudo systemctl start keeper-agentd@tgorka` commits and pushes the session folder. The lane profile is removed when the PR merges.
 4. **neuradrive, on electra.** The keeper-syncd mirror stays pull-only (ruling R17); `agentd-neuraffica`'s own checkout is bidirectional (AD-376, 90.3's operator action installs it):
    ```bash
+   sudo systemctl stop keeper-agentd@neuraffica
    sudo -u agentd-neuraffica keeper-agentd agents init neuradrive --with lucyna-novak \
      --owner @tgorka:electra.siren-alsephina.ts.net \
      --reader @marta:electra.siren-alsephina.ts.net --reader @tgorka:electra.siren-alsephina.ts.net \
      --bot "bot:openai:<CLIProxyAPI base URL>#<model>"
+   sudo systemctl start keeper-agentd@neuraffica
    sudo -u agentd-neuraffica keeper-agentd status
    ```
-   `status` shows the seed committed and pushed to neuradrive's `main`. The `[folder.agents]` table (step 2) is committed from the owner's own clone. neuradrive's zone layout is `[UNVERIFIED]` on this host (not checked out here, AD-361); the operator confirms `80` is free before running.
+   `status` shows the seed committed and pushed to neuradrive's `main` once `run` has started again (`agents init` commits nothing). The `[folder.agents]` table (step 2) is committed from the owner's own clone. neuradrive's zone layout is `[UNVERIFIED]` on this host (not checked out here, AD-361); the operator confirms `80` is free before running.
 
 **Shell crate:** touches `src-tauri/crates/keeper/**` (*Set up agents*' commands) — gated only on macOS.
 
 **binds:** FR-788, AD-360, AD-361, AD-362, UX-DR133
+
+**As built (review of rung 1, F1–F11, 2026-10-03):**
+- **`local_only`** (F1): `agents init --local-only` and *Set up agents*' *Local models only* checkbox write `local_only = true` into the seeded `_drive.toml`; the checkbox starts from a declared zone's file, else this Mac's pin. `SeedChoices::check_hosting` checks the pin against the declaration the zone will host under — the zone's own `_drive.toml` when there is one (`seed::check_declared` returns it and now compares `local_only` too), else the flags' — and refuses a bot that is not `ollama` on a `local_only` drive (by the file, the flags or the pin) with `home::not_local_bot`'s sentence, the one sign-in gives.
+- **The DM once on both sides** (F2): `main_dm` looks for the folder first; with none it adopts a room the proxy's copy is already in that is its DM (`is_main_dm`: a session room of the two of them whose newest status says `main`, or before any status marked direct) instead of making a second; `make_folder` settles a race — when another folder won, the DM is the room that folder names and the room just made is discarded (the person's invite revoked, left, forgotten), as it is when the folder write fails. The anchor goes only into the folder's room and only when it has none. `MainDm.made` says `RoomAndFolder`, `Folder` (adopted) or `Nothing`.
+- **One process holds the copies** (F3): the refusal, not a DM made by `run`. `run` holds an exclusive `flock` on `<data>/agentd.lock` (written `"<pid> <host>"`) while it serves; `agents init` against agentd's checkout takes the same lock for its whole run and otherwise refuses naming the principal, the host and the unit to stop. Chosen over having `run` make the DM because a DM made by every starting `run` would be made by every host of the principal and by a restarted unit before the person asked, whereas the lock keeps the one-shot, operator-run step and adds no room-making path to the daemon; it also stops a second `run`. `login` and `init` still open copies without the lock (noted, not in this review).
+- **Minors**: the `main` session's label readers are the person alone (F4, `seed::main_session`); the zone is where the checkout's `.keeper/keeper.toml` puts it, read through keeper-sync's `FolderTier` for `--into`, `agents new` and agentd's checkout, a `keeper.toml` that does not read refusing (F5); an `agentd.toml` that is there but does not read is refused, never taken as absent (F6); *Set up agents*' ticked agents are Rust's `AgentSeedFolderVm.preselected` (F7); a folder with no `_drive.toml` and no signed-in Matrix account carries `seed::NO_ACCOUNT` as its problem and offers no form (F8); `agents new` copies a non-UTF-8 file byte for byte and every folder, an empty one too, and refuses a link in `_template/` (F9); `AGENTS.md` names the `.keep` the seed leaves (F10).
+- **Coverage** (F11): `a_local_only_seed_is_declared_and_runs_on_a_local_bot` (core), `a_local_only_drive_is_seeded_on_a_local_bot` (keeper-agent and `seed_cli`), `the_main_dm_is_the_room_its_folder_names` (the `Existed` branch), `a_main_dm_is_known_by_its_room`, `the_form_starts_from_the_zone_and_the_pin`, `agents_new_copies_any_template_and_refuses_a_link`, `the_zone_is_where_the_checkouts_keeper_toml_puts_it`, `a_broken_agentd_toml_is_refused_not_ignored`, and `agents_init_waits_for_run_and_then_seeds_the_pinned_checkout`, which runs `keeper-agentd run`, is refused beside it, then seeds the pinned checkout once it stops. `--bot` is optional to clap, so `agents_init_requires_a_bot` asserts Rust's `NO_BOT`.
 
 ## What stays out
 

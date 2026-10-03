@@ -24,6 +24,7 @@ pub mod pins;
 pub mod placement;
 pub mod prompt;
 pub mod redact;
+pub mod seed;
 pub mod session;
 pub mod skills;
 pub mod soul;

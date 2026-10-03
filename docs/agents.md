@@ -112,6 +112,152 @@ A zone whose `_drive.toml` is refused hosts nothing either, and says
 In the Files view the zone's folder carries the agents mark, from the configuration and never from
 its name.
 
+## Setting up the agents zone
+
+A zone is seeded once, from the server or from the Mac. The seed is the guide (`README.md`), the
+rules (`AGENTS.md`), `_drive.toml`, `_template/`, and whichever of the catalogue's agents the person
+chooses: **Nixi** (`nixi/`, a proxy, the person's one door; written for tgdrive), **Dr Tola Grey**
+(`tola-grey/`, tgdrive's steward) and **Dr Lucyna Novak** (`lucyna-novak/`, neuradrive's steward).
+Each agent's folder gets `agent.toml`, `SOUL.md`, an empty `USER.md` and `MEMORY.md`, and
+`journal/` and `proposals/`. The seeded `_drive.toml` writes its `[integrity]` table out, with the
+three default untrusted zones and a comment saying why, so the person sees them and can change them.
+
+**Nothing is ever overwritten.** A file that is there is left, whatever it holds, and named as left;
+a file that appears while the seed is being written is left too. Running the seed twice writes
+nothing the second time. A folder on the way that is a link, or a file, refuses the seed rather than
+being followed. From their first commit the seeded files are the owner's: no keeper tool writes them
+again.
+
+**The bot has no default.** Every seeded agent runs on the bot the person names, with
+`--bot bot:<kind>:<base URL>#<model>` on the server or by picking one of their own bots on the Mac;
+without one the seed is refused and writes nothing. Before seeding a real drive whose bot is
+CLIProxyAPI, the operator writes § *The provider* below.
+
+**The owner, readers and `local_only` must be the host's pins** (90.3's `[[drives]]`, 90.6's
+sign-in). A zone whose `_drive.toml` differs from the pin hosts nothing, so the seed refuses an
+owner, readers or a weaker `local_only` that differ from the pin, naming each difference, and writes
+nothing. The owner must be one of the readers. When the zone already has a `_drive.toml`, the seed
+leaves it, refuses flags that say something else (`local_only` included), and checks the pin
+against the file, since the file is what the zone hosts under.
+
+**A `local_only` drive is seeded on a local bot.** `--local-only` (a checkbox on the Mac) writes
+`local_only = true` into the seeded `_drive.toml` (AD-377). When the drive the zone will host under
+is `local_only` — by the flags, the existing file or the host's pin — a bot that is not `ollama` is
+refused at seed time with the sentence sign-in would give ("_drive.toml's local_only is true for
+tgdrive, so the bot must be an ollama model that runs locally, and this one is openai.").
+
+**The zone is where the drive's `.keeper/keeper.toml` puts it**: `[folder.agents] subfolder`,
+read as the engine reads it, `80-agents/` when the file says nothing. A `keeper.toml` that does not
+read refuses the seed, naming the file.
+
+### From the server: `keeper-agentd agents init`
+
+```sh
+keeper-agentd agents init <drive> --with nixi,tola-grey \
+  --owner @tgorka:<server> --reader @tgorka:<server> \
+  --bot "bot:<kind>:<base URL>#<model>" [--local-only] [--principal <principal>] [--into <checkout>]
+```
+
+`--with` takes catalogue ids; an unknown id is refused naming the catalogue, and without `--with`
+the zone is written with no agent. `--principal` defaults to `agentd.toml`'s; an `agentd.toml` that
+is there but does not read is refused, never taken as absent. The matrix users are
+`@<id>:<the owner's server>`, Nixi's `human` is the owner, and the template's `agent.toml` is a
+`specialist` on the same bot.
+
+- **Against agentd's own checkout** (no `--into`), the drive must be one of `[[drives]]`, and
+  `keeper-agentd run` must not be running for the principal: the DM signs the proxy's copy in from
+  the same store `run` holds, and matrix-sdk's store is not safe for two processes signed in as one
+  device. `run` holds a lock (`agentd.lock` in its data folder) while it serves, and `agents init`
+  refuses beside it — "keeper-agentd run is serving tgorka's agents on electra (…), and agents init
+  would open the same copies beside it: stop keeper-agentd@tgorka, run this again, then start it."
+  The zone goes into agentd's checkout of the drive. **`agents init` commits and pushes nothing:
+  `run` does, when it starts again**, so run `agents init` on the host whose checkout `run` pushes.
+  When the seed includes Nixi and Nixi is in `[[agents]]` with its copy signed in
+  (`keeper-agentd login <drive>/nixi`), it also makes Nixi's DM with her person: one encrypted room
+  typed `dev.keeper.agent.session`, created `is_direct` with the person invited, where the person
+  may talk and set the scope; a `main` session folder under an id derived from the drive and the
+  agent, whose `agent.toml` names the room and whose label's readers are the person alone, not the
+  drive's; and a status anchor saying `kind: "main"`, `run: "idle"`. No claim is taken: a session
+  with no claim is acquirable, and placement chooses which host serves it.
+
+  The DM is made once on both sides. Run again, it finds that session by its id and makes nothing.
+  With no folder — a checkout made again before `run` pushed it — it looks through the rooms Nixi's
+  copy is in for the DM (a session room of Nixi and her person alone whose newest status says
+  `kind: "main"`, or, before any status, that Nixi marked direct) and writes the folder naming that
+  room instead of making a second. If the folder appears while the room is being made, the folder's
+  room is the DM; the room just made is left and forgotten and the person's invite to it revoked, as
+  it is when the folder cannot be written. The anchor goes only into the room the folder names, and
+  only when it has none. When Nixi is not signed in yet it says so and makes nothing; run it again
+  after the login. The anchor is encrypted for the devices the room's members have when it is sent:
+  a device of the person's that signs in later reads the host's next status, not that anchor.
+- **With `--into <checkout>`** it writes that checkout's agents zone only — the lane path for a
+  drive whose changes go through review — makes no room, and prints the `login` and `agents init`
+  commands that make the DM once the zone has reached agentd's checkout.
+
+`keeper-agentd agents new <id> [--name <name>] [--from-bmad <skill dir>] [--drive <drive>]
+[--into <checkout>]` copies `_template/` to `<id>/`, filling in `{{id}}`, `{{name}}` (the id when
+`--name` is left out) and `{{date}}` in its text files, copying any other file (an avatar image)
+byte for byte and every folder, an empty one too, and refuses a folder that is already there. A
+link inside `_template/` is refused, never followed. With
+`--from-bmad`, `SOUL.md` is the BMAD agent's persona merged over the project's `_bmad/custom/`
+layers (the nearest folder above the skill holding `_bmad/`), `agent.toml` takes its name, and every
+field not imported — menus, activation steps, a `file:` fact — is listed.
+
+### From the Mac: *Set up agents*
+
+Settings › Agents offers *Set up agents* for each synced folder that keeps agents
+(`[folder.agents]`); a folder without it is not offered. The person ticks the catalogue's agents
+(the ones written for the folder's drive are ticked when the form opens; keeper decides which),
+checks the owner, readers and *Local models only* (from the zone's `_drive.toml` when it has one,
+else the signed-in Matrix account and this Mac's pin), and picks the bot from their own bots — none
+is picked for them. With no Matrix account signed in, a folder with no `_drive.toml` says "Sign in
+to a Matrix account first: the owner and readers are Matrix ids." and offers no form. The preview
+lists the files to write and the files left; writing them shows the written list. It writes the zone
+only, under this Mac's principal (the organisation account's login) for a zone with no
+`_drive.toml`, and signs nothing in: each seeded agent then signs in on its own row, which pins the
+drive's readers on this Mac. Nixi's DM is made by `keeper-agentd agents init` on the host that
+serves her.
+
+### The operator's steps
+
+0. Record the provider (§ *The provider*), committed, before any seeding.
+1. Create the agents' users on the homeserver (90.5's procedure), then on electra
+   `sudo -u agentd-tgorka keeper-agentd login tgdrive/nixi`, `… login tgdrive/tola-grey`, and
+   `sudo -u agentd-neuraffica keeper-agentd login neuradrive/lucyna-novak`. The `--owner` and
+   `--reader` flags are each `agentd.toml`'s pins.
+2. Upgrade every machine that loads the drives' folder tier to a keeper that knows
+   `[folder.agents]`, then add `[folder.agents] subfolder = "80-agents"` to each drive's
+   `.keeper/keeper.toml` from the owner's own clone (§ *Turning the zone on*).
+3. tgdrive goes through review: `agents init tgdrive --into <lane checkout> --with nixi,tola-grey …`,
+   sync the lane, open the pull request; after it merges, on electra:
+   `sudo systemctl stop keeper-agentd@tgorka`, the same command without `--into` (it leaves every
+   file and makes Nixi's DM), then `sudo systemctl start keeper-agentd@tgorka`, which commits and
+   pushes the session folder.
+4. neuradrive: stop `keeper-agentd@neuraffica`, `sudo -u agentd-neuraffica keeper-agentd agents init
+   neuradrive --with lucyna-novak …` against agentd's own checkout, start the unit, then
+   `keeper-agentd status` shows the seed committed and pushed.
+
+## The provider
+
+The seeded agents all run on the bot the owner names. On the owner's drives that is CLIProxyAPI,
+one endpoint in front of several upstream providers: if an upstream enforces its terms against it,
+every agent stops at once. This section is the owner's record, written before any real drive is
+seeded (S-20); the pull request that seeds tgdrive cites the commit that wrote it.
+
+What the repository knows:
+
+- keeper names no provider for the seeded agents: `--bot` is required and has no default, and no
+  test or document in this repository names CLIProxyAPI's endpoint.
+- The bot is reached as `bot:openai:<base URL>#<model>`, a model its `/v1/models` lists (ruling
+  R13); `keeper-agentd`'s `[[providers]]` row carries the credential as `secret:<name>`.
+
+What the owner records here (owed, not yet written):
+
+- Which upstream providers sit behind CLIProxyAPI's endpoint: **owed by the owner**.
+- Whether `disable-claude-cloak-mode` is set in its configuration: **owed by the owner**.
+- In the owner's own words, that the owner accepts the risk that a provider's terms stop the
+  agents: **owed by the owner**.
+
 ## An agent's home
 
 An agent is a folder in the zone: `80-agents/<id>/`. The folder's name is the agent's id, and the
@@ -822,14 +968,16 @@ keys, so nothing sent before its first `run` can be decrypted by it: run the hos
 
 ## keeper-agentd
 
-`keeper-agentd` is the Linux host. One binary, five verbs:
+`keeper-agentd` is the Linux host. One binary, seven verbs:
 
 | verb | what it does |
 | --- | --- |
 | `keeper-agentd init` | creates agentd's data and state directories, writes the `agentd.toml` skeleton when there is none and says which file it left alone otherwise — it never overwrites; once the hosted proxy's copy is signed in it creates the principal's control room (`dev.keeper.agent.control`) as that proxy, inviting the drives' owners and every other agent of the principal, and sets `[homeserver].control_room`, every other byte of the file kept |
 | `keeper-agentd login <drive>/<agent>` | signs that agent's copy in as this host's device, displayed `<agent>@<host>`: asks for the password with the terminal's echo off, or reads it from `--password-credential <name>`; stores the session and the store passphrase in the secret store, and a later login reuses the device id |
 | `keeper-agentd agents list` | every zone and home with its verdict, each refused skill, and whether each served agent's copy is signed in |
-| `keeper-agentd run` | serves the agents until `SIGTERM` |
+| `keeper-agentd agents init <drive> --owner <@user> --reader <@user>… --bot <bot> [--local-only] [--with <ids>] [--principal <p>] [--into <dir>]` | seeds the drive's agents zone, never over a file, refusing an owner, readers or `local_only` that differ from the pin, and a bot that is not local on a `local_only` drive; against agentd's own checkout — refused while `run` serves the principal — makes the seeded proxy's DM and `main` session once its copy is signed in, adopting the DM when the copy is already in it (§ *Setting up the agents zone*) |
+| `keeper-agentd agents new <id> [--name <name>] [--from-bmad <dir>] [--drive <drive>] [--into <dir>]` | copies the zone's `_template/` to a new agent's folder, refusing one that is there and a link in the template; `--from-bmad` writes the BMAD agent's soul and lists what it did not import |
+| `keeper-agentd run` | serves the agents until `SIGTERM`, holding `agentd.lock` in its data folder so no second `run` or `agents init` opens the copies beside it |
 | `keeper-agentd status [--session <drive>/<session> [--no-probe]]` | the host, each drive's engine state and mount verdict, each copy, the sessions served (and a session not served because another names its room), and the tools each agent is and is not offered here; with `--session`, what that session's agent is told and whether its digest is the last `open` line's. Composing it asks an `ollama` provider which tools its model supports, as a turn does; `--no-probe` asks nothing and composes as if that were unknown |
 
 `--config <path>` (or `KEEPER_AGENTD_CONFIG`) names another configuration file. The exit codes are

@@ -19,6 +19,8 @@ path = "src/main.rs"
 [dependencies]
 keeper-agent = { path = "../keeper-agent" }
 keeper-core = { path = "../keeper-core" }
+# `agents new --from-bmad`: the BMAD agent's customization layers, merged.
+keeper-ported = { path = "../keeper-ported" }
 # The LFS filter git runs this binary as, and the default log filter.
 keeper-sync = { path = "../keeper-sync" }
 clap = { workspace = true }
@@ -33,6 +35,9 @@ serde_json = { workspace = true }
 # `status --session` composes the frame at this host's local time.
 chrono = { workspace = true }
 thiserror = { workspace = true }
+# One process per data directory holds the copies' stores: `run` and
+# `agents init` take the same exclusive lock.
+fs4 = { workspace = true }
 
 # `login` reads a password with the terminal's echo off.
 [target.'cfg(unix)'.dependencies]

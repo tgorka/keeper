@@ -1589,6 +1589,9 @@ pub fn run() {
         agents_host::agents_copies,
         agents_host::agents_copy_sign_in,
         agents_host::agents_drive_repin,
+        agents_host::agents_seed_offer,
+        agents_host::agents_seed_plan,
+        agents_host::agents_seed_apply,
     );
     // The commands that touch a window or a file manager have `Unsupported`
     // twins so the handler list is identical on every target and

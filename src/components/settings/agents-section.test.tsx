@@ -5,15 +5,34 @@ import {
   AgentsSection,
   PIN_LABEL,
   REVIEW_READERS_LABEL,
+  SEED_PREVIEW_LABEL,
+  SEED_WRITE_LABEL,
+  SET_UP_AGENTS_LABEL,
   SIGN_IN_LABEL,
 } from "@/components/settings/agents-section";
-import type { AgentCopyVm, AgentPersonVm, AgentPinVm } from "@/lib/ipc/client";
-import { agentsCopies, agentsCopySignIn, agentsDriveRepin } from "@/lib/ipc/client";
+import type {
+  AgentCopyVm,
+  AgentPersonVm,
+  AgentPinVm,
+  AgentSeedFolderVm,
+  AgentSeedOfferVm,
+} from "@/lib/ipc/client";
+import {
+  agentsCopies,
+  agentsCopySignIn,
+  agentsDriveRepin,
+  agentsSeedApply,
+  agentsSeedOffer,
+  agentsSeedPlan,
+} from "@/lib/ipc/client";
 
 vi.mock("@/lib/ipc/client", () => ({
   agentsCopies: vi.fn(),
   agentsCopySignIn: vi.fn(),
   agentsDriveRepin: vi.fn(),
+  agentsSeedOffer: vi.fn(),
+  agentsSeedPlan: vi.fn(),
+  agentsSeedApply: vi.fn(),
 }));
 
 const OWNER: AgentPersonVm = { matrixId: "@tgorka:tgorka.org", displayName: "Tomasz Gorka" };
@@ -71,8 +90,11 @@ function nixi(pin: AgentPinVm, signedIn = false): AgentCopyVm {
   };
 }
 
+const NO_FOLDERS: AgentSeedOfferVm = { folders: [], catalogue: [], bots: [], accounts: [] };
+
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(agentsSeedOffer).mockResolvedValue(NO_FOLDERS);
 });
 
 afterEach(() => {
@@ -234,5 +256,253 @@ describe("Settings › Agents", () => {
     render(<AgentsSection open />);
 
     expect(await screen.findByRole("status")).toHaveTextContent(/^Signed in as nixi$/);
+  });
+});
+
+/** tgdrive with its zone declared in `_drive.toml`, local models only. */
+const declared: AgentSeedFolderVm = {
+  profileId: "p1",
+  name: "tgdrive",
+  drive: "tgdrive",
+  owner: "@tgorka:tgorka.org",
+  readers: ["@marta:tgorka.org", "@tgorka:tgorka.org"],
+  localOnly: true,
+  declared: true,
+  preselected: ["nixi", "tola-grey"],
+  problem: null,
+};
+
+/** neuradrive, flagged for agents, with no `_drive.toml` yet. */
+const fresh: AgentSeedFolderVm = {
+  profileId: "p3",
+  name: "neuradrive",
+  drive: "neuradrive",
+  owner: "@tgorka:tgorka.org",
+  readers: ["@tgorka:tgorka.org"],
+  localOnly: false,
+  declared: false,
+  // Rust ticks the agents whose souls were written for neuradrive.
+  preselected: ["lucyna-novak"],
+  problem: null,
+};
+
+const WORK_BOT = "bot:openai:https://provider.example:8452/v1#gpt-5";
+
+function offerOf(...folders: AgentSeedFolderVm[]): AgentSeedOfferVm {
+  return {
+    folders,
+    catalogue: [
+      { id: "nixi", name: "Nixi", kind: "proxy", homeDrive: "tgdrive" },
+      { id: "tola-grey", name: "Dr Tola Grey", kind: "steward", homeDrive: "tgdrive" },
+      { id: "lucyna-novak", name: "Dr Lucyna Novak", kind: "steward", homeDrive: "neuradrive" },
+    ],
+    bots: [
+      { reference: WORK_BOT, name: "Work model", provider: "Provider" },
+      {
+        reference: "bot:ollama:http://electra.example:11434#qwen3:32b",
+        name: "Qwen on electra",
+        provider: "electra",
+      },
+    ],
+    accounts: ["@tgorka:tgorka.org"],
+  };
+}
+
+async function openSetUp() {
+  render(<AgentsSection open />);
+  fireEvent.click(await screen.findByRole("button", { name: SET_UP_AGENTS_LABEL }));
+}
+
+describe("Settings › Agents › Set up agents", () => {
+  it("picks no bot for the person and asks Rust with none until they pick one", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([]);
+    vi.mocked(agentsSeedOffer).mockResolvedValue(offerOf(declared));
+    vi.mocked(agentsSeedPlan).mockResolvedValue({ write: ["README.md"], left: [] });
+    await openSetUp();
+
+    const bots = screen.getAllByRole("radio");
+    expect(bots).toHaveLength(2);
+    for (const bot of bots) {
+      expect(bot).not.toBeChecked();
+    }
+    fireEvent.click(screen.getByRole("button", { name: SEED_PREVIEW_LABEL }));
+    await waitFor(() =>
+      expect(agentsSeedPlan).toHaveBeenLastCalledWith(expect.objectContaining({ bot: null })),
+    );
+
+    fireEvent.click(screen.getByRole("radio", { name: /Work model/ }));
+    fireEvent.click(screen.getByRole("button", { name: SEED_PREVIEW_LABEL }));
+    await waitFor(() =>
+      expect(agentsSeedPlan).toHaveBeenLastCalledWith(expect.objectContaining({ bot: WORK_BOT })),
+    );
+  });
+
+  it("shows Rust's refusal as given, with no files to write", async () => {
+    const sentence = "Name the bot the seeded agents run on: keeper never picks one for them.";
+    vi.mocked(agentsCopies).mockResolvedValue([]);
+    vi.mocked(agentsSeedOffer).mockResolvedValue(offerOf(declared));
+    vi.mocked(agentsSeedPlan).mockRejectedValue({
+      code: "internal",
+      message: sentence,
+      accountId: null,
+      retriable: false,
+    });
+    await openSetUp();
+    fireEvent.click(screen.getByRole("button", { name: SEED_PREVIEW_LABEL }));
+
+    expect((await screen.findByRole("alert")).textContent).toBe(sentence);
+    expect(screen.queryByRole("list", { name: /^Files to write/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: SEED_WRITE_LABEL })).not.toBeInTheDocument();
+  });
+
+  it("asks with a declared zone's own drive, owner and readers, and lists the files to write apart from the files left", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([]);
+    vi.mocked(agentsSeedOffer).mockResolvedValue(offerOf(declared));
+    vi.mocked(agentsSeedPlan).mockResolvedValue({
+      write: ["tola-grey/agent.toml", "tola-grey/SOUL.md"],
+      left: ["_drive.toml", "nixi/agent.toml"],
+    });
+    await openSetUp();
+
+    // The file decides these: nothing here edits them.
+    expect(screen.queryByLabelText("Drive id")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^Readers/)).not.toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /^Nixi/ })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: /^Dr Lucyna Novak/ })).not.toBeChecked();
+    fireEvent.click(screen.getByRole("radio", { name: /Work model/ }));
+    fireEvent.click(screen.getByRole("button", { name: SEED_PREVIEW_LABEL }));
+
+    const toWrite = await screen.findByRole("list", { name: /^Files to write/ });
+    const left = screen.getByRole("list", { name: /^Files left as they are/ });
+    expect(
+      within(toWrite)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual(["tola-grey/agent.toml", "tola-grey/SOUL.md"]);
+    expect(
+      within(left)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual(["_drive.toml", "nixi/agent.toml"]);
+    expect(agentsSeedPlan).toHaveBeenCalledWith({
+      profileId: "p1",
+      drive: "tgdrive",
+      owner: "@tgorka:tgorka.org",
+      readers: ["@marta:tgorka.org", "@tgorka:tgorka.org"],
+      localOnly: true,
+      bot: WORK_BOT,
+      with: ["nixi", "tola-grey"],
+    });
+  });
+
+  it("drops a preview the person changed the form after, so what is written is what was shown", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([]);
+    vi.mocked(agentsSeedOffer).mockResolvedValue(offerOf(fresh));
+    vi.mocked(agentsSeedPlan).mockResolvedValue({ write: ["README.md"], left: [] });
+    await openSetUp();
+    fireEvent.click(screen.getByRole("radio", { name: /Work model/ }));
+    fireEvent.click(screen.getByRole("button", { name: SEED_PREVIEW_LABEL }));
+    expect(await screen.findByRole("button", { name: SEED_WRITE_LABEL })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(/^Readers/), {
+      target: { value: "@tgorka:tgorka.org\n @marta:tgorka.org \n" },
+    });
+    expect(screen.queryByRole("button", { name: SEED_WRITE_LABEL })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: SEED_PREVIEW_LABEL }));
+    await waitFor(() =>
+      expect(agentsSeedPlan).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          drive: "neuradrive",
+          readers: ["@tgorka:tgorka.org", "@marta:tgorka.org"],
+          with: ["lucyna-novak"],
+        }),
+      ),
+    );
+  });
+
+  it("ticks only the agents Rust preselected, and asks local models only when the person ticks it", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([]);
+    vi.mocked(agentsSeedOffer).mockResolvedValue(
+      offerOf({ ...fresh, drive: "tgdrive", preselected: [] }),
+    );
+    vi.mocked(agentsSeedPlan).mockResolvedValue({ write: ["README.md"], left: [] });
+    await openSetUp();
+
+    for (const agent of [/^Nixi/, /^Dr Tola Grey/, /^Dr Lucyna Novak/]) {
+      expect(screen.getByRole("checkbox", { name: agent })).not.toBeChecked();
+    }
+    const local = screen.getByRole("checkbox", { name: /^Local models only/ });
+    expect(local).not.toBeChecked();
+    fireEvent.click(local);
+    fireEvent.click(screen.getByRole("radio", { name: /Qwen on electra/ }));
+    fireEvent.click(screen.getByRole("button", { name: SEED_PREVIEW_LABEL }));
+    await waitFor(() =>
+      expect(agentsSeedPlan).toHaveBeenLastCalledWith(
+        expect.objectContaining({ localOnly: true, with: [] }),
+      ),
+    );
+  });
+
+  it("writes, lists what it wrote, and takes the person to each seeded agent's sign-in row", async () => {
+    const lucyna: AgentCopyVm = {
+      ...nixi(unpinned),
+      profileId: "p3",
+      drive: "neuradrive",
+      agent: "lucyna-novak",
+      name: "Dr Lucyna Novak",
+      matrixUser: "@lucyna-novak:tgorka.org",
+    };
+    vi.mocked(agentsCopies).mockResolvedValueOnce([]).mockResolvedValue([lucyna]);
+    vi.mocked(agentsSeedOffer).mockResolvedValue(offerOf(fresh));
+    vi.mocked(agentsSeedPlan).mockResolvedValue({
+      write: ["README.md", "lucyna-novak/agent.toml"],
+      left: [],
+    });
+    vi.mocked(agentsSeedApply).mockResolvedValue({
+      profileId: "p3",
+      written: ["README.md", "lucyna-novak/agent.toml"],
+      left: [],
+      agents: ["lucyna-novak"],
+    });
+    await openSetUp();
+    expect(
+      screen.queryByLabelText("Password for @lucyna-novak:tgorka.org"),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("radio", { name: /Work model/ }));
+    fireEvent.click(screen.getByRole("button", { name: SEED_PREVIEW_LABEL }));
+    fireEvent.click(await screen.findByRole("button", { name: SEED_WRITE_LABEL }));
+
+    const written = await screen.findByRole("list", { name: /^Written/ });
+    expect(
+      within(written)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual(["README.md", "lucyna-novak/agent.toml"]);
+    expect(agentsSeedApply).toHaveBeenCalledWith(expect.objectContaining({ bot: WORK_BOT }));
+    expect(agentsCopySignIn).not.toHaveBeenCalled();
+
+    // The row is read again by the write itself, not by the next poll.
+    fireEvent.click(
+      await screen.findByRole(
+        "button",
+        { name: "Sign Dr Lucyna Novak in" },
+        { timeout: AGENTS_RELOAD_MS / 5 },
+      ),
+    );
+    expect(screen.getByLabelText("Password for @lucyna-novak:tgorka.org")).toHaveFocus();
+  });
+
+  it("shows why a folder cannot be seeded from this Mac, and no form", async () => {
+    const sentence = "`local_only` in _drive.toml must be true or false, not text.";
+    vi.mocked(agentsCopies).mockResolvedValue([]);
+    vi.mocked(agentsSeedOffer).mockResolvedValue(
+      offerOf({ ...fresh, profileId: "p2", name: "marta-notes", problem: sentence }),
+    );
+    render(<AgentsSection open />);
+
+    expect(await screen.findByText(sentence)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "marta-notes" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: SET_UP_AGENTS_LABEL })).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
   });
 });

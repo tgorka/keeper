@@ -58,6 +58,10 @@ import type {
   AgentCopyVm,
   AgentPersonVm,
   AgentPinVm,
+  AgentSeedOfferVm,
+  AgentSeedPlanVm,
+  AgentSeedReq,
+  AgentSeedResultVm,
   AutoUpdateRestartVm,
   AutoUpdateVm,
   BotAttachmentVm,
@@ -3942,6 +3946,124 @@ let agentRows: AgentCopyVm[] =
       ? [agentRow("nixi", "Nixi"), agentRow("tara", "Tara")]
       : [agentRow("nixi", "Nixi"), agentRow("tara", "Tara"), BROKEN_FOLDER];
 
+// --- Set up agents (story 91.5) --------------------------------------------
+//
+// p1 is tgdrive with its zone already declared (the rows above are its agents,
+// so Nixi's files are left); p3 is a fresh neuradrive with no `_drive.toml`;
+// p2 is the folder whose `_drive.toml` does not read. No bot is preselected.
+const SEED_NO_BOT = "Name the bot the seeded agents run on: keeper never picks one for them.";
+const SEED_CATALOGUE = ["nixi", "tola-grey", "lucyna-novak"];
+const seedOffer = (): AgentSeedOfferVm => ({
+  folders: [
+    {
+      profileId: "p1",
+      name: "tgdrive",
+      drive: "tgdrive",
+      owner: AGENT_OWNER.matrixId,
+      readers: AGENT_READERS.map((reader) => reader.matrixId).sort(),
+      localOnly: false,
+      declared: true,
+      preselected: ["nixi", "tola-grey"],
+      problem: null,
+    },
+    {
+      profileId: "p3",
+      name: "neuradrive",
+      drive: "neuradrive",
+      owner: AGENT_OWNER.matrixId,
+      readers: [AGENT_OWNER.matrixId],
+      localOnly: false,
+      declared: false,
+      preselected: ["lucyna-novak"],
+      problem: null,
+    },
+    {
+      profileId: "p2",
+      name: "marta-notes",
+      drive: "marta-notes",
+      owner: AGENT_OWNER.matrixId,
+      readers: [AGENT_OWNER.matrixId],
+      localOnly: false,
+      declared: false,
+      preselected: [],
+      problem: BROKEN_FOLDER.problem,
+    },
+  ],
+  catalogue: [
+    { id: "nixi", name: "Nixi", kind: "proxy", homeDrive: "tgdrive" },
+    { id: "tola-grey", name: "Dr Tola Grey", kind: "steward", homeDrive: "tgdrive" },
+    { id: "lucyna-novak", name: "Dr Lucyna Novak", kind: "steward", homeDrive: "neuradrive" },
+  ],
+  bots: [
+    {
+      reference: "bot:openai:https://provider.example:8452/v1#gpt-5",
+      name: "Work model",
+      provider: "Provider",
+    },
+    {
+      reference: "bot:ollama:http://electra.example:11434#qwen3:32b",
+      name: "Qwen on electra",
+      provider: "electra",
+    },
+  ],
+  accounts: [AGENT_OWNER.matrixId],
+});
+const seedFiles = (dir: string): string[] =>
+  ["agent.toml", "SOUL.md", "USER.md", "MEMORY.md", "journal/.keep", "proposals/.keep"].map(
+    (file) => `${dir}/${file}`,
+  );
+/** Which files of a seed are already in p1's zone: the zone and Nixi's home. */
+const seedExisting = (profileId: string, path: string): boolean =>
+  profileId === "p1" && !path.startsWith("tola-grey/") && !path.startsWith("lucyna-novak/");
+function seedPlan(req: AgentSeedReq): AgentSeedPlanVm {
+  const refuse = (message: string) => {
+    throw { code: "internal", message, accountId: null, retriable: false };
+  };
+  if (req.bot === null || req.bot.trim() === "") refuse(SEED_NO_BOT);
+  if (req.localOnly && !req.bot?.startsWith("bot:ollama:")) {
+    const kind = req.bot?.split(":")[1] ?? "";
+    refuse(
+      `_drive.toml's local_only is true for ${req.drive}, so the bot must be an ollama model that runs locally, and this one is ${kind}.`,
+    );
+  }
+  const unknown = req.with.find((id) => !SEED_CATALOGUE.includes(id));
+  if (unknown !== undefined) {
+    refuse(`"${unknown}" is not in the catalogue; the catalogue is ${SEED_CATALOGUE.join(", ")}.`);
+  }
+  if (!req.readers.includes(req.owner)) {
+    refuse(`The owner ${req.owner} is not among \`readers\`; the owner must be a reader.`);
+  }
+  const paths = [
+    "README.md",
+    "AGENTS.md",
+    "_drive.toml",
+    ...seedFiles("_template"),
+    ...SEED_CATALOGUE.filter((id) => req.with.includes(id)).flatMap(seedFiles),
+  ];
+  return {
+    write: paths.filter((path) => !seedExisting(req.profileId, path)),
+    left: paths.filter((path) => seedExisting(req.profileId, path)),
+  };
+}
+function seedApply(req: AgentSeedReq): AgentSeedResultVm {
+  const plan = seedPlan(req);
+  const agents = SEED_CATALOGUE.filter((id) => plan.write.includes(`${id}/agent.toml`));
+  const names: Record<string, string> = {
+    nixi: "Nixi",
+    "tola-grey": "Dr Tola Grey",
+    "lucyna-novak": "Dr Lucyna Novak",
+  };
+  agentRows = [
+    ...agentRows,
+    ...agents.map((id) => ({
+      ...agentRow(id, names[id] ?? id),
+      profileId: req.profileId,
+      drive: req.drive,
+    })),
+  ];
+  return { profileId: req.profileId, written: plan.write, left: plan.left, agents };
+}
+
 /** Answer after `ms`, so a loading state is on screen long enough to look at. */
 function later<T>(ms: number, answer: () => T): Promise<T> {
   return new Promise((resolve) => setTimeout(() => resolve(answer()), ms));
@@ -4184,6 +4306,9 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     );
     return agentRows.find((row) => row.agent === payload.agent);
   },
+  agents_seed_offer: () => seedOffer(),
+  agents_seed_plan: (payload) => seedPlan(payload.req as AgentSeedReq),
+  agents_seed_apply: (payload) => seedApply(payload.req as AgentSeedReq),
   agents_drive_repin: (payload) => {
     agentRows = agentRows.map((row) =>
       row.profileId !== payload.profileId || row.pin === null
