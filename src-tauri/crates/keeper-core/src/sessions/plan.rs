@@ -242,7 +242,7 @@ pub fn compile_create_from(
 /// the zone, and continuing one is a thing an operator does on day one. With the
 /// name fixed, the shell read the source's `README.md` — absent — and compiled
 /// `GuardedWrite { path: "<source>/README.md", expect_len: 0 }`, which
-/// `sessions_exec` reads before writing and refuses with a raw ENOENT; the append
+/// `keeper_agent::sessions::exec` reads before writing and refuses with a raw ENOENT; the append
 /// is pushed AFTER the create steps, so the operator got an errno, a new session
 /// already on disk, and no `continues`/`continued-by` pair — precisely the loss
 /// AD-112 exists to prevent. Worse in the half-migrated shape, where an old
@@ -625,7 +625,7 @@ mod tests {
     /// The append has to land on the file the bytes came out of. When the name was
     /// a constant, the shell read `<source>/README.md` (absent), got `""`, and
     /// compiled `GuardedWrite { path: "<source>/README.md", expect_len: 0 }`:
-    /// `sessions_exec` reads the target before writing and maps the ENOENT to
+    /// `keeper_agent::sessions::exec` reads the target before writing and maps the ENOENT to
     /// `Refused`, so the step failed with an errno *after* the create steps had
     /// already put the new session on disk — a stray session and no
     /// `continues`/`continued-by` pair, the loss AD-112 exists to prevent.

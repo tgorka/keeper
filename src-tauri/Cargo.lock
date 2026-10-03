@@ -4271,9 +4271,12 @@ dependencies = [
 name = "keeper-agent"
 version = "0.9.0"
 dependencies = [
+ "chrono",
+ "fs4",
  "keeper-core",
  "keeper-sync",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",

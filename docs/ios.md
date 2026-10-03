@@ -466,9 +466,10 @@ schemes. What stays desktop-only, and why:
 
 - The five plugins above (tray, hotkey, autostart, updater, process): no iOS concept.
 - `bots_drive_ipc` and the drive half of `agent_ports` (the drive half of Bots), `notes_window` (the
-  quick-capture window), `sessions_root` / `sessions_exec` (the sessions board and
-  the tasks runner — AD-201: iOS spawns nothing), `hotkey`, `menu`, `tray`,
-  `voice_window`, `recording_protocol`, `pdf_export` (macOS WebKit).
+  quick-capture window), `sessions_root` (the sessions board and the tasks runner — AD-201:
+  iOS spawns nothing), `hotkey`, `menu`, `tray`, `voice_window`, `recording_protocol`,
+  `pdf_export` (macOS WebKit). `keeper_agent::sessions` is not gated: `keeper-agent` is a
+  dependency on every target, so it compiles on the phone and nothing there calls it.
 - Inside `keeper-sync`, `git/cli.rs` is the one module that spawns a process. On
   iOS every verb on it refuses **before** `Command::new` with one sentence naming
   the phone and the in-process route (`GitEngine::Gix`, `GitCli::phone()`); the
@@ -806,7 +807,7 @@ it. The bridge runner: `bridges-pane.tsx` gates the runner on `bridgeSidecar`, w
 `cfg!(desktop)` (`ipc.rs:1430`); discovery, provisioning and health are on the phone since
 Story 66.1. The sessions board: the sessions commands have `unsupported` twins on the
 phone (`crates/keeper/src/sessions_ipc.rs:41-44` and every twin below it) and
-`sessions_root` / `sessions_exec` are `#[cfg(desktop)]` (`lib.rs:66-70`) — it reads a
+`sessions_root` is `#[cfg(desktop)]` (`lib.rs:66-70`) — it reads a
 synced folder and could follow the notes reader, but it is forty commands and its own
 epic (DW-237). Tasks: a task is one of keeper's own verbs and never a shell string
 (`keeper-sync/src/tasks.rs:148-161`, the closed `TaskKind`), so the wall is not a spawn;

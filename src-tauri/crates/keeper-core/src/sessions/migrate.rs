@@ -442,7 +442,7 @@ pub enum RecordRenameError {
 /// Every other step here is idempotent on replay: `WriteFile` overwrites,
 /// `TrashFile` answers `Ok` when the source is gone and the trash holds it, and
 /// `GuardedWrite` recognises its own output. `MoveFile` is the one that is not —
-/// `sessions_exec` deliberately refuses a `MoveFile` whose target exists, because
+/// `keeper_agent::sessions::exec` deliberately refuses a `MoveFile` whose target exists, because
 /// its only previous caller ran plans it had just stat'd and a gone source there
 /// means a stale list rather than a completed move. So the move sorts last, the
 /// place this codebase already puts a step whose replay is not free
@@ -1609,7 +1609,7 @@ Release drafted; DMG attached.\n\n\
     /// The plan's effect on a zone, as a map of zone-relative path → bytes.
     ///
     /// A four-step interpreter, and deliberately only the four steps
-    /// [`compile_record_rename`] emits, with the semantics `sessions_exec` gives
+    /// [`compile_record_rename`] emits, with the semantics `keeper_agent::sessions::exec` gives
     /// them: a guarded write that recognises its own output, a trash that keeps
     /// the basename under its key, a move that refuses an occupied target. It
     /// exists because this crate touches no filesystem by rule — `text_file`'s
@@ -2177,7 +2177,7 @@ Release drafted; DMG attached.\n\n\
 
     /// The migration is one plan through the existing executor, and every step
     /// before the move replays for free (AD-111). The move sorts last for exactly
-    /// that reason: `sessions_exec` refuses a `MoveFile` onto an occupied target,
+    /// that reason: `keeper_agent::sessions::exec` refuses a `MoveFile` onto an occupied target,
     /// so a resume that re-runs it refuses over a verb that has already finished
     /// rather than over one that still has work to do.
     #[test]

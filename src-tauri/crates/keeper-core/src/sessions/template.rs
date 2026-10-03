@@ -1312,7 +1312,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // A template's own files and folders (FR-284) — the spec's matrix, rows
     // 3-12 and 15, at the plan level. Rows 1-2 are the executor's
-    // (`keeper/src/sessions_exec.rs`) and rows 13-16 the shell's and the room's.
+    // (`keeper-agent/src/sessions/exec.rs`) and rows 13-16 the shell's and the room's.
     // -----------------------------------------------------------------------
 
     /// The template `_template/test1` the owner actually has, as a plan prefix.
@@ -1498,7 +1498,7 @@ mod tests {
         );
         // Row 8's collision is not decided here: the domain opens nothing
         // (AD-108), so the shell asks the disk and `MoveFile` refuses it again as
-        // it runs (`sessions_exec.rs`, matrix row 2).
+        // it runs (`keeper_agent::sessions::exec`, matrix row 2).
     }
 
     /// Row 9. A folder rename is a `MoveDir`, so its contents travel by moving
