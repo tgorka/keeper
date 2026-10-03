@@ -22,6 +22,11 @@ mod account_settings;
 // sheet, the notes vault and the sync profiles on desktop, chosen at compile
 // time so a phone's turn is armed with no drive.
 mod agent_ports;
+// This Mac as an agents host (story 90.6): the app's facts handed to
+// `keeper_agent::desktop`, ticked from the one interval below, and Settings ›
+// Agents' commands. Desktop-only: a phone is never a host.
+#[cfg(desktop)]
+mod agents_host;
 // The Bots surface's commands that run on every target (Epic 61, Story 61.4;
 // split in Story 62.1). A provider is a URL plus a credential and a
 // conversation two tables in the `keeper.db` every platform already opens;
@@ -706,6 +711,10 @@ pub fn run() {
                         // The recordings index's daily reconcile, the same
                         // way: a due-check here, the refresh on its own thread.
                         ipc::recordings_reconcile_tick(&handle);
+                        // This Mac's agents host rides the same clock (AD-62,
+                        // story 90.6): manifests, placement and claims, spawned
+                        // off the tick, a tick still running skipping this one.
+                        agents_host::tick();
                         // Voice rides the same clock (Story 63.5, FR-421): the
                         // tray's status line and verb follow Rust's own turn —
                         // `voice_snapshot`, not the webview's mirror — so the
@@ -786,6 +795,9 @@ pub fn run() {
             {
                 let state = app.state::<ipc::AppState>();
                 sync::start_supervisor(std::sync::Arc::clone(&state.platform));
+                // The agents host, once the engine whose drives it reads is
+                // running; it hosts from the next tick's scan (story 90.6).
+                agents_host::start(std::sync::Arc::clone(&state.platform));
             }
             #[cfg(not(desktop))]
             sync::phone_sync_all(app.handle(), "open");
@@ -1572,6 +1584,11 @@ pub fn run() {
         // The Recordings pane's "Reconcile now": the pane itself is
         // desktop-only (the `recording` capability), so there is no twin.
         ipc::recordings_reconcile_now,
+        // Settings › Agents (story 90.6): this Mac as a host is desktop-only,
+        // and the section is absent where `botTools` is false.
+        agents_host::agents_copies,
+        agents_host::agents_copy_sign_in,
+        agents_host::agents_drive_repin,
     );
     // The commands that touch a window or a file manager have `Unsupported`
     // twins so the handler list is identical on every target and
@@ -1771,8 +1788,16 @@ pub fn run() {
                 // window and keeps the host (`WindowEvent::CloseRequested`
                 // above), so releasing there would stop tasks the user never
                 // asked to stop.
+                // The agents this Mac hosts stop first: running turns get
+                // their final edits and their log lines, which the sync quit
+                // below commits and pushes; only then are the claims released,
+                // so a taker reads a log that has them (AD-378).
+                #[cfg(desktop)]
+                agents_host::stop_turns_for_quit();
                 #[cfg(desktop)]
                 sync::finalize_for_quit();
+                #[cfg(desktop)]
+                agents_host::release_for_quit();
                 // A short, bounded graceful shutdown: `shutdown_all` awaits each
                 // account's `sync.stop()`. Bounding it keeps quit responsive even if a
                 // network teardown hangs.

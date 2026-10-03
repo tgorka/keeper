@@ -176,7 +176,7 @@ pub fn inspect(config: &AgentdConfig, dirs: &XdgDirs) -> Inspection {
     Inspection { drives, hosted }
 }
 
-fn view(id: &str, profile: SyncProfile, hosts: Result<DriveDecl, String>) -> DriveView {
+pub(crate) fn view(id: &str, profile: SyncProfile, hosts: Result<DriveDecl, String>) -> DriveView {
     let zone = read_zone(id, &profile, hosts.as_ref().ok());
     let sessions = if hosts.is_ok() {
         active_sessions(&profile)
@@ -245,6 +245,16 @@ pub async fn check_out_missing(
 /// What an invite is decided against: every agent of a drive this host
 /// mounts, and the `[[trust]]` pins.
 pub fn known(config: &AgentdConfig, drives: &[DriveView], hosted: &[AgentHome]) -> Known {
+    known_with(config.trust.clone(), drives, hosted)
+}
+
+/// [`known`] over `trust` rather than a config's: the desktop has no
+/// `[[trust]]` pins, so every other person's invite stays pending there.
+pub(crate) fn known_with(
+    trust: Vec<keeper_core::agents::agentd::TrustEntry>,
+    drives: &[DriveView],
+    hosted: &[AgentHome],
+) -> Known {
     let mut agents = Vec::new();
     for drive in drives {
         for (_, home) in &drive.zone.homes {
@@ -264,10 +274,7 @@ pub fn known(config: &AgentdConfig, drives: &[DriveView], hosted: &[AgentHome]) 
             });
         }
     }
-    Known {
-        agents,
-        trust: config.trust.clone(),
-    }
+    Known { agents, trust }
 }
 
 /// A copy's client, restored from its stored session; `None` when `login`
@@ -278,21 +285,32 @@ pub async fn restore_copy(
     data_dir: &Path,
     user: &OwnedUserId,
 ) -> Result<Option<AgentClient>, String> {
-    let secrets = platform.secrets();
-    let get = |key: String| secrets.get(&key).map_err(|error| error.to_string());
+    open_copy(&config.homeserver.url.normalized, platform, data_dir, user).await
+}
+
+/// [`restore_copy`] over any host's secrets and homeserver: the session and
+/// the store passphrase are read from `platform`'s keychain under the
+/// copy's keys, `agents/<user>/…`.
+pub async fn open_copy(
+    homeserver: &str,
+    platform: &dyn keeper_core::platform::Platform,
+    data_dir: &Path,
+    user: &OwnedUserId,
+) -> Result<Option<AgentClient>, String> {
+    let get = |key: String| {
+        platform
+            .keychain_get(&key)
+            .map_err(|error| error.to_string())
+    };
     let (Some(session), Some(passphrase)) = (
         get(matrix::session_key(user))?,
         get(matrix::passphrase_key(user))?,
     ) else {
         return Ok(None);
     };
-    let client = AgentClient::open(
-        &config.homeserver.url.normalized,
-        &matrix::store_dir(data_dir, user),
-        &passphrase,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
+    let client = AgentClient::open(homeserver, &matrix::store_dir(data_dir, user), &passphrase)
+        .await
+        .map_err(|error| error.to_string())?;
     let stored = StoredSession::from_json(&session).map_err(|error| error.to_string())?;
     client
         .restore(stored)
@@ -305,6 +323,28 @@ pub async fn restore_copy(
 /// drives and provider rows.
 pub fn agent_deps(
     platform: &Arc<HeadlessPlatform>,
+    data_dir: &Path,
+    host: &HostSlug,
+    drives: &[DriveView],
+    rows: &[keeper_core::bots::store::ProviderRow],
+    home: &AgentHome,
+) -> Result<AgentDeps, String> {
+    deps_over(
+        &TurnEnv::new(Arc::clone(platform) as Arc<dyn keeper_core::platform::Platform>),
+        data_dir,
+        host,
+        drives,
+        rows,
+        home,
+    )
+}
+
+/// [`agent_deps`] over `base`: its platform and account, with the drive
+/// narrowed to the hosting drives, no notes-vault writer and nobody to
+/// approve. No host's copies write a vault, so placement may treat every
+/// host alike: a manifest has no word for "writes the person's vault".
+pub(crate) fn deps_over(
+    base: &TurnEnv,
     data_dir: &Path,
     host: &HostSlug,
     drives: &[DriveView],
@@ -350,7 +390,7 @@ pub fn agent_deps(
                 vault: None,
                 approval: None,
             }),
-            ..TurnEnv::new(Arc::clone(platform) as Arc<dyn keeper_core::platform::Platform>)
+            ..base.clone()
         },
         data_dir: data_dir.to_owned(),
         row,
@@ -550,15 +590,15 @@ fn rescan(
 }
 
 /// One agent's sessions, one per room.
-struct RoomSessions<'a> {
+pub(crate) struct RoomSessions<'a> {
     /// The session that serves each room: the first by path.
-    served: Vec<(&'a FoundSession, &'a SessionAgent)>,
+    pub(crate) served: Vec<(&'a FoundSession, &'a SessionAgent)>,
     /// Every other one, with the session it lost the room to.
-    shadowed: Vec<(&'a FoundSession, String)>,
+    pub(crate) shadowed: Vec<(&'a FoundSession, String)>,
 }
 
 /// The sessions of `copy`'s agent among `found`.
-fn sessions_of<'a>(copy: &Copy, found: &'a [FoundSession]) -> RoomSessions<'a> {
+pub(crate) fn sessions_of<'a>(copy: &Copy, found: &'a [FoundSession]) -> RoomSessions<'a> {
     let config = &copy.deps.home.config;
     let mut mine: Vec<(&FoundSession, &SessionAgent)> = found
         .iter()
@@ -581,6 +621,38 @@ fn sessions_of<'a>(copy: &Copy, found: &'a [FoundSession]) -> RoomSessions<'a> {
         }
     }
     sessions
+}
+
+/// A restored copy, live: its invite and timeline handlers registered and
+/// its sync loop running, which counts the rounds a taker's settle waits on.
+pub(crate) fn start_copy(
+    deps: Arc<AgentDeps>,
+    client: AgentClient,
+    known: Arc<RwLock<Arc<Known>>>,
+) -> (Arc<Copy>, JoinHandle<()>) {
+    let (rounds, rounds_seen) = watch::channel(0u64);
+    let copy = Arc::new(Copy {
+        deps,
+        client,
+        known,
+        router: Arc::new(Router::default()),
+        syncs: rounds_seen,
+    });
+    register_handlers(&copy);
+    let sync_client = copy.client.client().clone();
+    let sync = tokio::spawn(async move {
+        let rounds = &rounds;
+        let synced = sync_client
+            .sync_with_callback(matrix::sync_settings(), |_| async move {
+                rounds.send_modify(|count| *count += 1);
+                LoopCtrl::Continue
+            })
+            .await;
+        if let Err(error) = synced {
+            tracing::error!(%error, "agents: a copy's sync loop ended");
+        }
+    });
+    (copy, sync)
 }
 
 /// Run the host until `shutdown` turns `true`.
@@ -682,28 +754,8 @@ pub async fn run(
                 continue;
             }
         };
-        let (rounds, rounds_seen) = watch::channel(0u64);
-        let copy = Arc::new(Copy {
-            deps,
-            client,
-            known: Arc::clone(&known),
-            router: Arc::new(Router::default()),
-            syncs: rounds_seen,
-        });
-        register_handlers(&copy);
-        let sync_client = copy.client.client().clone();
-        syncs.push(tokio::spawn(async move {
-            let rounds = &rounds;
-            let synced = sync_client
-                .sync_with_callback(matrix::sync_settings(), |_| async move {
-                    rounds.send_modify(|count| *count += 1);
-                    LoopCtrl::Continue
-                })
-                .await;
-            if let Err(error) = synced {
-                tracing::error!(%error, "agentd: a copy's sync loop ended");
-            }
-        }));
+        let (copy, sync) = start_copy(deps, client, Arc::clone(&known));
+        syncs.push(sync);
         copies.push(copy);
     }
 

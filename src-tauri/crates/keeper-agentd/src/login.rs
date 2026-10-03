@@ -15,13 +15,7 @@ use crate::cli::{runtime, split_ref, CliError, Host};
 pub fn stored_device(secrets: &SecretMap, user: &str) -> Option<String> {
     let user = matrix_sdk_user(user)?;
     let json = secrets.get(&matrix::session_key(&user)).ok().flatten()?;
-    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
-    // A password session flattens the SDK's `MatrixSession`; an OAuth one
-    // nests it under `user.meta`.
-    value["device_id"]
-        .as_str()
-        .or_else(|| value["user"]["meta"]["device_id"].as_str())
-        .map(str::to_owned)
+    matrix::device_of_session(&json)
 }
 
 fn matrix_sdk_user(user: &str) -> Option<OwnedUserId> {
@@ -89,22 +83,17 @@ pub fn run(host: &Host, agent: &str, password_credential: Option<&str>) -> Resul
         None => prompt_without_echo(&format!("Password for {user}: "))?,
     };
     let device = stored_device(&secrets, user.as_str());
-    let passphrase = match secrets
+    let store = matrix::store_dir(&host.dirs.data, &user);
+    let stored = secrets
         .get(&matrix::passphrase_key(&user))
-        .map_err(|error| CliError::Config(error.to_string()))?
-    {
-        Some(passphrase) => passphrase,
-        None => matrix::new_store_passphrase(),
-    };
+        .map_err(|error| CliError::Config(error.to_string()))?;
+    let passphrase = matrix::sign_in_passphrase(stored, &store)
+        .map_err(|error| CliError::Failure(error.to_string()))?;
     let display = format!("{}@{}", home.config.id, config.host);
     let session: StoredSession = runtime.block_on(async {
-        let client = AgentClient::open(
-            &config.homeserver.url.normalized,
-            &matrix::store_dir(&host.dirs.data, &user),
-            &passphrase,
-        )
-        .await
-        .map_err(|error| CliError::Failure(error.to_string()))?;
+        let client = AgentClient::open(&config.homeserver.url.normalized, &store, &passphrase)
+            .await
+            .map_err(|error| CliError::Failure(error.to_string()))?;
         client
             .login(user.as_str(), &password, device.as_deref(), &display)
             .await

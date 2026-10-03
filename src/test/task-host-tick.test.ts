@@ -98,6 +98,19 @@ describe("the app hosts due tasks on the tick it already owns", () => {
     expect(occurrences(LIB, "daily_tick(")).toBe(1);
   });
 
+  it("ticks this Mac's agents host from that interval and from nowhere else (story 90.6)", () => {
+    // The desktop's `HostRuntime` has no clock of its own: a second interval
+    // for it would be a second scheduler over the same drives (AD-62, D13).
+    const at = LIB.indexOf("tokio::time::interval");
+    const block = LIB.slice(at, LIB.indexOf("\n            }", at));
+    expect(occurrences(block, "agents_host::tick()")).toBe(1);
+    const calls = shellSources().flatMap(([path, code]) =>
+      occurrences(code, "agents_host::tick()") > 0 ? [path] : [],
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatch(/lib\.rs$/);
+  });
+
   it("becomes a task host by starting the supervisor at boot, under #[cfg(desktop)]", () => {
     // This is the whole of "the app runs due tasks": `Engine::run`'s loop calls
     // `tick`, and `tick` calls `run_due_tasks`. Desktop-gated the way the rest

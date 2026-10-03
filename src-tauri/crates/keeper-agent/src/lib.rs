@@ -22,7 +22,8 @@
 //! - [`claims`] is which host writes a session: epoch claims with a settle
 //!   and a lease the writer checks; `hosts` (unix) is the placement, claims
 //!   and host manifest a host process runs each tick.
-//! - `runtime` (unix) is a Linux host's run loop.
+//! - `runtime` (unix) is a Linux host's run loop; `desktop` (unix) is the
+//!   app's host over the app's own drives, pins and keychain.
 //! - `headless` (unix) is a Linux host's process layer: directories, secrets,
 //!   its own engine and provider rows.
 
@@ -32,6 +33,8 @@
 pub mod agent;
 pub mod approval;
 pub mod claims;
+#[cfg(unix)]
+pub mod desktop;
 pub mod drive;
 pub mod grants;
 #[cfg(unix)]

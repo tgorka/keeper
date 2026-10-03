@@ -321,19 +321,6 @@ impl HostRuntime {
                 materialized: Materialized::Full,
             })
             .collect();
-        let mut principal_agents: Vec<OwnedUserId> = drives
-            .iter()
-            .filter(|drive| {
-                drive
-                    .hosts
-                    .as_ref()
-                    .is_ok_and(|decl| decl.principal == config.principal)
-            })
-            .flat_map(|drive| drive.zone.homes.iter())
-            .filter_map(|(_, home)| home.as_ref().ok().map(|h| h.config.matrix_user.clone()))
-            .collect();
-        principal_agents.sort();
-        principal_agents.dedup();
         HostRuntime {
             host,
             principal: config.principal.clone(),
@@ -342,7 +329,7 @@ impl HostRuntime {
             control_room: config.homeserver.control_room.clone(),
             tools,
             drives: manifest_drives,
-            principal_agents,
+            principal_agents: principal_agents(&config.principal, drives),
             copies: copies
                 .into_iter()
                 .map(|copy| copy as Arc<dyn CopyPort>)
@@ -353,6 +340,59 @@ impl HostRuntime {
             manifest_sent: None,
             first_published: None,
         }
+    }
+
+    /// The runtime of a desktop host: never always on, no tool of its own
+    /// yet, its drives as the app syncs them, and no control room until one
+    /// of its copies is found in the principal's ([`Self::set_control_room`]).
+    pub(crate) fn desktop(
+        host: HostSlug,
+        principal: &str,
+        version: &str,
+        drives: &[(DriveView, Materialized)],
+        copies: Vec<Arc<Copy>>,
+    ) -> HostRuntime {
+        HostRuntime {
+            host,
+            principal: principal.to_owned(),
+            always_on: false,
+            version: version.to_owned(),
+            control_room: None,
+            tools: Vec::new(),
+            drives: drives
+                .iter()
+                .map(|(view, materialized)| HostDrive {
+                    id: view.id.clone(),
+                    present: view.hosts.is_ok() && view.profile.local_path.exists(),
+                    materialized: *materialized,
+                })
+                .collect(),
+            principal_agents: principal_agents(principal, drives.iter().map(|(view, _)| view)),
+            copies: copies
+                .into_iter()
+                .map(|copy| copy as Arc<dyn CopyPort>)
+                .collect(),
+            slots: HashMap::new(),
+            clock: ServerClock::default(),
+            rtt: Rtt::default(),
+            manifest_sent: None,
+            first_published: None,
+        }
+    }
+
+    /// The principal's control room, once known.
+    pub(crate) fn control_room(&self) -> Option<&OwnedRoomId> {
+        self.control_room.as_ref()
+    }
+
+    /// Use `room` as the principal's control room from now on.
+    pub(crate) fn set_control_room(&mut self, room: OwnedRoomId) {
+        self.control_room = Some(room);
+    }
+
+    /// The agent users whose manifests this host believes.
+    pub(crate) fn principal_agents(&self) -> &[OwnedUserId] {
+        &self.principal_agents
     }
 
     /// This host's manifest at `server_now`; `live: false` withdraws it.
@@ -1013,6 +1053,28 @@ impl HostRuntime {
 /// `<drive>/<agent>`: how a manifest and placement name an agent.
 fn agent_name(config: &AgentConfig) -> String {
     format!("{}/{}", config.drive, config.id)
+}
+
+/// The agent users of `principal`'s drives among `drives`, whose manifests
+/// a host believes (AD-374).
+fn principal_agents<'a>(
+    principal: &str,
+    drives: impl IntoIterator<Item = &'a DriveView>,
+) -> Vec<OwnedUserId> {
+    let mut agents: Vec<OwnedUserId> = drives
+        .into_iter()
+        .filter(|drive| {
+            drive
+                .hosts
+                .as_ref()
+                .is_ok_and(|decl| decl.principal == principal)
+        })
+        .flat_map(|drive| drive.zone.homes.iter())
+        .filter_map(|(_, home)| home.as_ref().ok().map(|h| h.config.matrix_user.clone()))
+        .collect();
+    agents.sort();
+    agents.dedup();
+    agents
 }
 
 /// Who `copy` claims as on `host`.

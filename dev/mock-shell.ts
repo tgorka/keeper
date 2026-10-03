@@ -55,6 +55,9 @@ import type {
   AccountShareVm,
   AccountStateVm,
   AccountVm,
+  AgentCopyVm,
+  AgentPersonVm,
+  AgentPinVm,
   AutoUpdateRestartVm,
   AutoUpdateVm,
   BotAttachmentVm,
@@ -3865,6 +3868,80 @@ function forgeAddedProfile(
   };
 }
 
+/**
+ * Settings › Agents (Story 90.6). `?agents=differs` opens on a drive whose
+ * `_drive.toml` gained a reader and turned local-only off since this Mac
+ * pinned it, `?agents=none` on no flagged folder (the section is absent), and
+ * the default on a local-only drive nobody has pinned yet beside a flagged
+ * folder whose `_drive.toml` does not read. The password `wrong` is refused
+ * with Rust's sentence.
+ */
+const agentsParam = new URLSearchParams(window.location.search).get("agents");
+const AGENT_OWNER: AgentPersonVm = { matrixId: "@tgorka:tgorka.org", displayName: "Tomasz Gorka" };
+const AGENT_READERS: AgentPersonVm[] = [
+  AGENT_OWNER,
+  { matrixId: "@marta:tgorka.org", displayName: "Marta" },
+];
+function agentPin(): AgentPinVm {
+  if (agentsParam === "differs") {
+    return {
+      state: "differs",
+      owner: AGENT_OWNER,
+      readers: [...AGENT_READERS, { matrixId: "@eve:tgorka.org", displayName: null }],
+      localOnly: false,
+      pinnedOwner: AGENT_OWNER,
+      pinnedReaders: AGENT_READERS,
+      pinnedLocalOnly: true,
+      differences: [
+        "_drive.toml names the readers @eve:tgorka.org, @marta:tgorka.org, @tgorka:tgorka.org; this host pinned @marta:tgorka.org, @tgorka:tgorka.org",
+        "_drive.toml says local_only = false; this host pinned local_only = true",
+      ],
+    };
+  }
+  return {
+    state: "unpinned",
+    owner: AGENT_OWNER,
+    readers: AGENT_READERS,
+    localOnly: true,
+    pinnedOwner: null,
+    pinnedReaders: [],
+    pinnedLocalOnly: null,
+    differences: [],
+  };
+}
+function agentRow(agent: string, name: string): AgentCopyVm {
+  return {
+    profileId: "p1",
+    drive: "tgdrive",
+    agent,
+    name,
+    matrixUser: `@${agent}:tgorka.org`,
+    device: null,
+    host: "hesperia",
+    signedIn: false,
+    pin: agentPin(),
+    problem: agentsParam === "differs" ? "tgdrive's agents zone hosts nothing here." : null,
+  };
+}
+const BROKEN_FOLDER: AgentCopyVm = {
+  profileId: "p2",
+  drive: "marta-notes",
+  agent: "",
+  name: "marta-notes",
+  matrixUser: "",
+  device: null,
+  host: "hesperia",
+  signedIn: false,
+  pin: null,
+  problem: "`local_only` in _drive.toml must be true or false, not text.",
+};
+let agentRows: AgentCopyVm[] =
+  agentsParam === "none"
+    ? []
+    : agentsParam === "differs"
+      ? [agentRow("nixi", "Nixi"), agentRow("tara", "Tara")]
+      : [agentRow("nixi", "Nixi"), agentRow("tara", "Tara"), BROKEN_FOLDER];
+
 /** Answer after `ms`, so a loading state is on screen long enough to look at. */
 function later<T>(ms: number, answer: () => T): Promise<T> {
   return new Promise((resolve) => setTimeout(() => resolve(answer()), ms));
@@ -4075,6 +4152,57 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   // stream, and a `*_subscribe`-shaped fallback would hand back an id and never
   // emit — leaving the pane on its empty state forever, which is the failure
   // §5's own note about `"sub-mock"` describes.
+  agents_copies: () => agentRows,
+  agents_copy_sign_in: (payload) => {
+    if (payload.password === "wrong") {
+      throw {
+        code: "internal",
+        message: "The homeserver did not accept that password for @nixi:tgorka.org.",
+        accountId: null,
+        retriable: false,
+      };
+    }
+    const pinned = (row: AgentCopyVm): AgentCopyVm =>
+      row.pin?.state === "unpinned"
+        ? {
+            ...row,
+            pin: {
+              ...row.pin,
+              state: "pinned",
+              pinnedOwner: row.pin.owner,
+              pinnedReaders: row.pin.readers,
+              pinnedLocalOnly: row.pin.localOnly,
+            },
+          }
+        : row;
+    agentRows = agentRows.map((row) =>
+      row.profileId !== payload.profileId
+        ? row
+        : row.agent === payload.agent
+          ? { ...pinned(row), signedIn: true, device: "AGENTDEVICE" }
+          : pinned(row),
+    );
+    return agentRows.find((row) => row.agent === payload.agent);
+  },
+  agents_drive_repin: (payload) => {
+    agentRows = agentRows.map((row) =>
+      row.profileId !== payload.profileId || row.pin === null
+        ? row
+        : {
+            ...row,
+            problem: null,
+            pin: {
+              ...row.pin,
+              state: "pinned",
+              pinnedOwner: row.pin.owner,
+              pinnedReaders: row.pin.readers,
+              pinnedLocalOnly: row.pin.localOnly,
+              differences: [],
+            },
+          },
+    );
+    return agentRows;
+  },
   bots_providers_list: () => BOT_PROVIDERS,
   bots_bots_list: () => BOT_ROWS,
   bots_sessions_list: (payload) =>

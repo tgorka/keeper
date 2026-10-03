@@ -54,9 +54,41 @@ pub fn store_dir(data_dir: &Path, user: &UserId) -> PathBuf {
     data_dir.join("agents").join(user.as_str()).join("sdk")
 }
 
-/// A fresh store passphrase for a new copy.
-pub fn new_store_passphrase() -> String {
-    crate::auth::generate_store_passphrase()
+/// The passphrase a sign-in opens `store` with: `stored`, the one in the
+/// host's secrets, or a fresh one. Before a fresh one, a store already at
+/// `store` is removed: it was left by a sign-in that failed before its
+/// passphrase was kept, so it is encrypted under a passphrase nobody has
+/// and would refuse every later sign-in, and no session can open it.
+pub fn sign_in_passphrase(
+    stored: Option<String>,
+    store: &Path,
+) -> Result<String, AgentMatrixError> {
+    if let Some(passphrase) = stored {
+        return Ok(passphrase);
+    }
+    match std::fs::remove_dir_all(store) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(AgentMatrixError::Other(format!(
+                "could not remove {}: {err}",
+                store.display()
+            )))
+        }
+    }
+    Ok(crate::auth::generate_store_passphrase())
+}
+
+/// The device id of a stored session's JSON, so a later sign-in reuses it
+/// and the agent's user never collects stale devices. A password session
+/// flattens the SDK's `MatrixSession`; an OAuth one nests it under
+/// `user.meta`.
+pub fn device_of_session(json: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(json).ok()?;
+    value["device_id"]
+        .as_str()
+        .or_else(|| value["user"]["meta"]["device_id"].as_str())
+        .map(str::to_owned)
 }
 
 /// What a homeserver call ended in, in the terms a host acts on.
