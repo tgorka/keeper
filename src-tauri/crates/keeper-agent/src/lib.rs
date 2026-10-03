@@ -13,9 +13,13 @@
 //! - [`sessions`] is the sessions runtime: one plan at a time per zone.
 //! - [`ports`] is what a host process supplies.
 //! - [`approval`] is the ask-and-wait a host with a person at it plugs in.
+//! - `headless` (unix) is a Linux host's process layer: directories, secrets,
+//!   its own engine and provider rows.
 
 pub mod approval;
 pub mod drive;
+#[cfg(unix)]
+pub mod headless;
 pub mod host;
 pub mod ports;
 pub mod sessions;

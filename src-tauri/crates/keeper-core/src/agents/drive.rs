@@ -142,12 +142,7 @@ pub fn parse(text: &str) -> Result<DriveDecl, DriveDeclRefusal> {
     }
 
     let owner = user_id("owner", &text_of(&table, "owner")?)?;
-    let readers = readers(&table)?;
-    if !readers.contains(&owner) {
-        return Err(DriveDeclRefusal::OwnerNotReader {
-            owner: owner.to_string(),
-        });
-    }
+    let readers = audience(&owner, &reader_texts(&table)?)?;
 
     let local_only = match table.get("local_only") {
         None => false,
@@ -180,28 +175,45 @@ fn text_of(table: &toml::Table, key: &'static str) -> Result<String, DriveDeclRe
     }
 }
 
-fn readers(table: &toml::Table) -> Result<BTreeSet<OwnedUserId>, DriveDeclRefusal> {
+fn reader_texts(table: &toml::Table) -> Result<Vec<String>, DriveDeclRefusal> {
     let items = match required(table, "readers")? {
         toml::Value::Array(items) => items,
         other => return Err(wrong("readers", "a list of Matrix user ids", other)),
     };
-    if items.is_empty() {
+    items
+        .iter()
+        .map(|item| match item {
+            toml::Value::String(raw) => Ok(raw.clone()),
+            other => Err(wrong("readers", "a list of Matrix user ids", other)),
+        })
+        .collect()
+}
+
+/// A drive's audience as `_drive.toml` and a host's pin both state it: Matrix
+/// ids, at least one, none twice, and the owner among them (S-15).
+pub fn audience(
+    owner: &OwnedUserId,
+    readers: &[String],
+) -> Result<BTreeSet<OwnedUserId>, DriveDeclRefusal> {
+    if readers.is_empty() {
         return Err(DriveDeclRefusal::NoReaders);
     }
-    let mut readers = BTreeSet::new();
-    for item in items {
-        let toml::Value::String(raw) = item else {
-            return Err(wrong("readers", "a list of Matrix user ids", item));
-        };
+    let mut set = BTreeSet::new();
+    for raw in readers {
         let reader = user_id("readers", raw)?;
-        if readers.contains(&reader) {
+        if set.contains(&reader) {
             return Err(DriveDeclRefusal::DuplicateReader {
                 reader: reader.to_string(),
             });
         }
-        readers.insert(reader);
+        set.insert(reader);
     }
-    Ok(readers)
+    if !set.contains(owner) {
+        return Err(DriveDeclRefusal::OwnerNotReader {
+            owner: owner.to_string(),
+        });
+    }
+    Ok(set)
 }
 
 fn untrusted(table: &toml::Table) -> Result<Vec<String>, DriveDeclRefusal> {

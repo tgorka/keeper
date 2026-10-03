@@ -27,5 +27,10 @@ fs4 = { workspace = true }
 # The caller's clock, handed to a create (AD-56).
 chrono = { workspace = true }
 
+# The headless host's process layer: no secret variable and no core dump
+# after start (S-07), `prctl` on Linux.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }

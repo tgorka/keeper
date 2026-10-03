@@ -303,6 +303,12 @@ toml = "0.9"
 # included, stays. Already in Cargo.lock at this version through
 # `proc-macro-crate`, so the tree gains no package. MIT OR Apache-2.0.
 toml_edit = "0.25.12"
+# The headless hosts' process layer (Epic 90, S-07, S-34): `geteuid` for the
+# strict secrets directory, `O_NOFOLLOW` for its files and, on Linux,
+# `prctl(PR_SET_DUMPABLE, 0)`. Already in Cargo.lock at 1.1.4 through
+# tempfile and tokio, so the tree gains no package.
+# `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
 # Exact-length streaming request bodies for LFS uploads (Story 25.3). This is
 # not optional sugar: `reqwest::Body::wrap_stream` and `Body::from(File)` both
 # yield an unknown-size body and therefore `Transfer-Encoding: chunked`, which

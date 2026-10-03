@@ -575,3 +575,135 @@ history (DW-359). Re-measure with:
 ```sh
 cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core --test agents_log_growth -- --ignored --nocapture
 ```
+
+## A Linux host
+
+`keeper-agentd` runs a principal's agents on a server: one process per principal, as that
+principal's own OS user (`agentd-tgorka`, `agentd-marta`, `agentd-neuraffica`). Everything it keeps
+is under that user's XDG directories, named `keeper-agentd`, and never shares a file with
+`keeper-syncd`:
+
+| what | where |
+| --- | --- |
+| the configuration | `$XDG_CONFIG_HOME/keeper-agentd/agentd.toml` |
+| its own sync engine | `$XDG_DATA_HOME/keeper-agentd/sync.db`, beside the marker `.keeper-agentd` |
+| the provider rows | `$XDG_DATA_HOME/keeper-agentd/keeper.db` |
+| the checkouts | `$XDG_DATA_HOME/keeper-agentd/drives/<drive id>/` |
+| the copies' Matrix stores | `$XDG_DATA_HOME/keeper-agentd/agents/<user>/sdk` |
+| secret files | `$XDG_STATE_HOME/keeper-agentd/secrets/` |
+
+A `sync.db` without the marker beside it is never opened: opening another engine's database would
+requeue its running work. agentd says which file it refused and stops.
+
+### Secrets
+
+`agentd.toml` holds no secret. Every credential in it is written `secret:<name>`, and agentd reads
+`<name>` from, in order:
+
+1. `$CREDENTIALS_DIRECTORY/<name>` — a systemd credential (`LoadCredential=<name>:/etc/keeper-agentd/<principal>/<name>`).
+   This is the recommended way: the file stays root-owned outside agentd's own directories, and only
+   the running unit sees it.
+2. the environment, `KEEPER_AGENTD_SECRET_<NAME>` (`<name>` uppercased, every character that is not
+   a letter or digit written `_`) — the fallback for a container;
+3. `$XDG_STATE_HOME/keeper-agentd/secrets/<name>`, a file of mode `0600`.
+
+In the credential's and the file's name too, every character that is not a letter or digit is
+written `_`: `secret:desk-kvm` is the credential `desk_kvm`.
+
+The secrets directory must be mode `0700`, owned by the user agentd runs as, and not a symlink; a
+secret file that is a symlink is refused. A file another account can read is refused with "it must
+be 0600 — run: chmod 0600 …". The copies' Matrix sessions and store passphrases, which `login`
+writes, live in the same directory.
+
+Once it has read its secrets, before it starts any thread or child, agentd removes every
+`KEEPER_AGENTD_SECRET_*` variable from its own environment and, on Linux, makes itself
+non-dumpable (`PR_SET_DUMPABLE` 0): no program it runs inherits a secret, and no other process of
+its user can read its memory or its `/proc` files. A secret `agentd.toml` names that is in none of
+the three places stops it there, naming all three; so does a secret variable whose value is not
+text (it is removed all the same). A key `agentd.toml` binds to a `secret:<name>` is read-only to
+keeper: nothing keeper does writes or deletes the operator's secret.
+
+**What the store passphrase protects.** A copy's Matrix store is encrypted with a passphrase kept
+in the same secret store. That protects a stolen data directory only when the secrets are not
+stolen with it. Handing the passphrase over with `LoadCredential=` keeps it outside agentd's own
+directories, so a copy of `~agentd-<principal>` alone opens nothing.
+
+`keeper-syncd` is unchanged by any of this: its secrets stay environment-then-`0600` file under
+`$XDG_CONFIG_HOME/keeper-sync/secrets/`, with no credentials directory and no directory rule.
+
+### `agentd.toml`
+
+```toml
+version   = 1
+principal = "tgorka"
+host      = "electra"
+always_on = true
+
+[homeserver]
+url          = "https://<homeserver>"
+control_room = ""                        # written by `keeper-agentd init`
+
+[[drives]]
+id         = "tgdrive"
+remote     = "https://<forge>/tgorka/tgdrive.git"
+credential = "secret:tgdrive"
+owner      = "@tgorka:<homeserver>"
+readers    = ["@tgorka:<homeserver>"]
+local_only = false                       # optional; true pins the drive to local models
+
+[[providers]]
+kind       = "openai"
+base_url   = "https://<cliproxyapi-host>:8452"
+credential = "secret:cliproxy"
+
+[[agents]]
+drive = "tgdrive"
+ids   = ["nixi", "tola-grey", "amelia"]
+
+[[trust]]
+user  = "@tgorka:<homeserver>"
+proxy = "@nixi:<homeserver>"
+```
+
+The grammar is exact: `version` is read first, so a file of another version is refused as that;
+an unknown key is refused naming it; `host` and `principal` are
+`[a-z0-9-]{1,32}`; a provider's `kind` is `openai`, `ollama` or `hermes` and its `base_url` passes
+the bots' URL rules; an `[[agents]] drive` must be a `[[drives]] id`. Two `[[drives]]` may not name
+one `remote`. `[[trust]]` needs `user`;
+`master_key` (`ed25519:<unpadded base64>`) is written by a person after comparing the fingerprint
+with the person's own device, never by keeper, and without it the person is not pinned and no
+decision of theirs is accepted. `[[mcp]]`, `[[kvm]]` and `[sandbox]` are read and checked now and
+used by later epics; an `[[mcp]] role = "kvm:<id>"` must name a `[[kvm]] id`. `[sandbox]
+read_exec` must be absolute; that it names nothing inside a drive's checkout and nothing holding
+this host's secrets is checked by the sandbox that mounts it, in a later release.
+
+`[[providers]]` become `keeper.db` rows, one per entry and kept in step with the file at every
+start: a changed `base_url` updates its row, a removed entry deletes it. No token enters the
+database. `[[drives]]` are kept in step the same way, by `id`: a changed `remote` updates the
+drive's profile in place, and a removed entry's profile is deleted before anything syncs — its
+checkout under `drives/<id>/` stays on disk for the operator to remove.
+
+### The pins and the mount rule
+
+Each `[[drives]]` entry **pins** the drive's audience: `owner` and `readers` are required, and the
+operator copies them from the forge's collaborator list for the drive's repository — the real
+access list. `_drive.toml` is a file every reader of the drive can edit, so it is never where a
+host learns who may read the drive. For the same reason the pin carries `local_only`: a drive
+pinned `local_only = true` hosts nothing when its `_drive.toml` says `false`, so a reader cannot
+send the drive to a remote model by editing the file. A file that says `true` where the pin says
+`false` binds as it always does. `principal`, `title` and `[integrity]` are not pinned.
+
+The mount rule runs on the pins, before anything is fetched: every drive this host mounts must be
+readable by every reader of every drive it homes agents in. A host homing agents in neuradrive
+(read by tgorka and marta) never mounts tgdrive (read by tgorka alone): agentd stops with exit
+code `2`, naming `@marta`, and nothing is cloned. A host homing agents in tgdrive may mount
+neuradrive.
+
+After a drive's checkout, its agents zone hosts nothing when its `_drive.toml` names a different
+owner or different readers from the pin, or turns off a pinned `local_only`; `status` and `agents
+list` name each difference ("_drive.toml names the readers @marta, @tgorka, @x; this host pinned
+@marta, @tgorka"). The pin is never rewritten from the file. A zone also hosts nothing when a
+virtual pattern would leave the agents or sessions zone as pointers: agentd must read every file
+of them, and the sentence names the pattern. A `virtualOverBytes` floor counts only when it is
+below a log chunk's 192 KiB bound; above it, the only files it could leave as pointers are log
+blobs, which replay fetches when it needs them.

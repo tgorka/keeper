@@ -7,12 +7,14 @@
 //! function here opens a file inside a zone (the host walks the drive through
 //! `keeper_sync::browse::resolve`, AD-65) — except the session log's writer and
 //! reader and the `.keeper/` index, which own their own files (AD-366).
+pub mod agentd;
 pub mod drive;
 pub mod home;
 pub mod index;
 pub mod label;
 pub mod log;
 pub mod memory;
+pub mod mount;
 pub mod prompt;
 pub mod redact;
 pub mod session;

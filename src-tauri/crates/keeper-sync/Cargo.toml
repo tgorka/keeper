@@ -103,3 +103,7 @@ workspace = true
 # one syscall is not worth an exception to that.
 [target.'cfg(unix)'.dependencies]
 rlimit = "0.10"
+# `xdg`'s strict secrets directory compares its owner with the effective uid
+# and opens its files `O_NOFOLLOW` (S-34); std has neither `geteuid` nor the
+# flag's value, and this crate denies `unsafe_code`.
+rustix = { workspace = true }
