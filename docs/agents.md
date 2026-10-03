@@ -1164,6 +1164,63 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   or more who is not you. Anyone else's marked message — in any room — is an ordinary message:
   it notifies, shows "Edited" when edited, is cut at 4096 characters and never carries the caret.
 
+## Nixi beside your notes
+
+Your proxy's room can sit beside the notes view, docked, on the Mac (on the iPhone it is a room
+like any other). What keeper and the proxy's host do for it:
+
+- **The dock.** *Assistant* is a column right of the note panels in Notes. It starts folded to a
+  48 px rail and remembers whether you left it open; drag its left edge (or press ← / → on it) to
+  size it. Open, it shows a picker of your proxy's conversations (the DM first) with *New
+  conversation* beside it, the room's header — status line, scope chip, label chip — and the room's
+  timeline and composer. It is its own open conversation: it never changes the chat you have
+  selected, and a file dropped on the window goes to the note, not to the dock. Opened in a
+  window too narrow for every column, it folds the notes rail to its strip. With no proxy it says
+  so, looks again on its own and offers *Look again*.
+- **Which rooms.** The dock lists your proxy's conversations: the session rooms whose status says
+  `kind: main` — the DM, listed first, the dock's default — or `kind: conversation`, newest next.
+  A status is the word of whoever holds power in the room, so keeper also requires the room to be
+  encrypted, made by the agent its status names (its only creator), and — for `main` — your
+  direct conversation with that agent; anything else is never listed and nothing is sent there.
+  A room whose status keeper has not read yet is not listed; it is listed once its status
+  arrives, never guessed from the room's shape. Where the proxy's agents zone is on the Mac, the
+  proxy must also be yours (its `agent.toml`'s `human`). A conversation is listed by the title in
+  its status; its room is named after the proxy, because a room's name is not encrypted.
+- **The scope.** The dock's scope chip offers the drives the proxy's `[tools].drives` names, its
+  home drive first. Choosing drives sends a `dev.keeper.agent.scope` event into the room. The
+  host that holds the session's claim checks it: the home drive is always kept, and a drive
+  outside `[tools].drives` refuses the whole request, named in the status's detail. An accepted
+  scope that changes the session's drives is a `scope` line in the log with `set_by`; the next
+  turn arms its grants against it, so it reaches exactly those drives. The host then sends the
+  scope back — its own scope event, with the drives' titles and the session's label — which is
+  what the room's scope and label chips show; it does the same after a turn whose reads changed
+  the label. After you ask, the dock says it asked until the answer arrives.
+- **What you are looking at.** While the dock is open, the note in front of you — its drive, its
+  path from the drive's root and the heading above the caret, read from what the editor shows,
+  saved or not — goes into the same scope event, as `focus`, after a second of stillness and only
+  when it changed; closing the dock sends one event saying there is none, after any focus already
+  on its way, and nothing is sent while it is closed. A clear that could not be sent is tried
+  again; quitting keeper or signing out sends it too. A note in a folder that declares no drive is
+  no note to the proxy. The host keeps the focus in memory, never in the log, and the next turn's
+  frame says it ("The person is looking at notes/plans.md in tgdrive, under the heading Plans ›
+  Q3.") — only when that drive is in scope, and only for 15 minutes after it last heard it: the
+  open dock says it again every 5 minutes, so a note left behind by a crash stops being stated.
+- **A new conversation.** *New conversation* sends `dev.keeper.agent.conversation.request` into
+  the DM. Only the host holding the DM's claim acts on it, so two hosts never make two rooms: it
+  makes the room (typed `dev.keeper.agent.session`, encrypted, with the proxy-conversation power
+  levels, so you can talk and set its scope there but write no state), then the `conversation`
+  session folder naming it, under an id derived from the request — the same request served again
+  finds the folder and makes nothing — then the room's status anchor, invites you and tells the
+  DM; once you have joined it says the status again, so every device of yours can read it. The
+  dock opens the new conversation when it appears. A room made but whose folder could not be
+  written is left, your invite revoked. If the host stops between the room and the folder, that
+  room is left with no session; ask again.
+- **Who may ask.** A scope or a new conversation counts only from the proxy's `human`, in the
+  proxy's own rooms (a new conversation in the DM only), and only from a device that person's
+  cross-signing identity signed (ruling R47).
+  Anyone else's, or one from a device its owner never signed, is ignored and logged as a note.
+  These events are not messages: they are outside the Undo-Send hold and the two message triggers.
+
 ## Which host answers
 
 An agent can have a copy on several hosts — `nixi@electra` on the server, `nixi@hesperia` on the

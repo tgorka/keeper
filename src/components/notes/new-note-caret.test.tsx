@@ -49,6 +49,7 @@ vi.mock("@/lib/ipc/client", () => ({
 
 import { EditorView } from "@codemirror/view";
 import { NOTE_AUTOSAVE_IDLE_MS } from "@/hooks/use-notes-body";
+import { caretIn, noteCaretStore, textThroughCaret } from "@/lib/stores/note-caret";
 import {
   acceptPending,
   applyBodyBatch,
@@ -413,5 +414,46 @@ describe("a revision from outside the editor", () => {
     await waitFor(() => {
       expect(editor.state.doc.toString()).toBe(theirs);
     });
+  });
+});
+
+/**
+ * The assistant dock tells the proxy which line of the note the caret is on
+ * (UX-DR130), and the editor is the only thing that knows. The line is the
+ * BODY's: the frontmatter block is never in the buffer, so the scaffold's
+ * second line is line 2 here and not the file's line 6. The buffer goes with
+ * it, saved or not: Rust names the heading from what the person sees (D2).
+ */
+describe("the caret line the assistant dock reads", () => {
+  it("is published where the caret opens and wherever it moves", async () => {
+    const editor = await openTemplated("caret-line", false);
+    await waitFor(() => {
+      expect(caretIn(noteCaretStore.getState(), "v1", "caret-line")?.line).toBe(2);
+    });
+
+    act(() => {
+      editor.dispatch({ selection: { anchor: SCAFFOLDED.indexOf("## Agenda") } });
+    });
+    expect(caretIn(noteCaretStore.getState(), "v1", "caret-line")?.line).toBe(3);
+
+    // A heading typed above the caret and not saved yet is in what the dock
+    // sends, and the caret's line moved with it.
+    act(() => {
+      editor.dispatch({ changes: { from: 0, insert: "# Unsaved\n" } });
+    });
+    const caret = caretIn(noteCaretStore.getState(), "v1", "caret-line");
+    expect(caret?.line).toBe(4);
+    expect(caret === null ? "" : textThroughCaret(caret)).toBe(
+      `# Unsaved\n${SCAFFOLDED.slice(0, SCAFFOLDED.indexOf("## Agenda"))}## Agenda`,
+    );
+
+    // A change on the caret's own line moves no line, and is still news.
+    const agendaEnd = "# Unsaved\n".length + SCAFFOLDED.indexOf("## Agenda") + "## Agenda".length;
+    act(() => {
+      editor.dispatch({ changes: { from: agendaEnd, insert: " and risks" } });
+    });
+    const typed = caretIn(noteCaretStore.getState(), "v1", "caret-line");
+    expect(typed?.line).toBe(4);
+    expect(typed === null ? "" : textThroughCaret(typed)).toMatch(/## Agenda and risks$/);
   });
 });

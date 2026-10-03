@@ -48,6 +48,7 @@ import { type SurfaceRail, useSurfaceColumn } from "@/components/layout/surface-
 import { NoteDeleteDialog } from "@/components/notes/note-delete-dialog";
 import { NoteFilterBar, SAVE_UNION_REFUSED } from "@/components/notes/note-filter-bar";
 import { NoteList } from "@/components/notes/note-list";
+import { NotesAgentDock } from "@/components/notes/notes-agent-dock";
 import { type NotesEmptyKind, NotesEmptyState } from "@/components/notes/notes-empty-state";
 import { PhysicalTree } from "@/components/notes/physical-tree";
 import { SpaceList } from "@/components/notes/space-list";
@@ -754,6 +755,11 @@ export function NotesPane() {
           told which note; now the panel holds the note and the rail filters the
           list. `NotePanelBody` says so out loud if the vault is actually gone. */}
       <PanelStrip emptySentence={NOTES_PANEL_EMPTY_SENTENCE} />
+      {/* Pane 4 — the assistant (UX-DR130): the person's proxy room, docked
+          right of the panels so the note stays in the middle. Its seam is on
+          its left, and it starts folded: opening it is what starts telling the
+          proxy which note is in front of you. */}
+      <NotesAgentDock />
       {naming !== null && (
         <SpaceNamePopover
           anchor={naming.anchor}

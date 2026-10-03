@@ -25,15 +25,19 @@
 //! line when the turn could not finish.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, FixedOffset};
 use keeper_core::agents::drive::DriveDecl;
 use keeper_core::agents::events::{
-    edit_content, RunState, StatusContent, CONTENT_VERSION, STATUS, TURN,
+    edit_content, ConversationRequestContent, Focus, RunState, ScopeContent, ScopeDrive,
+    StatusContent, CONTENT_VERSION, SCOPE, STATUS, TURN,
 };
+use keeper_core::agents::focus::FOCUS_TTL;
 use keeper_core::agents::home::{serves_local_models, MenuItem};
 use keeper_core::agents::label::{
     label_drive_read, label_person_message, okf_label_facts, Author, Label, LabelBody, LabelCause,
@@ -43,12 +47,14 @@ use keeper_core::agents::log::reader::{hydrate_blob, read_session};
 use keeper_core::agents::log::replay::{message_for, ReplayRefusal};
 use keeper_core::agents::log::{
     ApprovalBody, ApprovalState, AssistantBody, ErrorBody, HostSlug, LineBody, LogLine, OpenBody,
-    ToolCallBody, ToolOutcomeWord, ToolResultBody, Truncated, Usage, UserBody,
+    ScopeBody, ToolCallBody, ToolOutcomeWord, ToolResultBody, Truncated, Usage, UserBody,
 };
+use keeper_core::agents::matrix::AgentMatrixError;
 use keeper_core::agents::memory::{self, MemorySnapshot};
 use keeper_core::agents::prompt::{self, ComposedPrompt, PromptInput, RenderedFact, SessionFrame};
+use keeper_core::agents::proxy::{conversation_session_id, ScopeRequest, NEW_CONVERSATION_TITLE};
 use keeper_core::agents::redact::redact_secrets;
-use keeper_core::agents::session::SessionAgent;
+use keeper_core::agents::session::{SessionAgent, SessionKind};
 use keeper_core::agents::skills::SkillsIndex;
 use keeper_core::agents::soul::{self, Fact, Soul};
 use keeper_core::bots::chat::{self, CancelSignal, ChatEvent, ChatMessage, ChatOptions, Role};
@@ -62,7 +68,7 @@ use keeper_core::bots::tools::{
 use keeper_core::bots::{http, Bot};
 use keeper_core::error::CoreError;
 use keeper_sync::SyncProfile;
-use matrix_sdk::ruma::{OwnedEventId, OwnedUserId, UserId};
+use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -73,11 +79,12 @@ use crate::drive::finish_word;
 use crate::grants::AgentGrants;
 use crate::host::HostIds;
 use crate::matrix_sink::{
-    anchor_content, cut, cut_to_log, deliver, notice_content, EditPort, MatrixSink, StatusBoard,
-    ToolProgress,
+    anchor_content, cut, cut_to_log, deliver, notice_content, EditPort, MatrixSink, SendFuture,
+    StatusBoard, ToolProgress,
 };
 use crate::ports::ProfileSource;
 use crate::rooms::{self, Arrival, Disposition, Served};
+use crate::sessions::verbs::{self, CreateOutcome};
 use crate::sessions::write::session_write;
 use crate::turn::{arm_turn_probing, endpoint_of, read_timeout_of, TurnEnv, TurnOrigin};
 use crate::writer::{SessionWriter, WriterError};
@@ -139,6 +146,14 @@ pub enum LoadRefusal {
     Home(String),
 }
 
+/// The docked note's focus as the host holds it: the note, and when its
+/// scope event reached this host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldFocus {
+    pub focus: Focus,
+    pub heard: Instant,
+}
+
 /// What a served session's turns read (F2).
 pub struct SessionContext {
     pub session: SessionRef,
@@ -160,6 +175,14 @@ pub struct SessionContext {
     pub label: Label,
     /// The drives in scope.
     pub scope: Vec<String>,
+    /// Who set the scope last: the session's requester until a `scope` line.
+    pub scope_set_by: OwnedUserId,
+    /// The note the person's docked notes view shows (R41): from their
+    /// newest scope event, held in memory and never logged, and stated
+    /// only while it was heard within [`FOCUS_TTL`] — the dock says it again
+    /// while it stays open, so one that was never cleared (a quit, a crash)
+    /// stops being stated.
+    pub focus: Option<HeldFocus>,
     pub epoch: u64,
     pub claim: Option<String>,
     /// The last `open` line.
@@ -202,6 +225,8 @@ impl SessionContext {
             session,
             label: agent.label.clone(),
             scope: agent.drives.clone(),
+            scope_set_by: agent.requested_by.clone(),
+            focus: None,
             agent,
             messages: Vec::new(),
             placed: Vec::new(),
@@ -251,7 +276,10 @@ impl SessionContext {
         match &line.body {
             // A label line holds the label after its join.
             LineBody::Label(body) => self.label = body.label(),
-            LineBody::Scope(body) => self.scope = body.drives.clone(),
+            LineBody::Scope(body) => {
+                self.scope = body.drives.clone();
+                self.scope_set_by = body.set_by.clone();
+            }
             LineBody::Open(body) => {
                 self.open = Some(body.clone());
                 self.frame_time = line.ts.with_timezone(&chrono::Local).fixed_offset();
@@ -350,6 +378,14 @@ impl SessionContext {
                 .collect(),
             audience_sentence: self.label.sentence(&|user| user.to_string()),
             now: self.frame_time,
+            // A note in a drive outside the scope is not named to the model,
+            // nor one not heard again within the TTL.
+            focus: self
+                .focus
+                .as_ref()
+                .filter(|held| held.heard.elapsed() < FOCUS_TTL)
+                .map(|held| held.focus.clone())
+                .filter(|focus| self.scope.contains(&focus.drive)),
         };
         prompt::compose(&PromptInput {
             soul: &self.soul,
@@ -483,7 +519,78 @@ impl ToolHost for AllowedTools {
 pub struct ServedSession {
     pub context: SessionContext,
     pub writer: SessionWriter,
+    /// Where a `main` session makes the conversations its person asks for
+    /// (R36); `None` serves no such request.
+    pub conversations: Option<Arc<dyn ConversationPort>>,
 }
+
+/// A boxed room-creating future.
+pub type RoomFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<OwnedRoomId, AgentMatrixError>> + Send + 'a>>;
+
+/// The agent's own rooms beyond the one it serves: what a `main` session
+/// needs to open a proxy conversation (R36).
+pub trait ConversationPort: Send + Sync {
+    /// A `conversation` session room named `name`, made by the agent, with
+    /// `person` invited. The name is room state, which the homeserver
+    /// reads: a conversation's title travels in its encrypted status.
+    fn create<'a>(&'a self, name: &'a str, person: &'a UserId) -> RoomFuture<'a>;
+    /// Send one event into `room`.
+    fn send<'a>(&'a self, room: &'a RoomId, event_type: &'a str, content: Value) -> SendFuture<'a>;
+    /// Leave a room no session names, the person's invite revoked first.
+    fn discard<'a>(
+        &'a self,
+        room: &'a RoomId,
+        person: &'a UserId,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    /// Whether `person` has joined `room`, as this copy last synced it.
+    fn joined<'a>(
+        &'a self,
+        room: &'a RoomId,
+        person: &'a UserId,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+}
+
+/// How long the host watches a new conversation for its person's join, and
+/// how often it looks.
+pub const JOIN_WATCH: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+pub const JOIN_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Say a new conversation's status again once its person has joined: the
+/// anchor went out with the person only invited, encrypted to the devices
+/// known then, so a device of theirs that was not could never read it — and
+/// a room whose status is unread is never in that device's dock. Sent after
+/// the join, it is shared with every device the person has.
+fn restate_once_joined(
+    rooms: Arc<dyn ConversationPort>,
+    room: OwnedRoomId,
+    person: OwnedUserId,
+    status: Value,
+) {
+    tokio::spawn(async move {
+        let until = Instant::now() + JOIN_WATCH;
+        while Instant::now() < until {
+            tokio::time::sleep(JOIN_POLL).await;
+            if rooms.joined(&room, &person).await {
+                if let Err(error) = rooms.send(&room, STATUS, status).await {
+                    tracing::warn!(%room, %error, "agents: a new conversation's status could not be said again");
+                }
+                return;
+            }
+        }
+    });
+}
+
+/// What the DM is told when a conversation could not be opened; why is in
+/// the host's log.
+pub const CONVERSATION_FAILED: &str =
+    "I could not open a new conversation. Ask me again in a moment.";
+
+/// A scope request keeper cannot read.
+pub const UNREADABLE_SCOPE_REQUEST: &str = "a scope this host cannot read is not applied";
+/// A request for a conversation keeper cannot read, or one this host cannot
+/// serve here.
+pub const UNSERVED_CONVERSATION: &str = "a request for a conversation this host cannot serve here";
 
 /// An event that arrived in a served session's room.
 #[derive(Debug, Clone)]
@@ -497,6 +604,10 @@ pub struct Arrived {
     pub content: Value,
     /// When this host received it.
     pub received_at: Instant,
+    /// Read back from the room when the worker started, not delivered live:
+    /// an event served before may not have left a line (a focus, an
+    /// unchanged scope), so it is served again on every start.
+    pub replay: bool,
 }
 
 /// What became of an arrival.
@@ -510,6 +621,16 @@ pub enum Outcome {
     Decided,
     /// A turn ran.
     Answered(TurnReport),
+    /// The person's scope: the drives now in scope, a `scope` line written
+    /// when they changed, and the focus taken.
+    Scoped(Vec<String>),
+    /// The person asked for drives the agent may not use: refused, named.
+    ScopeRefused(String),
+    /// A focus alone: held for the next turn, nothing logged.
+    Focused,
+    /// A conversation session at this path: made now, or made before for
+    /// the same request.
+    Conversation { path: String, made: bool },
 }
 
 /// How a turn ended.
@@ -632,7 +753,11 @@ impl ServedSession {
             claim,
             chrono::Local::now().fixed_offset(),
         )?;
-        Ok(ServedSession { context, writer })
+        Ok(ServedSession {
+            context,
+            writer,
+            conversations: None,
+        })
     }
 
     /// After a restart: a turn whose `user` line has no answer is not run
@@ -795,7 +920,231 @@ impl ServedSession {
                 .turn(deps, port, arrived, stop)
                 .await
                 .map(Outcome::Answered),
+            Disposition::Scope => self.scope(deps, port.as_ref(), arrived).await,
+            Disposition::NewConversation => {
+                self.new_conversation(deps, port.as_ref(), arrived).await
+            }
         }
+    }
+
+    /// The person's scope event (AD-382, R41): its focus replaces the held
+    /// one; its drives, checked against `[tools].drives` with the home kept,
+    /// become a `scope` line when they change the scope, and the accepted
+    /// scope is echoed for the room's chips. A refused scope changes nothing
+    /// and is named in the status's detail.
+    async fn scope(
+        &mut self,
+        deps: &AgentDeps,
+        port: &dyn EditPort,
+        arrived: Arrived,
+    ) -> Result<Outcome, ServeError> {
+        let request = match serde_json::from_value::<ScopeContent>(arrived.content) {
+            Ok(request) if request.v == CONTENT_VERSION => request,
+            _ => {
+                tracing::info!(session = %self.context.session.path, note = UNREADABLE_SCOPE_REQUEST, "agents: a scope was not applied");
+                return Ok(Outcome::Ignored(UNREADABLE_SCOPE_REQUEST));
+            }
+        };
+        self.context.focus = request.focus.map(|focus| HeldFocus {
+            focus,
+            heard: arrived.received_at,
+        });
+        let Some(drives) = request.drives else {
+            return Ok(Outcome::Focused);
+        };
+        let config = &deps.home.config;
+        let asked = ScopeRequest(drives.into_iter().map(|drive| drive.id).collect());
+        match asked.check(&config.drives, &config.drive) {
+            Ok(scope) => {
+                let changed = scope != self.context.scope;
+                if changed {
+                    self.writer.write(
+                        &mut self.context,
+                        None,
+                        Some(arrived.event_id.clone()),
+                        LineBody::Scope(ScopeBody {
+                            drives: scope.clone(),
+                            set_by: arrived.sender.clone(),
+                        }),
+                    )?;
+                    off_the_runtime(|| self.writer.sync())?;
+                }
+                // A scope read back on start that changed nothing was echoed
+                // when it first arrived; echoing it again on every restart
+                // would only make the chips flicker through old answers.
+                if changed || !arrived.replay {
+                    let echo = self.scope_echo(deps);
+                    deliver(port, SCOPE, echo, Instant::now()).await;
+                }
+                Ok(Outcome::Scoped(scope))
+            }
+            Err(refusal) => {
+                let sentence = refusal.to_string();
+                let mut status = self.status_base(deps);
+                status.run = RunState::Idle;
+                status.detail = Some(sentence.clone());
+                status.anchor = self.context.status_anchor.clone();
+                let content = serde_json::to_value(status).unwrap_or(Value::Null);
+                let (sent, _) = deliver(port, STATUS, content, Instant::now()).await;
+                if self.context.status_anchor.is_none() {
+                    self.context.status_anchor = Some(sent);
+                }
+                Ok(Outcome::ScopeRefused(sentence))
+            }
+        }
+    }
+
+    /// The scope and the label as the room's chips read them: the owning
+    /// host's own scope event (R30 shows only the agent's).
+    fn scope_echo(&self, deps: &AgentDeps) -> Value {
+        let echo = ScopeContent {
+            v: CONTENT_VERSION,
+            drives: Some(
+                self.context
+                    .scope
+                    .iter()
+                    .map(|id| ScopeDrive {
+                        id: id.clone(),
+                        title: deps
+                            .drives
+                            .get(id)
+                            .map_or_else(|| id.clone(), |decl| decl.title.clone()),
+                    })
+                    .collect(),
+            ),
+            label: Some(self.context.label.clone()),
+            focus: None,
+            set_by: self.context.scope_set_by.clone(),
+        };
+        serde_json::to_value(echo).unwrap_or(Value::Null)
+    }
+
+    /// The person asked in the DM for a new conversation (R36). Only the
+    /// claim holder serves this session, so only it acts: it makes the room
+    /// with the person invited, then the `conversation` session folder
+    /// naming it under an id derived from the request, then the room's
+    /// status anchor, and tells the DM. The same request served again finds
+    /// its folder and makes nothing.
+    async fn new_conversation(
+        &mut self,
+        deps: &AgentDeps,
+        port: &dyn EditPort,
+        arrived: Arrived,
+    ) -> Result<Outcome, ServeError> {
+        let (Some(rooms), Ok(request)) = (
+            self.conversations.clone(),
+            serde_json::from_value::<ConversationRequestContent>(arrived.content),
+        ) else {
+            return Ok(Outcome::Ignored(UNSERVED_CONVERSATION));
+        };
+        if request.v != CONTENT_VERSION {
+            return Ok(Outcome::Ignored(UNSERVED_CONVERSATION));
+        }
+        let config = &deps.home.config;
+        let title = request
+            .title
+            .map(|title| title.trim().to_owned())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| NEW_CONVERSATION_TITLE.to_owned());
+        let id = conversation_session_id(&config.drive, &config.id, &arrived.event_id);
+        let zone = deps.sessions_zone.clone();
+        if let Some(row) = off_the_runtime(|| verbs::find(&zone, &id.to_string())) {
+            return Ok(Outcome::Conversation {
+                path: row.path,
+                made: false,
+            });
+        }
+        let person = arrived.sender;
+        // The room is named after the proxy: its name is clear state, and
+        // the title the person typed goes only in the encrypted status.
+        let room = match rooms.create(&config.name, &person).await {
+            Ok(room) => room,
+            Err(error) => {
+                tracing::warn!(session = %self.context.session.path, %error, "agents: a conversation's room could not be made");
+                deliver(
+                    port,
+                    "m.room.message",
+                    notice_content(CONVERSATION_FAILED),
+                    Instant::now(),
+                )
+                .await;
+                return Ok(Outcome::Ignored(UNSERVED_CONVERSATION));
+            }
+        };
+        let agent = SessionAgent {
+            id,
+            agent: config.id.clone(),
+            drive: config.drive.clone(),
+            kind: SessionKind::Conversation,
+            title: title.clone(),
+            requested_by: person.clone(),
+            parent: None,
+            room: room.clone(),
+            drives: self.context.scope.clone(),
+            label: self.context.agent.label.clone(),
+            needs: None,
+            pin: None,
+            hop: 0,
+            limits: None,
+            workflow: None,
+            created_at: chrono::Utc::now(),
+        };
+        let path = match off_the_runtime(|| {
+            verbs::create_agent_session(&zone, &agent, chrono::Local::now())
+        }) {
+            Ok(CreateOutcome::Created { path, .. }) => path,
+            Ok(CreateOutcome::Existed { path, .. }) => {
+                rooms.discard(&room, &person).await;
+                return Ok(Outcome::Conversation { path, made: false });
+            }
+            Err(error) => {
+                tracing::warn!(session = %self.context.session.path, %error, "agents: a conversation's session could not be made");
+                rooms.discard(&room, &person).await;
+                deliver(
+                    port,
+                    "m.room.message",
+                    notice_content(CONVERSATION_FAILED),
+                    Instant::now(),
+                )
+                .await;
+                return Ok(Outcome::Ignored(UNSERVED_CONVERSATION));
+            }
+        };
+        let anchor = StatusContent {
+            v: CONTENT_VERSION,
+            session: format!("{}/{path}", deps.sessions_subfolder),
+            kind: SessionKind::Conversation,
+            title: title.clone(),
+            agent: config.matrix_user.clone(),
+            host: deps.host.as_str().to_owned(),
+            epoch: 0,
+            run: RunState::Idle,
+            detail: None,
+            waiting: None,
+            anchor: None,
+        };
+        let content = serde_json::to_value(&anchor).unwrap_or(Value::Null);
+        match rooms.send(&room, STATUS, content).await {
+            Ok(sent) => {
+                let again = StatusContent {
+                    anchor: Some(sent),
+                    ..anchor
+                };
+                let again = serde_json::to_value(again).unwrap_or(Value::Null);
+                restate_once_joined(Arc::clone(&rooms), room.clone(), person.clone(), again);
+            }
+            Err(error) => {
+                tracing::warn!(%room, %error, "agents: a new conversation's status anchor could not be sent");
+            }
+        }
+        deliver(
+            port,
+            "m.room.message",
+            notice_content(&format!("I opened a new conversation, “{title}”.")),
+            Instant::now(),
+        )
+        .await;
+        Ok(Outcome::Conversation { path, made: true })
     }
 
     async fn turn(
@@ -805,6 +1154,7 @@ impl ServedSession {
         arrived: Arrived,
         stop: CancelSignal,
     ) -> Result<TurnReport, ServeError> {
+        let label_before = self.context.label.clone();
         let person = deps
             .home
             .config
@@ -995,6 +1345,12 @@ impl ServedSession {
             )?;
         }
         off_the_runtime(|| self.writer.sync())?;
+        // A `label` line changes the label chip: the room is told, as after
+        // a `scope` line.
+        if self.context.label != label_before {
+            let echo = self.scope_echo(deps);
+            deliver(port.as_ref(), SCOPE, echo, Instant::now()).await;
+        }
 
         Ok(TurnReport {
             user_line: user.id,

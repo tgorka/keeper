@@ -33,6 +33,7 @@ pub mod naming;
 pub mod note_recording;
 pub mod okf;
 pub mod order;
+pub mod outline;
 pub mod prompt;
 pub mod query;
 pub mod rail;

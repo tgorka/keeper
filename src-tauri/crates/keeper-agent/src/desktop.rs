@@ -26,13 +26,16 @@ use std::sync::{Arc, RwLock};
 
 use keeper_core::agents::agentd::DrivePin;
 use keeper_core::agents::copy::{self, AgentCopyVm};
-use keeper_core::agents::drive::{self, DriveDecl};
+use keeper_core::agents::drive::DriveDecl;
 use keeper_core::agents::events::CONTROL_ROOM_TYPE;
+use keeper_core::agents::home::AgentKind;
 use keeper_core::agents::host::Materialized;
 use keeper_core::agents::index::Index;
 use keeper_core::agents::log::HostSlug;
 use keeper_core::agents::matrix::{self, AgentClient, AgentMatrixError};
 use keeper_core::agents::mount::pin_matches;
+use keeper_core::agents::proxy::ProxyFacts;
+use keeper_core::agents::room::ScopeDriveVm;
 use keeper_core::agents::soul;
 use keeper_core::bots::chat::{self, CancelHandle, CancelSignal};
 use keeper_core::bots::store::{self, ProviderRow};
@@ -49,6 +52,7 @@ use crate::runtime::{
     deps_over, known_with, open_copy, sessions_of, start_copy, view, Copy, DriveView, RoomSessions,
     TURNS_FINISH,
 };
+use crate::surface::declared;
 use crate::turn::TurnEnv;
 use crate::zone::{read_text, read_zone, AgentHome};
 
@@ -123,16 +127,6 @@ fn materialized(profile: &SyncProfile) -> Materialized {
     } else {
         Materialized::Partial
     }
-}
-
-/// A flagged folder's `_drive.toml`, as the file says it.
-fn declared(profile: &SyncProfile) -> Result<DriveDecl, String> {
-    let zone = profile
-        .agents_root()
-        .ok_or_else(|| keeper_core::agents::zone::NO_DRIVE.to_owned())?;
-    let text = read_text(&zone, drive::FILE_NAME)?
-        .ok_or_else(|| keeper_core::agents::zone::NO_DRIVE.to_owned())?;
-    drive::parse(&text).map_err(|refusal| refusal.sentence())
 }
 
 /// Whether a zone declaring `decl` hosts here, and under which
@@ -318,6 +312,64 @@ pub fn agent_icons(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, String> {
         }
     }
     icons
+}
+
+/// Each proxy of this principal's flagged folders, by Matrix user: its
+/// person and its `[tools].drives` with their titles where their
+/// `_drive.toml` is on this Mac — what the notes view's dock offers its
+/// scope chip (91.2).
+pub fn agent_proxies(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, ProxyFacts> {
+    let flagged: Vec<(&SyncProfile, DriveDecl)> = facts
+        .profiles
+        .iter()
+        .filter(|p| p.agents.is_some())
+        .filter_map(|profile| declared(profile).ok().map(|decl| (profile, decl)))
+        .filter(|(_, decl)| {
+            facts
+                .login
+                .as_deref()
+                .is_none_or(|login| copy::hosts_principal(decl, login).is_ok())
+        })
+        .collect();
+    let title = |id: &str| {
+        flagged
+            .iter()
+            .find(|(_, decl)| decl.id == id)
+            .map_or_else(|| id.to_owned(), |(_, decl)| decl.title.clone())
+    };
+    let mut proxies = BTreeMap::new();
+    for (profile, decl) in &flagged {
+        let zone = read_zone(&decl.id, profile, Some(decl));
+        for (_, home) in &zone.homes {
+            let Ok(home) = home else { continue };
+            let config = &home.config;
+            let (AgentKind::Proxy, Some(human)) = (config.kind, &config.human) else {
+                continue;
+            };
+            let mut drives = vec![config.drive.clone()];
+            drives.extend(
+                config
+                    .drives
+                    .iter()
+                    .filter(|d| **d != config.drive)
+                    .cloned(),
+            );
+            proxies.insert(
+                config.matrix_user.clone(),
+                ProxyFacts {
+                    human: human.clone(),
+                    allowed: drives
+                        .iter()
+                        .map(|id| ScopeDriveVm {
+                            id: id.clone(),
+                            title: title(id),
+                        })
+                        .collect(),
+                },
+            );
+        }
+    }
+    proxies
 }
 
 /// The flagged folder `profile_id` and its `_drive.toml`: what a re-pin

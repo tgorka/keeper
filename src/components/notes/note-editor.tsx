@@ -85,6 +85,7 @@ import {
 } from "@/lib/notes/follow-link";
 import { GALLERY_HEAD, type NoteWidgetChoice } from "@/lib/notes/widgets";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
+import { noteCaretStore } from "@/lib/stores/note-caret";
 import {
   consumeCaretHint,
   markSaved,
@@ -893,6 +894,12 @@ export function NoteEditor({
                 marksGeneration += 1;
                 dismissedQuery = notesFiltersStore.getState().text.trim();
               }
+              if (update.selectionSet || update.docChanged) {
+                const { doc } = update.state;
+                noteCaretStore
+                  .getState()
+                  .place(vaultId, noteId, doc.lineAt(update.state.selection.main.head).number, doc);
+              }
               if (!update.docChanged) {
                 return;
               }
@@ -1077,6 +1084,11 @@ export function NoteEditor({
         },
       };
       editorView.focus();
+      // Where the caret opened, before any selection change has said so.
+      const atOpen = editorView.state;
+      noteCaretStore
+        .getState()
+        .place(vaultId, noteId, atOpen.doc.lineAt(atOpen.selection.main.head).number, atOpen.doc);
       // The document almost never exists yet when this chunk lands — the channel
       // delivers `Reset` after the lazy import resolves — so the caret hint is
       // consumed here, once the runtime is able to act on it. Consumed, not just

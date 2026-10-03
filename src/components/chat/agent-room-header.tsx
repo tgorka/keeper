@@ -12,6 +12,7 @@
  * header row behind its 52px bar, and an agent's status is not something the
  * phone may lose with it.
  */
+import type { ReactNode } from "react";
 import { BotIdentityCell } from "@/components/bots/bot-identity";
 import { Badge } from "@/components/ui/badge";
 import { Lamp, type LampState } from "@/components/ui/lamp";
@@ -36,7 +37,17 @@ function labelChipText(label: LabelVm): string {
   return [readers, label.integrity, ...(label.localOnly ? ["local only"] : [])].join(" · ");
 }
 
-export function AgentRoomHeader({ header }: { header: AgentRoomHeaderVm }) {
+export function AgentRoomHeader({
+  header,
+  scopeControl,
+}: {
+  header: AgentRoomHeaderVm;
+  /**
+   * Drawn after the scope chip — the notes dock's editor. The chip itself always
+   * shows what the host echoed, never what was asked for.
+   */
+  scopeControl?: ReactNode;
+}) {
   const { status, scope, scopeUnreadable, label } = header;
   // The mark is the soul's icon where the agent's zone is on this device
   // (Rust checked it against the identity's bound), else the first letter of
@@ -92,6 +103,7 @@ export function AgentRoomHeader({ header }: { header: AgentRoomHeaderVm }) {
             ))}
           </ul>
         )}
+        {scopeControl}
         {label !== null && (
           <Badge variant="outline" data-testid="agent-label" className="max-w-full">
             <span className="truncate">{labelChipText(label)}</span>

@@ -45,7 +45,13 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
-use crate::agents::room::{self as agent_room, AgentIcons, AgentKinds};
+use crate::agents::events::{
+    ConversationRequestContent, Focus, ScopeContent, ScopeDrive, CONTENT_VERSION,
+};
+use crate::agents::focus::{FocusLanes, FocusPort, Named, SendFuture};
+use crate::agents::proxy::{self, AgentOutbound, AgentProxies, ProxyRoomRow, ProxyRoomVm};
+use crate::agents::room::{self as agent_room, AgentIcons, AgentKinds, AgentRoomKind};
+use crate::agents::session::SessionKind;
 use crate::archive::{self, ArchiveEvent, ArchiveHandle, ArchiveMedia, ArchiveWriter};
 use crate::auth::{self, session_keychain_key};
 use crate::backup::{self, BackupSink};
@@ -604,6 +610,12 @@ pub struct AccountManager {
     /// acceptance 6): the desktop's agents host replaces it on each scan
     /// through [`AccountManager::agent_icons`]; on the phone it stays empty.
     agent_icons: Arc<AgentIcons>,
+    /// The proxies whose agents zones are on this device (91.2): their person
+    /// and the drives a dock's scope chip offers. Replaced by the desktop's
+    /// agents host on each scan; empty on the phone.
+    agent_proxies: Arc<AgentProxies>,
+    /// Per (account, proxy room): the docked note's focus on its way there.
+    agent_focus: Arc<FocusLanes<(String, OwnedRoomId)>>,
 }
 
 /// Monotonic source of subscription ids handed back to the frontend.
@@ -696,6 +708,8 @@ impl AccountManager {
             badge,
             agent_kinds: Arc::new(AgentKinds::default()),
             agent_icons: Arc::new(AgentIcons::default()),
+            agent_proxies: Arc::new(AgentProxies::default()),
+            agent_focus: Arc::new(FocusLanes::default()),
         }
     }
 
@@ -3785,6 +3799,186 @@ impl AccountManager {
         self.agent_icons.clone()
     }
 
+    /// The proxies the dock knows from this device's agents zones (91.2): the
+    /// desktop's agents host replaces them on each scan.
+    pub fn agent_proxies(&self) -> Arc<AgentProxies> {
+        self.agent_proxies.clone()
+    }
+
+    /// The person's proxy conversations on `account_id` (UX-DR130): every
+    /// agent session room [`proxy::admits`] admits, the DM first. A room
+    /// whose status is not read yet is not listed; nothing is listed for an
+    /// account that is not live.
+    pub async fn agent_rooms(&self, account_id: &str) -> Vec<ProxyRoomVm> {
+        let client = {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(handle) => handle.client.clone(),
+                None => return Vec::new(),
+            }
+        };
+        let Some(me) = client.user_id().map(ToOwned::to_owned) else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for room in client.joined_rooms() {
+            if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session) {
+                continue;
+            }
+            rows.push(proxy_row(room, &self.agent_kinds).await);
+        }
+        proxy::proxy_rooms(&rows, &me, &self.agent_proxies.snapshot())
+    }
+
+    /// The live room `room_id` when it is one of the person's proxy rooms as
+    /// this account reads it ([`proxy::admits`]), with its kind and agent. A
+    /// scope, a focus or a request for a conversation is only ever sent
+    /// there (R29 F1: where power levels let the person).
+    async fn proxy_room(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<(Room, SessionKind, matrix_sdk::ruma::OwnedUserId), CoreError> {
+        let room_id = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let room = self
+            .room_for(account_id, &room_id)
+            .await
+            .map_err(|_| SendError::RoomNotFound)?;
+        if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session) {
+            return Err(SendError::RoomNotFound.into());
+        }
+        let row = proxy_row(room.clone(), &self.agent_kinds).await;
+        let proxies = self.agent_proxies.snapshot();
+        let admitted = proxy::admits(&row, room.own_user_id(), &proxies)
+            .map_err(|refusal| CoreError::Unsupported(refusal.to_string()))?;
+        let (kind, agent) = (admitted.kind, admitted.agent.to_owned());
+        Ok((room, kind, agent))
+    }
+
+    /// Ask the proxy for `drives` in scope in `room_id` (AD-382): the host
+    /// checks them against `[tools].drives`, keeps the home drive and logs a
+    /// `scope` line. The focus the host was last told travels with it, so a
+    /// scope change does not clear what the person is looking at; it waits
+    /// for the focus lane, so it never overtakes a clear on its way.
+    pub async fn agent_scope_set(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        drives: Vec<String>,
+    ) -> Result<(), CoreError> {
+        let (room, _, agent) = self.proxy_room(account_id, room_id).await?;
+        // Titles from this room's proxy only: two proxies may title one
+        // drive differently.
+        let titles: HashMap<String, String> = self
+            .agent_proxies
+            .snapshot()
+            .remove(&agent)
+            .map(|facts| facts.allowed)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|drive| (drive.id, drive.title))
+            .collect();
+        let lane = self
+            .agent_focus
+            .get(&(account_id.to_owned(), room.room_id().to_owned()));
+        let _held = match &lane {
+            Some(lane) => Some(lane.hold().await),
+            None => None,
+        };
+        let content = ScopeContent {
+            v: CONTENT_VERSION,
+            drives: Some(
+                drives
+                    .into_iter()
+                    .map(|id| ScopeDrive {
+                        title: titles.get(&id).cloned().unwrap_or_else(|| id.clone()),
+                        id,
+                    })
+                    .collect(),
+            ),
+            label: None,
+            focus: lane.as_ref().and_then(|lane| lane.last()),
+            set_by: room.own_user_id().to_owned(),
+        };
+        send_agent_event(&room, AgentOutbound::Scope(content)).await?;
+        Ok(())
+    }
+
+    /// The docked note in `room_id` changed, as the webview's call `seq`
+    /// says; `name` names it (blocking: the vault's index and the note) and
+    /// runs only once the change has been still a second
+    /// ([`crate::agents::focus`]). The change is registered before anything
+    /// is awaited, so a later [`Self::agent_focus_close`] always drops it.
+    pub async fn agent_focus(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        seq: u64,
+        name: impl FnOnce() -> Option<Focus> + Send + 'static,
+    ) -> Result<(), CoreError> {
+        let parsed = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let lane = self.agent_focus.lane(&(account_id.to_owned(), parsed));
+        let namer = Box::new(move || -> Named {
+            Box::pin(async move { tokio::task::spawn_blocking(name).await.ok().flatten() })
+        });
+        if !lane.change(seq, namer) {
+            return Ok(());
+        }
+        if !lane.connected() {
+            match self.proxy_room(account_id, room_id).await {
+                Ok((room, _, _)) => lane.connect(Arc::new(RoomFocus(room))),
+                Err(error) => {
+                    lane.forget_pending();
+                    return Err(error);
+                }
+            }
+        }
+        lane.drive();
+        Ok(())
+    }
+
+    /// The dock closed on `room_id` (the webview's call `seq`): what waits is
+    /// dropped, and the host is told there is no focus when it was told of
+    /// one — after any focus already on its way. A clear that fails is
+    /// owed and tried again.
+    pub async fn agent_focus_close(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        seq: u64,
+    ) -> Result<(), CoreError> {
+        let parsed = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        self.agent_focus
+            .lane(&(account_id.to_owned(), parsed))
+            .close(Some(seq))
+            .await
+            .map_err(|error| SendError::Dispatch(error).into())
+    }
+
+    /// Ask the proxy for a new conversation, in its `main` DM `room_id`
+    /// (R36): the claim holder of the DM's session makes the room and its
+    /// session and invites the person. Returns the request's event id.
+    pub async fn agent_conversation_new(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        title: Option<String>,
+    ) -> Result<String, CoreError> {
+        let (room, kind, _) = self.proxy_room(account_id, room_id).await?;
+        if kind != SessionKind::Main {
+            return Err(CoreError::Unsupported(
+                "A new conversation is asked for in your proxy's DM.".to_owned(),
+            ));
+        }
+        let content = ConversationRequestContent {
+            v: CONTENT_VERSION,
+            title: title
+                .map(|title| title.trim().to_owned())
+                .filter(|title| !title.is_empty()),
+        };
+        send_agent_event(&room, AgentOutbound::ConversationRequest(content)).await
+    }
+
     /// Read the dock-badge mode (Story 10.3, FR-53). Returns the in-memory
     /// [`BadgeConfig`] value (seeded from the persisted registry at construction; default
     /// [`DockBadgeMode::All`](crate::vm::DockBadgeMode)). Infallible — reads process state.
@@ -4716,6 +4910,15 @@ impl AccountManager {
     /// leave immediately while other accounts keep syncing), abort every
     /// subscription, and drop the live `Client`/`SyncService`.
     pub async fn shutdown(&self, account_id: &str) {
+        // The docked note's focus is cleared while the client can still send
+        // (quit, sign-out): the host would otherwise state it until its TTL.
+        // Bounded, so a homeserver that does not answer never holds the quit.
+        self.agent_focus
+            .close_where(
+                |(account, _)| account == account_id,
+                std::time::Duration::from_secs(1),
+            )
+            .await;
         // Drain the account's bridge-health monitor first (Story 6.5): abort its tick,
         // remove its mgmt-room handlers (which hold `Client` clones), and drop its
         // sessions from the shared health snapshot — so a signed-out account's health
@@ -4900,6 +5103,81 @@ where
     .into_iter()
     .flatten()
     .collect()
+}
+
+/// Send one of the dock's events ([`AgentOutbound`]: a scope or a request
+/// for a conversation, nothing else) into `room` with `Room::send_raw` —
+/// this file's only `send_raw` — and only into an encrypted room (R30:
+/// every session room is); the event id. These are not messages, so they
+/// are outside AD-13's two dispatch triggers (`send.rs`'s Scope paragraph).
+async fn send_agent_event(room: &Room, event: AgentOutbound) -> Result<String, CoreError> {
+    if !room.encryption_state().is_encrypted() {
+        return Err(CoreError::Unsupported(
+            proxy::Refusal::Unencrypted.to_string(),
+        ));
+    }
+    let content = event
+        .content()
+        .map_err(|error| CoreError::Internal(error.to_string()))?;
+    room.send_raw(event.event_type(), content)
+        .await
+        .map(|sent| sent.response.event_id.to_string())
+        .map_err(|error| SendError::Dispatch(error.to_string()).into())
+}
+
+/// What the dock reads of a session room to decide whether it is one of the
+/// person's proxy conversations ([`proxy::admits`]).
+async fn proxy_row(room: Room, kinds: &AgentKinds) -> ProxyRoomRow {
+    let room_id = room.room_id().to_string();
+    let name = room
+        .cached_display_name()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| room_id.clone());
+    let recency = room.recency_stamp().map_or(0, u64::from);
+    let encrypted = room
+        .latest_encryption_state()
+        .await
+        .is_ok_and(|state| state.is_encrypted());
+    let creators = room.creators().unwrap_or_default();
+    let direct_to = room
+        .direct_targets()
+        .iter()
+        .filter_map(|target| target.as_user_id().map(ToOwned::to_owned))
+        .collect();
+    let reader = agent_room::HeaderReader::open(room, kinds).await;
+    let state = reader.state();
+    ProxyRoomRow {
+        room_id,
+        name,
+        kind: state.kind(),
+        agent: state.agent().map(ToOwned::to_owned),
+        title: state.title().map(ToOwned::to_owned),
+        recency,
+        creators,
+        encrypted,
+        direct_to,
+    }
+}
+
+/// A focus lane's room: the focus goes there as a scope without drives.
+struct RoomFocus(Room);
+
+impl FocusPort for RoomFocus {
+    fn send(&self, focus: Option<Focus>) -> SendFuture<'_> {
+        Box::pin(async move {
+            let content = ScopeContent {
+                v: CONTENT_VERSION,
+                drives: None,
+                label: None,
+                focus,
+                set_by: self.0.own_user_id().to_owned(),
+            };
+            send_agent_event(&self.0, AgentOutbound::Scope(content))
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
 }
 
 /// Keychain key under which an account's saved base58 recovery key is stored

@@ -56,14 +56,17 @@ function Host({
   enabled,
   rail,
   onRail = () => {},
+  edge,
 }: {
   id: SurfaceColumnId;
   enabled?: boolean;
   rail?: readonly SurfaceRailControl[];
   onRail?: () => void;
+  edge?: "trailing" | "leading";
 }) {
   const column = useSurfaceColumn(id, {
     enabled,
+    edge,
     // Cast, because a non-empty tuple is the whole point of the type and one
     // test below has to get past it the way a future caller would.
     rail: (rail ?? [
@@ -399,5 +402,43 @@ describe("surface columns as a set", () => {
         name: `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS["notes-list"].label}`,
       }),
     ).toBeInTheDocument();
+  });
+});
+
+/**
+ * A column RIGHT of the document — the notes view's assistant dock — has its
+ * seam on its left edge, so the way it widens is the opposite of every column
+ * above. A seam that narrowed the dock as it was dragged open would be the
+ * whole column misbehaving under the hand.
+ */
+describe("a column with its seam on its leading edge", () => {
+  const spec = SURFACE_COLUMNS["notes-agent"];
+  const seam = `${COLUMN_RESIZER_LABEL} ${spec.label}`;
+
+  it("widens as its seam is dragged left", () => {
+    render(<Host id="notes-agent" edge="leading" />);
+    const handle = screen.getByRole("separator", { name: seam });
+
+    fireEvent.pointerDown(handle, { pointerId: 1, button: 0, clientX: 500 });
+    fireEvent.pointerMove(handle, { pointerId: 1, clientX: 460 });
+    fireEvent.pointerUp(handle, { pointerId: 1 });
+
+    expect(screen.getByTestId("column")).toHaveStyle({ flexBasis: `${spec.defaultWidth + 40}px` });
+    expect(readColumnWidths(document.cookie)["notes-agent"]).toBe(spec.defaultWidth + 40);
+  });
+
+  it("widens on ← and narrows on →, the way its edge moves", () => {
+    render(<Host id="notes-agent" edge="leading" />);
+    const handle = screen.getByRole("separator", { name: seam });
+
+    fireEvent.keyDown(handle, { key: "ArrowLeft" });
+    expect(screen.getByTestId("column")).toHaveStyle({
+      flexBasis: `${spec.defaultWidth + COLUMN_KEY_STEP}px`,
+    });
+    fireEvent.keyDown(handle, { key: "ArrowRight" });
+    fireEvent.keyDown(handle, { key: "ArrowRight" });
+    expect(screen.getByTestId("column")).toHaveStyle({
+      flexBasis: `${spec.defaultWidth - COLUMN_KEY_STEP}px`,
+    });
   });
 });

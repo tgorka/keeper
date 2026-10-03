@@ -15,8 +15,7 @@
  * non-secret render data the caller already holds. Targets are addressed only by
  * the opaque render `key` (`unique_id`).
  */
-import { useStore } from "zustand";
-import { createStore } from "zustand/vanilla";
+import { createStore, type StoreApi } from "zustand/vanilla";
 
 /** The active reply/edit context, or `null` when composing a fresh message. */
 export type PendingContext =
@@ -121,46 +120,45 @@ export interface ComposerState {
 }
 
 /**
- * The vanilla store instance. Created once at module load, shared across the app.
+ * A composer store for one open conversation. The chat's is
+ * {@link composerStore}; the notes view's dock makes its own, so a reply, an
+ * edit, a selection or a focus request in one never reaches the other.
  */
-export const composerStore = createStore<ComposerState>()((set, get) => ({
-  pending: null,
-  stashedDraft: null,
-  selectedKey: null,
-  restoreBody: null,
-  restoreTarget: null,
-  restoreNonce: 0,
-  focusNonce: 0,
-  startReply: ({ targetKey, sender, bodyPreview }) =>
-    // Reply leaves the typed draft alone: no stash, clear any prior edit stash.
-    set({ pending: { mode: "reply", targetKey, sender, bodyPreview }, stashedDraft: null }),
-  startEdit: ({ targetKey, body }, currentDraft) => {
-    set({ pending: { mode: "edit", targetKey }, stashedDraft: currentDraft });
-    return body;
-  },
-  cancel: () => {
-    const { pending, stashedDraft } = get();
-    const restore = pending?.mode === "edit" ? (stashedDraft ?? "") : null;
-    set({ pending: null, stashedDraft: null });
-    return restore;
-  },
-  clear: () => set({ pending: null, stashedDraft: null }),
-  select: (key) => set({ selectedKey: key }),
-  clearSelection: () => set({ selectedKey: null }),
-  requestFocus: () => set((state) => ({ focusNonce: state.focusNonce + 1 })),
-  restore: (accountId, roomId, body) =>
-    set((state) => ({
-      restoreBody: body,
-      restoreTarget: { accountId, roomId },
-      restoreNonce: state.restoreNonce + 1,
-      focusNonce: state.focusNonce + 1,
-    })),
-}));
-
-/**
- * React selector hook over {@link composerStore}. Pass a selector to subscribe to
- * just the slice a component needs.
- */
-export function useComposerStore<T>(selector: (state: ComposerState) => T): T {
-  return useStore(composerStore, selector);
+export function createComposerStore(): StoreApi<ComposerState> {
+  return createStore<ComposerState>()((set, get) => ({
+    pending: null,
+    stashedDraft: null,
+    selectedKey: null,
+    restoreBody: null,
+    restoreTarget: null,
+    restoreNonce: 0,
+    focusNonce: 0,
+    startReply: ({ targetKey, sender, bodyPreview }) =>
+      // Reply leaves the typed draft alone: no stash, clear any prior edit stash.
+      set({ pending: { mode: "reply", targetKey, sender, bodyPreview }, stashedDraft: null }),
+    startEdit: ({ targetKey, body }, currentDraft) => {
+      set({ pending: { mode: "edit", targetKey }, stashedDraft: currentDraft });
+      return body;
+    },
+    cancel: () => {
+      const { pending, stashedDraft } = get();
+      const restore = pending?.mode === "edit" ? (stashedDraft ?? "") : null;
+      set({ pending: null, stashedDraft: null });
+      return restore;
+    },
+    clear: () => set({ pending: null, stashedDraft: null }),
+    select: (key) => set({ selectedKey: key }),
+    clearSelection: () => set({ selectedKey: null }),
+    requestFocus: () => set((state) => ({ focusNonce: state.focusNonce + 1 })),
+    restore: (accountId, roomId, body) =>
+      set((state) => ({
+        restoreBody: body,
+        restoreTarget: { accountId, roomId },
+        restoreNonce: state.restoreNonce + 1,
+        focusNonce: state.focusNonce + 1,
+      })),
+  }));
 }
+
+/** The chat's composer, shared across the app (the quick switcher focuses it). */
+export const composerStore = createComposerStore();

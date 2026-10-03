@@ -471,6 +471,22 @@ impl AgentRoomState {
         matches!(&self.status, Some((_, StatusRead::Read(s))) if s.run == RunState::Running)
     }
 
+    /// The agent the newest readable status names.
+    pub fn agent(&self) -> Option<&UserId> {
+        match &self.status {
+            Some((_, StatusRead::Read(status))) => Some(&status.agent),
+            _ => None,
+        }
+    }
+
+    /// The title the newest readable status says.
+    pub fn title(&self) -> Option<&str> {
+        match &self.status {
+            Some((_, StatusRead::Read(status))) => Some(&status.title),
+            _ => None,
+        }
+    }
+
     /// The users the header names: the agent and the label's readers, for
     /// the caller to resolve to display names.
     pub fn named(&self) -> Vec<OwnedUserId> {
@@ -817,6 +833,11 @@ impl HeaderReader {
     /// trusts no one.
     pub fn levels(&self) -> Option<&RoomPowerLevels> {
         self.levels.as_ref()
+    }
+
+    /// The room's folded status and scope.
+    pub fn state(&self) -> &AgentRoomState {
+        &self.state
     }
 
     /// Fold one event-cache update; returns whether the header may have

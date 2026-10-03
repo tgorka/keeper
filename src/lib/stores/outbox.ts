@@ -12,10 +12,10 @@
  * pill(s) above the composer, both scoped to the open Chat.
  */
 import { useStore } from "zustand";
-import { createStore } from "zustand/vanilla";
+import { createStore, type StoreApi } from "zustand/vanilla";
 import type { HeldSendVm } from "@/lib/ipc/client";
 import { cancelHeldSend } from "@/lib/ipc/client";
-import { composerStore } from "@/lib/stores/composer";
+import type { ComposerState } from "@/lib/stores/composer";
 
 /** The composite key for a chat: `` `${accountId} ${roomId}` ``. */
 function roomKey(accountId: string, roomId: string): string {
@@ -39,9 +39,20 @@ export interface OutboxState {
    * full-snapshot batches.
    */
   applySnapshot: (accountId: string, roomId: string, rows: readonly HeldSendVm[]) => void;
-  /** Reset to the empty state (on unsubscribe / Chat close). */
+  /** A conversation began showing `(accountId, roomId)`'s held sends. */
+  hold: (accountId: string, roomId: string) => void;
+  /**
+   * It stopped: the room's rows are dropped once no conversation shows them — the
+   * chat and the notes dock may both show one room, and one closing must not wipe
+   * the other's Undo.
+   */
+  release: (accountId: string, roomId: string) => void;
+  /** Reset to the empty state. */
   clear: () => void;
 }
+
+/** Conversations showing each room's held sends: not state anyone renders. */
+const holders = new Map<string, number>();
 
 /** The vanilla store instance, created once at module load and shared app-wide. */
 export const outboxStore = createStore<OutboxState>()((set) => ({
@@ -63,25 +74,54 @@ export const outboxStore = createStore<OutboxState>()((set) => ({
       next.set(key, rows);
       return { rooms: next };
     }),
-  clear: () => set({ rooms: new Map<string, readonly HeldSendVm[]>() }),
+  hold: (accountId, roomId) => {
+    const key = roomKey(accountId, roomId);
+    holders.set(key, (holders.get(key) ?? 0) + 1);
+  },
+  release: (accountId, roomId) =>
+    set((state) => {
+      const key = roomKey(accountId, roomId);
+      const left = (holders.get(key) ?? 1) - 1;
+      if (left > 0) {
+        holders.set(key, left);
+        return state;
+      }
+      holders.delete(key);
+      if (!state.rooms.has(key)) {
+        return state;
+      }
+      const next = new Map(state.rooms);
+      next.delete(key);
+      return { rooms: next };
+    }),
+  clear: () => {
+    holders.clear();
+    set({ rooms: new Map<string, readonly HeldSendVm[]>() });
+  },
 }));
 
 /**
  * Undo a held send (Story 8.3/8.4): the single shared effect behind BOTH the
  * undo-send pill's Undo and the timeline Delete affordance on a held bubble. Cancels
  * the durable `outbox` row via {@link cancelHeldSend} (zero network activity) and, only
- * when a non-empty body comes back, restores it into the `(accountId, roomId)` composer
- * as a Draft via `composerStore.restore`.
+ * when a non-empty body comes back, restores it into the `(accountId, roomId)` draft of
+ * `composer` — the store of the conversation the undo was pressed in, the chat's or
+ * the notes dock's.
  *
  * `cancelHeldSend` is idempotent in Rust — an already-dispatched (window-elapsed) row
  * returns `""`, so nothing is restored. Errors are swallowed (mirrors the pill): a
  * failed cancel never crashes the affordance and never restores stale text. Keeping this
  * in one place stops the pill-undo and delete-undo from drifting apart.
  */
-export async function undoHeldSend(accountId: string, roomId: string, id: string): Promise<void> {
+export async function undoHeldSend(
+  accountId: string,
+  roomId: string,
+  id: string,
+  composer: StoreApi<ComposerState>,
+): Promise<void> {
   const body = await cancelHeldSend(accountId, roomId, id).catch(() => "");
   if (body.length > 0) {
-    composerStore.getState().restore(accountId, roomId, body);
+    composer.getState().restore(accountId, roomId, body);
   }
 }
 
