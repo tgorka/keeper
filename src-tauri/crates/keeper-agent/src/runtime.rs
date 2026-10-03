@@ -106,8 +106,8 @@ pub const PENDING_ROOMS: usize = 64;
 
 /// How far back a starting worker reads its room's timeline for what its log
 /// has not seen: pages of [`BACKLOG_PAGE`] events.
-const BACKLOG_PAGES: usize = 20;
-const BACKLOG_PAGE: u32 = 50;
+pub(crate) const BACKLOG_PAGES: usize = 20;
+pub(crate) const BACKLOG_PAGE: u32 = 50;
 
 /// One mounted drive, as this host reads it without the engine: the
 /// checkout `open_engine` makes, its zones, and the pin's verdict.

@@ -340,6 +340,13 @@ export type { AgentPersonVm } from "./gen/AgentPersonVm";
 export type { AgentPinReq } from "./gen/AgentPinReq";
 export type { AgentPinState } from "./gen/AgentPinState";
 export type { AgentPinVm } from "./gen/AgentPinVm";
+export type { AgentSeedAgentVm } from "./gen/AgentSeedAgentVm";
+export type { AgentSeedBotVm } from "./gen/AgentSeedBotVm";
+export type { AgentSeedFolderVm } from "./gen/AgentSeedFolderVm";
+export type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
+export type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
+export type { AgentSeedReq } from "./gen/AgentSeedReq";
+export type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
 export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 export type { AuditOutcome } from "./gen/AuditOutcome";
 export type { AuditVerdict } from "./gen/AuditVerdict";
@@ -708,6 +715,10 @@ import type { AccountShareVm } from "./gen/AccountShareVm";
 import type { AccountVm } from "./gen/AccountVm";
 import type { AgentCopyVm } from "./gen/AgentCopyVm";
 import type { AgentPinReq } from "./gen/AgentPinReq";
+import type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
+import type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
+import type { AgentSeedReq } from "./gen/AgentSeedReq";
+import type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
 import type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 import type { BackupStatus } from "./gen/BackupStatus";
 import type { BbctlAvailabilityVm } from "./gen/BbctlAvailabilityVm";
@@ -7279,6 +7290,44 @@ export async function agentsDriveRepin(
   pin: AgentPinReq,
 ): Promise<AgentCopyVm[]> {
   return await invoke<AgentCopyVm[]>("agents_drive_repin", { profileId, pin });
+}
+
+/**
+ * *Set up agents* (story 91.5, UX-DR133): every synced folder that keeps agents
+ * (`[folder.agents]`) with the drive id, owner and readers its form starts
+ * from, the catalogue (Nixi, Dr Tola Grey, Dr Lucyna Novak), the signed-in
+ * Matrix accounts, and the person's own bots. No bot is preselected (S-20).
+ * A folder whose `problem` is set cannot be seeded from this Mac.
+ *
+ * Rejects with: `internal`.
+ */
+export async function agentsSeedOffer(): Promise<AgentSeedOfferVm> {
+  return await invoke<AgentSeedOfferVm>("agents_seed_offer");
+}
+
+/**
+ * The zone-relative files `req` would write and the ones it would leave (they
+ * are there already; a seed never overwrites). Refused, with the sentence to
+ * show, when `req.bot` is `null`, an id is not the catalogue's, the owner is
+ * not a reader, or the owner and readers differ from this Mac's pin or from a
+ * `_drive.toml` the seed would leave.
+ *
+ * Rejects with: `internal`, its message the sentence to show.
+ */
+export async function agentsSeedPlan(req: AgentSeedReq): Promise<AgentSeedPlanVm> {
+  return await invoke<AgentSeedPlanVm>("agents_seed_plan", { req });
+}
+
+/**
+ * Write `req`'s seed into the folder's agents zone, never over a file: what was
+ * written, what was left, and the agents written — each signs in on its own
+ * Settings › Agents row (`agentsCopySignIn`). Writes the zone only; signs
+ * nothing in. Refused as `agentsSeedPlan` is.
+ *
+ * Rejects with: `internal`, its message the sentence to show.
+ */
+export async function agentsSeedApply(req: AgentSeedReq): Promise<AgentSeedResultVm> {
+  return await invoke<AgentSeedResultVm>("agents_seed_apply", { req });
 }
 
 // ---------------------------------------------------------------------------

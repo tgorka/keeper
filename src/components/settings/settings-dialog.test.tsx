@@ -222,6 +222,9 @@ vi.mock("@/lib/ipc/client", () => ({
   capabilities: vi.fn(),
   // Settings → Agents (Story 90.6) and Grants, mounted only under `botTools`.
   agentsCopies: vi.fn(() => Promise.resolve([])),
+  agentsSeedOffer: vi.fn(() =>
+    Promise.resolve({ folders: [], catalogue: [], bots: [], accounts: [] }),
+  ),
   botsGrantsList: vi.fn(() => Promise.resolve({ grants: [], unknown: [] })),
   botsBotsList: vi.fn(() => Promise.resolve([])),
   botsAuditList: vi.fn(() => Promise.resolve([])),

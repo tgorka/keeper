@@ -93,6 +93,45 @@ pub fn find(zone: &Path, session_id: &str) -> Option<SessionRowVm> {
 /// truth and a lineage only an index knew would be invisible to `cat`, to
 /// Obsidian and to the agent.
 pub fn create(zone: &Path, req: CreateReq) -> Result<CreateOutcome, VerbError> {
+    create_with(zone, req, Vec::new())
+}
+
+/// Create the session folder an agent works in (AD-365, AD-368): the flat
+/// create from the zone's skeleton, with the session's `agent.toml` written
+/// in the same journaled plan, so a crash never leaves a session an agent
+/// half-owns. Idempotent on `agent.id`, under the zone lock like every
+/// create: a second call finds the first's folder and writes nothing.
+///
+/// Only a writer of the session calls it: `agents init` for a proxy's new
+/// `main` session, before any claim on its new room exists (AD-378), and the
+/// claim holder of a proxy's main session for a conversation (R36).
+pub fn create_agent_session(
+    zone: &Path,
+    agent: &keeper_core::agents::session::SessionAgent,
+    now: chrono::DateTime<chrono::Local>,
+) -> Result<CreateOutcome, VerbError> {
+    use keeper_core::agents::session;
+    create_with(
+        zone,
+        CreateReq {
+            id: agent.id,
+            title: agent.title.clone(),
+            pattern_id: None,
+            now,
+        },
+        vec![(
+            session::FILE_NAME.to_owned(),
+            session::compose_session_agent_toml(agent),
+        )],
+    )
+}
+
+/// [`create`], with `extra` files composed into the new session's plan.
+fn create_with(
+    zone: &Path,
+    req: CreateReq,
+    extra: Vec<(String, String)>,
+) -> Result<CreateOutcome, VerbError> {
     use keeper_core::sessions::pattern::{self, PatternKind};
     use keeper_core::sessions::{model, plan, spaces, template};
 
@@ -261,6 +300,7 @@ pub fn create(zone: &Path, req: CreateReq) -> Result<CreateOutcome, VerbError> {
             stamped.push((file.name, file.content));
         }
     }
+    stamped.extend(extra);
 
     // The placeholders a template's markdown carries. This side reads the
     // bytes and supplies the context — the clock and the session's id are the

@@ -598,13 +598,7 @@ pub fn parse_agent_toml(
         } else {
             format!("_drive.toml's local_only is true for {}", drive.id)
         };
-        return Err(model.invalid(
-            "bot",
-            format!(
-                "{why}, so the bot must be an ollama model that runs locally, and this one is {}",
-                bot.kind.as_registry_str()
-            ),
-        ));
+        return Err(model.invalid("bot", not_local_bot(&why, bot.kind)));
     }
 
     let tools = root.table("tools", TOOLS_KEYS)?;
@@ -740,6 +734,15 @@ pub fn parse_agent_toml(
         memory,
         audience: drive.readers.clone(),
     })
+}
+
+/// Why a bot that does not run locally is refused where `local_only` holds:
+/// `why` names what made it hold. The seed refuses with the same reason.
+pub fn not_local_bot(why: &str, kind: ProviderKind) -> String {
+    format!(
+        "{why}, so the bot must be an ollama model that runs locally, and this one is {}",
+        kind.as_registry_str()
+    )
 }
 
 /// Whether a provider kind is one a `local_only` agent may use, and the

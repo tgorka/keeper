@@ -26,6 +26,8 @@
 //!   app's host over the app's own drives, pins and keychain.
 //! - `headless` (unix) is a Linux host's process layer: directories, secrets,
 //!   its own engine and provider rows.
+//! - [`seed`] writes an agents zone's seed and a new agent, never over a
+//!   file, and makes a proxy's DM with its `main` session.
 
 // matrix-sdk's sync future is deep enough to need it, as in keeper-core.
 #![recursion_limit = "256"]
@@ -47,6 +49,7 @@ pub mod ports;
 pub mod rooms;
 #[cfg(unix)]
 pub mod runtime;
+pub mod seed;
 pub mod sessions;
 pub mod task;
 pub mod turn;

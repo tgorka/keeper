@@ -1,0 +1,13 @@
+# A new agent of this drive. `keeper-agentd agents new <id>` copies this folder
+# and fills in its id, name and date; read every line before the agent runs.
+version     = 1
+id          = "{{id}}"
+name        = "{{name}}"
+kind        = "specialist"
+matrix_user = "@{{id}}:{{homeserver}}"
+
+[model]
+bot = {{bot}}
+
+[host]
+prefer_always_on = true

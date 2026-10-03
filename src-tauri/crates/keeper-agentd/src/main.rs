@@ -22,9 +22,11 @@
 #![recursion_limit = "256"]
 
 mod cli;
+mod host_lock;
 mod init;
 mod login;
 mod report;
+mod seed;
 
 use std::process::ExitCode;
 

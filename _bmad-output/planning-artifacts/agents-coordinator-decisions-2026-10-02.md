@@ -227,3 +227,33 @@ Full text: `_bmad-output/planning-artifacts/agents-review-consistency-2026-10-02
 - **F6–F9, F13, F15, F16, F18, F24, F25** are corrections applied as written.
 
 **R30 — session rooms are encrypted, so the host enforces who speaks (2026-10-02):** every session room allows `m.room.encrypted` at power 0 and keeps `state_default` 50: the homeserver sees a person's every event as `m.room.encrypted` and cannot tell a decision from free text (measured on Synapse), so people decide everywhere, talk in a proxy's rooms and write no state, and the agent host — which decrypts — keeps a person's free text out of any session that is not their proxy's conversation (logged as an observer note, never a turn), accepts a decision only from a reader's verified device, and ignores a `dev.keeper.agent.*` event or an edit from anyone but the agent's own user (AD-380; 90.4's power levels, 90.5's `keeper_agent::rooms::classify`).
+
+**R31 — a spoken send to an agent (2026-10-03):** a spoken utterance addressed to the person's own `main` or `conversation` agent room is a user-initiated dispatch: a third `SendTrigger::SpokenToAgent`, legal only for a room whose agent-room kind is `main` or `conversation` and whose proxy's human is the signed-in user, skipping the Undo-Send hold; the AD-13 guard tests move to the new exact count and assert the room restriction, AD-13 carries a note citing R31, and no other trigger is added.
+
+**R32 — status is a stream of events, not edits (2026-10-03):** each status update is a `dev.keeper.agent.status` event carrying `content.anchor`; 91.1 AC3 and the architecture's Matrix-events table say so, and the device's reader mirrors `trail_of` (group by `content.anchor` else the event id; the sender is `content.agent`, power ≥ 50 and not the own user; the newest `origin_server_ts` wins; an unknown `run`, `kind` or `v` is *unreadable*, never dropped).
+
+**R33 — the header's source (2026-10-03):** option B: the SDK's default timeline filter, plus dropping `dev.keeper.agent.claim` and `.host` state from agent-room timelines; status and scope are read beside the item stream from the room's event cache, paging back like `runtime::latest_status` when the in-memory chunk holds none. The first test measures whether the event cache holds decrypted custom events after a restart; if it does not, option A, said so. The header travels as `TimelineBatch.header?: AgentRoomHeaderVm` (`#[ts(optional)]`), not a second channel, and shows on the phone too.
+
+**R35 — the run vocabulary (2026-10-03):** the event's `RunState` (`idle | running | blocked | waiting | done`) is the device's vocabulary; UX-DR129 is corrected to it.
+
+**R36 — a new conversation is made by the proxy's host (2026-10-03):** the person's device sends `dev.keeper.agent.conversation.request {v, title?}` in its main DM, accepted only from the proxy's `human` sealed by a verified device (R30); only the current claim holder of that main session acts — it creates the room (`RoomKind::Session(Conversation)`), creates the session folder with `create_agent_session` under its claim (idempotent on the request's event id), invites the person and answers in the DM — so people never hold state power and two hosts never race.
+
+**R37 — presence (2026-10-03):** `control_power_levels` gains `dev.keeper.agent.presence: 0`; agentd brings existing control rooms up to date on start when it holds the power to (their creator), else logs one sentence naming the room.
+
+**R38 — surface tools are agent-only (2026-10-03):** ⌘9 bots are never offered them (`tool_specs` for ⌘9 unchanged, pinned by a test); the narrowest mechanism is chosen (an agent tool vocabulary in keeper-agent wrapping the drive verbs, or a gated `ToolName` extension) and the epic's As built says which and why.
+
+**R39 — surface results bypass the turn (2026-10-03):** `dev.keeper.agent.surface.result` is intercepted in `register_handlers` before routing and delivered through an approval-style map keyed by the request id (sender the proxy's human, sealed, verified device); it never queues behind the turn.
+
+**R40 — proposal ranges (2026-10-03):** Rust translates file lines to body lines (frontmatter excluded) and refuses a range inside the frontmatter; `surface.request` carries the exact `expected` text the agent read for the range; the device applies only while the live buffer still holds it, else answers `unavailable`. Apply is one unannotated CodeMirror transaction through the editor runtime (undo-able, through autosave with the buffer's own rev); Rust never writes the note and nothing calls `notes_save` with proposal text.
+
+**R41 — focus (2026-10-03):** the host keeps `focus {drive, path, heading?}` in `SessionContext` in memory (not logged) and states it in the prompt frame of the next turn.
+
+**R42 — answers are not truncated (2026-10-03):** a message carrying `dev.keeper.agent.turn` in an agent room is capped at `FINAL_CUT_BYTES`, not `MAX_BODY_CHARS`.
+
+**R43 — the identity mark (2026-10-03):** the seeded agents use one glyph each (`N`, `T`, `L`), within the existing bound and the 20 px cell.
+
+**R44 — the stop phrase (2026-10-03):** stopping a spoken agent answer stops speech locally; no cancel event exists, and a turn-cancel event is deferred work in the agents block (epic 93 or later).
+
+**R45 — notifications (2026-10-03):** the notify handler does not notify for an agent's `…` anchor or its edits; a notification when an agent's answer completes is deferred to 98.1.
+
+**R46 — 91.5 AC5 restated (2026-10-03):** as R30 says, AC5 asserts the power-level content and the host's `classify`; only a person's *state* write is refused by the server, because a person's encrypted message or scope reaches it as `m.room.encrypted`, allowed at 0.
