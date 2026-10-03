@@ -27,6 +27,10 @@ mod agent_ports;
 // Agents' commands. Desktop-only: a phone is never a host.
 #[cfg(desktop)]
 mod agents_host;
+// The person's proxy beside the notes view (story 91.2): the dock's rooms,
+// scope, focus and new conversations. Every target: the phone shows the
+// proxy's rooms too.
+mod agents_ipc;
 // The Bots surface's commands that run on every target (Epic 61, Story 61.4;
 // split in Story 62.1). A provider is a URL plus a credential and a
 // conversation two tables in the `keeper.db` every platform already opens;
@@ -800,6 +804,7 @@ pub fn run() {
                 agents_host::start(
                     std::sync::Arc::clone(&state.platform),
                     state.accounts.agent_icons(),
+                    state.accounts.agent_proxies(),
                 );
             }
             #[cfg(not(desktop))]
@@ -999,6 +1004,11 @@ pub fn run() {
                 // the shared literal for the same reason as the rest: the
                 // composer may always ask what a draft is.
                 bots_ipc::bots_command_preview,
+                // Story 91.2: the proxy beside the notes view, every target.
+                agents_ipc::agent_rooms_list,
+                agents_ipc::agent_scope_set,
+                agents_ipc::agent_focus,
+                agents_ipc::agent_conversation_new,
                 // Voice (Story 62.4): every target, the port decides.
                 voice_ipc::voice_availability,
                 voice_ipc::voice_start,

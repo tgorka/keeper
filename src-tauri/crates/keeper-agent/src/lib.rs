@@ -28,6 +28,7 @@
 //!   its own engine and provider rows.
 //! - [`seed`] writes an agents zone's seed and a new agent, never over a
 //!   file, and makes a proxy's DM with its `main` session.
+//! - [`surface`] names a note the person looks at by its drive.
 
 // matrix-sdk's sync future is deep enough to need it, as in keeper-core.
 #![recursion_limit = "256"]
@@ -51,6 +52,7 @@ pub mod rooms;
 pub mod runtime;
 pub mod seed;
 pub mod sessions;
+pub mod surface;
 pub mod task;
 pub mod turn;
 pub mod writer;

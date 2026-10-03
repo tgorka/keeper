@@ -56,6 +56,7 @@ import type {
   AccountStateVm,
   AccountVm,
   AgentCopyVm,
+  AgentFocusReq,
   AgentPersonVm,
   AgentPinVm,
   AgentRoomHeaderVm,
@@ -106,6 +107,7 @@ import type {
   NoteBodyBatch,
   OrgAccountVm,
   PacedWorkVm,
+  ProxyRoomVm,
   RecordingCaptureSourcesVm,
   RecordingRemovalPreviewVm,
   RecordingRemovedVm,
@@ -4315,7 +4317,8 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
     return id;
   }
   channel.onmessage?.({ ops: [{ op: "reset", items: agent.items }], header: agent.header });
-  if (roomId !== "!nixi-dm:example.org") {
+  dockChannels.set(id, { roomId, channel });
+  if (roomId !== "!nixi-dm:example.org" || dockParam !== null) {
     return id;
   }
   let step = 0;
@@ -4346,19 +4349,179 @@ function subscribeMockInbox(payload: Record<string, unknown>): number {
   for (const window of ["archive", "pins", "favourites"]) {
     (payload[window] as MockChannel<InboxBatch>).onmessage?.(reset([]));
   }
-  (payload.agents as MockChannel<InboxBatch>).onmessage?.(reset(AGENT_ROOM_ROWS));
+  agentsWindow = payload.agents as MockChannel<InboxBatch>;
+  agentsWindow.onmessage?.(reset(AGENT_ROOM_ROWS));
   (payload.spaces as MockChannel<SpacesSnapshot>).onmessage?.({ spaces: [] });
   (payload.networks as MockChannel<NetworksSnapshot>).onmessage?.({ networks: [] });
   return 1;
 }
 
+// ---------------------------------------------------------------------------
+// The proxy beside the notes view (91.2, UX-DR130). `agent_rooms_list` lists
+// Nixi's DM first and her reading-list conversation, for the harness's one
+// account only; the scope chip offers the DM's `allowed` drives.
+// `?dock=phone` lists them with `allowed: null` (no agents zone on the device:
+// no chip editor), `?dock=none` lists nothing (no proxy), `?dock=late` lists
+// nothing for the first eight seconds (statuses not read yet after a cold
+// start: the dock looks again on its own), `?dock=offline` is a host that
+// never answers — a scope is never echoed and a new conversation is refused.
+// With `?dock` set the DM's answer does not stream, so the docked timeline is
+// still. `agent_scope_set` answers as the host does: the home drive kept and
+// first, a drive outside `allowed` refused by name in the status detail, the
+// accepted scope echoed as a header-only batch to every open timeline of the
+// room. `agent_focus` answers after a naming's latency and keeps the calls
+// in `window.__keeperMockAgentFocus`, dropping one older than a call already
+// seen as Rust does (Rust also debounces and names the heading; the mock
+// does neither, so the log is every call, not what the host was told).
+// `agent_conversation_new` adds a conversation a second later — to the
+// list, the Agents window and the DM's timeline (the host's notice).
+// ---------------------------------------------------------------------------
+
+const dockParam = new URLSearchParams(window.location.search).get("dock");
+const dockListedFrom = Date.now() + (dockParam === "late" ? 8_000 : 0);
+const DM_ROOM = "!nixi-dm:example.org";
+const NIXI_ALLOWED = [
+  { id: "tgdrive", title: "tgdrive" },
+  { id: "neura", title: "Neura" },
+  { id: "private", title: "Private notes" },
+];
+
+let proxyRooms: ProxyRoomVm[] =
+  dockParam === "none"
+    ? []
+    : [
+        {
+          roomId: DM_ROOM,
+          name: "Nixi",
+          kind: "main" as const,
+          agent: NIXI,
+          allowed: NIXI_ALLOWED,
+        },
+        {
+          roomId: "!nixi-reading:example.org",
+          name: "Nixi — reading list",
+          kind: "conversation" as const,
+          agent: NIXI,
+          allowed: NIXI_ALLOWED,
+        },
+      ].map((room): ProxyRoomVm => (dockParam === "phone" ? { ...room, allowed: null } : room));
+
+/** Open timelines by subscription id, so a scope echo reaches the dock. */
+const dockChannels = new Map<number, { roomId: string; channel: MockChannel<TimelineBatch> }>();
+let agentsWindow: MockChannel<InboxBatch> | null = null;
+const focusLog: Array<{ roomId: string; seq: number; focus: AgentFocusReq | null }> = [];
+let focusSeq = 0;
+(window as unknown as { __keeperMockAgentFocus: typeof focusLog }).__keeperMockAgentFocus =
+  focusLog;
+
+function pushHeader(roomId: string, items?: TimelineItemVm[]): void {
+  const room = AGENT_ROOM_TIMELINES[roomId];
+  for (const open of dockChannels.values()) {
+    if (open.roomId === roomId) {
+      open.channel.onmessage?.({
+        ops: items ? items.map((item) => ({ op: "pushBack" as const, item })) : [],
+        header: room.header,
+      });
+    }
+  }
+}
+
+function mockScopeSet(payload: Record<string, unknown>): Promise<null> {
+  const roomId = String(payload.roomId);
+  const asked = (payload.drives as string[]) ?? [];
+  const room = AGENT_ROOM_TIMELINES[roomId];
+  const allowed = NIXI_ALLOWED;
+  if (dockParam === "offline") {
+    return later(400, () => null);
+  }
+  return later(400, () => {
+    const outside = asked.filter((id) => !allowed.some((drive) => drive.id === id));
+    if (outside.length > 0 && room.header.status) {
+      room.header = {
+        ...room.header,
+        status: {
+          ...room.header.status,
+          detail: `${outside.join(", ")} ${outside.length === 1 ? "is" : "are"} not among the drives this agent may use.`,
+        },
+      };
+    } else {
+      const home = allowed[0];
+      room.header = {
+        ...room.header,
+        scope: [home, ...allowed.slice(1).filter((drive) => asked.includes(drive.id))],
+        label: room.header.label ?? NIXI_LABEL,
+      };
+    }
+    pushHeader(roomId);
+    return null;
+  });
+}
+
+function mockConversationNew(payload: Record<string, unknown>): Promise<string> {
+  if (dockParam === "offline") {
+    return Promise.reject({ code: "sendFailed", message: "The homeserver did not answer." });
+  }
+  const title = String(payload.title ?? "").trim() || "conversation";
+  const n = proxyRooms.length + 1;
+  const roomId = `!nixi-new-${n}:example.org`;
+  setTimeout(() => {
+    AGENT_ROOM_TIMELINES[roomId] = {
+      header: {
+        status: {
+          agent: NIXI,
+          agentName: "Nixi",
+          handle: "nixi@electra",
+          icon: "N",
+          host: "electra",
+          title,
+          kind: "conversation",
+          run: "idle",
+          waiting: null,
+          detail: null,
+          unreadable: null,
+        },
+        scope: [NIXI_ALLOWED[0]],
+        label: NIXI_LABEL,
+        scopeUnreadable: null,
+        caretKey: null,
+      },
+      items: [],
+    };
+    proxyRooms = [...proxyRooms, { ...proxyRooms[0], roomId, name: title, kind: "conversation" }];
+    const row = inboxRow(roomId, title, "", 0, "proxy");
+    agentsWindow?.onmessage?.({ ops: [{ op: "insert", index: 0, room: row }], total: n });
+    pushHeader(DM_ROOM, [
+      textItem(`notice-${n}`, NIXI, "Nixi", `I opened a new conversation, “${title}”.`, 0),
+    ]);
+  }, 1000);
+  return Promise.resolve(`$request-${n}:example.org`);
+}
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   inbox_subscribe: subscribeMockInbox,
+  agent_rooms_list: (payload) =>
+    payload.accountId === MOCK_ACCOUNT_ID && Date.now() >= dockListedFrom ? proxyRooms : [],
+  agent_scope_set: mockScopeSet,
+  agent_focus: (payload) =>
+    later(40, () => {
+      const seq = Number(payload.seq);
+      if (seq > focusSeq) {
+        focusSeq = seq;
+        focusLog.push({
+          roomId: String(payload.roomId),
+          seq,
+          focus: (payload.focus as AgentFocusReq | null) ?? null,
+        });
+      }
+      return null;
+    }),
+  agent_conversation_new: mockConversationNew,
   timeline_subscribe: subscribeMockTimeline,
   timeline_unsubscribe: (payload) => {
     const id = Number(payload.subscriptionId);
     clearInterval(TIMELINE_STREAMS.get(id));
     TIMELINE_STREAMS.delete(id);
+    dockChannels.delete(id);
     return null;
   },
   ...transcriptionMockHandlers(() => ANSWERS.sync_profiles as SyncProfileVm[]),

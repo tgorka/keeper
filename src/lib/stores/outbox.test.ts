@@ -95,6 +95,23 @@ describe("outboxStore", () => {
     outboxStore.getState().clear();
     expect(outboxStore.getState().rooms.size).toBe(0);
   });
+
+  it("keeps a room's holds while another conversation still shows them (U2)", () => {
+    // The chat and the notes dock both show !r1; the dock closes.
+    outboxStore.getState().hold("acctA", "!r1");
+    outboxStore.getState().hold("acctA", "!r1");
+    outboxStore.getState().applySnapshot("acctA", "!r1", [held("id1", "!r1", 100)]);
+    outboxStore.getState().release("acctA", "!r1");
+    expect(
+      outboxStore
+        .getState()
+        .rooms.get("acctA !r1")
+        ?.map((r) => r.id),
+    ).toEqual(["id1"]);
+    // The last one closes: the rows go.
+    outboxStore.getState().release("acctA", "!r1");
+    expect(outboxStore.getState().rooms.has("acctA !r1")).toBe(false);
+  });
 });
 
 describe("undoHeldSend (shared undo effect, Story 8.4)", () => {
@@ -107,7 +124,7 @@ describe("undoHeldSend (shared undo effect, Story 8.4)", () => {
 
   it("cancels the held send and restores a non-empty returned body to the composer", async () => {
     mockCancel.mockResolvedValue("restored body");
-    await undoHeldSend("acctA", "!r1", "id1");
+    await undoHeldSend("acctA", "!r1", "id1", composerStore);
     expect(mockCancel).toHaveBeenCalledWith("acctA", "!r1", "id1");
     expect(composerStore.getState().restoreBody).toBe("restored body");
     // The restore is scoped to the originating chat (never lands in another room).
@@ -116,14 +133,14 @@ describe("undoHeldSend (shared undo effect, Story 8.4)", () => {
 
   it("does not restore when the cancel returns an empty body (already dispatched)", async () => {
     mockCancel.mockResolvedValue("");
-    await undoHeldSend("acctA", "!r1", "id1");
+    await undoHeldSend("acctA", "!r1", "id1", composerStore);
     expect(mockCancel).toHaveBeenCalledWith("acctA", "!r1", "id1");
     expect(composerStore.getState().restoreBody).toBeNull();
   });
 
   it("swallows a cancel rejection and does not restore (mirrors the pill)", async () => {
     mockCancel.mockRejectedValue(new Error("boom"));
-    await expect(undoHeldSend("acctA", "!r1", "id1")).resolves.toBeUndefined();
+    await expect(undoHeldSend("acctA", "!r1", "id1", composerStore)).resolves.toBeUndefined();
     expect(composerStore.getState().restoreBody).toBeNull();
   });
 });

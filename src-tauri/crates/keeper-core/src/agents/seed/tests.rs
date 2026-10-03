@@ -195,6 +195,7 @@ fn the_seeded_souls_compose() {
                     audience_sentence: Label::opening(&choices.decl, Integrity::Owner)
                         .sentence(&|user| user.localpart().to_owned()),
                     now: DateTime::parse_from_rfc3339("2026-10-03T09:00:00+02:00").expect("now"),
+                    focus: None,
                 };
                 let composed = prompt::compose(&PromptInput {
                     soul: &soul,

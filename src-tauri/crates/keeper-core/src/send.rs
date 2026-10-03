@@ -54,7 +54,8 @@
 //! send verbs each stay one call site), `exactly_two_legal_dispatch_triggers` (the
 //! wildcard-free exhaustiveness gate — a third variant fails to compile), and
 //! `submit_has_exactly_the_two_user_initiated_callers` (a source scan of production
-//! `account.rs` — a third or background [`submit`] caller fails the count).
+//! `account.rs` — a third or background [`submit`] caller fails the count, and so
+//! does a second `.send_raw(` beside the dock's closed agent-event sender).
 //!
 //! Secret containment (NFR-9): neither the message body, a txn id, an event id,
 //! nor a token ever reaches `tracing` — logs carry the opaque room id only, via
@@ -520,6 +521,20 @@ mod tests {
             "AD-13: `send::dispatch(` must have exactly one non-`submit` production \
              caller in account.rs (the outbox scheduler); found {dispatch_calls}. A \
              second caller is an invariant breach requiring a planning decision."
+        );
+
+        // The dock's agent events (story 91.2) go out through `Room::send_raw`,
+        // which takes any event type: exactly one call site may exist in
+        // production `account.rs` — the private `send_agent_event`, whose input
+        // is the closed `AgentOutbound` (a scope or a request for a
+        // conversation). A second one would be an open door for any event type
+        // — a status, a claim, an approval decision — outside this airlock.
+        let raw_calls = normalized.matches(".send_raw(").count();
+        assert_eq!(
+            raw_calls, 1,
+            "AD-13: `.send_raw(` must have exactly one production call site in \
+             account.rs (`send_agent_event`, over the closed `AgentOutbound`); \
+             found {raw_calls}."
         );
     }
 

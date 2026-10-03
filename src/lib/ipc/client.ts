@@ -336,6 +336,7 @@ export type { AccountShareVm } from "./gen/AccountShareVm";
 export type { AccountStateVm } from "./gen/AccountStateVm";
 export type { AccountVm } from "./gen/AccountVm";
 export type { AgentCopyVm } from "./gen/AgentCopyVm";
+export type { AgentFocusReq } from "./gen/AgentFocusReq";
 export type { AgentPersonVm } from "./gen/AgentPersonVm";
 export type { AgentPinReq } from "./gen/AgentPinReq";
 export type { AgentPinState } from "./gen/AgentPinState";
@@ -579,6 +580,7 @@ export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ProviderKind } from "./gen/ProviderKind";
 export type { ProviderOfferVm } from "./gen/ProviderOfferVm";
+export type { ProxyRoomVm } from "./gen/ProxyRoomVm";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
 export type { RecordingApplicationVm } from "./gen/RecordingApplicationVm";
 export type { RecordingCaptureSourcesPatchVm } from "./gen/RecordingCaptureSourcesPatchVm";
@@ -721,6 +723,7 @@ import type { AccountSetupVm } from "./gen/AccountSetupVm";
 import type { AccountShareVm } from "./gen/AccountShareVm";
 import type { AccountVm } from "./gen/AccountVm";
 import type { AgentCopyVm } from "./gen/AgentCopyVm";
+import type { AgentFocusReq } from "./gen/AgentFocusReq";
 import type { AgentPinReq } from "./gen/AgentPinReq";
 import type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
 import type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
@@ -831,6 +834,7 @@ import type { PacedWorkVm } from "./gen/PacedWorkVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
+import type { ProxyRoomVm } from "./gen/ProxyRoomVm";
 import type { RecordingCaptureSourcesPatchVm } from "./gen/RecordingCaptureSourcesPatchVm";
 import type { RecordingCaptureSourcesVm } from "./gen/RecordingCaptureSourcesVm";
 import type { RecordingFilterVm } from "./gen/RecordingFilterVm";
@@ -7344,6 +7348,78 @@ export async function agentsSeedPlan(req: AgentSeedReq): Promise<AgentSeedPlanVm
  */
 export async function agentsSeedApply(req: AgentSeedReq): Promise<AgentSeedResultVm> {
   return await invoke<AgentSeedResultVm>("agents_seed_apply", { req });
+}
+
+// ---------------------------------------------------------------------------
+// The proxy beside the notes view (story 91.2, UX-DR130)
+// ---------------------------------------------------------------------------
+
+/**
+ * The person's proxy conversations on `accountId`: every agent session room
+ * whose status says `main` (the DM, first — the dock's default) or
+ * `conversation`, newest next. A room whose status is not read yet is not
+ * listed. `allowed` is the drives the scope chip may offer (the home drive
+ * first), `null` where the proxy's agents zone is not on this device (the
+ * phone). Every target; never rejects (an account that is not live lists
+ * nothing).
+ */
+export async function agentRoomsList(accountId: string): Promise<ProxyRoomVm[]> {
+  return await invoke<ProxyRoomVm[]>("agent_rooms_list", { accountId });
+}
+
+/**
+ * Ask the proxy in `roomId` for `drives` (ids) in scope. The proxy's host
+ * keeps its home drive, refuses a drive outside its `[tools].drives` (named in
+ * the room's status detail) and echoes the accepted scope, which the room's
+ * header (`TimelineBatch.header.scope`) then shows — the chip reads the
+ * header, not this call.
+ *
+ * Rejects with: `sendFailed` (no such room, or the send failed),
+ * `unsupported` (the room is not one of the person's proxy conversations).
+ */
+export async function agentScopeSet(
+  accountId: string,
+  roomId: string,
+  drives: string[],
+): Promise<void> {
+  await invoke<void>("agent_scope_set", { accountId, roomId, drives });
+}
+
+/**
+ * The docked note changed (`focus`), or the dock closed (`null`). Call it on
+ * every change of the active note, the caret's line or the buffer while the
+ * dock is open, and again every `FOCUS_HEARTBEAT_MS` while it stays open:
+ * Rust names the note's drive, path and heading once the change has been
+ * still a second, sends it only when it changed (or the heartbeat is due),
+ * and on close tells the proxy there is none. `seq` must grow with every
+ * call, across reloads too: Rust drops a call older than one it has seen, so
+ * a focus that arrives after the close it preceded is never sent.
+ *
+ * Rejects as `agentScopeSet`.
+ */
+export async function agentFocus(
+  accountId: string,
+  roomId: string,
+  seq: number,
+  focus: AgentFocusReq | null,
+): Promise<void> {
+  await invoke<void>("agent_focus", { accountId, roomId, seq, focus });
+}
+
+/**
+ * *New conversation*: ask the proxy, in its DM `roomId`, for a new
+ * conversation titled `title` (blank: "conversation"). The proxy's host makes
+ * the room and invites the person; it appears in `agentRoomsList` once its
+ * status arrives. Resolves to the request's event id.
+ *
+ * Rejects as `agentScopeSet`; `unsupported` also when `roomId` is not the DM.
+ */
+export async function agentConversationNew(
+  accountId: string,
+  roomId: string,
+  title: string | null,
+): Promise<string> {
+  return await invoke<string>("agent_conversation_new", { accountId, roomId, title });
 }
 
 // ---------------------------------------------------------------------------

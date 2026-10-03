@@ -49,14 +49,13 @@ import {
   mirrorDraft,
   saveDraft,
 } from "@/lib/ipc/client";
-import {
-  attachmentId,
-  attachmentsStore,
-  type PendingAttachment,
-  useAttachmentsStore,
-} from "@/lib/stores/attachments";
+import { attachmentId, type PendingAttachment } from "@/lib/stores/attachments";
 import type { PendingContext } from "@/lib/stores/composer";
-import { composerStore, useComposerStore } from "@/lib/stores/composer";
+import {
+  useConversationAttachments,
+  useConversationComposer,
+  useConversationStores,
+} from "@/lib/stores/conversation-stores";
 import { draftsStore, useRemoteDraft } from "@/lib/stores/drafts";
 import { useIncognito } from "@/lib/stores/incognito";
 import { cn } from "@/lib/utils";
@@ -180,11 +179,13 @@ export function Composer({
   // Whether Incognito is effective for this chat (Story 8.1). Mirrored from the
   // Rust-resolved VM; drives the violet composer focus ring while it applies.
   const incognitoEffective = useIncognito(accountId, roomId)?.effective ?? false;
+  // This conversation's composer state and tray: the chat's, or the notes dock's.
+  const { composer, attachments: tray } = useConversationStores();
 
   // The textarea handle, focused programmatically when the composer store's focus
   // nonce is *bumped* (Story 6.6 — e.g. after a new chat is resolved and opened).
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const focusNonce = useComposerStore((s) => s.focusNonce);
+  const focusNonce = useConversationComposer((s) => s.focusNonce);
   // Seed to the current nonce so a fresh Composer mount (every room switch clears &
   // remounts the pane) does NOT self-focus off a stale, already-bumped nonce — only a
   // genuine change after mount steals focus into the composer.
@@ -373,7 +374,7 @@ export function Composer({
     [flushDraft, scheduleMirror],
   );
 
-  const attachments = useAttachmentsStore((s) => s.pending);
+  const attachments = useConversationAttachments((s) => s.pending);
   // The attach/paste affordances are available only when the parent wires the
   // attachment dispatcher and the composer is enabled.
   const attachEnabled = onSendAttachments != null && !disabled;
@@ -439,7 +440,7 @@ export function Composer({
   );
 
   // Undo-Send restore (Story 8.3): when a held send is cancelled, `cancelHeldSend`
-  // returns the held body and the pill calls `composerStore.restore(accountId, roomId,
+  // returns the held body and the pill calls `composer.restore(accountId, roomId,
   // body)`, bumping `restoreNonce`. Apply it here, establishing the composer text
   // (latching `restoreConsumed` so a late mount-restore can't clobber it) and persisting
   // it as the durable draft — replacing current composer content per the documented
@@ -447,14 +448,14 @@ export function Composer({
   // nonce so a fresh mount does not self-apply a stale, already-consumed restore. The
   // restore only applies when its target matches this composer's chat, so a restore that
   // resolves after the user switched rooms never lands in the wrong room's composer.
-  const restoreNonce = useComposerStore((s) => s.restoreNonce);
+  const restoreNonce = useConversationComposer((s) => s.restoreNonce);
   const seenRestoreNonce = useRef(restoreNonce);
   useEffect(() => {
     if (restoreNonce === seenRestoreNonce.current) {
       return;
     }
     seenRestoreNonce.current = restoreNonce;
-    const { restoreBody: body, restoreTarget: target } = composerStore.getState();
+    const { restoreBody: body, restoreTarget: target } = composer.getState();
     if (body === null || pendingModeRef.current === "edit") {
       return;
     }
@@ -469,7 +470,7 @@ export function Composer({
     setDraft(body);
     setError(null);
     scheduleDraftSave(body);
-  }, [restoreNonce, scheduleDraftSave]);
+  }, [restoreNonce, scheduleDraftSave, composer]);
 
   // Restore the persisted draft and reconcile the remote mirror once on mount (Story
   // 7.1 + 7.2). The composer remounts per (account, room) in the parent, so this runs
@@ -573,7 +574,7 @@ export function Composer({
     // instead of clearing (Story 7.1). A reply/text send owns the draft and clears it.
     const wasEdit = pending?.mode === "edit";
     const body = draft.trim();
-    const trayAttachments = attachmentsStore.getState().pending;
+    const trayAttachments = tray.getState().pending;
     const dispatchAttachments =
       onSendAttachments != null && pending?.mode !== "edit" && trayAttachments.length > 0;
     if ((body.length === 0 && !dispatchAttachments) || disabled || sending) {
@@ -619,7 +620,7 @@ export function Composer({
         }
         // Clear only on success so a failed enqueue keeps the tray + text. Attachments
         // never ride an edit (guarded above), so the draft is always cleared here.
-        attachmentsStore.getState().clear();
+        tray.getState().clear();
         setDraft("");
         clearPersistedDraft();
       } else {
@@ -676,7 +677,7 @@ export function Composer({
         return;
       }
       const paths = Array.isArray(selection) ? selection : [selection];
-      attachmentsStore.getState().addMany(
+      tray.getState().addMany(
         paths.map((path) => ({
           id: attachmentId(),
           kind: "path" as const,
@@ -710,7 +711,7 @@ export function Composer({
     e.preventDefault();
     void file.arrayBuffer().then((bytes) => {
       const ext = file.type.split("/")[1] || "png";
-      attachmentsStore.getState().add({
+      tray.getState().add({
         id: attachmentId(),
         kind: "bytes",
         bytes,
@@ -723,7 +724,7 @@ export function Composer({
 
   /** Remove a pending attachment (a pre-upload cancel). */
   function removeAttachment(id: string) {
-    attachmentsStore.getState().remove(id);
+    tray.getState().remove(id);
   }
 
   function cancelPending() {

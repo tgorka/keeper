@@ -8,17 +8,20 @@
  * seconds render (no `motion-safe:` ring). The remaining count is announced to
  * VoiceOver **once** on mount (`aria-live="polite"`), not per second.
  *
- * Clicking a pill's Undo — or pressing `⌘⇧Z` while the focused Chat has a pending hold
- * (undoes the OLDEST) — calls `cancelHeldSend` and restores the returned body into the
- * composer as a draft (via `composerStore.restore`). `⌘⇧Z` is a LOCAL keydown scoped to
- * this pane (not a global command registry — that is Epic 9); `⌘Z` is left to the
- * composer's own text-undo.
+ * Clicking a pill's Undo — or pressing `⌘⇧Z` while focus is inside this conversation
+ * and it has a pending hold (undoes the OLDEST) — calls `cancelHeldSend` and restores
+ * the returned body into the conversation's composer as a draft. `⌘⇧Z` is a LOCAL
+ * keydown scoped to this conversation (not a global command registry — that is Epic
+ * 9): the notes view mounts a conversation beside an editor whose own `⌘⇧Z` is redo,
+ * and a keystroke another handler already took is never a second command here. `⌘Z`
+ * is left to the composer's own text-undo.
  *
  * Held state is a pure mirror of the Rust `outbox` stream (`useHeldSends`); the row
  * disappears from this list when the scheduler dispatches it or the user undoes it.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { HeldSendVm } from "@/lib/ipc/client";
+import { useConversationStores } from "@/lib/stores/conversation-stores";
 import { undoHeldSend, useHeldSends } from "@/lib/stores/outbox";
 
 /** Whole seconds remaining until `dispatchAtMs`, clamped at 0 (never negative). */
@@ -29,14 +32,17 @@ function secondsLeft(dispatchAtMs: number, now: number): number {
 interface UndoSendPillProps {
   accountId: string;
   roomId: string;
+  /** The conversation's root: `⌘⇧Z` counts only while focus is inside it. */
+  scope: RefObject<HTMLElement | null>;
 }
 
 /**
  * The stack of undo-send pills for the open Chat. Renders nothing when the Chat has no
  * held sends. Owns the shared 1 s tick and the `⌘⇧Z` keydown for the oldest hold.
  */
-export function UndoSendPill({ accountId, roomId }: UndoSendPillProps) {
+export function UndoSendPill({ accountId, roomId, scope }: UndoSendPillProps) {
   const held = useHeldSends(accountId, roomId);
+  const { composer } = useConversationStores();
   // One shared tick drives every pill's countdown so N pills don't run N intervals.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -52,34 +58,38 @@ export function UndoSendPill({ accountId, roomId }: UndoSendPillProps) {
     // already-dispatched row returns ""); it only restores on a non-empty body. This is
     // the same helper the timeline Delete affordance on a held bubble calls, so the two
     // cannot drift.
-    (id: string) => void undoHeldSend(accountId, roomId, id),
-    [accountId, roomId],
+    (id: string) => void undoHeldSend(accountId, roomId, id, composer),
+    [accountId, roomId, composer],
   );
 
-  // `⌘⇧Z` undoes the OLDEST pending hold for this Chat. Held is oldest-first, so index 0
-  // is the oldest. `⌘Z` is left alone (composer text-undo). The listener is on `window`
-  // but scoped to the open Chat: it ignores the keystroke while a modal (e.g. the
-  // Settings dialog) holds focus, so `⌘⇧Z` there never silently cancels a held send.
+  // `⌘⇧Z` undoes the OLDEST pending hold for this conversation. Held is oldest-first,
+  // so index 0 is the oldest. `⌘Z` is left alone (composer text-undo). The listener is
+  // on `window` but scoped to this conversation: only while focus is inside its root —
+  // not in the note editor beside the dock (whose ⌘⇧Z is redo), not in a modal (it
+  // portals out of the root), not in another conversation's pill — and never for a
+  // keystroke a handler before it already took (`defaultPrevented`).
   const heldRef = useRef(held);
   heldRef.current = held;
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
-      if (mod && e.shiftKey && (e.key === "z" || e.key === "Z")) {
-        // Don't fire when a modal dialog owns focus — the pill stays mounted under it.
-        if (document.activeElement?.closest('[role="dialog"]') != null) {
-          return;
-        }
-        const oldest = heldRef.current[0];
-        if (oldest !== undefined) {
-          e.preventDefault();
-          void undo(oldest.id);
-        }
+      if (!mod || !e.shiftKey || (e.key !== "z" && e.key !== "Z") || e.defaultPrevented) {
+        return;
+      }
+      const root = scope.current;
+      const active = document.activeElement;
+      if (root === null || active === null || !root.contains(active)) {
+        return;
+      }
+      const oldest = heldRef.current[0];
+      if (oldest !== undefined) {
+        e.preventDefault();
+        void undo(oldest.id);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [undo]);
+  }, [undo, scope]);
 
   if (held.length === 0) {
     return null;

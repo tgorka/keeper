@@ -35,19 +35,20 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use keeper_core::agents::agentd::{AgentdConfig, DrivePin};
 use keeper_core::agents::drive::{self, DriveDecl};
-use keeper_core::agents::events::{APPROVAL_DECISION, TURN};
+use keeper_core::agents::events::{APPROVAL_DECISION, CONVERSATION_REQUEST, SCOPE, TURN};
 use keeper_core::agents::index::Index;
 use keeper_core::agents::label::{Label, Readers};
 use keeper_core::agents::log::{ClaimAction, HostSlug};
-use keeper_core::agents::matrix::{self, AgentClient};
+use keeper_core::agents::matrix::{self, AgentClient, RoomKind};
 use keeper_core::agents::mount;
-use keeper_core::agents::session::SessionAgent;
+use keeper_core::agents::session::{SessionAgent, SessionKind};
 use keeper_core::auth::StoredSession;
 use keeper_core::bots::chat::{self, CancelSignal};
 use keeper_core::bots::store;
@@ -67,7 +68,8 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::agent::{
-    bot_for, trail_of, AgentDeps, AgentProfiles, Arrived, ServedSession, SessionRef,
+    bot_for, trail_of, AgentDeps, AgentProfiles, Arrived, ConversationPort, RoomFuture,
+    ServedSession, SessionRef,
 };
 use crate::claims::Lease;
 use crate::headless::{
@@ -75,7 +77,7 @@ use crate::headless::{
     HeadlessSyncPlatform, SecretMap,
 };
 use crate::hosts::HostRuntime;
-use crate::matrix_sink::{EditPort, RoomPort};
+use crate::matrix_sink::{EditPort, RoomPort, SendFuture};
 use crate::rooms::{self, Arrival, Invite, InviteDecision, Known, KnownAgent};
 use crate::turn::{DrivePorts, TurnEnv};
 use crate::zone::{active_sessions, read_text, read_zone, AgentHome, FoundSession, ZoneRead};
@@ -937,6 +939,7 @@ async fn serve_session(
     }
     let deps = &copy.deps;
     let me = &deps.home.config.matrix_user;
+    served.conversations = Some(Arc::new(ClientRooms(copy.client.clone())));
     let port: Arc<dyn EditPort> = Arc::new(RoomPort::new(copy.client.clone(), room_id));
     let (events, mut backlog) = read_back(&room, &mut served, me).await;
     // A taker's log may not hold the last holder's lines yet: what another
@@ -963,6 +966,66 @@ async fn serve_session(
         .and_then(|_| served.writer.sync())
     {
         tracing::warn!(session = %session.path, %error, "agentd: the claim's last line could not be written");
+    }
+}
+
+/// The copy's own client, making the conversations a `main` session's
+/// person asks for (R36).
+struct ClientRooms(AgentClient);
+
+impl ConversationPort for ClientRooms {
+    fn create<'a>(&'a self, name: &'a str, person: &'a UserId) -> RoomFuture<'a> {
+        Box::pin(self.0.create_room(
+            RoomKind::Session(SessionKind::Conversation),
+            name,
+            vec![person.to_owned()],
+            &[],
+        ))
+    }
+
+    fn send<'a>(&'a self, room: &'a RoomId, event_type: &'a str, content: Value) -> SendFuture<'a> {
+        Box::pin(self.0.send(room, event_type, content, None))
+    }
+
+    fn discard<'a>(
+        &'a self,
+        room: &'a RoomId,
+        person: &'a UserId,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(joined) = self.0.client().get_room(room) else {
+                return;
+            };
+            if let Err(error) = joined
+                .kick_user(person, Some("This conversation could not be opened."))
+                .await
+            {
+                tracing::warn!(%room, %error, "agentd: the invite to an unopened conversation could not be revoked");
+            }
+            if let Err(error) = joined.leave().await {
+                tracing::warn!(%room, %error, "agentd: an unopened conversation could not be left");
+                return;
+            }
+            if let Err(error) = joined.forget().await {
+                tracing::warn!(%room, %error, "agentd: an unopened conversation could not be forgotten");
+            }
+        })
+    }
+
+    fn joined<'a>(
+        &'a self,
+        room: &'a RoomId,
+        person: &'a UserId,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(room) = self.0.client().get_room(room) else {
+                return false;
+            };
+            matches!(
+                room.get_member_no_sync(person).await,
+                Ok(Some(member)) if *member.membership() == MembershipState::Join
+            )
+        })
     }
 }
 
@@ -1010,6 +1073,10 @@ async fn read_back(
         .iter()
         .filter(|(value, _)| value["sender"].as_str() != Some(me.as_str()))
         .filter_map(|(value, encryption)| arrival_of(value, encryption.as_deref(), now))
+        .map(|arrived| Arrived {
+            replay: true,
+            ..arrived
+        })
         .collect();
     (
         unseen.into_iter().map(|(value, _)| value).collect(),
@@ -1132,6 +1199,21 @@ fn sealed_by_sender(encryption: Option<&EncryptionInfo>) -> bool {
     })
 }
 
+/// Whether a decrypted event came from a device its sender's cross-signing
+/// identity signed — verified by this host or not (R47): what a scope or a
+/// request for a conversation needs. A device its owner never signed, one
+/// keeper does not know, a session of another user's device, and an identity
+/// that changed after it was verified are refused.
+fn owner_signed(encryption: Option<&EncryptionInfo>) -> bool {
+    encryption.is_some_and(|info| {
+        matches!(
+            info.verification_state,
+            VerificationState::Verified
+                | VerificationState::Unverified(VerificationLevel::UnverifiedIdentity)
+        )
+    })
+}
+
 /// A decrypted timeline event as an [`Arrived`], or `None` for an event no
 /// session acts on (membership, state, reactions, attachments, notices).
 ///
@@ -1165,6 +1247,14 @@ pub fn arrival_of(
             verified: encryption
                 .is_some_and(|info| matches!(info.verification_state, VerificationState::Verified)),
         }
+    } else if event_type == SCOPE {
+        Arrival::Scope {
+            owner_signed: owner_signed(encryption),
+        }
+    } else if event_type == CONVERSATION_REQUEST {
+        Arrival::ConversationRequest {
+            owner_signed: owner_signed(encryption),
+        }
     } else if event_type.starts_with("dev.keeper.agent.") {
         Arrival::AgentEvent
     } else {
@@ -1177,6 +1267,7 @@ pub fn arrival_of(
         text: content["body"].as_str().unwrap_or_default().to_owned(),
         content,
         received_at,
+        replay: false,
     })
 }
 
@@ -1354,6 +1445,85 @@ mod tests {
                 arrival_of(&other, Some(&unverified), now).is_none(),
                 "{msgtype} is not a turn"
             );
+        }
+    }
+
+    /// R47: a scope or a request for a conversation counts from a device its
+    /// owner's identity signed, verified here or not; from an unsigned,
+    /// unknown or mismatched device, or in clear, the person's own scope in
+    /// their own DM is ignored.
+    #[test]
+    fn a_scope_counts_only_from_a_device_its_owner_signed() {
+        use crate::rooms::{classify, Disposition, Served, UNSIGNED_DEVICE};
+        use keeper_core::agents::home::AgentKind;
+        use keeper_core::agents::session::SessionKind;
+        use matrix_sdk::deserialized_responses::DeviceLinkProblem;
+
+        let now = Instant::now();
+        let tgorka = OwnedUserId::try_from("@tgorka:example.org").expect("user");
+        let nixi = OwnedUserId::try_from("@nixi:example.org").expect("user");
+        let readers = Readers::Only([tgorka.clone()].into_iter().collect());
+        let dm = Served {
+            agent_kind: AgentKind::Proxy,
+            human: Some(&tgorka),
+            session_kind: SessionKind::Main,
+            agent_user: &nixi,
+            readers: &readers,
+        };
+        let event = |kind: &str, content: Value| json!({"type": kind, "event_id": "$s:example.org", "sender": tgorka.as_str(), "content": content});
+        let scope = event(
+            SCOPE,
+            json!({"v": 1, "drives": [], "set_by": tgorka.as_str()}),
+        );
+        let ask = event(CONVERSATION_REQUEST, json!({"v": 1}));
+        for (encryption, counts) in [
+            (Some(sealed(None)), true),
+            (
+                Some(sealed(Some(VerificationLevel::UnverifiedIdentity))),
+                true,
+            ),
+            (Some(sealed(Some(VerificationLevel::UnsignedDevice))), false),
+            (
+                Some(sealed(Some(VerificationLevel::VerificationViolation))),
+                false,
+            ),
+            (
+                Some(sealed(Some(VerificationLevel::MismatchedSender))),
+                false,
+            ),
+            (
+                Some(sealed(Some(VerificationLevel::None(
+                    DeviceLinkProblem::MissingDevice,
+                )))),
+                false,
+            ),
+            (None, false),
+        ] {
+            let level = encryption
+                .as_ref()
+                .map(|info| info.verification_state.clone());
+            let scoped = arrival_of(&scope, encryption.as_ref(), now).expect("a scope");
+            assert_eq!(
+                scoped.arrival,
+                Arrival::Scope {
+                    owner_signed: counts
+                },
+                "{level:?}"
+            );
+            let asked = arrival_of(&ask, encryption.as_ref(), now).expect("a request");
+            let (scope_to, ask_to) = (
+                classify(&dm, &tgorka, scoped.arrival),
+                classify(&dm, &tgorka, asked.arrival),
+            );
+            if counts {
+                assert_eq!(
+                    (scope_to, ask_to),
+                    (Disposition::Scope, Disposition::NewConversation)
+                );
+            } else {
+                assert_eq!(scope_to, Disposition::Ignored(UNSIGNED_DEVICE), "{level:?}");
+                assert_eq!(ask_to, Disposition::Ignored(UNSIGNED_DEVICE), "{level:?}");
+            }
         }
     }
 

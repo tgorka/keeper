@@ -14,19 +14,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keeper_agent::agent::{
-    arm_agent, trail_of, AgentDeps, AgentProfiles, Arrived, Outcome, Probe, ServedSession,
-    SessionRef, Trail, TurnEnding, LOCAL_ONLY_REFUSAL, NARROWER_THAN_ROOM,
+    arm_agent, trail_of, AgentDeps, AgentProfiles, Arrived, ConversationPort, HeldFocus, Outcome,
+    Probe, RoomFuture, ServedSession, SessionRef, Trail, TurnEnding, JOIN_POLL, LOCAL_ONLY_REFUSAL,
+    NARROWER_THAN_ROOM,
 };
 use keeper_agent::claims::{blocked_status, conflict_line, conflict_of, Lease};
 use keeper_agent::host::UNATTENDED_REFUSAL;
 use keeper_agent::matrix_sink::{EditPort, SendFuture};
-use keeper_agent::rooms::Arrival;
+use keeper_agent::rooms::{Arrival, NOT_THE_PERSON, OBSERVER_TEXT, UNSIGNED_DEVICE};
 use keeper_agent::runtime::Router;
 use keeper_agent::turn::{DrivePorts, TurnEnv};
 use keeper_agent::writer::WriterError;
 use keeper_agent::zone::{read_zone, AgentHome};
 use keeper_core::agents::drive::{self, DriveDecl};
-use keeper_core::agents::events::{RunState, StatusContent, FINAL_CUT_BYTES, STATUS};
+use keeper_core::agents::events::{RunState, StatusContent, FINAL_CUT_BYTES, SCOPE, STATUS};
+use keeper_core::agents::focus::FOCUS_TTL;
 use keeper_core::agents::label::{Integrity, Label, Readers};
 use keeper_core::agents::log::reader::{hydrate_blob, read_session};
 use keeper_core::agents::log::replay::replay;
@@ -41,7 +43,9 @@ use keeper_core::bots::{store, Bot, Provider, ProviderKind};
 use keeper_core::error::CoreError;
 use keeper_core::platform::Platform;
 use keeper_sync::SyncProfile;
-use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedTransactionId, OwnedUserId};
+use matrix_sdk::ruma::{
+    OwnedEventId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, UserId,
+};
 use serde_json::{json, Value};
 
 const TGORKA: &str = "@tgorka:example.org";
@@ -376,15 +380,34 @@ fn world(kind: ProviderKind, allow: &[&str], script: Vec<Completion>) -> World {
 }
 
 fn session(drive: &Path, path: &str, home: &DriveDecl) -> SessionAgent {
+    session_of(
+        drive,
+        path,
+        home,
+        "nixi",
+        SessionKind::Conversation,
+        "!room:example.org",
+    )
+}
+
+/// A session of `agent`, of `kind`, in `room`, at `path` of `drive`.
+fn session_of(
+    drive: &Path,
+    path: &str,
+    home: &DriveDecl,
+    agent: &str,
+    kind: SessionKind,
+    room: &str,
+) -> SessionAgent {
     let agent = SessionAgent {
         id: ulid::Ulid::new(),
-        agent: "nixi".to_owned(),
+        agent: agent.to_owned(),
         drive: "tgdrive".to_owned(),
-        kind: SessionKind::Conversation,
+        kind,
         title: "chat".to_owned(),
         requested_by: user(TGORKA),
         parent: None,
-        room: "!room:example.org".try_into().expect("room"),
+        room: room.try_into().expect("room"),
         drives: vec!["tgdrive".to_owned(), "private".to_owned()],
         label: Label::opening(home, Integrity::Owner),
         needs: None,
@@ -440,6 +463,7 @@ impl World {
             text: text.to_owned(),
             content: json!({"msgtype":"m.text","body":text}),
             received_at: tokio::time::Instant::now(),
+            replay: false,
         }
     }
 
@@ -620,7 +644,9 @@ async fn an_interrupted_turn_is_not_rerun_after_a_restart() {
     {
         // The host died after logging the question.
         let mut served = world.open(SESSION);
-        let ServedSession { context, writer } = &mut served;
+        let ServedSession {
+            context, writer, ..
+        } = &mut served;
         writer
             .write(
                 context,
@@ -665,7 +691,9 @@ async fn a_turn_cut_off_mid_tool_loop_is_closed_by_editing_its_anchor() {
     let world = world(ProviderKind::OpenAi, &["drive_read"], vec![]);
     let user_line = {
         let mut served = world.open(SESSION);
-        let ServedSession { context, writer } = &mut served;
+        let ServedSession {
+            context, writer, ..
+        } = &mut served;
         let asked = writer
             .write(
                 context,
@@ -1270,7 +1298,9 @@ async fn a_served_sessions_second_turn_opens_no_file_under_log() {
 fn lines_written_in_one_millisecond_keep_their_order() {
     let world = world(ProviderKind::OpenAi, &["drive_read"], vec![]);
     let mut served = world.open(SESSION);
-    let ServedSession { context, writer } = &mut served;
+    let ServedSession {
+        context, writer, ..
+    } = &mut served;
     for n in 0..50 {
         writer
             .write(
@@ -1524,4 +1554,630 @@ async fn a_conflicted_session_is_served_by_no_host() {
         Some("Two hosts wrote this session at once (epoch 2). It waits for you.")
     );
     assert!(world.stub.requests().is_empty(), "no message was answered");
+}
+
+// ---------------------------------------------------------------------------
+// Story 91.2: the one door, the scope, the focus, new conversations
+// ---------------------------------------------------------------------------
+
+const DM: &str = "active/2026-10-03-main";
+const DELEGATED: &str = "active/2026-10-03-delegated";
+const TOLAS: &str = "active/2026-10-03-tola";
+
+impl World {
+    /// `served` opened under `deps` rather than Nixi's.
+    fn open_as(&self, deps: &AgentDeps, path: &str) -> ServedSession {
+        let text = std::fs::read_to_string(self.dir(path).join("agent.toml")).expect("agent.toml");
+        let agent = keeper_core::agents::session::parse_session_agent_toml(&text).expect("parse");
+        ServedSession::open(
+            deps,
+            &self.dir(path),
+            SessionRef {
+                drive: "tgdrive".to_owned(),
+                path: path.to_owned(),
+            },
+            agent,
+            None,
+        )
+        .expect("served")
+    }
+
+    /// An arrival of `arrival` from `sender` carrying `content`.
+    fn event(&mut self, sender: &str, arrival: Arrival, content: Value) -> Arrived {
+        let mut arrived = self.arrived(sender, "");
+        arrived.arrival = arrival;
+        arrived.content = content;
+        arrived
+    }
+
+    fn scope(&mut self, sender: &str, drives: &[&str], focus: Option<Value>) -> Arrived {
+        let mut content = json!({
+            "v": 1,
+            "set_by": sender,
+            "drives": drives.iter().map(|id| json!({"id": id, "title": id})).collect::<Vec<_>>(),
+        });
+        if let Some(focus) = focus {
+            content["focus"] = focus;
+        }
+        self.event(sender, Arrival::Scope { owner_signed: true }, content)
+    }
+
+    fn sent_of(&self, event_type: &str) -> Vec<Value> {
+        self.room
+            .sent()
+            .into_iter()
+            .filter(|(kind, _)| kind == event_type)
+            .map(|(_, content)| content)
+            .collect()
+    }
+}
+
+/// Dr Tola Grey, a steward of tgdrive, beside Nixi: her own deps over the
+/// same drives and provider.
+fn tolas_deps(world: &World) -> AgentDeps {
+    write(
+        &world.tgdrive,
+        "80-agents/tola/agent.toml",
+        "version = 1\nid = \"tola\"\nname = \"Dr Tola Grey\"\nkind = \"steward\"\nmatrix_user = \"@tola:example.org\"\n\n[model]\nbot = \"bot:openai:http://127.0.0.1:9#model\"\n\n[tools]\nallow = [\"drive_read\"]\ndrives = [\"tgdrive\"]\n",
+    );
+    write(
+        &world.tgdrive,
+        "80-agents/tola/SOUL.md",
+        &SOUL.replace("Nixi", "Dr Tola Grey"),
+    );
+    let tg_decl = world.deps.drives["tgdrive"].clone();
+    let zone = read_zone(
+        "tgdrive",
+        &profile("tgdrive", &world.tgdrive),
+        Some(&tg_decl),
+    );
+    let home = zone
+        .homes
+        .into_iter()
+        .find_map(|(folder, home)| (folder == "tola").then_some(home))
+        .expect("tola's folder")
+        .expect("tola reads");
+    AgentDeps {
+        env: world.deps.env.clone(),
+        data_dir: world.deps.data_dir.clone(),
+        row: world.deps.row.clone(),
+        bot: world.deps.bot.clone(),
+        home,
+        host: world.deps.host.clone(),
+        drives: world.deps.drives.clone(),
+        sessions_zone: world.deps.sessions_zone.clone(),
+        sessions_subfolder: world.deps.sessions_subfolder.clone(),
+        lfs_threshold_bytes: world.deps.lfs_threshold_bytes,
+    }
+}
+
+/// 91.2 acceptance 1, the one door: a person's message in Nixi's DM and in
+/// a second conversation with her opens a turn; the same message in Dr Tola
+/// Grey's session room, in a delegated session and in the control room
+/// opens none and writes no `user` line; Marta's message in Nixi's DM opens
+/// none (she is not Nixi's `human`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_person_is_answered_only_by_their_proxy() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![]);
+    let tg_decl = world.deps.drives["tgdrive"].clone();
+    session_of(
+        &world.tgdrive,
+        DM,
+        &tg_decl,
+        "nixi",
+        SessionKind::Main,
+        "!dm:example.org",
+    );
+    session_of(
+        &world.tgdrive,
+        DELEGATED,
+        &tg_decl,
+        "nixi",
+        SessionKind::Delegated,
+        "!delegated:example.org",
+    );
+    session_of(
+        &world.tgdrive,
+        TOLAS,
+        &tg_decl,
+        "tola",
+        SessionKind::Main,
+        "!tola:example.org",
+    );
+    let tola = tolas_deps(&world);
+
+    for path in [DM, SESSION] {
+        let mut served = world.open(path);
+        assert!(
+            matches!(world.ask(&mut served, "hello").await, Outcome::Answered(_)),
+            "{path}"
+        );
+        assert_eq!(kinds(&world.lines(path), LineKind::User).len(), 1, "{path}");
+    }
+
+    let mut delegated = world.open(DELEGATED);
+    assert!(matches!(
+        world.ask(&mut delegated, "hello").await,
+        Outcome::Ignored(OBSERVER_TEXT)
+    ));
+    let mut tolas = world.open_as(&tola, TOLAS);
+    let hello = world.arrived(TGORKA, "hello");
+    let (_stop, signal) = chat::cancellation();
+    assert!(matches!(
+        tolas
+            .serve(&tola, world.room.clone(), hello, signal)
+            .await
+            .expect("served"),
+        Outcome::Ignored(OBSERVER_TEXT)
+    ));
+    let mut dm = world.open(DM);
+    let martas = world.arrived(MARTA, "hello nixi");
+    assert!(matches!(
+        world.serve(&mut dm, martas).await,
+        Outcome::Ignored(NOT_THE_PERSON)
+    ));
+    for path in [DELEGATED, TOLAS] {
+        assert!(world.lines(path).is_empty(), "{path}");
+    }
+    assert_eq!(kinds(&world.lines(DM), LineKind::User).len(), 1);
+
+    // The control room names no session, so no worker serves it: what
+    // arrives there is kept, bounded, for a worker that never starts.
+    let router = Arc::new(Router::default());
+    let control = OwnedRoomId::try_from("!control:example.org").expect("room");
+    router.route(&control, world.arrived(TGORKA, "hello"));
+    assert!(router.served().is_empty());
+    assert_eq!(
+        world.stub.requests().len(),
+        2,
+        "two turns, the DM's and the conversation's"
+    );
+}
+
+/// 91.2 acceptance 3 (keeper-agent half): the person's scope within the
+/// agent's `[tools].drives` (tgdrive and private here) is logged as one
+/// `scope` line with `set_by` and echoed for the chips; a drive outside it
+/// is refused by name in the status and changes nothing; a scope without
+/// the home keeps the home; a scope from anyone but the person is ignored;
+/// and the next turn reaches exactly the drives in scope.
+#[tokio::test(flavor = "multi_thread")]
+async fn drives_in_scope_are_the_persons_choice_within_the_agents_allow() {
+    let read_both = || {
+        calls(&[
+            (
+                "t1",
+                "drive_read",
+                json!({"profile":"tgdrive","path":"notes/hello.md"}),
+            ),
+            (
+                "p1",
+                "drive_read",
+                json!({"profile":"private","path":"diary.md"}),
+            ),
+        ])
+    };
+    let mut world = world(
+        ProviderKind::Ollama,
+        &["drive_read"],
+        vec![read_both(), prose("read."), read_both(), prose("read.")],
+    );
+    let mut served = world.open(SESSION);
+    let scope_lines = |world: &World| -> Vec<(Vec<String>, OwnedUserId)> {
+        kinds(&world.lines(SESSION), LineKind::Scope)
+            .iter()
+            .map(|line| match &line.body {
+                LineBody::Scope(body) => (body.drives.clone(), body.set_by.clone()),
+                _ => unreachable!(),
+            })
+            .collect()
+    };
+
+    // {tgdrive} alone: one line, one echo.
+    let only_home = world.scope(TGORKA, &["tgdrive"], None);
+    assert!(matches!(
+        world.serve(&mut served, only_home).await,
+        Outcome::Scoped(ref scope) if scope == &["tgdrive".to_owned()]
+    ));
+    assert_eq!(
+        scope_lines(&world),
+        vec![(vec!["tgdrive".to_owned()], user(TGORKA))]
+    );
+    let echoes = world.sent_of(SCOPE);
+    assert_eq!(echoes.len(), 1);
+    assert_eq!(
+        echoes[0]["drives"],
+        json!([{"id": "tgdrive", "title": "tgdrive"}])
+    );
+    assert_eq!(echoes[0]["set_by"], TGORKA);
+    assert!(echoes[0]["label"].is_object(), "the label chip's source");
+
+    // The next turn reaches tgdrive and is refused private.
+    report(world.ask(&mut served, "read both").await);
+    let outcomes = |world: &World| -> Vec<ToolOutcomeWord> {
+        kinds(&world.lines(SESSION), LineKind::ToolResult)
+            .iter()
+            .map(|line| match &line.body {
+                LineBody::ToolResult(body) => body.outcome,
+                _ => unreachable!(),
+            })
+            .collect()
+    };
+    assert_eq!(
+        outcomes(&world),
+        [ToolOutcomeWord::Ok, ToolOutcomeWord::Refused]
+    );
+    let frame = served.context.compose(&world.deps, None).text;
+    assert!(frame.contains("- tgdrive: tgdrive"), "{frame}");
+    assert!(!frame.contains("- private: private"), "{frame}");
+
+    // A drive outside the allow: refused by name, nothing changes.
+    let marta_drive = world.scope(TGORKA, &["tgdrive", "marta-drive"], None);
+    assert!(matches!(
+        world.serve(&mut served, marta_drive).await,
+        Outcome::ScopeRefused(ref sentence) if sentence.contains("marta-drive")
+    ));
+    let refused = world.sent_of(STATUS);
+    let detail = refused.last().expect("a status")["detail"].clone();
+    assert!(
+        detail.as_str().is_some_and(|d| d.contains("marta-drive")),
+        "{detail}"
+    );
+    assert_eq!(scope_lines(&world).len(), 1);
+    assert_eq!(served.context.scope, ["tgdrive"]);
+
+    // Marta's scope is not hers to set; an unsigned device's is ignored.
+    let martas = world.scope(MARTA, &["tgdrive", "private"], None);
+    assert!(matches!(
+        world.serve(&mut served, martas).await,
+        Outcome::Ignored(NOT_THE_PERSON)
+    ));
+    let mut unsigned = world.scope(TGORKA, &["tgdrive", "private"], None);
+    unsigned.arrival = Arrival::Scope {
+        owner_signed: false,
+    };
+    assert!(matches!(
+        world.serve(&mut served, unsigned).await,
+        Outcome::Ignored(UNSIGNED_DEVICE)
+    ));
+    assert_eq!(scope_lines(&world).len(), 1);
+
+    // {private} without the home keeps the home: {tgdrive, private}.
+    let without_home = world.scope(TGORKA, &["private"], None);
+    assert!(matches!(
+        world.serve(&mut served, without_home).await,
+        Outcome::Scoped(ref scope) if scope == &["tgdrive".to_owned(), "private".to_owned()]
+    ));
+    assert_eq!(scope_lines(&world).len(), 2);
+    report(world.ask(&mut served, "read both again").await);
+    // Each turn changed the label — the person's message, then the diary's
+    // read — and the chips were told, as after each `scope` line.
+    let echoes = world.sent_of(SCOPE);
+    let labels: Vec<(Value, Value)> = echoes
+        .iter()
+        .map(|echo| {
+            (
+                echo["label"]["integrity"].clone(),
+                echo["label"]["readers"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(labels.len(), 4, "{echoes:?}");
+    assert_eq!(labels[0].0, "owner");
+    assert_eq!(labels[1].0, "agent", "after the first turn");
+    assert_eq!(labels[3].1, json!([TGORKA]), "after the diary's read");
+
+    // A host that restarts reads the scope from the log.
+    drop(served);
+    let mut again = world.open(SESSION);
+    assert_eq!(again.context.scope, ["tgdrive", "private"]);
+
+    // F5: read back on that start, a scope that changes nothing was echoed
+    // when it first arrived and is not echoed again; sent live, it is.
+    let echoed = world.sent_of(SCOPE).len();
+    let mut replayed = world.scope(TGORKA, &["private"], None);
+    replayed.replay = true;
+    assert!(matches!(
+        world.serve(&mut again, replayed).await,
+        Outcome::Scoped(_)
+    ));
+    assert_eq!(world.sent_of(SCOPE).len(), echoed);
+    let live = world.scope(TGORKA, &["private"], None);
+    world.serve(&mut again, live).await;
+    assert_eq!(world.sent_of(SCOPE).len(), echoed + 1);
+}
+
+/// R41: the docked note's focus is held in memory and stated in the next
+/// turn's frame — never logged, and never named when its drive is out of
+/// scope; a scope event without a focus clears it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_focus_is_told_to_the_next_turn_and_never_logged() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![]);
+    let mut served = world.open(SESSION);
+    let focus =
+        json!({"drive": "tgdrive", "path": "notes/secret-plan.md", "heading": "Plans › Q3"});
+    let focused = world.event(
+        TGORKA,
+        Arrival::Scope { owner_signed: true },
+        json!({"v": 1, "set_by": TGORKA, "focus": focus}),
+    );
+    assert!(matches!(
+        world.serve(&mut served, focused).await,
+        Outcome::Focused
+    ));
+    report(world.ask(&mut served, "what am I reading?").await);
+    let told =
+        "The person is looking at notes/secret-plan.md in tgdrive, under the heading Plans › Q3.";
+    let system = world.stub.requests()[0]["messages"][0]["content"].to_string();
+    assert!(system.contains(told), "{system}");
+    for line in world.lines(SESSION) {
+        let json = serde_json::to_string(&line).expect("line");
+        assert!(!json.contains("secret-plan"), "{json}");
+    }
+    assert!(kinds(&world.lines(SESSION), LineKind::Scope).is_empty());
+
+    // Out of scope: held, not named.
+    let hers = keeper_core::agents::events::Focus {
+        drive: "marta-drive".to_owned(),
+        path: "notes/hers.md".to_owned(),
+        heading: None,
+    };
+    served.context.focus = Some(HeldFocus {
+        focus: hers,
+        heard: tokio::time::Instant::now(),
+    });
+    let frame = served.context.compose(&world.deps, None).text;
+    assert!(!frame.contains("hers.md"), "{frame}");
+
+    // D3: a focus not heard again within the TTL — the dock's clear was
+    // lost with a quit or a crash — is no longer stated.
+    let mine = keeper_core::agents::events::Focus {
+        drive: "tgdrive".to_owned(),
+        path: "notes/stale.md".to_owned(),
+        heading: None,
+    };
+    let heard = tokio::time::Instant::now();
+    served.context.focus = Some(HeldFocus {
+        focus: mine.clone(),
+        heard,
+    });
+    let frame = served.context.compose(&world.deps, None).text;
+    assert!(frame.contains("stale.md"), "heard now: {frame}");
+    served.context.focus = Some(HeldFocus {
+        focus: mine,
+        heard: heard
+            .checked_sub(FOCUS_TTL + Duration::from_secs(1))
+            .expect("an instant that long ago"),
+    });
+    let frame = served.context.compose(&world.deps, None).text;
+    assert!(!frame.contains("stale.md"), "heard too long ago: {frame}");
+
+    // A scope event without a focus clears it.
+    let cleared = world.event(
+        TGORKA,
+        Arrival::Scope { owner_signed: true },
+        json!({"v": 1, "set_by": TGORKA}),
+    );
+    world.serve(&mut served, cleared).await;
+    assert_eq!(served.context.focus, None);
+    let frame = served.context.compose(&world.deps, None).text;
+    assert!(!frame.contains("The person is looking at"), "{frame}");
+}
+
+/// The agent's own rooms, as a recording fake: every room made, every event
+/// sent into one, every room discarded; the person has joined once
+/// `person_joined` is set.
+#[derive(Default)]
+struct Rooms {
+    made: Mutex<Vec<(String, OwnedUserId, OwnedRoomId)>>,
+    sent: Mutex<Vec<(OwnedRoomId, String, Value)>>,
+    discarded: Mutex<Vec<OwnedRoomId>>,
+    person_joined: std::sync::atomic::AtomicBool,
+}
+
+impl Rooms {
+    fn statuses(&self) -> Vec<Value> {
+        self.sent
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|(_, kind, _)| kind == STATUS)
+            .map(|(_, _, content)| content.clone())
+            .collect()
+    }
+}
+
+impl ConversationPort for Rooms {
+    fn create<'a>(&'a self, title: &'a str, person: &'a UserId) -> RoomFuture<'a> {
+        Box::pin(async move {
+            let mut made = self.made.lock().expect("lock");
+            let room = OwnedRoomId::try_from(format!("!conv{}:example.org", made.len() + 1))
+                .expect("room");
+            made.push((title.to_owned(), person.to_owned(), room.clone()));
+            Ok(room)
+        })
+    }
+
+    fn send<'a>(&'a self, room: &'a RoomId, event_type: &'a str, content: Value) -> SendFuture<'a> {
+        Box::pin(async move {
+            self.sent
+                .lock()
+                .expect("lock")
+                .push((room.to_owned(), event_type.to_owned(), content));
+            Ok(OwnedEventId::try_from("$anchor:example.org").expect("id"))
+        })
+    }
+
+    fn discard<'a>(
+        &'a self,
+        room: &'a RoomId,
+        _: &'a UserId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move { self.discarded.lock().expect("lock").push(room.to_owned()) })
+    }
+
+    fn joined<'a>(
+        &'a self,
+        _: &'a RoomId,
+        _: &'a UserId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move { self.person_joined.load(Ordering::SeqCst) })
+    }
+}
+
+/// 91.2 acceptance 2 (keeper-agent half, R36): Nixi's person asking in the
+/// DM makes one room and one `conversation` session folder naming it, with
+/// a status anchor saying `kind: "conversation"`, and the DM is told; the
+/// same request served again — after a restart too — makes nothing more;
+/// anyone else's request, or one outside the DM, makes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_proxy_conversation_is_made_once() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![]);
+    let tg_decl = world.deps.drives["tgdrive"].clone();
+    session_of(
+        &world.tgdrive,
+        DM,
+        &tg_decl,
+        "nixi",
+        SessionKind::Main,
+        "!dm:example.org",
+    );
+    let rooms = Arc::new(Rooms::default());
+    let mut dm = world.open(DM);
+    dm.conversations = Some(rooms.clone());
+    let ask = world.event(
+        TGORKA,
+        Arrival::ConversationRequest { owner_signed: true },
+        json!({"v": 1, "title": "Trip to Lisbon"}),
+    );
+    let Outcome::Conversation { path, made: true } = world.serve(&mut dm, ask.clone()).await else {
+        panic!("a conversation")
+    };
+    let made = rooms.made.lock().expect("lock").clone();
+    assert_eq!(made.len(), 1);
+    // The room is named after the proxy: the title is in the encrypted
+    // status, never in the room's clear state (F7).
+    assert_eq!(made[0].0, "Nixi");
+    assert_eq!(made[0].1, user(TGORKA));
+    let text = std::fs::read_to_string(world.dir(&path).join("agent.toml")).expect("agent.toml");
+    let agent = keeper_core::agents::session::parse_session_agent_toml(&text).expect("parse");
+    assert_eq!(agent.kind, SessionKind::Conversation);
+    assert_eq!(agent.room, made[0].2);
+    assert_eq!(agent.agent, "nixi");
+    assert_eq!(agent.requested_by, user(TGORKA));
+    assert_eq!(
+        agent.id,
+        keeper_core::agents::proxy::conversation_session_id("tgdrive", "nixi", &ask.event_id)
+    );
+    let sent = rooms.sent.lock().expect("lock").clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!((&sent[0].0, sent[0].1.as_str()), (&made[0].2, STATUS));
+    assert_eq!(sent[0].2["kind"], "conversation");
+    assert_eq!(sent[0].2["session"], format!("60-sessions/{path}"));
+    assert_eq!(sent[0].2["title"], "Trip to Lisbon");
+    let told = world.sent_of("m.room.message");
+    assert_eq!(told.len(), 1);
+    assert!(told[0]["body"]
+        .as_str()
+        .is_some_and(|b| b.contains("Trip to Lisbon")));
+
+    // Served again, and again after a restart: nothing more is made.
+    assert!(matches!(
+        world.serve(&mut dm, ask.clone()).await,
+        Outcome::Conversation { made: false, .. }
+    ));
+    drop(dm);
+    let mut restarted = world.open(DM);
+    restarted.conversations = Some(rooms.clone());
+    assert!(matches!(
+        world.serve(&mut restarted, ask).await,
+        Outcome::Conversation { made: false, .. }
+    ));
+    // Marta, an unsigned device, and a request outside the DM make nothing.
+    let martas = world.event(
+        MARTA,
+        Arrival::ConversationRequest { owner_signed: true },
+        json!({"v": 1}),
+    );
+    assert!(matches!(
+        world.serve(&mut restarted, martas).await,
+        Outcome::Ignored(NOT_THE_PERSON)
+    ));
+    let unsigned = world.event(
+        TGORKA,
+        Arrival::ConversationRequest {
+            owner_signed: false,
+        },
+        json!({"v": 1}),
+    );
+    assert!(matches!(
+        world.serve(&mut restarted, unsigned).await,
+        Outcome::Ignored(UNSIGNED_DEVICE)
+    ));
+    let mut conversation = world.open(SESSION);
+    conversation.conversations = Some(rooms.clone());
+    let elsewhere = world.event(
+        TGORKA,
+        Arrival::ConversationRequest { owner_signed: true },
+        json!({"v": 1}),
+    );
+    assert!(matches!(
+        world.serve(&mut conversation, elsewhere).await,
+        Outcome::Ignored(_)
+    ));
+    assert_eq!(rooms.made.lock().expect("lock").len(), 1);
+    assert!(rooms.discarded.lock().expect("lock").is_empty());
+    let conversations = std::fs::read_dir(world.dir("active"))
+        .expect("active")
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .is_ok_and(|entry| entry.path().join("agent.toml").is_file())
+        })
+        .count();
+    assert_eq!(
+        conversations, 3,
+        "the chat, the DM and one new conversation"
+    );
+}
+
+/// F6: the new conversation's status anchor went out with the person only
+/// invited, so a device of theirs the host did not know then can never read
+/// it; once the person has joined, the host says the status again — an
+/// edit of the anchor, the same title and kind — and only once.
+#[tokio::test(start_paused = true)]
+async fn a_new_conversation_says_its_status_again_once_its_person_joined() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![]);
+    let tg_decl = world.deps.drives["tgdrive"].clone();
+    session_of(
+        &world.tgdrive,
+        DM,
+        &tg_decl,
+        "nixi",
+        SessionKind::Main,
+        "!dm:example.org",
+    );
+    let rooms = Arc::new(Rooms::default());
+    let mut dm = world.open(DM);
+    dm.conversations = Some(rooms.clone());
+    let ask = world.event(
+        TGORKA,
+        Arrival::ConversationRequest { owner_signed: true },
+        json!({"v": 1, "title": "Trip to Lisbon"}),
+    );
+    assert!(matches!(
+        world.serve(&mut dm, ask).await,
+        Outcome::Conversation { made: true, .. }
+    ));
+    tokio::time::sleep(JOIN_POLL * 5).await;
+    assert_eq!(rooms.statuses().len(), 1, "nothing again before the join");
+
+    rooms.person_joined.store(true, Ordering::SeqCst);
+    tokio::time::sleep(JOIN_POLL * 2).await;
+    let statuses = rooms.statuses();
+    assert_eq!(statuses.len(), 2, "{statuses:?}");
+    assert_eq!(statuses[1]["anchor"], "$anchor:example.org");
+    assert_eq!(statuses[1]["kind"], "conversation");
+    assert_eq!(statuses[1]["title"], "Trip to Lisbon");
+    tokio::time::sleep(JOIN_POLL * 5).await;
+    assert_eq!(rooms.statuses().len(), 2, "once");
 }

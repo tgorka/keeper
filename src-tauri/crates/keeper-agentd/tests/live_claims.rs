@@ -1,5 +1,6 @@
 //! Two `keeper-agentd run` hosts sharing one agent over one drive, against a
-//! real homeserver (story 90.6, acceptance 9–13).
+//! real homeserver (story 90.6, acceptance 9–13; story 91.2, the dock's
+//! scope and a new conversation made by the claim holder only).
 //!
 //! `electra-sim` (`always_on = true`) and `hesperia-sim` each sign in their
 //! own copy of `nixi-smoke` — two devices of one user — over one bare drive,
@@ -23,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use keeper_agent::claims::{acquire, Acquired, RoomClaims, Rtt, ServerClock};
 use keeper_core::agents::claim::{Claimant, TTL};
-use keeper_core::agents::events::{CLAIM, HOST, STATUS};
+use keeper_core::agents::events::{CLAIM, CONVERSATION_REQUEST, HOST, SCOPE, STATUS};
 use keeper_core::agents::host::HostManifest;
 use keeper_core::agents::label::{Integrity, Label, Readers};
 use keeper_core::agents::log::reader::read_session;
@@ -220,7 +221,7 @@ async fn pair(smoke: &Smoke, model_url: &str) -> Pair {
             (
                 "80-agents/nixi/agent.toml".to_owned(),
                 format!(
-                    "version = 1\nid = \"nixi\"\nname = \"Nixi\"\nkind = \"proxy\"\nmatrix_user = \"{agent}\"\nhuman = \"{person}\"\n\n[model]\nbot = \"bot:openai:{model_url}#stub\"\n\n[tools]\nallow = [\"drive_list\", \"drive_read\"]\ndrives = [\"smoke\"]\n\n[host]\nprefer_always_on = true\n"
+                    "version = 1\nid = \"nixi\"\nname = \"Nixi\"\nkind = \"proxy\"\nmatrix_user = \"{agent}\"\nhuman = \"{person}\"\n\n[model]\nbot = \"bot:openai:{model_url}#stub\"\n\n[tools]\nallow = [\"drive_list\", \"drive_read\"]\ndrives = [\"smoke\", \"elsewhere\"]\n\n[host]\nprefer_always_on = true\n"
                 ),
             ),
             ("80-agents/nixi/SOUL.md".to_owned(), soul.to_owned()),
@@ -762,6 +763,221 @@ async fn a_session_no_live_host_can_serve_waits_named() {
     assert_eq!(said, waiting, "each said once");
     assert!(pair.electra.acquired(&pair.mac).is_empty());
     assert!(pair.hesperia.acquired(&pair.mac).is_empty());
+    pair.electra.terminate();
+    pair.hesperia.terminate();
+}
+
+/// The person's device signs itself with the person's cross-signing
+/// identity (R47): a scope or a request for a conversation counts only from
+/// such a device. The account keeps its identity between runs, so a second
+/// bootstrap answers the server's password challenge.
+async fn sign_own_device(client: &AgentClient, user: &OwnedUserId, password: &str) {
+    use matrix_sdk::ruma::api::client::uiaa;
+    let encryption = client.client().encryption();
+    if let Err(error) = encryption.bootstrap_cross_signing(None).await {
+        let Some(challenge) = error.as_uiaa_response() else {
+            panic!("cross-signing: {error}");
+        };
+        let mut auth = uiaa::Password::new(
+            uiaa::UserIdentifier::Matrix(uiaa::MatrixUserIdentifier::new(user.to_string())),
+            password.to_owned(),
+        );
+        auth.session = challenge.session.clone();
+        encryption
+            .bootstrap_cross_signing(Some(uiaa::AuthData::Password(auth)))
+            .await
+            .expect("cross-signing with the password");
+    }
+    // The hosts read the new signature with their next key query.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+}
+
+/// 91.2 acceptance 7: a scope event the test person sends from a device
+/// their identity signed reaches the host holding the main session, which
+/// logs the `scope` line (with `set_by`) before the next turn arms, echoes
+/// the accepted scope for the room's chips, and the next turn is told it.
+#[ignore = "live: Synapse on delectra"]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_dock_scope_reaches_the_next_turn() {
+    let smoke = Smoke::from_env();
+    let model = stub(ANSWER, 1, Duration::from_millis(10));
+    let mut pair = pair(&smoke, &model.url).await;
+    let (person, agent) = (smoke.user("tgorka-smoke"), smoke.user("nixi-smoke"));
+    pair.electra.start();
+    let main = pair.main.clone();
+    wait_for("electra's claim", Duration::from_secs(120), || {
+        !pair.electra.acquired(&main).is_empty()
+    })
+    .await;
+    sign_own_device(&pair.person, &person, smoke.secret("TGORKA_SMOKE_PASSWORD")).await;
+    pair.person
+        .send(
+            &pair.main,
+            SCOPE,
+            json!({
+                "v": 1,
+                "drives": [{"id": "smoke", "title": "smoke"}, {"id": "elsewhere", "title": "elsewhere"}],
+                "focus": {"drive": "smoke", "path": "notes/a.md", "heading": "Plans"},
+                "set_by": person.as_str(),
+            }),
+            None,
+        )
+        .await
+        .expect("scope sent");
+    let seen = Arc::clone(&pair.seen);
+    let echo = move || {
+        seen.lock()
+            .expect("lock")
+            .iter()
+            .map(|(_, e)| e.clone())
+            .find(|e| {
+                e["type"] == SCOPE
+                    && e["sender"] == agent.as_str()
+                    && e["content"]["drives"][1]["id"] == "elsewhere"
+            })
+    };
+    wait_for("the host's scope echo", Duration::from_secs(60), || {
+        echo().is_some()
+    })
+    .await;
+    let echoed = echo().expect("an echo");
+    assert_eq!(echoed["content"]["set_by"], person.as_str());
+    assert!(echoed["content"]["label"].is_object(), "{echoed}");
+
+    ask(&pair, "what is in scope?").await;
+    let lines = read_session(&pair.electra.session_dir(MAIN)).lines;
+    let scope_at = lines
+        .iter()
+        .position(|line| {
+            matches!(&line.body, LineBody::Scope(scope)
+                if scope.drives == ["smoke", "elsewhere"] && scope.set_by == person)
+        })
+        .expect("a scope line");
+    let user_at = lines
+        .iter()
+        .position(|line| matches!(line.body, LineBody::User(_)))
+        .expect("the turn's user line");
+    assert!(
+        scope_at < user_at,
+        "the scope is logged before the turn arms"
+    );
+    let open = lines[scope_at..]
+        .iter()
+        .find_map(|line| match &line.body {
+            LineBody::Open(open) => Some(open.clone()),
+            _ => None,
+        })
+        .expect("the turn's open line");
+    assert_eq!(open.drives, ["smoke", "elsewhere"]);
+    pair.electra.terminate();
+}
+
+/// 91.2 acceptance 2 (R36), live, with two copies of Nixi running: the
+/// person's request for a new conversation in the DM makes exactly one room
+/// — the claim holder's — with the proxy-conversation power levels and a
+/// status saying `kind: "conversation"`, and the DM is told; in it the
+/// person's message and scope are accepted (F1).
+#[ignore = "live: Synapse on delectra"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_conversation_is_made_by_the_claim_holder_only() {
+    let smoke = Smoke::from_env();
+    let model = stub(ANSWER, 1, Duration::from_millis(10));
+    let mut pair = pair(&smoke, &model.url).await;
+    let (person, agent) = (smoke.user("tgorka-smoke"), smoke.user("nixi-smoke"));
+    pair.electra.start();
+    pair.hesperia.start();
+    let main = pair.main.clone();
+    wait_for("a claim on the DM", Duration::from_secs(120), || {
+        !pair.electra.acquired(&main).is_empty() || !pair.hesperia.acquired(&main).is_empty()
+    })
+    .await;
+    // The test person keeps invites from earlier runs: only one made after
+    // the request counts.
+    let invited = |client: &matrix_sdk::Client| -> Vec<OwnedRoomId> {
+        client
+            .invited_rooms()
+            .into_iter()
+            .map(|room| room.room_id().to_owned())
+            .collect()
+    };
+    let known = invited(pair.person.client());
+    sign_own_device(&pair.person, &person, smoke.secret("TGORKA_SMOKE_PASSWORD")).await;
+    pair.person
+        .send(
+            &pair.main,
+            CONVERSATION_REQUEST,
+            json!({"v": 1, "title": "Trip to Lisbon"}),
+            None,
+        )
+        .await
+        .expect("request sent");
+    let client = pair.person.client().clone();
+    let invites = move || -> Vec<OwnedRoomId> {
+        invited(&client)
+            .into_iter()
+            .filter(|room| !known.contains(room))
+            .collect()
+    };
+    wait_for(
+        "the new conversation's invite",
+        Duration::from_secs(90),
+        || !invites().is_empty(),
+    )
+    .await;
+    // Both copies saw the request; only the holder acts.
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    let made = invites();
+    assert_eq!(made.len(), 1, "one room for one request: {made:?}");
+    let room = made[0].clone();
+    let told = pair.seen.lock().expect("lock").iter().any(|(_, e)| {
+        e["sender"] == agent.as_str()
+            && e["type"] == "m.room.message"
+            && e["content"]["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("Trip to Lisbon"))
+    });
+    assert!(told, "the DM is told");
+
+    pair.person.join(&room).await.expect("join");
+    pair.person.sync_once().await.expect("sync");
+    let content = pair
+        .person
+        .server_state(&room, "m.room.power_levels", "")
+        .await
+        .expect("read")
+        .expect("power levels")
+        .content;
+    assert_eq!(content["events"]["m.room.message"], 0, "{content}");
+    assert_eq!(content["events"][SCOPE], 0, "{content}");
+    assert_eq!(content["users"][agent.as_str()], 100, "{content}");
+    assert!(content["users"].get(person.as_str()).is_none(), "{content}");
+    let seen = Arc::clone(&pair.seen);
+    wait_for("the conversation's status", Duration::from_secs(30), || {
+        seen.lock().expect("lock").iter().any(|(_, e)| {
+            e["type"] == STATUS
+                && e["sender"] == agent.as_str()
+                && e["content"]["kind"] == "conversation"
+        })
+    })
+    .await;
+    pair.person
+        .send(
+            &room,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": "hello"}),
+            None,
+        )
+        .await
+        .expect("the person talks in it");
+    pair.person
+        .send(
+            &room,
+            SCOPE,
+            json!({"v": 1, "drives": [{"id": "smoke", "title": "smoke"}], "set_by": person.as_str()}),
+            None,
+        )
+        .await
+        .expect("and sets its scope");
     pair.electra.terminate();
     pair.hesperia.terminate();
 }

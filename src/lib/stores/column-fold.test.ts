@@ -4,6 +4,7 @@ import {
   COLUMN_FOLD_COOKIE,
   columnFoldCookie,
   columnFoldStore,
+  columnsAtFirstRun,
   columnsUnfolded,
   hydrateColumnFold,
   readColumnFold,
@@ -30,6 +31,7 @@ describe("column fold cookie", () => {
     const fold = {
       "notes-rail": true,
       "notes-list": false,
+      "notes-agent": false,
       "files-tree": true,
       "chat-list": false,
       "tasks-list": true,
@@ -47,12 +49,12 @@ describe("column fold cookie", () => {
     }
   });
 
-  it("keeps a column open when the jar says something it cannot read", () => {
+  it("keeps a column as it starts when the jar says something it cannot read", () => {
     // Three shapes of damage in one value: a key this build has no column for,
     // a value that is not 0/1, and an entry with no colon at all. None of them
     // may cost the user a surface.
     const damaged = `${COLUMN_FOLD_COOKIE}=${encodeURIComponent("nope:1|notes-rail:yes|chat-list")}`;
-    expect(readColumnFold(damaged)).toEqual(columnsUnfolded());
+    expect(readColumnFold(damaged)).toEqual(columnsAtFirstRun());
   });
 
   it("reads its own cookie and not another fold's", () => {
@@ -60,21 +62,28 @@ describe("column fold cookie", () => {
     // one of them has a `spaces` key. A column fold and a section fold are
     // different facts and must not be able to read each other.
     const foreign = "keeper_notes_rail_fold=spaces%3A1%7Ctags%3A1%7Cfiles%3A1";
-    expect(readColumnFold(foreign)).toEqual(columnsUnfolded());
+    expect(readColumnFold(foreign)).toEqual(columnsAtFirstRun());
   });
 
-  it("starts with every column showing", () => {
+  it("starts with every column showing but the assistant dock", () => {
     // The rail's Files section defaults FOLDED (a cold directory scan per
-    // expansion). No column has an equivalent cost, and one that started away
-    // would read as a surface that failed to render.
+    // expansion). No browsing column has an equivalent cost, and one that
+    // started away would read as a surface that failed to render. The dock is
+    // the exception: opening it starts telling the proxy which note is in
+    // front of you, which is the person's act, not a default.
     expect(readColumnFold("")).toEqual({
       "notes-rail": false,
       "notes-list": false,
+      "notes-agent": true,
       "files-tree": false,
       "chat-list": false,
       "tasks-list": false,
       "bots-list": false,
     });
+  });
+
+  it("remembers an opened dock", () => {
+    expect(readColumnFold(columnFoldCookie(columnsUnfolded()))["notes-agent"]).toBe(false);
   });
 });
 

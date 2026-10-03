@@ -34,6 +34,9 @@ pub const SURFACE_RESULT: &str = "dev.keeper.agent.surface.result";
 pub const CLAIM: &str = "dev.keeper.agent.claim";
 /// A host's manifest (state, key = the host slug).
 pub const HOST: &str = "dev.keeper.agent.host";
+/// A person's ask, in their proxy's `main` DM, for a new conversation
+/// (ruling R36): only the main session's claim holder acts on it.
+pub const CONVERSATION_REQUEST: &str = "dev.keeper.agent.conversation.request";
 
 /// The contents' schema version, `"v": 1`.
 pub const CONTENT_VERSION: u32 = 1;
@@ -97,6 +100,55 @@ pub struct TurnRef {
     pub session: String,
     /// The `user` line's id.
     pub line: String,
+}
+
+/// `dev.keeper.agent.scope` (timeline, encrypted).
+///
+/// The person's device sends it in its proxy's own rooms: `drives` asks for
+/// a scope (absent: the scope stays), `focus` says what the docked notes
+/// view shows (absent: nothing). The owning host echoes each accepted scope
+/// with the drives' titles and the session's label, which is what a room's
+/// scope and label chips read (R30: only the agent's own scope is shown).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeContent {
+    pub v: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drives: Option<Vec<ScopeDrive>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<crate::agents::label::Label>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<Focus>,
+    /// Who chose the scope: the person, also in the host's echo.
+    pub set_by: OwnedUserId,
+}
+
+/// A drive in a scope event, in the scope's order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeDrive {
+    pub id: String,
+    pub title: String,
+}
+
+/// The note the person is looking at in the docked notes view: a drive, a
+/// drive-relative path and the heading above the caret (AD-382).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Focus {
+    pub drive: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading: Option<String>,
+}
+
+/// `dev.keeper.agent.conversation.request` (timeline, encrypted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationRequestContent {
+    pub v: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// `dev.keeper.agent.claim` (state, key `""`, unencrypted): who writes the

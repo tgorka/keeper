@@ -22,6 +22,7 @@ use super::home::{MenuAction, MenuItem};
 use super::memory::{MemorySnapshot, SEPARATOR};
 use super::skills::SkillsIndex;
 use super::soul::Soul;
+use crate::agents::events::Focus;
 use crate::bots::context_files::ContextBundle;
 use crate::bots::tools::FILE_CONTENT_IS_DATA;
 
@@ -42,6 +43,9 @@ pub struct SessionFrame {
     pub audience_sentence: String,
     /// The writing host's local time, with its offset (choice C4).
     pub now: DateTime<FixedOffset>,
+    /// The note the person's docked notes view shows, when its drive is in
+    /// scope (R41): held in memory, never logged.
+    pub focus: Option<Focus>,
 }
 
 /// One persistent fact as it enters the prompt: a sentence, or a file from
@@ -276,6 +280,17 @@ fn frame_slot(b: &mut Builder, frame: &SessionFrame, facts: &[RenderedFact]) {
         b.line(&format!("- {id}: {title}"));
     }
     b.line(&frame.audience_sentence);
+    if let Some(focus) = &frame.focus {
+        let under = focus
+            .heading
+            .as_ref()
+            .map(|heading| format!(", under the heading {heading}"))
+            .unwrap_or_default();
+        b.line(&format!(
+            "The person is looking at {} in {}{under}.",
+            focus.path, focus.drive
+        ));
+    }
     b.line(&format!(
         "Now: {}",
         frame.now.to_rfc3339_opts(SecondsFormat::Secs, false)
@@ -404,6 +419,7 @@ mod tests {
             drives: vec![("tgdrive".to_owned(), "tgdrive".to_owned())],
             audience_sentence: label.sentence(&|user| user.localpart().to_owned()),
             now: DateTime::parse_from_rfc3339("2026-10-02T10:15:03+02:00").expect("time"),
+            focus: None,
         };
         let agents_md = fixture("zone-ok/AGENTS.md");
         let bytes = agents_md.len();

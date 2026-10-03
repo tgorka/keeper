@@ -107,6 +107,7 @@ export interface SurfaceColumnSpec {
 export const SURFACE_COLUMN_IDS = [
   "notes-rail",
   "notes-list",
+  "notes-agent",
   "files-tree",
   "chat-list",
   "tasks-list",
@@ -126,6 +127,11 @@ export const SURFACE_COLUMNS: Record<SurfaceColumnId, SurfaceColumnSpec> = {
   // field above them. Narrower and the chips wrap one per line, which makes the
   // list taller rather than narrower and helps nobody.
   "notes-list": { label: "note list", title: "Note list", defaultWidth: 320, minWidth: 240 },
+  // The proxy's room docked beside the notes (UX-DR130), to the RIGHT of the
+  // panel strip. 360 holds a message bubble at a readable measure beside the
+  // header's identity line and run badge; the floor is the composer — its
+  // attach button, a field worth typing in and Send on one row.
+  "notes-agent": { label: "assistant", title: "Assistant", defaultWidth: 360, minWidth: 280 },
   // The tree used to be `flex-1`, splitting the surface evenly with the panel
   // strip. That was never a decision — it was two panes with the same class —
   // and it gave half the window to a folder list while the document it opened

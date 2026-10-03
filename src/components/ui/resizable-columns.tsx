@@ -95,6 +95,17 @@ export interface ColumnResizerProps {
    * same rule — the rule names an owner, it does not name an element type.
    */
   seam?: "neighbour" | "self";
+  /**
+   * Which edge of the sized column this handle is on.
+   *
+   * `"trailing"`, the default, is every column left of the document: the seam
+   * is its right edge, so dragging right widens it. `"leading"` is a column
+   * RIGHT of the document — the notes view's assistant dock — whose seam is
+   * its left edge: dragging left widens it, and so does `←`. Its hairline is
+   * the column's own `border-l`, one pixel right of where a left neighbour's
+   * `border-r` would be, so the lit seam sits on that pixel instead.
+   */
+  edge?: "trailing" | "leading";
 }
 
 /**
@@ -187,7 +198,10 @@ export function ColumnResizer({
   min,
   className,
   seam = "neighbour",
+  edge = "trailing",
 }: ColumnResizerProps) {
+  // Pointer travel and arrow keys widen toward the side the column grows to.
+  const grow = edge === "leading" ? -1 : 1;
   const drag = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
 
   const onPointerDown = (event: PointerEvent<HTMLDivElement>): void => {
@@ -208,7 +222,7 @@ export function ColumnResizer({
     if (active === null || active.pointerId !== event.pointerId) {
       return;
     }
-    onWidth(active.startWidth + (event.clientX - active.startX));
+    onWidth(active.startWidth + grow * (event.clientX - active.startX));
   };
 
   const endDrag = (event: PointerEvent<HTMLDivElement>): void => {
@@ -226,10 +240,10 @@ export function ColumnResizer({
     const current = width ?? event.currentTarget.getBoundingClientRect().left - containerLeft();
     if (event.key === "ArrowLeft") {
       event.preventDefault();
-      onWidth(current - step);
+      onWidth(current - grow * step);
     } else if (event.key === "ArrowRight") {
       event.preventDefault();
-      onWidth(current + step);
+      onWidth(current + grow * step);
     } else if (event.key === "Home") {
       // Back to fitted, which is also the only way to forget a width — a column
       // dragged somewhere regrettable must have a door out that is not the
@@ -270,7 +284,8 @@ export function ColumnResizer({
           // `left-1` is this zero-width track's own x, and the extra pixel back
           // is where a neighbouring column's `border-r` lives. Aligned, so
           // lighting the seam changes its colour and never its thickness.
-          "before:absolute before:inset-y-0 before:left-1 before:w-px before:-translate-x-px",
+          "before:absolute before:inset-y-0 before:left-1 before:w-px",
+          edge === "trailing" && "before:-translate-x-px",
           // Transparent at rest wherever a box already owns the edge — see
           // `seam`. This handle is a grip, and a grip that also paints is the
           // 2px seam every resizable column in the app used to have.

@@ -257,3 +257,5 @@ Full text: `_bmad-output/planning-artifacts/agents-review-consistency-2026-10-02
 **R45 — notifications (2026-10-03):** the notify handler does not notify for an agent's `…` anchor or its edits; a notification when an agent's answer completes is deferred to 98.1.
 
 **R46 — 91.5 AC5 restated (2026-10-03):** as R30 says, AC5 asserts the power-level content and the host's `classify`; only a person's *state* write is refused by the server, because a person's encrypted message or scope reaches it as `m.room.encrypted`, allowed at 0.
+
+**R47 — who may set a scope or ask for a conversation (2026-10-03):** `dev.keeper.agent.scope` and `dev.keeper.agent.conversation.request` count from the proxy's `human` on a device signed by that person's own cross-signing identity — `Verified` or `Unverified(UnverifiedIdentity)` — and are ignored from an `UnsignedDevice`, an unknown device (`None`), a `MismatchedSender` or a `VerificationViolation`; an approval decision stays strict `Verified` (epic 93 adds person-pinned trust). Both only act within the agent's own allowed drives or make a room for the proxy's human, so an unpinned but self-signed identity is enough.
