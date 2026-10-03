@@ -212,8 +212,8 @@ de-duplicated, ordered after the sync remotes and before the update endpoint, an
 when the last provider is removed.
 
 Since Epic 67 (AD-205, AD-211) a *spoken* question reaches this same endpoint from Rust —
-`bots_ipc::send_spoken` runs the one `open_turn` a typed message runs
-(`src-tauri/crates/keeper/src/bots_ipc.rs:1330`, `:1356`), with the same request, the same
+`bots_ipc::send_spoken` runs the one `keeper_agent::turn::open_turn` a typed message runs
+(`src-tauri/crates/keeper/src/bots_ipc.rs`, `send_spoken`), with the same request, the same
 host and nothing new on the wire — and the lock-screen banner that says what was heard is a
 local notification posted by the app process with no trigger and no push
 (`crates/keeper/src/voice_notify.rs:175-193`, `UNUserNotificationCenter` in-process; no APNs,

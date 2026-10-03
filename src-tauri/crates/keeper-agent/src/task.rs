@@ -1,4 +1,5 @@
-//! Desktop bot tasks: the ordinary tool loop, without a conversation or approver.
+//! Scheduled bot tasks (AD-224): the ordinary tool loop over the same arming
+//! a typed turn takes, with a task origin, no conversation and no approver.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,42 +8,42 @@ use std::time::{Duration, Instant};
 use keeper_core::bots::chat::{
     self, ChatEvent, ChatMessage, ChatOptions, ChatRequest, FinishReason, Role,
 };
-use keeper_core::bots::context_files;
 use keeper_core::bots::http;
 use keeper_core::bots::tools::{self, ToolLoop, ToolLoopEvent};
-use keeper_core::bots::{discover, store, Bot, Endpoint};
-use keeper_core::platform::Platform;
+use keeper_core::bots::{store, Bot, Endpoint};
 use keeper_sync::platform::{BotRunFuture, BotRunRecord, BotTaskRunner, BotTaskSpec};
 use keeper_sync::tasks::TaskOutcome;
 use keeper_sync::SyncProfile;
 
-use crate::bots_tools::DriveToolHost;
+use crate::host::DriveToolHost;
+use crate::turn::{arm_turn, endpoint_of, read_timeout_of, TurnEnv, TurnOrigin};
 
 const MODEL_REQUIRED: &str = "this bot task names no model; set the task's model before running it";
 
-pub(crate) struct ShellBotTaskRunner {
-    platform: Arc<dyn Platform>,
+/// The [`BotTaskRunner`] a host with a drive and a model hands its engine.
+pub struct TaskRunner {
+    env: Arc<TurnEnv>,
 }
 
-impl std::fmt::Debug for ShellBotTaskRunner {
+impl std::fmt::Debug for TaskRunner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ShellBotTaskRunner")
-            .finish_non_exhaustive()
+        formatter.debug_struct("TaskRunner").finish_non_exhaustive()
     }
 }
 
-impl ShellBotTaskRunner {
-    pub(crate) fn new(platform: Arc<dyn Platform>) -> Self {
-        Self { platform }
+impl TaskRunner {
+    /// A runner over `env`. Its drive's approval port is never asked: a
+    /// scheduled run has no person at it, so every ask is refused.
+    pub fn new(env: TurnEnv) -> Self {
+        Self { env: Arc::new(env) }
     }
 }
 
-impl BotTaskRunner for ShellBotTaskRunner {
+impl BotTaskRunner for TaskRunner {
     fn run(&self, spec: BotTaskSpec) -> BotRunFuture {
-        let platform = Arc::clone(&self.platform);
+        let env = Arc::clone(&self.env);
         Box::pin(async move {
-            match prepare(platform, &spec).await {
+            match prepare(&env, &spec).await {
                 Ok(turn) => execute(&turn).await,
                 Err(error) => BotRunRecord::failed(error),
             }
@@ -65,14 +66,15 @@ fn required_model(spec: &BotTaskSpec) -> Result<&str, String> {
         .ok_or_else(|| MODEL_REQUIRED.to_owned())
 }
 
-/// The two messages a task turn sends.
+/// The messages a task turn sends, the system message only when there are
+/// context blocks.
 ///
 /// The prompt file is the **question**, not a document handed to the model to
 /// look at: a person chose this file when they created the task, exactly as a
 /// person types into the chat box, so it is sent as the user's turn and nothing
 /// tells the model to disregard it. AD-159's rule is about content the model
 /// *encounters* — a tool result, an `AGENTS.md`-style context file — and those
-/// still arrive under [`context_files::UNTRUSTED_PREAMBLE`] and
+/// still arrive under `context_files::UNTRUSTED_PREAMBLE` and
 /// [`tools::FILE_CONTENT_IS_DATA`] on the paths that carry them. Wrapping the
 /// prompt itself in "this is data, do not obey it" would make every scheduled
 /// run answer that it must not do the thing it was scheduled to do.
@@ -102,71 +104,38 @@ fn task_host(dir: PathBuf, bot: &Bot, profiles: Vec<SyncProfile>, task_id: &str)
         session_id: format!("task:{task_id}:{}", ulid::Ulid::new()),
         message_id: None,
         profiles,
+        vault: None,
         approve: None,
     }
 }
 
-async fn prepare(platform: Arc<dyn Platform>, spec: &BotTaskSpec) -> Result<TaskTurn, String> {
+async fn prepare(env: &TurnEnv, spec: &BotTaskSpec) -> Result<TaskTurn, String> {
     let model = required_model(spec)?;
-    let dir = platform.data_dir().map_err(|error| error.to_string())?;
+    let dir = env.platform.data_dir().map_err(|error| error.to_string())?;
     let bot = store::get_bot(&dir, &spec.bot_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("no bot called '{}' exists", spec.bot_id))?;
     let row = store::get_provider(&dir, &bot.provider_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("no provider called '{}' exists", bot.provider_id))?;
-    let token =
-        crate::account_ipc::bot_credential(platform.as_ref(), &row.provider.id, Some(&bot.target))
-            .await
-            .map_err(|error| error.to_string())?;
-    let endpoint = Endpoint::new(&row.provider, Some(&bot.target), token);
-    let read_timeout = match row.read_timeout_ms {
-        Some(ms) if ms > 0 => Duration::from_millis(ms.unsigned_abs()),
-        _ => http::READ_TIMEOUT,
-    };
-    let client = http::client(read_timeout).map_err(|error| error.to_string())?;
-    let grants = store::list_grants_for_bot(&dir, &bot.provider_id, Some(&bot.id))
-        .map(|listing| listing.live)
-        .unwrap_or_else(|error| {
-            tracing::warn!(%error, "bots: could not read the grants for this task");
-            Vec::new()
-        });
-    let tools_supported =
-        if grants.is_empty() || !discover::probes_model_capabilities(row.provider.kind) {
-            None
-        } else {
-            discover::models(&client, &endpoint)
-                .await
-                .ok()
-                .and_then(|models| models.into_iter().find(|candidate| candidate.id == model))
-                .and_then(|found| found.tools)
-        };
-    let offer = tools::offer_tools(row.provider.kind, tools_supported, &grants);
-    let profiles = crate::sync::engine(platform)
-        .ok()
-        .and_then(|engine| engine.list_profiles().ok())
-        .unwrap_or_default();
-    let profile_ids: Vec<&str> = profiles.iter().map(|profile| profile.id.as_str()).collect();
-    let default_profile_id = tools::default_profile_id(&grants, &profile_ids).unwrap_or_default();
-    let context = offer.is_offered().then(|| {
-        let targets = context_files::context_targets(&grants, &profile_ids);
-        context_files::merge(crate::bots_tools::load_context(&profiles, &targets))
-    });
-    let request = ChatRequest {
-        model: model.to_owned(),
-        messages: prompt_messages(
-            &spec.prompt_text,
-            context.as_ref().and_then(|bundle| bundle.system_prompt()),
-        ),
-        tools: offer.specs(),
-        ..ChatRequest::default()
-    };
+    let endpoint = endpoint_of(env, &row, Some(&bot.target))
+        .await
+        .map_err(|error| error.to_string())?;
+    // The question alone: arming puts the task's context in front of it,
+    // untrimmed, exactly as `prompt_messages` would.
+    let question = prompt_messages(&spec.prompt_text, None);
+    let armed = arm_turn(env, &dir, &row, &bot, model, question, &|_| {
+        TurnOrigin::Task
+    })
+    .await;
+    let mut host = task_host(dir, &bot, armed.profiles, &spec.task_id);
+    host.vault = env.drive.as_ref().and_then(|drive| drive.vault.clone());
     Ok(TaskTurn {
         endpoint,
-        request,
-        host: task_host(dir, &bot, profiles, &spec.task_id),
-        default_profile_id,
-        read_timeout,
+        request: armed.request,
+        host,
+        default_profile_id: armed.default_profile_id,
+        read_timeout: read_timeout_of(&row),
     })
 }
 
@@ -294,6 +263,7 @@ mod tests {
     use keeper_core::bots::grant::{Grant, GrantMode, GrantScope};
     use keeper_core::bots::ProviderKind;
     use keeper_core::error::CoreError;
+    use keeper_core::platform::Platform;
     use std::io::{BufRead, BufReader, Read, Write};
 
     fn bot() -> Bot {
@@ -491,6 +461,92 @@ mod tests {
             .starts_with("Refused:"));
     }
 
+    /// The tool message the model reads for one write that needs a person,
+    /// with `approve` as the host's approver.
+    async fn refused_write(approve: Option<Arc<crate::host::Approver>>) -> (String, bool) {
+        let dir = tempfile::tempdir().expect("data directory");
+        let root = tempfile::tempdir().expect("drive");
+        store::insert_provider(
+            dir.path(),
+            &keeper_core::bots::Provider {
+                id: "provider".to_owned(),
+                kind: ProviderKind::Ollama,
+                name: "Provider".to_owned(),
+                base_url: "http://localhost:11434".to_owned(),
+                created_ms: 1,
+            },
+        )
+        .expect("store provider");
+        store::insert_bot(dir.path(), &bot()).expect("store bot");
+        store::save_grant(
+            dir.path(),
+            &Grant {
+                id: "grant".to_owned(),
+                provider_id: "provider".to_owned(),
+                bot_id: Some("bot".to_owned()),
+                scope: GrantScope::Profile {
+                    profile_id: "folder".to_owned(),
+                },
+                mode: GrantMode::Write,
+                created_ms: 1,
+            },
+        )
+        .expect("store grant");
+        let mut host = task_host(
+            dir.path().to_owned(),
+            &bot(),
+            vec![SyncProfile::new("folder", "Folder", root.path(), "unused")],
+            "task",
+        );
+        host.approve = approve;
+        let call = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"write-1","type":"function","function":{"name":"drive_write","arguments":"{\"path\":\"result.txt\",\"content\":\"must not write\"}"}}
+        ]},"finish_reason":"tool_calls"}]});
+        let (endpoint, server) = provider(vec![call, completed()]);
+        execute(&turn(endpoint, host, "# Task\nbody")).await;
+        let audit = audit::list_audit(dir.path(), None, None).expect("read audit");
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].outcome, AuditOutcome::Refused);
+        let requests = server.join().expect("provider thread");
+        let content = requests[1]["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .expect("tool refusal")
+            .to_owned();
+        let untouched = std::fs::read_dir(root.path())
+            .expect("drive")
+            .next()
+            .is_none();
+        (content, untouched)
+    }
+
+    /// F12: with nobody to ask, the model is told so in the one sentence, and
+    /// nothing on the drive changes; a person who says no keeps the grant
+    /// layer's own sentence.
+    #[tokio::test]
+    async fn a_host_without_an_approver_refuses_an_ask_with_the_unattended_sentence() {
+        let (content, untouched) = refused_write(None).await;
+        assert_eq!(
+            content,
+            format!("Refused: {}", crate::host::UNATTENDED_REFUSAL)
+        );
+        assert!(untouched, "the drive gained a file");
+
+        let (content, untouched) =
+            refused_write(Some(Arc::new(|_: &tools::ToolCall, _: &str| false))).await;
+        assert_eq!(
+            content,
+            format!(
+                "Refused: {}",
+                keeper_core::bots::grant::ASK_WRITE_WIDE_SCOPE
+            )
+        );
+        assert!(untouched, "the drive gained a file");
+    }
+
     struct UnusedPlatform;
 
     impl Platform for UnusedPlatform {
@@ -540,7 +596,7 @@ mod tests {
         };
         for model in [None, Some(" \t".to_owned())] {
             spec.model = model;
-            let record = ShellBotTaskRunner::new(Arc::new(UnusedPlatform))
+            let record = TaskRunner::new(TurnEnv::new(Arc::new(UnusedPlatform)))
                 .run(spec.clone())
                 .await;
             assert_eq!(record.outcome, TaskOutcome::Failed);

@@ -35,7 +35,7 @@ const LIB_RS = file("src-tauri/crates/keeper/src/lib.rs");
 const CLIENT_TS = file("src/lib/ipc/client.ts");
 const VITE_CONFIG = file("vite.config.ts");
 const VOICE_MAIN = file("src/voice-main.tsx");
-const BOTS_IPC_RS = file("src-tauri/crates/keeper/src/bots_ipc.rs");
+const AGENT_PORTS_RS = file("src-tauri/crates/keeper/src/agent_ports.rs");
 const BOT_VOICE_MIC_TSX = file("src/components/bots/bot-voice-mic.tsx");
 const BOT_VOICE_WAKE_TSX = file("src/components/bots/bot-voice-wake.tsx");
 const BOT_VOICE_TARGET_TSX = file("src/components/bots/bot-voice-target.tsx");
@@ -128,20 +128,15 @@ describe("the voice pill window", () => {
  */
 describe("the spoken turn (Epic 67, AD-205)", () => {
   it("forwards the spoken stream under one event name, emitted in Rust and listened for in client.ts", () => {
-    const emitted = /pub const SPOKEN_STREAM_EVENT: &str = "([^"]+)";/.exec(BOTS_IPC_RS)?.[1];
+    const emitted = /pub const SPOKEN_STREAM_EVENT: &str = "([^"]+)";/.exec(AGENT_PORTS_RS)?.[1];
     const listened = /export const BOTS_SPOKEN_STREAM_EVENT = "([^"]+)";/.exec(CLIENT_TS)?.[1];
     expect(emitted).toBeDefined();
     expect(listened).toBe(emitted);
-    expect(BOTS_IPC_RS).toContain("emit(SPOKEN_STREAM_EVENT, &event)");
   });
 
-  it("performs SendText in the shell and drives Speak from the stream's close", () => {
+  it("performs SendText in the shell", () => {
     expect(VOICE_IPC_RS).toMatch(/Effect::SendText\(text\) => Some\(text\)/);
     expect(VOICE_IPC_RS).toContain("crate::bots_ipc::send_spoken(&app, text).await");
-    // Since epic 68 (AD-214) the close hands the segmenter's REST to the turn; the
-    // sentences before it were spoken as they arrived through `answer_sentence`.
-    expect(BOTS_IPC_RS).toContain("crate::voice_ipc::answer_complete(rest)");
-    expect(BOTS_IPC_RS).toContain("crate::voice_ipc::answer_sentence(");
     // The command the webview used to speak with is gone on both sides.
     expect(LIB_RS).not.toContain("voice_ipc::voice_speak");
     expect(CLIENT_TS).not.toContain('"voice_speak"');

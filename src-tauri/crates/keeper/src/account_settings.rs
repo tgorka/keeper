@@ -329,7 +329,7 @@ pub(crate) fn grant_of(
         }
     };
     Ok(Some(Grant {
-        id: crate::bots_ipc::new_id(),
+        id: keeper_agent::turn::new_id(),
         provider_id: provider_id.to_owned(),
         bot_id,
         scope,

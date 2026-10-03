@@ -1,209 +1,54 @@
 //! The drive half of the Bots surface (Epic 62, Story 62.1): every `bots_*`
-//! command that only makes sense where `keeper-sync` links.
+//! command that only makes sense where a drive exists.
 //!
 //! **No decisions live here** — the same rule as [`crate::bots_ipc`] (AD-55,
-//! AD-56). This file exists because `keeper-sync` is not a dependency of the
-//! shell crate on iOS or Android, and a phone can therefore hold a
-//! conversation but not a folder: no grant, no audit, no deliverable path, no
-//! image staging. Everything that reaches `keeper_sync` or
-//! [`crate::bots_tools`] is here, the module is `#[cfg(desktop)]` in `lib.rs`,
-//! and its commands are spliced into the desktop `$extra` beside the sync
-//! surface they belong to. What keeps the affordances off a phone is
-//! `CapabilitiesVm.botTools`, which is false there — absence rather than a
-//! refusing twin (AD-27).
+//! AD-56). A phone holds a conversation but not a folder the bots surface may
+//! reach: no grant, no audit, no deliverable path, no image staging. The
+//! module is `#[cfg(desktop)]` in `lib.rs`, and its commands are spliced into
+//! the desktop `$extra` beside the sync surface they belong to. What keeps the
+//! affordances off a phone is `CapabilitiesVm.botTools`, which is false there
+//! — absence rather than a refusing twin (AD-27).
 //!
 //! # Where the seam is
 //!
 //! The streaming pair (`bots_chat_send`, `bots_message_retry`) stays in
-//! `bots_ipc` and runs on every platform, and a turn is always one tool loop
-//! over a [`ToolHost`]. This module fills the port that loop needs on a build
-//! with a drive: [`arm_drive`] reads the sync profiles, loads the context
-//! files a grant allows, and returns a [`DesktopDrive`] that later builds a
-//! [`DriveToolHost`] over them once the channel and cancel signal exist. A
-//! build without a drive fills the same port with `bots_ipc`'s `NoDrive`,
-//! and the streaming code cannot tell which it got.
+//! `bots_ipc` and runs on every platform, and a turn is always one
+//! `keeper_agent` tool loop. On desktop its drive ports are
+//! `crate::agent_ports`': the sync profiles, the notes vault and the approval
+//! sheet whose answer arrives here.
 //!
 //! # The approval round trip (Story 61.10)
 //!
 //! The approval a grant can demand (`GrantVerdict::Ask`) is a round trip the
 //! `Channel` cannot carry alone: the turn sends
-//! [`BotStreamEvent::ApprovalAsked`] and **blocks** on a one-shot sender
-//! registered under the ask's id, and the pane answers through
-//! [`bots_approval_answer`]. Stop releases a blocked ask as a refusal, and so
-//! does a pane that went away — nothing but an explicit `true` is consent.
-//! Both ends are in this file because an ask is only ever raised by the drive
-//! host.
+//! [`BotStreamEvent::ApprovalAsked`] down its stream — the pane's channel, or
+//! the spoken-stream event for a spoken turn — and **blocks** in
+//! `keeper_agent::approval` on a one-shot sender registered under the ask's
+//! id, and the pane answers through [`bots_approval_answer`]. Stop releases a
+//! blocked ask as a refusal, and so does a pane that went away — nothing but
+//! an explicit `true` is consent.
+//!
+//! [`BotStreamEvent::ApprovalAsked`]: keeper_core::vm::BotStreamEvent::ApprovalAsked
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{RecvTimeoutError, SyncSender};
-use std::sync::Arc;
-use std::time::Duration;
 
+use keeper_agent::turn::{new_id, now_ms};
 use keeper_core::bots::audit;
-use keeper_core::bots::chat;
-use keeper_core::bots::context_files;
 use keeper_core::bots::deliverable;
 use keeper_core::bots::grant::{self, Grant, GrantScope};
-use keeper_core::bots::tools::{ToolCall, ToolHost};
 use keeper_core::bots::{store, Bot};
 use keeper_core::vm::{
-    BotApprovalRequestVm, BotAttachmentVm, BotAuditRowVm, BotDeliverableVm, BotGrantListVm,
-    BotGrantSaveReq, BotGrantVm, BotStreamEvent, IpcError, IpcErrorCode,
+    BotAttachmentVm, BotAuditRowVm, BotDeliverableVm, BotGrantListVm, BotGrantSaveReq, BotGrantVm,
+    IpcError, IpcErrorCode,
 };
-use keeper_sync::SyncProfile;
-use tauri::ipc::Channel;
 use tauri::State;
 
-use crate::bots_ipc::{
-    bot_of, data_dir, discovered_model, new_id, no_such, now_ms, ArmedDrive, Turn, TurnHost,
-};
-use crate::bots_tools::{Approver, DriveToolHost};
+use crate::bots_ipc::{bot_of, data_dir, no_such};
 use crate::ipc::{to_ipc_error, AppState};
-
-// ---------------------------------------------------------------------------
-// The drive port for one turn (Story 62.1)
-// ---------------------------------------------------------------------------
-
-/// Every sync profile keeper holds, or none when the engine is unavailable.
-///
-/// No profiles means every tool call is refused as naming no folder and no
-/// context file is read — no control, and a reason — which is the failure
-/// direction `deliverable_roots` already takes.
-fn sync_profiles(state: &AppState) -> Vec<SyncProfile> {
-    let platform = Arc::clone(&state.platform);
-    let Ok(engine) = crate::sync::engine(platform) else {
-        return Vec::new();
-    };
-    engine.list_profiles().unwrap_or_default()
-}
-
-/// Arm the drive half of one turn on a build that has a drive.
-///
-/// Two reads, and one decision that is `keeper-core`'s: the sync profiles,
-/// then — only when `offered` says tools went in the request — the context
-/// files [`context_files::context_targets`] picks from the live grants,
-/// loaded through [`crate::bots_tools::load_context`] and merged into the
-/// bundle the model is shown. The profiles are kept by value on the returned
-/// [`DesktopDrive`] because the host built from them holds them the same way.
-pub(crate) fn arm_drive(state: &AppState, grants: &[Grant], offered: bool) -> ArmedDrive {
-    let profiles = sync_profiles(state);
-    let profile_ids: Vec<&str> = profiles.iter().map(|profile| profile.id.as_str()).collect();
-    let context = offered.then(|| {
-        let targets = context_files::context_targets(grants, &profile_ids);
-        context_files::merge(crate::bots_tools::load_context(&profiles, &targets))
-    });
-    ArmedDrive {
-        profile_ids: profile_ids.iter().map(|id| (*id).to_owned()).collect(),
-        context,
-        host: Box::new(DesktopDrive { profiles }),
-    }
-}
-
-/// The drive port as a desktop build fills it: the profiles a tool call may
-/// name, held until the turn's task exists and the host can be built.
-///
-/// The grants are **not** here: `DriveToolHost::run` re-reads them per call
-/// (FR-386), and a copy on this struct would be an unrevocable grant.
-struct DesktopDrive {
-    profiles: Vec<SyncProfile>,
-}
-
-impl TurnHost for DesktopDrive {
-    fn host(
-        &self,
-        turn: &Turn,
-        channel: Channel<BotStreamEvent>,
-        signal: chat::CancelSignal,
-    ) -> Box<dyn ToolHost> {
-        Box::new(DriveToolHost {
-            data_dir: turn.dir.clone(),
-            provider_id: turn.provider_id.clone(),
-            bot_id: Some(turn.bot_id.clone()),
-            session_id: turn.session_id.clone(),
-            message_id: Some(turn.assistant_id.clone()),
-            profiles: self.profiles.clone(),
-            approve: Some(approver(
-                channel,
-                signal,
-                turn.provider_id.clone(),
-                turn.bot_id.clone(),
-            )),
-        })
-    }
-}
 
 // ---------------------------------------------------------------------------
 // The approval round trip (Story 61.10, FR-387)
 // ---------------------------------------------------------------------------
-
-/// Approvals waiting on a person, keyed by request id (Story 61.10, FR-387).
-///
-/// The other end of each sender is a tool call blocked inside a turn; the
-/// answer arrives through [`bots_approval_answer`] from the sheet the
-/// [`BotStreamEvent::ApprovalAsked`] event opened. An entry outlives nothing:
-/// the asking side removes it when it has its answer, or when its turn was
-/// stopped.
-fn asks() -> std::sync::MutexGuard<'static, HashMap<String, SyncSender<bool>>> {
-    static ASKS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, SyncSender<bool>>>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-    // A poisoned lock means a driver panicked mid-answer. The map holds
-    // senders and nothing else, so there is no torn state to protect and
-    // refusing every later ask would be the worse failure —
-    // `bots_ipc::streams`' reasoning, verbatim.
-    ASKS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// How long a blocked approval waits between looks at its cancel signal.
-///
-/// The approval port is synchronous (`bots_tools.rs`'s `Approver`), so the
-/// wait is a blocking receive; polling at this cadence is what lets Stop
-/// release a turn that is waiting on a sheet nobody will answer.
-const APPROVAL_POLL: Duration = Duration::from_millis(250);
-
-/// The approval port for one turn: ask the pane, wait, and obey (Story 61.10,
-/// FR-387).
-///
-/// The port is synchronous by `bots_tools.rs`'s design — a tool call is a
-/// blocking act inside one round — so the wait is a blocking receive inside
-/// `tokio::task::block_in_place`, which hands this worker's slot to another
-/// thread for the duration rather than starving the runtime while a person
-/// reads a sheet. The wait ends on the answer, on Stop (the cancel signal is
-/// looked at every [`APPROVAL_POLL`]), or on a pane that went away — and every
-/// way it ends other than an explicit `true` is a refusal. A missing answer
-/// must never read as consent.
-fn approver(
-    channel: Channel<BotStreamEvent>,
-    signal: chat::CancelSignal,
-    provider_id: String,
-    bot_id: String,
-) -> Arc<Approver> {
-    Arc::new(move |call: &ToolCall, reason: &str| -> bool {
-        let request_id = new_id();
-        let (answer, waiting) = std::sync::mpsc::sync_channel::<bool>(1);
-        asks().insert(request_id.clone(), answer);
-        let request =
-            BotApprovalRequestVm::compose(&request_id, &provider_id, Some(&bot_id), call, reason);
-        if channel
-            .send(BotStreamEvent::ApprovalAsked {
-                request: Box::new(request),
-            })
-            .is_err()
-        {
-            asks().remove(&request_id);
-            return false;
-        }
-        let approved = tokio::task::block_in_place(|| loop {
-            match waiting.recv_timeout(APPROVAL_POLL) {
-                Ok(approved) => break approved,
-                Err(RecvTimeoutError::Timeout) if !signal.is_cancelled() => {}
-                Err(_) => break false,
-            }
-        });
-        asks().remove(&request_id);
-        approved
-    })
-}
 
 /// Answer a tool call waiting on a person (Story 61.10, FR-387).
 ///
@@ -221,11 +66,7 @@ fn approver(
 /// Rejects with: nothing.
 #[tauri::command]
 pub fn bots_approval_answer(request_id: String, approved: bool) -> Result<(), IpcError> {
-    if let Some(answer) = asks().remove(&request_id) {
-        // A receiver that is gone was a turn that stopped waiting; the answer
-        // then changes nothing, which is what a late answer should change.
-        let _ = answer.send(approved);
-    }
+    keeper_agent::approval::answer(&request_id, approved);
     Ok(())
 }
 
@@ -454,7 +295,7 @@ pub async fn bots_image_paste(
 /// not read is unknown, and the paste is then offered with a warning rather
 /// than refused on the strength of a network error.
 async fn vision_of(state: &AppState, dir: &Path, bot: &Bot, model: &str) -> Option<bool> {
-    discovered_model(state, dir, bot, model)
+    keeper_agent::turn::discovered_model(&crate::agent_ports::plain_env(state), dir, bot, model)
         .await
         .and_then(|found| found.vision)
 }
@@ -516,7 +357,12 @@ pub async fn bots_deliverable_paths(
 /// the outside-the-drive sentence — the same failure direction the rest of this
 /// story takes: no control, and a reason.
 fn deliverable_roots(state: &AppState) -> Vec<deliverable::DeliverableRoot> {
-    sync_profiles(state)
+    let Ok(engine) = crate::sync::engine(std::sync::Arc::clone(&state.platform)) else {
+        return Vec::new();
+    };
+    engine
+        .list_profiles()
+        .unwrap_or_default()
         .into_iter()
         .map(|profile| deliverable::DeliverableRoot {
             profile_id: profile.id,

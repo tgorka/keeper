@@ -5,7 +5,7 @@
  * `keeper-core::bots::grant::decide` answers `Ask` for exactly one shape of
  * call: a write that lands inside a `write`-mode scope wider than a subtree.
  * The shell's tool host turns that into an approval port
- * (`bots_tools.rs:74-96`, "a host built with no approver declines every ask"),
+ * (`keeper_agent::host`, where a host built with no approver refuses every ask),
  * and this dialog is what fills it in.
  *
  * # The three answers, and why the third one is a grant and not a memory

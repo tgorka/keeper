@@ -31,6 +31,9 @@ keeper-core = { path = "../keeper-core" }
 # that spawns (`keeper_sync::git::cli`). The engine is tauri-free, so this
 # edge goes one way only.
 keeper-sync = { path = "../keeper-sync" }
+# The turn loop, the drive tool host and the task runner (AD-367). On every
+# target: ⌘9 runs on the phone too, armed with no drive.
+keeper-agent = { path = "../keeper-agent" }
 tauri = { workspace = true }
 tauri-plugin-opener = { workspace = true }
 tauri-plugin-deep-link = { workspace = true }

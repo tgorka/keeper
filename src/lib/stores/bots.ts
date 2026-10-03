@@ -75,7 +75,7 @@ export interface BotFollow {
  * The callback lives in the store rather than the answer being written to a
  * row, because the thing waiting is a blocking tool call inside one chat turn:
  * Rust's approval port is a function that returns consent
- * (`bots_tools.rs:74`), so what the UI holds is that function's other end. It
+ * (`keeper_agent::host::Approver`), so what the UI holds is that function's other end. It
  * is a live continuation and never persisted; a reload finds no ask, which is
  * correct — the call it belonged to died with the process, and a grant is the
  * only thing that outlives a turn.

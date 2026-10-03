@@ -17,35 +17,23 @@ mod account_restore;
 // providers and Matrix accounts as portable records, and where a pulled
 // setting is written. Every target, like the account itself.
 mod account_settings;
-// The Bots surface's sync-free commands (Epic 61, Story 61.4; split in Story
-// 62.1). On every target: a provider is a URL plus a credential and a
-// conversation two tables in the `keeper.db` every platform already opens.
-// The module imports nothing from `keeper_sync` and nothing from
-// `bots_tools`; what it needs of the drive it asks through a port with a
-// desktop body in `bots_drive_ipc` and a refusing body everywhere else. The
-// iOS compile check is what keeps this sentence true.
+// The app's side of `keeper_agent`'s ports (AD-367): the stream sinks, the
+// voice turn's hooks and the error mapping on every target; the approval
+// sheet, the notes vault and the sync profiles on desktop, chosen at compile
+// time so a phone's turn is armed with no drive.
+mod agent_ports;
+// The Bots surface's commands that run on every target (Epic 61, Story 61.4;
+// split in Story 62.1). A provider is a URL plus a credential and a
+// conversation two tables in the `keeper.db` every platform already opens;
+// the turn loop itself is `keeper_agent` (AD-367).
 mod bots_ipc;
 // The drive half of the Bots surface (Story 62.1): grants, the audit log, the
-// approval answer, image staging and deliverable paths. Desktop-only because
-// every one of them reaches `keeper_sync` or `crate::bots_tools`, and
-// `keeper-sync` is not a dependency on iOS or Android. `CapabilitiesVm.botTools`
-// is false where this module is absent, so nothing on a phone calls it —
-// absence rather than a refusing twin (AD-27).
+// approval answer, image staging and deliverable paths. Desktop-only: the
+// phone has no drive for a bot to reach. `CapabilitiesVm.botTools` is false
+// where this module is absent, so nothing on a phone calls it — absence
+// rather than a refusing twin (AD-27).
 #[cfg(desktop)]
 mod bots_drive_ipc;
-// The unattended turn a scheduled `bot` task runs (Story 72.8, AD-244).
-// Desktop-only: it needs the drive, so it links where `keeper-sync` does, and
-// a phone lists the task row while the Mac runs it (AD-226). It builds the
-// turn `bots_ipc` builds minus the session, the channel and the voice, with no
-// approver, so every `Ask` a grant produces is a refusal it records.
-#[cfg(desktop)]
-mod bot_task;
-// The drive-as-tools host (Story 61.11). Desktop-only: it composes
-// `keeper_sync::bots_fs`, and `keeper-sync` is not a dependency on iOS or
-// Android. Every decision it sequences lives in `keeper-core` or
-// `keeper-sync` — this module is a call site by rule (AD-55/AD-56).
-#[cfg(desktop)]
-mod bots_tools;
 mod build_identity;
 // The copy engine drives `keeper_sync`, which links on every target since
 // Epic 66 (AD-198); its three commands sit in the shared handler list.
@@ -935,15 +923,11 @@ pub fn run() {
                 // `config_layers`' reason: `keeper_core::bots` has no desktop
                 // gate — a provider is a URL and a credential, a conversation
                 // is two tables in `keeper.db` — so a phone can hold a
-                // conversation with a Hermes bot. These once sat in the
-                // desktop `$extra` because Story 61.11's tool loop gave
-                // `bots_ipc` `keeper_sync::bots_fs` through `crate::bots_tools`
-                // and the iOS compile check failed on `unresolved import
-                // keeper_sync`; what moved out to `bots_drive_ipc` (below, in
-                // the desktop splice) is every command that reaches
-                // `keeper-sync` — grants, audit, the approval answer, image
-                // staging, deliverable paths — and what stayed imports
-                // neither. `CapabilitiesVm.bots` is true wherever the pane
+                // conversation with a Hermes bot. The drive half — grants,
+                // audit, the approval answer, image staging, deliverable
+                // paths — is `bots_drive_ipc` (below, in the desktop splice),
+                // and a phone's turn is armed with no drive
+                // (`agent_ports::turn_env`). `CapabilitiesVm.bots` is true wherever the pane
                 // exists; `CapabilitiesVm.botTools` is what keeps the drive
                 // affordances off a phone.
                 bots_ipc::bots_providers_list,

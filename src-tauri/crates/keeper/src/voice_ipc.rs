@@ -297,8 +297,8 @@ fn transition(event: TurnEvent) {
 
 /// Whether the stream's events are this turn's to act on: it is waiting for
 /// the answer, or already reading it aloud while the rest streams (Epic 68,
-/// AD-214). A typed conversation's stream is never fed here (`bots_ipc`
-/// gates on `turn.spoken`), so no other turn can be in either state.
+/// AD-214). A typed conversation's stream is never fed here (`agent_ports`
+/// wraps only a spoken turn in its `SpokenSink`), so no other turn can be in either state.
 fn owns_answer(turn: &Turn) -> bool {
     turn.awaiting_send() || matches!(turn.state(), TurnState::Speaking)
 }
