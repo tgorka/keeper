@@ -9,6 +9,7 @@
 use matrix_sdk::ruma::{OwnedEventId, OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use ts_rs::TS;
 
 use crate::agents::session::SessionKind;
 
@@ -37,6 +38,12 @@ pub const HOST: &str = "dev.keeper.agent.host";
 /// A person's ask, in their proxy's `main` DM, for a new conversation
 /// (ruling R36): only the main session's claim holder acts on it.
 pub const CONVERSATION_REQUEST: &str = "dev.keeper.agent.conversation.request";
+/// A host's ask to the one device of its person that is in front: open a
+/// note, highlight, point, scroll, or propose an edit (AD-383).
+pub const SURFACE_REQUEST: &str = "dev.keeper.agent.surface.request";
+/// One of a person's keeper clients, and whether it is in front (state in
+/// the principal's control room, key = its Matrix device id; AD-383).
+pub const PRESENCE: &str = "dev.keeper.agent.presence";
 
 /// The contents' schema version, `"v": 1`.
 pub const CONTENT_VERSION: u32 = 1;
@@ -170,6 +177,153 @@ pub struct ClaimContent {
     pub window: Option<String>,
 }
 
+/// `dev.keeper.agent.presence` (state, key = the device id, unencrypted):
+/// metadata only — which device, on which platform, whether it is in front
+/// and which primary view it shows. No path, no title, no drive (AD-383).
+/// Times are RFC 3339 UTC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PresenceContent {
+    pub v: u32,
+    pub user: OwnedUserId,
+    pub device: String,
+    pub platform: PresencePlatform,
+    pub focused: bool,
+    /// A primary view's id (`notes`, `chats`), never a note.
+    pub view: String,
+    pub renewed_at: String,
+    pub expires_at: String,
+}
+
+/// The platform a presence names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PresencePlatform {
+    Macos,
+    Ios,
+    Android,
+}
+
+/// `dev.keeper.agent.surface.request` (timeline, encrypted): one surface
+/// call, for the device `device` only, until `expires_at`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceRequestContent {
+    pub v: u32,
+    pub id: String,
+    pub device: String,
+    pub tool: SurfaceTool,
+    pub args: SurfaceArgs,
+    pub expires_at: String,
+}
+
+/// What a surface call asks the device to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum SurfaceTool {
+    Open,
+    Highlight,
+    Point,
+    Scroll,
+    ProposeEdit,
+}
+
+impl SurfaceTool {
+    /// The tool's name as the model calls it.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Open => "surface_open",
+            Self::Highlight => "surface_highlight",
+            Self::Point => "surface_point",
+            Self::Scroll => "surface_scroll",
+            Self::ProposeEdit => "surface_propose_edit",
+        }
+    }
+
+    /// The five, in the order a turn offers them.
+    pub const ALL: [Self; 5] = [
+        Self::Open,
+        Self::Highlight,
+        Self::Point,
+        Self::Scroll,
+        Self::ProposeEdit,
+    ];
+
+    /// The tool the model called `name`, if it is one of the five.
+    pub fn from_wire(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tool| tool.wire() == name)
+    }
+}
+
+/// A surface call's arguments. `range` counts lines of the note's body —
+/// the editor's buffer, without the frontmatter — 1-based and inclusive;
+/// `expected` is the text the agent read in that range, so the device
+/// applies a proposal only while its buffer still holds it (R40).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceArgs {
+    pub drive: String,
+    /// The note's path from the drive's root, `/`-joined.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<LineSpan>,
+    /// `propose_edit`: the lines that replace `range`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+}
+
+/// Lines `from` through `to` of a note's body, 1-based and inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct LineSpan {
+    pub from: u32,
+    pub to: u32,
+}
+
+/// `dev.keeper.agent.surface.result` (timeline, encrypted): the named
+/// device's answer to the request `request`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceResultContent {
+    pub v: u32,
+    pub request: String,
+    pub device: String,
+    pub outcome: SurfaceOutcome,
+    /// `propose_edit`: whether the person applied it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// How a surface call ended, in the word the model is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum SurfaceOutcome {
+    Done,
+    Declined,
+    Expired,
+    Unavailable,
+}
+
+impl SurfaceOutcome {
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Declined => "declined",
+            Self::Expired => "expired",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// A streamed answer's edit: `m.replace` of `target`, the whole text in
 /// `m.new_content`, and a fallback `body` of at most [`FALLBACK_BODY_MAX`]
 /// bytes, so an edit never carries its text twice (AD-373).
@@ -245,8 +399,10 @@ pub fn power_levels(kind: SessionKind, creator: &UserId, agents: &[OwnedUserId])
 
 /// A principal's control room's power levels (AD-374): the creating agent
 /// 100, every other agent user of the principal 50 — so any of them writes
-/// its host's manifest, `dev.keeper.agent.host` at 50 — and people 0, so a
-/// person writes no state there. `events_default` and `state_default` are 50.
+/// its host's manifest, `dev.keeper.agent.host` at 50 — and people 0. A
+/// person writes one state there: each of their devices' presence,
+/// `dev.keeper.agent.presence` at 0 (R37). `events_default` and
+/// `state_default` are 50.
 pub fn control_power_levels(creator: &UserId, agents: &[OwnedUserId]) -> Value {
     let mut users = Map::new();
     for agent in agents {
@@ -256,7 +412,7 @@ pub fn control_power_levels(creator: &UserId, agents: &[OwnedUserId]) -> Value {
     json!({
         "users": users,
         "users_default": 0,
-        "events": { HOST: 50 },
+        "events": { HOST: 50, PRESENCE: 0 },
         "events_default": 50,
         "state_default": 50,
         "ban": 50,
@@ -264,6 +420,46 @@ pub fn control_power_levels(creator: &UserId, agents: &[OwnedUserId]) -> Value {
         "redact": 50,
         "invite": 50,
     })
+}
+
+/// What a control room made before R37 needs so its people can publish
+/// their presence.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PresenceLevels {
+    /// `dev.keeper.agent.presence` is already at 0.
+    UpToDate,
+    /// These levels: the room's, with the presence row added.
+    Update(Value),
+    /// `me` may not change the room's power levels.
+    NoPower,
+}
+
+/// Whether the control room whose `m.room.power_levels` content is
+/// `levels` needs the presence row, and whether `me` may write it.
+pub fn presence_levels(levels: &Value, me: &UserId) -> PresenceLevels {
+    if levels["events"][PRESENCE] == json!(0) {
+        return PresenceLevels::UpToDate;
+    }
+    let level = |value: &Value, default: i64| value.as_i64().unwrap_or(default);
+    let mine = level(
+        &levels["users"][me.as_str()],
+        level(&levels["users_default"], 0),
+    );
+    let needed = level(
+        &levels["events"]["m.room.power_levels"],
+        level(&levels["state_default"], 50),
+    );
+    if mine < needed {
+        return PresenceLevels::NoPower;
+    }
+    let mut updated = levels.clone();
+    match updated["events"].as_object_mut() {
+        Some(events) => {
+            events.insert(PRESENCE.to_owned(), json!(0));
+        }
+        None => updated["events"] = json!({ PRESENCE: 0 }),
+    }
+    PresenceLevels::Update(updated)
 }
 
 #[cfg(test)]
@@ -417,7 +613,7 @@ mod tests {
         assert_eq!(levels["events"][HOST], 50);
         assert_eq!(levels["state_default"], 50);
         // Each agent reaches the manifest's level; a person (users_default)
-        // reaches no state.
+        // reaches no state but their devices' presence (R37).
         let level = |id: &str| {
             levels["users"]
                 .get(id)
@@ -426,5 +622,81 @@ mod tests {
         };
         assert!(level("@amelia:example.org").as_i64() >= levels["events"][HOST].as_i64());
         assert!(level("@tgorka:example.org").as_i64() < levels["state_default"].as_i64());
+        assert!(level("@tgorka:example.org").as_i64() < levels["events"][HOST].as_i64());
+        assert_eq!(levels["events"][PRESENCE], 0);
+        assert!(level("@tgorka:example.org").as_i64() >= levels["events"][PRESENCE].as_i64());
+    }
+
+    #[test]
+    fn a_control_room_made_before_presence_is_brought_up_to_date_by_its_creator() {
+        let creator = user("@nixi:example.org");
+        let amelia = user("@amelia:example.org");
+        let mut old = control_power_levels(&creator, std::slice::from_ref(&amelia));
+        old["events"]
+            .as_object_mut()
+            .expect("events")
+            .remove(PRESENCE);
+        let PresenceLevels::Update(updated) = presence_levels(&old, &creator) else {
+            panic!("the creator updates the room");
+        };
+        assert_eq!(updated["events"][PRESENCE], 0);
+        // Everything else is the room's own.
+        let mut back = updated.clone();
+        back["events"]
+            .as_object_mut()
+            .expect("events")
+            .remove(PRESENCE);
+        assert_eq!(back, old);
+        // An agent at 50 may not change the power levels (state_default 50
+        // is reached, but a room naming the levels' own row at 100 is not).
+        old["events"]["m.room.power_levels"] = json!(100);
+        assert_eq!(presence_levels(&old, &amelia), PresenceLevels::NoPower);
+        assert!(matches!(
+            presence_levels(&old, &creator),
+            PresenceLevels::Update(_)
+        ));
+        assert_eq!(presence_levels(&updated, &amelia), PresenceLevels::UpToDate);
+    }
+
+    #[test]
+    fn surface_events_round_trip_with_exactly_their_keys() {
+        let request = SurfaceRequestContent {
+            v: CONTENT_VERSION,
+            id: "01J".to_owned(),
+            device: "KALYPSO".to_owned(),
+            tool: SurfaceTool::ProposeEdit,
+            args: SurfaceArgs {
+                drive: "tgdrive".to_owned(),
+                path: "notes/plan.md".to_owned(),
+                heading: None,
+                range: Some(LineSpan { from: 3, to: 5 }),
+                text: Some("new".to_owned()),
+                expected: Some("old".to_owned()),
+            },
+            expires_at: "2026-10-03T12:01:00.000Z".to_owned(),
+        };
+        let value = serde_json::to_value(&request).expect("serialise");
+        assert_eq!(value["tool"], "propose_edit");
+        assert_eq!(
+            keys(&value["args"]),
+            ["drive", "expected", "path", "range", "text"]
+                .map(str::to_owned)
+                .into()
+        );
+        assert_eq!(
+            serde_json::from_value::<SurfaceRequestContent>(value).expect("read back"),
+            request
+        );
+        let result = json!({"v": 1, "request": "01J", "device": "KALYPSO", "outcome": "done", "applied": true});
+        let read: SurfaceResultContent = serde_json::from_value(result).expect("a result");
+        assert_eq!(read.outcome, SurfaceOutcome::Done);
+        assert!(serde_json::from_value::<SurfaceResultContent>(
+            json!({"v": 1, "request": "01J", "device": "K", "outcome": "maybe"})
+        )
+        .is_err());
+        for tool in SurfaceTool::ALL {
+            assert_eq!(SurfaceTool::from_wire(tool.wire()), Some(tool));
+        }
+        assert_eq!(SurfaceTool::from_wire("drive_read"), None);
     }
 }

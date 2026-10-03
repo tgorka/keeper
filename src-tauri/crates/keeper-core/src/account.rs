@@ -45,13 +45,16 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
+use crate::agents::device::{self as agent_device, AccountAgents, AgentDevice};
 use crate::agents::events::{
     ConversationRequestContent, Focus, ScopeContent, ScopeDrive, CONTENT_VERSION,
 };
+use crate::agents::events::{PresencePlatform, SurfaceResultContent};
 use crate::agents::focus::{FocusLanes, FocusPort, Named, SendFuture};
 use crate::agents::proxy::{self, AgentOutbound, AgentProxies, ProxyRoomRow, ProxyRoomVm};
 use crate::agents::room::{self as agent_room, AgentIcons, AgentKinds, AgentRoomKind};
 use crate::agents::session::SessionKind;
+use crate::agents::surface::{SurfaceAnswerReq, SurfaceRequestArrived};
 use crate::archive::{self, ArchiveEvent, ArchiveHandle, ArchiveMedia, ArchiveWriter};
 use crate::auth::{self, session_keychain_key};
 use crate::backup::{self, BackupSink};
@@ -228,6 +231,7 @@ type ActivatedAccount = (
     EventHandlerHandle,
     EventHandlerHandle,
     EventHandlerHandle,
+    AccountAgents,
     JoinHandle<()>,
     tokio::sync::broadcast::Sender<OutboxChange>,
 );
@@ -317,6 +321,10 @@ struct AccountHandle {
     /// task. Aborted on `unsubscribe_outbox` and on shutdown; a producer whose sink
     /// closes ends on its own.
     outbox_subs: Arc<Mutex<HashMap<u64, JoinHandle<()>>>>,
+    /// The account's agents on this device (91.3): its surface request
+    /// handler and presence publisher, started in [`activate`]; dropping the
+    /// handle stops both.
+    agents: AccountAgents,
 }
 
 /// A change signal broadcast on an account's outbox (Story 8.3). Carries no payload:
@@ -616,6 +624,9 @@ pub struct AccountManager {
     agent_proxies: Arc<AgentProxies>,
     /// Per (account, proxy room): the docked note's focus on its way there.
     agent_focus: Arc<FocusLanes<(String, OwnedRoomId)>>,
+    /// The app's agents on this device (91.3): whether keeper is in front,
+    /// which view it shows, and the surface requests its accounts admit.
+    agent_device: Arc<AgentDevice>,
 }
 
 /// Monotonic source of subscription ids handed back to the frontend.
@@ -710,6 +721,7 @@ impl AccountManager {
             agent_icons: Arc::new(AgentIcons::default()),
             agent_proxies: Arc::new(AgentProxies::default()),
             agent_focus: Arc::new(FocusLanes::default()),
+            agent_device: Arc::new(AgentDevice::default()),
         }
     }
 
@@ -833,6 +845,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -842,6 +855,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    &self.agent_device,
                 )
                 .await?;
                 accounts.insert(
@@ -857,6 +871,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1195,6 +1210,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1204,6 +1220,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    &self.agent_device,
                 )
                 .await?;
                 accounts.insert(
@@ -1219,6 +1236,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1293,6 +1311,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1302,6 +1321,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    &self.agent_device,
                 )
                 .await?;
                 accounts.insert(
@@ -1317,6 +1337,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1454,6 +1475,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1463,6 +1485,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    &self.agent_device,
                 )
                 .await?;
                 accounts.insert(
@@ -1478,6 +1501,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1579,6 +1603,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1588,6 +1613,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    &self.agent_device,
                 )
                 .await?;
                 accounts.insert(
@@ -1603,6 +1629,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1703,6 +1730,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1712,6 +1740,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    &self.agent_device,
                 )
                 .await?;
                 accounts.insert(
@@ -1727,6 +1756,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1871,6 +1901,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1880,6 +1911,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    &self.agent_device,
                 )
                 .await?;
                 accounts.insert(
@@ -1895,6 +1927,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -2065,6 +2098,7 @@ impl AccountManager {
                 redaction_handler,
                 draft_handler,
                 notify_handler,
+                agents,
                 outbox_scheduler,
                 outbox_tx,
             ) = activate(
@@ -2074,6 +2108,7 @@ impl AccountManager {
                 self.archive.clone(),
                 self.draft_mirror_tx.clone(),
                 self.notify.clone(),
+                &self.agent_device,
             )
             .await?;
             accounts.insert(
@@ -2089,6 +2124,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                     login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     outbox_scheduler,
@@ -2972,6 +3008,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -2981,6 +3018,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    &self.agent_device,
                 )
                 .await?;
                 accounts.insert(
@@ -2996,6 +3034,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -3977,6 +4016,79 @@ impl AccountManager {
                 .filter(|title| !title.is_empty()),
         };
         send_agent_event(&room, AgentOutbound::ConversationRequest(content)).await
+    }
+
+    /// Every surface request a live account of this device admits from now
+    /// on (AD-383): the shell names its target and hands it to the notes
+    /// view.
+    pub fn surface_requests(&self) -> tokio::sync::broadcast::Receiver<SurfaceRequestArrived> {
+        self.agent_device.requests()
+    }
+
+    /// keeper came to the front or left it (the shell's window focus on the
+    /// desktop, the app's lifecycle on the phone): every live account's
+    /// presence follows after a second of stillness.
+    pub fn agent_presence_focus(&self, platform: PresencePlatform, focused: bool) {
+        self.agent_device.focus(platform, focused);
+    }
+
+    /// The primary view keeper shows (`notes`, `chats`): a view id only,
+    /// never a note (AD-383).
+    pub fn agent_presence_view(&self, view: &str) -> Result<(), CoreError> {
+        if !crate::agents::presence::is_view_id(view) {
+            return Err(CoreError::Unsupported(format!(
+                "\"{view}\" is not a view id."
+            )));
+        }
+        self.agent_device.view(view.to_owned());
+        Ok(())
+    }
+
+    /// The notes view's answer to the surface request `answer` names, sent
+    /// into the agent session room `room_id` it came from — only for a
+    /// request this device admitted and handed on, and only once.
+    pub async fn agent_surface_result(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        answer: SurfaceAnswerReq,
+    ) -> Result<(), CoreError> {
+        let room_id = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let (client, handed_on) = {
+            let accounts = self.accounts.lock().await;
+            let handle = accounts.get(account_id).ok_or(SendError::RoomNotFound)?;
+            (
+                handle.client.clone(),
+                handle.agents.answer(&room_id, &answer.request_id),
+            )
+        };
+        if !handed_on {
+            return Err(CoreError::Unsupported(
+                "No surface request of that id is waiting on this device.".to_owned(),
+            ));
+        }
+        let room = client.get_room(&room_id).ok_or(SendError::RoomNotFound)?;
+        if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session) {
+            return Err(SendError::RoomNotFound.into());
+        }
+        let device = client
+            .device_id()
+            .map(ToString::to_string)
+            .ok_or_else(|| CoreError::Internal("this client has no device id".to_owned()))?;
+        let result = SurfaceResultContent {
+            v: CONTENT_VERSION,
+            request: answer.request_id,
+            device,
+            outcome: answer.outcome,
+            applied: answer.applied,
+            detail: answer
+                .detail
+                .map(|detail| detail.trim().chars().take(200).collect::<String>())
+                .filter(|detail| !detail.is_empty()),
+        };
+        send_agent_event(&room, AgentOutbound::SurfaceResult(result))
+            .await
+            .map(|_| ())
     }
 
     /// Read the dock-badge mode (Story 10.3, FR-53). Returns the in-memory
@@ -4976,6 +5088,9 @@ impl AccountManager {
             // account produces no further native notifications and no handler (holding
             // a `Client` clone) leaks past teardown.
             handle.client.remove_event_handler(handle.notify_handler);
+            // Stop the account's surface request handler and presence
+            // publisher (91.3); the publisher holds a `Client` clone.
+            drop(handle.agents);
             // Stop the SyncService first so no further diffs are produced, then
             // abort the reconnect supervisor and any remaining producer tasks.
             handle.sync.stop().await;
@@ -5105,12 +5220,15 @@ where
     .collect()
 }
 
-/// Send one of the dock's events ([`AgentOutbound`]: a scope or a request
-/// for a conversation, nothing else) into `room` with `Room::send_raw` —
-/// this file's only `send_raw` — and only into an encrypted room (R30:
+/// Send one of the device's agent events ([`AgentOutbound`]: a scope, a
+/// request for a conversation or a surface result, nothing else) into
+/// `room` with `Room::send_raw` — this file's only `send_raw` — and only into an encrypted room (R30:
 /// every session room is); the event id. These are not messages, so they
 /// are outside AD-13's two dispatch triggers (`send.rs`'s Scope paragraph).
-async fn send_agent_event(room: &Room, event: AgentOutbound) -> Result<String, CoreError> {
+pub(crate) async fn send_agent_event(
+    room: &Room,
+    event: AgentOutbound,
+) -> Result<String, CoreError> {
     if !room.encryption_state().is_encrypted() {
         return Err(CoreError::Unsupported(
             proxy::Refusal::Unencrypted.to_string(),
@@ -5214,6 +5332,7 @@ async fn activate(
     archive: Option<ArchiveHandle>,
     draft_mirror_tx: tokio::sync::broadcast::Sender<DraftMirrorBatch>,
     notify_config: Arc<NotifyConfig>,
+    agent_device: &AgentDevice,
 ) -> Result<ActivatedAccount, CoreError> {
     // Use the blob the caller already holds when there is one; otherwise read it
     // here, once. `None` is the honest answer for the callers that activate an
@@ -5295,6 +5414,10 @@ async fn activate(
     // body is never logged; a notifier failure is swallowed and never blocks sync.
     let notify_handler =
         notify::register_notify_handler(&client, account_id, platform.clone(), notify_config);
+    // The agents' surface request handler (91.3) beside the notify handler,
+    // before sync starts, so a request in the first batch is read; and this
+    // device's presence publisher into the account's control rooms.
+    let agents = agent_device::register(&client, account_id, agent_device);
 
     // Archive-first back-pagination enablement (Story 5.6, FR-17). Subscribe the
     // SDK event cache once here — alongside the archive/redaction handlers and
@@ -5381,6 +5504,7 @@ async fn activate(
         redaction_handler,
         draft_handler,
         notify_handler,
+        agents,
         outbox_scheduler,
         outbox_tx,
     ))
@@ -6910,6 +7034,7 @@ mod tests {
             _redaction_handler,
             _draft_handler,
             _notify_handler,
+            _agents,
             outbox_scheduler,
             _outbox_tx,
         ) = activated;
@@ -6994,6 +7119,7 @@ mod tests {
             None,
             draft_tx.clone(),
             Arc::new(NotifyConfig::new(true)),
+            &AgentDevice::default(),
         )
         .await
         .expect("offline activation succeeds");
@@ -7017,6 +7143,7 @@ mod tests {
             None,
             draft_tx,
             Arc::new(NotifyConfig::new(true)),
+            &AgentDevice::default(),
         )
         .await
         .expect("re-activation succeeds");
@@ -7050,6 +7177,7 @@ mod tests {
             None,
             draft_tx,
             Arc::new(NotifyConfig::new(true)),
+            &AgentDevice::default(),
         )
         .await
         .expect("activation succeeds even when backup exclusion fails");
@@ -7111,6 +7239,7 @@ mod tests {
                 None,
                 draft_tx.clone(),
                 Arc::new(NotifyConfig::new(true)),
+                &AgentDevice::default(),
             )
             .await
             .expect("offline activation succeeds");
@@ -7160,6 +7289,7 @@ mod tests {
             None,
             draft_tx,
             Arc::new(NotifyConfig::new(true)),
+            &AgentDevice::default(),
         )
         .await
         .expect("activation succeeds without a pre-read session");
@@ -7235,6 +7365,7 @@ mod tests {
                 None,
                 draft_tx.clone(),
                 Arc::new(NotifyConfig::new(true)),
+                &AgentDevice::default(),
             )
             .await
             .expect("offline activation succeeds");

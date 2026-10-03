@@ -24,19 +24,23 @@ use std::time::{Duration, Instant};
 
 use keeper_agent::claims::{acquire, Acquired, RoomClaims, Rtt, ServerClock};
 use keeper_core::agents::claim::{Claimant, TTL};
-use keeper_core::agents::events::{CLAIM, CONVERSATION_REQUEST, HOST, SCOPE, STATUS};
+use keeper_core::agents::events::{
+    PresencePlatform, CLAIM, CONVERSATION_REQUEST, HOST, PRESENCE, SCOPE, STATUS, SURFACE_REQUEST,
+    SURFACE_RESULT,
+};
 use keeper_core::agents::host::HostManifest;
 use keeper_core::agents::label::{Integrity, Label, Readers};
 use keeper_core::agents::log::reader::read_session;
 use keeper_core::agents::log::{ClaimAction, LineBody};
 use keeper_core::agents::matrix::{AgentClient, RoomKind};
+use keeper_core::agents::presence::{presence_content, DevicePresence};
 use keeper_core::agents::session::{compose_session_agent_toml, SessionAgent, SessionKind};
 use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId};
 use serde_json::{json, Value};
 
 mod common;
 
-use common::{bare_drive, record, stub, syncing, Smoke};
+use common::{bare_drive, record, stub, syncing, tool_then, Smoke};
 
 const BIN: &str = env!("CARGO_BIN_EXE_keeper-agentd");
 const MAIN: &str = "active/2026-10-03-main";
@@ -182,6 +186,11 @@ fn drive_toml(person: &OwnedUserId) -> String {
 
 /// The two hosts over one drive, signed in, not started.
 async fn pair(smoke: &Smoke, model_url: &str) -> Pair {
+    pair_allowing(smoke, model_url, "\"drive_list\", \"drive_read\"").await
+}
+
+/// [`pair`], Nixi's `[tools].allow` being `allow`.
+async fn pair_allowing(smoke: &Smoke, model_url: &str, allow: &str) -> Pair {
     let root = tempfile::tempdir().expect("tempdir");
     let agent = smoke.user("nixi-smoke");
     let person = smoke.user("tgorka-smoke");
@@ -221,10 +230,14 @@ async fn pair(smoke: &Smoke, model_url: &str) -> Pair {
             (
                 "80-agents/nixi/agent.toml".to_owned(),
                 format!(
-                    "version = 1\nid = \"nixi\"\nname = \"Nixi\"\nkind = \"proxy\"\nmatrix_user = \"{agent}\"\nhuman = \"{person}\"\n\n[model]\nbot = \"bot:openai:{model_url}#stub\"\n\n[tools]\nallow = [\"drive_list\", \"drive_read\"]\ndrives = [\"smoke\", \"elsewhere\"]\n\n[host]\nprefer_always_on = true\n"
+                    "version = 1\nid = \"nixi\"\nname = \"Nixi\"\nkind = \"proxy\"\nmatrix_user = \"{agent}\"\nhuman = \"{person}\"\n\n[model]\nbot = \"bot:openai:{model_url}#stub\"\n\n[tools]\nallow = [{allow}]\ndrives = [\"smoke\", \"elsewhere\"]\n\n[host]\nprefer_always_on = true\n"
                 ),
             ),
             ("80-agents/nixi/SOUL.md".to_owned(), soul.to_owned()),
+            (
+                "notes/a.md".to_owned(),
+                "---\ntitle: A\n---\n# Plans\nfirst\n".to_owned(),
+            ),
             (
                 format!("60-sessions/{MAIN}/agent.toml"),
                 compose_session_agent_toml(&session_agent(&main, &person, false)),
@@ -980,4 +993,108 @@ async fn a_new_conversation_is_made_by_the_claim_holder_only() {
         .expect("and sets its scope");
     pair.electra.terminate();
     pair.hesperia.terminate();
+}
+
+/// 91.3, live: the person's device publishes its presence in the control
+/// room (R37: allowed at 0); Nixi's `surface_open` sends one request naming
+/// that device; a result from anyone but the person — the agent's other
+/// device, the person naming another device — is ignored, and the person's
+/// own releases the turn well inside its 60 s, the `surface` line saying
+/// `done`.
+#[ignore = "live: Synapse on delectra"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surface_request_reaches_the_persons_device_and_its_answer_releases_the_turn() {
+    let smoke = Smoke::from_env();
+    let model = tool_then(
+        "surface_open",
+        json!({"drive": "smoke", "path": "notes/a.md", "heading": "Plans"}),
+        ANSWER,
+    );
+    let mut pair = pair_allowing(&smoke, &model.url, "\"drive_read\", \"surface_open\"").await;
+    let person = smoke.user("tgorka-smoke");
+    pair.electra.start();
+    let main = pair.main.clone();
+    wait_for("electra's claim", Duration::from_secs(120), || {
+        !pair.electra.acquired(&main).is_empty()
+    })
+    .await;
+    sign_own_device(&pair.person, &person, smoke.secret("TGORKA_SMOKE_PASSWORD")).await;
+    let device = pair.person.device_id().expect("a device");
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).expect("now");
+    let state = DevicePresence {
+        platform: PresencePlatform::Macos,
+        focused: true,
+        view: "notes".to_owned(),
+    };
+    pair.person
+        .send_state(
+            &pair.control,
+            PRESENCE,
+            &device,
+            &serde_json::to_value(presence_content(&person, &device, &state, now))
+                .expect("presence"),
+        )
+        .await
+        .expect("a person publishes their presence in the control room");
+    // The host reads presence from its sync's cache.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let seen = Arc::clone(&pair.seen);
+    let (person_client, maker, room) = (pair.person.clone(), pair.maker.clone(), main.clone());
+    let target = device.clone();
+    let answering = tokio::spawn(async move {
+        let request = loop {
+            let found = seen.lock().expect("lock").iter().find_map(|(at, e)| {
+                (e["type"] == SURFACE_REQUEST).then(|| (*at, e["content"].clone()))
+            });
+            if let Some(found) = found {
+                break found;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        let (at, content) = request;
+        assert_eq!(content["device"], target.as_str(), "{content}");
+        assert_eq!(content["tool"], "open");
+        // Body lines: the frontmatter is three, `# Plans` is the first.
+        assert_eq!(content["args"]["range"]["from"], 1, "{content}");
+        let answer = |device: &str, outcome: &str| json!({"v": 1, "request": content["id"], "device": device, "outcome": outcome});
+        maker
+            .send(&room, SURFACE_RESULT, answer(&target, "declined"), None)
+            .await
+            .expect("the agent's other device answers");
+        person_client
+            .send(&room, SURFACE_RESULT, answer("ANOTHER", "declined"), None)
+            .await
+            .expect("a result naming another device");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        person_client
+            .send(&room, SURFACE_RESULT, answer(&target, "done"), None)
+            .await
+            .expect("the device answers");
+        (at, content["id"].as_str().expect("id").to_owned())
+    });
+
+    ask(&pair, "open my plans").await;
+    let answered_at = Instant::now();
+    let (requested_at, id) = answering.await.expect("answered");
+    assert!(
+        answered_at.duration_since(requested_at) < Duration::from_secs(30),
+        "the turn was released by the answer, not the 60 s timeout"
+    );
+    let lines = read_session(&pair.electra.session_dir(MAIN)).lines;
+    let surfaced = lines
+        .iter()
+        .find_map(|line| match &line.body {
+            LineBody::Surface(surface) => Some(surface.clone()),
+            _ => None,
+        })
+        .expect("a surface line");
+    assert_eq!(surfaced.id, id);
+    assert_eq!(surfaced.device, device);
+    assert_eq!(
+        surfaced.outcome.as_deref(),
+        Some("done"),
+        "neither the agent's other device nor another device's result counted"
+    );
+    pair.electra.terminate();
 }

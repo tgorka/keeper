@@ -1009,6 +1009,10 @@ pub fn run() {
                 agents_ipc::agent_scope_set,
                 agents_ipc::agent_focus,
                 agents_ipc::agent_conversation_new,
+                // Story 91.3: surface requests and presence, every target.
+                agents_ipc::agent_surface_subscribe,
+                agents_ipc::agent_surface_result,
+                agents_ipc::agent_presence_view,
                 // Voice (Story 62.4): every target, the port decides.
                 voice_ipc::voice_availability,
                 voice_ipc::voice_start,
@@ -1653,14 +1657,22 @@ pub fn run() {
                 // Losing focus is the weaker version of the same signal, and it is
                 // the one that fires when the user switches app without hiding
                 // anything. `push_on_blur` decides whether it reaches the network.
-                WindowEvent::Focused(false) => notes_vault::flush(),
+                WindowEvent::Focused(false) => {
+                    notes_vault::flush();
+                    // Out of front: this Mac is no longer where an agent's
+                    // surface call goes (AD-383).
+                    agents_ipc::presence_focus(window.app_handle(), false);
+                }
                 // Keeper back in front is one of the things that clear a
                 // refusal to listen for the phrase (Epic 65, AD-190): the
                 // person allowed the microphone in System Settings and came
                 // back. The rule is `keeper_core::voice::should_rearm`; an
                 // armed or switched-off phrase costs one probe and nothing
                 // else, and the probe runs off this thread.
-                WindowEvent::Focused(true) => voice_ipc::voice_rearm(),
+                WindowEvent::Focused(true) => {
+                    voice_ipc::voice_rearm();
+                    agents_ipc::presence_focus(window.app_handle(), true);
+                }
                 // The voice pill sits on the main window's screen (Story
                 // 64.4): a drag onto another display takes it along. Per
                 // compositor frame, but `follow` returns on one lock while
@@ -1845,6 +1857,10 @@ pub fn run() {
             // The desktop's equivalent is the main window's focus, above.
             tauri::RunEvent::Resumed => {
                 voice_ipc::voice_rearm();
+                // The phone in front again is where an agent's surface call
+                // goes (AD-383); the desktop's is the main window's focus.
+                #[cfg(not(desktop))]
+                agents_ipc::presence_focus(app_handle, true);
                 // A Live Activity can be requested only with keeper in
                 // front (Story 65.5): one refused while it was not — the
                 // eight-hour renew, an arm from the port's own resume — is
@@ -1859,6 +1875,17 @@ pub fn run() {
                 #[cfg(not(desktop))]
                 sync::phone_sync_all(app_handle, "foreground");
             }
+            // The phone leaving the front (`applicationWillResignActive`):
+            // its presence stops naming it as the device in front.
+            #[cfg(not(desktop))]
+            tauri::RunEvent::WindowEvent {
+                event: tauri::WindowEvent::Suspended,
+                ..
+            } => agents_ipc::presence_focus(app_handle, false),
+            // keeper opened on the phone is in front; `Resumed` comes only
+            // on a return from the background.
+            #[cfg(not(desktop))]
+            tauri::RunEvent::Ready => agents_ipc::presence_focus(app_handle, true),
             // `RunEvent::Reopen` is an Apple-platform variant (there is no dock on
             // Linux/Windows), so this arm is gated on macOS specifically rather than on
             // `desktop` — the wider gate does not compile on the Linux desktop target.

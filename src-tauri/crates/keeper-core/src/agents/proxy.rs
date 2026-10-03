@@ -26,7 +26,8 @@ use ts_rs::TS;
 use ulid::Ulid;
 
 use crate::agents::events::{
-    ConversationRequestContent, ScopeContent, CONVERSATION_REQUEST, SCOPE,
+    ConversationRequestContent, ScopeContent, SurfaceResultContent, CONVERSATION_REQUEST, SCOPE,
+    SURFACE_RESULT,
 };
 use crate::agents::room::ScopeDriveVm;
 use crate::agents::session::SessionKind;
@@ -197,12 +198,14 @@ pub fn admits<'a>(
 
 /// What the dock may send into a proxy room: a closed set, each with its
 /// fixed event type. A scope (with or without drives, with the focus or
-/// none) and a request for a conversation — never a status, a claim, a turn
-/// or an approval decision, which are the agent's or the reader's own.
+/// none), a request for a conversation, and a surface result for a request
+/// this device was handed (91.3) — never a status, a claim, a turn or an
+/// approval decision, which are the agent's or the reader's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentOutbound {
     Scope(ScopeContent),
     ConversationRequest(ConversationRequestContent),
+    SurfaceResult(SurfaceResultContent),
 }
 
 impl AgentOutbound {
@@ -211,6 +214,7 @@ impl AgentOutbound {
         match self {
             AgentOutbound::Scope(_) => SCOPE,
             AgentOutbound::ConversationRequest(_) => CONVERSATION_REQUEST,
+            AgentOutbound::SurfaceResult(_) => SURFACE_RESULT,
         }
     }
 
@@ -219,6 +223,7 @@ impl AgentOutbound {
         match self {
             AgentOutbound::Scope(content) => serde_json::to_value(content),
             AgentOutbound::ConversationRequest(content) => serde_json::to_value(content),
+            AgentOutbound::SurfaceResult(content) => serde_json::to_value(content),
         }
     }
 }

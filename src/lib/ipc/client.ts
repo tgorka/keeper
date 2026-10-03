@@ -486,6 +486,7 @@ export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
 export type { LabelVm } from "./gen/LabelVm";
 export type { LifecyclePhase } from "./gen/LifecyclePhase";
+export type { LineSpan } from "./gen/LineSpan";
 export type { LoginFieldVm } from "./gen/LoginFieldVm";
 export type { LoginFlowVm } from "./gen/LoginFlowVm";
 export type { MatrixOfferVm } from "./gen/MatrixOfferVm";
@@ -655,6 +656,10 @@ export type { SlidesVm } from "./gen/SlidesVm";
 export type { SlideVm } from "./gen/SlideVm";
 export type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 export type { SpaceVm } from "./gen/SpaceVm";
+export type { SurfaceAnswerReq } from "./gen/SurfaceAnswerReq";
+export type { SurfaceOutcome } from "./gen/SurfaceOutcome";
+export type { SurfaceRequestVm } from "./gen/SurfaceRequestVm";
+export type { SurfaceTool } from "./gen/SurfaceTool";
 export type { SyncActivityVm } from "./gen/SyncActivityVm";
 export type { SyncDeviceVm } from "./gen/SyncDeviceVm";
 export type { SyncFootprintVm } from "./gen/SyncFootprintVm";
@@ -874,6 +879,8 @@ import type { SessionSpaceVm } from "./gen/SessionSpaceVm";
 import type { SessionTemplateEntryVm } from "./gen/SessionTemplateEntryVm";
 import type { SessionTreeVm } from "./gen/SessionTreeVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
+import type { SurfaceAnswerReq } from "./gen/SurfaceAnswerReq";
+import type { SurfaceRequestVm } from "./gen/SurfaceRequestVm";
 import type { SyncActivityVm } from "./gen/SyncActivityVm";
 import type { SyncDeviceVm } from "./gen/SyncDeviceVm";
 import type { SyncFootprintVm } from "./gen/SyncFootprintVm";
@@ -7420,6 +7427,49 @@ export async function agentConversationNew(
   title: string | null,
 ): Promise<string> {
   return await invoke<string>("agent_conversation_new", { accountId, roomId, title });
+}
+
+/**
+ * The surface requests this device executes (91.3, AD-383): every request an
+ * agent's host sends to this device, from now on, with its `target` named by
+ * Rust (a vault note, or a file for the Files preview). `range` counts the
+ * editor buffer's lines (the body, without frontmatter), 1-based, inclusive.
+ * A request whose note this device cannot name is answered `unavailable` by
+ * Rust and never delivered. Answer each with {@link agentSurfaceResult}
+ * before `expiresAtMs`.
+ */
+export async function agentSurfaceSubscribe(
+  onRequest: (request: SurfaceRequestVm) => void,
+): Promise<void> {
+  const channel = new Channel<SurfaceRequestVm>();
+  channel.onmessage = onRequest;
+  await invoke<void>("agent_surface_subscribe", { channel });
+}
+
+/**
+ * Answer the surface request `answer.requestId` that arrived in `roomId`:
+ * `done` (with `applied` for a proposal), `declined`, or `unavailable` (the
+ * buffer no longer holds `expected`, a range past the end). `detail` is a
+ * short sentence, never note text.
+ *
+ * Rejects with: `unsupported` (no such request is waiting on this device —
+ * answered already, or never handed on), `roomNotFound`.
+ */
+export async function agentSurfaceResult(
+  accountId: string,
+  roomId: string,
+  answer: SurfaceAnswerReq,
+): Promise<void> {
+  await invoke<void>("agent_surface_result", { accountId, roomId, answer });
+}
+
+/**
+ * The primary view keeper shows now (`notes`, `chats`, …): a lower-case view
+ * id, published in this device's presence. Rejects with `unsupported` for
+ * anything that is not a view id.
+ */
+export async function agentPresenceView(view: string): Promise<void> {
+  await invoke<void>("agent_presence_view", { view });
 }
 
 // ---------------------------------------------------------------------------
