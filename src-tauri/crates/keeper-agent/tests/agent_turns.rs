@@ -17,20 +17,24 @@ use keeper_agent::agent::{
     arm_agent, trail_of, AgentDeps, AgentProfiles, Arrived, Outcome, Probe, ServedSession,
     SessionRef, Trail, TurnEnding, LOCAL_ONLY_REFUSAL, NARROWER_THAN_ROOM,
 };
+use keeper_agent::claims::{blocked_status, conflict_line, conflict_of, Lease};
 use keeper_agent::host::UNATTENDED_REFUSAL;
 use keeper_agent::matrix_sink::{EditPort, SendFuture, FINAL_CUT_BYTES};
 use keeper_agent::rooms::Arrival;
 use keeper_agent::runtime::Router;
 use keeper_agent::turn::{DrivePorts, TurnEnv};
+use keeper_agent::writer::WriterError;
 use keeper_agent::zone::{read_zone, AgentHome};
 use keeper_core::agents::drive::{self, DriveDecl};
 use keeper_core::agents::events::STATUS;
+use keeper_core::agents::events::{RunState, StatusContent};
 use keeper_core::agents::label::{Integrity, Label, Readers};
 use keeper_core::agents::log::reader::{hydrate_blob, read_session};
 use keeper_core::agents::log::replay::replay;
+use keeper_core::agents::log::writer::{rotate_at, ChunkWriter};
 use keeper_core::agents::log::{
-    AssistantBody, HostSlug, LineBody, LineKind, LogLine, ToolCallBody, ToolOutcomeWord,
-    ToolResultBody, UserBody,
+    AssistantBody, ClaimAction, ClaimBody, HostSlug, LineBody, LineKind, LogLine, ToolCallBody,
+    ToolOutcomeWord, ToolResultBody, UserBody, LINE_VERSION,
 };
 use keeper_core::agents::session::{compose_session_agent_toml, SessionAgent, SessionKind};
 use keeper_core::bots::chat::{self, CancelHandle};
@@ -405,6 +409,15 @@ impl World {
     }
 
     fn open(&self, path: &str) -> ServedSession {
+        self.open_under(path, None).expect("served")
+    }
+
+    /// Open `path` as the holder of `lease`.
+    fn open_under(
+        &self,
+        path: &str,
+        lease: Option<Arc<Lease>>,
+    ) -> Result<ServedSession, keeper_agent::agent::ServeOpenError> {
         let text = std::fs::read_to_string(self.dir(path).join("agent.toml")).expect("agent.toml");
         let agent = keeper_core::agents::session::parse_session_agent_toml(&text).expect("parse");
         ServedSession::open(
@@ -415,10 +428,8 @@ impl World {
                 path: path.to_owned(),
             },
             agent,
-            0,
-            None,
+            lease,
         )
-        .expect("served")
     }
 
     fn arrived(&mut self, sender: &str, text: &str) -> Arrived {
@@ -782,6 +793,7 @@ async fn a_message_sent_before_the_worker_exists_is_still_answered() {
             Vec::new(),
             &mut arrivals,
             signal,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -843,6 +855,7 @@ async fn a_queued_arrival_is_not_started_on_shutdown() {
             Vec::new(),
             &mut arrivals,
             signal,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
     assert!(world.lines(SESSION).is_empty());
@@ -1282,4 +1295,234 @@ fn lines_written_in_one_millisecond_keep_their_order() {
         })
         .collect();
     assert_eq!(texts, (0..50).map(|n| n.to_string()).collect::<Vec<_>>());
+}
+
+// ---------------------------------------------------------------------------
+// Claims (story 90.6)
+// ---------------------------------------------------------------------------
+
+fn lease(epoch: u64, event: &str) -> Arc<Lease> {
+    Arc::new(Lease::new(
+        epoch,
+        OwnedEventId::try_from(event).expect("event"),
+        1_790_000_000_000,
+        None,
+        keeper_agent::claims::Moment::now(),
+    ))
+}
+
+/// A line `host` writes straight into its chunk, past any lease.
+fn forced(dir: &Path, host: &str, epoch: u64, claim: &str, body: LineBody) {
+    let mut chunks = ChunkWriter::open(
+        dir,
+        &HostSlug::new(host).expect("slug"),
+        rotate_at(1 << 20),
+        chrono::Utc::now().date_naive(),
+    )
+    .expect("chunk");
+    let now = chrono::Utc::now();
+    chunks
+        .append(&LogLine {
+            v: LINE_VERSION,
+            id: ulid::Ulid::new(),
+            parent: None,
+            ts: chrono::DateTime::from_timestamp_millis(now.timestamp_millis()).expect("ts"),
+            host: HostSlug::new(host).expect("slug"),
+            epoch,
+            claim: Some(claim.to_owned()),
+            matrix_event: None,
+            body,
+        })
+        .expect("append");
+    std::thread::sleep(Duration::from_millis(3));
+}
+
+fn acquired(epoch: u64, event: &str) -> LineBody {
+    LineBody::Claim(ClaimBody {
+        epoch,
+        action: ClaimAction::Acquired,
+        from_host: None,
+        claim_event: event.to_owned(),
+        server_ts: "2026-10-03T12:00:00.000Z".to_owned(),
+    })
+}
+
+/// S-05: every line a holder writes names the epoch and the claim event it
+/// confirmed, its `claim acquired` line first.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_line_carries_the_claims_epoch_and_event() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("hello.")]);
+    let held = lease(3, "$claim3:example.org");
+    let mut served = world
+        .open_under(SESSION, Some(Arc::clone(&held)))
+        .expect("served");
+    served
+        .writer
+        .write_claim(
+            &mut served.context,
+            held.line(ClaimAction::Acquired, Some("hesperia".to_owned())),
+        )
+        .expect("claim line");
+    report(world.ask(&mut served, "hi").await);
+
+    let lines = world.lines(SESSION);
+    assert!(lines.len() >= 4, "{lines:?}");
+    match &lines[0].body {
+        LineBody::Claim(body) => {
+            assert_eq!(body.action, ClaimAction::Acquired);
+            assert_eq!(body.claim_event, "$claim3:example.org");
+            assert_eq!(body.from_host.as_deref(), Some("hesperia"));
+            assert_eq!(body.server_ts, "2026-09-21T14:13:20.000Z");
+        }
+        other => panic!("the first line is the claim: {other:?}"),
+    }
+    for line in &lines {
+        assert_eq!(line.epoch, 3, "{line:?}");
+        assert_eq!(
+            line.claim.as_deref(),
+            Some("$claim3:example.org"),
+            "{line:?}"
+        );
+    }
+}
+
+/// NFR-120 and the fence: a holder whose claim is lost writes nothing more,
+/// and a line forced into its chunk after the taker's `acquired` is dropped
+/// by every reader — the log reader, replay, and the taker's context.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_claims_late_line_is_dropped_by_every_reader() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("hello.")]);
+    let electra = lease(1, "$e1:example.org");
+    let mut served = world
+        .open_under(SESSION, Some(Arc::clone(&electra)))
+        .expect("served");
+    served
+        .writer
+        .write_claim(
+            &mut served.context,
+            electra.line(ClaimAction::Acquired, None),
+        )
+        .expect("claim line");
+    report(world.ask(&mut served, "before").await);
+
+    // hesperia takes the session over at epoch 2.
+    std::thread::sleep(Duration::from_millis(3));
+    forced(
+        &world.dir(SESSION),
+        "hesperia",
+        2,
+        "$h2:example.org",
+        acquired(2, "$h2:example.org"),
+    );
+
+    electra.lose();
+    let refused = served.writer.write(
+        &mut served.context,
+        None,
+        None,
+        LineBody::User(UserBody {
+            sender: user(TGORKA),
+            text: "refused".to_owned(),
+            attachments: Vec::new(),
+        }),
+    );
+    assert!(matches!(refused, Err(WriterError::NoClaim)), "{refused:?}");
+    // The `lost` line is still written: the fence never drops a transition.
+    served
+        .writer
+        .write_claim(&mut served.context, electra.line(ClaimAction::Lost, None))
+        .expect("lost line");
+
+    // A stale writer that ignores its lease.
+    forced(
+        &world.dir(SESSION),
+        "electra",
+        1,
+        "$e1:example.org",
+        LineBody::User(UserBody {
+            sender: user(TGORKA),
+            text: "LATE".to_owned(),
+            attachments: Vec::new(),
+        }),
+    );
+
+    let log = read_session(&world.dir(SESSION));
+    assert!(log
+        .lines
+        .iter()
+        .all(|line| !format!("{line:?}").contains("LATE")));
+    assert!(log
+        .problems
+        .iter()
+        .any(|p| p.sentence.contains("newer epoch")));
+    assert!(
+        log.lines
+            .iter()
+            .any(|line| matches!(&line.body, LineBody::Claim(c) if c.action == ClaimAction::Lost)),
+        "the lost line stays"
+    );
+    let dir = world.dir(SESSION);
+    let replayed = replay(&log, &|sha| hydrate_blob(&dir, sha)).expect("replay");
+    assert!(!messages_text(&replayed.messages).contains("LATE"));
+    let taker = world
+        .open_under(SESSION, Some(lease(2, "$h2:example.org")))
+        .expect("taker");
+    assert!(!messages_text(&taker.context.messages).contains("LATE"));
+    assert!(messages_text(&taker.context.messages).contains("before"));
+}
+
+/// S-05: two `acquired` lines at one epoch with different claim events.
+/// No host loads the session; its status is parked once with the sentence;
+/// `status` names both events.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conflicted_session_is_served_by_no_host() {
+    let world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("never.")]);
+    let dir = world.dir(SESSION);
+    forced(
+        &dir,
+        "electra",
+        2,
+        "$a:example.org",
+        acquired(2, "$a:example.org"),
+    );
+    forced(
+        &dir,
+        "hesperia",
+        2,
+        "$b:example.org",
+        acquired(2, "$b:example.org"),
+    );
+
+    let refused = world.open_under(SESSION, Some(lease(3, "$c:example.org")));
+    assert!(
+        matches!(refused, Err(keeper_agent::agent::ServeOpenError::Load(_))),
+        "no context is loaded"
+    );
+    let conflict = conflict_of(&dir).expect("conflicted");
+    assert_eq!(conflict.epoch, 2);
+    assert_eq!(
+        conflict_line(&conflict),
+        "conflicted at epoch 2: claim events $a:example.org and $b:example.org"
+    );
+    let base = StatusContent {
+        v: 1,
+        session: "60-sessions/active/2026-10-02-chat".to_owned(),
+        kind: SessionKind::Conversation,
+        title: "chat".to_owned(),
+        agent: user("@nixi:example.org"),
+        host: "electra".to_owned(),
+        epoch: 0,
+        run: RunState::Running,
+        detail: None,
+        waiting: None,
+        anchor: None,
+    };
+    let parked = blocked_status(base, &conflict);
+    assert_eq!(parked.run, RunState::Blocked);
+    assert_eq!(parked.epoch, 2);
+    assert_eq!(
+        parked.detail.as_deref(),
+        Some("Two hosts wrote this session at once (epoch 2). It waits for you.")
+    );
+    assert!(world.stub.requests().is_empty(), "no message was answered");
 }

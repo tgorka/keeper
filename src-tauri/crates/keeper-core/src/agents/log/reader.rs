@@ -51,8 +51,24 @@ pub struct SessionLog {
     pub chunks: Vec<ChunkInfo>,
     /// What was skipped, and why.
     pub problems: Vec<LogProblem>,
-    /// Two hosts acquired the same epoch with different claim events.
-    pub conflicted: bool,
+    /// Every epoch two hosts acquired with different claim events.
+    pub conflicts: Vec<ClaimConflict>,
+}
+
+/// Two `acquired` lines at one epoch with different claim events: two hosts
+/// both believed they held the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimConflict {
+    pub epoch: u64,
+    /// The first claim event acquired at that epoch, then the other.
+    pub events: [String; 2],
+}
+
+impl SessionLog {
+    /// Whether two hosts wrote the session at one epoch: replay refuses it.
+    pub fn conflicted(&self) -> bool {
+        !self.conflicts.is_empty()
+    }
 }
 
 /// Read every chunk of `session_dir/log/`.
@@ -188,7 +204,15 @@ fn fence(log: &mut SessionLog, lines: Vec<Placed>) {
                 acquired.insert(claim.epoch, (line.ts, claim.claim_event.clone()));
             }
             Some((_, event)) if *event != claim.claim_event => {
-                log.conflicted = true;
+                let conflict = ClaimConflict {
+                    epoch: claim.epoch,
+                    events: [event.clone(), claim.claim_event.clone()],
+                };
+                // The same second claim logged twice is one conflict.
+                if log.conflicts.contains(&conflict) {
+                    continue;
+                }
+                log.conflicts.push(conflict);
                 log.problems.push(LogProblem {
                     chunk: format!("{LOG_DIR}/"),
                     line: None,

@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use keeper_agent::agent::{arm_agent, Probe, SessionContext, SessionRef};
+use keeper_agent::claims::{conflict_line, conflict_of};
 use keeper_agent::headless::{HeadlessPlatform, SecretMap};
 use keeper_agent::runtime::{agent_deps, inspect, Inspection, STATUS_FILE};
 use keeper_agent::zone::{skills_of, AgentHome};
@@ -73,6 +74,16 @@ pub fn agents_list(host: &Host) -> Result<(), CliError> {
                     }
                     if served {
                         println!("    {}", copy_line(&secrets, home));
+                    }
+                    for found in drive.sessions.iter().filter(|found| {
+                        found
+                            .agent
+                            .as_ref()
+                            .is_ok_and(|agent| agent.agent == *folder)
+                    }) {
+                        if let Some(conflict) = conflict_of(&found.dir) {
+                            println!("    session {}: {}", found.path, conflict_line(&conflict));
+                        }
                     }
                 }
                 Err(sentence) => println!("  {folder}: refused. {sentence}"),
@@ -170,8 +181,22 @@ pub fn status(host: &Host, session: Option<&str>, probe: bool) -> Result<(), Cli
             if agent.agent != home.config.id {
                 continue;
             }
-            let state = if listed("sessions", &found.path).is_some() {
-                "served".to_owned()
+            let claim = live
+                .as_ref()
+                .and_then(|status| status["claims"].as_array())
+                .and_then(|claims| claims.iter().find(|c| c["room"] == agent.room.as_str()))
+                .map(|c| {
+                    format!(
+                        ", claim epoch {} ({})",
+                        c["epoch"],
+                        c["claim_event"].as_str().unwrap_or("?")
+                    )
+                })
+                .unwrap_or_default();
+            let state = if let Some(conflict) = conflict_of(&found.dir) {
+                conflict_line(&conflict)
+            } else if listed("sessions", &found.path).is_some() {
+                format!("served{claim}")
             } else if let Some(entry) = listed("unserved", &found.path) {
                 format!(
                     "not served: {} names the same room",
@@ -180,7 +205,7 @@ pub fn status(host: &Host, session: Option<&str>, probe: bool) -> Result<(), Cli
                         .unwrap_or("another session")
                 )
             } else {
-                "not served now".to_owned()
+                "not served here now".to_owned()
             };
             println!(
                 "  session {} ({}): {state}",

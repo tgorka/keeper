@@ -436,3 +436,55 @@ fn study_preview_neither_exposes_identity_nor_activates_egress() {
         .installation_id
         .is_none());
 }
+
+/// Every operation this module can export, by the name it is exported under.
+/// No wildcard: an operation added to the module stops this file compiling
+/// until its author says here what it carries — the closed set is the whole
+/// of what can leave (ruling D4).
+fn exported_name(operation: Operation) -> &'static str {
+    match operation {
+        Operation::Frontend(kind) => match kind {
+            TelemetryEventKind::AppReady => "keeper_app_ready",
+            TelemetryEventKind::CommandPaletteOpened => "keeper_command_palette_opened",
+            TelemetryEventKind::SettingsOpened => "keeper_settings_opened",
+            TelemetryEventKind::FrontendError => "keeper_frontend_error",
+            TelemetryEventKind::Interaction => "keeper_interaction",
+        },
+        Operation::RemoteConfig => "keeper.remote_config",
+        Operation::FlagsRequest => "keeper.flags_request",
+    }
+}
+
+/// S-19, NFR-121: an agent host's records never reach the export queue. The
+/// module installs no `tracing` subscriber and builds every record itself
+/// from a closed set, so records under `keeper_agent::…` and
+/// `keeper_core::agents::…` — spans, tool arguments, paths, provider errors —
+/// have no way in, while an ordinary record beside them is queued.
+#[test]
+fn agent_host_records_are_never_exported() {
+    let local = LocalDir::new();
+    let telemetry = Telemetry::open(Some(&local.0), Some(config()));
+    telemetry
+        .set_consent(TelemetryConsentVm {
+            diagnostics: true,
+            product_analytics: true,
+            remote_config: true,
+        })
+        .expect("consent");
+    tracing::error!(target: "keeper_agent::runtime", path = "60-sessions/active/plan", "agentd: a turn could not be served");
+    tracing::error!(target: "keeper_core::agents::matrix", error = "PRIVATE_SENTINEL", "a provider error");
+    telemetry
+        .capture(event(TelemetryEventKind::Interaction))
+        .expect("ordinary");
+    let inner = telemetry.inner.lock().expect("state");
+    let names: Vec<&str> = inner
+        .queue
+        .iter()
+        .map(|record| {
+            let name = exported_name(record.operation);
+            assert_eq!(name, record.operation.name());
+            name
+        })
+        .collect();
+    assert_eq!(names, ["keeper_interaction"]);
+}

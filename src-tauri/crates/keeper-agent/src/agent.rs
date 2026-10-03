@@ -26,6 +26,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, FixedOffset};
@@ -67,6 +68,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use ulid::Ulid;
 
+use crate::claims::Lease;
 use crate::drive::finish_word;
 use crate::grants::AgentGrants;
 use crate::host::HostIds;
@@ -192,7 +194,7 @@ impl SessionContext {
         opened_at: DateTime<FixedOffset>,
     ) -> Result<SessionContext, LoadRefusal> {
         let log = read_session(dir);
-        if log.conflicted {
+        if log.conflicted() {
             return Err(ReplayRefusal::Conflicted.into());
         }
         let frozen = Frozen::read(home)?;
@@ -601,23 +603,25 @@ fn off_the_runtime<T>(work: impl FnOnce() -> T) -> T {
 }
 
 impl ServedSession {
-    /// Open a served session: its writer, then its context.
+    /// Open a served session under `lease` (none before claims): its
+    /// writer, then its context.
     pub fn open(
         deps: &AgentDeps,
         dir: &Path,
         session: SessionRef,
         agent: SessionAgent,
-        epoch: u64,
-        claim: Option<String>,
+        lease: Option<Arc<Lease>>,
     ) -> Result<ServedSession, ServeOpenError> {
+        let (epoch, claim) = lease.as_ref().map_or((0, None), |lease| {
+            (lease.epoch, Some(lease.claim_event.to_string()))
+        });
         let writer = SessionWriter::open(
             &deps.sessions_zone,
             &session.path,
             &agent,
             &deps.host,
             deps.lfs_threshold_bytes,
-            epoch,
-            claim.clone(),
+            lease,
         )?;
         let context = SessionContext::load(
             &deps.home,
@@ -701,6 +705,7 @@ impl ServedSession {
         backlog: Vec<Arrived>,
         arrivals: &mut mpsc::UnboundedReceiver<Arrived>,
         mut stop: CancelSignal,
+        busy: &AtomicBool,
     ) {
         let mut backlog = backlog.into_iter();
         loop {
@@ -719,10 +724,12 @@ impl ServedSession {
                 },
             };
             let session = self.context.session.path.clone();
-            match self
+            busy.store(true, Ordering::Relaxed);
+            let outcome = self
                 .serve(deps, Arc::clone(&port), arrived, stop.clone())
-                .await
-            {
+                .await;
+            busy.store(false, Ordering::Relaxed);
+            match outcome {
                 Ok(Outcome::Answered(report)) => tracing::info!(
                     %session,
                     anchor_ms = report.anchor_at.duration_since(report.received_at).as_millis() as u64,

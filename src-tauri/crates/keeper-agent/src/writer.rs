@@ -8,6 +8,7 @@
 //! so the context in memory always equals a fresh replay of the files.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use keeper_core::agents::index::{Index, IndexError};
@@ -18,6 +19,7 @@ use matrix_sdk::ruma::{EventId, OwnedEventId};
 use ulid::Ulid;
 
 use crate::agent::SessionContext;
+use crate::claims::Lease;
 
 /// Why a line could not be written.
 #[derive(Debug, thiserror::Error)]
@@ -26,6 +28,10 @@ pub enum WriterError {
     Log(#[from] LogError),
     #[error(transparent)]
     Index(#[from] IndexError),
+    /// The claim this writer wrote under is lost, or unconfirmed for too
+    /// long (NFR-120): another host may hold the session now.
+    #[error("this host no longer holds the session's claim, so it writes nothing more")]
+    NoClaim,
 }
 
 /// The writer of one session's log on this host.
@@ -35,25 +41,25 @@ pub struct SessionWriter {
     host: HostSlug,
     /// Zone-relative: the index's key.
     session: String,
-    epoch: u64,
-    claim: Option<String>,
+    /// The claim every line is written under; `None` before claims (epoch 0).
+    lease: Option<Arc<Lease>>,
     ids: ulid::Generator,
     last_ts: DateTime<Utc>,
 }
 
 impl SessionWriter {
     /// Open the writer of `session` (zone-relative) in the sessions zone at
-    /// `zone`, as `host`, at `epoch` under `claim` (epoch 0 and no claim
-    /// before claims exist, C5). The session is added to the index if it is
-    /// not there yet.
+    /// `zone`, as `host`, under `lease`: every line carries its epoch and
+    /// claim event, and nothing is written once it may not write (epoch 0
+    /// and no claim without one, C5). The session is added to the index if
+    /// it is not there yet.
     pub fn open(
         zone: &Path,
         session: &str,
         agent: &SessionAgent,
         host: &HostSlug,
         lfs_threshold_bytes: u64,
-        epoch: u64,
-        claim: Option<String>,
+        lease: Option<Arc<Lease>>,
     ) -> Result<SessionWriter, WriterError> {
         let mut index = Index::open(zone)?;
         if index.session(session)?.is_none() {
@@ -71,8 +77,7 @@ impl SessionWriter {
             index,
             host: host.clone(),
             session: session.to_owned(),
-            epoch,
-            claim,
+            lease,
             ids: ulid::Generator::new(),
             last_ts: DateTime::<Utc>::MIN_UTC,
         })
@@ -90,6 +95,13 @@ impl SessionWriter {
         let now = Utc::now();
         let now = DateTime::from_timestamp_millis(now.timestamp_millis()).unwrap_or(now);
         now.max(self.last_ts)
+    }
+
+    /// The lease's epoch and claim event, as a line carries them.
+    fn fence_key(&self) -> (u64, Option<String>) {
+        self.lease.as_ref().map_or((0, None), |lease| {
+            (lease.epoch, Some(lease.claim_event.to_string()))
+        })
     }
 
     /// Write one line and push it into `context`.
@@ -117,6 +129,33 @@ impl SessionWriter {
         matrix_event: Option<OwnedEventId>,
         body: LineBody,
     ) -> Result<LogLine, WriterError> {
+        if self.lease.as_ref().is_some_and(|lease| !lease.may_write()) {
+            return Err(WriterError::NoClaim);
+        }
+        self.append(context, ts, parent, matrix_event, body)
+    }
+
+    /// Write a `claim` line whatever the lease says: a holder that lost its
+    /// claim still records that it noticed (the fence never drops a claim
+    /// transition).
+    pub fn write_claim(
+        &mut self,
+        context: &mut SessionContext,
+        body: keeper_core::agents::log::ClaimBody,
+    ) -> Result<LogLine, WriterError> {
+        let ts = self.next_ts();
+        self.append(context, ts, None, None, LineBody::Claim(body))
+    }
+
+    fn append(
+        &mut self,
+        context: &mut SessionContext,
+        ts: DateTime<Utc>,
+        parent: Option<Ulid>,
+        matrix_event: Option<OwnedEventId>,
+        body: LineBody,
+    ) -> Result<LogLine, WriterError> {
+        let (epoch, claim) = self.fence_key();
         let ts = ts.max(self.last_ts);
         self.last_ts = ts;
         let id = self.ids.generate().unwrap_or_else(|_| Ulid::new());
@@ -126,8 +165,8 @@ impl SessionWriter {
             parent,
             ts,
             host: self.host.clone(),
-            epoch: self.epoch,
-            claim: self.claim.clone(),
+            epoch,
+            claim,
             matrix_event,
             body,
         };

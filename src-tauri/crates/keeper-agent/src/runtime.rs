@@ -35,15 +35,16 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use keeper_core::agents::agentd::{AgentdConfig, DrivePin};
 use keeper_core::agents::drive::{self, DriveDecl};
-use keeper_core::agents::events::APPROVAL_DECISION;
+use keeper_core::agents::events::{APPROVAL_DECISION, TURN};
 use keeper_core::agents::index::Index;
 use keeper_core::agents::label::{Label, Readers};
-use keeper_core::agents::log::HostSlug;
+use keeper_core::agents::log::{ClaimAction, HostSlug};
 use keeper_core::agents::matrix::{self, AgentClient};
 use keeper_core::agents::mount;
 use keeper_core::agents::session::SessionAgent;
@@ -59,7 +60,7 @@ use matrix_sdk::ruma::events::room::member::{MembershipState, StrippedRoomMember
 use matrix_sdk::ruma::events::AnySyncTimelineEvent;
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId};
-use matrix_sdk::{Room, RoomState};
+use matrix_sdk::{LoopCtrl, Room, RoomState};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -68,10 +69,12 @@ use tokio::time::Instant;
 use crate::agent::{
     bot_for, trail_of, AgentDeps, AgentProfiles, Arrived, ServedSession, SessionRef,
 };
+use crate::claims::Lease;
 use crate::headless::{
     apply_providers, drive_path, open_engine, zone_verdicts, HeadlessError, HeadlessPlatform,
     HeadlessSyncPlatform, SecretMap,
 };
+use crate::hosts::HostRuntime;
 use crate::matrix_sink::{EditPort, RoomPort};
 use crate::rooms::{self, Arrival, Invite, InviteDecision, Known, KnownAgent};
 use crate::turn::{DrivePorts, TurnEnv};
@@ -457,6 +460,17 @@ impl Router {
     pub fn close(&self) {
         self.routes().workers.clear();
     }
+
+    /// Drop what was kept for `room`: another host holds its claim and
+    /// answers it (story 90.6).
+    pub fn forget(&self, room: &RoomId) {
+        self.routes().pending.remove(room);
+    }
+
+    /// Close `room`'s worker channel: its claim ended (story 90.6).
+    pub fn close_room(&self, room: &RoomId) {
+        self.routes().workers.remove(room);
+    }
 }
 
 /// Frees a worker's room when the worker ends, a panic included.
@@ -472,12 +486,25 @@ impl Drop for Detach {
 }
 
 /// One hosted agent's copy on this host while it runs.
-struct Copy {
-    deps: Arc<AgentDeps>,
-    client: AgentClient,
+pub(crate) struct Copy {
+    pub(crate) deps: Arc<AgentDeps>,
+    pub(crate) client: AgentClient,
     /// Read again with every scan, so a home that arrives by sync counts.
     known: Arc<RwLock<Arc<Known>>>,
-    router: Arc<Router>,
+    pub(crate) router: Arc<Router>,
+    /// Counts the copy's completed `/sync` rounds: a taker's settle waits one.
+    pub(crate) syncs: watch::Receiver<u64>,
+}
+
+/// The claim a worker writes under (story 90.6).
+pub(crate) struct Claimed {
+    pub(crate) lease: Arc<Lease>,
+    /// The host the claim was taken from.
+    pub(crate) from_host: Option<String>,
+    /// The `claim` line the worker writes when it stops.
+    pub(crate) ending: Arc<Mutex<ClaimAction>>,
+    /// Set while a turn runs: a hand-back waits for it to clear.
+    pub(crate) busy: Arc<AtomicBool>,
 }
 
 /// How the engine's supervisor ended.
@@ -635,7 +662,6 @@ pub async fn run(
     let (stop_turns, stop_signal) = chat::cancellation();
     let mut copies: Vec<Arc<Copy>> = Vec::new();
     let mut syncs: Vec<JoinHandle<()>> = Vec::new();
-    let mut workers: Vec<JoinHandle<()>> = Vec::new();
     for home in hosted.iter() {
         let user = home.config.matrix_user.clone();
         let client = match restore_copy(&config, &platform, &dirs.data, &user).await {
@@ -656,21 +682,38 @@ pub async fn run(
                 continue;
             }
         };
+        let (rounds, rounds_seen) = watch::channel(0u64);
         let copy = Arc::new(Copy {
             deps,
             client,
             known: Arc::clone(&known),
             router: Arc::new(Router::default()),
+            syncs: rounds_seen,
         });
         register_handlers(&copy);
         let sync_client = copy.client.client().clone();
         syncs.push(tokio::spawn(async move {
-            if let Err(error) = sync_client.sync(matrix::sync_settings()).await {
+            let rounds = &rounds;
+            let synced = sync_client
+                .sync_with_callback(matrix::sync_settings(), |_| async move {
+                    rounds.send_modify(|count| *count += 1);
+                    LoopCtrl::Continue
+                })
+                .await;
+            if let Err(error) = synced {
                 tracing::error!(%error, "agentd: a copy's sync loop ended");
             }
         }));
         copies.push(copy);
     }
+
+    let mut hosts = HostRuntime::agentd(
+        &config,
+        host.clone(),
+        env!("CARGO_PKG_VERSION"),
+        &drives,
+        copies.clone(),
+    );
 
     let (engine_stop, engine_shutdown) = watch::channel(false);
     let engine = Arc::clone(&agentd.engine);
@@ -724,10 +767,10 @@ pub async fn run(
                     served,
                     shadowed: lost,
                 } = sessions_of(copy, &home_drive.sessions);
+                // Each served session is placed and claimed by the host
+                // runtime; only the claim's holder starts a worker.
                 for (session, agent) in served {
-                    if let Some(worker) = spawn_worker(copy, session, agent, &stop_signal) {
-                        workers.push(worker);
-                    }
+                    hosts.offer(copy, session, agent);
                 }
                 for (session, winner) in lost {
                     if reported.insert(session.path.clone()) {
@@ -739,23 +782,16 @@ pub async fn run(
                     ));
                 }
             }
-            workers.retain(|worker| !worker.is_finished());
+            // A session the rescan no longer finds is handed back.
+            hosts.scanned();
         }
-        status.publish(&config, &agentd.engine, &copies, &shadowed);
+        hosts.tick(&stop_signal).await;
+        status.publish(&config, &agentd.engine, &copies, &shadowed, &hosts);
     }
 
     tracing::info!("agentd: stopping; running turns get their final edits");
     stop_turns.cancel();
-    for copy in &copies {
-        copy.router.close();
-    }
-    let finish = futures_join(workers);
-    if tokio::time::timeout(TURNS_FINISH, finish).await.is_err() {
-        tracing::warn!("agentd: a turn did not finish within the bound");
-    }
-    for sync in syncs {
-        sync.abort();
-    }
+    hosts.stop_workers(TURNS_FINISH).await;
     agentd.engine.request_stop();
     let _ = engine_stop.send(true);
     let finalize = match tokio::time::timeout(GRACEFUL_FINALIZE, &mut supervisor).await {
@@ -766,23 +802,23 @@ pub async fn run(
             Finalize::TimedOut
         }
     };
+    // The log is pushed: now another host may take the sessions (AD-378).
+    hosts.release_all().await;
+    for sync in syncs {
+        sync.abort();
+    }
     finalized(finalize, stopped_by_itself)
 }
 
-async fn futures_join(handles: Vec<JoinHandle<()>>) {
-    for handle in handles {
-        let _ = handle.await;
-    }
-}
-
-/// Start serving `session` when the copy has joined its room and no worker
-/// serves it yet. Joining is the invite rule's alone (F5): any reader of the
-/// home drive can write a session file naming any room.
-fn spawn_worker(
+/// Start serving `session` under `claimed` when the copy has joined its room
+/// and no worker serves it yet. Joining is the invite rule's alone (F5): any
+/// reader of the home drive can write a session file naming any room.
+pub(crate) fn spawn_worker(
     copy: &Arc<Copy>,
     session: &FoundSession,
     agent: &SessionAgent,
     stop: &CancelSignal,
+    claimed: Claimed,
 ) -> Option<JoinHandle<()>> {
     let joined = copy
         .client
@@ -799,7 +835,7 @@ fn spawn_worker(
     copy.router.spawn(
         &agent.room.clone(),
         &session.path.clone(),
-        move |arrivals| serve_session(worker, session, agent, arrivals, stop),
+        move |arrivals| serve_session(worker, session, agent, arrivals, stop, claimed),
     )
 }
 
@@ -809,6 +845,7 @@ async fn serve_session(
     agent: SessionAgent,
     mut arrivals: mpsc::UnboundedReceiver<Arrived>,
     stop: CancelSignal,
+    claimed: Claimed,
 ) {
     let room_id = agent.room.clone();
     let Some(room) = copy.client.client().get_room(&room_id) else {
@@ -819,8 +856,10 @@ async fn serve_session(
         path: session.path.clone(),
     };
     let (deps, dir) = (Arc::clone(&copy.deps), session.dir.clone());
+    let lease = Arc::clone(&claimed.lease);
+    let held = Some(Arc::clone(&lease));
     let opened = tokio::task::spawn_blocking(move || {
-        ServedSession::open(&deps, &dir, reference, agent, 0, None)
+        ServedSession::open(&deps, &dir, reference, agent, held)
     })
     .await;
     let mut served = match opened {
@@ -834,10 +873,24 @@ async fn serve_session(
             return;
         }
     };
+    // The first line under a claim says so, with its event and server time.
+    let acquired = lease.line(ClaimAction::Acquired, claimed.from_host.clone());
+    if let Err(error) = served
+        .writer
+        .write_claim(&mut served.context, acquired)
+        .and_then(|_| served.writer.sync())
+    {
+        tracing::error!(session = %session.path, %error, "agentd: the claim line could not be written");
+        return;
+    }
     let deps = &copy.deps;
     let me = &deps.home.config.matrix_user;
     let port: Arc<dyn EditPort> = Arc::new(RoomPort::new(copy.client.clone(), room_id));
-    let (events, backlog) = read_back(&room, &mut served, me).await;
+    let (events, mut backlog) = read_back(&room, &mut served, me).await;
+    // A taker's log may not hold the last holder's lines yet: what another
+    // copy of this agent already answered is not asked again.
+    let answered = answered_by(&events, me);
+    backlog.retain(|arrived| !answered.contains(arrived.event_id.as_str()));
     let trail = trail_of(&events, me, served.context.unanswered);
     match served.recover(deps, port.as_ref(), &trail).await {
         Ok(true) => {
@@ -849,8 +902,16 @@ async fn serve_session(
         }
     }
     served
-        .serve_arrivals(deps, port, backlog, &mut arrivals, stop)
+        .serve_arrivals(deps, port, backlog, &mut arrivals, stop, &claimed.busy)
         .await;
+    let ending = *claimed.ending.lock().unwrap_or_else(|p| p.into_inner());
+    if let Err(error) = served
+        .writer
+        .write_claim(&mut served.context, lease.line(ending, None))
+        .and_then(|_| served.writer.sync())
+    {
+        tracing::warn!(session = %session.path, %error, "agentd: the claim's last line could not be written");
+    }
 }
 
 /// `room`'s timeline after the newest event `served`'s log has seen, oldest
@@ -902,6 +963,56 @@ async fn read_back(
         unseen.into_iter().map(|(value, _)| value).collect(),
         arrivals,
     )
+}
+
+/// The anchor of the latest status `me` sent in `room`, read newest page
+/// first: the anchor a host edits rather than posting a second one.
+pub(crate) async fn latest_status(room: &Room, me: &UserId) -> Option<OwnedEventId> {
+    let mut from: Option<String> = None;
+    for _ in 0..BACKLOG_PAGES {
+        let mut options = MessagesOptions::backward().from(from.as_deref());
+        options.limit = UInt::from(BACKLOG_PAGE);
+        let page = room.messages(options).await.ok()?;
+        let mut events: Vec<Value> = page
+            .chunk
+            .iter()
+            .filter_map(|event| event.raw().deserialize_as::<Value>().ok())
+            .collect();
+        events.reverse();
+        if let Some((anchor, _)) = trail_of(&events, me, None).status {
+            return Some(anchor);
+        }
+        match page.end {
+            Some(end) if !page.chunk.is_empty() => from = Some(end),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The questions among `events` (oldest first) that a copy of `me` already
+/// started answering. A room's turns run in order, so each answer's anchor
+/// `me` sent answers the oldest question before it no anchor answered yet.
+fn answered_by(events: &[Value], me: &UserId) -> HashSet<String> {
+    let mut open: VecDeque<&str> = VecDeque::new();
+    let mut answered = HashSet::new();
+    for event in events {
+        if event["sender"] == me.as_str() {
+            if event["content"][TURN].is_object() {
+                if let Some(question) = open.pop_front() {
+                    answered.insert(question.to_owned());
+                }
+            }
+            continue;
+        }
+        let edit = event["content"]["m.relates_to"]["rel_type"] == "m.replace";
+        if event["type"] == "m.room.message" && !edit {
+            if let Some(id) = event["event_id"].as_str() {
+                open.push_back(id);
+            }
+        }
+    }
+    answered
 }
 
 /// The copy's invite and timeline handlers.
@@ -1038,6 +1149,7 @@ impl StatusFile {
         engine: &keeper_sync::engine::Engine,
         copies: &[Arc<Copy>],
         shadowed: &[(String, Value)],
+        hosts: &HostRuntime,
     ) {
         let drives: Vec<Value> = match engine.statuses() {
             Ok(statuses) => statuses
@@ -1081,6 +1193,7 @@ impl StatusFile {
             "host": config.host,
             "drives": drives,
             "copies": copies,
+            "claims": hosts.held(),
         });
         let body = status.to_string();
         let fresh = self
@@ -1108,6 +1221,35 @@ mod tests {
     use matrix_sdk::deserialized_responses::AlgorithmInfo;
 
     use super::*;
+
+    #[test]
+    fn a_question_another_copy_answered_is_not_asked_again() {
+        let me = OwnedUserId::try_from("@nixi:example.org").expect("user");
+        let message = |id: &str, sender: &str, content: Value| json!({"event_id": id, "sender": sender, "type": "m.room.message", "content": content});
+        let text = |body: &str| json!({"msgtype": "m.text", "body": body});
+        let events = [
+            message("$q1", "@tgorka:example.org", text("one")),
+            message("$q2", "@tgorka:example.org", text("two")),
+            // The last holder answered the first, then died.
+            message(
+                "$a1",
+                me.as_str(),
+                json!({"body": "…", TURN: {"session": "s", "line": "l"}}),
+            ),
+            message(
+                "$e1",
+                me.as_str(),
+                json!({"m.relates_to": {"rel_type": "m.replace", "event_id": "$a1"}}),
+            ),
+            message("$q3", "@tgorka:example.org", text("three")),
+            message(
+                "$x",
+                "@tgorka:example.org",
+                json!({"m.relates_to": {"rel_type": "m.replace", "event_id": "$q3"}}),
+            ),
+        ];
+        assert_eq!(answered_by(&events, &me), HashSet::from(["$q1".to_owned()]));
+    }
 
     fn sealed(level: Option<VerificationLevel>) -> EncryptionInfo {
         EncryptionInfo {

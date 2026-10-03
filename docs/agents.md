@@ -862,8 +862,11 @@ sent while the host was down, or before the folder arrived, is answered; a messa
 for a room with no session yet is also kept, the newest 16 per room. A served session whose log
 cannot be opened is tried again at the next scan. The process's one clock is a 1 Hz tick; every
 5 s it reads the zones again for sessions and homes that arrived with a sync (an invite is decided
-against the homes read then), and it writes `$XDG_STATE_HOME/keeper-agentd/status.json` for
-`status` whenever it changes, and at least once a minute.
+against the homes read then). Each tick renews the host's manifest, places every session it serves
+a room for, claims what it wins and renews what it holds (§ *Which host answers*) — a session is
+served only by the host that holds its claim — and writes
+`$XDG_STATE_HOME/keeper-agentd/status.json` for `status` whenever it changes, and at least once a
+minute.
 
 **An interrupted turn is not run again.** After a crash, a question whose answer never finished —
 cut off before the model answered or in the middle of its tool calls — gets an `error` line, its
@@ -872,9 +875,10 @@ it." (a message, when the anchor is not found), and a status left `running` is s
 its tool calls may already have had effects.
 
 **On `SIGTERM`** each running turn ends with a final edit, "… (stopped: electra is shutting down)",
-its lines are `fsync`ed, the engine finalises within 10 s, and the process exits `0`. A message
-that arrived but whose turn had not started is left alone, and the next start answers it from the
-timeline.
+its lines are `fsync`ed, each held session gets a `claim released` line, the engine finalises
+(pushes) within 10 s, then the host withdraws its manifest and writes `released: true` on every
+claim it holds, and the process exits `0`. A message that arrived but whose turn had not started is
+left alone, and the next start answers it from the timeline.
 
 ### The system unit
 
@@ -967,4 +971,88 @@ A served session's history is held in memory: it is read from the log once, when
 session or restarts, and every line the host writes is added to it. A turn reads no file under
 `log/`. Core memory (`USER.md`, `MEMORY.md`) is read at that same moment and not again while the
 session is served, so an edit lands in the next session, or after a restart.
+
+## Which host answers
+
+An agent can have a copy on several hosts — `nixi@electra` on the server, `nixi@hesperia` on the
+Mac — and every copy is in the session's room. Exactly one host writes a session at a time: the one
+that holds its **claim**.
+
+**Each host's manifest.** Every host keeps `dev.keeper.agent.host` in its principal's control room,
+under its slug: its capabilities (`mcp:<name>`, `kvm:<id>`; the Mac adds `screen:mac`), its drives
+with whether each is checked out and how much of it is on disk (`full`, `partial`, `virtual`), the
+bots it resolves, the agents it hosts, `always_on`, and its version. It is renewed every 60 s and
+lapses 180 s after its last renewal by the homeserver's clock. A state event is not encrypted, so a
+bot is named by its **bot id** — the first 16 hex digits of the SHA-256 of its
+`bot:{kind}:{base}#{target}` reference, the base URL normalised (a trailing `/` makes no
+difference) — never by its address. A manifest is believed only when its `host` is its state key
+and its sender is one of the principal's agents. A key this build does not know is ignored, so a
+newer host that adds one at the same `v` is still believed; a manifest with a higher `v` is not.
+Every copy joins the control room `agentd.toml` names when it is invited to it, so any of the
+principal's agents can publish. A host shut down cleanly withdraws its manifest.
+
+**Placement.** Every host decides, for each active session of the agents it hosts, where it should
+run, from the same facts, so two hosts never disagree: the candidates are the principal's live
+hosts that run a copy of the agent (the manifest's `agents`), offer every need of the session
+(`[host].needs`, or the session's own), have every drive in its scope checked out with its content
+on disk, and resolve the agent's bot. A `pin` keeps only the pinned host. Among candidates, an
+always-on host comes first when the agent prefers one (`prefer_always_on`, the default), then the
+host that held the session's last claim, then the lowest slug. A session no host can serve
+**waits**, and its status says what for: `waiting: hesperia — screen:mac` (the pinned host, then
+the first thing missing), or `waiting: a copy of tgdrive/nixi` when no live host runs the agent.
+One host — the principal's first live always-on host, once it has been in the control room for
+10 s — says it, as an edit of the session's own status anchor, once per change; it says it again
+when the claim changes hands or another host served the session meanwhile. `agent.toml` edits
+(`pin`, `needs`, `drives`) reach placement at the next rescan (5 s); a session moved out of
+`active/` is handed back and forgotten.
+
+**The claim.** `dev.keeper.agent.claim` (state key `""`) in the session's room holds the host, its
+copy's device, the agent, an **epoch**, and when the claim was taken, renewed and expires. A claim
+is a host's only when the agent's own Matrix user sent it. The host placement names takes it when
+there is no claim, the claim is released, or the claim's event is 180 s old by the homeserver's
+clock: it writes `epoch + 1`, reads the claim back from the server, waits twice the longest round
+trip it has measured or one `/sync` round, whichever is longer, and reads it again. It proceeds
+only if both reads name its own event; otherwise it yields and writes nothing. Its first log line
+is `claim acquired`, with the claim event and the server's time, and every line it writes after
+carries the epoch and that event. It renews every 60 s. The homeserver's clock is this host's
+clock plus the offset its last read-back of its own event showed; until the first read-back (the
+manifest's, at start) a host takes no claim, and a host with no control room yet takes another
+host's claim only after a claim of its own has calibrated it.
+
+**When a host goes away.** A host that cannot confirm a renewal for 120 s stops writing the
+session, logs `claim lost` and parks its status as blocked, 60 s before anyone may take over; a
+line it writes anyway is dropped by every reader (§ *The log*). The 120 s are counted on both of
+the host's clocks: the monotonic one stands still while a laptop's lid is closed or a VM is paused,
+the wall clock does not, so a Mac that slept ten minutes writes nothing when it wakes. After a
+shorter sleep (the wall clock more than 5 s ahead of the monotonic one) it writes nothing until its
+next renewal has read the claim back as its own. A host that stops cleanly releases its claims, and
+the next host takes over within two ticks. A host that crashes is taken over 180 s after its last
+renewal. The always-on host owns its agents' main sessions: when it comes back, the host that took
+over hands the session back at its next idle moment, never during a turn (`claim released`), and
+the always-on host takes it at the next epoch. A session pinned to another host is handed back the
+same way, even while the pinned host cannot serve it, so its status says what it waits for. A
+hand-back closes the room and releases the claim once the worker has finished what it was doing;
+the host's tick never waits for it, so its other claims are renewed meanwhile. A taker reads the
+room back like any start does, but a question another copy already began answering — an answer's
+anchor follows it — is not asked again, even when the last holder's lines have not reached the
+taker's checkout yet; and a host that is not the holder keeps nothing a holder will answer.
+
+Measured on the Synapse test homeserver (v1.156.0 on delectra), 2026-10-03, every run of
+`live_claims` that day:
+- two copies writing one session's claim at the same moment were stamped 1 ms apart, then in the
+  same millisecond; both times the server kept the later write, and the earlier writer — which had
+  read its own event back — yielded after its settled re-read and wrote nothing;
+- a host killed with `SIGKILL` was taken over 180 065 ms and 180 597 ms after its last renewal, and
+  the taker continued the session from the drive's files;
+- after a clean shutdown, the other host's claim followed the release by 187, 683, 736, 787 and 1 738 ms.
+
+**A conflicted session.** If two hosts ever both acquired one epoch — two `claim acquired` lines at
+one epoch with different claim events — the session has two truths, and no host serves it. The
+first host to find it loads nothing, sets its status to blocked with "Two hosts wrote this session
+at once (epoch 2). It waits for you.", and `keeper-agentd status` and `agents list` print both
+claim events. To resolve it, decide which host's lines are true and remove the other host's lines
+whose `epoch` is that epoch from its chunks (`log/<date>.<host>.<n>.jsonl`) — move a chunk out of
+`log/` only when it holds nothing else, since one chunk can hold a host's lines of several epochs —
+and commit. The host reads a conflicted log again every 30 s, so the next read after the commit is
+clean and the session is served again. keeper has no resolve action yet.
 
