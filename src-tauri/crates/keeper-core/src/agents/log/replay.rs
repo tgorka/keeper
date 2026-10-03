@@ -11,7 +11,7 @@ use serde_json::Value;
 use ulid::Ulid;
 
 use super::reader::SessionLog;
-use super::{LineBody, LogError, LogLine, OpenBody};
+use super::{LineBody, LogError, LogLine, OpenBody, PeerBody, UserBody};
 use crate::bots::chat::{ChatMessage, ContentPart, Role, ToolCall};
 
 /// The heading of the system message a `compact` line becomes.
@@ -57,11 +57,13 @@ impl ReplayRefusal {
 ///
 /// A `tool_call` line is an assistant message holding just that call:
 /// [`replay`] folds it into the assistant message of its `parent` line. A
-/// blob line has no message until it is hydrated.
+/// blob line has no message until it is hydrated. A person's attachments and
+/// a peer's question are part of the message the model is sent, so they are
+/// part of the message a replay rebuilds: the turn loop sends exactly this.
 pub fn message_for(line: &LogLine) -> Option<ChatMessage> {
     match &line.body {
-        LineBody::User(body) => Some(ChatMessage::text(Role::User, body.text.clone())),
-        LineBody::Peer(body) => Some(ChatMessage::text(Role::User, body.text.clone())),
+        LineBody::User(body) => Some(ChatMessage::text(Role::User, user_text(body))),
+        LineBody::Peer(body) => Some(ChatMessage::text(Role::User, peer_text(body))),
         LineBody::Assistant(body) => Some(ChatMessage {
             role: Role::Assistant,
             content: if body.text.is_empty() {
@@ -94,6 +96,27 @@ pub fn message_for(line: &LogLine) -> Option<ChatMessage> {
             format!("{COMPACT_HEADING}\n\n{}", body.summary),
         )),
         _ => None,
+    }
+}
+
+/// A person's text, then the drive files they attached, one per line.
+fn user_text(body: &UserBody) -> String {
+    if body.attachments.is_empty() {
+        return body.text.clone();
+    }
+    let mut text = body.text.clone();
+    text.push_str("\n\nAttached files:");
+    for attachment in &body.attachments {
+        text.push_str(&format!("\n- {}:{}", attachment.drive, attachment.path));
+    }
+    text
+}
+
+/// Another agent's text, then the question it asks, under the ask's id.
+fn peer_text(body: &PeerBody) -> String {
+    match &body.ask {
+        None => body.text.clone(),
+        Some(ask) => format!("{}\n\nQuestion {}: {}", body.text, ask.id, ask.question),
     }
 }
 

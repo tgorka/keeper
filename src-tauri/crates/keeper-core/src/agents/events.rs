@@ -179,6 +179,29 @@ pub fn power_levels(kind: SessionKind, creator: &UserId, agents: &[OwnedUserId])
     })
 }
 
+/// A principal's control room's power levels (AD-374): the creating agent
+/// 100, every other agent user of the principal 50 — so any of them writes
+/// its host's manifest, `dev.keeper.agent.host` at 50 — and people 0, so a
+/// person writes no state there. `events_default` and `state_default` are 50.
+pub fn control_power_levels(creator: &UserId, agents: &[OwnedUserId]) -> Value {
+    let mut users = Map::new();
+    for agent in agents {
+        users.insert(agent.to_string(), json!(50));
+    }
+    users.insert(creator.to_string(), json!(100));
+    json!({
+        "users": users,
+        "users_default": 0,
+        "events": { HOST: 50 },
+        "events_default": 50,
+        "state_default": 50,
+        "ban": 50,
+        "kick": 50,
+        "redact": 50,
+        "invite": 50,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -317,5 +340,27 @@ mod tests {
 
         let short = edit_content(&target, "hi");
         assert_eq!(short["body"], "* hi");
+    }
+
+    #[test]
+    fn a_control_room_lets_every_agent_of_the_principal_write_its_manifest() {
+        let creator = user("@nixi:example.org");
+        let amelia = user("@amelia:example.org");
+        let levels = control_power_levels(&creator, std::slice::from_ref(&amelia));
+        assert_eq!(levels["users"]["@nixi:example.org"], 100);
+        assert_eq!(levels["users"]["@amelia:example.org"], 50);
+        assert_eq!(levels["users_default"], 0);
+        assert_eq!(levels["events"][HOST], 50);
+        assert_eq!(levels["state_default"], 50);
+        // Each agent reaches the manifest's level; a person (users_default)
+        // reaches no state.
+        let level = |id: &str| {
+            levels["users"]
+                .get(id)
+                .cloned()
+                .unwrap_or(levels["users_default"].clone())
+        };
+        assert!(level("@amelia:example.org").as_i64() >= levels["events"][HOST].as_i64());
+        assert!(level("@tgorka:example.org").as_i64() < levels["state_default"].as_i64());
     }
 }

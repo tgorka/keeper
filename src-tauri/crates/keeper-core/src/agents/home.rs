@@ -742,9 +742,10 @@ pub fn parse_agent_toml(
     })
 }
 
-/// Whether a provider kind is one a `local_only` agent may use: an exhaustive
+/// Whether a provider kind is one a `local_only` agent may use, and the
+/// `local` a turn asks `Label::may_use_model` with (S-04): an exhaustive
 /// match, so the next kind decides here rather than by an equality test.
-fn serves_local_models(kind: ProviderKind) -> bool {
+pub fn serves_local_models(kind: ProviderKind) -> bool {
     match kind {
         ProviderKind::Ollama => true,
         ProviderKind::Hermes | ProviderKind::OpenAi => false,

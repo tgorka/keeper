@@ -26,6 +26,8 @@ serde_json = { workspace = true }
 fs4 = { workspace = true }
 # The caller's clock, handed to a create (AD-56).
 chrono = { workspace = true }
+# An agent's room: the event ids and transaction ids its sends carry.
+matrix-sdk = { workspace = true }
 
 # The headless host's process layer: no secret variable and no core dump
 # after start (S-07), `prctl` on Linux.
@@ -34,3 +36,7 @@ rustix = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The paced edits are tested on tokio's paused clock.
+tokio = { workspace = true, features = ["test-util"] }
+# A served session's second turn opens no file under log/: counted by inotify.
+notify = { workspace = true }

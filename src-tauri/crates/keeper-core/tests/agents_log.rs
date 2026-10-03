@@ -1316,3 +1316,74 @@ fn the_index_answers_with_the_logs_gone() {
     index.rebuild().expect("rebuild");
     assert_eq!(index.session(FIXTURE_SESSION).expect("q"), Some(rebuilt));
 }
+
+/// R-18: a person's attachments and a peer's question are in the message the
+/// turn sends (`message_for` of the line as written) and in the message a
+/// replay rebuilds, the same bytes both ways.
+#[test]
+fn attachments_and_a_peer_question_replay_as_they_were_sent() {
+    use keeper_core::agents::log::replay::message_for;
+    use keeper_core::agents::log::{Attachment, PeerAsk, PeerBody};
+
+    let scratch = Scratch::new();
+    let session = &scratch.0;
+    let mut writer = ChunkWriter::open(session, &host("electra"), ROTATE, day()).expect("open");
+    let asked = line(
+        "electra",
+        0,
+        at(0),
+        1,
+        LineBody::User(UserBody {
+            sender: user("@tgorka:h"),
+            text: "Compare these.".to_owned(),
+            attachments: vec![
+                Attachment {
+                    drive: "tgdrive".to_owned(),
+                    path: "notes/a.md".to_owned(),
+                },
+                Attachment {
+                    drive: "tgdrive".to_owned(),
+                    path: "notes/b.md".to_owned(),
+                },
+            ],
+        }),
+    );
+    let peer = line(
+        "electra",
+        0,
+        at(1),
+        2,
+        LineBody::Peer(PeerBody {
+            sender: user("@tola:h"),
+            text: "Here is the plan.".to_owned(),
+            ask: Some(PeerAsk {
+                id: "q1".to_owned(),
+                question: "Ship on Friday?".to_owned(),
+            }),
+            artifacts: None,
+        }),
+    );
+    let sent: Vec<String> = [&asked, &peer]
+        .into_iter()
+        .map(|line| {
+            let receipt = writer.append(line).expect("append");
+            format!("{:?}", message_for(&receipt.line).expect("a message"))
+        })
+        .collect();
+    writer.sync().expect("sync");
+
+    let replayed =
+        replay(&read_session(session), &|sha| hydrate_blob(session, sha)).expect("replay");
+    let replayed: Vec<String> = replayed.messages.iter().map(|m| format!("{m:?}")).collect();
+    assert_eq!(replayed, sent);
+    assert!(
+        sent[0].contains("Attached files:\\n- tgdrive:notes/a.md\\n- tgdrive:notes/b.md"),
+        "{}",
+        sent[0]
+    );
+    assert!(
+        sent[1].contains("Question q1: Ship on Friday?"),
+        "{}",
+        sent[1]
+    );
+}

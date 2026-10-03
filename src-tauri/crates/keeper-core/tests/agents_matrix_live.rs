@@ -25,7 +25,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use keeper_core::agents::events::{self, ClaimContent, CONTENT_VERSION, SESSION_ROOM_TYPE};
+use keeper_core::agents::events::{
+    self, ClaimContent, CONTENT_VERSION, CONTROL_ROOM_TYPE, HOST, SESSION_ROOM_TYPE,
+};
 use keeper_core::agents::matrix::{AgentClient, AgentMatrixError, RoomKind};
 use keeper_core::agents::session::SessionKind;
 use keeper_core::auth::StoredSession;
@@ -710,4 +712,78 @@ async fn p95_delivery_between_two_copies() {
         pct(95),
         pct(99)
     );
+}
+
+/// AD-374 on Synapse: in a principal's control room a second agent user of
+/// the principal writes its own host's manifest, and a person writes none.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn a_second_agent_of_the_principal_writes_its_manifest_in_the_control_room() {
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let (nixi, _) = smoke
+        .copy(
+            &root.path().join("nixi"),
+            "nixi-smoke",
+            "NIXI_SMOKE_PASSWORD",
+            "nixi@smoke",
+        )
+        .await;
+    let (paced, _) = smoke
+        .copy(
+            &root.path().join("paced"),
+            "nixi-paced",
+            "NIXI_PACED_PASSWORD",
+            "paced@smoke",
+        )
+        .await;
+    let (person, _) = smoke
+        .copy(
+            &root.path().join("tgorka"),
+            "tgorka-smoke",
+            "TGORKA_SMOKE_PASSWORD",
+            "tgorka@smoke",
+        )
+        .await;
+    let second = smoke.user("nixi-paced");
+    let room = nixi
+        .create_room(
+            RoomKind::Control,
+            "tgorka's agents",
+            vec![second.clone(), smoke.user("tgorka-smoke")],
+            std::slice::from_ref(&second),
+        )
+        .await
+        .expect("control room");
+    for client in [&paced, &person] {
+        sync_until(client, || client.client().get_room(&room).is_some()).await;
+        client.join(&room).await.expect("join");
+        client.sync_once().await.expect("sync");
+    }
+    let state = state_of(&smoke, &nixi, &room).await;
+    let create = state
+        .iter()
+        .find(|e| e["type"] == "m.room.create")
+        .expect("create");
+    assert_eq!(create["content"]["type"], CONTROL_ROOM_TYPE);
+
+    let manifest = |host: &str| json!({"v": CONTENT_VERSION, "host": host});
+    let written = paced
+        .send_state(&room, HOST, "paced-host", &manifest("paced-host"))
+        .await
+        .expect("the second agent writes its manifest");
+    let read = nixi
+        .server_state(&room, HOST, "paced-host")
+        .await
+        .expect("read")
+        .expect("the manifest");
+    assert_eq!(read.event_id, written);
+    assert_eq!(read.sender, second);
+    match person
+        .send_state(&room, HOST, "laptop", &manifest("laptop"))
+        .await
+    {
+        Err(AgentMatrixError::Forbidden(_)) => {}
+        other => panic!("a person writes no manifest: {other:?}"),
+    }
 }

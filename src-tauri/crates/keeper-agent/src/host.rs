@@ -8,7 +8,7 @@
 //!
 //! | question | answered by | crate |
 //! |---|---|---|
-//! | may this bot touch this path? | `bots::grant::check` | `keeper-core` |
+//! | may this bot touch this path? | `bots::grant::{check, decide}`, through [`GrantSource`] | `keeper-core` |
 //! | is this path inside the profile? | `browse::resolve` / `plain_segments` | `keeper-sync` |
 //! | which writer owns it? | `WriteScope::route` | `keeper-sync` |
 //! | how many bytes may come back? | `bots::tools`' caps | `keeper-core` |
@@ -21,9 +21,9 @@
 //!
 //! 1. Find the profile the target names. An unknown profile is a refusal, not
 //!    a panic.
-//! 2. `grant::check` — **every call, never once per conversation**. A grant
-//!    revoked while a turn is in flight must stop the next call in that turn,
-//!    which is only true if the store is re-read here (FR-386).
+//! 2. [`GrantSource::verdict`] — **every call, never once per conversation**.
+//!    A grant revoked while a turn is in flight must stop the next call in
+//!    that turn, which is only true if the source is asked again here (FR-386).
 //! 3. `audit::append_intent` — **before the effect**, so a crash mid-write
 //!    leaves a row saying a write was starting. A row written afterwards
 //!    records only the calls that survived, which is the opposite of an audit.
@@ -33,7 +33,7 @@
 //!
 //! # What the approval port is for
 //!
-//! `grant::check` can answer [`GrantVerdict::Ask`], and asking is an act this
+//! A verdict can be [`GrantVerdict::Ask`], and asking is an act this
 //! crate cannot perform from inside a blocking tool call. So the ask is a
 //! **port**: [`DriveToolHost::approve`] is built from the host process's
 //! [`ApprovalPort`] — the app's is [`crate::approval::SinkApprover`], which
@@ -49,7 +49,7 @@ use keeper_core::bots::audit::{self, AuditIntent, AuditOutcome};
 use keeper_core::bots::chat::CancelSignal;
 use keeper_core::bots::context_files::{self, ContextBundle, LoadedContext};
 use keeper_core::bots::error::BotsError;
-use keeper_core::bots::grant::{self, Grant, GrantVerdict, ToolTarget};
+use keeper_core::bots::grant::{Grant, GrantVerdict, ToolTarget};
 use keeper_core::bots::tools::{
     self, EntryLine, ToolArgs, ToolCall, ToolHost, ToolName, ToolOutcome,
 };
@@ -58,6 +58,7 @@ use keeper_sync::bots_fs::{self, FileRead, FsRefusal, Limits, LineRange};
 use keeper_sync::files_write::WriteRoute;
 use keeper_sync::SyncProfile;
 
+use crate::grants::GrantSource;
 use crate::ports::{ApprovalPort, VaultWriter};
 use crate::turn::{new_id, now_ms, DrivePorts};
 
@@ -147,6 +148,7 @@ impl ToolHost for NoDrive {
 pub struct DriveTurnHost {
     vault: Option<Arc<dyn VaultWriter>>,
     approval: Option<Arc<dyn ApprovalPort>>,
+    grants: Arc<dyn GrantSource>,
 }
 
 impl TurnHost for DriveTurnHost {
@@ -173,6 +175,7 @@ impl TurnHost for DriveTurnHost {
             profiles,
             vault: self.vault.clone(),
             approve,
+            grants: Arc::clone(&self.grants),
         })
     }
 }
@@ -197,8 +200,13 @@ fn approver(
 /// then — only when `offered` says tools went in the request — the context
 /// files [`context_files::context_targets`] picks from the live grants,
 /// loaded through [`load_context`] and merged into the bundle the model is
-/// shown.
-pub fn arm_drive(ports: &DrivePorts, grants: &[Grant], offered: bool) -> ArmedDrive {
+/// shown. `source` is what every call of the turn is checked against.
+pub fn arm_drive(
+    ports: &DrivePorts,
+    source: Arc<dyn GrantSource>,
+    grants: &[Grant],
+    offered: bool,
+) -> ArmedDrive {
     let profiles = ports.profiles.profiles();
     let context = offered.then(|| {
         let profile_ids: Vec<&str> = profiles.iter().map(|profile| profile.id.as_str()).collect();
@@ -211,6 +219,7 @@ pub fn arm_drive(ports: &DrivePorts, grants: &[Grant], offered: bool) -> ArmedDr
         host: Box::new(DriveTurnHost {
             vault: ports.vault.clone(),
             approval: ports.approval.clone(),
+            grants: source,
         }),
     }
 }
@@ -240,7 +249,7 @@ pub type Approver = dyn Fn(&ToolCall, &str) -> bool + Send + Sync;
 /// reason `browse` takes a `&SyncProfile`: a host that could reach the engine
 /// is a host that will eventually spend something on a model's behalf.
 pub struct DriveToolHost {
-    /// Where `keeper.db` lives — the grant store and the audit log.
+    /// Where `keeper.db` lives — the audit log.
     pub data_dir: PathBuf,
     /// Which provider this conversation is with.
     pub provider_id: String,
@@ -258,6 +267,8 @@ pub struct DriveToolHost {
     /// The approval port. `None` refuses every ask with
     /// [`UNATTENDED_REFUSAL`].
     pub approve: Option<Arc<Approver>>,
+    /// What every call is checked against, re-read per call.
+    pub grants: Arc<dyn GrantSource>,
 }
 
 impl DriveToolHost {
@@ -290,16 +301,12 @@ impl ToolHost for DriveToolHost {
 
         let effect = call.name.effect();
         // Step 2 — every call, never once per conversation (FR-386).
-        let verdict = grant::check(
-            &self.data_dir,
-            &self.provider_id,
-            self.bot_id.as_deref(),
-            &call.target,
-            effect,
-        )
-        .map_err(|error| BotsError::Tool {
-            detail: error.to_string(),
-        })?;
+        let verdict =
+            self.grants
+                .verdict(&call.target, effect)
+                .map_err(|error| BotsError::Tool {
+                    detail: error.to_string(),
+                })?;
 
         // Step 3 — before the effect (NFR-47). A row that cannot be written is
         // a refusal and never a silent proceed: an unauditable effect is one

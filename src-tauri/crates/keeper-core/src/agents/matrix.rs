@@ -241,8 +241,9 @@ impl AgentClient {
             .map_err(from_sdk)
     }
 
-    /// Create a typed, encrypted room, inviting `invite`; a session room gets
-    /// its power levels from [`events::power_levels`] with `agents` at 50.
+    /// Create a typed, encrypted room, inviting `invite`, with `agents` at 50:
+    /// a session room's power levels from [`events::power_levels`], a control
+    /// room's from [`events::control_power_levels`].
     pub async fn create_room(
         &self,
         kind: RoomKind,
@@ -269,10 +270,11 @@ impl AgentClient {
             "state_key": "",
             "content": { "algorithm": "m.megolm.v1.aes-sha2" },
         }))?];
-        if let RoomKind::Session(session) = kind {
-            request.power_level_content_override =
-                Some(raw(&events::power_levels(session, &me, agents))?);
-        }
+        let levels = match kind {
+            RoomKind::Session(session) => events::power_levels(session, &me, agents),
+            RoomKind::Control => events::control_power_levels(&me, agents),
+        };
+        request.power_level_content_override = Some(raw(&levels)?);
         let room = self.client.create_room(request).await.map_err(from_sdk)?;
         Ok(room.room_id().to_owned())
     }

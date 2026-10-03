@@ -71,6 +71,9 @@ pub enum HeadlessError {
     ForeignDatabase { path: PathBuf },
     #[error("{0}")]
     Config(String),
+    /// A failure while running that a restart may cure.
+    #[error("{0}")]
+    Runtime(String),
     #[error(transparent)]
     Sync(#[from] keeper_sync::SyncError),
     #[error(transparent)]
@@ -86,7 +89,7 @@ impl HeadlessError {
             | HeadlessError::Config(_) => 2,
             HeadlessError::Sync(keeper_sync::SyncError::GitMissing { .. }) => 3,
             HeadlessError::Sync(keeper_sync::SyncError::Config(_)) => 2,
-            HeadlessError::Sync(_) | HeadlessError::Core(_) => 1,
+            HeadlessError::Runtime(_) | HeadlessError::Sync(_) | HeadlessError::Core(_) => 1,
         }
     }
 }

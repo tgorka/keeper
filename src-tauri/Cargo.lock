@@ -4275,6 +4275,8 @@ dependencies = [
  "fs4",
  "keeper-core",
  "keeper-sync",
+ "matrix-sdk",
+ "notify",
  "reqwest",
  "rustix",
  "serde",
@@ -4283,6 +4285,28 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "ulid",
+]
+
+[[package]]
+name = "keeper-agentd"
+version = "0.9.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "keeper-agent",
+ "keeper-core",
+ "keeper-sync",
+ "matrix-sdk",
+ "reqwest",
+ "rustix",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml_edit 0.25.12+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
  "ulid",
 ]
 

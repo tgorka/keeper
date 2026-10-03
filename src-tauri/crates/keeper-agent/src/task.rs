@@ -16,7 +16,7 @@ use keeper_sync::tasks::TaskOutcome;
 use keeper_sync::SyncProfile;
 
 use crate::host::DriveToolHost;
-use crate::turn::{arm_turn, endpoint_of, read_timeout_of, TurnEnv, TurnOrigin};
+use crate::turn::{arm_turn, endpoint_of, read_timeout_of, store_grants, TurnEnv, TurnOrigin};
 
 const MODEL_REQUIRED: &str = "this bot task names no model; set the task's model before running it";
 
@@ -97,6 +97,7 @@ fn prompt_messages(source: &str, context: Option<String>) -> Vec<ChatMessage> {
 
 fn task_host(dir: PathBuf, bot: &Bot, profiles: Vec<SyncProfile>, task_id: &str) -> DriveToolHost {
     DriveToolHost {
+        grants: store_grants(&dir, bot),
         data_dir: dir,
         provider_id: bot.provider_id.clone(),
         bot_id: Some(bot.id.clone()),
@@ -124,7 +125,8 @@ async fn prepare(env: &TurnEnv, spec: &BotTaskSpec) -> Result<TaskTurn, String> 
     // The question alone: arming puts the task's context in front of it,
     // untrimmed, exactly as `prompt_messages` would.
     let question = prompt_messages(&spec.prompt_text, None);
-    let armed = arm_turn(env, &dir, &row, &bot, model, question, &|_| {
+    let grants = store_grants(&dir, &bot);
+    let armed = arm_turn(env, &dir, &row, &bot, model, question, grants, &|_| {
         TurnOrigin::Task
     })
     .await;

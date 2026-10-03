@@ -908,7 +908,7 @@ impl CancelSignal {
     }
 
     /// Resolves when cancellation is requested.
-    async fn cancelled(&mut self) {
+    pub async fn cancelled(&mut self) {
         loop {
             if *self.rx.borrow_and_update() {
                 return;
