@@ -51,6 +51,20 @@ the download against the `.sha256` published beside it. That authenticates the t
 publisher — a weaker guarantee than the app's minisign check, stated plainly rather than implied
 to be equivalent.
 
+### The agents' Linux host
+
+`keeper-agentd` (docs/agents.md § *keeper-agentd*) reaches only what its `agentd.toml` names, and
+registers no telemetry or export of any kind — no PostHog, no OTLP; `bun run check:agentd-lean`
+keeps those crates out of its build.
+
+| Destination | When | Why |
+| --- | --- | --- |
+| **`[homeserver].url`'s host** | While `run` serves, and on `init` and `login` | The agents' Matrix traffic: each copy's sign-in, `/sync`, the rooms it joins, the anchors and edits of its answers, its status anchor. One homeserver per host; agentd listens on nothing. |
+| **Each `[[providers]] base_url`'s host** | Each turn of an agent whose `[model].bot` names that provider, and the model probe while arming it | Chat completions for the agent's own model, the one the person chose for it. Only providers the file names are reached; a session whose label is `local_only` reaches none but a local (`ollama`) one. |
+| **Each `[[drives]] remote`'s host**, and the LFS destinations the daemon rows above describe | Each drive's checkout and every sync while `run` serves | Fetch and push of the drives, through agentd's own engine: the sessions' logs and artifacts reach the drive this way. |
+
+No other destination: no update check, and no telemetry destination at all.
+
 ## Bridges add no distinct egress
 
 Bridges (WhatsApp, Telegram, Signal, …) are Matrix **appservices** that run **server-side**,

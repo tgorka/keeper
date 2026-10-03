@@ -724,7 +724,9 @@ creating agent 100, other agents 50, people 0, `events_default` and `state_defau
 room is encrypted, the homeserver sees every event a person sends as `m.room.encrypted` and cannot
 tell a decision from free text, so `m.room.encrypted` is allowed at 0 in every session room
 (ruling R30): a person may talk in their proxy's rooms (`main`, `conversation`) and may decide
-approvals everywhere, and writes no state anywhere.
+approvals everywhere, and writes no state anywhere. A control room's power levels are the
+creating agent 100, every other agent of the principal 50 — each writes its host's manifest,
+`dev.keeper.agent.host`, at 50 (AD-374) — and people 0, with `state_default` 50.
 
 The same rule lets a person send *any* agent event type encrypted: a fake status, a scope, a turn
 or an edit of the agent's anchor reaches the room, and the server cannot tell. So the host checks
@@ -733,6 +735,19 @@ room's power levels before acting on it: it acts only when the sender has power 
 one of the room's agents. The per-type rows (decisions, `heard`, surface results, and in a proxy's
 rooms `m.room.message` and the scope at 0) bind only a client that sends in clear. In a session
 room that is not a proxy's, the host also keeps a person's free text out of the agent's turns.
+
+**The host checks every sender.** At power level 0 a person can send any encrypted event, so the
+homeserver cannot stop a person in a session room from sending what looks like the agent's own
+status, scope or turn reference, or an `m.replace` of the agent's anchor. The host, which decrypts,
+checks the sender of each one: a `dev.keeper.agent.*` event or an edit counts only from the agent's
+own user, and anyone else's is ignored and not logged; a decision on an approval counts only from a
+reader of the session on a device this host has verified — and since nothing on the host verifies
+a device before Epic 93, every decision is ignored until then. Free text becomes a turn only in a
+proxy's `main` or `conversation` session, from its person, and only as an `m.text` sealed by one of
+the sender's own devices: a message sent in clear, or one whose Megolm session belongs to someone
+else's device (`MismatchedSender`, the sign of a forged envelope), is never a turn, and neither is
+an image, a file or a notice. Anywhere else a person's text is an observer's, noted in the host's
+own log and never sent to the model.
 
 **Sends.** Every send disables matrix-sdk's own retry, so a `M_LIMIT_EXCEEDED` reaches the caller
 with its `retry_after_ms` and the caller decides how to pace; a retried send reuses its
@@ -767,3 +782,189 @@ received more events between two rounds came back cut, and the cut events never 
 
 `nixi-paced`, limited to one message a second with a burst of five, got eight `429`s in a burst of
 fifteen sends, each with `retry_after_ms` 1000.
+
+**A streamed answer, on the same Synapse** (2026-10-03, `keeper-agentd/tests/live_turn.rs`,
+`keeper-agentd run` as a child against the local stub provider streaming a fixed answer over 2 s):
+
+- `nfr_113_holds_over_fifty_turns`, 50 turns: p95 from the host's receipt of the person's message
+  to the homeserver's acceptance of the anchor **47 ms**; p95 from the end of the model's stream to
+  the acceptance of the final edit **287 ms** (both on the host's monotonic clock; NFR-113 asks
+  ≤ 1 s for each); every edit ≥ 400 ms after the one before by `origin_server_ts`. Synapse is the
+  test homeserver; NFR-113's published figure is tuwunel's, the operator's run of the same test.
+- `a_paced_agent_meets_a_429_and_still_lands_the_final_edit`: `nixi-paced` at one message a second
+  with a burst of two met two `429`s in one answer, and its final edit carried the whole answer.
+- `the_largest_final_message_that_fits_encrypted`: the largest text an encrypted final edit could
+  carry was **47 061 bytes** (the server's 64 KiB event cap, after Megolm and base64), so R23's
+  60 KiB does not fit. `FINAL_CUT_BYTES` is **45 KiB** (46 080 bytes): that, less room for the
+  artifact sentence, rounded down to 1 KiB.
+
+Run them:
+
+```sh
+KEEPER_AGENTS_SMOKE_HOMESERVER=http://100.101.101.23:8008 \
+KEEPER_AGENTS_SMOKE_SECRETS=$HOME/.config/keeper-smoke/synapse.env \
+KEEPER_OPENAI_SMOKE_BASE_URL=<CLIProxyAPI's base URL> \
+KEEPER_OPENAI_SMOKE_TOKEN_FILE=$HOME/.omp/cliproxyapi.token \
+KEEPER_OPENAI_SMOKE_MODEL=<a model it serves> \
+cargo test --manifest-path src-tauri/Cargo.toml -p keeper-agentd --test live_turn -- --ignored --nocapture --test-threads=1
+```
+
+`a_turn_with_cliproxyapi_reads_the_drive_and_lands_in_the_log` is the same host with a real model:
+it reads a drive file through the host and quotes it, its chunk holds the `user`, `tool_call`,
+`tool_result` and `assistant` lines and reaches the bare remote, a `kill -9` and a restart answer
+nothing twice, and every connection the host holds goes to the homeserver or the provider.
+`an_invite_from_an_unknown_user_stays_pending` leaves a stranger's invite at `invite`, and
+`a_session_file_naming_a_strangers_room_does_not_join_it` leaves it there even when a session
+folder names that room. `a_question_asked_while_the_host_is_down_is_answered` asks while the host
+is down and gets one answer once it starts again. A copy that has never synced has published no
+keys, so nothing sent before its first `run` can be decrypted by it: run the host once after
+`login` before anyone writes to it.
+
+## keeper-agentd
+
+`keeper-agentd` is the Linux host. One binary, five verbs:
+
+| verb | what it does |
+| --- | --- |
+| `keeper-agentd init` | creates agentd's data and state directories, writes the `agentd.toml` skeleton when there is none and says which file it left alone otherwise — it never overwrites; once the hosted proxy's copy is signed in it creates the principal's control room (`dev.keeper.agent.control`) as that proxy, inviting the drives' owners and every other agent of the principal, and sets `[homeserver].control_room`, every other byte of the file kept |
+| `keeper-agentd login <drive>/<agent>` | signs that agent's copy in as this host's device, displayed `<agent>@<host>`: asks for the password with the terminal's echo off, or reads it from `--password-credential <name>`; stores the session and the store passphrase in the secret store, and a later login reuses the device id |
+| `keeper-agentd agents list` | every zone and home with its verdict, each refused skill, and whether each served agent's copy is signed in |
+| `keeper-agentd run` | serves the agents until `SIGTERM` |
+| `keeper-agentd status [--session <drive>/<session> [--no-probe]]` | the host, each drive's engine state and mount verdict, each copy, the sessions served (and a session not served because another names its room), and the tools each agent is and is not offered here; with `--session`, what that session's agent is told and whether its digest is the last `open` line's. Composing it asks an `ollama` provider which tools its model supports, as a turn does; `--no-probe` asks nothing and composes as if that were unknown |
+
+`--config <path>` (or `KEEPER_AGENTD_CONFIG`) names another configuration file. The exit codes are
+`keeper-syncd`'s: `0` done, `1` a failure while running (a sync engine that stopped, panicked or
+would not finalise among them, which the unit restarts), `2` a configuration agentd refuses (the
+mount rule among them), `3` no usable `git`.
+
+**Before anything else**, `keeper-agentd` answers git's LFS filter invocations — its own engine
+registers the binary as the drives' filter — then parses the command line, reads every secret,
+removes the secret variables from its environment and makes itself non-dumpable while it still has
+one thread, and only then starts its async runtime. It logs to stderr, which journald keeps, and
+registers no other sink: no telemetry, no export (`bun run check:agentd-lean` fails the build if an
+OpenTelemetry or PostHog crate, or the app itself, enters its dependency tree).
+
+**What `run` does.** It applies the `[[providers]]`, opens its engine behind the mount rule, checks
+each drive out, checks each zone against its pin, resumes every interrupted session plan, rebuilds
+each `.keeper/agents.db`, restores each served agent's copy and serves the active sessions those
+agents own whose room the copy has joined. A room is joined only on an invite: for a session room
+(`dev.keeper.agent.session`) from the invited proxy's own person, from an agent of a mounted drive
+whose home readers the invited agent may reach, or from the proxy of a pinned `[[trust]]` person
+who reads the invited agent's home; every other invite stays pending, neither joined nor declined.
+A session folder naming a room is never a reason to join it — any reader of the drive can write
+one. When two sessions name one room, the first by path is served and `status` names the other.
+
+A turn begins when the proxy's person writes in its `main` or `conversation` session; a redelivered
+event is never a second turn (the session index remembers every logged event id). When a session
+starts being served — at start, after a join, or when its folder arrives with a sync — the host
+first reads the room's timeline back to the newest event the session's log has seen, so a question
+sent while the host was down, or before the folder arrived, is answered; a message that arrives
+for a room with no session yet is also kept, the newest 16 per room. A served session whose log
+cannot be opened is tried again at the next scan. The process's one clock is a 1 Hz tick; every
+5 s it reads the zones again for sessions and homes that arrived with a sync (an invite is decided
+against the homes read then), and it writes `$XDG_STATE_HOME/keeper-agentd/status.json` for
+`status` whenever it changes, and at least once a minute.
+
+**An interrupted turn is not run again.** After a crash, a question whose answer never finished —
+cut off before the model answered or in the middle of its tool calls — gets an `error` line, its
+`…` anchor is edited to "My answer was cut off when electra restarted. Ask again if you still need
+it." (a message, when the anchor is not found), and a status left `running` is set `idle`, because
+its tool calls may already have had effects.
+
+**On `SIGTERM`** each running turn ends with a final edit, "… (stopped: electra is shutting down)",
+its lines are `fsync`ed, the engine finalises within 10 s, and the process exits `0`. A message
+that arrived but whose turn had not started is left alone, and the next start answers it from the
+timeline.
+
+### The system unit
+
+`src-tauri/crates/keeper-agentd/packaging/keeper-agentd@.service` is a system template unit, one
+instance per principal, running as that principal's own user:
+
+```sh
+sudo install -Dm755 keeper-agentd /usr/local/bin/keeper-agentd
+sudo install -Dm644 keeper-agentd@.service /etc/systemd/system/
+sudo install -d -m700 /etc/keeper-agentd/<principal>     # one file per secret, root-owned
+sudo -u agentd-<principal> keeper-agentd init
+sudo -u agentd-<principal> keeper-agentd login <drive>/<agent>
+sudo systemctl enable --now keeper-agentd@<principal>
+```
+
+Edit the unit's `LoadCredential=<name>:/etc/keeper-agentd/%i/<name>` lines to the `secret:<name>`s
+your `agentd.toml` names. A copy's store passphrase is one too: `login` writes it to
+`$XDG_STATE_HOME/keeper-agentd/secrets/` under the file name of its key, every character that is
+not a letter or digit written `_` — for `@nixi:example.org`, `agents__nixi_example_org_sdk_passphrase`.
+Move that file to `/etc/keeper-agentd/<principal>/` and add
+`LoadCredential=agents__nixi_example_org_sdk_passphrase:/etc/keeper-agentd/%i/agents__nixi_example_org_sdk_passphrase`,
+so a copy of agentd's home alone opens no store. Its hardening, by name: `NoNewPrivileges=yes`,
+`PrivateTmp=yes`, `ProtectSystem=strict`, and `ReadWritePaths=` agentd's XDG data and state
+directories (`/var/lib/agentd-%i/.local/share/keeper-agentd` and
+`/var/lib/agentd-%i/.local/state/keeper-agentd`, which `init` creates; each is `-`-prefixed, so a
+unit started before `init` reaches agentd, which says what is missing), so everything else on the
+machine — its own configuration included — is read-only to it. `ProtectHome` is not set: agentd's
+data lives under its own home, and `ReadWritePaths=` names exactly the part of it that may change.
+`Restart=on-failure` with `RestartPreventExitStatus=2 3`: a refused configuration or a missing git
+keeps the unit down until a person acts. agentd listens on nothing.
+
+### Checking a download
+
+Each release carries `keeper-agentd-<target>` for `x86_64-unknown-linux-gnu` and
+`aarch64-unknown-linux-gnu`, its `.sha256`, and its `.sig`: a minisign signature made with the
+app's updater key, signed in the release job by the distribution's `minisign` (no package from a
+registry ever holds the key). Check a download against keeper's public key —
+`plugins.updater.pubkey` in `src-tauri/crates/keeper/tauri.conf.json`, base64 of a minisign public
+key — before installing it:
+
+```sh
+T=keeper-agentd-x86_64-unknown-linux-gnu
+jq -r .plugins.updater.pubkey src-tauri/crates/keeper/tauri.conf.json | base64 -d > keeper.pub
+base64 -d "$T.sig" > "$T.minisig"
+minisign -V -p keeper.pub -x "$T.minisig" -m "$T"
+```
+
+`minisign` says `Signature and comment signature verified`; a file with any byte changed fails.
+
+## A streamed answer
+
+An answer is one Matrix message the host keeps editing, not a stream of tokens:
+
+- **The anchor.** As soon as the request reaches the host it sends `…` with
+  `dev.keeper.agent.turn {session, line}` naming the session and the `user` line it answers.
+- **Edits.** The first edit comes no sooner than 400 ms after the anchor, and each later one no
+  sooner than 400 ms after the one before, carrying the whole text so far in `m.new_content`; the
+  fallback `body` is at most 1 KiB.
+- **When the homeserver asks to wait** (`M_LIMIT_EXCEEDED`), the host waits `retry_after_ms` and
+  then sends the whole text once: never a backlog of stale edits.
+- **The final edit** carries the whole answer and is retried, with the same transaction id and a
+  growing pause, until the homeserver accepts it; a stop or a shutdown still sends it.
+- **Secrets are redacted in the room as in the log**: every edit, the final one included, goes
+  through the log's secret scan, so a token the model quotes reads `[REDACTED secret-like: …]` in
+  the room too.
+- **Tool progress** goes out as edits of the session's status anchor (`dev.keeper.agent.status`)
+  carrying counts only — "reading 2 files, 3 tool calls" — never a path, a title or a heading.
+- **A long answer** is cut: past `FINAL_CUT_BYTES` the message is its first `FINAL_CUT_BYTES` (on a
+  character boundary) and "The full answer is in artifacts/answer-<line>.md", written into the
+  session; the log holds the whole text. When that file cannot be written, the message says
+  "(the full answer is in this session's log)" instead.
+- **An answer narrower than the room.** The room is opened for the readers the session's
+  `agent.toml` names. Once a read narrows the session's label below them (a file from a drive fewer
+  people read), no more of the answer is streamed and the final edit is one sentence: "This answer
+  drew on something not everyone in this room may read, so it is not shown here. It is in this
+  session's log." The log keeps the whole answer, followed by an `error` line with code `label`.
+  Sending the details to the requester's own proxy conversation is 92.6's.
+- **A failed answer.** When the model or the host fails mid-answer, the room keeps what it was shown
+  and "I could not finish this answer. The reason is in this session's log."; the log holds that
+  shown prose as an `assistant` line (`finish: "failed"`), so the next turn's model reads what the
+  person read, then the `error` line.
+- **The model is a sink.** Before every request, each round of a tool-using turn included, the
+  host asks whether the session's label may reach this agent's model. Once the session has read
+  something from a `local_only` drive, a model that does not run on the readers' own machines
+  (anything but `ollama`) is sent nothing more; the turn ends with an `error` line and "This
+  conversation has read something that may go only to a model on your own machines, and this
+  agent's model is not one. Nothing more was sent."
+
+A served session's history is held in memory: it is read from the log once, when the host opens the
+session or restarts, and every line the host writes is added to it. A turn reads no file under
+`log/`. Core memory (`USER.md`, `MEMORY.md`) is read at that same moment and not again while the
+session is served, so an edit lands in the next session, or after a restart.
+

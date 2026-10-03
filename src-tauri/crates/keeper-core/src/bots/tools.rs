@@ -1222,6 +1222,44 @@ pub async fn run_tool_loop_reporting(
     sink: ToolLoopSink<'_>,
     report: ToolCallReporter<'_>,
 ) -> Result<ToolLoopOutcome, BotsError> {
+    let mut open = |_: usize| Ok(());
+    run_tool_loop_gated(
+        context,
+        request,
+        options,
+        loop_options,
+        cancel,
+        sink,
+        report,
+        &mut open,
+    )
+    .await
+}
+
+/// Asked before each round's request leaves, with the 0-based round. An
+/// `Err` sends nothing more: the loop returns it, every call already run
+/// having been reported.
+pub type RoundGate<'a> = &'a mut (dyn FnMut(usize) -> Result<(), BotsError> + Send);
+
+/// [`run_tool_loop_reporting`], asking `gate` before every request.
+///
+/// The gate is how a caller stops a conversation from reaching a model it
+/// may no longer reach: what a round sends includes every tool result so
+/// far, so a result that narrowed what may leave must be able to stop the
+/// next request, not only the next turn.
+// One parameter per seam the loop has; a struct would only move the same
+// names one line down.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tool_loop_gated(
+    context: &ToolLoop<'_>,
+    request: &ChatRequest,
+    options: &ChatOptions,
+    loop_options: &ToolLoopOptions,
+    cancel: CancelSignal,
+    sink: ToolLoopSink<'_>,
+    report: ToolCallReporter<'_>,
+    gate: RoundGate<'_>,
+) -> Result<ToolLoopOutcome, BotsError> {
     let ToolLoop {
         client,
         endpoint,
@@ -1238,6 +1276,7 @@ pub async fn run_tool_loop_reporting(
 
     loop {
         let tools_offered = rounds < budget;
+        gate(rounds)?;
         sink(ToolLoopEvent::RoundStarted {
             round: rounds,
             tools_offered,

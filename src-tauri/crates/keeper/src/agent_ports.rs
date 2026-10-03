@@ -114,7 +114,7 @@ pub(crate) fn sink_for(opened: &OpenedTurn, base: Arc<dyn TurnSink>) -> Arc<dyn 
             segmenter: Mutex::new(Segmenter::new()),
             bot_name: opened.bot_name.clone(),
         }),
-        TurnOrigin::Typed | TurnOrigin::Task => base,
+        TurnOrigin::Typed | TurnOrigin::Task | TurnOrigin::Agent { .. } => base,
     }
 }
 

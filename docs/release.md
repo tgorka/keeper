@@ -390,7 +390,7 @@ admin must, under **Settings → Branches → Branch protection rules** for `mai
 - **Frontend** — biome lint, `tsc` typecheck, vitest, and credential-free PostHog provisioning safety tests.
 - **Rust** — `rustfmt --check`, clippy `-D warnings`, cargo-nextest.
 - **Tauri build** — `tauri build --no-bundle` with a synthetic management-env canary, followed by credential exclusion over frontend assets, the app executable and staged recording sidecar.
-- **iOS (compile check)** — `cargo check --workspace --target aarch64-apple-ios` (Rust, device-free compile gate; no signing/simulator).
+- **iOS (compile check)** — `cargo check --workspace --exclude keeper-agentd --target aarch64-apple-ios` (Rust, device-free compile gate; no signing/simulator; the Linux-only `keeper-agentd` is excluded).
 - **Recording sidecar (gapless-concat, NFR-22)** — `swift test` on the `keeper-rec` package (rotation unit tests + the gapless-concat gate, fixtures generated on the runner; no capture hardware, no signing). Maps to the `recording` job in `ci.yml`.
 
 These correspond to the `licenses`, `frontend`, `rust`, `build`, `ios`, and `recording` jobs in

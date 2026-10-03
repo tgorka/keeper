@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - "v*"
+  # A dry run of the keeper-agentd job (story 90.5): it builds, signs and
+  # checks both Linux targets and keeps them as workflow artifacts. Nothing
+  # else runs, and nothing is attached to a release.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -15,6 +19,7 @@ concurrency:
 jobs:
   release:
     name: Signed, notarized macOS release (aarch64)
+    if: ${{ github.event_name == 'push' }}
     runs-on: macos-latest
     steps:
       # fetch-depth: 0 pulls full history + tags so the "Egress diff note" step can
@@ -319,4 +324,139 @@ jobs:
           # failing on a name collision.
           gh release upload "$REF" \
             "keeper-syncd-$TARGET" "keeper-syncd-$TARGET.sha256" \
+            --clobber
+
+  # -------------------------------------------------------------------------
+  # keeper-agentd, the agents' Linux host (story 90.5, AD-375).
+  #
+  # Linux only, both architectures; aarch64 on GitHub's ARM runner rather
+  # than a cross linker. Each artifact gets a .sha256 sidecar and a minisign
+  # signature made with the app's updater key (S-30): agentd holds every
+  # agent's Matrix session and the drives' write tokens, so a download is
+  # checked against keeper's public key before it is installed
+  # (docs/agents.md § keeper-agentd gives the command). On a tag it waits for
+  # the app's gate and uploads to its draft; on `workflow_dispatch` it is a
+  # dry run whose artifacts stay on the workflow run.
+  # -------------------------------------------------------------------------
+  agentd:
+    name: keeper-agentd (${{ matrix.target }})
+    needs: release
+    if: ${{ always() && (needs.release.result == 'success' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: agentd-${{ matrix.target }}
+          workspaces: src-tauri
+
+      # -p keeper-agentd only: the workspace's Tauri shell needs GTK on Linux.
+      - name: Build
+        working-directory: src-tauri
+        run: cargo build --release --locked -p keeper-agentd --target ${{ matrix.target }}
+
+      - name: Package with a checksum
+        working-directory: src-tauri
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          BIN="target/$TARGET/release/keeper-agentd"
+          test -x "$BIN" || { echo "::error::$BIN was not produced"; exit 1; }
+          OUT="keeper-agentd-$TARGET"
+          cp "$BIN" "$OUT"
+          sha256sum "$OUT" > "$OUT.sha256"
+          echo "packaged $(cat "$OUT.sha256")"
+
+      - name: Check packaged agentd executable for privileged credentials
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bun scripts/check-client-secrets.ts "src-tauri/keeper-agentd-$TARGET"
+
+      - name: Verify the systemd unit
+        working-directory: src-tauri
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          sudo install -Dm755 "keeper-agentd-$TARGET" /usr/local/bin/keeper-agentd
+          dir="$(mktemp -d)"
+          cp crates/keeper-agentd/packaging/keeper-agentd@.service "$dir/keeper-agentd@ci.service"
+          systemd-analyze verify --man=no "$dir/keeper-agentd@ci.service"
+
+      # The updater's key: its public half is plugins.updater.pubkey in
+      # src-tauri/crates/keeper/tauri.conf.json. Tauri's private key is base64
+      # of a minisign secret key, so the distribution's minisign signs with it
+      # and no package from a registry ever holds it. The signature is
+      # checked against that public key right here, and must fail on a
+      # flipped byte.
+      - name: Sign and check the signature
+        working-directory: src-tauri
+        env:
+          TARGET: ${{ matrix.target }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$TAURI_SIGNING_PRIVATE_KEY" || { echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set"; exit 1; }
+          sudo apt-get update
+          sudo apt-get install -y minisign
+          OUT="keeper-agentd-$TARGET"
+          key="$(mktemp)"
+          trap 'rm -f "$key"' EXIT
+          base64 -d <<<"$TAURI_SIGNING_PRIVATE_KEY" > "$key"
+          printf '%s\n' "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" | minisign -S -s "$key" -m "$OUT" -x "$OUT.minisig"
+          base64 -w0 "$OUT.minisig" > "$OUT.sig"
+          test -s "$OUT.sig"
+          jq -r .plugins.updater.pubkey crates/keeper/tauri.conf.json | base64 -d > keeper.pub
+          base64 -d "$OUT.sig" > "$OUT.checked"
+          minisign -V -p keeper.pub -x "$OUT.checked" -m "$OUT"
+          cp "$OUT" flipped
+          python3 -c 'import sys; p = sys.argv[1]; b = bytearray(open(p, "rb").read()); b[4096] ^= 0xFF; open(p, "wb").write(b)' flipped
+          if minisign -V -p keeper.pub -x "$OUT.checked" -m flipped; then
+            echo "::error::a flipped byte still verified"; exit 1
+          fi
+          rm -f flipped keeper.pub "$OUT.minisig" "$OUT.checked"
+
+      - name: Keep the dry run's artifacts
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: keeper-agentd-${{ matrix.target }}
+          path: |
+            src-tauri/keeper-agentd-${{ matrix.target }}
+            src-tauri/keeper-agentd-${{ matrix.target }}.sha256
+            src-tauri/keeper-agentd-${{ matrix.target }}.sig
+
+      - name: Attach to the release
+        if: ${{ github.event_name == 'push' }}
+        working-directory: src-tauri
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ matrix.target }}
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$REF" --json isDraft --jq '.isDraft')" = true || {
+            echo "::error::companion assets require the existing human-reviewed draft"
+            exit 1
+          }
+          gh release upload "$REF" \
+            "keeper-agentd-$TARGET" "keeper-agentd-$TARGET.sha256" "keeper-agentd-$TARGET.sig" \
             --clobber

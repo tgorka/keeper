@@ -1,0 +1,44 @@
+[package]
+name = "keeper-agentd"
+description = "keeper's agents on a Linux server: rooms in, streamed edits out, the log written (FR-781)"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "keeper-agentd"
+path = "src/main.rs"
+
+# Lean by rule (S-19): no tauri, no observability sink. `bun run
+# check:agentd-lean` asserts it over `cargo tree`.
+[dependencies]
+keeper-agent = { path = "../keeper-agent" }
+keeper-core = { path = "../keeper-core" }
+# The LFS filter git runs this binary as, and the default log filter.
+keeper-sync = { path = "../keeper-sync" }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# `init` sets `[homeserver].control_room` and keeps every other byte.
+toml_edit = { workspace = true }
+# User ids, as the agents' Matrix client names them.
+matrix-sdk = { workspace = true }
+serde_json = { workspace = true }
+# `status --session` composes the frame at this host's local time.
+chrono = { workspace = true }
+thiserror = { workspace = true }
+
+# `login` reads a password with the terminal's echo off.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["termios"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+reqwest = { workspace = true }
+ulid = { workspace = true }

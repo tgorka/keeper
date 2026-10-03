@@ -13,15 +13,33 @@
 //! - [`sessions`] is the sessions runtime: one plan at a time per zone.
 //! - [`ports`] is what a host process supplies.
 //! - [`approval`] is the ask-and-wait a host with a person at it plugs in.
+//! - [`grants`] is where a turn's grants come from: the app's rows or an
+//!   agent's own `agent.toml`.
+//! - [`agent`] is an agent's turn in a session, over its held context;
+//!   [`writer`] writes the session's log, [`zone`] reads the drives' zones,
+//!   [`rooms`] decides invites and whose words are a turn, and
+//!   [`matrix_sink`] streams an answer as paced edits.
+//! - `runtime` (unix) is a Linux host's run loop.
 //! - `headless` (unix) is a Linux host's process layer: directories, secrets,
 //!   its own engine and provider rows.
 
+// matrix-sdk's sync future is deep enough to need it, as in keeper-core.
+#![recursion_limit = "256"]
+
+pub mod agent;
 pub mod approval;
 pub mod drive;
+pub mod grants;
 #[cfg(unix)]
 pub mod headless;
 pub mod host;
+pub mod matrix_sink;
 pub mod ports;
+pub mod rooms;
+#[cfg(unix)]
+pub mod runtime;
 pub mod sessions;
 pub mod task;
 pub mod turn;
+pub mod writer;
+pub mod zone;

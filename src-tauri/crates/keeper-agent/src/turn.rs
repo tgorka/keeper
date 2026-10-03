@@ -41,6 +41,8 @@ use keeper_core::vm::{
 use keeper_core::voice::speech;
 use keeper_sync::SyncProfile;
 
+use crate::agent::SessionRef;
+use crate::grants::{GrantSource, StoreGrants};
 use crate::host::{self, ArmedDrive, TurnHost};
 use crate::ports::{ApprovalPort, ProfileSource, VaultWriter};
 
@@ -83,6 +85,12 @@ pub enum TurnOrigin {
     },
     /// A scheduled bot task (AD-224): no conversation, no person.
     Task,
+    /// An agent's turn in a session (90.5): its log is the record and its
+    /// system message is the agent's own composed prompt.
+    Agent {
+        /// The session the turn belongs to.
+        session: SessionRef,
+    },
 }
 
 /// The configured account, for a provider set to "Use my account" (AD-315).
@@ -328,10 +336,10 @@ pub struct Armed {
 /// Everything about one turn that `keeper-core` decides from the live grants,
 /// gathered here and decided there.
 ///
-/// Three reads and three decisions. The reads: the live grants for this
-/// `(provider, bot)`, the drive's profiles, and — only where a grant exists
-/// and the provider is one keeper runs tools for — whether the model states
-/// it can use tools. The decisions, all `keeper-core`'s: [`tools::offer_tools`]
+/// Three reads and three decisions. The reads: the live grants `source`
+/// holds, the drive's profiles, and — only where a grant exists and the
+/// provider is one keeper runs tools for — whether the model states it can
+/// use tools. The decisions, all `keeper-core`'s: [`tools::offer_tools`]
 /// for what goes in `tools`, `context_files::context_targets` for which drive
 /// files the model is told about, and [`tools::default_profile_id`] for the
 /// profile an unqualified path means.
@@ -343,10 +351,15 @@ pub struct Armed {
 /// The system message: a typed or spoken turn joins the context prompt and
 /// the spoken turn's answer instruction with `ChatMessage::instructions`; a
 /// task sends the context prompt as it is, untrimmed, because that is what a
-/// scheduled run has always sent.
+/// scheduled run has always sent; an agent's turn gets none here, because
+/// its system message is its composed prompt, whose last slot is the bundle
+/// returned in [`Armed::context`].
 ///
-/// An unreadable grant table reads as no grants: no tools, no context, and
+/// An unreadable grant source reads as no grants: no tools, no context, and
 /// the turn still runs as plain prose.
+// One parameter per fact a turn is armed from; a struct would only move the
+// same names one line down.
+#[allow(clippy::too_many_arguments)]
 pub async fn arm_turn(
     env: &TurnEnv,
     dir: &Path,
@@ -354,32 +367,49 @@ pub async fn arm_turn(
     bot: &Bot,
     model: &str,
     messages: Vec<ChatMessage>,
+    source: Arc<dyn GrantSource>,
     origin_of: &(dyn Fn(&Path) -> TurnOrigin + Sync),
 ) -> Armed {
-    let grants = store::list_grants_for_bot(dir, &bot.provider_id, Some(&bot.id))
-        .map(|listing| listing.live)
-        .unwrap_or_else(|error| {
-            tracing::warn!(%error, "bots: could not read the grants for this turn");
-            Vec::new()
-        });
+    arm_turn_probing(env, dir, row, bot, model, messages, source, origin_of, true).await
+}
+
+/// [`arm_turn`], where `probe: false` never asks the provider what its model
+/// supports and arms as if nobody knew: what a read-only verb composes with.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn arm_turn_probing(
+    env: &TurnEnv,
+    dir: &Path,
+    row: &store::ProviderRow,
+    bot: &Bot,
+    model: &str,
+    messages: Vec<ChatMessage>,
+    source: Arc<dyn GrantSource>,
+    origin_of: &(dyn Fn(&Path) -> TurnOrigin + Sync),
+    probe: bool,
+) -> Armed {
+    let grants = source.grants().unwrap_or_else(|error| {
+        tracing::warn!(%error, "bots: could not read the grants for this turn");
+        Vec::new()
+    });
     let kind = row.provider.kind;
     // The probe is a network round trip, spent only where its answer can
     // change the decision: `offer_tools` withholds for Hermes and for no
     // grant whatever the capability says.
-    let tools_supported = if grants.is_empty() || !discover::probes_model_capabilities(kind) {
-        None
-    } else {
-        discovered_model(env, dir, bot, model)
-            .await
-            .and_then(|found| found.tools)
-    };
+    let tools_supported =
+        if !probe || grants.is_empty() || !discover::probes_model_capabilities(kind) {
+            None
+        } else {
+            discovered_model(env, dir, bot, model)
+                .await
+                .and_then(|found| found.tools)
+        };
     let offer = tools::offer_tools(kind, tools_supported, &grants);
     if let ToolOffer::Withheld { reason } = &offer {
         tracing::debug!(reason, "bots: no tools offered this turn");
     }
 
     let drive = match &env.drive {
-        Some(ports) => host::arm_drive(ports, &grants, offer.is_offered()),
+        Some(ports) => host::arm_drive(ports, source, &grants, offer.is_offered()),
         None => ArmedDrive::none(),
     };
     let profile_ids: Vec<&str> = drive
@@ -416,6 +446,7 @@ pub async fn arm_turn(
                 prompted.push(system);
             }
         }
+        TurnOrigin::Agent { .. } => {}
     }
     prompted.extend(messages);
 
@@ -433,6 +464,15 @@ pub async fn arm_turn(
         default_profile_id,
         origin,
     }
+}
+
+/// The app's grants for `bot`: its `keeper.db` rows.
+pub fn store_grants(dir: &Path, bot: &Bot) -> Arc<dyn GrantSource> {
+    Arc::new(StoreGrants::new(
+        dir.to_owned(),
+        bot.provider_id.clone(),
+        Some(bot.id.clone()),
+    ))
 }
 
 /// Open a turn: the conversation (created when `req.session_id` is absent),
@@ -496,7 +536,17 @@ pub async fn open_turn(
     // Story 61.12: the pasted images of this turn become `data:` content parts
     // on the user message, here and nowhere else.
     let messages = attach_staged_images(&dir, replay(&history, &assistant.id), &req.attachment_ids);
-    let mut armed = arm_turn(env, &dir, &row, &bot, &req.model, messages, origin_of).await;
+    let mut armed = arm_turn(
+        env,
+        &dir,
+        &row,
+        &bot,
+        &req.model,
+        messages,
+        store_grants(&dir, &bot),
+        origin_of,
+    )
+    .await;
     armed.request.session_id = continuity;
     let turn = Turn {
         dir,
@@ -597,6 +647,7 @@ pub async fn open_retry(
         &bot,
         &req.model,
         replay(&replayed, &assistant.id),
+        store_grants(&dir, &bot),
         origin_of,
     )
     .await;
@@ -928,9 +979,16 @@ mod tests {
         let arm = |origin: TurnOrigin| {
             let (env, row, bot) = (&env, &row, &bot);
             async move {
-                arm_turn(env, dir, row, bot, "model", question(), &move |_| {
-                    origin.clone()
-                })
+                arm_turn(
+                    env,
+                    dir,
+                    row,
+                    bot,
+                    "model",
+                    question(),
+                    store_grants(dir, bot),
+                    &move |_| origin.clone(),
+                )
                 .await
             }
         };

@@ -1,0 +1,58 @@
+# keeper-agentd for one principal: `systemctl enable --now keeper-agentd@<principal>`.
+#
+# A system template unit (F21): one instance per principal, each running as
+# that principal's own OS user `agentd-<principal>`, whose home is
+# /var/lib/agentd-<principal>. Install:
+#
+#   sudo install -Dm755 keeper-agentd /usr/local/bin/keeper-agentd
+#   sudo install -Dm644 keeper-agentd@.service /etc/systemd/system/
+#   sudo install -d -m700 /etc/keeper-agentd/<principal>    # one file per secret
+#   sudo -u agentd-<principal> keeper-agentd init
+#   sudo -u agentd-<principal> keeper-agentd login <drive>/<agent>
+#   sudo systemctl enable --now keeper-agentd@<principal>
+#
+# See docs/agents.md § keeper-agentd.
+
+[Unit]
+Description=keeper agents for %i
+Documentation=https://github.com/tgorka/keeper/blob/main/docs/agents.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=agentd-%i
+ExecStart=/usr/local/bin/keeper-agentd run
+Environment=HOME=/var/lib/agentd-%i
+
+# Secrets come from root-owned files outside agentd's directories, seen only
+# by the running unit (S-07, S-26). One line per `secret:<name>` that
+# agentd.toml names; add yours. A copy's store passphrase, which `login`
+# writes to $XDG_STATE_HOME/keeper-agentd/secrets/, moves here under the
+# same file name, e.g. agents__nixi_example_org_sdk_passphrase
+# (docs/agents.md § The system unit).
+LoadCredential=cliproxy:/etc/keeper-agentd/%i/cliproxy
+LoadCredential=tgdrive:/etc/keeper-agentd/%i/tgdrive
+
+# 2 is a configuration agentd refuses and 3 a missing git: restarting
+# repeats the refusal, so the unit stays down until a person acts.
+Restart=on-failure
+RestartPreventExitStatus=2 3
+KillSignal=SIGTERM
+# Running turns get their final edits, then the engine finalises (10 s).
+TimeoutStopSec=30
+
+# Hardening (F21). agentd listens on nothing (AD-370).
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# Its data (drives, keeper.db, the copies' stores) and its state (secrets,
+# status) are the only paths it writes, both made by `keeper-agentd init`;
+# its own configuration is read-only to it. ProtectHome is not set: those
+# directories are under its own home, and ReadWritePaths names exactly the
+# part of it that may change. The `-` lets a unit started before `init`
+# reach agentd, which says what is missing.
+ReadWritePaths=-/var/lib/agentd-%i/.local/share/keeper-agentd -/var/lib/agentd-%i/.local/state/keeper-agentd
+
+[Install]
+WantedBy=multi-user.target
