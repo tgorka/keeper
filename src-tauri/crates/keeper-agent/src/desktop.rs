@@ -33,6 +33,7 @@ use keeper_core::agents::index::Index;
 use keeper_core::agents::log::HostSlug;
 use keeper_core::agents::matrix::{self, AgentClient, AgentMatrixError};
 use keeper_core::agents::mount::pin_matches;
+use keeper_core::agents::soul;
 use keeper_core::bots::chat::{self, CancelHandle, CancelSignal};
 use keeper_core::bots::store::{self, ProviderRow};
 use keeper_core::platform::Platform;
@@ -283,6 +284,40 @@ pub fn listing(
         }
     }
     listed
+}
+
+/// Each agent's `SOUL.md` `icon` by Matrix user, for every agent of a flagged
+/// folder of this principal's whose soul reads and names one: the mark its
+/// room's header draws on this Mac (91.1 acceptance 6). keeper-core keeps
+/// only the marks the bot identity draws.
+pub fn agent_icons(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, String> {
+    let mut icons = BTreeMap::new();
+    for profile in facts.profiles.iter().filter(|p| p.agents.is_some()) {
+        let Ok(decl) = declared(profile) else {
+            continue;
+        };
+        if facts
+            .login
+            .as_deref()
+            .is_some_and(|login| copy::hosts_principal(&decl, login).is_err())
+        {
+            continue;
+        }
+        let zone = read_zone(&decl.id, profile, Some(&decl));
+        for (_, home) in &zone.homes {
+            let Ok(home) = home else { continue };
+            let Ok(Some(text)) = read_text(&home.dir, soul::FILE_NAME) else {
+                continue;
+            };
+            let Ok(soul) = soul::parse_soul(&text, &home.config.name) else {
+                continue;
+            };
+            if !soul.icon.trim().is_empty() {
+                icons.insert(home.config.matrix_user.clone(), soul.icon);
+            }
+        }
+    }
+    icons
 }
 
 /// The flagged folder `profile_id` and its `_drive.toml`: what a re-pin
@@ -962,6 +997,35 @@ mod tests {
         assert_eq!(rows[0].agent, "");
         assert_eq!(rows[0].pin, None);
         assert_eq!(rows[0].problem.as_deref(), Some(sentence.as_str()));
+    }
+
+    /// The soul's icon of each agent of the principal's flagged folders, by
+    /// Matrix user; an agent with no soul, or a soul naming no icon, has none.
+    #[test]
+    fn each_hosted_agent_is_marked_with_its_souls_icon() {
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let soul = |icon: &str| {
+            format!(
+                "---\nname: \"Nixi\"\ntitle: \"Proxy\"\nicon: \"{icon}\"\nrole: \"r\"\nidentity: \"i\"\ncommunication_style: \"c\"\n---\nBody.\n"
+            )
+        };
+        let facts = |login: &str| DesktopFacts {
+            login: Some(login.to_owned()),
+            profiles: vec![profile(root.path())],
+            ..DesktopFacts::default()
+        };
+        let nixi = OwnedUserId::try_from("@nixi:example.org").expect("user");
+        assert!(agent_icons(&facts("tgorka")).is_empty(), "no soul yet");
+        write(root.path(), "80-agents/nixi/SOUL.md", &soul("N"));
+        assert_eq!(
+            agent_icons(&facts("tgorka")),
+            BTreeMap::from([(nixi, "N".to_owned())])
+        );
+        // Another principal's folder marks nothing here.
+        assert!(agent_icons(&facts("marta")).is_empty());
+        write(root.path(), "80-agents/nixi/SOUL.md", &soul(""));
+        assert!(agent_icons(&facts("tgorka")).is_empty(), "no icon named");
     }
 
     /// A first sign-in that fails after its store was created must not

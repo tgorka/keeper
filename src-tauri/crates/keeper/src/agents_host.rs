@@ -20,6 +20,7 @@ use keeper_agent::desktop::{self, DesktopFacts, DesktopHost, TickGate};
 use keeper_agent::seed as seeding;
 use keeper_core::agents::copy::{self, AgentCopyVm, AgentPinReq};
 use keeper_core::agents::pins;
+use keeper_core::agents::room::AgentIcons;
 use keeper_core::agents::seed::{
     self, AgentSeedOfferVm, AgentSeedPlanVm, AgentSeedReq, AgentSeedResultVm,
 };
@@ -49,6 +50,9 @@ const NAMES_WITHIN: Duration = Duration::from_secs(2);
 #[derive(Default)]
 struct Runtime {
     platform: OnceLock<Arc<dyn Platform>>,
+    /// The account manager's agent marks, replaced from the souls on each
+    /// scan (91.1 acceptance 6).
+    icons: OnceLock<Arc<AgentIcons>>,
     /// The host; also held across a sign-in, so no tick rebuilds it while
     /// a copy's store is open for the sign-in.
     host: tokio::sync::Mutex<Option<DesktopHost>>,
@@ -72,7 +76,7 @@ fn refusal(message: impl Into<String>) -> IpcError {
 
 /// Start hosting at app start, after the sync supervisor: the first scan
 /// is the next tick's.
-pub fn start(platform: Arc<dyn Platform>) {
+pub fn start(platform: Arc<dyn Platform>, icons: Arc<AgentIcons>) {
     let data_dir = match platform.data_dir() {
         Ok(dir) => dir,
         Err(error) => {
@@ -82,6 +86,7 @@ pub fn start(platform: Arc<dyn Platform>) {
     };
     let base = crate::agent_ports::task_env(Arc::clone(&platform));
     let host = DesktopHost::new(base, data_dir, env!("CARGO_PKG_VERSION"));
+    let _ = RUNTIME.icons.set(icons);
     if RUNTIME.platform.set(platform).is_ok() {
         if let Ok(mut slot) = RUNTIME.host.try_lock() {
             *slot = Some(host);
@@ -106,8 +111,18 @@ pub fn tick() {
     tauri::async_runtime::spawn(async move {
         let _pass = pass;
         let facts = if scan {
-            match tokio::task::spawn_blocking(move || facts(platform.as_ref())).await {
-                Ok(facts) => Some(facts),
+            let scanned = tokio::task::spawn_blocking(move || {
+                let facts = facts(platform.as_ref());
+                let icons = desktop::agent_icons(&facts);
+                (facts, icons)
+            });
+            match scanned.await {
+                Ok((facts, icons)) => {
+                    if let Some(marks) = RUNTIME.icons.get() {
+                        marks.replace(icons);
+                    }
+                    Some(facts)
+                }
                 Err(error) => {
                     tracing::error!(%error, "agents: this Mac's facts could not be read");
                     None

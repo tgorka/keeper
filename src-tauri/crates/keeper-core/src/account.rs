@@ -45,6 +45,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
+use crate::agents::room::{self as agent_room, AgentIcons, AgentKinds};
 use crate::archive::{self, ArchiveEvent, ArchiveHandle, ArchiveMedia, ArchiveWriter};
 use crate::auth::{self, session_keychain_key};
 use crate::backup::{self, BackupSink};
@@ -596,6 +597,13 @@ pub struct AccountManager {
     /// `static`) so there is no new global mutable state; the Settings command reads/sets
     /// it via [`AccountManager::dock_badge_mode_get`] / [`AccountManager::dock_badge_mode_set`].
     badge: Arc<BadgeConfig>,
+    /// The session kind of every agent room read so far (UX-DR132): fed by the
+    /// room list and by an open agent room's header, read by the room list.
+    agent_kinds: Arc<AgentKinds>,
+    /// The soul's mark of every agent whose zone is on this device (91.1
+    /// acceptance 6): the desktop's agents host replaces it on each scan
+    /// through [`AccountManager::agent_icons`]; on the phone it stays empty.
+    agent_icons: Arc<AgentIcons>,
 }
 
 /// Monotonic source of subscription ids handed back to the frontend.
@@ -686,6 +694,8 @@ impl AccountManager {
             palette: Arc::new(Mutex::new(PaletteIndex::new())),
             notify,
             badge,
+            agent_kinds: Arc::new(AgentKinds::default()),
+            agent_icons: Arc::new(AgentIcons::default()),
         }
     }
 
@@ -891,6 +901,7 @@ impl AccountManager {
         // reads, so the glyph and notification suppression never diverge, and no
         // per-row SQLite open happens on the inbox hot path.
         let notify = self.notify.clone();
+        let kinds = self.agent_kinds.clone();
         let span = tracing::info_span!("room_list_producer", account_id = %account_id);
         let reaper_subs = subs_arc.clone();
         let task = tokio::spawn(
@@ -898,7 +909,7 @@ impl AccountManager {
                 // `client` is captured to keep the account alive for the task's
                 // lifetime; the producer reads from the room list only.
                 let _keep_alive = client;
-                run_producer(room_list, sink, &account_id_owned, &notify).await;
+                run_producer(room_list, sink, &account_id_owned, &notify, &kinds).await;
                 // A naturally-completed producer reaps its own subscription entry.
                 reaper_subs.lock().await.remove(&subscription_id);
             }
@@ -932,11 +943,13 @@ impl AccountManager {
     /// `inbox_sink`, the Archive window into `archive_sink`, the Pins window into
     /// `pins_sink` (seeded from keeper-local [`registry::get_pins`], Story 4.3),
     /// and the Favorites window into `favourites_sink` (SDK-sourced `m.favourite`
-    /// tag, Story 4.4). Returns the inbox subscription id. Replacing an
+    /// tag, Story 4.4), and the Agents window into `agents_sink` (every agent
+    /// session room and only there; control rooms in no window — UX-DR132).
+    /// Returns the inbox subscription id. Replacing an
     /// existing inbox subscription (e.g. the frontend re-subscribes after adding an
     /// account) first tears the old one down. Adding the Nth account is identical
     /// to the 2nd — no count limit.
-    // Six sinks (Inbox/Archive/Pins/Favorites/Spaces/Networks) plus `self` and the
+    // Seven sinks (Inbox/Archive/Pins/Favorites/Agents/Spaces/Networks) plus `self` and the
     // platform each cross the IPC boundary as a distinct stream; grouping them into a
     // struct would only obscure the one-to-one channel mapping.
     #[allow(clippy::too_many_arguments)]
@@ -947,6 +960,7 @@ impl AccountManager {
         archive_sink: InboxSink,
         pins_sink: InboxSink,
         favourites_sink: InboxSink,
+        agents_sink: InboxSink,
         spaces_sink: SpacesSink,
         networks_sink: NetworksSink,
     ) -> Result<u64, CoreError> {
@@ -964,6 +978,7 @@ impl AccountManager {
             archive_sink,
             pins_sink,
             favourites_sink,
+            agents_sink,
             pins,
             spaces_sink,
             networks_sink,
@@ -1034,10 +1049,17 @@ impl AccountManager {
             // `MuteState` consults the same live muted-Network set the notify handler
             // reads (Story 10.2) — no per-row SQLite open on the inbox hot path.
             let notify_for_task = self.notify.clone();
+            let kinds_for_task = self.agent_kinds.clone();
             let task = tokio::spawn(
                 async move {
-                    run_inbox_producer(room_list, merger_for_task, &account_id, &notify_for_task)
-                        .await;
+                    run_inbox_producer(
+                        room_list,
+                        merger_for_task,
+                        &account_id,
+                        &notify_for_task,
+                        &kinds_for_task,
+                    )
+                    .await;
                 }
                 .instrument(
                     tracing::info_span!("inbox_producer", account_id = %account.account_id),
@@ -1344,11 +1366,13 @@ impl AccountManager {
         let reaper_timelines = timelines_arc.clone();
         let room_id_task = room_id.clone();
         let room_id_log = room_id.clone();
+        let kinds = self.agent_kinds.clone();
+        let icons = self.agent_icons.clone();
         let span =
             tracing::info_span!("timeline_producer", account_id = %account_id, room_id = %room_id);
         let task = tokio::spawn(
             async move {
-                timeline::forward_timeline(open, room_id_task, sink).await;
+                timeline::forward_timeline(open, room_id_task, sink, kinds, icons).await;
                 // A naturally-completed producer reaps its own subscription entry
                 // and drops its stored `Arc<Timeline>` so nothing leaks (AD-19).
                 reaper_subs.lock().await.remove(&subscription_id);
@@ -3754,6 +3778,13 @@ impl AccountManager {
         Ok(())
     }
 
+    /// The soul's marks of the agents whose zones are on this device, shared
+    /// with the desktop's agents host, which replaces them on each scan; every
+    /// agent room header reads its agent's mark here (91.1 acceptance 6).
+    pub fn agent_icons(&self) -> Arc<AgentIcons> {
+        self.agent_icons.clone()
+    }
+
     /// Read the dock-badge mode (Story 10.3, FR-53). Returns the in-memory
     /// [`BadgeConfig`] value (seeded from the persisted registry at construction; default
     /// [`DockBadgeMode::All`](crate::vm::DockBadgeMode)). Infallible — reads process state.
@@ -5618,6 +5649,7 @@ async fn run_producer(
     sink: BatchSink,
     account_id: &str,
     notify: &NotifyConfig,
+    kinds: &AgentKinds,
 ) {
     let mut loading_state = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
@@ -5642,7 +5674,7 @@ async fn run_producer(
                     Some(diffs) => {
                         let mut ops = Vec::with_capacity(diffs.len());
                         for diff in diffs {
-                            ops.push(diff_to_op(diff, notify).await);
+                            ops.push(diff_to_op(diff, notify, kinds).await);
                         }
                         if !(sink)(RoomListBatch { ops, total }) {
                             tracing::info!(account_id = %account_id, "room list channel closed, stopping producer");
@@ -5676,6 +5708,7 @@ async fn run_inbox_producer(
     merger: InboxMerger,
     account_id: &str,
     notify: &NotifyConfig,
+    kinds: &AgentKinds,
 ) {
     let mut loading_state = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
@@ -5696,7 +5729,7 @@ async fn run_inbox_producer(
                     Some(diffs) => {
                         let mut ops = Vec::with_capacity(diffs.len());
                         for diff in diffs {
-                            ops.push(diff_to_op(diff, notify).await);
+                            ops.push(diff_to_op(diff, notify, kinds).await);
                         }
                         if !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await {
                             tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
@@ -5930,8 +5963,12 @@ fn loaded_total(state: &RoomListLoadingState) -> Option<u32> {
 /// Convert a `VectorDiff<RoomListItem>` into a [`RoomListOp`], resolving each
 /// carried item to a [`RoomVm`] (async) before delegating to the pure
 /// [`vector_diff_to_op`] seam.
-async fn diff_to_op(diff: VectorDiff<RoomListItem>, notify: &NotifyConfig) -> RoomListOp {
-    let mapped = map_vector_diff(diff, notify).await;
+async fn diff_to_op(
+    diff: VectorDiff<RoomListItem>,
+    notify: &NotifyConfig,
+    kinds: &AgentKinds,
+) -> RoomListOp {
+    let mapped = map_vector_diff(diff, notify, kinds).await;
     vector_diff_to_op(mapped)
 }
 
@@ -5941,41 +5978,43 @@ async fn diff_to_op(diff: VectorDiff<RoomListItem>, notify: &NotifyConfig) -> Ro
 /// (display name / latest event / mute state) while the diff→op conversion is pure.
 /// `notify` threads the in-memory muted-Network set into the per-room [`MuteState`]
 /// resolution (Story 10.2) — the same live source the notify handler reads.
+/// `kinds` holds the agent rooms' session kinds read so far (UX-DR132).
 async fn map_vector_diff(
     diff: VectorDiff<RoomListItem>,
     notify: &NotifyConfig,
+    kinds: &AgentKinds,
 ) -> VectorDiff<RoomVm> {
     match diff {
         VectorDiff::Append { values } => {
             let mut vms = Vec::with_capacity(values.len());
             for item in values {
-                vms.push(room_item_to_vm(&item, notify).await);
+                vms.push(room_item_to_vm(&item, notify, kinds).await);
             }
             VectorDiff::Append { values: vms.into() }
         }
         VectorDiff::Clear => VectorDiff::Clear,
         VectorDiff::PushFront { value } => VectorDiff::PushFront {
-            value: room_item_to_vm(&value, notify).await,
+            value: room_item_to_vm(&value, notify, kinds).await,
         },
         VectorDiff::PushBack { value } => VectorDiff::PushBack {
-            value: room_item_to_vm(&value, notify).await,
+            value: room_item_to_vm(&value, notify, kinds).await,
         },
         VectorDiff::PopFront => VectorDiff::PopFront,
         VectorDiff::PopBack => VectorDiff::PopBack,
         VectorDiff::Insert { index, value } => VectorDiff::Insert {
             index,
-            value: room_item_to_vm(&value, notify).await,
+            value: room_item_to_vm(&value, notify, kinds).await,
         },
         VectorDiff::Set { index, value } => VectorDiff::Set {
             index,
-            value: room_item_to_vm(&value, notify).await,
+            value: room_item_to_vm(&value, notify, kinds).await,
         },
         VectorDiff::Remove { index } => VectorDiff::Remove { index },
         VectorDiff::Truncate { length } => VectorDiff::Truncate { length },
         VectorDiff::Reset { values } => {
             let mut vms = Vec::with_capacity(values.len());
             for item in values {
-                vms.push(room_item_to_vm(&item, notify).await);
+                vms.push(room_item_to_vm(&item, notify, kinds).await);
             }
             VectorDiff::Reset { values: vms.into() }
         }
@@ -6043,7 +6082,7 @@ async fn resolve_mute_state(
 
 /// Resolve a [`RoomListItem`] to a non-secret [`RoomVm`]: display name plus a
 /// latest-event text preview and timestamp.
-async fn room_item_to_vm(item: &RoomListItem, notify: &NotifyConfig) -> RoomVm {
+async fn room_item_to_vm(item: &RoomListItem, notify: &NotifyConfig, kinds: &AgentKinds) -> RoomVm {
     let room_id = item.room_id().to_string();
     let resolved = item.display_name().await;
     if resolved.is_err() {
@@ -6098,6 +6137,9 @@ async fn room_item_to_vm(item: &RoomListItem, notify: &NotifyConfig) -> RoomVm {
     // any read error so a transient push-rule failure never blocks the inbox stream
     // and never touches the unread computation above.
     let mute_state = resolve_mute_state(item, network.as_deref(), notify).await;
+    // An agent room from its cached create type; a session room's proxy-or-watched
+    // from its status's session kind, never guessed (UX-DR132).
+    let agent_room = agent_room::room_kind_vm(item, kinds).await;
 
     RoomVm {
         room_id,
@@ -6113,6 +6155,7 @@ async fn room_item_to_vm(item: &RoomListItem, notify: &NotifyConfig) -> RoomVm {
         network,
         network_id,
         mute_state,
+        agent_room,
     }
 }
 
@@ -7540,6 +7583,7 @@ mod tests {
             network: None,
             network_id: None,
             mute_state: MuteState::None,
+            agent_room: None,
         }
     }
 

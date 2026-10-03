@@ -44,7 +44,7 @@
  * is present, so `tauri dev` is never quietly served fixtures.
  */
 
-import { mockIPC } from "@tauri-apps/api/mocks";
+import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { IDLE_RECORDING_STATUS } from "@/hooks/use-recording-session";
 import { remoteOnSourceHost } from "@/lib/forge-repos";
 import type {
@@ -58,6 +58,7 @@ import type {
   AgentCopyVm,
   AgentPersonVm,
   AgentPinVm,
+  AgentRoomHeaderVm,
   AgentSeedOfferVm,
   AgentSeedPlanVm,
   AgentSeedReq,
@@ -99,6 +100,9 @@ import type {
   ForgeSourceVm,
   GrantScope,
   HotkeyVm,
+  InboxBatch,
+  InboxRoomVm,
+  NetworksSnapshot,
   NoteBodyBatch,
   OrgAccountVm,
   PacedWorkVm,
@@ -110,6 +114,7 @@ import type {
   SessionSpaceFilesVm,
   SessionSpaceFileVm,
   SessionSpaceVm,
+  SpacesSnapshot,
   SyncFootprintVm,
   SyncProblemsVm,
   SyncProfileReq,
@@ -125,6 +130,8 @@ import type {
   TaskSchedulePreviewVm,
   TaskVm,
   TextFileVm,
+  TimelineBatch,
+  TimelineItemVm,
   VoiceStateVm,
   VoiceUnavailableVm,
   VoiceWakeVm,
@@ -4069,7 +4076,291 @@ function later<T>(ms: number, answer: () => T): Promise<T> {
   return new Promise((resolve) => setTimeout(() => resolve(answer()), ms));
 }
 
+// ---------------------------------------------------------------------------
+// Agent rooms (91.1): the merged inbox with its Agents window, and an agent
+// room's timeline with the header beside it, shaped as `keeper-core` streams
+// them (`inbox_subscribe`'s seven channels; `timeline_subscribe`'s
+// `TimelineBatch.header`). Rust decides every word here — the run, the handle,
+// the unreadable sentence, the label sentence; these fixtures only copy the
+// shapes so the header line and the Agents window can be drawn in a browser.
+//
+// Rooms: Nixi's DM (a proxy conversation whose answer grows by `set` ops and
+// whose run goes `running` → `done`), a second proxy conversation with no
+// scope yet, a delegated session waiting for hesperia, a session whose status
+// and scope came from a newer keeper (run `unreadable`), and a session room
+// with no status yet, whose kind keeper has not read (`unknown`). One ordinary
+// chat stays in the Inbox window. A control room is in no window, so it is not
+// here.
+// ---------------------------------------------------------------------------
+
+const MOCK_ACCOUNT_ID = "01J8ACCOUNTMOCKAAAAAAAAAAA";
+const MOCK_NOW = Date.now();
+
+function inboxRow(
+  roomId: string,
+  displayName: string,
+  lastMessage: string,
+  minutesAgo: number,
+  agentRoom?: InboxRoomVm["agentRoom"],
+): InboxRoomVm {
+  return {
+    accountId: MOCK_ACCOUNT_ID,
+    hueIndex: 3,
+    roomId,
+    displayName,
+    lastMessage,
+    timestamp: MOCK_NOW - minutesAgo * 60_000,
+    avatarUrl: null,
+    isUnread: false,
+    mentionCount: 0,
+    isArchived: false,
+    isFavourite: false,
+    isPinned: false,
+    network: null,
+    networkId: null,
+    muteState: "none",
+    ...(agentRoom ? { agentRoom } : {}),
+  };
+}
+
+const AGENT_ROOM_ROWS: InboxRoomVm[] = [
+  inboxRow("!nixi-dm:example.org", "Nixi", "…", 1, "proxy"),
+  inboxRow("!nixi-reading:example.org", "Nixi — reading list", "Three left.", 40, "proxy"),
+  inboxRow(
+    "!tola-review:example.org",
+    "Dr Tola Grey — review",
+    "Waiting for hesperia.",
+    90,
+    "session",
+  ),
+  inboxRow("!lucyna-notes:example.org", "Dr Lucyna Novak", "Done.", 600, "session"),
+  inboxRow("!nixi-new:example.org", "New conversation", "", 900, "unknown"),
+];
+
+const CHAT_ROWS: InboxRoomVm[] = [inboxRow("!marta:example.org", "Marta", "See you on Friday", 15)];
+
+const NIXI = "@nixi:example.org";
+const PERSON = "@harness:example.org";
+
+function textItem(
+  key: string,
+  sender: string,
+  senderDisplayName: string,
+  body: string,
+  minutesAgo: number,
+): TimelineItemVm {
+  return {
+    kind: "message",
+    key,
+    sender,
+    senderDisplayName,
+    body,
+    timestamp: MOCK_NOW - minutesAgo * 60_000,
+    isOwn: sender === PERSON,
+    sendState: null,
+    isEdited: false,
+    reply: null,
+    reactions: [],
+    media: null,
+    readers: [],
+  };
+}
+
+const NIXI_LABEL = {
+  readers: ["harness", "Marta"],
+  anyone: false,
+  integrity: "owner",
+  localOnly: false,
+  sentence: "What you read here may be shown only to: harness, Marta.",
+};
+
+function nixiHeader(run: "running" | "done", caretKey: string | null): AgentRoomHeaderVm {
+  return {
+    status: {
+      agent: NIXI,
+      agentName: "Nixi",
+      handle: "nixi@electra",
+      // Nixi's zone is on this (desktop) device: her soul's mark. The other
+      // rooms carry none, as on the phone, and draw the handle's first letter.
+      icon: "N",
+      host: "electra",
+      title: "Nixi",
+      kind: "main",
+      run,
+      waiting: null,
+      detail: run === "running" ? "2 notes read" : null,
+      unreadable: null,
+    },
+    scope: [
+      { id: "tgdrive", title: "tgdrive" },
+      { id: "neura", title: "Neura" },
+    ],
+    label: NIXI_LABEL,
+    scopeUnreadable: null,
+    caretKey,
+  };
+}
+
+/** Each agent room's header and items as the stream's first batch carries them. */
+const AGENT_ROOM_TIMELINES: Record<string, { header: AgentRoomHeaderVm; items: TimelineItemVm[] }> =
+  {
+    "!nixi-dm:example.org": {
+      header: nixiHeader("running", "nixi-answer"),
+      items: [
+        textItem("nixi-q", PERSON, "harness", "What did I write about Synapse limits?", 2),
+        textItem("nixi-answer", NIXI, "Nixi", "…", 1),
+      ],
+    },
+    "!nixi-reading:example.org": {
+      header: {
+        status: {
+          agent: NIXI,
+          agentName: "Nixi",
+          handle: "nixi@hesperia",
+          host: "hesperia",
+          title: "Reading list",
+          kind: "conversation",
+          run: "idle",
+          waiting: null,
+          detail: null,
+          unreadable: null,
+        },
+        scope: null,
+        label: null,
+        scopeUnreadable: null,
+        caretKey: null,
+      },
+      items: [textItem("reading-1", NIXI, "Nixi", "Three left.", 40)],
+    },
+    "!tola-review:example.org": {
+      header: {
+        status: {
+          agent: "@tola:example.org",
+          agentName: "Dr Tola Grey",
+          handle: "tola@electra",
+          host: "electra",
+          title: "Review of the sync chapter",
+          kind: "delegated",
+          run: "waiting",
+          waiting: "hesperia",
+          detail: null,
+          unreadable: null,
+        },
+        scope: [{ id: "tgdrive", title: "tgdrive" }],
+        label: { ...NIXI_LABEL, integrity: "agent" },
+        scopeUnreadable: null,
+        caretKey: null,
+      },
+      items: [textItem("tola-1", "@tola:example.org", "Dr Tola Grey", "Waiting for hesperia.", 90)],
+    },
+    "!lucyna-notes:example.org": {
+      header: {
+        status: {
+          agent: "@lucyna:example.org",
+          agentName: "Dr Lucyna Novak",
+          handle: "lucyna",
+          host: null,
+          title: null,
+          kind: null,
+          run: "unreadable",
+          waiting: null,
+          detail: null,
+          unreadable: "This status is from a newer keeper. Update keeper to read it.",
+        },
+        scope: null,
+        label: null,
+        scopeUnreadable: "This scope is from a newer keeper. Update keeper to read it.",
+        caretKey: null,
+      },
+      items: [textItem("lucyna-1", "@lucyna:example.org", "Dr Lucyna Novak", "Done.", 600)],
+    },
+    "!nixi-new:example.org": {
+      header: {
+        status: null,
+        scope: null,
+        label: null,
+        scopeUnreadable: null,
+        caretKey: null,
+      },
+      items: [],
+    },
+  };
+
+/** Nixi's answer as it grows: each step is one `set` op on the anchor. */
+const NIXI_ANSWER_STEPS = [
+  "Synapse",
+  "Synapse accepted an encrypted final edit",
+  "Synapse accepted an encrypted final edit of 47 061 bytes",
+  "Synapse accepted an encrypted final edit of 47 061 bytes, so the cut sits at 45 KiB.",
+];
+
+/** The running fake streams, by subscription id, so unsubscribe stops one. */
+const TIMELINE_STREAMS = new Map<number, ReturnType<typeof setInterval>>();
+let nextTimelineSubscription = 1;
+
+function subscribeMockTimeline(payload: Record<string, unknown>): number {
+  const channel = payload.channel as MockChannel<TimelineBatch>;
+  const roomId = String(payload.roomId);
+  const id = nextTimelineSubscription++;
+  const agent = AGENT_ROOM_TIMELINES[roomId];
+  if (!agent) {
+    channel.onmessage?.({
+      ops: [
+        {
+          op: "reset",
+          items: [textItem(`${roomId}-1`, "@marta:example.org", "Marta", "See you on Friday", 15)],
+        },
+      ],
+    });
+    return id;
+  }
+  channel.onmessage?.({ ops: [{ op: "reset", items: agent.items }], header: agent.header });
+  if (roomId !== "!nixi-dm:example.org") {
+    return id;
+  }
+  let step = 0;
+  const timer = setInterval(() => {
+    const body = NIXI_ANSWER_STEPS[step];
+    const last = step === NIXI_ANSWER_STEPS.length - 1;
+    const item = { ...textItem("nixi-answer", NIXI, "Nixi", body, 1) };
+    channel.onmessage?.({
+      ops: [{ op: "set", index: 1, item }],
+      ...(last ? { header: nixiHeader("done", null) } : {}),
+    });
+    step += 1;
+    if (last) {
+      clearInterval(timer);
+      TIMELINE_STREAMS.delete(id);
+    }
+  }, 900);
+  TIMELINE_STREAMS.set(id, timer);
+  return id;
+}
+
+function subscribeMockInbox(payload: Record<string, unknown>): number {
+  const reset = (rooms: InboxRoomVm[]): InboxBatch => ({
+    ops: [{ op: "reset", rooms }],
+    total: rooms.length,
+  });
+  (payload.channel as MockChannel<InboxBatch>).onmessage?.(reset(CHAT_ROWS));
+  for (const window of ["archive", "pins", "favourites"]) {
+    (payload[window] as MockChannel<InboxBatch>).onmessage?.(reset([]));
+  }
+  (payload.agents as MockChannel<InboxBatch>).onmessage?.(reset(AGENT_ROOM_ROWS));
+  (payload.spaces as MockChannel<SpacesSnapshot>).onmessage?.({ spaces: [] });
+  (payload.networks as MockChannel<NetworksSnapshot>).onmessage?.({ networks: [] });
+  return 1;
+}
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  inbox_subscribe: subscribeMockInbox,
+  timeline_subscribe: subscribeMockTimeline,
+  timeline_unsubscribe: (payload) => {
+    const id = Number(payload.subscriptionId);
+    clearInterval(TIMELINE_STREAMS.get(id));
+    TIMELINE_STREAMS.delete(id);
+    return null;
+  },
   ...transcriptionMockHandlers(() => ANSWERS.sync_profiles as SyncProfileVm[]),
   ...mediaBlockMockHandlers(),
   "plugin:dialog|open": (payload) => {
@@ -6091,5 +6382,9 @@ export function installMockShell(): void {
     console.debug("[mock-shell]", command, payload ?? "", "→", answer);
     return answer;
   });
+  // The conversation pane listens for file drops on the current webview, which
+  // reads the window's label from the shell's metadata; without it opening any
+  // room throws before the timeline draws.
+  mockWindows("main");
   document.documentElement.dataset.mockShell = "on";
 }

@@ -9,10 +9,19 @@
  * **never sorts, re-sorts, or re-orders**. A `Reset` replaces contents wholesale,
  * which is why re-subscribing (StrictMode remount, room re-open) never
  * duplicates items.
+ *
+ * In an agent room the stream also carries the room's header beside the ops
+ * ({@link AgentRoomHeaderVm}). Rust sends it on the first batch and again only
+ * when it changed, so a batch without one leaves the last header standing.
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
-import type { TimelineBatch, TimelineItemVm, TimelineOp } from "@/lib/ipc/client";
+import type {
+  AgentRoomHeaderVm,
+  TimelineBatch,
+  TimelineItemVm,
+  TimelineOp,
+} from "@/lib/ipc/client";
 import { applyDiffOp } from "@/lib/stores/vector-diff";
 
 /**
@@ -28,6 +37,8 @@ function applyOp(items: TimelineItemVm[], op: TimelineOp): TimelineItemVm[] {
 export interface TimelineState {
   /** The ordered timeline, exactly as Rust streamed it. */
   items: TimelineItemVm[];
+  /** The agent room's header, or `null` in every other room. */
+  header: AgentRoomHeaderVm | null;
   /** Apply one streamed batch (its ops in sequence). */
   applyBatch: (batch: TimelineBatch) => void;
   /** Reset to the empty state (on room change / unsubscribe). */
@@ -40,11 +51,13 @@ export interface TimelineState {
  */
 export const timelineStore = createStore<TimelineState>()((set) => ({
   items: [],
+  header: null,
   applyBatch: (batch) =>
     set((state) => ({
       items: batch.ops.reduce(applyOp, state.items),
+      header: batch.header ?? state.header,
     })),
-  clear: () => set({ items: [] }),
+  clear: () => set({ items: [], header: null }),
 }));
 
 /**

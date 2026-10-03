@@ -156,7 +156,7 @@ import {
   SYNC_REMOTE_URL_LABEL,
   SYNC_TOKEN_LABEL,
 } from "@/components/sync/add-folder-form";
-import { phoneRoutesView } from "@/lib/phone-surfaces";
+import { isChatWindowView, phoneRoutesView } from "@/lib/phone-surfaces";
 
 const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -1565,7 +1565,7 @@ describe("PhoneShell view surfaces (Story 66.1, AD-197)", () => {
   it("every drawer row on the phone lands on a level (the registry against the surfaces)", async () => {
     // Generic on purpose: whatever rows `SidebarPane` draws for this tier are
     // tapped one by one, and each must leave the stack either on level 0
-    // (the two chat windows) or on a level 1 with a way back. A surface added
+    // (the chat windows) or on a level 1 with a way back. A surface added
     // to `phone-surfaces.ts` without its branch in the shell fails here as a
     // level with no back control; a row the shell cannot route is filtered
     // out of the drawer by the same table, so the count is asserted too.
@@ -1601,7 +1601,7 @@ describe("PhoneShell view surfaces (Story 66.1, AD-197)", () => {
       }
       await tapDrawerRow(new RegExp(`^${entry.label}`));
       expect(primaryViewStore.getState().view).toBe(entry.view);
-      if (entry.view === "inbox" || entry.view === "archive") {
+      if (isChatWindowView(entry.view)) {
         expect(document.querySelector('[data-level="1"]'), entry.label).toBeNull();
         continue;
       }

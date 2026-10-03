@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::agents::room::{AgentRoomHeaderVm, AgentRoomKindVm};
 use crate::bots::{BotHealthState, ProviderKind};
 use crate::notes::export::NoteExportPlan;
 use crate::signals::IncognitoScope;
@@ -731,6 +732,12 @@ pub struct RoomVm {
     /// the keeper-local muted-Network set. Copied through to [`InboxRoomVm`] to render
     /// the mute glyph; never gates unread. Fail-open `None` on any read error.
     pub mute_state: MuteState,
+    /// Which agent room this is, from its create type and its status's
+    /// session kind (UX-DR132); absent for every other room. The merge puts a
+    /// session room in the Agents window only and a control room in none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_room: Option<AgentRoomKindVm>,
 }
 
 /// One Matrix Space the user belongs to, surfaced as a filter view (Story 4.5,
@@ -1416,6 +1423,12 @@ pub enum TimelineOp {
 pub struct TimelineBatch {
     /// The ordered ops to apply, in sequence.
     pub ops: Vec<TimelineOp>,
+    /// An agent room's header, sent on the first batch and on every batch
+    /// after it changed (ruling R33); absent in every other room and on a
+    /// batch where it did not change. A batch may carry a header and no ops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub header: Option<AgentRoomHeaderVm>,
 }
 
 /// One member currently typing in the open room (Story 3.9, typing, AD-14,
@@ -1896,6 +1909,11 @@ pub struct InboxRoomVm {
     /// (`Muted` → bell-off, `MentionOnly` → at-sign); `None` shows no glyph. Reflects
     /// durable mute only — never the global DND switch — and never gates unread.
     pub mute_state: MuteState,
+    /// Copied through from [`RoomVm::agent_room`]: `proxy` or `session` for a
+    /// row in the Agents window; absent for every other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_room: Option<AgentRoomKindVm>,
 }
 
 /// One index-based merged-inbox operation mirroring an eyeball-im `VectorDiff`
@@ -8009,6 +8027,7 @@ mod tests {
             network: None,
             network_id: None,
             mute_state: MuteState::None,
+            agent_room: None,
         }
     }
 
@@ -8192,6 +8211,7 @@ mod tests {
             network: None,
             network_id: None,
             mute_state: MuteState::None,
+            agent_room: None,
         }
     }
 
@@ -8225,6 +8245,7 @@ mod tests {
             network: None,
             network_id: None,
             mute_state: MuteState::None,
+            agent_room: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(json.contains("\"lastMessage\":null"), "json was: {json}");
@@ -9205,6 +9226,7 @@ mod tests {
                     },
                 },
             ],
+            header: None,
         };
         let json = serde_json::to_string(&batch).expect("serialize batch");
         assert!(json.contains("\"ops\":"), "json was: {json}");

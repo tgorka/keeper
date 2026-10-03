@@ -12539,17 +12539,23 @@ pub async fn egress_list(
 /// streams over one subscription: the Inbox window over `channel`, the Archive
 /// window over `archive`, the Pins window over `pins`, and the Favorites window
 /// over `favourites` (each a `Reset` window that updates as accounts sync or as
-/// archive/pin/favourite state changes). Returns the inbox subscription id — one
-/// `inbox_unsubscribe` tears down all four. Ordering and the four-way split are
+/// archive/pin/favourite state changes), and the Agents window over `agents`
+/// (every agent session room and only there; an agents' control room is in no
+/// window — UX-DR132). Returns the inbox subscription id — one
+/// `inbox_unsubscribe` tears down all of them. Ordering and the split are
 /// computed in `keeper-core::inbox`, never in JS. A stream-start failure funnels
 /// through [`to_ipc_error`] to `SyncUnavailable`.
 #[tauri::command]
+// One parameter per window and snapshot channel: each is a distinct stream the
+// frontend arms before invoking, so a struct would only hide the mapping.
+#[allow(clippy::too_many_arguments)]
 pub async fn inbox_subscribe(
     state: State<'_, AppState>,
     channel: Channel<InboxBatch>,
     archive: Channel<InboxBatch>,
     pins: Channel<InboxBatch>,
     favourites: Channel<InboxBatch>,
+    agents: Channel<InboxBatch>,
     spaces: Channel<SpacesSnapshot>,
     networks: Channel<NetworksSnapshot>,
 ) -> Result<u64, IpcError> {
@@ -12557,9 +12563,10 @@ pub async fn inbox_subscribe(
     let archive_sink = Box::new(move |batch: InboxBatch| archive.send(batch).is_ok());
     let pins_sink = Box::new(move |batch: InboxBatch| pins.send(batch).is_ok());
     let favourites_sink = Box::new(move |batch: InboxBatch| favourites.send(batch).is_ok());
-    // Fifth channel (Story 4.5): the aggregated Space list as a whole snapshot.
+    let agents_sink = Box::new(move |batch: InboxBatch| agents.send(batch).is_ok());
+    // The aggregated Space list as a whole snapshot (Story 4.5).
     let spaces_sink = Box::new(move |snapshot: SpacesSnapshot| spaces.send(snapshot).is_ok());
-    // Sixth channel (Story 4.6): the distinct-Networks list as a whole snapshot.
+    // The distinct-Networks list as a whole snapshot (Story 4.6).
     let networks_sink = Box::new(move |snapshot: NetworksSnapshot| networks.send(snapshot).is_ok());
     state
         .accounts
@@ -12569,6 +12576,7 @@ pub async fn inbox_subscribe(
             archive_sink,
             pins_sink,
             favourites_sink,
+            agents_sink,
             spaces_sink,
             networks_sink,
         )

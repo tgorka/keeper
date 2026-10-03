@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
-import type { TimelineBatch, TimelineItemVm, TimelineOp } from "@/lib/ipc/client";
+import type {
+  AgentRoomHeaderVm,
+  TimelineBatch,
+  TimelineItemVm,
+  TimelineOp,
+} from "@/lib/ipc/client";
 import { timelineStore } from "@/lib/stores/timeline";
 
 function message(key: string, sender = "@bob:example.org"): TimelineItemVm {
@@ -99,5 +104,33 @@ describe("timelineStore.applyBatch", () => {
     timelineStore.getState().applyBatch(batch([{ op: "reset", items: [message("a")] }]));
     timelineStore.getState().clear();
     expect(timelineStore.getState().items).toEqual([]);
+  });
+});
+
+describe("timelineStore header", () => {
+  const header = (caretKey: string | null): AgentRoomHeaderVm => ({
+    status: null,
+    scope: null,
+    label: null,
+    scopeUnreadable: null,
+    caretKey,
+  });
+
+  it("keeps the last header through batches that carry none, and replaces it when one does", () => {
+    timelineStore
+      .getState()
+      .applyBatch({ ops: [{ op: "reset", items: [message("a")] }], header: header("a") });
+    timelineStore.getState().applyBatch(batch([{ op: "pushBack", item: message("b") }]));
+    expect(timelineStore.getState().header).toEqual(header("a"));
+    // A header arriving alone is a batch with no ops.
+    timelineStore.getState().applyBatch({ ops: [], header: header(null) });
+    expect(timelineStore.getState().header).toEqual(header(null));
+    expect(keys()).toEqual(["a", "b"]);
+  });
+
+  it("clear drops the header with the room", () => {
+    timelineStore.getState().applyBatch({ ops: [], header: header("a") });
+    timelineStore.getState().clear();
+    expect(timelineStore.getState().header).toBeNull();
   });
 });

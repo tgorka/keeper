@@ -38,6 +38,18 @@ pub const HOST: &str = "dev.keeper.agent.host";
 /// The contents' schema version, `"v": 1`.
 pub const CONTENT_VERSION: u32 = 1;
 
+/// The longest final message of a streamed answer, in bytes (R23). Longer
+/// answers are cut on a `char` boundary and point to an artifact holding
+/// the whole text; a device draws an answer up to this and that sentence
+/// (R42).
+///
+/// Measured, not chosen (90.5 acceptance 14): the largest text whose
+/// encrypted final edit the Synapse test homeserver accepted was 47 061
+/// bytes (2026-10-03; the server's 64 KiB event cap after Megolm and base64),
+/// so R23's 60 KiB does not fit. This is that, less room for the artifact
+/// sentence, rounded down to 1 KiB (`docs/agents.md` § Measured).
+pub const FINAL_CUT_BYTES: usize = 45 * 1024;
+
 /// `dev.keeper.agent.status` (timeline, encrypted).
 ///
 /// `kind` tells a device a proxy conversation (`main`, `conversation`) from a

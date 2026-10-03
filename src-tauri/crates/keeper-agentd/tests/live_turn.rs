@@ -948,7 +948,7 @@ async fn the_largest_final_message_that_fits_encrypted() {
             high = mid;
         }
     }
-    let cut = keeper_agent::matrix_sink::FINAL_CUT_BYTES;
+    let cut = keeper_core::agents::events::FINAL_CUT_BYTES;
     println!(
         "the largest final edit that fits encrypted: {low} bytes of text; FINAL_CUT_BYTES = {cut}"
     );

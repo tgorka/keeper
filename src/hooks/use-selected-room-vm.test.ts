@@ -2,6 +2,7 @@ import { renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { useSelectedRoomVm } from "@/hooks/use-selected-room-vm";
 import type { InboxRoomVm } from "@/lib/ipc/client";
+import { agentRoomsStore } from "@/lib/stores/agent-rooms";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
@@ -38,6 +39,7 @@ function resetAll() {
   pinsRoomsStore.getState().clear();
   favoritesRoomsStore.getState().clear();
   archiveRoomsStore.getState().clear();
+  agentRoomsStore.getState().clear();
 }
 
 afterEach(resetAll);
@@ -67,6 +69,16 @@ describe("useSelectedRoomVm", () => {
     roomsStore.getState().selectRoom({ accountId: "acctA", roomId: "!pin" });
     const { result } = renderHook(() => useSelectedRoomVm());
     expect(result.current?.roomId).toBe("!pin");
+  });
+
+  it("finds an agent room, which lives in the Agents window only", () => {
+    agentRoomsStore.getState().applyBatch({
+      ops: [{ op: "reset", rooms: [room("!nixi", "acctA", { agentRoom: "proxy" })] }],
+      total: 1,
+    });
+    roomsStore.getState().selectRoom({ accountId: "acctA", roomId: "!nixi" });
+    const { result } = renderHook(() => useSelectedRoomVm());
+    expect(result.current?.agentRoom).toBe("proxy");
   });
 
   it("returns null when the selection is not in any window (graceful degrade)", () => {
