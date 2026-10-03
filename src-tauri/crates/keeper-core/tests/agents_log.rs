@@ -12,7 +12,7 @@ use std::time::Duration;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use keeper_core::agents::index::Index;
 use keeper_core::agents::label::{Integrity, Label, Readers};
-use keeper_core::agents::log::reader::{hydrate_blob, read_session};
+use keeper_core::agents::log::reader::{hydrate_blob, read_session, ClaimConflict};
 use keeper_core::agents::log::replay::{replay, COMPACT_HEADING};
 use keeper_core::agents::log::writer::{rotate_at, ChunkWriter};
 use keeper_core::agents::log::{
@@ -542,7 +542,7 @@ fn a_superseded_epochs_late_lines_are_dropped() {
 
     let log = read_session(session);
     assert_eq!(texts(&log), ["before", "after"]);
-    assert!(!log.conflicted);
+    assert!(!log.conflicted());
     assert_eq!(log.problems.len(), 1);
     assert!(log.problems[0].sentence.contains("newer epoch"));
     // The dropped line is named where it is: electra's chunk, line 3.
@@ -573,7 +573,7 @@ fn a_superseded_epochs_late_lines_are_dropped() {
         .expect("w");
     let log = read_session(&calm.0);
     assert_eq!(texts(&log), ["kept"]);
-    assert!(!log.conflicted, "{:?}", log.problems);
+    assert!(!log.conflicted(), "{:?}", log.problems);
 }
 
 #[test]
@@ -593,7 +593,13 @@ fn a_double_acquire_at_one_epoch_is_a_conflict_and_replay_refuses() {
         .append(&claim_line("hesperia", 2, at(20), 3, "$b"))
         .expect("w");
     let log = read_session(session);
-    assert!(log.conflicted);
+    assert_eq!(
+        log.conflicts,
+        [ClaimConflict {
+            epoch: 2,
+            events: ["$a".to_owned(), "$b".to_owned()]
+        }]
+    );
     assert!(log
         .problems
         .iter()
@@ -607,7 +613,7 @@ fn a_double_acquire_at_one_epoch_is_a_conflict_and_replay_refuses() {
         .expect("w");
     only.append(&claim_line("electra", 2, at(10), 2, "$a"))
         .expect("w");
-    assert!(!read_session(&calm.0).conflicted);
+    assert!(!read_session(&calm.0).conflicted());
 }
 
 // ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use matrix_sdk::config::{RequestConfig, SyncSettings};
+use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
 use matrix_sdk::ruma::api::client::filter::{FilterDefinition, RoomEventFilter, RoomFilter};
 use matrix_sdk::ruma::api::client::room::create_room;
 use matrix_sdk::ruma::api::client::state::{get_state_events, send_state_event};
@@ -160,6 +161,20 @@ pub struct ServerState {
     pub sender: OwnedUserId,
     pub origin_server_ts: MilliSecondsSinceUnixEpoch,
     pub content: Value,
+}
+
+impl ServerState {
+    /// A state event's JSON as a [`ServerState`]; `None` when it lacks a field.
+    pub fn from_event(value: &Value) -> Option<ServerState> {
+        Some(ServerState {
+            event_id: OwnedEventId::try_from(value["event_id"].as_str()?).ok()?,
+            sender: OwnedUserId::try_from(value["sender"].as_str()?).ok()?,
+            origin_server_ts: MilliSecondsSinceUnixEpoch(
+                value["origin_server_ts"].as_u64()?.try_into().ok()?,
+            ),
+            content: value["content"].clone(),
+        })
+    }
 }
 
 /// One copy's client.
@@ -359,19 +374,38 @@ impl AgentClient {
             if value["type"] != event_type || value["state_key"] != state_key {
                 continue;
             }
-            let parsed = (|| {
-                Some(ServerState {
-                    event_id: OwnedEventId::try_from(value["event_id"].as_str()?).ok()?,
-                    sender: OwnedUserId::try_from(value["sender"].as_str()?).ok()?,
-                    origin_server_ts: MilliSecondsSinceUnixEpoch(
-                        value["origin_server_ts"].as_u64()?.try_into().ok()?,
-                    ),
-                    content: value["content"].clone(),
-                })
-            })();
-            return Ok(parsed);
+            return Ok(ServerState::from_event(&value));
         }
         Ok(None)
+    }
+
+    /// Every `event_type` state event of `room` as the last sync left it, by
+    /// state key: what placement reads, never what a claim is decided on (C9).
+    pub async fn cached_states(
+        &self,
+        room: &RoomId,
+        event_type: &str,
+    ) -> Vec<(String, ServerState)> {
+        let Some(room) = self.client.get_room(room) else {
+            return Vec::new();
+        };
+        let Ok(events) = room
+            .get_state_events(StateEventType::from(event_type))
+            .await
+        else {
+            return Vec::new();
+        };
+        events
+            .into_iter()
+            .filter_map(|event| {
+                let value = match event {
+                    RawAnySyncOrStrippedState::Sync(raw) => raw.deserialize_as::<Value>().ok()?,
+                    RawAnySyncOrStrippedState::Stripped(_) => return None,
+                };
+                let key = value["state_key"].as_str()?.to_owned();
+                Some((key, ServerState::from_event(&value)?))
+            })
+            .collect()
     }
 
     fn joined(&self, room: &RoomId) -> Result<matrix_sdk::Room, AgentMatrixError> {

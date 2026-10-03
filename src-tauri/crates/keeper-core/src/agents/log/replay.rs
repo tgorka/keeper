@@ -133,7 +133,7 @@ pub fn replay(
     log: &SessionLog,
     blobs: &dyn Fn(&str) -> Result<Value, LogError>,
 ) -> Result<Replay, ReplayRefusal> {
-    if log.conflicted {
+    if log.conflicted() {
         return Err(ReplayRefusal::Conflicted);
     }
     let mut placed: Vec<Placed> = Vec::new();
