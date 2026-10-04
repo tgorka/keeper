@@ -1213,7 +1213,11 @@ impl ServedSession {
         let (anchor, anchor_at) = deliver(
             port.as_ref(),
             "m.room.message",
-            anchor_content(&self.context.session.path, &user.id.to_string()),
+            anchor_content(
+                &self.context.session.path,
+                &user.id.to_string(),
+                &arrived.event_id,
+            ),
             Instant::now(),
         )
         .await;
@@ -1235,9 +1239,6 @@ impl ServedSession {
         )
         .await;
         let stream_end = Instant::now();
-        if let Some(anchor) = board.finish().await {
-            self.context.status_anchor = Some(anchor);
-        }
 
         // S-16's room half: once a read narrowed the label below the readers
         // the session's `agent.toml` names, the room gets one fixed sentence
@@ -1283,6 +1284,11 @@ impl ServedSession {
             None => final_text.clone(),
         };
         let delivered = sink.finish(&message).await;
+        // Only now is the status `idle`: a device following the answer takes
+        // that as the answer being whole (AD-384).
+        if let Some(anchor) = board.finish(&delivered).await {
+            self.context.status_anchor = Some(anchor);
+        }
 
         let closing = match ran.ending {
             TurnEnding::Complete | TurnEnding::Stopped => {

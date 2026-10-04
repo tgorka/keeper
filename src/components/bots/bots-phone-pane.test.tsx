@@ -75,7 +75,7 @@ const botsDeliverablePaths = vi.fn();
 const botsSessionOpen = vi.fn();
 const voiceAvailability = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
 const voiceWakeGet = vi.fn<() => Promise<VoiceWakeVm>>();
-const voiceTargetSet = vi.fn<(botId: string | null) => Promise<VoiceWakeVm>>();
+const voiceTargetSet = vi.fn<(target: string | null) => Promise<VoiceWakeVm>>();
 /** The listening switch's one command (Epic 68, AD-218). */
 const voiceWakeToggle = vi.fn<() => Promise<VoiceWakeVm>>();
 /** The event sink the level handed to `botsChatSend`, driven as Rust would. */
@@ -147,7 +147,7 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     voiceWatch: () => Promise.resolve(1),
     voiceUnwatch: () => Promise.resolve(),
     voiceWakeGet: () => voiceWakeGet(),
-    voiceTargetSet: (botId: string | null) => voiceTargetSet(botId),
+    voiceTargetSet: (target: string | null) => voiceTargetSet(target),
     voiceWakeToggle: () => voiceWakeToggle(),
     voiceTargetSpeeds: () => Promise.resolve([]),
   };
@@ -474,7 +474,9 @@ describe("the Bots view on the phone stack", () => {
       voiceTarget: null,
     };
     voiceWakeGet.mockResolvedValue(wake);
-    voiceTargetSet.mockImplementation((botId) => Promise.resolve({ ...wake, voiceTarget: botId }));
+    voiceTargetSet.mockImplementation((target) =>
+      Promise.resolve({ ...wake, voiceTarget: target }),
+    );
     render(<PhoneShell />);
     await openBots();
     await openConversation();

@@ -712,6 +712,7 @@ export type { UnknownBotGrantVm } from "./gen/UnknownBotGrantVm";
 export type { UnknownTaskVm } from "./gen/UnknownTaskVm";
 export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";
+export type { VoiceAgentTargetVm } from "./gen/VoiceAgentTargetVm";
 export type { VoiceEventVm } from "./gen/VoiceEventVm";
 export type { VoiceStateVm } from "./gen/VoiceStateVm";
 export type { VoiceTargetSpeedVm } from "./gen/VoiceTargetSpeedVm";
@@ -911,6 +912,7 @@ import type { TemplateUpdateResultVm } from "./gen/TemplateUpdateResultVm";
 import type { TimelineBatch } from "./gen/TimelineBatch";
 import type { TypingBatch } from "./gen/TypingBatch";
 import type { VerificationFlowVm } from "./gen/VerificationFlowVm";
+import type { VoiceAgentTargetVm } from "./gen/VoiceAgentTargetVm";
 import type { VoiceEventVm } from "./gen/VoiceEventVm";
 import type { VoiceStateVm } from "./gen/VoiceStateVm";
 import type { VoiceTargetSpeedVm } from "./gen/VoiceTargetSpeedVm";
@@ -8146,15 +8148,29 @@ export async function voiceWakeSet(
 }
 
 /**
- * Choose the bot a spoken turn goes to (Epic 67, AD-206): a pinned bot's id,
- * or `null` for "the pinned bot most recently talked to". Which bot a turn
- * actually reaches is decided in `keeper_core::bots::voice_target` at send
+ * Choose where a spoken turn goes (Epic 67, AD-206; AD-384): a pinned bot's
+ * id, a proxy conversation's `target` as {@link voiceAgentTargets} lists it,
+ * or `null` for "the pinned bot most recently talked to". Where a turn
+ * actually goes is decided in `keeper_core::bots::voice_target` at send
  * time, never here; the fresh {@link VoiceWakeVm} says what was stored.
  *
  * Rejects with: `internal`.
  */
-export async function voiceTargetSet(botId: string | null): Promise<VoiceWakeVm> {
-  return await invoke<VoiceWakeVm>("voice_target_set", { botId });
+export async function voiceTargetSet(target: string | null): Promise<VoiceWakeVm> {
+  return await invoke<VoiceWakeVm>("voice_target_set", { target });
+}
+
+/**
+ * The person's proxy conversations a spoken turn may go to (AD-384), on
+ * every signed-in account, the DM first: what "Speak to" lists after the
+ * pinned bots. Choose one with `voiceTargetSet(entry.target)`; once chosen,
+ * `VoiceWakeVm.voiceTarget` equals that `target`. An empty list means the
+ * person has no proxy conversation keeper can read yet.
+ *
+ * Never rejects.
+ */
+export async function voiceAgentTargets(): Promise<VoiceAgentTargetVm[]> {
+  return await invoke<VoiceAgentTargetVm[]>("voice_agent_targets");
 }
 
 /**

@@ -7548,6 +7548,34 @@ location: `src-tauri/crates/keeper-agent/src/approvals.rs` (the decision check);
 reason: The desktop app hosts its person's agents in-process (D-3's asymmetry, "no sidecar"), and the person's verified identity it checks a decision against is held by that same process. A T4 decision is therefore taken only from another device — the phone, or another of the person's keepers — and only from the requester (S-22, S-28). Below T4 the Mac's own card still decides, so a compromised keeper on that Mac could approve its own T2 or T3 request, seen only as the card's verdict on the person's other devices; and a person with no other device cannot decide a T4 action on a run the Mac hosts, which waits and then expires denied. Revisit when the person routinely carries a second device: require another device for T3 as well; or when keeper on the Mac gains a separately signed helper that holds the identity outside the app.
 status: open
 
+### DW-419: Stopping a spoken answer stops the speech, not the agent's turn.
+
+origin: ruling R44 (2026-10-03); epic 91, story 91.4 (as built, rung `agents-91-voice`)
+location: `src-tauri/crates/keeper-core/src/agents/spoken.rs` (the device stops following), `src-tauri/crates/keeper-agent/src/agent.rs` (`ServedSession::turn`, which nothing cancels from the room); the architecture's *Matrix events* table (no cancel event)
+reason: A spoken question to the person's proxy is an ordinary message in its room, and the event table has no event a device can send to cancel an agent's turn. So the stop phrase (and the next question) only stops speech and the device's watch of the answer; the host keeps running the turn — tools, provider tokens — and finishes the answer in the room, where the person can read it. Revisit with epic 93 or later: a `dev.keeper.agent.turn.cancel {v, line}` the proxy's `human` may send from a signed device (R47's rule), checked by `rooms::classify` and delivered like `surface.result` ahead of the turn queue (R39's path), ending the turn as `TurnEnding::Stopped`.
+status: open
+
+### DW-420: A person with no Mac keeping their agents zone has no proxy on the phone.
+
+origin: ruling R72 (2026-10-04); epic 91, story 91.4 review fix R5-F1 (rung `agents-91-voice`)
+location: `src-tauri/crates/keeper-core/src/agents/proxy.rs` (`KnownProxies::proxy_of`, fail-closed), `src-tauri/crates/keeper-core/src/account.rs` (`known_proxies`, the only writer of `dev.keeper.agent.proxies`)
+reason: Whose proxy an agent is fails closed: a device admits a proxy only from its own agents zone or from the person's `dev.keeper.agent.proxies` list, and only a keeper whose zone says `human == me` adds an agent to that list. A person whose proxy runs only on a server (`keeper-agentd`) and who uses keeper only on the phone has no keeper that can vouch for it, so the phone lists no proxy room, the voice target offers no assistant, and surface requests and presence do not reach that proxy. Revisit with a confirmation the phone itself can make — the person confirming the proxy once on the device, signed by their cross-signing identity (R47's rule), or `keeper-agentd agents init` writing the list with the person's consent.
+status: open
+
+### DW-421: Two of a person's keepers writing their proxy list at once can drop one's change until it reads the list again.
+
+origin: ruling R72 (2026-10-04); epic 91, story 91.4 review fix R5-F1 (rung `agents-91-voice`)
+location: `src-tauri/crates/keeper-core/src/account.rs` (`known_proxies`: read the stored list, mirror, `set_account_data`)
+reason: Matrix account data has no compare-and-set: each keeper reads the list from its store, adds and removes from its own zone and writes the whole list back. Two Macs with different zones writing in the same sync window can each overwrite the other's addition; the lost one is written again the next time that keeper reads the list (a dock listing, an admission, the minute's presence), and until then a phone may not list that proxy. Revisit if a person keeps different proxies on different Macs in practice.
+status: open
+
+### DW-422: An answer event decrypted after it left the room's in-memory cache is not heard.
+
+origin: epic 91, story 91.4 review fix R5-F4 (rung `agents-91-voice`)
+location: `src-tauri/crates/keeper-core/src/agents/spoken.rs` (`SpokenAnswer`, `CacheFeed`); matrix-sdk 0.18 `event_cache/redecryptor.rs` (`on_resolved_utds`)
+reason: The spoken answer is followed through the room's event cache, whose redecryptor replaces an event once its key arrives and reports it as a `VectorDiff::Set` — for an event in the in-memory linked chunk (`on_resolved_utds` → `replace_event_at` → `updates_as_vector_diffs`). One held only in the store is replaced there with no diff, and the watch holds behind it until the quiet deadline ends the turn on "Nixi stopped answering." The watch holds a cache subscriber, and the SDK shrinks a room's chunk only when its last subscriber goes (`RoomEventCacheSubscriber`'s drop), so an answer's recent events stay in memory while it is followed; this was read in the SDK's source, not reproduced. Revisit if a spoken answer is ever followed across a cache reset.
+status: open
+
 ### DW-430: A secret whose shape is outside the closed pattern set is logged as written.
 
 origin: security review S-17, accepted by ruling R28 (2026-10-02); epic 89's plan, story 89.5 (amendment A4)

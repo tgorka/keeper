@@ -136,6 +136,7 @@ import type {
   TextFileVm,
   TimelineBatch,
   TimelineItemVm,
+  VoiceAgentTargetVm,
   VoiceStateVm,
   VoiceUnavailableVm,
   VoiceWakeVm,
@@ -5351,15 +5352,33 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     voiceWake = { ...voiceWake, localeChosen: chosen, locale: chosen ?? VOICE_SYSTEM_LOCALE };
     return voiceWake;
   },
-  // Epic 67 (AD-206): who a spoken turn goes to. Any string is a bot id here;
-  // whether it names a pinned bot is Rust's business at send time.
+  // Epic 67 (AD-206), 91.4 (AD-384): where a spoken turn goes — a bot id or
+  // an `agent:<room id>` from `voice_agent_targets`, stored as given; whether
+  // it names a pinned bot or the person's proxy conversation is Rust's
+  // business at send time.
   voice_target_set: (payload) => {
     voiceWake = {
       ...voiceWake,
-      voiceTarget: typeof payload.botId === "string" && payload.botId !== "" ? payload.botId : null,
+      voiceTarget:
+        typeof payload.target === "string" && payload.target !== "" ? payload.target : null,
     };
     return voiceWake;
   },
+  // 91.4: the proxy conversations "Speak to" lists after the pinned bots —
+  // the dock's rooms (`?dock=none` lists none, `?dock=late` none for eight
+  // seconds), each with the value that chooses it.
+  voice_agent_targets: () =>
+    Date.now() >= dockListedFrom
+      ? proxyRooms.map(
+          (room): VoiceAgentTargetVm => ({
+            target: `agent:${room.roomId}`,
+            accountId: MOCK_ACCOUNT_ID,
+            roomId: room.roomId,
+            name: room.name,
+            kind: room.kind,
+          }),
+        )
+      : [],
   // --- Voice, the talk mode (Epic 62, Story 62.6; Epic 67, AD-205) ---------
   //
   // A scripted turn so the mic control's states can be looked at in

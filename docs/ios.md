@@ -1081,6 +1081,10 @@ listed (`model_for`, `voice_target.rs:110`). Nothing is ever taken from what is 
 the screen: the picker's note says so ("Where a spoken question goes, whatever is open on
 the screen", `bot-voice-target.tsx:33-34`), and a stream opened by Rust replaces the
 conversation on screen with the target's rather than the other way round.
+Since 91.4 (AD-384) the same key may name one of your assistant's conversations as
+`agent:<room id>` — the phone's Bots sheet lists them under "Speak to" from
+`voice_agent_targets` — and the question then goes into that room as your own message,
+with the answer spoken from the room's edits (`docs/agents.md` § *Talking to Nixi*).
 
 **The banner (AD-207, Story 67.2).** `crates/keeper/src/voice_notify.rs` is iOS-only and
 is called from the same fan-out as the island (`voice_ipc.rs:409-412`). On every change of

@@ -106,15 +106,24 @@ pub(crate) fn origin_of(dir: &Path) -> TurnOrigin {
 }
 
 /// The sink a turn streams into: `base`, wrapped in the voice turn's hooks
-/// when the turn is spoken.
-pub(crate) fn sink_for(opened: &OpenedTurn, base: Arc<dyn TurnSink>) -> Arc<dyn TurnSink> {
-    match opened.turn.origin {
-        TurnOrigin::Spoken { .. } => Arc::new(SpokenSink {
+/// when the turn is spoken — for `question`, the voice turn's question the
+/// send was made for (`voice_ipc::question_now` as it armed, or the one the
+/// voice turn handed over with the text). A spoken turn with no question
+/// has no voice turn to report to.
+pub(crate) fn sink_for(
+    opened: &OpenedTurn,
+    base: Arc<dyn TurnSink>,
+    question: Option<u64>,
+) -> Arc<dyn TurnSink> {
+    match (&opened.turn.origin, question) {
+        (TurnOrigin::Spoken { .. }, Some(question)) => Arc::new(SpokenSink {
             inner: base,
             segmenter: Mutex::new(Segmenter::new()),
             bot_name: opened.bot_name.clone(),
+            question,
         }),
-        TurnOrigin::Typed | TurnOrigin::Task | TurnOrigin::Agent { .. } => base,
+        (TurnOrigin::Spoken { .. }, None)
+        | (TurnOrigin::Typed | TurnOrigin::Task | TurnOrigin::Agent { .. }, _) => base,
     }
 }
 
@@ -151,11 +160,13 @@ impl TurnSink for EventSink {
 /// sentence as the stream closes each one, so the first is spoken when it
 /// arrives; and the close is its cue — a clean finish hands it what the
 /// segmenter had not closed, a Stop abandons the question, a failure ends the
-/// turn on its sentence.
+/// turn on its sentence. Every report names `question`, so a stream for a
+/// question the person has since stopped or replaced moves nothing.
 struct SpokenSink {
     inner: Arc<dyn TurnSink>,
     segmenter: Mutex<Segmenter>,
     bot_name: String,
+    question: u64,
 }
 
 impl SpokenSink {
@@ -169,19 +180,19 @@ impl SpokenSink {
 impl TurnSink for SpokenSink {
     fn event(&self, event: BotStreamEvent) -> bool {
         if let BotStreamEvent::FirstToken { after_ms } = &event {
-            crate::voice_ipc::note_answer_chunk(*after_ms);
+            crate::voice_ipc::note_answer_chunk(self.question, *after_ms);
         }
         self.inner.event(event)
     }
 
     fn request_sent(&self) {
-        crate::voice_ipc::note_sent(&self.bot_name);
+        crate::voice_ipc::note_sent(self.question, &self.bot_name);
     }
 
     fn answer_text(&self, text: &str) {
         let sentences = self.segmenter().push(text);
         for sentence in sentences {
-            crate::voice_ipc::answer_sentence(sentence);
+            crate::voice_ipc::answer_sentence(self.question, sentence);
         }
     }
 
@@ -189,10 +200,10 @@ impl TurnSink for SpokenSink {
         match end {
             TurnEnd::Complete => {
                 let rest = self.segmenter().flush().unwrap_or_default();
-                crate::voice_ipc::answer_complete(rest);
+                crate::voice_ipc::answer_complete(self.question, rest);
             }
-            TurnEnd::Stopped => crate::voice_ipc::answer_stopped(),
-            TurnEnd::Failed(reason) => crate::voice_ipc::answer_failed(reason),
+            TurnEnd::Stopped => crate::voice_ipc::answer_stopped(self.question),
+            TurnEnd::Failed(reason) => crate::voice_ipc::answer_failed(self.question, reason),
         }
     }
 }

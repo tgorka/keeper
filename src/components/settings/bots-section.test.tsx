@@ -112,7 +112,7 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     voiceAvailability: () => voiceAvailability(),
     voiceWakeGet: () => voiceWakeGet(),
     voiceEvents: (limit: number) => voiceEvents(limit),
-    voiceTargetSet: (botId: string | null) => voiceTargetSet(botId),
+    voiceTargetSet: (target: string | null) => voiceTargetSet(target),
     // Epic 68 (AD-216): the picker reads each bot's first-token median too.
     voiceTargetSpeeds: () => Promise.resolve([]),
     // Epic 82: where an endpoint's key comes from. Read only with an account.

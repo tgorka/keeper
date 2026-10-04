@@ -16,28 +16,44 @@
  *    "Butler · first word ~25 s" from `voice_target_speeds`'s median, a bot
  *    with no median reads its name alone, and a failed read leaves the
  *    names.
+ * 6. **The assistant's conversations** (AD-384) — listed after the bots, the
+ *    DM first, one group per account when more than one has any and no group
+ *    with none; choosing one stores its `agent:<room id>`, a stored one reads
+ *    back as chosen, and one not listed yet stays chosen until the rooms
+ *    arrive, never rewritten.
  */
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BotVoiceTarget,
+  VOICE_TARGET_AGENT_GROUP,
   VOICE_TARGET_LABEL,
   VOICE_TARGET_RECENT_LABEL,
+  VOICE_TARGET_UNLISTED_LABEL,
   voiceTargetOptionLabel,
 } from "@/components/bots/bot-voice-target";
-import type { BotVm, VoiceTargetSpeedVm, VoiceWakeVm } from "@/lib/ipc/client";
+import type {
+  AccountVm,
+  BotVm,
+  VoiceAgentTargetVm,
+  VoiceTargetSpeedVm,
+  VoiceWakeVm,
+} from "@/lib/ipc/client";
+import { accountsStore } from "@/lib/stores/accounts";
 import { voiceStore } from "@/lib/stores/voice";
 
 const botsBotsList = vi.fn<() => Promise<BotVm[]>>();
-const voiceTargetSet = vi.fn<(botId: string | null) => Promise<VoiceWakeVm>>();
+const voiceTargetSet = vi.fn<(target: string | null) => Promise<VoiceWakeVm>>();
 const voiceTargetSpeeds = vi.fn<() => Promise<VoiceTargetSpeedVm[]>>();
+const voiceAgentTargets = vi.fn<() => Promise<VoiceAgentTargetVm[]>>();
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
   return {
     ...actual,
     botsBotsList: () => botsBotsList(),
-    voiceTargetSet: (botId: string | null) => voiceTargetSet(botId),
+    voiceTargetSet: (target: string | null) => voiceTargetSet(target),
     voiceTargetSpeeds: () => voiceTargetSpeeds(),
+    voiceAgentTargets: () => voiceAgentTargets(),
   };
 });
 
@@ -68,13 +84,48 @@ function bot(id: string, name: string): BotVm {
 
 const BOTS = [bot("a", "Archivist"), bot("b", "Butler")];
 
+function account(accountId: string, userId: string): AccountVm {
+  return {
+    accountId,
+    userId,
+    homeserverUrl: "https://example.org",
+    hueIndex: 0,
+    provider: "password",
+  };
+}
+
+function room(
+  accountId: string,
+  roomId: string,
+  name: string,
+  kind: "main" | "conversation",
+): VoiceAgentTargetVm {
+  return { target: `agent:${roomId}`, accountId, roomId, name, kind };
+}
+
+const DM = room("acc-1", "!dm:example.org", "Nixi", "main");
+const READING = room("acc-1", "!reading:example.org", "Nixi — reading list", "conversation");
+
+/** Every option's words, in the order the select offers them. */
+function optionTexts(): (string | null)[] {
+  return screen.getAllByRole("option").map((option) => option.textContent);
+}
+
 beforeEach(() => {
   botsBotsList.mockReset();
   voiceTargetSet.mockReset();
   voiceTargetSpeeds.mockReset();
+  voiceAgentTargets.mockReset();
   botsBotsList.mockResolvedValue(BOTS);
   voiceTargetSpeeds.mockResolvedValue([]);
+  voiceAgentTargets.mockResolvedValue([]);
+  voiceTargetSet.mockImplementation((target) => Promise.resolve({ ...WAKE, voiceTarget: target }));
   voiceStore.setState({ state: null, unavailable: null, wake: WAKE });
+  accountsStore.setState({ accounts: [account("acc-1", "@tg:example.org")] });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe("BotVoiceTarget", () => {
@@ -91,7 +142,6 @@ describe("BotVoiceTarget", () => {
   });
 
   it("writes a choice and shows what Rust stored", async () => {
-    voiceTargetSet.mockImplementation((botId) => Promise.resolve({ ...WAKE, voiceTarget: botId }));
     render(<BotVoiceTarget />);
     const control = await screen.findByRole("combobox", { name: VOICE_TARGET_LABEL });
     fireEvent.change(control, { target: { value: "b" } });
@@ -112,7 +162,7 @@ describe("BotVoiceTarget", () => {
     expect(control).toHaveValue("");
   });
 
-  it("is absent with no pinned bot, and before the wake facts are read", async () => {
+  it("is absent with no pinned bot and no conversation, and before the wake facts are read", async () => {
     botsBotsList.mockResolvedValue([]);
     const { unmount } = render(<BotVoiceTarget />);
     await waitFor(() => expect(botsBotsList).toHaveBeenCalledTimes(1));
@@ -127,6 +177,7 @@ describe("BotVoiceTarget", () => {
   });
 
   it("shows a failed write as its sentence and keeps the stored value", async () => {
+    voiceTargetSet.mockReset();
     voiceTargetSet.mockRejectedValue({
       code: "internal",
       message: "the settings table is read-only",
@@ -174,5 +225,112 @@ describe("BotVoiceTarget", () => {
     expect(voiceTargetOptionLabel("ollama", 1_900)).toBe("ollama · first word ~2 s");
     expect(voiceTargetOptionLabel("ollama", 240)).toBe("ollama · first word ~1 s");
     expect(voiceTargetOptionLabel("new", null)).toBe("new");
+  });
+  it("lists the assistant's conversations after the bots, the DM first, in one group", async () => {
+    voiceAgentTargets.mockResolvedValue([DM, READING]);
+    render(<BotVoiceTarget />);
+    await screen.findByRole("option", { name: "Nixi — reading list" });
+    expect(optionTexts()).toEqual([
+      VOICE_TARGET_RECENT_LABEL,
+      "Archivist",
+      "Butler",
+      "Nixi",
+      "Nixi — reading list",
+    ]);
+    const group = screen.getByRole("group", { name: VOICE_TARGET_AGENT_GROUP });
+    expect(
+      within(group)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["Nixi", "Nixi — reading list"]);
+  });
+
+  it("groups the conversations by account when two accounts have an assistant", async () => {
+    accountsStore.setState({
+      accounts: [account("acc-1", "@tg:example.org"), account("acc-2", "@tg:work.org")],
+    });
+    const workDm = room("acc-2", "!work-dm:work.org", "Nixi", "main");
+    voiceAgentTargets.mockResolvedValue([DM, READING, workDm]);
+    render(<BotVoiceTarget />);
+    const work = await screen.findByRole("group", {
+      name: `${VOICE_TARGET_AGENT_GROUP} · @tg:work.org`,
+    });
+    expect(
+      within(work)
+        .getAllByRole<HTMLOptionElement>("option")
+        .map((option) => option.value),
+    ).toEqual([workDm.target]);
+    const home = screen.getByRole("group", {
+      name: `${VOICE_TARGET_AGENT_GROUP} · @tg:example.org`,
+    });
+    expect(
+      within(home)
+        .getAllByRole<HTMLOptionElement>("option")
+        .map((option) => option.value),
+    ).toEqual([DM.target, READING.target]);
+  });
+
+  it("stores a chosen conversation as agent:<room id> and shows it chosen", async () => {
+    voiceAgentTargets.mockResolvedValue([DM, READING]);
+    render(<BotVoiceTarget />);
+    const control = await screen.findByRole("combobox", { name: VOICE_TARGET_LABEL });
+    await screen.findByRole("option", { name: "Nixi — reading list" });
+    fireEvent.change(control, { target: { value: READING.target } });
+    await waitFor(() => expect(voiceTargetSet).toHaveBeenCalledWith("agent:!reading:example.org"));
+    await waitFor(() => expect(control).toHaveValue(READING.target));
+    expect(voiceStore.getState().wake?.voiceTarget).toBe(READING.target);
+  });
+
+  it("still stores a bot by its id beside the conversations", async () => {
+    voiceAgentTargets.mockResolvedValue([DM]);
+    render(<BotVoiceTarget />);
+    const control = await screen.findByRole("combobox", { name: VOICE_TARGET_LABEL });
+    await screen.findByRole("option", { name: "Nixi" });
+    fireEvent.change(control, { target: { value: "a" } });
+    await waitFor(() => expect(voiceTargetSet).toHaveBeenCalledWith("a"));
+    await waitFor(() => expect(control).toHaveValue("a"));
+  });
+
+  it("reads a stored conversation back as that row chosen", async () => {
+    voiceStore.setState({ wake: { ...WAKE, voiceTarget: DM.target } });
+    voiceAgentTargets.mockResolvedValue([DM, READING]);
+    render(<BotVoiceTarget />);
+    await screen.findByRole("option", { name: "Nixi — reading list" });
+    expect(screen.getByRole("combobox", { name: VOICE_TARGET_LABEL })).toHaveValue(DM.target);
+    expect(screen.getByRole("option", { name: "Nixi" })).toHaveProperty("selected", true);
+    expect(screen.queryByRole("option", { name: VOICE_TARGET_UNLISTED_LABEL })).toBeNull();
+  });
+
+  it("keeps a stored conversation chosen until the rooms arrive late, never rewriting it", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    voiceStore.setState({ wake: { ...WAKE, voiceTarget: READING.target } });
+    // No pinned bot either: the stored conversation alone keeps the control.
+    botsBotsList.mockResolvedValue([]);
+    render(<BotVoiceTarget />);
+    const control = await screen.findByRole("combobox", { name: VOICE_TARGET_LABEL });
+    expect(control).toHaveValue(READING.target);
+    expect(screen.getByRole("option", { name: VOICE_TARGET_UNLISTED_LABEL })).toHaveProperty(
+      "selected",
+      true,
+    );
+
+    voiceAgentTargets.mockResolvedValue([DM, READING]);
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    await screen.findByRole("option", { name: "Nixi — reading list" });
+    expect(control).toHaveValue(READING.target);
+    expect(screen.getByRole("option", { name: "Nixi — reading list" })).toHaveProperty(
+      "selected",
+      true,
+    );
+    expect(screen.queryByRole("option", { name: VOICE_TARGET_UNLISTED_LABEL })).toBeNull();
+    expect(voiceTargetSet).not.toHaveBeenCalled();
+  });
+
+  it("offers the bots alone, with no empty group, when the assistant has no conversation", async () => {
+    render(<BotVoiceTarget />);
+    await screen.findByRole("combobox", { name: VOICE_TARGET_LABEL });
+    await waitFor(() => expect(voiceAgentTargets).toHaveBeenCalled());
+    expect(optionTexts()).toEqual([VOICE_TARGET_RECENT_LABEL, "Archivist", "Butler"]);
+    expect(screen.queryByRole("group")).toBeNull();
   });
 });

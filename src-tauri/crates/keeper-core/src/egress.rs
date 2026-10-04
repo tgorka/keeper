@@ -922,7 +922,7 @@ mod tests {
     /// never emits — a disclosure the app claims it can make and cannot — fails too.
     ///
     /// Do NOT add a `_ =>` arm: a wildcard would silently absorb a new variant and
-    /// defeat the gate. (Same idiom as `send::tests::exactly_two_legal_dispatch_triggers`.)
+    /// defeat the gate. (Same idiom as `send::tests::exactly_three_legal_dispatch_triggers`.)
     #[test]
     fn every_egress_kind_is_produced_by_the_disclosure_matrix() {
         const ALL_KINDS: &[EgressKind] = &[

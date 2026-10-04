@@ -1024,6 +1024,8 @@ pub fn run() {
                 agents_ipc::agent_surface_subscribe,
                 agents_ipc::agent_surface_result,
                 agents_ipc::agent_presence_view,
+                // Story 91.4: the proxy conversations "Speak to" offers.
+                agents_ipc::voice_agent_targets,
                 // Voice (Story 62.4): every target, the port decides.
                 voice_ipc::voice_availability,
                 voice_ipc::voice_start,

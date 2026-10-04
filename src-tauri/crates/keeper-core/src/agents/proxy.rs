@@ -12,13 +12,20 @@
 //! status is what it reads. A status alone is anyone's word who holds power
 //! in the room, so the room must also be one the agent made — its only
 //! creator — and encrypted, and a `main` room the person's DM with it.
-//! Where the zone is on the device (the Mac), the proxy's `agent.toml` also
-//! says whose proxy it is and which drives its `[tools].drives` allows
-//! ([`AgentProxies`]).
+//!
+//! Whose proxy the agent is fails closed (ruling R72, [`KnownProxies`]): the
+//! agent is the signed-in person's proxy only when this device's agents
+//! zone says its `human` is them ([`AgentProxies`], the Mac), or the
+//! person's own account data `dev.keeper.agent.proxies` lists it and no
+//! zone here says otherwise (the phone). Only the person's keeper writes
+//! that list, from its own zone ([`KnownProxies::mirrored`]). An agent
+//! neither names is no one's proxy here: its rooms are not listed, spoken
+//! to, asked for a surface or told where the person is.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::RwLock;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Mutex, RwLock};
 
+use matrix_sdk::ruma::events::macros::EventContent;
 use matrix_sdk::ruma::{EventId, OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,8 +33,8 @@ use ts_rs::TS;
 use ulid::Ulid;
 
 use crate::agents::events::{
-    ConversationRequestContent, ScopeContent, SurfaceResultContent, CONVERSATION_REQUEST, SCOPE,
-    SURFACE_RESULT,
+    ConversationRequestContent, ScopeContent, SurfaceResultContent, CONTENT_VERSION,
+    CONVERSATION_REQUEST, SCOPE, SURFACE_RESULT,
 };
 use crate::agents::room::ScopeDriveVm;
 use crate::agents::session::SessionKind;
@@ -95,6 +102,9 @@ pub struct ProxyFacts {
 #[derive(Debug, Default)]
 pub struct AgentProxies {
     proxies: RwLock<BTreeMap<OwnedUserId, ProxyFacts>>,
+    /// Per person: the `dev.keeper.agent.proxies` list this device last
+    /// wrote, until the account's sync brings it back.
+    written: Mutex<HashMap<OwnedUserId, BTreeSet<OwnedUserId>>>,
 }
 
 impl AgentProxies {
@@ -110,6 +120,93 @@ impl AgentProxies {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Whether `list` is owed to `me`'s account data: not the one this
+    /// device last wrote there. Recorded as written when it is.
+    pub fn owes(&self, me: &UserId, list: &BTreeSet<OwnedUserId>) -> bool {
+        let mut written = self
+            .written
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if written.get(me) == Some(list) {
+            return false;
+        }
+        written.insert(me.to_owned(), list.clone());
+        true
+    }
+
+    /// The write of `me`'s list did not land: the next reading owes it again.
+    pub fn unwritten(&self, me: &UserId) {
+        self.written
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(me);
+    }
+}
+
+/// `dev.keeper.agent.proxies` (global account data, ruling R72): the agents
+/// the person's own keeper found, in an agents zone on one of their
+/// devices, to be their proxies — what a device without that zone (the
+/// phone) admits a proxy by.
+#[derive(Clone, Debug, Serialize, Deserialize, EventContent)]
+#[ruma_event(type = "dev.keeper.agent.proxies", kind = GlobalAccountData)]
+pub struct ProxyListEventContent {
+    pub v: u32,
+    pub agents: Vec<OwnedUserId>,
+}
+
+impl ProxyListEventContent {
+    /// The content for `agents`.
+    pub fn of(agents: &BTreeSet<OwnedUserId>) -> ProxyListEventContent {
+        ProxyListEventContent {
+            v: CONTENT_VERSION,
+            agents: agents.iter().cloned().collect(),
+        }
+    }
+
+    /// The agents it lists; `None` for a version this keeper does not read,
+    /// which then admits nothing and is not written over.
+    pub fn agents(&self) -> Option<BTreeSet<OwnedUserId>> {
+        (self.v == CONTENT_VERSION).then(|| self.agents.iter().cloned().collect())
+    }
+}
+
+/// What this account knows of whose proxy an agent is (R72): this device's
+/// zone facts, and the person's own `dev.keeper.agent.proxies` list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KnownProxies {
+    pub facts: BTreeMap<OwnedUserId, ProxyFacts>,
+    pub listed: BTreeSet<OwnedUserId>,
+}
+
+impl KnownProxies {
+    /// Whether `agent` is `me`'s proxy: the zone here says so (its facts
+    /// come along), or the person's list names it and no zone here
+    /// contradicts it. Anything else is refused — unknown is not yes.
+    pub fn proxy_of(&self, agent: &UserId, me: &UserId) -> Result<Option<&ProxyFacts>, Refusal> {
+        match self.facts.get(agent) {
+            Some(facts) if facts.human == me => Ok(Some(facts)),
+            Some(_) => Err(Refusal::SomeoneElses),
+            None if self.listed.contains(agent) => Ok(None),
+            None => Err(Refusal::NotKnownYours),
+        }
+    }
+
+    /// The list `me`'s keeper keeps in their account data: what it says,
+    /// with every agent this device's zone says is `me`'s added and every
+    /// one it says is someone else's removed. Equal to [`Self::listed`]
+    /// when nothing is owed — a device without a zone changes nothing.
+    pub fn mirrored(&self, me: &UserId) -> BTreeSet<OwnedUserId> {
+        let mut list = self.listed.clone();
+        for (agent, facts) in &self.facts {
+            if facts.human == me {
+                list.insert(agent.clone());
+            } else {
+                list.remove(agent);
+            }
+        }
+        list
     }
 }
 
@@ -154,6 +251,8 @@ pub enum Refusal {
     NotYourDm,
     #[error("This agent is someone else's proxy.")]
     SomeoneElses,
+    #[error("keeper has not been told this agent is your proxy.")]
+    NotKnownYours,
 }
 
 /// What [`admits`] read a proxy room as.
@@ -169,13 +268,13 @@ pub struct Admitted<'a> {
 /// status says `main` or `conversation` and names an agent; the room is
 /// encrypted (R30: every session room is) and the agent is its only
 /// creator (session rooms are made by their agent, at 100); a `main` room
-/// is `me`'s DM with that agent; and where `proxies` knows the agent, its
-/// `human` is `me`. A member who holds power in a room can say anything in
-/// its status — none of the rest.
+/// is `me`'s DM with that agent; and `known` says the agent is `me`'s
+/// proxy ([`KnownProxies::proxy_of`], R72). A member who holds power in a
+/// room can say anything in its status — none of the rest.
 pub fn admits<'a>(
     row: &'a ProxyRoomRow,
     me: &UserId,
-    proxies: &'a BTreeMap<OwnedUserId, ProxyFacts>,
+    known: &'a KnownProxies,
 ) -> Result<Admitted<'a>, Refusal> {
     let (Some(kind), Some(agent)) = (row.kind, row.agent.as_deref()) else {
         return Err(Refusal::Unread);
@@ -192,10 +291,7 @@ pub fn admits<'a>(
     if kind == SessionKind::Main && !row.direct_to.iter().any(|user| user == agent) {
         return Err(Refusal::NotYourDm);
     }
-    let facts = proxies.get(agent);
-    if facts.is_some_and(|facts| facts.human != me) {
-        return Err(Refusal::SomeoneElses);
-    }
+    let facts = known.proxy_of(agent, me)?;
     Ok(Admitted { kind, agent, facts })
 }
 
@@ -215,12 +311,8 @@ pub struct RoomProxy {
 /// names — the ones its host resolves a surface call within — and `None`
 /// before its host echoed one. A surface request is acted on only from that
 /// agent, and only over those drives where they are known.
-pub fn room_proxy(
-    row: &ProxyRoomRow,
-    me: &UserId,
-    proxies: &BTreeMap<OwnedUserId, ProxyFacts>,
-) -> Option<RoomProxy> {
-    let admitted = admits(row, me, proxies).ok()?;
+pub fn room_proxy(row: &ProxyRoomRow, me: &UserId, known: &KnownProxies) -> Option<RoomProxy> {
+    let admitted = admits(row, me, known).ok()?;
     let drives = match admitted.facts {
         Some(facts) => Some(facts.allowed.iter().map(|drive| drive.id.clone()).collect()),
         None => row.scope.clone(),
@@ -231,23 +323,16 @@ pub fn room_proxy(
     })
 }
 
-/// The agents that are `me`'s own proxies: the agent of each of `rows`
-/// [`admits`] admits, and each proxy whose zone on this device names `me`
-/// its human. Presence goes only into control rooms one of them made.
-pub fn own_proxies(
-    rows: &[ProxyRoomRow],
-    me: &UserId,
-    proxies: &BTreeMap<OwnedUserId, ProxyFacts>,
-) -> BTreeSet<OwnedUserId> {
-    rows.iter()
-        .filter_map(|row| admits(row, me, proxies).ok())
-        .map(|admitted| admitted.agent.to_owned())
-        .chain(
-            proxies
-                .iter()
-                .filter(|(_, facts)| facts.human == me)
-                .map(|(agent, _)| agent.clone()),
-        )
+/// The agents that are `me`'s own proxies by `known` ([`KnownProxies::proxy_of`]):
+/// every one the zone here or the person's list names that is not someone
+/// else's. Presence goes only into control rooms one of them made.
+pub fn own_proxies(me: &UserId, known: &KnownProxies) -> BTreeSet<OwnedUserId> {
+    known
+        .facts
+        .keys()
+        .chain(&known.listed)
+        .filter(|agent| known.proxy_of(agent, me).is_ok())
+        .cloned()
         .collect()
 }
 
@@ -330,15 +415,11 @@ pub struct AgentFocusReq {
 /// is not read yet is not listed — it is listed once its status arrives,
 /// never guessed from the room's shape. A conversation is named by its
 /// status's title, which travels encrypted; its room name is generic.
-pub fn proxy_rooms(
-    rows: &[ProxyRoomRow],
-    me: &UserId,
-    proxies: &BTreeMap<OwnedUserId, ProxyFacts>,
-) -> Vec<ProxyRoomVm> {
+pub fn proxy_rooms(rows: &[ProxyRoomRow], me: &UserId, known: &KnownProxies) -> Vec<ProxyRoomVm> {
     let mut listed: Vec<(bool, u64, ProxyRoomVm)> = rows
         .iter()
         .filter_map(|row| {
-            let admitted = admits(row, me, proxies).ok()?;
+            let admitted = admits(row, me, known).ok()?;
             let name = match (admitted.kind, &row.title) {
                 (SessionKind::Conversation, Some(title)) => title.clone(),
                 _ => row.name.clone(),
@@ -408,6 +489,33 @@ mod tests {
         }
     }
 
+    /// The phone: no zone, the person's own list naming `agents`.
+    fn listing(agents: &[&OwnedUserId]) -> KnownProxies {
+        KnownProxies {
+            facts: BTreeMap::new(),
+            listed: agents.iter().map(|agent| (*agent).clone()).collect(),
+        }
+    }
+
+    /// The Mac: a zone naming each agent's human, and no list yet.
+    fn zoned(humans: &[(&OwnedUserId, &OwnedUserId)]) -> KnownProxies {
+        KnownProxies {
+            facts: humans
+                .iter()
+                .map(|(agent, human)| {
+                    (
+                        (*agent).clone(),
+                        ProxyFacts {
+                            human: (*human).clone(),
+                            allowed: Vec::new(),
+                        },
+                    )
+                })
+                .collect(),
+            listed: BTreeSet::new(),
+        }
+    }
+
     #[test]
     fn drives_in_scope_are_the_persons_choice_within_the_agents_allow() {
         let allowed = drives(&["tgdrive", "neuradrive"]);
@@ -457,7 +565,7 @@ mod tests {
         ];
         // An ordinary DM with a person is not an agent session room, so it
         // never reaches the rows; an unread status is never guessed.
-        let listed = proxy_rooms(&rows, &me, &BTreeMap::new());
+        let listed = proxy_rooms(&rows, &me, &listing(&[&nixi]));
         let ids: Vec<&str> = listed.iter().map(|room| room.room_id.as_str()).collect();
         assert_eq!(ids, ["!dm", "!conv", "!older"]);
         assert_eq!(listed[0].kind, SessionKind::Main);
@@ -467,45 +575,128 @@ mod tests {
         let names: Vec<&str> = listed.iter().map(|room| room.name.as_str()).collect();
         assert_eq!(names, ["Nixi", "conv", "older"]);
 
-        // Where the zone is on the device, the proxy must be this person's,
-        // and its allowed drives come along.
+        // Where the zone is on the device, its allowed drives come along.
         let allowed = vec![ScopeDriveVm {
             id: "tgdrive".to_owned(),
             title: "tgdrive".to_owned(),
         }];
-        let mine = BTreeMap::from([(
-            nixi.clone(),
-            ProxyFacts {
-                human: me.clone(),
-                allowed: allowed.clone(),
-            },
-        )]);
+        let mut mine = zoned(&[(&nixi, &me)]);
+        if let Some(facts) = mine.facts.get_mut(&nixi) {
+            facts.allowed = allowed.clone();
+        }
         let listed = proxy_rooms(&rows, &me, &mine);
         assert_eq!(listed.len(), 3);
         assert_eq!(listed[0].allowed.as_ref(), Some(&allowed));
-        let martas = BTreeMap::from([(
-            nixi,
-            ProxyFacts {
-                human: user("@marta:example.org"),
-                allowed,
-            },
-        )]);
-        assert!(proxy_rooms(&rows, &me, &martas).is_empty());
+    }
+
+    /// R72: whose proxy an agent is fails closed. Its rooms count as the
+    /// person's only where this device's zone says its human is them, or
+    /// their own list names it and no zone here says otherwise; an agent
+    /// nobody vouched for — on a phone with no list, or a room Marta made
+    /// for herself and calls a `conversation` — is nobody's proxy here.
+    #[test]
+    fn a_proxy_is_mine_only_when_my_zone_or_my_list_says_so() {
+        let me = user("@tgorka:example.org");
+        let marta = user("@marta:example.org");
+        let nixi = user("@nixi:example.org");
+        let dm = row("!dm", Some(SessionKind::Main), &nixi, 10);
+        // Marta's own room: hers alone, encrypted, her status naming
+        // herself a `conversation` agent.
+        let hers = row("!hers", Some(SessionKind::Conversation), &marta, 9);
+        let rows = [dm.clone(), hers.clone()];
+
+        let nobody = KnownProxies::default();
+        assert_eq!(admits(&dm, &me, &nobody), Err(Refusal::NotKnownYours));
+        assert_eq!(admits(&hers, &me, &nobody), Err(Refusal::NotKnownYours));
+        assert!(proxy_rooms(&rows, &me, &nobody).is_empty());
+        assert_eq!(room_proxy(&dm, &me, &nobody), None);
+        assert!(own_proxies(&me, &nobody).is_empty());
+
+        // The phone, with the list the person's Mac wrote.
+        let phone = listing(&[&nixi]);
+        assert_eq!(
+            admits(&dm, &me, &phone).map(|ok| (ok.agent.to_owned(), ok.facts)),
+            Ok((nixi.clone(), None))
+        );
+        assert_eq!(admits(&hers, &me, &phone), Err(Refusal::NotKnownYours));
+        assert_eq!(own_proxies(&me, &phone), BTreeSet::from([nixi.clone()]));
+
+        // The Mac, whose zone says whose each is, list or none.
+        let mac = zoned(&[(&nixi, &me)]);
+        assert_eq!(
+            admits(&dm, &me, &mac).map(|ok| ok.facts.is_some()),
+            Ok(true)
+        );
+        // A zone here naming another human wins over the list.
+        let contradicted = KnownProxies {
+            listed: BTreeSet::from([nixi.clone(), marta.clone()]),
+            ..zoned(&[(&nixi, &marta), (&marta, &marta)])
+        };
+        assert_eq!(admits(&dm, &me, &contradicted), Err(Refusal::SomeoneElses));
+        assert_eq!(
+            admits(&hers, &me, &contradicted),
+            Err(Refusal::SomeoneElses)
+        );
+        assert!(proxy_rooms(&rows, &me, &contradicted).is_empty());
+        assert!(own_proxies(&me, &contradicted).is_empty());
+    }
+
+    /// The person's keeper keeps their list from its own zone: it adds an
+    /// agent its zone says is theirs and removes one it says is someone
+    /// else's, keeps the rest, and owes no write when nothing changes — a
+    /// phone, with no zone, never changes it. A list of a version it does
+    /// not read admits nothing.
+    #[test]
+    fn my_keeper_keeps_my_list_from_its_zone() {
+        let me = user("@tgorka:example.org");
+        let marta = user("@marta:example.org");
+        let (nixi, tola, lucyna) = (
+            user("@nixi:example.org"),
+            user("@tola:example.org"),
+            user("@lucyna:example.org"),
+        );
+        let mac = KnownProxies {
+            listed: BTreeSet::from([nixi.clone(), lucyna.clone()]),
+            ..zoned(&[(&tola, &me), (&lucyna, &marta)])
+        };
+        let list = mac.mirrored(&me);
+        assert_eq!(list, BTreeSet::from([nixi.clone(), tola.clone()]));
+        let phone = listing(&[&nixi, &tola]);
+        assert_eq!(phone.mirrored(&me), phone.listed);
+
+        let proxies = AgentProxies::default();
+        assert!(proxies.owes(&me, &list));
+        assert!(!proxies.owes(&me, &list), "written once");
+        proxies.unwritten(&me);
+        assert!(
+            proxies.owes(&me, &list),
+            "a write that failed is owed again"
+        );
+        assert!(proxies.owes(&marta, &list), "per person");
+
+        let content = ProxyListEventContent::of(&list);
+        assert_eq!(content.agents(), Some(list));
+        let later = ProxyListEventContent {
+            v: 2,
+            agents: vec![nixi],
+        };
+        assert_eq!(later.agents(), None);
     }
 
     /// F1: Marta makes a room typed as a session, sends a status naming
     /// herself `main` and invites tgorka. Her word in the status is all
     /// she controls: the room is not one an agent made alone, not
-    /// encrypted, not tgorka's DM — any one of those keeps it out.
+    /// encrypted, not tgorka's DM — any one of those keeps it out, even
+    /// for an agent tgorka's list names.
     #[test]
     fn a_status_alone_does_not_make_a_room_my_proxys() {
         let me = user("@tgorka:example.org");
         let marta = user("@marta:example.org");
         let nixi = user("@nixi:example.org");
-        let none = BTreeMap::new();
+        let known = listing(&[&nixi, &marta]);
         let dm = row("!dm", Some(SessionKind::Main), &nixi, 10);
         assert_eq!(
-            admits(&dm, &me, &none).map(|ok| ok.kind),
+            admits(&dm, &me, &known).map(|ok| ok.kind),
             Ok(SessionKind::Main)
         );
 
@@ -513,14 +704,14 @@ mod tests {
             encrypted: false,
             ..dm.clone()
         };
-        assert_eq!(admits(&clear, &me, &none), Err(Refusal::Unencrypted));
+        assert_eq!(admits(&clear, &me, &known), Err(Refusal::Unencrypted));
         // Marta made it, and her status names Nixi as its agent.
         let made_by_marta = ProxyRoomRow {
             creators: vec![marta.clone()],
             ..dm.clone()
         };
         assert_eq!(
-            admits(&made_by_marta, &me, &none),
+            admits(&made_by_marta, &me, &known),
             Err(Refusal::NotMadeByItsAgent)
         );
         // Marta made it with Nixi as an additional creator.
@@ -528,46 +719,19 @@ mod tests {
             creators: vec![marta.clone(), nixi.clone()],
             ..dm.clone()
         };
-        assert_eq!(admits(&shared, &me, &none), Err(Refusal::NotMadeByItsAgent));
+        assert_eq!(
+            admits(&shared, &me, &known),
+            Err(Refusal::NotMadeByItsAgent)
+        );
         // Marta's own room, her status naming herself `main`: hers alone,
         // encrypted even — but not tgorka's DM with her as an agent.
         let hers = ProxyRoomRow {
             agent: Some(marta.clone()),
-            creators: vec![marta.clone()],
+            creators: vec![marta],
             ..dm.clone()
         };
-        assert_eq!(admits(&hers, &me, &none), Err(Refusal::NotYourDm));
-        // The same as a `conversation` is admitted only on the phone's
-        // word that it is encrypted and hers alone; where the zone is on
-        // the device, her agent is not tgorka's proxy.
-        let conversation = ProxyRoomRow {
-            kind: Some(SessionKind::Conversation),
-            direct_to: Vec::new(),
-            ..hers.clone()
-        };
-        assert_eq!(
-            admits(
-                &ProxyRoomRow {
-                    encrypted: false,
-                    ..conversation.clone()
-                },
-                &me,
-                &none
-            ),
-            Err(Refusal::Unencrypted)
-        );
-        let zone = BTreeMap::from([(
-            marta.clone(),
-            ProxyFacts {
-                human: marta,
-                allowed: Vec::new(),
-            },
-        )]);
-        assert_eq!(
-            admits(&conversation, &me, &zone),
-            Err(Refusal::SomeoneElses)
-        );
-        assert!(proxy_rooms(&[clear, made_by_marta, shared, hers], &me, &none).is_empty());
+        assert_eq!(admits(&hers, &me, &known), Err(Refusal::NotYourDm));
+        assert!(proxy_rooms(&[clear, made_by_marta, shared, hers], &me, &known).is_empty());
     }
 
     /// A surface request names a drive: the device acts only over the
@@ -587,15 +751,16 @@ mod tests {
         };
 
         // The phone: no zone, the scope Nixi's host echoed — or none yet.
+        let phone = listing(&[&nixi]);
         assert_eq!(
-            room_proxy(&dm, &me, &BTreeMap::new()),
+            room_proxy(&dm, &me, &phone),
             Some(RoomProxy {
                 agent: nixi.clone(),
                 drives: Some(drives(&["tgdrive"])),
             })
         );
         assert_eq!(
-            room_proxy(&fresh, &me, &BTreeMap::new()),
+            room_proxy(&fresh, &me, &phone),
             Some(RoomProxy {
                 agent: nixi.clone(),
                 drives: None,
@@ -603,22 +768,20 @@ mod tests {
         );
         // The Mac: the zone's `[tools].drives`, whatever the scope says.
         let zone = |human: &OwnedUserId| {
-            BTreeMap::from([(
-                nixi.clone(),
-                ProxyFacts {
-                    human: human.clone(),
-                    allowed: vec![
-                        ScopeDriveVm {
-                            id: "tgdrive".to_owned(),
-                            title: "tgdrive".to_owned(),
-                        },
-                        ScopeDriveVm {
-                            id: "neuradrive".to_owned(),
-                            title: "Neura".to_owned(),
-                        },
-                    ],
-                },
-            )])
+            let mut known = zoned(&[(&nixi, human)]);
+            if let Some(facts) = known.facts.get_mut(&nixi) {
+                facts.allowed = vec![
+                    ScopeDriveVm {
+                        id: "tgdrive".to_owned(),
+                        title: "tgdrive".to_owned(),
+                    },
+                    ScopeDriveVm {
+                        id: "neuradrive".to_owned(),
+                        title: "Neura".to_owned(),
+                    },
+                ];
+            }
+            known
         };
         assert_eq!(
             room_proxy(&dm, &me, &zone(&me)).map(|proxy| proxy.drives),
@@ -630,7 +793,7 @@ mod tests {
             creators: vec![marta],
             ..dm
         };
-        assert_eq!(room_proxy(&made_by_marta, &me, &BTreeMap::new()), None);
+        assert_eq!(room_proxy(&made_by_marta, &me, &phone), None);
     }
 
     /// A presence says whether the person is at their keyboard: it goes into
@@ -642,28 +805,13 @@ mod tests {
         let nixi = user("@nixi:example.org");
         let tola = user("@tola:example.org");
         let lucyna = user("@lucyna:example.org");
-        let zone = BTreeMap::from([
-            (
-                tola.clone(),
-                ProxyFacts {
-                    human: me.clone(),
-                    allowed: Vec::new(),
-                },
-            ),
-            (
-                lucyna.clone(),
-                ProxyFacts {
-                    human: marta.clone(),
-                    allowed: Vec::new(),
-                },
-            ),
-        ]);
-        // Nixi by its DM; Tola by its zone; Lucyna's room is Marta's proxy's.
-        let rows = [
-            row("!dm", Some(SessionKind::Main), &nixi, 10),
-            row("!lucyna", Some(SessionKind::Conversation), &lucyna, 9),
-        ];
-        let own = own_proxies(&rows, &me, &zone);
+        // Nixi by the person's list; Tola by the zone; Lucyna is Marta's
+        // proxy, whatever the list says.
+        let known = KnownProxies {
+            listed: BTreeSet::from([nixi.clone(), lucyna.clone()]),
+            ..zoned(&[(&tola, &me), (&lucyna, &marta)])
+        };
+        let own = own_proxies(&me, &known);
         assert_eq!(own, BTreeSet::from([nixi.clone(), tola.clone()]));
 
         assert!(is_own_control_room(std::slice::from_ref(&nixi), &own));

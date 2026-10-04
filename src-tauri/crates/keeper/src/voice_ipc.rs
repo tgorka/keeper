@@ -266,7 +266,10 @@ fn meter(level: f32) {
 /// Since Epic 67 (AD-205) this is also where a [`Effect::SendText`] is
 /// carried out: the text the turn heard goes to the bots adapter on the
 /// runtime, off this lock — `send_spoken` reads the store and the network,
-/// and the turn's own `note_sent` will want the lock back.
+/// and the turn's own `note_sent` will want the lock back. The question's
+/// generation goes with it, taken from the turn under this lock before
+/// anything is awaited: every report of the send carries it back, and only
+/// the turn's current question's moves the turn ([`Turn::owns_answer`]).
 fn transition(event: TurnEvent) {
     let mut voice = voice();
     let port = Arc::clone(&voice.port);
@@ -282,12 +285,12 @@ fn transition(event: TurnEvent) {
         Effect::SendText(text) => Some(text),
         _ => None,
     });
-    if let Some(text) = heard {
+    if let (Some(text), Some(question)) = (heard, voice.turn.question()) {
         match voice.app.clone() {
             Some(app) => {
                 drop(voice);
                 tauri::async_runtime::spawn(async move {
-                    crate::bots_ipc::send_spoken(&app, text).await;
+                    crate::bots_ipc::send_spoken(&app, question, text).await;
                 });
             }
             None => tracing::warn!("voice: heard a question before boot; nothing to send it with"),
@@ -295,71 +298,72 @@ fn transition(event: TurnEvent) {
     }
 }
 
-/// Whether the stream's events are this turn's to act on: it is waiting for
-/// the answer, or already reading it aloud while the rest streams (Epic 68,
-/// AD-214). A typed conversation's stream is never fed here (`agent_ports`
-/// wraps only a spoken turn in its `SpokenSink`), so no other turn can be in either state.
-fn owns_answer(turn: &Turn) -> bool {
-    turn.awaiting_send() || matches!(turn.state(), TurnState::Speaking)
+/// The voice turn's current question, when an answer is its to hear: what a
+/// send arming now belongs to.
+pub fn question_now() -> Option<u64> {
+    voice().turn.question()
 }
 
-/// One sentence of the spoken turn's answer has arrived (Epic 68, AD-214):
-/// the bots adapter calls this from the stream as its segmenter closes each
-/// one. The first takes the turn to `Speaking` with a `Speak`; every later
-/// one is an `Enqueue` behind it. Only the turn that owns the answer moves.
-pub fn answer_sentence(text: String) {
-    if owns_answer(&voice().turn) {
+/// One sentence of the spoken turn's answer to `question` has arrived (Epic
+/// 68, AD-214): the bots adapter calls this from the stream as its
+/// segmenter closes each one. The first takes the turn to `Speaking` with a
+/// `Speak`; every later one is an `Enqueue` behind it. Only the turn whose
+/// question it is moves.
+pub fn answer_sentence(question: u64, text: String) {
+    if voice().turn.owns_answer(question) {
         transition(TurnEvent::AnswerSentence(text));
     }
 }
 
-/// The spoken turn's answer has finished arriving (Epic 67, AD-205; Epic
-/// 68, AD-214): the bots adapter calls this from the stream's clean close
-/// with what was left after the last sentence it handed out — the whole
-/// answer when nothing was streamed sentence by sentence, nothing when the
-/// last sentence closed it. The turn queues the rest, and from here the
-/// synthesiser's own end is the turn's end. Only the turn that owns the
-/// answer moves; a typed conversation's close is nothing here.
-pub fn answer_complete(rest: String) {
-    if owns_answer(&voice().turn) {
+/// The spoken turn's answer to `question` has finished arriving (Epic 67,
+/// AD-205; Epic 68, AD-214): the bots adapter calls this from the stream's
+/// clean close with what was left after the last sentence it handed out —
+/// the whole answer when nothing was streamed sentence by sentence, nothing
+/// when the last sentence closed it. The turn queues the rest, and from
+/// here the synthesiser's own end is the turn's end. Only the turn whose
+/// question it is moves; a typed conversation's close is nothing here.
+pub fn answer_complete(question: u64, rest: String) {
+    if voice().turn.owns_answer(question) {
         transition(TurnEvent::AnswerDone(rest));
     }
 }
 
-/// The spoken turn's stream ended without a clean answer — stopped, failed,
-/// or never opened (Epic 67, AD-205). The turn ends on `reason`, the
-/// sentence the surface shows beside the switch (AD-190) and the ring
-/// records, and the microphone is released: a turn left in `Sending` with
-/// nothing coming would hold the device open until somebody noticed. Only a
-/// turn that is waiting for an answer moves.
-pub fn answer_failed(reason: String) {
-    if owns_answer(&voice().turn) {
+/// The spoken turn's stream for `question` ended without a clean answer —
+/// stopped, failed, or never opened (Epic 67, AD-205). The turn ends on
+/// `reason`, the sentence the surface shows beside the switch (AD-190) and
+/// the ring records, and the microphone is released: a turn left in
+/// `Sending` with nothing coming would hold the device open until somebody
+/// noticed. Only the turn whose question it is moves.
+pub fn answer_failed(question: u64, reason: String) {
+    if voice().turn.owns_answer(question) {
         crate::voice_log::record(VoiceEventKind::Refused, Some(reason.clone()));
         transition(TurnEvent::Failed(reason));
     }
 }
 
-/// The spoken turn's stream was stopped by hand (Epic 67, AD-205): the
-/// person pressed Stop on the answer, which is the question abandoned —
-/// whatever was queued to be read stops (AD-212), the microphone is
-/// released and a switched-on phrase is re-armed by the turn's own rule.
-/// Only the turn that owns the answer moves.
-pub fn answer_stopped() {
-    if owns_answer(&voice().turn) {
+/// The spoken turn's stream for `question` was stopped by hand (Epic 67,
+/// AD-205): the person pressed Stop on the answer, which is the question
+/// abandoned — whatever was queued to be read stops (AD-212), the
+/// microphone is released and a switched-on phrase is re-armed by the
+/// turn's own rule. Only the turn whose question it is moves.
+pub fn answer_stopped(question: u64) {
+    if voice().turn.owns_answer(question) {
         transition(TurnEvent::Abandoned);
     }
 }
 
-/// The request for what the turn heard has left (Story 64.3, AD-186), to
-/// the bot named `bot`: the bots adapter calls this as it spawns a turn's
-/// driver, whatever started that turn. Only a turn in `Heard` moves — to
-/// `Sending` — so a typed message leaving while no voice turn runs is
-/// nothing here, and nothing is streamed or re-armed for it. The moment is
-/// stamped on the turn (AD-215), so the surface can count from it.
-pub fn note_sent(bot: &str) {
+/// The request for what the turn heard as `question` has left (Story 64.3,
+/// AD-186), to the bot named `bot`: the bots adapter calls this as it
+/// spawns a turn's driver. Only a turn in `Heard` whose question it is
+/// moves — to `Sending` — so a typed message leaving while no voice turn
+/// runs, or an earlier question's send landing late, is nothing here. The
+/// moment is stamped on the turn (AD-215), so the surface can count from
+/// it.
+pub fn note_sent(question: u64, bot: &str) {
     let awaiting = {
         let mut voice = voice();
-        let awaiting = matches!(voice.turn.state(), TurnState::Heard { .. });
+        let awaiting = matches!(voice.turn.state(), TurnState::Heard { .. })
+            && voice.turn.owns_answer(question);
         if awaiting {
             voice
                 .turn
@@ -372,16 +376,18 @@ pub fn note_sent(bot: &str) {
     }
 }
 
-/// The first token of the answer arrived, `after_ms` after the request left
-/// (Story 64.3, AD-186; Epic 68, AD-215): the bots adapter calls this on the
-/// stream's first delta. Only a turn in `Sending` that has not yet seen one
-/// moves, so a stream that is not the voice turn's costs a lock and nothing
-/// else. The wait is stamped on the turn and recorded in the ring as
-/// `first_token` — the provider's seconds, named.
-pub fn note_answer_chunk(after_ms: u64) {
+/// The first token of the answer to `question` arrived, `after_ms` after
+/// the request left (Story 64.3, AD-186; Epic 68, AD-215): the bots adapter
+/// calls this on the stream's first delta. Only a turn in `Sending` whose
+/// question it is that has not yet seen one moves, so a stream that is not
+/// the voice turn's costs a lock and nothing else. The wait is stamped on
+/// the turn and recorded in the ring as `first_token` — the provider's
+/// seconds, named.
+pub fn note_answer_chunk(question: u64, after_ms: u64) {
     let thinking = {
         let mut voice = voice();
-        let thinking = matches!(voice.turn.state(), TurnState::Sending { answering: false });
+        let thinking = matches!(voice.turn.state(), TurnState::Sending { answering: false })
+            && voice.turn.owns_answer(question);
         if thinking {
             let after_ms = i64::try_from(after_ms).unwrap_or(i64::MAX);
             if voice.turn.note_first_token(after_ms) {
@@ -688,19 +694,21 @@ pub fn voice_wake_set(
     wake_vm(&data_dir, enabled, phrase.trim().to_owned(), port.as_ref())
 }
 
-/// Choose the bot a spoken turn goes to (Epic 67, AD-206): a pinned bot's
-/// id, or `None` for "the pinned bot most recently talked to". Persisted as
-/// given; which bot a turn actually reaches is
+/// Choose where a spoken turn goes (Epic 67, AD-206; AD-384): a pinned
+/// bot's id, a proxy conversation's `agent:<room id>` (as
+/// `voice_agent_targets` lists it), or `None` for "the pinned bot most
+/// recently talked to". Persisted as given; where a turn actually goes is
 /// `keeper_core::bots::voice_target::resolve`'s answer at send time, so a
-/// bot unpinned after being chosen is skipped rather than written to.
+/// bot unpinned after being chosen is skipped rather than written to, and a
+/// room that is no longer the person's proxy conversation is refused.
 /// Returns the wake VM, whose `voice_target` is what was stored.
 #[tauri::command]
 pub fn voice_target_set(
     state: State<'_, AppState>,
-    bot_id: Option<String>,
+    target: Option<String>,
 ) -> Result<VoiceWakeVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    let chosen = bot_id.as_deref().map(str::trim).filter(|id| !id.is_empty());
+    let chosen = target.as_deref().map(str::trim).filter(|id| !id.is_empty());
     registry::set_bots_voice_target(&data_dir, chosen).map_err(to_ipc_error)?;
     let enabled = registry::get_bots_wake_enabled(&data_dir).map_err(to_ipc_error)?;
     let phrase = registry::get_bots_wake_phrase(&data_dir).map_err(to_ipc_error)?;
@@ -1093,14 +1101,15 @@ mod tests {
         }
         transition(TurnEvent::WakeMatched);
         transition(TurnEvent::FinalHeard("tell me something".to_owned()));
-        note_sent("nixie");
-        note_answer_chunk(2_000);
+        let question = question_now().expect("the question is out");
+        note_sent(question, "nixie");
+        note_answer_chunk(question, 2_000);
         // The stream, as `bots_ipc::drive` cuts it: three chunks close two
         // sentences and leave a tail for the close.
         let mut segmenter = keeper_core::voice::speech::Segmenter::new();
         for chunk in ["The sky is", " blue. The grass", " is green. And"] {
             for sentence in segmenter.push(chunk) {
-                answer_sentence(sentence);
+                answer_sentence(question, sentence);
             }
         }
         assert_eq!(
@@ -1114,7 +1123,7 @@ mod tests {
         assert_eq!(port.stopped_speaking.load(Ordering::SeqCst), 0);
 
         // Stop pressed on the stream after the first sentence.
-        answer_stopped();
+        answer_stopped(question);
         assert_eq!(port.stopped_speaking.load(Ordering::SeqCst), 1);
         {
             let voice = voice();
@@ -1122,7 +1131,7 @@ mod tests {
             assert!(voice.turn.microphone_open(), "the phrase listens again");
         }
         // The stream's late close reaches an idle turn: nothing more is said.
-        answer_complete(segmenter.flush().unwrap_or_default());
+        answer_complete(question, segmenter.flush().unwrap_or_default());
         assert_eq!(port.spoken.lock().expect("lock").len(), 2);
         assert_eq!(voice().turn.state(), &TurnState::Idle);
     }

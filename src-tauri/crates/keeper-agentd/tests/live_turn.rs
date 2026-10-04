@@ -29,10 +29,15 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use keeper_core::account::spoken_send;
 use keeper_core::agents::events;
 use keeper_core::agents::label::{Integrity, Label, Readers};
 use keeper_core::agents::matrix::{AgentClient, AgentMatrixError, RoomKind};
+use keeper_core::agents::proxy::{AgentProxies, ProxyFacts, ProxyListEventContent};
+use keeper_core::agents::room::AgentKinds;
 use keeper_core::agents::session::{compose_session_agent_toml, SessionAgent, SessionKind};
+use keeper_core::agents::spoken::SpokenStep;
+use keeper_core::error::CoreError;
 use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId};
 use serde_json::{json, Value};
 
@@ -880,6 +885,187 @@ async fn a_question_asked_while_the_host_is_down_is_answered() {
     let answer = answer_to(&seen, &agent, &sent, question, &|t| t == ANSWER).await;
     assert_eq!(answer.final_text, ANSWER);
     assert_eq!(anchors(&seen, &agent), 1, "answered once");
+}
+
+/// Write the person's `dev.keeper.agent.proxies` list and wait until their
+/// syncing client reads it back.
+async fn set_proxy_list(client: &AgentClient, agents: &[&OwnedUserId]) {
+    let list = agents.iter().map(|agent| (*agent).clone()).collect();
+    client
+        .client()
+        .account()
+        .set_account_data(ProxyListEventContent::of(&list))
+        .await
+        .expect("the list is written");
+    proxy_list_becomes(client, &list).await;
+}
+
+/// Wait until the person's client reads `list` as their proxy list.
+async fn proxy_list_becomes(client: &AgentClient, list: &std::collections::BTreeSet<OwnedUserId>) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let read = client
+            .client()
+            .account()
+            .account_data::<ProxyListEventContent>()
+            .await
+            .expect("account data")
+            .and_then(|raw| raw.deserialize().ok())
+            .and_then(|content| content.agents());
+        if read.as_ref() == Some(list) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the list reads {read:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Story 91.4, acceptance 6 (AD-384, rulings R31, R72), at the spoken-send
+/// boundary (`keeper_core::account::spoken_send`, which the app's
+/// `agent_spoken_send` calls): a room whose agent nobody vouched for is
+/// refused and nothing is sent; so is one whose agent this device's zone
+/// says is someone else's — and the person's keeper takes it off their
+/// list. With the agent on the person's list (the phone), what the voice
+/// turn heard goes into the proxy's DM as one `m.room.message` from the
+/// person and reaches the host as a turn; the device's watch over the
+/// room's event cache, taken before the send and told the question's event
+/// by the send queue, hears the answer's first words, each closed sentence
+/// once and in order as the edits grow it, and the tail once the turn's
+/// status says `idle` — which the host sets only after the final edit.
+#[ignore = "live: Synapse on delectra"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spoken_question_is_one_message_and_its_answer_follows() {
+    let smoke = Smoke::from_env();
+    let stub = stub(ANSWER, 12, Duration::from_secs(3));
+    let agent = smoke.user("nixi-smoke");
+    smoke.set_ratelimit(&agent, 0, 0).await;
+    let mut host = host(
+        &smoke,
+        "nixi-smoke",
+        "NIXI_SMOKE_PASSWORD",
+        &stub_model(&stub),
+        None,
+    )
+    .await;
+    host.start();
+    host.wait_serving(&host.room.clone()).await;
+    let dir = host.root.path().join("person");
+    let (client, seen, _sync) = person(&smoke, &dir, &host.room).await;
+    let room = client
+        .client()
+        .get_room(&host.room)
+        .expect("the person's room");
+    let me = client.user_id().expect("signed in").to_owned();
+    client
+        .client()
+        .account()
+        .mark_as_dm(&host.room, std::slice::from_ref(&agent))
+        .await
+        .expect("the DM");
+    // A first turn, typed, so the room has the session's status — a room is
+    // read as a proxy conversation by its status, never guessed.
+    ask(&client, &seen, &host.room, &agent, "hello", &|text| {
+        text == ANSWER
+    })
+    .await;
+    let kinds = AgentKinds::default();
+    let refused = |sent: Result<_, CoreError>| match sent {
+        Err(CoreError::Unsupported(why)) => why,
+        Err(other) => panic!("refused as unsupported, not {other:?}"),
+        Ok(_) => panic!("refused"),
+    };
+
+    // Nobody vouched for Nixi on this device: no zone, an empty list.
+    set_proxy_list(&client, &[]).await;
+    let why =
+        refused(spoken_send(&room, &kinds, &AgentProxies::default(), None, "not for you").await);
+    assert_eq!(why, "keeper has not been told this agent is your proxy.");
+    // The list names Nixi, but this device's zone says it is Marta's: the
+    // zone wins, and the person's keeper takes Nixi off their list.
+    set_proxy_list(&client, &[&agent]).await;
+    let martas = AgentProxies::default();
+    martas.replace(std::collections::BTreeMap::from([(
+        agent.clone(),
+        ProxyFacts {
+            human: OwnedUserId::try_from("@marta:example.org").expect("user"),
+            allowed: Vec::new(),
+        },
+    )]));
+    let why = refused(spoken_send(&room, &kinds, &martas, None, "not for marta").await);
+    assert_eq!(why, "This agent is someone else's proxy.");
+    proxy_list_becomes(&client, &std::collections::BTreeSet::new()).await;
+
+    // The phone, with the list the person's Mac keeps.
+    set_proxy_list(&client, &[&agent]).await;
+    let question = "what is the answer";
+    let mut answer = spoken_send(&room, &kinds, &AgentProxies::default(), None, question)
+        .await
+        .expect("sent to the person's own proxy");
+    assert!(!answer.agent_name().is_empty());
+
+    // Followed on its own task, as the app's shell follows it.
+    let heard = tokio::spawn(async move {
+        let mut steps = Vec::new();
+        while let Some(step) = answer.next().await {
+            steps.push(step);
+        }
+        steps
+    });
+    let steps = tokio::time::timeout(Duration::from_secs(180), heard)
+        .await
+        .expect("the answer ends")
+        .expect("the follower ran");
+    println!("spoken steps: {steps:?}");
+
+    // The question: one message from the person; the refused ones never
+    // left.
+    let mine: Vec<Value> = seen
+        .lock()
+        .expect("lock")
+        .iter()
+        .map(|(_, e)| e.clone())
+        .filter(|e| {
+            e["sender"] == me.as_str()
+                && e["type"] == "m.room.message"
+                && e["content"]["m.relates_to"].is_null()
+        })
+        .collect();
+    let bodies: Vec<&str> = mine
+        .iter()
+        .filter_map(|e| e["content"]["body"].as_str())
+        .collect();
+    assert_eq!(bodies, ["hello", question], "{mine:?}");
+
+    // The host took it as a turn, once.
+    assert_eq!(*stub.requests.lock().expect("lock"), 2);
+    assert_eq!(anchors(&seen, &agent), 2, "answered once each");
+    assert!(host.log_text().contains("a turn was answered"));
+
+    // What was heard: the first words, the closed sentence once, the tail.
+    let (first, rest) = steps.split_first().expect("something was heard");
+    assert!(
+        matches!(first, SpokenStep::FirstText { after_ms } if *after_ms < 60_000),
+        "{first:?}"
+    );
+    assert!(
+        !steps.iter().any(|s| matches!(s, SpokenStep::Failed(_))),
+        "{steps:?}"
+    );
+    let (closing, sentences) = rest.split_last().expect("the answer completes");
+    let sentences: Vec<&str> = sentences
+        .iter()
+        .map(|s| match s {
+            SpokenStep::Sentence(sentence) => sentence.as_str(),
+            other => panic!("a sentence, not {other:?}"),
+        })
+        .collect();
+    let SpokenStep::Complete(tail) = closing else {
+        panic!("the answer completes: {closing:?}");
+    };
+    let (first_sentence, second) = ANSWER.split_once(". ").expect("two sentences");
+    assert_eq!(sentences, [format!("{first_sentence}.")]);
+    assert_eq!(tail, second);
+    host.kill();
 }
 
 /// Acceptance 14: the largest final edit whose encrypted event the server

@@ -204,6 +204,81 @@ impl Segmenter {
     }
 }
 
+/// An agent's answer followed by its edits, spoken once (AD-384).
+///
+/// An agent answers in its room with one message that it then replaces,
+/// again and again, with the whole text so far. Each replacement is handed
+/// here whole; only what it adds goes to the [`Segmenter`], so a sentence is
+/// handed out once however many replacements repeat it. A replacement that
+/// does not extend the last one — the agent rewrote earlier text — starts
+/// the cut again from its beginning, and the sentences already handed out
+/// are skipped by position: what was said cannot be unsaid, and saying it
+/// twice is worse than a rewritten clause going unheard. A message other
+/// than the one followed starts over.
+#[derive(Debug, Default)]
+pub struct AnswerFollower {
+    /// The message followed.
+    anchor: Option<String>,
+    /// The text handed to the segmenter since it last started.
+    fed: String,
+    segmenter: Segmenter,
+    /// Sentences the segmenter closed since it last started.
+    closed: usize,
+    /// Sentences handed out for this message.
+    spoken: usize,
+}
+
+impl AnswerFollower {
+    /// A follower that has seen nothing.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `text` is the whole text `anchor` reads as now: every sentence it
+    /// closed that was not handed out before, in order.
+    pub fn edit(&mut self, anchor: &str, text: &str) -> Vec<String> {
+        if self.anchor.as_deref() != Some(anchor) {
+            *self = Self {
+                anchor: Some(anchor.to_owned()),
+                ..Self::default()
+            };
+        }
+        let added = match text.strip_prefix(self.fed.as_str()) {
+            Some(added) => added,
+            None => {
+                self.segmenter = Segmenter::new();
+                self.closed = 0;
+                text
+            }
+        };
+        let closed = self.segmenter.push(added);
+        self.fed.clear();
+        self.fed.push_str(text);
+        let mut fresh = Vec::new();
+        for sentence in closed {
+            self.closed += 1;
+            if self.closed > self.spoken {
+                self.spoken = self.closed;
+                fresh.push(sentence);
+            }
+        }
+        fresh
+    }
+
+    /// The answer is complete: the words after its last closed sentence,
+    /// unless they stand where a sentence was already handed out.
+    pub fn finish(&mut self) -> Option<String> {
+        let tail = self.segmenter.flush()?;
+        self.fed.clear();
+        let position = self.closed + 1;
+        self.closed = 0;
+        (position > self.spoken).then(|| {
+            self.spoken = position;
+            tail
+        })
+    }
+}
+
 /// The byte index just past the first sentence `text` has closed — past its
 /// run of marks, or past its line break — or `None` while none is closed.
 fn boundary(text: &str) -> Option<usize> {
@@ -476,6 +551,68 @@ mod tests {
         assert_eq!(sentences, Vec::<String>::new());
         assert_eq!(rest, Some("No terminator at all".to_owned()));
         assert_eq!(feed(&["", "  \n"]), (Vec::new(), None));
+    }
+
+    /// An answer that grows by whole-text replacements is spoken sentence
+    /// by sentence, each sentence once, the last one when it completes.
+    #[test]
+    fn an_answer_is_spoken_from_its_edits_once() {
+        let mut follower = AnswerFollower::new();
+        assert_eq!(follower.edit("$a", "The sky"), Vec::<String>::new());
+        assert_eq!(
+            follower.edit("$a", "The sky is blue. The"),
+            list(&["The sky is blue."])
+        );
+        assert_eq!(
+            follower.edit("$a", "The sky is blue. The grass is green."),
+            Vec::<String>::new()
+        );
+        // The final replacement repeats the whole text: nothing again.
+        assert_eq!(
+            follower.edit("$a", "The sky is blue. The grass is green."),
+            Vec::<String>::new()
+        );
+        assert_eq!(follower.finish(), Some("The grass is green.".to_owned()));
+        assert_eq!(follower.finish(), None);
+    }
+
+    /// A replacement that rewrites earlier text — shorter, or different —
+    /// starts the cut again without repeating a sentence already said; the
+    /// first unsaid sentence is the next one heard.
+    #[test]
+    fn a_rewrite_resumes_at_the_first_unspoken_sentence() {
+        let mut follower = AnswerFollower::new();
+        assert_eq!(
+            follower.edit("$a", "One. Two. Thr"),
+            list(&["One.", "Two."])
+        );
+        // Shorter: the agent took text back.
+        assert_eq!(follower.edit("$a", "One. Tw"), Vec::<String>::new());
+        assert_eq!(
+            follower.edit("$a", "One. Two. Three. Four"),
+            list(&["Three."])
+        );
+        // Different: the first sentence rewritten, already said, not again.
+        assert_eq!(
+            follower.edit("$a", "Uno. Two. Three. Four. Five"),
+            list(&["Four."])
+        );
+        assert_eq!(follower.finish(), Some("Five".to_owned()));
+
+        // A tail standing where a sentence was said is not said again.
+        let mut follower = AnswerFollower::new();
+        assert_eq!(follower.edit("$a", "Yes. No. "), list(&["Yes.", "No."]));
+        assert_eq!(follower.edit("$a", "Yes. Maybe"), Vec::<String>::new());
+        assert_eq!(follower.finish(), None);
+    }
+
+    /// Another message is another answer: it starts from nothing.
+    #[test]
+    fn a_new_anchor_starts_over() {
+        let mut follower = AnswerFollower::new();
+        assert_eq!(follower.edit("$a", "Hello. Wor"), list(&["Hello."]));
+        assert_eq!(follower.edit("$b", "Hello. Again."), list(&["Hello."]));
+        assert_eq!(follower.finish(), Some("Again.".to_owned()));
     }
 
     /// A detected language changes the voice mid-answer only on a sentence

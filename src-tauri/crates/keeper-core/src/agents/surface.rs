@@ -285,14 +285,14 @@ pub struct SurfaceAnswerReq {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use matrix_sdk::ruma::OwnedUserId;
     use serde_json::json;
 
     use super::*;
     use crate::agents::claim::rfc3339;
-    use crate::agents::proxy::{room_proxy, ProxyFacts, ProxyRoomRow};
+    use crate::agents::proxy::{room_proxy, KnownProxies, ProxyFacts, ProxyRoomRow};
     use crate::agents::session::SessionKind;
 
     const NOW: u64 = 1_790_000_000_000;
@@ -434,7 +434,12 @@ mod tests {
         let room = room();
         let mut inbox = SurfaceInbox::default();
         let live = request("KALYPSO");
-        let none = BTreeMap::new();
+        // The phone: the person's list names Nixi — and Lucyna, which a list
+        // can say: her rooms are still not Nixi's.
+        let phone = KnownProxies {
+            facts: BTreeMap::new(),
+            listed: BTreeSet::from([nixi().agent, lucyna.clone()]),
+        };
         let nixis_dm = ProxyRoomRow {
             room_id: room.to_string(),
             name: "Nixi".to_owned(),
@@ -447,7 +452,7 @@ mod tests {
             direct_to: vec![nixi().agent],
             scope: Some(vec!["tgdrive".to_owned()]),
         };
-        let nixi = room_proxy(&nixis_dm, &me, &none).expect("Nixi's DM is a proxy room");
+        let nixi = room_proxy(&nixis_dm, &me, &phone).expect("Nixi's DM is a proxy room");
 
         // Another agent at 50 in Nixi's own DM.
         let from_lucyna = RequestEvent {
@@ -469,15 +474,18 @@ mod tests {
             kind: Some(SessionKind::Conversation),
             ..lucynas.clone()
         };
-        let zone = BTreeMap::from([(
-            lucyna.clone(),
-            ProxyFacts {
-                human: marta,
-                allowed: Vec::new(),
-            },
-        )]);
+        let zone = KnownProxies {
+            facts: BTreeMap::from([(
+                lucyna.clone(),
+                ProxyFacts {
+                    human: marta,
+                    allowed: Vec::new(),
+                },
+            )]),
+            listed: phone.listed.clone(),
+        };
         for refused in [
-            room_proxy(&lucynas, &me, &none),
+            room_proxy(&lucynas, &me, &phone),
             room_proxy(&conversation, &me, &zone),
         ] {
             assert_eq!(refused, None);
@@ -513,7 +521,7 @@ mod tests {
             scope: None,
             ..nixis_dm
         };
-        let unknown = room_proxy(&unechoed, &me, &none).expect("still Nixi's DM");
+        let unknown = room_proxy(&unechoed, &me, &phone).expect("still Nixi's DM");
         assert_eq!(unknown.drives, None);
         assert!(matches!(
             inbox.admit(event("$e", &room, &diary, &unknown, NOW)),

@@ -136,7 +136,7 @@ describe("the spoken turn (Epic 67, AD-205)", () => {
 
   it("performs SendText in the shell", () => {
     expect(VOICE_IPC_RS).toMatch(/Effect::SendText\(text\) => Some\(text\)/);
-    expect(VOICE_IPC_RS).toContain("crate::bots_ipc::send_spoken(&app, text).await");
+    expect(VOICE_IPC_RS).toMatch(/crate::bots_ipc::send_spoken\(&app, [^)]*\)\.await/);
     // The command the webview used to speak with is gone on both sides.
     expect(LIB_RS).not.toContain("voice_ipc::voice_speak");
     expect(CLIENT_TS).not.toContain('"voice_speak"');

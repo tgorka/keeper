@@ -943,6 +943,13 @@ fifteen sends, each with `retry_after_ms` 1000.
   carry was **47 061 bytes** (the server's 64 KiB event cap, after Megolm and base64), so R23's
   60 KiB does not fit. `FINAL_CUT_BYTES` is **45 KiB** (46 080 bytes): that, less room for the
   artifact sentence, rounded down to 1 KiB.
+- `a_spoken_question_is_one_message_and_its_answer_follows` (91.4, 2026-10-04, the stub streaming
+  over 3 s): the person's text reached the room as one `m.room.message` and the host as one turn;
+  the device's watch over the room (`agents::spoken::SpokenAnswer`) heard the first words
+  **2.5 s** after the send, the first sentence once while the answer still grew, and the rest as
+  the tail once the status left `running` — which the host sets only after the final edit. With
+  the host setting `idle` before the final edit the same watch completes on a cut tail, which is
+  why the order is pinned (`a_turn_is_running_until_its_final_edit_is_sent`).
 
 Run them:
 
@@ -1081,7 +1088,8 @@ minisign -V -p keeper.pub -x "$T.minisig" -m "$T"
 An answer is one Matrix message the host keeps editing, not a stream of tokens:
 
 - **The anchor.** As soon as the request reaches the host it sends `…` with
-  `dev.keeper.agent.turn {session, line}` naming the session and the `user` line it answers.
+  `dev.keeper.agent.turn {session, line, question}` naming the session, the `user` line it
+  answers and the Matrix event of the person's message that line is.
 - **Edits.** The first edit comes no sooner than 400 ms after the anchor, and each later one no
   sooner than 400 ms after the one before, carrying the whole text so far in `m.new_content`; the
   fallback `body` is at most 1 KiB.
@@ -1092,9 +1100,14 @@ An answer is one Matrix message the host keeps editing, not a stream of tokens:
 - **Secrets are redacted in the room as in the log**: every edit, the final one included, goes
   through the log's secret scan, so a token the model quotes reads `[REDACTED secret-like: …]` in
   the room too.
-- **Tool progress** goes out as status updates — each its own `dev.keeper.agent.status` event
-  naming the session's status anchor in `content.anchor`, not an edit of it — carrying counts
-  only — "reading 2 files, 3 tool calls" — never a path, a title or a heading.
+- **The status runs with the turn.** Every turn — tool calls or none — first sets the session's
+  status `running` (the status anchor, or an update naming it), and sets it `idle` only once the
+  final edit is accepted, so a reader that sees the turn's status say `idle` knows the answer is
+  whole. A turn cut off before its final edit landed — the host stopping mid-send, the turn's
+  task dropped — sends no `idle`, and its status task stops with it. Tool progress goes out
+  between as status updates — each its own `dev.keeper.agent.status` event naming the session's
+  status anchor in `content.anchor`, not an edit of it — carrying counts only — "reading 2 files,
+  3 tool calls" — never a path, a title or a heading.
 - **A long answer** is cut: past `FINAL_CUT_BYTES` the message is its first `FINAL_CUT_BYTES` (on a
   character boundary) and "The full answer is in artifacts/answer-<line>.md", written into the
   session; the log holds the whole text. When that file cannot be written, the message says
@@ -1183,9 +1196,18 @@ like any other). What keeper and the proxy's host do for it:
   encrypted, made by the agent its status names (its only creator), and — for `main` — your
   direct conversation with that agent; anything else is never listed and nothing is sent there.
   A room whose status keeper has not read yet is not listed; it is listed once its status
-  arrives, never guessed from the room's shape. Where the proxy's agents zone is on the Mac, the
-  proxy must also be yours (its `agent.toml`'s `human`). A conversation is listed by the title in
-  its status; its room is named after the proxy, because a room's name is not encrypted.
+  arrives, never guessed from the room's shape. A conversation is listed by the title in its
+  status; its room is named after the proxy, because a room's name is not encrypted.
+- **Whose proxy (ruling R72).** Whose proxy an agent is fails closed. It is yours only when the
+  agents zone on this device says so (its `agent.toml`'s `human` is you — the Mac that keeps
+  it), or when your own account data `dev.keeper.agent.proxies` (`{v: 1, agents: [...]}`) lists
+  it and no zone on this device says it is someone else's (the phone). Only your keeper writes
+  that list: each time it reads it — listing the dock's rooms, admitting a room, publishing
+  where you are — it adds every agent its zone says is yours and removes every one it says is
+  someone else's, writing only when that changes the list. An agent nobody vouched for is no
+  one's proxy here: its rooms are not listed or spoken to, its surface requests are not acted
+  on and your presence does not go to its control room. A phone whose person has no Mac with
+  the zone lists none (DW-420).
 - **The scope.** The dock's scope chip offers the drives the proxy's `[tools].drives` names, its
   home drive first. Choosing drives sends a `dev.keeper.agent.scope` event into the room. The
   host that holds the session's claim checks it: the home drive is always kept, and a drive
@@ -1219,7 +1241,7 @@ like any other). What keeper and the proxy's host do for it:
   proxy's own rooms (a new conversation in the DM only), and only from a device that person's
   cross-signing identity signed (ruling R47).
   Anyone else's, or one from a device its owner never signed, is ignored and logged as a note.
-  These events are not messages: they are outside the Undo-Send hold and the two message triggers.
+  These events are not messages: they are outside the Undo-Send hold and the message triggers.
 
 ## What Nixi can do in your note
 
@@ -1287,6 +1309,47 @@ them (a proxy's defaults do, a steward's do not). What happens:
   until the request expires is withdrawn and answered `expired`, and for three seconds the strip
   says the agent stopped waiting, so a diff you were reading does not simply vanish. Nothing in
   Rust writes the note for it.
+
+## Talking to Nixi
+
+The voice target, *Speak to* (Settings › Bots, the Bots pane's voice fold, the phone's Bots sheet),
+lists your proxy's conversations after the pinned bots under *Your assistant*: the DM first, then
+each conversation, one group per account when more than one has them. Choosing one stores
+`bots.voice_target = agent:<room id>`; a chosen conversation keeper has not listed yet still shows
+as chosen ("not listed yet") and is looked for again, never rewritten. What happens when you speak:
+
+- **What leaves the device.** Recognition stays on the device (D-5); only the words it heard, once
+  the utterance ends, go into the room as your own `m.room.message`. It is the send gate's third
+  trigger, `SpokenToAgent` (ruling R31): legal only in a room keeper reads as your own proxy's
+  `main` or `conversation` room, and never held for Undo-Send, because the end of the utterance
+  was the send. Audio and partial transcripts never leave.
+- **A choice that went stale is refused**, never sent to a bot instead: "The conversation chosen
+  under Speak to is not one of your assistant's here: choose again under Speak to." A bot id is
+  read as before, and a room is never guessed from what is on screen.
+- **It travels.** Settings sync carries `agent:<room id>` as it is — a room id is the same on every
+  device — where a bot id travels as its provider's reference.
+- **The answer is spoken as it grows.** keeper follows the room's event cache from just before
+  the send — so an event whose key arrives late is read once it is decrypted, in the room's
+  order, nothing after it read before it — and the send queue says which event your question
+  became. The answer is the anchor from the room's agent (at an agent's power, not you) whose
+  `dev.keeper.agent.turn` names that event (`question`): an older question's answer still
+  queued, or the same words asked from your other device, names another. Each edit hands its
+  new sentences to the speech segmenter once — an edit that rewrites earlier text resumes at the
+  first sentence not yet said. It is whole when the turn's own status says `idle` (or `done`):
+  the first `running` after the anchor names the session, host and claim epoch answering, and
+  only that one's end counts; the host sends it only after the final edit, and never when the
+  turn was cut off before it. `blocked` (a copy that lost its claim), `waiting`, another copy's
+  status or an older one completes nothing. No anchor within a minute ("Nixi has not answered:
+  no copy of it may be running right now.") or nothing from the turn for two minutes once it
+  answered ("Nixi stopped answering.") ends the turn; a question the send queue gave up on ends
+  it at once ("Your question did not reach Nixi.").
+- **Stopping.** The stop phrase stops the speech on this device; nothing tells the agent, which
+  finishes its answer in the room (ruling R44; a turn-cancel event is DW-419). Every question
+  the voice turn sends is numbered before anything is sent: stopping it, or asking again, makes
+  every later report of the earlier one — its send, its first words, its sentences, its end —
+  move nothing, whichever finishes first; the earlier one's send and watch are stopped.
+- **The wake phrase is unchanged.** Naming the proxy "Nixi" renames nothing; the wake phrase is
+  the one you set.
 
 ## Which host answers
 

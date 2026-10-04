@@ -788,6 +788,7 @@ The settings files carry a reference instead:
 | `drive:<remote URL>#<branch>^<name>` | the same, when two of this device's drives share a repository and branch |
 | `provider:<kind>:<base URL>` | the provider inside `notes.embedding_model` |
 | `bot:<kind>:<base URL>#<target>` | `bots.voice_target` |
+| `agent:<room id>` — as stored, a room id being the same on every device | `bots.voice_target`, when it names one of your assistant's conversations |
 
 Remote and base URLs are compared in a normalized form: the scheme and host lower-cased, a
 trailing `/` or `.git` dropped, and any user name or password removed. So

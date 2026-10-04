@@ -102,13 +102,18 @@ pub enum RunState {
 }
 
 /// `dev.keeper.agent.turn` inside a streamed answer's anchor: which session
-/// and which log line the answer belongs to.
+/// and which log line the answer belongs to, and the person's message it
+/// answers — so a device that asked follows the answer to its own question,
+/// never an older one still queued (AD-384).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TurnRef {
     pub session: String,
     /// The `user` line's id.
     pub line: String,
+    /// The Matrix event the turn answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<OwnedEventId>,
 }
 
 /// `dev.keeper.agent.scope` (timeline, encrypted).

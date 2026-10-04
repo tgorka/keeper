@@ -41,6 +41,7 @@ use std::sync::Arc;
 use keeper_agent::drive;
 use keeper_agent::ports::TurnSink;
 use keeper_agent::turn::{self, new_id, now_ms, TurnEnv};
+use keeper_core::agents::proxy::ProxyRoomVm;
 use keeper_core::bots::error::BotsError;
 use keeper_core::bots::follow;
 use keeper_core::bots::remote::{self, SessionCapabilities};
@@ -804,38 +805,63 @@ pub async fn bots_chat_send(
 ) -> Result<String, IpcError> {
     let base: Arc<dyn TurnSink> = Arc::new(ChannelSink(channel));
     let env = crate::agent_ports::turn_env(&state, Some(Arc::clone(&base)));
+    // Typed while a voice turn waits, the send is that turn's answer: its
+    // question as the send arms.
+    let question = crate::voice_ipc::question_now();
     let opened = turn::open_turn(&env, req, &crate::agent_ports::origin_of)
         .await
         .map_err(agent_error)?;
-    let sink = sink_for(&opened, base);
+    let sink = sink_for(&opened, base, question);
     Ok(drive::spawn_turn(opened, sink))
 }
 
-/// Send what the voice turn heard (Epic 67, Story 67.1, AD-205, AD-206).
+/// Send what the voice turn heard as `question` (Epic 67, Story 67.1,
+/// AD-205, AD-206).
 ///
 /// Called by `voice_ipc::transition` when the turn hands out
-/// `Effect::SendText`. Where the question goes is
-/// `keeper_core::bots::voice_target::resolve`'s answer over `bots.voice_target`,
-/// the pinned bots and the conversation list — never what is open on the
-/// screen — and which model is `voice_target::model_for`'s; this function
-/// gathers the facts and then opens the turn exactly as a typed send would, so
-/// there is one stream code path. The voice turn is in `Heard`, so the turn's
-/// origin is spoken, which routes its close back into the voice turn. The
-/// stream goes to the app-wide [`crate::agent_ports::SPOKEN_STREAM_EVENT`],
-/// for the pane when there is one.
+/// `Effect::SendText`, with the question's generation. Where the question
+/// goes is `keeper_core::bots::voice_target::resolve`'s answer over
+/// `bots.voice_target`, the pinned bots, the conversation list and the
+/// person's proxy conversations — never what is open on the screen. A bot
+/// target's model is `voice_target::model_for`'s; this function gathers the
+/// facts and then opens the turn exactly as a typed send would, so there is
+/// one stream code path. The voice turn is in `Heard`, so the turn's origin
+/// is spoken, which routes its close back into the voice turn. The stream
+/// goes to the app-wide [`crate::agent_ports::SPOKEN_STREAM_EVENT`], for the
+/// pane when there is one. An agent room target (`agent:<room id>`, AD-384)
+/// is [`crate::agents_ipc::send_spoken`]'s: the question goes into that
+/// room as the person's message and its answer is followed there.
 ///
-/// A refusal — no bot to talk to, no model to send with, a send that never
-/// opened — ends the turn through `voice_ipc::answer_failed` with the
-/// sentence, which puts it beside the switch (AD-190) and in the ring
-/// (AD-192). Nothing is guessed and nothing is sent to a bot nobody chose.
-pub async fn send_spoken(app: &AppHandle, text: String) {
+/// A refusal — no bot to talk to, no model to send with, a chosen agent room
+/// that is not the person's proxy conversation, a send that never opened —
+/// ends the turn through `voice_ipc::answer_failed` with the sentence, which
+/// puts it beside the switch (AD-190) and in the ring (AD-192). Nothing is
+/// guessed and nothing is sent to a bot nobody chose. Every report names
+/// `question`: one the person has since stopped or replaced moves nothing.
+pub async fn send_spoken(app: &AppHandle, question: u64, text: String) {
+    // A new question: an earlier one's answer is not this turn's to speak.
+    crate::agents_ipc::drop_spoken_answer();
     let state = app.state::<AppState>();
-    let outcome = spoken_request(&state, &text).await;
+    let outcome = match spoken_target_now(&state).await {
+        Ok(SpokenTarget::Agent {
+            account_id,
+            room_id,
+        }) => {
+            crate::agents_ipc::send_spoken(app, question, account_id, room_id, text);
+            return;
+        }
+        Ok(SpokenTarget::Bot {
+            bot,
+            session_id,
+            history,
+        }) => spoken_request(&state, bot, session_id, history, &text).await,
+        Err(refusal) => Err(refusal),
+    };
     let req = match outcome {
         Ok(req) => req,
         Err(refusal) => {
             tracing::warn!(message = %refusal.message, "bots: a spoken turn was refused");
-            crate::voice_ipc::answer_failed(refusal.message);
+            crate::voice_ipc::answer_failed(question, refusal.message);
             return;
         }
     };
@@ -845,18 +871,23 @@ pub async fn send_spoken(app: &AppHandle, text: String) {
     let env = crate::agent_ports::turn_env(&state, Some(Arc::clone(&base)));
     match turn::open_turn(&env, req, &crate::agent_ports::origin_of).await {
         Ok(opened) => {
-            let sink = sink_for(&opened, base);
+            let sink = sink_for(&opened, base, Some(question));
             drive::spawn_turn(opened, sink);
         }
-        Err(error) => crate::voice_ipc::answer_failed(agent_error(error).message),
+        Err(error) => crate::voice_ipc::answer_failed(question, agent_error(error).message),
     }
 }
 
-/// The request a spoken turn sends: the target's bot, its conversation (or
-/// none, for a new one) and the model, resolved from the store.
-async fn spoken_request(state: &AppState, text: &str) -> Result<BotChatSendReq, IpcError> {
+/// The request a spoken turn sends to `bot`: its conversation (or none, for
+/// a new one) and the model, resolved from the store.
+async fn spoken_request(
+    state: &AppState,
+    bot: Bot,
+    session_id: Option<String>,
+    history: Vec<session::BotMessage>,
+    text: &str,
+) -> Result<BotChatSendReq, IpcError> {
     let dir = data_dir(state)?;
-    let (bot, target, history) = spoken_target(&dir)?;
     let kind = provider_of(&dir, &bot.provider_id)?.provider.kind;
     // The endpoint's list is asked only when neither the conversation nor
     // the provider names a model of its own (AD-217's first two rungs) — a
@@ -869,33 +900,78 @@ async fn spoken_request(state: &AppState, text: &str) -> Result<BotChatSendReq, 
     let model = voice_target::model_for(&bot, kind, &history, &offered)
         .map_err(|refusal| refused(refusal.message()))?;
     Ok(BotChatSendReq {
-        session_id: target.session_id,
-        bot_id: target.bot_id,
+        session_id,
+        bot_id: bot.id,
         model,
         text: text.to_owned(),
         attachment_ids: Vec::new(),
     })
 }
 
+/// Where a spoken turn goes, with what sending there needs.
+#[derive(Debug)]
+enum SpokenTarget {
+    /// A pinned bot, its conversation (none: a new one) and that
+    /// conversation's messages.
+    Bot {
+        bot: Bot,
+        session_id: Option<String>,
+        history: Vec<session::BotMessage>,
+    },
+    /// One of the person's proxy conversations, on the account that reads
+    /// it as theirs.
+    Agent { account_id: String, room_id: String },
+}
+
+/// [`spoken_target`] over the store and, when the choice names an agent
+/// room, every live account's proxy conversations — listed only then.
+async fn spoken_target_now(state: &AppState) -> Result<SpokenTarget, IpcError> {
+    let dir = data_dir(state)?;
+    let chosen = registry::get_bots_voice_target(&dir).map_err(to_ipc_error)?;
+    let rooms = match chosen.as_deref().and_then(voice_target::agent_room_of) {
+        Some(_) => state.accounts.agent_rooms_everywhere().await,
+        None => Vec::new(),
+    };
+    spoken_target(&dir, &rooms)
+}
+
 /// Where a spoken turn goes, read from the store: `bots.voice_target`, the
-/// pinned bots and the live conversations newest first go to
-/// `voice_target::resolve`; the answer comes back with the bot's row and the
-/// target conversation's messages (empty for a new one). A refusal is the
-/// sentence, as an `IpcError` the caller hands to the turn.
-fn spoken_target(
-    dir: &Path,
-) -> Result<(Bot, voice_target::VoiceTarget, Vec<session::BotMessage>), IpcError> {
+/// pinned bots, the live conversations newest first and `rooms` — the
+/// person's proxy conversations by account — go to `voice_target::resolve`;
+/// a bot comes back with its row and the target conversation's messages
+/// (empty for a new one). A refusal is the sentence, as an `IpcError` the
+/// caller hands to the turn.
+fn spoken_target(dir: &Path, rooms: &[(String, ProxyRoomVm)]) -> Result<SpokenTarget, IpcError> {
     let chosen = registry::get_bots_voice_target(dir).map_err(to_ipc_error)?;
     let bots = store::list_bots(dir).map_err(to_ipc_error)?;
     let sessions = session::list_sessions(dir, false).map_err(to_ipc_error)?;
-    let target = voice_target::resolve(chosen.as_deref(), &bots, &sessions)
-        .map_err(|refusal| refused(refusal.message()))?;
-    let bot = bot_of(dir, &target.bot_id)?;
-    let history = match &target.session_id {
-        Some(id) => session::list_messages(dir, id).map_err(to_ipc_error)?,
-        None => Vec::new(),
-    };
-    Ok((bot, target, history))
+    let room_ids: Vec<String> = rooms.iter().map(|(_, room)| room.room_id.clone()).collect();
+    match voice_target::resolve(chosen.as_deref(), &bots, &sessions, &room_ids)
+        .map_err(|refusal| refused(refusal.message()))?
+    {
+        voice_target::VoiceTarget::Agent { room_id } => {
+            let (account_id, _) = rooms
+                .iter()
+                .find(|(_, room)| room.room_id == room_id)
+                .ok_or_else(|| refused(voice_target::AGENT_ROOM_GONE_SENTENCE.to_owned()))?;
+            Ok(SpokenTarget::Agent {
+                account_id: account_id.clone(),
+                room_id,
+            })
+        }
+        voice_target::VoiceTarget::Bot { bot_id, session_id } => {
+            let bot = bot_of(dir, &bot_id)?;
+            let history = match &session_id {
+                Some(id) => session::list_messages(dir, id).map_err(to_ipc_error)?,
+                None => Vec::new(),
+            };
+            Ok(SpokenTarget::Bot {
+                bot,
+                session_id,
+                history,
+            })
+        }
+    }
 }
 
 /// Every model the bot's endpoint lists right now, or none when keeper
@@ -945,10 +1021,11 @@ pub async fn bots_message_retry(
 ) -> Result<String, IpcError> {
     let base: Arc<dyn TurnSink> = Arc::new(ChannelSink(channel));
     let env = crate::agent_ports::turn_env(&state, Some(Arc::clone(&base)));
+    let question = crate::voice_ipc::question_now();
     let opened = turn::open_retry(&env, req, &crate::agent_ports::origin_of)
         .await
         .map_err(agent_error)?;
-    let sink = sink_for(&opened, base);
+    let sink = sink_for(&opened, base, question);
     Ok(drive::spawn_turn(opened, sink))
 }
 
@@ -1185,7 +1262,7 @@ mod tests {
         .expect("provider");
 
         // Nothing pinned, nothing talked to: the sentence, and no bot.
-        let refused = spoken_target(&dir).expect_err("nothing to talk to");
+        let refused = spoken_target(&dir, &[]).expect_err("nothing to talk to");
         assert_eq!(
             refused.message,
             keeper_core::bots::voice_target::NO_TARGET_SENTENCE
@@ -1196,11 +1273,21 @@ mod tests {
         talk(&dir, "s1", "a", 10, "llama4:8b");
         talk(&dir, "s2", "b", 20, "qwen3");
 
+        let bot_of_target = |target: SpokenTarget| match target {
+            SpokenTarget::Bot {
+                bot,
+                session_id,
+                history,
+            } => (bot, session_id, history),
+            SpokenTarget::Agent { .. } => panic!("a bot target"),
+        };
+
         // Unset: the pinned bot most recently talked to, with its
         // conversation and the model that answered there.
-        let (bot, target, history) = spoken_target(&dir).expect("b was talked to last");
+        let (bot, session_id, history) =
+            bot_of_target(spoken_target(&dir, &[]).expect("b was talked to last"));
         assert_eq!(bot.id, "b");
-        assert_eq!(target.session_id.as_deref(), Some("s2"));
+        assert_eq!(session_id.as_deref(), Some("s2"));
         assert_eq!(
             voice_target::model_for(&bot, keeper_core::bots::ProviderKind::Ollama, &history, &[]),
             Ok("qwen3".to_owned())
@@ -1208,9 +1295,10 @@ mod tests {
 
         // Chosen: that bot, its own conversation.
         registry::set_bots_voice_target(&dir, Some("a")).expect("choose a");
-        let (bot, target, history) = spoken_target(&dir).expect("a is chosen");
+        let (bot, session_id, history) =
+            bot_of_target(spoken_target(&dir, &[]).expect("a is chosen"));
         assert_eq!(bot.id, "a");
-        assert_eq!(target.session_id.as_deref(), Some("s1"));
+        assert_eq!(session_id.as_deref(), Some("s1"));
         assert_eq!(
             voice_target::model_for(&bot, keeper_core::bots::ProviderKind::Ollama, &history, &[]),
             Ok("llama4:8b".to_owned())
@@ -1218,8 +1306,37 @@ mod tests {
 
         // A chosen bot that was unpinned since is no choice: back to b.
         store::delete_bot(&dir, "a").expect("unpin a");
-        let (bot, _, _) = spoken_target(&dir).expect("b remains");
+        let (bot, _, _) = bot_of_target(spoken_target(&dir, &[]).expect("b remains"));
         assert_eq!(bot.id, "b");
+
+        // A chosen agent room goes to the account that reads it as its
+        // proxy's; one no account lists is refused, never sent to b.
+        registry::set_bots_voice_target(&dir, Some("agent:!dm:example.org")).expect("choose");
+        let rooms = [(
+            "acct".to_owned(),
+            ProxyRoomVm {
+                room_id: "!dm:example.org".to_owned(),
+                name: "Nixi".to_owned(),
+                kind: keeper_core::agents::session::SessionKind::Main,
+                agent: "@nixi:example.org".to_owned(),
+                allowed: None,
+            },
+        )];
+        match spoken_target(&dir, &rooms).expect("the proxy room") {
+            SpokenTarget::Agent {
+                account_id,
+                room_id,
+            } => assert_eq!(
+                (account_id.as_str(), room_id.as_str()),
+                ("acct", "!dm:example.org")
+            ),
+            other => panic!("not the agent room: {other:?}"),
+        }
+        let refused = spoken_target(&dir, &[]).expect_err("no account lists it");
+        assert_eq!(
+            refused.message,
+            keeper_core::bots::voice_target::AGENT_ROOM_GONE_SENTENCE
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

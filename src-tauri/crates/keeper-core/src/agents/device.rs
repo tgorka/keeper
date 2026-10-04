@@ -26,7 +26,7 @@ use serde_json::Value;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
-use crate::account::{proxy_row, send_agent_event};
+use crate::account::{known_proxies, proxy_row, send_agent_event};
 use crate::agents::events::{
     PresencePlatform, SurfaceOutcome, SurfaceResultContent, CONTENT_VERSION, PRESENCE,
     SURFACE_REQUEST,
@@ -196,7 +196,8 @@ pub(crate) fn register(
                 // The room as one of this person's proxy conversations, and
                 // the proxy whose it is: the one sender acted on here.
                 let row = proxy_row(room.clone(), &kinds).await;
-                let proxy = proxy::room_proxy(&row, me, &proxies.snapshot());
+                let known = known_proxies(&client, &proxies).await;
+                let proxy = proxy::room_proxy(&row, me, &known);
                 let now = now_ms();
                 let admission = lock(&inbox).admit(RequestEvent {
                     event_id: value["event_id"].as_str().unwrap_or_default(),
@@ -252,7 +253,6 @@ pub(crate) fn register(
     );
     let publisher = Arc::new(Publisher {
         client: client.clone(),
-        kinds,
         proxies,
     });
     let presence = tokio::spawn(publish_presence(
@@ -294,7 +294,6 @@ async fn answer(
 /// its own proxies made.
 struct Publisher {
     client: Client,
-    kinds: Arc<AgentKinds>,
     proxies: Arc<AgentProxies>,
 }
 
@@ -306,19 +305,16 @@ impl Publisher {
         let Some(me) = self.client.user_id() else {
             return Vec::new();
         };
-        let (mut sessions, mut controls) = (Vec::new(), Vec::new());
-        for room in self.client.joined_rooms() {
-            match AgentRoomKind::of(room.room_type().as_ref()) {
-                Some(AgentRoomKind::Session) => sessions.push(room),
-                Some(AgentRoomKind::Control) => controls.push(room),
-                _ => {}
-            }
-        }
-        let mut rows = Vec::with_capacity(sessions.len());
-        for room in sessions {
-            rows.push(proxy_row(room, &self.kinds).await);
-        }
-        let own = proxy::own_proxies(&rows, me, &self.proxies.snapshot());
+        let mut controls: Vec<Room> = self
+            .client
+            .joined_rooms()
+            .into_iter()
+            .filter(|room| {
+                AgentRoomKind::of(room.room_type().as_ref()) == Some(AgentRoomKind::Control)
+            })
+            .collect();
+        let known = known_proxies(&self.client, &self.proxies).await;
+        let own = proxy::own_proxies(me, &known);
         controls
             .retain(|room| proxy::is_own_control_room(&room.creators().unwrap_or_default(), &own));
         controls

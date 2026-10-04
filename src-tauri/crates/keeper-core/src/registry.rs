@@ -1015,10 +1015,11 @@ pub fn set_bots_voice_locale(data_dir: &Path, locale: Option<&str>) -> Result<()
     )
 }
 
-/// The `settings` key holding the bot a spoken turn goes to (Epic 67,
-/// Story 67.1, AD-206): a bot id, or absent/blank for "the pinned bot most
-/// recently talked to". Which bot that is, and what happens when there is
-/// none, is `keeper_core::bots::voice_target::resolve`'s answer.
+/// The `settings` key holding where a spoken turn goes (Epic 67,
+/// Story 67.1, AD-206; AD-384): a bot id, `agent:<room id>` for one of the
+/// person's proxy conversations, or absent/blank for "the pinned bot most
+/// recently talked to". What happens with each, and when there is nothing
+/// to talk to, is `keeper_core::bots::voice_target::resolve`'s answer.
 const BOTS_VOICE_TARGET_KEY: &str = "bots.voice_target";
 
 /// Read the chosen voice target (AD-206). Absent or blank ⇒ `None`, "the
@@ -1031,11 +1032,11 @@ pub fn get_bots_voice_target(data_dir: &Path) -> Result<Option<String>, CoreErro
 
 /// Write the chosen voice target (AD-206): `None` clears the choice back to
 /// "most recently talked to". Stored trimmed under `bots.voice_target`.
-pub fn set_bots_voice_target(data_dir: &Path, bot_id: Option<&str>) -> Result<(), CoreError> {
+pub fn set_bots_voice_target(data_dir: &Path, target: Option<&str>) -> Result<(), CoreError> {
     set_setting(
         data_dir,
         BOTS_VOICE_TARGET_KEY,
-        bot_id.map(str::trim).unwrap_or_default(),
+        target.map(str::trim).unwrap_or_default(),
     )
 }
 

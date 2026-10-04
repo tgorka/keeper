@@ -16,7 +16,7 @@
 //! plaintext beyond the rendered preview crosses IPC or reaches a `tracing` log
 //! (NFR-9).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::path::Path;
 use std::str::FromStr;
@@ -51,9 +51,13 @@ use crate::agents::events::{
 };
 use crate::agents::events::{PresencePlatform, SurfaceResultContent};
 use crate::agents::focus::{FocusLanes, FocusPort, Named, SendFuture};
-use crate::agents::proxy::{self, AgentOutbound, AgentProxies, ProxyRoomRow, ProxyRoomVm};
+use crate::agents::proxy::{
+    self, AgentOutbound, AgentProxies, KnownProxies, ProxyListEventContent, ProxyRoomRow,
+    ProxyRoomVm,
+};
 use crate::agents::room::{self as agent_room, AgentIcons, AgentKinds, AgentRoomKind};
 use crate::agents::session::SessionKind;
+use crate::agents::spoken::SpokenAnswer;
 use crate::agents::surface::{SurfaceAnswerReq, SurfaceRequestArrived};
 use crate::archive::{self, ArchiveEvent, ArchiveHandle, ArchiveMedia, ArchiveWriter};
 use crate::auth::{self, session_keychain_key};
@@ -484,7 +488,7 @@ async fn run_outbox_scheduler(
             // then remove the row. A dispatch error is best-effort — leave the row to
             // retry next tick rather than deleting an undispatched message.
             match send::dispatch(&timeline, &row.body).await {
-                Ok(()) => {
+                Ok(_) => {
                     if let Err(e) = registry::delete_outbox(&data_dir, &row.id) {
                         // Handed off but not yet deleted: remember it so the next tick
                         // retries the delete instead of re-dispatching a duplicate.
@@ -3875,18 +3879,12 @@ impl AccountManager {
             }
             rows.push(proxy_row(room, &self.agent_kinds).await);
         }
-        proxy::proxy_rooms(&rows, &me, &self.agent_proxies.snapshot())
+        let known = known_proxies(&client, &self.agent_proxies).await;
+        proxy::proxy_rooms(&rows, &me, &known)
     }
 
-    /// The live room `room_id` when it is one of the person's proxy rooms as
-    /// this account reads it ([`proxy::admits`]), with its kind and agent. A
-    /// scope, a focus or a request for a conversation is only ever sent
-    /// there (R29 F1: where power levels let the person).
-    async fn proxy_room(
-        &self,
-        account_id: &str,
-        room_id: &str,
-    ) -> Result<(Room, SessionKind, matrix_sdk::ruma::OwnedUserId), CoreError> {
+    /// The live agent session room `room_id` on `account_id`.
+    async fn session_room(&self, account_id: &str, room_id: &str) -> Result<Room, CoreError> {
         let room_id = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
         let room = self
             .room_for(account_id, &room_id)
@@ -3895,11 +3893,20 @@ impl AccountManager {
         if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session) {
             return Err(SendError::RoomNotFound.into());
         }
-        let row = proxy_row(room.clone(), &self.agent_kinds).await;
-        let proxies = self.agent_proxies.snapshot();
-        let admitted = proxy::admits(&row, room.own_user_id(), &proxies)
-            .map_err(|refusal| CoreError::Unsupported(refusal.to_string()))?;
-        let (kind, agent) = (admitted.kind, admitted.agent.to_owned());
+        Ok(room)
+    }
+
+    /// The live room `room_id` when it is one of the person's proxy rooms as
+    /// this account reads it ([`admit_proxy_room`]), with its kind and agent.
+    /// A scope, a focus or a request for a conversation is only ever sent
+    /// there (R29 F1: where power levels let the person).
+    async fn proxy_room(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<(Room, SessionKind, matrix_sdk::ruma::OwnedUserId), CoreError> {
+        let room = self.session_room(account_id, room_id).await?;
+        let (kind, agent) = admit_proxy_room(&room, &self.agent_kinds, &self.agent_proxies).await?;
         Ok((room, kind, agent))
     }
 
@@ -4025,6 +4032,41 @@ impl AccountManager {
                 .filter(|title| !title.is_empty()),
         };
         send_agent_event(&room, AgentOutbound::ConversationRequest(content)).await
+    }
+
+    /// Every live account's proxy conversations, by account id (AD-384): the
+    /// rooms a spoken question may go to.
+    pub async fn agent_rooms_everywhere(&self) -> Vec<(String, ProxyRoomVm)> {
+        let account_ids: Vec<String> = self.accounts.lock().await.keys().cloned().collect();
+        let mut rooms = Vec::new();
+        for account_id in account_ids {
+            for room in self.agent_rooms(&account_id).await {
+                rooms.push((account_id.clone(), room));
+            }
+        }
+        rooms
+    }
+
+    /// Send what the voice turn heard into `room_id`, the person's own
+    /// proxy conversation on `account_id`, as their message (AD-384) —
+    /// [`spoken_send`], with the conversation's open timeline when one is.
+    ///
+    /// Errors: a room that is not live → [`SendError::RoomNotFound`]; else
+    /// [`spoken_send`]'s.
+    pub async fn agent_spoken_send(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        text: &str,
+    ) -> Result<SpokenAnswer, CoreError> {
+        let room = self.session_room(account_id, room_id).await?;
+        let open = self
+            .open_timeline_for(account_id, room.room_id())
+            .await
+            .ok();
+        let answer = spoken_send(&room, &self.agent_kinds, &self.agent_proxies, open, text).await?;
+        tracing::info!(account_id = %account_id, room_id = %room.room_id(), "spoken question dispatched to the person's agent");
+        Ok(answer)
     }
 
     /// Every surface request a live account of this device admits from now
@@ -5287,6 +5329,103 @@ async fn send_surface_result(
     send_agent_event(&room, AgentOutbound::SurfaceResult(result))
         .await
         .map(|_| ())
+}
+
+/// What `client`'s account knows of whose proxy an agent is (ruling R72):
+/// this device's zone facts, and the person's own `dev.keeper.agent.proxies`
+/// list. Read on every admission and listing, which is also when this
+/// keeper brings the list in line with its zone
+/// ([`KnownProxies::mirrored`]) — written only when that changes it, and
+/// never over a list of a version it does not read.
+pub(crate) async fn known_proxies(client: &Client, proxies: &AgentProxies) -> KnownProxies {
+    let stored = match client
+        .account()
+        .account_data::<ProxyListEventContent>()
+        .await
+    {
+        Ok(Some(raw)) => raw.deserialize().ok().map(|content| content.agents()),
+        Ok(None) => Some(Some(BTreeSet::new())),
+        Err(error) => {
+            tracing::warn!(%error, "agents: the person's proxy list could not be read");
+            None
+        }
+    };
+    let known = KnownProxies {
+        facts: proxies.snapshot(),
+        listed: stored.clone().flatten().unwrap_or_default(),
+    };
+    let (Some(Some(listed)), Some(me)) = (stored, client.user_id()) else {
+        return known;
+    };
+    let mirrored = known.mirrored(me);
+    if mirrored != listed && proxies.owes(me, &mirrored) {
+        if let Err(error) = client
+            .account()
+            .set_account_data(ProxyListEventContent::of(&mirrored))
+            .await
+        {
+            proxies.unwritten(me);
+            tracing::warn!(%error, "agents: the person's proxy list could not be written");
+        }
+    }
+    known
+}
+
+/// Whether `room` is one of its own user's proxy conversations
+/// ([`proxy::admits`] over [`known_proxies`]): its kind and agent, or
+/// `unsupported` with the refusal's sentence.
+async fn admit_proxy_room(
+    room: &Room,
+    kinds: &AgentKinds,
+    proxies: &AgentProxies,
+) -> Result<(SessionKind, matrix_sdk::ruma::OwnedUserId), CoreError> {
+    let row = proxy_row(room.clone(), kinds).await;
+    let known = known_proxies(&room.client(), proxies).await;
+    let admitted = proxy::admits(&row, room.own_user_id(), &known)
+        .map_err(|refusal| CoreError::Unsupported(refusal.to_string()))?;
+    Ok((admitted.kind, admitted.agent.to_owned()))
+}
+
+/// Send what the voice turn heard into `room`, its own user's proxy
+/// conversation, as their message (AD-384) — through the single dispatch
+/// gate with [`SendTrigger::SpokenToAgent`], legal only there (ruling R31,
+/// whose "the proxy's human is the signed-in user" R72 makes fail closed)
+/// and never held for Undo-Send: the end of the utterance was the send.
+/// The answer's watch is on the room's event cache before the send, and
+/// learns the question's event id from the send queue; it reads the answer
+/// as it grows. `open` is the conversation's timeline when one is open
+/// (no screen need be: the voice turn runs with none).
+///
+/// Errors: a blank text → [`SendError::EmptyBody`]; a room that is not the
+/// person's own `main`/`conversation` proxy room → `unsupported` with
+/// [`proxy::admits`]' reason, and nothing is sent; a transient-build
+/// failure → [`TimelineError::Build`]; an SDK enqueue failure →
+/// [`SendError::Dispatch`].
+pub async fn spoken_send(
+    room: &Room,
+    kinds: &AgentKinds,
+    proxies: &AgentProxies,
+    open: Option<Arc<Timeline>>,
+    text: &str,
+) -> Result<SpokenAnswer, CoreError> {
+    if text.trim().is_empty() {
+        return Err(SendError::EmptyBody.into());
+    }
+    let (_, agent) = admit_proxy_room(room, kinds, proxies).await?;
+    let mut answer = SpokenAnswer::watch(room, agent).await?;
+    let timeline = match open {
+        Some(timeline) => timeline,
+        None => Arc::new(
+            TimelineBuilder::new(room)
+                .build()
+                .await
+                .map_err(|e| TimelineError::Build(e.to_string()))?,
+        ),
+    };
+    if let Some(handle) = send::submit(&timeline, text, SendTrigger::SpokenToAgent).await? {
+        answer.sent(&handle, text);
+    }
+    Ok(answer)
 }
 
 /// What the dock and the surface handler read of a session room to decide

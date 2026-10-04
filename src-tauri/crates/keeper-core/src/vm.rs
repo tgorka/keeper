@@ -7506,7 +7506,9 @@ pub struct VoiceWakeVm {
     /// never blank.
     pub stop_phrase: String,
     /// `bots.voice_target` as stored — the id of the pinned bot a spoken
-    /// turn goes to; `None` means "the pinned bot most recently talked to".
+    /// turn goes to, or `agent:<room id>` for one of the person's proxy
+    /// conversations ([`VoiceAgentTargetVm::target`]); `None` means "the
+    /// pinned bot most recently talked to".
     pub voice_target: Option<String>,
 }
 
@@ -7527,6 +7529,26 @@ pub struct VoiceTargetSpeedVm {
     /// shows nothing rather than a number one slow answer made.
     #[ts(type = "number | null")]
     pub first_token_median_ms: Option<u64>,
+}
+
+/// One of the person's proxy conversations a spoken turn may go to
+/// (AD-384), from `voice_agent_targets`, listed by the voice target picker
+/// ("Speak to") after the pinned bots: the `main` DM first, then the
+/// conversations, per signed-in account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct VoiceAgentTargetVm {
+    /// What `voice_target_set` stores to choose it, and what
+    /// `VoiceWakeVm.voiceTarget` reads back once chosen.
+    pub target: String,
+    /// The account the room is on.
+    pub account_id: String,
+    pub room_id: String,
+    /// The room's name for the DM, the conversation's title otherwise.
+    pub name: String,
+    /// `main` (the DM) or `conversation`.
+    pub kind: crate::agents::session::SessionKind,
 }
 
 /// One thing the voice port did (Epic 65, Story 65.3, AD-192), from

@@ -1,8 +1,9 @@
-//! The person's proxy beside the notes view (stories 91.2, 91.3; AD-382,
-//! AD-383): the dock's commands, the surface requests this device executes,
-//! and its presence. On every target — the phone shows the proxy's rooms and
-//! answers surface requests too (P5: it is never a host, which is
-//! `agents_host`'s, desktop only).
+//! The person's proxy beside the notes view (stories 91.2–91.4; AD-382,
+//! AD-383, AD-384): the dock's commands, the surface requests this device
+//! executes, its presence, and a spoken question sent to the proxy with its
+//! answer spoken as it grows. On every target — the phone shows the proxy's
+//! rooms, answers surface requests and speaks to it too (P5: it is never a
+//! host, which is `agents_host`'s, desktop only).
 //!
 //! It decides nothing: which rooms are the proxy's, which agent and which
 //! drives a request may come from, what a scope, a focus, a presence or a
@@ -10,15 +11,19 @@
 //! `AccountManager`'s; which drive and path a note is, and which note or
 //! file a request names, `keeper_agent::surface`'s.
 
+use std::sync::Mutex;
+
 use keeper_agent::surface::{drive_of, locate, Located};
 use keeper_core::agents::events::{Focus, PresencePlatform, SurfaceOutcome};
 use keeper_core::agents::proxy::{AgentFocusReq, ProxyRoomVm};
+use keeper_core::agents::spoken::{FollowSlot, SpokenStep};
 use keeper_core::agents::surface::{
     SurfaceAnswerReq, SurfaceRequestArrived, SurfaceRequestVm, CANNOT_SHOW,
 };
+use keeper_core::bots::voice_target;
 use keeper_core::notes::outline::{heading_at, heading_in};
 use keeper_core::panels::PanelTargetVm;
-use keeper_core::vm::IpcError;
+use keeper_core::vm::{IpcError, VoiceAgentTargetVm};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 
@@ -296,4 +301,94 @@ pub async fn agent_conversation_new(
         .agent_conversation_new(&account_id, &room_id, title)
         .await
         .map_err(to_ipc_error)
+}
+
+/// The proxy conversations a spoken turn may go to, on every signed-in
+/// account, for the voice target picker ("Speak to", AD-384): each with the
+/// value `voice_target_set` stores to choose it.
+#[tauri::command]
+pub async fn voice_agent_targets(
+    state: State<'_, AppState>,
+) -> Result<Vec<VoiceAgentTargetVm>, IpcError> {
+    Ok(voice_target::agent_targets(
+        state.accounts.agent_rooms_everywhere().await,
+    ))
+}
+
+/// The send and then the following of the answer to the voice turn's
+/// current question, when it went to the person's agent: only that
+/// question's is ever kept ([`FollowSlot`]).
+static SPOKEN_ANSWER: Mutex<FollowSlot<tauri::async_runtime::JoinHandle<()>>> =
+    Mutex::new(FollowSlot::new());
+
+fn spoken_answer(
+) -> std::sync::MutexGuard<'static, FollowSlot<tauri::async_runtime::JoinHandle<()>>> {
+    SPOKEN_ANSWER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A new question was heard: an earlier one's send or answer is not the
+/// new turn's to speak (R44: the agent itself is not told; it finishes its
+/// answer in the room).
+pub fn drop_spoken_answer() {
+    let current = crate::voice_ipc::question_now();
+    if let Some(earlier) = spoken_answer().keep_only(current) {
+        earlier.abort();
+    }
+}
+
+/// Send what the voice turn heard as `question` into `room_id`, the
+/// person's proxy conversation on `account_id` (AD-384, R31), and speak the
+/// answer as it grows. Called by `bots_ipc::send_spoken` for an agent room
+/// target. Only the text leaves the device, as the person's own message;
+/// which room is allowed and what of the answer is heard when are
+/// `keeper_core::account::spoken_send`'s and `keeper_core::agents::spoken`'s.
+/// The voice turn hears the send leave (`note_sent`, with the agent's name),
+/// the first words, each sentence and the end — or the refusal or failure
+/// as its sentence — each for `question`. The work is in the slot before it
+/// starts: a question that is no longer the voice turn's never sends, and
+/// a newer one stops it.
+pub fn send_spoken(
+    app: &AppHandle,
+    question: u64,
+    account_id: String,
+    room_id: String,
+    text: String,
+) {
+    let app = app.clone();
+    let work = tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let mut answer = match state
+            .accounts
+            .agent_spoken_send(&account_id, &room_id, &text)
+            .await
+        {
+            Ok(answer) => answer,
+            Err(error) => {
+                let refusal = to_ipc_error(error);
+                tracing::warn!(message = %refusal.message, "agents: a spoken question was not sent");
+                crate::voice_ipc::answer_failed(question, refusal.message);
+                return;
+            }
+        };
+        tracing::info!(room = %room_id, "agents: sent what the voice turn heard to the person's agent");
+        crate::voice_ipc::note_sent(question, answer.agent_name());
+        while let Some(step) = answer.next().await {
+            match step {
+                SpokenStep::FirstText { after_ms } => {
+                    crate::voice_ipc::note_answer_chunk(question, after_ms);
+                }
+                SpokenStep::Sentence(sentence) => {
+                    crate::voice_ipc::answer_sentence(question, sentence);
+                }
+                SpokenStep::Complete(rest) => crate::voice_ipc::answer_complete(question, rest),
+                SpokenStep::Failed(why) => crate::voice_ipc::answer_failed(question, why),
+            }
+        }
+    });
+    let current = crate::voice_ipc::question_now();
+    if let Some(stopped) = spoken_answer().install(question, current, work) {
+        stopped.abort();
+    }
 }

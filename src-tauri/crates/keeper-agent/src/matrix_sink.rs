@@ -24,7 +24,7 @@ use keeper_core::agents::events::{
 use keeper_core::agents::matrix::{AgentClient, AgentMatrixError};
 use keeper_core::agents::redact::redact_secrets;
 use keeper_core::vm::BotStreamEvent;
-use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedTransactionId, TransactionId};
+use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedTransactionId, TransactionId};
 use serde_json::{json, Value};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -136,12 +136,17 @@ pub fn cut_to_log(answer: &str) -> String {
     )
 }
 
-/// An answer's anchor: the placeholder and the turn it belongs to.
-pub fn anchor_content(session: &str, user_line: &str) -> Value {
+/// An answer's anchor: the placeholder, the turn it belongs to and the
+/// person's message `question` it answers.
+pub fn anchor_content(session: &str, user_line: &str, question: &EventId) -> Value {
     json!({
         "msgtype": "m.text",
         "body": PLACEHOLDER,
-        TURN: TurnRef { session: session.to_owned(), line: user_line.to_owned() },
+        TURN: TurnRef {
+            session: session.to_owned(),
+            line: user_line.to_owned(),
+            question: Some(question.to_owned()),
+        },
     })
 }
 
@@ -265,8 +270,10 @@ async fn pace(
     Paced { last_send, edits }
 }
 
-/// How a streamed answer ended in the room.
+/// How a streamed answer ended in the room: made only by
+/// [`MatrixSink::finish`], once the homeserver accepted the final edit.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Delivered {
     /// The final edit's event.
     pub final_event: OwnedEventId,
@@ -402,47 +409,57 @@ impl ToolProgress {
 }
 
 /// The session's status anchor and its paced edits for one turn.
+///
+/// The status says `running` from the turn's start, whatever the turn does,
+/// and `idle` only once [`StatusBoard::finish`] is handed the answer's
+/// accepted final edit, so a device following the answer reads the status
+/// leaving `running` as "the answer is whole" (AD-384). A board dropped
+/// without that — the turn cancelled, or unwinding — stops its task where it
+/// is and publishes nothing more: never an `idle` for an answer that did
+/// not land.
 pub struct StatusBoard {
     progress: watch::Sender<Progress>,
     task: Mutex<Option<JoinHandle<Option<OwnedEventId>>>>,
 }
 
+/// A task that is aborted when its holder goes.
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl StatusBoard {
-    /// Start a board for one turn. `anchor` is the session's status anchor
-    /// when it has one; the first progress creates it otherwise. `base` is
-    /// the status every edit carries, `detail` and `anchor` aside.
+    /// Start a board for one turn: a `running` status at once, as an edit
+    /// of `anchor` — the session's status anchor — or as the anchor itself
+    /// when the session has none yet. `base` is the status every edit
+    /// carries, `detail` and `anchor` aside.
     pub fn start(
         port: Arc<dyn EditPort>,
         anchor: Option<OwnedEventId>,
         base: StatusContent,
     ) -> StatusBoard {
-        let (progress, mut receiver) = watch::channel(Progress::default());
+        let (progress, receiver) = watch::channel(Progress::default());
         let task = tokio::spawn(async move {
             let status = move |anchor: Option<&OwnedEventId>, run: RunState, detail: &str| {
                 let mut content = base.clone();
                 content.v = CONTENT_VERSION;
                 content.run = run;
-                content.detail = Some(detail.to_owned());
+                content.detail = (!detail.is_empty()).then(|| detail.to_owned());
                 content.anchor = anchor.cloned();
                 serde_json::to_value(content).unwrap_or(Value::Null)
             };
-            let anchor = match anchor {
-                Some(anchor) => anchor,
-                None => {
-                    if receiver.changed().await.is_err() || receiver.borrow().finished {
-                        return None;
-                    }
-                    let detail = receiver.borrow_and_update().text.clone();
-                    let (anchor, _) = deliver(
-                        port.as_ref(),
-                        STATUS,
-                        status(None, RunState::Running, &detail),
-                        Instant::now(),
-                    )
-                    .await;
-                    anchor
-                }
-            };
+            let detail = receiver.borrow().text.clone();
+            let (sent, started) = deliver(
+                port.as_ref(),
+                STATUS,
+                status(anchor.as_ref(), RunState::Running, &detail),
+                Instant::now(),
+            )
+            .await;
+            let anchor = anchor.unwrap_or(sent);
             let status = Arc::new(status);
             let running = Arc::clone(&status);
             let content: EditContent =
@@ -452,21 +469,27 @@ impl StatusBoard {
                 STATUS,
                 anchor.clone(),
                 content,
-                Instant::now(),
+                started,
                 receiver.clone(),
             )
             .await;
-            // The turn is over: the status says so, with the last counts.
-            let detail = receiver.borrow().text.clone();
-            if !detail.is_empty() {
-                deliver(
-                    port.as_ref(),
-                    STATUS,
-                    status(Some(&anchor), RunState::Idle, &detail),
-                    paced.last_send + MIN_EDIT_GAP,
-                )
-                .await;
+            // The pacer also returns when the board's owner went without
+            // finishing: only a finish says the answer landed.
+            let (finished, detail) = {
+                let now = receiver.borrow();
+                (now.finished, now.text.clone())
+            };
+            if !finished {
+                return None;
             }
+            // The turn is over: the status says so, with the last counts.
+            deliver(
+                port.as_ref(),
+                STATUS,
+                status(Some(&anchor), RunState::Idle, &detail),
+                paced.last_send + MIN_EDIT_GAP,
+            )
+            .await;
             Some(anchor)
         });
         StatusBoard {
@@ -481,13 +504,27 @@ impl StatusBoard {
         self.progress.send_modify(|now| now.text = detail);
     }
 
-    /// Stop the board; the session's status anchor, when there is one.
-    pub async fn finish(&self) -> Option<OwnedEventId> {
+    /// The answer's final edit was accepted (`delivered`, which only
+    /// [`MatrixSink::finish`] makes): the status goes `idle`. The session's
+    /// status anchor, when there is one.
+    pub async fn finish(&self, _delivered: &Delivered) -> Option<OwnedEventId> {
         self.progress.send_modify(|now| now.finished = true);
         let task = self.task.lock().unwrap_or_else(|p| p.into_inner()).take();
         match task {
-            Some(task) => task.await.ok().flatten(),
+            // Held so that a finish dropped mid-wait still stops the task.
+            Some(task) => {
+                let mut task = AbortOnDrop(task);
+                (&mut task.0).await.ok().flatten()
+            }
             None => None,
+        }
+    }
+}
+
+impl Drop for StatusBoard {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            task.abort();
         }
     }
 }
@@ -690,5 +727,77 @@ mod tests {
         assert!(answer.starts_with(head));
         assert_eq!(tail, "artifacts/answer-X.md");
         assert_eq!(cut("short", "x"), None);
+    }
+
+    fn base() -> StatusContent {
+        StatusContent {
+            v: CONTENT_VERSION,
+            session: "60-sessions/main".to_owned(),
+            kind: keeper_core::agents::session::SessionKind::Main,
+            title: "Nixi".to_owned(),
+            agent: matrix_sdk::ruma::OwnedUserId::try_from("@nixi:example.org").expect("user"),
+            host: "electra".to_owned(),
+            epoch: 1,
+            run: RunState::Running,
+            detail: None,
+            waiting: None,
+            anchor: None,
+        }
+    }
+
+    fn failing(n: usize) -> Vec<Option<AgentMatrixError>> {
+        (0..n)
+            .map(|_| Some(AgentMatrixError::Other("HTTP 502".to_owned())))
+            .collect()
+    }
+
+    /// A turn cancelled while its answer's final edit is still being
+    /// retried never shows the session `idle` — that would tell a device
+    /// following the answer that a partial answer was whole — and nothing
+    /// is sent once the turn is gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_cancelled_before_its_final_edit_never_says_idle() {
+        // The board's `running` lands; every send after it fails for a
+        // while, then the homeserver accepts again.
+        let mut script = vec![None];
+        script.extend(failing(40));
+        let port = FakePort::new(script);
+        let sink = MatrixSink::start(port.clone(), anchor(), Instant::now());
+        let board = StatusBoard::start(port.clone(), None, base());
+        sink.push("Half an answer");
+        let turn = async move {
+            let delivered = sink.finish("Half an answer").await;
+            board.finish(&delivered).await
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), turn)
+                .await
+                .is_err(),
+            "the final edit is still being retried"
+        );
+        let at_cancel = port.sent().len();
+        sleep(Duration::from_secs(600)).await;
+        let sent = port.sent();
+        assert_eq!(sent.len(), at_cancel, "{sent:?}");
+        let runs: Vec<&str> = sent
+            .iter()
+            .filter(|s| s.event_type == STATUS)
+            .filter_map(|s| s.content["run"].as_str())
+            .collect();
+        assert_eq!(runs, ["running"]);
+    }
+
+    /// A board dropped while its first status is still being retried stops
+    /// retrying: its task does not outlive the turn that owned it.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_board_stops_its_task() {
+        let port = FakePort::new(failing(200));
+        let board = StatusBoard::start(port.clone(), None, base());
+        sleep(Duration::from_secs(3)).await;
+        assert!(!port.sent().is_empty());
+        drop(board);
+        let at_drop = port.sent().len();
+        sleep(Duration::from_secs(600)).await;
+        assert_eq!(port.sent().len(), at_drop);
     }
 }

@@ -33,5 +33,6 @@ pub mod seed;
 pub mod session;
 pub mod skills;
 pub mod soul;
+pub mod spoken;
 pub mod surface;
 pub mod zone;

@@ -1218,6 +1218,84 @@ async fn tool_progress_carries_counts_not_paths() {
     assert_eq!(last["run"], "idle");
 }
 
+/// AD-384: a turn's status says `running` from its start and `idle` only
+/// once the answer's final edit is sent — tool calls or none — so a device
+/// following a spoken question reads the status leaving `running` as the
+/// answer being whole. The next turn edits the same status anchor.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_is_running_until_its_final_edit_is_sent() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &[],
+        vec![prose("The sky is blue."), prose("Still blue.")],
+    );
+    let mut served = world.open(SESSION);
+    report(world.ask(&mut served, "sky?").await);
+    let sent = world.room.sent();
+    let anchor = sent
+        .iter()
+        .position(|(_, content)| content["dev.keeper.agent.turn"].is_object())
+        .expect("the answer's anchor");
+    let statuses: Vec<usize> = (0..sent.len()).filter(|&i| sent[i].0 == STATUS).collect();
+    let (first, last) = (statuses[0], *statuses.last().expect("a status"));
+    assert!(first > anchor, "{sent:?}");
+    assert_eq!(sent[first].1["run"], "running");
+    assert!(
+        sent[first].1.get("anchor").is_none(),
+        "the session's first status"
+    );
+    assert!(sent[first].1.get("detail").is_none(), "{}", sent[first].1);
+    assert_eq!(
+        last,
+        sent.len() - 1,
+        "the idle status is the turn's last send"
+    );
+    assert_eq!(sent[last].1["run"], "idle");
+    let final_edit_at = (0..sent.len())
+        .rev()
+        .find(|&i| sent[i].1["m.relates_to"]["rel_type"] == "m.replace")
+        .expect("the final edit");
+    assert!(final_edit_at < last, "{sent:?}");
+    assert_eq!(final_edit(&world.room), "The sky is blue.");
+    let status_anchor = format!("$sent{}:example.org", first + 1);
+    assert_eq!(sent[last].1["anchor"], status_anchor.as_str());
+
+    report(world.ask(&mut served, "and now?").await);
+    let again = world.room.sent();
+    let running = (sent.len()..again.len())
+        .find(|&i| again[i].0 == STATUS)
+        .expect("the second turn's status");
+    assert_eq!(again[running].1["run"], "running");
+    assert_eq!(again[running].1["anchor"], status_anchor.as_str());
+    assert_eq!(again.last().expect("a send").1["run"], "idle");
+}
+
+/// AD-384, review fix R5-F3: each answer's anchor names the person's
+/// message it answers, so a device that asked follows its own question's
+/// answer — not the one to a question queued before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_names_the_message_it_answers() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &[],
+        vec![prose("One."), prose("Two.")],
+    );
+    let mut served = world.open(SESSION);
+    report(world.ask(&mut served, "first?").await);
+    report(world.ask(&mut served, "second?").await);
+    let answered: Vec<Value> = world
+        .room
+        .sent()
+        .iter()
+        .filter_map(|(_, content)| content.get("dev.keeper.agent.turn").cloned())
+        .map(|turn| turn["question"].clone())
+        .collect();
+    assert_eq!(
+        answered,
+        [json!("$in1:example.org"), json!("$in2:example.org")]
+    );
+}
+
 fn messages_text(messages: &[keeper_core::bots::chat::ChatMessage]) -> String {
     format!("{messages:?}")
 }
