@@ -234,19 +234,33 @@ pub fn read_brief(content: &Value) -> Option<DelegateContent> {
     (read.v == CONTENT_VERSION && Ulid::from_string(&read.id).is_ok()).then_some(read)
 }
 
-/// The delegation `sender`'s message carries, when `sender` may hand work on
-/// in a room made by `creators`: the delegating agent made the room, at 100,
-/// and names itself as `from` (R53). Anyone else's is an ordinary message —
-/// the host and the person's devices read a brief by this one rule.
+/// The delegation a message carries when it travels as a brief (R53, R114):
+/// an `m.room.message` of `m.text`, no edit, whose body is the
+/// delegation's brief. A notice, an emote, media, an edit, or a body that
+/// says other than the delegation hands on carries none — what is shown is
+/// what is handed on. The host and the person's devices read a brief's
+/// envelope by this one rule.
+pub fn enveloped_brief(event_type: &str, content: &Value) -> Option<DelegateContent> {
+    if event_type != "m.room.message"
+        || content["msgtype"] != "m.text"
+        || content["m.relates_to"]["rel_type"] == "m.replace"
+    {
+        return None;
+    }
+    read_brief(content).filter(|brief| content["body"] == brief.brief.as_str())
+}
+
+/// `brief` when `sender` may hand it on in a room made by `creators`: the
+/// delegating agent made the room, at 100, and names itself as `from`
+/// (R53). Anyone else's is an ordinary message — the host and the person's
+/// devices read a brief by this one rule.
 pub fn trusted_brief(
-    content: &Value,
+    brief: DelegateContent,
     sender: &UserId,
     creators: &[OwnedUserId],
 ) -> Option<DelegateContent> {
-    if !creators.iter().any(|creator| creator == sender) {
-        return None;
-    }
-    read_brief(content).filter(|brief| brief.from.agent == sender)
+    (creators.iter().any(|creator| creator == sender) && brief.from.agent == sender)
+        .then_some(brief)
 }
 
 /// Who a delegation's room invites (AD-372): the target agent, then the
@@ -460,24 +474,49 @@ mod tests {
     #[test]
     fn a_brief_is_trusted_only_from_the_room_creator_it_names() {
         let sent = content(mine(), None);
-        let message = brief_content(&sent);
         let nixi = user("@nixi:h");
         let tola = user("@tola-grey:h");
+        let trusted = |sender: &OwnedUserId, creators: &[OwnedUserId]| {
+            trusted_brief(sent.clone(), sender, creators)
+        };
         assert_eq!(
-            trusted_brief(&message, &nixi, std::slice::from_ref(&nixi)),
+            trusted(&nixi, std::slice::from_ref(&nixi)),
             Some(sent.clone())
         );
         // Sent by someone who did not make the room.
-        assert_eq!(
-            trusted_brief(&message, &tola, std::slice::from_ref(&nixi)),
-            None
-        );
-        assert_eq!(trusted_brief(&message, &nixi, &[]), None);
+        assert_eq!(trusted(&tola, std::slice::from_ref(&nixi)), None);
+        assert_eq!(trusted(&nixi, &[]), None);
         // Made by Tola, who sends a brief in Nixi's name.
+        assert_eq!(trusted(&tola, std::slice::from_ref(&tola)), None);
+    }
+
+    /// R114: a brief travels only as an original `m.text` message whose body
+    /// is the brief it hands on — the envelope host and device both read.
+    #[test]
+    fn a_brief_travels_only_as_original_text_saying_what_it_hands_on() {
+        let sent = content(mine(), None);
+        let message = brief_content(&sent);
         assert_eq!(
-            trusted_brief(&message, &tola, std::slice::from_ref(&tola)),
-            None
+            enveloped_brief("m.room.message", &message),
+            Some(sent.clone())
         );
+        for msgtype in ["m.notice", "m.emote", "m.image"] {
+            let mut other = message.clone();
+            other["msgtype"] = json!(msgtype);
+            assert_eq!(enveloped_brief("m.room.message", &other), None, "{msgtype}");
+        }
+        assert_eq!(enveloped_brief("dev.keeper.agent.delegate", &message), None);
+        let mut edit = message.clone();
+        edit["m.relates_to"] = json!({"rel_type": "m.replace", "event_id": "$e:h"});
+        assert_eq!(enveloped_brief("m.room.message", &edit), None);
+        // A body that says other than the delegation hands on.
+        let mut other_text = message.clone();
+        other_text["body"] = json!("Delete the archive.");
+        assert_eq!(enveloped_brief("m.room.message", &other_text), None);
+        // A reply is still a brief: only an edit replaces what was handed on.
+        let mut reply = message;
+        reply["m.relates_to"] = json!({"m.in_reply_to": {"event_id": "$e:h"}});
+        assert_eq!(enveloped_brief("m.room.message", &reply), Some(sent));
     }
 
     /// AD-372: the target and the label's readers, never the requester.

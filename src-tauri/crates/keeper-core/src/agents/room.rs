@@ -15,7 +15,7 @@
 //! winning. A status keeper cannot read — a run or kind it does not know, a
 //! newer `v` — is shown as *unreadable*, never dropped.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Mutex, RwLock};
 
 use matrix_sdk::event_cache::RoomEventCacheUpdate;
@@ -25,7 +25,7 @@ use matrix_sdk::ruma::room::RoomType;
 use matrix_sdk::ruma::room_version_rules::RoomVersionRules;
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{Int, OwnedRoomId, OwnedUserId, RoomId, UserId};
-use matrix_sdk::Room;
+use matrix_sdk::{Room, RoomMemberships};
 use matrix_sdk_ui::eyeball_im::VectorDiff;
 use matrix_sdk_ui::timeline::default_event_filter;
 use serde::de::IgnoredAny;
@@ -34,11 +34,13 @@ use serde_json::Value;
 use tokio::sync::watch;
 use ts_rs::TS;
 
+use crate::agents::delegation::{enveloped_brief, trusted_brief, DelegateContent};
 use crate::agents::events::{
-    RunState, StatusContent, CLAIM, CONTENT_VERSION, CONTROL_ROOM_TYPE, HOST, SCOPE,
+    RunState, StatusContent, CLAIM, CONTENT_VERSION, CONTROL_ROOM_TYPE, DELEGATE, HOST, SCOPE,
     SESSION_ROOM_TYPE, STATUS, TURN,
 };
-use crate::agents::label::{Label, LabelVm};
+use crate::agents::label::{Label, LabelVm, Readers};
+use crate::agents::proxy::ProxyListEventContent;
 use crate::agents::session::SessionKind;
 use crate::bots::identity::parse_identity;
 
@@ -162,12 +164,18 @@ pub fn is_trusted_turn(
         && json.is_some_and(is_agent_turn)
 }
 
-/// Who may stream an answer in the room being drawn: its agent room kind and
-/// its power levels as last read (`None` when unread, which trusts no one).
+/// Who may stream an answer or hand work on in the room being drawn: its
+/// agent room kind, its power levels as last read (`None` when unread,
+/// which trusts no one), its creators (empty when unread, which trusts no
+/// brief), its members as last read ([`Roster`]) and the agents this device
+/// knows (`None` knows none).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TurnTrust<'a> {
     pub kind: Option<AgentRoomKind>,
     pub levels: Option<&'a RoomPowerLevels>,
+    pub creators: &'a [OwnedUserId],
+    pub roster: Option<&'a Roster>,
+    pub known: Option<&'a BTreeSet<OwnedUserId>>,
 }
 
 impl TurnTrust<'_> {
@@ -180,6 +188,178 @@ impl TurnTrust<'_> {
             holds_agent_power(self.levels, sender),
             json,
         )
+    }
+
+    /// The brief `sender`'s message hands on, read by `own`, with `json` its
+    /// original event and `edited` whether it was edited since (R114): a
+    /// brief's envelope ([`enveloped_brief`] — the host's, so an edited
+    /// brief, which the host refuses, is an ordinary message), by the host's
+    /// creator rule ([`trusted_brief`], R53), in a session room, from a
+    /// sender at an agent's power who is not the own user and is an agent
+    /// this device knows: of an agents zone here, or on the person's own
+    /// proxy list (R72). Anything else is an ordinary message. The JSON is
+    /// parsed only for such a sender, and only when it names a delegation.
+    pub fn brief(
+        &self,
+        own: &UserId,
+        sender: &UserId,
+        json: Option<&str>,
+        edited: bool,
+    ) -> Option<BriefVm> {
+        if edited
+            || self.kind != Some(AgentRoomKind::Session)
+            || sender == own
+            || !holds_agent_power(self.levels, sender)
+            || !self.known.is_some_and(|known| known.contains(sender))
+        {
+            return None;
+        }
+        let json = json.filter(|json| json.contains(DELEGATE))?;
+        let event: EventProbe = serde_json::from_str(json).ok()?;
+        let brief = enveloped_brief(&event.kind, &event.content)
+            .and_then(|brief| trusted_brief(brief, sender, self.creators))?;
+        Some(BriefVm::of(&brief, self.roster))
+    }
+}
+
+#[derive(Deserialize)]
+struct EventProbe {
+    #[serde(rename = "type")]
+    kind: String,
+    content: Value,
+}
+
+/// The positions among `loaded` whose brief `after` draws other than
+/// `before` did (R117): the loaded messages a change of the room's members
+/// or power, or of the agents this device knows, draws again. Each item is
+/// a message's sender, original event and whether it was edited, `None`
+/// for any other item.
+pub fn rebriefed<'a>(
+    loaded: impl IntoIterator<Item = Option<(&'a UserId, Option<&'a str>, bool)>>,
+    own: &UserId,
+    before: TurnTrust<'_>,
+    after: TurnTrust<'_>,
+) -> Vec<usize> {
+    loaded
+        .into_iter()
+        .enumerate()
+        .filter_map(|(at, message)| {
+            let (sender, json, edited) = message?;
+            (before.brief(own, sender, json, edited) != after.brief(own, sender, json, edited))
+                .then_some(at)
+        })
+        .collect()
+}
+
+/// What a session room's reader last read of whose brief it draws and who
+/// reads it (R114, R117): its power levels, creators, members — `None`
+/// unless the SDK holds them all — and the agents this device knows.
+#[derive(Debug, Clone, Default)]
+pub struct Trust {
+    levels: Option<RoomPowerLevels>,
+    creators: Vec<OwnedUserId>,
+    roster: Option<Roster>,
+    known: BTreeSet<OwnedUserId>,
+}
+
+impl Trust {
+    /// Who may stream an answer or hand work on in this session room.
+    pub fn turns(&self) -> TurnTrust<'_> {
+        TurnTrust {
+            kind: Some(AgentRoomKind::Session),
+            levels: self.levels.as_ref(),
+            creators: &self.creators,
+            roster: self.roster.as_ref(),
+            known: Some(&self.known),
+        }
+    }
+}
+
+/// A room's members as the device last read them: the people among them
+/// (every joined or invited member below an agent's power) and the display
+/// names they go by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Roster {
+    people: Readers,
+    names: HashMap<OwnedUserId, String>,
+}
+
+impl Roster {
+    /// The roster of `members` — each a user and its display name — where
+    /// `agent` says who holds an agent's power.
+    pub fn of<'a>(
+        members: impl IntoIterator<Item = (&'a UserId, Option<&'a str>)>,
+        agent: &dyn Fn(&UserId) -> bool,
+    ) -> Roster {
+        let mut people = BTreeSet::new();
+        let mut names = HashMap::new();
+        for (user, name) in members {
+            if !agent(user) {
+                people.insert(user.to_owned());
+            }
+            if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
+                names.insert(user.to_owned(), name.to_owned());
+            }
+        }
+        Roster {
+            people: Readers::Only(people),
+            names,
+        }
+    }
+
+    /// `user`'s display name, else its user id.
+    pub fn name(&self, user: &UserId) -> String {
+        self.names
+            .get(user)
+            .cloned()
+            .unwrap_or_else(|| user.to_string())
+    }
+}
+
+/// A delegation's brief as the room draws it (UX-DR135): one message from
+/// the delegating agent, the brief its body, marked with whom the work is
+/// handed to and what it covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BriefVm {
+    /// The agent the work is handed to: its Matrix user id.
+    pub to: String,
+    /// Its display name in the room, else its user id.
+    pub to_name: String,
+    /// The title of the card the brief opens; `None` when it names none, or
+    /// under a narrowed label.
+    pub title: Option<String>,
+    /// The drives in scope, by id, the target's home first; empty under a
+    /// narrowed label.
+    pub drives: Vec<String>,
+    /// Whether the brief's label is narrower than the room's people (R64):
+    /// the room then draws no title or drives. A room whose members keeper
+    /// does not hold complete counts as narrowed. The brief's text is drawn
+    /// either way: the sender's label check let it into the room (R94), so
+    /// keeper hides nothing of it (R115).
+    pub narrowed: bool,
+}
+
+impl BriefVm {
+    /// `brief` as drawn in a room whose members are `roster`.
+    pub fn of(brief: &DelegateContent, roster: Option<&Roster>) -> BriefVm {
+        let narrowed = !roster.is_some_and(|roster| brief.label.may_reach(&roster.people));
+        BriefVm {
+            to: brief.to.to_string(),
+            to_name: roster.map_or_else(|| brief.to.to_string(), |roster| roster.name(&brief.to)),
+            title: brief
+                .card
+                .as_ref()
+                .filter(|_| !narrowed)
+                .map(|card| card.title.clone()),
+            drives: if narrowed {
+                Vec::new()
+            } else {
+                brief.drives.clone()
+            },
+            narrowed,
+        }
     }
 }
 
@@ -612,52 +792,72 @@ fn status_vm(
     }
 }
 
-/// The soul's mark of every agent whose agents zone is on this device, by
-/// Matrix user: the desktop's host replaces it on each scan; on the phone it
-/// stays empty.
+/// The agents whose agents zones are on this device, by Matrix user, and
+/// the soul's mark of each that has one: the desktop's host replaces them
+/// on each scan; on the phone they stay empty. An agent here is one this
+/// device knows (R114).
 #[derive(Debug, Default)]
 pub struct AgentIcons {
-    marks: RwLock<BTreeMap<OwnedUserId, String>>,
-    /// Bumped when the marks change, so an open room's header redraws
-    /// without waiting for its next status.
+    zone: RwLock<Zone>,
+    /// Bumped when the agents or their marks change, so an open room's
+    /// header and briefs redraw without waiting for its next event.
     changes: watch::Sender<u64>,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Zone {
+    agents: BTreeSet<OwnedUserId>,
+    marks: BTreeMap<OwnedUserId, String>,
+}
+
 impl AgentIcons {
-    /// Replace every mark with `icons` (each a `SOUL.md` `icon`, as read),
-    /// keeping only those the bot identity draws: a mark it would refuse is
-    /// dropped, and that agent is drawn by its first letter.
-    pub fn replace(&self, icons: BTreeMap<OwnedUserId, String>) {
-        let drawable: BTreeMap<OwnedUserId, String> = icons
-            .into_iter()
-            .filter_map(|(user, icon)| {
-                let mark = parse_identity(None, None, Some(&icon)).ok()?.mark?;
-                Some((user, mark))
-            })
-            .collect();
+    /// Replace every agent with `agents`, each with its `SOUL.md` `icon` as
+    /// read when it names one, keeping only the marks the bot identity
+    /// draws: a mark it would refuse is dropped, and that agent is drawn by
+    /// its first letter.
+    pub fn replace(&self, agents: BTreeMap<OwnedUserId, Option<String>>) {
+        let mut zone = Zone::default();
+        for (user, icon) in agents {
+            let mark = icon.and_then(|icon| parse_identity(None, None, Some(&icon)).ok()?.mark);
+            if let Some(mark) = mark {
+                zone.marks.insert(user.clone(), mark);
+            }
+            zone.agents.insert(user);
+        }
         {
-            let mut marks = self
-                .marks
+            let mut held = self
+                .zone
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if *marks == drawable {
+            if *held == zone {
                 return;
             }
-            *marks = drawable;
+            *held = zone;
         }
         self.changes.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     /// `user`'s mark, when its zone is on this device.
     pub fn get(&self, user: &UserId) -> Option<String> {
-        self.marks
+        self.zone
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .marks
             .get(user)
             .cloned()
     }
 
-    /// A receiver that sees every change of the marks after now.
+    /// The agents whose zones are on this device.
+    pub fn agents(&self) -> BTreeSet<OwnedUserId> {
+        self.zone
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .agents
+            .clone()
+    }
+
+    /// A receiver that sees every change of the agents or their marks
+    /// after now.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changes.subscribe()
     }
@@ -763,11 +963,31 @@ pub async fn room_kind_vm(room: &Room, kinds: &AgentKinds) -> Option<AgentRoomKi
     Some(AgentRoomKindVm::of(kind, session))
 }
 
-/// A session room's header reader: the folded state and the room it reads.
+/// The agents the person's own `dev.keeper.agent.proxies` lists (R72): on
+/// a device with no agents zone, the agents it knows. None when the list
+/// cannot be read or is of a version this keeper does not read.
+async fn listed_proxies(room: &Room) -> BTreeSet<OwnedUserId> {
+    match room
+        .client()
+        .account()
+        .account_data::<ProxyListEventContent>()
+        .await
+    {
+        Ok(Some(raw)) => raw
+            .deserialize()
+            .ok()
+            .and_then(|list| list.agents())
+            .unwrap_or_default(),
+        _ => BTreeSet::new(),
+    }
+}
+
+/// A session room's header reader: the folded state, what it last read of
+/// whose brief to draw ([`Trust`]) and the room it reads.
 pub struct HeaderReader {
     room: Room,
     state: AgentRoomState,
-    levels: Option<RoomPowerLevels>,
+    trust: Trust,
     /// The display names the header resolved, until a member event.
     names: HashMap<OwnedUserId, String>,
 }
@@ -776,11 +996,15 @@ impl HeaderReader {
     /// Read `room`'s status and scope from its event cache, and when the
     /// cache holds no status, from the server's history newest page first,
     /// as the host's `latest_status` does — once per process for a room
-    /// whose history held none.
+    /// whose history held none. Only its power levels are read for that;
+    /// whose brief to draw is [`Self::refresh`]'s.
     pub async fn open(room: Room, kinds: &AgentKinds) -> HeaderReader {
         let mut reader = HeaderReader {
             state: AgentRoomState::new(room.own_user_id().to_owned()),
-            levels: room.power_levels().await.ok(),
+            trust: Trust {
+                levels: room.power_levels().await.ok(),
+                ..Trust::default()
+            },
             room,
             names: HashMap::new(),
         };
@@ -835,7 +1059,7 @@ impl HeaderReader {
     }
 
     fn apply(&mut self, event: &Value) -> bool {
-        let levels = self.levels.as_ref();
+        let levels = self.trust.levels.as_ref();
         self.state
             .apply(event, &|user| holds_agent_power(levels, user))
     }
@@ -846,10 +1070,57 @@ impl HeaderReader {
         }
     }
 
-    /// The room's power levels as last read; `None` when unread, which
-    /// trusts no one.
-    pub fn levels(&self) -> Option<&RoomPowerLevels> {
-        self.levels.as_ref()
+    /// Read again from the store whose brief to draw and who reads it, with
+    /// the agents of `icons`' zones; returns what it replaces. Never asks
+    /// the server.
+    pub async fn refresh(&mut self, icons: &AgentIcons) -> Trust {
+        let levels = self.room.power_levels().await.ok();
+        let roster = self.read_roster(levels.as_ref()).await;
+        let mut known = icons.agents();
+        known.extend(listed_proxies(&self.room).await);
+        let trust = Trust {
+            levels,
+            creators: self.room.creators().unwrap_or_default(),
+            roster,
+            known,
+        };
+        std::mem::replace(&mut self.trust, trust)
+    }
+
+    /// The room's members, only while the SDK holds them all (R117): a
+    /// store that may miss some — lazy-loaded, or after a gap — never says
+    /// who is not here, so the roster is then unknown and every brief
+    /// narrowed until a fetch completes it.
+    async fn read_roster(&self, levels: Option<&RoomPowerLevels>) -> Option<Roster> {
+        if !self.room.are_members_synced() {
+            return None;
+        }
+        let members = self
+            .room
+            .members_no_sync(RoomMemberships::JOIN | RoomMemberships::INVITE)
+            .await
+            .ok()?;
+        // A gap while reading leaves what was read partial.
+        if !self.room.are_members_synced() {
+            return None;
+        }
+        Some(Roster::of(
+            members
+                .iter()
+                .map(|member| (member.user_id(), member.display_name())),
+            &|user| holds_agent_power(levels, user),
+        ))
+    }
+
+    /// Whether the room's member list is whole in the store; while it is
+    /// not, the reader's roster is unknown.
+    pub fn members_synced(&self) -> bool {
+        self.room.are_members_synced()
+    }
+
+    /// Who may stream an answer or hand work on here, as last read.
+    pub fn turns(&self) -> TurnTrust<'_> {
+        self.trust.turns()
     }
 
     /// The room's folded status and scope.
@@ -858,12 +1129,11 @@ impl HeaderReader {
     }
 
     /// Fold one event-cache update; returns whether the header may have
-    /// changed.
-    pub async fn update(&mut self, update: &RoomEventCacheUpdate, kinds: &AgentKinds) -> bool {
+    /// changed. Whose word counts is [`Self::refresh`]'s, read before.
+    pub fn update(&mut self, update: &RoomEventCacheUpdate, kinds: &AgentKinds) -> bool {
         let RoomEventCacheUpdate::UpdateTimelineEvents(diffs) = update else {
             return false;
         };
-        self.levels = self.room.power_levels().await.ok();
         let mut changed = false;
         for diff in &diffs.diffs {
             let events: Vec<&matrix_sdk::deserialized_responses::TimelineEvent> = match diff {
@@ -1349,6 +1619,7 @@ mod tests {
         let session = TurnTrust {
             kind: Some(AgentRoomKind::Session),
             levels: Some(&levels),
+            ..TurnTrust::default()
         };
         let own = own();
         let nixi = user(NIXI);
@@ -1364,7 +1635,7 @@ mod tests {
         // Unread power levels trust no one.
         let unread = TurnTrust {
             kind: Some(AgentRoomKind::Session),
-            levels: None,
+            ..TurnTrust::default()
         };
         assert!(!unread.is_turn(&own, &nixi, Some(&turn)));
         // A room with no create type, and a control room, hold no answers.
@@ -1372,9 +1643,360 @@ mod tests {
             let trust = TurnTrust {
                 kind,
                 levels: Some(&levels),
+                ..TurnTrust::default()
             };
             assert!(!trust.is_turn(&own, &nixi, Some(&turn)), "{kind:?}");
         }
+    }
+
+    fn brief_json(sender: &str, from: &str, readers: &[&str]) -> Value {
+        use crate::agents::delegation::{
+            brief_content, DelegateCard, DelegateFrom, DelegateLimits,
+        };
+        use crate::agents::label::Integrity;
+        let content = DelegateContent {
+            v: CONTENT_VERSION,
+            id: ulid::Ulid::new().to_string(),
+            from: DelegateFrom {
+                agent: user(from),
+                drive: "tgdrive".to_owned(),
+                session: "active/2026-10-04-chat".to_owned(),
+                room: OwnedRoomId::try_from("!parent:example.org").expect("room"),
+            },
+            to: user(TOLA),
+            brief: "Review the sync chapter.".to_owned(),
+            drives: vec!["tgdrive".to_owned(), "neura".to_owned()],
+            label: Label {
+                readers: Readers::Only(readers.iter().map(|reader| user(reader)).collect()),
+                integrity: Integrity::Agent,
+                local_only: false,
+            },
+            hop: 1,
+            limits: DelegateLimits {
+                rounds_per_exchange: 3,
+                tokens: 200_000,
+            },
+            card: Some(DelegateCard {
+                title: "Sync chapter".to_owned(),
+                schedule: None,
+                workflow: None,
+            }),
+            dispatch_chain: Vec::new(),
+        };
+        json!({"type": "m.room.message", "sender": sender, "content": brief_content(&content)})
+    }
+
+    fn brief_event(sender: &str, from: &str, readers: &[&str]) -> String {
+        brief_json(sender, from, readers).to_string()
+    }
+
+    const TOLA: &str = "@tola:example.org";
+
+    /// The roster of a room holding the person, Marta and the agents, where
+    /// `levels` says who is an agent.
+    fn roster_of(members: &[(&str, Option<&str>)], levels: &RoomPowerLevels) -> Roster {
+        let members: Vec<(OwnedUserId, Option<&str>)> =
+            members.iter().map(|(id, name)| (user(id), *name)).collect();
+        Roster::of(
+            members.iter().map(|(id, name)| (id.as_ref(), *name)),
+            &|user| holds_agent_power(Some(levels), user),
+        )
+    }
+
+    /// UX-DR135, R53: a brief is drawn as one only from the agent that made
+    /// the session room, naming itself as `from`; everyone else's delegate
+    /// object is an ordinary message. Its title and drives are drawn only
+    /// while its label reaches every person in the room (R64).
+    #[test]
+    fn a_brief_counts_only_from_the_rooms_creating_agent() {
+        let levels = power_levels_for(&[(NIXI, 100), (TOLA, 50)]);
+        let creators = [user(NIXI)];
+        let known = BTreeSet::from([user(NIXI), user(TOLA)]);
+        let roster = roster_of(
+            &[
+                (PERSON, Some("tgorka")),
+                (MARTA, None),
+                (NIXI, Some("Nixi")),
+                (TOLA, Some("Dr Tola Grey")),
+            ],
+            &levels,
+        );
+        let session = TurnTrust {
+            kind: Some(AgentRoomKind::Session),
+            levels: Some(&levels),
+            creators: &creators,
+            roster: Some(&roster),
+            known: Some(&known),
+        };
+        let own = own();
+        let nixi = user(NIXI);
+        let tola = user(TOLA);
+        let both = brief_event(NIXI, NIXI, &[PERSON, MARTA]);
+
+        // The creating agent's brief, its label reaching both people.
+        assert_eq!(
+            session.brief(&own, &nixi, Some(&both), false),
+            Some(BriefVm {
+                to: TOLA.to_owned(),
+                to_name: "Dr Tola Grey".to_owned(),
+                title: Some("Sync chapter".to_owned()),
+                drives: vec!["tgdrive".to_owned(), "neura".to_owned()],
+                narrowed: false,
+            })
+        );
+        // Forged: an agent at 50 that did not make the room, a person at 0,
+        // the creator naming another agent as `from`, the own user.
+        assert_eq!(
+            session.brief(
+                &own,
+                &tola,
+                Some(&brief_event(TOLA, TOLA, &[PERSON, MARTA])),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            session.brief(
+                &own,
+                &user(MARTA),
+                Some(&brief_event(MARTA, MARTA, &[PERSON, MARTA])),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            session.brief(
+                &own,
+                &nixi,
+                Some(&brief_event(NIXI, TOLA, &[PERSON, MARTA])),
+                false
+            ),
+            None
+        );
+        // The own user, even when it made the room and holds 100.
+        let own_levels = power_levels_for(&[(PERSON, 100)]);
+        let with_own = BTreeSet::from([own.clone()]);
+        let from_own = TurnTrust {
+            levels: Some(&own_levels),
+            creators: std::slice::from_ref(&own),
+            known: Some(&with_own),
+            ..session
+        };
+        assert_eq!(
+            from_own.brief(
+                &own,
+                &own,
+                Some(&brief_event(PERSON, PERSON, &[PERSON, MARTA])),
+                false
+            ),
+            None
+        );
+        // Unread levels or creators, no known agents, a control room, no
+        // original: no brief.
+        for trust in [
+            TurnTrust {
+                levels: None,
+                ..session
+            },
+            TurnTrust {
+                creators: &[],
+                ..session
+            },
+            TurnTrust {
+                known: None,
+                ..session
+            },
+            TurnTrust {
+                kind: Some(AgentRoomKind::Control),
+                ..session
+            },
+        ] {
+            assert_eq!(trust.brief(&own, &nixi, Some(&both), false), None);
+        }
+        assert_eq!(session.brief(&own, &nixi, None, false), None);
+
+        // Narrowed: Marta is in the room and not a reader, or the members
+        // are not held whole. The text stays; the title and drives do not.
+        let narrowed = BriefVm {
+            to: TOLA.to_owned(),
+            to_name: "Dr Tola Grey".to_owned(),
+            title: None,
+            drives: Vec::new(),
+            narrowed: true,
+        };
+        let mine = brief_event(NIXI, NIXI, &[PERSON]);
+        assert_eq!(
+            session.brief(&own, &nixi, Some(&mine), false),
+            Some(narrowed.clone())
+        );
+        let unread = TurnTrust {
+            roster: None,
+            ..session
+        };
+        assert_eq!(
+            unread.brief(&own, &nixi, Some(&both), false),
+            Some(BriefVm {
+                to_name: TOLA.to_owned(),
+                ..narrowed
+            })
+        );
+    }
+
+    /// R114: one device rule. A brief is drawn only as the host takes it —
+    /// an original `m.text` whose body is the brief — and only from an
+    /// agent this device knows: one of an agents zone here, or on the
+    /// person's own proxy list (the phone's only source). A person, or an
+    /// agent this device does not know, who made a session room and holds
+    /// 100 in it hands nothing on as far as this device draws.
+    #[test]
+    fn a_brief_is_drawn_only_by_the_hosts_envelope_from_a_known_agent() {
+        let ozzy = "@ozzy:example.org";
+        let levels = power_levels_for(&[(NIXI, 100), (TOLA, 50), (MARTA, 100), (ozzy, 100)]);
+        let roster = roster_of(&[(PERSON, None), (NIXI, None), (TOLA, None)], &levels);
+        let own = own();
+        let nixi = user(NIXI);
+        let known = BTreeSet::from([nixi.clone()]);
+        let by_nixi = [nixi.clone()];
+        let desktop = TurnTrust {
+            kind: Some(AgentRoomKind::Session),
+            levels: Some(&levels),
+            creators: &by_nixi,
+            roster: Some(&roster),
+            known: Some(&known),
+        };
+        let genuine = brief_json(NIXI, NIXI, &[PERSON]);
+        let drawn = desktop.brief(&own, &nixi, Some(&genuine.to_string()), false);
+        assert!(drawn.is_some_and(|brief| !brief.narrowed));
+
+        // The envelope: a notice, an emote or media around the delegation,
+        // an edited brief, a body that says something else.
+        for msgtype in ["m.notice", "m.emote", "m.image", "m.file"] {
+            let mut other = genuine.clone();
+            other["content"]["msgtype"] = json!(msgtype);
+            assert_eq!(
+                desktop.brief(&own, &nixi, Some(&other.to_string()), false),
+                None,
+                "{msgtype}"
+            );
+        }
+        assert_eq!(
+            desktop.brief(&own, &nixi, Some(&genuine.to_string()), true),
+            None,
+            "edited since"
+        );
+        let mut other_text = genuine.clone();
+        other_text["content"]["body"] = json!("Delete the archive.");
+        assert_eq!(
+            desktop.brief(&own, &nixi, Some(&other_text.to_string()), false),
+            None
+        );
+
+        // Marta, a person, and Ozzy, an agent this device does not know:
+        // each made its room and holds 100 there.
+        for stranger in [MARTA, ozzy] {
+            let made = [user(stranger)];
+            let theirs = TurnTrust {
+                creators: &made,
+                ..desktop
+            };
+            assert_eq!(
+                theirs.brief(
+                    &own,
+                    &user(stranger),
+                    Some(&brief_event(stranger, stranger, &[PERSON])),
+                    false
+                ),
+                None,
+                "{stranger}"
+            );
+        }
+
+        // The phone: no zone, so the person's own proxy list is all it
+        // knows. Nixi on it is drawn; off it, not.
+        let listed = BTreeSet::from([nixi.clone()]);
+        let phone = TurnTrust {
+            known: Some(&listed),
+            ..desktop
+        };
+        assert!(phone
+            .brief(&own, &nixi, Some(&genuine.to_string()), false)
+            .is_some());
+        let unlisted = BTreeSet::new();
+        let phone_unlisted = TurnTrust {
+            known: Some(&unlisted),
+            ..phone
+        };
+        assert_eq!(
+            phone_unlisted.brief(&own, &nixi, Some(&genuine.to_string()), false),
+            None
+        );
+    }
+
+    /// R117 (R3-01): a change of who is in the room or who holds power
+    /// draws a loaded brief again — an outsider invited narrows it, its
+    /// creator demoted makes it an ordinary message, members held whole
+    /// again widen it — and no other message.
+    #[test]
+    fn a_change_of_members_or_power_redraws_the_loaded_briefs_it_touches() {
+        let levels = power_levels_for(&[(NIXI, 100), (TOLA, 50)]);
+        let demoted = power_levels_for(&[(TOLA, 50)]);
+        let creators = [user(NIXI)];
+        let known = BTreeSet::from([user(NIXI), user(TOLA)]);
+        let people: [(&str, Option<&str>); 3] = [(PERSON, None), (NIXI, None), (TOLA, None)];
+        let complete = roster_of(&people, &levels);
+        let invited = roster_of(&[people[0], people[1], people[2], (MARTA, None)], &levels);
+        let before = TurnTrust {
+            kind: Some(AgentRoomKind::Session),
+            levels: Some(&levels),
+            creators: &creators,
+            roster: Some(&complete),
+            known: Some(&known),
+        };
+        let own = own();
+        let nixi = user(NIXI);
+        let brief = brief_event(NIXI, NIXI, &[PERSON]);
+        let answer = json!({
+            "type": "m.room.message", "sender": NIXI,
+            "content": {"msgtype": "m.text", "body": "Done."},
+        })
+        .to_string();
+        // A message, a brief, a non-message item, the brief edited since.
+        let loaded = || {
+            [
+                Some((nixi.as_ref(), Some(answer.as_str()), false)),
+                Some((nixi.as_ref(), Some(brief.as_str()), false)),
+                None,
+                Some((nixi.as_ref(), Some(brief.as_str()), true)),
+            ]
+        };
+        assert!(before
+            .brief(&own, &nixi, Some(&brief), false)
+            .is_some_and(|brief| brief.title.is_some()));
+        // Marta invited: the brief at 1 narrows.
+        let after = TurnTrust {
+            roster: Some(&invited),
+            ..before
+        };
+        assert_eq!(rebriefed(loaded(), &own, before, after), [1]);
+        assert!(after
+            .brief(&own, &nixi, Some(&brief), false)
+            .is_some_and(|brief| brief.narrowed && brief.title.is_none()));
+        // Nixi demoted below 50: no brief.
+        let after = TurnTrust {
+            levels: Some(&demoted),
+            ..before
+        };
+        assert_eq!(rebriefed(loaded(), &own, before, after), [1]);
+        assert_eq!(after.brief(&own, &nixi, Some(&brief), false), None);
+        // The roster unknown (a gap), then whole again.
+        let unknown = TurnTrust {
+            roster: None,
+            ..before
+        };
+        assert_eq!(rebriefed(loaded(), &own, before, unknown), [1]);
+        assert_eq!(rebriefed(loaded(), &own, unknown, before), [1]);
+        // Nothing changed: nothing drawn again.
+        assert!(rebriefed(loaded(), &own, before, before).is_empty());
     }
 
     #[test]
@@ -1412,23 +2034,31 @@ mod tests {
         assert_eq!(header.scope.map(|drives| drives.len()), Some(1));
     }
 
+    /// The agents this device knows and their marks: a change of either
+    /// redraws — a header's mark, a brief's drawing (R114) — and a rescan
+    /// that finds the same does not.
     #[test]
-    fn a_change_of_marks_redraws_and_a_rescan_without_one_does_not() {
+    fn a_change_of_agents_or_marks_redraws_and_a_rescan_without_one_does_not() {
         let icons = AgentIcons::default();
         let mut changes = icons.subscribe();
-        let marks = |icon: &str| BTreeMap::from([(user(NIXI), icon.to_owned())]);
-        icons.replace(marks("N"));
+        let nixi = |icon: Option<&str>| BTreeMap::from([(user(NIXI), icon.map(str::to_owned))]);
+        icons.replace(nixi(Some("N")));
         assert!(changes.has_changed().expect("open"));
         changes.borrow_and_update();
-        // The next scan finds the same marks: nothing to redraw.
-        icons.replace(marks("N"));
+        // The next scan finds the same: nothing to redraw.
+        icons.replace(nixi(Some("N")));
         assert!(!changes.has_changed().expect("open"));
         // A refused mark is no mark: a change from `N`, then none from none.
-        icons.replace(marks("Nixie"));
+        icons.replace(nixi(Some("Nixie")));
         assert!(changes.has_changed().expect("open"));
         changes.borrow_and_update();
-        icons.replace(BTreeMap::new());
+        icons.replace(nixi(None));
         assert!(!changes.has_changed().expect("open"));
+        assert_eq!(icons.agents(), BTreeSet::from([user(NIXI)]));
+        // Its zone gone from this device: an agent it no longer knows.
+        icons.replace(BTreeMap::new());
+        assert!(changes.has_changed().expect("open"));
+        assert!(icons.agents().is_empty());
     }
 
     #[test]
@@ -1459,27 +2089,30 @@ mod tests {
         let nixi = OwnedUserId::try_from(NIXI).expect("user");
         let tola = OwnedUserId::try_from("@tola:example.org").expect("user");
         icons.replace(BTreeMap::from([
-            (nixi.clone(), "N".to_owned()),
-            (tola, "🜂".to_owned()),
+            (nixi.clone(), Some("N".to_owned())),
+            (tola, Some("🜂".to_owned())),
         ]));
         assert_eq!(icon_of(&state, &icons).as_deref(), Some("N"));
         // An icon name is a mark too.
-        icons.replace(BTreeMap::from([(nixi.clone(), "sparkles".to_owned())]));
+        icons.replace(BTreeMap::from([(
+            nixi.clone(),
+            Some("sparkles".to_owned()),
+        )]));
         assert_eq!(icon_of(&state, &icons).as_deref(), Some("sparkles"));
         // A mark the bot identity refuses — too long, or not drawable — is
         // dropped, never cut or shown as text.
         for refused in ["Nixie", "N x", "  "] {
-            icons.replace(BTreeMap::from([(nixi.clone(), refused.to_owned())]));
+            icons.replace(BTreeMap::from([(nixi.clone(), Some(refused.to_owned()))]));
             assert_eq!(icon_of(&state, &icons), None, "{refused:?}");
         }
         // Another agent's mark is never this one's.
         icons.replace(BTreeMap::from([(
             OwnedUserId::try_from("@tola:example.org").expect("user"),
-            "T".to_owned(),
+            Some("T".to_owned()),
         )]));
         assert_eq!(icon_of(&state, &icons), None);
         // An unreadable status still names its agent's mark.
-        icons.replace(BTreeMap::from([(nixi, "N".to_owned())]));
+        icons.replace(BTreeMap::from([(nixi, Some("N".to_owned()))]));
         let mut odd = AgentRoomState::new(own());
         odd.apply(&status("$b", 10, content("wat", "electra", None)), &agents);
         assert_eq!(icon_of(&odd, &icons).as_deref(), Some("N"));

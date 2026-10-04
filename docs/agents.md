@@ -1398,14 +1398,35 @@ brief. Someone invited since, or a read that narrowed the label since the room w
 the send: nothing goes in, and a `delegate refused` line names who would have been added. A
 blocked first brief ends the delegation.
 
+**The brief in the room.** keeper draws a brief as one only by the rule the host takes it by: an
+original `m.text` message, never edited since, whose body is the brief the delegation carries,
+sent by the room's creating agent naming itself as `from`. The device adds its own checks: a
+session room, a sender who is not you and holds an agent's power there, and an agent this device
+knows — one of an agents zone on it, or one your own keeper put on your proxy list
+(`dev.keeper.agent.proxies`). Anything else, a notice, an emote, an image, an edited brief, a
+body that says something else, or a hand-off from a person or an agent this device does not know,
+is an ordinary message. On a phone, which has no agents zone, a brief from an agent that is not
+one of your proxies is therefore drawn as an ordinary message. The brief stays the agent's
+message, on a card surface with an accent, read aloud as "Brief from Nixi for Dr Tola Grey": whom
+the work is handed to and the card's title above its text, the drives in scope under it. The
+title and the drives are drawn only while keeper holds the room's whole member list and the
+brief's label reaches every person on it; otherwise the message says it shows them only when it
+knows everyone in the room may read them. The brief's own text is always drawn, in the room and
+wherever messages appear (previews, notifications, replies, search): its sender's label check
+let it into the room, so every member already has it. The room opens at once from what keeper
+holds; a member list it lacks is fetched beside it, and when members, power or the agents keeper
+knows change, every brief in view is drawn again. Briefs live in the delegated rooms, so they
+are read in the room view; the notes dock lists only your proxy's own rooms.
+
 **The target's side.** A host joins the invite when the inviter is an agent homed in a drive it
 mounts and the invited agent's opening label reaches that agent's audience, or — `keeper-agentd`
 only — the `proxy` of a pinned `[[trust]]` person who reads the invited agent's home drive; a Mac
 joins only the first. A brief is taken only through one admission, the same live, after a
 restart, and in the session that serves it: an `m.text` message (not an edit, not a notice, not
-a custom event) its sender's device sealed; in a session-typed room where a person may not send
-a message in clear (not a proxy's own room); from the room's creator, who is an agent this host
-knows or a pinned person's proxy and still holds an agent's power there; addressed to this agent
+a custom event) whose body is the brief it carries, sealed by its sender's device; in a
+session-typed room where a person may not send a message in clear (not a proxy's own room);
+from the room's creator, who is an agent this host knows or a pinned person's proxy and still
+holds an agent's power there; addressed to this agent
 by its sender; under a label that reaches this agent's audience and every other person in the
 room. The served session also needs the brief to be its own delegation from its parent's room.
 The first brief admitted in a room is its opening; later rounds never replace it, and a host

@@ -21,15 +21,17 @@
 //! opaque room id only — never a message body.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use futures_util::{Stream, StreamExt};
+use eyeball::Subscriber;
+use futures_util::{FutureExt, Stream, StreamExt};
 use matrix_sdk::event_cache::PaginationStatus;
 use matrix_sdk::event_cache::{RoomEventCacheSubscriber, RoomEventCacheUpdate};
 use matrix_sdk::ruma::events::room::message::MessageType;
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
-use matrix_sdk::{Client, Room};
+use matrix_sdk::{Client, Room, RoomInfo};
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::timeline::{
     EventSendState, MsgLikeKind, TimelineBuilder, TimelineDetails, TimelineItem,
@@ -419,12 +421,9 @@ pub fn item_to_vm(
                 // Neither media nor renderable text (e.g. location): render nothing.
                 (None, None) => return TimelineItemVm::Other { key },
             };
+            let json = ev.original_json().map(|raw| raw.json().get());
             let (is_edited, max_body) = message_shape(
-                turns.is_turn(
-                    own_user_id,
-                    ev.sender(),
-                    ev.original_json().map(|raw| raw.json().get()),
-                ),
+                turns.is_turn(own_user_id, ev.sender(), json),
                 message.is_edited(),
             );
             TimelineItemVm::Message {
@@ -440,6 +439,9 @@ pub fn item_to_vm(
                 reactions: reaction_groups(ev.content(), own_user_id),
                 media: media.map(Box::new),
                 readers: readers_of(ev.read_receipts().keys(), own_user_id),
+                brief: turns
+                    .brief(own_user_id, ev.sender(), json, message.is_edited())
+                    .map(Box::new),
             }
         }
         // An event that cannot be decrypted yet: surface an honest stub. No
@@ -647,8 +649,10 @@ pub async fn open_timeline(
 }
 
 /// The header beside an agent session room's timeline (R33): its reader,
-/// the newest answer anchor the caret may sit on, and the header last sent,
-/// so a batch carries one only when it changed.
+/// the newest answer anchor the caret may sit on, the header last sent, so
+/// a batch carries one only when it changed, and the items as the batches
+/// sent so far left them, so a brief is drawn again when what it rests on
+/// changes (R117).
 struct AgentHeader {
     reader: HeaderReader,
     own_user_id: OwnedUserId,
@@ -657,16 +661,14 @@ struct AgentHeader {
     sent: Option<AgentRoomHeaderVm>,
     kinds: Arc<AgentKinds>,
     icons: Arc<AgentIcons>,
+    loaded: Vector<Arc<TimelineItem>>,
 }
 
 impl AgentHeader {
-    /// Who may stream an answer here: an agent of this session room, under
-    /// its power levels as the reader last read them.
+    /// Who may stream an answer or hand work on here: an agent of this
+    /// session room, under what the reader last read of it.
     fn turns(&self) -> TurnTrust<'_> {
-        TurnTrust {
-            kind: Some(AgentRoomKind::Session),
-            levels: self.reader.levels(),
-        }
+        self.reader.turns()
     }
 
     /// Note the answer anchors among `items` (a snapshot when `reset`).
@@ -686,7 +688,7 @@ impl AgentHeader {
         self.newest_turn = newest;
     }
 
-    /// Note the answer anchors a diff carries.
+    /// Note the answer anchors a diff carries, and the items it leaves.
     fn see_diff(&mut self, diff: &VectorDiff<Arc<TimelineItem>>) {
         match diff {
             VectorDiff::Clear => self.newest_turn = None,
@@ -701,6 +703,7 @@ impl AgentHeader {
             | VectorDiff::Remove { .. }
             | VectorDiff::Truncate { .. } => {}
         }
+        diff.clone().apply(&mut self.loaded);
     }
 
     /// The header when it differs from the one last sent.
@@ -718,6 +721,114 @@ impl AgentHeader {
         self.sent = Some(header.clone());
         Some(header)
     }
+
+    /// Read again whose brief to draw and who reads it; the positions of
+    /// the loaded messages it draws differently now.
+    async fn rebrief(&mut self) -> Vec<usize> {
+        let before = self.reader.refresh(&self.icons).await;
+        self.rebriefed(before.turns())
+    }
+
+    /// The positions of the loaded messages drawn differently now than
+    /// under `before`.
+    fn rebriefed(&self, before: TurnTrust<'_>) -> Vec<usize> {
+        room::rebriefed(
+            self.loaded.iter().map(|item| brief_input(item)),
+            &self.own_user_id,
+            before,
+            self.turns(),
+        )
+    }
+
+    /// The `Set`s that draw the loaded items at `positions` again.
+    fn redraw(
+        &self,
+        positions: Vec<usize>,
+        index: &ReplyIndex,
+        account_id: &str,
+        room_id: &str,
+    ) -> Vec<TimelineOp> {
+        let turns = self.turns();
+        positions
+            .into_iter()
+            .map(|at| TimelineOp::Set {
+                index: at as u32,
+                item: item_to_vm(
+                    &self.loaded[at],
+                    index,
+                    &self.own_user_id,
+                    account_id,
+                    room_id,
+                    turns,
+                ),
+            })
+            .collect()
+    }
+}
+
+/// A loaded item as [`room::rebriefed`] reads it: a message's sender, its
+/// original event and whether it was edited; `None` for any other item.
+fn brief_input(item: &TimelineItem) -> Option<(&UserId, Option<&str>, bool)> {
+    let ev = item.as_event()?;
+    let TimelineItemContent::MsgLike(msg_like) = ev.content() else {
+        return None;
+    };
+    let MsgLikeKind::Message(message) = &msg_like.kind else {
+        return None;
+    };
+    Some((
+        ev.sender(),
+        ev.original_json().map(|raw| raw.json().get()),
+        message.is_edited(),
+    ))
+}
+
+/// A fetch of an agent room's members from the server.
+type MemberFetch = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Start fetching `room`'s members when the store does not hold them all
+/// and no fetch runs (R117): beside the timeline, never before it. A failed
+/// fetch leaves the roster unknown, so every brief narrowed; the room's
+/// next change starts another.
+fn fetch_members(fetch: &mut Option<MemberFetch>, reader: &HeaderReader, room: &Room) {
+    if fetch.is_some() || reader.members_synced() {
+        return;
+    }
+    let room = room.clone();
+    *fetch = Some(Box::pin(async move {
+        if let Err(error) = room.sync_members().await {
+            tracing::warn!(room_id = %room.room_id(), %error, "agent room: members not fetched");
+        }
+    }));
+}
+
+/// The end of the running member fetch, or never when none runs.
+async fn next_fetch(fetch: &mut Option<MemberFetch>) {
+    match fetch {
+        Some(fetch) => fetch.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The next change of the room's info — a sync that touched it, its
+/// members fetched or marked missing — or never when there is no
+/// subscriber.
+async fn next_info(info: &mut Option<Subscriber<RoomInfo>>) {
+    match info {
+        Some(info) => {
+            if info.next_ref().await.is_none() {
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Whether the room's info changed since it was last read, without
+/// waiting; reading it marks it read.
+fn info_changed(info: &mut Option<Subscriber<RoomInfo>>) -> bool {
+    info.as_mut()
+        .is_some_and(|info| info.next_ref().now_or_never().flatten().is_some())
 }
 
 /// The next event-cache update, or never when there is no subscriber.
@@ -756,6 +867,15 @@ async fn next_mark_change(marks: &mut Option<watch::Receiver<u64>>) {
 /// is an agent's growing answer only from a sender with an agent's power
 /// under the room's levels as the header last read them.
 ///
+/// A brief (R114, R117) is drawn from what the store holds when the snapshot
+/// is sent — the member list only when the store holds it whole, else every
+/// brief narrowed — and a member list it lacks is fetched beside the
+/// timeline, never before the first batch. Whenever the room changes — a
+/// sync that touched it, a gap, its members fetched — or the agents this
+/// device knows change, every loaded message whose brief is drawn
+/// differently now is sent again as a `Set`, ahead of any items that came
+/// with the change.
+///
 /// The `Timeline` is kept alive for the whole loop — its drop handle cancels the
 /// SDK's background timeline tasks (AD-19). The producer breaks when the channel
 /// closes (`sink` returns `false`) or the stream ends.
@@ -780,10 +900,11 @@ pub async fn forward_timeline(
     // media-URL coordinates threaded into every mapped item.
     let room_id_str = room_id.to_string();
 
-    // A session room's header, and the event-cache subscription that keeps it
-    // current. The subscriber is taken before the cache is read, so no update
-    // falls between the read and the first `recv`.
-    let (mut header, mut updates, mut marks, _cache_handles) =
+    // A session room's header, and the subscriptions that keep it current.
+    // Each is taken before the room is read, so no change falls between the
+    // read and the first wait.
+    let mut fetch: Option<MemberFetch> = None;
+    let (mut header, mut updates, mut marks, mut info, _cache_handles) =
         if agent == Some(AgentRoomKind::Session) {
             let (updates, handles) = match room.event_cache().await {
                 Ok((cache, handles)) => match cache.subscribe().await {
@@ -793,7 +914,10 @@ pub async fn forward_timeline(
                 Err(_) => (None, None),
             };
             let marks = icons.subscribe();
-            let reader = HeaderReader::open(room.clone(), &kinds).await;
+            let info = room.subscribe_info();
+            let mut reader = HeaderReader::open(room.clone(), &kinds).await;
+            reader.refresh(&icons).await;
+            fetch_members(&mut fetch, &reader, &room);
             let header = AgentHeader {
                 reader,
                 own_user_id: own_user_id.clone(),
@@ -801,10 +925,11 @@ pub async fn forward_timeline(
                 sent: None,
                 kinds,
                 icons,
+                loaded: initial.clone(),
             };
-            (Some(header), updates, Some(marks), handles)
+            (Some(header), updates, Some(marks), Some(info), handles)
         } else {
-            (None, None, None, None)
+            (None, None, None, None, None)
         };
 
     // The producer-owned `event_id → unique_id` index. Built from the snapshot,
@@ -840,12 +965,22 @@ pub async fn forward_timeline(
     }
 
     loop {
-        tokio::select! {
+        // What a branch sends: the briefs drawn again, then its own ops,
+        // and the header when it changed; an empty batch is not sent.
+        let batch = tokio::select! {
             diffs = stream.next() => {
                 let Some(diffs) = diffs else {
                     break;
                 };
+                let mut ops = Vec::new();
                 if let Some(header) = &mut header {
+                    // A change of the room that came with these items is
+                    // read first, so they are drawn under it.
+                    if info_changed(&mut info) {
+                        let positions = header.rebrief().await;
+                        ops = header.redraw(positions, &index, &account_id, &room_id_str);
+                        fetch_members(&mut fetch, &header.reader, &room);
+                    }
                     for diff in &diffs {
                         header.see_diff(diff);
                     }
@@ -853,65 +988,85 @@ pub async fn forward_timeline(
                 let turns = header
                     .as_ref()
                     .map_or_else(TurnTrust::default, AgentHeader::turns);
-                let ops = diffs
-                    .into_iter()
-                    .map(|d| {
-                        timeline_diff_to_op(map_diff_indexing(
-                            d,
-                            &mut index,
-                            &own_user_id,
-                            &account_id,
-                            &room_id_str,
-                            turns,
-                        ))
-                    })
-                    .collect();
+                ops.extend(diffs.into_iter().map(|d| {
+                    timeline_diff_to_op(map_diff_indexing(
+                        d,
+                        &mut index,
+                        &own_user_id,
+                        &account_id,
+                        &room_id_str,
+                        turns,
+                    ))
+                }));
                 let changed = match &mut header {
                     Some(header) => header.changed().await,
                     None => None,
                 };
-                if !sink(TimelineBatch { ops, header: changed }) {
-                    tracing::info!(room_id = %room_id, "timeline channel closed, stopping producer");
-                    break;
-                }
+                TimelineBatch { ops, header: changed }
             }
             update = next_update(&mut updates) => {
                 let Some(header) = &mut header else {
                     continue;
                 };
-                match update {
-                    Ok(update) => {
-                        if !header.reader.update(&update, &header.kinds).await {
-                            continue;
-                        }
-                    }
+                // Whose status counts is read before the update is folded.
+                let mut ops = Vec::new();
+                if info_changed(&mut info) {
+                    let positions = header.rebrief().await;
+                    ops = header.redraw(positions, &index, &account_id, &room_id_str);
+                    fetch_members(&mut fetch, &header.reader, &room);
+                }
+                let folded = match update {
+                    Ok(update) => header.reader.update(&update, &header.kinds),
                     // Missed updates: read the header again from the cache.
                     Err(RecvError::Lagged(_)) => {
-                        header.reader = HeaderReader::open(room.clone(), &header.kinds).await;
+                        let mut reader = HeaderReader::open(room.clone(), &header.kinds).await;
+                        reader.refresh(&header.icons).await;
+                        let old = std::mem::replace(&mut header.reader, reader);
+                        let positions = header.rebriefed(old.turns());
+                        ops.extend(header.redraw(positions, &index, &account_id, &room_id_str));
+                        fetch_members(&mut fetch, &header.reader, &room);
+                        true
                     }
                     Err(RecvError::Closed) => {
                         updates = None;
-                        continue;
+                        false
                     }
-                }
-                if let Some(changed) = header.changed().await {
-                    if !sink(TimelineBatch { ops: Vec::new(), header: Some(changed) }) {
-                        tracing::info!(room_id = %room_id, "timeline channel closed, stopping producer");
-                        break;
-                    }
-                }
+                };
+                let changed = if folded { header.changed().await } else { None };
+                TimelineBatch { ops, header: changed }
+            }
+            () = next_info(&mut info) => {
+                let Some(header) = &mut header else {
+                    continue;
+                };
+                let positions = header.rebrief().await;
+                fetch_members(&mut fetch, &header.reader, &room);
+                let ops = header.redraw(positions, &index, &account_id, &room_id_str);
+                TimelineBatch { ops, header: None }
+            }
+            () = next_fetch(&mut fetch) => {
+                // A fetch that completes the list marks the room's members
+                // synced, a room-info change the branch above redraws on; a
+                // failure is tried again at the room's next change.
+                fetch = None;
+                continue;
             }
             () = next_mark_change(&mut marks) => {
                 let Some(header) = &mut header else {
                     continue;
                 };
-                if let Some(changed) = header.changed().await {
-                    if !sink(TimelineBatch { ops: Vec::new(), header: Some(changed) }) {
-                        tracing::info!(room_id = %room_id, "timeline channel closed, stopping producer");
-                        break;
-                    }
-                }
+                // The agents this device knows may have changed with them.
+                let positions = header.rebrief().await;
+                let ops = header.redraw(positions, &index, &account_id, &room_id_str);
+                TimelineBatch { ops, header: header.changed().await }
             }
+        };
+        if batch.ops.is_empty() && batch.header.is_none() {
+            continue;
+        }
+        if !sink(batch) {
+            tracing::info!(room_id = %room_id, "timeline channel closed, stopping producer");
+            break;
         }
     }
     tracing::info!(room_id = %room_id, "timeline stream ended");
@@ -1017,6 +1172,9 @@ pub async fn run_pagination_status_producer(timeline: Arc<Timeline>, sink: Pagin
 }
 
 #[cfg(test)]
+mod brief_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use matrix_sdk::ruma::events::room::message::{
@@ -1038,6 +1196,7 @@ mod tests {
             reactions: Vec::new(),
             media: None,
             readers: Vec::new(),
+            brief: None,
         }
     }
 
@@ -1449,6 +1608,7 @@ mod tests {
         let turns = TurnTrust {
             kind: Some(AgentRoomKind::Session),
             levels: Some(&levels),
+            ..TurnTrust::default()
         };
         let own = UserId::parse("@tgorka:example.org").expect("user");
         let sender = UserId::parse(sender).expect("user");

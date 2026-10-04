@@ -21,6 +21,10 @@ thiserror = { workspace = true }
 # Homed here as the architectural owner (AD-6); not yet exercised in Story 1.1.
 matrix-sdk = { workspace = true }
 matrix-sdk-ui = { workspace = true }
+# The room's info observable, by name (`Room::subscribe_info`): an agent
+# room's timeline draws its briefs again when its members or power change
+# (R117). Already resolved in Cargo.lock via matrix-sdk; no new package.
+eyeball = "0.8"
 # QR-code SVG rendering for device-verification display (Story 3.2). Renders the
 # `qrcode::QrCode` from `QrVerification::to_qr_code()` to an SVG string in Rust —
 # the webview never decodes QR crypto.

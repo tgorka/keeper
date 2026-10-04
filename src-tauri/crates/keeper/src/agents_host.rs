@@ -118,7 +118,7 @@ pub fn tick() {
         let facts = if scan {
             let scanned = tokio::task::spawn_blocking(move || {
                 let facts = facts(platform.as_ref());
-                let icons = desktop::agent_icons(&facts);
+                let icons = desktop::zone_agents(&facts);
                 let proxies = desktop::agent_proxies(&facts);
                 (facts, icons, proxies)
             });

@@ -7597,6 +7597,20 @@ location: `src-tauri/crates/keeper-agent/src/claims.rs` (a conflicted session is
 reason: When two hosts both acquired one epoch with different claim events (a race the settle makes unlikely, not impossible), the log holds two truths, replay refuses it, and no host serves the session. Its status anchor says so, and `docs/agents.md` tells a person to move the losing host's chunks of that epoch out of `log/` and commit. There is no button, because choosing which host's lines are the truth is the person's call and a wrong choice discards work. Revisit when a conflict happens in practice: a Settings › Agents action that shows both hosts' lines of the epoch side by side and moves the unchosen chunks to `log/conflicted/` in one commit.
 status: open
 
+### DW-444: On a phone, a brief from an agent that is not one of the person's proxies is drawn as an ordinary message.
+
+origin: story 92.1 review fixes (rung `agents-92-brief`, 2026-10-04; ruling R114, R3-03)
+location: `src-tauri/crates/keeper-core/src/agents/room.rs` (`TurnTrust::brief`'s known-agent gate, `HeaderReader::refresh`'s `known` = the zone's agents ∪ `dev.keeper.agent.proxies`)
+reason: A device draws a brief only from an agent it knows: an agent of an agents zone mounted on it, or one the person's own keeper listed as their proxy. The phone mounts no zone, so it knows only the person's proxies; Nixi handing work to Tola draws as a brief there (Nixi is listed), but Tola handing on to a third agent, in a room the person watches, draws as Tola's ordinary message with its text — never as a hand-off the device cannot vouch for. Revisit when the person watches agent-to-agent hand-offs on the phone: a signed, portable list of the person's known agents (all of them, not only proxies) their keeper writes beside `dev.keeper.agent.proxies`, or an authenticated host-admission fact the device can check.
+status: open
+
+### DW-445: A change of the person's proxy list alone redraws an open room's briefs only at the room's next change.
+
+origin: story 92.1 review fixes (rung `agents-92-brief`, 2026-10-04; ruling R117)
+location: `src-tauri/crates/keeper-core/src/timeline.rs` (`forward_timeline`: briefs are drawn again on a room-info change, a member fetch's end or a zone rescan)
+reason: The agents a device knows are read again whenever the open room changes (any sync that touches it, a gap, its members fetched) and whenever this Mac's zone scan changes them, but the person's `dev.keeper.agent.proxies` arriving on its own does not wake the open room. A phone that opens a delegated room before its keeper's first proxy list arrives draws Nixi's brief as an ordinary message until the room next changes or is opened again — fail-closed, never the other way. Revisit if it is seen: subscribe the producer to the account-data event (`Client::observe_events`) and redraw on it.
+status: open
+
 ### DW-435: A delegated session made by a host that stops before it pushes can be made again elsewhere.
 
 origin: story 92.1 review fixes (rung `agents-92-delegate`, 2026-10-04; ruling R95)

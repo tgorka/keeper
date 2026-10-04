@@ -280,12 +280,13 @@ pub fn listing(
     listed
 }
 
-/// Each agent's `SOUL.md` `icon` by Matrix user, for every agent of a flagged
-/// folder of this principal's whose soul reads and names one: the mark its
-/// room's header draws on this Mac (91.1 acceptance 6). keeper-core keeps
-/// only the marks the bot identity draws.
-pub fn agent_icons(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, String> {
-    let mut icons = BTreeMap::new();
+/// Every agent of a flagged folder of this principal's, by Matrix user, with
+/// its `SOUL.md` `icon` when its soul reads and names one: the agents this
+/// Mac knows, whose briefs its rooms draw as briefs (R114), and the mark
+/// each room's header draws (91.1 acceptance 6). keeper-core keeps only the
+/// marks the bot identity draws.
+pub fn zone_agents(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, Option<String>> {
+    let mut agents = BTreeMap::new();
     for profile in facts.profiles.iter().filter(|p| p.agents.is_some()) {
         let Ok(decl) = declared(profile) else {
             continue;
@@ -300,18 +301,16 @@ pub fn agent_icons(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, String> {
         let zone = read_zone(&decl.id, profile, Some(&decl));
         for (_, home) in &zone.homes {
             let Ok(home) = home else { continue };
-            let Ok(Some(text)) = read_text(&home.dir, soul::FILE_NAME) else {
-                continue;
-            };
-            let Ok(soul) = soul::parse_soul(&text, &home.config.name) else {
-                continue;
-            };
-            if !soul.icon.trim().is_empty() {
-                icons.insert(home.config.matrix_user.clone(), soul.icon);
-            }
+            let icon = read_text(&home.dir, soul::FILE_NAME)
+                .ok()
+                .flatten()
+                .and_then(|text| soul::parse_soul(&text, &home.config.name).ok())
+                .map(|soul| soul.icon)
+                .filter(|icon| !icon.trim().is_empty());
+            agents.insert(home.config.matrix_user.clone(), icon);
         }
     }
-    icons
+    agents
 }
 
 /// Each proxy of this principal's flagged folders, by Matrix user: its
@@ -1051,10 +1050,11 @@ mod tests {
         assert_eq!(rows[0].problem.as_deref(), Some(sentence.as_str()));
     }
 
-    /// The soul's icon of each agent of the principal's flagged folders, by
-    /// Matrix user; an agent with no soul, or a soul naming no icon, has none.
+    /// Each agent of the principal's flagged folders, by Matrix user, with
+    /// its soul's icon; an agent with no soul, or a soul naming no icon, is
+    /// still one this Mac knows, with none.
     #[test]
-    fn each_hosted_agent_is_marked_with_its_souls_icon() {
+    fn each_hosted_agent_is_known_with_its_souls_icon() {
         let root = tempfile::tempdir().expect("tempdir");
         nixi_drive(root.path());
         let soul = |icon: &str| {
@@ -1068,16 +1068,23 @@ mod tests {
             ..DesktopFacts::default()
         };
         let nixi = OwnedUserId::try_from("@nixi:example.org").expect("user");
-        assert!(agent_icons(&facts("tgorka")).is_empty(), "no soul yet");
-        write(root.path(), "80-agents/nixi/SOUL.md", &soul("N"));
+        let nixi_with =
+            |icon: Option<&str>| BTreeMap::from([(nixi.clone(), icon.map(str::to_owned))]);
         assert_eq!(
-            agent_icons(&facts("tgorka")),
-            BTreeMap::from([(nixi, "N".to_owned())])
+            zone_agents(&facts("tgorka")),
+            nixi_with(None),
+            "no soul yet"
         );
-        // Another principal's folder marks nothing here.
-        assert!(agent_icons(&facts("marta")).is_empty());
+        write(root.path(), "80-agents/nixi/SOUL.md", &soul("N"));
+        assert_eq!(zone_agents(&facts("tgorka")), nixi_with(Some("N")));
+        // Another principal's folder holds no agent of this Mac's.
+        assert!(zone_agents(&facts("marta")).is_empty());
         write(root.path(), "80-agents/nixi/SOUL.md", &soul(""));
-        assert!(agent_icons(&facts("tgorka")).is_empty(), "no icon named");
+        assert_eq!(
+            zone_agents(&facts("tgorka")),
+            nixi_with(None),
+            "no icon named"
+        );
     }
 
     /// A first sign-in that fails after its store was created must not

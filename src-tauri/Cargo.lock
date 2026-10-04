@@ -4319,6 +4319,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "chrono",
+ "eyeball",
  "flate2",
  "futures-util",
  "globset",

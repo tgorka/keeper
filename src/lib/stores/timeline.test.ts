@@ -22,6 +22,7 @@ function message(key: string, sender = "@bob:example.org"): TimelineItemVm {
     reactions: [],
     media: null,
     readers: [],
+    brief: null,
   };
 }
 

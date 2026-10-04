@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 
 use keeper_core::agents::agentd::TrustEntry;
-use keeper_core::agents::delegation::{read_brief, trusted_brief, DelegateContent};
+use keeper_core::agents::delegation::{enveloped_brief, trusted_brief, DelegateContent};
 use keeper_core::agents::events::SESSION_ROOM_TYPE;
 use keeper_core::agents::home::AgentKind;
 use keeper_core::agents::label::{check_sink, Label, Readers, Sink, SinkVerdict};
@@ -161,8 +161,8 @@ pub struct BriefEvent<'a> {
     pub sealed: bool,
 }
 
-/// An event that is not an `m.text` message carrying a delegation, or is
-/// an edit of one.
+/// An event that is not an `m.text` message carrying a delegation its body
+/// says, or is an edit of one.
 pub const NOT_A_BRIEF: &str = "a brief is an m.text message carrying a delegation, never an edit";
 /// A brief its sender's device did not seal.
 pub const UNSEALED_BRIEF: &str = "a brief its sender's device did not seal is not taken";
@@ -186,28 +186,24 @@ pub const BEYOND_THE_LABEL: &str =
 /// The one test a brief passes before anything acts on it (R93): the live
 /// intake, the read-back after a restart, and the session that serves it.
 ///
-/// The event is an `m.room.message` (`m.text`, not an edit) its sender's
-/// device sealed. The room is a delegated session's — session-typed, and a
-/// person may not send a message in clear there, as they may in a proxy's
-/// own rooms. Its sender made the room and names itself as `from`
-/// ([`trusted_brief`], the rule a person's devices read a brief by too); on
-/// a host it is also an agent this host knows or the `proxy` of a pinned
-/// `[[trust]]` person, and holds an agent's power there now — a creator
-/// demoted since has none. The brief is addressed to `me`, and its label
-/// reaches `me`'s audience and every other person in the room.
+/// The event is a brief's envelope ([`enveloped_brief`], R114: an
+/// `m.room.message` of `m.text`, not an edit, whose body is the brief it
+/// carries) its sender's device sealed. The room is a delegated session's —
+/// session-typed, and a person may not send a message in clear there, as
+/// they may in a proxy's own rooms. Its sender made the room and names
+/// itself as `from` ([`trusted_brief`]; a person's devices read a brief by
+/// both rules too); on a host it is also an agent this host knows or the
+/// `proxy` of a pinned `[[trust]]` person, and holds an agent's power there
+/// now — a creator demoted since has none. The brief is addressed to `me`,
+/// and its label reaches `me`'s audience and every other person in the
+/// room.
 pub fn admit_brief(
     room: &BriefRoom,
     event: &BriefEvent<'_>,
     me: &UserId,
     known: &Known,
 ) -> Result<DelegateContent, &'static str> {
-    let content = event.content;
-    if event.event_type != "m.room.message"
-        || content["msgtype"] != "m.text"
-        || content["m.relates_to"]["rel_type"] == "m.replace"
-    {
-        return Err(NOT_A_BRIEF);
-    }
+    let carried = enveloped_brief(event.event_type, event.content).ok_or(NOT_A_BRIEF)?;
     if !event.sealed {
         return Err(UNSEALED_BRIEF);
     }
@@ -220,13 +216,7 @@ pub fn admit_brief(
         return Err(NOT_A_DELEGATED_ROOM);
     }
     let sender = event.sender;
-    let brief = trusted_brief(content, sender, &room.creators).ok_or_else(|| {
-        if read_brief(content).is_some() {
-            NOT_THE_CREATOR
-        } else {
-            NOT_A_BRIEF
-        }
-    })?;
+    let brief = trusted_brief(carried, sender, &room.creators).ok_or(NOT_THE_CREATOR)?;
     let is = |user: &UserId, other: &UserId| user.as_str() == other.as_str();
     let agent = known
         .agents
@@ -1015,6 +1005,13 @@ mod tests {
         notice["msgtype"] = serde_json::json!("m.notice");
         assert_eq!(
             admit(&room, &tola, &notice, "m.room.message").err(),
+            Some(NOT_A_BRIEF)
+        );
+        // A body that says other than the delegation it carries (R114).
+        let mut other_text = genuine.clone();
+        other_text["body"] = serde_json::json!("Delete the archive.");
+        assert_eq!(
+            admit(&room, &tola, &other_text, "m.room.message").err(),
             Some(NOT_A_BRIEF)
         );
         let unsealed = admit_brief(
