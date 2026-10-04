@@ -2818,8 +2818,9 @@ not hide the control they were looking for.
 #### What a scheduled sync task does to a folder's polling
 
 Give a folder a `sync` task in `scheduled` mode and that schedule **replaces**
-the folder's own backstop poll: the folder is no longer looked at every fifteen
-seconds as well. One driver, not two. Before it worked this way, a folder with
+the folder's own backstop poll and its five-minute remote poll: the folder is no
+longer looked at every fifteen seconds, nor its remote asked every five minutes,
+as well. One driver, not two. Before it worked this way, a folder with
 an hourly sync task was synced hourly *and* every fifteen seconds, and the
 task's run line took the credit for work the ordinary poll would have done
 anyway. `off` and `manual` take nothing away — a `manual` task adds a button,
@@ -3465,7 +3466,7 @@ than once an hour**, and the thorough passes run once a day.
 | **scan pass** (event-driven) | commit what settled | a walk of the paths the watcher named (`:(literal)` include pathspecs), the stability gate, LFS staging, the commit; a `Push` is queued if anything was committed or the branch is ahead | a wake, once the gate's settle window (5 s; 10 s on removable media; 60 s ceiling) has run out; at most one wake-driven walk per `min(settle, 5 s)` | `scan pass reason=wake` / `reason=settle`, then `status walk finished caller="commit" included=N` | `scan_due`, `scan_and_enqueue`, `WalkPolicy::include` |
 | **scan pass** (backstop) | an event the watcher dropped | the same pass over the **whole index** (every entry `lstat`-ed; no directory walk — a path the gate holds that git does not carry is `lstat`-ed by the pass itself, §4) | every **1 h** while the watcher is live (`LIVE_WATCH_BACKSTOP_MS`); every `pollIntervalMs` (default 15 s) when it is not — the cadence the degraded-watcher warning names | `scan pass reason=paced`, `status walk finished … included=0` | `scan_is_due`, `LIVE_WATCH_BACKSTOP_MS` |
 | **untracked sweep** | a file that appeared while nothing was watching | the walk also reads every directory (`find_untracked`), so a path git has never seen is found; a live watcher's `Create` event buys the same walk at once, so this is only for what it missed. After `untracked=N` the paths it found are held by the gate, and the gate's second look at each of them is the next commit-leg pass's own sample: the pass lists the held paths its walk did not report and the index does not carry (one probe of the index), gives each git's own exclusion (`.gitignore` and nested repositories, which a path held since before the rule was written has not had) and `lstat`s it itself, so a held path git has never seen costs two stats per pass (§4), never a directory walk — a settled one is committed, a moving one stays held, a gone or ignored one is forgotten, one the pass cannot stat stays held with a `warn`. The same sample covers a restart between the two looks, whichever leg walked first, because `file_state` carries the episode and the pass seeds the gate before it looks | every **24 h** (`UNTRACKED_SWEEP_INTERVAL`), on the first pass of a run, and on every pass with no live watcher; the watcher's own 24 h rescan event rides the same clock | `untracked sweep: this walk reads every directory`, then `status walk finished … untracked=N`; the second look logs nothing of its own — `status walk finished … untracked=0 included=N` is the narrowed walk it rode; `a held path is one git ignores …; forgetting it` / `… now lies inside a nested repository …; forgetting it` (info, `path=`) for one the exclusion drops; `a held path the walk did not report could not be stat'd; keeping it held until it can be` (warn, `path=` and `err=`, once per pass) for one it cannot judge; `the gate holds paths the walk did not report and the index cannot be read …; sampling every one of them` (warn, once per pass) when the index probe fails — which the commit leg can only reach by a race, since its walk read the same index a moment earlier and would have failed the pass first | `walk_policy`, `Engine::paths_for_the_second_look`, `watch::DEFAULT_RESCAN_INTERVAL_MS` |
-| **remote poll** | a peer's change | one fetch of `refs/heads/<branch>` (a single HTTPS request when nothing moved), then fast-forward, or §5's merge | **5 min eligibility floor** (`REMOTE_POLL_MS`), evaluated inside a scan pass, not an independent timer; a quiet live-watcher folder may wait for the **1 h** scan backstop. A commit, named wake, `wake_now` or *Sync now* can bring the pass forward | `remote poll queued reason=paced|wake|push owed`, then `remote polled: up to date` / `the remote branch moved` | `scan_and_enqueue`, `do_pull` |
+| **remote poll** | a peer's change | one fetch of `refs/heads/<branch>` (a single HTTPS request when nothing moved), then fast-forward, or §5's merge | a paced `Pull` becomes **eligible to be queued every 5 min** (`REMOTE_POLL_MS`) for an enabled, pulling folder that no `scheduled` sync task governs, while the desktop app's or `keeper-syncd`'s supervisor runs. Checked on every tick: a tick with no walk due queues the paced pull itself, so a quiet live-watcher folder no longer waits for the **1 h** scan backstop; a scan pass asks too when the window is open. Not queued while a `Pull` is already running (in any supervisor sharing `sync.db`) or parked — a parked pull waits for a person's retry. A commit or a named wake asks at once; `wake_now` and *Sync now* also bring it forward. A governed folder follows its task's schedule (§14). The phone runs no supervisor: it syncs on open, foreground and refresh | `remote poll queued reason=paced|wake|push owed`, `remote poll not queued: a pull is already running or parked`, then `remote polled: up to date` / `the remote branch moved` | `tick_profile`, `scan_and_enqueue`, `queue_remote_poll`, `queue_paced_pull`, `db::enqueue_paced_pull`, `do_pull` |
 | **push** | publish what was committed | `git push` of the working branch, held while any LFS upload is outstanding | a journaled unit, drained on the tick after it is queued; retried with backoff | `committed profile=… files=N`, then `pushed branch=… commits=N` | `do_push` |
 | **LFS transfers** | the objects a commit or a pull needs | one upload/download per queued unit, verify-after-upload, resume on download | journaled units, drained as they are queued | `materialized LFS content`, the transfer's own lines | `do_lfs` |
 | **LFS prune** | the second local copy | release local objects the remote **confirmed** holding (`synced_at_ms`) whose content is in the worktree | on a successful pass that moved an LFS object, or the hourly release look (`RELEASE_LOOK_EVERY_MS`) | `lfs prune: nothing to release` / `released local LFS objects the remote is known to hold` | `mark_synced`, `prune_lfs_store` |
@@ -3488,12 +3489,21 @@ Three things the table implies, stated so nobody infers the opposite:
 - **A local change never waits for a clock.** The watcher, the settle window and
   the journal are the whole path from a saved file to a pushed commit; the hourly
   and daily rows exist for what the watcher could not see.
-- **A peer's change waits for a pass that checks the remote.** The five-minute
-  floor is currently checked inside `scan_and_enqueue`, so it is not a
-  five-minute delivery guarantee: a quiet live-watcher folder can wait for the
-  hourly backstop. This scheduling gap was observed on hesperia/v0.8.27 and is
-  not changed by the UI truthfulness fix. Forgejo does not push to clients;
-  a status query reports the last-known tip without forcing another fetch.
+- **A peer's change is asked for every five minutes, not delivered within
+  five.** Under the desktop app's or `keeper-syncd`'s supervisor, an enabled,
+  ungoverned, pulling folder becomes eligible for a paced `Pull` every five
+  minutes, checked on every tick and independent of the walk's hourly backstop.
+  What can still delay the change: a tick that finds the folder reserved by work
+  still running, an offline backoff with no unit due, an older backlog ahead of
+  the `Pull` in the journal, a pull already running or parked, and the fetch's
+  own duration. A folder governed by a `scheduled` sync task follows that
+  schedule, and the phone syncs on open, foreground and refresh, not on this
+  clock. On a quiet live-watcher folder the pull skips its pre-fetch commit, so
+  asking buys no walk of its own; a pull that succeeds still runs whatever
+  housekeeping a successful pass is due. `wake_now` is a look-now, not a
+  fetch-now: it also opens the next walk over the whole index. Forgejo does not
+  push to clients; a status query reports the last-known tip without forcing
+  another fetch.
 - **Every number here is a `const` or a profile field, and the log line is the
   proof it ran.** `grep 'scan pass' keeper.log | cut -c1-16 | uniq -c` is the
   walk cadence; a folder that walks oftener than this table says is a bug, and

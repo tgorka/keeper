@@ -236,6 +236,15 @@ pub struct EngineCounters {
     /// the hourly anomaly is re-emitted from the memo while neither moves, and
     /// "re-emitted without a walk" is a claim only a count can pin.
     pub footprint_sweeps: u64,
+    /// Remote polls that reached the journal for this profile — a push owed,
+    /// a wake or a paced poll, whether it wrote a `Pull` or a pending one
+    /// absorbed it. A paced poll that a running or parked `Pull` stands down
+    /// is not counted: it asked nothing.
+    ///
+    /// Counted because "a quiet folder asks its remote every five minutes" is
+    /// a claim about a clock nobody watches: the folder looks the same whether
+    /// it asked or not until a peer's change is late.
+    pub remote_polls: u64,
 }
 
 /// How safe one recorded file already is, read locally (Story 41.6, FR-138).
@@ -5524,6 +5533,11 @@ impl Engine {
         }
 
         let scan = self.scan_due(profile);
+        // A walk asks the remote itself; a tick that walks nothing must too,
+        // or a quiet live-watcher folder asks on the hourly backstop.
+        if !scan {
+            self.poll_remote_on_a_quiet_tick(profile)?;
+        }
         // The supervisor's own pass. Nobody asked for this one — the clock
         // did — so it is the only genuinely `Watch` caller (AD-34-12).
         self.drain_journal(profile, scan, SyncSource::Watch)
@@ -16813,18 +16827,13 @@ impl Engine {
         // change of ours — a push owed, a wake — asks sooner, because that is
         // when a peer's change is most likely.
         if profile.direction.pulls() && (self.remote_poll_due(profile, now) || push_owed || woke) {
-            let reason = if push_owed {
-                "push owed"
+            if push_owed {
+                self.queue_remote_poll(profile, now, "push owed")?;
             } else if woke {
-                "wake"
+                self.queue_remote_poll(profile, now, "wake")?;
             } else {
-                "paced"
-            };
-            tracing::info!(profile = profile.name, reason, "remote poll queued");
-            self.arm_remote_poll(profile, now);
-            self.with_db(|conn| {
-                db::enqueue_unique(conn, &profile.id, &WorkKind::Pull, now, now).map(drop)
-            })?;
+                self.queue_paced_pull(profile, now)?;
+            }
         }
         if push_owed {
             self.with_db(|conn| {
@@ -16833,6 +16842,76 @@ impl Engine {
         }
         self.refresh_pending(&profile.id);
         Ok(())
+    }
+
+    /// Queue one `Pull` for a change of ours — a push owed or a wake — and arm
+    /// the next remote-poll window, saying why.
+    ///
+    /// A running `Pull` is not cover here (`db::enqueue_unique`): it fetched
+    /// before the change that asks, so the newer request keeps its own row.
+    fn queue_remote_poll(&self, profile: &SyncProfile, now: i64, reason: &str) -> Result<()> {
+        tracing::info!(profile = profile.name, reason, "remote poll queued");
+        self.arm_remote_poll(profile, now);
+        self.with_db(|conn| {
+            db::enqueue_unique(conn, &profile.id, &WorkKind::Pull, now, now).map(drop)
+        })?;
+        self.count_remote_poll(&profile.id);
+        Ok(())
+    }
+
+    /// Queue the paced `Pull` — the one nobody asked for — and arm the next
+    /// window, unless the journal already holds a `Pull` (`db::enqueue_paced_pull`):
+    /// a running one, in any supervisor sharing the database, or a parked one,
+    /// which waits for a person's retry.
+    fn queue_paced_pull(&self, profile: &SyncProfile, now: i64) -> Result<()> {
+        self.arm_remote_poll(profile, now);
+        let outcome = self.with_db(|conn| db::enqueue_paced_pull(conn, &profile.id, now))?;
+        if outcome == db::PacedPull::StoodDown {
+            tracing::info!(
+                profile = profile.name,
+                "remote poll not queued: a pull is already running or parked"
+            );
+            return Ok(());
+        }
+        tracing::info!(
+            profile = profile.name,
+            reason = "paced",
+            "remote poll queued"
+        );
+        self.count_remote_poll(&profile.id);
+        Ok(())
+    }
+
+    fn count_remote_poll(&self, profile_id: &str) {
+        self.bump_counters(profile_id, |counters| {
+            counters.remote_polls = counters.remote_polls.saturating_add(1);
+        });
+    }
+
+    /// The paced remote poll on a tick that walks nothing.
+    ///
+    /// [`REMOTE_POLL_MS`] is the remote's clock and [`LIVE_WATCH_BACKSTOP_MS`]
+    /// the walk's. Asked only from inside a scan pass, the remote poll ran when
+    /// the walk did — hourly on a quiet live-watcher folder — so the tick asks
+    /// it on every pass that does not walk. On a quiet live-watcher folder the
+    /// `Pull` skips its pre-fetch commit, so asking buys no walk of its own.
+    ///
+    /// A `scheduled` sync task is the folder's clock ([`Self::sync_poll_permits`])
+    /// and the remote poll is part of the paced driver it replaces. A declined
+    /// window is armed anyway, so the tasks table is read once per window
+    /// rather than once per tick — the reason `scan_due` asks governance only
+    /// after the paced window fired.
+    fn poll_remote_on_a_quiet_tick(&self, profile: &SyncProfile) -> Result<()> {
+        let now = self.platform.now_ms();
+        if !profile.direction.pulls() || !self.remote_poll_due(profile, now) {
+            return Ok(());
+        }
+        if self.sync_poll_permits(profile) {
+            self.queue_paced_pull(profile, now)
+        } else {
+            self.arm_remote_poll(profile, now);
+            Ok(())
+        }
     }
 
     /// Whether the paced remote poll's window is open for this profile.
@@ -30751,23 +30830,30 @@ mod tests {
     /// Written with gix plumbing rather than a second engine because the point
     /// is only that the remote moved: the local side is what is under test.
     fn advance_remote(remote_dir: &Path, file: &str, content: &str) {
+        advance_remote_with(remote_dir, &[(file, content)], content);
+    }
+
+    /// [`advance_remote`] with a whole tree: `files` (sorted by name, as a git
+    /// tree is) are every path the new commit holds.
+    fn advance_remote_with(remote_dir: &Path, files: &[(&str, &str)], message: &str) {
         let remote = gix::open(remote_dir).expect("open bare remote");
         let tip = remote
             .find_reference("refs/heads/main")
             .expect("the pushed branch")
             .id()
             .detach();
-        let blob = remote
-            .write_blob(content.as_bytes())
-            .expect("blob")
-            .detach();
-        let tree = gix::objs::Tree {
-            entries: vec![gix::objs::tree::Entry {
+        let entries = files
+            .iter()
+            .map(|(file, content)| gix::objs::tree::Entry {
                 mode: gix::objs::tree::EntryKind::Blob.into(),
-                filename: file.into(),
-                oid: blob,
-            }],
-        };
+                filename: (*file).into(),
+                oid: remote
+                    .write_blob(content.as_bytes())
+                    .expect("blob")
+                    .detach(),
+            })
+            .collect();
+        let tree = gix::objs::Tree { entries };
         let tree = remote.write_object(&tree).expect("tree").detach();
         let mut buf = gix::date::parse::TimeBuf::default();
         let author = gix::actor::Signature {
@@ -30777,7 +30863,7 @@ mod tests {
         };
         let author = author.to_ref(&mut buf);
         remote
-            .commit_as(author, author, "refs/heads/main", content, tree, vec![tip])
+            .commit_as(author, author, "refs/heads/main", message, tree, vec![tip])
             .expect("advance the remote");
     }
 
@@ -36463,6 +36549,387 @@ mod tests {
         platform.advance_ms(15_000);
         engine.wake_now(&p.id);
         assert_eq!(scan(), 1, "a wake pulls at once");
+    }
+
+    /// Two committed files published to a local bare remote, so a `Pull`
+    /// really fetches and comes back up to date — the remote polls a test
+    /// counts are never held back by an offline backoff — with a live watcher
+    /// that `ensure_watcher` keeps.
+    ///
+    /// The watcher is the poll backend: it needs no inotify instance, so the
+    /// fixture is live on a host whose per-user instances are spent, and its
+    /// 30 s re-stat never fires inside a test that runs on the fake clock.
+    async fn published_fixture(
+        engine: &Engine,
+        platform: &TestPlatform,
+        dir: &Path,
+        remote_dir: &Path,
+    ) -> SyncProfile {
+        let mut p = adoptable(dir);
+        p.remote_url = remote_dir.to_string_lossy().into_owned();
+        p.poll_interval_ms = 15_000;
+        std::fs::write(p.local_path.join("a.txt"), b"alpha").expect("write a");
+        std::fs::write(p.local_path.join("b.txt"), b"beta").expect("write b");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(engine, platform, &p), 2);
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("publish to the bare remote");
+        arm_poll_watcher(engine, &p);
+        p
+    }
+
+    /// A live watcher on the poll backend, recorded the way `ensure_watcher`
+    /// records one so it is kept.
+    fn arm_poll_watcher(engine: &Engine, p: &SyncProfile) {
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = FolderWatcher::start(
+            &p.local_path,
+            WatchConfig {
+                debounce_ms: 50,
+                rescan_interval_ms: 0,
+                force_poll: true,
+            },
+            tx,
+        )
+        .expect("a poll watcher arms over a real directory");
+        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+    }
+
+    /// `ticks` supervisor ticks, 15 s apart.
+    async fn quiet_ticks(engine: &Engine, platform: &TestPlatform, p: &SyncProfile, ticks: u32) {
+        for _ in 0..ticks {
+            platform.advance_ms(15_000);
+            engine.tick_profile(p).await.expect("a tick never raises");
+        }
+    }
+
+    fn local_head(engine: &Engine, p: &SyncProfile) -> gix::hash::ObjectId {
+        git::repo::head_commit_id(&engine.open_repo(p).expect("open"))
+            .expect("head")
+            .expect("a commit")
+    }
+
+    fn remote_tip(remote_dir: &Path) -> gix::hash::ObjectId {
+        gix::open(remote_dir)
+            .expect("open bare remote")
+            .find_reference("refs/heads/main")
+            .expect("the pushed branch")
+            .id()
+            .detach()
+    }
+
+    /// FR-793, NFR-122: a folder whose watcher is live and which nobody
+    /// touches asks its remote on every [`REMOTE_POLL_MS`] deadline — not a
+    /// tick before it, not a tick after it, and not once per
+    /// [`LIVE_WATCH_BACKSTOP_MS`] — and a peer's commit lands on that tick.
+    ///
+    /// Driven through `tick_profile`, the supervisor's own door, because the
+    /// gap was in which tick reached the remote poll at all:
+    /// `a_pull_is_queued_once_per_remote_poll_when_idle_and_at_once_when_a_push_is`
+    /// calls `scan_and_enqueue` directly, and passed while a quiet folder on
+    /// hesperia asked its remote once an hour.
+    #[tokio::test]
+    async fn a_quiet_live_watcher_folder_asks_the_remote_every_remote_poll() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = published_fixture(&engine, &platform, dir.path(), remote_dir.path()).await;
+
+        // First sight: the walk, and the remote poll it brings. The next
+        // deadline is twenty 15 s ticks away.
+        engine.tick_profile(&p).await.expect("a tick never raises");
+        assert!(
+            engine.watch_is_live(&p.id),
+            "the question is about a folder whose watcher is live"
+        );
+        let first = engine.counters(&p.id);
+        let polls = || engine.counters(&p.id).remote_polls - first.remote_polls;
+
+        quiet_ticks(&engine, &platform, &p, 19).await;
+        assert_eq!(
+            polls(),
+            0,
+            "the tick before the first deadline asks nothing"
+        );
+        quiet_ticks(&engine, &platform, &p, 1).await;
+        assert_eq!(polls(), 1, "the deadline's own tick asks the remote");
+        assert_eq!(
+            units_of_kind(&engine, &p.id, "pull"),
+            0,
+            "and the pull it queued was fetched on that tick"
+        );
+        quiet_ticks(&engine, &platform, &p, 1).await;
+        assert_eq!(polls(), 1, "the tick after it asks nothing more");
+        assert_eq!(
+            engine.counters(&p.id).status_walks,
+            first.status_walks,
+            "asking the remote is not a walk: the backstop is an hour away"
+        );
+
+        // A peer's commit lands just before the second deadline.
+        quiet_ticks(&engine, &platform, &p, 18).await;
+        advance_remote_with(
+            remote_dir.path(),
+            &[("a.txt", "alpha"), ("b.txt", "beta"), ("c.txt", "gamma")],
+            "a peer's change",
+        );
+        assert_eq!(
+            polls(),
+            1,
+            "the tick before the second deadline asks nothing"
+        );
+        assert_ne!(local_head(&engine, &p), remote_tip(remote_dir.path()));
+        assert!(!p.local_path.join("c.txt").exists());
+        quiet_ticks(&engine, &platform, &p, 1).await;
+        assert_eq!(polls(), 2, "the second deadline's tick asks the remote");
+        assert_eq!(
+            local_head(&engine, &p),
+            remote_tip(remote_dir.path()),
+            "and the peer's commit is here on that tick"
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("c.txt")).expect("the peer's file"),
+            b"gamma"
+        );
+        quiet_ticks(&engine, &platform, &p, 1).await;
+        assert_eq!(polls(), 2, "the tick after it asks nothing more");
+    }
+
+    /// A pull parked by a permanent failure — a rejected credential, which
+    /// must not be retried unchanged — stands the paced poll down: window after
+    /// window, the journal holds that one parked row and nothing new is asked.
+    /// A person's retry is what asks again, and then the clock resumes.
+    ///
+    /// The parked row is seeded: the local bare remote cannot reject a
+    /// credential, and the parking itself is `record_failure`'s, unchanged.
+    #[tokio::test]
+    async fn a_parked_pull_stands_the_paced_poll_down_until_it_is_retried() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = published_fixture(&engine, &platform, dir.path(), remote_dir.path()).await;
+        engine.tick_profile(&p).await.expect("a tick never raises");
+        let now = platform.now_ms();
+        let parked = engine
+            .with_db(|conn| {
+                let id = db::enqueue(conn, &p.id, &WorkKind::Pull, now, now)?;
+                conn.execute(
+                    "UPDATE journal SET state = 'parked', last_error = 'authentication rejected'
+                      WHERE id = ?1",
+                    [id],
+                )?;
+                Ok(id)
+            })
+            .expect("park a pull");
+        let before = engine.counters(&p.id).remote_polls;
+
+        // Three remote-poll windows.
+        quiet_ticks(&engine, &platform, &p, 61).await;
+        assert_eq!(
+            engine.counters(&p.id).remote_polls,
+            before,
+            "a parked pull asks nothing at any window"
+        );
+        assert_eq!(
+            units_of_kind(&engine, &p.id, "pull"),
+            1,
+            "and the journal holds that one row, no new attempt beside it"
+        );
+        assert_eq!(
+            engine
+                .with_db(|conn| db::list_parked(conn, &p.id))
+                .expect("parked")
+                .len(),
+            1
+        );
+
+        engine.retry_parked(&p.id, parked).await.expect("retry");
+        quiet_ticks(&engine, &platform, &p, 1).await;
+        assert_eq!(
+            units_of_kind(&engine, &p.id, "pull"),
+            0,
+            "the retry is what asks again"
+        );
+        quiet_ticks(&engine, &platform, &p, 20).await;
+        assert_eq!(
+            engine.counters(&p.id).remote_polls,
+            before + 1,
+            "and after it the clock resumes"
+        );
+    }
+
+    /// The app and the daemon may share one `sync.db`, and each engine's
+    /// reservation is its own: a `Pull` running in one engine covers the paced
+    /// poll of the other through the journal itself. A wake is a newer request
+    /// and still queues its own.
+    #[tokio::test]
+    async fn a_pull_running_in_another_engine_covers_the_paced_poll() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        // Both open before any row runs: opening recovers `running` rows.
+        let Ok(app) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let Ok(daemon) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = published_fixture(&app, &platform, dir.path(), remote_dir.path()).await;
+        // The first-sight pass queued a `Pull`; the app's next tick would claim
+        // it, and here the app claims it and is still fetching.
+        app.tick_profile(&p).await.expect("a tick never raises");
+        let now = platform.now_ms();
+        let claimed = app
+            .with_db(|conn| db::claim_ready(conn, &p.id, now, CLAIM_LIMIT))
+            .expect("the app's pull is running");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(units_of_kind(&app, &p.id, "pull"), 1);
+
+        // The daemon's first sight walks and polls through the scan pass; its
+        // next window is a quiet tick's.
+        arm_poll_watcher(&daemon, &p);
+        daemon.tick_profile(&p).await.expect("a tick never raises");
+        quiet_ticks(&daemon, &platform, &p, 21).await;
+        assert_eq!(
+            daemon.counters(&p.id).remote_polls,
+            0,
+            "neither of the daemon's paced polls asks while the app's pull runs"
+        );
+        assert_eq!(
+            units_of_kind(&daemon, &p.id, "pull"),
+            1,
+            "the journal holds the running pull and nothing beside it"
+        );
+
+        daemon.wake_now(&p.id);
+        quiet_ticks(&daemon, &platform, &p, 1).await;
+        assert_eq!(
+            daemon.counters(&p.id).remote_polls,
+            1,
+            "a wake is a newer request than the running fetch, and asks"
+        );
+    }
+
+    /// A `Pull` waiting out a backoff absorbs the paced poll: one row, its
+    /// `not_before_ms` is the backoff's, not pulled forward to the window, and
+    /// nothing is fetched at the window — a peer's commit waits for the backoff.
+    #[tokio::test]
+    async fn a_backed_off_pull_absorbs_the_paced_poll_and_keeps_its_backoff() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = published_fixture(&engine, &platform, dir.path(), remote_dir.path()).await;
+        engine.tick_profile(&p).await.expect("a tick never raises");
+        let now = platform.now_ms();
+        let backoff_until = now + 3_600_000;
+        engine
+            .with_db(|conn| db::enqueue(conn, &p.id, &WorkKind::Pull, now, backoff_until))
+            .expect("a backed-off pull");
+        let before = engine.counters(&p.id).remote_polls;
+        let not_before = || {
+            engine
+                .with_db(|conn| {
+                    conn.query_row(
+                        "SELECT not_before_ms FROM journal WHERE profile_id = ?1 AND kind = 'pull'",
+                        [&p.id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .map_err(SyncError::from)
+                })
+                .expect("one pull row")
+        };
+
+        quiet_ticks(&engine, &platform, &p, 19).await;
+        advance_remote_with(
+            remote_dir.path(),
+            &[("a.txt", "alpha"), ("b.txt", "beta"), ("c.txt", "gamma")],
+            "a peer's change",
+        );
+        quiet_ticks(&engine, &platform, &p, 1).await;
+        assert_eq!(
+            engine.counters(&p.id).remote_polls,
+            before + 1,
+            "the window's poll reached the journal"
+        );
+        assert_eq!(units_of_kind(&engine, &p.id, "pull"), 1, "and was absorbed");
+        assert_eq!(
+            not_before(),
+            backoff_until,
+            "with the backoff left as it was"
+        );
+        assert_ne!(
+            local_head(&engine, &p),
+            remote_tip(remote_dir.path()),
+            "and nothing was fetched past it"
+        );
+    }
+
+    /// A `scheduled` sync task is the folder's clock (Story 58.8), and the
+    /// remote poll is part of the paced driver it replaces: the tick queues no
+    /// paced pull for a governed folder. `manual` takes nothing away, so the
+    /// next window asks the remote again.
+    #[tokio::test]
+    async fn a_governed_quiet_folder_pulls_on_its_schedule_not_on_the_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = published_fixture(&engine, &platform, dir.path(), remote_dir.path()).await;
+        let mut governing = task("01HOURLY", Some(&p.id), "@hourly");
+        governing.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&governing, None).expect("save");
+
+        engine.tick_profile(&p).await.expect("a tick never raises");
+        let before = engine.counters(&p.id).remote_polls;
+        for _ in 0..44 {
+            platform.advance_ms(15_000);
+            engine.tick_profile(&p).await.expect("a tick never raises");
+        }
+        assert_eq!(
+            engine.counters(&p.id).remote_polls,
+            before,
+            "governed: the task's schedule is the folder's clock, so eleven quiet \
+             minutes ask the remote nothing"
+        );
+
+        governing.mode = tasks::TaskMode::Manual;
+        engine.save_task(&governing, None).expect("save");
+        for _ in 0..21 {
+            platform.advance_ms(15_000);
+            engine.tick_profile(&p).await.expect("a tick never raises");
+        }
+        assert!(
+            engine.counters(&p.id).remote_polls > before,
+            "manual takes nothing away: the next window asks the remote"
+        );
     }
 
     /// AD-233. With a live watcher the poll is a backstop at

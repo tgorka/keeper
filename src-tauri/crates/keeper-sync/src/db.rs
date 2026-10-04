@@ -2179,6 +2179,63 @@ pub fn enqueue_unique(
     enqueue(conn, profile_id, kind, now_ms, not_before_ms)
 }
 
+/// What [`enqueue_paced_pull`] did with one paced remote poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacedPull {
+    /// A new `Pull` row was written.
+    Queued,
+    /// A `pending` or `deferred` `Pull` already covers it, backoff and all.
+    Covered,
+    /// A `Pull` is `running` — in this process or another sharing the file —
+    /// or `parked`; the poll asks nothing.
+    StoodDown,
+}
+
+/// The paced remote poll's enqueue: one `Pull` unless the journal already
+/// holds one in any live or parked state.
+///
+/// Stricter than [`enqueue_unique`] in two states, and only for the poll
+/// nobody asked for. A `running` pull is cover because a clock tick is not a
+/// newer request — unlike a push owed or a wake — and the app and the daemon
+/// share this file while their reservations are each process-local, so a
+/// second supervisor reaching its window during a slow fetch would otherwise
+/// queue and claim a second `Pull` against the same tree. A `parked` pull is
+/// cover because parking is the answer to a permanent failure — a rejected
+/// credential above all, which must not be retried unchanged every five
+/// minutes — and only [`unpark`] (or a forced sync) asks again.
+///
+/// One `INSERT … WHERE NOT EXISTS`, so the check and the insert are one
+/// statement under SQLite's write lock: two connections cannot both pass it.
+pub fn enqueue_paced_pull(conn: &Connection, profile_id: &str, now_ms: i64) -> Result<PacedPull> {
+    let kind = WorkKind::Pull;
+    let payload = serde_json::to_string(&kind)
+        .map_err(|e| SyncError::Journal(format!("work item is not serializable: {e}")))?;
+    let inserted = conn.execute(
+        "INSERT INTO journal (profile_id, kind, payload, state, not_before_ms, created_ms)
+         SELECT ?1, ?2, ?3, 'pending', ?4, ?4
+          WHERE NOT EXISTS (
+                SELECT 1 FROM journal
+                 WHERE profile_id = ?1 AND payload = ?3
+                   AND state IN ('pending','deferred','running','parked'))",
+        (profile_id, kind.tag(), &payload, now_ms),
+    )?;
+    if inserted > 0 {
+        return Ok(PacedPull::Queued);
+    }
+    let covered: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM journal
+                         WHERE profile_id = ?1 AND payload = ?2
+                           AND state IN ('pending','deferred'))",
+        (profile_id, &payload),
+        |r| r.get(0),
+    )?;
+    Ok(if covered {
+        PacedPull::Covered
+    } else {
+        PacedPull::StoodDown
+    })
+}
+
 /// Claim the ready units for one profile, marking them `running` so two
 /// supervisors can never take the same row.
 ///
