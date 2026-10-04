@@ -191,6 +191,7 @@ async fn host(
         needs: None,
         pin: None,
         hop: 0,
+        dispatch_chain: Vec::new(),
         limits: None,
         workflow: None,
         created_at: chrono::Utc::now(),

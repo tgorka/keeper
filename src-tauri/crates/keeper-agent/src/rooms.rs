@@ -8,12 +8,19 @@
 //! that is not their proxy's conversation, because the homeserver sees every
 //! encrypted event as `m.room.encrypted` and cannot tell a decision from text.
 
+use std::collections::BTreeSet;
+
 use keeper_core::agents::agentd::TrustEntry;
+use keeper_core::agents::delegation::{read_brief, trusted_brief, DelegateContent};
 use keeper_core::agents::events::SESSION_ROOM_TYPE;
 use keeper_core::agents::home::AgentKind;
-use keeper_core::agents::label::{Label, Readers};
+use keeper_core::agents::label::{check_sink, Label, Readers, Sink, SinkVerdict};
+use keeper_core::agents::room::holds_agent_power;
 use keeper_core::agents::session::SessionKind;
+use matrix_sdk::ruma::events::room::power_levels::RoomPowerLevels;
+use matrix_sdk::ruma::events::MessageLikeEventType;
 use matrix_sdk::ruma::{OwnedUserId, UserId};
+use serde_json::Value;
 
 /// An invite as the stripped state shows it.
 #[derive(Debug, Clone)]
@@ -29,6 +36,12 @@ pub struct Invite {
 /// An agent this host knows: homed in a drive it mounts.
 #[derive(Debug, Clone)]
 pub struct KnownAgent {
+    /// Its id in its home drive.
+    pub id: String,
+    /// Its home drive's id.
+    pub drive: String,
+    /// The name it answers to.
+    pub name: String,
     pub matrix_user: OwnedUserId,
     pub kind: AgentKind,
     /// A proxy's person.
@@ -39,6 +52,15 @@ pub struct KnownAgent {
     pub home_readers: Readers,
     /// Its opening label: its home drive's readers, its `local_only`.
     pub opening: Label,
+    /// `[tools].drives`: what a session of its may have in scope.
+    pub drives: Vec<String>,
+}
+
+impl KnownAgent {
+    /// `<drive>/<id>`, how a delegation names it (R67).
+    pub fn name_in_drive(&self) -> String {
+        format!("{}/{}", self.drive, self.id)
+    }
 }
 
 /// What a host knows when an invite arrives.
@@ -64,10 +86,14 @@ pub enum InviteDecision {
 /// when the inviter is:
 /// - **(a)** the `human` of the invited proxy, hosted here — a new proxy
 ///   conversation;
-/// - **(b)** the user of an agent homed in a drive this host mounts, when the
-///   invited agent's opening label may reach that agent's home readers;
+/// - **(b)** the user of an agent homed in a drive this host mounts, when
+///   `check_sink(Room)` lets the invited agent's opening label reach that
+///   agent's audience — a delegation;
 /// - **(c)** the `proxy` of a `[[trust]]` entry that is pinned (it has a
-///   `master_key`) and whose person reads the invited agent's home drive.
+///   `master_key`) and whose person reads the invited agent's home drive,
+///   when `check_sink(Room)` lets the opening label reach that person.
+///
+/// The desktop has no `[[trust]]`, so there only (a) and (b) join (R63).
 pub fn invite_decision(invite: &Invite, known: &Known) -> InviteDecision {
     if invite.room_type.as_deref() != Some(SESSION_ROOM_TYPE) {
         return InviteDecision::Pending;
@@ -79,15 +105,24 @@ pub fn invite_decision(invite: &Invite, known: &Known) -> InviteDecision {
     else {
         return InviteDecision::Pending;
     };
+    let reaches = |sink: Sink| check_sink(&invited.opening, &sink) == SinkVerdict::Allow;
     let proxy_person = invited.kind == AgentKind::Proxy
         && invited.human.as_deref() == Some(invite.inviter.as_ref());
     let mounted_agent = known.agents.iter().any(|agent| {
-        agent.matrix_user == invite.inviter && invited.opening.may_reach(&agent.home_readers)
+        agent.matrix_user == invite.inviter
+            && reaches(Sink::Room {
+                humans: BTreeSet::new(),
+                agent_audiences: vec![agent.home_readers.clone()],
+            })
     });
     let pinned_proxy = known.trust.iter().any(|trust| {
         trust.master_key.is_some()
             && trust.proxy.as_deref() == Some(invite.inviter.as_ref())
             && reads(&invited.home_readers, &trust.user)
+            && reaches(Sink::Room {
+                humans: BTreeSet::from([trust.user.clone()]),
+                agent_audiences: Vec::new(),
+            })
     });
     if proxy_person || mounted_agent || pinned_proxy {
         InviteDecision::Join
@@ -101,6 +136,133 @@ fn reads(readers: &Readers, user: &UserId) -> bool {
         Readers::Anyone => true,
         Readers::Only(set) => set.contains(user),
     }
+}
+
+/// What a host reads of the room a brief arrived in, as the room is now.
+#[derive(Debug, Clone)]
+pub struct BriefRoom {
+    /// The `m.room.create` `type`.
+    pub room_type: Option<String>,
+    /// Who made the room.
+    pub creators: Vec<OwnedUserId>,
+    /// Its `m.room.power_levels`; `None` when they could not be read.
+    pub levels: Option<RoomPowerLevels>,
+    /// Who is in it, or invited.
+    pub members: BTreeSet<OwnedUserId>,
+}
+
+/// A brief's event, decrypted.
+#[derive(Debug, Clone, Copy)]
+pub struct BriefEvent<'a> {
+    pub event_type: &'a str,
+    pub sender: &'a UserId,
+    pub content: &'a Value,
+    /// Whether its sender's own device sealed it (R30).
+    pub sealed: bool,
+}
+
+/// An event that is not an `m.text` message carrying a delegation, or is
+/// an edit of one.
+pub const NOT_A_BRIEF: &str = "a brief is an m.text message carrying a delegation, never an edit";
+/// A brief its sender's device did not seal.
+pub const UNSEALED_BRIEF: &str = "a brief its sender's device did not seal is not taken";
+/// A room that is not a delegated session's.
+pub const NOT_A_DELEGATED_ROOM: &str = "a brief is taken only in a delegated session's room";
+/// A sender who did not make the room, or a brief naming another sender.
+pub const NOT_THE_CREATOR: &str =
+    "a brief is taken only from the agent that made its room, in its own name";
+/// A sender who is no agent this host knows and no pinned proxy.
+pub const NOT_AN_AGENT: &str =
+    "a brief is taken only from an agent this host knows or a pinned person's proxy";
+/// A sender below an agent's power in the room now.
+pub const NO_AGENT_POWER: &str = "a brief is taken only from a sender at an agent's power";
+/// A brief for another agent.
+pub const NOT_ADDRESSED: &str = "a brief is taken only by the agent it is for";
+/// A brief whose label does not reach this agent's audience and the room's
+/// people.
+pub const BEYOND_THE_LABEL: &str =
+    "a brief whose label does not reach this agent's audience and the room's people is not taken";
+
+/// The one test a brief passes before anything acts on it (R93): the live
+/// intake, the read-back after a restart, and the session that serves it.
+///
+/// The event is an `m.room.message` (`m.text`, not an edit) its sender's
+/// device sealed. The room is a delegated session's — session-typed, and a
+/// person may not send a message in clear there, as they may in a proxy's
+/// own rooms. Its sender made the room and names itself as `from`
+/// ([`trusted_brief`], the rule a person's devices read a brief by too); on
+/// a host it is also an agent this host knows or the `proxy` of a pinned
+/// `[[trust]]` person, and holds an agent's power there now — a creator
+/// demoted since has none. The brief is addressed to `me`, and its label
+/// reaches `me`'s audience and every other person in the room.
+pub fn admit_brief(
+    room: &BriefRoom,
+    event: &BriefEvent<'_>,
+    me: &UserId,
+    known: &Known,
+) -> Result<DelegateContent, &'static str> {
+    let content = event.content;
+    if event.event_type != "m.room.message"
+        || content["msgtype"] != "m.text"
+        || content["m.relates_to"]["rel_type"] == "m.replace"
+    {
+        return Err(NOT_A_BRIEF);
+    }
+    if !event.sealed {
+        return Err(UNSEALED_BRIEF);
+    }
+    let levels = room.levels.as_ref();
+    let delegated = room.room_type.as_deref() == Some(SESSION_ROOM_TYPE)
+        && levels.is_some_and(|levels| {
+            levels.for_message(MessageLikeEventType::RoomMessage) > levels.users_default
+        });
+    if !delegated {
+        return Err(NOT_A_DELEGATED_ROOM);
+    }
+    let sender = event.sender;
+    let brief = trusted_brief(content, sender, &room.creators).ok_or_else(|| {
+        if read_brief(content).is_some() {
+            NOT_THE_CREATOR
+        } else {
+            NOT_A_BRIEF
+        }
+    })?;
+    let is = |user: &UserId, other: &UserId| user.as_str() == other.as_str();
+    let agent = known
+        .agents
+        .iter()
+        .any(|agent| is(&agent.matrix_user, sender))
+        || known.trust.iter().any(|trust| {
+            trust.master_key.is_some() && trust.proxy.as_deref().is_some_and(|p| is(p, sender))
+        });
+    if !agent {
+        return Err(NOT_AN_AGENT);
+    }
+    if !holds_agent_power(levels, sender) {
+        return Err(NO_AGENT_POWER);
+    }
+    if !is(&brief.to, me) {
+        return Err(NOT_ADDRESSED);
+    }
+    let target = known
+        .agents
+        .iter()
+        .find(|agent| is(&agent.matrix_user, me))
+        .ok_or(NOT_ADDRESSED)?;
+    let people = room
+        .members
+        .iter()
+        .filter(|member| !is(member, sender) && !is(member, me))
+        .cloned()
+        .collect();
+    let sink = Sink::Delegation {
+        target_audience: target.home_readers.clone(),
+        room_members: people,
+    };
+    if check_sink(&brief.label, &sink) != SinkVerdict::Allow {
+        return Err(BEYOND_THE_LABEL);
+    }
+    Ok(brief)
 }
 
 /// What arrived in a served session's room.
@@ -128,6 +290,15 @@ pub enum Arrival {
         /// As for a scope (R47).
         owner_signed: bool,
     },
+    /// A brief: an `m.room.message` carrying `dev.keeper.agent.delegate`
+    /// (R53), the first round of a delegation or a later one (R49).
+    Brief,
+    /// The target agent joined a room this session delegated into: routed
+    /// here from that room by the host (R55).
+    Joined,
+    /// The target agent's reply in a room this session delegated into,
+    /// routed here the same way.
+    Replied,
     /// Any other `dev.keeper.agent.*` event: a status, a turn reference, a
     /// claim.
     AgentEvent,
@@ -144,6 +315,8 @@ pub enum Disposition {
     Scope,
     /// The proxy's person asked, in its DM, for a new conversation.
     NewConversation,
+    /// A delegation this session made moved: its target joined or replied.
+    Delegation,
     /// Neither: not logged, not a turn. The sentence is the host's own note.
     Ignored(&'static str),
 }
@@ -155,6 +328,8 @@ pub struct Served<'a> {
     pub human: Option<&'a UserId>,
     pub session_kind: SessionKind,
     pub agent_user: &'a UserId,
+    /// Who asked for the session: a delegated one's delegating agent.
+    pub requester: &'a UserId,
     /// The session's readers (its label's).
     pub readers: &'a Readers,
 }
@@ -182,6 +357,10 @@ pub const NOT_THE_DM: &str = "a new conversation is asked for in the proxy's DM"
 /// sign (R47).
 pub const UNSIGNED_DEVICE: &str =
     "a scope or a new conversation counts only from a device its owner's identity signed";
+/// A brief from anyone but the delegating agent, or outside a delegated
+/// session.
+pub const NOT_THE_REQUESTER: &str =
+    "a brief is a turn only in a delegated session, from the agent that delegated it";
 
 /// Whether `sender`'s arrival becomes a turn, a decision, a scope, a new
 /// conversation, or nothing (AD-380, R30). Text becomes a turn only in a
@@ -210,6 +389,16 @@ pub fn classify(served: &Served<'_>, sender: &UserId, arrival: Arrival) -> Dispo
         );
     match arrival {
         Arrival::Edit | Arrival::AgentEvent => Disposition::Ignored(FORGED),
+        Arrival::Brief => {
+            if served.session_kind == SessionKind::Delegated && sender == served.requester {
+                Disposition::Turn
+            } else {
+                Disposition::Ignored(NOT_THE_REQUESTER)
+            }
+        }
+        // Made only by this host, from the room the session delegated into;
+        // the worker checks the sender against the delegation it made.
+        Arrival::Joined | Arrival::Replied => Disposition::Delegation,
         Arrival::Scope { owner_signed } | Arrival::ConversationRequest { owner_signed } => {
             let asks_conversation = matches!(arrival, Arrival::ConversationRequest { .. });
             if !conversation {
@@ -269,6 +458,14 @@ mod tests {
         hosted: bool,
     ) -> KnownAgent {
         KnownAgent {
+            id: id
+                .trim_start_matches('@')
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .to_owned(),
+            drive: "tgdrive".to_owned(),
+            name: id.to_owned(),
             matrix_user: user(id),
             kind,
             human: human.map(user),
@@ -279,6 +476,7 @@ mod tests {
                 integrity: Integrity::Owner,
                 local_only: false,
             },
+            drives: vec!["tgdrive".to_owned()],
         }
     }
 
@@ -407,6 +605,46 @@ mod tests {
             ),
             InviteDecision::Pending
         );
+
+        // 92.1 acceptance 11: a delegation's room. On Dr Lucyna Novak's host,
+        // which mounts neither tgdrive nor Nixi's home, Nixi's invite joins
+        // only while tgorka is pinned there with `proxy = "@nixi:…"`.
+        let lucyna = || agent(LUCYNA, AgentKind::Steward, None, &[TGORKA, MARTA], true);
+        let nixi_invites = invite("@nixi:example.org", LUCYNA, true);
+        let pinned_for_nixi = Known {
+            agents: vec![lucyna()],
+            trust: vec![trust(TGORKA, "@nixi:example.org", true)],
+        };
+        assert_eq!(
+            invite_decision(&nixi_invites, &pinned_for_nixi),
+            InviteDecision::Join
+        );
+        for unpinned in [
+            trust(TGORKA, "@nixi:example.org", false),
+            TrustEntry {
+                proxy: None,
+                ..trust(TGORKA, "@nixi:example.org", true)
+            },
+        ] {
+            let known = Known {
+                agents: vec![lucyna()],
+                trust: vec![unpinned.clone()],
+            };
+            assert_eq!(
+                invite_decision(&nixi_invites, &known),
+                InviteDecision::Pending,
+                "{unpinned:?}"
+            );
+        }
+        // A session-typed room from someone this host does not know stays
+        // pending, however it is shaped.
+        assert_eq!(
+            invite_decision(
+                &invite("@stranger:example.org", LUCYNA, true),
+                &pinned_for_nixi
+            ),
+            InviteDecision::Pending
+        );
     }
 
     fn served<'a>(
@@ -421,8 +659,46 @@ mod tests {
             human,
             session_kind: session,
             agent_user: agent,
+            requester: human.unwrap_or(agent),
             readers,
         }
+    }
+
+    /// R53: a brief is a turn only in a delegated session and only from the
+    /// agent that delegated it — never from an observer, nor in any other
+    /// session.
+    #[test]
+    fn a_brief_is_a_turn_only_from_the_delegating_agent() {
+        let nixi = user("@nixi:example.org");
+        let tola = user("@tola:example.org");
+        let tgorka = user(TGORKA);
+        let room = readers(&[TGORKA]);
+        let delegated = Served {
+            requester: &nixi,
+            ..served(
+                AgentKind::Steward,
+                None,
+                SessionKind::Delegated,
+                &tola,
+                &room,
+            )
+        };
+        assert_eq!(
+            classify(&delegated, &nixi, Arrival::Brief),
+            Disposition::Turn
+        );
+        assert_eq!(
+            classify(&delegated, &tgorka, Arrival::Brief),
+            Disposition::Ignored(NOT_THE_REQUESTER)
+        );
+        let main = Served {
+            requester: &nixi,
+            ..served(AgentKind::Steward, None, SessionKind::Main, &tola, &room)
+        };
+        assert_eq!(
+            classify(&main, &nixi, Arrival::Brief),
+            Disposition::Ignored(NOT_THE_REQUESTER)
+        );
     }
 
     #[test]
@@ -628,4 +904,230 @@ mod tests {
             );
         }
     }
+
+    /// A room's power levels as `events::power_levels` makes them for
+    /// `kind`, `creator` at 100 and `agents` at 50, with `changes` applied.
+    fn levels_of(
+        kind: SessionKind,
+        creator: &UserId,
+        agents: &[OwnedUserId],
+        changes: impl FnOnce(&mut Value),
+    ) -> RoomPowerLevels {
+        use matrix_sdk::ruma::events::room::power_levels::RoomPowerLevelsEventContent;
+        use matrix_sdk::ruma::room_version_rules::AuthorizationRules;
+        let mut json = keeper_core::agents::events::power_levels(kind, creator, agents);
+        changes(&mut json);
+        let content: RoomPowerLevelsEventContent = serde_json::from_value(json).expect("levels");
+        RoomPowerLevels::new(
+            content.into(),
+            &AuthorizationRules::V1,
+            Vec::<OwnedUserId>::new(),
+        )
+    }
+
+    /// R93: the one admission test a brief passes — live, after a restart,
+    /// and in the session that serves it. Only a sealed `m.text` from the
+    /// room's creator, a known agent still at an agent's power, addressed to
+    /// this agent in a delegated room under a label that reaches its audience
+    /// and the room's people, is a brief.
+    #[test]
+    fn a_brief_is_admitted_only_from_the_delegating_agent_in_its_room() {
+        use keeper_core::agents::delegation::{
+            brief_content, DelegateContent, DelegateFrom, DelegateLimits,
+        };
+        use keeper_core::agents::events::CONTENT_VERSION;
+
+        let known = known(vec![trust(MARTA, "@mira:example.org", true)]);
+        let (tola, amelia, tgorka) = (
+            user("@tola:example.org"),
+            user("@amelia:example.org"),
+            user(TGORKA),
+        );
+        let delegation = |from: &OwnedUserId, readers_: &[&str]| DelegateContent {
+            v: CONTENT_VERSION,
+            id: ulid::Ulid::new().to_string(),
+            from: DelegateFrom {
+                agent: from.clone(),
+                drive: "tgdrive".to_owned(),
+                session: "active/2026-10-04-triage".to_owned(),
+                room: "!parent:example.org".try_into().expect("room"),
+            },
+            to: amelia.clone(),
+            brief: "Sort the inbox.".to_owned(),
+            drives: vec!["tgdrive".to_owned()],
+            label: Label {
+                readers: readers(readers_),
+                integrity: Integrity::Agent,
+                local_only: false,
+            },
+            hop: 1,
+            limits: DelegateLimits {
+                rounds_per_exchange: 3,
+                tokens: 1000,
+            },
+            card: None,
+            dispatch_chain: Vec::new(),
+        };
+        let room_by = |creator: &OwnedUserId, levels: RoomPowerLevels| BriefRoom {
+            room_type: Some(SESSION_ROOM_TYPE.to_owned()),
+            creators: vec![creator.clone()],
+            levels: Some(levels),
+            members: BTreeSet::from([creator.clone(), amelia.clone(), tgorka.clone()]),
+        };
+        let delegated = |creator: &OwnedUserId| {
+            levels_of(
+                SessionKind::Delegated,
+                creator,
+                std::slice::from_ref(&amelia),
+                |_| {},
+            )
+        };
+        let room = room_by(&tola, delegated(&tola));
+        let genuine = brief_content(&delegation(&tola, &[TGORKA]));
+        let admit = |room: &BriefRoom, sender: &OwnedUserId, content: &Value, kind: &str| {
+            admit_brief(
+                room,
+                &BriefEvent {
+                    event_type: kind,
+                    sender,
+                    content,
+                    sealed: true,
+                },
+                &amelia,
+                &known,
+            )
+        };
+        assert!(admit(&room, &tola, &genuine, "m.room.message").is_ok());
+
+        // The shape: a custom event, an edit, a notice, an unsealed message.
+        assert_eq!(
+            admit(&room, &tola, &genuine, DELEGATE_EVENT).err(),
+            Some(NOT_A_BRIEF)
+        );
+        let mut edit = genuine.clone();
+        edit["m.relates_to"] =
+            serde_json::json!({"rel_type": "m.replace", "event_id": "$a:example.org"});
+        assert_eq!(
+            admit(&room, &tola, &edit, "m.room.message").err(),
+            Some(NOT_A_BRIEF)
+        );
+        let mut notice = genuine.clone();
+        notice["msgtype"] = serde_json::json!("m.notice");
+        assert_eq!(
+            admit(&room, &tola, &notice, "m.room.message").err(),
+            Some(NOT_A_BRIEF)
+        );
+        let unsealed = admit_brief(
+            &room,
+            &BriefEvent {
+                event_type: "m.room.message",
+                sender: &tola,
+                content: &genuine,
+                sealed: false,
+            },
+            &amelia,
+            &known,
+        );
+        assert_eq!(unsealed.err(), Some(UNSEALED_BRIEF));
+
+        // A person makes a session-typed room, grants the agent power and
+        // hands work on as themselves.
+        let by_person = room_by(
+            &tgorka,
+            levels_of(
+                SessionKind::Delegated,
+                &tgorka,
+                std::slice::from_ref(&amelia),
+                |_| {},
+            ),
+        );
+        let from_person = brief_content(&delegation(&tgorka, &[TGORKA]));
+        assert_eq!(
+            admit(&by_person, &tgorka, &from_person, "m.room.message").err(),
+            Some(NOT_AN_AGENT)
+        );
+        // ... and a known agent who did not make the room.
+        assert_eq!(
+            admit(&by_person, &tola, &genuine, "m.room.message").err(),
+            Some(NOT_THE_CREATOR)
+        );
+        // The creator demoted since: no agent's power now.
+        let demoted = room_by(
+            &tola,
+            levels_of(
+                SessionKind::Delegated,
+                &tola,
+                std::slice::from_ref(&amelia),
+                |json| json["users"][tola.as_str()] = serde_json::json!(0),
+            ),
+        );
+        assert_eq!(
+            admit(&demoted, &tola, &genuine, "m.room.message").err(),
+            Some(NO_AGENT_POWER)
+        );
+        // A proxy's own room, where a person may message in clear, and a
+        // room of no session type.
+        let conversation = room_by(
+            &tola,
+            levels_of(
+                SessionKind::Conversation,
+                &tola,
+                std::slice::from_ref(&amelia),
+                |_| {},
+            ),
+        );
+        assert_eq!(
+            admit(&conversation, &tola, &genuine, "m.room.message").err(),
+            Some(NOT_A_DELEGATED_ROOM)
+        );
+        let untyped = BriefRoom {
+            room_type: None,
+            ..room.clone()
+        };
+        assert_eq!(
+            admit(&untyped, &tola, &genuine, "m.room.message").err(),
+            Some(NOT_A_DELEGATED_ROOM)
+        );
+        // Addressed to someone else, naming another sender, or of a version
+        // this build does not read.
+        let mut elsewhere = delegation(&tola, &[TGORKA]);
+        elsewhere.to = user("@nixi:example.org");
+        assert_eq!(
+            admit(&room, &tola, &brief_content(&elsewhere), "m.room.message").err(),
+            Some(NOT_ADDRESSED)
+        );
+        let as_lena = brief_content(&delegation(&user("@lena:example.org"), &[TGORKA]));
+        assert_eq!(
+            admit(&room, &tola, &as_lena, "m.room.message").err(),
+            Some(NOT_THE_CREATOR)
+        );
+        let mut later = genuine.clone();
+        later[DELEGATE_EVENT]["v"] = serde_json::json!(99);
+        assert_eq!(
+            admit(&room, &tola, &later, "m.room.message").err(),
+            Some(NOT_A_BRIEF)
+        );
+        // A label narrower than the audience, or a person in the room it
+        // does not reach.
+        let narrow = brief_content(&delegation(&tola, &[]));
+        assert_eq!(
+            admit(&room, &tola, &narrow, "m.room.message").err(),
+            Some(BEYOND_THE_LABEL)
+        );
+        let mut watched = room.clone();
+        watched.members.insert(user(MARTA));
+        assert_eq!(
+            admit(&watched, &tola, &genuine, "m.room.message").err(),
+            Some(BEYOND_THE_LABEL)
+        );
+
+        // A pinned person's proxy is an agent here, though no drive this
+        // host mounts homes it.
+        let mira = user("@mira:example.org");
+        let by_mira = room_by(&mira, delegated(&mira));
+        let from_mira = brief_content(&delegation(&mira, &[TGORKA]));
+        assert!(admit(&by_mira, &mira, &from_mira, "m.room.message").is_ok());
+    }
+
+    const DELEGATE_EVENT: &str = keeper_core::agents::events::DELEGATE;
 }

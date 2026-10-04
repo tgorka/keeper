@@ -29,6 +29,7 @@
 //! - [`seed`] writes an agents zone's seed and a new agent, never over a
 //!   file, and makes a proxy's DM with its `main` session.
 //! - [`surface`] names a note the person looks at by its drive.
+//! - [`delegate`] hands work to another agent and answers a delegation.
 
 // matrix-sdk's sync future is deep enough to need it, as in keeper-core.
 #![recursion_limit = "256"]
@@ -36,6 +37,7 @@
 pub mod agent;
 pub mod approval;
 pub mod claims;
+pub mod delegate;
 #[cfg(unix)]
 pub mod desktop;
 pub mod drive;

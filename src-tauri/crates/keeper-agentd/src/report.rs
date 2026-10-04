@@ -106,7 +106,10 @@ fn tools(home: &AgentHome) -> (Vec<&str>, Vec<&str>) {
         .allow
         .iter()
         .map(String::as_str)
-        .partition(|name| ToolName::ALL.iter().any(|tool| tool.as_wire() == *name))
+        .partition(|name| {
+            keeper_agent::delegate::is_delegation(name)
+                || ToolName::ALL.iter().any(|tool| tool.as_wire() == *name)
+        })
 }
 
 /// `status`. With `--session`, `probe: false` composes without asking the

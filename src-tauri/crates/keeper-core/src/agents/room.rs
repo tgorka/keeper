@@ -708,8 +708,9 @@ impl AgentKinds {
     }
 }
 
-/// Whether `user` holds an agent's power under `levels`.
-pub(crate) fn holds_agent_power(levels: Option<&RoomPowerLevels>, user: &UserId) -> bool {
+/// Whether `user` holds an agent's power under `levels`: what a host asks
+/// of an agent's event, a brief included (R53).
+pub fn holds_agent_power(levels: Option<&RoomPowerLevels>, user: &UserId) -> bool {
     levels.is_some_and(|levels| levels.for_user(user) >= Int::from(AGENT_POWER as i32))
 }
 

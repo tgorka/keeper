@@ -112,12 +112,20 @@ fn user_text(body: &UserBody) -> String {
     text
 }
 
-/// Another agent's text, then the question it asks, under the ask's id.
+/// Another agent's message, as data: who sent it, its text, the files it
+/// hands over one per line, then the question it asks under the ask's id.
 fn peer_text(body: &PeerBody) -> String {
-    match &body.ask {
-        None => body.text.clone(),
-        Some(ask) => format!("{}\n\nQuestion {}: {}", body.text, ask.id, ask.question),
+    let mut text = format!("From {}:\n{}", body.sender, body.text);
+    if let Some(files) = body.artifacts.as_ref().filter(|files| !files.is_empty()) {
+        text.push_str("\n\nFiles handed over:");
+        for file in files {
+            text.push_str(&format!("\n- {file}"));
+        }
     }
+    if let Some(ask) = &body.ask {
+        text.push_str(&format!("\n\nQuestion {}: {}", ask.id, ask.question));
+    }
+    text
 }
 
 /// One replayed message and the line that made it.

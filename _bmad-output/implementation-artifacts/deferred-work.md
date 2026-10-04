@@ -7597,6 +7597,20 @@ location: `src-tauri/crates/keeper-agent/src/claims.rs` (a conflicted session is
 reason: When two hosts both acquired one epoch with different claim events (a race the settle makes unlikely, not impossible), the log holds two truths, replay refuses it, and no host serves the session. Its status anchor says so, and `docs/agents.md` tells a person to move the losing host's chunks of that epoch out of `log/` and commit. There is no button, because choosing which host's lines are the truth is the person's call and a wrong choice discards work. Revisit when a conflict happens in practice: a Settings › Agents action that shows both hosts' lines of the epoch side by side and moves the unchosen chunks to `log/conflicted/` in one commit.
 status: open
 
+### DW-435: A delegated session made by a host that stops before it pushes can be made again elsewhere.
+
+origin: story 92.1 review fixes (rung `agents-92-delegate`, 2026-10-04; ruling R95)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`HostRuntime::make_delegated`), `src-tauri/crates/keeper-agent/src/sessions/verbs.rs` (`create_with`'s local `taken_names`)
+reason: The placed host takes the child room's claim keyed by the opening's server time before it makes the folder and hands it back after, so two hosts never both make it while either is up, and both would date it the same. If the maker stops before its commit reaches the other host and stays down past the claim's TTL after its session claim replaced the creation claim, the other host can make the folder again; a local name collision can also give the second folder another name. Revisit when a synced folder can be awaited: record the creation in the room (a state event naming the session path) and make a second host wait for that path to arrive rather than make it.
+status: open
+
+### DW-434: On the Mac, an invite from another principal's proxy (invite arm (c)) stays pending.
+
+origin: ruling R63 (coordinator, 2026-10-04; codemap Q16), story 92.1
+location: `src-tauri/crates/keeper-agent/src/rooms.rs` (`invite_decision`, arm (c)), `src-tauri/crates/keeper-agent/src/desktop.rs` (`known_with(Vec::new(), …)`: the desktop has no `[[trust]]`)
+reason: Arm (c) joins a delegation's room when the inviter is the `proxy` of a pinned `[[trust]]` person who reads the invited agent's home — how Nixi's released hand-off reaches Dr Lucyna Novak's host, which never mounts tgdrive. Only `keeper-agentd` has `[[trust]]`; the epic's "a proxy the desktop hosts for the signed-in person" is not built, so on a Mac only arms (a) and (b) join, and a cross-principal hand-off reaches agentd only. Revisit when a Mac should take such hand-offs: derive the desktop's trust from the signed-in person's own verified cross-signing identity and their proxy's `agent.toml`, pinned as `[[trust]]` is.
+status: open
+
 ### DW-440: A person adopts an agent's skill by editing its file; keeper has no adopt action.
 
 origin: epic 95's amendment, 2026-10-02 (story 95.2, Q5; R28 S-12)

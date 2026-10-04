@@ -519,6 +519,7 @@ mod dm {
             needs: None,
             pin: None,
             hop: 0,
+            dispatch_chain: vec![human.to_owned(), proxy.matrix_user.clone()],
             limits: None,
             workflow: None,
             created_at: now.with_timezone(&chrono::Utc),

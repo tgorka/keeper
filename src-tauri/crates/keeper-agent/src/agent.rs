@@ -24,7 +24,7 @@
 //! final `assistant` line naming the anchor its answer edited — or an `error`
 //! line when the turn could not finish.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -32,22 +32,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, FixedOffset};
+use keeper_core::agents::card::Run;
+use keeper_core::agents::delegation::{read_brief, BoundReached, Limits as DelegationLimits};
 use keeper_core::agents::drive::DriveDecl;
 use keeper_core::agents::events::{
     edit_content, ConversationRequestContent, Focus, RunState, ScopeContent, ScopeDrive,
-    StatusContent, CONTENT_VERSION, SCOPE, STATUS, TURN,
+    StatusContent, ARTIFACTS, CONTENT_VERSION, SCOPE, STATUS, TURN,
 };
 use keeper_core::agents::focus::FOCUS_TTL;
 use keeper_core::agents::home::{serves_local_models, MenuItem};
 use keeper_core::agents::label::{
-    label_drive_read, label_person_message, okf_label_facts, Author, Label, LabelBody, LabelCause,
-    LabelCauseKind, ReadFacts,
+    check_sink, label_drive_read, label_person_message, okf_label_facts, Author, Integrity, Label,
+    LabelBody, LabelCause, LabelCauseKind, ReadFacts, Sink, SinkVerdict,
 };
 use keeper_core::agents::log::reader::{hydrate_blob, read_session};
 use keeper_core::agents::log::replay::{message_for, ReplayRefusal};
 use keeper_core::agents::log::{
-    ApprovalBody, ApprovalState, AssistantBody, ErrorBody, HostSlug, LineBody, LogLine, OpenBody,
-    ScopeBody, ToolCallBody, ToolOutcomeWord, ToolResultBody, Truncated, Usage, UserBody,
+    ApprovalBody, ApprovalState, AssistantBody, ChildSession, DelegateBody, DelegateReply,
+    DelegateState, ErrorBody, HostSlug, LineBody, LogLine, OpenBody, PeerBody, RunBody, ScopeBody,
+    ToolCallBody, ToolOutcomeWord, ToolResultBody, Truncated, Usage, UserBody,
 };
 use keeper_core::agents::matrix::AgentMatrixError;
 use keeper_core::agents::memory::{self, MemorySnapshot};
@@ -75,6 +78,7 @@ use tokio::time::Instant;
 use ulid::Ulid;
 
 use crate::claims::Lease;
+use crate::delegate::{self, DelegateTools, Delegation, DelegationPort, Delegator, TurnView};
 use crate::drive::finish_word;
 use crate::grants::AgentGrants;
 use crate::host::HostIds;
@@ -83,7 +87,7 @@ use crate::matrix_sink::{
     StatusBoard, ToolProgress,
 };
 use crate::ports::ProfileSource;
-use crate::rooms::{self, Arrival, Disposition, Served};
+use crate::rooms::{self, Arrival, BriefEvent, Disposition, Served};
 use crate::sessions::verbs::{self, CreateOutcome};
 use crate::sessions::write::session_write;
 use crate::turn::{arm_turn_probing, endpoint_of, read_timeout_of, TurnEnv, TurnOrigin};
@@ -192,10 +196,29 @@ pub struct SessionContext {
     /// so a session's prompt changes only when what it says changes, and
     /// `status --session` recomposes exactly what the model was told.
     pub frame_time: DateTime<FixedOffset>,
-    /// A `user` line no `assistant` or `error` line answered yet.
+    /// A `user` or `peer` line no `assistant` or `error` line answered yet.
     pub unanswered: Option<Ulid>,
     /// The session's status anchor in its room, once there is one.
     pub status_anchor: Option<OwnedEventId>,
+    /// The delegations this session made, by id (R55).
+    pub delegations: BTreeMap<String, Delegation>,
+    /// Each `delegate` call's arguments, by its `tool_call` line, until its
+    /// `delegate opened` line names it.
+    delegate_calls: HashMap<Ulid, String>,
+    /// Tokens every `assistant` line reports, summed: what a delegated
+    /// session has spent of its budget.
+    pub tokens_spent: u64,
+    /// Messages from the delegating agent since this session's last reply:
+    /// the rounds of the exchange under way (Q12). Only a reply that went
+    /// out — this session's own `delegate replied` line — closes it.
+    pub exchange_rounds: u32,
+    /// Whether this delegated session logged `delegate accepted`.
+    pub accepted: bool,
+    /// The last `run` line's state.
+    pub run: Option<keeper_core::agents::log::RunState>,
+    /// A delegation's reply whose receipt is logged and whose `peer` line
+    /// is not: the receipt's line, its event, and the receipt.
+    reply_unpeered: Option<(Ulid, Option<OwnedEventId>, DelegateBody)>,
 }
 
 impl SessionContext {
@@ -242,6 +265,13 @@ impl SessionContext {
             frame_time: opened_at,
             unanswered: None,
             status_anchor: None,
+            delegations: BTreeMap::new(),
+            delegate_calls: HashMap::new(),
+            tokens_spent: 0,
+            exchange_rounds: 0,
+            accepted: false,
+            run: None,
+            reply_unpeered: None,
         };
         for stored in &log.lines {
             match &stored.body {
@@ -273,6 +303,7 @@ impl SessionContext {
     pub fn push(&mut self, line: &LogLine) {
         let position = self.lines.len();
         self.lines.push(line.id);
+        self.keep(line);
         match &line.body {
             // A label line holds the label after its join.
             LineBody::Label(body) => self.label = body.label(),
@@ -284,7 +315,7 @@ impl SessionContext {
                 self.open = Some(body.clone());
                 self.frame_time = line.ts.with_timezone(&chrono::Local).fixed_offset();
             }
-            LineBody::User(_) => self.unanswered = Some(line.id),
+            LineBody::User(_) | LineBody::Peer(_) => self.unanswered = Some(line.id),
             // A round that called tools is the middle of a turn (C6): a crash
             // after it still leaves the person's question unanswered.
             LineBody::Assistant(body) if body.finish == ROUND_FINISH => {}
@@ -335,6 +366,112 @@ impl SessionContext {
             self.messages.push(message);
             self.placed.push((line.id, position));
         }
+    }
+
+    /// What a line changes beyond the conversation: the budget, the
+    /// exchange, the delegations, the run.
+    fn keep(&mut self, line: &LogLine) {
+        match &line.body {
+            LineBody::Assistant(body) => {
+                let used = |n: Option<u32>| u64::from(n.unwrap_or(0));
+                self.tokens_spent += used(body.usage.prompt) + used(body.usage.completion);
+            }
+            LineBody::ToolCall(call) if call.tool == delegate::DELEGATE => {
+                self.delegate_calls.insert(line.id, call.args.clone());
+            }
+            LineBody::Peer(peer) => {
+                if peer.sender == self.agent.requested_by {
+                    self.exchange_rounds += 1;
+                }
+                self.reply_unpeered = None;
+            }
+            LineBody::Run(run) => self.run = Some(run.state),
+            LineBody::Delegate(body) => match body.state {
+                DelegateState::Opened => {
+                    let (Some(room), Ok(to)) =
+                        (&body.room, OwnedUserId::try_from(body.to.as_str()))
+                    else {
+                        return;
+                    };
+                    let args = line
+                        .parent
+                        .and_then(|call| self.delegate_calls.remove(&call));
+                    self.delegations.insert(
+                        body.id.clone(),
+                        Delegation {
+                            id: body.id.clone(),
+                            to,
+                            room: room.clone(),
+                            args,
+                            sent: false,
+                            replied: false,
+                            rounds: 0,
+                        },
+                    );
+                }
+                DelegateState::Sent => {
+                    if let Some(open) = self.delegations.get_mut(&body.id) {
+                        open.sent = true;
+                        open.replied = false;
+                        open.rounds += 1;
+                    }
+                }
+                // This session's own reply went out: its exchange is closed.
+                DelegateState::Replied if body.id == self.agent.id.to_string() => {
+                    self.exchange_rounds = 0;
+                }
+                DelegateState::Replied => {
+                    if let Some(open) = self.delegations.get_mut(&body.id) {
+                        open.replied = true;
+                        open.rounds = 0;
+                    }
+                    if body.reply.is_some() {
+                        self.reply_unpeered =
+                            Some((line.id, line.matrix_event.clone(), body.clone()));
+                    }
+                }
+                DelegateState::Accepted => self.accepted = true,
+                // A brief its label no longer lets in is never sent: the
+                // delegation is over before it began.
+                DelegateState::Refused => {
+                    if self
+                        .delegations
+                        .get(&body.id)
+                        .is_some_and(|open| !open.sent)
+                    {
+                        self.delegations.remove(&body.id);
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+
+    /// Why a brief arriving now is not a turn: this delegated session's
+    /// exchange has had its rounds, or its budget is spent (Q12).
+    pub fn exchange_closed(&self) -> Option<&'static str> {
+        let limits = self.agent.limits.as_ref()?;
+        if self.token_bound().is_some() {
+            Some(BUDGET_SPENT)
+        } else if self.exchange_rounds >= limits.rounds_per_exchange {
+            Some(ROUNDS_SPENT)
+        } else {
+            None
+        }
+    }
+
+    /// The bound a delegated session's budget reached, if it did.
+    pub fn token_bound(&self) -> Option<BoundReached> {
+        let limits = self.agent.limits.as_ref()?;
+        match DelegationLimits::of_session(limits).check(0, 0, self.tokens_spent) {
+            Err(bound @ BoundReached::Tokens { .. }) => Some(bound),
+            _ => None,
+        }
+    }
+
+    /// The delegation this session made into `room`.
+    pub fn delegation_in(&self, room: &RoomId) -> Option<&Delegation> {
+        self.delegations.values().find(|open| open.room == room)
     }
 
     /// A person's message joins the label (`label_person_message`); the new
@@ -498,14 +635,16 @@ impl AgentDeps {
 }
 
 /// A tool host that refuses any tool outside `[tools].allow`, and serves the
-/// agent's surface tools itself (R38: no ⌘9 host has them).
-struct AllowedTools {
+/// agent's surface, `delegate` and `reply` tools itself (R38: no ⌘9 host
+/// has them).
+struct AllowedTools<'t> {
     inner: Box<dyn ToolHost>,
     allow: Vec<String>,
     surface: Option<crate::surface::SurfaceTools>,
+    delegation: DelegateTools<'t>,
 }
 
-impl ToolHost for AllowedTools {
+impl ToolHost for AllowedTools<'_> {
     fn run(&self, call: &ToolCall) -> Result<ToolOutcome, BotsError> {
         let name = call.name.as_wire();
         if !self.allow.iter().any(|allowed| allowed == name) {
@@ -517,6 +656,9 @@ impl ToolHost for AllowedTools {
     }
 
     fn run_named(&self, wire: &chat::ToolCall) -> Option<ToolOutcome> {
+        if delegate::is_delegation(&wire.name) {
+            return self.delegation.run(wire);
+        }
         if !crate::surface::is_surface(&wire.name) {
             return None;
         }
@@ -529,6 +671,15 @@ impl ToolHost for AllowedTools {
     }
 }
 
+/// What a turn's own tools reach beyond the drive: the person's device,
+/// the rooms delegations go through, this session's room.
+struct TurnTools {
+    surface: Option<Arc<dyn crate::surface::SurfacePort>>,
+    delegations: Option<Arc<dyn DelegationPort>>,
+    room: Arc<dyn EditPort>,
+    from: Delegator,
+}
+
 /// One served session: its context and its writer.
 pub struct ServedSession {
     pub context: SessionContext,
@@ -539,6 +690,28 @@ pub struct ServedSession {
     /// Where the session's surface calls go (AD-383); `None`: every one is
     /// `unavailable`.
     pub surface: Option<Arc<dyn crate::surface::SurfacePort>>,
+    /// Where this session's delegations go (92.1); `None`: `delegate` is
+    /// refused, a joined target is not told and a brief is not taken.
+    pub delegations: Option<Arc<dyn DelegationPort>>,
+    /// Work on this session's delegations that failed and is tried again on
+    /// the host's clock while the worker runs: briefs a joined target has
+    /// not been sent, child rooms whose replies could not be read back.
+    retry: Retry,
+}
+
+/// What a worker tries again every [`crate::runtime::TICK`].
+#[derive(Debug, Default)]
+struct Retry {
+    /// Delegations whose joined target's brief could not be sent.
+    briefs: std::collections::BTreeSet<String>,
+    /// Delegations whose room could not be read back for a reply.
+    replies: std::collections::BTreeSet<String>,
+}
+
+impl Retry {
+    fn is_empty(&self) -> bool {
+        self.briefs.is_empty() && self.replies.is_empty()
+    }
 }
 
 /// A boxed room-creating future.
@@ -625,6 +798,56 @@ pub struct Arrived {
     /// an event served before may not have left a line (a focus, an
     /// unchanged scope), so it is served again on every start.
     pub replay: bool,
+    /// For an arrival the host routed here from another room — a target's
+    /// join or reply in a room this session delegated into — that room.
+    pub via: Option<OwnedRoomId>,
+}
+
+/// A brief whose delegation is not this session's.
+pub const NOT_THIS_DELEGATION: &str = "a brief for another delegation is not a turn here";
+/// A join or a reply no delegation of this session waits for.
+pub const NOT_A_DELEGATION: &str = "no delegation of this session waits for this";
+/// A brief that arrived after the exchange's last round, before a reply.
+pub const ROUNDS_SPENT: &str =
+    "this exchange has had its rounds; a brief is not a turn here until this session replies";
+/// A brief that arrived after the session spent its token budget.
+pub const BUDGET_SPENT: &str = "this delegation spent its token budget; a brief is not a turn here";
+/// A brief in a room this host could not read the state of.
+pub const ROOM_UNREAD: &str = "the delegated room could not be read, so the brief is not taken";
+/// A target's join whose brief could not be sent: sent again on the clock.
+pub const BRIEF_UNSENT: &str = "the brief could not be sent; it is sent again on the host's clock";
+/// A target's join whose brief the label no longer lets into the room.
+pub const BRIEF_REFUSED: &str = "the brief was not sent: the label no longer lets it into the room";
+
+/// `event` (decrypted) as the reply of `to` in the room `room` a session
+/// delegated into: an `m.room.message` from `to`, not an edit, carrying
+/// `dev.keeper.agent.artifacts` and the replying session's label (R55, R94).
+/// A reply without a label this build reads is not taken.
+pub fn reply_of(
+    event: &Value,
+    to: &UserId,
+    room: &RoomId,
+    received_at: Instant,
+) -> Option<Arrived> {
+    let content = &event["content"];
+    let reply = event["type"] == "m.room.message"
+        && event["sender"].as_str() == Some(to.as_str())
+        && content["m.relates_to"]["rel_type"] != "m.replace"
+        && content[ARTIFACTS].is_array()
+        && delegate::reply_label(content).is_some();
+    if !reply {
+        return None;
+    }
+    Some(Arrived {
+        event_id: OwnedEventId::try_from(event["event_id"].as_str()?).ok()?,
+        sender: to.to_owned(),
+        arrival: Arrival::Replied,
+        text: content["body"].as_str().unwrap_or_default().to_owned(),
+        content: content.clone(),
+        received_at,
+        replay: false,
+        via: Some(room.to_owned()),
+    })
 }
 
 /// What became of an arrival.
@@ -648,6 +871,8 @@ pub enum Outcome {
     /// A conversation session at this path: made now, or made before for
     /// the same request.
     Conversation { path: String, made: bool },
+    /// The brief of the delegation with this id went in, its target joined.
+    BriefSent(String),
 }
 
 /// How a turn ended.
@@ -659,6 +884,8 @@ pub enum TurnEnding {
     Stopped,
     /// The label stopped the model (S-04).
     LocalOnly,
+    /// A delegated session reached its token budget (92.1).
+    Bounded,
     /// The model or the log failed.
     Failed,
 }
@@ -689,6 +916,25 @@ pub struct TurnReport {
 pub enum ServeError {
     #[error(transparent)]
     Writer(#[from] WriterError),
+    /// A reply's turn opens on its logged receipt, and there was none.
+    #[error("a delegation's reply has no logged receipt to open its turn")]
+    NoReceipt,
+}
+
+/// `<drive>/<path>` of each file a reply's content hands over.
+fn handed_over(content: &Value) -> Vec<String> {
+    content[ARTIFACTS]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|file| {
+            Some(format!(
+                "{}/{}",
+                file["drive"].as_str()?,
+                file["path"].as_str()?
+            ))
+        })
+        .collect()
 }
 
 /// What a room shows of this session's last turn, read from its timeline
@@ -775,6 +1021,8 @@ impl ServedSession {
             writer,
             conversations: None,
             surface: None,
+            delegations: None,
+            retry: Retry::default(),
         })
     }
 
@@ -782,6 +1030,8 @@ impl ServedSession {
     /// again (C6). An `error` line closes it and the room is told — by an
     /// edit of the turn's anchor when `trail` found it, else by a message —
     /// and a status left `running` is set `idle`; `true` when there was one.
+    /// A delegation's reply whose receipt was logged but not its `peer` line
+    /// gets that line first, from the receipt, and is closed the same way.
     pub async fn recover(
         &mut self,
         deps: &AgentDeps,
@@ -791,6 +1041,7 @@ impl ServedSession {
         if let Some((status, _)) = &trail.status {
             self.context.status_anchor = Some(status.clone());
         }
+        self.peer_the_reply()?;
         let Some(user_line) = self.context.unanswered else {
             return Ok(false);
         };
@@ -840,7 +1091,8 @@ impl ServedSession {
     /// Serve `backlog`, then every arrival until the channel closes or `stop`
     /// fires. A stop is checked before each arrival, so a queued arrival is
     /// never started on shutdown: it stays unlogged, and the next start reads
-    /// it from the room's timeline.
+    /// it from the room's timeline. While a delegation's brief or reply
+    /// read failed, it is tried again every [`crate::runtime::TICK`].
     pub async fn serve_arrivals(
         &mut self,
         deps: &AgentDeps,
@@ -850,12 +1102,12 @@ impl ServedSession {
         mut stop: CancelSignal,
         busy: &AtomicBool,
     ) {
-        let mut backlog = backlog.into_iter();
+        let mut backlog: std::collections::VecDeque<Arrived> = backlog.into();
         loop {
             if stop.is_cancelled() {
                 return;
             }
-            let arrived = match backlog.next() {
+            let arrived = match backlog.pop_front() {
                 Some(arrived) => arrived,
                 None => tokio::select! {
                     biased;
@@ -864,6 +1116,10 @@ impl ServedSession {
                         Some(arrived) => arrived,
                         None => return,
                     },
+                    () = tokio::time::sleep(crate::runtime::TICK), if !self.retry.is_empty() => {
+                        backlog.extend(self.retry_delegations(deps).await);
+                        continue;
+                    }
                 },
             };
             let session = self.context.session.path.clone();
@@ -907,6 +1163,7 @@ impl ServedSession {
                 human: config.human.as_deref(),
                 session_kind: self.context.agent.kind,
                 agent_user: &config.matrix_user,
+                requester: &self.context.agent.requested_by,
                 readers: &self.context.label.readers,
             },
             &arrived.sender,
@@ -934,6 +1191,9 @@ impl ServedSession {
                 off_the_runtime(|| self.writer.sync())?;
                 Ok(Outcome::Decided)
             }
+            Disposition::Turn if arrived.arrival == Arrival::Brief => {
+                self.take_brief(deps, port, arrived, stop).await
+            }
             Disposition::Turn => self
                 .turn(deps, port, arrived, stop)
                 .await
@@ -942,7 +1202,366 @@ impl ServedSession {
             Disposition::NewConversation => {
                 self.new_conversation(deps, port.as_ref(), arrived).await
             }
+            Disposition::Delegation => self.delegation_moved(deps, port, arrived, stop).await,
         }
+    }
+
+    /// The session as its `delegate` and `reply` tools and its briefs name it.
+    fn delegator(&self, deps: &AgentDeps) -> Delegator {
+        let config = &deps.home.config;
+        Delegator {
+            user: config.matrix_user.clone(),
+            drive: config.drive.clone(),
+            id: self.context.agent.id.to_string(),
+            session: self.context.session.path.clone(),
+            room: self.context.agent.room.clone(),
+            kind: self.context.agent.kind,
+            requester: self.context.agent.requested_by.clone(),
+            hop: self.context.agent.hop,
+            limits: config.limits,
+            zone: deps.sessions_zone.clone(),
+            subfolder: deps.sessions_subfolder.clone(),
+            chain: keeper_core::agents::delegation::session_chain(
+                &self.context.agent,
+                &config.matrix_user,
+            ),
+        }
+    }
+
+    /// A brief from the agent that delegated this session: a turn only when
+    /// it passes the admission the live intake and the read-back after a
+    /// restart use (R93), is this session's own delegation from its parent's
+    /// room, and arrives while its exchange is open (Q12).
+    async fn take_brief(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        arrived: Arrived,
+        stop: CancelSignal,
+    ) -> Result<Outcome, ServeError> {
+        let session = self.context.session.path.clone();
+        let Some(delegations) = self.delegations.clone() else {
+            return Ok(Outcome::Ignored(ROOM_UNREAD));
+        };
+        let Some(room) = delegations.brief_room(&self.context.agent.room).await else {
+            tracing::warn!(%session, "agents: the delegated room could not be read for a brief");
+            return Ok(Outcome::Ignored(ROOM_UNREAD));
+        };
+        // `arrival_of` makes a brief only of an `m.room.message` its sender's
+        // device sealed; the content says the rest.
+        let event = BriefEvent {
+            event_type: "m.room.message",
+            sender: &arrived.sender,
+            content: &arrived.content,
+            sealed: true,
+        };
+        let brief = match rooms::admit_brief(
+            &room,
+            &event,
+            &deps.home.config.matrix_user,
+            &delegations.known(),
+        ) {
+            Ok(brief) => brief,
+            Err(note) => {
+                tracing::info!(%session, sender = %arrived.sender, note, "agents: a brief is not taken");
+                return Ok(Outcome::Ignored(note));
+            }
+        };
+        let parent = self
+            .context
+            .agent
+            .parent
+            .as_ref()
+            .map(|parent| &parent.room);
+        if brief.id != self.context.agent.id.to_string() || parent != Some(&brief.from.room) {
+            return Ok(Outcome::Ignored(NOT_THIS_DELEGATION));
+        }
+        if let Some(note) = self.context.exchange_closed() {
+            tracing::info!(%session, note, "agents: a brief is not taken");
+            return Ok(Outcome::Ignored(note));
+        }
+        self.turn(deps, port, arrived, stop)
+            .await
+            .map(Outcome::Answered)
+    }
+
+    /// A delegation this session made moved (R55): its target joined — the
+    /// brief goes in now — or replied, which is logged with what it said and
+    /// answered by a turn of this session's agent. Anyone else's event from
+    /// that room, and one for a delegation in another state, changes nothing.
+    async fn delegation_moved(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        arrived: Arrived,
+        stop: CancelSignal,
+    ) -> Result<Outcome, ServeError> {
+        let Some(open) = arrived
+            .via
+            .as_deref()
+            .and_then(|room| self.context.delegation_in(room))
+            .filter(|open| open.to == arrived.sender)
+            .cloned()
+        else {
+            return Ok(Outcome::Ignored(NOT_A_DELEGATION));
+        };
+        match arrived.arrival {
+            Arrival::Joined if !open.sent => {
+                self.send_brief(deps, &open, Some(arrived.event_id)).await
+            }
+            Arrival::Replied if open.sent && !open.replied => {
+                let Some(label) = delegate::reply_label(&arrived.content) else {
+                    return Ok(Outcome::Ignored(NOT_A_DELEGATION));
+                };
+                // The receipt carries the reply: a crash before its `peer`
+                // line loses nothing (`peer_the_reply`).
+                self.writer.write(
+                    &mut self.context,
+                    None,
+                    Some(arrived.event_id.clone()),
+                    LineBody::Delegate(DelegateBody {
+                        id: open.id.clone(),
+                        to: open.to.to_string(),
+                        room: Some(open.room.clone()),
+                        child: None,
+                        state: DelegateState::Replied,
+                        reason: None,
+                        reply: Some(DelegateReply {
+                            text: arrived.text.clone(),
+                            artifacts: handed_over(&arrived.content),
+                            label,
+                        }),
+                    }),
+                )?;
+                self.turn(deps, port, arrived, stop)
+                    .await
+                    .map(Outcome::Answered)
+            }
+            _ => Ok(Outcome::Ignored(NOT_A_DELEGATION)),
+        }
+    }
+
+    /// The `peer` line of a reply whose receipt is logged and whose line is
+    /// not, written now: the reply's label joined into the session's —
+    /// readers narrowed, `local_only` and a lower integrity kept, another
+    /// agent's words at most `agent` (R94) — then its words and its files.
+    fn peer_the_reply(&mut self) -> Result<Option<LogLine>, ServeError> {
+        let Some((receipt, event, body)) = self.context.reply_unpeered.clone() else {
+            return Ok(None);
+        };
+        let (Some(reply), Ok(sender)) = (body.reply, OwnedUserId::try_from(body.to.as_str()))
+        else {
+            return Ok(None);
+        };
+        let agent = Label {
+            integrity: Integrity::Agent,
+            ..Label::top()
+        };
+        let joined = self.context.label.join(&reply.label).join(&agent);
+        if joined != self.context.label {
+            let reference = event.map_or_else(|| receipt.to_string(), |event| event.to_string());
+            self.writer.write(
+                &mut self.context,
+                None,
+                None,
+                LineBody::Label(LabelBody::new(
+                    &joined,
+                    LabelCause {
+                        kind: LabelCauseKind::AgentMessage,
+                        reference,
+                    },
+                )),
+            )?;
+        }
+        let peer = self.writer.write(
+            &mut self.context,
+            Some(receipt),
+            None,
+            LineBody::Peer(PeerBody {
+                sender,
+                text: reply.text,
+                ask: None,
+                artifacts: (!reply.artifacts.is_empty()).then_some(reply.artifacts),
+            }),
+        )?;
+        Ok(Some(peer))
+    }
+
+    /// Send `open`'s brief, its target joined, and log `delegate sent`.
+    ///
+    /// The label as it is now must still let the brief into the room as it
+    /// is now (R94): a block is logged `delegate refused` and sends nothing,
+    /// ending the delegation. A send that fails is tried again on the
+    /// host's clock under the same transaction id.
+    async fn send_brief(
+        &mut self,
+        deps: &AgentDeps,
+        open: &Delegation,
+        join: Option<OwnedEventId>,
+    ) -> Result<Outcome, ServeError> {
+        let Some(rooms) = self.delegations.clone() else {
+            return Ok(Outcome::Ignored(NOT_A_DELEGATION));
+        };
+        let session = self.context.session.path.clone();
+        let known = rooms.known();
+        let content = match delegate::content_for(
+            open,
+            &self.delegator(deps),
+            &self.context.label,
+            &known,
+        ) {
+            Ok(content) => content,
+            Err(sentence) => {
+                tracing::warn!(%session, delegation = %open.id, %sentence, "agents: a brief could not be composed");
+                return Ok(Outcome::Ignored(NOT_A_DELEGATION));
+            }
+        };
+        let members = match rooms.members(&open.room).await {
+            Ok(members) => members,
+            Err(error) => {
+                tracing::warn!(%session, delegation = %open.id, %error, "agents: a delegation's room could not be read; its brief waits");
+                self.retry.briefs.insert(open.id.clone());
+                return Ok(Outcome::Ignored(BRIEF_UNSENT));
+            }
+        };
+        let me = deps.home.config.matrix_user.clone();
+        let checked = match delegate::audience_of(&known, &open.to) {
+            Some(audience) => {
+                delegate::check_room(&content.label, members, [&me, &open.to], vec![audience])
+            }
+            None => Err(format!("{} is no longer known on this host.", open.to)),
+        };
+        if let Err(reason) = checked {
+            self.retry.briefs.remove(&open.id);
+            self.writer.write(
+                &mut self.context,
+                None,
+                join,
+                LineBody::Delegate(DelegateBody {
+                    id: open.id.clone(),
+                    to: open.to.to_string(),
+                    room: Some(open.room.clone()),
+                    child: None,
+                    state: DelegateState::Refused,
+                    reason: Some(reason),
+                    reply: None,
+                }),
+            )?;
+            off_the_runtime(|| self.writer.sync())?;
+            return Ok(Outcome::Ignored(BRIEF_REFUSED));
+        }
+        // The delegation's id is the send's transaction: a host that sends
+        // it again — on the clock, or after a restart — sends one event.
+        let txn = matrix_sdk::ruma::OwnedTransactionId::from(open.id.as_str());
+        if let Err(error) = rooms
+            .send(
+                &open.room,
+                keeper_core::agents::delegation::brief_content(&content),
+                txn,
+            )
+            .await
+        {
+            tracing::warn!(%session, delegation = %open.id, %error, "agents: a brief could not be sent; it is sent again on the clock");
+            self.retry.briefs.insert(open.id.clone());
+            return Ok(Outcome::Ignored(BRIEF_UNSENT));
+        }
+        self.retry.briefs.remove(&open.id);
+        self.writer.write(
+            &mut self.context,
+            None,
+            join,
+            LineBody::Delegate(DelegateBody {
+                id: open.id.clone(),
+                to: open.to.to_string(),
+                room: Some(open.room.clone()),
+                child: None,
+                state: DelegateState::Sent,
+                reason: None,
+                reply: None,
+            }),
+        )?;
+        off_the_runtime(|| self.writer.sync())?;
+        Ok(Outcome::BriefSent(open.id.clone()))
+    }
+
+    /// The replies `open`'s target sent since its latest round that this
+    /// session has not logged, read back from the room; a room that could
+    /// not be read is tried again on the clock.
+    async fn read_replies(&mut self, open: &Delegation, me: &UserId) -> Vec<Arrived> {
+        let Some(rooms) = self.delegations.clone() else {
+            return Vec::new();
+        };
+        let events = match rooms.since_brief(&open.room, me).await {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::warn!(delegation = %open.id, %error, "agents: a delegation's room could not be read back; it is read again on the clock");
+                self.retry.replies.insert(open.id.clone());
+                return Vec::new();
+            }
+        };
+        self.retry.replies.remove(&open.id);
+        let now = Instant::now();
+        events
+            .iter()
+            .filter_map(|event| reply_of(event, &open.to, &open.room, now))
+            .filter(|arrived| !self.writer.seen(&arrived.event_id).unwrap_or(true))
+            .collect()
+    }
+
+    /// On a worker's start: every delegation's room is watched again —
+    /// replied ones too, since a later round's reply must come back here; a
+    /// brief whose target joined while this host was down is sent now; a
+    /// reply that came meanwhile is returned, to be served like one that
+    /// arrives (R55).
+    pub async fn resume_delegations(&mut self, deps: &AgentDeps) -> Vec<Arrived> {
+        let Some(rooms) = self.delegations.clone() else {
+            return Vec::new();
+        };
+        let me = deps.home.config.matrix_user.clone();
+        let all: Vec<Delegation> = self.context.delegations.values().cloned().collect();
+        let mut replies = Vec::new();
+        for open in all {
+            rooms.watch(&open.room, &self.context.agent.room);
+            if !open.sent {
+                if rooms.joined(&open.room, &open.to).await {
+                    if let Err(error) = self.send_brief(deps, &open, None).await {
+                        tracing::warn!(delegation = %open.id, %error, "agents: a brief could not be logged");
+                    }
+                }
+            } else if !open.replied {
+                replies.extend(self.read_replies(&open, &me).await);
+            }
+        }
+        replies
+    }
+
+    /// What failed on the delegations and waits for the clock, tried again:
+    /// unsent briefs are sent, unread rooms read back; the replies found.
+    async fn retry_delegations(&mut self, deps: &AgentDeps) -> Vec<Arrived> {
+        let me = deps.home.config.matrix_user.clone();
+        let mut replies = Vec::new();
+        for id in std::mem::take(&mut self.retry.briefs) {
+            let Some(open) = self.context.delegations.get(&id).filter(|open| !open.sent) else {
+                continue;
+            };
+            let open = open.clone();
+            if let Err(error) = self.send_brief(deps, &open, None).await {
+                tracing::warn!(delegation = %open.id, %error, "agents: a brief could not be logged");
+            }
+        }
+        for id in std::mem::take(&mut self.retry.replies) {
+            let Some(open) = self
+                .context
+                .delegations
+                .get(&id)
+                .filter(|open| open.sent && !open.replied)
+            else {
+                continue;
+            };
+            let open = open.clone();
+            replies.extend(self.read_replies(&open, &me).await);
+        }
+        replies
     }
 
     /// The person's scope event (AD-382, R41): its focus replaces the held
@@ -1103,6 +1722,7 @@ impl ServedSession {
             needs: None,
             pin: None,
             hop: 0,
+            dispatch_chain: vec![person.clone(), config.matrix_user.clone()],
             limits: None,
             workflow: None,
             created_at: chrono::Utc::now(),
@@ -1165,6 +1785,187 @@ impl ServedSession {
         Ok(Outcome::Conversation { path, made: true })
     }
 
+    /// After a turn of a delegated session: a token budget that stopped it
+    /// — at the gate before a request, or crossed by the turn's last
+    /// completion — is told to the requester as the reply (the bound and
+    /// what was spent), and the card goes `run: blocked` with the bound's
+    /// word; so does an exchange whose last round passed without a reply,
+    /// since no more message can come in it (Q12). Once blocked, nothing
+    /// more is said or written.
+    async fn after_delegated_turn(
+        &mut self,
+        deps: &AgentDeps,
+        port: &dyn EditPort,
+        bound: Option<BoundReached>,
+    ) -> Result<(), ServeError> {
+        if self.context.agent.kind != SessionKind::Delegated
+            || self.context.run == Some(keeper_core::agents::log::RunState::Blocked)
+        {
+            return Ok(());
+        }
+        let detail = match (bound, &self.context.agent.limits) {
+            (Some(bound), _) => {
+                // The host's own sentence, no word the session read: it
+                // carries the label so the delegating session takes it.
+                let told =
+                    delegate::reply_content(&bound.sentence(), Vec::new(), &self.context.label);
+                deliver(port, "m.room.message", told, Instant::now()).await;
+                bound.word()
+            }
+            (None, Some(limits)) if self.context.exchange_rounds >= limits.rounds_per_exchange => {
+                "rounds"
+            }
+            _ => return Ok(()),
+        };
+        let (zone, path) = (
+            deps.sessions_zone.clone(),
+            self.context.session.path.clone(),
+        );
+        if let Err(error) = off_the_runtime(|| delegate::set_card_run(&zone, &path, Run::Blocked)) {
+            tracing::warn!(session = %path, %error, "agents: a delegated card could not be set blocked");
+        }
+        self.writer.write(
+            &mut self.context,
+            None,
+            None,
+            LineBody::Run(RunBody {
+                state: keeper_core::agents::log::RunState::Blocked,
+                detail: Some(detail.to_owned()),
+            }),
+        )?;
+        off_the_runtime(|| self.writer.sync())?;
+        Ok(())
+    }
+
+    /// While a delegation this session opened waits for its target to join,
+    /// the session's status says so (AD-385, R29 F5).
+    async fn say_waiting(&mut self, port: &dyn EditPort, deps: &AgentDeps) {
+        let waiting: Vec<&Delegation> = self
+            .context
+            .delegations
+            .values()
+            .filter(|open| !open.sent)
+            .collect();
+        if waiting.is_empty() {
+            return;
+        }
+        let known = self.delegations.as_ref().map(|rooms| rooms.known());
+        let names: Vec<String> = waiting
+            .iter()
+            .map(|open| {
+                known
+                    .as_ref()
+                    .and_then(|known| {
+                        known
+                            .agents
+                            .iter()
+                            .find(|agent| agent.matrix_user == open.to)
+                    })
+                    .map_or_else(|| open.to.to_string(), |agent| agent.name.clone())
+            })
+            .collect();
+        let mut status = self.status_base(deps);
+        status.run = RunState::Idle;
+        status.detail = Some(format!("waiting for {} to join", names.join(", ")));
+        status.anchor = self.context.status_anchor.clone();
+        let content = serde_json::to_value(status).unwrap_or(Value::Null);
+        let (sent, _) = deliver(port, STATUS, content, Instant::now()).await;
+        self.context.status_anchor.get_or_insert(sent);
+    }
+
+    /// The lines that open a turn, and the one its answer answers: for a
+    /// person's message, its label join and a `user` line; for a brief, the
+    /// session's `delegate accepted` (once), the delegation's label and a
+    /// `peer` line; for a delegation's reply, the `peer` line its receipt
+    /// stands for ([`Self::peer_the_reply`]).
+    fn open_turn(&mut self, deps: &AgentDeps, arrived: &Arrived) -> Result<LogLine, ServeError> {
+        if arrived.arrival == Arrival::Replied {
+            return self.peer_the_reply()?.ok_or(ServeError::NoReceipt);
+        }
+        let (joined, cause, opening) = match arrived.arrival {
+            Arrival::Brief => {
+                let brief = read_brief(&arrived.content);
+                if !self.context.accepted {
+                    let accepted = LineBody::Delegate(DelegateBody {
+                        id: self.context.agent.id.to_string(),
+                        to: deps.home.config.matrix_user.to_string(),
+                        room: Some(self.context.agent.room.clone()),
+                        child: Some(ChildSession {
+                            drive: deps.home.config.drive.clone(),
+                            session: self.context.session.path.clone(),
+                        }),
+                        state: DelegateState::Accepted,
+                        reason: None,
+                        reply: None,
+                    });
+                    self.writer.write(&mut self.context, None, None, accepted)?;
+                }
+                let label = brief.as_ref().map_or_else(
+                    || self.context.label.clone(),
+                    |brief| self.context.label.join(&brief.label),
+                );
+                let text = brief.map_or_else(|| arrived.text.clone(), |brief| brief.brief);
+                (
+                    label,
+                    LabelCauseKind::Delegation,
+                    LineBody::Peer(PeerBody {
+                        sender: arrived.sender.clone(),
+                        text,
+                        ask: None,
+                        artifacts: None,
+                    }),
+                )
+            }
+            _ => {
+                let person = deps
+                    .home
+                    .config
+                    .human
+                    .clone()
+                    .unwrap_or_else(|| arrived.sender.clone());
+                let readers = Label {
+                    readers: keeper_core::agents::label::Readers::Only(
+                        deps.home.config.audience.clone(),
+                    ),
+                    ..Label::top()
+                };
+                let joined = self
+                    .context
+                    .on_user_line(&arrived.sender, &person, &readers)
+                    .unwrap_or_else(|| self.context.label.clone());
+                (
+                    joined,
+                    LabelCauseKind::PersonMessage,
+                    LineBody::User(UserBody {
+                        sender: arrived.sender.clone(),
+                        text: arrived.text.clone(),
+                        attachments: Vec::new(),
+                    }),
+                )
+            }
+        };
+        if joined != self.context.label {
+            self.writer.write(
+                &mut self.context,
+                None,
+                None,
+                LineBody::Label(LabelBody::new(
+                    &joined,
+                    LabelCause {
+                        kind: cause,
+                        reference: arrived.event_id.to_string(),
+                    },
+                )),
+            )?;
+        }
+        Ok(self.writer.write(
+            &mut self.context,
+            None,
+            Some(arrived.event_id.clone()),
+            opening,
+        )?)
+    }
+
     async fn turn(
         &mut self,
         deps: &AgentDeps,
@@ -1173,43 +1974,7 @@ impl ServedSession {
         stop: CancelSignal,
     ) -> Result<TurnReport, ServeError> {
         let label_before = self.context.label.clone();
-        let person = deps
-            .home
-            .config
-            .human
-            .clone()
-            .unwrap_or_else(|| arrived.sender.clone());
-        let readers = Label {
-            readers: keeper_core::agents::label::Readers::Only(deps.home.config.audience.clone()),
-            ..Label::top()
-        };
-        if let Some(joined) = self
-            .context
-            .on_user_line(&arrived.sender, &person, &readers)
-        {
-            self.writer.write(
-                &mut self.context,
-                None,
-                None,
-                LineBody::Label(LabelBody::new(
-                    &joined,
-                    LabelCause {
-                        kind: LabelCauseKind::PersonMessage,
-                        reference: arrived.event_id.to_string(),
-                    },
-                )),
-            )?;
-        }
-        let user = self.writer.write(
-            &mut self.context,
-            None,
-            Some(arrived.event_id.clone()),
-            LineBody::User(UserBody {
-                sender: arrived.sender.clone(),
-                text: arrived.text.clone(),
-                attachments: Vec::new(),
-            }),
-        )?;
+        let user = self.open_turn(deps, &arrived)?;
         let (anchor, anchor_at) = deliver(
             port.as_ref(),
             "m.room.message",
@@ -1228,6 +1993,12 @@ impl ServedSession {
             self.status_base(deps),
         );
 
+        let tools = TurnTools {
+            surface: self.surface.clone(),
+            delegations: self.delegations.clone(),
+            room: Arc::clone(&port),
+            from: self.delegator(deps),
+        };
         let ran = run_agent_turn(
             &mut self.context,
             &mut self.writer,
@@ -1235,7 +2006,7 @@ impl ServedSession {
             &sink,
             &board,
             stop,
-            self.surface.clone(),
+            tools,
         )
         .await;
         let stream_end = Instant::now();
@@ -1262,6 +2033,13 @@ impl ServedSession {
                 (format!("{visible}{suffix}"), format!("{shown}{suffix}"))
             }
             TurnEnding::LocalOnly => (join_note(&visible, LOCAL_ONLY_REFUSAL), shown.clone()),
+            TurnEnding::Bounded => (
+                join_note(
+                    &visible,
+                    &ran.bound.map(|b| b.sentence()).unwrap_or_default(),
+                ),
+                shown.clone(),
+            ),
             TurnEnding::Failed => (join_note(&visible, TURN_FAILED), shown.clone()),
         };
         // The room gets the log's redaction (S-17), and the artifact too, so
@@ -1319,7 +2097,7 @@ impl ServedSession {
                     }),
                 )?
             }
-            TurnEnding::LocalOnly | TurnEnding::Failed => {
+            TurnEnding::LocalOnly | TurnEnding::Bounded | TurnEnding::Failed => {
                 let mut parent = ran.parent.or(Some(user.id));
                 // The prose the room already saw of the round that failed:
                 // the next turn's model must read what the person read.
@@ -1340,8 +2118,9 @@ impl ServedSession {
                     )?;
                     parent = Some(partial.id);
                 }
-                let (sentence, code) = match ran.ending {
-                    TurnEnding::LocalOnly => (LOCAL_ONLY_REFUSAL.to_owned(), "local_only"),
+                let (sentence, code) = match (ran.ending, ran.bound) {
+                    (TurnEnding::LocalOnly, _) => (LOCAL_ONLY_REFUSAL.to_owned(), "local_only"),
+                    (TurnEnding::Bounded, Some(bound)) => (bound.sentence(), bound.word()),
                     _ => (
                         ran.error.clone().unwrap_or_else(|| TURN_FAILED.to_owned()),
                         "turn_failed",
@@ -1376,6 +2155,12 @@ impl ServedSession {
             let echo = self.scope_echo(deps);
             deliver(port.as_ref(), SCOPE, echo, Instant::now()).await;
         }
+        // The closing line counts the last completion's tokens too: a budget
+        // it crossed parks the session as one the gate stopped would.
+        let bound = ran.bound.or_else(|| self.context.token_bound());
+        self.after_delegated_turn(deps, port.as_ref(), bound)
+            .await?;
+        self.say_waiting(port.as_ref(), deps).await;
 
         Ok(TurnReport {
             user_line: user.id,
@@ -1421,6 +2206,8 @@ struct Ran {
     parent: Option<Ulid>,
     prompt_sha256: Option<String>,
     error: Option<String>,
+    /// The bound that stopped a delegated session's run.
+    bound: Option<BoundReached>,
 }
 
 /// The lines a running turn writes, behind one lock: the tool loop's event
@@ -1435,9 +2222,32 @@ struct TurnLog<'a> {
     progress: ToolProgress,
     failure: Option<WriterError>,
     local_only: bool,
+    /// The delegated session's budget stopped the run before this round.
+    bound: Option<BoundReached>,
+    /// The usage the endpoint reported for the round under way (R69).
+    round_usage: Usage,
     /// Why the model's stream broke, when it did: the partial answer is
     /// returned as an outcome, the cause only to the event sink.
     broken: Option<String>,
+}
+
+impl TurnView for Mutex<TurnLog<'_>> {
+    fn label(&self) -> Label {
+        self.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .context
+            .label
+            .clone()
+    }
+
+    fn delegation(&self, id: &str) -> Option<Delegation> {
+        self.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .context
+            .delegations
+            .get(id)
+            .cloned()
+    }
 }
 
 impl TurnLog<'_> {
@@ -1503,12 +2313,18 @@ pub async fn arm_agent(
         .request
         .tools
         .retain(|spec| config.allow.contains(&spec.name));
-    // The surface tools are the agent's own, never a drive verb's spec.
+    // The surface, `delegate` and `reply` tools are the agent's own, never
+    // a drive verb's spec: `delegate` as `[tools].allow` says, `reply` in a
+    // delegated session whatever it says (R48).
     if tools_offered {
         armed
             .request
             .tools
             .extend(crate::surface::specs(&crate::surface::offered(config)));
+        armed.request.tools.extend(delegate::specs(
+            config.allow.iter().any(|name| name == delegate::DELEGATE),
+            context.agent.kind == SessionKind::Delegated,
+        ));
     }
     armed
 }
@@ -1544,7 +2360,7 @@ async fn run_agent_turn(
     sink: &MatrixSink,
     board: &StatusBoard,
     stop: CancelSignal,
-    surface_port: Option<Arc<dyn crate::surface::SurfacePort>>,
+    tools: TurnTools,
 ) -> Ran {
     let config = &deps.home.config;
     let local = deps.model_is_local();
@@ -1560,6 +2376,7 @@ async fn run_agent_turn(
         parent: None,
         prompt_sha256: None,
         error: Some(error),
+        bound: None,
     };
 
     let mut composed = context.compose(deps, armed.context.as_ref());
@@ -1593,7 +2410,7 @@ async fn run_agent_turn(
     let surface = crate::surface::person(config)
         .filter(|_| !offered.is_empty())
         .map(|person| crate::surface::SurfaceTools {
-            port: surface_port,
+            port: tools.surface,
             person: person.clone(),
             offered,
             profiles: armed.profiles.clone(),
@@ -1602,27 +2419,17 @@ async fn run_agent_turn(
             wait: keeper_core::agents::events::SURFACE_WAIT,
             lines: Mutex::new(Vec::new()),
         });
-    let host = AllowedTools {
-        inner: armed.drive.host(
-            HostIds {
-                data_dir: deps.data_dir.clone(),
-                provider_id: deps.row.provider.id.clone(),
-                bot_id: deps.bot.id.clone(),
-                session_id: context.agent.id.to_string(),
-                message_id: None,
-            },
-            armed.profiles,
-            stop.clone(),
-        ),
-        allow: config.allow.clone(),
-        surface,
-    };
-    let tool_loop = ToolLoop {
-        client: &client,
-        endpoint: &endpoint,
-        host: &host,
-        default_profile_id: &armed.default_profile_id,
-    };
+    let drive_host = armed.drive.host(
+        HostIds {
+            data_dir: deps.data_dir.clone(),
+            provider_id: deps.row.provider.id.clone(),
+            bot_id: deps.bot.id.clone(),
+            session_id: context.agent.id.to_string(),
+            message_id: None,
+        },
+        armed.profiles,
+        stop.clone(),
+    );
 
     let log = Mutex::new(TurnLog {
         context,
@@ -1634,8 +2441,28 @@ async fn run_agent_turn(
         progress: ToolProgress::default(),
         failure: None,
         local_only: false,
+        bound: None,
+        round_usage: Usage::default(),
         broken: None,
     });
+    let host = AllowedTools {
+        inner: drive_host,
+        allow: config.allow.clone(),
+        surface,
+        delegation: DelegateTools::new(
+            tools.from,
+            tools.delegations,
+            tools.room,
+            &log,
+            config.allow.iter().any(|name| name == delegate::DELEGATE),
+        ),
+    };
+    let tool_loop = ToolLoop {
+        client: &client,
+        endpoint: &endpoint,
+        host: &host,
+        default_profile_id: &armed.default_profile_id,
+    };
     let lock = || log.lock().unwrap_or_else(|p| p.into_inner());
 
     let mut events = |event: ToolLoopEvent| match event {
@@ -1643,10 +2470,17 @@ async fn run_agent_turn(
             let mut log = lock();
             log.round_text.clear();
             log.round_line = None;
+            log.round_usage = Usage::default();
             let shown = sink.text();
             if round > 0 && !shown.is_empty() && !shown.ends_with('\n') {
                 sink.push("\n\n");
             }
+        }
+        ToolLoopEvent::Chat(ChatEvent::Usage(usage)) => {
+            lock().round_usage = Usage {
+                prompt: usage.prompt_tokens,
+                completion: usage.completion_tokens,
+            };
         }
         ToolLoopEvent::Chat(ChatEvent::ContentDelta(text)) => {
             let mut log = lock();
@@ -1668,7 +2502,7 @@ async fn run_agent_turn(
                 text: log.round_text.clone(),
                 model: log.model.clone(),
                 finish: ROUND_FINISH.to_owned(),
-                usage: Usage::default(),
+                usage: log.round_usage,
                 ttft_ms: None,
                 duration_ms: 0,
                 anchor_event: None,
@@ -1684,6 +2518,8 @@ async fn run_agent_turn(
                 args: wire.arguments_raw.clone(),
                 tier: if crate::surface::is_surface(&wire.name) {
                     crate::surface::TIER
+                } else if delegate::is_delegation(&wire.name) {
+                    delegate::TIER
                 } else {
                     tier(record.name)
                 },
@@ -1727,6 +2563,9 @@ async fn run_agent_turn(
         for line in surfaced {
             log.write(call_line, LineBody::Surface(line));
         }
+        for line in host.delegation.take_lines() {
+            log.write(call_line, line);
+        }
         if let Some((label, path)) = read {
             let joined = log.context.label.join(&label);
             if joined != log.context.label {
@@ -1753,10 +2592,16 @@ async fn run_agent_turn(
                 detail: "the session's log could not be written".to_owned(),
             });
         }
-        if !log.context.label.may_use_model(local) {
+        if let SinkVerdict::Block { .. } = check_sink(&log.context.label, &Sink::Model { local }) {
             log.local_only = true;
             return Err(BotsError::Tool {
                 detail: LOCAL_ONLY_REFUSAL.to_owned(),
+            });
+        }
+        if let Some(bound) = log.context.token_bound() {
+            log.bound = Some(bound);
+            return Err(BotsError::Tool {
+                detail: bound.sentence(),
             });
         }
         Ok(())
@@ -1782,11 +2627,13 @@ async fn run_agent_turn(
     )
     .await;
 
+    drop(host);
     let log = log.into_inner().unwrap_or_else(|p| p.into_inner());
     let parent = log.last_line;
     let round_logged = log.round_line.is_some();
     let round_text = log.round_text;
     let prompt_sha256 = Some(composed.prompt_sha256);
+    let bound = log.bound;
     let ran =
         move |ending: TurnEnding, outcome: Option<chat::ChatOutcome>, error: Option<String>| Ran {
             ending,
@@ -1796,6 +2643,7 @@ async fn run_agent_turn(
             parent,
             prompt_sha256,
             error,
+            bound,
         };
     if let Some(error) = log.failure {
         return ran(TurnEnding::Failed, None, Some(error.to_string()));
@@ -1814,6 +2662,7 @@ async fn run_agent_turn(
             }
         }
         Err(_) if log.local_only => ran(TurnEnding::LocalOnly, None, None),
+        Err(_) if bound.is_some() => ran(TurnEnding::Bounded, None, None),
         Err(error) => ran(TurnEnding::Failed, None, Some(error.to_string())),
     }
 }

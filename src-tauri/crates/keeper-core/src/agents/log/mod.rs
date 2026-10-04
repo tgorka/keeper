@@ -313,7 +313,7 @@ pub struct PeerBody {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask: Option<PeerAsk>,
-    /// Session-relative paths of the artifacts it hands over.
+    /// `<drive>/<path>` of each file it hands over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<Vec<String>>,
 }
@@ -413,11 +413,16 @@ pub struct ChildSession {
     pub session: String,
 }
 
-/// Where a delegation stands.
+/// Where a delegation stands: `opened` when the room is made, `sent` when
+/// the brief went in after the target joined (each round after is another
+/// `sent`), `accepted` in the child once its host created it, `replied` when
+/// the target replied (in the child, when its `reply` went out), `refused`
+/// when a call or a send was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DelegateState {
     Opened,
+    Sent,
     Accepted,
     Replied,
     Refused,
@@ -429,12 +434,30 @@ pub enum DelegateState {
 pub struct DelegateBody {
     pub id: String,
     pub to: String,
-    pub room: OwnedRoomId,
+    /// The delegation's room; absent on a refusal made before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<OwnedRoomId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child: Option<ChildSession>,
     pub state: DelegateState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// On the delegating side's `replied`: the reply itself, so the receipt
+    /// that marks its event seen never loses what it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<DelegateReply>,
+}
+
+/// A reply as the delegating session received it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegateReply {
+    pub text: String,
+    /// `<drive>/<path>` of each file it hands over.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
+    /// The replying session's label when it replied (R94).
+    pub label: Label,
 }
 
 /// `scope`: the drives in scope, changed by the person.
@@ -451,6 +474,8 @@ pub struct ScopeBody {
 pub enum RunState {
     Queued,
     Running,
+    /// No host can serve it now; the detail says what it waits for.
+    Waiting,
     Blocked,
     Review,
     Failed,
@@ -463,6 +488,7 @@ impl RunState {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
+            Self::Waiting => "waiting",
             Self::Blocked => "blocked",
             Self::Review => "review",
             Self::Failed => "failed",
@@ -940,13 +966,18 @@ mod tests {
             LineBody::Delegate(DelegateBody {
                 id: "d1".into(),
                 to: "winston".into(),
-                room: RoomId::parse("!child:h").expect("room"),
+                room: Some(RoomId::parse("!child:h").expect("room")),
                 child: Some(ChildSession {
                     drive: "tgdrive".into(),
                     session: "active/2026-10-02-x".into(),
                 }),
-                state: DelegateState::Opened,
+                state: DelegateState::Replied,
                 reason: None,
+                reply: Some(DelegateReply {
+                    text: "Done.".into(),
+                    artifacts: vec!["tgdrive/60-sessions/active/x/artifacts/a.md".into()],
+                    label: label(),
+                }),
             }),
             LineBody::Label(LabelBody::new(
                 &label(),

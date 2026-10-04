@@ -628,14 +628,14 @@ per date and host, compared as a number. Each host writes only its own chunks an
 | `claim` | `epoch, action` (`acquired`, `renewed`, `released`, `lost`), `from_host, claim_event, server_ts` |
 | `user` | `sender, text, attachments` |
 | `peer` | `sender, text`, optional `ask {id, question}` and `artifacts` |
-| `assistant` | `text, model, finish, usage {prompt, completion}, ttft_ms, duration_ms, anchor_event` |
+| `assistant` | `text, model, finish, usage {prompt, completion}, ttft_ms, duration_ms, anchor_event`; a round that called tools carries that round's own usage |
 | `tool_call` | `call_id, tool, args, tier`, optional `grant_id`; `args` is the string the model sent, verbatim |
 | `tool_result` | `call_id, outcome` (`ok`, `refused`, `failed`), `content`, optional `truncated {shown, total}`, `label` |
 | `approval` | `id, state` (`requested`, `decided`, `consumed`, `expired`), optional `decision, by, result` |
-| `delegate` | `id, to, room`, optional `child {drive, session}`, `state`, optional `reason` |
+| `delegate` | `id, to`, optional `room` (absent on a refusal made before the room existed), optional `child {drive, session}`, `state` (`opened`, `sent`, `accepted`, `replied`, `refused`), optional `reason` |
 | `label` | `readers, integrity`, optional `local_only`, `cause {kind, ref}` |
 | `scope` | `drives, set_by` |
-| `run` | `state` (`queued`, `running`, `blocked`, `review`, `failed`, `idle`), optional `detail` |
+| `run` | `state` (`queued`, `running`, `waiting`, `blocked`, `review`, `failed`, `idle`), optional `detail` |
 | `surface` | `id, tool, device`, optional `outcome` |
 | `heard` | `assistant, heard_until, sentence, reason` (`barge_in`, `stop`) |
 | `memory` | `op` (`journal`, `proposal`), `ref` |
@@ -644,7 +644,8 @@ per date and host, compared as a number. Each host writes only its own chunks an
 | `close` | `reason` (`done`, `archived`, `failed`), `by` |
 
 A line of another version or an unknown kind, or one that does not parse, is skipped and named as
-a problem; it never stops the read.
+a problem; it never stops the read. Every host of a principal upgrades together when a kind or a
+state is added (92.1 added `delegate sent`, `run waiting` and each round's own usage).
 
 **Writing.** A chunk is opened for append and each line is written whole in one write ending in a
 newline; the writer `fsync`s at the end of every turn. A host that died mid-line finds half a line
@@ -1350,6 +1351,104 @@ as chosen ("not listed yet") and is looked for again, never rewritten. What happ
   move nothing, whichever finishes first; the earlier one's send and watch are stopped.
 - **The wake phrase is unchanged.** Naming the proxy "Nixi" renames nothing; the wake phrase is
   the one you set.
+
+## Handing work on
+
+An agent hands work to another agent with `delegate`; the work happens in a session of the
+target's own, in the target's home drive, with a room of its own, and the answer comes back to the
+session that asked. Nothing runs as a hidden sub-agent: every hand-off is a session anyone who may
+read it can open.
+
+**The two tools.** `delegate(agent, brief, drives?, card?, session?)` is offered when
+`[tools].allow` names it. `agent` is `<drive>/<id>`; an id alone works only when exactly one agent
+keeper knows has it, and otherwise the refusal names the candidates. `reply(text, artifacts?)` is
+offered in every delegated session, whatever `[tools].allow` says, and in no other: it is how a
+delegated session answers. A ⌘9 bot has neither.
+
+**What is checked before anything is sent.** A refusal sends nothing, makes no room and writes a
+`delegate refused` line with the reason:
+
+| check | refused when |
+| --- | --- |
+| depth | the new session would be deeper than the delegating agent's `[limits].hop_limit` (at most 3 hops from a person's request) |
+| drives | `drives` names one outside the target's `[tools].drives` (its home drive is always in) |
+| label | the target's audience, or anyone the room would invite, may not read what the session has read; the refusal names who would be added |
+| a person's tick | `card` sets `schedule` or `workflow`: until approvals exist the call gets "This needs a person's approval, and there is no one here to ask, so keeper did not do it. Nothing was changed." |
+
+**The room.** Encrypted, typed `dev.keeper.agent.session`, named `<target-id> <YYYY-MM-DD>` so no
+state says what the work is: the delegating agent at power 100, the target at 50, the label's
+readers invited as observers at 0. The call returns at once ("Handed to Dr Tola Grey as
+delegation `<id>`; waiting for it to join … To say more in this exchange, call delegate with
+session = `<id>`") — the id is in the result, so the model and every replay of the session have
+it — and the session's status says "waiting for Dr Tola Grey to join".
+
+**The brief waits for the join.** An invited device may be outside the room's encryption key, so
+the delegating host sends the brief only when it sees the target agent join, and logs
+`delegate sent`. The brief is one ordinary `m.room.message` whose body is the brief, so every
+device shows it, carrying `dev.keeper.agent.delegate`: `{v, id, from {agent, drive, session,
+room}, to, brief, drives, label, hop, limits {rounds_per_exchange, tokens}, card?}`. Its `id` is a
+ULID, the child session's id, and the send's transaction id, so a host that restarts between the
+join and the send sends it once. A send that fails is tried again every second while the worker
+runs, under the same transaction id.
+
+**Every send is checked when it happens.** The brief at the join, each later round and the
+reply are checked against the session's label as it is at that moment and the room's members
+as they are then (joined or invited, the two agents aside), plus the target's audience for a
+brief. Someone invited since, or a read that narrowed the label since the room was made, blocks
+the send: nothing goes in, and a `delegate refused` line names who would have been added. A
+blocked first brief ends the delegation.
+
+**The target's side.** A host joins the invite when the inviter is an agent homed in a drive it
+mounts and the invited agent's opening label reaches that agent's audience, or — `keeper-agentd`
+only — the `proxy` of a pinned `[[trust]]` person who reads the invited agent's home drive; a Mac
+joins only the first. A brief is taken only through one admission, the same live, after a
+restart, and in the session that serves it: an `m.text` message (not an edit, not a notice, not
+a custom event) its sender's device sealed; in a session-typed room where a person may not send
+a message in clear (not a proxy's own room); from the room's creator, who is an agent this host
+knows or a pinned person's proxy and still holds an agent's power there; addressed to this agent
+by its sender; under a label that reaches this agent's audience and every other person in the
+room. The served session also needs the brief to be its own delegation from its parent's room.
+The first brief admitted in a room is its opening; later rounds never replace it, and a host
+holds at most 64 rooms' openings — a room past that is read back later, not forgotten. Every
+joined delegated room with no session yet is read back, oldest admitted brief first, before its
+session is placed; a read that fails is read again on the next tick. Placement decides which host
+makes the session; that host first takes the room's claim keyed by the opening's server time, so
+two hosts whose checkouts cannot see each other's folders do not both make it; it makes the folder
+with its `agent.toml` (`kind = "delegated"`, the target as `agent`, the delegating agent as
+`requested_by`, `[parent]` naming the delegating session and room, the brief's label, `hop`,
+`[limits]`, dated by the opening's server time) and one card, `brief.md`, in one journaled step
+that finds the folder again when the same brief arrives twice, then hands the claim back. The card
+is a task for the target, `run: queued`, the brief as its body; a schedule on it carries
+`scheduled_by: <the delegating agent>`, and a brief at `untrusted` integrity gives it
+`integrity: untrusted`; an agent's later write of the card never replaces or adds either mark.
+When no host can serve it, the room's status says `waiting: <host> — <need>`. The claim holder's
+worker logs `delegate accepted` and the brief as a `peer` line, and the target's turn runs.
+
+**Bounds.** One exchange runs from a brief to the target's next reply and has at most
+`rounds_per_exchange` messages from the requester (`delegate` with `session` set to the
+delegation's id sends the next one); the next is refused and named, a delegated session that
+had its last round without replying parks its card `run: blocked`, detail `rounds`, and a brief
+that reaches it anyway is not a turn. Only a reply that went out closes the exchange: a refused
+or failed `reply` leaves the rounds counted. Each round's tokens are on its `assistant` line;
+once a delegated session has spent its `[limits].tokens` — at the check before a request, or by
+its turn's last completion — the room gets the reply "This delegation spent N tokens of its
+M-token budget, so it stopped.", the card goes `run: blocked`, detail `tokens`, once, and no
+later brief is a turn.
+
+**The reply.** `reply` sends one message carrying `dev.keeper.agent.artifacts` — `[{drive, path}]`
+for each file under the session's `artifacts/` it names, resolved through keeper-sync's
+containment, so a link out of `artifacts/` is refused — and `dev.keeper.agent.label`, the
+session's label as it is then, and sets the card's `run: review`. The delegating host routes
+the target's join and reply from the child room to the session that delegated — every child it
+ever delegated to is routed again after a restart, and a later round registers its room before
+it is sent — which logs `delegate replied` carrying the reply's text, files and label, joins the
+reply's label into its own (readers narrow, `local_only` and a lower integrity stay, another
+agent's words are at most `agent`), writes the reply as a `peer` line and runs a turn of its own
+agent on it. The model reads a `peer` line as "From `<sender>`:", the text, and the files handed
+over. A reply without a label is not taken. A reply sent while the delegating host was down is
+read back as far as that host's newest brief in the room, however many pages. A `peer` line,
+like a `user` line, is a question a restart closes rather than reruns; a `delegate replied` line
+whose `peer` line a crash lost gets it back from the receipt first.
 
 ## Which host answers
 

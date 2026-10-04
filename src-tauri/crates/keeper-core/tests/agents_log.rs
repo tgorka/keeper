@@ -1366,7 +1366,9 @@ fn attachments_and_a_peer_question_replay_as_they_were_sent() {
                 id: "q1".to_owned(),
                 question: "Ship on Friday?".to_owned(),
             }),
-            artifacts: None,
+            artifacts: Some(vec![
+                "tgdrive/60-sessions/active/x/artifacts/plan.md".to_owned()
+            ]),
         }),
     );
     let sent: Vec<String> = [&asked, &peer]
@@ -1388,7 +1390,9 @@ fn attachments_and_a_peer_question_replay_as_they_were_sent() {
         sent[0]
     );
     assert!(
-        sent[1].contains("Question q1: Ship on Friday?"),
+        sent[1].contains(
+            "From @tola:h:\\nHere is the plan.\\n\\nFiles handed over:\\n- tgdrive/60-sessions/active/x/artifacts/plan.md\\n\\nQuestion q1: Ship on Friday?"
+        ),
         "{}",
         sent[1]
     );

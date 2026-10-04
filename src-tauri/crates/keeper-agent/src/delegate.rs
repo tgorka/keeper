@@ -1,0 +1,856 @@
+//! The `delegate` and `reply` tools: an agent hands work to another agent
+//! in a session the target owns (AD-385, story 92.1).
+//!
+//! Like the surface tools they are an agent's alone, served from the
+//! agent's own host through [`ToolHost::run_named`]; a ⌘9 bot never has them
+//! (R38). `delegate` is offered when `[tools].allow` names it, `reply` in
+//! every delegated session and nowhere else (R48).
+//!
+//! # Handing on
+//!
+//! A `delegate` call checks, before anything is sent: the bounds
+//! ([`Limits::check`]), the drives against the target's `[tools].drives`,
+//! the label against the target's audience and the room's members
+//! (`check_sink(Delegation)`, `check_sink(Room)`), and a card's schedule or
+//! workflow, which needs a person (Q16) and so is refused before Epic 93.
+//! Then it makes the room — the target and the label's readers invited — and
+//! returns at once with a `delegate opened` line. The brief is not sent yet:
+//! an invited device may be outside the room's key, so the host sends it once
+//! the target has joined ([`content_for`], R29 F5) and writes `delegate sent`.
+//! With `session` naming an open delegation, the call sends the next round of
+//! its exchange instead (R49), at most `rounds_per_exchange` before a reply.
+//!
+//! # Replying
+//!
+//! `reply` sends the delegated session's answer into its room, carrying
+//! `dev.keeper.agent.artifacts` and the session's label as it is then
+//! (`dev.keeper.agent.label`, R94), and sets its card's `run: review`.
+//!
+//! Every send — the brief once the target joined, each later round, and the
+//! reply — is checked against the label at that moment and the room's people
+//! as they are then; a block sends nothing and writes `delegate refused`.
+//!
+//! [`ToolHost::run_named`]: keeper_core::bots::tools::ToolHost::run_named
+
+use std::collections::BTreeSet;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+
+use keeper_core::agents::card::{self, Run};
+use keeper_core::agents::delegation::{
+    self, brief_content, child_label, observers, room_invites, session_title, BoundReached,
+    DelegateCard, DelegateContent, DelegateFrom, DelegateLimits, Limits, CARD_FILE,
+};
+use keeper_core::agents::events::{ARTIFACTS, CONTENT_VERSION, REPLY_LABEL};
+use keeper_core::agents::home;
+use keeper_core::agents::label::{check_sink, Label, Readers, Sink, SinkVerdict};
+use keeper_core::agents::log::{DelegateBody, DelegateState, LineBody, RunBody, RunState};
+use keeper_core::agents::proxy::ScopeRequest;
+use keeper_core::agents::session::SessionKind;
+use keeper_core::bots::chat::{ToolCall as WireToolCall, ToolSpec};
+use keeper_core::bots::tools::ToolOutcome;
+use keeper_core::sessions::model::ARTIFACTS_DIR;
+use keeper_core::sessions::plan::{Plan, PlanStep};
+use keeper_sync::browse;
+use matrix_sdk::ruma::{
+    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use ulid::Ulid;
+
+use crate::agent::RoomFuture;
+use crate::host::UNATTENDED_REFUSAL;
+use crate::matrix_sink::{EditPort, SendFuture};
+use crate::rooms::{BriefRoom, Known, KnownAgent};
+use crate::sessions::exec;
+use crate::sessions::verbs::VerbError;
+
+/// The tool that hands work on.
+pub const DELEGATE: &str = "delegate";
+/// The tool a delegated session answers with.
+pub const REPLY: &str = "reply";
+/// Both tools' tier: each sends into a room another agent acts on, which a
+/// person can see and undo by talking (AD-392's recoverable mutation).
+pub const TIER: u8 = 2;
+
+/// What `reply` says outside a delegated session.
+pub const NOT_DELEGATED: &str =
+    "reply answers a delegation, and this session was not delegated to you.";
+/// What a call says on a host with no room to make one in.
+pub const NO_ROOMS: &str = "This host cannot open a room for a delegation.";
+
+/// Whether `name` is `delegate` or `reply`.
+pub fn is_delegation(name: &str) -> bool {
+    name == DELEGATE || name == REPLY
+}
+
+/// The specs a turn is offered: `delegate` when `[tools].allow` names it,
+/// `reply` in a delegated session (R48).
+pub fn specs(delegate: bool, reply: bool) -> Vec<ToolSpec> {
+    let mut specs = Vec::new();
+    if delegate {
+        specs.push(ToolSpec {
+            name: DELEGATE.to_owned(),
+            description: "Hand work to another agent: it works in a session of its own and replies here. Name it as <drive>/<id> (an id alone when only one agent has it). The brief is all it is told. With session set to an open delegation's id, send it the next message of that exchange instead.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string", "description": "The agent: <drive>/<id>."},
+                    "brief": {"type": "string", "description": "What to do, whole: the agent reads nothing else of this session."},
+                    "drives": {"type": "array", "items": {"type": "string"}, "description": "Drives it works in; its home drive always."},
+                    "card": {
+                        "type": "object",
+                        "description": "The card the session opens with.",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "schedule": {"type": "string"},
+                            "workflow": {"type": "string"},
+                            "integrity": {"type": "string", "enum": ["untrusted"], "description": "untrusted when the card was made from outside content."}
+                        },
+                        "required": ["title"],
+                        "additionalProperties": false
+                    },
+                    "session": {"type": "string", "description": "An open delegation's id, to say more in its exchange."}
+                },
+                "required": ["agent", "brief"],
+                "additionalProperties": false
+            }),
+        });
+    }
+    if reply {
+        specs.push(ToolSpec {
+            name: REPLY.to_owned(),
+            description: "Reply to the agent that delegated this session: your answer, and the files under artifacts/ it should read. This closes the exchange.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "artifacts": {"type": "array", "items": {"type": "string"}, "description": "Session-relative paths under artifacts/."}
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            }),
+        });
+    }
+    specs
+}
+
+/// A boxed future answering yes or no.
+pub type BoolFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+/// A boxed future of decrypted timeline events, oldest first, or why they
+/// could not all be read.
+pub type EventsFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<Value>, String>> + Send + 'a>>;
+/// A boxed future of a room's members, joined or invited.
+pub type MembersFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<BTreeSet<OwnedUserId>, String>> + Send + 'a>>;
+/// A boxed future of what a host reads of a room a brief arrived in.
+pub type BriefRoomFuture<'a> = Pin<Box<dyn Future<Output = Option<BriefRoom>> + Send + 'a>>;
+
+/// The rooms a delegation goes through.
+pub trait DelegationPort: Send + Sync {
+    /// Every agent of a drive this host mounts.
+    fn known(&self) -> Arc<Known>;
+    /// A delegated session room named `name`, made by the agent, `invite`
+    /// invited and `agents` at power 50.
+    fn create<'a>(
+        &'a self,
+        name: &'a str,
+        invite: Vec<OwnedUserId>,
+        agents: Vec<OwnedUserId>,
+    ) -> RoomFuture<'a>;
+    /// Send one `m.room.message` into `room`, once.
+    fn send<'a>(
+        &'a self,
+        room: &'a RoomId,
+        content: Value,
+        txn: OwnedTransactionId,
+    ) -> SendFuture<'a>;
+    /// Whether `user` has joined `room`, as this copy last synced it.
+    fn joined<'a>(&'a self, room: &'a RoomId, user: &'a UserId) -> BoolFuture<'a>;
+    /// Who is in `room` or invited to it now.
+    fn members<'a>(&'a self, room: &'a RoomId) -> MembersFuture<'a>;
+    /// `room`'s events after the newest brief `me` sent into it, oldest
+    /// first: paged back as far as that brief, so a reply behind any number
+    /// of later events is found (R55).
+    fn since_brief<'a>(&'a self, room: &'a RoomId, me: &'a UserId) -> EventsFuture<'a>;
+    /// What `room` is now, as a brief's admission reads it (R93).
+    fn brief_room<'a>(&'a self, room: &'a RoomId) -> BriefRoomFuture<'a>;
+    /// Route `child`'s joins and replies to `parent`'s worker from now on.
+    fn watch(&self, child: &RoomId, parent: &RoomId);
+}
+
+/// One delegation a session made, as its log says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delegation {
+    /// Its id: the child session's.
+    pub id: String,
+    pub to: OwnedUserId,
+    pub room: OwnedRoomId,
+    /// The `delegate` call's arguments, verbatim.
+    pub args: Option<String>,
+    /// Whether the brief went in.
+    pub sent: bool,
+    /// Whether the target replied to the latest round.
+    pub replied: bool,
+    /// Rounds sent since the last reply.
+    pub rounds: u32,
+}
+
+/// The session a turn runs in, as its `delegate` and `reply` read it.
+#[derive(Debug, Clone)]
+pub struct Delegator {
+    pub user: OwnedUserId,
+    /// The home drive.
+    pub drive: String,
+    /// The session's id.
+    pub id: String,
+    /// The session, zone-relative.
+    pub session: String,
+    pub room: OwnedRoomId,
+    pub kind: SessionKind,
+    /// Who asked for the session: a delegated one's delegating agent.
+    pub requester: OwnedUserId,
+    pub hop: u8,
+    pub limits: home::Limits,
+    /// The home drive's sessions zone, and its folder inside the drive.
+    pub zone: PathBuf,
+    pub subfolder: String,
+    /// The delegating session's dispatch chain (R76).
+    pub chain: Vec<OwnedUserId>,
+}
+
+/// What a running turn's tools read of its session: the label now, which a
+/// read earlier in the turn may have narrowed, and its delegations.
+pub trait TurnView: Sync {
+    fn label(&self) -> Label;
+    fn delegation(&self, id: &str) -> Option<Delegation>;
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CardArgs {
+    title: String,
+    #[serde(default)]
+    schedule: Option<String>,
+    #[serde(default)]
+    workflow: Option<String>,
+    #[serde(default)]
+    integrity: Option<String>,
+}
+
+/// A `delegate` call's arguments.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DelegateArgs {
+    agent: String,
+    brief: String,
+    #[serde(default)]
+    drives: Vec<String>,
+    #[serde(default)]
+    card: Option<CardArgs>,
+    #[serde(default)]
+    session: Option<String>,
+}
+
+fn parse_args(raw: &str) -> Result<DelegateArgs, String> {
+    serde_json::from_str(raw).map_err(|error| format!("delegate's arguments do not read: {error}"))
+}
+
+/// The agent `name` names (R67): `<drive>/<id>`, or a bare id only when
+/// exactly one known agent has it.
+pub fn resolve<'k>(known: &'k Known, name: &str) -> Result<&'k KnownAgent, String> {
+    let name = name.trim();
+    let found: Vec<&KnownAgent> = match name.split_once('/') {
+        Some((drive, id)) => known
+            .agents
+            .iter()
+            .filter(|agent| agent.drive == drive && agent.id == id)
+            .collect(),
+        None => known
+            .agents
+            .iter()
+            .filter(|agent| agent.id == name)
+            .collect(),
+    };
+    match found.as_slice() {
+        [one] => Ok(one),
+        [] => Err(format!("No agent named {name} is known on this host.")),
+        many => Err(format!(
+            "{name} names more than one agent: {}. Name one as <drive>/<id>.",
+            many.iter()
+                .map(|agent| agent.name_in_drive())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// The delegation `args` (a `delegate` call's) describes from `from` to
+/// `target` under the session's `label`, its id `id`: the drives checked
+/// against the target's `[tools].drives`, the label lowered for a card of
+/// outside content (Q17).
+fn compose(
+    args: &DelegateArgs,
+    from: &Delegator,
+    target: &KnownAgent,
+    label: &Label,
+    id: &str,
+) -> Result<DelegateContent, String> {
+    let drives = ScopeRequest(args.drives.clone())
+        .check(&target.drives, &target.drive)
+        .map_err(|refusal| refusal.to_string())?;
+    let untrusted = args
+        .card
+        .as_ref()
+        .and_then(|card| card.integrity.as_deref())
+        .is_some_and(|word| word.trim() == "untrusted");
+    Ok(DelegateContent {
+        v: CONTENT_VERSION,
+        id: id.to_owned(),
+        from: DelegateFrom {
+            agent: from.user.clone(),
+            drive: from.drive.clone(),
+            session: from.session.clone(),
+            room: from.room.clone(),
+        },
+        to: target.matrix_user.clone(),
+        brief: args.brief.clone(),
+        drives,
+        label: child_label(label, untrusted),
+        hop: from.hop.saturating_add(1),
+        limits: DelegateLimits {
+            rounds_per_exchange: from.limits.rounds_per_exchange,
+            tokens: from.limits.tokens_per_delegation,
+        },
+        card: args.card.as_ref().map(|card| DelegateCard {
+            title: card.title.clone(),
+            schedule: card.schedule.clone(),
+            workflow: card.workflow.clone(),
+        }),
+        dispatch_chain: delegation::child_chain(&from.chain, &from.user),
+    })
+}
+
+/// The brief to send for `delegation` now that its target has joined,
+/// under the session's label now: from the `delegate` call it was opened
+/// by, so a host that restarted between the two sends the same brief.
+pub fn content_for(
+    delegation: &Delegation,
+    from: &Delegator,
+    label: &Label,
+    known: &Known,
+) -> Result<DelegateContent, String> {
+    let args = parse_args(delegation.args.as_deref().unwrap_or_default())?;
+    let target = known
+        .agents
+        .iter()
+        .find(|agent| agent.matrix_user == delegation.to)
+        .ok_or_else(|| format!("{} is no longer known on this host.", delegation.to))?;
+    compose(&args, from, target, label, &delegation.id)
+}
+
+/// A reply's `m.room.message` content: the text, the files handed over, and
+/// the replying session's label now, which the delegating session joins.
+pub fn reply_content(text: &str, artifacts: Vec<Value>, label: &Label) -> Value {
+    json!({
+        "msgtype": "m.text",
+        "body": text,
+        ARTIFACTS: artifacts,
+        REPLY_LABEL: label,
+    })
+}
+
+/// The label a reply's content carries; `None` when it carries none this
+/// build reads, and such a reply is not taken.
+pub fn reply_label(content: &Value) -> Option<Label> {
+    serde_json::from_value(content.get(REPLY_LABEL)?.clone()).ok()
+}
+
+/// The audience of the known agent `user`.
+pub fn audience_of(known: &Known, user: &UserId) -> Option<Readers> {
+    known
+        .agents
+        .iter()
+        .find(|agent| agent.matrix_user.as_str() == user.as_str())
+        .map(|agent| agent.home_readers.clone())
+}
+
+/// Whether what `label` covers may go into a room whose members — joined
+/// or invited — are `members` (R94): to its people, everyone but the two
+/// agents of the delegation, `agents`, and to `audiences`, the agents' own
+/// beyond them. `Err` is the sentence a refusal says.
+pub fn check_room(
+    label: &Label,
+    members: BTreeSet<OwnedUserId>,
+    agents: [&UserId; 2],
+    audiences: Vec<Readers>,
+) -> Result<(), String> {
+    let humans = members
+        .into_iter()
+        .filter(|member| agents.iter().all(|agent| agent.as_str() != member.as_str()))
+        .collect();
+    let sink = Sink::Room {
+        humans,
+        agent_audiences: audiences,
+    };
+    match check_sink(label, &sink) {
+        SinkVerdict::Allow => Ok(()),
+        SinkVerdict::Block { reason, .. } => Err(reason),
+    }
+}
+
+/// [`check_room`] over `room`'s members as they are now.
+pub async fn may_send(
+    port: &dyn DelegationPort,
+    room: &RoomId,
+    label: &Label,
+    agents: [&UserId; 2],
+    audiences: Vec<Readers>,
+) -> Result<(), String> {
+    let members = port.members(room).await.map_err(|error| {
+        format!("Who is in the delegation's room could not be read, so nothing was sent: {error}")
+    })?;
+    check_room(label, members, agents, audiences)
+}
+
+/// Whether `rel`, session-relative, names a file under the session's
+/// `artifacts/` — through keeper-sync's containment (AD-65), so `..`, a
+/// missing file and a link that leads out of `artifacts/` are refused alike.
+pub fn artifact_in(zone: &Path, session: &str, rel: &str) -> Result<(), String> {
+    let refused = || format!("{rel} is not a file under {ARTIFACTS_DIR}/ in this session.");
+    let segments = browse::plain_segments(rel).map_err(|refusal| refusal.to_string())?;
+    if segments.len() < 2 || *segments[0] != *ARTIFACTS_DIR {
+        return Err(refused());
+    }
+    let root = browse::lexical_join(zone, session).map_err(|refusal| refusal.to_string())?;
+    let artifacts = browse::resolve(&root, ARTIFACTS_DIR)
+        .map_err(|refusal| refusal.to_string())?
+        .ok_or_else(refused)?;
+    match browse::resolve(&root, rel) {
+        Ok(Some(file)) if file.starts_with(&artifacts) && file.is_file() => Ok(()),
+        Ok(_) => Err(refused()),
+        Err(refusal) => Err(refusal.to_string()),
+    }
+}
+
+/// Set the card of the session at `session` (zone-relative) to `run`,
+/// through the journaled executor, on a transition only: whether it wrote.
+pub fn set_card_run(zone: &Path, session: &str, run: Run) -> Result<bool, VerbError> {
+    let held = exec::hold(zone)?;
+    let rel = format!("{session}/{CARD_FILE}");
+    let Ok(text) = std::fs::read_to_string(held.zone().join(&rel)) else {
+        return Ok(false);
+    };
+    let Some(content) = card::set_run(&text, run) else {
+        return Ok(false);
+    };
+    exec::run_held(
+        Plan {
+            verb: "card-run".to_owned(),
+            session: session.to_owned(),
+            steps: vec![PlanStep::WriteFile { path: rel, content }],
+        },
+        &held,
+    )?;
+    Ok(true)
+}
+
+fn block_on<F: Future>(fut: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
+}
+
+/// One turn's `delegate` and `reply`.
+pub struct DelegateTools<'t> {
+    pub from: Delegator,
+    pub port: Option<Arc<dyn DelegationPort>>,
+    /// This session's own room, where a reply goes.
+    pub room: Arc<dyn EditPort>,
+    pub view: &'t dyn TurnView,
+    pub offer_delegate: bool,
+    pub offer_reply: bool,
+    lines: Mutex<Vec<LineBody>>,
+}
+
+fn refused(reason: impl Into<String>) -> Option<ToolOutcome> {
+    Some(ToolOutcome::Refused {
+        reason: reason.into(),
+    })
+}
+
+impl<'t> DelegateTools<'t> {
+    pub fn new(
+        from: Delegator,
+        port: Option<Arc<dyn DelegationPort>>,
+        room: Arc<dyn EditPort>,
+        view: &'t dyn TurnView,
+        offer_delegate: bool,
+    ) -> DelegateTools<'t> {
+        DelegateTools {
+            offer_reply: from.kind == SessionKind::Delegated,
+            from,
+            port,
+            room,
+            view,
+            offer_delegate,
+            lines: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The `delegate` and `run` lines written since the last take: the
+    /// call's reporter writes them under its `tool_call` line.
+    pub fn take_lines(&self) -> Vec<LineBody> {
+        std::mem::take(&mut *self.lines.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn line(&self, body: LineBody) {
+        self.lines
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(body);
+    }
+
+    fn refuse(
+        &self,
+        id: &str,
+        to: &str,
+        room: Option<OwnedRoomId>,
+        reason: String,
+    ) -> Option<ToolOutcome> {
+        self.line(LineBody::Delegate(DelegateBody {
+            id: id.to_owned(),
+            to: to.to_owned(),
+            room,
+            child: None,
+            state: DelegateState::Refused,
+            reason: Some(reason.clone()),
+            reply: None,
+        }));
+        refused(reason)
+    }
+
+    /// Run `wire` when it is `delegate` or `reply`; `None` for any other name.
+    pub fn run(&self, wire: &WireToolCall) -> Option<ToolOutcome> {
+        match wire.name.as_str() {
+            DELEGATE if !self.offer_delegate => {
+                refused(format!("{DELEGATE} is not one of this agent's tools."))
+            }
+            DELEGATE => self.delegate(&wire.arguments_raw),
+            REPLY if !self.offer_reply => refused(NOT_DELEGATED),
+            REPLY => self.reply(wire.arguments.as_ref()),
+            _ => None,
+        }
+    }
+
+    fn delegate(&self, raw: &str) -> Option<ToolOutcome> {
+        let args = match parse_args(raw) {
+            Ok(args) => args,
+            Err(sentence) => return refused(sentence),
+        };
+        let Some(port) = self.port.clone() else {
+            return refused(NO_ROOMS);
+        };
+        if let Some(id) = &args.session {
+            return self.next_round(port.as_ref(), id, &args.brief);
+        }
+        let id = Ulid::new().to_string();
+        let known = port.known();
+        let target = match resolve(&known, &args.agent) {
+            Ok(target) => target,
+            Err(sentence) => return self.refuse(&id, args.agent.trim(), None, sentence),
+        };
+        let to = target.matrix_user.to_string();
+        if target.matrix_user == self.from.user {
+            return self.refuse(
+                &id,
+                &to,
+                None,
+                "An agent does not delegate to itself.".to_owned(),
+            );
+        }
+        if let Err(bound) = Limits::of(&self.from.limits).check(self.from.hop, 0, 0) {
+            return self.refuse(&id, &to, None, bound.sentence());
+        }
+        let content = match compose(&args, &self.from, target, &self.view.label(), &id) {
+            Ok(content) => content,
+            Err(sentence) => return self.refuse(&id, &to, None, sentence),
+        };
+        let invites = room_invites(&target.matrix_user, &self.from.user, &content.label);
+        let members = observers(&invites, &target.matrix_user);
+        for sink in [
+            Sink::Delegation {
+                target_audience: target.home_readers.clone(),
+                room_members: members.clone(),
+            },
+            Sink::Room {
+                humans: members.clone(),
+                agent_audiences: vec![target.home_readers.clone()],
+            },
+        ] {
+            if let SinkVerdict::Block { reason, .. } = check_sink(&content.label, &sink) {
+                return self.refuse(&id, &to, None, reason);
+            }
+        }
+        // A schedule or a workflow is a person's to allow (Q16, T3).
+        if content
+            .card
+            .as_ref()
+            .is_some_and(|card| card.schedule.is_some() || card.workflow.is_some())
+        {
+            return self.refuse(&id, &to, None, UNATTENDED_REFUSAL.to_owned());
+        }
+        let name = session_title(&target.id, chrono::Utc::now());
+        let room = match block_on(port.create(&name, invites, vec![target.matrix_user.clone()])) {
+            Ok(room) => room,
+            Err(error) => {
+                return self.refuse(
+                    &id,
+                    &to,
+                    None,
+                    format!("The delegation's room could not be made: {error}"),
+                )
+            }
+        };
+        port.watch(&room, &self.from.room);
+        self.line(LineBody::Delegate(DelegateBody {
+            id: id.clone(),
+            to,
+            room: Some(room),
+            child: None,
+            state: DelegateState::Opened,
+            reason: None,
+            reply: None,
+        }));
+        // The id is what a later round names: the result says it, and a
+        // replay of the session says it again.
+        Some(ToolOutcome::Answered {
+            text: format!(
+                "Handed to {} as delegation {id}; waiting for it to join. Its reply will come to this session. To say more in this exchange, call delegate with session = {id}.",
+                target.name
+            ),
+        })
+    }
+
+    /// The next round of an open delegation's exchange (R49).
+    fn next_round(&self, port: &dyn DelegationPort, id: &str, brief: &str) -> Option<ToolOutcome> {
+        let Some(delegation) = self.view.delegation(id) else {
+            return refused(format!("No delegation of this session has the id {id}."));
+        };
+        let to = delegation.to.to_string();
+        if !delegation.sent {
+            return refused(format!(
+                "{to} has not joined yet; the brief goes in once it does."
+            ));
+        }
+        let limit = self.from.limits.rounds_per_exchange;
+        if delegation.rounds >= limit {
+            let bound = BoundReached::Rounds { limit };
+            return self.refuse(id, &to, Some(delegation.room.clone()), bound.sentence());
+        }
+        let known = port.known();
+        let mut content = match content_for(&delegation, &self.from, &self.view.label(), &known) {
+            Ok(content) => content,
+            Err(sentence) => return refused(sentence),
+        };
+        content.brief = brief.to_owned();
+        content.card = None;
+        let Some(audience) = audience_of(&known, &delegation.to) else {
+            return refused(format!("{to} is no longer known on this host."));
+        };
+        // Its answer comes back here whatever this copy was told before.
+        port.watch(&delegation.room, &self.from.room);
+        if let Err(reason) = block_on(may_send(
+            port,
+            &delegation.room,
+            &content.label,
+            [&self.from.user, &delegation.to],
+            vec![audience],
+        )) {
+            return self.refuse(id, &to, Some(delegation.room.clone()), reason);
+        }
+        let txn = TransactionId::new();
+        if let Err(error) = block_on(port.send(&delegation.room, brief_content(&content), txn)) {
+            return refused(format!("The message could not be sent: {error}"));
+        }
+        self.line(LineBody::Delegate(DelegateBody {
+            id: id.to_owned(),
+            to: to.clone(),
+            room: Some(delegation.room),
+            child: None,
+            state: DelegateState::Sent,
+            reason: None,
+            reply: None,
+        }));
+        Some(ToolOutcome::Answered {
+            text: format!("Sent to {to}."),
+        })
+    }
+
+    fn reply(&self, args: Option<&Value>) -> Option<ToolOutcome> {
+        let Some(text) = args.and_then(|args| args["text"].as_str()) else {
+            return refused("reply needs a \"text\" argument.");
+        };
+        let mut handed = Vec::new();
+        for rel in args
+            .and_then(|args| args["artifacts"].as_array())
+            .into_iter()
+            .flatten()
+        {
+            let Some(rel) = rel.as_str() else {
+                return refused("reply's artifacts are session-relative paths.");
+            };
+            if let Err(sentence) = artifact_in(&self.from.zone, &self.from.session, rel) {
+                return refused(sentence);
+            }
+            handed.push(json!({
+                "drive": self.from.drive,
+                "path": format!("{}/{}/{rel}", self.from.subfolder, self.from.session),
+            }));
+        }
+        let Some(port) = self.port.clone() else {
+            return refused(NO_ROOMS);
+        };
+        let (me, requester) = (&self.from.user, &self.from.requester);
+        let label = self.view.label();
+        // The room's people read the reply as it is; the delegating session
+        // joins the label it carries, so no agent's audience is added here.
+        if let Err(reason) = block_on(may_send(
+            port.as_ref(),
+            &self.from.room,
+            &label,
+            [me, requester],
+            Vec::new(),
+        )) {
+            return self.refuse(
+                &self.from.id,
+                requester.as_str(),
+                Some(self.from.room.clone()),
+                reason,
+            );
+        }
+        let content = reply_content(text, handed, &label);
+        if let Err(error) = block_on(self.room.send(
+            "m.room.message",
+            content,
+            TransactionId::new(),
+        )) {
+            return refused(format!("The reply could not be sent: {error}"));
+        }
+        // The exchange closes on this line alone: a refused or failed reply
+        // leaves its rounds counted.
+        self.line(LineBody::Delegate(DelegateBody {
+            id: self.from.id.clone(),
+            to: requester.to_string(),
+            room: Some(self.from.room.clone()),
+            child: None,
+            state: DelegateState::Replied,
+            reason: None,
+            reply: None,
+        }));
+        let (zone, session) = (self.from.zone.clone(), self.from.session.clone());
+        match set_card_run(&zone, &session, Run::Review) {
+            Ok(_) => self.line(LineBody::Run(RunBody {
+                state: RunState::Review,
+                detail: None,
+            })),
+            Err(error) => {
+                tracing::warn!(%session, %error, "agents: a reply's card could not be set to review");
+            }
+        }
+        Some(ToolOutcome::Answered {
+            text: "Replied.".to_owned(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use keeper_core::agents::home::AgentKind;
+    use keeper_core::agents::label::{Integrity, Readers};
+
+    use super::*;
+
+    fn agent(drive: &str, id: &str) -> KnownAgent {
+        let readers = Readers::Only(Default::default());
+        KnownAgent {
+            id: id.to_owned(),
+            drive: drive.to_owned(),
+            name: id.to_owned(),
+            matrix_user: OwnedUserId::try_from(format!("@{drive}-{id}:h")).expect("user"),
+            kind: AgentKind::Specialist,
+            human: None,
+            hosted: false,
+            home_readers: readers.clone(),
+            opening: Label {
+                readers,
+                integrity: Integrity::Owner,
+                local_only: false,
+            },
+            drives: vec![drive.to_owned()],
+        }
+    }
+
+    /// R67: `<drive>/<id>` names one agent; a bare id only when it is
+    /// unique, otherwise the refusal names the candidates.
+    #[test]
+    fn a_target_is_named_by_drive_and_id() {
+        let known = Known {
+            agents: vec![
+                agent("tgdrive", "amelia"),
+                agent("neuradrive", "amelia"),
+                agent("tgdrive", "tola-grey"),
+            ],
+            trust: Vec::new(),
+        };
+        assert_eq!(
+            resolve(&known, "neuradrive/amelia").expect("one").drive,
+            "neuradrive"
+        );
+        assert_eq!(resolve(&known, "tola-grey").expect("one").id, "tola-grey");
+        let both = resolve(&known, "amelia").expect_err("two");
+        assert!(
+            both.contains("tgdrive/amelia") && both.contains("neuradrive/amelia"),
+            "{both}"
+        );
+        assert!(resolve(&known, "tgdrive/winston").is_err());
+    }
+
+    /// A reply hands over only files under its session's `artifacts/`:
+    /// `..`, a path elsewhere in the session, a missing file, and a link out
+    /// of `artifacts/` — to another session's file or the session's own
+    /// `agent.toml` — are refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_reply_hands_over_only_its_own_artifacts() {
+        let zone = tempfile::tempdir().expect("zone");
+        let session = "active/2026-10-04-tola";
+        let dir = zone.path().join(session);
+        std::fs::create_dir_all(dir.join("artifacts")).expect("artifacts");
+        std::fs::write(dir.join("artifacts/report.md"), "# Inbox\n").expect("report");
+        std::fs::write(dir.join("agent.toml"), "version = 1\n").expect("agent.toml");
+        let other = zone.path().join("active/2026-10-04-other");
+        std::fs::create_dir_all(&other).expect("other");
+        std::fs::write(other.join("secret.md"), "theirs\n").expect("secret");
+        std::os::unix::fs::symlink(other.join("secret.md"), dir.join("artifacts/out.md"))
+            .expect("link out");
+        std::os::unix::fs::symlink(dir.join("agent.toml"), dir.join("artifacts/own.md"))
+            .expect("link in");
+
+        assert_eq!(
+            artifact_in(zone.path(), session, "artifacts/report.md"),
+            Ok(())
+        );
+        for rel in [
+            "artifacts/../agent.toml",
+            "agent.toml",
+            "artifacts/missing.md",
+            "artifacts/out.md",
+            "artifacts/own.md",
+            "artifacts",
+        ] {
+            assert!(artifact_in(zone.path(), session, rel).is_err(), "{rel}");
+        }
+    }
+}

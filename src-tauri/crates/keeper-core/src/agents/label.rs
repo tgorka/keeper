@@ -7,8 +7,8 @@
 //! is the [`Label::join`] of everything it has read, so it only ever narrows:
 //! readers intersect, integrity falls to the lower side, `local_only` sticks.
 //!
-//! This module labels inputs and answers [`Label::may_reach`]; enforcing a
-//! label at a sink is `check_sink`'s (AD-391), not this module's.
+//! This module labels inputs, answers [`Label::may_reach`], and decides
+//! whether content with a label may go to a sink ([`check_sink`], AD-391).
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -81,6 +81,14 @@ impl Readers {
             (_, Readers::Anyone) => true,
             (Readers::Anyone, Readers::Only(_)) => false,
             (Readers::Only(a), Readers::Only(b)) => a.is_subset(b),
+        }
+    }
+
+    /// The union, with `Anyone` absorbing: who reads what either side shows.
+    pub fn union(&self, other: &Readers) -> Readers {
+        match (self, other) {
+            (Readers::Anyone, _) | (_, Readers::Anyone) => Readers::Anyone,
+            (Readers::Only(a), Readers::Only(b)) => Readers::Only(a.union(b).cloned().collect()),
         }
     }
 }
@@ -218,6 +226,114 @@ impl Label {
             out.push_str(" It may be sent only to a model that runs locally.");
         }
         out
+    }
+}
+
+/// Where content goes (AD-391): every place an agent sends what it read
+/// names who will read it there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sink {
+    /// A room: its people, and the audience of every agent in it.
+    Room {
+        humans: BTreeSet<OwnedUserId>,
+        agent_audiences: Vec<Readers>,
+    },
+    /// A delegation: the target agent's audience and the room's other
+    /// members.
+    Delegation {
+        target_audience: Readers,
+        room_members: BTreeSet<OwnedUserId>,
+    },
+    /// A write into a drive, read by its readers.
+    DriveWrite { drive_readers: Readers },
+    /// A write into an agent's memory, read with its home.
+    MemoryWrite { home_readers: Readers },
+    /// A model call (R28 S-04): a provider is a processor the person chose,
+    /// not an audience, so only `local_only` binds it.
+    Model { local: bool },
+    /// A configured MCP server or KVM, read by its configured `readers`
+    /// (R24(1)): `*` only when the configuration says so.
+    External { readers: Readers },
+}
+
+/// What a sink may receive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SinkVerdict {
+    Allow,
+    /// Not sent: the sentence the caller says instead, and the readers the
+    /// sink would add (empty when it would reach anyone, or for a model).
+    Block {
+        reason: String,
+        wider: BTreeSet<OwnedUserId>,
+    },
+}
+
+/// What a model that may not see a `local_only` label is told it was not
+/// sent.
+pub const LOCAL_ONLY_SINK: &str =
+    "This session has read something that may go only to a model on its readers' own machines.";
+
+/// Whether content labelled `label` may go to `sink`: a model by
+/// [`Label::may_use_model`], every other sink by [`Label::may_reach`] over
+/// the sink's whole audience.
+pub fn check_sink(label: &Label, sink: &Sink) -> SinkVerdict {
+    let audience = match sink {
+        Sink::Model { local } => {
+            return if label.may_use_model(*local) {
+                SinkVerdict::Allow
+            } else {
+                SinkVerdict::Block {
+                    reason: LOCAL_ONLY_SINK.to_owned(),
+                    wider: BTreeSet::new(),
+                }
+            };
+        }
+        Sink::Room {
+            humans,
+            agent_audiences,
+        } => agent_audiences
+            .iter()
+            .fold(Readers::Only(humans.clone()), |all, one| all.union(one)),
+        Sink::Delegation {
+            target_audience,
+            room_members,
+        } => target_audience.union(&Readers::Only(room_members.clone())),
+        Sink::DriveWrite { drive_readers } => drive_readers.clone(),
+        Sink::MemoryWrite { home_readers } => home_readers.clone(),
+        Sink::External { readers } => readers.clone(),
+    };
+    if label.may_reach(&audience) {
+        return SinkVerdict::Allow;
+    }
+    let only = match &label.readers {
+        Readers::Only(set) => set
+            .iter()
+            .map(|user| user.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        Readers::Anyone => String::new(),
+    };
+    let only = if only.is_empty() {
+        "no one".to_owned()
+    } else {
+        only
+    };
+    match (&audience, &label.readers) {
+        (Readers::Only(audience), Readers::Only(readers)) => {
+            let wider: BTreeSet<OwnedUserId> = audience.difference(readers).cloned().collect();
+            let names: Vec<&str> = wider.iter().map(|user| user.as_str()).collect();
+            SinkVerdict::Block {
+                reason: format!(
+                    "This would let {} read what only {only} may read.",
+                    names.join(", ")
+                ),
+                wider,
+            }
+        }
+        _ => SinkVerdict::Block {
+            reason: format!("This would let anyone read what only {only} may read."),
+            wider: BTreeSet::new(),
+        },
     }
 }
 
@@ -824,5 +940,134 @@ mod tests {
         assert_eq!(vm.readers, vec!["Marta".to_owned(), "tgorka".to_owned()]);
         assert_eq!(vm.integrity, "owner");
         assert_eq!(vm.sentence, neura.sentence(&display_name));
+    }
+
+    /// 92.1 acceptance 12: a model is bound by `local_only` alone; every
+    /// other arm blocks exactly when its whole audience is not within the
+    /// label's readers, naming who would be added.
+    #[test]
+    fn check_sink_decides_every_arm() {
+        let tgorka = only(&["@tgorka:h"]);
+        let mine = Label {
+            readers: tgorka.clone(),
+            integrity: Integrity::Owner,
+            local_only: false,
+        };
+        for readers in all_readers() {
+            let local_only = Label {
+                readers,
+                integrity: Integrity::Owner,
+                local_only: true,
+            };
+            assert!(matches!(
+                check_sink(&local_only, &Sink::Model { local: false }),
+                SinkVerdict::Block { .. }
+            ));
+            assert_eq!(
+                check_sink(&local_only, &Sink::Model { local: true }),
+                SinkVerdict::Allow
+            );
+        }
+        assert_eq!(
+            check_sink(&mine, &Sink::Model { local: false }),
+            SinkVerdict::Allow
+        );
+        assert!(matches!(
+            check_sink(
+                &mine,
+                &Sink::External {
+                    readers: Readers::Anyone
+                }
+            ),
+            SinkVerdict::Block { .. }
+        ));
+        assert_eq!(
+            check_sink(
+                &mine,
+                &Sink::External {
+                    readers: tgorka.clone()
+                }
+            ),
+            SinkVerdict::Allow
+        );
+
+        for label in all_labels() {
+            for audience in all_readers() {
+                let mut sinks = vec![
+                    Sink::DriveWrite {
+                        drive_readers: audience.clone(),
+                    },
+                    Sink::MemoryWrite {
+                        home_readers: audience.clone(),
+                    },
+                    Sink::External {
+                        readers: audience.clone(),
+                    },
+                    Sink::Delegation {
+                        target_audience: audience.clone(),
+                        room_members: BTreeSet::new(),
+                    },
+                    Sink::Room {
+                        humans: BTreeSet::new(),
+                        agent_audiences: vec![audience.clone()],
+                    },
+                ];
+                // People are named one by one: a member set is never "anyone".
+                if let Readers::Only(people) = &audience {
+                    sinks.push(Sink::Delegation {
+                        target_audience: Readers::Only(BTreeSet::new()),
+                        room_members: people.clone(),
+                    });
+                    sinks.push(Sink::Room {
+                        humans: people.clone(),
+                        agent_audiences: Vec::new(),
+                    });
+                }
+                for sink in sinks {
+                    let verdict = check_sink(&label, &sink);
+                    assert_eq!(
+                        verdict == SinkVerdict::Allow,
+                        label.may_reach(&audience),
+                        "{label:?} {sink:?}"
+                    );
+                    if let (
+                        SinkVerdict::Block { wider, .. },
+                        Readers::Only(readers),
+                        Readers::Only(audience),
+                    ) = (&verdict, &label.readers, &audience)
+                    {
+                        let expected: BTreeSet<OwnedUserId> =
+                            audience.difference(readers).cloned().collect();
+                        assert_eq!(wider, &expected, "{label:?} {sink:?}");
+                    }
+                }
+            }
+        }
+
+        // Nixi's {tgorka} session handing work to Dr Lucyna Novak, whose
+        // audience is {tgorka, Marta}: blocked, naming Marta (92.1 AC4); a
+        // room whose extra member is Marta is blocked the same way (AC5).
+        let lucyna = only(&["@marta:h", "@tgorka:h"]);
+        let SinkVerdict::Block { reason, wider } = check_sink(
+            &mine,
+            &Sink::Delegation {
+                target_audience: lucyna,
+                room_members: BTreeSet::from([user("@tgorka:h")]),
+            },
+        ) else {
+            panic!("blocked")
+        };
+        assert_eq!(wider, BTreeSet::from([user("@marta:h")]));
+        assert!(reason.contains("@marta:h"), "{reason}");
+        assert!(matches!(
+            check_sink(
+                &mine,
+                &Sink::Room {
+                    humans: BTreeSet::from([user("@tgorka:h"), user("@marta:h")]),
+                    agent_audiences: vec![tgorka],
+                },
+            ),
+            SinkVerdict::Block { .. }
+        ));
     }
 }

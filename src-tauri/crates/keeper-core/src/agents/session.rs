@@ -31,7 +31,7 @@ pub const TITLE_MAX: usize = 120;
 /// The deepest delegation hop.
 pub const HOP_MAX: i64 = 3;
 
-const ROOT_KEYS: [&str; 17] = [
+const ROOT_KEYS: [&str; 18] = [
     "version",
     "id",
     "agent",
@@ -46,6 +46,7 @@ const ROOT_KEYS: [&str; 17] = [
     "needs",
     "pin",
     "hop",
+    "dispatch_chain",
     "limits",
     "workflow",
     "created_at",
@@ -163,6 +164,9 @@ pub struct SessionAgent {
     pub pin: Option<String>,
     /// Delegation depth, 0–[`HOP_MAX`].
     pub hop: u8,
+    /// Who the work came from, the person who started it first, then each
+    /// agent that handed it on (R76); empty in a file that names none.
+    pub dispatch_chain: Vec<OwnedUserId>,
     /// A delegated session's bounds; `None` means the agent's own.
     pub limits: Option<SessionLimits>,
     /// A folder under `_workflows/`.
@@ -486,6 +490,11 @@ pub fn parse_session_agent_toml(text_in: &str) -> Result<SessionAgent, SessionRe
             drives
         }
     };
+    let dispatch_chain = text_list(&table, "dispatch_chain")?
+        .unwrap_or_default()
+        .iter()
+        .map(|raw| user("dispatch_chain", raw))
+        .collect::<Result<Vec<_>, _>>()?;
     let hop = match integer(&table, "hop", "hop")? {
         None => 0,
         Some(hop) if (0..=HOP_MAX).contains(&hop) => hop as u8,
@@ -522,6 +531,7 @@ pub fn parse_session_agent_toml(text_in: &str) -> Result<SessionAgent, SessionRe
         needs: text_list(&table, "needs")?,
         pin: text(&table, "pin", "pin")?,
         hop,
+        dispatch_chain,
         limits: limits(&table)?,
         workflow: text(&table, "workflow", "workflow")?,
         created_at,
@@ -566,6 +576,12 @@ pub fn compose_session_agent_toml(session: &SessionAgent) -> String {
         line("pin", quoted(pin));
     }
     line("hop", session.hop.to_string());
+    if !session.dispatch_chain.is_empty() {
+        line(
+            "dispatch_chain",
+            quoted_list(session.dispatch_chain.iter().map(|user| user.as_str())),
+        );
+    }
     if let Some(workflow) = &session.workflow {
         line("workflow", quoted(workflow));
     }
@@ -622,6 +638,7 @@ drives = ["tgdrive"]
 needs = ["git"]
 pin = ""
 hop = 1
+dispatch_chain = ["@tgorka:h", "@nixi:h", "@tola-grey:h"]
 workflow = "release-notes"
 created_at = "2026-09-30T08:15:03.120Z"
 
@@ -661,6 +678,8 @@ tokens = 200000
         assert_eq!(session.kind, SessionKind::Delegated);
         assert_eq!(session.hop, 1);
         assert_eq!(session.label.integrity, Integrity::Peer);
+        assert_eq!(session.dispatch_chain.len(), 3);
+        assert_eq!(session.dispatch_chain[0].as_str(), "@tgorka:h");
         let composed = compose_session_agent_toml(&session);
         assert_eq!(
             parse_session_agent_toml(&composed).expect("reparse"),
@@ -687,6 +706,7 @@ local_only = true
         assert_eq!(session.drives, vec!["neuradrive".to_owned()]);
         assert_eq!(session.hop, 0);
         assert_eq!(session.needs, None);
+        assert!(session.dispatch_chain.is_empty(), "a file before R76");
         assert!(session.label.local_only);
         let again = parse_session_agent_toml(&compose_session_agent_toml(&session)).expect("again");
         assert_eq!(again, session);
@@ -757,6 +777,10 @@ local_only = true
             "id"
         );
         assert_eq!(refused_key(&with("version = 1", "version = 2")), "version");
+        assert_eq!(
+            refused_key(&with("\"@nixi:h\", \"@tola", "\"nixi\", \"@tola")),
+            "dispatch_chain"
+        );
         assert_eq!(
             refused_key(&with("rounds_per_exchange = 8", "rounds_per_exchange = 0")),
             "limits.rounds_per_exchange"

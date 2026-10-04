@@ -126,6 +126,36 @@ pub fn create_agent_session(
     )
 }
 
+/// [`create_agent_session`] for a delegated session (AD-385): its
+/// `agent.toml` and its card, `card_name` at the session's root, in the same
+/// journaled plan. Only the host placement chose calls it, and a second call
+/// — a replayed brief, a racing copy — finds the first's folder.
+pub fn create_delegated_session(
+    zone: &Path,
+    agent: &keeper_core::agents::session::SessionAgent,
+    card_name: &str,
+    card: String,
+    now: chrono::DateTime<chrono::Local>,
+) -> Result<CreateOutcome, VerbError> {
+    use keeper_core::agents::session;
+    create_with(
+        zone,
+        CreateReq {
+            id: agent.id,
+            title: agent.title.clone(),
+            pattern_id: None,
+            now,
+        },
+        vec![
+            (
+                session::FILE_NAME.to_owned(),
+                session::compose_session_agent_toml(agent),
+            ),
+            (card_name.to_owned(), card),
+        ],
+    )
+}
+
 /// [`create`], with `extra` files composed into the new session's plan.
 fn create_with(
     zone: &Path,

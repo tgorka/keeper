@@ -172,6 +172,7 @@ fn session_agent(room: &OwnedRoomId, person: &OwnedUserId, mac: bool) -> Session
         needs: mac.then(|| vec!["screen:mac".to_owned()]),
         pin: mac.then(|| "hesperia-sim".to_owned()),
         hop: 0,
+        dispatch_chain: Vec::new(),
         limits: None,
         workflow: None,
         created_at: chrono::Utc::now(),

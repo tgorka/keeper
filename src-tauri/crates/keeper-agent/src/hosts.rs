@@ -14,7 +14,8 @@
 //! a claim handed back is released once its worker has finished, at a later
 //! tick, so every other claim is renewed on time meanwhile.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,7 @@ use std::time::Duration;
 
 use keeper_core::agents::agentd::AgentdConfig;
 use keeper_core::agents::claim::{self, Claimant, ServerClaim, RENEW_EVERY};
+use keeper_core::agents::delegation::{session_title, DelegateContent};
 use keeper_core::agents::events::{RunState, StatusContent, CLAIM, CONTENT_VERSION, HOST, STATUS};
 use keeper_core::agents::home::AgentConfig;
 use keeper_core::agents::host::{accept, bot_id, HostDrive, HostManifest, Materialized};
@@ -29,7 +31,7 @@ use keeper_core::agents::log::reader::ClaimConflict;
 use keeper_core::agents::log::{ClaimAction, HostSlug};
 use keeper_core::agents::matrix::{AgentMatrixError, ServerState};
 use keeper_core::agents::placement::{place, Ask, Placement};
-use keeper_core::agents::session::SessionAgent;
+use keeper_core::agents::session::{SessionAgent, SessionKind};
 use keeper_core::bots::chat::CancelSignal;
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, TransactionId};
 use matrix_sdk::RoomState;
@@ -42,7 +44,7 @@ use crate::claims::{
     ClaimFuture, ClaimPort, Lease, Moment, RoomClaims, Rtt, ServerClock, Step, REQUEST_TIMEOUT,
 };
 use crate::matrix_sink::{EditPort, RoomPort};
-use crate::runtime::{self, spawn_worker, Claimed, Copy, DriveView};
+use crate::runtime::{self, spawn_worker, Claimed, Copy, DriveView, PENDING_ROOMS};
 
 use crate::zone::FoundSession;
 
@@ -59,6 +61,114 @@ const RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// How long a clean shutdown waits for each claim's release.
 pub const RELEASE_BOUND: Duration = Duration::from_secs(10);
+
+/// The opening brief of a delegated room no session folder names yet, as a
+/// copy holds it for placement (R54, R93).
+#[derive(Debug, Clone)]
+pub(crate) struct Opening {
+    /// The brief's event: the first one admitted in its room.
+    pub(crate) event: OwnedEventId,
+    /// Its server time, ms: the session's creation time on whichever host
+    /// makes it, and the key of the claim that host takes first (R95).
+    pub(crate) at: u64,
+    pub(crate) brief: Arc<DelegateContent>,
+}
+
+/// What a copy holds for placement: each delegated room's opening — at
+/// most [`PENDING_ROOMS`] rooms, as the router keeps — and which rooms were
+/// read back from the server. A room past the bound is not forgotten: it
+/// stays unread, and is read back once there is space.
+#[derive(Debug, Default)]
+pub(crate) struct PendingBriefs {
+    held: BTreeMap<OwnedRoomId, Opening>,
+    read: HashSet<OwnedRoomId>,
+}
+
+impl PendingBriefs {
+    /// A brief admitted live: held unless its room holds one already — the
+    /// first admitted is the opening, and a later round never replaces it —
+    /// or the bound is reached, when the room is left for its read-back.
+    pub(crate) fn hold(&mut self, room: &RoomId, opening: Opening) {
+        if self.held.contains_key(room) {
+            return;
+        }
+        if self.held.len() >= PENDING_ROOMS {
+            self.read.remove(room);
+            return;
+        }
+        self.held.insert(room.to_owned(), opening);
+    }
+
+    /// `room` read back: the opening its timeline holds replaces whatever a
+    /// live hold took — a later round, when the opening came while this host
+    /// was down; none leaves a live hold be. `false` when the bound left no
+    /// space for it, and the room stays unread.
+    pub(crate) fn read_back(&mut self, room: &RoomId, opening: Option<Opening>) -> bool {
+        if let Some(opening) = opening {
+            if !self.held.contains_key(room) && self.held.len() >= PENDING_ROOMS {
+                return false;
+            }
+            self.held.insert(room.to_owned(), opening);
+        }
+        self.read.insert(room.to_owned());
+        true
+    }
+
+    /// Whether `room` was read back.
+    pub(crate) fn is_read(&self, room: &RoomId) -> bool {
+        self.read.contains(room)
+    }
+
+    /// Read `room` back again: its state could not be read when a brief
+    /// arrived.
+    pub(crate) fn unread(&mut self, room: &RoomId) {
+        self.read.remove(room);
+    }
+
+    /// The openings of the rooms read back: what placement acts on.
+    pub(crate) fn ready(&self) -> Vec<(OwnedRoomId, Opening)> {
+        self.held
+            .iter()
+            .filter(|(room, _)| self.read.contains(*room))
+            .map(|(room, opening)| (room.clone(), opening.clone()))
+            .collect()
+    }
+
+    /// Forget `room`'s opening: its session exists.
+    pub(crate) fn forget(&mut self, room: &RoomId) {
+        self.held.remove(room);
+    }
+}
+
+/// Read back every room of `rooms` that is not yet with `read`, keeping
+/// what it finds in `pending`. A read that fails — a `/messages` error, a
+/// room whose state does not read — leaves the room unread, to be read on a
+/// later tick, never taken as a room with no brief.
+pub(crate) async fn read_back_rooms<F, Fut>(
+    pending: &Mutex<PendingBriefs>,
+    rooms: Vec<OwnedRoomId>,
+    mut read: F,
+) where
+    F: FnMut(OwnedRoomId) -> Fut,
+    Fut: Future<Output = Result<Option<Opening>, String>>,
+{
+    let lock = || pending.lock().unwrap_or_else(|p| p.into_inner());
+    for room in rooms {
+        if lock().is_read(&room) {
+            continue;
+        }
+        match read(room.clone()).await {
+            Ok(opening) => {
+                if !lock().read_back(&room, opening) {
+                    tracing::info!(%room, "agents: too many delegations wait here; this one is read back later");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%room, %error, "agents: a delegated room could not be read back; it is read again on the next tick")
+            }
+        }
+    }
+}
 
 /// What the host runtime uses of one copy: its agent, its client in the
 /// control and session rooms, its router and its workers. [`Copy`] is the
@@ -118,6 +228,21 @@ pub(crate) trait CopyPort: Send + Sync {
         stop: &CancelSignal,
         claimed: Claimed,
     ) -> Option<JoinHandle<()>>;
+    /// The opening briefs to this agent of rooms no session folder names
+    /// yet, each room read back (R54).
+    fn pending_delegates(&self) -> Vec<(OwnedRoomId, Opening)>;
+    /// Forget `room`'s brief: its session exists.
+    fn drop_pending(&self, room: &RoomId);
+    /// Make the session `opening` opens in `room`, idempotently on its id.
+    fn create_delegated<'a>(
+        &'a self,
+        room: &'a OwnedRoomId,
+        opening: &'a Opening,
+    ) -> ClaimFuture<'a, Result<(), String>>;
+    /// Once this copy has synced: read back, for its opening brief, every
+    /// delegated room it joined that no session among `served` names and
+    /// that was not read back yet (R54).
+    fn recover_briefs<'a>(&'a self, served: HashSet<OwnedRoomId>) -> ClaimFuture<'a, ()>;
 }
 
 impl CopyPort for Copy {
@@ -237,6 +362,74 @@ impl CopyPort for Copy {
     ) -> Option<JoinHandle<()>> {
         spawn_worker(&self, session, agent, stop, claimed)
     }
+
+    fn pending_delegates(&self) -> Vec<(OwnedRoomId, Opening)> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .ready()
+    }
+
+    fn drop_pending(&self, room: &RoomId) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .forget(room);
+    }
+
+    fn create_delegated<'a>(
+        &'a self,
+        room: &'a OwnedRoomId,
+        opening: &'a Opening,
+    ) -> ClaimFuture<'a, Result<(), String>> {
+        let (zone, config) = (
+            self.deps.sessions_zone.clone(),
+            self.deps.home.config.clone(),
+        );
+        let (room, opening) = (room.clone(), opening.clone());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                create_delegated(&zone, &config, &room, &opening.brief, made_at(&opening))
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        })
+    }
+
+    fn recover_briefs<'a>(&'a self, served: HashSet<OwnedRoomId>) -> ClaimFuture<'a, ()> {
+        Box::pin(runtime::recover_briefs(self, served))
+    }
+}
+
+/// When a delegated session was made: its opening brief's server time, the
+/// same on every host that might make it.
+pub(crate) fn made_at(opening: &Opening) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp_millis(i64::try_from(opening.at).unwrap_or(i64::MAX))
+        .unwrap_or_else(chrono::Utc::now)
+}
+
+/// Make the delegated session `brief` opens in `room` for `config`'s agent
+/// in the sessions zone `zone`, as made at `at`: its `agent.toml` and its
+/// card in one journaled plan, nothing when its id names a session already.
+pub fn create_delegated(
+    zone: &std::path::Path,
+    config: &AgentConfig,
+    room: &OwnedRoomId,
+    brief: &DelegateContent,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    use keeper_core::agents::delegation::{child_card, child_session, CARD_FILE};
+    let agent = child_session(brief, &config.id, &config.drive, room, at)
+        .ok_or_else(|| "the brief's id is not a ULID".to_owned())?;
+    crate::sessions::verbs::create_delegated_session(
+        zone,
+        &agent,
+        CARD_FILE,
+        child_card(brief, &config.id),
+        at.with_timezone(&chrono::Local),
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 /// One session this host sees, and what it holds of it.
@@ -295,6 +488,8 @@ pub struct HostRuntime {
     manifest_sent: Option<Instant>,
     /// When this host's manifest first reached the control room.
     first_published: Option<Instant>,
+    /// What each pending delegation's room was last told it waits for.
+    pending_shown: HashMap<OwnedRoomId, String>,
 }
 
 impl HostRuntime {
@@ -339,6 +534,7 @@ impl HostRuntime {
             rtt: Rtt::default(),
             manifest_sent: None,
             first_published: None,
+            pending_shown: HashMap::new(),
         }
     }
 
@@ -377,6 +573,7 @@ impl HostRuntime {
             rtt: Rtt::default(),
             manifest_sent: None,
             first_published: None,
+            pending_shown: HashMap::new(),
         }
     }
 
@@ -514,6 +711,168 @@ impl HostRuntime {
         let rooms: Vec<OwnedRoomId> = self.slots.keys().cloned().collect();
         for room in rooms {
             self.tick_session(&room, &hosts, stop).await;
+        }
+        self.recover_briefs().await;
+        self.tick_pending(&hosts).await;
+    }
+
+    /// Each copy, once it has synced, reads back the delegated rooms it
+    /// joined that no session names yet and that it has not read, for their
+    /// opening briefs (R54) — every tick, so a read that failed is tried
+    /// again without a restart.
+    async fn recover_briefs(&mut self) {
+        for copy in self.copies.clone() {
+            let served: HashSet<OwnedRoomId> = self.slots.keys().cloned().collect();
+            copy.recover_briefs(served).await;
+        }
+    }
+
+    /// Make the session `opening` opens in `room` through `copy`, placed on
+    /// this host, when the room's claim says no other host does (R95): the
+    /// two hosts' checkouts do not see each other's folders, so the room's
+    /// claim — keyed by the opening's server time, which only it has there —
+    /// is taken before the folder is made and handed back once it is. A
+    /// handed-back claim under that key means the session was made, here or
+    /// elsewhere, and its folder is on its way; a live one, that another
+    /// host is making it now.
+    async fn make_delegated(
+        &mut self,
+        copy: &Arc<dyn CopyPort>,
+        room: &OwnedRoomId,
+        opening: &Opening,
+    ) {
+        let key = claim::rfc3339(opening.at);
+        let me = claimant(&self.host, copy.as_ref());
+        let port = copy.claims(room);
+        let made = match bounded(port.read()).await {
+            Ok(state) => state
+                .as_ref()
+                .and_then(|state| ServerClaim::read(state).ok())
+                .is_some_and(|claim| {
+                    claim.content.released && claim.content.window.as_deref() == Some(key.as_str())
+                }),
+            Err(error) => {
+                tracing::warn!(%room, %error, "agents: a delegated room's claim could not be read");
+                return;
+            }
+        };
+        if made {
+            return;
+        }
+        let lease = match acquire(port.as_ref(), &me, &self.clock, &self.rtt, Some(key)).await {
+            Ok(Acquired::Won { lease, .. }) => lease,
+            Ok(Acquired::HeldElsewhere | Acquired::Yielded) => return,
+            Err(error) => {
+                tracing::warn!(%room, %error, "agents: a delegated room's claim could not be taken");
+                return;
+            }
+        };
+        match copy.create_delegated(room, opening).await {
+            Ok(()) => {
+                tracing::info!(%room, delegation = %opening.brief.id, brief = %opening.event, "agents: a delegated session was made here");
+                if let Err(error) =
+                    release(port.as_ref(), &me, &lease, &self.clock, &self.rtt).await
+                {
+                    tracing::warn!(%room, %error, "agents: a made delegation's claim could not be handed back");
+                }
+                copy.drop_pending(room);
+                self.pending_shown.remove(room);
+            }
+            // The claim lapses unreleased: the session counts as unmade,
+            // and is made again once it has.
+            Err(error) => {
+                tracing::warn!(%room, %error, "agents: a delegated session could not be made")
+            }
+        }
+    }
+
+    /// Every brief this host's copies hold for a room no session names yet
+    /// is placed (AD-379, R54): the placed host makes the session, which its
+    /// next rescan offers and its claim then serves; a brief nobody can
+    /// serve says in its room what it waits for, by the one announcing host.
+    async fn tick_pending(&mut self, hosts: &[HostManifest]) {
+        let me = self.host.as_str().to_owned();
+        let server_now = self.clock.now();
+        let settled = self.control_room.is_none()
+            || self
+                .first_published
+                .is_some_and(|at| at.elapsed() >= ANNOUNCE_AFTER);
+        for copy in self.copies.clone() {
+            for (room, opening) in copy.pending_delegates() {
+                if self.slots.contains_key(&room) {
+                    copy.drop_pending(&room);
+                    self.pending_shown.remove(&room);
+                    continue;
+                }
+                // A host that has just started may not know the others yet:
+                // two hosts that both thought they won would each make the
+                // folder in their own checkout.
+                if !settled {
+                    continue;
+                }
+                let config = copy.config();
+                let principal = copy
+                    .principal_of(&config.drive)
+                    .unwrap_or_else(|| self.principal.clone());
+                let (bot, agent) = (bot_id(&config.bot), agent_name(config));
+                let placement = place(
+                    &Ask {
+                        needs: &config.host.needs,
+                        pin: (!config.host.pin.is_empty()).then_some(config.host.pin.as_str()),
+                        drives: &opening.brief.drives,
+                        agent: &agent,
+                        bot: &bot,
+                        principal: &principal,
+                        prefer_always_on: config.host.prefer_always_on,
+                        holder: None,
+                    },
+                    hosts,
+                    server_now,
+                );
+                match &placement {
+                    Placement::Host(host) if *host == me => {
+                        self.make_delegated(&copy, &room, &opening).await;
+                    }
+                    Placement::Host(_) => {}
+                    Placement::Waiting { .. } => {
+                        let Some(text) = placement.waiting_text() else {
+                            continue;
+                        };
+                        let announces = announcer(hosts, &principal, server_now).as_deref()
+                            == Some(me.as_str());
+                        if !announces || self.pending_shown.get(&room) == Some(&text) {
+                            continue;
+                        }
+                        let status = StatusContent {
+                            v: CONTENT_VERSION,
+                            session: String::new(),
+                            kind: SessionKind::Delegated,
+                            title: session_title(&config.id, chrono::Utc::now()),
+                            agent: config.matrix_user.clone(),
+                            host: me.clone(),
+                            epoch: 0,
+                            run: RunState::Waiting,
+                            detail: None,
+                            waiting: Some(text.clone()),
+                            anchor: None,
+                        };
+                        match copy
+                            .send_status(
+                                &room,
+                                serde_json::to_value(&status).unwrap_or(Value::Null),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                self.pending_shown.insert(room, text);
+                            }
+                            Err(error) => {
+                                tracing::warn!(%room, %error, "agents: a waiting delegation's status was not sent")
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1106,7 +1465,7 @@ fn announcer(hosts: &[HostManifest], principal: &str, server_now: u64) -> Option
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashSet, VecDeque};
     use std::path::Path;
     use std::sync::atomic::AtomicU64;
 
@@ -1143,13 +1502,339 @@ mod tests {
     }
 
     fn config() -> AgentConfig {
+        config_pinned("")
+    }
+
+    /// Nixi's `agent.toml` with `[host].pin = pin`.
+    fn config_pinned(pin: &str) -> AgentConfig {
         let decl = keeper_core::agents::drive::parse(&drive_toml()).expect("decl");
         parse_agent_toml(
-            &format!("version = 1\nid = \"nixi\"\nname = \"Nixi\"\nkind = \"proxy\"\nmatrix_user = \"@nixi:example.org\"\nhuman = \"{PERSON}\"\n\n[model]\nbot = \"bot:openai:http://127.0.0.1:9#model\"\n\n[host]\nneeds = []\n"),
+            &format!("version = 1\nid = \"nixi\"\nname = \"Nixi\"\nkind = \"proxy\"\nmatrix_user = \"@nixi:example.org\"\nhuman = \"{PERSON}\"\n\n[model]\nbot = \"bot:openai:http://127.0.0.1:9#model\"\n\n[host]\nneeds = []\npin = \"{pin}\"\n"),
             "nixi",
             &decl,
         )
         .expect("agent.toml")
+    }
+
+    /// A brief to Nixi in `drives`, handed on by Dr Tola Grey.
+    fn brief_to_nixi(drives: &[&str]) -> DelegateContent {
+        use keeper_core::agents::delegation::{DelegateFrom, DelegateLimits};
+        let decl = keeper_core::agents::drive::parse(&drive_toml()).expect("decl");
+        DelegateContent {
+            v: CONTENT_VERSION,
+            id: ulid::Ulid::new().to_string(),
+            from: DelegateFrom {
+                agent: user("@tola:example.org"),
+                drive: "tgdrive".to_owned(),
+                session: "active/2026-10-04-triage".to_owned(),
+                room: room(90),
+            },
+            to: user("@nixi:example.org"),
+            brief: "Ask tgorka about Friday.".to_owned(),
+            drives: drives.iter().map(|d| (*d).to_owned()).collect(),
+            label: Label::opening(&decl, Integrity::Owner),
+            hop: 1,
+            limits: DelegateLimits {
+                rounds_per_exchange: 3,
+                tokens: 200_000,
+            },
+            card: None,
+            dispatch_chain: Vec::new(),
+        }
+    }
+
+    /// The session folders under `zone`'s `active/`.
+    fn folders(zone: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(zone.join("active"))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| path.join("agent.toml").is_file())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `brief`'s opening event, the `n`th, at a fixed server time.
+    fn opening(brief: &DelegateContent, n: u64) -> Opening {
+        Opening {
+            event: OwnedEventId::try_from(format!("$brief{n}:example.org")).expect("event"),
+            at: 1_759_570_000_000 + n,
+            brief: Arc::new(brief.clone()),
+        }
+    }
+
+    /// `room` read back by `copy` with `opening` in it, as its scan would.
+    fn read_back(copy: &FakeCopy, room: &OwnedRoomId, opening: Option<Opening>) {
+        copy.pending.lock().expect("lock").read_back(room, opening);
+    }
+
+    /// The folders under `zone`'s `active/`, zone-relative, with the bytes of
+    /// their `agent.toml` and card.
+    fn made(zone: &Path) -> Vec<(PathBuf, String, String)> {
+        folders(zone)
+            .into_iter()
+            .map(|dir| {
+                let read = |name: &str| std::fs::read_to_string(dir.join(name)).expect("file");
+                (
+                    dir.strip_prefix(zone).expect("in zone").to_owned(),
+                    read("agent.toml"),
+                    read(keeper_core::agents::delegation::CARD_FILE),
+                )
+            })
+            .collect()
+    }
+
+    /// 92.1 acceptance 3 and R95: two hosts of the principal, each with its
+    /// own checkout, each placing the delegation on itself (their pins say
+    /// so), each holding the brief twice (a replay), tick at once: the room's
+    /// claim, keyed by the opening, lets one make the session, and the other
+    /// never does — though it cannot see that folder — however often it ticks.
+    /// What either would make is the same bytes at the same path: the
+    /// opening's server time, not the host's clock, dates it.
+    #[tokio::test(start_paused = true)]
+    async fn a_replayed_delegate_event_makes_one_session() {
+        let server = Arc::new(Server::default());
+        let (zone_here, zone_there) = (
+            tempfile::tempdir().expect("zone"),
+            tempfile::tempdir().expect("zone"),
+        );
+        let copy = |pin: &str, zone: &Path| {
+            Arc::new(FakeCopy {
+                config: config_pinned(pin),
+                server: Arc::clone(&server),
+                zone: Some(zone.to_owned()),
+                ..fake_copy()
+            })
+        };
+        let mut here = world_over(copy(ME, zone_here.path()), true);
+        let mut there = world_over(copy(OTHER, zone_there.path()), true);
+        there.rt.host = HostSlug::new(OTHER).expect("slug");
+        let (child, brief) = (room(7), brief_to_nixi(&["tgdrive"]));
+        for w in [&here, &there] {
+            let held = || opening(&brief, 1);
+            w.copy.pending.lock().expect("lock").hold(&child, held());
+            w.copy.pending.lock().expect("lock").hold(&child, held());
+            read_back(&w.copy, &child, Some(held()));
+        }
+        tokio::join!(here.tick(), there.tick());
+        assert!(made(zone_here.path()).is_empty() && made(zone_there.path()).is_empty());
+        tokio::time::advance(ANNOUNCE_AFTER).await;
+        for _ in 0..3 {
+            tokio::join!(here.tick(), there.tick());
+        }
+
+        let (mine, theirs) = (made(zone_here.path()), made(zone_there.path()));
+        assert_eq!(mine.len() + theirs.len(), 1, "{mine:?} {theirs:?}");
+        let created = here.copy.created.lock().expect("lock").len()
+            + there.copy.created.lock().expect("lock").len();
+        assert_eq!(created, 1);
+        let claim = here.server().claim(&child).expect("the room's claim");
+        assert!(claim.content.released);
+        assert_eq!(
+            claim.content.window.as_deref(),
+            Some(claim::rfc3339(opening(&brief, 1).at).as_str())
+        );
+
+        // The other checkout, made regardless of the claim, holds the same.
+        let (first, other) = if mine.is_empty() {
+            (&theirs[0], zone_here.path())
+        } else {
+            (&mine[0], zone_there.path())
+        };
+        create_delegated(
+            other,
+            &config(),
+            &child,
+            &brief,
+            made_at(&opening(&brief, 1)),
+        )
+        .expect("made");
+        assert_eq!(made(other)[0], *first);
+        assert!(first.1.contains(&brief.id), "{}", first.1);
+    }
+
+    /// R93: the first brief held for a room is its opening, and rounds that
+    /// arrive before the first tick never replace it; a later round held
+    /// live before the room was read back gives way to the opening the
+    /// read-back finds. Each session's card is its opening's.
+    #[tokio::test(start_paused = true)]
+    async fn later_rounds_never_replace_the_opening_brief() {
+        let zone = tempfile::tempdir().expect("zone");
+        let copy = Arc::new(FakeCopy {
+            zone: Some(zone.path().to_owned()),
+            ..fake_copy()
+        });
+        let mut w = world_over(copy, true);
+        let opened = || DelegateContent {
+            card: Some(keeper_core::agents::delegation::DelegateCard {
+                title: "Friday".to_owned(),
+                schedule: None,
+                workflow: None,
+            }),
+            ..brief_to_nixi(&["tgdrive"])
+        };
+        let round = |first: &DelegateContent, n: u64, text: &str| {
+            opening(
+                &DelegateContent {
+                    brief: text.to_owned(),
+                    card: None,
+                    ..first.clone()
+                },
+                n,
+            )
+        };
+        let (live, restarted) = (room(7), room(8));
+        let (one, two) = (opened(), opened());
+        {
+            let mut pending = w.copy.pending.lock().expect("lock");
+            pending.hold(&live, opening(&one, 1));
+            pending.hold(&live, round(&one, 2, "And Monday."));
+            pending.hold(&live, round(&one, 3, "And Tuesday."));
+            pending.read_back(&live, None);
+            pending.hold(&restarted, round(&two, 5, "And Monday."));
+            pending.read_back(&restarted, Some(opening(&two, 4)));
+        }
+        w.tick().await;
+        tokio::time::advance(ANNOUNCE_AFTER).await;
+        w.tick().await;
+
+        assert_eq!(*w.copy.created.lock().expect("lock"), vec![live, restarted]);
+        let made = made(zone.path());
+        assert_eq!(made.len(), 2, "{made:?}");
+        for (_, _, card) in &made {
+            let (fields, _) = keeper_core::notes::frontmatter::Frontmatter::parse(card);
+            assert_eq!(fields.as_string("title"), Some("Friday"), "{card}");
+            assert!(card.ends_with("\nAsk tgorka about Friday.\n"), "{card}");
+        }
+    }
+
+    /// A room whose read-back failed is not taken for a room with no brief:
+    /// it stays unread, its live hold waits, and the next tick reads it
+    /// again and makes the session — no restart needed.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_read_back_is_read_again_on_the_next_tick() {
+        let zone = tempfile::tempdir().expect("zone");
+        let copy = Arc::new(FakeCopy {
+            zone: Some(zone.path().to_owned()),
+            ..fake_copy()
+        });
+        let mut w = world_over(copy, true);
+        let (child, brief) = (room(7), brief_to_nixi(&["tgdrive"]));
+        w.copy.reads.lock().expect("lock").insert(
+            child.clone(),
+            VecDeque::from([
+                Err("messages: 502".to_owned()),
+                Ok(Some(opening(&brief, 1))),
+            ]),
+        );
+        // The failed read: nothing held, the room still unread.
+        w.tick().await;
+        assert!(!w.copy.pending.lock().expect("lock").is_read(&child));
+        assert!(folders(zone.path()).is_empty());
+        tokio::time::advance(ANNOUNCE_AFTER).await;
+        w.tick().await;
+        assert_eq!(*w.copy.created.lock().expect("lock"), vec![child]);
+        assert_eq!(folders(zone.path()).len(), 1);
+    }
+
+    /// The held briefs are bounded like the router's rooms: with the target
+    /// pinned to a host that is not live, a room past the bound — read back
+    /// or arriving live — is left unread rather than kept or forgotten, and
+    /// is read back once a held room's session exists.
+    #[tokio::test(start_paused = true)]
+    async fn held_briefs_are_bounded_and_the_rest_read_back_later() {
+        let copy = Arc::new(FakeCopy {
+            config: config_pinned(OTHER),
+            ..fake_copy()
+        });
+        let mut w = world_over(copy, true);
+        let rooms: Vec<OwnedRoomId> = (0..=PENDING_ROOMS as u32).map(|n| room(100 + n)).collect();
+        {
+            let mut reads = w.copy.reads.lock().expect("lock");
+            for (n, child) in rooms.iter().enumerate() {
+                let brief = brief_to_nixi(&["tgdrive"]);
+                reads.insert(
+                    child.clone(),
+                    VecDeque::from([Ok(Some(opening(&brief, n as u64)))]),
+                );
+            }
+        }
+        w.tick().await;
+        let held = w.copy.pending_delegates();
+        assert_eq!(held.len(), PENDING_ROOMS);
+        let left: Vec<&OwnedRoomId> = rooms
+            .iter()
+            .filter(|room| !w.copy.pending.lock().expect("lock").is_read(room))
+            .collect();
+        assert_eq!(left.len(), 1, "{left:?}");
+        // A brief admitted live past the bound is left for its read-back too.
+        let live = room(500);
+        {
+            let mut pending = w.copy.pending.lock().expect("lock");
+            pending.hold(&live, opening(&brief_to_nixi(&["tgdrive"]), 500));
+            assert!(!pending.held.contains_key(&live) && !pending.is_read(&live));
+        }
+        let last = left[0].clone();
+        // The server answers its read every tick it is read again.
+        let brief = brief_to_nixi(&["tgdrive"]);
+        w.copy.reads.lock().expect("lock").insert(
+            last.clone(),
+            VecDeque::from([
+                Ok(Some(opening(&brief, 999))),
+                Ok(Some(opening(&brief, 999))),
+            ]),
+        );
+
+        // electra made one held room's session; the rescan here found it.
+        w.offer(&held[0].0, None);
+        w.tick().await;
+        w.tick().await;
+        let now: Vec<OwnedRoomId> = w
+            .copy
+            .pending_delegates()
+            .into_iter()
+            .map(|(room, _)| room)
+            .collect();
+        assert_eq!(
+            now.len(),
+            PENDING_ROOMS,
+            "last {last} held[0] {}",
+            held[0].0
+        );
+        assert!(now.contains(&last) && !now.contains(&held[0].0));
+    }
+
+    /// 92.1 acceptance 7, the target's half: with the agent pinned to a
+    /// host that is not live, the joined room's status says `waiting:
+    /// <host> — <need>` once, from the announcing host, and nothing is made.
+    #[tokio::test(start_paused = true)]
+    async fn a_delegation_nobody_can_serve_says_what_it_waits_for() {
+        let zone = tempfile::tempdir().expect("zone");
+        let copy = Arc::new(FakeCopy {
+            config: config_pinned(OTHER),
+            zone: Some(zone.path().to_owned()),
+            ..fake_copy()
+        });
+        let mut w = world_over(copy, true);
+        let child = room(8);
+        read_back(
+            &w.copy,
+            &child,
+            Some(opening(&brief_to_nixi(&["tgdrive"]), 1)),
+        );
+        w.tick().await;
+        tokio::time::advance(ANNOUNCE_AFTER).await;
+        w.tick().await;
+        w.tick().await;
+        let statuses = w.server().statuses();
+        assert_eq!(statuses.len(), 1, "{statuses:?}");
+        assert_eq!(statuses[0]["run"], "waiting");
+        assert_eq!(statuses[0]["waiting"], "electra — a live host");
+        assert_eq!(statuses[0]["kind"], "delegated");
+        assert!(folders(zone.path()).is_empty());
+        assert_eq!(w.copy.pending_delegates().len(), 1, "still waiting");
     }
 
     /// The homeserver: every room's state as one copy's sync sees it, and
@@ -1250,6 +1935,9 @@ mod tests {
         }
     }
 
+    /// One read-back of a room: a failure, or the opening found.
+    type ReadBack = Result<Option<Opening>, String>;
+
     /// One copy over [`Server`]. Its workers serve until their room is
     /// closed, then take `worker_takes` to finish — a turn, or a backlog.
     struct FakeCopy {
@@ -1263,6 +1951,15 @@ mod tests {
         workers: Mutex<HashMap<OwnedRoomId, Arc<Notify>>>,
         spawned: Mutex<Vec<OwnedRoomId>>,
         closed: Mutex<Vec<OwnedRoomId>>,
+        /// What the copy holds for placement, as [`Copy`] holds it.
+        pending: Mutex<PendingBriefs>,
+        /// Each joined delegated room's read-backs to come, in order: a
+        /// failure, or the opening found (none once they run out).
+        reads: Mutex<BTreeMap<OwnedRoomId, VecDeque<ReadBack>>>,
+        /// The sessions zone delegated sessions are made in.
+        zone: Option<PathBuf>,
+        /// Every room a delegated session was made for, in order.
+        created: Mutex<Vec<OwnedRoomId>>,
     }
 
     impl CopyPort for FakeCopy {
@@ -1392,6 +2089,51 @@ mod tests {
                 tokio::time::sleep(takes).await;
             }))
         }
+
+        fn pending_delegates(&self) -> Vec<(OwnedRoomId, Opening)> {
+            self.pending.lock().expect("lock").ready()
+        }
+
+        fn drop_pending(&self, room: &RoomId) {
+            self.pending.lock().expect("lock").forget(room);
+        }
+
+        fn create_delegated<'a>(
+            &'a self,
+            room: &'a OwnedRoomId,
+            opening: &'a Opening,
+        ) -> ClaimFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                let zone = self.zone.as_ref().ok_or("no zone")?;
+                create_delegated(zone, &self.config, room, &opening.brief, made_at(opening))?;
+                self.created.lock().expect("lock").push(room.clone());
+                Ok(())
+            })
+        }
+
+        fn recover_briefs<'a>(&'a self, served: HashSet<OwnedRoomId>) -> ClaimFuture<'a, ()> {
+            Box::pin(async move {
+                let rooms: Vec<OwnedRoomId> = self
+                    .reads
+                    .lock()
+                    .expect("lock")
+                    .keys()
+                    .filter(|room| !served.contains(*room))
+                    .cloned()
+                    .collect();
+                read_back_rooms(&self.pending, rooms, |room| {
+                    let next = self
+                        .reads
+                        .lock()
+                        .expect("lock")
+                        .get_mut(&room)
+                        .and_then(VecDeque::pop_front)
+                        .unwrap_or(Ok(None));
+                    std::future::ready(next)
+                })
+                .await;
+            })
+        }
     }
 
     struct World {
@@ -1435,6 +2177,7 @@ mod tests {
             rtt: Rtt::default(),
             manifest_sent: None,
             first_published: None,
+            pending_shown: HashMap::new(),
         };
         let (cancel, stop) = cancellation();
         World {
@@ -1473,6 +2216,7 @@ mod tests {
                 needs: None,
                 pin: pin.map(str::to_owned),
                 hop: 0,
+                dispatch_chain: Vec::new(),
                 limits: None,
                 workflow: None,
                 created_at: chrono::Utc::now(),
@@ -1631,6 +2375,10 @@ mod tests {
             workers: Mutex::default(),
             spawned: Mutex::default(),
             closed: Mutex::default(),
+            pending: Mutex::default(),
+            reads: Mutex::default(),
+            zone: None,
+            created: Mutex::default(),
         }
     }
 

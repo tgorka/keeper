@@ -32,7 +32,7 @@
 //! process exits. An engine that stops while the host runs stops the host
 //! too, with the runtime's exit code, so its unit restarts it.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -44,7 +44,7 @@ use keeper_core::agents::agentd::{AgentdConfig, DrivePin};
 use keeper_core::agents::drive::{self, DriveDecl};
 use keeper_core::agents::events::{
     presence_levels, PresenceLevels, APPROVAL_DECISION, CONTROL_ROOM_TYPE, CONVERSATION_REQUEST,
-    PRESENCE, SCOPE, SURFACE_REQUEST, SURFACE_RESULT, TURN,
+    DELEGATE, PRESENCE, SCOPE, SESSION_ROOM_TYPE, SURFACE_REQUEST, SURFACE_RESULT, TURN,
 };
 use keeper_core::agents::index::Index;
 use keeper_core::agents::label::{Label, Readers};
@@ -64,25 +64,30 @@ use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::events::room::member::{MembershipState, StrippedRoomMemberEvent};
 use matrix_sdk::ruma::events::AnySyncTimelineEvent;
 use matrix_sdk::ruma::serde::Raw;
-use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId};
-use matrix_sdk::{LoopCtrl, Room, RoomState};
+use matrix_sdk::ruma::{
+    OwnedEventId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, UInt, UserId,
+};
+use matrix_sdk::{LoopCtrl, Room, RoomMemberships, RoomState};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::agent::{
-    bot_for, trail_of, AgentDeps, AgentProfiles, Arrived, ConversationPort, RoomFuture,
+    bot_for, reply_of, trail_of, AgentDeps, AgentProfiles, Arrived, ConversationPort, RoomFuture,
     ServedSession, SessionRef,
 };
 use crate::claims::Lease;
+use crate::delegate::{BoolFuture, BriefRoomFuture, DelegationPort, EventsFuture, MembersFuture};
 use crate::headless::{
     apply_providers, drive_path, open_engine, zone_verdicts, HeadlessError, HeadlessPlatform,
     HeadlessSyncPlatform, SecretMap,
 };
-use crate::hosts::HostRuntime;
+use crate::hosts::{read_back_rooms, HostRuntime, Opening, PendingBriefs};
 use crate::matrix_sink::{EditPort, RoomPort, SendFuture};
-use crate::rooms::{self, Arrival, Invite, InviteDecision, Known, KnownAgent};
+use crate::rooms::{
+    self, Arrival, BriefEvent, BriefRoom, Invite, InviteDecision, Known, KnownAgent,
+};
 use crate::surface::{self, PresenceFuture, SurfacePort};
 use crate::turn::{DrivePorts, TurnEnv};
 use crate::zone::{active_sessions, read_text, read_zone, AgentHome, FoundSession, ZoneRead};
@@ -268,6 +273,9 @@ pub(crate) fn known_with(
             let Ok(home) = home else { continue };
             let readers = Readers::Only(home.config.audience.clone());
             agents.push(KnownAgent {
+                id: home.config.id.clone(),
+                drive: home.config.drive.clone(),
+                name: home.config.name.clone(),
                 matrix_user: home.config.matrix_user.clone(),
                 kind: home.config.kind,
                 human: home.config.human.clone(),
@@ -278,6 +286,7 @@ pub(crate) fn known_with(
                     ..Label::top()
                 },
                 home_readers: readers,
+                drives: home.config.drives.clone(),
             });
         }
     }
@@ -518,6 +527,11 @@ impl Router {
     pub fn close_room(&self, room: &RoomId) {
         self.routes().workers.remove(room);
     }
+
+    /// Whether a worker serves `room`.
+    pub fn serves(&self, room: &RoomId) -> bool {
+        self.routes().workers.contains_key(room)
+    }
 }
 
 /// Frees a worker's room when the worker ends, a panic included.
@@ -541,6 +555,13 @@ pub(crate) struct Copy {
     pub(crate) router: Arc<Router>,
     /// Counts the copy's completed `/sync` rounds: a taker's settle waits one.
     pub(crate) syncs: watch::Receiver<u64>,
+    /// Rooms this copy's sessions delegated into, each with the room of the
+    /// session that did: their joins and replies go to that session (R55).
+    pub(crate) children: Arc<Mutex<HashMap<OwnedRoomId, OwnedRoomId>>>,
+    /// The opening brief of each delegated room no session folder names
+    /// yet, addressed to this agent: placement decides which host makes the
+    /// session (R54). Bounded like the router's rooms.
+    pub(crate) pending: Mutex<PendingBriefs>,
 }
 
 /// The claim a worker writes under (story 90.6).
@@ -644,6 +665,8 @@ pub(crate) fn start_copy(
         known,
         router: Arc::new(Router::default()),
         syncs: rounds_seen,
+        children: Arc::default(),
+        pending: Mutex::default(),
     });
     register_handlers(&copy);
     let sync_client = copy.client.client().clone();
@@ -966,7 +989,13 @@ async fn serve_session(
     }
     let deps = &copy.deps;
     let me = &deps.home.config.matrix_user;
-    served.conversations = Some(Arc::new(ClientRooms(copy.client.clone())));
+    let rooms = Arc::new(ClientRooms {
+        client: copy.client.clone(),
+        known: Arc::clone(&copy.known),
+        children: Arc::clone(&copy.children),
+    });
+    served.conversations = Some(Arc::clone(&rooms) as Arc<dyn ConversationPort>);
+    served.delegations = Some(rooms);
     served.surface = Some(Arc::new(ClientSurface {
         client: copy.client.clone(),
         room: room_id.clone(),
@@ -988,6 +1017,8 @@ async fn serve_session(
             tracing::error!(session = %session.path, %error, "agentd: the interrupted turn could not be closed")
         }
     }
+    // What this session's delegations did while no worker served it.
+    backlog.extend(served.resume_delegations(deps).await);
     served
         .serve_arrivals(deps, port, backlog, &mut arrivals, stop, &claimed.busy)
         .await;
@@ -1003,11 +1034,15 @@ async fn serve_session(
 
 /// The copy's own client, making the conversations a `main` session's
 /// person asks for (R36).
-struct ClientRooms(AgentClient);
+struct ClientRooms {
+    client: AgentClient,
+    known: Arc<RwLock<Arc<Known>>>,
+    children: Arc<Mutex<HashMap<OwnedRoomId, OwnedRoomId>>>,
+}
 
 impl ConversationPort for ClientRooms {
     fn create<'a>(&'a self, name: &'a str, person: &'a UserId) -> RoomFuture<'a> {
-        Box::pin(self.0.create_room(
+        Box::pin(self.client.create_room(
             RoomKind::Session(SessionKind::Conversation),
             name,
             vec![person.to_owned()],
@@ -1016,7 +1051,7 @@ impl ConversationPort for ClientRooms {
     }
 
     fn send<'a>(&'a self, room: &'a RoomId, event_type: &'a str, content: Value) -> SendFuture<'a> {
-        Box::pin(self.0.send(room, event_type, content, None))
+        Box::pin(self.client.send(room, event_type, content, None))
     }
 
     fn discard<'a>(
@@ -1025,7 +1060,7 @@ impl ConversationPort for ClientRooms {
         person: &'a UserId,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            let Some(joined) = self.0.client().get_room(room) else {
+            let Some(joined) = self.client.client().get_room(room) else {
                 return;
             };
             if let Err(error) = joined
@@ -1050,7 +1085,7 @@ impl ConversationPort for ClientRooms {
         person: &'a UserId,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
-            let Some(room) = self.0.client().get_room(room) else {
+            let Some(room) = self.client.client().get_room(room) else {
                 return false;
             };
             matches!(
@@ -1058,6 +1093,83 @@ impl ConversationPort for ClientRooms {
                 Ok(Some(member)) if *member.membership() == MembershipState::Join
             )
         })
+    }
+}
+
+impl DelegationPort for ClientRooms {
+    fn known(&self) -> Arc<Known> {
+        Arc::clone(&self.known.read().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn create<'a>(
+        &'a self,
+        name: &'a str,
+        invite: Vec<OwnedUserId>,
+        agents: Vec<OwnedUserId>,
+    ) -> RoomFuture<'a> {
+        Box::pin(async move {
+            self.client
+                .create_room(
+                    RoomKind::Session(SessionKind::Delegated),
+                    name,
+                    invite,
+                    &agents,
+                )
+                .await
+        })
+    }
+
+    fn send<'a>(
+        &'a self,
+        room: &'a RoomId,
+        content: Value,
+        txn: OwnedTransactionId,
+    ) -> SendFuture<'a> {
+        Box::pin(async move {
+            self.client
+                .send(room, "m.room.message", content, Some(&txn))
+                .await
+        })
+    }
+
+    fn joined<'a>(&'a self, room: &'a RoomId, user: &'a UserId) -> BoolFuture<'a> {
+        ConversationPort::joined(self, room, user)
+    }
+
+    fn members<'a>(&'a self, room: &'a RoomId) -> MembersFuture<'a> {
+        Box::pin(async move {
+            let room = self
+                .client
+                .client()
+                .get_room(room)
+                .ok_or_else(|| "this copy is not in the room".to_owned())?;
+            members_of(&room).await
+        })
+    }
+
+    fn since_brief<'a>(&'a self, room: &'a RoomId, me: &'a UserId) -> EventsFuture<'a> {
+        Box::pin(async move {
+            let room = self
+                .client
+                .client()
+                .get_room(room)
+                .ok_or_else(|| "this copy is not in the room".to_owned())?;
+            after_brief(|from| page_back(&room, from), me).await
+        })
+    }
+
+    fn brief_room<'a>(&'a self, room: &'a RoomId) -> BriefRoomFuture<'a> {
+        Box::pin(async move {
+            let room = self.client.client().get_room(room)?;
+            brief_room(&room).await
+        })
+    }
+
+    fn watch(&self, child: &RoomId, parent: &RoomId) {
+        self.children
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(child.to_owned(), parent.to_owned());
     }
 }
 
@@ -1310,6 +1422,23 @@ fn register_handlers(copy: &Arc<Copy>) {
                     }
                     return;
                 }
+                // A room one of this agent's sessions delegated into: its
+                // target's join and reply go to that session, and nothing
+                // else of it to anyone (R55).
+                let parent = copy
+                    .children
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(room.room_id())
+                    .cloned();
+                if let Some(parent) = parent {
+                    if let Some(arrived) =
+                        child_arrival(&value, encryption.as_ref(), room.room_id(), received_at)
+                    {
+                        copy.router.route(&parent, arrived);
+                    }
+                    return;
+                }
                 let Some(arrived) = arrival_of(&value, encryption.as_ref(), received_at) else {
                     return;
                 };
@@ -1318,10 +1447,295 @@ fn register_handlers(copy: &Arc<Copy>) {
                 if arrived.sender == copy.deps.home.config.matrix_user {
                     return;
                 }
+                if arrived.arrival == Arrival::Brief && !copy.router.serves(room.room_id()) {
+                    hold_brief(&copy, &room, &value, sealed_by_sender(encryption.as_ref())).await;
+                }
                 copy.router.route(room.room_id(), arrived);
             }
         },
     );
+}
+
+/// Who is in `room` or invited to it.
+async fn members_of(room: &Room) -> Result<BTreeSet<OwnedUserId>, String> {
+    let members = room
+        .members(RoomMemberships::JOIN | RoomMemberships::INVITE)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(members
+        .iter()
+        .map(|member| member.user_id().to_owned())
+        .collect())
+}
+
+/// What a brief's admission reads of `room` now (R93); `None` when its
+/// power levels or its members could not be read, and then no brief is
+/// taken from it.
+pub(crate) async fn brief_room(room: &Room) -> Option<BriefRoom> {
+    let levels = room.power_levels().await.ok()?;
+    let members = members_of(room).await.ok()?;
+    Some(BriefRoom {
+        room_type: room.room_type().map(|kind| kind.to_string()),
+        creators: room.creators().unwrap_or_default(),
+        levels: Some(levels),
+        members,
+    })
+}
+
+/// `event` (decrypted, `sealed` by its sender's device or not) as the
+/// opening of a delegation to `me` in a room that is `room` now: what
+/// [`rooms::admit_brief`] admits, with the event's id and server time.
+pub(crate) fn admitted(
+    room: &BriefRoom,
+    event: &Value,
+    sealed: bool,
+    me: &UserId,
+    known: &Known,
+) -> Result<Opening, &'static str> {
+    let sender = event["sender"]
+        .as_str()
+        .and_then(|sender| UserId::parse(sender).ok())
+        .ok_or(rooms::NOT_A_BRIEF)?;
+    let brief = rooms::admit_brief(
+        room,
+        &BriefEvent {
+            event_type: event["type"].as_str().unwrap_or_default(),
+            sender: &sender,
+            content: &event["content"],
+            sealed,
+        },
+        me,
+        known,
+    )?;
+    Ok(Opening {
+        event: event["event_id"]
+            .as_str()
+            .and_then(|id| OwnedEventId::try_from(id).ok())
+            .ok_or(rooms::NOT_A_BRIEF)?,
+        at: event["origin_server_ts"]
+            .as_u64()
+            .ok_or(rooms::NOT_A_BRIEF)?,
+        brief: Arc::new(brief),
+    })
+}
+
+/// A brief in a room no worker serves yet, admitted as every brief is
+/// (R93), is held for placement (R54); the first held is the room's
+/// opening, and a later round never replaces it. A room whose state could
+/// not be read is read back on a later tick instead.
+async fn hold_brief(copy: &Copy, room: &Room, event: &Value, sealed: bool) {
+    let me = &copy.deps.home.config.matrix_user;
+    let known = Arc::clone(&copy.known.read().unwrap_or_else(|p| p.into_inner()));
+    let pending = || copy.pending.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(facts) = brief_room(room).await else {
+        tracing::warn!(room = %room.room_id(), "agents: a brief's room could not be read; it is read back later");
+        pending().unread(room.room_id());
+        return;
+    };
+    match admitted(&facts, event, sealed, me, &known) {
+        Ok(opening) => {
+            pending().hold(room.room_id(), opening);
+        }
+        Err(note) => {
+            tracing::info!(room = %room.room_id(), sender = event["sender"].as_str().unwrap_or_default(), note, "agents: a brief this agent may not take is ignored")
+        }
+    }
+}
+
+/// Every delegated room this copy joined that no session among `served`
+/// names and no worker serves, not read back yet, is read back for its
+/// opening brief (R54): after a restart, and for a room joined since. A
+/// room whose read failed stays unread and is read again on a later tick.
+pub(crate) async fn recover_briefs(copy: &Copy, served: HashSet<OwnedRoomId>) {
+    if *copy.syncs.borrow() == 0 {
+        return;
+    }
+    let me = copy.deps.home.config.matrix_user.clone();
+    let known = Arc::clone(&copy.known.read().unwrap_or_else(|p| p.into_inner()));
+    let rooms: Vec<Room> = copy
+        .client
+        .client()
+        .joined_rooms()
+        .into_iter()
+        .filter(|room| {
+            room.room_type()
+                .is_some_and(|kind| kind.to_string() == SESSION_ROOM_TYPE)
+                && !served.contains(room.room_id())
+                && !copy.router.serves(room.room_id())
+                && room
+                    .creators()
+                    .is_some_and(|creators| !creators.contains(&me))
+        })
+        .collect();
+    let ids = rooms.iter().map(|room| room.room_id().to_owned()).collect();
+    let zone = copy.deps.sessions_zone.clone();
+    read_back_rooms(&copy.pending, ids, |id: OwnedRoomId| {
+        let room = rooms.iter().find(|room| *room.room_id() == *id).cloned();
+        let (me, known, zone) = (me.clone(), Arc::clone(&known), zone.clone());
+        async move {
+            let Some(room) = room else {
+                return Ok(None);
+            };
+            let facts = brief_room(&room)
+                .await
+                .ok_or_else(|| "the room's state could not be read".to_owned())?;
+            let Some(opening) =
+                oldest_opening(|from| page_back(&room, from), &facts, &me, &known).await?
+            else {
+                return Ok(None);
+            };
+            let id = opening.brief.id.clone();
+            let made = tokio::task::spawn_blocking(move || {
+                crate::sessions::verbs::find(&zone, &id).is_some()
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            if made {
+                return Ok(None);
+            }
+            tracing::info!(room = %room.room_id(), delegation = %opening.brief.id, "agents: a brief with no session yet was read back");
+            Ok(Some(opening))
+        }
+    })
+    .await;
+}
+
+/// One page of a room's timeline read backward: its events, newest first,
+/// each with whether its sender's device sealed it, and where the next
+/// page starts — `None` at the room's beginning.
+pub(crate) struct Page {
+    pub(crate) events: Vec<(Value, bool)>,
+    pub(crate) end: Option<String>,
+}
+
+/// The page of `room` before `from` (the newest when `None`).
+async fn page_back(room: &Room, from: Option<String>) -> Result<Page, String> {
+    let mut options = MessagesOptions::backward().from(from.as_deref());
+    options.limit = UInt::from(BACKLOG_PAGE);
+    let page = room
+        .messages(options)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(Page {
+        events: page
+            .chunk
+            .iter()
+            .filter_map(|event| {
+                let value = event.raw().deserialize_as::<Value>().ok()?;
+                Some((
+                    value,
+                    sealed_by_sender(event.encryption_info().map(|info| &**info)),
+                ))
+            })
+            .collect(),
+        end: page.end.filter(|_| !page.chunk.is_empty()),
+    })
+}
+
+/// Read a timeline back, newest first, at most [`BACKLOG_PAGES`] pages of
+/// `fetch`, handing every event to `visit` until it says stop; whether it
+/// did. A page that could not be read is an error, never an empty room.
+pub(crate) async fn walk_back<F, Fut>(
+    mut fetch: F,
+    mut visit: impl FnMut(&Value, bool) -> bool,
+) -> Result<bool, String>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<Page, String>>,
+{
+    let mut from = None;
+    for _ in 0..BACKLOG_PAGES {
+        let page = fetch(from.take()).await?;
+        for (event, sealed) in &page.events {
+            if visit(event, *sealed) {
+                return Ok(true);
+            }
+        }
+        match page.end {
+            Some(end) => from = Some(end),
+            None => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
+/// The events its senders' devices sealed after the newest brief `me` sent
+/// into a room, oldest first, read back as far as that brief however many
+/// pages away it is (R55).
+pub(crate) async fn after_brief<F, Fut>(fetch: F, me: &UserId) -> Result<Vec<Value>, String>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<Page, String>>,
+{
+    let mut after = Vec::new();
+    walk_back(fetch, |event, sealed| {
+        let brief =
+            event["sender"].as_str() == Some(me.as_str()) && event["content"][DELEGATE].is_object();
+        if !brief && sealed {
+            after.push(event.clone());
+        }
+        brief
+    })
+    .await?;
+    after.reverse();
+    Ok(after)
+}
+
+/// The opening of a delegation to `me` in a room that is `room` now: the
+/// oldest event of its timeline [`admitted`] admits, so a later round never
+/// stands for the brief that opened it (R93).
+pub(crate) async fn oldest_opening<F, Fut>(
+    fetch: F,
+    room: &BriefRoom,
+    me: &UserId,
+    known: &Known,
+) -> Result<Option<Opening>, String>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<Page, String>>,
+{
+    let mut oldest = None;
+    walk_back(fetch, |event, sealed| {
+        if let Ok(opening) = admitted(room, event, sealed, me, known) {
+            oldest = Some(opening);
+        }
+        false
+    })
+    .await?;
+    Ok(oldest)
+}
+
+/// An event of a room a session delegated into, as that session's arrival:
+/// a member's join, or a reply its sender's device sealed. The session
+/// checks the sender is its target.
+fn child_arrival(
+    value: &Value,
+    encryption: Option<&EncryptionInfo>,
+    room: &RoomId,
+    received_at: Instant,
+) -> Option<Arrived> {
+    let sender = UserId::parse(value["sender"].as_str()?).ok()?;
+    if value["type"] == "m.room.member" {
+        if value["content"]["membership"] != "join"
+            || value["state_key"].as_str() != Some(sender.as_str())
+        {
+            return None;
+        }
+        return Some(Arrived {
+            event_id: OwnedEventId::try_from(value["event_id"].as_str()?).ok()?,
+            sender,
+            arrival: Arrival::Joined,
+            text: String::new(),
+            content: value["content"].clone(),
+            received_at,
+            replay: false,
+            via: Some(room.to_owned()),
+        });
+    }
+    if !sealed_by_sender(encryption) {
+        return None;
+    }
+    reply_of(value, &sender, room, received_at)
 }
 
 /// Whether a decrypted event's sender is who its envelope says: an event
@@ -1376,6 +1790,8 @@ pub fn arrival_of(
                 "agentd: a message its sender's device did not seal is not a turn"
             );
             return None;
+        } else if content[DELEGATE].is_object() {
+            Arrival::Brief
         } else {
             Arrival::Text
         }
@@ -1405,6 +1821,7 @@ pub fn arrival_of(
         content,
         received_at,
         replay: false,
+        via: None,
     })
 }
 
@@ -1605,6 +2022,7 @@ mod tests {
             human: Some(&tgorka),
             session_kind: SessionKind::Main,
             agent_user: &nixi,
+            requester: &tgorka,
             readers: &readers,
         };
         let event = |kind: &str, content: Value| json!({"type": kind, "event_id": "$s:example.org", "sender": tgorka.as_str(), "content": content});
@@ -1678,5 +2096,213 @@ mod tests {
             let error = finalized(finalize, by_itself).expect_err("a failure");
             assert_eq!(error.exit_code(), 1, "{error}");
         }
+    }
+
+    const NIXI: &str = "@nixi:example.org";
+    const TOLA: &str = "@tola:example.org";
+
+    fn user(id: &str) -> OwnedUserId {
+        OwnedUserId::try_from(id).expect("user")
+    }
+
+    /// `timeline` (oldest first) as a homeserver pages it backward, 50 a
+    /// page; the page starting `failing` events back fails.
+    fn pages(
+        timeline: &[(Value, bool)],
+        failing: Option<usize>,
+    ) -> impl FnMut(Option<String>) -> std::future::Ready<Result<Page, String>> + '_ {
+        move |from| {
+            let skip: usize = from.as_deref().map_or(0, |n| n.parse().unwrap_or(0));
+            if failing == Some(skip) {
+                return std::future::ready(Err("messages: 502".to_owned()));
+            }
+            let newest_first: Vec<(Value, bool)> =
+                timeline.iter().rev().skip(skip).take(50).cloned().collect();
+            let end = (skip + 50 < timeline.len()).then(|| (skip + 50).to_string());
+            std::future::ready(Ok(Page {
+                events: newest_first,
+                end,
+            }))
+        }
+    }
+
+    fn event(n: usize, sender: &str, content: Value) -> Value {
+        json!({
+            "type": "m.room.message",
+            "event_id": format!("$e{n}:example.org"),
+            "sender": sender,
+            "origin_server_ts": 1_759_570_000_000u64 + n as u64,
+            "content": content,
+        })
+    }
+
+    /// R55: a reply followed by more than a page of the child's other
+    /// events while the parent's host was down is still found — the read
+    /// goes back to the parent's newest brief and no further — and a page
+    /// that cannot be read is an error, not an empty room.
+    #[tokio::test]
+    async fn a_reply_more_than_a_page_back_is_found() {
+        let label = Label::top();
+        let reply = crate::delegate::reply_content("Sorted.", Vec::new(), &label);
+        let mut timeline = vec![
+            (event(0, TOLA, reply.clone()), true),
+            (
+                event(
+                    1,
+                    NIXI,
+                    json!({"msgtype": "m.text", "body": "b", DELEGATE: {}}),
+                ),
+                true,
+            ),
+            (event(2, TOLA, reply), true),
+        ];
+        for n in 3..70 {
+            let status = json!({"type": "dev.keeper.agent.status", "event_id": format!("$e{n}:example.org"), "sender": TOLA, "content": {}});
+            timeline.push((status, true));
+        }
+        let after = after_brief(pages(&timeline, None), &user(NIXI))
+            .await
+            .expect("read back");
+        assert_eq!(
+            after.len(),
+            68,
+            "everything after the brief, nothing before"
+        );
+        let room = OwnedRoomId::try_from("!child:example.org").expect("room");
+        let replies: Vec<String> = after
+            .iter()
+            .filter_map(|event| reply_of(event, &user(TOLA), &room, Instant::now()))
+            .map(|arrived| arrived.event_id.to_string())
+            .collect();
+        assert_eq!(replies, ["$e2:example.org"]);
+        assert!(after_brief(pages(&timeline, Some(50)), &user(NIXI))
+            .await
+            .is_err());
+    }
+
+    /// R93: the live intake and the read-back after a restart take a brief
+    /// by the one admission: an edit carrying a delegation, the delegation
+    /// as a custom event, a notice and an unsealed message are refused by
+    /// both; and the read-back pins the oldest admitted brief, never a
+    /// later round.
+    #[tokio::test]
+    async fn the_live_intake_and_the_read_back_admit_the_same_briefs() {
+        use keeper_core::agents::delegation::{
+            brief_content, DelegateContent, DelegateFrom, DelegateLimits,
+        };
+        use keeper_core::agents::events::CONTENT_VERSION;
+        use keeper_core::agents::home::AgentKind;
+        use matrix_sdk::ruma::events::room::power_levels::{
+            RoomPowerLevels, RoomPowerLevelsEventContent,
+        };
+        use matrix_sdk::ruma::room_version_rules::AuthorizationRules;
+
+        let readers = Readers::Only(std::collections::BTreeSet::from([user(
+            "@tgorka:example.org",
+        )]));
+        let agent = |id: &str, hosted: bool| KnownAgent {
+            id: id.trim_start_matches('@').to_owned(),
+            drive: "tgdrive".to_owned(),
+            name: id.to_owned(),
+            matrix_user: user(id),
+            kind: AgentKind::Steward,
+            human: None,
+            hosted,
+            home_readers: readers.clone(),
+            opening: Label {
+                readers: readers.clone(),
+                ..Label::top()
+            },
+            drives: vec!["tgdrive".to_owned()],
+        };
+        let known = Known {
+            agents: vec![agent(NIXI, false), agent(TOLA, true)],
+            trust: Vec::new(),
+        };
+        let levels: RoomPowerLevelsEventContent =
+            serde_json::from_value(keeper_core::agents::events::power_levels(
+                SessionKind::Delegated,
+                &user(NIXI),
+                &[user(TOLA)],
+            ))
+            .expect("levels");
+        let room = BriefRoom {
+            room_type: Some(SESSION_ROOM_TYPE.to_owned()),
+            creators: vec![user(NIXI)],
+            levels: Some(RoomPowerLevels::new(
+                levels.into(),
+                &AuthorizationRules::V1,
+                Vec::<OwnedUserId>::new(),
+            )),
+            members: std::collections::BTreeSet::from([user(NIXI), user(TOLA)]),
+        };
+        let delegation = |text: &str| DelegateContent {
+            v: CONTENT_VERSION,
+            id: "01J9ZZZZZZZZZZZZZZZZZZZZZZ".to_owned(),
+            from: DelegateFrom {
+                agent: user(NIXI),
+                drive: "tgdrive".to_owned(),
+                session: "active/2026-10-04-chat".to_owned(),
+                room: OwnedRoomId::try_from("!parent:example.org").expect("room"),
+            },
+            to: user(TOLA),
+            brief: text.to_owned(),
+            drives: vec!["tgdrive".to_owned()],
+            label: Label {
+                readers: readers.clone(),
+                ..Label::top()
+            },
+            hop: 1,
+            limits: DelegateLimits {
+                rounds_per_exchange: 3,
+                tokens: 1000,
+            },
+            card: None,
+            dispatch_chain: Vec::new(),
+        };
+        let opening = brief_content(&delegation("Sort the inbox."));
+        let mut edit = opening.clone();
+        edit["m.relates_to"] = json!({"rel_type": "m.replace", "event_id": "$e1:example.org"});
+        let mut notice = opening.clone();
+        notice["msgtype"] = json!("m.notice");
+        let mut custom = event(4, NIXI, opening.clone());
+        custom["type"] = json!(DELEGATE);
+        let forged = [
+            (event(2, NIXI, edit), true),
+            (custom, true),
+            (event(5, NIXI, notice), true),
+            (event(6, NIXI, opening.clone()), false),
+        ];
+        let me = user(TOLA);
+        for (forgery, sealed) in &forged {
+            assert!(
+                admitted(&room, forgery, *sealed, &me, &known).is_err(),
+                "{forgery}"
+            );
+            let read = oldest_opening(
+                pages(std::slice::from_ref(&(forgery.clone(), *sealed)), None),
+                &room,
+                &me,
+                &known,
+            )
+            .await
+            .expect("read back");
+            assert!(read.is_none(), "{forgery}");
+        }
+
+        let genuine = event(1, NIXI, opening);
+        let live = admitted(&room, &genuine, true, &me, &known).expect("admitted live");
+        let mut timeline = vec![(genuine, true)];
+        timeline.extend(forged.iter().cloned());
+        timeline.push((
+            event(7, NIXI, brief_content(&delegation("And Monday."))),
+            true,
+        ));
+        let read = oldest_opening(pages(&timeline, None), &room, &me, &known)
+            .await
+            .expect("read back")
+            .expect("an opening");
+        assert_eq!((read.event, read.at), (live.event, live.at));
+        assert_eq!(read.brief.brief, "Sort the inbox.");
     }
 }

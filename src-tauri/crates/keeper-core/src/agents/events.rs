@@ -46,6 +46,15 @@ pub const SURFACE_REQUEST: &str = "dev.keeper.agent.surface.request";
 /// One of a person's keeper clients, and whether it is in front (state in
 /// the principal's control room, key = its Matrix device id; AD-383).
 pub const PRESENCE: &str = "dev.keeper.agent.presence";
+/// The key inside a brief's `m.room.message` content carrying the
+/// delegation (ruling R53): who hands what to whom, under which label.
+pub const DELEGATE: &str = "dev.keeper.agent.delegate";
+/// The key inside an agent's `m.room.message` content naming the files it
+/// hands over, `[{drive, path}]`: a delegated session's reply carries it.
+pub const ARTIFACTS: &str = "dev.keeper.agent.artifacts";
+/// The key inside a delegated session's reply naming the session's label
+/// as it is when it replies (ruling R94): what the delegating session joins.
+pub const REPLY_LABEL: &str = "dev.keeper.agent.label";
 
 /// The contents' schema version, `"v": 1`.
 pub const CONTENT_VERSION: u32 = 1;

@@ -6,7 +6,7 @@
 //! OpenAI-shaped SSE stub that records every request body.
 #![cfg(unix)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,20 +14,31 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keeper_agent::agent::{
-    arm_agent, trail_of, AgentDeps, AgentProfiles, Arrived, ConversationPort, HeldFocus, Outcome,
-    Probe, RoomFuture, ServedSession, SessionRef, Trail, TurnEnding, JOIN_POLL, LOCAL_ONLY_REFUSAL,
-    NARROWER_THAN_ROOM,
+    arm_agent, reply_of, trail_of, AgentDeps, AgentProfiles, Arrived, ConversationPort, HeldFocus,
+    Outcome, Probe, RoomFuture, ServedSession, SessionRef, Trail, TurnEnding, BRIEF_REFUSED,
+    BRIEF_UNSENT, BUDGET_SPENT, JOIN_POLL, LOCAL_ONLY_REFUSAL, NARROWER_THAN_ROOM,
+    NOT_THIS_DELEGATION, ROUNDS_SPENT,
 };
 use keeper_agent::claims::{blocked_status, conflict_line, conflict_of, Lease};
+use keeper_agent::delegate::{
+    reply_content, BoolFuture, BriefRoomFuture, DelegationPort, EventsFuture, MembersFuture,
+    NOT_DELEGATED,
+};
 use keeper_agent::host::UNATTENDED_REFUSAL;
 use keeper_agent::matrix_sink::{EditPort, SendFuture};
-use keeper_agent::rooms::{Arrival, NOT_THE_PERSON, OBSERVER_TEXT, UNSIGNED_DEVICE};
+use keeper_agent::rooms::{
+    Arrival, BriefRoom, Known, KnownAgent, NOT_THE_PERSON, NO_AGENT_POWER, OBSERVER_TEXT,
+    UNSIGNED_DEVICE,
+};
 use keeper_agent::runtime::Router;
 use keeper_agent::turn::{DrivePorts, TurnEnv};
 use keeper_agent::writer::WriterError;
 use keeper_agent::zone::{read_zone, AgentHome};
+use keeper_core::agents::delegation::{read_brief, DelegateContent};
 use keeper_core::agents::drive::{self, DriveDecl};
-use keeper_core::agents::events::{RunState, StatusContent, FINAL_CUT_BYTES, SCOPE, STATUS};
+use keeper_core::agents::events::{
+    RunState, StatusContent, FINAL_CUT_BYTES, SCOPE, SESSION_ROOM_TYPE, STATUS,
+};
 use keeper_core::agents::focus::FOCUS_TTL;
 use keeper_core::agents::label::{Integrity, Label, Readers};
 use keeper_core::agents::log::reader::{hydrate_blob, read_session};
@@ -37,12 +48,15 @@ use keeper_core::agents::log::{
     AssistantBody, ClaimAction, ClaimBody, HostSlug, LineBody, LineKind, LogLine, ToolCallBody,
     ToolOutcomeWord, ToolResultBody, UserBody, LINE_VERSION,
 };
+use keeper_core::agents::log::{DelegateBody, DelegateReply, DelegateState, PeerBody};
 use keeper_core::agents::session::{compose_session_agent_toml, SessionAgent, SessionKind};
 use keeper_core::bots::chat::{self, CancelHandle};
 use keeper_core::bots::{store, Bot, Provider, ProviderKind};
 use keeper_core::error::CoreError;
 use keeper_core::platform::Platform;
 use keeper_sync::SyncProfile;
+use matrix_sdk::ruma::events::room::power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent};
+use matrix_sdk::ruma::room_version_rules::AuthorizationRules;
 use matrix_sdk::ruma::{
     OwnedEventId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, UserId,
 };
@@ -51,6 +65,10 @@ use serde_json::{json, Value};
 const TGORKA: &str = "@tgorka:example.org";
 const MARTA: &str = "@marta:example.org";
 const SESSION: &str = "active/2026-10-02-chat";
+/// In a scripted completion: the delegation id the request names.
+const DELEGATION: &str = "@DELEGATION@";
+/// What a `delegate` result says just before the delegation's id.
+const DELEGATION_SAID: &str = "as delegation ";
 
 struct DataDir(PathBuf);
 
@@ -206,13 +224,27 @@ impl Stub {
                         .expect("lock")
                         .pop()
                         .unwrap_or_else(|| prose("ok."));
+                    // `@DELEGATION@` in a scripted frame is the delegation id
+                    // the request itself carries — what a model would read
+                    // in its `delegate` result — never one the test knows.
+                    let request = String::from_utf8_lossy(&body);
+                    let named = request.rfind(DELEGATION_SAID).map(|at| {
+                        let from = at + DELEGATION_SAID.len();
+                        request[from..(from + 26).min(request.len())].to_owned()
+                    });
                     // A `{"pause_ms": n}` entry is no frame: the stream
                     // waits there, so the edits in between are paced.
                     let mut parts: Vec<(String, u64)> = Vec::new();
                     for data in completion {
                         match data["pause_ms"].as_u64() {
                             Some(pause) => parts.push((String::new(), pause)),
-                            None => parts.push((format!("data: {data}\n\n"), 0)),
+                            None => {
+                                let mut frame = format!("data: {data}\n\n");
+                                if let Some(id) = &named {
+                                    frame = frame.replace(DELEGATION, id);
+                                }
+                                parts.push((frame, 0))
+                            }
                         }
                     }
                     parts.push(("data: [DONE]\n\n".to_owned(), 0));
@@ -424,6 +456,7 @@ fn session_of(
         needs: None,
         pin: None,
         hop: 0,
+        dispatch_chain: Vec::new(),
         limits: None,
         workflow: None,
         created_at: chrono::Utc::now(),
@@ -475,6 +508,7 @@ impl World {
             content: json!({"msgtype":"m.text","body":text}),
             received_at: tokio::time::Instant::now(),
             replay: false,
+            via: None,
         }
     }
 
@@ -2507,4 +2541,1530 @@ async fn a_surface_call_is_answered_by_the_device_and_logged() {
     assert_eq!(line.id, requests[0]["id"].as_str().expect("id"));
     assert_eq!(line.device, "KALYPSO");
     assert_eq!(line.outcome.as_deref(), Some("done"));
+}
+
+// ---------------------------------------------------------------------------
+// Story 92.1: delegation
+// ---------------------------------------------------------------------------
+
+/// A room a delegation made: its name, its invites, its agents at 50.
+type MadeRoom = (String, Vec<OwnedUserId>, Vec<OwnedUserId>, OwnedRoomId);
+
+/// The rooms a delegation goes through, as a recording fake: every room
+/// made, every brief sent, who has joined which room, who else is in it,
+/// what its timeline holds since the brief, and what fails.
+#[derive(Default)]
+struct Delegations {
+    known: Mutex<Arc<Known>>,
+    made: Mutex<Vec<MadeRoom>>,
+    sent: Mutex<Vec<(OwnedRoomId, Value, String)>>,
+    joined: Mutex<Vec<(OwnedRoomId, OwnedUserId)>>,
+    watched: Mutex<Vec<(OwnedRoomId, OwnedRoomId)>>,
+    /// `watch <room>` and `send <room>`, in order.
+    ops: Mutex<Vec<String>>,
+    /// People added to a room after it was made.
+    added: Mutex<Vec<(OwnedRoomId, OwnedUserId)>>,
+    /// The events since the newest brief, per room, oldest first.
+    history: Mutex<Vec<(OwnedRoomId, Value)>>,
+    /// Sends that fail before one succeeds, and every attempt's
+    /// transaction id.
+    failing_sends: std::sync::atomic::AtomicUsize,
+    attempts: Mutex<Vec<String>>,
+    /// Reads back that fail before one succeeds.
+    failing_reads: std::sync::atomic::AtomicUsize,
+    /// The room a brief arrives in, when not the one made by Nixi with
+    /// Tola at 50.
+    facts: Mutex<Option<BriefRoom>>,
+}
+
+impl Delegations {
+    fn over(known: Known) -> Arc<Delegations> {
+        Arc::new(Delegations {
+            known: Mutex::new(Arc::new(known)),
+            ..Delegations::default()
+        })
+    }
+
+    fn made(&self) -> Vec<MadeRoom> {
+        self.made.lock().expect("lock").clone()
+    }
+
+    fn sent(&self) -> Vec<(OwnedRoomId, Value, String)> {
+        self.sent.lock().expect("lock").clone()
+    }
+
+    /// Who is in `room`: Nixi, who made it, everyone it invited, and anyone
+    /// added since; Nixi and Tola in a room this fake did not make.
+    fn people(&self, room: &RoomId) -> BTreeSet<OwnedUserId> {
+        let mut people = BTreeSet::from([user(NIXI)]);
+        match self.made().into_iter().find(|made| made.3 == room) {
+            Some((_, invites, _, _)) => people.extend(invites),
+            None => {
+                people.insert(user(TOLA));
+            }
+        }
+        people.extend(
+            self.added
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|(r, _)| r == room)
+                .map(|(_, who)| who.clone()),
+        );
+        people
+    }
+}
+
+/// Power levels as `events::power_levels` makes them for a delegated room
+/// Nixi made with Tola at 50, with `changes` applied.
+fn delegated_levels(changes: impl FnOnce(&mut Value)) -> RoomPowerLevels {
+    let mut json = keeper_core::agents::events::power_levels(
+        SessionKind::Delegated,
+        &user(NIXI),
+        &[user(TOLA)],
+    );
+    changes(&mut json);
+    let content: RoomPowerLevelsEventContent = serde_json::from_value(json).expect("levels");
+    RoomPowerLevels::new(
+        content.into(),
+        &AuthorizationRules::V1,
+        Vec::<OwnedUserId>::new(),
+    )
+}
+
+impl DelegationPort for Delegations {
+    fn known(&self) -> Arc<Known> {
+        Arc::clone(&self.known.lock().expect("lock"))
+    }
+
+    fn create<'a>(
+        &'a self,
+        name: &'a str,
+        invite: Vec<OwnedUserId>,
+        agents: Vec<OwnedUserId>,
+    ) -> RoomFuture<'a> {
+        Box::pin(async move {
+            let mut made = self.made.lock().expect("lock");
+            let room = OwnedRoomId::try_from(format!("!child{}:example.org", made.len() + 1))
+                .expect("room");
+            made.push((name.to_owned(), invite, agents, room.clone()));
+            Ok(room)
+        })
+    }
+
+    fn send<'a>(
+        &'a self,
+        room: &'a RoomId,
+        content: Value,
+        txn: OwnedTransactionId,
+    ) -> SendFuture<'a> {
+        Box::pin(async move {
+            self.attempts.lock().expect("lock").push(txn.to_string());
+            let failing = &self.failing_sends;
+            if failing.load(Ordering::SeqCst) > 0 {
+                failing.fetch_sub(1, Ordering::SeqCst);
+                return Err(keeper_core::agents::matrix::AgentMatrixError::Network(
+                    "unreachable".to_owned(),
+                ));
+            }
+            self.ops.lock().expect("lock").push(format!("send {room}"));
+            let mut sent = self.sent.lock().expect("lock");
+            sent.push((room.to_owned(), content, txn.to_string()));
+            Ok(OwnedEventId::try_from(format!("$brief{}:example.org", sent.len())).expect("id"))
+        })
+    }
+
+    fn joined<'a>(&'a self, room: &'a RoomId, user: &'a UserId) -> BoolFuture<'a> {
+        Box::pin(async move {
+            self.joined
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|(r, u)| r == room && u == user)
+        })
+    }
+
+    fn members<'a>(&'a self, room: &'a RoomId) -> MembersFuture<'a> {
+        Box::pin(async move { Ok(self.people(room)) })
+    }
+
+    fn since_brief<'a>(&'a self, room: &'a RoomId, _me: &'a UserId) -> EventsFuture<'a> {
+        Box::pin(async move {
+            let failing = &self.failing_reads;
+            if failing.load(Ordering::SeqCst) > 0 {
+                failing.fetch_sub(1, Ordering::SeqCst);
+                return Err("messages: 502".to_owned());
+            }
+            Ok(self
+                .history
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|(r, _)| r == room)
+                .map(|(_, event)| event.clone())
+                .collect())
+        })
+    }
+
+    fn brief_room<'a>(&'a self, room: &'a RoomId) -> BriefRoomFuture<'a> {
+        Box::pin(async move {
+            if let Some(facts) = self.facts.lock().expect("lock").clone() {
+                return Some(facts);
+            }
+            Some(BriefRoom {
+                room_type: Some(SESSION_ROOM_TYPE.to_owned()),
+                creators: vec![user(NIXI)],
+                levels: Some(delegated_levels(|_| {})),
+                members: self.people(room),
+            })
+        })
+    }
+
+    fn watch(&self, child: &RoomId, parent: &RoomId) {
+        self.ops
+            .lock()
+            .expect("lock")
+            .push(format!("watch {child}"));
+        self.watched
+            .lock()
+            .expect("lock")
+            .push((child.to_owned(), parent.to_owned()));
+    }
+}
+
+const NIXI: &str = "@nixi:example.org";
+const TOLA: &str = "@tola:example.org";
+const LUCYNA: &str = "@lucyna:example.org";
+
+fn known_agent(drive: &str, id: &str, name: &str, user_id: &str, readers: &[&str]) -> KnownAgent {
+    let readers = Readers::Only(readers.iter().map(|r| user(r)).collect());
+    KnownAgent {
+        id: id.to_owned(),
+        drive: drive.to_owned(),
+        name: name.to_owned(),
+        matrix_user: user(user_id),
+        kind: keeper_core::agents::home::AgentKind::Steward,
+        human: None,
+        hosted: false,
+        home_readers: readers.clone(),
+        opening: Label {
+            readers,
+            ..Label::top()
+        },
+        drives: vec![drive.to_owned()],
+    }
+}
+
+/// Nixi and Dr Tola Grey in tgdrive (read by `readers`), and Dr Lucyna
+/// Novak in neuradrive, read by tgorka and Marta.
+fn known(readers: &[&str]) -> Known {
+    Known {
+        agents: vec![
+            known_agent("tgdrive", "nixi", "Nixi", NIXI, readers),
+            known_agent("tgdrive", "tola", "Dr Tola Grey", TOLA, readers),
+            known_agent(
+                "neuradrive",
+                "lucyna",
+                "Dr Lucyna Novak",
+                LUCYNA,
+                &[TGORKA, MARTA],
+            ),
+        ],
+        trust: Vec::new(),
+    }
+}
+
+fn tolas(world: &World, allow: &[&str]) -> AgentDeps {
+    deps_of(world, "tola", &steward_toml("tola", "Dr Tola Grey", allow))
+}
+
+fn delegate_call(id: &str, args: Value) -> Completion {
+    calls(&[(id, "delegate", args)])
+}
+
+fn hand_inbox() -> Completion {
+    delegate_call(
+        "d1",
+        json!({"agent": "tgdrive/tola", "brief": "Sort the inbox.", "card": {"title": "Inbox"}}),
+    )
+}
+
+/// The `delegate` lines of `lines`, in order.
+fn delegate_lines(lines: &[LogLine]) -> Vec<DelegateBody> {
+    kinds(lines, LineKind::Delegate)
+        .iter()
+        .map(|line| match &line.body {
+            LineBody::Delegate(body) => body.clone(),
+            _ => unreachable!(),
+        })
+        .collect()
+}
+
+fn tool_results(lines: &[LogLine]) -> Vec<ToolResultBody> {
+    kinds(lines, LineKind::ToolResult)
+        .iter()
+        .map(|line| match &line.body {
+            LineBody::ToolResult(body) => body.clone(),
+            _ => unreachable!(),
+        })
+        .collect()
+}
+
+fn card_field(world: &World, path: &str, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(
+        world
+            .dir(path)
+            .join(keeper_core::agents::delegation::CARD_FILE),
+    )
+    .expect("the card");
+    keeper_core::notes::frontmatter::Frontmatter::parse(&text)
+        .0
+        .as_string(key)
+        .map(str::to_owned)
+}
+
+impl World {
+    /// Nixi's session, served with `rooms` for its delegations.
+    fn delegating(&self, rooms: &Arc<Delegations>) -> ServedSession {
+        let mut served = self.open(SESSION);
+        served.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+        served
+    }
+
+    /// The target's join of the room Nixi made, routed to her session.
+    fn joined(&mut self, child: &OwnedRoomId) -> Arrived {
+        let mut arrived = self.event(TOLA, Arrival::Joined, json!({"membership": "join"}));
+        arrived.via = Some(child.clone());
+        arrived
+    }
+
+    /// The brief `content` (as sent) arriving in its room, from Nixi.
+    fn brief(&mut self, content: &Value) -> Arrived {
+        let mut arrived = self.event(NIXI, Arrival::Brief, content.clone());
+        arrived.text = content["body"].as_str().unwrap_or_default().to_owned();
+        arrived
+    }
+
+    /// Make the session `brief` opens for `target` in `room`, as the placed
+    /// host does: its zone-relative path.
+    fn create_child(
+        &self,
+        target: &AgentDeps,
+        room: &OwnedRoomId,
+        brief: &DelegateContent,
+    ) -> String {
+        keeper_agent::hosts::create_delegated(
+            &self.deps.sessions_zone,
+            &target.home.config,
+            room,
+            brief,
+            chrono::Utc::now(),
+        )
+        .expect("created");
+        keeper_agent::sessions::verbs::find(&self.deps.sessions_zone, &brief.id)
+            .expect("the child session")
+            .path
+    }
+
+    /// Tola's session at `path`, served with `rooms` as her host serves it.
+    fn child(&self, tola: &AgentDeps, path: &str, rooms: &Arc<Delegations>) -> ServedSession {
+        let mut served = self.open_as(tola, path);
+        served.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+        served
+    }
+
+    /// Tola's reply `content` in `child`, as the host routes it to Nixi.
+    fn reply(&mut self, child: &OwnedRoomId, content: &Value) -> Arrived {
+        self.next += 1;
+        let event = json!({
+            "type": "m.room.message",
+            "sender": TOLA,
+            "event_id": format!("$reply{}:example.org", self.next),
+            "content": content,
+        });
+        reply_of(&event, &user(TOLA), child, tokio::time::Instant::now()).expect("a reply")
+    }
+}
+
+/// Serve `arrived` in Tola's session `served` under her deps, into `room`.
+async fn serve_as(
+    tola: &AgentDeps,
+    served: &mut ServedSession,
+    room: &Arc<Room>,
+    arrived: Arrived,
+) -> Outcome {
+    let (_stop, signal) = chat::cancellation();
+    served
+        .serve(tola, room.clone(), arrived, signal)
+        .await
+        .expect("served")
+}
+
+/// Nixi hands the inbox to Dr Tola Grey and Tola joins: the brief, as sent.
+async fn handed_over(
+    world: &mut World,
+    rooms: &Arc<Delegations>,
+) -> (ServedSession, OwnedRoomId, Value) {
+    let mut nixi = world.delegating(rooms);
+    report(world.ask(&mut nixi, "hand the inbox to Tola").await);
+    let child = rooms.made()[0].3.clone();
+    let joined = world.joined(&child);
+    assert!(matches!(
+        world.serve(&mut nixi, joined).await,
+        Outcome::BriefSent(_)
+    ));
+    let brief = rooms.sent().last().expect("the brief").1.clone();
+    (nixi, child, brief)
+}
+
+fn relabel(world: &World, path: &str, integrity: Integrity) -> Label {
+    let file = world.dir(path).join("agent.toml");
+    let text = std::fs::read_to_string(&file).expect("agent.toml");
+    let mut agent = keeper_core::agents::session::parse_session_agent_toml(&text).expect("parse");
+    agent.label.integrity = integrity;
+    std::fs::write(&file, compose_session_agent_toml(&agent)).expect("write");
+    agent.label
+}
+
+/// 92.1 acceptance 2, 5 and 7: Nixi (tgdrive) delegating to Dr Tola Grey
+/// (tgdrive) makes a room inviting exactly Tola and the label's readers,
+/// Tola at 50; nothing goes in until Tola joins, and the session says it
+/// waits; then one brief, once, however often the join is delivered; and
+/// the session Tola's host makes from it is hers — `kind = "delegated"`,
+/// her id, Nixi as requester and parent, Nixi's session label (not
+/// tgdrive's opening) — with one card, `run: queued`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delegation_makes_a_session_in_the_targets_home() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![hand_inbox(), prose("Handed on.")],
+    );
+    let label = relabel(&world, SESSION, Integrity::Agent);
+    let tola = tolas(&world, &["drive_read"]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let mut nixi = world.delegating(&rooms);
+    report(world.ask(&mut nixi, "hand the inbox to Tola").await);
+
+    let made = rooms.made();
+    assert_eq!(made.len(), 1);
+    let (name, invites, agents, child) = made[0].clone();
+    assert!(name.starts_with("tola 20"), "{name}");
+    assert_eq!(invites, vec![user(TOLA), user(MARTA), user(TGORKA)]);
+    assert_eq!(agents, vec![user(TOLA)]);
+    assert!(rooms.sent().is_empty(), "nothing before the join");
+    let waiting = world.sent_of(STATUS);
+    assert_eq!(
+        waiting.last().expect("a status")["detail"],
+        "waiting for Dr Tola Grey to join"
+    );
+    let opened = delegate_lines(&world.lines(SESSION));
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened[0].state, DelegateState::Opened);
+    assert_eq!(opened[0].room.as_ref(), Some(&child));
+
+    // The join, twice: one brief, sent under the delegation's id.
+    let joined = world.joined(&child);
+    assert!(matches!(
+        world.serve(&mut nixi, joined.clone()).await,
+        Outcome::BriefSent(_)
+    ));
+    assert!(matches!(
+        world.serve(&mut nixi, joined).await,
+        Outcome::Duplicate
+    ));
+    let sent = rooms.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, child);
+    assert_eq!(sent[0].2, opened[0].id);
+    assert_eq!(sent[0].1["body"], "Sort the inbox.");
+    let brief = read_brief(&sent[0].1).expect("a brief");
+    assert_eq!(brief.label, label);
+    assert_eq!(brief.from.session, SESSION);
+    assert_eq!(brief.hop, 1);
+    assert_eq!(
+        delegate_lines(&world.lines(SESSION))
+            .iter()
+            .map(|line| line.state)
+            .collect::<Vec<_>>(),
+        [DelegateState::Opened, DelegateState::Sent]
+    );
+
+    let path = world.create_child(&tola, &child, &brief);
+    let text = std::fs::read_to_string(world.dir(&path).join("agent.toml")).expect("agent.toml");
+    let agent = keeper_core::agents::session::parse_session_agent_toml(&text).expect("parse");
+    assert_eq!(agent.kind, SessionKind::Delegated);
+    assert_eq!(agent.agent, "tola");
+    assert_eq!(agent.requested_by, user(NIXI));
+    let parent = agent.parent.expect("a parent");
+    assert_eq!((parent.session.as_str(), parent.room), (SESSION, room_id()));
+    assert_eq!(agent.label, label);
+    assert_eq!(agent.room, child);
+    // R76: tgorka started it in Nixi's conversation; Nixi handed it on.
+    assert_eq!(agent.dispatch_chain, vec![user(TGORKA), user(NIXI)]);
+    assert_eq!(brief.dispatch_chain, agent.dispatch_chain);
+    assert_eq!(
+        card_field(&world, &path, "assignee").as_deref(),
+        Some("tola")
+    );
+    assert_eq!(
+        card_field(&world, &path, "requested_by").as_deref(),
+        Some(NIXI)
+    );
+    assert_eq!(card_field(&world, &path, "run").as_deref(), Some("queued"));
+}
+
+/// 92.1 acceptance 6: Tola's `reply` sends one message carrying its
+/// artifact's `{drive, path}` and her session's label, sets her card
+/// `run: review`; Nixi's session logs `delegate replied`, gets a `peer` line
+/// naming the artifact and runs a turn — in which her own `reply`, outside
+/// a delegated session, is refused. The model is told who replied and which
+/// files it handed over, in that turn and after a reload.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_closes_the_exchange() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![
+            hand_inbox(),
+            prose("Handed on."),
+            calls(&[(
+                "r1",
+                "reply",
+                json!({"text": "Inbox sorted.", "artifacts": ["artifacts/report.md"]}),
+            )]),
+            prose("Replied."),
+            calls(&[("r2", "reply", json!({"text": "me too"}))]),
+            prose("Tola sorted it."),
+        ],
+    );
+    let tola = tolas(&world, &["drive_read"]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let (mut nixi, child, brief) = handed_over(&mut world, &rooms).await;
+    let content = read_brief(&brief).expect("a brief");
+    let path = world.create_child(&tola, &child, &content);
+    write(&world.dir(&path), "artifacts/report.md", "# Inbox\n");
+
+    let mut tolas_session = world.child(&tola, &path, &rooms);
+    let tolas_room = Arc::new(Room::default());
+    let arrived = world.brief(&brief);
+    report(serve_as(&tola, &mut tolas_session, &tolas_room, arrived).await);
+    let reply = tolas_room
+        .sent()
+        .into_iter()
+        .find(|(_, content)| content["dev.keeper.agent.artifacts"].is_array())
+        .expect("a reply")
+        .1;
+    assert_eq!(reply["body"], "Inbox sorted.");
+    assert_eq!(
+        keeper_agent::delegate::reply_label(&reply),
+        Some(tolas_session.context.label.clone()),
+        "the reply carries the session's label"
+    );
+    let artifact = format!("60-sessions/{path}/artifacts/report.md");
+    assert_eq!(
+        reply["dev.keeper.agent.artifacts"],
+        json!([{"drive": "tgdrive", "path": artifact}])
+    );
+    assert_eq!(card_field(&world, &path, "run").as_deref(), Some("review"));
+    let childs = world.lines(&path);
+    assert_eq!(delegate_lines(&childs)[0].state, DelegateState::Accepted);
+    let LineBody::Peer(peer) = &kinds(&childs, LineKind::Peer)[0].body else {
+        panic!("a peer line");
+    };
+    assert_eq!(
+        (peer.sender.as_str(), peer.text.as_str()),
+        (NIXI, "Sort the inbox.")
+    );
+    assert!(kinds(&childs, LineKind::Run).iter().any(|line| matches!(
+        &line.body,
+        LineBody::Run(run) if run.state == keeper_core::agents::log::RunState::Review
+    )));
+
+    // The reply reaches Nixi's session, as the host routes it.
+    let replied = world.reply(&child, &reply);
+    report(world.serve(&mut nixi, replied.clone()).await);
+    assert!(matches!(
+        world.serve(&mut nixi, replied).await,
+        Outcome::Duplicate
+    ));
+    let lines = world.lines(SESSION);
+    assert_eq!(
+        delegate_lines(&lines).last().expect("a line").state,
+        DelegateState::Replied
+    );
+    let LineBody::Peer(peer) = &kinds(&lines, LineKind::Peer)[0].body else {
+        panic!("a peer line");
+    };
+    assert_eq!(
+        (peer.sender.as_str(), peer.text.as_str()),
+        (TOLA, "Inbox sorted.")
+    );
+    assert_eq!(peer.artifacts, Some(vec![format!("tgdrive/{artifact}")]));
+    let refused = tool_results(&lines);
+    let last = refused.last().expect("a result");
+    assert_eq!(last.outcome, ToolOutcomeWord::Refused);
+    assert!(last.content.contains(NOT_DELEGATED), "{}", last.content);
+    let told =
+        format!("From {TOLA}:\\nInbox sorted.\\n\\nFiles handed over:\\n- tgdrive/{artifact}");
+    let requests = world.stub.requests();
+    assert_eq!(requests.len(), 6);
+    assert!(requests[4].to_string().contains(&told), "{}", requests[4]);
+
+    // After a reload the replayed conversation says the same.
+    drop(nixi);
+    let mut again = world.delegating(&rooms);
+    report(world.ask(&mut again, "what did Tola send?").await);
+    let requests = world.stub.requests();
+    assert!(requests[6].to_string().contains(&told), "{}", requests[6]);
+}
+
+/// 92.1 acceptance 4: Nixi's {tgorka} session handing work to Dr Lucyna
+/// Novak, whose audience adds Marta, is refused naming Marta: no room, no
+/// invite, no event, and a `delegate refused` line with the reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delegation_beyond_the_label_is_refused_before_the_room_exists() {
+    let mut world = world_read_by(
+        &[TGORKA],
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![
+            delegate_call(
+                "d1",
+                json!({"agent": "neuradrive/lucyna", "brief": "Summarise my diary."}),
+            ),
+            prose("I could not."),
+        ],
+    );
+    let rooms = Delegations::over(known(&[TGORKA]));
+    let mut nixi = world.delegating(&rooms);
+    report(world.ask(&mut nixi, "ask Lucyna").await);
+    assert!(rooms.made().is_empty());
+    assert!(rooms.sent().is_empty());
+    assert!(rooms.watched.lock().expect("lock").is_empty());
+    let lines = world.lines(SESSION);
+    let refused = delegate_lines(&lines);
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].state, DelegateState::Refused);
+    assert_eq!(refused[0].room, None);
+    let reason = refused[0].reason.clone().expect("a reason");
+    assert!(reason.contains(MARTA), "{reason}");
+    let result = &tool_results(&lines)[0];
+    assert_eq!(result.outcome, ToolOutcomeWord::Refused);
+    assert!(result.content.contains(MARTA));
+}
+
+/// 92.1 acceptance 8, the hand-off: a card with a schedule needs a person,
+/// so before Epic 93 the call gets `UNATTENDED_REFUSAL` and nothing reaches
+/// the homeserver.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delegated_schedule_is_refused_before_epic_93() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![
+            delegate_call(
+                "d1",
+                json!({"agent": "tola", "brief": "Every morning.", "card": {"title": "Digest", "schedule": "@daily"}}),
+            ),
+            prose("It needs you."),
+        ],
+    );
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let mut nixi = world.delegating(&rooms);
+    report(world.ask(&mut nixi, "a daily digest from Tola").await);
+    assert!(rooms.made().is_empty());
+    assert!(rooms.sent().is_empty());
+    let lines = world.lines(SESSION);
+    let result = &tool_results(&lines)[0];
+    assert_eq!(result.content, format!("Refused: {UNATTENDED_REFUSAL}"));
+    assert_eq!(delegate_lines(&lines)[0].state, DelegateState::Refused);
+}
+
+/// 92.1 acceptance 8, inside the child: a write that would ask is refused
+/// with `UNATTENDED_REFUSAL` and logged; the file is never written.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_action_needing_a_person_in_a_delegated_session_is_refused() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![
+            hand_inbox(),
+            prose("Handed on."),
+            calls(&[(
+                "w1",
+                "drive_write",
+                json!({"profile": "tgdrive", "path": "notes/sorted.md", "content": "must not land"}),
+            )]),
+            prose("That needs tgorka."),
+        ],
+    );
+    let tola = tolas(&world, &["drive_read", "drive_write"]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let (_nixi, child, brief) = handed_over(&mut world, &rooms).await;
+    let path = world.create_child(&tola, &child, &read_brief(&brief).expect("a brief"));
+    let mut tolas_session = world.child(&tola, &path, &rooms);
+    let arrived = world.brief(&brief);
+    report(
+        serve_as(
+            &tola,
+            &mut tolas_session,
+            &Arc::new(Room::default()),
+            arrived,
+        )
+        .await,
+    );
+    assert!(!world.tgdrive.join("notes/sorted.md").exists());
+    let result = &tool_results(&world.lines(&path))[0];
+    assert_eq!(result.outcome, ToolOutcomeWord::Refused);
+    assert_eq!(result.content, format!("Refused: {UNATTENDED_REFUSAL}"));
+}
+
+/// 92.1 acceptance 1, the rounds: Nixi's fourth message in one exchange is
+/// refused and she is told which bound; Tola's session, three rounds in
+/// without a reply, parks its card `run: blocked` with detail `rounds`, and
+/// a fourth brief that reaches it anyway is not a turn. Nixi names the
+/// delegation only by what her `delegate` result told her model.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fourth_round_parks_the_requester() {
+    let rounds: Vec<(String, Value)> = (2..=4)
+        .map(|n| {
+            (
+                format!("m{n}"),
+                json!({"agent": "tola", "brief": format!("And round {n}."), "session": DELEGATION}),
+            )
+        })
+        .collect();
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![
+            hand_inbox(),
+            prose("Handed on."),
+            calls(
+                &rounds
+                    .iter()
+                    .map(|(call, args)| (call.as_str(), "delegate", args.clone()))
+                    .collect::<Vec<_>>(),
+            ),
+            prose("Told her."),
+            prose("Working on it."),
+            prose("Still working."),
+            prose("Nearly."),
+        ],
+    );
+    let tola = tolas(&world, &["drive_read"]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let (mut nixi, child, brief) = handed_over(&mut world, &rooms).await;
+
+    report(world.ask(&mut nixi, "say more to Tola").await);
+    let results = tool_results(&world.lines(SESSION));
+    let outcomes: Vec<ToolOutcomeWord> = results.iter().map(|r| r.outcome).collect();
+    assert_eq!(
+        &outcomes[outcomes.len() - 3..],
+        [
+            ToolOutcomeWord::Ok,
+            ToolOutcomeWord::Ok,
+            ToolOutcomeWord::Refused
+        ]
+    );
+    let told = &results.last().expect("a result").content;
+    assert!(told.contains("3 rounds"), "{told}");
+    let sent = rooms.sent();
+    assert_eq!(sent.len(), 3, "the brief and two more rounds");
+    let last = delegate_lines(&world.lines(SESSION)).pop().expect("a line");
+    assert_eq!(last.state, DelegateState::Refused);
+
+    // Tola's session hears the three rounds and replies to none.
+    let path = world.create_child(&tola, &child, &read_brief(&brief).expect("a brief"));
+    let mut tolas_session = world.child(&tola, &path, &rooms);
+    let room = Arc::new(Room::default());
+    for (n, (_, content, _)) in sent.iter().enumerate() {
+        let arrived = world.brief(content);
+        report(serve_as(&tola, &mut tolas_session, &room, arrived).await);
+        let run = card_field(&world, &path, "run");
+        if n < 2 {
+            assert_eq!(run.as_deref(), Some("queued"), "round {}", n + 1);
+        } else {
+            assert_eq!(run.as_deref(), Some("blocked"));
+        }
+    }
+    let parked = kinds(&world.lines(&path), LineKind::Run)
+        .iter()
+        .filter_map(|line| match &line.body {
+            LineBody::Run(run) => run.detail.clone(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(parked, ["rounds"]);
+
+    // A fourth brief, however it got there, is not a turn.
+    let asked = world.stub.requests().len();
+    let fourth = world.brief(&sent[2].1);
+    assert!(matches!(
+        serve_as(&tola, &mut tolas_session, &room, fourth).await,
+        Outcome::Ignored(ROUNDS_SPENT)
+    ));
+    assert_eq!(world.stub.requests().len(), asked);
+}
+
+/// A reply the tool refused — missing text, a file outside `artifacts/` —
+/// is no reply: it does not close the exchange, so three rounds still park
+/// the card. Only a reply that went out does (its `delegate replied` line).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_reply_keeps_the_rounds_counted() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![
+            hand_inbox(),
+            prose("Handed on."),
+            calls(&[("r1", "reply", json!({"artifacts": ["artifacts/report.md"]}))]),
+            prose("No text."),
+            calls(&[(
+                "r2",
+                "reply",
+                json!({"text": "Here.", "artifacts": ["../agent.toml"]}),
+            )]),
+            prose("Bad path."),
+            prose("Still nothing."),
+        ],
+    );
+    let tola = tolas(&world, &["drive_read"]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let (_nixi, child, brief) = handed_over(&mut world, &rooms).await;
+    let path = world.create_child(&tola, &child, &read_brief(&brief).expect("a brief"));
+    let mut tolas_session = world.child(&tola, &path, &rooms);
+    let room = Arc::new(Room::default());
+    for n in 0..3 {
+        let arrived = world.brief(&brief);
+        report(serve_as(&tola, &mut tolas_session, &room, arrived).await);
+        assert_eq!(tolas_session.context.exchange_rounds, n + 1);
+    }
+    let refused: Vec<ToolOutcomeWord> = tool_results(&world.lines(&path))
+        .iter()
+        .map(|result| result.outcome)
+        .collect();
+    assert_eq!(
+        refused,
+        [ToolOutcomeWord::Refused, ToolOutcomeWord::Refused]
+    );
+    assert!(room
+        .sent()
+        .iter()
+        .all(|(_, content)| !content["dev.keeper.agent.artifacts"].is_array()));
+    assert_eq!(card_field(&world, &path, "run").as_deref(), Some("blocked"));
+}
+
+/// 92.1 acceptance 1, the budget (R69): a scripted provider reports 1200
+/// tokens on the first round of a child whose budget is 1000; the run stops
+/// after that step, the round's `assistant` line carries its usage, and the
+/// reply names what was spent and the bound; the card goes `run: blocked`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_token_budget_stops_the_run_and_says_what_it_spent() {
+    let mut round = calls(&[(
+        "r1",
+        "drive_read",
+        json!({"profile": "tgdrive", "path": "notes/hello.md"}),
+    )]);
+    round.push(json!({"choices": [], "usage": {"prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200}}));
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![round, prose("never asked")],
+    );
+    let tola = tolas(&world, &["drive_read"]);
+    let content = DelegateContent {
+        v: 1,
+        id: ulid::Ulid::new().to_string(),
+        from: keeper_core::agents::delegation::DelegateFrom {
+            agent: user(NIXI),
+            drive: "tgdrive".to_owned(),
+            session: SESSION.to_owned(),
+            room: room_id(),
+        },
+        to: user(TOLA),
+        brief: "Read hello.".to_owned(),
+        drives: vec!["tgdrive".to_owned()],
+        label: Label::opening(&world.deps.drives["tgdrive"], Integrity::Agent),
+        hop: 1,
+        limits: keeper_core::agents::delegation::DelegateLimits {
+            rounds_per_exchange: 3,
+            tokens: 1000,
+        },
+        card: None,
+        dispatch_chain: Vec::new(),
+    };
+    let child = OwnedRoomId::try_from("!child:example.org").expect("room");
+    let path = world.create_child(&tola, &child, &content);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let mut tolas_session = world.child(&tola, &path, &rooms);
+    let tolas_room = Arc::new(Room::default());
+    let arrived = world.brief(&keeper_core::agents::delegation::brief_content(&content));
+    let ran = report(serve_as(&tola, &mut tolas_session, &tolas_room, arrived).await);
+    assert_eq!(ran.ending, TurnEnding::Bounded);
+    assert_eq!(world.stub.requests().len(), 1, "stopped after that step");
+    let lines = world.lines(&path);
+    let round = kinds(&lines, LineKind::Assistant)
+        .iter()
+        .find_map(|line| match &line.body {
+            LineBody::Assistant(body) if body.finish == "tool_calls" => Some(body.usage),
+            _ => None,
+        })
+        .expect("the round's line");
+    assert_eq!((round.prompt, round.completion), (Some(1000), Some(200)));
+    let reply = tolas_room
+        .sent()
+        .into_iter()
+        .find(|(_, content)| content["dev.keeper.agent.artifacts"].is_array())
+        .expect("a reply")
+        .1;
+    let said = reply["body"].as_str().expect("text");
+    assert!(said.contains("1200") && said.contains("1000"), "{said}");
+    assert_eq!(card_field(&world, &path, "run").as_deref(), Some("blocked"));
+    let LineBody::Error(error) = &kinds(&lines, LineKind::Error)[0].body else {
+        panic!("an error line");
+    };
+    assert_eq!(error.code, "tokens");
+}
+
+/// The budget crossed by a turn's last completion — no tool round, so no
+/// gate before another request — parks the session as the gate would: the
+/// reply names the bound, the card goes `run: blocked`, once. After a
+/// reload the spent budget still holds: another brief is not a turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_budget_crossed_by_the_last_completion_parks_the_session() {
+    let mut answer = prose("Read it.");
+    answer.push(json!({"choices": [], "usage": {"prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200}}));
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![answer]);
+    let tola = tolas(&world, &["drive_read"]);
+    let content = DelegateContent {
+        v: 1,
+        id: ulid::Ulid::new().to_string(),
+        from: keeper_core::agents::delegation::DelegateFrom {
+            agent: user(NIXI),
+            drive: "tgdrive".to_owned(),
+            session: SESSION.to_owned(),
+            room: room_id(),
+        },
+        to: user(TOLA),
+        brief: "Read hello.".to_owned(),
+        drives: vec!["tgdrive".to_owned()],
+        label: Label::opening(&world.deps.drives["tgdrive"], Integrity::Agent),
+        hop: 1,
+        limits: keeper_core::agents::delegation::DelegateLimits {
+            rounds_per_exchange: 3,
+            tokens: 1000,
+        },
+        card: None,
+        dispatch_chain: Vec::new(),
+    };
+    let child = OwnedRoomId::try_from("!child:example.org").expect("room");
+    let path = world.create_child(&tola, &child, &content);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let mut tolas_session = world.child(&tola, &path, &rooms);
+    let tolas_room = Arc::new(Room::default());
+    let brief = keeper_core::agents::delegation::brief_content(&content);
+    let arrived = world.brief(&brief);
+    let ran = report(serve_as(&tola, &mut tolas_session, &tolas_room, arrived).await);
+    assert_eq!(ran.ending, TurnEnding::Complete);
+    let replies: Vec<Value> = tolas_room
+        .sent()
+        .into_iter()
+        .filter(|(_, content)| content["dev.keeper.agent.artifacts"].is_array())
+        .map(|(_, content)| content)
+        .collect();
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    let said = replies[0]["body"].as_str().expect("text");
+    assert!(said.contains("1200") && said.contains("1000"), "{said}");
+    assert_eq!(card_field(&world, &path, "run").as_deref(), Some("blocked"));
+    let blocked = kinds(&world.lines(&path), LineKind::Run)
+        .iter()
+        .filter_map(|line| match &line.body {
+            LineBody::Run(run) => run.detail.clone(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(blocked, ["tokens"]);
+
+    // Reloaded, the session has still spent its budget.
+    drop(tolas_session);
+    let mut again = world.child(&tola, &path, &rooms);
+    assert!(again.context.token_bound().is_some());
+    let asked = world.stub.requests().len();
+    let next = world.brief(&brief);
+    assert!(matches!(
+        serve_as(&tola, &mut again, &tolas_room, next).await,
+        Outcome::Ignored(BUDGET_SPENT)
+    ));
+    assert_eq!(world.stub.requests().len(), asked);
+}
+
+/// 92.1 acceptance 11 (R29 F5), the delegating half: no brief exists until
+/// the target's join; a host that restarts after the join sends it exactly
+/// once, and a join delivered after that sends nothing more.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_brief_is_sent_only_after_the_target_joins() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![hand_inbox(), prose("Handed on.")],
+    );
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let mut nixi = world.delegating(&rooms);
+    report(world.ask(&mut nixi, "hand the inbox to Tola").await);
+    let child = rooms.made()[0].3.clone();
+    assert!(nixi.resume_delegations(&world.deps).await.is_empty());
+    assert!(rooms.sent().is_empty(), "not joined: nothing sent");
+
+    // The host stops; Tola joins; the host starts again.
+    drop(nixi);
+    rooms
+        .joined
+        .lock()
+        .expect("lock")
+        .push((child.clone(), user(TOLA)));
+    let mut restarted = world.delegating(&rooms);
+    restarted.resume_delegations(&world.deps).await;
+    restarted.resume_delegations(&world.deps).await;
+    assert_eq!(rooms.sent().len(), 1, "once");
+    assert!(rooms
+        .watched
+        .lock()
+        .expect("lock")
+        .iter()
+        .any(|(c, parent)| *c == child && *parent == room_id()));
+    let joined = world.joined(&child);
+    assert!(matches!(
+        world.serve(&mut restarted, joined).await,
+        Outcome::Ignored(_)
+    ));
+    assert_eq!(rooms.sent().len(), 1);
+}
+
+/// The `delegate` and `reply` specs a turn of `served` is offered.
+async fn delegation_offer(served: &ServedSession, deps: &AgentDeps) -> Vec<String> {
+    arm_agent(&served.context, deps, Probe::Skip)
+        .await
+        .request
+        .tools
+        .into_iter()
+        .map(|spec| spec.name)
+        .filter(|name| name == "delegate" || name == "reply")
+        .collect()
+}
+
+/// R48: `delegate` is offered as `[tools].allow` says; `reply` in a
+/// delegated session whatever it says, and in no other.
+#[tokio::test(flavor = "multi_thread")]
+async fn delegate_follows_the_allow_and_reply_the_session_kind() {
+    let offer = delegation_offer;
+    let world = world(ProviderKind::OpenAi, &["drive_read", "delegate"], vec![]);
+    let nixi = world.open(SESSION);
+    assert_eq!(offer(&nixi, &world.deps).await, ["delegate"]);
+    let tola = tolas(&world, &["drive_read"]);
+    let tg_decl = world.deps.drives["tgdrive"].clone();
+    session_of(
+        &world.tgdrive,
+        TOLAS,
+        &tg_decl,
+        "tola",
+        SessionKind::Delegated,
+        "!tola:example.org",
+    );
+    let delegated = world.open_as(&tola, TOLAS);
+    assert_eq!(offer(&delegated, &tola).await, ["reply"]);
+    session_of(
+        &world.tgdrive,
+        DM,
+        &tg_decl,
+        "tola",
+        SessionKind::Main,
+        "!dm:example.org",
+    );
+    let main = world.open_as(&tola, DM);
+    assert!(offer(&main, &tola).await.is_empty());
+}
+
+/// R55: a `peer` line a crash left unanswered — a brief, a delegation's
+/// reply — is closed on restart like a `user` line, never run again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unanswered_peer_line_is_closed_after_a_restart() {
+    let world = world(ProviderKind::OpenAi, &["drive_read"], vec![]);
+    {
+        let mut served = world.open(SESSION);
+        let ServedSession {
+            context, writer, ..
+        } = &mut served;
+        writer
+            .write(
+                context,
+                None,
+                None,
+                LineBody::Peer(keeper_core::agents::log::PeerBody {
+                    sender: user(TOLA),
+                    text: "The inbox is sorted.".to_owned(),
+                    ask: None,
+                    artifacts: None,
+                }),
+            )
+            .expect("write");
+        writer.sync().expect("sync");
+    }
+    let mut again = world.open(SESSION);
+    assert!(again
+        .recover(&world.deps, world.room.as_ref(), &Trail::default())
+        .await
+        .expect("recover"));
+    assert_eq!(kinds(&world.lines(SESSION), LineKind::Error).len(), 1);
+    assert!(world.stub.requests().is_empty(), "never run again");
+}
+
+/// Narrow `served`'s label to `readers`, as a read of a file only they may
+/// read would.
+fn narrow(served: &mut ServedSession, readers: &[&str]) {
+    use keeper_core::agents::label::{LabelBody, LabelCause, LabelCauseKind};
+    let label = Label {
+        readers: Readers::Only(readers.iter().map(|r| user(r)).collect()),
+        ..served.context.label.clone()
+    };
+    let ServedSession {
+        context, writer, ..
+    } = served;
+    writer
+        .write(
+            context,
+            None,
+            None,
+            LineBody::Label(LabelBody::new(
+                &label,
+                LabelCause {
+                    kind: LabelCauseKind::ToolResult,
+                    reference: "a read".to_owned(),
+                },
+            )),
+        )
+        .expect("a label line");
+}
+
+/// R93 in the session that serves a brief: the admission the live intake
+/// and the read-back use — a creator demoted since is no agent, and a brief
+/// naming another parent room is not this session's. Neither is a turn,
+/// and no model is asked; the genuine brief is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_brief_the_admission_refuses_is_not_a_turn_in_the_child() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![hand_inbox(), prose("Handed on."), prose("On it.")],
+    );
+    let tola = tolas(&world, &["drive_read"]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let (_nixi, child, brief) = handed_over(&mut world, &rooms).await;
+    let path = world.create_child(&tola, &child, &read_brief(&brief).expect("a brief"));
+    let mut tolas_session = world.child(&tola, &path, &rooms);
+    let room = Arc::new(Room::default());
+    let asked = world.stub.requests().len();
+
+    *rooms.facts.lock().expect("lock") = Some(BriefRoom {
+        room_type: Some(SESSION_ROOM_TYPE.to_owned()),
+        creators: vec![user(NIXI)],
+        levels: Some(delegated_levels(|json| json["users"][NIXI] = json!(0))),
+        members: rooms.people(&child),
+    });
+    let demoted = world.brief(&brief);
+    assert!(matches!(
+        serve_as(&tola, &mut tolas_session, &room, demoted).await,
+        Outcome::Ignored(NO_AGENT_POWER)
+    ));
+    *rooms.facts.lock().expect("lock") = None;
+    let mut elsewhere = read_brief(&brief).expect("a brief");
+    elsewhere.from.room = OwnedRoomId::try_from("!other:example.org").expect("room");
+    let foreign = world.brief(&keeper_core::agents::delegation::brief_content(&elsewhere));
+    assert!(matches!(
+        serve_as(&tola, &mut tolas_session, &room, foreign).await,
+        Outcome::Ignored(NOT_THIS_DELEGATION)
+    ));
+    assert_eq!(world.stub.requests().len(), asked);
+    assert!(kinds(&world.lines(&path), LineKind::Peer).is_empty());
+
+    let genuine = world.brief(&brief);
+    report(serve_as(&tola, &mut tolas_session, &room, genuine).await);
+}
+
+/// R94: the label is checked again when the brief goes in, not only when
+/// the room was made. Nixi's session read something only tgorka may read
+/// between opening the room for tgorka and Marta and Tola's join: the brief
+/// is never sent, the refusal is logged naming Marta, and the delegation
+/// is over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_brief_the_label_no_longer_lets_in_is_never_sent() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![hand_inbox(), prose("Handed on.")],
+    );
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let mut nixi = world.delegating(&rooms);
+    report(world.ask(&mut nixi, "hand the inbox to Tola").await);
+    let child = rooms.made()[0].3.clone();
+    narrow(&mut nixi, &[TGORKA]);
+
+    let joined = world.joined(&child);
+    assert!(matches!(
+        world.serve(&mut nixi, joined).await,
+        Outcome::Ignored(BRIEF_REFUSED)
+    ));
+    assert!(rooms.sent().is_empty());
+    let refused = delegate_lines(&world.lines(SESSION)).pop().expect("a line");
+    assert_eq!(refused.state, DelegateState::Refused);
+    assert!(
+        refused.reason.as_deref().is_some_and(|r| r.contains(MARTA)),
+        "{refused:?}"
+    );
+    assert!(
+        nixi.context.delegations.is_empty(),
+        "the delegation is over"
+    );
+}
+
+/// R94: someone invited into the delegation's room after it was made is
+/// one more reader of the brief; the label decides with them in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_person_added_to_the_room_since_it_opened_blocks_the_brief() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![hand_inbox(), prose("Handed on.")],
+    );
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let mut nixi = world.delegating(&rooms);
+    report(world.ask(&mut nixi, "hand the inbox to Tola").await);
+    let child = rooms.made()[0].3.clone();
+    let mallory = "@mallory:example.org";
+    rooms
+        .added
+        .lock()
+        .expect("lock")
+        .push((child.clone(), user(mallory)));
+    let joined = world.joined(&child);
+    assert!(matches!(
+        world.serve(&mut nixi, joined).await,
+        Outcome::Ignored(BRIEF_REFUSED)
+    ));
+    assert!(rooms.sent().is_empty());
+    let refused = delegate_lines(&world.lines(SESSION)).pop().expect("a line");
+    assert!(
+        refused
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains(mallory)),
+        "{refused:?}"
+    );
+}
+
+/// R94 on the rounds after the first and on the reply: a next round after
+/// Nixi's session read something only tgorka may read, and a reply from a
+/// Tola who read the same, are refused naming Marta — nothing is sent, and
+/// Tola's refused reply leaves her exchange open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_round_or_a_reply_the_label_no_longer_lets_in_is_refused() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![
+            hand_inbox(),
+            prose("Handed on."),
+            delegate_call(
+                "m2",
+                json!({"agent": "tola", "brief": "And the plan.", "session": DELEGATION}),
+            ),
+            prose("I could not."),
+            calls(&[("r1", "reply", json!({"text": "Done."}))]),
+            prose("Refused."),
+        ],
+    );
+    let tola = tolas(&world, &["drive_read"]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let (mut nixi, child, brief) = handed_over(&mut world, &rooms).await;
+    narrow(&mut nixi, &[TGORKA]);
+    report(world.ask(&mut nixi, "tell Tola the plan").await);
+    let round = tool_results(&world.lines(SESSION)).pop().expect("a result");
+    assert_eq!(round.outcome, ToolOutcomeWord::Refused);
+    assert!(round.content.contains(MARTA), "{}", round.content);
+    assert_eq!(rooms.sent().len(), 1, "the brief alone");
+    let last = delegate_lines(&world.lines(SESSION)).pop().expect("a line");
+    assert_eq!(
+        (last.state, last.room.as_ref()),
+        (DelegateState::Refused, Some(&child))
+    );
+
+    let path = world.create_child(&tola, &child, &read_brief(&brief).expect("a brief"));
+    let mut tolas_session = world.child(&tola, &path, &rooms);
+    narrow(&mut tolas_session, &[TGORKA]);
+    let room = Arc::new(Room::default());
+    let arrived = world.brief(&brief);
+    report(serve_as(&tola, &mut tolas_session, &room, arrived).await);
+    assert!(room
+        .sent()
+        .iter()
+        .all(|(_, content)| !content["dev.keeper.agent.artifacts"].is_array()));
+    let reply = tool_results(&world.lines(&path)).pop().expect("a result");
+    assert_eq!(reply.outcome, ToolOutcomeWord::Refused);
+    assert!(reply.content.contains(MARTA), "{}", reply.content);
+    assert_eq!(tolas_session.context.exchange_rounds, 1);
+}
+
+/// R94 at the delegating side: a reply's label is joined into the session
+/// it comes back to. Tola read something local-only and outside content,
+/// for tgorka alone, and replied to the same people: Nixi's session is now
+/// local-only, untrusted and tgorka's alone, so the reply never reaches
+/// Nixi's remote model. A reply carrying no label is not taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replys_label_narrows_the_delegating_session() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![hand_inbox(), prose("Handed on.")],
+    );
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let (mut nixi, child, _) = handed_over(&mut world, &rooms).await;
+    let unlabelled = json!({
+        "type": "m.room.message",
+        "sender": TOLA,
+        "event_id": "$bare:example.org",
+        "content": {"msgtype": "m.text", "body": "Done.", "dev.keeper.agent.artifacts": []},
+    });
+    assert!(reply_of(
+        &unlabelled,
+        &user(TOLA),
+        &child,
+        tokio::time::Instant::now()
+    )
+    .is_none());
+
+    let read = Label {
+        readers: Readers::Only(BTreeSet::from([user(TGORKA)])),
+        integrity: Integrity::Untrusted,
+        local_only: true,
+    };
+    let replied = world.reply(
+        &child,
+        &reply_content("Your diary says Friday.", Vec::new(), &read),
+    );
+    let asked = world.stub.requests().len();
+    let ran = report(world.serve(&mut nixi, replied).await);
+    assert_eq!(ran.ending, TurnEnding::LocalOnly);
+    assert_eq!(world.stub.requests().len(), asked, "no remote model saw it");
+    let label = &nixi.context.label;
+    assert!(label.local_only);
+    assert_eq!(label.integrity, Integrity::Untrusted);
+    assert_eq!(label.readers, read.readers);
+}
+
+/// R55 across a restart: a child that already replied stays watched, so
+/// the next round's answer comes back to the delegating session and runs
+/// its turn; the round registers its room before it is sent. The round
+/// names the delegation by the id the replayed `delegate` result carries.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replied_child_is_continued_after_a_restart() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![
+            hand_inbox(),
+            prose("Handed on."),
+            prose("Tola sorted it."),
+            delegate_call(
+                "m2",
+                json!({"agent": "tola", "brief": "And the archive.", "session": DELEGATION}),
+            ),
+            prose("Asked again."),
+            prose("Tola sorted that too."),
+        ],
+    );
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let (mut nixi, child, _) = handed_over(&mut world, &rooms).await;
+    let label = nixi.context.label.clone();
+    let first = world.reply(&child, &reply_content("Sorted.", Vec::new(), &label));
+    report(world.serve(&mut nixi, first).await);
+
+    // The host stops; a fresh copy routes nothing yet.
+    drop(nixi);
+    rooms.watched.lock().expect("lock").clear();
+    rooms.ops.lock().expect("lock").clear();
+    let mut again = world.delegating(&rooms);
+    assert!(again.resume_delegations(&world.deps).await.is_empty());
+    assert!(rooms
+        .watched
+        .lock()
+        .expect("lock")
+        .contains(&(child.clone(), room_id())));
+
+    rooms.ops.lock().expect("lock").clear();
+    report(world.ask(&mut again, "ask Tola about the archive").await);
+    assert_eq!(
+        *rooms.ops.lock().expect("lock"),
+        [format!("watch {child}"), format!("send {child}")]
+    );
+    let second = world.reply(&child, &reply_content("Archived.", Vec::new(), &label));
+    report(world.serve(&mut again, second).await);
+    let states: Vec<DelegateState> = delegate_lines(&world.lines(SESSION))
+        .iter()
+        .map(|line| line.state)
+        .collect();
+    assert_eq!(
+        states,
+        [
+            DelegateState::Opened,
+            DelegateState::Sent,
+            DelegateState::Replied,
+            DelegateState::Sent,
+            DelegateState::Replied
+        ]
+    );
+}
+
+/// A crash between a reply's receipt and its `peer` line loses nothing.
+/// The log a crash leaves after the receipt's append — the receipt and no
+/// more — is restored on the next start: the `peer` line is written from
+/// the receipt, its label joined, and closed as interrupted; the reply's
+/// event stays seen, and the next turn's model reads the reply.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_whose_peer_line_was_lost_is_restored_from_its_receipt() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![hand_inbox(), prose("Handed on.")],
+    );
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let (mut nixi, child, _) = handed_over(&mut world, &rooms).await;
+    let id = nixi.context.delegations.keys().next().expect("one").clone();
+    let event = OwnedEventId::try_from("$reply9:example.org").expect("event");
+    let read = Label {
+        readers: Readers::Only(BTreeSet::from([user(TGORKA)])),
+        ..nixi.context.label.clone()
+    };
+    {
+        let ServedSession {
+            context, writer, ..
+        } = &mut nixi;
+        writer
+            .write(
+                context,
+                None,
+                Some(event.clone()),
+                LineBody::Delegate(DelegateBody {
+                    id,
+                    to: TOLA.to_owned(),
+                    room: Some(child.clone()),
+                    child: None,
+                    state: DelegateState::Replied,
+                    reason: None,
+                    reply: Some(DelegateReply {
+                        text: "Sorted.".to_owned(),
+                        artifacts: vec!["tgdrive/60-sessions/x/artifacts/report.md".to_owned()],
+                        label: read.clone(),
+                    }),
+                }),
+            )
+            .expect("the receipt");
+        writer.sync().expect("sync");
+    }
+    drop(nixi);
+
+    let mut again = world.delegating(&rooms);
+    assert!(again
+        .recover(&world.deps, world.room.as_ref(), &Trail::default())
+        .await
+        .expect("recover"));
+    let lines = world.lines(SESSION);
+    let LineBody::Peer(peer) = &kinds(&lines, LineKind::Peer).last().expect("a peer").body else {
+        unreachable!()
+    };
+    assert_eq!(
+        *peer,
+        PeerBody {
+            sender: user(TOLA),
+            text: "Sorted.".to_owned(),
+            ask: None,
+            artifacts: Some(vec!["tgdrive/60-sessions/x/artifacts/report.md".to_owned()]),
+        }
+    );
+    assert_eq!(again.context.label.readers, read.readers);
+    let LineBody::Error(closed) = &kinds(&lines, LineKind::Error).last().expect("closed").body
+    else {
+        unreachable!()
+    };
+    assert_eq!(closed.code, "interrupted");
+
+    let redelivered = reply_of(
+        &json!({
+            "type": "m.room.message",
+            "sender": TOLA,
+            "event_id": event.as_str(),
+            "content": reply_content("Sorted.", Vec::new(), &read),
+        }),
+        &user(TOLA),
+        &child,
+        tokio::time::Instant::now(),
+    )
+    .expect("a reply");
+    assert!(matches!(
+        world.serve(&mut again, redelivered).await,
+        Outcome::Duplicate
+    ));
+    report(world.ask(&mut again, "what did Tola say?").await);
+    let last = world.stub.requests().pop().expect("a request").to_string();
+    assert!(last.contains("From @tola:example.org:\\nSorted."), "{last}");
+}
+
+/// A brief whose send failed while its target sat joined is not left
+/// waiting for a join that will not come again: while the worker runs, its
+/// clock sends it again under the same transaction id, once it can.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_brief_that_failed_to_send_is_sent_again_on_the_clock() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![hand_inbox(), prose("Handed on.")],
+    );
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    rooms.failing_sends.store(1, Ordering::SeqCst);
+    let mut nixi = world.delegating(&rooms);
+    report(world.ask(&mut nixi, "hand the inbox to Tola").await);
+    let child = rooms.made()[0].3.clone();
+    let joined = world.joined(&child);
+    assert!(matches!(
+        world.serve(&mut nixi, joined).await,
+        Outcome::Ignored(BRIEF_UNSENT)
+    ));
+    assert!(rooms.sent().is_empty());
+
+    let (keep, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let (_stop, signal) = chat::cancellation();
+    let busy = std::sync::atomic::AtomicBool::new(false);
+    let _ = tokio::time::timeout(
+        Duration::from_secs(3),
+        nixi.serve_arrivals(
+            &world.deps,
+            world.room.clone(),
+            Vec::new(),
+            &mut arrivals,
+            signal,
+            &busy,
+        ),
+    )
+    .await;
+    drop(keep);
+    let id = delegate_lines(&world.lines(SESSION))[0].id.clone();
+    assert_eq!(rooms.sent().len(), 1);
+    assert_eq!(*rooms.attempts.lock().expect("lock"), [id.clone(), id]);
+    assert_eq!(
+        delegate_lines(&world.lines(SESSION))
+            .iter()
+            .map(|line| line.state)
+            .collect::<Vec<_>>(),
+        [DelegateState::Opened, DelegateState::Sent]
+    );
 }
