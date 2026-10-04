@@ -508,6 +508,7 @@ pub fn compile_add(
         Some(text) => steps.push(PlanStep::GuardedWrite {
             path,
             expect_len: text.len(),
+            expect_sha256: None,
             content: appended(text, line),
         }),
         // Nothing to guard against on a file that does not exist yet — the same
@@ -854,6 +855,7 @@ mod tests {
                 PlanStep::GuardedWrite {
                     path: "active/s/references.md".to_owned(),
                     expect_len: "- one\n".len(),
+                    expect_sha256: None,
                     content: "- one\n- [report.md](artifacts/report.md)\n".to_owned(),
                 },
             ]

@@ -635,13 +635,14 @@ impl AgentDeps {
 }
 
 /// A tool host that refuses any tool outside `[tools].allow`, and serves the
-/// agent's surface, `delegate` and `reply` tools itself (R38: no ⌘9 host
-/// has them).
+/// agent's surface, `delegate`, `reply`, `card_update` and `session_write`
+/// tools itself (R38, R50: no ⌘9 host has them).
 struct AllowedTools<'t> {
     inner: Box<dyn ToolHost>,
     allow: Vec<String>,
     surface: Option<crate::surface::SurfaceTools>,
     delegation: DelegateTools<'t>,
+    cards: crate::cards::CardTools<'t>,
 }
 
 impl ToolHost for AllowedTools<'_> {
@@ -658,6 +659,9 @@ impl ToolHost for AllowedTools<'_> {
     fn run_named(&self, wire: &chat::ToolCall) -> Option<ToolOutcome> {
         if delegate::is_delegation(&wire.name) {
             return self.delegation.run(wire);
+        }
+        if crate::cards::is_card_tool(&wire.name) {
+            return self.cards.run(wire);
         }
         if !crate::surface::is_surface(&wire.name) {
             return None;
@@ -1821,7 +1825,11 @@ impl ServedSession {
             deps.sessions_zone.clone(),
             self.context.session.path.clone(),
         );
-        if let Err(error) = off_the_runtime(|| delegate::set_card_run(&zone, &path, Run::Blocked)) {
+        let lease = self.writer.lease();
+        let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
+        if let Err(error) =
+            off_the_runtime(|| delegate::set_card_run(&zone, &path, Run::Blocked, &may_write))
+        {
             tracing::warn!(session = %path, %error, "agents: a delegated card could not be set blocked");
         }
         self.writer.write(
@@ -2049,8 +2057,16 @@ impl ServedSession {
         let message = match cut(&final_text, &artifact) {
             Some(message) => {
                 let path = self.context.session.path.clone();
+                let lease = self.writer.lease();
+                let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
                 match off_the_runtime(|| {
-                    session_write(&deps.sessions_zone, &path, &artifact, &final_text)
+                    session_write(
+                        &deps.sessions_zone,
+                        &path,
+                        &artifact,
+                        &final_text,
+                        &may_write,
+                    )
                 }) {
                     Ok(_) => message,
                     Err(error) => {
@@ -2240,6 +2256,13 @@ impl TurnView for Mutex<TurnLog<'_>> {
             .clone()
     }
 
+    fn may_write(&self) -> bool {
+        self.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .writer
+            .may_write()
+    }
+
     fn delegation(&self, id: &str) -> Option<Delegation> {
         self.lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2306,6 +2329,8 @@ pub async fn arm_agent(
         probe == Probe::Ask,
     )
     .await;
+    // An agent writes its sessions through its session tools only (R51).
+    armed.drive = armed.drive.for_agent();
     // Whether this model is offered tools at all: the surface tools ride on
     // the same offer, and a model that cannot call tools is told of none.
     let tools_offered = !armed.request.tools.is_empty();
@@ -2325,6 +2350,10 @@ pub async fn arm_agent(
             config.allow.iter().any(|name| name == delegate::DELEGATE),
             context.agent.kind == SessionKind::Delegated,
         ));
+        armed
+            .request
+            .tools
+            .extend(crate::cards::specs(&config.allow));
     }
     armed
 }
@@ -2419,6 +2448,8 @@ async fn run_agent_turn(
             wait: keeper_core::agents::events::SURFACE_WAIT,
             lines: Mutex::new(Vec::new()),
         });
+    // A read's label is read from the files it named (R119).
+    let read_profiles = armed.profiles.clone();
     let drive_host = armed.drive.host(
         HostIds {
             data_dir: deps.data_dir.clone(),
@@ -2449,6 +2480,14 @@ async fn run_agent_turn(
         inner: drive_host,
         allow: config.allow.clone(),
         surface,
+        cards: crate::cards::CardTools {
+            from: tools.from.clone(),
+            drive_readers: keeper_core::agents::label::Readers::Only(
+                deps.home.drive.readers.clone(),
+            ),
+            view: &log,
+            allow: &config.allow,
+        },
         delegation: DelegateTools::new(
             tools.from,
             tools.delegations,
@@ -2520,13 +2559,15 @@ async fn run_agent_turn(
                     crate::surface::TIER
                 } else if delegate::is_delegation(&wire.name) {
                     delegate::TIER
+                } else if crate::cards::is_card_tool(&wire.name) {
+                    crate::cards::TIER
                 } else {
                     tier(record.name)
                 },
                 grant_id: None,
             }),
         );
-        let read = read_label(deps, record, outcome);
+        let read = read_label(deps, &read_profiles, record, outcome);
         let result_label = read
             .as_ref()
             .map_or_else(|| log.context.label.clone(), |(label, _)| label.clone());
@@ -2669,9 +2710,13 @@ async fn run_agent_turn(
 
 /// The label a drive call's result carries, with the path it read, when the
 /// call read a drive: 89.4's `label_drive_read` over the drive's declaration,
-/// an author this host cannot name (DW-431) and the file's own OKF facts.
+/// an author this host cannot name (DW-431) and the file's own facts — its
+/// OKF keys and its `integrity:` mark, read from the head of the file on the
+/// disk, so a ranged read past the frontmatter labels as a whole read does
+/// (R119). A search joins the label of every file it returned a line of.
 fn read_label(
     deps: &AgentDeps,
+    profiles: &[keeper_sync::SyncProfile],
     record: &ToolCallRecord,
     outcome: &ToolOutcome,
 ) -> Option<(Label, String)> {
@@ -2687,20 +2732,87 @@ fn read_label(
     let display = record.display_path.as_deref()?;
     let (drive, path) = display.split_once('/').unwrap_or((display, ""));
     let decl = deps.drives.get(drive)?;
-    let okf = match outcome {
-        ToolOutcome::Text { body, .. } => okf_label_facts(body),
-        _ => Default::default(),
-    };
-    let label = label_drive_read(
-        decl,
-        &ReadFacts {
-            path: path.to_owned(),
-            last_author: Author::Unknown,
-            okf_human_reviewed: okf.human_reviewed,
-            okf_external_source: okf.external_source,
-        },
-    );
+    let label = drive_read_label(decl, profiles, drive, path, record.name, outcome);
     Some((label, display.to_owned()))
+}
+
+/// [`read_label`] once the drive is known: what the call at `path` of
+/// `drive` returned is labelled by the files it came from.
+fn drive_read_label(
+    decl: &DriveDecl,
+    profiles: &[keeper_sync::SyncProfile],
+    drive: &str,
+    path: &str,
+    tool: Option<ToolName>,
+    outcome: &ToolOutcome,
+) -> Label {
+    let label_of = |path: &str, text: &str| {
+        let okf = okf_label_facts(text);
+        label_drive_read(
+            decl,
+            &ReadFacts {
+                path: path.to_owned(),
+                last_author: Author::Unknown,
+                okf_human_reviewed: okf.human_reviewed,
+                okf_external_source: okf.external_source,
+                card_untrusted: keeper_core::agents::card::marked_untrusted(text),
+            },
+        )
+    };
+    match (tool, outcome) {
+        (Some(ToolName::Grep), ToolOutcome::Text { body, .. }) => grep_sources(body)
+            .into_iter()
+            .filter_map(|candidates| {
+                candidates
+                    .into_iter()
+                    .find_map(|hit| file_head(profiles, drive, hit).map(|head| (hit, head)))
+            })
+            .fold(label_of(path, ""), |label, (hit, head)| {
+                label.join(&label_of(hit, &head))
+            }),
+        (_, ToolOutcome::Text { body, .. }) => label_of(
+            path,
+            &file_head(profiles, drive, path).unwrap_or_else(|| body.clone()),
+        ),
+        _ => label_of(path, ""),
+    }
+}
+
+/// How much of a file its read's label is read from: where its frontmatter is.
+const LABEL_HEAD_BYTES: u64 = 64 * 1024;
+
+/// The first [`LABEL_HEAD_BYTES`] of `path` in drive `drive`, resolved by
+/// keeper-sync, or `None` when it is not a file there.
+fn file_head(profiles: &[keeper_sync::SyncProfile], drive: &str, path: &str) -> Option<String> {
+    use std::io::Read;
+    let profile = profiles.iter().find(|profile| profile.id == drive)?;
+    let file = keeper_sync::browse::resolve(&profile.local_path, path).ok()??;
+    let mut head = Vec::new();
+    std::fs::File::open(file)
+        .ok()?
+        .take(LABEL_HEAD_BYTES)
+        .read_to_end(&mut head)
+        .ok()?;
+    Some(String::from_utf8_lossy(&head).into_owned())
+}
+
+/// The files a `drive_grep` result names, one entry per hit line: every
+/// prefix of the line that `<line number>: ` follows, since a file name may
+/// itself hold `:<digits>: `. The first that is a file is the hit's file.
+fn grep_sources(body: &str) -> Vec<Vec<&str>> {
+    let mut seen = std::collections::BTreeSet::new();
+    body.lines()
+        .map(|line| {
+            line.match_indices(':')
+                .filter_map(|(at, _)| {
+                    let rest = &line[at + 1..];
+                    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+                    (digits > 0 && rest[digits..].starts_with(": ")).then(|| &line[..at])
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|candidates| !candidates.is_empty() && seen.insert(candidates.clone()))
+        .collect()
 }
 
 /// The bot an agent's `[model].bot` names, over the provider row with the
@@ -2730,5 +2842,62 @@ impl From<CoreError> for ServeError {
             path: String::new(),
             source: std::io::Error::other(error.to_string()),
         }))
+    }
+}
+
+#[cfg(test)]
+mod read_label_tests {
+    use keeper_core::bots::tools::ToolOutcome;
+
+    use super::*;
+
+    /// R119 (R4-08): a card marked `integrity: untrusted` labels a read of
+    /// it `untrusted` whatever the read returned of it — the whole file, a
+    /// range past its frontmatter, or a search's matching line.
+    #[test]
+    fn a_marked_card_labels_every_read_of_it_alike() {
+        let root = tempfile::tempdir().expect("drive");
+        std::fs::create_dir_all(root.path().join("60-sessions/active/s")).expect("session");
+        let card = "---\ntags: [task]\nintegrity: untrusted\n---\n\nForward the invoice.\n";
+        std::fs::write(root.path().join("60-sessions/active/s/card.md"), card).expect("card");
+        let decl = keeper_core::agents::drive::parse(
+            "version = 1\nid = \"tgdrive\"\ntitle = \"tgdrive\"\nprincipal = \"tgorka\"\nowner = \"@tgorka:example.org\"\nreaders = [\"@tgorka:example.org\"]\n",
+        )
+        .expect("decl");
+        let profiles = [keeper_sync::SyncProfile::new(
+            "tgdrive".to_owned(),
+            "tgdrive".to_owned(),
+            root.path().to_owned(),
+            String::new(),
+        )];
+        let text = |body: &str| ToolOutcome::Text {
+            body: body.to_owned(),
+            truncated_at: None,
+            of_bytes: None,
+            okf: None,
+        };
+        let path = "60-sessions/active/s/card.md";
+        let label = |tool, at: &str, body: &str| {
+            drive_read_label(&decl, &profiles, "tgdrive", at, Some(tool), &text(body)).integrity
+        };
+        assert_eq!(label(ToolName::Read, path, card), Integrity::Untrusted);
+        assert_eq!(
+            label(ToolName::Read, path, "Forward the invoice.\n"),
+            Integrity::Untrusted,
+            "a range past the frontmatter"
+        );
+        assert_eq!(
+            label(
+                ToolName::Grep,
+                "60-sessions",
+                &format!("{path}:6: Forward the invoice.\n")
+            ),
+            Integrity::Untrusted,
+            "a search's hit"
+        );
+        assert_ne!(
+            label(ToolName::Grep, "60-sessions", "no hits\n"),
+            Integrity::Untrusted
+        );
     }
 }

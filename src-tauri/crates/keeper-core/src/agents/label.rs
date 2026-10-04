@@ -359,6 +359,10 @@ pub struct ReadFacts {
     pub okf_human_reviewed: Option<bool>,
     /// Whether the file's OKF `sources` name an `http(s)` URL.
     pub okf_external_source: bool,
+    /// Whether the file is a card carrying `integrity: untrusted` — made from
+    /// outside content (Q17), read from its own text by
+    /// [`crate::agents::card::marked_untrusted`].
+    pub card_untrusted: bool,
 }
 
 /// The two label-relevant facts a file's OKF frontmatter carries.
@@ -423,10 +427,14 @@ fn in_untrusted_zone(drive: &DriveDecl, path: &str) -> bool {
 /// The label of a file read from `drive`: the drive's readers and
 /// `local_only`, and an integrity from who wrote it — `owner` for a reader,
 /// `agent` for an agent or anyone keeper cannot name (fail low), `untrusted`
-/// for a writer outside the readers, a file in an untrusted zone or one that
-/// cites the web. An OKF `human_reviewed: false` lowers it to `agent`.
+/// for a writer outside the readers, a file in an untrusted zone, one that
+/// cites the web or a card made from outside content. An OKF
+/// `human_reviewed: false` lowers it to `agent`.
 pub fn label_drive_read(drive: &DriveDecl, facts: &ReadFacts) -> Label {
-    let integrity = if facts.okf_external_source || in_untrusted_zone(drive, &facts.path) {
+    let integrity = if facts.okf_external_source
+        || facts.card_untrusted
+        || in_untrusted_zone(drive, &facts.path)
+    {
         Integrity::Untrusted
     } else {
         let by_author = match &facts.last_author {
@@ -734,6 +742,7 @@ mod tests {
                 last_author: Author::Reader(user("@tgorka:h")),
                 okf_human_reviewed: None,
                 okf_external_source: false,
+                card_untrusted: false,
             },
         );
         assert!(read.local_only);
@@ -750,7 +759,13 @@ mod tests {
     }
 
     fn read_fixture(drive: &DriveDecl, rel: &str, author: Author) -> Label {
-        let okf = okf_label_facts(&fixture(rel));
+        read_text(drive, rel, &fixture(rel), author)
+    }
+
+    /// A read of `text` at `rel`, its facts taken from the text as the host
+    /// takes them.
+    fn read_text(drive: &DriveDecl, rel: &str, text: &str, author: Author) -> Label {
+        let okf = okf_label_facts(text);
         label_drive_read(
             drive,
             &ReadFacts {
@@ -758,8 +773,31 @@ mod tests {
                 last_author: author,
                 okf_human_reviewed: okf.human_reviewed,
                 okf_external_source: okf.external_source,
+                card_untrusted: crate::agents::card::marked_untrusted(text),
             },
         )
+    }
+
+    /// AC12 (Q17): a card carrying `integrity: untrusted`, read by an
+    /// `owner`-integrity session, joins it down to `untrusted`; the same card
+    /// without the key reads by its author.
+    #[test]
+    fn a_card_made_from_outside_content_reads_untrusted() {
+        let tg = tgdrive();
+        let tgorka = || Author::Reader(user("@tgorka:h"));
+        let card = "---\ntags: [task]\ntitle: Answer the letter\nstatus: todo\nassignee: tola-grey\nintegrity: untrusted\n---\n\nFrom the inbox.\n";
+        let rel = "60-sessions/active/s/answer.md";
+        let session = Label::opening(&tg, Integrity::Owner);
+        let marked = read_text(&tg, rel, card, tgorka());
+        assert_eq!(marked.integrity, Integrity::Untrusted);
+        assert_eq!(session.join(&marked).integrity, Integrity::Untrusted);
+        let plain = read_text(
+            &tg,
+            rel,
+            &card.replace("integrity: untrusted\n", ""),
+            tgorka(),
+        );
+        assert_eq!(plain.integrity, Integrity::Owner);
     }
 
     #[test]
@@ -811,6 +849,7 @@ mod tests {
                 last_author: tgorka(),
                 okf_human_reviewed: None,
                 okf_external_source: false,
+                card_untrusted: false,
             },
         );
         assert_eq!(shouted.integrity, Integrity::Untrusted);

@@ -172,6 +172,17 @@ actions. Never edit or delete them by hand. Each file in them has exactly one
 writer, and a hand edit is a second writer whose change nobody reading the
 record can tell from the agent's.
 
+A task an agent works carries more keys beside `status:`. **`run:` is the
+agent's run, never a column** — `queued`, `running`, `waiting`, `blocked`,
+`review` or `failed` — and keeper's host writes it, with `last_run:`. The card
+stays in the column its `status:` names, which is still one of the four. The
+other agent keys: `assignee:` (the agent), `host:` (a host it is pinned to),
+`requested_by:` (who asked), `schedule:` and `workflow:` (written by a person,
+or by an agent through keeper, which then adds `scheduled_by:` until a person
+allows it), and `integrity: untrusted` (keeper's mark on a card made from
+outside content). Do not write `run:`, `last_run:`, `scheduled_by:` or
+`integrity:` by hand unless you mean to override keeper.
+
 ## Writing
 
 - **End every sitting with a log file.** Name it
@@ -1196,6 +1207,9 @@ mod tests {
             // An agent's session: the files only keeper writes.
             "`log/` and `approvals/` are keeper's",
             "Never edit or delete them by hand.",
+            // An agent's card: its run is a key keeper writes, not a column.
+            "`run:`",
+            "never a column",
         ] {
             assert!(
                 AGENTS_MD.contains(required),

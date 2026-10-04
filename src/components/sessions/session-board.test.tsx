@@ -28,6 +28,8 @@ function task(over: Partial<SessionTaskVm> & Pick<SessionTaskVm, "title">): Sess
     orderIsOwn: true,
     tags: ["task"],
     unstableIdentity: false,
+    // A person's card: no agent key (92.2).
+    agent: null,
     ...over,
     relPath,
   };

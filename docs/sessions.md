@@ -957,6 +957,18 @@ fractional number, so dragging one card rewrites one file rather than renumberin
 everything below it. A `status:` keeper cannot read is shown as unreadable rather than
 quietly filed under "to do".
 
+**A card an agent works is still a card in its column.** Its `run:` (`queued`, `running`,
+`waiting`, `blocked`, `review`, `failed`) is the agent's run, written by keeper's host, never a
+fifth column: `status: todo` with `run: blocked` sits in *To do*. Each card's view model carries
+its agent keys — who it is for, the host it is pinned to, who asked, its schedule and whether it
+reads, the mark of a schedule an agent wrote and of a card made from outside content — and, from
+the session's log, the host it runs on now and why it waits. Moving a card writes `status:` and
+`order:` and leaves every agent key as it was; the write is guarded on the exact bytes the move was
+computed from, so a card the host changed meanwhile (its `run:`) is refused rather than written
+back, and moving it again reads it afresh. A key written twice, or in a form the reader does not
+model, shows as unreadable rather than missing. The keys and who writes them are in
+`docs/agents.md` (*Cards*).
+
 **The board follows the pool, not the shape.** It used to be drawn for flat sessions
 only, and the reason was true at the time: a folder-shaped session had no pool to tag, so
 its board would have been four empty columns saying nothing. That shape's markdown is in

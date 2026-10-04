@@ -7632,6 +7632,35 @@ location: `src-tauri/crates/keeper-core/src/agents/skills.rs` (`index`: a skill 
 reason: An agent's skill lands in `_skills/` stamped `metadata.keeper_proposal` and is offered to no agent until a person adopts it (S-12). Adoption is deleting that key from the skill's `SKILL.md` frontmatter by hand, in keeper's editor or any other; `skills_list` tells the agent the skill waits for a person, and the curator archives one nobody adopted 30 days after its last change. Nothing in keeper lists the skills waiting for a person or adopts one in a click, so a person who does not open `_skills/` never sees them, and an agent's useful procedure goes unused. On a shared drive the owner's approval of the review card is the adoption (95.2 #11). Revisit when the owner wants to review agents' skills as they arrive: a *Skills waiting for you* list in the agents' settings, showing each skill whole, with *Adopt* (the same byte-preserving key removal) and *Archive*.
 status: open
 
+### DW-441: A person's move and a host's `run:` write on two machines merge their lines, but keeper-sync still keeps a conflict copy of the card.
+
+origin: story 92.2 (rung `agents-92-cards`, 2026-10-04; acceptance 7, ruling R70; review R4-14/R4-15, ruling R122, 2026-10-05)
+location: `src-tauri/crates/keeper-sync/src/engine.rs` (`converge_with_conflict_copies`), `src-tauri/crates/keeper-sync/src/git/conflict.rs` (`resolve`: Modified/Modified is `ConflictCopy`), `src-tauri/crates/keeper-core/src/agents/card.rs` (`set_host_keys`)
+reason: The host's first `run:` now goes where an unchanged line separates it from `status:`/`order:` (and never where a move would add them), and `a_move_and_a_run_merge_through_gits_own_merge` proves both edits survive `GitCli::merge_theirs` — the `git merge -X theirs` keeper-sync converges with — on a card whose agent keys sit beside the move's keys and on one with none. The R70 spike (2026-10-05) ran the two-copy case in-process through one `Engine` and `advance_remote` (the remote copy's commit), the harness keeper-sync's own divergence tests use: the canonical `card.md` held both edits (`run: running`, `status: done`, `order: 2`), and the engine also wrote `card.sync-conflict-<stamp>-<device>.md` — the local revision — because its convergence keeps a copy of every path both sides changed to different bytes before the line merge runs (AD-43; `conflict::resolve` decides by change kind, never by hunk). So acceptance 7's "no conflict copy" does not hold in keeper-sync as built; the line separation makes the merged card right, not copy-free. Revisit with a ruling: either keeper-sync skips the copy for a markdown path whose `-X theirs` merge had no conflicting hunk (the merged file then carries both sides, and nothing is lost), or acceptance 7 is restated as "the canonical card carries both edits". The device check (hesperia moves while `nixi@electra` runs) stays owed either way.
+status: open
+
+### DW-442: The board's incremental index refresh does not run the claim epoch fence over the lines it appends.
+
+origin: story 92.2 (rung `agents-92-cards`, 2026-10-04; ruling R62)
+location: `src-tauri/crates/keeper-core/src/agents/index.rs` (`Index::refresh_session`, the tail arm)
+reason: A whole read of a session's log runs the epoch fence: a line from a host whose claim epoch was superseded does not move the session's claim or run state. `refresh_session` reads only the chunks that grew and projects their new lines in `(ts, host, id)` order onto the row the index held, without the fence, so a stale host's late append can show as *running on* that host on the board until the next whole read (a chunk that shrank or went away, or a schema rebuild). Only the board reads it; no decision is taken from it. Revisit if the board shows a fenced host: keep each session's highest seen claim epoch in the row and skip a tail line below it.
+status: closed 2026-10-05
+resolution: review R4-11, ruling R121 — `refresh_session` projects grown lines in log order through the same fence a whole read runs (the fence state kept per session in `fences`), and reads the session whole when a line sorts before one already projected; `a_refresh_agrees_with_a_whole_read_whatever_the_order` proves agreement with a whole read over 60 seeded orders.
+
+### DW-443: The board's agent cards are proved over the mock shell only; the device check on hesperia is owed.
+
+origin: story 92.2 (rung `agents-92-cards`, 2026-10-04; acceptance 9)
+location: `src-tauri/crates/keeper/src/sessions_root.rs` (`detail`: the projection), `src-tauri/crates/keeper/src/sessions_ipc.rs` (`sessions_task_allow_schedule`)
+reason: The shell's projection (the index refresh, `CardAgentVm::of`) and *Allow* compile only on macOS and are by inspection on Linux; the board's rendering is rung 5's, over `dev/mock-shell.ts`. Nothing yet shows a real session with an agent card while `nixi@electra` runs it, its *running on* read from the real index, or *Allow* writing `allowed_by:` with the person the Mac finds (R118: the signed-in owner of the drive, else the only signed-in account). Revisit when rung 5 lands: open such a session on hesperia and record it in the epic's As built.
+status: open
+
+### DW-447: A session the index has never seen, or whose log arrived out of order, is read whole on the board's open.
+
+origin: story 92.2 (review R4-13, ruling R121, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/index.rs` (`Index::refresh_session`, `replay_whole`)
+reason: A refresh reads at most `REFRESH_BYTES` (1 MiB) of grown log per open, and the cards come from the detail's own bounded pool. Two cases still read the whole log under the index's write lock: the first open of a session the index does not hold, and a refresh that finds a line sorting before one already projected (a host's chunk arriving late), a chunk that shrank or went away. Both are what a rebuild does; a session with a very long log pays it once per such event. Revisit if an open is measured slow: keep per-chunk projections so a late chunk is merged rather than replayed.
+status: open
+
 ### DW-450: A screen or KVM approval's preview is not part of the session's record.
 
 origin: epic 96's amendment, 2026-10-02 (stories 96.4, 96.5; R28 S-18)

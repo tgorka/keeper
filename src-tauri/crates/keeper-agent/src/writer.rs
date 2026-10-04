@@ -97,6 +97,18 @@ impl SessionWriter {
         now.max(self.last_ts)
     }
 
+    /// Whether a line — or a file effect beside it — may be written under
+    /// the lease now; always before claims.
+    pub fn may_write(&self) -> bool {
+        self.lease.as_ref().is_none_or(|lease| lease.may_write())
+    }
+
+    /// The lease this writer writes under, for a file writer that must ask
+    /// it right before its effect (R120).
+    pub fn lease(&self) -> Option<Arc<Lease>> {
+        self.lease.clone()
+    }
+
     /// The lease's epoch and claim event, as a line carries them.
     fn fence_key(&self) -> (u64, Option<String>) {
         self.lease.as_ref().map_or((0, None), |lease| {
@@ -129,7 +141,7 @@ impl SessionWriter {
         matrix_event: Option<OwnedEventId>,
         body: LineBody,
     ) -> Result<LogLine, WriterError> {
-        if self.lease.as_ref().is_some_and(|lease| !lease.may_write()) {
+        if !self.may_write() {
             return Err(WriterError::NoClaim);
         }
         self.append(context, ts, parent, matrix_event, body)

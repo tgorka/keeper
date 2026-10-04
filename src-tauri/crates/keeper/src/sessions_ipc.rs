@@ -3711,6 +3711,114 @@ pub async fn sessions_task_move(
     Ok(())
 }
 
+/// A person's *Allow* on a card whose schedule an agent wrote (92.2, Q16):
+/// the card's `scheduled_by:` line becomes `allowed_by: <person>` (R76), and
+/// no other byte changes. The person is the shell's to find (R118): of the
+/// accounts signed in on this device, the one whose user owns the drive by
+/// its `_drive.toml`, else the only one; otherwise it is refused with a
+/// sentence naming whom to sign in as.
+///
+/// The card's bytes are re-read here, and the write is guarded on their
+/// SHA-256 ([`keeper_core::sessions::tasks::compile_allow_schedule`], R120):
+/// a card rewritten since is read and allowed once more, then refused rather
+/// than reverted.
+///
+/// Rejects with: `internal` (no account to record, unknown root or session,
+/// a card not in the pool, no schedule to allow, a refused write),
+/// `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_task_allow_schedule(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    root_id: String,
+    session_id: String,
+    rel: String,
+) -> Result<(), IpcError> {
+    let internal = |message: String| IpcError {
+        code: IpcErrorCode::Internal,
+        message,
+        account_id: None,
+        retriable: false,
+    };
+    let data_dir = state
+        .platform
+        .data_dir()
+        .map_err(crate::ipc::to_ipc_error)?;
+    let zone_root = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    // The registry and `_drive.toml` are files: read off the async runtime.
+    let profile_id = root_id.clone();
+    let person = tauri::async_runtime::spawn_blocking(move || {
+        let signed_in: Vec<String> = keeper_core::registry::list_accounts(&data_dir)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| row.user_id)
+            .collect();
+        let owner = crate::sync::engine_if_open()
+            .and_then(|engine| engine.list_profiles().ok())
+            .and_then(|profiles| {
+                profiles
+                    .into_iter()
+                    .find(|profile| profile.id == profile_id)
+            })
+            .and_then(|profile| keeper_agent::surface::declared(&profile).ok())
+            .map(|decl| decl.owner.to_string());
+        keeper_core::sessions::tasks::allowing_person(owner.as_deref(), &signed_in)
+            .map_err(|refusal| refusal.to_string())
+    })
+    .await
+    .map_err(|join| internal(format!("task-allow-schedule task failed: {join}")))?
+    .map_err(internal)?;
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let pool_read = crate::sessions_root::session_pool(&root_id, &session_id)
+            .ok_or_else(|| internal(format!("no such session: {session_id}")))?;
+        let text = pool_read
+            .files
+            .iter()
+            .find(|(candidate, _, _)| *candidate == rel)
+            .map(|(_, text, _)| text.as_str())
+            .ok_or_else(|| {
+                internal(format!(
+                    "{rel} is not in this session any more — someone moved or deleted it while \
+                     the board was open. Reopen the session to see where its cards are now."
+                ))
+            })?;
+        let compiled = keeper_core::sessions::tasks::compile_allow_schedule(
+            &pool_read.path,
+            &rel,
+            text,
+            &person,
+        )
+        .map_err(|refusal| internal(refusal.to_string()))?;
+        let zone = zone_root.clone();
+        let ran = tauri::async_runtime::spawn_blocking(move || {
+            keeper_agent::sessions::exec::run(&zone, compiled)
+        })
+        .await
+        .map_err(|join| internal(format!("task-allow-schedule task failed: {join}")))?;
+        match ran {
+            Ok(()) => break,
+            // The card changed between the read and the write: once more.
+            Err(keeper_agent::sessions::exec::ExecError::Refused(_)) if attempts == 1 => {}
+            Err(error) => return Err(exec_error(error)),
+        }
+    }
+    crate::sessions_root::rescan(&root_id);
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_task_allow_schedule(
+    root_id: String,
+    session_id: String,
+    rel: String,
+) -> Result<(), IpcError> {
+    let _ = (root_id, session_id, rel);
+    Err(unsupported())
+}
+
 #[cfg(not(desktop))]
 #[tauri::command]
 pub fn sessions_task_move(

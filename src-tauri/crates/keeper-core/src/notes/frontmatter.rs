@@ -233,6 +233,28 @@ impl Frontmatter {
         splice(source, entry.line_span, &rendered)
     }
 
+    /// [`Frontmatter::set_in`], except that a key the block lacks goes in
+    /// on the line after the last of `after` present in the block — so a
+    /// writer can keep its own keys together — and before the closing fence
+    /// when none is.
+    pub fn set_after_in(source: &str, after: &[&str], key: &str, value: FieldValue) -> String {
+        let (fm, _) = Self::parse(source);
+        if fm.block.is_empty() || fm.entry(key).is_some() {
+            return Self::set_in(source, key, value);
+        }
+        let Some(anchor) = fm
+            .entries
+            .iter()
+            .filter(|entry| after.contains(&entry.key.as_str()))
+            .map(|entry| entry.line_span.1.min(fm.inner.1))
+            .max()
+        else {
+            return Self::set_in(source, key, value);
+        };
+        let rendered = render_entry(key, &value, true, newline_of(&fm.block));
+        splice(source, (anchor, anchor), &rendered)
+    }
+
     /// Delete `key` and its lines. Unknown key, or no block at all, returns the
     /// source unchanged.
     pub fn remove_in(source: &str, key: &str) -> String {
@@ -252,6 +274,122 @@ impl Frontmatter {
         }
 
         splice(source, entry.line_span, "")
+    }
+
+    /// How many times `key` appears in the block. More than once is a YAML
+    /// error [`Frontmatter::get`] reads past by taking the first.
+    pub fn count(&self, key: &str) -> usize {
+        self.entries.iter().filter(|e| e.key == key).count()
+    }
+
+    /// Every line of every occurrence of `key`, verbatim and in order —
+    /// terminators included — or `""` when the key is absent. What a writer
+    /// restores when it must put a key back exactly as it was, whatever its
+    /// value is and whether this parser models it.
+    pub fn lines_of(&self, key: &str) -> String {
+        self.entries
+            .iter()
+            .filter(|e| e.key == key)
+            .map(|e| &self.block[e.line_span.0..e.line_span.1.min(self.inner.1)])
+            .collect()
+    }
+
+    /// The value text of `key`'s first occurrence as the source spells it,
+    /// modelled or not.
+    pub fn raw_value(&self, key: &str) -> Option<&str> {
+        self.entry(key)
+            .map(|e| &self.block[e.value_span.0..e.value_span.1.min(self.inner.1)])
+    }
+
+    /// [`Frontmatter::remove_in`] for every occurrence of `key`.
+    pub fn remove_all_in(source: &str, key: &str) -> String {
+        let mut out = source.to_owned();
+        while Self::parse(&out).0.entry(key).is_some() {
+            out = Self::remove_in(&out, key);
+        }
+        out
+    }
+
+    /// `source` with `key` exactly as `lines` spell it — whole entry lines,
+    /// terminators included, or `""` for no key: every occurrence goes, and
+    /// `lines` take the first one's place, or go in on the line after the
+    /// last of `after` present (before the closing fence when none is).
+    /// Every other byte is kept.
+    pub fn replace_lines_in(source: &str, key: &str, lines: &str, after: &[&str]) -> String {
+        if lines.is_empty() {
+            return Self::remove_all_in(source, key);
+        }
+        let (fm, _) = Self::parse(source);
+        if fm.block.is_empty() {
+            let bom = bom_len(source);
+            return format!("{}---\n{lines}---\n{}", &source[..bom], &source[bom..]);
+        }
+        let spans: Vec<(usize, usize)> = fm
+            .entries
+            .iter()
+            .filter(|e| e.key == key)
+            .map(|e| (e.line_span.0, e.line_span.1.min(fm.inner.1)))
+            .collect();
+        let Some(first) = spans.first() else {
+            let anchor = fm
+                .entries
+                .iter()
+                .filter(|e| after.contains(&e.key.as_str()))
+                .map(|e| e.line_span.1.min(fm.inner.1))
+                .max()
+                .unwrap_or(fm.inner.1);
+            return splice(source, (anchor, anchor), lines);
+        };
+        let mut out = source.to_owned();
+        for span in spans.iter().skip(1).rev() {
+            out.replace_range(span.0..span.1, "");
+        }
+        out.replace_range(first.0..first.1, lines);
+        out
+    }
+
+    /// [`Frontmatter::set_in`], except that a key the block lacks goes in
+    /// where its line has an unchanged line between it and every key of
+    /// `apart` — a line merge then never sees the two writers' edits touch —
+    /// as near after the last of `near` present as that allows. When a key
+    /// of `apart` is absent, its writer would add it before the closing
+    /// fence, so that place is not taken either. A block with no such place
+    /// takes the key after the last of `near`, as [`Frontmatter::set_after_in`].
+    pub fn set_apart_in(
+        source: &str,
+        key: &str,
+        value: FieldValue,
+        near: &[&str],
+        apart: &[&str],
+    ) -> String {
+        let (fm, _) = Self::parse(source);
+        if fm.block.is_empty() || fm.entry(key).is_some() {
+            return Self::set_in(source, key, value);
+        }
+        let entries = &fm.entries;
+        let n = entries.len();
+        let apart_key = |i: usize| apart.contains(&entries[i].key.as_str());
+        let some_absent = apart.iter().any(|k| fm.entry(k).is_none());
+        let allowed = |gap: usize| {
+            !(gap > 0 && apart_key(gap - 1))
+                && !(gap < n && apart_key(gap))
+                && !(gap == n && some_absent)
+        };
+        let anchor = entries
+            .iter()
+            .rposition(|e| near.contains(&e.key.as_str()))
+            .map_or(n, |i| i + 1);
+        let gap = (anchor..=n)
+            .chain((0..anchor).rev())
+            .find(|gap| allowed(*gap))
+            .unwrap_or(anchor);
+        let at = if gap == 0 {
+            fm.inner.0
+        } else {
+            entries[gap - 1].line_span.1.min(fm.inner.1)
+        };
+        let rendered = render_entry(key, &value, true, newline_of(&fm.block));
+        splice(source, (at, at), &rendered)
     }
 
     /// Render a fresh block for a note keeper authors.

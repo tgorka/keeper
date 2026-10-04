@@ -446,6 +446,33 @@ pub fn detail(
     })
     .collect();
 
+    // Where an agent session's work runs, from its log (R62, R121): the index
+    // reads only the chunks that grew since it last looked, a bounded amount
+    // per open, and takes the cards from the pool this detail already read
+    // rather than reading them again. A person's session has no `agent.toml`,
+    // no log and no index row.
+    let place = if dir.join(keeper_core::agents::session::FILE_NAME).is_file() {
+        let read: Vec<keeper_core::sessions::pool::PoolFile<'_>> = sources
+            .iter()
+            .map(|source| keeper_core::sessions::pool::PoolFile {
+                rel: &source.rel,
+                text: &source.text,
+            })
+            .collect();
+        keeper_core::agents::index::Index::open(&zone)
+            .and_then(|mut index| index.refresh_session(&row.path, Some(&read)))
+            .unwrap_or_else(|error| {
+                tracing::warn!(session = %row.path, %error, "sessions: the agents index could not say where a card runs");
+                None
+            })
+    } else {
+        None
+    };
+    let running_on = place.as_ref().and_then(|place| place.claim_host.as_deref());
+    let waiting = place
+        .as_ref()
+        .and_then(keeper_core::agents::index::SessionRow::waiting);
+
     let tasks: Vec<SessionTaskVm> = pool
         .tasks
         .iter()
@@ -458,6 +485,20 @@ pub fn detail(
             order_is_own: entry.order.is_own(),
             tags: entry.tags.clone(),
             unstable_identity: entry.unstable_identity,
+            // From the card's own bytes, so a key the flattened fields drop
+            // (written twice, or in a form the parser does not model) shows
+            // as unreadable rather than absent (R119).
+            agent: sources
+                .iter()
+                .find(|source| source.rel == entry.rel)
+                .and_then(|source| keeper_core::agents::card::CardAgent::of_text(&source.text))
+                .map(|card| {
+                    let readable = card
+                        .schedule
+                        .as_deref()
+                        .is_none_or(|raw| keeper_sync::tasks::TaskSchedule::parse(raw).is_ok());
+                    keeper_core::agents::card::CardAgentVm::of(&card, readable, running_on, waiting)
+                }),
         })
         .collect();
 

@@ -416,6 +416,8 @@ export type { BriefVm } from "./gen/BriefVm";
 export type { CapabilitiesVm } from "./gen/CapabilitiesVm";
 export type { CaptureTargetVm } from "./gen/CaptureTargetVm";
 export type { CaptureWindowVm } from "./gen/CaptureWindowVm";
+export type { CardAgentVm } from "./gen/CardAgentVm";
+export type { CardKeyVm } from "./gen/CardKeyVm";
 export type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 export type { ConfigFaultVm } from "./gen/ConfigFaultVm";
 export type { ConfigLayersVm } from "./gen/ConfigLayersVm";
@@ -6882,6 +6884,27 @@ export async function sessionsTaskMove(
   index: number,
 ): Promise<void> {
   await invoke<null>("sessions_task_move", { rootId, sessionId, rel, status, index });
+}
+
+/**
+ * A person's *Allow* on a card whose schedule an agent wrote (92.2, UX-DR134):
+ * the card's `scheduled_by:` becomes `allowed_by:` naming the person, and
+ * nothing else in the file changes. The shell finds the person (R118): the
+ * account signed in on this device whose user owns the drive, else the only
+ * one signed in. Offer it only on a card whose {@link CardAgentVm} carries
+ * `scheduledBy`.
+ *
+ * Rejects with: `internal` (no such account — "Sign in as <owner> to allow
+ * this schedule." — unknown root or session, a card since moved or deleted,
+ * no schedule to allow, a card rewritten twice while it was being allowed),
+ * `unsupported`.
+ */
+export async function sessionsTaskAllowSchedule(
+  rootId: string,
+  sessionId: string,
+  rel: string,
+): Promise<void> {
+  await invoke<null>("sessions_task_allow_schedule", { rootId, sessionId, rel });
 }
 
 /**

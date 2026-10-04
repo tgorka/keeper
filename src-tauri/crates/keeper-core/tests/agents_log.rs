@@ -1323,6 +1323,355 @@ fn the_index_answers_with_the_logs_gone() {
     assert_eq!(index.session(FIXTURE_SESSION).expect("q"), Some(rebuilt));
 }
 
+/// Every markdown file under `dir`, session-relative, as the board's pool
+/// reads them.
+fn markdown_of(dir: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut pending = vec![String::new()];
+    while let Some(prefix) = pending.pop() {
+        for entry in fs::read_dir(dir.join(&prefix)).expect("dir").flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if entry.file_type().expect("type").is_dir() {
+                pending.push(rel);
+            } else if name.ends_with(".md") {
+                out.push((rel, fs::read_to_string(entry.path()).expect("read")));
+            }
+        }
+    }
+    out
+}
+
+fn pool_of(files: &[(String, String)]) -> Vec<keeper_core::sessions::pool::PoolFile<'_>> {
+    files
+        .iter()
+        .map(|(rel, text)| keeper_core::sessions::pool::PoolFile { rel, text })
+        .collect()
+}
+
+/// 92.2 AC6 (R62): where a card runs comes from its session's log, read
+/// through `refresh_session` on a zone no host ever indexed (a Mac with no
+/// signed-in copy): `running_on` is the claim's host, never the card's
+/// `host:` pin, and `waiting` is the latest `run` line's detail. A refresh
+/// reads only the chunks that grew, and the cards wherever the pool reads
+/// them.
+#[test]
+fn where_a_card_runs_comes_from_its_sessions_log() {
+    let scratch = Scratch::new();
+    let zone = scratch.0.join("60-sessions");
+    copy_tree(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agents/sessions"),
+        &zone,
+    );
+    let session_dir = zone.join(FIXTURE_SESSION);
+    let mut index = Index::open(&zone).expect("open");
+    let pool = markdown_of(&session_dir);
+    let row = index
+        .refresh_session(FIXTURE_SESSION, Some(&pool_of(&pool)))
+        .expect("refresh")
+        .expect("an agent session");
+    assert_eq!(row.claim_host.as_deref(), Some("hesperia"));
+    let cards = index.cards(FIXTURE_SESSION).expect("cards");
+    assert_eq!(cards[0].host.as_deref(), Some("electra"), "the pin");
+    assert_eq!(row.run.as_deref(), Some("blocked"));
+    assert_eq!(row.waiting(), None, "blocked is not waiting");
+    assert_eq!(row.lines, 11);
+
+    // electra's chunk is rewritten to the same size: no refresh reads it.
+    let electra = session_dir.join("log/2026-09-30.electra.1.jsonl");
+    let size = fs::metadata(&electra).expect("electra").len();
+    let electra_bytes = fs::read(&electra).expect("electra");
+    fs::write(&electra, "x".repeat(size as usize)).expect("same size");
+    let mut writer =
+        ChunkWriter::open(&session_dir, &host("hesperia"), ROTATE, day()).expect("writer");
+    let mut waiting = line(
+        "hesperia",
+        2,
+        Utc.with_ymd_and_hms(2026, 9, 30, 9, 5, 0)
+            .single()
+            .expect("ts"),
+        12,
+        LineBody::Run(RunBody {
+            state: RunState::Waiting,
+            detail: Some("hesperia — a live host".to_owned()),
+        }),
+    );
+    waiting.claim = Some("$c2".into());
+    writer.append(&waiting).expect("append");
+    let row = index
+        .refresh_session(FIXTURE_SESSION, None)
+        .expect("refresh")
+        .expect("row");
+    assert_eq!(row.lines, 12, "one line read, electra's bytes untouched");
+    assert_eq!(row.run.as_deref(), Some("waiting"));
+    assert_eq!(row.waiting(), Some("hesperia — a live host"));
+    assert_eq!(row.claim_host.as_deref(), Some("hesperia"));
+
+    let mut released = line(
+        "hesperia",
+        2,
+        Utc.with_ymd_and_hms(2026, 9, 30, 9, 6, 0)
+            .single()
+            .expect("ts"),
+        13,
+        LineBody::Claim(ClaimBody {
+            epoch: 2,
+            action: ClaimAction::Released,
+            from_host: None,
+            claim_event: "$c2".to_owned(),
+            server_ts: "2026-09-30T09:06:00.000Z".to_owned(),
+        }),
+    );
+    released.claim = Some("$c2".into());
+    writer.append(&released).expect("append");
+    let row = index
+        .refresh_session(FIXTURE_SESSION, None)
+        .expect("refresh")
+        .expect("row");
+    assert_eq!(row.claim_host, None, "nobody holds it now");
+
+    // A chunk that shrank is a rewrite, not an append: it is read whole
+    // again, and the release it no longer holds is gone from the row.
+    fs::write(&electra, &electra_bytes).expect("restore");
+    let hesperia = session_dir.join("log").join(
+        writer
+            .current_chunk()
+            .expect("hesperia's chunk")
+            .to_string(),
+    );
+    let text = fs::read_to_string(&hesperia).expect("chunk");
+    let cut = text.trim_end_matches('\n').rfind('\n').expect("two lines") + 1;
+    fs::write(&hesperia, &text[..cut]).expect("shrink");
+    let row = index
+        .refresh_session(FIXTURE_SESSION, None)
+        .expect("refresh")
+        .expect("row");
+    assert_eq!(row.lines, 12);
+    assert_eq!(row.claim_host.as_deref(), Some("hesperia"));
+
+    // Cards wherever the pool reads them (R52); never under log/ or
+    // workspace/.
+    let task = "---\ntags: [task]\nstatus: todo\nassignee: amelia\nrun: queued\n---\n\nMore.\n";
+    for rel in ["cards/more.md", "workspace/scratch.md", "log/stray.md"] {
+        let path = session_dir.join(rel);
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        fs::write(path, task).expect("card");
+    }
+    let pool = markdown_of(&session_dir);
+    index
+        .refresh_session(FIXTURE_SESSION, Some(&pool_of(&pool)))
+        .expect("refresh");
+    let rels: Vec<String> = index
+        .cards(FIXTURE_SESSION)
+        .expect("cards")
+        .into_iter()
+        .map(|card| card.rel)
+        .collect();
+    assert_eq!(rels, ["card-release-notes.md", "cards/more.md"]);
+
+    // A folder that is no longer an agent session leaves no rows.
+    fs::remove_file(session_dir.join("agent.toml")).expect("remove");
+    assert_eq!(
+        index
+            .refresh_session(FIXTURE_SESSION, None)
+            .expect("refresh"),
+        None
+    );
+    assert_eq!(index.session(FIXTURE_SESSION).expect("q"), None);
+    assert!(index.cards(FIXTURE_SESSION).expect("cards").is_empty());
+}
+
+/// R121 (R4-11, R4-13): whatever order the chunks' lines arrive in — a
+/// host's chunk late, a superseded epoch's line after a newer acquire, a
+/// claim from an older chunk — and however little each refresh may read,
+/// refreshing as they arrive ends at the row a whole read of the log gives.
+/// Seeded, so a failure names its case.
+#[test]
+fn a_refresh_agrees_with_a_whole_read_whatever_the_order() {
+    let toml = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/agents/sessions")
+            .join(FIXTURE_SESSION)
+            .join("agent.toml"),
+    )
+    .expect("agent.toml");
+    for seed in 1..=60u64 {
+        let mut state = seed;
+        let mut next = |n: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % n
+        };
+        let scratch = Scratch::new();
+        let zone = scratch.0.join("60-sessions");
+        let dir = zone.join("active/s");
+        fs::create_dir_all(dir.join("log")).expect("log");
+        fs::write(dir.join("agent.toml"), &toml).expect("agent.toml");
+        let mut index = Index::open(&zone).expect("open");
+        index.refresh_session("active/s", None).expect("first read");
+        let hosts = ["electra", "hesperia", "kalypso"];
+        for seq in 0..30u64 {
+            let slug = hosts[next(3) as usize];
+            let epoch = 1 + next(3);
+            let ts = Utc
+                .with_ymd_and_hms(2026, 9, 30, 9, 0, 0)
+                .single()
+                .expect("ts")
+                + chrono::Duration::seconds(next(600) as i64);
+            let written = match next(4) {
+                0 => claim_line(slug, epoch, ts, seq, &format!("$e{epoch}{slug}")),
+                1 => {
+                    let mut released =
+                        claim_line(slug, epoch, ts, seq, &format!("$e{epoch}{slug}"));
+                    if let LineBody::Claim(claim) = &mut released.body {
+                        claim.action = ClaimAction::Released;
+                    }
+                    released
+                }
+                _ => line(
+                    slug,
+                    epoch,
+                    ts,
+                    seq,
+                    LineBody::Run(RunBody {
+                        state: [RunState::Running, RunState::Waiting, RunState::Review]
+                            [next(3) as usize],
+                        detail: Some(format!("line {seq}")),
+                    }),
+                ),
+            };
+            let chunk = chunk_path(&dir, &format!("2026-09-30.{slug}.1.jsonl"));
+            let mut text = fs::read_to_string(&chunk).unwrap_or_default();
+            text.push_str(&written.to_json().expect("json"));
+            text.push('\n');
+            fs::write(&chunk, text).expect("append");
+            if next(3) == 0 {
+                index.set_refresh_bytes(50 + next(1_500));
+                index.refresh_session("active/s", None).expect("refresh");
+            }
+        }
+        index.set_refresh_bytes(u64::MAX / 2);
+        let refreshed = index
+            .refresh_session("active/s", None)
+            .expect("refresh")
+            .expect("row");
+
+        let whole_zone = scratch.0.join("whole");
+        copy_tree(&zone.join("active"), &whole_zone.join("active"));
+        let whole = Index::open(&whole_zone)
+            .expect("open")
+            .refresh_session("active/s", None)
+            .expect("whole read")
+            .expect("row");
+        assert_eq!(refreshed, whole, "seed {seed}");
+    }
+}
+
+/// R121 (R4-11): a line of a superseded epoch that arrives after the newer
+/// epoch's acquire was refreshed in is fenced as a whole read fences it.
+#[test]
+fn a_refresh_fences_a_superseded_epochs_late_line() {
+    let scratch = Scratch::new();
+    let zone = scratch.0.join("60-sessions");
+    let dir = zone.join("active/s");
+    fs::create_dir_all(dir.join("log")).expect("log");
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/agents/sessions")
+            .join(FIXTURE_SESSION)
+            .join("agent.toml"),
+        dir.join("agent.toml"),
+    )
+    .expect("agent.toml");
+    let at = |minute| {
+        Utc.with_ymd_and_hms(2026, 9, 30, 9, minute, 0)
+            .single()
+            .expect("ts")
+    };
+    let append = |slug: &str, written: &LogLine| {
+        let chunk = chunk_path(&dir, &format!("2026-09-30.{slug}.1.jsonl"));
+        let mut text = fs::read_to_string(&chunk).unwrap_or_default();
+        text.push_str(&written.to_json().expect("json"));
+        text.push('\n');
+        fs::write(&chunk, text).expect("append");
+    };
+    let mut index = Index::open(&zone).expect("open");
+    index.refresh_session("active/s", None).expect("first read");
+    append("hesperia", &claim_line("hesperia", 2, at(1), 1, "$e2"));
+    index.refresh_session("active/s", None).expect("refresh");
+    let stale = line(
+        "electra",
+        1,
+        at(2),
+        2,
+        LineBody::Run(RunBody {
+            state: RunState::Running,
+            detail: None,
+        }),
+    );
+    append("electra", &stale);
+    let row = index
+        .refresh_session("active/s", None)
+        .expect("refresh")
+        .expect("row");
+    assert_eq!(row.run, None, "the stale host's run is fenced");
+    assert_eq!(row.lines, 1);
+}
+
+/// R121 (R4-13): one refresh reads about its byte budget of grown log and
+/// leaves the rest to the next.
+#[test]
+fn a_refresh_reads_a_bounded_amount_of_log() {
+    let scratch = Scratch::new();
+    let zone = scratch.0.join("60-sessions");
+    copy_tree(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agents/sessions"),
+        &zone,
+    );
+    let session_dir = zone.join(FIXTURE_SESSION);
+    let mut index = Index::open(&zone).expect("open");
+    let first = index
+        .refresh_session(FIXTURE_SESSION, None)
+        .expect("refresh")
+        .expect("row");
+    let mut writer =
+        ChunkWriter::open(&session_dir, &host("hesperia"), ROTATE, day()).expect("writer");
+    let base = Utc
+        .with_ymd_and_hms(2026, 9, 30, 10, 0, 0)
+        .single()
+        .expect("ts");
+    let mut one = 0;
+    for seq in 0..20u64 {
+        let mut written = user_line(
+            "hesperia",
+            2,
+            base + chrono::Duration::seconds(seq as i64),
+            100 + seq,
+            "x",
+        );
+        written.claim = Some("$c2".into());
+        one = writer.append(&written).expect("append").bytes;
+    }
+    index.set_refresh_bytes(one * 5);
+    let row = index
+        .refresh_session(FIXTURE_SESSION, None)
+        .expect("refresh")
+        .expect("row");
+    assert_eq!(row.lines, first.lines + 5, "five lines' worth read");
+    for _ in 0..3 {
+        index
+            .refresh_session(FIXTURE_SESSION, None)
+            .expect("refresh");
+    }
+    let row = index.session(FIXTURE_SESSION).expect("q").expect("row");
+    assert_eq!(row.lines, first.lines + 20, "the rest on the next opens");
+}
+
 /// R-18: a person's attachments and a peer's question are in the message the
 /// turn sends (`message_for` of the line as written) and in the message a
 /// replay rebuilds, the same bytes both ways.

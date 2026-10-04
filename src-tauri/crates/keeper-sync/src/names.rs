@@ -170,6 +170,24 @@ pub fn is_lossy_rendering(text: &str) -> bool {
     text.contains(REPLACEMENT)
 }
 
+/// Whether two names are one directory entry on a volume that folds case and
+/// Unicode normalization, as the Mac's default APFS does: `README.md` and
+/// `readme.md` are one file there, and so are an `é` composed and the same
+/// `é` decomposed. A fence that compares names it must keep keeper's own
+/// compares them this way on every platform, so it refuses on Linux what the
+/// Mac would let through.
+pub fn same_entry_folded(a: &str, b: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    let fold = |name: &str| -> String {
+        name.nfd()
+            .collect::<String>()
+            .to_lowercase()
+            .nfd()
+            .collect()
+    };
+    fold(a) == fold(b)
+}
+
 /// Byte-exact ASCII rendering: printable ASCII verbatim, `\xNN` for the rest.
 ///
 /// `\\` for a literal backslash, so the escaping is unambiguous and two
@@ -226,6 +244,15 @@ pub(crate) const UNSPELLABLE_UNAVAILABLE: &str =
 
 #[cfg(test)]
 mod tests {
+    /// The Mac's volume reads these as one entry, so a fence compares them
+    /// alike on every platform.
+    #[test]
+    fn names_fold_as_the_macs_volume_folds_them() {
+        assert!(super::same_entry_folded("README.md", "readme.md"));
+        assert!(super::same_entry_folded("Caf\u{e9}", "cafe\u{301}"));
+        assert!(!super::same_entry_folded("log", "logs"));
+    }
+
     use super::*;
 
     #[cfg(unix)]

@@ -36,6 +36,7 @@
 
 pub mod agent;
 pub mod approval;
+pub mod cards;
 pub mod claims;
 pub mod delegate;
 #[cfg(unix)]

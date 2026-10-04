@@ -1467,6 +1467,7 @@ pub fn run() {
                 sessions_ipc::sessions_file_rename,
                 sessions_ipc::sessions_file_path,
                 sessions_ipc::sessions_task_move,
+                sessions_ipc::sessions_task_allow_schedule,
                 sessions_ipc::sessions_ref_candidates,
                 sessions_ipc::sessions_ref_add,
                 sessions_ipc::sessions_search,

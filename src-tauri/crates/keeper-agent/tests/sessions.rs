@@ -387,15 +387,18 @@ fn a_link_is_trashed_as_a_link_and_its_target_is_left_alone() {
     );
 }
 
-/// `session_write` takes artifacts and scratch, and never keeper's own files
-/// (90.2 acceptance 7).
+/// `session_write` takes artifacts, scratch and the session's own pool, and
+/// never keeper's own files (90.2 acceptance 7; R52: a card is a pool file).
 #[test]
 fn session_write_refuses_log_approvals_and_keepers_files() {
     let zone = zone();
     std::fs::create_dir_all(zone.path().join("active/s")).expect("session");
-    let write = |rel: &str| session_write(zone.path(), "active/s", rel, "text\n");
+    let write = |rel: &str| session_write(zone.path(), "active/s", rel, "text\n", &|| true);
     write("artifacts/answer-01J5DDDDDDDDDDDDDDDDDDDDDD.md").expect("an artifact");
     write("workspace/run.jsonl").expect("scratch, any extension");
+    write("cards/inbox.md").expect("a pool file, in a folder");
+    write("notes.md").expect("a pool file");
+    write("notes.md").expect("and replaced");
     assert_eq!(
         std::fs::read_to_string(zone.path().join("active/s/workspace/run.jsonl")).expect("read"),
         "text\n"
@@ -407,7 +410,8 @@ fn session_write_refuses_log_approvals_and_keepers_files() {
         "agent.toml",
         "README.md",
         "AGENTS.md",
-        "notes.md",
+        "notes.jsonl",
+        "Workspace/x.md",
         "artifacts/../README.md",
     ] {
         assert!(write(refused).is_err(), "{refused} was written");
@@ -421,7 +425,13 @@ fn session_write_refuses_log_approvals_and_keepers_files() {
 #[test]
 fn session_write_into_a_session_that_is_not_there_makes_nothing() {
     let zone = zone();
-    let refused = session_write(zone.path(), "active/missing", "workspace/x.md", "text\n");
+    let refused = session_write(
+        zone.path(),
+        "active/missing",
+        "workspace/x.md",
+        "text\n",
+        &|| true,
+    );
     assert!(
         matches!(&refused, Err(verbs::VerbError::NoSuchSession(session)) if session == "active/missing"),
         "{refused:?}"

@@ -220,6 +220,13 @@ pub enum WriteRefusal {
         /// The path that was asked for, profile-relative.
         subpath: String,
     },
+    /// The path is in the sessions zone and the scope is an agent host's
+    /// (R51): an agent writes a session only through its session tools,
+    /// which stamp what they write; `drive_write` and `drive_edit` never do.
+    SessionsZone {
+        /// The path that was asked for, profile-relative.
+        subpath: String,
+    },
 }
 
 impl std::fmt::Display for WriteRefusal {
@@ -309,6 +316,12 @@ impl std::fmt::Display for WriteRefusal {
                 f,
                 "That is an agent's home file. Only a person edits it, in the drive itself."
             ),
+            Self::SessionsZone { subpath } => write!(
+                f,
+                "{subpath} is in the sessions zone, which an agent writes only through its \
+                 session tools: session_write for a file of its own session, card_update for a \
+                 card. drive_write and drive_edit never reach it."
+            ),
             Self::NoSystemTrash { reason } => write!(
                 f,
                 "keeper could not find this computer's trash ({reason}), and it will not \
@@ -393,6 +406,9 @@ pub struct WriteScope<'a> {
     /// when this profile keeps no agents (AD-361). It fences every home file
     /// from every tool writer (AD-362).
     agents_subfolder: Option<String>,
+    /// Whether the whole sessions zone is closed to this scope's writes
+    /// (R51) — an agent host's scope, never a person's or a ⌘9 bot's.
+    sessions_closed: bool,
 }
 
 impl<'a> WriteScope<'a> {
@@ -417,6 +433,7 @@ impl<'a> WriteScope<'a> {
             subfolder: subfolder.map(normalise_subfolder),
             sessions_subfolder: None,
             agents_subfolder: None,
+            sessions_closed: false,
         }
     }
 
@@ -429,6 +446,33 @@ impl<'a> WriteScope<'a> {
     pub fn with_sessions(mut self, sessions_subfolder: Option<&str>) -> Self {
         self.sessions_subfolder = sessions_subfolder.map(normalise_subfolder);
         self
+    }
+
+    /// The same scope, closed to the whole sessions zone when `closed`
+    /// (R51): armed by an agent host only, beside [`Self::with_sessions`],
+    /// whose zone it closes — a scope that does not know its zone closes
+    /// nothing, as that builder's note says.
+    pub fn with_sessions_closed(mut self, closed: bool) -> Self {
+        self.sessions_closed = closed;
+        self
+    }
+
+    /// Whether a profile-relative path lies at or under the sessions zone
+    /// this scope keeps closed. Folded per segment, as the agents fence is.
+    fn in_closed_sessions(&self, subpath: &str) -> bool {
+        let Some(zone) = self
+            .sessions_subfolder
+            .as_deref()
+            .filter(|_| self.sessions_closed)
+        else {
+            return false;
+        };
+        let mut parts = subpath.split('/').filter(|part| !part.is_empty());
+        zone.split('/').all(|zone_part| {
+            parts
+                .next()
+                .is_some_and(|part| part.eq_ignore_ascii_case(zone_part))
+        })
     }
 
     /// The same scope, aware of the profile's agents zone (AD-361, AD-362).
@@ -601,6 +645,11 @@ impl<'a> WriteScope<'a> {
                     subpath: subpath.to_owned(),
                 });
             }
+            if self.in_closed_sessions(&landing) {
+                return Err(WriteRefusal::SessionsZone {
+                    subpath: subpath.to_owned(),
+                });
+            }
         }
         match self.classify(subpath, resolved.is_dir())? {
             Owned::Vault(relative) => Ok(WriteRoute::Vault {
@@ -727,6 +776,13 @@ impl<'a> WriteScope<'a> {
         // tool write, wherever the vault is (AD-362).
         if self.in_agent_home(subpath) {
             return Err(WriteRefusal::AgentHome {
+                subpath: subpath.to_owned(),
+            });
+        }
+        // An agent host's scope keeps the whole sessions zone for its
+        // session tools (R51).
+        if self.in_closed_sessions(subpath) {
+            return Err(WriteRefusal::SessionsZone {
                 subpath: subpath.to_owned(),
             });
         }
@@ -1531,6 +1587,57 @@ mod tests {
         assert!(matches!(
             scope.route(None::<FakeVault>, root.path(), "plain.md"),
             Ok(WriteRoute::Unmanaged(_))
+        ));
+    }
+
+    /// R51: an agent host's scope refuses every write in the sessions zone —
+    /// cards, logs, `agent.toml` — folded as the agents fence is, at the
+    /// path asked for and where a link lands; a person's scope (the fence
+    /// unarmed) routes the same card as before.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_hosts_scope_closes_the_sessions_zone() {
+        let agent = WriteScope::new("tgdrive", Some("10-notes"))
+            .with_sessions(Some("60-sessions"))
+            .with_agents(Some("80-agents"))
+            .with_sessions_closed(true);
+        let refused = |subpath: &str| {
+            matches!(
+                agent.classify(subpath, false),
+                Err(WriteRefusal::SessionsZone { .. })
+            )
+        };
+        for closed in [
+            "60-sessions/active/s/brief.md",
+            "60-sessions/active/s/cards/inbox.md",
+            "60-sessions/active/s/log/2026-10-04.electra.1.jsonl",
+            "60-sessions/active/s/agent.toml",
+            "60-sessions/archive/2026/s/brief.md",
+            "60-Sessions/active/s/brief.md",
+            "60-sessions/AGENTS.md",
+        ] {
+            assert!(refused(closed), "{closed} is in the sessions zone");
+        }
+        for open in ["60-sessions-old/a.md", "10-notes/60-sessions/a.md", "a.md"] {
+            assert!(!refused(open), "{open} is not in the sessions zone");
+        }
+        let person = WriteScope::new("tgdrive", Some("10-notes"))
+            .with_sessions(Some("60-sessions"))
+            .with_agents(Some("80-agents"));
+        assert!(matches!(
+            person.classify("60-sessions/active/s/brief.md", false),
+            Ok(Owned::Unmanaged)
+        ));
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let session = root.path().join("60-sessions/active/s");
+        std::fs::create_dir_all(&session).expect("session");
+        std::fs::write(session.join("brief.md"), "card").expect("card");
+        std::os::unix::fs::symlink("60-sessions/active/s/brief.md", root.path().join("x.md"))
+            .expect("link");
+        assert!(matches!(
+            agent.route(None::<FakeVault>, root.path(), "x.md"),
+            Err(WriteRefusal::SessionsZone { .. })
         ));
     }
 

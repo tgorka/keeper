@@ -115,6 +115,11 @@ pub trait TurnHost: Send + Sync {
         profiles: Vec<SyncProfile>,
         signal: CancelSignal,
     ) -> Box<dyn ToolHost>;
+
+    /// The same host, for an agent's turn: its writes never reach the
+    /// sessions zone, which the agent writes through its session tools only
+    /// (R51). A ⌘9 bot's host is never asked.
+    fn for_agent(self: Box<Self>) -> Box<dyn TurnHost>;
 }
 
 /// The drive port on a host with no drive.
@@ -129,6 +134,10 @@ pub struct NoDrive;
 impl TurnHost for NoDrive {
     fn host(&self, _: HostIds, _: Vec<SyncProfile>, _: CancelSignal) -> Box<dyn ToolHost> {
         Box::new(NoDrive)
+    }
+
+    fn for_agent(self: Box<Self>) -> Box<dyn TurnHost> {
+        self
     }
 }
 
@@ -149,6 +158,7 @@ pub struct DriveTurnHost {
     vault: Option<Arc<dyn VaultWriter>>,
     approval: Option<Arc<dyn ApprovalPort>>,
     grants: Arc<dyn GrantSource>,
+    sessions_closed: bool,
 }
 
 impl TurnHost for DriveTurnHost {
@@ -176,7 +186,13 @@ impl TurnHost for DriveTurnHost {
             vault: self.vault.clone(),
             approve,
             grants: Arc::clone(&self.grants),
+            sessions_closed: self.sessions_closed,
         })
+    }
+
+    fn for_agent(mut self: Box<Self>) -> Box<dyn TurnHost> {
+        self.sessions_closed = true;
+        self
     }
 }
 
@@ -220,6 +236,7 @@ pub fn arm_drive(
             vault: ports.vault.clone(),
             approval: ports.approval.clone(),
             grants: source,
+            sessions_closed: false,
         }),
     }
 }
@@ -269,6 +286,9 @@ pub struct DriveToolHost {
     pub approve: Option<Arc<Approver>>,
     /// What every call is checked against, re-read per call.
     pub grants: Arc<dyn GrantSource>,
+    /// Whether this host's writes keep out of the sessions zone (R51): an
+    /// agent's host, never a ⌘9 bot's.
+    pub sessions_closed: bool,
 }
 
 impl DriveToolHost {
@@ -368,7 +388,7 @@ impl ToolHost for DriveToolHost {
 
         // Step 4 — the effect. Every arm below is one `bots_fs` call plus the
         // projection into the vocabulary the model reads.
-        let outcome = perform(profile, self.vault.as_deref(), call);
+        let outcome = perform(profile, self.vault.as_deref(), call, self.sessions_closed);
 
         // Step 5 — the outcome, with the numbers.
         match &outcome {
@@ -400,6 +420,7 @@ fn perform(
     profile: &SyncProfile,
     vault: Option<&dyn VaultWriter>,
     call: &ToolCall,
+    sessions_closed: bool,
 ) -> Result<ToolOutcome, BotsError> {
     let root = profile.local_path.as_path();
     let subpath = call.target.subpath.as_str();
@@ -556,7 +577,7 @@ fn perform(
                     reason: "drive_write needs a \"content\" argument.".to_owned(),
                 });
             };
-            write_through(profile, vault, subpath, &content, &limits)
+            write_through(profile, vault, subpath, &content, &limits, sessions_closed)
         }
         ToolName::Edit => {
             let (Some(old_text), Some(new_text)) = (old_text, new_text) else {
@@ -574,7 +595,7 @@ fn perform(
                 // One writer for both verbs: an edit is not a second way to
                 // put bytes on the drive, it is a way to compose the bytes a
                 // write puts there.
-                Ok(next) => write_through(profile, vault, subpath, &next, &limits),
+                Ok(next) => write_through(profile, vault, subpath, &next, &limits, sessions_closed),
                 Err(refusal) => refused(refusal),
             }
         }
@@ -593,6 +614,7 @@ fn write_through(
     subpath: &str,
     content: &str,
     limits: &Limits,
+    sessions_closed: bool,
 ) -> Result<ToolOutcome, BotsError> {
     // The LIVE vault and the scope built from it, in one lookup — the same
     // rule `sync_ipc::vault_and_scope` states: a scope built from
@@ -605,7 +627,8 @@ fn write_through(
                 .as_ref()
                 .map(|sessions| sessions.subfolder.as_str()),
         )
-        .with_agents(profile.agents.as_ref().map(|a| a.subfolder.as_str()));
+        .with_agents(profile.agents.as_ref().map(|a| a.subfolder.as_str()))
+        .with_sessions_closed(sessions_closed);
 
     let live = subfolder.as_ref().and(vault);
     let route = match bots_fs::plan_write(&scope, live, profile.local_path.as_path(), subpath) {
@@ -690,4 +713,37 @@ pub fn load_context(profiles: &[SyncProfile], targets: &[ToolTarget]) -> Vec<Loa
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R51: an agent host's write never lands in the sessions zone — its
+    /// session tools are the only door — while a ⌘9 bot's host writes there
+    /// as it always has.
+    #[test]
+    fn an_agent_hosts_write_stops_at_the_sessions_zone() {
+        let drive = tempfile::tempdir().expect("drive");
+        let mut profile = SyncProfile::new("tgdrive", "tgdrive", drive.path(), "unused");
+        profile.sessions = Some(Default::default());
+        let zone = profile
+            .sessions
+            .as_ref()
+            .expect("sessions")
+            .subfolder
+            .clone();
+        let card = format!("{zone}/active/s/card.md");
+        std::fs::create_dir_all(drive.path().join(&zone).join("active/s")).expect("session");
+        std::fs::write(drive.path().join(&card), "old").expect("card");
+
+        let agent = write_through(&profile, None, &card, "x", &limits(), true).expect("an outcome");
+        assert!(matches!(agent, ToolOutcome::Refused { .. }), "{agent:?}");
+        let on_disk = || std::fs::read_to_string(drive.path().join(&card)).expect("card");
+        assert_eq!(on_disk(), "old");
+
+        let bot = write_through(&profile, None, &card, "x", &limits(), false).expect("an outcome");
+        assert!(matches!(bot, ToolOutcome::Wrote { .. }), "{bot:?}");
+        assert_eq!(on_disk(), "x");
+    }
 }

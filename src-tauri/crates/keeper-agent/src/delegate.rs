@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use keeper_core::agents::card::{self, Run};
+use keeper_core::agents::card::Run;
 use keeper_core::agents::delegation::{
     self, brief_content, child_label, observers, room_invites, session_title, BoundReached,
     DelegateCard, DelegateContent, DelegateFrom, DelegateLimits, Limits, CARD_FILE,
@@ -52,7 +52,6 @@ use keeper_core::agents::session::SessionKind;
 use keeper_core::bots::chat::{ToolCall as WireToolCall, ToolSpec};
 use keeper_core::bots::tools::ToolOutcome;
 use keeper_core::sessions::model::ARTIFACTS_DIR;
-use keeper_core::sessions::plan::{Plan, PlanStep};
 use keeper_sync::browse;
 use matrix_sdk::ruma::{
     OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
@@ -65,7 +64,6 @@ use crate::agent::RoomFuture;
 use crate::host::UNATTENDED_REFUSAL;
 use crate::matrix_sink::{EditPort, SendFuture};
 use crate::rooms::{BriefRoom, Known, KnownAgent};
-use crate::sessions::exec;
 use crate::sessions::verbs::VerbError;
 
 /// The tool that hands work on.
@@ -227,6 +225,9 @@ pub struct Delegator {
 pub trait TurnView: Sync {
     fn label(&self) -> Label;
     fn delegation(&self, id: &str) -> Option<Delegation>;
+    /// Whether the session's claim lets this host write now (NFR-120):
+    /// asked by every file writer right before its effect (R120).
+    fn may_write(&self) -> bool;
 }
 
 #[derive(Debug, Deserialize)]
@@ -437,25 +438,20 @@ pub fn artifact_in(zone: &Path, session: &str, rel: &str) -> Result<(), String> 
 }
 
 /// Set the card of the session at `session` (zone-relative) to `run`,
-/// through the journaled executor, on a transition only: whether it wrote.
-pub fn set_card_run(zone: &Path, session: &str, run: Run) -> Result<bool, VerbError> {
-    let held = exec::hold(zone)?;
-    let rel = format!("{session}/{CARD_FILE}");
-    let Ok(text) = std::fs::read_to_string(held.zone().join(&rel)) else {
+/// through the host's run writer, on a transition only: whether it wrote.
+/// A session without its card writes nothing; neither does a host whose
+/// claim `may_write` denies.
+pub fn set_card_run(
+    zone: &Path,
+    session: &str,
+    run: Run,
+    may_write: &dyn Fn() -> bool,
+) -> Result<bool, VerbError> {
+    let card = zone.join(session).join(CARD_FILE);
+    if !card.is_file() {
         return Ok(false);
-    };
-    let Some(content) = card::set_run(&text, run) else {
-        return Ok(false);
-    };
-    exec::run_held(
-        Plan {
-            verb: "card-run".to_owned(),
-            session: session.to_owned(),
-            steps: vec![PlanStep::WriteFile { path: rel, content }],
-        },
-        &held,
-    )?;
-    Ok(true)
+    }
+    crate::cards::write_run(zone, session, CARD_FILE, run, None, may_write)
 }
 
 fn block_on<F: Future>(fut: F) -> F::Output {
@@ -750,7 +746,7 @@ impl<'t> DelegateTools<'t> {
             reply: None,
         }));
         let (zone, session) = (self.from.zone.clone(), self.from.session.clone());
-        match set_card_run(&zone, &session, Run::Review) {
+        match set_card_run(&zone, &session, Run::Review, &|| self.view.may_write()) {
             Ok(_) => self.line(LineBody::Run(RunBody {
                 state: RunState::Review,
                 detail: None,

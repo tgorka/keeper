@@ -34,11 +34,17 @@ pub enum PlanStep {
     /// Write these exact bytes to a file, atomically, overwriting.
     WriteFile { path: String, content: String },
     /// Replace a file's whole content with `content` **only if** its current
-    /// content is `expect` — the splice-writer's optimistic guard, so a
-    /// concurrent agent write turns into a refusal rather than a lost edit.
+    /// content is what the plan was compiled from — the splice-writer's
+    /// optimistic guard, so a concurrent agent write turns into a refusal
+    /// rather than a lost edit. `expect_len` is the length read; a card's
+    /// writers also give `expect_sha256`, the SHA-256 of the bytes read,
+    /// because an edit of the same length (`todo` → `done`) is still an edit
+    /// (R120). Build one through [`PlanStep::guarded`].
     GuardedWrite {
         path: String,
         expect_len: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect_sha256: Option<String>,
         content: String,
     },
     /// Move a directory. Succeeds if the source is gone and the target exists.
@@ -70,6 +76,25 @@ pub enum PlanStep {
     /// Remove every entry under a directory except `.gitkeep`, writing one if
     /// absent — the zone's "empty the workspace" (FR-245 step 3).
     EmptyDirKeep { path: String },
+}
+
+impl PlanStep {
+    /// A [`PlanStep::GuardedWrite`] of `content` over `path`, guarded on the
+    /// exact bytes `read` — their length and their SHA-256.
+    pub fn guarded(path: String, read: &str, content: String) -> PlanStep {
+        PlanStep::GuardedWrite {
+            path,
+            expect_len: read.len(),
+            expect_sha256: Some(sha256_hex(read)),
+            content,
+        }
+    }
+}
+
+/// The lowercase hex SHA-256 of `text`, as a guard compares it.
+pub fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(text.as_bytes()))
 }
 
 /// A compiled verb: its steps, in execution order.
@@ -274,6 +299,7 @@ pub fn compile_create_from_shaped(
     plan.steps.push(PlanStep::GuardedWrite {
         path: format!("{source_session}/{record_name}"),
         expect_len: source_record.len(),
+        expect_sha256: None,
         content: updated,
     });
     plan
@@ -375,6 +401,7 @@ pub fn compile_log_today(session: &str, readme: &str, date: &str) -> Option<(Pla
             steps: vec![PlanStep::GuardedWrite {
                 path: format!("{session}/README.md"),
                 expect_len: readme.len(),
+                expect_sha256: None,
                 content: updated,
             }],
         },
@@ -609,6 +636,7 @@ mod tests {
             path,
             expect_len,
             content,
+            ..
         }) = plan.steps.last()
         else {
             panic!("the source write is the last step");
@@ -656,6 +684,7 @@ mod tests {
             path,
             expect_len,
             content,
+            ..
         }) = plan.steps.last()
         else {
             panic!("the source write is the last step: {:?}", plan.steps);

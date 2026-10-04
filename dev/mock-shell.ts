@@ -82,6 +82,8 @@ import type {
   BotStreamEvent,
   BotVm,
   CapabilitiesVm,
+  CardAgentVm,
+  CardKeyVm,
   CopyJobVm,
   CredentialChoicesVm,
   DeviceCodeVm,
@@ -116,6 +118,7 @@ import type {
   SessionSpaceFilesVm,
   SessionSpaceFileVm,
   SessionSpaceVm,
+  SessionTaskVm,
   SpacesSnapshot,
   SurfaceAnswerReq,
   SurfaceRequestVm,
@@ -702,7 +705,37 @@ const WIDGET_NOTES = [
   },
 ];
 
-const SESSION_TASKS = [
+/** One agent key as Rust projects it: the value, and whether it reads. */
+function cardKey(value: string, readable = true): CardKeyVm {
+  return { value, readable };
+}
+
+/** A card's agent block: every key absent but those given (92.2, UX-DR134). */
+function cardAgent(over: Partial<CardAgentVm>): CardAgentVm {
+  return {
+    run: null,
+    assignee: null,
+    host: null,
+    requestedBy: null,
+    schedule: null,
+    lastRun: null,
+    workflow: null,
+    scheduledBy: null,
+    integrity: null,
+    runningOn: null,
+    waiting: null,
+    ...over,
+  };
+}
+
+/**
+ * The board's cards: a person's own four (`agent: null`), and one agent card
+ * per state the board must draw — running on electra while pinned to hesperia,
+ * waiting with its reason, blocked and in review in an ordinary column, a run
+ * keeper cannot read, a schedule Nixi wrote that waits for *Allow*, a card made
+ * from outside content, and a schedule that does not parse.
+ */
+const SESSION_TASKS: SessionTaskVm[] = [
   {
     id: "01J8AAAAAAAAAAAAAAAAAAAAAA",
     relPath: "task-migrate-the-live-zone.md",
@@ -712,6 +745,7 @@ const SESSION_TASKS = [
     orderIsOwn: true,
     tags: ["task", "migration"],
     unstableIdentity: false,
+    agent: null,
   },
   {
     id: "01J8BBBBBBBBBBBBBBBBBBBBBB",
@@ -722,6 +756,7 @@ const SESSION_TASKS = [
     orderIsOwn: true,
     tags: ["task", "ui"],
     unstableIdentity: false,
+    agent: null,
   },
   {
     id: "path:task-search-everywhere.md",
@@ -732,6 +767,7 @@ const SESSION_TASKS = [
     orderIsOwn: false,
     tags: ["task"],
     unstableIdentity: true,
+    agent: null,
   },
   {
     id: "01J8CCCCCCCCCCCCCCCCCCCCCC",
@@ -742,6 +778,119 @@ const SESSION_TASKS = [
     orderIsOwn: true,
     tags: ["task"],
     unstableIdentity: false,
+    agent: null,
+  },
+  {
+    id: "path:cards/release-notes.md",
+    relPath: "cards/release-notes.md",
+    title: "Write the 0.9 release notes",
+    status: "todo",
+    order: 2,
+    orderIsOwn: true,
+    tags: ["task"],
+    unstableIdentity: true,
+    agent: cardAgent({
+      run: cardKey("running"),
+      assignee: cardKey("tola-grey"),
+      host: cardKey("hesperia"),
+      requestedBy: cardKey("@nixi:example.org"),
+      lastRun: cardKey("2026-10-04T09:00:00+02:00"),
+      runningOn: "electra",
+    }),
+  },
+  {
+    id: "path:cards/transcribe-the-call.md",
+    relPath: "cards/transcribe-the-call.md",
+    title: "Transcribe Tuesday's call",
+    status: "todo",
+    order: 3,
+    orderIsOwn: true,
+    tags: ["task"],
+    unstableIdentity: true,
+    agent: cardAgent({
+      run: cardKey("waiting"),
+      assignee: cardKey("lucyna-novak"),
+      host: cardKey("hesperia"),
+      requestedBy: cardKey("@tgorka:example.org"),
+      waiting: "hesperia — a live host",
+    }),
+  },
+  {
+    id: "path:cards/approve-the-budget.md",
+    relPath: "cards/approve-the-budget.md",
+    title: "Approve the budget line",
+    status: "todo",
+    order: 4,
+    orderIsOwn: true,
+    tags: ["task"],
+    unstableIdentity: true,
+    agent: cardAgent({
+      run: cardKey("blocked"),
+      assignee: cardKey("tola-grey"),
+      requestedBy: cardKey("@nixi:example.org"),
+    }),
+  },
+  {
+    id: "path:cards/summarise-the-inbox.md",
+    relPath: "cards/summarise-the-inbox.md",
+    title: "Summarise the inbox",
+    status: "in-preparation",
+    order: 2,
+    orderIsOwn: true,
+    tags: ["task"],
+    unstableIdentity: true,
+    agent: cardAgent({
+      run: cardKey("review"),
+      assignee: cardKey("tola-grey"),
+      requestedBy: cardKey("@nixi:example.org"),
+      integrity: cardKey("untrusted"),
+    }),
+  },
+  {
+    id: "path:cards/tidy-the-shelf.md",
+    relPath: "cards/tidy-the-shelf.md",
+    title: "Tidy the shelf",
+    status: "deferred",
+    order: 1,
+    orderIsOwn: true,
+    tags: ["task"],
+    unstableIdentity: true,
+    agent: cardAgent({
+      run: cardKey("Running!", false),
+      assignee: cardKey("Nixi", false),
+    }),
+  },
+  {
+    id: "path:cards/daily-triage.md",
+    relPath: "cards/daily-triage.md",
+    title: "Triage what came in today",
+    status: "todo",
+    order: 5,
+    orderIsOwn: true,
+    tags: ["task"],
+    unstableIdentity: true,
+    agent: cardAgent({
+      run: cardKey("queued"),
+      assignee: cardKey("tola-grey"),
+      requestedBy: cardKey("@nixi:example.org"),
+      schedule: cardKey("@daily"),
+      scheduledBy: cardKey("@nixi:example.org"),
+    }),
+  },
+  {
+    id: "path:cards/check-the-mirror.md",
+    relPath: "cards/check-the-mirror.md",
+    title: "Check the mirror",
+    status: "done",
+    order: 2,
+    orderIsOwn: true,
+    tags: ["task"],
+    unstableIdentity: true,
+    agent: cardAgent({
+      run: cardKey("failed"),
+      assignee: cardKey("tola-grey"),
+      schedule: cardKey("every 30s", false),
+    }),
   },
 ];
 
@@ -6081,6 +6230,34 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     // it read as before — which is the one thing the real write changes about
     // how the card renders.
     card.orderIsOwn = true;
+    return null;
+  },
+  // A person's *Allow* (92.2): Rust turns the card's `scheduled_by:` into
+  // `allowed_by: <the person the shell found>`, so the card loses its mark
+  // and keeps its schedule. A card without the mark is refused, as Rust
+  // refuses it.
+  sessions_task_allow_schedule: (payload) => {
+    const rel = String(payload.rel ?? "");
+    // The shell finds the person (R118); `?allow=signed-out` is neither the
+    // drive's owner nor a single account signed in on this device.
+    if (new URLSearchParams(window.location.search).get("allow") === "signed-out") {
+      throw {
+        code: "internal",
+        message: "Sign in as @tgorka:example.org to allow this schedule.",
+        accountId: null,
+        retriable: false,
+      };
+    }
+    const card = SESSION_TASKS.find((task) => task.relPath === rel);
+    if (card?.agent?.scheduledBy == null) {
+      throw {
+        code: "internal",
+        message: `${rel} carries no schedule an agent wrote, so there is nothing to allow. It runs on its schedule as it is.`,
+        accountId: null,
+        retriable: false,
+      };
+    }
+    card.agent.scheduledBy = null;
     return null;
   },
   // The reference picker (FR-265). Candidates come from the SAME fixture the

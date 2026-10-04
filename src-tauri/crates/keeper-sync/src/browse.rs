@@ -779,6 +779,57 @@ pub fn lexical_join(root: &Path, subpath: &str) -> Result<PathBuf, BrowseRefusal
     Ok(target)
 }
 
+/// Where `subpath` lands under `root` on the disk, as root-relative names:
+/// the canonical form of the deepest part of it that exists — through every
+/// link on the way — followed by the names that are not there yet.
+///
+/// [`resolve`]'s two halves for a path a write may be about to create, which
+/// cannot be canonicalized whole: the lexical test first, then the landing of
+/// what exists, which must be under the canonical root. A caller fencing
+/// names inside the root asks this rather than the requested string, because
+/// a folder link (`workspace/back -> ..`) makes the two differ. A dangling
+/// link is refused: what it would lead to cannot be vouched for.
+pub fn landing(root: &Path, subpath: &str) -> Result<Vec<String>, BrowseRefusal> {
+    let segments = plain_segments(subpath)?;
+    let escapes = || BrowseRefusal::EscapesAfterResolution {
+        subpath: subpath.to_owned(),
+    };
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| BrowseRefusal::Unreadable {
+            reason: error.to_string(),
+        })?;
+    let mut existing = root.to_path_buf();
+    let mut found = 0;
+    for name in &segments {
+        let next = existing.join(name);
+        if next.symlink_metadata().is_err() {
+            break;
+        }
+        existing = next;
+        found += 1;
+    }
+    let resolved = existing.canonicalize().map_err(|_| escapes())?;
+    let inside = resolved
+        .strip_prefix(&canonical_root)
+        .map_err(|_| escapes())?;
+    let mut names = Vec::with_capacity(segments.len());
+    for name in inside
+        .components()
+        .map(Component::as_os_str)
+        .chain(segments[found..].iter().copied())
+    {
+        names.push(
+            name.to_str()
+                .ok_or_else(|| BrowseRefusal::Unspellable {
+                    subpath: subpath.to_owned(),
+                })?
+                .to_owned(),
+        );
+    }
+    Ok(names)
+}
+
 /// Split a profile-relative subpath into its components, refusing any that is
 /// not a plain name.
 ///

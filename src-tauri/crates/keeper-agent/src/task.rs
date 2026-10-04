@@ -107,6 +107,8 @@ fn task_host(dir: PathBuf, bot: &Bot, profiles: Vec<SyncProfile>, task_id: &str)
         profiles,
         vault: None,
         approve: None,
+        // A ⌘9 bot task, not an agent: the sessions zone is not closed (R51).
+        sessions_closed: false,
     }
 }
 

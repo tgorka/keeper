@@ -108,6 +108,7 @@ fn tools(home: &AgentHome) -> (Vec<&str>, Vec<&str>) {
         .map(String::as_str)
         .partition(|name| {
             keeper_agent::delegate::is_delegation(name)
+                || keeper_agent::cards::is_card_tool(name)
                 || ToolName::ALL.iter().any(|tool| tool.as_wire() == *name)
         })
 }

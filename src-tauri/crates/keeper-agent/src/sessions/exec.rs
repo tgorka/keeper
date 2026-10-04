@@ -185,12 +185,17 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
         PlanStep::GuardedWrite {
             path,
             expect_len,
+            expect_sha256,
             content,
         } => {
             let target = rel(zone, path)?;
             let current = std::fs::read_to_string(&target)
                 .map_err(|e| failed(format!("read {path}: {e}")))?;
-            if current.len() != *expect_len {
+            let changed = current.len() != *expect_len
+                || expect_sha256
+                    .as_ref()
+                    .is_some_and(|sha| *sha != keeper_core::sessions::plan::sha256_hex(&current));
+            if changed {
                 // Idempotency first: a resume re-running a completed guarded
                 // write sees its own output. Then the real guard.
                 if current == *content {
@@ -579,6 +584,7 @@ mod tests {
             steps: vec![PlanStep::GuardedWrite {
                 path: "active/s/README.md".to_owned(),
                 expect_len: "stale-length-that-is-wrong".len(),
+                expect_sha256: None,
                 content: "clobber".to_owned(),
             }],
         };
@@ -593,6 +599,36 @@ mod tests {
             !zone.path().join(JOURNAL_REL).exists(),
             "refusal clears the journal"
         );
+    }
+
+    /// R120 (R4-09): a guard on the bytes read refuses an edit of the same
+    /// length — `todo` → `done` — that a length alone lets through.
+    #[test]
+    fn a_guarded_write_refuses_a_same_length_edit() {
+        let zone = zone();
+        std::fs::create_dir_all(zone.path().join("active/s")).expect("mkdir");
+        let card = zone.path().join("active/s/card.md");
+        let read = "---\nstatus: todo\n---\n";
+        std::fs::write(&card, read.replace("todo", "done")).expect("a person's edit");
+        let plan = |read: &str| Plan {
+            verb: "card-run".to_owned(),
+            session: "active/s".to_owned(),
+            steps: vec![PlanStep::guarded(
+                "active/s/card.md".to_owned(),
+                read,
+                "---\nstatus: todo\nrun: running\n---\n".to_owned(),
+            )],
+        };
+        assert!(matches!(
+            run(zone.path(), plan(read)),
+            Err(ExecError::Refused(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&card).expect("read"),
+            "---\nstatus: done\n---\n",
+            "the person's edit stands"
+        );
+        run(zone.path(), plan("---\nstatus: done\n---\n")).expect("the bytes it read");
     }
 
     /// The executor's own containment: a plan path that escapes refuses, no

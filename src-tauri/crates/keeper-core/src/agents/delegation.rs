@@ -350,7 +350,6 @@ pub fn child_card(content: &DelegateContent, target: &str) -> String {
             card::REQUESTED_BY.to_owned(),
             text(content.from.agent.as_str()),
         ),
-        (card::RUN.to_owned(), text(card::Run::Queued.as_str())),
     ];
     if let Some(delegated) = &content.card {
         if let Some(schedule) = &delegated.schedule {
@@ -365,7 +364,15 @@ pub fn child_card(content: &DelegateContent, target: &str) -> String {
         Frontmatter::serialise_new(&fields),
         content.brief.trim_end()
     );
-    card::stamp_agent_write(None, &written, &content.from.agent, content.label.integrity)
+    let stamped =
+        card::stamp_agent_write(None, &written, &content.from.agent, content.label.integrity);
+    // `run:` is the host's, never the agent's write: put in after the stamp.
+    Frontmatter::set_after_in(
+        &stamped,
+        &[card::REQUESTED_BY],
+        card::RUN,
+        text(card::Run::Queued.as_str()),
+    )
 }
 
 #[cfg(test)]

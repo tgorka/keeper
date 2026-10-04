@@ -465,7 +465,8 @@ impl<'a> Section<'a> {
     }
 }
 
-fn is_agent_id(id: &str) -> bool {
+/// Whether `id` is an agent id: `[a-z][a-z0-9-]{0,31}`.
+pub fn is_agent_id(id: &str) -> bool {
     let mut chars = id.chars();
     chars.next().is_some_and(|c| c.is_ascii_lowercase())
         && id.len() <= 32

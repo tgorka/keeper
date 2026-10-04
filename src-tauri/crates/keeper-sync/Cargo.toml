@@ -31,6 +31,9 @@ notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
 globset = { workspace = true }
 sha2 = { workspace = true }
+# Folding names as the Mac's volume folds them (`names::same_entry_folded`):
+# already resolved in Cargo.lock, so the tree gains no package.
+unicode-normalization = { workspace = true }
 hex = { workspace = true }
 tempfile = { workspace = true }
 # Exact-Content-Length streaming bodies for LFS uploads — see the workspace

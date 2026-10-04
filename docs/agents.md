@@ -690,11 +690,110 @@ another host or restarts; a host serving a session keeps its history in memory a
 its log on a turn.
 
 **The index.** `<sessions zone>/.keeper/agents.db` answers the session list and the board: each
-session's agent, kind, label, scope, run state, claim host and epoch, line count and last
-activity; each chunk's size; each card's agent fields (`run`, `assignee`, `host`, `requested_by`,
-`schedule`, `last_run`, `workflow`); and the Matrix events already logged. It is derived and
-disposable: deleted, or written by a keeper of another schema version, it is rebuilt from the
-session folders, and nothing in it is anywhere but in the files.
+session's agent, kind, label, scope, run state and that `run` line's detail, claim host and
+epoch, line count and last activity; each chunk's size; each card's nine agent keys (`run`,
+`assignee`, `host`, `requested_by`, `schedule`, `last_run`, `workflow`, `scheduled_by`,
+`integrity`), wherever in the session the board finds a card — every folder but `artifacts/`,
+`workspace/`, `log/` and dotted ones; and the Matrix events already logged. It is derived and
+disposable: deleted, or written by a keeper of another schema version (this one writes 3), it is
+rebuilt from the session folders, and nothing in it is anywhere but in the files. A host keeps it
+current with its own appends; what other hosts wrote reaches it when the Mac opens the session:
+the detail reads only the chunks that grew, from where it stopped, at most 1 MiB of them per open
+(the rest on the next), and projects their lines in the log's order through the same claim epoch
+fence a whole read runs, so the row is always the one a whole read would give. A line that sorts
+before one already projected (a host's chunk arriving late), or a chunk that shrank or went away,
+has the session read whole again. The refresh holds the index's write lock from before it reads,
+so a host appending to the same session waits for it, and a line the refresh already read is not
+counted again when its writer reports it. The cards come from the markdown the detail already read
+under its own byte budget; a rebuild reads at most 10 MiB of a session's cards and reports the
+rest.
+
+## Cards
+
+A card is a task file of the session (`tags: [task]`, one of the four `status:` columns). A card an
+agent works carries agent keys beside `status:` and `order:`:
+
+| key | written by | grammar |
+| --- | --- | --- |
+| `run` | the host that holds the card's session | `queued`, `running`, `waiting`, `blocked`, `review`, `failed`; never a column |
+| `last_run` | that host | RFC 3339: the window the last run ran in |
+| `assignee` | whoever makes or edits the card | an agent id of this drive |
+| `host` | the same | a host slug: a pin, not where it runs |
+| `requested_by` | the card's maker | a Matrix user id |
+| `schedule` | a person, or an agent through keeper | a keeper task schedule (`@daily`, `every 2h`, a 5-field cron) |
+| `workflow` | the same | a folder under `_workflows/` |
+| `scheduled_by` | keeper | the agent whose write set `schedule` or `workflow`; the card waits for a person's *Allow* |
+| `integrity` | keeper | `untrusted`: the card was made from outside content |
+| `allowed_by` | keeper, on a person's *Allow* | the person who allowed the schedule: the requester of its runs |
+
+A value outside its grammar is shown as unreadable on the card and kept as written; `run: todo`
+is unreadable, not a column. So is a key written twice, a value of another type (`run: [running]`)
+and one the frontmatter reader does not model (`run: |`, `!!str`): the board reads the card's own
+bytes, so such a key is shown, never dropped. A card with an unreadable `scheduled_by` is still
+marked. The board
+adds two facts from the session's log: *running on* is the host holding the session's claim, never
+the `host:` pin, and *waiting* is the latest `run` line's detail while it says `waiting`.
+
+**The host's writes.** `run:` and `last_run:` are written only on a transition (`running` to
+`running` writes nothing), one key changed and every other byte kept, through the journaled
+executor with a write guarded on the exact bytes read (their SHA-256: an edit of the same length,
+`todo` to `done`, still counts). A card that changed by the time the write ran (a person moved it,
+a pull landed) is read again and written once more; a second change is reported. The host writes
+only while it holds the card's session's claim, asked right before the write. A key the card lacks
+goes in on its own line beside the agent keys, with a line it does not change between it and the
+`status:` and `order:` a person's move writes (and never where a move would add those), so a line
+merge of the two edits does not see them touch. On one copy that is proved through the same `git
+merge -X theirs` keeper-sync converges with; across two machines keeper-sync still keeps a conflict
+copy of any file both changed (DW-441).
+
+**An agent's writes.** An agent writes a session only through two tools, offered when `[tools].allow`
+names them; its `drive_write` and `drive_edit` are refused anywhere in the sessions zone ("… is in
+the sessions zone, which an agent writes only through its session tools …"). A ⌘9 bot is offered
+neither tool and keeps its fences as they were.
+
+- `card_update(card, fields)` sets a card of the session the turn runs in: `status` (one of the
+  four), `order`, `assignee`, `host`. `schedule` is checked by keeper's schedule parser and refused
+  with its sentence; a readable `schedule`, or any `workflow`, needs a person, so it is refused with
+  "This needs a person's approval, and there is no one here to ask, so keeper did not do it.
+  Nothing was changed." `run` and `last_run` are refused ("… is written by the host that runs the
+  card"), `scheduled_by` and `integrity` too ("… is written by keeper"), and `requested_by`.
+- `session_write(path, content)` writes a file of the session: markdown, csv or json anywhere in
+  it, finished output under `artifacts/`, anything under `workspace/`; never `log/`, `approvals/`,
+  `agent.toml`, `README.md` or `AGENTS.md`. A file that exists is replaced through a write guarded
+  on its exact bytes.
+
+Both are one fenced door. A path is followed on the disk to where it lands, and the fence is asked
+there: a folder link out of the session (to another session's cards) is refused, and so is one
+inside it that leads back to keeper's own files (`workspace/back -> ..`, then
+`workspace/back/agent.toml`). Keeper's own names are compared as the Mac's volume compares them —
+`readme.md`, `Agents.md` and `Approvals/` are refused too. Both write only while the host holds the
+session's claim, asked after the zone is locked and right before the write. Both refuse when the
+home drive is read by someone the session's label does not admit, and both pass every markdown file
+they write — a card or not, so a note retagged as a card later carries it — through one stamp:
+
+- a write that sets or changes `schedule:` or `workflow:`, or makes a file holding either into a
+  card, stores `scheduled_by: <the agent>` whatever it wrote there, and drops `allowed_by:`;
+- any other write keeps `scheduled_by:` and `allowed_by:` exactly as the file had them, whether the
+  agent dropped, rewrote, repeated or invented them;
+- a write from a session at `untrusted` integrity stores `integrity: untrusted`, as may the agent
+  itself; any other keeps `integrity:` exactly as it was;
+- `run:` and `last_run:` are the host's: every agent write keeps them exactly as they were, and a
+  new file cannot bring them.
+
+"Exactly" is the file's own lines, so a key written twice by the agent is stored as the single line
+the card had. A read of a card while it carries `integrity: untrusted` lowers the turn's label to
+`untrusted` however the card was read: the mark is read from the head of the file on the disk, so a
+ranged `drive_read` past the frontmatter and a `drive_grep` hit (each file it returned a line of)
+label as a whole read does.
+
+**A person's *Allow*** (`sessions_task_allow_schedule`, the board's action on a marked card) turns
+the card's `scheduled_by:` line — every one, should it be there twice — into one `allowed_by:
+<person>` and changes no other byte. The Mac finds the person: of the accounts signed in on it, the
+one whose user owns the drive by its `_drive.toml`, else the only one; otherwise it says "Sign in as
+<owner> to allow this schedule." A card without the mark is refused. The write is guarded on the
+card's exact bytes; a card changed meanwhile is read and allowed once more, then refused. A
+person's move of a card is guarded the same way, so it never writes back over a host's newer
+`run:`.
 
 ## What a session costs the drive
 

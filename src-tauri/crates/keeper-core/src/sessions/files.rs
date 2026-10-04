@@ -827,6 +827,7 @@ pub fn compile_rename(
         steps.push(PlanStep::GuardedWrite {
             path: format!("{session}/{}", rewrite.rel),
             expect_len: rewrite.expect_len,
+            expect_sha256: None,
             content: rewrite.content.clone(),
         });
     }
@@ -1774,11 +1775,13 @@ mod tests {
                 PlanStep::GuardedWrite {
                     path: "active/2026-08-16-keeper/2026-08-16-1812-untitled.md".to_owned(),
                     expect_len: 30,
+                    expect_sha256: None,
                     content: "titled".to_owned(),
                 },
                 PlanStep::GuardedWrite {
                     path: "active/2026-08-16-keeper/README.md".to_owned(),
                     expect_len: 40,
+                    expect_sha256: None,
                     content: "pointed".to_owned(),
                 },
                 PlanStep::MoveFile {

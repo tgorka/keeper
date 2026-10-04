@@ -3,22 +3,28 @@
 //!
 //! The board, the session list and a turn answer from here and from the
 //! writer's in-memory tail, never by re-reading a log (NFR-116). It is
-//! rebuilt from the logs, the session `agent.toml` files and the cards, and
-//! kept current by [`Index::apply`] after each append. A schema version this
-//! build does not know is dropped and rebuilt, never migrated and never an
-//! error: nothing in it is anywhere but in the files.
+//! rebuilt from the logs, the session `agent.toml` files and the cards, kept
+//! current by [`Index::apply`] after each of this host's appends, and by
+//! [`Index::refresh_session`] for what other hosts wrote, which reads only
+//! the chunks that grew (R62). A schema version this build does not know is
+//! dropped and rebuilt, never migrated and never an error: nothing in it is
+//! anywhere but in the files.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
+use crate::agents::card;
 use crate::agents::label::Label;
 use crate::agents::log::reader::{read_session, SessionLog};
 use crate::agents::log::writer::AppendReceipt;
-use crate::agents::log::{ClaimAction, LineBody, LogLine};
+use crate::agents::log::{ChunkName, ClaimAction, LineBody, LogLine, LOG_DIR};
 use crate::agents::session::{self, parse_session_agent_toml, SessionAgent};
+use crate::notes::frontmatter::Frontmatter;
+use crate::sessions::model::{ARTIFACTS_DIR, WORKSPACE_DIR};
 use crate::sessions::pool::{read_one, PoolFile};
 use crate::sessions::shape::KindTag;
 
@@ -26,18 +32,18 @@ use crate::sessions::shape::KindTag;
 pub const INDEX_PATH: [&str; 2] = [".keeper", "agents.db"];
 
 /// The schema this build writes. A different `user_version` rebuilds.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 3;
 
-/// The card fields the index projects (ruling R2).
-pub const CARD_FIELDS: [&str; 7] = [
-    "run",
-    "assignee",
-    "host",
-    "requested_by",
-    "schedule",
-    "last_run",
-    "workflow",
-];
+/// The most directory entries one session's card walk visits.
+const CARD_WALK_BUDGET: usize = 2_000;
+
+/// The most bytes a rebuild reads of one session's cards; a card past it is
+/// reported, not read.
+const CARD_READ_BUDGET: u64 = 10 * 1024 * 1024;
+
+/// The most bytes of grown log one [`Index::refresh_session`] reads; the
+/// rest is read by the next one.
+pub const REFRESH_BYTES: u64 = 1024 * 1024;
 
 const SCHEMA: &str = "
 CREATE TABLE sessions (
@@ -51,6 +57,7 @@ CREATE TABLE sessions (
     label TEXT NOT NULL,
     scope TEXT NOT NULL,
     run TEXT,
+    run_detail TEXT,
     claim_host TEXT,
     claim_epoch INTEGER,
     lines INTEGER NOT NULL,
@@ -75,7 +82,16 @@ CREATE TABLE cards (
     schedule TEXT,
     last_run TEXT,
     workflow TEXT,
+    scheduled_by TEXT,
+    integrity TEXT,
     PRIMARY KEY (session, rel)
+);
+CREATE TABLE fences (
+    session TEXT PRIMARY KEY,
+    last_ns INTEGER,
+    last_host TEXT,
+    last_id TEXT,
+    acquired TEXT NOT NULL
 );
 CREATE TABLE seen_events (
     session TEXT NOT NULL,
@@ -125,6 +141,8 @@ pub struct SessionRow {
     pub scope: Vec<String>,
     /// The last `run` state.
     pub run: Option<String>,
+    /// That `run` line's detail: why, for `waiting` and `blocked`.
+    pub run_detail: Option<String>,
     /// The host that holds the claim, while one does.
     pub claim_host: Option<String>,
     /// The last claim epoch.
@@ -133,6 +151,19 @@ pub struct SessionRow {
     pub lines: u64,
     /// The newest line's `ts`.
     pub last_ts: Option<String>,
+}
+
+impl SessionRow {
+    /// Why no host can run the session's work, while its latest `run` line
+    /// says `waiting` (Q7): that line's detail.
+    pub fn waiting(&self) -> Option<&str> {
+        match self.run.as_deref() {
+            Some(word) if word == crate::agents::log::RunState::Waiting.as_str() => {
+                self.run_detail.as_deref()
+            }
+            _ => None,
+        }
+    }
 }
 
 /// One chunk, as the index projects it.
@@ -145,7 +176,7 @@ pub struct ChunkRow {
     pub last_offset: u64,
 }
 
-/// One card's agent fields.
+/// One card's agent keys (the nine of [`card::KEYS`]), as written.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CardRow {
     /// Session-relative.
@@ -157,6 +188,8 @@ pub struct CardRow {
     pub schedule: Option<String>,
     pub last_run: Option<String>,
     pub workflow: Option<String>,
+    pub scheduled_by: Option<String>,
+    pub integrity: Option<String>,
 }
 
 /// What a rebuild found.
@@ -173,6 +206,7 @@ pub struct Index {
     conn: Connection,
     zone_root: PathBuf,
     rebuilt_schema: bool,
+    refresh_bytes: u64,
 }
 
 impl Index {
@@ -190,7 +224,8 @@ impl Index {
         if rebuilt_schema {
             conn.execute_batch(
                 "DROP TABLE IF EXISTS sessions; DROP TABLE IF EXISTS chunks;
-                 DROP TABLE IF EXISTS cards; DROP TABLE IF EXISTS seen_events;",
+                 DROP TABLE IF EXISTS cards; DROP TABLE IF EXISTS seen_events;
+                 DROP TABLE IF EXISTS fences;",
             )?;
             conn.execute_batch(SCHEMA)?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -199,6 +234,7 @@ impl Index {
             conn,
             zone_root: zone_root.to_owned(),
             rebuilt_schema,
+            refresh_bytes: REFRESH_BYTES,
         })
     }
 
@@ -234,7 +270,8 @@ impl Index {
 
         let tx = self.conn.transaction()?;
         tx.execute_batch(
-            "DELETE FROM sessions; DELETE FROM chunks; DELETE FROM cards; DELETE FROM seen_events;",
+            "DELETE FROM sessions; DELETE FROM chunks; DELETE FROM cards; DELETE FROM seen_events;
+             DELETE FROM fences;",
         )?;
         for (rel, dir, agent) in &found {
             let log = read_session(dir);
@@ -257,32 +294,120 @@ impl Index {
         insert_session(&self.conn, path, agent, &SessionLog::default())
     }
 
-    /// Project one appended line into its session's row and chunk.
+    /// The most bytes of grown log one refresh reads, [`REFRESH_BYTES`]
+    /// unless set.
+    pub fn set_refresh_bytes(&mut self, bytes: u64) {
+        self.refresh_bytes = bytes.max(1);
+    }
+
+    /// Bring one session's rows up to its files (R62, R121). The index is a
+    /// projection of the log, never its authority, so the row this leaves
+    /// is the row a whole read of the log would give:
+    ///
+    /// - the log chunks that grew are read from where the index stopped, at
+    ///   most [`REFRESH_BYTES`] per call (whole lines; the rest on the next
+    ///   call), and their lines are projected in (`ts`, `host`, `id`) order
+    ///   through the claim epoch fence a whole read runs, against the claims
+    ///   already projected;
+    /// - when a line read now sorts before one already projected (a chunk
+    ///   that arrived late), or a chunk shrank, went away or ends where the
+    ///   index did not, the session is read whole again — as one the index
+    ///   does not hold yet is;
+    /// - all of it in one write transaction taken before anything is read,
+    ///   so it never interleaves with [`Index::apply`] on another
+    ///   connection.
+    ///
+    /// `pool` is the session's markdown as the caller already read it (the
+    /// board's bounded pool): the cards are projected from it and no card is
+    /// read again; `None` leaves them as they are. A folder that is not an
+    /// agent session leaves no rows. Returns the session's row.
+    pub fn refresh_session(
+        &mut self,
+        path: &str,
+        pool: Option<&[PoolFile<'_>]>,
+    ) -> Result<Option<SessionRow>, IndexError> {
+        self.refresh_session_with(path, pool, &mut || {})
+    }
+
+    /// [`Self::refresh_session`], running `between` once the held row and
+    /// chunk cursors are read, before the log is.
+    fn refresh_session_with(
+        &mut self,
+        path: &str,
+        pool: Option<&[PoolFile<'_>]>,
+        between: &mut dyn FnMut(),
+    ) -> Result<Option<SessionRow>, IndexError> {
+        let dir = self.zone_root.join(path);
+        let budget = self.refresh_bytes;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(agent) = session_agent(&dir) else {
+            forget(&tx, path)?;
+            tx.commit()?;
+            return Ok(None);
+        };
+        let held = session_in(&tx, path)?;
+        let cursors = chunks_in(&tx, path)?;
+        between();
+        let tails = held
+            .as_ref()
+            .and_then(|_| grown_chunks(&dir, &cursors, budget));
+        match (held, tails) {
+            (Some(row), Some(tails)) => {
+                let lines: Vec<LogLine> =
+                    tails.iter().flat_map(|tail| tail.lines.clone()).collect();
+                if append_lines(&tx, path, row, lines)? {
+                    for tail in &tails {
+                        set_cursor(&tx, path, &tail.name, tail.bytes, tail.last_offset)?;
+                    }
+                } else {
+                    replay_whole(&tx, path, &agent, &dir)?;
+                }
+            }
+            _ => replay_whole(&tx, path, &agent, &dir)?,
+        }
+        if let Some(pool) = pool {
+            tx.execute("DELETE FROM cards WHERE session = ?1", params![path])?;
+            for file in pool.iter().filter(|file| card_place(file.rel)) {
+                insert_card(&tx, path, file.rel, file.text)?;
+            }
+        }
+        let row = session_in(&tx, path)?;
+        tx.commit()?;
+        Ok(row)
+    }
+
+    /// Project one line this host appended into its session's row and
+    /// chunk — once: a line a refresh already read (its chunk's cursor is
+    /// past it) is not projected again, and one that sorts before a line
+    /// already projected replays the session whole, as a refresh would.
     pub fn apply(&mut self, session: &str, receipt: &AppendReceipt) -> Result<(), IndexError> {
-        let Some(mut row) = self.session(session)? else {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(row) = session_in(&tx, session)? else {
             return Err(IndexError::UnknownSession(session.to_owned()));
         };
-        project(&mut row, &receipt.line);
-        let tx = self.conn.transaction()?;
-        write_row(&tx, &row)?;
-        tx.execute(
-            "INSERT INTO chunks (session, name, host, n, bytes, last_offset)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT (session, name) DO UPDATE SET bytes = ?5, last_offset = ?6",
-            params![
-                session,
-                receipt.chunk.to_string(),
-                receipt.chunk.host.as_str(),
-                receipt.chunk.n,
-                receipt.offset + receipt.bytes,
-                receipt.offset
-            ],
-        )?;
-        if let Some(event) = &receipt.line.matrix_event {
-            tx.execute(
-                "INSERT OR IGNORE INTO seen_events (session, event_id) VALUES (?1, ?2)",
-                params![session, event.as_str()],
-            )?;
+        let chunk = receipt.chunk.to_string();
+        let end = receipt.offset + receipt.bytes;
+        let cursor = chunks_in(&tx, session)?
+            .into_iter()
+            .find(|cursor| cursor.name == chunk)
+            .map_or(0, |cursor| cursor.bytes);
+        if cursor < end {
+            // Only a line that starts where the index stopped can follow it.
+            if cursor == receipt.offset
+                && append_lines(&tx, session, row, vec![receipt.line.clone()])?
+            {
+                set_cursor(&tx, session, &receipt.chunk, end, receipt.offset)?;
+            } else {
+                let dir = self.zone_root.join(session);
+                match session_agent(&dir) {
+                    Some(agent) => replay_whole(&tx, session, &agent, &dir)?,
+                    None => return Err(IndexError::UnknownSession(session.to_owned())),
+                }
+            }
         }
         tx.commit()?;
         Ok(())
@@ -290,15 +415,7 @@ impl Index {
 
     /// One session's row.
     pub fn session(&self, path: &str) -> Result<Option<SessionRow>, IndexError> {
-        let raw = self
-            .conn
-            .query_row(
-                &format!("{SESSION_SELECT} WHERE path = ?1"),
-                params![path],
-                raw_session,
-            )
-            .optional()?;
-        raw.map(RawSession::into_row).transpose()
+        session_in(&self.conn, path)
     }
 
     /// Every session, by path.
@@ -314,27 +431,14 @@ impl Index {
 
     /// One session's chunks, in name order.
     pub fn chunks(&self, session: &str) -> Result<Vec<ChunkRow>, IndexError> {
-        let mut statement = self.conn.prepare(
-            "SELECT name, host, n, bytes, last_offset FROM chunks WHERE session = ?1 ORDER BY name",
-        )?;
-        let rows = statement
-            .query_map(params![session], |row| {
-                Ok(ChunkRow {
-                    name: row.get(0)?,
-                    host: row.get(1)?,
-                    n: row.get(2)?,
-                    bytes: row.get::<_, i64>(3)? as u64,
-                    last_offset: row.get::<_, i64>(4)? as u64,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        chunks_in(&self.conn, session)
     }
 
     /// One session's cards, by path.
     pub fn cards(&self, session: &str) -> Result<Vec<CardRow>, IndexError> {
         let mut statement = self.conn.prepare(
-            "SELECT rel, run, assignee, host, requested_by, schedule, last_run, workflow
+            "SELECT rel, run, assignee, host, requested_by, schedule, last_run, workflow,
+                scheduled_by, integrity
              FROM cards WHERE session = ?1 ORDER BY rel",
         )?;
         let rows = statement
@@ -348,6 +452,8 @@ impl Index {
                     schedule: row.get(5)?,
                     last_run: row.get(6)?,
                     workflow: row.get(7)?,
+                    scheduled_by: row.get(8)?,
+                    integrity: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -370,7 +476,7 @@ impl Index {
 }
 
 const SESSION_SELECT: &str = "SELECT path, id, agent, drive, kind, title, room, label, scope, run,
-    claim_host, claim_epoch, lines, last_ts FROM sessions";
+    claim_host, claim_epoch, lines, last_ts, run_detail FROM sessions";
 
 struct RawSession {
     row: SessionRow,
@@ -400,6 +506,7 @@ fn raw_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSession> {
             label: Label::top(),
             scope: Vec::new(),
             run: row.get(9)?,
+            run_detail: row.get(14)?,
             claim_host: row.get(10)?,
             claim_epoch: row.get::<_, Option<i64>>(11)?.map(|e| e as u64),
             lines: row.get::<_, i64>(12)? as u64,
@@ -408,6 +515,206 @@ fn raw_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSession> {
         label: row.get(7)?,
         scope: row.get(8)?,
     })
+}
+
+fn session_in(conn: &Connection, path: &str) -> Result<Option<SessionRow>, IndexError> {
+    let raw = conn
+        .query_row(
+            &format!("{SESSION_SELECT} WHERE path = ?1"),
+            params![path],
+            raw_session,
+        )
+        .optional()?;
+    raw.map(RawSession::into_row).transpose()
+}
+
+fn chunks_in(conn: &Connection, session: &str) -> Result<Vec<ChunkRow>, IndexError> {
+    let mut statement = conn.prepare(
+        "SELECT name, host, n, bytes, last_offset FROM chunks WHERE session = ?1 ORDER BY name",
+    )?;
+    let rows = statement
+        .query_map(params![session], |row| {
+            Ok(ChunkRow {
+                name: row.get(0)?,
+                host: row.get(1)?,
+                n: row.get(2)?,
+                bytes: row.get::<_, i64>(3)? as u64,
+                last_offset: row.get::<_, i64>(4)? as u64,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn set_cursor(
+    conn: &Connection,
+    session: &str,
+    chunk: &ChunkName,
+    bytes: u64,
+    last_offset: u64,
+) -> Result<(), IndexError> {
+    conn.execute(
+        "INSERT OR REPLACE INTO chunks (session, name, host, n, bytes, last_offset)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            session,
+            chunk.to_string(),
+            chunk.host.as_str(),
+            chunk.n,
+            bytes as i64,
+            last_offset as i64
+        ],
+    )?;
+    Ok(())
+}
+
+/// A session folder's `agent.toml`, when it is a regular file that reads.
+fn session_agent(dir: &Path) -> Option<SessionAgent> {
+    let toml = dir.join(session::FILE_NAME);
+    fs::symlink_metadata(&toml)
+        .is_ok_and(|meta| meta.file_type().is_file())
+        .then(|| fs::read_to_string(&toml).ok())
+        .flatten()
+        .and_then(|text| parse_session_agent_toml(&text).ok())
+}
+
+/// Read the session's whole log again and project it, as a first read does.
+fn replay_whole(
+    conn: &Connection,
+    path: &str,
+    agent: &SessionAgent,
+    dir: &Path,
+) -> Result<(), IndexError> {
+    for table in [
+        "sessions WHERE path",
+        "chunks WHERE session",
+        "seen_events WHERE session",
+        "fences WHERE session",
+    ] {
+        conn.execute(&format!("DELETE FROM {table} = ?1"), params![path])?;
+    }
+    insert_session(conn, path, agent, &read_session(dir))
+}
+
+/// A line's place in the merged order of a session's log: (`ts`, `host`,
+/// `id`), as the reader sorts.
+type LineKey = (i64, String, String);
+
+fn key_of(line: &LogLine) -> LineKey {
+    (
+        line.ts.timestamp_nanos_opt().unwrap_or(i64::MAX),
+        line.host.as_str().to_owned(),
+        line.id.to_string(),
+    )
+}
+
+/// What the projection needs to carry on where it stopped as a whole read
+/// would: the last line projected, and when each claim epoch was first
+/// acquired (the fence).
+#[derive(Debug, Default)]
+struct Fence {
+    last: Option<LineKey>,
+    acquired: BTreeMap<u64, i64>,
+}
+
+impl Fence {
+    fn load(conn: &Connection, session: &str) -> Result<Fence, IndexError> {
+        let row = conn
+            .query_row(
+                "SELECT last_ns, last_host, last_id, acquired FROM fences WHERE session = ?1",
+                params![session],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((ns, host, id, acquired)) = row else {
+            return Ok(Fence::default());
+        };
+        Ok(Fence {
+            last: ns.zip(host).zip(id).map(|((ns, host), id)| (ns, host, id)),
+            acquired: serde_json::from_str(&acquired)?,
+        })
+    }
+
+    fn store(&self, conn: &Connection, session: &str) -> Result<(), IndexError> {
+        let (ns, host, id) = self
+            .last
+            .clone()
+            .map_or((None, None, None), |(ns, host, id)| {
+                (Some(ns), Some(host), Some(id))
+            });
+        conn.execute(
+            "INSERT OR REPLACE INTO fences (session, last_ns, last_host, last_id, acquired)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                session,
+                ns,
+                host,
+                id,
+                serde_json::to_string(&self.acquired)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Take `line` in order: whether a whole read keeps it. A claim
+    /// transition is never fenced; any other line of an epoch below one
+    /// acquired before it is a stale host's late line (AD-378).
+    fn admit(&mut self, line: &LogLine) -> bool {
+        let ns = line.ts.timestamp_nanos_opt().unwrap_or(i64::MAX);
+        self.last = Some(key_of(line));
+        if let LineBody::Claim(claim) = &line.body {
+            if claim.action == ClaimAction::Acquired {
+                self.acquired.entry(claim.epoch).or_insert(ns);
+            }
+            return true;
+        }
+        let superseded_at = self
+            .acquired
+            .range(line.epoch.saturating_add(1)..)
+            .map(|(_, at)| *at)
+            .min();
+        superseded_at.is_none_or(|at| ns <= at)
+    }
+}
+
+/// Project `lines` onto the session's `row` as a whole read of the log
+/// would, when every one of them sorts after the last line projected;
+/// `false`, projecting nothing, when one does not.
+fn append_lines(
+    conn: &Connection,
+    path: &str,
+    mut row: SessionRow,
+    mut lines: Vec<LogLine>,
+) -> Result<bool, IndexError> {
+    let mut fence = Fence::load(conn, path)?;
+    lines.sort_by_key(key_of);
+    if let (Some(first), Some(last)) = (lines.first(), &fence.last) {
+        if key_of(first) <= *last {
+            return Ok(false);
+        }
+    }
+    for line in &lines {
+        if !fence.admit(line) {
+            continue;
+        }
+        project(&mut row, line);
+        if let Some(event) = &line.matrix_event {
+            conn.execute(
+                "INSERT OR IGNORE INTO seen_events (session, event_id) VALUES (?1, ?2)",
+                params![path, event.as_str()],
+            )?;
+        }
+    }
+    write_row(conn, &row)?;
+    fence.store(conn, path)?;
+    Ok(true)
 }
 
 /// Fold one line into a session's row.
@@ -420,7 +727,10 @@ fn project(row: &mut SessionRow, line: &LogLine) {
     match &line.body {
         LineBody::Label(body) => row.label = body.label(),
         LineBody::Scope(body) => row.scope = body.drives.clone(),
-        LineBody::Run(body) => row.run = Some(body.state.as_str().to_owned()),
+        LineBody::Run(body) => {
+            row.run = Some(body.state.as_str().to_owned());
+            row.run_detail = body.detail.clone();
+        }
         LineBody::Claim(body) => {
             row.claim_epoch = Some(body.epoch);
             row.claim_host = match body.action {
@@ -435,11 +745,11 @@ fn project(row: &mut SessionRow, line: &LogLine) {
 fn write_row(conn: &Connection, row: &SessionRow) -> Result<(), IndexError> {
     conn.execute(
         "INSERT INTO sessions (path, id, agent, drive, kind, title, room, label, scope, run,
-            claim_host, claim_epoch, lines, last_ts)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            claim_host, claim_epoch, lines, last_ts, run_detail)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT (path) DO UPDATE SET id = ?2, agent = ?3, drive = ?4, kind = ?5,
             title = ?6, room = ?7, label = ?8, scope = ?9, run = ?10, claim_host = ?11,
-            claim_epoch = ?12, lines = ?13, last_ts = ?14",
+            claim_epoch = ?12, lines = ?13, last_ts = ?14, run_detail = ?15",
         params![
             row.path,
             row.id,
@@ -455,6 +765,7 @@ fn write_row(conn: &Connection, row: &SessionRow) -> Result<(), IndexError> {
             row.claim_epoch.map(|e| e as i64),
             row.lines as i64,
             row.last_ts,
+            row.run_detail,
         ],
     )?;
     Ok(())
@@ -477,12 +788,16 @@ fn insert_session(
         label: agent.label.clone(),
         scope: agent.drives.clone(),
         run: None,
+        run_detail: None,
         claim_host: None,
         claim_epoch: None,
         lines: 0,
         last_ts: None,
     };
+    let mut fence = Fence::default();
     for line in &log.lines {
+        // The reader fenced these already; this records where it stopped.
+        fence.admit(line);
         project(&mut row, line);
         if let Some(event) = &line.matrix_event {
             conn.execute(
@@ -492,6 +807,7 @@ fn insert_session(
         }
     }
     write_row(conn, &row)?;
+    fence.store(conn, path)?;
     for chunk in &log.chunks {
         conn.execute(
             "INSERT OR REPLACE INTO chunks (session, name, host, n, bytes, last_offset)
@@ -509,55 +825,260 @@ fn insert_session(
     Ok(())
 }
 
-/// The cards of one session: its root's markdown files tagged `task`, read
-/// as the pool reads them.
+/// The cards of one session: its markdown files tagged `task`, read as the
+/// pool reads them, wherever the board's pool finds them (R52) — at most
+/// [`CARD_READ_BUDGET`] bytes of them, the rest reported.
 fn insert_cards(
     conn: &Connection,
     session: &str,
     dir: &Path,
     report: &mut RebuildReport,
 ) -> Result<(), IndexError> {
-    let entries = fs::read_dir(dir).map_err(|e| io(dir, e))?;
-    for entry in entries.filter_map(Result::ok) {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if !name.ends_with(".md") || !entry.file_type().is_ok_and(|t| t.is_file()) {
-            continue;
+    let mut budget = CARD_READ_BUDGET;
+    for rel in card_rels(session, dir, report) {
+        let path = rel
+            .split('/')
+            .fold(dir.to_path_buf(), |path, part| path.join(part));
+        let size = fs::metadata(&path).map_or(0, |meta| meta.len());
+        if size > budget {
+            report.problems.push(format!(
+                "{session}: more than {CARD_READ_BUDGET} bytes of cards; {rel} and the cards after it were not read."
+            ));
+            break;
         }
-        let text = match fs::read_to_string(entry.path()) {
+        budget -= size;
+        let text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) => {
-                report.problems.push(format!("{session}/{name}: {error}."));
+                report.problems.push(format!("{session}/{rel}: {error}."));
                 continue;
             }
         };
-        let card = read_one(PoolFile {
-            rel: &name,
-            text: &text,
-        });
-        if card.kind != Some(KindTag::Task) {
-            continue;
-        }
-        let field = |key: &str| card.fields.get(key).cloned();
-        conn.execute(
-            "INSERT OR REPLACE INTO cards
-             (session, rel, run, assignee, host, requested_by, schedule, last_run, workflow)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                session,
-                card.rel,
-                field(CARD_FIELDS[0]),
-                field(CARD_FIELDS[1]),
-                field(CARD_FIELDS[2]),
-                field(CARD_FIELDS[3]),
-                field(CARD_FIELDS[4]),
-                field(CARD_FIELDS[5]),
-                field(CARD_FIELDS[6]),
-            ],
-        )?;
+        insert_card(conn, session, &rel, &text)?;
     }
     Ok(())
+}
+
+/// One file's card row, when it is a card.
+fn insert_card(conn: &Connection, session: &str, rel: &str, text: &str) -> Result<(), IndexError> {
+    if read_one(PoolFile { rel, text }).kind != Some(KindTag::Task) {
+        return Ok(());
+    }
+    let (fm, _) = Frontmatter::parse(text);
+    let field = |key: &str| card::raw_key(&fm, key);
+    conn.execute(
+        "INSERT OR REPLACE INTO cards
+         (session, rel, run, assignee, host, requested_by, schedule, last_run, workflow,
+          scheduled_by, integrity)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            session,
+            rel,
+            field(card::RUN),
+            field(card::ASSIGNEE),
+            field(card::HOST),
+            field(card::REQUESTED_BY),
+            field(card::SCHEDULE),
+            field(card::LAST_RUN),
+            field(card::WORKFLOW),
+            field(card::SCHEDULED_BY),
+            field(card::INTEGRITY),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Whether a session-relative path is where the board's pool reads a card:
+/// markdown in no dotted folder and under none of `artifacts/`,
+/// `workspace/` and `log/` (folded, as the drive folds) — [`card_rels`]'s
+/// walk, asked of one path.
+fn card_place(rel: &str) -> bool {
+    let skipped = [ARTIFACTS_DIR, WORKSPACE_DIR, LOG_DIR];
+    let parts: Vec<&str> = rel.split('/').collect();
+    let Some((name, folders)) = parts.split_last() else {
+        return false;
+    };
+    !name.starts_with('.')
+        && name.to_ascii_lowercase().ends_with(".md")
+        && folders.iter().all(|folder| {
+            !folder.starts_with('.')
+                && !skipped.iter().any(|skip| folder.eq_ignore_ascii_case(skip))
+        })
+}
+
+/// Every `.md` file of a session the board's pool can hold, session-relative
+/// and sorted: each folder but a dotted one, `artifacts/`, `workspace/` and
+/// `log/` (folded, as the drive folds), no link followed, at most
+/// [`CARD_WALK_BUDGET`] entries visited.
+fn card_rels(session: &str, dir: &Path, report: &mut RebuildReport) -> Vec<String> {
+    let skipped = [ARTIFACTS_DIR, WORKSPACE_DIR, LOG_DIR];
+    let mut out = Vec::new();
+    let mut budget = CARD_WALK_BUDGET;
+    let mut pending = vec![String::new()];
+    while let Some(prefix) = pending.pop() {
+        let here = prefix
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .fold(dir.to_path_buf(), |path, part| path.join(part));
+        let entries = match fs::read_dir(&here) {
+            Ok(entries) => entries,
+            Err(error) => {
+                report.problems.push(format!(
+                    "{session}/{prefix}: the folder could not be listed: {error}."
+                ));
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                report.problems.push(format!(
+                    "{session}: more than {CARD_WALK_BUDGET} entries; the cards past them were not read."
+                ));
+                out.sort();
+                return out;
+            }
+            budget -= 1;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if kind.is_dir() {
+                if !skipped.iter().any(|skip| name.eq_ignore_ascii_case(skip)) {
+                    pending.push(rel);
+                }
+            } else if kind.is_file() && name.to_ascii_lowercase().ends_with(".md") {
+                out.push(rel);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Drop every row of the session at `path`.
+fn forget(conn: &Connection, path: &str) -> Result<(), IndexError> {
+    for table in [
+        "sessions WHERE path",
+        "chunks WHERE session",
+        "cards WHERE session",
+        "seen_events WHERE session",
+        "fences WHERE session",
+    ] {
+        conn.execute(&format!("DELETE FROM {table} = ?1"), params![path])?;
+    }
+    Ok(())
+}
+
+/// What one grown chunk added past what the index held.
+struct Tail {
+    name: ChunkName,
+    lines: Vec<LogLine>,
+    /// Where its last complete line ends.
+    bytes: u64,
+    last_offset: u64,
+}
+
+/// The new lines of the chunks of `session_dir/log/` that grew since
+/// `indexed`, read from where the index stopped — whole lines, about
+/// `budget` bytes in all (a line longer than what is left is still read
+/// whole, so a refresh always moves on); a chunk past the budget keeps its
+/// cursor for the next read. `None` when the log was not only appended to —
+/// a chunk shrank, went away, is not a file, or grew from mid-line — and
+/// only a whole read can say what it holds.
+fn grown_chunks(session_dir: &Path, indexed: &[ChunkRow], budget: u64) -> Option<Vec<Tail>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let log_dir = session_dir.join(LOG_DIR);
+    let mut on_disk: Vec<(ChunkName, u64)> = Vec::new();
+    match fs::symlink_metadata(&log_dir) {
+        Ok(meta) if meta.is_dir() => {
+            for entry in fs::read_dir(&log_dir).ok()?.flatten() {
+                let Some(Ok(name)) = entry.file_name().to_str().map(str::parse::<ChunkName>) else {
+                    continue;
+                };
+                if !entry.file_type().ok()?.is_file() {
+                    return None;
+                }
+                on_disk.push((name, entry.metadata().ok()?.len()));
+            }
+        }
+        Ok(_) => return None,
+        Err(_) => {}
+    }
+    let gone = indexed
+        .iter()
+        .any(|row| !on_disk.iter().any(|(name, _)| name.to_string() == row.name));
+    if gone {
+        return None;
+    }
+    let mut tails = Vec::new();
+    let mut left = budget;
+    on_disk.sort();
+    for (name, size) in on_disk {
+        let file = name.to_string();
+        let (from, last_offset) = indexed
+            .iter()
+            .find(|row| row.name == file)
+            .map_or((0, 0), |row| (row.bytes, row.last_offset));
+        if size == from {
+            continue;
+        }
+        if size < from {
+            return None;
+        }
+        if left == 0 {
+            continue;
+        }
+        // One byte before where the index stopped, so a stop that was not at
+        // a line's end is seen rather than read from mid-line.
+        let start = from.saturating_sub(1);
+        let mut chunk = fs::File::open(log_dir.join(&file)).ok()?;
+        chunk.seek(SeekFrom::Start(start)).ok()?;
+        let mut bytes = Vec::new();
+        // The byte before, then what the budget leaves.
+        (&mut chunk).take(left + 1).read_to_end(&mut bytes).ok()?;
+        if !bytes[1.min(bytes.len())..].contains(&b'\n') {
+            chunk.read_to_end(&mut bytes).ok()?;
+        }
+        let tail = if from == 0 {
+            &bytes[..]
+        } else if bytes.first() == Some(&b'\n') {
+            &bytes[1..]
+        } else {
+            return None;
+        };
+        let mut read = Tail {
+            name,
+            lines: Vec::new(),
+            bytes: from,
+            last_offset,
+        };
+        let mut at = 0usize;
+        while let Some(end) = tail[at..].iter().position(|b| *b == b'\n') {
+            if let Some(line) = std::str::from_utf8(&tail[at..at + end])
+                .ok()
+                .and_then(|text| LogLine::parse(text).ok())
+            {
+                read.lines.push(line);
+            }
+            read.last_offset = from + at as u64;
+            at += end + 1;
+            read.bytes = from + at as u64;
+        }
+        left = left.saturating_sub(read.bytes - from);
+        tails.push(read);
+    }
+    Some(tails)
 }
 
 /// Every real (non-link) session folder holding an `agent.toml`, as
@@ -597,4 +1118,124 @@ fn session_dirs(zone_root: &Path, report: &mut RebuildReport) -> Vec<(String, Pa
         },
     );
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use chrono::{TimeZone, Utc};
+    use ulid::Ulid;
+
+    use super::*;
+    use crate::agents::log::{HostSlug, RunBody, RunState, LINE_VERSION};
+
+    const SESSION: &str = "active/s";
+    const CHUNK: &str = "2026-09-30.hesperia.1.jsonl";
+
+    /// A zone holding one agent session with an empty log, removed on drop.
+    struct Zone(PathBuf);
+
+    impl Drop for Zone {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn zone() -> Zone {
+        let root = std::env::temp_dir().join(format!("keeper-index-{}", Ulid::new()));
+        let dir = root.join(SESSION);
+        fs::create_dir_all(dir.join(LOG_DIR)).expect("log");
+        fs::write(
+            dir.join(session::FILE_NAME),
+            include_str!(
+                "../../tests/fixtures/agents/sessions/active/2026-09-30-release-notes/agent.toml"
+            ),
+        )
+        .expect("agent.toml");
+        Zone(root)
+    }
+
+    fn run_line(minute: u32, state: RunState) -> LogLine {
+        let ts = Utc
+            .with_ymd_and_hms(2026, 9, 30, 9, minute, 0)
+            .single()
+            .expect("ts");
+        LogLine {
+            v: LINE_VERSION,
+            id: Ulid::from_parts(ts.timestamp_millis() as u64, u128::from(minute)),
+            parent: None,
+            ts,
+            host: HostSlug::new("hesperia").expect("host"),
+            epoch: 0,
+            claim: None,
+            matrix_event: None,
+            body: LineBody::Run(RunBody {
+                state,
+                detail: None,
+            }),
+        }
+    }
+
+    /// Append `line` to the session's chunk, as the writer does, and its
+    /// receipt.
+    fn append(zone: &Path, line: &LogLine) -> AppendReceipt {
+        let path = zone.join(SESSION).join(LOG_DIR).join(CHUNK);
+        let offset = fs::metadata(&path).map_or(0, |meta| meta.len());
+        let text = format!("{}\n", line.to_json().expect("json"));
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("chunk")
+            .write_all(text.as_bytes())
+            .expect("append");
+        AppendReceipt {
+            chunk: CHUNK.parse().expect("chunk name"),
+            offset,
+            bytes: text.len() as u64,
+            line: line.clone(),
+            blob: None,
+        }
+    }
+
+    /// R121 (R4-12): a refresh holds the index's write lock from before it
+    /// reads the row, so the live writer's `apply` on another connection
+    /// waits for it rather than being written over; and a line a refresh
+    /// already read is not projected again by its writer's `apply`.
+    #[test]
+    fn a_refresh_never_interleaves_with_the_writers_apply() {
+        let zone = zone();
+        let root = zone.0.clone();
+        let mut board = Index::open(&root).expect("open");
+        board.refresh_session(SESSION, None).expect("first read");
+        let mut writer = Index::open(&root).expect("open");
+        writer
+            .apply(SESSION, &append(&root, &run_line(1, RunState::Running)))
+            .expect("apply");
+
+        let mut live = None;
+        board
+            .refresh_session_with(SESSION, None, &mut || {
+                let root = root.clone();
+                live = Some(std::thread::spawn(move || {
+                    let receipt = append(&root, &run_line(2, RunState::Waiting));
+                    Index::open(&root)
+                        .expect("open")
+                        .apply(SESSION, &receipt)
+                        .expect("apply");
+                }));
+                std::thread::sleep(Duration::from_millis(300));
+            })
+            .expect("a refresh beside a live writer");
+        live.expect("spawned").join().expect("writer");
+
+        let read_first = append(&root, &run_line(3, RunState::Review));
+        board.refresh_session(SESSION, None).expect("refresh");
+        writer.apply(SESSION, &read_first).expect("apply");
+
+        let row = board.session(SESSION).expect("row").expect("session");
+        assert_eq!(row.lines, 3, "each line projected once");
+        assert_eq!(row.run.as_deref(), Some("review"));
+    }
 }
