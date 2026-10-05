@@ -213,7 +213,9 @@ pub struct Lease {
     pub claim_event: OwnedEventId,
     /// The server's time of that event, ms.
     pub server_ts: u64,
-    pub window: Option<String>,
+    /// The scheduled window the claim names (R56): set before a scheduled
+    /// run, and sent with every renewal and the release after it.
+    window: Mutex<Option<String>>,
     confirmed: Mutex<Moment>,
     lost: AtomicBool,
 }
@@ -231,10 +233,23 @@ impl Lease {
             epoch,
             claim_event,
             server_ts,
-            window,
+            window: Mutex::new(window),
             confirmed: Mutex::new(at),
             lost: AtomicBool::new(false),
         }
+    }
+
+    /// The window the claim names now.
+    pub fn window(&self) -> Option<String> {
+        self.window
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Name `window` in the claim from its next write on.
+    pub fn set_window(&self, window: Option<String>) {
+        *self.window.lock().unwrap_or_else(|p| p.into_inner()) = window;
     }
 
     /// Whether a line may be written under this lease now (NFR-120).
@@ -311,6 +326,8 @@ pub enum Acquired {
     Won {
         lease: std::sync::Arc<Lease>,
         from_host: Option<String>,
+        /// The window the claim named before this host took it.
+        from_window: Option<String>,
     },
     /// Another host's claim is live.
     HeldElsewhere,
@@ -324,6 +341,7 @@ pub enum Acquired {
 struct Current {
     epoch: u64,
     host: Option<String>,
+    window: Option<String>,
     acquirable: bool,
     /// Whether `acquirable` was decided by the server's clock: a claim that
     /// is neither absent, released, nor `me`'s own.
@@ -335,6 +353,7 @@ fn current(state: Option<&ServerState>, me: &Claimant, server_now: u64) -> Curre
         return Current {
             epoch: 0,
             host: None,
+            window: None,
             acquirable: true,
             clocked: false,
         };
@@ -345,12 +364,14 @@ fn current(state: Option<&ServerState>, me: &Claimant, server_now: u64) -> Curre
             acquirable: claim::may_acquire(Some(&claim), server_now),
             clocked: !claim.content.released && !claim.is_held_by(me, claim.content.epoch),
             host: Some(claim.content.host),
+            window: claim.content.window,
         },
         Err(refusal) => {
             tracing::warn!(event = %state.event_id, %refusal, "agents: a session's claim does not read");
             Current {
                 epoch: state.content["epoch"].as_u64().unwrap_or(0),
                 host: None,
+                window: None,
                 acquirable: server_now
                     >= u64::from(state.origin_server_ts.get())
                         .saturating_add(claim::TTL.as_millis() as u64),
@@ -382,6 +403,29 @@ pub async fn acquire(
     rtt: &Rtt,
     window: Option<String>,
 ) -> Result<Acquired, AgentMatrixError> {
+    acquire_naming(port, me, clock, rtt, |_| window).await
+}
+
+/// [`acquire`] for a scheduled session: the claim it writes names the
+/// window the claim it takes named (R163). A window in flight stays named
+/// from its first write on, through every takeover, until a holder that
+/// settled it names its own.
+pub async fn acquire_carrying(
+    port: &dyn ClaimPort,
+    me: &Claimant,
+    clock: &ServerClock,
+    rtt: &Rtt,
+) -> Result<Acquired, AgentMatrixError> {
+    acquire_naming(port, me, clock, rtt, |found| found).await
+}
+
+async fn acquire_naming(
+    port: &dyn ClaimPort,
+    me: &Claimant,
+    clock: &ServerClock,
+    rtt: &Rtt,
+    window: impl FnOnce(Option<String>) -> Option<String>,
+) -> Result<Acquired, AgentMatrixError> {
     let before = timed(rtt, port.read()).await?;
     let server_now = clock.now();
     let found = current(before.as_ref(), me, server_now);
@@ -389,6 +433,7 @@ pub async fn acquire(
         return Ok(Acquired::HeldElsewhere);
     }
     let epoch = found.epoch.saturating_add(1).max(1);
+    let window = window(found.window.clone());
     let content = me.content(epoch, server_now, server_now, false, window.clone());
     let sent_at = Moment::now();
     let sent_wall = sent_at.wall_ms;
@@ -417,6 +462,7 @@ pub async fn acquire(
     Ok(Acquired::Won {
         lease: std::sync::Arc::new(Lease::new(epoch, event, server_ts, window, sent_at)),
         from_host: found.host.filter(|host| *host != me.host),
+        from_window: found.window,
     })
 }
 
@@ -441,7 +487,7 @@ pub async fn renew(
         lease.server_ts,
         server_now,
         false,
-        lease.window.clone(),
+        lease.window(),
     );
     timed(
         rtt,
@@ -470,7 +516,7 @@ pub async fn release(
         lease.server_ts,
         clock.now(),
         true,
-        lease.window.clone(),
+        lease.window(),
     );
     timed(
         rtt,
@@ -723,7 +769,9 @@ mod tests {
         }
         assert!(matches!(won_a.expect("a"), Acquired::Yielded), "A yields");
         match won_b.expect("b") {
-            Acquired::Won { lease, from_host } => {
+            Acquired::Won {
+                lease, from_host, ..
+            } => {
                 assert_eq!(lease.epoch, 5);
                 assert_eq!(lease.claim_event.as_str(), "$claim2:example.org");
                 assert_eq!(from_host.as_deref(), Some("argo"));
@@ -732,11 +780,15 @@ mod tests {
         }
     }
 
+    /// A live claim is left alone; once it lapses the taker wins it, and
+    /// learns the window the claim named (R56): a scheduled run it may have
+    /// begun.
     #[tokio::test(start_paused = true)]
     async fn a_live_claim_is_left_alone_and_a_read_back_of_another_event_yields() {
         let server = Arc::new(Server::default());
         let electra = claimant("electra");
-        server.hold(&electra.content(2, T0, T0, false, None), T0);
+        let window = "2026-10-05T09:00:00Z".to_owned();
+        server.hold(&electra.content(2, T0, T0, false, Some(window.clone())), T0);
         let port = Port::new(&server, None, 0);
         let rtt = Rtt::default();
         let clock = clock_at(T0 + 179_000);
@@ -749,13 +801,49 @@ mod tests {
             .await
             .expect("acquire")
         {
-            Acquired::Won { lease, from_host } => {
+            Acquired::Won {
+                lease,
+                from_host,
+                from_window,
+            } => {
                 assert_eq!(lease.epoch, 3, "epoch + 1");
                 assert_eq!(from_host.as_deref(), Some("electra"));
+                assert_eq!(from_window, Some(window));
+                assert_eq!(lease.window(), None, "the taker names no window of its own");
                 assert_eq!(lease.server_ts, T0 + 1);
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// R163: a scheduled session's taker names the window the lapsed claim
+    /// named from its very first write, so a taker dying before it settles
+    /// the window still leaves it named for the next.
+    #[tokio::test(start_paused = true)]
+    async fn a_carrying_taker_names_the_window_from_its_first_write() {
+        let server = Arc::new(Server::default());
+        let window = "2026-10-05T09:00:00Z".to_owned();
+        server.hold(
+            &claimant("electra").content(2, T0, T0, false, Some(window.clone())),
+            T0,
+        );
+        let port = Port::new(&server, None, 0);
+        let (rtt, clock) = (Rtt::default(), clock_at(T0 + 180_000));
+        let Acquired::Won {
+            lease, from_window, ..
+        } = acquire_carrying(&port, &claimant("hesperia"), &clock, &rtt)
+            .await
+            .expect("acquire")
+        else {
+            panic!("won");
+        };
+        let named =
+            ServerClaim::read(&server.current.lock().expect("lock").clone().expect("claim"))
+                .expect("claim");
+        assert_eq!(named.content.host, "hesperia");
+        assert_eq!(named.content.window, Some(window.clone()));
+        assert_eq!(lease.window(), Some(window.clone()));
+        assert_eq!(from_window, Some(window));
     }
 
     /// NFR-120: renewals fail from T; the lease stops writing at T + 120 s,
@@ -810,6 +898,9 @@ mod tests {
         assert_eq!(takeover - stop_at, 60_000, "the margin");
     }
 
+    /// R56: a window set on a held lease is named by the next renewal and
+    /// kept by the release, so a taker finds it; the release hands the claim
+    /// back and stops the writer.
     #[tokio::test(start_paused = true)]
     async fn a_release_hands_the_claim_back_and_stops_the_writer() {
         let server = Arc::new(Server::default());
@@ -820,13 +911,23 @@ mod tests {
         else {
             panic!("won");
         };
+        let claim_now = || {
+            ServerClaim::read(&server.current.lock().expect("lock").clone().expect("claim"))
+                .expect("claim")
+        };
+        let window = "2026-10-05T09:00:00Z".to_owned();
+        lease.set_window(Some(window.clone()));
+        assert!(renew(&port, &me, &lease, &clock, &rtt)
+            .await
+            .expect("renew"));
+        assert_eq!(claim_now().content.window, Some(window.clone()));
         assert!(release(&port, &me, &lease, &clock, &rtt)
             .await
             .expect("release"));
         assert!(!lease.may_write());
-        let state = server.current.lock().expect("lock").clone().expect("claim");
-        let released = ServerClaim::read(&state).expect("claim");
+        let released = claim_now();
         assert!(released.content.released);
+        assert_eq!(released.content.window, Some(window));
         assert!(claim::may_acquire(Some(&released), T0));
     }
 

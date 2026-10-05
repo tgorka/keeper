@@ -77,6 +77,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use ulid::Ulid;
 
+use crate::cards::{self, Begun, Scheduled};
 use crate::claims::Lease;
 use crate::delegate::{self, DelegateTools, Delegation, DelegationPort, Delegator, TurnView};
 use crate::drive::finish_word;
@@ -854,6 +855,41 @@ pub fn reply_of(
     })
 }
 
+/// A scheduled arrival whose content is not one this build reads.
+pub const NOT_SCHEDULED: &str = "the host's clock sent nothing this host reads";
+/// A scheduled card that could not be read or written.
+pub const CARD_UNWRITTEN: &str =
+    "the scheduled card could not be read or written; it is tried at its next window";
+
+/// The arrival the host's clock routes to a scheduled session's worker
+/// (92.3), in the agent's own name. A window's run has an id derived from
+/// its window — however often it is routed, the session's dedupe keeps it
+/// to one turn; a settlement or a wait is a fresh event each time, routed
+/// again until the card reads settled (R163). Never a room's event.
+pub fn scheduled_arrival(agent: &UserId, scheduled: &Scheduled) -> Option<Arrived> {
+    let fresh = || Ulid::new().to_string().to_ascii_lowercase();
+    let key = match scheduled {
+        Scheduled::Run { window, .. } => format!(
+            "run-{}",
+            DateTime::parse_from_rfc3339(window)
+                .map(|at| at.timestamp_millis().to_string())
+                .unwrap_or_else(|_| fresh())
+        ),
+        Scheduled::TakenOver { .. } => format!("taken-{}", fresh()),
+        Scheduled::Wait { .. } => format!("wait-{}", fresh()),
+    };
+    Some(Arrived {
+        event_id: OwnedEventId::try_from(format!("$scheduled-{key}:keeper.invalid")).ok()?,
+        sender: agent.to_owned(),
+        arrival: Arrival::Scheduled,
+        text: String::new(),
+        content: serde_json::to_value(scheduled).ok()?,
+        received_at: Instant::now(),
+        replay: false,
+        via: None,
+    })
+}
+
 /// What became of an arrival.
 #[derive(Debug)]
 pub enum Outcome {
@@ -877,6 +913,8 @@ pub enum Outcome {
     Conversation { path: String, made: bool },
     /// The brief of the delegation with this id went in, its target joined.
     BriefSent(String),
+    /// The scheduled card says this `run` line's state now; no turn ran.
+    Scheduled(keeper_core::agents::log::RunState),
 }
 
 /// How a turn ended.
@@ -1207,7 +1245,141 @@ impl ServedSession {
                 self.new_conversation(deps, port.as_ref(), arrived).await
             }
             Disposition::Delegation => self.delegation_moved(deps, port, arrived, stop).await,
+            Disposition::Scheduled => self.scheduled(deps, port, arrived, stop).await,
         }
+    }
+
+    /// The host's clock asked about the session's scheduled card (92.3).
+    /// [`cards::begin`] reads the card again under the claim and writes its
+    /// keys; a run is a turn whose brief is the card's body, opened by a
+    /// `run: running` line and a `peer` line in the agent's own name, and the
+    /// card then says how the turn ended: `review`, `failed` or `blocked`.
+    /// An action in it that needs a person is refused as in every agent
+    /// turn before Epic 93 (`UNATTENDED_REFUSAL`).
+    async fn scheduled(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        mut arrived: Arrived,
+        stop: CancelSignal,
+    ) -> Result<Outcome, ServeError> {
+        use keeper_core::agents::log::RunState as LogRun;
+        let Ok(scheduled) = serde_json::from_value::<Scheduled>(arrived.content.clone()) else {
+            return Ok(Outcome::Ignored(NOT_SCHEDULED));
+        };
+        let session = self.context.session.path.clone();
+        let lease = self.writer.lease();
+        let may_write = {
+            let lease = lease.clone();
+            move || lease.as_ref().is_none_or(|lease| lease.may_write())
+        };
+        // A window begins only while the claim names it (R56): a run routed
+        // before the host named a later window never begins.
+        let names = match &scheduled {
+            Scheduled::Run { window, .. } => Some(window.clone()),
+            _ => None,
+        };
+        let may_begin = move || {
+            lease.as_ref().is_none_or(|lease| {
+                lease.may_write()
+                    && names
+                        .as_ref()
+                        .is_none_or(|w| lease.window().as_ref() == Some(w))
+            })
+        };
+        let zone = deps.sessions_zone.clone();
+        let holder = cards::Holder {
+            agent: &self.context.agent,
+            host: deps.host.as_str(),
+        };
+        let begun = match off_the_runtime(|| {
+            cards::begin(&zone, &session, &holder, &scheduled, &may_begin)
+        }) {
+            Ok(begun) => begun,
+            Err(error) => {
+                tracing::warn!(%session, %error, "agents: a scheduled card could not be read or written");
+                return Ok(Outcome::Ignored(CARD_UNWRITTEN));
+            }
+        };
+        let (brief, untrusted) = match begun {
+            Begun::Nothing(note) => {
+                tracing::info!(%session, card = scheduled.card(), note, "agents: the scheduled card is left as it is");
+                return Ok(Outcome::Ignored(note));
+            }
+            Begun::Said(body) => {
+                let state = body.state;
+                self.writer.write(
+                    &mut self.context,
+                    None,
+                    Some(arrived.event_id.clone()),
+                    LineBody::Run(body),
+                )?;
+                off_the_runtime(|| self.writer.sync())?;
+                return Ok(Outcome::Scheduled(state));
+            }
+            Begun::Run { brief, untrusted } => (brief, untrusted),
+        };
+        self.writer.write(
+            &mut self.context,
+            None,
+            None,
+            LineBody::Run(RunBody {
+                state: LogRun::Running,
+                detail: None,
+            }),
+        )?;
+        // The card is read as the drive read of it would be (S-02): one
+        // made from outside content lowers the session's integrity.
+        let joined = if untrusted {
+            self.context.label.join(&Label {
+                integrity: Integrity::Untrusted,
+                ..Label::top()
+            })
+        } else {
+            self.context.label.clone()
+        };
+        if joined != self.context.label {
+            self.writer.write(
+                &mut self.context,
+                None,
+                None,
+                LineBody::Label(LabelBody::new(
+                    &joined,
+                    LabelCause {
+                        kind: LabelCauseKind::DriveRead,
+                        reference: scheduled.card().to_owned(),
+                    },
+                )),
+            )?;
+        }
+        arrived.text = brief;
+        let ran = self.turn(deps, port, arrived, stop).await;
+        let (run, state) = match ran.as_ref().map(|report| report.ending) {
+            Ok(TurnEnding::Complete) => (Run::Review, LogRun::Review),
+            Ok(TurnEnding::Stopped | TurnEnding::LocalOnly | TurnEnding::Bounded) => {
+                (Run::Blocked, LogRun::Blocked)
+            }
+            Ok(TurnEnding::Failed) | Err(_) => (Run::Failed, LogRun::Failed),
+        };
+        let card = scheduled.card().to_owned();
+        match off_the_runtime(|| cards::write_run(&zone, &session, &card, run, None, &may_write)) {
+            Ok(_) => {
+                self.writer.write(
+                    &mut self.context,
+                    None,
+                    None,
+                    LineBody::Run(RunBody {
+                        state,
+                        detail: None,
+                    }),
+                )?;
+                off_the_runtime(|| self.writer.sync())?;
+            }
+            Err(error) => {
+                tracing::warn!(%session, %card, %error, "agents: the scheduled card's end could not be written")
+            }
+        }
+        ran.map(Outcome::Answered)
     }
 
     /// The session as its `delegate` and `reply` tools and its briefs name it.
@@ -1924,6 +2096,17 @@ impl ServedSession {
                     }),
                 )
             }
+            // The card's body, in the agent's own name: no person spoke.
+            Arrival::Scheduled => (
+                self.context.label.clone(),
+                LabelCauseKind::AgentMessage,
+                LineBody::Peer(PeerBody {
+                    sender: arrived.sender.clone(),
+                    text: arrived.text.clone(),
+                    ask: None,
+                    artifacts: None,
+                }),
+            ),
             _ => {
                 let person = deps
                     .home

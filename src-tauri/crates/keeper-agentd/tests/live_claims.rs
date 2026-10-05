@@ -45,6 +45,7 @@ use common::{bare_drive, record, stub, syncing, tool_then, Smoke};
 const BIN: &str = env!("CARGO_BIN_EXE_keeper-agentd");
 const MAIN: &str = "active/2026-10-03-main";
 const MAC: &str = "active/2026-10-03-mac";
+const SORT: &str = "active/2026-10-05-sort";
 const ANSWER: &str = "Answered.";
 
 /// One `keeper-agentd` host.
@@ -141,6 +142,8 @@ struct Pair {
     main: OwnedRoomId,
     mac: OwnedRoomId,
     control: OwnedRoomId,
+    /// The `kind = scheduled` session's room, when the pair has one.
+    sort: Option<OwnedRoomId>,
     electra: Sim,
     hesperia: Sim,
     person: AgentClient,
@@ -187,11 +190,14 @@ fn drive_toml(person: &OwnedUserId) -> String {
 
 /// The two hosts over one drive, signed in, not started.
 async fn pair(smoke: &Smoke, model_url: &str) -> Pair {
-    pair_allowing(smoke, model_url, "\"drive_list\", \"drive_read\"").await
+    pair_allowing(smoke, model_url, "\"drive_list\", \"drive_read\"", false).await
 }
 
-/// [`pair`], Nixi's `[tools].allow` being `allow`.
-async fn pair_allowing(smoke: &Smoke, model_url: &str, allow: &str) -> Pair {
+/// [`pair`], Nixi's `[tools].allow` being `allow`; with `scheduled`, the
+/// drive also holds Nixi's scheduled session [`SORT`] with its `every 24h`
+/// card, which has never run: due at once, and not again for a day — no
+/// second legitimate window falls inside a run of the test.
+async fn pair_allowing(smoke: &Smoke, model_url: &str, allow: &str, scheduled: bool) -> Pair {
     let root = tempfile::tempdir().expect("tempdir");
     let agent = smoke.user("nixi-smoke");
     let person = smoke.user("tgorka-smoke");
@@ -222,11 +228,24 @@ async fn pair_allowing(smoke: &Smoke, model_url: &str, allow: &str) -> Pair {
         .await
         .expect("control room");
     let (main, mac) = (rooms[0].clone(), rooms[1].clone());
+    let sort = if scheduled {
+        Some(
+            maker
+                .create_room(
+                    RoomKind::Session(SessionKind::Scheduled),
+                    "sort",
+                    vec![person.clone()],
+                    &[],
+                )
+                .await
+                .expect("room"),
+        )
+    } else {
+        None
+    };
 
     let soul = "---\nname: Nixi\ntitle: the smoke proxy\nicon: \"*\"\nrole: Answers the smoke test.\nidentity: \"A test proxy.\"\ncommunication_style: Short.\nprinciples:\n  - Answer.\n---\n\nNixi answers.\n";
-    let bare = bare_drive(
-        root.path(),
-        &[
+    let mut files = vec![
             ("80-agents/_drive.toml".to_owned(), drive_toml(&person)),
             (
                 "80-agents/nixi/agent.toml".to_owned(),
@@ -247,8 +266,23 @@ async fn pair_allowing(smoke: &Smoke, model_url: &str, allow: &str) -> Pair {
                 format!("60-sessions/{MAC}/agent.toml"),
                 compose_session_agent_toml(&session_agent(&mac, &person, true)),
             ),
-        ],
-    );
+    ];
+    if let Some(sort) = &sort {
+        let agent = SessionAgent {
+            kind: SessionKind::Scheduled,
+            title: "sort".to_owned(),
+            ..session_agent(sort, &person, false)
+        };
+        files.push((
+            format!("60-sessions/{SORT}/agent.toml"),
+            compose_session_agent_toml(&agent),
+        ));
+        files.push((
+            format!("60-sessions/{SORT}/card.md"),
+            "---\ntags: [task]\ntitle: Sort the inbox\nstatus: todo\nassignee: nixi\nschedule: every 24h\n---\n\nSay what came in.\n".to_owned(),
+        ));
+    }
+    let bare = bare_drive(root.path(), &files);
 
     let sim = |slug: &'static str, always_on: bool| {
         let home = root.path().join(slug);
@@ -314,7 +348,7 @@ async fn pair_allowing(smoke: &Smoke, model_url: &str, allow: &str) -> Pair {
             smoke.secret("TGORKA_SMOKE_PASSWORD"),
         )
         .await;
-    for room in [&main, &mac, &control] {
+    for room in [&main, &mac, &control].into_iter().chain(sort.as_ref()) {
         person_client.join(room).await.expect("join");
     }
     person_client.sync_once().await.expect("sync");
@@ -326,6 +360,7 @@ async fn pair_allowing(smoke: &Smoke, model_url: &str, allow: &str) -> Pair {
         main,
         mac,
         control,
+        sort,
         electra,
         hesperia,
         person: person_client,
@@ -1011,7 +1046,13 @@ async fn a_surface_request_reaches_the_persons_device_and_its_answer_releases_th
         json!({"drive": "smoke", "path": "notes/a.md", "heading": "Plans"}),
         ANSWER,
     );
-    let mut pair = pair_allowing(&smoke, &model.url, "\"drive_read\", \"surface_open\"").await;
+    let mut pair = pair_allowing(
+        &smoke,
+        &model.url,
+        "\"drive_read\", \"surface_open\"",
+        false,
+    )
+    .await;
     let person = smoke.user("tgorka-smoke");
     pair.electra.start();
     let main = pair.main.clone();
@@ -1098,4 +1139,72 @@ async fn a_surface_request_reaches_the_persons_device_and_its_answer_releases_th
         "neither the agent's other device nor another device's result counted"
     );
     pair.electra.terminate();
+}
+
+/// 92.3 acceptance 8 (R56, R58): both hosts start with Nixi's `every 24h`
+/// card due in its scheduled session and never run; exactly one holds the
+/// session's claim, names the window in it and runs the card once; the other
+/// never runs it. The card's next window is a day away, so every run counted
+/// is of the one window.
+#[ignore = "live: Synapse on delectra"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scheduled_card_claim_race_on_a_real_homeserver() {
+    let smoke = Smoke::from_env();
+    let model = stub(ANSWER, 1, Duration::from_millis(10));
+    let mut pair = pair_allowing(&smoke, &model.url, "\"drive_list\", \"drive_read\"", true).await;
+    let sort = pair.sort.clone().expect("the scheduled room");
+    pair.electra.start();
+    pair.hesperia.start();
+    let ran = |sim: &Sim| {
+        sim.log_text()
+            .lines()
+            .filter(|line| line.contains("agentd: a turn was answered") && line.contains(SORT))
+            .count()
+    };
+    wait_for("the scheduled card ran", Duration::from_secs(180), || {
+        ran(&pair.electra) + ran(&pair.hesperia) > 0
+    })
+    .await;
+    // A loser's settle, renewals and rescans on both hosts.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let runs = [
+        (pair.electra.slug, ran(&pair.electra)),
+        (pair.hesperia.slug, ran(&pair.hesperia)),
+    ];
+    let holders: Vec<&str> = [&pair.electra, &pair.hesperia]
+        .iter()
+        .filter(|sim| !sim.acquired(&sort).is_empty())
+        .map(|sim| sim.slug)
+        .collect();
+    let (_, _, claim) = server_claim(&pair.maker, &sort).await.expect("the claim");
+    let runner = if runs[0].1 > 0 {
+        &pair.electra
+    } else {
+        &pair.hesperia
+    };
+    let card = std::fs::read_to_string(runner.session_dir(SORT).join("card.md")).expect("card");
+    let running = read_session(&runner.session_dir(SORT))
+        .lines
+        .iter()
+        .filter(|line| {
+            matches!(&line.body, LineBody::Run(run) if run.state == keeper_core::agents::log::RunState::Running)
+        })
+        .count();
+    println!(
+        "a scheduled card on two agentd over Synapse: turns per host {runs:?}; claim holders {holders:?}; the server's claim {claim}; the runner's card:\n{card}"
+    );
+    assert_eq!(runs.iter().map(|(_, n)| n).sum::<usize>(), 1, "{runs:?}");
+    assert_eq!(holders.len(), 1, "{holders:?}");
+    assert_eq!(claim["host"], holders[0]);
+    let window = claim["window"]
+        .as_str()
+        .expect("the claim names the window");
+    assert!(card.contains("run: review"), "{card}");
+    assert!(
+        card.contains(window),
+        "last_run is the claim's window: {card}"
+    );
+    assert_eq!(running, 1);
+    pair.electra.terminate();
+    pair.hesperia.terminate();
 }

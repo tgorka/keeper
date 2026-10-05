@@ -834,29 +834,103 @@ fn insert_cards(
     dir: &Path,
     report: &mut RebuildReport,
 ) -> Result<(), IndexError> {
-    let mut budget = CARD_READ_BUDGET;
-    for rel in card_rels(session, dir, report) {
-        let path = rel
-            .split('/')
-            .fold(dir.to_path_buf(), |path, part| path.join(part));
-        let size = fs::metadata(&path).map_or(0, |meta| meta.len());
-        if size > budget {
+    let read = read_card_files(session, dir, CARD_READ_BUDGET, CARD_READ_BUDGET);
+    report.problems.extend(read.problems);
+    for file in read.files {
+        if !file.whole {
             report.problems.push(format!(
-                "{session}: more than {CARD_READ_BUDGET} bytes of cards; {rel} and the cards after it were not read."
+                "{session}: more than {CARD_READ_BUDGET} bytes of cards; {} and the cards after it were not read.",
+                file.rel
             ));
             break;
         }
-        budget -= size;
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) => {
-                report.problems.push(format!("{session}/{rel}: {error}."));
-                continue;
-            }
-        };
-        insert_card(conn, session, &rel, &text)?;
+        insert_card(conn, session, &file.rel, &file.text)?;
     }
     Ok(())
+}
+
+/// One file a bounded read of a session's cards reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardFile {
+    /// Session-relative.
+    pub rel: String,
+    /// Its text, as far as the read went.
+    pub text: String,
+    /// Whether `text` is the whole file: a longer one is cut, never read on.
+    pub whole: bool,
+}
+
+/// What a bounded read of one session's card files found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CardFiles {
+    pub files: Vec<CardFile>,
+    /// What could not be listed or read, as sentences. While there is one,
+    /// `files` is not every card file of the session.
+    pub problems: Vec<String>,
+}
+
+/// Every `.md` file of the session folder `dir` where the board's pool reads
+/// a card ([`card_rels`]'s walk), read by bounded reads rather than by
+/// size: at most `per_file` bytes of each — a longer file comes back cut —
+/// and `total` bytes in all, past which the files left are reported, not
+/// read.
+pub fn read_card_files(session: &str, dir: &Path, per_file: u64, total: u64) -> CardFiles {
+    let mut report = RebuildReport::default();
+    let rels = card_rels(session, dir, &mut report);
+    let mut files = Vec::new();
+    let mut left = total;
+    for rel in rels {
+        if left == 0 {
+            report.problems.push(format!(
+                "{session}: more than {total} bytes of cards; {rel} and the cards after it were not read."
+            ));
+            break;
+        }
+        let path = rel
+            .split('/')
+            .fold(dir.to_path_buf(), |path, part| path.join(part));
+        match read_prefix(&path, per_file.min(left)) {
+            Ok((text, read, whole)) => {
+                left -= read;
+                files.push(CardFile { rel, text, whole });
+            }
+            Err(error) => report.problems.push(format!("{session}/{rel}: {error}.")),
+        }
+    }
+    CardFiles {
+        files,
+        problems: report.problems,
+    }
+}
+
+/// At most `limit` bytes of the file at `path`: its text, the bytes read,
+/// and whether that is the whole file. A cut text ends at the last whole
+/// character; an uncut one that is not UTF-8 is an error.
+pub fn read_prefix(path: &Path, limit: u64) -> std::io::Result<(String, u64, bool)> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let whole = bytes.len() as u64 <= limit;
+    bytes.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    let read = bytes.len() as u64;
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) if !whole => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).unwrap_or_default()
+        }
+        Err(error) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.utf8_error(),
+            ))
+        }
+    };
+    Ok((text, read, whole))
 }
 
 /// One file's card row, when it is a card.
@@ -1237,5 +1311,35 @@ mod tests {
         let row = board.session(SESSION).expect("row").expect("session");
         assert_eq!(row.lines, 3, "each line projected once");
         assert_eq!(row.run.as_deref(), Some("review"));
+    }
+
+    /// A card read never reads past its budgets: at most `per_file` bytes
+    /// of a file, which then says it is cut, and at most `total` across the
+    /// session, past which the files left are reported, not read.
+    #[test]
+    fn a_card_read_stays_within_its_budgets() {
+        let dir = std::env::temp_dir().join(format!("keeper-cards-{}", Ulid::new()));
+        fs::create_dir_all(&dir).expect("session");
+        fs::write(dir.join("a.md"), "x".repeat(3 * 1024 * 1024)).expect("a");
+        fs::write(dir.join("b.md"), "short").expect("b");
+        fs::write(dir.join("c.md"), "y".repeat(800)).expect("c");
+        fs::write(dir.join("d.md"), "z").expect("d");
+        let read = read_card_files("s", &dir, 1_000, 1_600);
+        fs::remove_dir_all(&dir).expect("cleaned");
+        let seen: Vec<(&str, usize, bool)> = read
+            .files
+            .iter()
+            .map(|file| (file.rel.as_str(), file.text.len(), file.whole))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("a.md", 1_000, false),
+                ("b.md", 5, true),
+                ("c.md", 595, false)
+            ]
+        );
+        assert_eq!(read.problems.len(), 1, "{:?}", read.problems);
+        assert!(read.problems[0].contains("d.md"), "{:?}", read.problems);
     }
 }

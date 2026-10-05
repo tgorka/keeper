@@ -4068,3 +4068,96 @@ async fn a_brief_that_failed_to_send_is_sent_again_on_the_clock() {
         [DelegateState::Opened, DelegateState::Sent]
     );
 }
+
+/// 92.3 AC6 (before Epic 93): a scheduled run is a turn whose brief is the
+/// card's body, opened by `run: running` with the window as `last_run`;
+/// an action in it that needs a person gets `UNATTENDED_REFUSAL` as its
+/// tool result and is logged; the card ends `review`; and the same window
+/// routed again is no second turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scheduled_run_refuses_what_needs_a_person_before_epic_93() {
+    use keeper_agent::agent::scheduled_arrival;
+    use keeper_agent::cards::Scheduled;
+    use keeper_core::agents::card::{CardAgent, Field, Run};
+    use keeper_core::agents::log::RunState as LogRun;
+    const SCHEDULED: &str = "active/2026-10-05-sort";
+    let world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "drive_write"],
+        vec![
+            calls(&[(
+                "w1",
+                "drive_write",
+                json!({"profile":"tgdrive","path":"notes/new.md","content":"must not land"}),
+            )]),
+            prose("I could not write it."),
+        ],
+    );
+    session_of(
+        &world.tgdrive,
+        SCHEDULED,
+        &decl("tgdrive", &[TGORKA, MARTA], false),
+        "nixi",
+        SessionKind::Scheduled,
+        "!sort:example.org",
+    );
+    let card = "---\ntags: [task]\ntitle: Sort the inbox\nstatus: todo\nassignee: nixi\nschedule: \"@hourly\"\nlast_run: \"2026-10-05T08:00:00Z\"\n---\n\nWrite a note about what came in.\n";
+    write(
+        &world.tgdrive,
+        &format!("60-sessions/{SCHEDULED}/card.md"),
+        card,
+    );
+    let mut served = world.open(SCHEDULED);
+    let window = "2026-10-05T09:00:00.000Z";
+    let arrival = || {
+        scheduled_arrival(
+            &user("@nixi:example.org"),
+            &Scheduled::Run {
+                card: "card.md".to_owned(),
+                window: window.to_owned(),
+                now_ms: chrono::DateTime::parse_from_rfc3339("2026-10-05T09:30:00Z")
+                    .expect("an instant")
+                    .timestamp_millis(),
+                utc_offset_minutes: 0,
+            },
+        )
+        .expect("an arrival")
+    };
+    let report = report(world.serve(&mut served, arrival()).await);
+    assert_eq!(report.ending, TurnEnding::Complete);
+    assert!(!world.tgdrive.join("notes/new.md").exists());
+
+    let lines = world.lines(SCHEDULED);
+    let runs: Vec<LogRun> = kinds(&lines, LineKind::Run)
+        .iter()
+        .map(|line| match &line.body {
+            LineBody::Run(body) => body.state,
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(runs, [LogRun::Running, LogRun::Review]);
+    let peers = kinds(&lines, LineKind::Peer);
+    let LineBody::Peer(peer) = &peers[0].body else {
+        panic!("a peer line")
+    };
+    assert_eq!(peer.text, "Write a note about what came in.");
+    let result = kinds(&lines, LineKind::ToolResult);
+    let LineBody::ToolResult(body) = &result[0].body else {
+        panic!("a tool result")
+    };
+    assert_eq!(body.content, format!("Refused: {UNATTENDED_REFUSAL}"));
+    let text = std::fs::read_to_string(world.dir(SCHEDULED).join("card.md")).expect("card");
+    let keys = CardAgent::of_text(&text).expect("keys");
+    assert_eq!(keys.run, Some(Field::Read(Run::Review)), "{text}");
+    assert!(
+        matches!(&keys.last_run, Some(Field::Read(at)) if at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) == window),
+        "{text}"
+    );
+
+    // The host's clock routing the same window again is the same event.
+    assert!(matches!(
+        world.serve(&mut served, arrival()).await,
+        Outcome::Duplicate
+    ));
+    assert_eq!(world.stub.requests().len(), 2);
+}

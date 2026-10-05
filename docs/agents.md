@@ -796,6 +796,63 @@ person's move of a card is guarded the same way, so it never writes back over a 
 `run:`. The board shows the refusal on the card; on the phone it shows the mark and no
 button, since the command is the Mac's.
 
+### Cards that run on a schedule
+
+A card with `schedule:` runs only in a `kind = scheduled` session of its `assignee`, alone there:
+its `host:` is that session's placement pin. Only a scheduled session's cards are read for a
+schedule. In such a session a card that does not run says why in the holder's status ("runs only
+in nixi's session", "runs only alone in a scheduled session of nixi"); a scheduled card in any other
+session — a conversation, a delegated session, a person's own — is never read for its schedule, so
+it never runs and nothing says so yet (DW-455). It never becomes a keeper-sync task: there is no new
+`TaskKind`, and the host's own tick is the only clock — `keeper-agentd`'s and the desktop host's,
+the same code.
+
+The rescan reads a scheduled session's cards by a bounded read: at most 64 KiB of each markdown
+file and 1 MiB of the session, over the board's 2,000-entry walk. A longer file whose frontmatter
+names no schedule is passed over after its first 64 KiB. Anything the read cannot settle — a folder
+or file that does not read, a file with a schedule past 64 KiB, a spent budget — leaves the set
+incomplete, and then no card of the session runs: the one it missed may be a second scheduled card.
+The holder's status says which file.
+
+**When.** The schedule is keeper-sync's dialect (`@hourly`, `@daily`, a 5-field cron, `every <n><unit>`
+no oftener than a minute), read at the machine's UTC offset against the server's time. A card is due
+when its first window after `last_run` has come; one that never ran is due at once, a cron card in
+its latest window within the dialect's eight-year horizon (so `0 0 29 2 *` runs its last 29
+February). The window it runs is the *latest* one at or before now, so a host away for five hours
+runs an `@hourly` card once on return, not five times, and that window becomes `last_run`. An
+unreadable `schedule:` or `last_run:` never runs (the board shows the key unreadable). A card
+carrying `scheduled_by` never runs until a person's *Allow*; then its next due window runs once.
+
+**Who.** The host holding the session's claim runs it, on its tick, and only while placement picks
+that host: a holder kept for the session's messages while placement waits — a need it no longer
+meets — begins no window, and has the card say `run: waiting` instead. The holder decides the
+window by the card as it reads now, never by its rescan's copy; it renews the claim naming the
+window (`window`, RFC 3339); then its worker reads the card again under the claim and judges it
+again on those bytes, at the same instant: still a task carrying a person's or an allowed schedule,
+still its agent's, pinned nowhere else, alone in the session, and due in exactly that window, which
+the claim still names. Any edit that changes one of those runs nothing; an edit of the body alone
+runs the new body. Then it writes `run: running` and `last_run`, logs a `run` line, and runs one
+turn whose brief is the card's body (a `peer` line in the agent's own name; a card marked
+`integrity: untrusted` lowers the turn's label to `untrusted`). The turn ends the card `review`, or
+`blocked` (stopped, bounded, refused by the label) or `failed`, with a `run` line. An action in it
+that needs a person is refused as in every agent turn ("This needs a person's approval, and there is
+no one here to ask, …").
+
+**Waiting.** When no live host may run a due card — its `host:` is offline — the principal's
+announcing host (always-on first) takes the session's claim, writes `run: waiting` and a `run` line
+saying what it waits for (`hesperia — a live host`), and hands the claim back. When the pinned host
+is live again, it runs the window once.
+
+**A takeover.** The claim's `window` is the one record of which window is in flight. A host that
+takes a scheduled session names the previous claim's window in its own first claim write, so it
+stays named through any number of takers until one settles it. Before it begins anything, the new
+holder settles that window on the card as it reads now: if `last_run` is older — the previous
+holder began the window and its commit never arrived — it writes `last_run` = the window; if the
+card still says `run: running` — its host died in the turn, its own restart included — it leaves
+`last_run`; either way it writes `run: review` and the `run` line "ran on <host>, effect unknown",
+and runs no turn. A settlement whose write fails is tried again on every tick until the card reads
+settled, and no window begins meanwhile. The next window runs as usual.
+
 ## What a session costs the drive
 
 A chunk is appended to, so each commit of a turn stores that chunk again; git's loose objects

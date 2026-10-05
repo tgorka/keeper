@@ -315,6 +315,10 @@ pub enum Arrival {
     /// The target agent's reply in a room this session delegated into,
     /// routed here the same way.
     Replied,
+    /// The host's clock: its scheduled card's window, a wait, or a takeover
+    /// (92.3). Made only by the session's claim holder, never read from the
+    /// room.
+    Scheduled,
     /// Any other `dev.keeper.agent.*` event: a status, a turn reference, a
     /// claim.
     AgentEvent,
@@ -333,6 +337,8 @@ pub enum Disposition {
     NewConversation,
     /// A delegation this session made moved: its target joined or replied.
     Delegation,
+    /// The host's clock asks about the session's scheduled card.
+    Scheduled,
     /// Neither: not logged, not a turn. The sentence is the host's own note.
     Ignored(&'static str),
 }
@@ -395,6 +401,10 @@ pub const NOT_THE_REQUESTER: &str =
 /// counts only from the proxy's `human`, on a device that person's
 /// cross-signing identity signed (R47).
 pub fn classify(served: &Served<'_>, sender: &UserId, arrival: Arrival) -> Disposition {
+    // No event from the room is ever this kind: only the host's clock makes it.
+    if arrival == Arrival::Scheduled {
+        return Disposition::Scheduled;
+    }
     if sender == served.agent_user {
         return Disposition::Ignored(OWN_EVENT);
     }
@@ -415,6 +425,7 @@ pub fn classify(served: &Served<'_>, sender: &UserId, arrival: Arrival) -> Dispo
         // Made only by this host, from the room the session delegated into;
         // the worker checks the sender against the delegation it made.
         Arrival::Joined | Arrival::Replied => Disposition::Delegation,
+        Arrival::Scheduled => Disposition::Scheduled,
         Arrival::Scope { owner_signed } | Arrival::ConversationRequest { owner_signed } => {
             let asks_conversation = matches!(arrival, Arrival::ConversationRequest { .. });
             if !conversation {

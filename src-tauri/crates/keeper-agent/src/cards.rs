@@ -1,4 +1,5 @@
-//! Cards on the board, as an agent's host writes them (story 92.2, AD-386).
+//! Cards on the board, as an agent's host writes and runs them (stories
+//! 92.2 and 92.3, AD-386, AD-387).
 //!
 //! Two writers, both through the journaled executor:
 //!
@@ -19,13 +20,21 @@
 //! host holds (NFR-120): a card in another session or another drive is out of
 //! reach by construction.
 //!
+//! **A card that runs on a schedule** (92.3) lives alone in a
+//! `kind = scheduled` session of its assignee (Q9, R57). The holder of that
+//! session's claim runs it: [`due`] says when, over keeper-sync's
+//! [`TaskSchedule`] — never a `TaskKind` row (AD-387, R9) — and [`begin`]
+//! writes `run: running` and `last_run:` under the claim before the turn.
+//!
 //! [`ToolHost::run_named`]: keeper_core::bots::tools::ToolHost::run_named
 
 use std::path::Path;
 
-use keeper_core::agents::card::{self, Run};
+use keeper_core::agents::card::{self, CardAgent, Field, Run};
+use keeper_core::agents::index::{read_card_files, read_prefix};
 use keeper_core::agents::label::{check_sink, Readers, Sink, SinkVerdict};
-use keeper_core::agents::log::HostSlug;
+use keeper_core::agents::log::{HostSlug, RunBody, RunState};
+use keeper_core::agents::session::{SessionAgent, SessionKind};
 use keeper_core::bots::chat::{ToolCall as WireToolCall, ToolSpec};
 use keeper_core::bots::tools::ToolOutcome;
 use keeper_core::notes::frontmatter::{FieldValue, Frontmatter};
@@ -37,6 +46,7 @@ use keeper_core::sessions::shape::{KindTag, TaskStatus};
 use keeper_core::sessions::tasks::TASK_STATUS_KEY;
 use keeper_sync::browse;
 use keeper_sync::tasks::TaskSchedule;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::delegate::{Delegator, TurnView};
@@ -187,6 +197,467 @@ fn rewrite(
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+/// Whether a scheduled card runs now (AD-387, R58).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Due {
+    /// The card has no `schedule:`.
+    Unscheduled,
+    /// Its `schedule:` or its `last_run:` does not read: it never runs, and
+    /// the board shows the key as unreadable.
+    Unreadable,
+    /// An agent wrote its schedule and no person allowed it (Q16): it never
+    /// runs, and the board shows who scheduled it.
+    Unticked,
+    /// Its next window after `last_run` is still to come.
+    NotDue,
+    /// It runs now, in the window starting at `window_ms` (epoch ms): the
+    /// latest instant the schedule fires at or before now, so the windows a
+    /// host missed while away run once, as this one (DW-376).
+    Due { window_ms: i64 },
+}
+
+/// Whether `card` runs at `now_ms`, its schedule read at the local offset
+/// `utc_offset_minutes` (keeper-sync's dialect: `@daily`, five-field cron,
+/// `every <n><unit>` no oftener than a minute).
+///
+/// Due ⇔ the schedule's first window after `last_run` is at or before now
+/// (R58); a card that never ran is due at once. The window it runs is the
+/// latest one at or before now, written as `last_run` and named in the
+/// claim: `next_due_after` is strictly after, so the card is not due again
+/// until the next window. An `every` card that never ran takes the minute
+/// it is first seen in, the same on every host that sees it then.
+pub fn due(card: &CardAgent, now_ms: i64, utc_offset_minutes: i32) -> Due {
+    let Some(raw) = card.schedule.as_deref() else {
+        return Due::Unscheduled;
+    };
+    if card.marked() {
+        return Due::Unticked;
+    }
+    let Ok(schedule) = TaskSchedule::parse(raw) else {
+        return Due::Unreadable;
+    };
+    let last = match &card.last_run {
+        None => None,
+        Some(Field::Read(at)) => Some(at.timestamp_millis()),
+        Some(Field::Unreadable(_)) => return Due::Unreadable,
+    };
+    let window = match (schedule, last) {
+        (TaskSchedule::Every { interval_ms }, Some(last)) => {
+            let missed = now_ms.saturating_sub(last) / interval_ms;
+            (missed >= 1).then(|| last + missed * interval_ms)
+        }
+        (TaskSchedule::Every { .. }, None) => Some(now_ms - now_ms.rem_euclid(60_000)),
+        (TaskSchedule::Cron(_), last) => {
+            // A card that never ran: the latest window at or before now,
+            // as if it had run just before that one.
+            let since = last.unwrap_or(now_ms.saturating_sub(MAX_LOOKBACK_MS));
+            schedule
+                .next_due_after(since, utc_offset_minutes)
+                .filter(|first| *first <= now_ms)
+                .map(|first| latest_fire(&schedule, first, now_ms, utc_offset_minutes))
+        }
+    };
+    window.map_or(Due::NotDue, |window_ms| Due::Due { window_ms })
+}
+
+/// How far back a cron card that never ran looks for its first window: the
+/// horizon keeper-sync's own search covers, eight years and two days, for
+/// the sparsest schedule its dialect accepts — `0 0 29 2 *`, whose windows
+/// are eight years apart across 2100. A year would leave such a card
+/// `NotDue` until its next window instead of running its latest one.
+const MAX_LOOKBACK_MS: i64 = (366 * 8 + 2) * 24 * 60 * 60_000;
+
+/// The latest instant `schedule` fires at or before `now_ms`, given that it
+/// fires at `first` ≤ `now_ms`. The search is bounded: it looks back over
+/// spans doubling from the dialect's one minute until one holds a fire,
+/// then walks forward only across that span, so a host away for a year
+/// asks the schedule a few dozen times, not once per missed window.
+fn latest_fire(schedule: &TaskSchedule, first: i64, now_ms: i64, offset: i32) -> i64 {
+    let mut span = keeper_sync::tasks::MIN_SCHEDULE_INTERVAL_MS;
+    loop {
+        let from = now_ms.saturating_sub(span).max(first);
+        if let Some(mut fire) = schedule
+            .next_due_after(from, offset)
+            .filter(|at| *at <= now_ms)
+        {
+            while let Some(next) = schedule
+                .next_due_after(fire, offset)
+                .filter(|at| *at <= now_ms)
+            {
+                fire = next;
+            }
+            return fire;
+        }
+        if from == first {
+            return first;
+        }
+        span = span.saturating_mul(2);
+    }
+}
+
+/// A card of a scheduled session, read when the host rescans its zone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledCard {
+    /// Session-relative.
+    pub rel: String,
+    pub card: CardAgent,
+}
+
+/// The cards carrying `schedule:` of one session, as far as a bounded read
+/// established them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScheduledScan {
+    pub cards: Vec<ScheduledCard>,
+    /// Why the read could not establish every such card — a folder or a
+    /// file that did not read, the walk's or the read's budget spent. While
+    /// it could not, none runs: a card it missed may be a second one (R57).
+    pub incomplete: Option<String>,
+}
+
+/// The most bytes the scan reads of one file. A longer one whose
+/// frontmatter reads whole and names no schedule is no scheduled card; any
+/// other leaves the scan incomplete.
+const SCAN_FILE_BYTES: u64 = 64 * 1024;
+/// The most bytes the scan reads of one session.
+const SCAN_SESSION_BYTES: u64 = 1024 * 1024;
+
+/// The cards carrying `schedule:` of the session `session` at `dir`,
+/// wherever the board's pool reads a card, by keeper-core's bounded read
+/// ([`read_card_files`]): at the host's rescan, and again under the claim
+/// before a window begins.
+pub fn scheduled_cards(session: &str, dir: &Path) -> ScheduledScan {
+    let read = read_card_files(session, dir, SCAN_FILE_BYTES, SCAN_SESSION_BYTES);
+    let mut problems = read.problems;
+    let mut cards = Vec::new();
+    for file in read.files {
+        if !file.whole {
+            let (fm, body_at) = Frontmatter::parse(&file.text);
+            let may_name = if body_at > 0 {
+                fm.count(card::SCHEDULE) > 0
+            } else {
+                file.text.starts_with("---")
+            };
+            if may_name {
+                problems.push(format!(
+                    "{session}/{}: more than {SCAN_FILE_BYTES} bytes, past what is read for a schedule.",
+                    file.rel
+                ));
+            }
+            continue;
+        }
+        if let Some(card) = scheduled_of(&file.rel, &file.text) {
+            cards.push(ScheduledCard {
+                rel: file.rel,
+                card,
+            });
+        }
+    }
+    ScheduledScan {
+        cards,
+        incomplete: problems.into_iter().next(),
+    }
+}
+
+/// `text`'s agent keys, when it is a card carrying `schedule:`.
+fn scheduled_of(rel: &str, text: &str) -> Option<CardAgent> {
+    if read_one(PoolFile { rel, text }).kind != Some(KindTag::Task) {
+        return None;
+    }
+    CardAgent::of_text(text).filter(|card| card.schedule.is_some())
+}
+
+/// The card at `rel` of the session folder `dir`, read now by a bounded
+/// read: `None` once it is no card carrying `schedule:`. The holder decides
+/// a window by it, never by its rescan's copy (R163).
+pub fn read_scheduled(dir: &Path, rel: &str) -> Result<Option<CardAgent>, String> {
+    let path = rel
+        .split('/')
+        .fold(dir.to_path_buf(), |path, part| path.join(part));
+    let (text, _, whole) =
+        read_prefix(&path, SCAN_FILE_BYTES).map_err(|error| format!("{rel}: {error}"))?;
+    if !whole {
+        return Err(format!(
+            "{rel}: more than {SCAN_FILE_BYTES} bytes, past what is read for a schedule"
+        ));
+    }
+    Ok(scheduled_of(rel, &text))
+}
+
+/// The scheduled card `session` runs, from its folder's scan (Q9, R57): a
+/// scheduled card runs only in a session of its assignee, which holds it
+/// alone — its `host:` is that session's pin. `Ok(None)`: the session has
+/// none. `Err`: the sentence saying why the one it holds does not run
+/// there, or why the scan cannot tell it is alone. `session` is `None` for
+/// a person's session, which has no `agent.toml`.
+pub fn session_schedule<'c>(
+    session: Option<&SessionAgent>,
+    scan: &'c ScheduledScan,
+) -> Result<Option<&'c ScheduledCard>, String> {
+    if let Some(problem) = &scan.incomplete {
+        return Err(format!(
+            "the session's cards do not all read, so none runs on a schedule: {problem}"
+        ));
+    }
+    let cards = &scan.cards;
+    let Some(first) = cards.first() else {
+        return Ok(None);
+    };
+    let assignee = match &first.card.assignee {
+        Some(Field::Read(id)) => id.as_str(),
+        Some(Field::Unreadable(raw)) => raw.as_str(),
+        None => "its assignee",
+    };
+    let belongs = matches!(
+        (&first.card.assignee, session),
+        (Some(Field::Read(id)), Some(session)) if *id == session.agent
+    );
+    if !belongs {
+        return Err(format!("runs only in {assignee}'s session"));
+    }
+    if session.is_some_and(|session| session.kind != SessionKind::Scheduled) || cards.len() > 1 {
+        return Err(format!(
+            "runs only alone in a scheduled session of {assignee}"
+        ));
+    }
+    if let Some(Field::Unreadable(raw)) = &first.card.host {
+        return Err(format!("its host: {raw} is not a host's name"));
+    }
+    Ok(Some(first))
+}
+
+/// What a scheduled session's host asks its worker to do about the card,
+/// under the session's claim (R56–R58, R163, R164). It travels to the
+/// worker as the content of a scheduled arrival.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "do", rename_all = "snake_case")]
+pub enum Scheduled {
+    /// Run the card's window `window` (RFC 3339), which the claim names, as
+    /// the host's clock found it due at `now_ms` read at the offset
+    /// `utc_offset_minutes`: the worker judges the card it reads under the
+    /// claim by the same instant.
+    Run {
+        card: String,
+        window: String,
+        now_ms: i64,
+        utc_offset_minutes: i32,
+    },
+    /// No host can run it now: the card says `run: waiting`, the `run`
+    /// line what it waits for (Q8).
+    Wait { card: String, waiting: String },
+    /// This host holds the session after `host`, whose claim named `window`:
+    /// whether that window ran, or how a run the card still says is running
+    /// ended, is not known here (Q18, S-25, R163, R164).
+    TakenOver {
+        card: String,
+        window: Option<String>,
+        host: String,
+    },
+}
+
+impl Scheduled {
+    /// The card it is about, session-relative.
+    pub fn card(&self) -> &str {
+        match self {
+            Scheduled::Run { card, .. }
+            | Scheduled::Wait { card, .. }
+            | Scheduled::TakenOver { card, .. } => card,
+        }
+    }
+}
+
+/// Who begins a window: the session's agent, on this host.
+#[derive(Debug, Clone, Copy)]
+pub struct Holder<'h> {
+    pub agent: &'h SessionAgent,
+    pub host: &'h str,
+}
+
+/// What [`begin`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Begun {
+    /// Nothing: the sentence says why.
+    Nothing(&'static str),
+    /// The card says what this `run` line says; no turn runs.
+    Said(RunBody),
+    /// `run: running` and `last_run:` are written: a turn runs with the
+    /// card's body as its brief, read at the card's integrity.
+    Run { brief: String, untrusted: bool },
+}
+
+/// A window the card's `last_run` has reached already.
+pub const WINDOW_RAN: &str = "the card's last_run has reached this window already";
+/// A card whose schedule no person allowed yet.
+pub const SCHEDULE_UNTICKED: &str = "an agent's schedule runs only once a person allows it";
+/// A card that waits already.
+pub const WAITS_ALREADY: &str = "the card says it waits already";
+/// A card that is no longer this session's one scheduled card.
+pub const NOT_ITS_SCHEDULE: &str =
+    "the card no longer runs alone on a schedule in this session of its assignee";
+/// A card pinned to another host since the window was found.
+pub const PINNED_ELSEWHERE: &str = "the card is pinned to another host";
+/// A card whose schedule or `last_run` no longer makes this window due.
+pub const NOT_DUE: &str = "the card as it reads now is not due in this window";
+
+/// The `run` line of a window another host may have run.
+pub fn effect_unknown(host: &str) -> String {
+    format!("ran on {host}, effect unknown")
+}
+
+/// Whether a claim's window `window` is unsettled on `card` (R163, R164):
+/// its `last_run` is before the window, absent or unreadable — the window
+/// may have run with nothing written here — or the card still says
+/// `run: running`, a run nobody finishes now.
+pub fn unsettled(card: &CardAgent, window: Option<&str>) -> bool {
+    matches!(card.run, Some(Field::Read(Run::Running)))
+        || window.is_some_and(|window| behind(card, window))
+}
+
+/// Whether `card`'s `last_run` is before `window`, absent or unreadable. A
+/// window that is no instant is none.
+fn behind(card: &CardAgent, window: &str) -> bool {
+    let Ok(window) = chrono::DateTime::parse_from_rfc3339(window) else {
+        return false;
+    };
+    !matches!(&card.last_run, Some(Field::Read(at)) if *at >= window)
+}
+
+/// Why the card's `text`, read under the claim, does not run `window` as
+/// judged at `now_ms` and `offset`: what the host's clock found at its read
+/// is found again on these bytes — still a task, still a person's or an
+/// allowed schedule, still its agent's and pinned nowhere else, and still
+/// due in exactly this window.
+fn not_runnable(
+    rel: &str,
+    text: &str,
+    holder: &Holder<'_>,
+    window: &str,
+    now_ms: i64,
+    offset: i32,
+) -> Option<&'static str> {
+    let Some(card) = scheduled_of(rel, text) else {
+        return Some(NOT_ITS_SCHEDULE);
+    };
+    if card.marked() {
+        return Some(SCHEDULE_UNTICKED);
+    }
+    if !matches!(&card.assignee, Some(Field::Read(id)) if *id == holder.agent.agent) {
+        return Some(NOT_ITS_SCHEDULE);
+    }
+    match &card.host {
+        Some(Field::Read(pin)) if pin.as_str() == holder.host => {}
+        None => {}
+        Some(_) => return Some(PINNED_ELSEWHERE),
+    }
+    let Ok(at) = chrono::DateTime::parse_from_rfc3339(window) else {
+        return Some(NOT_DUE);
+    };
+    if !behind(&card, window) {
+        return Some(WINDOW_RAN);
+    }
+    match due(&card, now_ms, offset) {
+        Due::Due { window_ms } if window_ms == at.timestamp_millis() => None,
+        _ => Some(NOT_DUE),
+    }
+}
+
+/// Act on `scheduled` for the card of the session at `session` (zone
+/// relative), as `holder`, reading the card again under the claim
+/// (`may_write`, asked right before the write): the bytes it writes on
+/// decide, never what the host read before.
+///
+/// - `Run`: a card that is still the session's one scheduled card, its
+///   agent's, pinned nowhere else, a person's or an allowed schedule, and
+///   due in exactly this window gets `run: running` and `last_run` = the
+///   window, and its turn runs.
+/// - `Wait`: `run: waiting`, when the card does not say so already.
+/// - `TakenOver`: a card on which the previous claim's window is unsettled
+///   ([`unsettled`]) gets `run: review`, and `last_run` = that window when
+///   it was before it, its line saying the effect is unknown; no turn runs.
+pub fn begin(
+    zone: &Path,
+    session: &str,
+    holder: &Holder<'_>,
+    scheduled: &Scheduled,
+    may_write: &dyn Fn() -> bool,
+) -> Result<Begun, VerbError> {
+    let skipped = std::cell::Cell::new(None);
+    let body = std::cell::RefCell::new(None);
+    let held = exec::hold(zone)?;
+    if let Scheduled::Run { card, .. } = scheduled {
+        let dir = browse::lexical_join(zone, session)
+            .map_err(|refusal| VerbError::Refused(refusal.to_string()))?;
+        let scan = scheduled_cards(session, &dir);
+        if !session_schedule(Some(holder.agent), &scan)
+            .is_ok_and(|found| found.is_some_and(|found| found.rel == *card))
+        {
+            return Ok(Begun::Nothing(NOT_ITS_SCHEDULE));
+        }
+    }
+    let wrote = rewrite(
+        &held,
+        session,
+        scheduled.card(),
+        "card-run",
+        |text| {
+            let (run, last_run) = match scheduled {
+                Scheduled::Run {
+                    card,
+                    window,
+                    now_ms,
+                    utc_offset_minutes,
+                } => {
+                    if let Some(why) =
+                        not_runnable(card, text, holder, window, *now_ms, *utc_offset_minutes)
+                    {
+                        skipped.set(Some(why));
+                        return Ok(None);
+                    }
+                    let (_, body_at) = Frontmatter::parse(text);
+                    *body.borrow_mut() = Some((
+                        text.get(body_at..).unwrap_or_default().trim().to_owned(),
+                        card::marked_untrusted(text),
+                    ));
+                    (Run::Running, Some(window.as_str()))
+                }
+                Scheduled::Wait { .. } => (Run::Waiting, None),
+                Scheduled::TakenOver { window, .. } => {
+                    let window = window.as_deref();
+                    let Some(keys) =
+                        CardAgent::of_text(text).filter(|keys| unsettled(keys, window))
+                    else {
+                        skipped.set(Some(WINDOW_RAN));
+                        return Ok(None);
+                    };
+                    (Run::Review, window.filter(|window| behind(&keys, window)))
+                }
+            };
+            Ok(card::set_host_keys(text, run, last_run))
+        },
+        may_write,
+        &mut |_| {},
+    )?;
+    if !wrote {
+        return Ok(Begun::Nothing(skipped.get().unwrap_or(match scheduled {
+            Scheduled::Wait { .. } => WAITS_ALREADY,
+            _ => WINDOW_RAN,
+        })));
+    }
+    Ok(match scheduled {
+        Scheduled::Run { .. } => {
+            let (brief, untrusted) = body.into_inner().unwrap_or_default();
+            Begun::Run { brief, untrusted }
+        }
+        Scheduled::Wait { waiting, .. } => Begun::Said(RunBody {
+            state: RunState::Waiting,
+            detail: Some(waiting.clone()),
+        }),
+        Scheduled::TakenOver { host, .. } => Begun::Said(RunBody {
+            state: RunState::Review,
+            detail: Some(effect_unknown(host)),
+        }),
+    })
 }
 
 /// Whether a session file is markdown, which the stamp keeps: a card is
@@ -1002,5 +1473,499 @@ mod tests {
             assert_eq!(fm.as_string(card::RUN), Some("running"), "{text}");
             assert!(fm.as_string(card::LAST_RUN).is_some(), "{text}");
         }
+    }
+
+    /// `text`'s instant, epoch ms.
+    fn at(text: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .expect("an instant")
+            .timestamp_millis()
+    }
+
+    /// A card for Nixi with `keys` among its frontmatter.
+    fn scheduled(keys: &str) -> CardAgent {
+        CardAgent::of_text(&format!(
+            "---\ntags: [task]\ntitle: Sort\nstatus: todo\nassignee: nixi\n{keys}---\n\nSort.\n"
+        ))
+        .expect("agent keys")
+    }
+
+    /// `due` of a card with `keys` at `now`, at UTC.
+    fn due_at(keys: &str, now: &str) -> Due {
+        due(&scheduled(keys), at(now), 0)
+    }
+
+    fn window(text: &str) -> Due {
+        Due::Due {
+            window_ms: at(text),
+        }
+    }
+
+    /// 92.3 AC1: keeper-sync's dialect decides, after `last_run`; a card that
+    /// never ran is due at once in its latest window; an unreadable schedule
+    /// (the 60 s floor included) or `last_run` never runs; an agent's
+    /// schedule waits for a person's tick.
+    #[test]
+    fn a_card_is_due_by_keepers_own_dialect() {
+        let daily = "schedule: \"@daily\"\nlast_run: \"2026-10-04T00:00:00Z\"\n";
+        assert_eq!(due_at(daily, "2026-10-04T23:59:59Z"), Due::NotDue);
+        assert_eq!(
+            due_at(daily, "2026-10-05T00:00:00Z"),
+            window("2026-10-05T00:00:00Z")
+        );
+        // Friday's run; nothing at the weekend; Monday at nine.
+        let weekdays = "schedule: \"0 9 * * 1-5\"\nlast_run: \"2026-10-02T09:00:00Z\"\n";
+        assert_eq!(due_at(weekdays, "2026-10-03T12:00:00Z"), Due::NotDue);
+        assert_eq!(due_at(weekdays, "2026-10-05T08:59:00Z"), Due::NotDue);
+        assert_eq!(
+            due_at(weekdays, "2026-10-05T09:00:00Z"),
+            window("2026-10-05T09:00:00Z")
+        );
+        let every = "schedule: every 2h\nlast_run: \"2026-10-05T09:00:00Z\"\n";
+        assert_eq!(due_at(every, "2026-10-05T10:59:59Z"), Due::NotDue);
+        assert_eq!(
+            due_at(every, "2026-10-05T11:00:00Z"),
+            window("2026-10-05T11:00:00Z")
+        );
+        // The offset is the machine's: nine o'clock at +02:00 is seven UTC.
+        assert_eq!(
+            due(
+                &scheduled("schedule: \"0 9 * * *\"\nlast_run: \"2026-10-04T07:00:00Z\"\n"),
+                at("2026-10-05T07:00:00Z"),
+                120
+            ),
+            window("2026-10-05T07:00:00Z")
+        );
+
+        // Never ran: its latest window, or the minute an `every` is seen in.
+        assert_eq!(
+            due_at("schedule: \"@daily\"\n", "2026-10-05T09:30:00Z"),
+            window("2026-10-05T00:00:00Z")
+        );
+        assert_eq!(
+            due_at("schedule: every 2h\n", "2026-10-05T09:30:42Z"),
+            window("2026-10-05T09:30:00Z")
+        );
+
+        assert_eq!(
+            due_at("schedule: every 30s\n", "2026-10-05T09:30:00Z"),
+            Due::Unreadable,
+            "under the 60 s floor"
+        );
+        assert_eq!(
+            due_at("schedule: every 1m\n", "2026-10-05T09:30:00Z"),
+            window("2026-10-05T09:30:00Z")
+        );
+        assert_eq!(
+            due_at("schedule: \"0 0 30 2 *\"\n", "2026-10-05T09:30:00Z"),
+            Due::Unreadable
+        );
+        assert_eq!(
+            due_at(
+                "schedule: \"@daily\"\nlast_run: yesterday\n",
+                "2026-10-05T09:30:00Z"
+            ),
+            Due::Unreadable
+        );
+        assert_eq!(
+            due_at(
+                "schedule: \"@daily\"\nscheduled_by: \"@tola:h\"\n",
+                "2026-10-05T09:30:00Z"
+            ),
+            Due::Unticked
+        );
+        assert_eq!(
+            due_at("run: queued\n", "2026-10-05T09:30:00Z"),
+            Due::Unscheduled
+        );
+    }
+
+    /// 92.3 AC4 (DW-376): an `@hourly` card whose host was away five hours
+    /// runs once on return, in the latest window; its `last_run` then makes
+    /// it due only at the next one. A year away is one window too.
+    #[test]
+    fn missed_windows_run_once_on_return() {
+        let away = "schedule: \"@hourly\"\nlast_run: \"2026-10-05T04:00:00Z\"\n";
+        assert_eq!(
+            due_at(away, "2026-10-05T09:30:00Z"),
+            window("2026-10-05T09:00:00Z")
+        );
+        let ran = "schedule: \"@hourly\"\nlast_run: \"2026-10-05T09:00:00Z\"\n";
+        assert_eq!(due_at(ran, "2026-10-05T09:59:59Z"), Due::NotDue);
+        assert_eq!(
+            due_at(ran, "2026-10-05T10:00:00Z"),
+            window("2026-10-05T10:00:00Z")
+        );
+        let every = "schedule: every 1h\nlast_run: \"2026-10-05T04:00:00Z\"\n";
+        assert_eq!(
+            due_at(every, "2026-10-05T09:30:00Z"),
+            window("2026-10-05T09:00:00Z")
+        );
+        let year = "schedule: \"*/5 * * * *\"\nlast_run: \"2025-10-05T09:00:00Z\"\n";
+        assert_eq!(
+            due_at(year, "2026-10-05T09:32:10Z"),
+            window("2026-10-05T09:30:00Z")
+        );
+        // Three windows inside the span the look-back finds: the latest.
+        let thrice = "schedule: \"0,1,2 9 * * *\"\nlast_run: \"2026-10-04T09:02:00Z\"\n";
+        assert_eq!(
+            due_at(thrice, "2026-10-05T09:30:00Z"),
+            window("2026-10-05T09:02:00Z")
+        );
+    }
+
+    fn session_of(agent: &str, kind: SessionKind) -> SessionAgent {
+        let decl = keeper_core::agents::drive::parse(
+            "version = 1\nid = \"tgdrive\"\ntitle = \"tgdrive\"\nprincipal = \"tgorka\"\nowner = \"@tgorka:h\"\nreaders = [\"@tgorka:h\"]\n",
+        )
+        .expect("decl");
+        SessionAgent {
+            id: ulid::Ulid::new(),
+            agent: agent.to_owned(),
+            drive: "tgdrive".to_owned(),
+            kind,
+            title: "schedule".to_owned(),
+            requested_by: tgorka(),
+            parent: None,
+            room: OwnedRoomId::try_from("!r:h").expect("room"),
+            drives: vec!["tgdrive".to_owned()],
+            label: Label::opening(&decl, Integrity::Owner),
+            needs: None,
+            pin: None,
+            hop: 0,
+            dispatch_chain: Vec::new(),
+            limits: None,
+            workflow: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// 92.3 AC5 (Q9, R57): a scheduled card runs only alone in a scheduled
+    /// session of its assignee, and says why anywhere else; a scan that
+    /// could not read every card says so, and runs none.
+    #[test]
+    fn a_scheduled_card_runs_only_in_its_assignees_session() {
+        let card = |keys: &str| ScheduledCard {
+            rel: "card.md".to_owned(),
+            card: scheduled(&format!("schedule: \"@daily\"\n{keys}")),
+        };
+        let scan = |cards: Vec<ScheduledCard>| ScheduledScan {
+            cards,
+            incomplete: None,
+        };
+        let mine = session_of("nixi", SessionKind::Scheduled);
+        let one = scan(vec![card("")]);
+        assert_eq!(session_schedule(Some(&mine), &one), Ok(Some(&one.cards[0])));
+        assert_eq!(session_schedule(Some(&mine), &scan(Vec::new())), Ok(None));
+        let elsewhere = "runs only in nixi's session".to_owned();
+        assert_eq!(
+            session_schedule(Some(&session_of("tola", SessionKind::Scheduled)), &one),
+            Err(elsewhere.clone())
+        );
+        assert_eq!(session_schedule(None, &one), Err(elsewhere));
+        assert_eq!(
+            session_schedule(Some(&mine), &scan(vec![card(""), card("")])),
+            Err("runs only alone in a scheduled session of nixi".to_owned())
+        );
+        let pinned = scan(vec![card("host: Hesperia!\n")]);
+        assert!(session_schedule(Some(&mine), &pinned)
+            .expect_err("an unreadable pin")
+            .contains("Hesperia!"));
+        let partial = ScheduledScan {
+            incomplete: Some("a/b.md: unreadable.".to_owned()),
+            ..one.clone()
+        };
+        assert!(session_schedule(Some(&mine), &partial)
+            .expect_err("a partial scan")
+            .contains("a/b.md: unreadable."));
+    }
+
+    /// R57: the scan reads a bounded prefix of each file — a
+    /// large note whose frontmatter names no schedule costs that prefix and
+    /// hides nothing — and a set it could not read whole is never taken for
+    /// the whole: a scheduled card too long to read, a file that does not
+    /// read, or a second card past the walk's budget leaves it incomplete.
+    #[test]
+    fn a_scan_that_misses_a_card_is_never_taken_for_the_whole() {
+        let dir = tempfile::tempdir().expect("session");
+        let card =
+            "---\ntags: [task]\ntitle: Sort\nassignee: nixi\nschedule: \"@daily\"\n---\n\nSort.\n";
+        std::fs::write(dir.path().join("card.md"), card).expect("card");
+        let mut note = "---\ntags: [note]\ntitle: Archive\n---\n\n".to_owned();
+        note.push_str(&"x".repeat(5 * 1024 * 1024));
+        std::fs::write(dir.path().join("archive.md"), &note).expect("note");
+        let found = scheduled_cards("s", dir.path());
+        assert_eq!(found.incomplete, None, "{found:?}");
+        assert_eq!(found.cards.len(), 1);
+        assert_eq!(found.cards[0].rel, "card.md");
+
+        let long = format!("{}{}", card, "y".repeat(SCAN_FILE_BYTES as usize));
+        std::fs::write(dir.path().join("long.md"), long).expect("long");
+        let found = scheduled_cards("s", dir.path());
+        assert!(
+            found
+                .incomplete
+                .as_deref()
+                .is_some_and(|why| why.contains("s/long.md")),
+            "{found:?}"
+        );
+        std::fs::remove_file(dir.path().join("long.md")).expect("gone");
+
+        std::fs::write(dir.path().join("bytes.md"), [0xff, 0xfe, 0x00]).expect("bytes");
+        let found = scheduled_cards("s", dir.path());
+        assert!(
+            found
+                .incomplete
+                .as_deref()
+                .is_some_and(|why| why.contains("s/bytes.md")),
+            "{found:?}"
+        );
+        std::fs::remove_file(dir.path().join("bytes.md")).expect("gone");
+
+        for n in 0..2_000 {
+            std::fs::write(dir.path().join(format!("n{n:04}.md")), "").expect("note");
+        }
+        std::fs::write(dir.path().join("z-second.md"), card).expect("second");
+        let found = scheduled_cards("s", dir.path());
+        assert!(found.incomplete.is_some(), "{found:?}");
+        assert!(
+            session_schedule(Some(&session_of("nixi", SessionKind::Scheduled)), &found).is_err()
+        );
+    }
+
+    /// R58: a leap-day card that never ran takes its latest window, by
+    /// the horizon keeper-sync's dialect allows — four years back, or eight
+    /// across 2100, which is no leap year.
+    #[test]
+    fn a_leap_day_card_that_never_ran_takes_its_latest_window() {
+        let leap = "schedule: \"0 0 29 2 *\"\n";
+        assert_eq!(
+            due_at(leap, "2026-10-05T09:30:00Z"),
+            window("2024-02-29T00:00:00Z")
+        );
+        assert_eq!(
+            due_at(leap, "2103-06-01T00:00:00Z"),
+            window("2096-02-29T00:00:00Z")
+        );
+        assert_eq!(
+            due_at(
+                "schedule: \"0 0 29 2 *\"\nlast_run: \"2096-02-29T00:00:00Z\"\n",
+                "2103-06-01T00:00:00Z"
+            ),
+            Due::NotDue
+        );
+    }
+
+    /// The session at [`SESSION`] with its card [`CARD_FILE`] as `text`.
+    fn session_with(text: &str) -> tempfile::TempDir {
+        let zone = tempfile::tempdir().expect("zone");
+        let session = zone.path().join(SESSION);
+        std::fs::create_dir_all(&session).expect("session");
+        std::fs::write(session.join(CARD_FILE), text).expect("card");
+        zone
+    }
+
+    const HOURLY: &str = "---\ntags: [task]\ntitle: Sort\nstatus: todo\nassignee: tola\nschedule: \"@hourly\"\nlast_run: \"2026-10-05T08:00:00Z\"\n---\n\nSort what came in.\n";
+
+    /// Tola's run of `window` as the host's clock found it due at `now`.
+    fn run_at(window: &str, now: &str) -> Scheduled {
+        Scheduled::Run {
+            card: CARD_FILE.to_owned(),
+            window: window.to_owned(),
+            now_ms: at(now),
+            utc_offset_minutes: 0,
+        }
+    }
+
+    /// `begin` as tola's session on hesperia, the claim held.
+    fn begin_in(zone: &Path, scheduled: &Scheduled) -> Result<Begun, VerbError> {
+        let agent = session_of("tola", SessionKind::Scheduled);
+        let holder = Holder {
+            agent: &agent,
+            host: "hesperia",
+        };
+        begin(zone, SESSION, &holder, scheduled, &|| true)
+    }
+
+    fn card_of(zone: &Path) -> String {
+        std::fs::read_to_string(zone.join(SESSION).join(CARD_FILE)).expect("card")
+    }
+
+    /// R56–R58, R163, R164 under the claim: a window runs once whatever the
+    /// host's scan said, an agent's schedule never, a wait is said once, a
+    /// taken-over window is settled when `last_run` is before it, a run the
+    /// card still says is running is settled too, and nothing is written
+    /// without the claim.
+    #[test]
+    fn a_window_is_begun_once_under_the_claim() {
+        let zone = session_with(HOURLY);
+        let run = || run_at("2026-10-05T09:00:00Z", "2026-10-05T09:30:00Z");
+        let agent = session_of("tola", SessionKind::Scheduled);
+        let holder = Holder {
+            agent: &agent,
+            host: "hesperia",
+        };
+        assert!(matches!(
+            begin(zone.path(), SESSION, &holder, &run(), &|| false),
+            Err(VerbError::Refused(sentence)) if sentence == NO_CLAIM
+        ));
+        assert_eq!(card_of(zone.path()), HOURLY);
+        assert_eq!(
+            begin_in(zone.path(), &run()).expect("run"),
+            Begun::Run {
+                brief: "Sort what came in.".to_owned(),
+                untrusted: false
+            }
+        );
+        let ran = CardAgent::of_text(&card_of(zone.path())).expect("keys");
+        assert_eq!(ran.run, Some(Field::Read(Run::Running)));
+        assert_eq!(due(&ran, at("2026-10-05T09:30:00Z"), 0), Due::NotDue);
+        assert_eq!(
+            begin_in(zone.path(), &run()).expect("again"),
+            Begun::Nothing(WINDOW_RAN)
+        );
+
+        let taken = |window: &str| Scheduled::TakenOver {
+            card: CARD_FILE.to_owned(),
+            window: Some(window.to_owned()),
+            host: "electra".to_owned(),
+        };
+        let unknown = Begun::Said(RunBody {
+            state: RunState::Review,
+            detail: Some("ran on electra, effect unknown".to_owned()),
+        });
+        // The window was written, its run never finished: it is settled,
+        // `last_run` left as it is (R164).
+        assert_eq!(
+            begin_in(zone.path(), &taken("2026-10-05T09:00:00Z")).expect("crashed"),
+            unknown
+        );
+        let settled = CardAgent::of_text(&card_of(zone.path())).expect("keys");
+        assert_eq!(settled.run, Some(Field::Read(Run::Review)));
+        assert!(!unsettled(&settled, Some("2026-10-05T09:00:00Z")));
+        assert_eq!(
+            begin_in(zone.path(), &taken("2026-10-05T09:00:00Z")).expect("settled"),
+            Begun::Nothing(WINDOW_RAN)
+        );
+        std::fs::write(zone.path().join(SESSION).join(CARD_FILE), HOURLY).expect("card");
+        assert_eq!(
+            begin_in(zone.path(), &taken("2026-10-05T09:00:00Z")).expect("unknown"),
+            unknown
+        );
+        let settled = CardAgent::of_text(&card_of(zone.path())).expect("keys");
+        assert_eq!(settled.run, Some(Field::Read(Run::Review)));
+        assert_eq!(due(&settled, at("2026-10-05T09:59:00Z"), 0), Due::NotDue);
+
+        let wait = Scheduled::Wait {
+            card: CARD_FILE.to_owned(),
+            waiting: "hesperia — a live host".to_owned(),
+        };
+        assert!(
+            matches!(begin_in(zone.path(), &wait), Ok(Begun::Said(body)) if body.state == RunState::Waiting)
+        );
+        assert_eq!(
+            begin_in(zone.path(), &wait).expect("again"),
+            Begun::Nothing(WAITS_ALREADY)
+        );
+
+        let marked = HOURLY.replace(
+            "assignee: tola\n",
+            "assignee: tola\nscheduled_by: \"@tola:h\"\n",
+        );
+        std::fs::write(zone.path().join(SESSION).join(CARD_FILE), &marked).expect("card");
+        assert_eq!(
+            begin_in(zone.path(), &run()).expect("unticked"),
+            Begun::Nothing(SCHEDULE_UNTICKED)
+        );
+        assert_eq!(card_of(zone.path()), marked);
+    }
+
+    /// R163: what the host's clock found is found again on the
+    /// bytes under the claim. An edit made while the run waited for the
+    /// zone — the schedule gone, later or unreadable, `last_run` unreadable
+    /// or reached by a run a minute before, the assignee changed, the card
+    /// pinned elsewhere or untagged, a second scheduled card — runs nothing
+    /// and writes nothing; an edit of the body alone runs the new body.
+    #[test]
+    fn a_run_is_judged_again_on_the_card_under_the_claim() {
+        let run = || run_at("2026-10-05T09:00:00Z", "2026-10-05T09:30:00Z");
+        for (edited, why) in [
+            (
+                HOURLY.replace("schedule: \"@hourly\"\n", ""),
+                NOT_ITS_SCHEDULE,
+            ),
+            (HOURLY.replace("@hourly", "0 23 * * *"), NOT_DUE),
+            (HOURLY.replace("@hourly", "every 10s"), NOT_DUE),
+            (
+                HOURLY.replace("\"2026-10-05T08:00:00Z\"", "yesterday"),
+                NOT_DUE,
+            ),
+            (
+                HOURLY.replace("assignee: tola", "assignee: nixi"),
+                NOT_ITS_SCHEDULE,
+            ),
+            (
+                HOURLY.replace("assignee: tola\n", "assignee: tola\nhost: electra\n"),
+                PINNED_ELSEWHERE,
+            ),
+            (
+                HOURLY.replace("tags: [task]", "tags: [note]"),
+                NOT_ITS_SCHEDULE,
+            ),
+        ] {
+            let zone = session_with(&edited);
+            assert_eq!(
+                begin_in(zone.path(), &run()).expect("judged"),
+                Begun::Nothing(why),
+                "{edited}"
+            );
+            assert_eq!(card_of(zone.path()), edited);
+        }
+
+        let zone = session_with(HOURLY);
+        std::fs::write(zone.path().join(SESSION).join("second.md"), HOURLY).expect("second");
+        assert_eq!(
+            begin_in(zone.path(), &run()).expect("judged"),
+            Begun::Nothing(NOT_ITS_SCHEDULE)
+        );
+        assert_eq!(card_of(zone.path()), HOURLY);
+
+        // A run of 09:00 reaching the card at 10:30, when 10:00 is the
+        // latest window, is no run of the window the card is due in.
+        let zone = session_with(HOURLY);
+        assert_eq!(
+            begin_in(
+                zone.path(),
+                &run_at("2026-10-05T09:00:00Z", "2026-10-05T10:30:00Z")
+            )
+            .expect("judged"),
+            Begun::Nothing(NOT_DUE)
+        );
+        assert_eq!(card_of(zone.path()), HOURLY);
+
+        // An `every 2h` card first seen at 09:30:58 ran 09:30; at 09:31:00
+        // a host whose scan still says it never ran finds 09:31 due.
+        let every = HOURLY
+            .replace("@hourly", "every 2h")
+            .replace("2026-10-05T08:00:00Z", "2026-10-05T09:30:00Z");
+        let zone = session_with(&every);
+        assert_eq!(
+            begin_in(
+                zone.path(),
+                &run_at("2026-10-05T09:31:00Z", "2026-10-05T09:31:00Z")
+            )
+            .expect("judged"),
+            Begun::Nothing(NOT_DUE)
+        );
+        assert_eq!(card_of(zone.path()), every);
+
+        let zone = session_with(&HOURLY.replace("Sort what came in.", "Sort it twice."));
+        assert_eq!(
+            begin_in(zone.path(), &run()).expect("run"),
+            Begun::Run {
+                brief: "Sort it twice.".to_owned(),
+                untrusted: false
+            }
+        );
     }
 }

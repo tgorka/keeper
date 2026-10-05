@@ -13,6 +13,13 @@
 //! both copies receive is answered once. The tick never waits for a worker:
 //! a claim handed back is released once its worker has finished, at a later
 //! tick, so every other claim is renewed on time meanwhile.
+//!
+//! A `kind = scheduled` session's card (92.3) is placed by its `host:` pin
+//! and run by the session's holder on the same tick, never a second clock:
+//! a due window is named in the claim before the worker writes
+//! `run: running` (R56); a window the previous holder named is settled, not
+//! run again (R58); and when no host can run it, the announcing host takes
+//! the claim, says so on the card and hands it back (Q8).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
@@ -42,6 +49,7 @@ use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::cards::{self, Due, Scheduled};
 use crate::claims::{
     self, acquire, blocked_status, bounded, conflict_of, release, renew, wall_ms, Acquired,
     ClaimFuture, ClaimPort, Lease, Moment, RoomClaims, Rtt, ServerClock, Step, REQUEST_TIMEOUT,
@@ -51,6 +59,21 @@ use crate::matrix_sink::{EditPort, RoomPort};
 use crate::runtime::{self, spawn_worker, Claimed, Copy, DriveView, PENDING_ROOMS};
 
 use crate::zone::FoundSession;
+
+/// The time a card's schedule is read at, epoch ms, and the machine's UTC
+/// offset then in minutes, given the server's time now.
+pub(crate) type Calendar = Arc<dyn Fn(u64) -> (i64, i32) + Send + Sync>;
+
+/// The server's time — the one every host's claims agree on — at this
+/// machine's offset, which keeper-sync's dialect reads a wall clock by.
+fn server_calendar() -> Calendar {
+    Arc::new(|server_now| {
+        (
+            i64::try_from(server_now).unwrap_or(i64::MAX),
+            chrono::Local::now().offset().local_minus_utc() / 60,
+        )
+    })
+}
 
 /// What a holder that lost its claim parks the session's status with.
 const LOST_DETAIL: &str = "This host lost its claim on the session; another host may continue it.";
@@ -257,6 +280,8 @@ pub(crate) trait CopyPort: Send + Sync {
     /// Every doorbell in the state of the rooms this copy is in, as the
     /// last sync left it: `(sender, state key, content)`.
     fn doorbells(&self) -> ClaimFuture<'_, Vec<(OwnedUserId, String, Value)>>;
+    /// Hand `scheduled` to `room`'s worker as a scheduled arrival.
+    fn route_scheduled(&self, room: &RoomId, scheduled: Scheduled);
 }
 
 impl CopyPort for Copy {
@@ -452,6 +477,15 @@ impl CopyPort for Copy {
             bells
         })
     }
+
+    fn route_scheduled(&self, room: &RoomId, scheduled: Scheduled) {
+        match crate::agent::scheduled_arrival(&self.deps.home.config.matrix_user, &scheduled) {
+            Some(arrived) => self.router.route(room, arrived),
+            None => {
+                tracing::warn!(%room, ?scheduled, "agents: a scheduled card's arrival could not be made")
+            }
+        }
+    }
 }
 
 /// When a delegated session was made: its opening brief's server time, the
@@ -513,6 +547,15 @@ struct Slot {
     offered: bool,
     /// The last rescan did not find it: its claim goes back, then the slot.
     gone: bool,
+    /// The host and window of the claim this host took a scheduled session
+    /// from, until the card reads settled against them (Q18, R163, R164).
+    taken: Option<(String, Option<String>)>,
+    /// The window of the scheduled card last handed to the worker.
+    sent: Option<String>,
+    /// The window the scheduled card was last said to wait in.
+    waited: Option<String>,
+    /// Why the session's scheduled card does not run here, as last said.
+    refused: Option<String>,
 }
 
 /// A claim this host holds and the worker writing under it.
@@ -543,6 +586,7 @@ pub struct HostRuntime {
     first_published: Option<Instant>,
     /// What each pending delegation's room was last told it waits for.
     pending_shown: HashMap<OwnedRoomId, String>,
+    calendar: Calendar,
 }
 
 impl HostRuntime {
@@ -588,6 +632,7 @@ impl HostRuntime {
             manifest_sent: None,
             first_published: None,
             pending_shown: HashMap::new(),
+            calendar: server_calendar(),
         }
     }
 
@@ -627,6 +672,7 @@ impl HostRuntime {
             manifest_sent: None,
             first_published: None,
             pending_shown: HashMap::new(),
+            calendar: server_calendar(),
         }
     }
 
@@ -977,6 +1023,10 @@ impl HostRuntime {
                 retry_at: None,
                 offered: true,
                 gone: false,
+                taken: None,
+                sent: None,
+                waited: None,
+                refused: None,
             },
         );
     }
@@ -1069,10 +1119,18 @@ impl HostRuntime {
             .needs
             .clone()
             .unwrap_or_else(|| config.host.needs.clone());
-        let pin = slot
-            .agent
-            .pin
-            .clone()
+        // A scheduled card's `host:` is its session's pin (R57).
+        let card_pin = cards::session_schedule(Some(&slot.agent), &slot.session.scheduled)
+            .ok()
+            .flatten()
+            .and_then(|card| match &card.card.host {
+                Some(keeper_core::agents::card::Field::Read(slug)) => {
+                    Some(slug.as_str().to_owned())
+                }
+                _ => None,
+            });
+        let pin = card_pin
+            .or_else(|| slot.agent.pin.clone())
             .unwrap_or_else(|| config.host.pin.clone());
         let (bot, agent) = (bot_id(&config.bot), agent_name(config));
         let placement = place(
@@ -1134,7 +1192,9 @@ impl HostRuntime {
 
         match action {
             Step::Acquire => self.acquire(room, stop).await,
-            Step::Renew => self.renew(room).await,
+            Step::Renew => {
+                self.renew(room).await;
+            }
             Step::Stop => {
                 tracing::warn!(%room, "agents: no renewal was confirmed in time; this host stops writing the session");
                 self.end(room, ClaimAction::Lost, false);
@@ -1146,10 +1206,12 @@ impl HostRuntime {
                     Some(LOST_DETAIL.to_owned()),
                 )
                 .await;
+                return;
             }
             Step::HandBack => {
                 tracing::info!(%room, ?placement, "agents: another live host is preferred; handing the session back");
                 self.end(room, ClaimAction::Released, true);
+                return;
             }
             Step::Nothing => {
                 if let (Some(text), true, false) = (placement.waiting_text(), announces, holding) {
@@ -1158,6 +1220,153 @@ impl HostRuntime {
                 }
             }
         }
+        self.tick_schedule(room, &placement, may, announces, epoch, stop)
+            .await;
+    }
+
+    /// The session's scheduled card on this tick (92.3). Its holder first
+    /// settles what the claim it took named and a run the card still says
+    /// is running, every tick until the card reads settled (R163, R164);
+    /// then, placed here — never while placement waits — it begins a due
+    /// window: the card read now, the claim renewed naming the window, and
+    /// the worker, which reads the card again under the claim before it
+    /// writes `run: running` (R56, R58, [`cards::begin`]). While placement
+    /// waits, a holder has the card say `run: waiting`; with no holder, the
+    /// announcing host takes the claim to say it and hands it back (Q8).
+    async fn tick_schedule(
+        &mut self,
+        room: &OwnedRoomId,
+        placement: &Placement,
+        may: bool,
+        announces: bool,
+        epoch: u64,
+        stop: &CancelSignal,
+    ) {
+        let server_now = self.clock.now();
+        let me = self.host.as_str().to_owned();
+        let Some(slot) = self.slots.get_mut(room) else {
+            return;
+        };
+        let card = match cards::session_schedule(Some(&slot.agent), &slot.session.scheduled) {
+            Ok(Some(card)) => card.clone(),
+            Ok(None) => return,
+            Err(sentence) => {
+                if slot.claim.is_some() && slot.refused.as_deref() != Some(sentence.as_str()) {
+                    tracing::info!(%room, %sentence, "agents: the session's scheduled card does not run here");
+                    slot.refused = Some(sentence.clone());
+                    self.show(room, RunState::Blocked, epoch, None, Some(sentence))
+                        .await;
+                }
+                return;
+            }
+        };
+        let copy = Arc::clone(&slot.copy);
+        let (now_ms, offset) = (self.calendar)(server_now);
+        let due_in =
+            |card: &keeper_core::agents::card::CardAgent| match cards::due(card, now_ms, offset) {
+                Due::Due { window_ms } => {
+                    Some(claim::rfc3339(u64::try_from(window_ms).unwrap_or(0)))
+                }
+                _ => None,
+            };
+        if let Some(held) = &slot.claim {
+            if held.busy.load(Ordering::Relaxed) || slot.draining.is_some() {
+                return;
+            }
+            let lease = Arc::clone(&held.lease);
+            let (dir, rel) = (slot.session.dir.clone(), card.rel.clone());
+            let fresh = match tokio::task::spawn_blocking(move || cards::read_scheduled(&dir, &rel))
+                .await
+            {
+                Ok(Ok(Some(fresh))) => fresh,
+                Ok(Ok(None)) | Err(_) => return,
+                Ok(Err(error)) => {
+                    tracing::warn!(%room, %error, "agents: the scheduled card could not be read");
+                    return;
+                }
+            };
+            // A turn begun while the card was read is left to finish.
+            let Some(slot) = self.slots.get_mut(room).filter(|slot| {
+                slot.claim
+                    .as_ref()
+                    .is_some_and(|held| !held.busy.load(Ordering::Relaxed))
+            }) else {
+                return;
+            };
+            if let Some((host, window)) = slot.taken.clone() {
+                if cards::unsettled(&fresh, window.as_deref()) {
+                    copy.route_scheduled(
+                        room,
+                        Scheduled::TakenOver {
+                            card: card.rel,
+                            window,
+                            host,
+                        },
+                    );
+                    return;
+                }
+                slot.taken = None;
+            }
+            let window = due_in(&fresh);
+            if !matches!(placement, Placement::Host(host) if *host == me) {
+                // Holding the session for its messages is no leave to
+                // begin a window (R164).
+                if let (Some(window), Some(waiting)) = (window, placement.waiting_text()) {
+                    if slot.waited.as_ref() != Some(&window) {
+                        slot.waited = Some(window);
+                        copy.route_scheduled(
+                            room,
+                            Scheduled::Wait {
+                                card: card.rel,
+                                waiting,
+                            },
+                        );
+                    }
+                }
+                return;
+            }
+            let Some(window) = window.filter(|window| slot.sent.as_ref() != Some(window)) else {
+                return;
+            };
+            lease.set_window(Some(window.clone()));
+            if !self.renew(room).await {
+                return;
+            }
+            if let Some(slot) = self.slots.get_mut(room).filter(|slot| slot.claim.is_some()) {
+                copy.route_scheduled(
+                    room,
+                    Scheduled::Run {
+                        card: card.rel,
+                        window: window.clone(),
+                        now_ms,
+                        utc_offset_minutes: offset,
+                    },
+                );
+                slot.sent = Some(window);
+            }
+            return;
+        }
+        let window = due_in(&card.card);
+        let (Some(window), Some(waiting)) = (window, placement.waiting_text()) else {
+            return;
+        };
+        if !announces || !may || slot.draining.is_some() || slot.waited.as_ref() == Some(&window) {
+            return;
+        }
+        self.acquire(room, stop).await;
+        let Some(slot) = self.slots.get_mut(room).filter(|slot| slot.claim.is_some()) else {
+            return;
+        };
+        slot.taken = None;
+        slot.waited = Some(window);
+        copy.route_scheduled(
+            room,
+            Scheduled::Wait {
+                card: card.rel,
+                waiting,
+            },
+        );
+        self.end(room, ClaimAction::Released, true);
     }
 
     async fn acquire(&mut self, room: &OwnedRoomId, stop: &CancelSignal) {
@@ -1175,14 +1384,35 @@ impl HostRuntime {
         }
         let me = claimant(&self.host, copy.as_ref());
         let port = copy.claims(room);
-        match acquire(port.as_ref(), &me, &self.clock, &self.rtt, None).await {
-            Ok(Acquired::Won { lease, from_host }) => {
+        let scheduled = agent.kind == SessionKind::Scheduled;
+        let acquired = if scheduled {
+            claims::acquire_carrying(port.as_ref(), &me, &self.clock, &self.rtt).await
+        } else {
+            acquire(port.as_ref(), &me, &self.clock, &self.rtt, None).await
+        };
+        match acquired {
+            Ok(Acquired::Won {
+                lease,
+                from_host,
+                from_window,
+            }) => {
                 tracing::info!(
                     session = %session.path, %room, epoch = lease.epoch,
                     claim_event = %lease.claim_event, server_ts = %claim::rfc3339(lease.server_ts),
                     from_host = from_host.as_deref().unwrap_or(""),
+                    from_window = from_window.as_deref().unwrap_or(""),
                     "agents: claim acquired"
                 );
+                // Every holder of a scheduled session settles what the claim
+                // it took named, and a run its card still says is running,
+                // before it begins a window (R163, R164) — its own earlier
+                // claim's too, after a restart.
+                let taken = scheduled.then(|| {
+                    (
+                        from_host.clone().unwrap_or_else(|| me.host.clone()),
+                        from_window,
+                    )
+                });
                 let ending = Arc::new(Mutex::new(ClaimAction::Released));
                 let busy = Arc::new(AtomicBool::new(false));
                 let worker = Arc::clone(&copy).spawn_worker(
@@ -1201,6 +1431,8 @@ impl HostRuntime {
                     // this host says edits whichever is latest.
                     slot.shown = None;
                     slot.anchor_read = false;
+                    slot.taken = taken;
+                    slot.refused = None;
                     if let Some(worker) = worker {
                         slot.claim = Some(Held {
                             lease,
@@ -1222,11 +1454,14 @@ impl HostRuntime {
         }
     }
 
-    async fn renew(&mut self, room: &OwnedRoomId) {
+    /// Renew `room`'s claim; whether the server confirmed it.
+    async fn renew(&mut self, room: &OwnedRoomId) -> bool {
         let Some(slot) = self.slots.get(room) else {
-            return;
+            return false;
         };
-        let Some(held) = &slot.claim else { return };
+        let Some(held) = &slot.claim else {
+            return false;
+        };
         let (copy, lease, dir) = (
             Arc::clone(&slot.copy),
             Arc::clone(&held.lease),
@@ -1236,7 +1471,7 @@ impl HostRuntime {
         if let Some(conflict) = conflict_in(dir).await {
             self.end(room, ClaimAction::Released, true);
             self.park_conflicted(room, conflict).await;
-            return;
+            return false;
         }
         let me = claimant(&self.host, copy.as_ref());
         let renewed = renew(
@@ -1248,12 +1483,16 @@ impl HostRuntime {
         )
         .await;
         match renewed {
-            Ok(true) => {}
+            Ok(true) => true,
             Ok(false) => {
                 tracing::warn!(%room, "agents: another host holds the session's claim now; claim lost");
                 self.end(room, ClaimAction::Lost, false);
+                false
             }
-            Err(error) => tracing::warn!(%room, %error, "agents: the claim was not renewed"),
+            Err(error) => {
+                tracing::warn!(%room, %error, "agents: the claim was not renewed");
+                false
+            }
         }
     }
 
@@ -2008,6 +2247,9 @@ mod tests {
     /// One read-back of a room: a failure, or the opening found.
     type ReadBack = Result<Option<Opening>, String>;
 
+    /// A served room's session path, agent and lease.
+    type Served = (String, SessionAgent, Arc<Lease>);
+
     /// One copy over [`Server`]. Its workers serve until their room is
     /// closed, then take `worker_takes` to finish — a turn, or a backlog.
     struct FakeCopy {
@@ -2034,6 +2276,18 @@ mod tests {
         controls: Mutex<Vec<OwnedRoomId>>,
         /// Each room's members, as the server would list them.
         members: Mutex<HashMap<OwnedRoomId, BTreeSet<OwnedUserId>>>,
+        /// Each served room's session path, agent and lease, as its worker
+        /// holds them.
+        served: Mutex<HashMap<OwnedRoomId, Served>>,
+        /// What the host's clock routed, and what the worker's
+        /// [`cards::begin`] made of it in the zone, in order.
+        routed: Mutex<Vec<(Scheduled, Result<cards::Begun, String>)>>,
+        /// How many routed asks from now on fail as a refused guarded write
+        /// does, the card left as it is.
+        refuse_writes: std::sync::atomic::AtomicUsize,
+        /// A turn that begins never ends: the host dies in it, its card
+        /// left `run: running`.
+        turns_die: AtomicBool,
     }
 
     impl CopyPort for FakeCopy {
@@ -2147,11 +2401,19 @@ mod tests {
 
         fn spawn_worker(
             self: Arc<Self>,
-            _session: &FoundSession,
+            session: &FoundSession,
             agent: &SessionAgent,
             _stop: &CancelSignal,
             claimed: Claimed,
         ) -> Option<JoinHandle<()>> {
+            self.served.lock().expect("lock").insert(
+                agent.room.clone(),
+                (
+                    session.path.clone(),
+                    agent.clone(),
+                    Arc::clone(&claimed.lease),
+                ),
+            );
             let closed = Arc::new(Notify::new());
             self.workers
                 .lock()
@@ -2244,6 +2506,69 @@ mod tests {
                     .collect()
             })
         }
+
+        /// The worker's half, as `ServedSession::scheduled` does it: the
+        /// card read and written under the claim, and a run's turn ending
+        /// in `review`.
+        fn route_scheduled(&self, room: &RoomId, scheduled: Scheduled) {
+            // One refusal is spent per routed ask while any are left (a
+            // compare-and-swap loop: `fetch_update` is deprecated from
+            // Rust 1.99, and its replacement does not exist before it).
+            let mut left = self.refuse_writes.load(Ordering::Relaxed);
+            let refused = loop {
+                if left == 0 {
+                    break false;
+                }
+                match self.refuse_writes.compare_exchange_weak(
+                    left,
+                    left - 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break true,
+                    Err(now) => left = now,
+                }
+            };
+            let host = self.server.claim(room).map(|claim| claim.content.host);
+            let begun = match (
+                &self.zone,
+                self.served.lock().expect("lock").get(room),
+                host,
+            ) {
+                _ if refused => Err("the card changed under the write".to_owned()),
+                (Some(zone), Some((session, agent, lease)), Some(host)) => {
+                    let names = match &scheduled {
+                        Scheduled::Run { window, .. } => Some(window.clone()),
+                        _ => None,
+                    };
+                    let may_write = || {
+                        lease.may_write()
+                            && names
+                                .as_ref()
+                                .is_none_or(|w| lease.window().as_ref() == Some(w))
+                    };
+                    let holder = cards::Holder { agent, host: &host };
+                    let begun = cards::begin(zone, session, &holder, &scheduled, &may_write)
+                        .map_err(|error| error.to_string());
+                    if let Ok(cards::Begun::Run { .. }) = &begun {
+                        if !self.turns_die.load(Ordering::Relaxed) {
+                            cards::write_run(
+                                zone,
+                                session,
+                                scheduled.card(),
+                                keeper_core::agents::card::Run::Review,
+                                None,
+                                &|| lease.may_write(),
+                            )
+                            .expect("the turn's end");
+                        }
+                    }
+                    begun
+                }
+                _ => Err("no worker serves the room".to_owned()),
+            };
+            self.routed.lock().expect("lock").push((scheduled, begun));
+        }
     }
 
     struct World {
@@ -2252,6 +2577,8 @@ mod tests {
         rt: HostRuntime,
         stop: CancelSignal,
         _cancel: CancelHandle,
+        /// What the host's calendar reads, epoch ms (UTC).
+        now: Arc<std::sync::atomic::AtomicI64>,
     }
 
     /// This host, `hesperia`, not always on, in the control room unless
@@ -2288,15 +2615,20 @@ mod tests {
             manifest_sent: None,
             first_published: None,
             pending_shown: HashMap::new(),
+            calendar: server_calendar(),
         };
         let (cancel, stop) = cancellation();
-        World {
+        let now = Arc::new(std::sync::atomic::AtomicI64::new(wall_ms() as i64));
+        let mut w = World {
             root: tempfile::tempdir().expect("tempdir"),
             copy,
             rt,
             stop,
             _cancel: cancel,
-        }
+            now: Arc::clone(&now),
+        };
+        w.rt.calendar = Arc::new(move |_| (now.load(Ordering::Relaxed), 0));
+        w
     }
 
     impl World {
@@ -2337,6 +2669,7 @@ mod tests {
                 path: format!("active/{room}"),
                 dir,
                 agent: Ok(agent.clone()),
+                scheduled: cards::ScheduledScan::default(),
             };
             self.rt.offer(&self.copy, &session, &agent);
         }
@@ -2491,6 +2824,10 @@ mod tests {
             created: Mutex::default(),
             controls: Mutex::default(),
             members: Mutex::default(),
+            served: Mutex::default(),
+            routed: Mutex::default(),
+            refuse_writes: Default::default(),
+            turns_die: AtomicBool::new(false),
         }
     }
 
@@ -3164,5 +3501,615 @@ mod tests {
         tokio::time::advance(RETRY_AFTER).await;
         w.tick().await;
         assert!(w.held_by_me(&a));
+    }
+
+    /// The scheduled session's folder, zone-relative.
+    const SCHEDULED: &str = "active/2026-10-05-sort";
+
+    /// Nixi's `@hourly` card, with `keys`.
+    fn hourly(keys: &str) -> String {
+        format!("---\ntags: [task]\ntitle: Sort the inbox\nstatus: todo\nassignee: nixi\nschedule: \"@hourly\"\n{keys}---\n\nSort what came in.\n")
+    }
+
+    fn put_card(zone: &Path, text: &str) {
+        let dir = zone.join(SCHEDULED);
+        std::fs::create_dir_all(&dir).expect("session");
+        std::fs::write(dir.join("card.md"), text).expect("card");
+    }
+
+    fn card_text_in(zone: &Path) -> String {
+        std::fs::read_to_string(zone.join(SCHEDULED).join("card.md")).expect("card")
+    }
+
+    fn card_in(zone: &Path) -> keeper_core::agents::card::CardAgent {
+        keeper_core::agents::card::CardAgent::of_text(&card_text_in(zone)).expect("agent keys")
+    }
+
+    fn ms(text: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .expect("an instant")
+            .timestamp_millis()
+    }
+
+    /// `text` as a claim names a window.
+    fn named(text: &str) -> String {
+        claim::rfc3339(ms(text) as u64)
+    }
+
+    fn ran_in(card: &keeper_core::agents::card::CardAgent, text: &str) -> bool {
+        matches!(&card.last_run, Some(keeper_core::agents::card::Field::Read(at)) if at.timestamp_millis() == ms(text))
+    }
+
+    fn run_of(
+        card: &keeper_core::agents::card::CardAgent,
+    ) -> Option<keeper_core::agents::card::Run> {
+        match &card.run {
+            Some(keeper_core::agents::card::Field::Read(run)) => Some(*run),
+            _ => None,
+        }
+    }
+
+    impl FakeCopy {
+        fn routed(&self) -> Vec<(Scheduled, Result<cards::Begun, String>)> {
+            self.routed.lock().expect("lock").clone()
+        }
+
+        /// The turns the worker ran.
+        fn runs(&self) -> usize {
+            self.routed()
+                .iter()
+                .filter(|(_, begun)| matches!(begun, Ok(cards::Begun::Run { .. })))
+                .count()
+        }
+    }
+
+    impl World {
+        /// The rescan finds Nixi's scheduled session of `room` in the copy's
+        /// zone, with the cards its folder holds now.
+        fn offer_scheduled(&mut self, room: &OwnedRoomId) {
+            self.offer_scheduled_needing(room, None);
+        }
+
+        /// [`World::offer_scheduled`], the session needing `needs`.
+        fn offer_scheduled_needing(&mut self, room: &OwnedRoomId, needs: Option<Vec<String>>) {
+            self.copy.joined.lock().expect("lock").insert(room.clone());
+            let zone = self.copy.zone.clone().expect("a zone");
+            let decl = keeper_core::agents::drive::parse(&drive_toml()).expect("decl");
+            let agent = SessionAgent {
+                id: ulid::Ulid::new(),
+                agent: "nixi".to_owned(),
+                drive: "tgdrive".to_owned(),
+                kind: SessionKind::Scheduled,
+                title: "sort".to_owned(),
+                requested_by: user(PERSON),
+                parent: None,
+                room: room.clone(),
+                drives: vec!["tgdrive".to_owned()],
+                label: Label::opening(&decl, Integrity::Owner),
+                needs,
+                pin: None,
+                hop: 0,
+                dispatch_chain: Vec::new(),
+                limits: None,
+                workflow: None,
+                created_at: chrono::Utc::now(),
+            };
+            let dir = zone.join(SCHEDULED);
+            let session = FoundSession {
+                path: SCHEDULED.to_owned(),
+                dir: dir.clone(),
+                agent: Ok(agent.clone()),
+                scheduled: cards::scheduled_cards(SCHEDULED, &dir),
+            };
+            self.rt.offer(&self.copy, &session, &agent);
+        }
+
+        /// The calendar reads `text`.
+        fn at(&self, text: &str) {
+            self.now.store(ms(text), Ordering::Relaxed);
+        }
+
+        /// `host`'s manifest, as this world would publish it, lapsed: the
+        /// host is gone.
+        fn lapse_manifest(&self, host: &str) {
+            let now = wall_ms();
+            let mut manifest = self.rt.manifest(now, true);
+            manifest.host = host.to_owned();
+            manifest.expires_at = claim::rfc3339(now - 1_000);
+            self.server().put(
+                &control(),
+                HOST,
+                host,
+                &self.copy.config.matrix_user,
+                serde_json::to_value(manifest).expect("manifest"),
+            );
+        }
+    }
+
+    /// A copy over `server` whose worker reads and writes cards in `zone`.
+    fn copy_over(server: &Arc<Server>, zone: &Path) -> Arc<FakeCopy> {
+        Arc::new(FakeCopy {
+            server: Arc::clone(server),
+            zone: Some(zone.to_owned()),
+            ..fake_copy()
+        })
+    }
+
+    /// 92.3 AC2 (R56): two hosts see one card due over one drive and one
+    /// homeserver; one holds the session's claim, names the window in it and
+    /// runs it — one `run: running`, one `last_run`, one turn — and the other
+    /// writes nothing, however often both tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_due_card_runs_once_across_two_hosts() {
+        let (server, zone) = (
+            Arc::new(Server::default()),
+            tempfile::tempdir().expect("zone"),
+        );
+        put_card(zone.path(), &hourly("last_run: \"2026-10-05T08:00:00Z\"\n"));
+        let mut here = world_over(copy_over(&server, zone.path()), true);
+        let mut there = world_over(copy_over(&server, zone.path()), true);
+        there.rt.host = HostSlug::new(OTHER).expect("slug");
+        let a = room(1);
+        for w in [&mut here, &mut there] {
+            w.at("2026-10-05T09:30:00Z");
+            w.offer_scheduled(&a);
+        }
+        for _ in 0..6 {
+            tokio::join!(here.tick(), there.tick());
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+
+        let (mine, theirs) = (here.copy.routed(), there.copy.routed());
+        assert_eq!(
+            here.copy.runs() + there.copy.runs(),
+            1,
+            "{mine:?} {theirs:?}"
+        );
+        assert_eq!(
+            mine.len() + theirs.len(),
+            1,
+            "one window, routed once: {mine:?} {theirs:?}"
+        );
+        let claim = server.claim(&a).expect("the session's claim");
+        assert_eq!(claim.content.window, Some(named("2026-10-05T09:00:00Z")));
+        let card = card_in(zone.path());
+        assert!(ran_in(&card, "2026-10-05T09:00:00Z"), "{card:?}");
+        assert_eq!(run_of(&card), Some(keeper_core::agents::card::Run::Review));
+    }
+
+    /// 92.3 AC3 (Q8, R57): a card pinned to hesperia while hesperia is not
+    /// live is said to wait by electra, the announcing host — `run: waiting`
+    /// and its line naming what it waits for — which then hands the claim
+    /// back; once hesperia's manifest is live, hesperia runs it once and
+    /// electra does nothing more.
+    #[tokio::test(start_paused = true)]
+    async fn a_card_pinned_to_an_absent_host_waits_named() {
+        let (server, zone) = (
+            Arc::new(Server::default()),
+            tempfile::tempdir().expect("zone"),
+        );
+        put_card(
+            zone.path(),
+            &hourly("host: hesperia\nlast_run: \"2026-10-05T08:00:00Z\"\n"),
+        );
+        let a = room(1);
+        let mut electra = world_over(copy_over(&server, zone.path()), true);
+        electra.rt.host = HostSlug::new(OTHER).expect("slug");
+        electra.rt.always_on = true;
+        electra.at("2026-10-05T09:30:00Z");
+        electra.offer_scheduled(&a);
+        electra.tick().await;
+        assert!(
+            electra.copy.routed().is_empty(),
+            "not before ANNOUNCE_AFTER"
+        );
+        tokio::time::advance(ANNOUNCE_AFTER).await;
+        for _ in 0..3 {
+            electra.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        let waited = electra.copy.routed();
+        assert_eq!(waited.len(), 1, "{waited:?}");
+        let waiting = "hesperia — a live host".to_owned();
+        assert_eq!(
+            waited[0],
+            (
+                Scheduled::Wait {
+                    card: "card.md".to_owned(),
+                    waiting: waiting.clone()
+                },
+                Ok(cards::Begun::Said(keeper_core::agents::log::RunBody {
+                    state: keeper_core::agents::log::RunState::Waiting,
+                    detail: Some(waiting)
+                }))
+            )
+        );
+        assert_eq!(
+            run_of(&card_in(zone.path())),
+            Some(keeper_core::agents::card::Run::Waiting)
+        );
+        assert!(electra.released(&a), "electra hands the claim back");
+
+        let mut hesperia = world_over(copy_over(&server, zone.path()), true);
+        hesperia.at("2026-10-05T09:30:00Z");
+        hesperia.offer_scheduled(&a);
+        for _ in 0..4 {
+            tokio::join!(electra.tick(), hesperia.tick());
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(hesperia.copy.runs(), 1, "{:?}", hesperia.copy.routed());
+        assert_eq!(electra.copy.routed().len(), 1, "electra did nothing more");
+        let card = card_in(zone.path());
+        assert!(ran_in(&card, "2026-10-05T09:00:00Z"), "{card:?}");
+        assert_eq!(run_of(&card), Some(keeper_core::agents::card::Run::Review));
+    }
+
+    /// 92.3 AC9 (S-21): a card due by its schedule but carrying
+    /// `scheduled_by` names no window and runs nothing across a day of
+    /// ticks; once a person's *Allow* removes the mark, the next due window
+    /// runs once.
+    #[tokio::test(start_paused = true)]
+    async fn an_agent_scheduled_card_never_runs_before_a_persons_tick() {
+        let (server, zone) = (
+            Arc::new(Server::default()),
+            tempfile::tempdir().expect("zone"),
+        );
+        let marked = hourly("scheduled_by: \"@tola:example.org\"\n");
+        put_card(zone.path(), &marked);
+        let mut w = world_over(copy_over(&server, zone.path()), true);
+        let a = room(1);
+        w.at("2026-10-05T00:00:30Z");
+        w.offer_scheduled(&a);
+        for _ in 0..24 * 60 {
+            w.tick().await;
+            tokio::time::advance(Duration::from_secs(60)).await;
+            w.now.fetch_add(60_000, Ordering::Relaxed);
+        }
+        assert!(w.held_by_me(&a), "the session is served all along");
+        assert!(w.copy.routed().is_empty(), "{:?}", w.copy.routed());
+        assert_eq!(server.claim(&a).expect("claim").content.window, None);
+        assert_eq!(card_text_in(zone.path()), marked);
+
+        let plan = keeper_core::sessions::tasks::compile_allow_schedule(
+            SCHEDULED, "card.md", &marked, PERSON,
+        )
+        .expect("a person's tick");
+        crate::sessions::exec::run(zone.path(), plan).expect("allowed");
+        w.offer_scheduled(&a);
+        for _ in 0..3 {
+            w.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(w.copy.runs(), 1, "{:?}", w.copy.routed());
+        assert!(ran_in(&card_in(zone.path()), "2026-10-06T00:00:00Z"));
+        assert_eq!(
+            server.claim(&a).expect("claim").content.window,
+            Some(named("2026-10-06T00:00:00Z"))
+        );
+    }
+
+    /// `room`'s claim, as the server holds it now, ten minutes old by the
+    /// server's clock: lapsed.
+    fn lapse(server: &Server, room: &OwnedRoomId) {
+        let lapsed = wall_ms() - 600_000;
+        server
+            .states
+            .lock()
+            .expect("lock")
+            .get_mut(&(room.clone(), CLAIM.to_owned(), String::new()))
+            .expect("the claim")
+            .origin_server_ts = MilliSecondsSinceUnixEpoch(UInt::new(lapsed).expect("ts"));
+    }
+
+    /// Electra's lapsed claim on `room` at epoch 4, naming `window`.
+    fn electra_lapsed(server: &Server, room: &OwnedRoomId, window: Option<String>) {
+        let lapsed = wall_ms() - 600_000;
+        let electra = Claimant {
+            host: OTHER.to_owned(),
+            device: "ELECTRA1".to_owned(),
+            agent: user("@nixi:example.org"),
+        };
+        server.put(
+            room,
+            CLAIM,
+            "",
+            &user("@nixi:example.org"),
+            serde_json::to_value(electra.content(4, lapsed, lapsed, false, window)).expect("claim"),
+        );
+        lapse(server, room);
+    }
+
+    /// 92.3 AC10 (S-25, R58): electra claimed the session naming window W,
+    /// wrote its card locally and never pushed; hesperia takes the session
+    /// over within W, finds the claim's W and the card's older `last_run`,
+    /// and settles W as "ran on electra, effect unknown" — `last_run` = W,
+    /// `run: review`, no turn — then runs the next window once.
+    #[tokio::test(start_paused = true)]
+    async fn a_takeover_mid_window_does_not_run_the_window_again() {
+        let (server, zone) = (
+            Arc::new(Server::default()),
+            tempfile::tempdir().expect("zone"),
+        );
+        put_card(zone.path(), &hourly("last_run: \"2026-10-05T08:00:00Z\"\n"));
+        let a = room(1);
+        let w_9 = named("2026-10-05T09:00:00Z");
+        electra_lapsed(&server, &a, Some(w_9.clone()));
+        let mut w = world_over(copy_over(&server, zone.path()), true);
+        w.at("2026-10-05T09:10:00Z");
+        w.offer_scheduled(&a);
+        // One tick takes the session and settles W; the rescan then reads
+        // the card as written, and a renewal is due.
+        w.tick().await;
+        w.offer_scheduled(&a);
+        tokio::time::advance(RENEW_EVERY).await;
+        w.tick().await;
+        let routed = w.copy.routed();
+        assert_eq!(
+            routed[0],
+            (
+                Scheduled::TakenOver {
+                    card: "card.md".to_owned(),
+                    window: Some(w_9.clone()),
+                    host: OTHER.to_owned()
+                },
+                Ok(cards::Begun::Said(keeper_core::agents::log::RunBody {
+                    state: keeper_core::agents::log::RunState::Review,
+                    detail: Some("ran on electra, effect unknown".to_owned())
+                }))
+            ),
+            "{routed:?}"
+        );
+        assert_eq!(w.copy.runs(), 0, "{routed:?}");
+        let card = card_in(zone.path());
+        assert!(ran_in(&card, "2026-10-05T09:00:00Z"), "{card:?}");
+        assert_eq!(run_of(&card), Some(keeper_core::agents::card::Run::Review));
+        let claim = server.claim(&a).expect("claim");
+        assert!(w.held_by_me(&a) && claim.content.epoch == 5);
+        assert_eq!(
+            claim.content.window,
+            Some(w_9),
+            "the renewal keeps W named: a later taker finds it too"
+        );
+        assert_eq!(routed.len(), 1, "{routed:?}");
+
+        w.at("2026-10-05T10:05:00Z");
+        for _ in 0..3 {
+            w.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(w.copy.runs(), 1, "{:?}", w.copy.routed());
+        assert!(ran_in(&card_in(zone.path()), "2026-10-05T10:00:00Z"));
+    }
+
+    /// R163: the claim's window survives a taker that dies before it
+    /// settles it. Electra named W and never pushed; hesperia takes the
+    /// session — its very first claim write names W — and dies before its
+    /// settlement lands; kalypso, over a checkout as stale as hesperia's,
+    /// takes it from hesperia, settles W, and never runs it.
+    #[tokio::test(start_paused = true)]
+    async fn a_window_stays_named_through_a_taker_that_dies() {
+        let server = Arc::new(Server::default());
+        let (zone_b, zone_c) = (
+            tempfile::tempdir().expect("hesperia's checkout"),
+            tempfile::tempdir().expect("kalypso's checkout"),
+        );
+        for zone in [&zone_b, &zone_c] {
+            put_card(zone.path(), &hourly("last_run: \"2026-10-05T08:00:00Z\"\n"));
+        }
+        let a = room(1);
+        let w_9 = named("2026-10-05T09:00:00Z");
+        electra_lapsed(&server, &a, Some(w_9.clone()));
+
+        let mut hesperia = world_over(copy_over(&server, zone_b.path()), true);
+        hesperia
+            .copy
+            .refuse_writes
+            .store(usize::MAX, Ordering::Relaxed);
+        hesperia.at("2026-10-05T09:10:00Z");
+        hesperia.offer_scheduled(&a);
+        hesperia.tick().await;
+        assert!(hesperia.held_by_me(&a));
+        assert_eq!(
+            server.claim(&a).expect("claim").content.window,
+            Some(w_9.clone()),
+            "the taker's acquisition names W"
+        );
+        hesperia.lapse_manifest(ME);
+        lapse(&server, &a);
+
+        let mut kalypso = world_over(copy_over(&server, zone_c.path()), true);
+        kalypso.rt.host = HostSlug::new("kalypso").expect("slug");
+        kalypso.at("2026-10-05T09:20:00Z");
+        kalypso.offer_scheduled(&a);
+        for _ in 0..3 {
+            kalypso.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        let routed = kalypso.copy.routed();
+        assert_eq!(kalypso.copy.runs(), 0, "{routed:?}");
+        assert_eq!(
+            routed.first().map(|(scheduled, _)| scheduled.clone()),
+            Some(Scheduled::TakenOver {
+                card: "card.md".to_owned(),
+                window: Some(w_9),
+                host: ME.to_owned()
+            }),
+            "{routed:?}"
+        );
+        let card = card_in(zone_c.path());
+        assert!(ran_in(&card, "2026-10-05T09:00:00Z"), "{card:?}");
+        assert_eq!(run_of(&card), Some(keeper_core::agents::card::Run::Review));
+    }
+
+    /// R163: a window is decided by the card as it reads now, never by the
+    /// rescan's copy. A never-run `every 2h` card runs its 09:30 window at
+    /// 09:30:58 and nothing at 09:31:00 though no rescan saw its
+    /// `last_run`; a clone that never saw it run, taking the session from
+    /// electra whose claim named 09:30, settles 09:30 and runs nothing at
+    /// 09:31 either.
+    #[tokio::test(start_paused = true)]
+    async fn a_window_is_decided_by_the_card_as_it_reads_now() {
+        let every = hourly("").replace("\"@hourly\"", "every 2h");
+        let (server, zone) = (
+            Arc::new(Server::default()),
+            tempfile::tempdir().expect("zone"),
+        );
+        put_card(zone.path(), &every);
+        let mut w = world_over(copy_over(&server, zone.path()), true);
+        let a = room(1);
+        w.at("2026-10-05T09:30:58Z");
+        w.offer_scheduled(&a);
+        w.tick().await;
+        assert_eq!(w.copy.runs(), 1, "{:?}", w.copy.routed());
+        w.at("2026-10-05T09:31:00Z");
+        for _ in 0..3 {
+            w.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(w.copy.runs(), 1, "{:?}", w.copy.routed());
+        assert!(ran_in(&card_in(zone.path()), "2026-10-05T09:30:00Z"));
+
+        let (server, zone) = (
+            Arc::new(Server::default()),
+            tempfile::tempdir().expect("zone"),
+        );
+        put_card(zone.path(), &every);
+        electra_lapsed(&server, &a, Some(named("2026-10-05T09:30:00Z")));
+        let mut w = world_over(copy_over(&server, zone.path()), true);
+        w.at("2026-10-05T09:30:40Z");
+        w.offer_scheduled(&a);
+        w.tick().await;
+        w.at("2026-10-05T09:31:00Z");
+        for _ in 0..3 {
+            w.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        let routed = w.copy.routed();
+        assert_eq!(w.copy.runs(), 0, "{routed:?}");
+        assert!(
+            matches!(&routed[..], [(Scheduled::TakenOver { .. }, Ok(_))]),
+            "{routed:?}"
+        );
+        assert!(ran_in(&card_in(zone.path()), "2026-10-05T09:30:00Z"));
+    }
+
+    /// R163: a settlement whose write fails is not forgotten. The worker's
+    /// guarded write is refused once; the next tick settles W again rather
+    /// than run it, and no later tick runs W.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_settlement_is_tried_until_it_lands() {
+        let (server, zone) = (
+            Arc::new(Server::default()),
+            tempfile::tempdir().expect("zone"),
+        );
+        put_card(zone.path(), &hourly("last_run: \"2026-10-05T08:00:00Z\"\n"));
+        let a = room(1);
+        let w_9 = named("2026-10-05T09:00:00Z");
+        electra_lapsed(&server, &a, Some(w_9.clone()));
+        let mut w = world_over(copy_over(&server, zone.path()), true);
+        w.copy.refuse_writes.store(1, Ordering::Relaxed);
+        w.at("2026-10-05T09:10:00Z");
+        w.offer_scheduled(&a);
+        for _ in 0..6 {
+            w.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        let routed = w.copy.routed();
+        assert_eq!(w.copy.runs(), 0, "{routed:?}");
+        assert!(
+            routed
+                .iter()
+                .all(|(scheduled, _)| matches!(scheduled, Scheduled::TakenOver { window, .. } if *window == Some(w_9.clone()))),
+            "{routed:?}"
+        );
+        assert!(
+            matches!(&routed[..], [(_, Err(_)), (_, Ok(cards::Begun::Said(_)))]),
+            "{routed:?}"
+        );
+        let card = card_in(zone.path());
+        assert!(ran_in(&card, "2026-10-05T09:00:00Z"), "{card:?}");
+        assert_eq!(run_of(&card), Some(keeper_core::agents::card::Run::Review));
+    }
+
+    /// R164: holding the session is no leave to begin a window. Hesperia
+    /// runs 09:00; the session then needs `screen:mac`, which no live host
+    /// has, and placement waits — hesperia keeps the claim for its
+    /// messages, has the card say it waits, and begins no 10:00 window.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_placement_no_longer_picks_begins_no_window() {
+        let (server, zone) = (
+            Arc::new(Server::default()),
+            tempfile::tempdir().expect("zone"),
+        );
+        put_card(zone.path(), &hourly("last_run: \"2026-10-05T08:00:00Z\"\n"));
+        let mut w = world_over(copy_over(&server, zone.path()), true);
+        let a = room(1);
+        w.at("2026-10-05T09:30:00Z");
+        w.offer_scheduled(&a);
+        w.tick().await;
+        assert_eq!(w.copy.runs(), 1, "{:?}", w.copy.routed());
+
+        w.at("2026-10-05T10:05:00Z");
+        w.offer_scheduled_needing(&a, Some(vec!["screen:mac".to_owned()]));
+        for _ in 0..3 {
+            w.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        let routed = w.copy.routed();
+        assert_eq!(w.copy.runs(), 1, "{routed:?}");
+        assert!(w.held_by_me(&a), "the holder keeps the session");
+        assert!(
+            matches!(routed.last(), Some((Scheduled::Wait { waiting, .. }, Ok(_))) if waiting.contains("screen:mac")),
+            "{routed:?}"
+        );
+        let card = card_in(zone.path());
+        assert!(ran_in(&card, "2026-10-05T09:00:00Z"), "{card:?}");
+        assert_eq!(run_of(&card), Some(keeper_core::agents::card::Run::Waiting));
+    }
+
+    /// R164: a run its host died in — after the card said `running`, before
+    /// the turn wrote how it ended — is settled by the next holder, the
+    /// same host restarted included: `run: review`, "ran on hesperia,
+    /// effect unknown", `last_run` left at its window, and no turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_left_running_by_a_dead_host_is_settled() {
+        let (server, zone) = (
+            Arc::new(Server::default()),
+            tempfile::tempdir().expect("zone"),
+        );
+        put_card(zone.path(), &hourly("last_run: \"2026-10-05T08:00:00Z\"\n"));
+        let mut dead = world_over(copy_over(&server, zone.path()), true);
+        dead.copy.turns_die.store(true, Ordering::Relaxed);
+        let a = room(1);
+        dead.at("2026-10-05T09:30:00Z");
+        dead.offer_scheduled(&a);
+        dead.tick().await;
+        assert_eq!(dead.copy.runs(), 1, "{:?}", dead.copy.routed());
+        assert_eq!(
+            run_of(&card_in(zone.path())),
+            Some(keeper_core::agents::card::Run::Running)
+        );
+        lapse(&server, &a);
+
+        let mut again = world_over(copy_over(&server, zone.path()), true);
+        again.at("2026-10-05T09:40:00Z");
+        again.offer_scheduled(&a);
+        for _ in 0..3 {
+            again.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        let routed = again.copy.routed();
+        assert_eq!(again.copy.runs(), 0, "{routed:?}");
+        assert_eq!(
+            routed.first().map(|(_, begun)| begun.clone()),
+            Some(Ok(cards::Begun::Said(keeper_core::agents::log::RunBody {
+                state: keeper_core::agents::log::RunState::Review,
+                detail: Some("ran on hesperia, effect unknown".to_owned())
+            }))),
+            "{routed:?}"
+        );
+        let card = card_in(zone.path());
+        assert!(ran_in(&card, "2026-10-05T09:00:00Z"), "{card:?}");
+        assert_eq!(run_of(&card), Some(keeper_core::agents::card::Run::Review));
     }
 }

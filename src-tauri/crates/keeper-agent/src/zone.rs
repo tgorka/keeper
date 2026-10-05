@@ -49,6 +49,10 @@ pub struct FoundSession {
     pub dir: PathBuf,
     /// Its `agent.toml`, or the sentence refusing it.
     pub agent: Result<SessionAgent, String>,
+    /// The cards carrying `schedule:` of a `kind = scheduled` session and
+    /// whether the bounded read found them all, read at the rescan (92.3);
+    /// empty for any other session, whose cards are not read for a schedule.
+    pub scheduled: crate::cards::ScheduledScan,
 }
 
 /// A file's text under `root`, reached through `browse::resolve`; `None`
@@ -161,10 +165,18 @@ pub fn active_sessions(profile: &SyncProfile) -> Vec<FoundSession> {
             }
             Err(sentence) => Err(sentence),
         };
+        let dir = zone_dir.join(&path);
+        let scheduled = match &agent {
+            Ok(agent) if agent.kind == session::SessionKind::Scheduled => {
+                crate::cards::scheduled_cards(&path, &dir)
+            }
+            _ => crate::cards::ScheduledScan::default(),
+        };
         found.push(FoundSession {
-            dir: zone_dir.join(&path),
+            dir,
             path,
             agent,
+            scheduled,
         });
     }
     found
