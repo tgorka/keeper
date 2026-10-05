@@ -292,6 +292,54 @@ async fn drive(
 // The loop
 // ---------------------------------------------------------------------------
 
+/// R73: a call the host parks ends the loop right after it — the round's
+/// earlier calls ran and answered, the parked one has no `role: "tool"`
+/// message, the later ones are handed back unrun, and no completion follows.
+/// A host that never parks (every ⌘9 host) never sees this exit.
+#[tokio::test]
+async fn a_parked_call_ends_the_loop_and_hands_back_the_rest() {
+    let server = TestServer::start(Arc::new(|nth| match nth {
+        0 => tool_round(&[
+            ("c1", "drive_read", json!({ "path": "a.md" })),
+            ("c2", "drive_read", json!({ "path": "park.md" })),
+            ("c3", "drive_read", json!({ "path": "c.md" })),
+        ]),
+        _ => prose_round("never asked"),
+    }))
+    .await;
+    let approval = ulid::Ulid::new();
+    let host = FakeHost::new(move |call| {
+        if call.target.subpath == "park.md" {
+            return Ok(ToolOutcome::Parked { approval });
+        }
+        Ok(ToolOutcome::Text {
+            body: "ran".to_owned(),
+            truncated_at: None,
+            of_bytes: None,
+            okf: None,
+        })
+    });
+    let mut events = Vec::new();
+    let outcome = drive(&server, &host, ToolLoopOptions::default(), &mut events).await;
+
+    assert_eq!(server.request_count(), 1, "no completion after a park");
+    let (parked, rest) = outcome.parked.expect("parked");
+    assert_eq!(parked, approval);
+    assert_eq!(
+        rest.iter().map(|call| call.id.as_str()).collect::<Vec<_>>(),
+        ["c3"]
+    );
+    let ran: Vec<String> = host.calls().into_iter().map(|c| c.target.subpath).collect();
+    assert_eq!(ran, ["a.md", "park.md"], "the third call never ran");
+    let answered: Vec<Option<&str>> = outcome
+        .appended
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .map(|message| message.tool_call_id.as_deref())
+        .collect();
+    assert_eq!(answered, [Some("c1")]);
+}
+
 /// The whole shape in one test: the model asks for a file, the host answers,
 /// the result re-enters the completion as a `role: "tool"` message answering
 /// the call's id, and the second completion produces the answer.

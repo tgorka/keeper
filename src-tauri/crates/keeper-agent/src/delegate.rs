@@ -66,7 +66,7 @@ use crate::agent::RoomFuture;
 use crate::matrix_sink::{EditPort, SendFuture};
 use crate::rooms::{BriefRoom, Known, KnownAgent};
 use crate::sessions::verbs::VerbError;
-use crate::sinks::{room_audience, Blocked, CallAudit, Sinks};
+use crate::sinks::{room_audience, Blocked, CallAudit, Sinks, Withheld};
 
 /// The tool that hands work on.
 pub const DELEGATE: &str = "delegate";
@@ -632,6 +632,21 @@ impl<'t> DelegateTools<'t> {
         refused(reason)
     }
 
+    /// What a call its audit did not admit answers: a refusal is the
+    /// delegation's, its line written; a park waits, with no line yet.
+    fn withheld(
+        &self,
+        id: &str,
+        to: &str,
+        room: Option<OwnedRoomId>,
+        withheld: Withheld,
+    ) -> Option<ToolOutcome> {
+        match withheld {
+            Withheld::Refused(reason) => self.refuse(id, to, room, reason),
+            Withheld::Parked(approval) => Some(ToolOutcome::Parked { approval }),
+        }
+    }
+
     /// Run `wire` when it is `delegate` or `reply`; `None` for any other name.
     /// `audit` is the call's one row (R90): a sink's block is written in it,
     /// and once the sinks pass it is admitted — the integrity rule and the
@@ -779,8 +794,8 @@ impl<'t> DelegateTools<'t> {
         // The label's say first, then the integrity rule's and the tier's: a
         // card with a schedule or a workflow is a person's to allow (S-21,
         // T3).
-        if let Err(sentence) = audit.admit(&target.drive, &to) {
-            return self.refuse(&id, &to, None, sentence);
+        if let Err(withheld) = audit.admit(&target.drive, &to) {
+            return self.withheld(&id, &to, None, withheld);
         }
         let name = session_title(&target.id, chrono::Utc::now());
         let room = match block_on(port.create(&name, invites, vec![target.matrix_user.clone()])) {
@@ -902,10 +917,10 @@ impl<'t> DelegateTools<'t> {
                 None,
             )
         })
-        .map_err(|blocked| audit.blocked(blocked))
+        .map_err(|blocked| Withheld::Refused(audit.blocked(blocked)))
         .and_then(|()| audit.admit(&target.drive, &to));
-        if let Err(reason) = checked {
-            return self.refuse(id, &to, Some(delegation.room.clone()), reason);
+        if let Err(withheld) = checked {
+            return self.withheld(id, &to, Some(delegation.room.clone()), withheld);
         }
         let txn = TransactionId::new();
         if let Err(error) = block_on(port.send(&delegation.room, brief_content(&content), txn)) {
@@ -960,14 +975,14 @@ impl<'t> DelegateTools<'t> {
             &label,
             &content,
         ))
-        .map_err(|blocked| audit.blocked(blocked))
+        .map_err(|blocked| Withheld::Refused(audit.blocked(blocked)))
         .and_then(|()| audit.admit("", self.from.room.as_str()));
-        if let Err(reason) = admitted {
-            return self.refuse(
+        if let Err(withheld) = admitted {
+            return self.withheld(
                 &self.from.id,
                 requester.as_str(),
                 Some(self.from.room.clone()),
-                reason,
+                withheld,
             );
         }
         if let Err(error) = block_on(self.room.send(

@@ -143,6 +143,33 @@ pub fn write_run(
     )
 }
 
+/// [`write_run`] of `run: blocked` alone, saying the card's exact bytes
+/// before and after the write — what a park re-pins by (R178); `None` when
+/// the card said so already.
+pub fn block_run(
+    zone: &Path,
+    session: &str,
+    rel: &str,
+    may_write: &dyn Fn() -> bool,
+) -> Result<Option<(String, String)>, VerbError> {
+    let seen = std::cell::RefCell::new(None);
+    let held = exec::hold(zone)?;
+    let wrote = rewrite(
+        &held,
+        session,
+        rel,
+        "card-run",
+        |text| {
+            let next = card::set_host_keys(text, Run::Blocked, None);
+            *seen.borrow_mut() = next.clone().map(|next| (text.to_owned(), next));
+            Ok(next)
+        },
+        may_write,
+        &mut |_| {},
+    )?;
+    Ok(if wrote { seen.into_inner() } else { None })
+}
+
 /// Rewrite one file of a session under the zone's hold, where it lands
 /// through the session fence ([`landing`]): `compose` makes the new bytes
 /// from the current ones (`None`: nothing to write), and the write is

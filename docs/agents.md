@@ -649,6 +649,86 @@ surface and the session's own files work in every session — but its audit row 
 reasons that held, in `raised_by`, as a comma list. The person's own DM resets to `owner` at their
 message (above), so a turn they started there raises nothing.
 
+## When an action waits
+
+On a keeper host with a decision source installed (none is installed yet: a person cannot decide
+from a keeper client until the approval card exists, so every host still refuses as above), a call
+that needs a person does not wait in a thread — it **parks**:
+
+1. The round's earlier calls have run; the parked call and the round's later calls keep their
+   `tool_call` lines and get no result yet.
+2. The chunk is `fsync`ed and keeper writes, each once: `approvals/<ulid>.round.json` (the round's
+   later calls exactly as the model sent them), then `approvals/<ulid>.json` — the exact action, its
+   arguments (over 16 KiB they go to `approvals/blobs/<sha256>.json`), the files it relies on with
+   where each landed (the drive-relative path through every link) and its SHA-256 (`null` for a
+   file that did not exist), the checkpoint (the chunk, its last line, the SHA-256 of the chunk
+   through it), keeper's own one-sentence summary (never the model's words), the tier, the label,
+   the scopes a person may give (`once`; `session` too at T2 outside a proxy's DM) and when it
+   expires (24 h at T2–T3, 1 h at T4). A digest binds the record's id, session and agent with the
+   tool, the arguments, the checkpoint and the files: a decision is for that record and nothing
+   else.
+3. Only then is the request sent into the session room (large arguments as an encrypted file; when
+   that upload fails nothing is sent anywhere — a request without them could be approved unseen —
+   and the call is refused, the turn saying why), `approval requested` logged, and the status says
+   "Waiting for a decision on: …". The turn ends; the host holds nothing and may hand the session to
+   another host. Every attempt to send the request — a retry after the homeserver asked to wait too
+   — asks first whether the room as it is then may carry it. A room grown wider than the session's
+   label does not get the request: the room's status is sent first, saying only "This work
+   continues where only some of you can read it.", and the request goes to each approver's proxy DM
+   that this host runs, each DM checked against the label; the room is read for that approval from
+   that status on. An approver whose proxy runs on another host is not asked from here. A host
+   stopped after the record and before `approval requested` asks again when it starts — or, past
+   its time, expires it. `approvals/` and `approvals/blobs/` must be real folders of the session: a
+   link there is refused and nothing is written or read through it.
+
+The call keeps one audit row: written when it parks, pending and naming the approval, and closed
+however it ends — by the run after approval with what that run did, or refused by a deny, an
+expiry, a superseding message, drift, or an approval another copy used. A host that took over
+writes one row of its own naming the approval.
+
+While it waits, a new message from the person in their own DM or conversation declines it
+("superseded by your message") and is answered as usual; in any other session what arrives is held
+until the approval ends, and the status says so once. A restart does not cut a parked turn off.
+
+When a decision counts, the host that holds the session's claim — checked before it writes
+anything, for a deny as for an approval — writes `approvals/<ulid>.decision.json` once and, for an
+approval, consumes it — exactly once across restarts, crashes and takeovers:
+
+- it reads the room first: a `dev.keeper.agent.approval.consumed` event for the approval from any
+  copy means it was used, and is never run again;
+- it re-reads the record and recomputes its digest, checks that the log through the checkpoint is
+  unchanged and that nothing it relied on moved — each file where it landed and its hash (a link
+  pointed at another file of the same bytes is a change), the label still letting the write reach
+  its drive, its age, its expiry — and that it holds the claim;
+- it sends `consumed` (an unencrypted state event keyed by the approval's id, carrying only the id,
+  the claim's epoch and the host's slug; a person cannot send one), waits for the server's id, and
+  goes on only if its event is the first for that id in the room's order, read forward from the
+  request;
+- it logs `approval consumed` and `fsync`s it, runs the call exactly as the record holds it (never
+  the log's copy, whose secret-shaped text is redacted), and the turn continues: that call's
+  result, then the round's later calls in order, as `round.json` holds them, then the model.
+
+A host stopped while those later calls ran answers every one of them when it starts: the call
+that may have been running is told keeper does not know whether it took effect and is never run
+again, and the ones after it run.
+
+A send or a read that fails runs nothing and the run stays parked; the same host tries it again
+every second, and a `consumed` its server already took is never sent twice. A read of the room
+stops after 5,000 events of that type; a read that stops there without finding one is not taken
+to mean nothing was used. A crash after `consumed` and before the effect is known is reported to
+the model as "approved and used on <host>, but keeper does not know whether it took effect" —
+never a second run. Drift is logged `approval refused` with what moved and refused to the model; a
+deny is refused, with the person's note as a message after it; an approval past its time is
+settled on the host's own clock with the room read first: used by any copy, the model is told the
+effect is unknown; a room that could not be read far enough is `approval refused` with that
+reason; otherwise `approval expired` — "nobody decided", or "approved, but not used in time".
+
+A scheduled run that parks says `run: blocked` on its card before its record is written, so the
+host's own write is not drift when its own card is what waits; while it waits its card is not due —
+no later window is named or begun, on this host or a host that takes the session over — and the
+run after the decision, a deny or an expiry ends it on the card (`review`, `failed`, or `blocked`
+again) and in the log.
+
 ## A session an agent works in
 
 An agent works in an ordinary flat session of its home drive's sessions zone, with three more
@@ -752,7 +832,7 @@ per date and host, compared as a number. Each host writes only its own chunks an
 | `assistant` | `text, model, finish, usage {prompt, completion}, ttft_ms, duration_ms, anchor_event`; a round that called tools carries that round's own usage |
 | `tool_call` | `call_id, tool, args, tier`, optional `grant_id`; `args` is the string the model sent, verbatim |
 | `tool_result` | `call_id, outcome` (`ok`, `refused`, `failed`), `content`, optional `truncated {shown, total}`, `label` |
-| `approval` | `id, state` (`requested`, `decided`, `consumed`, `expired`), optional `decision, by, result` |
+| `approval` | `id, state` (`requested`, `decided`, `consumed`, `expired`, `refused`), optional `decision, by, result, reason, scope`; terminal: `consumed`, `expired`, `refused`, and `decided` with `decision: "deny"`; a `decided` line without `decision` is a decision ignored, `reason` saying why |
 | `delegate` | `id, to`, optional `room` (absent on a refusal made before the room existed), optional `child {drive, session}`, `state` (`opened`, `sent`, `accepted`, `replied`, `refused`), optional `reason` |
 | `label` | `readers, integrity`, optional `local_only`, `cause {kind, ref}` |
 | `scope` | `drives, set_by` |

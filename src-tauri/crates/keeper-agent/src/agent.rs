@@ -82,12 +82,13 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use ulid::Ulid;
 
+use crate::approvals::Parking;
 use crate::cards::{self, Begun, Scheduled};
 use crate::claims::Lease;
 use crate::delegate::{self, DelegateTools, Delegation, DelegationPort, Delegator, TurnView};
 use crate::drive::finish_word;
 use crate::grants::AgentGrants;
-use crate::host::{AgentDrive, Classified, HostIds, UNATTENDED_REFUSAL};
+use crate::host::{AgentDrive, Approval, Classified, HostIds, UNATTENDED_REFUSAL};
 use crate::matrix_sink::{
     anchor_content, cut, cut_to_log, deliver, deliver_gated, deliver_unless_narrowed,
     notice_content, status_content, EditPort, MatrixSink, SendFuture, StatusBoard, ToolProgress,
@@ -97,7 +98,8 @@ use crate::rooms::{self, Arrival, BriefEvent, Disposition, Served};
 use crate::sessions::verbs::{self, CreateOutcome};
 use crate::sessions::write::session_write;
 use crate::sinks::{
-    room_audience, CallAudit, ProxyDoors, RoomGate, Sinks, MEMBERS_UNREAD, NARROWED_STATUS,
+    room_audience, CallAudit, Gated, ProxyDoors, RoomGate, Sinks, Withheld, MEMBERS_UNREAD,
+    NARROWED_STATUS,
 };
 use crate::turn::{arm_turn_probing, endpoint_of, read_timeout_of, TurnEnv, TurnOrigin};
 use crate::writer::{SessionWriter, WriterError};
@@ -232,6 +234,12 @@ pub struct SessionContext {
     /// Whether an answer of the session was withheld from its room as the
     /// room then was — an `error` line coded [`LABEL_CODE`] (R168).
     pub withheld: bool,
+    /// The approvals whose call has no result yet, by id (93.2): a turn
+    /// parked on one is waiting, not unanswered, and `recover` leaves it.
+    pub parked: BTreeMap<String, crate::approvals::Pending>,
+    /// Every `tool_call` line with no result yet, in order: a parked
+    /// round's call and the calls after it.
+    open_calls: Vec<(Ulid, chat::ToolCall)>,
 }
 
 impl SessionContext {
@@ -288,6 +296,8 @@ impl SessionContext {
             harvested: HashSet::new(),
             told: false,
             withheld: false,
+            parked: BTreeMap::new(),
+            open_calls: Vec::new(),
         };
         for stored in &log.lines {
             match &stored.body {
@@ -320,6 +330,7 @@ impl SessionContext {
         let position = self.lines.len();
         self.lines.push(line.id);
         self.keep(line);
+        self.track(line);
         match &line.body {
             // A label line holds the label after its join.
             LineBody::Label(body) => self.label = body.label(),
@@ -382,6 +393,83 @@ impl SessionContext {
             self.messages.push(message);
             self.placed.push((line.id, position));
         }
+    }
+
+    /// The calls a parked round left open, and its approvals.
+    fn track(&mut self, line: &LogLine) {
+        match &line.body {
+            LineBody::ToolCall(call) => self.open_calls.push((
+                line.id,
+                chat::ToolCall {
+                    id: call.call_id.clone(),
+                    name: call.tool.clone(),
+                    arguments_raw: call.args.clone(),
+                    arguments: serde_json::from_str(&call.args).ok(),
+                },
+            )),
+            LineBody::ToolResult(result) => {
+                self.open_calls
+                    .retain(|(_, wire)| wire.id != result.call_id);
+                // An approval stays until every call of its round has its
+                // result, so a continuation a stop cut is resumed (R176).
+                for pending in self.parked.values_mut() {
+                    pending.round.retain(|id| *id != result.call_id);
+                }
+                self.parked.retain(|_, pending| !pending.round.is_empty());
+            }
+            LineBody::Approval(body) => match body.state {
+                ApprovalState::Requested => {
+                    let round = line
+                        .parent
+                        .map(|parent| self.calls_from(parent))
+                        .unwrap_or_default();
+                    if let Some((call_line, call)) = round.first() {
+                        self.parked.insert(
+                            body.id.clone(),
+                            crate::approvals::Pending {
+                                id: body.id.clone(),
+                                call_id: call.id.clone(),
+                                call_line: *call_line,
+                                request_event: line.matrix_event.clone(),
+                                ended: None,
+                                round: round.iter().map(|(_, wire)| wire.id.clone()).collect(),
+                                announced: true,
+                                ran: false,
+                            },
+                        );
+                    }
+                }
+                _ if body.is_terminal() => {
+                    if let Some(pending) = self.parked.get_mut(&body.id) {
+                        pending.ended.get_or_insert(body.state);
+                        // Consumed here, not mirrored from another copy:
+                        // it runs here, and the rest of its round with it.
+                        pending.ran |=
+                            body.state == ApprovalState::Consumed && body.result.is_none();
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// The open calls whose ids are `ids`, in the log's order.
+    pub(crate) fn calls_of(&self, ids: &[String]) -> Vec<(Ulid, chat::ToolCall)> {
+        self.open_calls
+            .iter()
+            .filter(|(_, wire)| ids.contains(&wire.id))
+            .cloned()
+            .collect()
+    }
+
+    /// The open calls from the `tool_call` line `call_line` on, in order.
+    pub(crate) fn calls_from(&self, call_line: Ulid) -> Vec<(Ulid, chat::ToolCall)> {
+        self.open_calls
+            .iter()
+            .skip_while(|(id, _)| *id != call_line)
+            .cloned()
+            .collect()
     }
 
     /// What a line changes beyond the conversation: the budget, the
@@ -698,6 +786,11 @@ pub struct AgentDeps {
     /// Its folder inside the drive, for the frame's drive-relative path.
     pub sessions_subfolder: String,
     pub lfs_threshold_bytes: u64,
+    /// Who may decide an approval (R77): installed, a call that needs a
+    /// person parks and waits for a decision; `None` refuses it with
+    /// [`UNATTENDED_REFUSAL`], as every host does until the card can be
+    /// decided on (R92).
+    pub decisions: Option<Arc<dyn crate::approvals::DecisionSource>>,
 }
 
 impl AgentDeps {
@@ -736,6 +829,14 @@ struct AllowedTools<'t> {
     agent: SessionAgent,
     /// Each classified call's tier by call id, for its `tool_call` line.
     tiers: Mutex<HashMap<String, Tier>>,
+    /// Whether a call that needs a person parks: a decision source is
+    /// installed (R77).
+    parks: bool,
+    /// The call a consumed approval lets run, by its wire id, and the
+    /// record (taken by that call).
+    approved: Mutex<Option<(String, Ulid)>>,
+    /// The call this turn parked on.
+    parked: Mutex<Option<Parking>>,
 }
 
 /// Where `subpath` of the drive checked out at `profile` lands, as
@@ -802,33 +903,81 @@ impl AllowedTools<'_> {
         )
     }
 
-    /// What a call to `recipients` answers instead of its effect once its
-    /// sinks have passed (R82): the integrity rule's block; else, at T5,
-    /// [`FORBIDDEN`] — never an approval's to give; else the integrity
-    /// rule's approval; else the tier's own gate. `None` runs it.
-    fn refusal_of(
+    /// What classified call `id` to `recipients` comes to once its sinks
+    /// have passed (R82): the integrity rule's block; else, at T5,
+    /// [`FORBIDDEN`] — never an approval's to give; else a call that needs
+    /// a person, by the integrity rule or by its tier, runs when a consumed
+    /// approval names it, parks when a decision source is installed (R77),
+    /// and is refused otherwise, as when nobody can be asked. `pins` are
+    /// the files a park relies on.
+    fn gated(
         &self,
+        id: &str,
         tool: &str,
         classification: &Classification,
         recipients: &[Recipient],
-    ) -> Option<String> {
-        match check_call(&self.view.label(), tool, classification.tier, recipients) {
-            CallVerdict::Block { reason } => Some(reason),
-            _ if classification.gate() == Gate::Refuse => Some(FORBIDDEN.to_owned()),
-            CallVerdict::NeedsApproval => Some(NEEDS_APPROVAL.to_owned()),
-            CallVerdict::Allow => gate_refusal(classification),
+        pins: Vec<(String, String)>,
+    ) -> Gated {
+        let refusal = match check_call(&self.view.label(), tool, classification.tier, recipients) {
+            CallVerdict::Block { reason } => return Gated::Refuse(reason),
+            _ if classification.gate() == Gate::Refuse => {
+                return Gated::Refuse(FORBIDDEN.to_owned())
+            }
+            CallVerdict::NeedsApproval => NEEDS_APPROVAL,
+            CallVerdict::Allow if classification.gate() == Gate::Run => return Gated::Run(None),
+            CallVerdict::Allow => UNATTENDED_REFUSAL,
+        };
+        let mut approved = self.approved.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, approval)) = approved.as_ref().filter(|(call, _)| call == id) {
+            let approval = *approval;
+            *approved = None;
+            return Gated::Run(Some(Approval::Approved(approval)));
         }
+        if !self.parks {
+            return Gated::Refuse(refusal.to_owned());
+        }
+        let approval = Ulid::new();
+        *self.parked.lock().unwrap_or_else(|p| p.into_inner()) = Some(Parking {
+            approval,
+            call_id: id.to_owned(),
+            classification: classification.clone(),
+            pins,
+        });
+        Gated::Park(approval)
     }
-}
 
-/// What a call's tier answers instead of its effect: nothing at T0–T1; at
-/// T2–T4 a person's approval, which nobody can give until a decision source
-/// is installed (epic 93's Q3); never at T5.
-fn gate_refusal(classification: &Classification) -> Option<String> {
-    match classification.gate() {
-        Gate::Run => None,
-        Gate::Person => Some(UNATTENDED_REFUSAL.to_owned()),
-        Gate::Refuse => Some(FORBIDDEN.to_owned()),
+    /// Where a card tool's call lands, as it runs it: `card_update`'s card,
+    /// `session_write`'s path, in this session.
+    fn card_at(&self, tool: AgentTool, args: &Value) -> String {
+        let key = if tool == AgentTool::CardUpdate {
+            "card"
+        } else {
+            "path"
+        };
+        format!("{}/{}", self.session_dir, args[key].as_str().unwrap_or(""))
+    }
+
+    /// A call later in a parked round, by the table's tier for its line:
+    /// its facts read as [`ToolHost::run`] and [`ToolHost::run_named`] read
+    /// them when it runs.
+    fn table_tier(&self, wire: &chat::ToolCall, default_profile_id: &str) -> u8 {
+        let Some(tool) = AgentTool::from_wire(&wire.name) else {
+            return 0;
+        };
+        let args = wire.arguments.as_ref().unwrap_or(&Value::Null);
+        let facts = match tools::parse_call(default_profile_id, wire) {
+            Ok(call) if call.name.effect() == Effect::Write => {
+                self.landed_facts(&call.target.profile_id, &call.target.subpath)
+            }
+            Ok(_) => CallFacts::default(),
+            Err(_) if crate::cards::is_card_tool(&wire.name) => {
+                let landed = self.landed_facts(&self.home.id, &self.card_at(tool, args));
+                tier::named_facts(tool, args, landed)
+            }
+            Err(_) => tier::named_facts(tool, args, CallFacts::default()),
+        };
+        let context = Context::of_session(&self.agent, self.view.label().integrity);
+        tier::classify(tool, &facts, &context).tier.as_u8()
     }
 }
 
@@ -867,7 +1016,22 @@ impl ToolHost for AllowedTools<'_> {
         // The table's tier before the grant answers: what the line and the
         // row say of a call refused before it reaches the drive.
         let table = self.classify(&call.id, tool, &facts, None);
-        let audit = CallAudit::new(self.sinks, name, effect, &table, None, (drive, path));
+        // An approved call refused here closes the row its park left (R172).
+        let approved = self
+            .approved
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .filter(|(id, _)| *id == call.id)
+            .map(|(_, approval)| Approval::Approved(*approval));
+        let audit = CallAudit::new(
+            self.sinks,
+            name,
+            effect,
+            &table,
+            Gated::Run(approved),
+            (drive, path),
+        );
         if !self.allow.iter().any(|allowed| allowed == name) {
             return Ok(audit.refuse(format!("{name} is not one of this agent's tools.")));
         }
@@ -893,13 +1057,21 @@ impl ToolHost for AllowedTools<'_> {
             }
         }
         // Its sinks passed: the drive host writes the row, on the grant's
-        // answer.
+        // answer; a park relies on the file it writes.
+        let pins = if effect == Effect::Write {
+            vec![(drive.to_owned(), path.to_owned())]
+        } else {
+            Vec::new()
+        };
         self.inner.run_classified(call, &|verdict| {
             let classification = self.classify(&call.id, tool, &facts, Some(verdict.into()));
-            let refusal = self.refusal_of(name, &classification, &[]);
+            let (refusal, approval) = self
+                .gated(&call.id, name, &classification, &[], pins.clone())
+                .split();
             Classified {
                 classification,
                 refusal,
+                approval,
             }
         })
     }
@@ -920,14 +1092,20 @@ impl ToolHost for AllowedTools<'_> {
                 .collect();
             // Decided now, said only once the delegation's own sinks have
             // passed (R82).
-            let withheld = self.refusal_of(&wire.name, &classification, &recipients);
+            let gated = self.gated(
+                &wire.id,
+                &wire.name,
+                &classification,
+                &recipients,
+                Vec::new(),
+            );
             let (drive, at) = self.delegation.destination(wire);
             let audit = CallAudit::new(
                 self.sinks,
                 &wire.name,
                 Effect::Write,
                 &classification,
-                withheld,
+                gated,
                 (&drive, &at),
             );
             let outcome = self.delegation.run(wire, &audit);
@@ -938,24 +1116,23 @@ impl ToolHost for AllowedTools<'_> {
         }
         if crate::cards::is_card_tool(&wire.name) {
             let tool = AgentTool::from_wire(&wire.name)?;
-            // The file the tool changes, as it runs it: `card_update`'s
-            // card, `session_write`'s path.
-            let key = if tool == AgentTool::CardUpdate {
-                "card"
-            } else {
-                "path"
-            };
-            let at = format!("{}/{}", self.session_dir, args[key].as_str().unwrap_or(""));
+            let at = self.card_at(tool, args);
             let landed = self.landed_facts(&self.home.id, &at);
             let facts = tier::named_facts(tool, args, landed);
             let classification = self.classify(&wire.id, tool, &facts, None);
-            let withheld = self.refusal_of(&wire.name, &classification, &[]);
+            let gated = self.gated(
+                &wire.id,
+                &wire.name,
+                &classification,
+                &[],
+                vec![(self.home.id.clone(), at.clone())],
+            );
             let audit = CallAudit::new(
                 self.sinks,
                 &wire.name,
                 Effect::Write,
                 &classification,
-                withheld,
+                gated,
                 (&self.home.id, &at),
             );
             // A tool the agent was not given is refused by the card tools.
@@ -977,11 +1154,11 @@ impl ToolHost for AllowedTools<'_> {
                         wire.arguments_raw.as_bytes(),
                         None,
                     )
-                    .map_err(|blocked| audit.blocked(blocked))
+                    .map_err(|blocked| Withheld::Refused(audit.blocked(blocked)))
                     .and_then(|()| audit.admit(&self.home.id, &at));
                 match admitted {
                     Ok(()) => self.cards.run(wire),
-                    Err(sentence) => Some(refusal(sentence)),
+                    Err(withheld) => Some(withheld.into()),
                 }
             };
             if let Some(outcome) = &outcome {
@@ -995,13 +1172,13 @@ impl ToolHost for AllowedTools<'_> {
         let tool = AgentTool::from_wire(&wire.name)?;
         let facts = tier::named_facts(tool, args, CallFacts::default());
         let classification = self.classify(&wire.id, tool, &facts, None);
-        let withheld = self.refusal_of(&wire.name, &classification, &[]);
+        let gated = self.gated(&wire.id, &wire.name, &classification, &[], Vec::new());
         let audit = CallAudit::new(
             self.sinks,
             &wire.name,
             Effect::Read,
             &classification,
-            withheld,
+            gated,
             (
                 args["drive"].as_str().unwrap_or(""),
                 args["path"].as_str().unwrap_or(""),
@@ -1012,7 +1189,7 @@ impl ToolHost for AllowedTools<'_> {
             // send, and its row written then.
             Some(surface) => surface.run(wire, &|verdict, (drive, path)| {
                 verdict
-                    .map_err(|blocked| audit.blocked(blocked))
+                    .map_err(|blocked| Withheld::Refused(audit.blocked(blocked)))
                     .and_then(|()| audit.admit(drive, path))
             }),
             None => Some(ToolOutcome::Refused {
@@ -1062,6 +1239,47 @@ pub struct ServedSession {
     /// not been sent, child rooms whose replies could not be read back, a
     /// person not yet told their work narrowed.
     retry: Retry,
+    /// The room's `consumed` events, its claim and its uploads (R75, R86);
+    /// `None`: an approval is never consumed here and a run stays parked.
+    pub approval_room: Option<Arc<dyn crate::approvals::ApprovalRoom>>,
+    /// When each pending approval expires, by id (R84's timer).
+    pub(crate) due: BTreeMap<String, chrono::DateTime<chrono::Utc>>,
+    /// Arrivals held while a call waits for a person (R74).
+    held: Vec<Arrived>,
+    /// Whether the status said, since the last hold began, that arrivals
+    /// wait.
+    held_said: bool,
+    /// Each approval whose approve decision is written here and whose
+    /// settlement did not finish, tried again on the worker's clock: the
+    /// `consumed` event this copy's server took already, if any (R179).
+    pub(crate) settling: BTreeMap<String, Option<OwnedEventId>>,
+    /// The scheduled card whose run the turn under way is — its own or a
+    /// parked run's continuation — so a park records it and the run's end
+    /// is written on it (R178).
+    pub(crate) scheduled_card: Option<String>,
+}
+
+/// What a session's worker tells its host while it holds the claim.
+#[derive(Debug, Default)]
+pub struct Activity {
+    /// Set while the worker does anything — starting, a turn, a parked
+    /// run's continuation, an expiry, a settlement: a hand-back waits for
+    /// it to clear and no window is begun (R177).
+    pub busy: AtomicBool,
+    /// Set while a call of the session waits for a person: its scheduled
+    /// card is not due, so no window is named (R84, R177). It is idle — a
+    /// hand-back may go on.
+    pub parked: AtomicBool,
+}
+
+impl Activity {
+    /// A worker just spawned: busy until it has settled what waited for it.
+    pub fn starting() -> Activity {
+        Activity {
+            busy: AtomicBool::new(true),
+            parked: AtomicBool::new(false),
+        }
+    }
 }
 
 /// What a harvest worker made of each closed session it was handed, by id:
@@ -1326,6 +1544,9 @@ pub enum Outcome {
     BriefSent(String),
     /// The scheduled card says this `run` line's state now; no turn ran.
     Scheduled(keeper_core::agents::log::RunState),
+    /// A call of this session waits for a person: the arrival is held,
+    /// and served once the approval ends (R74).
+    Held,
 }
 
 /// How a turn ended.
@@ -1339,6 +1560,9 @@ pub enum TurnEnding {
     LocalOnly,
     /// A delegated session reached its token budget (92.1).
     Bounded,
+    /// A call waits for a person's decision: the turn holds nothing and
+    /// goes on when it is decided (93.2).
+    Parked,
     /// The model or the log failed.
     Failed,
 }
@@ -1436,7 +1660,7 @@ pub fn trail_of(events: &[Value], agent: &UserId, user_line: Option<Ulid>) -> Tr
 
 /// Run blocking work (an `fsync`, a zone write) where it does not stall the
 /// runtime's other tasks: in place on a multi-thread runtime's worker.
-fn off_the_runtime<T>(work: impl FnOnce() -> T) -> T {
+pub(crate) fn off_the_runtime<T>(work: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(work)
@@ -1484,6 +1708,12 @@ impl ServedSession {
             harvests: None,
             doors: None,
             retry: Retry::default(),
+            approval_room: None,
+            due: BTreeMap::new(),
+            held: Vec::new(),
+            held_said: false,
+            settling: BTreeMap::new(),
+            scheduled_card: None,
         })
     }
 
@@ -1503,6 +1733,13 @@ impl ServedSession {
             self.context.status_anchor = Some(status.clone());
         }
         self.peer_the_reply()?;
+        // A record whose `approval requested` line a stop lost still waits
+        // (R176): it is announced again, never cut off.
+        self.adopt_records(deps);
+        // A turn parked on an approval waits; it was not cut off (R74).
+        if !self.context.parked.is_empty() {
+            return Ok(false);
+        }
         let Some(user_line) = self.context.unanswered else {
             return Ok(false);
         };
@@ -1549,7 +1786,7 @@ impl ServedSession {
     }
 
     /// This session's sinks: its audit ids, and what routes a declassification.
-    fn sinks(&self, deps: &AgentDeps) -> Sinks {
+    pub(crate) fn sinks(&self, deps: &AgentDeps) -> Sinks {
         Sinks {
             data_dir: deps.data_dir.clone(),
             provider_id: deps.row.provider.id.clone(),
@@ -1566,7 +1803,11 @@ impl ServedSession {
     /// fires. A stop is checked before each arrival, so a queued arrival is
     /// never started on shutdown: it stays unlogged, and the next start reads
     /// it from the room's timeline. While a delegation's brief or reply
-    /// read failed, it is tried again every [`crate::runtime::TICK`].
+    /// read failed, it is tried again every [`crate::runtime::TICK`]; so is
+    /// an approval's settlement that did not finish (R179). `activity` is
+    /// busy through all work — what waited at start, every arrival, every
+    /// expiry and settlement — and says, before busy clears, whether a call
+    /// waits for a person (R177).
     pub async fn serve_arrivals(
         &mut self,
         deps: &AgentDeps,
@@ -1574,24 +1815,52 @@ impl ServedSession {
         backlog: Vec<Arrived>,
         arrivals: &mut mpsc::UnboundedReceiver<Arrived>,
         mut stop: CancelSignal,
-        busy: &AtomicBool,
+        activity: &Activity,
     ) {
         let mut backlog: std::collections::VecDeque<Arrived> = backlog.into();
+        activity.busy.store(true, Ordering::SeqCst);
         // A person not told before a restart is told now.
         self.tell_the_requester(deps).await;
+        // What waited for a person while no worker served it is settled
+        // first: an approval decided or expired meanwhile (93.2 AC5, R84).
+        self.resume_approvals(deps, Arc::clone(&port), stop.clone())
+            .await;
+        self.idle(activity);
         loop {
             if stop.is_cancelled() {
                 return;
             }
+            // Once nothing waits, what was held meanwhile is served (R74).
+            if !self.waiting() && !self.held.is_empty() {
+                backlog.extend(self.held.drain(..));
+                self.held_said = false;
+            }
+            let expiry = self.next_expiry().map(|at| {
+                (at - chrono::Utc::now())
+                    .to_std()
+                    .unwrap_or(std::time::Duration::ZERO)
+            });
             let arrived = match backlog.pop_front() {
                 Some(arrived) => arrived,
                 None => tokio::select! {
                     biased;
                     () = stop.cancelled() => return,
+                    () = tokio::time::sleep(expiry.unwrap_or_default()), if expiry.is_some() => {
+                        activity.busy.store(true, Ordering::SeqCst);
+                        self.expire_due(deps, &port, stop.clone()).await;
+                        self.idle(activity);
+                        continue;
+                    }
                     arrived = arrivals.recv() => match arrived {
                         Some(arrived) => arrived,
                         None => return,
                     },
+                    () = tokio::time::sleep(crate::runtime::TICK), if self.settling() => {
+                        activity.busy.store(true, Ordering::SeqCst);
+                        self.retry_settlements(deps, &port, stop.clone()).await;
+                        self.idle(activity);
+                        continue;
+                    }
                     () = tokio::time::sleep(crate::runtime::TICK), if !self.retry.is_empty() => {
                         backlog.extend(self.retry_delegations(deps).await);
                         continue;
@@ -1606,11 +1875,11 @@ impl ServedSession {
                     .to_owned();
                 (id, arrived.event_id.clone())
             });
-            busy.store(true, Ordering::Relaxed);
+            activity.busy.store(true, Ordering::SeqCst);
             let outcome = self
                 .serve(deps, Arc::clone(&port), arrived, stop.clone())
                 .await;
-            busy.store(false, Ordering::Relaxed);
+            self.idle(activity);
             // The host hands a harvest again only when it failed before it
             // began: one that began and then failed is the interrupted
             // turn's, never run twice.
@@ -1635,6 +1904,14 @@ impl ServedSession {
                 }
             }
         }
+    }
+
+    /// The work is done: say first whether a call waits for a person, then
+    /// clear busy — the host never sees an idle worker it may begin a
+    /// window beside while a run is parked (R177).
+    fn idle(&self, activity: &Activity) {
+        activity.parked.store(self.waiting(), Ordering::SeqCst);
+        activity.busy.store(false, Ordering::SeqCst);
     }
 
     /// Serve one arrival: ignore it, log a decision, or run a turn.
@@ -1666,6 +1943,9 @@ impl ServedSession {
                 tracing::info!(session = %self.context.session.path, sender = %arrived.sender, note, "agents: an observer's event is not a turn");
                 Ok(Outcome::Ignored(note))
             }
+            Disposition::Decision if deps.decisions.is_some() => {
+                self.decided(deps, port, arrived, stop).await
+            }
             Disposition::Decision => {
                 let field = |key: &str| arrived.content[key].as_str().map(str::to_owned);
                 self.writer.write(
@@ -1678,10 +1958,41 @@ impl ServedSession {
                         decision: field("decision"),
                         by: Some(arrived.sender.to_string()),
                         result: None,
+                        reason: None,
+                        scope: None,
                     }),
                 )?;
                 off_the_runtime(|| self.writer.sync())?;
                 Ok(Outcome::Decided)
+            }
+            // While a call waits for a person (R74): in the person's own
+            // `main` or `conversation` session their new message denies it
+            // and then runs; anywhere else what would start a turn is held
+            // until the approval ends, and the status says once what waits.
+            _ if self.waiting() => {
+                let persons_word = matches!(
+                    self.context.agent.kind,
+                    SessionKind::Main | SessionKind::Conversation
+                ) && disposition == Disposition::Turn
+                    && arrived.arrival == Arrival::Text;
+                if persons_word {
+                    self.supersede(deps, &arrived.sender);
+                    return self
+                        .turn(deps, port, arrived, stop)
+                        .await
+                        .map(Outcome::Answered);
+                }
+                if !self.held_said {
+                    self.held_said = true;
+                    let detail = format!(
+                        "{} (new messages wait until it is decided)",
+                        crate::approvals::WAITING_FOR.trim_end_matches(':')
+                    );
+                    self.send_status(deps, &port, RunState::Blocked, Some(&detail))
+                        .await;
+                }
+                self.held.push(arrived);
+                Ok(Outcome::Held)
             }
             Disposition::Turn if arrived.arrival == Arrival::Brief => {
                 self.take_brief(deps, port, arrived, stop).await
@@ -1790,10 +2101,6 @@ impl ServedSession {
         };
         let session = self.context.session.path.clone();
         let lease = self.writer.lease();
-        let may_write = {
-            let lease = lease.clone();
-            move || lease.as_ref().is_none_or(|lease| lease.may_write())
-        };
         // A window begins only while the claim names it (R56): a run routed
         // before the host named a later window never begins.
         let names = match &scheduled {
@@ -1874,16 +2181,41 @@ impl ServedSession {
             )?;
         }
         arrived.text = brief;
+        let card = scheduled.card().to_owned();
+        self.scheduled_card = Some(card.clone());
         let ran = self.turn(deps, port, arrived, stop).await;
-        let (run, state) = match ran.as_ref().map(|report| report.ending) {
-            Ok(TurnEnding::Complete) => (Run::Review, LogRun::Review),
-            Ok(TurnEnding::Stopped | TurnEnding::LocalOnly | TurnEnding::Bounded) => {
+        self.scheduled_card = None;
+        self.finish_scheduled(deps, &card, ran.as_ref().ok().map(|report| report.ending))?;
+        ran.map(Outcome::Answered)
+    }
+
+    /// End the run of the scheduled card `card` as its turn — the run's own
+    /// or a parked run's continuation — ended (`None`: it failed), on the
+    /// card and as a `run` line: `review`, `failed`, or `blocked` — a run
+    /// parked on a person reads `blocked` until its approval ends (93.2 AC1,
+    /// R84, R178); one that could not wait for anyone failed.
+    pub(crate) fn finish_scheduled(
+        &mut self,
+        deps: &AgentDeps,
+        card: &str,
+        ending: Option<TurnEnding>,
+    ) -> Result<(), ServeError> {
+        use keeper_core::agents::log::RunState as LogRun;
+        let (run, state) = match ending {
+            Some(TurnEnding::Complete) => (Run::Review, LogRun::Review),
+            Some(TurnEnding::Parked) if self.waiting() => (Run::Blocked, LogRun::Blocked),
+            Some(TurnEnding::Stopped | TurnEnding::LocalOnly | TurnEnding::Bounded) => {
                 (Run::Blocked, LogRun::Blocked)
             }
-            Ok(TurnEnding::Failed) | Err(_) => (Run::Failed, LogRun::Failed),
+            Some(TurnEnding::Parked | TurnEnding::Failed) | None => (Run::Failed, LogRun::Failed),
         };
-        let card = scheduled.card().to_owned();
-        match off_the_runtime(|| cards::write_run(&zone, &session, &card, run, None, &may_write)) {
+        let (zone, session) = (
+            deps.sessions_zone.clone(),
+            self.context.session.path.clone(),
+        );
+        let lease = self.writer.lease();
+        let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
+        match off_the_runtime(|| cards::write_run(&zone, &session, card, run, None, &may_write)) {
             Ok(_) => {
                 self.writer.write(
                     &mut self.context,
@@ -1900,7 +2232,7 @@ impl ServedSession {
                 tracing::warn!(%session, %card, %error, "agents: the scheduled card's end could not be written")
             }
         }
-        ran.map(Outcome::Answered)
+        Ok(())
     }
 
     /// The session as its `delegate` and `reply` tools and its briefs name it.
@@ -2808,17 +3140,67 @@ impl ServedSession {
         arrived: Arrived,
         stop: CancelSignal,
     ) -> Result<TurnReport, ServeError> {
+        self.run_turn(deps, port, Opening::Arrived(arrived), stop)
+            .await
+    }
+
+    /// Go on with the turn a parked call ended, that call settled (93.2):
+    /// its result, then the round's remaining calls in order, then the
+    /// model, under a new anchor answering the same question.
+    pub(crate) async fn resume_turn(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        resume: crate::approvals::Resume,
+        stop: CancelSignal,
+    ) -> Result<TurnReport, ServeError> {
+        self.run_turn(deps, port, Opening::Resumed(Box::new(resume)), stop)
+            .await
+    }
+
+    async fn run_turn(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        opening: Opening,
+        stop: CancelSignal,
+    ) -> Result<TurnReport, ServeError> {
         let label_before = self.context.label.clone();
         let sinks = self.sinks(deps);
-        let user = self.open_turn(deps, &arrived)?;
+        let (user_id, question, received_at, harvest, resume) = match opening {
+            Opening::Arrived(arrived) => {
+                let user = self.open_turn(deps, &arrived)?;
+                // A harvest's anchor names its arrival, the closed session:
+                // each attempt asks the room as it is then, and a room its
+                // label no longer reaches hears only that a harvest ran
+                // (R166).
+                let harvest = arrived.arrival == Arrival::Harvest;
+                (
+                    user.id,
+                    arrived.event_id,
+                    arrived.received_at,
+                    harvest,
+                    None,
+                )
+            }
+            Opening::Resumed(resume) => (
+                self.context.unanswered.unwrap_or_else(|| {
+                    resume
+                        .call
+                        .as_ref()
+                        .or(resume.rest.first())
+                        .map_or_else(Ulid::new, |(line, _)| *line)
+                }),
+                resume.question.clone(),
+                Instant::now(),
+                false,
+                Some(*resume),
+            ),
+        };
         // Every send of the turn into the room asks this gate, against the
         // room's members at that send (R168).
         let gate = self.gate(deps, &port);
-        // A harvest's anchor names its arrival, the closed session: each
-        // attempt asks the room as it is then, and a room its label no
-        // longer reaches hears only that a harvest ran (R166).
-        let harvest = arrived.arrival == Arrival::Harvest;
-        let (session, line) = (&self.context.session.path, user.id.to_string());
+        let (session, line) = (&self.context.session.path, user_id.to_string());
         let (anchor, anchor_at, _) = deliver_gated(
             port.as_ref(),
             "m.room.message",
@@ -2827,7 +3209,7 @@ impl ServedSession {
                 let question = if narrowed {
                     unnamed_harvest()
                 } else {
-                    &arrived.event_id
+                    &question
                 };
                 anchor_content(session, &line, question)
             },
@@ -2863,6 +3245,7 @@ impl ServedSession {
             &board,
             stop,
             tools,
+            resume,
         )
         .await;
         let stream_end = Instant::now();
@@ -2896,11 +3279,21 @@ impl ServedSession {
                 shown.clone(),
             ),
             TurnEnding::Failed => (join_note(&visible, TURN_FAILED), shown.clone()),
+            TurnEnding::Parked => {
+                let summary = ran.parked.as_ref().map_or_else(String::new, |parked| {
+                    keeper_core::agents::approval::summary_of(
+                        parked.parking.classification.tool,
+                        &parked.args,
+                    )
+                });
+                let note = format!("{} {summary}", crate::approvals::WAITING_FOR);
+                (join_note(&visible, &note), shown.clone())
+            }
         };
         // The room gets the log's redaction (S-17), and the artifact too, so
         // it equals the log's line.
         let final_text = redact_secrets(&final_text).text;
-        let artifact = format!("artifacts/answer-{}.md", user.id);
+        let artifact = format!("artifacts/answer-{user_id}.md");
         let message = match cut(&final_text, &artifact) {
             Some(message) => {
                 let path = self.context.session.path.clone();
@@ -2965,10 +3358,12 @@ impl ServedSession {
         }
 
         let closing = match ran.ending {
+            // A parked turn is not over: nothing closes it yet.
+            TurnEnding::Parked => None,
             TurnEnding::Complete | TurnEnding::Stopped => {
                 let outcome = ran.outcome.as_ref();
                 let usage = outcome.and_then(|o| o.usage.as_ref());
-                self.writer.write(
+                let line = self.writer.write(
                     &mut self.context,
                     ran.parent,
                     Some(delivered.final_event.clone()),
@@ -2991,10 +3386,11 @@ impl ServedSession {
                         duration_ms: outcome.map_or(0, |o| o.total_ms),
                         anchor_event: Some(anchor.to_string()),
                     }),
-                )?
+                )?;
+                Some(line)
             }
             TurnEnding::LocalOnly | TurnEnding::Bounded | TurnEnding::Failed => {
-                let mut parent = ran.parent.or(Some(user.id));
+                let mut parent = ran.parent.or(Some(user_id));
                 // The prose the room already saw of the round that failed:
                 // the next turn's model must read what the person read.
                 if !ran.round_logged && !ran.round_text.is_empty() {
@@ -3022,7 +3418,7 @@ impl ServedSession {
                         "turn_failed",
                     ),
                 };
-                self.writer.write(
+                Some(self.writer.write(
                     &mut self.context,
                     parent,
                     Some(delivered.final_event.clone()),
@@ -3030,13 +3426,13 @@ impl ServedSession {
                         sentence,
                         code: code.to_owned(),
                     }),
-                )?
+                )?)
             }
         };
         if withheld {
             self.writer.write(
                 &mut self.context,
-                Some(closing.id),
+                closing.as_ref().map(|line| line.id),
                 None,
                 LineBody::Error(ErrorBody {
                     sentence: NARROWER_THAN_ROOM.to_owned(),
@@ -3045,6 +3441,14 @@ impl ServedSession {
             )?;
         }
         off_the_runtime(|| self.writer.sync())?;
+        if let Some(parked) = &ran.parked {
+            if let Err(error) = self.park(deps, &port, parked).await {
+                // It cannot wait for anyone: refused as if no one could be
+                // asked, and the turn closes.
+                tracing::error!(session = %self.context.session.path, %error, "agents: a call could not be parked");
+                self.refuse_parked(deps, parked, user_id, &error)?;
+            }
+        }
         // A `label` line changes the label chip: the room is told, as after
         // a `scope` line — unless the label no longer reaches the room, whose
         // members the chip's drives and readers would then reach (R64).
@@ -3059,9 +3463,9 @@ impl ServedSession {
         self.say_waiting(&port, deps).await;
 
         Ok(TurnReport {
-            user_line: user.id,
+            user_line: user_id,
             anchor,
-            received_at: arrived.received_at,
+            received_at,
             anchor_at,
             stream_end,
             final_at: delivered.accepted_at,
@@ -3075,7 +3479,7 @@ impl ServedSession {
     /// This session's room gate over `port` (R168): the room's members at
     /// each send, the known agents through their audiences, the session's
     /// own agents left out, under the label now; a suppression audited.
-    fn gate(&self, deps: &AgentDeps, port: &Arc<dyn EditPort>) -> Arc<RoomGate> {
+    pub(crate) fn gate(&self, deps: &AgentDeps, port: &Arc<dyn EditPort>) -> Arc<RoomGate> {
         Arc::new(RoomGate::new(
             Arc::clone(port),
             self.delegations.as_ref().map(|rooms| rooms.known()),
@@ -3107,7 +3511,7 @@ impl ServedSession {
     /// Send this session's status — `run`, `detail` — into the room as an
     /// edit of its anchor, each attempt under the room as it is then (R64,
     /// R168): narrowed, the fixed title and no detail, audited (R65).
-    async fn send_status(
+    pub(crate) async fn send_status(
         &mut self,
         deps: &AgentDeps,
         port: &Arc<dyn EditPort>,
@@ -3194,7 +3598,10 @@ impl ServedSession {
             self.retry.tell = false;
             return;
         }
-        if let Err(error) = doors.tell(&person, notice_content(&detail)).await {
+        if let Err(error) = doors
+            .tell(&person, "m.room.message", notice_content(&detail))
+            .await
+        {
             tracing::warn!(%dm, %error, "agents: a narrowed session's detail could not reach its person's DM; it is sent again");
             self.retry.tell = true;
             return;
@@ -3208,6 +3615,54 @@ impl ServedSession {
         );
         if let Err(error) = told.and_then(|_| off_the_runtime(|| self.writer.sync())) {
             tracing::warn!(session = %self.context.session.path, %error, "agents: a told line could not be written");
+        }
+    }
+
+    /// An approval's request `content` that its room may not carry (R85):
+    /// to each approver — each reader of the session's label — through
+    /// their proxy's DM, as the proxy, each DM checked against the label as
+    /// it is now and a refusal audited (R65). An approver no door on this
+    /// host reaches is not asked from here (DW-485); the room's status
+    /// says only R64's fixed sentence.
+    pub(crate) async fn request_by_doors(&mut self, deps: &AgentDeps, content: &Value) {
+        let event_type = keeper_core::agents::events::APPROVAL_REQUEST;
+        let Readers::Only(approvers) = &self.context.label.readers else {
+            return;
+        };
+        let Some(doors) = self.doors.clone() else {
+            tracing::info!(session = %self.context.session.path, "agents: an approval's approvers have no proxy on this host");
+            return;
+        };
+        let sinks = self.sinks(deps);
+        let known = self.delegations.as_ref().map(|rooms| rooms.known());
+        let effect = content.to_string();
+        for person in approvers {
+            let Some(dm) = doors.dm(person) else {
+                tracing::info!(session = %self.context.session.path, %person, "agents: an approver has no DM this host can name");
+                continue;
+            };
+            let members = match doors.members(person).await {
+                Ok(members) => members,
+                Err(error) => {
+                    tracing::warn!(%dm, %error, "agents: an approver's DM could not be read; the request is not sent there");
+                    continue;
+                }
+            };
+            // The proxy is its person's door: its audience is theirs.
+            let refused = sinks.check(
+                event_type,
+                &Destination::Room { room: dm.clone() },
+                &self.context.label,
+                &room_audience(members, known.as_deref(), &[]),
+                effect.as_bytes(),
+                None,
+            );
+            if refused.is_err() {
+                continue;
+            }
+            if let Err(error) = doors.tell(person, event_type, content.clone()).await {
+                tracing::warn!(%dm, %error, "agents: an approval's request could not reach its approver's DM");
+            }
         }
     }
 }
@@ -3243,6 +3698,14 @@ struct Ran {
     error: Option<String>,
     /// The bound that stopped a delegated session's run.
     bound: Option<BoundReached>,
+    /// The call the turn parked on, when it did.
+    parked: Option<crate::approvals::ParkedTurn>,
+}
+
+/// How a turn opens: on an arrival, or at a call that waited for a person.
+enum Opening {
+    Arrived(Arrived),
+    Resumed(Box<crate::approvals::Resume>),
 }
 
 /// The lines a running turn writes, behind one lock: the tool loop's event
@@ -3264,6 +3727,8 @@ struct TurnLog<'a> {
     /// Why the model's stream broke, when it did: the partial answer is
     /// returned as an outcome, the cause only to the event sink.
     broken: Option<String>,
+    /// The parked call's `tool_call` line and wire call (R73).
+    parked: Option<(Option<Ulid>, chat::ToolCall)>,
 }
 
 impl TurnView for Mutex<TurnLog<'_>> {
@@ -3407,6 +3872,7 @@ fn open_body(context: &SessionContext, deps: &AgentDeps, composed: &ComposedProm
 
 /// Run one turn of `context`'s agent: arm, compose, and drive the tool loop
 /// into `sink`, writing every round, call, result and label to the log.
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_turn(
     context: &mut SessionContext,
     writer: &mut SessionWriter,
@@ -3415,6 +3881,7 @@ async fn run_agent_turn(
     board: &StatusBoard,
     stop: CancelSignal,
     tools: TurnTools,
+    resume: Option<crate::approvals::Resume>,
 ) -> Ran {
     let config = &deps.home.config;
     let local = deps.model_is_local();
@@ -3428,6 +3895,7 @@ async fn run_agent_turn(
         prompt_sha256: None,
         error: Some(error),
         bound: None,
+        parked: None,
     };
 
     // What the prompt carries beyond the conversation — the home's frozen
@@ -3522,6 +3990,7 @@ async fn run_agent_turn(
         bound: None,
         round_usage: Usage::default(),
         broken: None,
+        parked: None,
     });
     let host = AllowedTools {
         inner: drive_host,
@@ -3550,6 +4019,9 @@ async fn run_agent_turn(
         profiles,
         agent,
         tiers: Mutex::new(HashMap::new()),
+        parks: deps.decisions.is_some(),
+        approved: Mutex::new(None),
+        parked: Mutex::new(None),
     };
     let tool_loop = ToolLoop {
         client: &client,
@@ -3588,31 +4060,12 @@ async fn run_agent_turn(
         }
         _ => {}
     };
-    let mut report = |record: &ToolCallRecord, wire: &chat::ToolCall, outcome: &ToolOutcome| {
-        let mut log = lock();
-        if log.round_line.is_none() {
-            let body = LineBody::Assistant(AssistantBody {
-                text: log.round_text.clone(),
-                model: log.model.clone(),
-                finish: ROUND_FINISH.to_owned(),
-                usage: log.round_usage,
-                ttft_ms: None,
-                duration_ms: 0,
-                anchor_event: None,
-            });
-            log.round_line = log.write(None, body);
-        }
-        let parent = log.round_line;
-        let call_line = log.write(
-            parent,
-            LineBody::ToolCall(ToolCallBody {
-                call_id: wire.id.clone(),
-                tool: wire.name.clone(),
-                args: wire.arguments_raw.clone(),
-                tier: host.tier_of(&wire.id),
-                grant_id: None,
-            }),
-        );
+    // A call's result and what follows it, under its `tool_call` line.
+    let finish = |log: &mut TurnLog<'_>,
+                  call_line: Option<Ulid>,
+                  record: &ToolCallRecord,
+                  wire: &chat::ToolCall,
+                  outcome: &ToolOutcome| {
         let read = read_label(deps, &read_profiles, record, outcome);
         let result_label = read
             .as_ref()
@@ -3674,6 +4127,112 @@ async fn run_agent_turn(
         board.relabel(&log.context.label);
         board.update(log.progress);
     };
+    let mut report = |record: &ToolCallRecord, wire: &chat::ToolCall, outcome: &ToolOutcome| {
+        let mut log = lock();
+        if log.round_line.is_none() {
+            let body = LineBody::Assistant(AssistantBody {
+                text: log.round_text.clone(),
+                model: log.model.clone(),
+                finish: ROUND_FINISH.to_owned(),
+                usage: log.round_usage,
+                ttft_ms: None,
+                duration_ms: 0,
+                anchor_event: None,
+            });
+            log.round_line = log.write(None, body);
+        }
+        let parent = log.round_line;
+        let call_line = log.write(
+            parent,
+            LineBody::ToolCall(ToolCallBody {
+                call_id: wire.id.clone(),
+                tool: wire.name.clone(),
+                args: wire.arguments_raw.clone(),
+                tier: host.tier_of(&wire.id),
+                grant_id: None,
+            }),
+        );
+        // A parked call has no result until a person decided (R73).
+        if let ToolOutcome::Parked { .. } = outcome {
+            log.parked = Some((call_line, wire.clone()));
+            return;
+        }
+        finish(&mut log, call_line, record, wire, outcome);
+    };
+
+    // A turn resuming at a parked call (93.2 AC6): that call's result —
+    // run, its approval consumed, or refused — then the round's later calls
+    // in order, each run once, then the model reads them all.
+    let mut reparked = false;
+    // The round's calls after a parked call, as the model sent them.
+    let mut parked_rest: Vec<(Ulid, chat::ToolCall)> = Vec::new();
+    if let Some(resume) = resume {
+        let default_profile = armed.default_profile_id.clone();
+        let refused = |wire: &chat::ToolCall, reason: &str| {
+            (
+                ToolCallRecord {
+                    id: wire.id.clone(),
+                    requested_name: wire.name.clone(),
+                    name: ToolName::from_wire(&wire.name),
+                    display_path: None,
+                    refusal: Some(reason.to_owned()),
+                    grant_denied: false,
+                },
+                ToolOutcome::Refused {
+                    reason: reason.to_owned(),
+                },
+            )
+        };
+        if let Some((call_line, logged)) = resume.call {
+            let (call, (record, outcome)) = match resume.settled {
+                // What runs is what the record bound, not the log's
+                // redacted copy (R174).
+                crate::approvals::Settled::Run(bound) => {
+                    *host.approved.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Some((bound.id.clone(), resume.approval));
+                    let ran = match tools::run_call(&host, &default_profile, &bound, &mut events) {
+                        // Its approval is spent: it never waits again.
+                        (_, ToolOutcome::Parked { .. }) => refused(&bound, UNATTENDED_REFUSAL),
+                        ran => ran,
+                    };
+                    (bound, ran)
+                }
+                crate::approvals::Settled::Refuse(reason) => {
+                    let ran = refused(&logged, &reason);
+                    (logged, ran)
+                }
+            };
+            finish(&mut lock(), Some(call_line), &record, &call, &outcome);
+        }
+        let mut uncertain = resume.uncertain;
+        let mut rest = resume.rest.into_iter();
+        while let Some((line, wire)) = rest.next() {
+            let (record, outcome) = if let Some(reason) = uncertain.take() {
+                refused(&wire, &reason)
+            } else if !resume.run_rest {
+                refused(&wire, crate::approvals::NOT_RUN)
+            } else if resume.unbound.contains(&wire.id) {
+                refused(&wire, crate::approvals::UNBOUND)
+            } else {
+                tools::run_call(&host, &default_profile, &wire, &mut events)
+            };
+            if let ToolOutcome::Parked { .. } = outcome {
+                lock().parked = Some((Some(line), wire));
+                parked_rest = rest.collect();
+                reparked = true;
+                break;
+            }
+            finish(&mut lock(), Some(line), &record, &wire, &outcome);
+        }
+        if let (Some(note), false) = (resume.note, reparked) {
+            let mut log = lock();
+            log.last_line = log.write(None, LineBody::Peer(note));
+        }
+        // The model reads the conversation as it is now.
+        let mut messages = vec![ChatMessage::text(Role::System, composed.text.clone())];
+        messages.extend(lock().context.messages.iter().cloned());
+        armed.request.messages = messages;
+    }
     let mut gate = |_round: usize| {
         let mut log = lock();
         if log.failure.is_some() {
@@ -3699,33 +4258,85 @@ async fn run_agent_turn(
         Ok(())
     };
 
-    let result = tools::run_tool_loop_gated(
-        &tool_loop,
-        &armed.request,
-        &ChatOptions {
-            read_timeout,
-            ..ChatOptions::default()
-        },
-        &ToolLoopOptions {
-            max_rounds: usize::try_from(config.limits.rounds_per_turn)
-                .unwrap_or(tools::MAX_TOOL_ROUNDS)
-                .max(1),
-            ..ToolLoopOptions::default()
-        },
-        stop.clone(),
-        &mut events,
-        &mut report,
-        &mut gate,
-    )
-    .await;
-
+    let result = if reparked {
+        None
+    } else {
+        Some(
+            tools::run_tool_loop_gated(
+                &tool_loop,
+                &armed.request,
+                &ChatOptions {
+                    read_timeout,
+                    ..ChatOptions::default()
+                },
+                &ToolLoopOptions {
+                    max_rounds: usize::try_from(config.limits.rounds_per_turn)
+                        .unwrap_or(tools::MAX_TOOL_ROUNDS)
+                        .max(1),
+                    ..ToolLoopOptions::default()
+                },
+                stop.clone(),
+                &mut events,
+                &mut report,
+                &mut gate,
+            )
+            .await,
+        )
+    };
+    // The calls a parked round leaves unrun keep their `tool_call` lines,
+    // with the table's tier, until it resumes (93.2).
+    if let Some(Ok(done)) = &result {
+        if let Some((_, rest)) = &done.parked {
+            // The tiers first: the table reads the label, which the log's
+            // lock guards.
+            let tiers: Vec<u8> = rest
+                .iter()
+                .map(|wire| host.table_tier(wire, &armed.default_profile_id))
+                .collect();
+            let mut log = lock();
+            let parent = log.round_line;
+            for (wire, tier) in rest.iter().zip(tiers) {
+                let line = log.write(
+                    parent,
+                    LineBody::ToolCall(ToolCallBody {
+                        call_id: wire.id.clone(),
+                        tool: wire.name.clone(),
+                        args: wire.arguments_raw.clone(),
+                        tier,
+                        grant_id: None,
+                    }),
+                );
+                if let Some(line) = line {
+                    parked_rest.push((line, wire.clone()));
+                }
+            }
+        }
+    }
+    let parking = host.parked.lock().unwrap_or_else(|p| p.into_inner()).take();
     drop(host);
     let log = log.into_inner().unwrap_or_else(|p| p.into_inner());
+    let parked = match (parking, log.parked) {
+        (Some(parking), Some((Some(call_line), wire))) => {
+            let files = crate::approvals::pin_files(&read_profiles, &parking.pins);
+            Some(crate::approvals::ParkedTurn {
+                parking,
+                call_line,
+                args: wire.arguments.unwrap_or(Value::Null),
+                preconditions: keeper_core::agents::approval::Preconditions {
+                    files,
+                    ..Default::default()
+                },
+                rest: parked_rest,
+            })
+        }
+        _ => None,
+    };
     let parent = log.last_line;
     let round_logged = log.round_line.is_some();
     let round_text = log.round_text;
     let prompt_sha256 = Some(composed.prompt_sha256);
     let bound = log.bound;
+    let waits = parked.is_some();
     let ran =
         move |ending: TurnEnding, outcome: Option<chat::ChatOutcome>, error: Option<String>| Ran {
             ending,
@@ -3736,12 +4347,21 @@ async fn run_agent_turn(
             prompt_sha256,
             error,
             bound,
+            parked,
         };
     if let Some(error) = log.failure {
         return ran(TurnEnding::Failed, None, Some(error.to_string()));
     }
+    if waits {
+        return ran(TurnEnding::Parked, None, None);
+    }
     match result {
-        Ok(done) => {
+        None => ran(
+            TurnEnding::Failed,
+            None,
+            Some("a parked call was lost".to_owned()),
+        ),
+        Some(Ok(done)) => {
             if stop.is_cancelled() {
                 ran(TurnEnding::Stopped, Some(done.final_outcome), None)
             } else if done.final_outcome.finish_reason == chat::FinishReason::Failed {
@@ -3753,9 +4373,9 @@ async fn run_agent_turn(
                 ran(TurnEnding::Complete, Some(done.final_outcome), None)
             }
         }
-        Err(_) if log.local_only => ran(TurnEnding::LocalOnly, None, None),
-        Err(_) if bound.is_some() => ran(TurnEnding::Bounded, None, None),
-        Err(error) => ran(TurnEnding::Failed, None, Some(error.to_string())),
+        Some(Err(_)) if log.local_only => ran(TurnEnding::LocalOnly, None, None),
+        Some(Err(_)) if bound.is_some() => ran(TurnEnding::Bounded, None, None),
+        Some(Err(error)) => ran(TurnEnding::Failed, None, Some(error.to_string())),
     }
 }
 

@@ -133,11 +133,32 @@ pub trait TurnHost: Send + Sync {
 }
 
 /// What an agent's host made of one drive call once its grant answered:
-/// the call's classification (AD-392), and the sentence refusing it when it
-/// does not run — a block, a person's approval nobody can give, or T5.
+/// the call's classification (AD-392), the sentence refusing it when it
+/// does not run — a block, a person's approval nobody can give, or T5 —
+/// and the approval record it parks on or was approved by.
 pub struct Classified {
     pub classification: Classification,
     pub refusal: Option<String>,
+    pub approval: Option<Approval>,
+}
+
+/// A call's approval record (AD-393).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    /// It waits for a person on this record: its row is written, marked
+    /// and left pending, and nothing runs (R73).
+    Park(ulid::Ulid),
+    /// A person approved it on this record and the approval was consumed:
+    /// it runs, closing the row its park left pending on this machine.
+    Approved(ulid::Ulid),
+}
+
+impl Approval {
+    pub fn id(self) -> String {
+        match self {
+            Approval::Park(id) | Approval::Approved(id) => id.to_string(),
+        }
+    }
 }
 
 /// An agent's drive host. `classify` is asked once per call, after the
@@ -411,15 +432,37 @@ impl DriveToolHost {
         // Step 2½ — an agent's call is classified on the grant's answer, so
         // its row carries the tier (R90).
         let classified = classify.map(|classify| classify(&verdict));
+        let approval = classified
+            .as_ref()
+            .and_then(|classified| classified.approval);
 
         // Step 3 — before the effect (NFR-47). A row that cannot be written is
         // a refusal and never a silent proceed: an unauditable effect is one
-        // this app does not perform.
-        let audit_id = self.intent(
-            call,
-            &verdict,
-            classified.as_ref().map(|c| &c.classification),
-        )?;
+        // this app does not perform. An approved call closes the row its
+        // park left pending, so a call keeps one row.
+        let parked_row = match approval {
+            Some(Approval::Approved(id)) => {
+                audit::parked_row(&self.data_dir, &id.to_string()).unwrap_or(None)
+            }
+            _ => None,
+        };
+        let audit_id = match parked_row {
+            Some(row) => row,
+            None => self.intent(
+                call,
+                &verdict,
+                classified.as_ref().map(|c| &c.classification),
+            )?,
+        };
+        if let Some(approval) = approval {
+            audit::mark_approval(&self.data_dir, audit_id, &approval.id()).map_err(|error| {
+                BotsError::Tool {
+                    detail: format!(
+                        "keeper could not record this tool call, so it did not run: {error}"
+                    ),
+                }
+            })?;
+        }
         let close = |outcome: AuditOutcome, bytes: Option<i64>, truncated: bool| {
             self.close(audit_id, outcome, bytes, truncated);
         };
@@ -430,11 +473,17 @@ impl DriveToolHost {
                 reason: reason.clone(),
             });
         }
+        let agent = classified.is_some();
         if let Some(reason) = classified.and_then(|classified| classified.refusal) {
             close(AuditOutcome::Refused, None, false);
             return Err(BotsError::GrantDenied { reason });
         }
-        if let GrantVerdict::Ask { reason, .. } = &verdict {
+        if let Some(Approval::Park(approval)) = approval {
+            return Ok(ToolOutcome::Parked { approval });
+        }
+        // An agent's ask is its tier's (a grant's `Ask` is at least T2):
+        // decided above. A ⌘9 bot asks its approver.
+        if let (GrantVerdict::Ask { reason, .. }, false) = (&verdict, agent) {
             // No one to ask is not a "no": the model is told there was
             // nobody here, while a person's no keeps the grant's sentence.
             let refusal = match &self.approve {
@@ -471,7 +520,7 @@ impl DriveToolHost {
                 close(AuditOutcome::Ok, None, false)
             }
             Ok(ToolOutcome::Refused { .. }) => close(AuditOutcome::Refused, None, false),
-            Err(_) => close(AuditOutcome::Failed, None, false),
+            Ok(ToolOutcome::Parked { .. }) | Err(_) => close(AuditOutcome::Failed, None, false),
         }
         outcome
     }
@@ -514,7 +563,9 @@ impl DriveToolHost {
 
     /// An agent's call that ends before its grant answers still has its one
     /// row (R90): `Deny` with `reason`, classified on that, closed
-    /// `outcome`. A ⌘9 bot's (`classify` is `None`) has none, as before.
+    /// `outcome` — an approved call's the row its park left pending here,
+    /// else a new one carrying the approval (R172). A ⌘9 bot's (`classify`
+    /// is `None`) has none, as before.
     fn unanswered(
         &self,
         call: &ToolCall,
@@ -529,7 +580,25 @@ impl DriveToolHost {
             reason: reason.to_owned(),
         };
         let classified = classify(&verdict);
-        let row = self.intent(call, &verdict, Some(&classified.classification))?;
+        let approved = match classified.approval {
+            Some(Approval::Approved(id)) => Some(id.to_string()),
+            _ => None,
+        };
+        let parked = approved
+            .as_deref()
+            .and_then(|id| audit::parked_row(&self.data_dir, id).unwrap_or(None));
+        let row = match parked {
+            Some(row) => row,
+            None => {
+                let row = self.intent(call, &verdict, Some(&classified.classification))?;
+                if let Some(id) = &approved {
+                    if let Err(error) = audit::mark_approval(&self.data_dir, row, id) {
+                        tracing::warn!(%error, "bots: could not mark a tool-call audit row");
+                    }
+                }
+                row
+            }
+        };
         self.close(row, outcome, None, false);
         Ok(())
     }

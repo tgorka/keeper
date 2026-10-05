@@ -47,7 +47,7 @@ use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde_json::{json, Value};
 
 use crate::matrix_sink::SendFuture;
-use crate::sinks::Blocked;
+use crate::sinks::{Blocked, Withheld};
 use crate::zone::read_text;
 
 /// How often a waiting call looks at its turn's cancel signal.
@@ -401,8 +401,9 @@ pub type SurfaceAdmit = Arc<dyn Fn(&str, &[u8]) -> Result<(), Blocked> + Send + 
 
 /// What the call's audit makes of the room's verdict on its request to the
 /// note at `(drive, path)`: nothing to say, its row written before the
-/// request is sent, or the sentence refusing it (R90).
-pub type Admission<'a> = &'a dyn Fn(Result<(), Blocked>, (&str, &str)) -> Result<(), String>;
+/// request is sent, or what the call answers instead — a refusal or its
+/// park (R90).
+pub type Admission<'a> = &'a dyn Fn(Result<(), Blocked>, (&str, &str)) -> Result<(), Withheld>;
 
 fn refused(reason: String) -> Option<ToolOutcome> {
     Some(ToolOutcome::Refused { reason })
@@ -543,8 +544,8 @@ impl SurfaceTools {
             Some(admit) => admit(name, content.to_string().as_bytes()),
             None => Ok(()),
         };
-        if let Err(sentence) = admission(verdict, (&call.drive, &call.path)) {
-            return refused(sentence);
+        if let Err(withheld) = admission(verdict, (&call.drive, &call.path)) {
+            return Some(withheld.into());
         }
         let (answer, answers) = std::sync::mpsc::sync_channel::<SurfaceResultContent>(1);
         waiting().insert(
@@ -820,8 +821,8 @@ mod tests {
     }
 
     /// The room's verdict as the call's answer, with no audit row.
-    fn unaudited(verdict: Result<(), Blocked>, _: (&str, &str)) -> Result<(), String> {
-        verdict.map_err(|blocked| blocked.sentence)
+    fn unaudited(verdict: Result<(), Blocked>, _: (&str, &str)) -> Result<(), Withheld> {
+        verdict.map_err(|blocked| Withheld::Refused(blocked.sentence))
     }
 
     fn said(outcome: Option<ToolOutcome>) -> String {

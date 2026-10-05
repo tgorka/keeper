@@ -40,6 +40,7 @@
 
 pub mod agent;
 pub mod approval;
+pub mod approvals;
 pub mod cards;
 pub mod claims;
 pub mod delegate;

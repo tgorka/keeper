@@ -16,11 +16,13 @@
 //! because, with keeper's features, `Room::send_state_event_raw` is a plain
 //! async fn with no request-config hook (ruling D1).
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use matrix_sdk::config::{RequestConfig, SyncSettings};
 use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
+use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::api::client::filter::{FilterDefinition, RoomEventFilter, RoomFilter};
 use matrix_sdk::ruma::api::client::room::create_room;
 use matrix_sdk::ruma::api::client::state::{get_state_events, send_state_event};
@@ -29,8 +31,8 @@ use matrix_sdk::ruma::api::error::{ErrorKind, RetryAfter};
 use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{
-    MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, TransactionId,
-    UserId,
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId,
+    TransactionId, UInt, UserId,
 };
 use matrix_sdk::{Client, RoomState};
 use serde_json::{json, Value};
@@ -168,6 +170,13 @@ fn from_sdk(error: matrix_sdk::Error) -> AgentMatrixError {
 /// second, 12% of a copy's events were lost that way with the default.
 pub const SYNC_TIMELINE_LIMIT: u32 = 500;
 
+/// How many pages, of [`FORWARD_PAGE`] events, a forward read of a room
+/// goes through at most; a read that reaches it with history left says so
+/// ([`ForwardStates::complete`]).
+pub const FORWARD_PAGES: usize = 50;
+/// Events per forward page.
+pub const FORWARD_PAGE: u32 = 100;
+
 /// The sync settings every copy's loop uses ([`SYNC_TIMELINE_LIMIT`]).
 pub fn sync_settings() -> SyncSettings {
     let mut timeline = RoomEventFilter::default();
@@ -212,6 +221,61 @@ impl ServerState {
             content: value["content"].clone(),
         })
     }
+}
+
+/// What a forward read of a room found, and whether it read to the room's
+/// end (R75, R179).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForwardStates {
+    /// The matching state events, in room order from where the read began.
+    pub found: Vec<ServerState>,
+    /// `false`: the read stopped at [`FORWARD_PAGES`] with history left, so
+    /// an event it did not find may still be there. What it found is still
+    /// in order from where it began: the first of them is the first.
+    pub complete: bool,
+}
+
+/// One page of a forward read: its events' JSON, and the token of the next
+/// page, `None` at the room's end.
+pub type ForwardPage = (Vec<Value>, Option<String>);
+
+/// Read forward page by page from `token` through `page` — no more than
+/// [`FORWARD_PAGES`] pages — keeping each `(event_type, state_key)` state
+/// event. A page may be empty while more history follows (a filtered read
+/// skips what it does not match): only a missing next token ends the room.
+pub async fn read_forward<F, Fut>(
+    mut token: Option<String>,
+    mut page: F,
+    event_type: &str,
+    state_key: &str,
+) -> Result<ForwardStates, AgentMatrixError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<ForwardPage, AgentMatrixError>>,
+{
+    let mut found = Vec::new();
+    for _ in 0..FORWARD_PAGES {
+        let (events, next) = page(token.clone()).await?;
+        found.extend(
+            events
+                .iter()
+                .filter(|value| value["type"] == event_type && value["state_key"] == state_key)
+                .filter_map(ServerState::from_event),
+        );
+        match next {
+            Some(next) if Some(&next) != token.as_ref() => token = Some(next),
+            _ => {
+                return Ok(ForwardStates {
+                    found,
+                    complete: true,
+                })
+            }
+        }
+    }
+    Ok(ForwardStates {
+        found,
+        complete: false,
+    })
 }
 
 /// One copy's client.
@@ -449,6 +513,64 @@ impl AgentClient {
             .collect()
     }
 
+    /// Every `(event_type, state_key)` state event in `room`'s timeline, in
+    /// room order, read forward from just after `from` (its `/context` end
+    /// token) — or from the room's first visible event when `from` is
+    /// unknown — the server filtering by type, over at most
+    /// [`FORWARD_PAGES`] pages, saying whether it reached the room's end
+    /// (R75: the first one is what counts; the server's current state shows
+    /// only the last).
+    pub async fn state_events_from(
+        &self,
+        room: &RoomId,
+        from: Option<&EventId>,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<ForwardStates, AgentMatrixError> {
+        let room = self.joined(room)?;
+        let token = match from {
+            Some(event) => {
+                room.event_with_context(event, false, UInt::from(0u32), Some(no_retry()))
+                    .await
+                    .map_err(from_sdk)?
+                    .next_batch_token
+            }
+            None => None,
+        };
+        let room = &room;
+        read_forward(
+            token,
+            |token| async move {
+                let mut options = MessagesOptions::forward().from(token.as_deref());
+                options.limit = UInt::from(FORWARD_PAGE);
+                options.filter.types = Some(vec![event_type.to_owned()]);
+                let page = room.messages(options).await.map_err(from_sdk)?;
+                let events = page
+                    .chunk
+                    .iter()
+                    .filter_map(|event| event.raw().deserialize_as::<Value>().ok())
+                    .collect();
+                Ok((events, page.end))
+            },
+            event_type,
+            state_key,
+        )
+        .await
+    }
+
+    /// Encrypt `bytes` and upload them: the `EncryptedFile` a message names
+    /// (R86: an approval's large arguments travel only encrypted).
+    pub async fn upload_encrypted(&self, bytes: &[u8]) -> Result<Value, AgentMatrixError> {
+        let mut reader = std::io::Cursor::new(bytes);
+        let file = self
+            .client
+            .upload_encrypted_file(&mut reader)
+            .await
+            .map_err(from_sdk)?;
+        serde_json::to_value(&file)
+            .map_err(|err| AgentMatrixError::Other(format!("could not encode the file: {err}")))
+    }
+
     fn joined(&self, room: &RoomId) -> Result<matrix_sdk::Room, AgentMatrixError> {
         match self.client.get_room(room) {
             Some(room) if room.state() == RoomState::Joined => Ok(room),
@@ -622,5 +744,71 @@ mod tests {
             classify(None, true, "connection refused".to_owned()),
             AgentMatrixError::Network(_)
         ));
+    }
+
+    fn consumed_at(n: usize) -> Value {
+        json!({
+            "type": events::APPROVAL_CONSUMED,
+            "state_key": "A",
+            "event_id": format!("$c{n}:example.org"),
+            "sender": "@nixi:example.org",
+            "origin_server_ts": 1,
+            "content": {"host": format!("h{n}")},
+        })
+    }
+
+    /// R93P-14: a read that spends its pages with history left says it is
+    /// incomplete — it is no proof that nothing was consumed — while what
+    /// it found first is still the first.
+    #[tokio::test]
+    async fn a_forward_read_past_its_bound_says_it_is_incomplete() {
+        let endless = |token: Option<String>| async move {
+            let at: usize = token.as_deref().map_or(0, |t| t.parse().unwrap_or(0));
+            let events = if at == 3 {
+                vec![consumed_at(at)]
+            } else {
+                Vec::new()
+            };
+            Ok::<_, AgentMatrixError>((events, Some((at + 1).to_string())))
+        };
+        let read = read_forward(None, endless, events::APPROVAL_CONSUMED, "A")
+            .await
+            .expect("read");
+        assert!(!read.complete);
+        assert_eq!(read.found.len(), 1);
+        assert_eq!(read.found[0].event_id.as_str(), "$c3:example.org");
+
+        let none = |token: Option<String>| async move {
+            let at: usize = token.as_deref().map_or(0, |t| t.parse().unwrap_or(0));
+            Ok::<_, AgentMatrixError>((Vec::new(), Some((at + 1).to_string())))
+        };
+        let read = read_forward(None, none, events::APPROVAL_CONSUMED, "A")
+            .await
+            .expect("read");
+        assert_eq!((read.found.len(), read.complete), (0, false));
+    }
+
+    /// An empty page with a next token is not the room's end: a filtered
+    /// read goes on past it to the match; no next token is the end.
+    #[tokio::test]
+    async fn empty_pages_do_not_end_a_forward_read() {
+        let pages = |token: Option<String>| async move {
+            let at: usize = token.as_deref().map_or(0, |t| t.parse().unwrap_or(0));
+            let page = match at {
+                0..=9 => (Vec::new(), Some((at + 1).to_string())),
+                10 => (
+                    vec![consumed_at(10), consumed_at(11)],
+                    Some("11".to_owned()),
+                ),
+                _ => (Vec::new(), None),
+            };
+            Ok::<_, AgentMatrixError>(page)
+        };
+        let read = read_forward(None, pages, events::APPROVAL_CONSUMED, "A")
+            .await
+            .expect("read");
+        assert!(read.complete);
+        let ids: Vec<&str> = read.found.iter().map(|s| s.event_id.as_str()).collect();
+        assert_eq!(ids, ["$c10:example.org", "$c11:example.org"]);
     }
 }

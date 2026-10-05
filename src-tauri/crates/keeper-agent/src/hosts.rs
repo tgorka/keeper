@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -720,7 +720,14 @@ struct Held {
     lease: Arc<Lease>,
     worker: JoinHandle<()>,
     ending: Arc<Mutex<ClaimAction>>,
-    busy: Arc<AtomicBool>,
+    activity: Arc<crate::agent::Activity>,
+}
+
+/// Whether `held`'s worker is at work, or its session's run waits for a
+/// person: either way no window of its scheduled card is begun or named —
+/// a run blocked on an approval is not due (R84, R177).
+fn busy_or_parked(held: &Held) -> bool {
+    held.activity.busy.load(Ordering::SeqCst) || held.activity.parked.load(Ordering::SeqCst)
 }
 
 /// A host's placement and claims over its copies.
@@ -1561,7 +1568,7 @@ impl HostRuntime {
         let busy = slot
             .claim
             .as_ref()
-            .is_some_and(|held| held.busy.load(Ordering::Relaxed));
+            .is_some_and(|held| held.activity.busy.load(Ordering::Relaxed));
         // With a control room the clock is calibrated by the manifest's
         // read-back before any claim is taken; without one, `acquire` leaves
         // another host's claim alone until its own read-back has.
@@ -1632,6 +1639,10 @@ impl HostRuntime {
     /// writes `run: running` (R56, R58, [`cards::begin`]). While placement
     /// waits, a holder has the card say `run: waiting`; with no holder, the
     /// announcing host takes the claim to say it and hands it back (Q8).
+    /// While the worker works or its run waits for a person nothing of
+    /// this is done: the claim keeps naming the parked run's window, and the
+    /// worker's own timer expires the approval before a window is judged
+    /// again (R84, R177).
     async fn tick_schedule(
         &mut self,
         room: &OwnedRoomId,
@@ -1669,7 +1680,7 @@ impl HostRuntime {
                 _ => None,
             };
         if let Some(held) = &slot.claim {
-            if held.busy.load(Ordering::Relaxed) || slot.draining.is_some() {
+            if busy_or_parked(held) || slot.draining.is_some() {
                 return;
             }
             let lease = Arc::clone(&held.lease);
@@ -1688,7 +1699,7 @@ impl HostRuntime {
             let Some(slot) = self.slots.get_mut(room).filter(|slot| {
                 slot.claim
                     .as_ref()
-                    .is_some_and(|held| !held.busy.load(Ordering::Relaxed))
+                    .is_some_and(|held| !busy_or_parked(held))
             }) else {
                 return;
             };
@@ -1813,7 +1824,7 @@ impl HostRuntime {
                     )
                 });
                 let ending = Arc::new(Mutex::new(ClaimAction::Released));
-                let busy = Arc::new(AtomicBool::new(false));
+                let activity = Arc::new(crate::agent::Activity::starting());
                 let worker = Arc::clone(&copy).spawn_worker(
                     &session,
                     &agent,
@@ -1822,7 +1833,7 @@ impl HostRuntime {
                         lease: Arc::clone(&lease),
                         from_host,
                         ending: Arc::clone(&ending),
-                        busy: Arc::clone(&busy),
+                        activity: Arc::clone(&activity),
                     },
                 );
                 if let Some(slot) = self.slots.get_mut(room) {
@@ -1837,7 +1848,7 @@ impl HostRuntime {
                             lease,
                             worker,
                             ending,
-                            busy,
+                            activity,
                         });
                         return;
                     }
@@ -2218,7 +2229,7 @@ fn announcer(hosts: &[HostManifest], principal: &str, server_now: u64) -> Option
 mod tests {
     use std::collections::{HashSet, VecDeque};
     use std::path::Path;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
 
     use keeper_core::agents::home::parse_agent_toml;
     use keeper_core::agents::label::{Integrity, Label};
@@ -2755,6 +2766,15 @@ mod tests {
         known: Option<Arc<crate::rooms::Known>>,
         /// Where its sessions' audit rows are written.
         data_dir: tempfile::TempDir,
+        /// A run that begins parks on a person, as a worker with a decision
+        /// source does: its card says `run: blocked` and the worker that it
+        /// waits.
+        parks: AtomicBool,
+        /// A worker that starts finds a run parked in the session's
+        /// `approvals/`, as `resume_approvals` does at serve start.
+        parked_at_start: AtomicBool,
+        /// Each served room's worker activity, as its host reads it.
+        activities: Mutex<HashMap<OwnedRoomId, Arc<crate::agent::Activity>>>,
     }
 
     impl CopyPort for FakeCopy {
@@ -2909,6 +2929,17 @@ mod tests {
                 .expect("lock")
                 .insert(agent.room.clone(), Arc::clone(&closed));
             self.spawned.lock().expect("lock").push(agent.room.clone());
+            // The worker's start, as `serve_arrivals`'s: what waited is
+            // settled — a parked run found — before busy clears.
+            claimed.activity.parked.store(
+                self.parked_at_start.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+            claimed.activity.busy.store(false, Ordering::SeqCst);
+            self.activities
+                .lock()
+                .expect("lock")
+                .insert(agent.room.clone(), Arc::clone(&claimed.activity));
             let (fails, takes) = (self.workers_fail, self.worker_takes);
             Some(tokio::spawn(async move {
                 let _claimed = claimed;
@@ -3040,7 +3071,21 @@ mod tests {
                     let begun = cards::begin(zone, session, &holder, &scheduled, &may_write)
                         .map_err(|error| error.to_string());
                     if let Ok(cards::Begun::Run { .. }) = &begun {
-                        if !self.turns_die.load(Ordering::Relaxed) {
+                        if self.parks.load(Ordering::SeqCst) {
+                            cards::write_run(
+                                zone,
+                                session,
+                                scheduled.card(),
+                                keeper_core::agents::card::Run::Blocked,
+                                None,
+                                &|| lease.may_write(),
+                            )
+                            .expect("the park's card");
+                            if let Some(activity) = self.activities.lock().expect("lock").get(room)
+                            {
+                                activity.parked.store(true, Ordering::SeqCst);
+                            }
+                        } else if !self.turns_die.load(Ordering::Relaxed) {
                             cards::write_run(
                                 zone,
                                 session,
@@ -3683,6 +3728,9 @@ mod tests {
             routed: Mutex::default(),
             refuse_writes: Default::default(),
             turns_die: AtomicBool::new(false),
+            parks: AtomicBool::new(false),
+            parked_at_start: AtomicBool::new(false),
+            activities: Mutex::default(),
             harvests: Mutex::default(),
             acks: Mutex::default(),
             stall_steward_rooms: false,
@@ -5184,5 +5232,70 @@ mod tests {
         let card = card_in(zone.path());
         assert!(ran_in(&card, "2026-10-05T09:00:00Z"), "{card:?}");
         assert_eq!(run_of(&card), Some(keeper_core::agents::card::Run::Review));
+    }
+
+    /// R84, R177: a run parked on a person keeps its window. Across three
+    /// more due windows its holder names none and routes none while the
+    /// worker says the run waits; a host that takes the session over while
+    /// it waits — its worker finding the parked run at serve start — names
+    /// only the parked window and begins none either.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_run_names_no_window_while_it_waits() {
+        let (server, zone) = (
+            Arc::new(Server::default()),
+            tempfile::tempdir().expect("zone"),
+        );
+        put_card(zone.path(), &hourly("last_run: \"2026-10-05T08:00:00Z\"\n"));
+        let mut w = world_over(copy_over(&server, zone.path()), true);
+        w.copy.parks.store(true, Ordering::SeqCst);
+        let a = room(1);
+        w.at("2026-10-05T09:30:00Z");
+        w.offer_scheduled(&a);
+        for _ in 0..3 {
+            w.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(w.copy.runs(), 1, "{:?}", w.copy.routed());
+        assert_eq!(
+            run_of(&card_in(zone.path())),
+            Some(keeper_core::agents::card::Run::Blocked)
+        );
+        let w_9 = named("2026-10-05T09:00:00Z");
+        for at in [
+            "2026-10-05T10:05:00Z",
+            "2026-10-05T11:05:00Z",
+            "2026-10-05T12:05:00Z",
+        ] {
+            w.at(at);
+            w.offer_scheduled(&a);
+            for _ in 0..3 {
+                w.tick().await;
+                tokio::time::advance(RENEW_EVERY).await;
+            }
+        }
+        assert_eq!(w.copy.routed().len(), 1, "{:?}", w.copy.routed());
+        assert_eq!(
+            server.claim(&a).expect("claim").content.window,
+            Some(w_9.clone())
+        );
+        assert!(ran_in(&card_in(zone.path()), "2026-10-05T09:00:00Z"));
+
+        lapse(&server, &a);
+        let mut taker = world_over(copy_over(&server, zone.path()), true);
+        taker.rt.host = HostSlug::new(OTHER).expect("slug");
+        taker.copy.parked_at_start.store(true, Ordering::SeqCst);
+        // Hesperia is gone: its claim lapsed and so did its manifest.
+        taker.lapse_manifest(ME);
+        taker.at("2026-10-05T12:05:00Z");
+        taker.offer_scheduled(&a);
+        for _ in 0..4 {
+            taker.tick().await;
+            tokio::time::advance(RENEW_EVERY).await;
+        }
+        let claim = server.claim(&a).expect("claim");
+        assert_eq!(claim.content.host, OTHER, "the taker holds it");
+        assert_eq!(claim.content.window, Some(w_9));
+        assert!(taker.copy.routed().is_empty(), "{:?}", taker.copy.routed());
+        assert!(ran_in(&card_in(zone.path()), "2026-10-05T09:00:00Z"));
     }
 }

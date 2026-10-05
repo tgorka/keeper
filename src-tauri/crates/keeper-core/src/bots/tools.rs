@@ -481,6 +481,14 @@ pub enum ToolOutcome {
         /// What the model is told.
         text: String,
     },
+    /// The call waits for a person's decision on the approval record
+    /// `approval` (R73): the loop returns right after it, the round's later
+    /// calls handed back unrun. Only an agent's host answers so — never a
+    /// ⌘9 bot's — and the agent's host writes no result for it.
+    Parked {
+        /// The record's id.
+        approval: ulid::Ulid,
+    },
 }
 
 /// The impure half.
@@ -1023,6 +1031,7 @@ pub fn render_result(outcome: &ToolOutcome) -> String {
         }
         ToolOutcome::Refused { reason } => format!("Refused: {reason}"),
         ToolOutcome::Answered { text } => text.clone(),
+        ToolOutcome::Parked { .. } => "Waiting for a person's approval.".to_owned(),
     };
     clip_result(text)
 }
@@ -1154,6 +1163,9 @@ pub struct ToolLoopOutcome {
     pub exhausted: bool,
     /// Every tool call, in order.
     pub calls: Vec<ToolCallRecord>,
+    /// The approval a call parked on, and the round's calls after it, not
+    /// run (R73). `None` for every ⌘9 turn.
+    pub parked: Option<(ulid::Ulid, Vec<WireToolCall>)>,
 }
 
 /// The things a tool loop needs that do not change between its rounds.
@@ -1333,6 +1345,7 @@ pub async fn run_tool_loop_gated(
                 rounds,
                 exhausted: !tools_offered,
                 calls,
+                parked: None,
             });
         }
 
@@ -1355,6 +1368,7 @@ pub async fn run_tool_loop_gated(
             sink(ToolLoopEvent::RoundsExhausted { rounds });
         }
 
+        let mut parked = None;
         for (index, wire) in outcome.tool_calls.iter().enumerate() {
             let (record, ran) = if exhausted {
                 // The budget is spent, but the call still has to be ANSWERED:
@@ -1389,7 +1403,7 @@ pub async fn run_tool_loop_gated(
                     },
                 )
             } else {
-                run_one(host, default_profile_id, wire, sink)
+                run_call(host, default_profile_id, wire, sink)
             };
 
             let result = render_result(&ran);
@@ -1399,6 +1413,10 @@ pub async fn run_tool_loop_gated(
             });
             report(&record, wire, &ran);
             calls.push(record);
+            if let ToolOutcome::Parked { approval } = ran {
+                parked = Some((approval, index));
+                break;
+            }
             let message = ChatMessage {
                 role: Role::Tool,
                 content: vec![ContentPart::Text(result)],
@@ -1408,11 +1426,24 @@ pub async fn run_tool_loop_gated(
             messages.push(message.clone());
             appended.push(message);
         }
+        if let Some((approval, index)) = parked {
+            // The rest of the round runs only once a person decided.
+            let rest = outcome.tool_calls[index + 1..].to_vec();
+            return Ok(ToolLoopOutcome {
+                final_outcome: outcome,
+                appended,
+                rounds,
+                exhausted: false,
+                calls,
+                parked: Some((approval, rest)),
+            });
+        }
     }
 }
 
-/// One call: parse it, run it, and say what happened. The caller renders it.
-fn run_one(
+/// One call: parse it, run it, and say what happened. The caller renders
+/// it. The loop's own step, and an agent's resume of a parked round's calls.
+pub fn run_call(
     host: &dyn ToolHost,
     default_profile_id: &str,
     wire: &WireToolCall,
@@ -1602,13 +1633,13 @@ mod tests {
             arguments_raw: "{}".to_owned(),
             arguments: Some(json!({})),
         };
-        let (record, outcome) = run_one(&DriveOnly, "folder", &wire, &mut |_| {});
+        let (record, outcome) = run_call(&DriveOnly, "folder", &wire, &mut |_| {});
         assert!(
             matches!(&outcome, ToolOutcome::Refused { reason } if reason.starts_with("There is no tool called \"surface_open\"")),
             "{outcome:?}"
         );
         assert_eq!(record.name, None);
-        let (record, outcome) = run_one(&Named, "folder", &wire, &mut |_| {});
+        let (record, outcome) = run_call(&Named, "folder", &wire, &mut |_| {});
         assert_eq!(render_result(&outcome), "done");
         assert_eq!((record.name, record.refusal), (None, None));
         assert_eq!(record.requested_name, "surface_open");

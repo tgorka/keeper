@@ -116,6 +116,12 @@ struct Room {
     /// Its next send is asked to wait, and meanwhile its members become
     /// these.
     limited: Mutex<Option<Vec<&'static str>>>,
+    /// As `limited`, for its next approval request only.
+    limited_request: Mutex<Option<Vec<&'static str>>>,
+    /// An approvals folder whose records are counted when a request is
+    /// sent: what was on disk before the room heard of it.
+    witness: Mutex<Option<PathBuf>>,
+    records_at_request: Mutex<Option<usize>>,
 }
 
 impl Room {
@@ -144,6 +150,20 @@ impl EditPort for Room {
         Box::pin(async move {
             if let Some(stop) = self.stop.lock().expect("lock").take() {
                 stop.cancel();
+            }
+            if event_type == keeper_core::agents::events::APPROVAL_REQUEST {
+                if let Some(dir) = self.witness.lock().expect("lock").as_ref() {
+                    let records = std::fs::read_dir(dir).map_or(0, |entries| entries.count());
+                    *self.records_at_request.lock().expect("lock") = Some(records);
+                }
+            }
+            if event_type == keeper_core::agents::events::APPROVAL_REQUEST {
+                if let Some(members) = self.limited_request.lock().expect("lock").take() {
+                    self.set_members(&members);
+                    return Err(keeper_core::agents::matrix::AgentMatrixError::RateLimited {
+                        retry_after_ms: Some(1),
+                    });
+                }
             }
             if let Some(members) = self.limited.lock().expect("lock").take() {
                 self.set_members(&members);
@@ -444,6 +464,7 @@ fn world_read_by(
         sessions_zone: tg_profile.sessions_root().expect("sessions"),
         sessions_subfolder: "60-sessions".to_owned(),
         lfs_threshold_bytes: 1_000_000,
+        decisions: None,
     };
     World {
         _root: root,
@@ -649,11 +670,12 @@ async fn an_ignored_arrival_writes_no_line() {
     assert!(world.room.sent().is_empty());
 }
 
-/// C4/F12: a write under the agent's profile-wide grant is an ask, and an
-/// unattended ask is refused with `UNATTENDED_REFUSAL`; the model reads it
-/// as `Refused: …` (D9) and the file is untouched.
+/// 93.2 AC7 (C4/F12): with no decision source installed, a write under the
+/// agent's profile-wide grant needs a person and is refused with
+/// `UNATTENDED_REFUSAL`, exactly as before Epic 93; the model reads it as
+/// `Refused: …` (D9), the file is untouched, and no approval is written.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_write_needing_approval_is_refused_before_epic_93() {
+async fn without_a_decision_source_an_ask_is_refused_as_before() {
     let mut world = world(
         ProviderKind::OpenAi,
         &["drive_read", "drive_write"],
@@ -670,6 +692,10 @@ async fn a_write_needing_approval_is_refused_before_epic_93() {
     let report = report(world.ask(&mut served, "write a note").await);
     assert_eq!(report.ending, TurnEnding::Complete);
     assert!(!world.tgdrive.join("notes/new.md").exists());
+    assert!(!world.dir(SESSION).join("approvals").exists());
+    assert!(world
+        .sent_of(keeper_core::agents::events::APPROVAL_REQUEST)
+        .is_empty());
 
     let lines = world.lines(SESSION);
     let result = kinds(&lines, LineKind::ToolResult);
@@ -904,7 +930,7 @@ async fn a_message_sent_before_the_worker_exists_is_still_answered() {
             Vec::new(),
             &mut arrivals,
             signal,
-            &std::sync::atomic::AtomicBool::new(false),
+            &keeper_agent::agent::Activity::default(),
         )
         .await;
 
@@ -966,7 +992,7 @@ async fn a_queued_arrival_is_not_started_on_shutdown() {
             Vec::new(),
             &mut arrivals,
             signal,
-            &std::sync::atomic::AtomicBool::new(false),
+            &keeper_agent::agent::Activity::default(),
         )
         .await;
     assert!(world.lines(SESSION).is_empty());
@@ -1810,6 +1836,7 @@ fn tolas_deps(world: &World) -> AgentDeps {
         sessions_zone: world.deps.sessions_zone.clone(),
         sessions_subfolder: world.deps.sessions_subfolder.clone(),
         lfs_threshold_bytes: world.deps.lfs_threshold_bytes,
+        decisions: None,
     }
 }
 
@@ -2406,6 +2433,7 @@ fn deps_of(world: &World, folder: &str, agent_toml: &str) -> AgentDeps {
         sessions_zone: world.deps.sessions_zone.clone(),
         sessions_subfolder: world.deps.sessions_subfolder.clone(),
         lfs_threshold_bytes: world.deps.lfs_threshold_bytes,
+        decisions: None,
     }
 }
 
@@ -4126,7 +4154,7 @@ async fn a_brief_that_failed_to_send_is_sent_again_on_the_clock() {
 
     let (keep, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
     let (_stop, signal) = chat::cancellation();
-    let busy = std::sync::atomic::AtomicBool::new(false);
+    let busy = keeper_agent::agent::Activity::default();
     let _ = tokio::time::timeout(
         Duration::from_secs(3),
         nixi.serve_arrivals(
@@ -4152,13 +4180,14 @@ async fn a_brief_that_failed_to_send_is_sent_again_on_the_clock() {
     );
 }
 
-/// 92.3 AC6 (before Epic 93): a scheduled run is a turn whose brief is the
-/// card's body, opened by `run: running` with the window as `last_run`;
-/// an action in it that needs a person gets `UNATTENDED_REFUSAL` as its
-/// tool result and is logged; the card ends `review`; and the same window
-/// routed again is no second turn.
+/// 92.3 AC6 with no decision source (93.2 AC7): a scheduled run is a turn
+/// whose brief is the card's body, opened by `run: running` with the window
+/// as `last_run`; an action in it that needs a person gets
+/// `UNATTENDED_REFUSAL` as its tool result and is logged; the card ends
+/// `review`; and the same window routed again is no second turn. With a
+/// source it parks instead: `parks::a_scheduled_run_parks_and_holds_its_next_window`.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_scheduled_run_refuses_what_needs_a_person_before_epic_93() {
+async fn a_scheduled_run_refuses_what_needs_a_person_without_a_decision_source() {
     use keeper_agent::agent::scheduled_arrival;
     use keeper_agent::cards::Scheduled;
     use keeper_core::agents::card::{CardAgent, Field, Run};
@@ -4843,11 +4872,11 @@ fn nixis_dm(world: &World) {
     );
 }
 
-/// tgorka's proxy DM as this host runs it: what was told through it, and
-/// how many sends fail before one goes.
+/// tgorka's proxy DM as this host runs it: what was told through it, by
+/// event type, and how many sends fail before one goes.
 #[derive(Default)]
 struct Doors {
-    told: Mutex<Vec<Value>>,
+    told: Mutex<Vec<(String, Value)>>,
     failing: AtomicUsize,
 }
 
@@ -4860,7 +4889,7 @@ impl keeper_agent::sinks::ProxyDoors for Doors {
         Box::pin(async { Ok(BTreeSet::from([user(TGORKA)])) })
     }
 
-    fn tell<'a>(&'a self, _: &'a UserId, content: Value) -> SendFuture<'a> {
+    fn tell<'a>(&'a self, _: &'a UserId, event_type: &'a str, content: Value) -> SendFuture<'a> {
         Box::pin(async move {
             if self.failing.load(Ordering::SeqCst) > 0 {
                 self.failing.fetch_sub(1, Ordering::SeqCst);
@@ -4868,7 +4897,10 @@ impl keeper_agent::sinks::ProxyDoors for Doors {
                     "unreachable".to_owned(),
                 ));
             }
-            self.told.lock().expect("lock").push(content);
+            self.told
+                .lock()
+                .expect("lock")
+                .push((event_type.to_owned(), content));
             Ok(OwnedEventId::try_from("$told:example.org").expect("id"))
         })
     }
@@ -4880,7 +4912,18 @@ impl Doors {
             .lock()
             .expect("lock")
             .iter()
-            .map(|content| content["body"].as_str().unwrap_or_default().to_owned())
+            .filter(|(kind, _)| kind == "m.room.message")
+            .map(|(_, content)| content["body"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    fn of(&self, event_type: &str) -> Vec<Value> {
+        self.told
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|(kind, _)| kind == event_type)
+            .map(|(_, content)| content.clone())
             .collect()
     }
 }
@@ -5384,7 +5427,7 @@ async fn a_room_grown_wider_than_the_label_tells_its_person() {
     served.doors = Some(doors.clone());
     let (keep, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
     let (_stop, signal) = chat::cancellation();
-    let busy = std::sync::atomic::AtomicBool::new(false);
+    let busy = keeper_agent::agent::Activity::default();
     let _ = tokio::time::timeout(
         Duration::from_secs(2),
         served.serve_arrivals(
@@ -5731,7 +5774,7 @@ async fn a_narrowed_detail_whose_first_send_failed_is_sent_again() {
 
     let (keep, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
     let (_stop, signal) = chat::cancellation();
-    let busy = std::sync::atomic::AtomicBool::new(false);
+    let busy = keeper_agent::agent::Activity::default();
     let _ = tokio::time::timeout(
         Duration::from_secs(2),
         served.serve_arrivals(
@@ -6686,4 +6729,1957 @@ async fn a_card_update_changes_and_audits_only_its_card() {
             (card, AuditOutcome::Ok)
         ]
     );
+}
+
+/// Epic 93.2: a run that parks and resumes, consumed exactly once.
+mod parks {
+    use super::*;
+    use keeper_agent::approvals::{
+        decision_content, effect_unknown, ApprovalRoom, Consumed, ConsumedRead, DecisionSource,
+        RoomFuture, DENIED, EXPIRED, NOT_RUN, NO_SUCH_APPROVAL, SUPERSEDED, SUPERSEDED_RESULT,
+    };
+    use keeper_core::agents::approval::{
+        parse_record, sha256_hex, ApprovalRecord, DecidedBy, Decision,
+    };
+    use keeper_core::agents::events::{ConsumedContent, APPROVAL_REQUEST};
+    use keeper_core::agents::log::{ApprovalBody, ApprovalState};
+    use keeper_core::agents::matrix::AgentMatrixError;
+
+    /// An in-test decision source: a reader's decision counts.
+    struct Admit;
+
+    impl DecisionSource for Admit {
+        fn decided_by(&self, _: &ApprovalRecord, arrived: &Arrived) -> Result<DecidedBy, String> {
+            Ok(DecidedBy {
+                user: arrived.sender.to_string(),
+                device: "PHONE".to_owned(),
+                verified: true,
+            })
+        }
+    }
+
+    /// The session room as every host of the test sees it: its `consumed`
+    /// events in the server's order, whether this host holds the claim, and
+    /// whether the server accepts a `consumed` event. Each request yields
+    /// once, so two hosts interleave as two clients would.
+    #[derive(Default)]
+    struct Approvals {
+        consumed: Mutex<Vec<Consumed>>,
+        elsewhere: std::sync::atomic::AtomicBool,
+        down: std::sync::atomic::AtomicBool,
+        uploads: AtomicUsize,
+        /// The server answers no read of the room.
+        unread: std::sync::atomic::AtomicBool,
+        /// Every read stops at its bound with history left, finding none.
+        truncated: std::sync::atomic::AtomicBool,
+        /// An upload fails.
+        no_uploads: std::sync::atomic::AtomicBool,
+        /// Where each read of the room began.
+        froms: Mutex<Vec<Option<OwnedEventId>>>,
+        /// A `consumed` the server takes is followed by reads that fail,
+        /// until the test lets them through: accepted, not read back.
+        unread_after_consume: std::sync::atomic::AtomicBool,
+        /// The worker whose busy flag each request of the room reads.
+        probe: Mutex<Option<Arc<keeper_agent::agent::Activity>>>,
+        /// What the probe read, request by request.
+        busy_seen: Mutex<Vec<bool>>,
+    }
+
+    impl Approvals {
+        fn look(&self) {
+            if let Some(activity) = self.probe.lock().expect("lock").as_ref() {
+                self.busy_seen
+                    .lock()
+                    .expect("lock")
+                    .push(activity.busy.load(Ordering::SeqCst));
+            }
+        }
+    }
+
+    impl Approvals {
+        fn events(&self) -> Vec<Consumed> {
+            self.consumed.lock().expect("lock").clone()
+        }
+
+        /// Another copy's `consumed` event, accepted by the server.
+        fn consumed_by(&self, id: &str, host: &str) {
+            let mut consumed = self.consumed.lock().expect("lock");
+            consumed.push(Consumed {
+                event: OwnedEventId::try_from(format!("${host}:example.org")).expect("id"),
+                content: ConsumedContent {
+                    v: 1,
+                    id: id.to_owned(),
+                    epoch: 4,
+                    host: host.to_owned(),
+                },
+            });
+        }
+    }
+
+    impl ApprovalRoom for Approvals {
+        fn upload(&self, bytes: Vec<u8>) -> RoomFuture<'_, Value> {
+            Box::pin(async move {
+                if self.no_uploads.load(Ordering::SeqCst) {
+                    return Err(AgentMatrixError::Network("the upload failed".to_owned()));
+                }
+                self.uploads.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"url": "mxc://example.org/args", "bytes": bytes.len()}))
+            })
+        }
+
+        fn consume(&self, content: ConsumedContent) -> RoomFuture<'_, OwnedEventId> {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                self.look();
+                if self.down.load(Ordering::SeqCst) {
+                    return Err(AgentMatrixError::Network("the server went away".to_owned()));
+                }
+                if self.unread_after_consume.load(Ordering::SeqCst) {
+                    self.unread.store(true, Ordering::SeqCst);
+                }
+                let mut consumed = self.consumed.lock().expect("lock");
+                let event =
+                    OwnedEventId::try_from(format!("$consumed{}:example.org", consumed.len() + 1))
+                        .expect("id");
+                consumed.push(Consumed {
+                    event: event.clone(),
+                    content,
+                });
+                Ok(event)
+            })
+        }
+
+        fn consumed<'a>(
+            &'a self,
+            id: &'a str,
+            from: Option<&'a matrix_sdk::ruma::EventId>,
+        ) -> RoomFuture<'a, ConsumedRead> {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                self.look();
+                self.froms
+                    .lock()
+                    .expect("lock")
+                    .push(from.map(ToOwned::to_owned));
+                if self.unread.load(Ordering::SeqCst) {
+                    return Err(AgentMatrixError::Network("the read failed".to_owned()));
+                }
+                if self.truncated.load(Ordering::SeqCst) {
+                    return Ok(ConsumedRead::default());
+                }
+                Ok(ConsumedRead {
+                    consumed: self
+                        .events()
+                        .into_iter()
+                        .filter(|consumed| consumed.content.id == id)
+                        .collect(),
+                    complete: true,
+                })
+            })
+        }
+
+        fn holds(&self, _: u64) -> RoomFuture<'_, bool> {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                Ok(!self.elsewhere.load(Ordering::SeqCst))
+            })
+        }
+    }
+
+    const NOTE: &str = "10-notes/a.md";
+    /// What `NOTE` holds before anything is approved.
+    const ORIGINAL: &str = "needle here\n";
+
+    fn write_note(id: &str, content: &str) -> (&'static str, &'static str, Value) {
+        let id: &'static str = Box::leak(id.to_owned().into_boxed_str());
+        (
+            id,
+            "drive_write",
+            json!({"profile": "tgdrive", "path": NOTE, "content": content}),
+        )
+    }
+
+    /// Nixi with a decision source, and the room double her sessions use.
+    fn deciding(script: Vec<Completion>) -> (World, Arc<Approvals>) {
+        let mut world = world(ProviderKind::OpenAi, &["drive_read", "drive_write"], script);
+        world.deps.decisions = Some(Arc::new(Admit));
+        (world, Arc::new(Approvals::default()))
+    }
+
+    fn open(world: &World, approvals: &Arc<Approvals>) -> ServedSession {
+        let mut served = world.open(SESSION);
+        served.approval_room = Some(Arc::clone(approvals) as Arc<dyn ApprovalRoom>);
+        served
+    }
+
+    impl World {
+        fn approvals(&self) -> PathBuf {
+            self.dir(SESSION).join("approvals")
+        }
+
+        /// The session's one approval record, read strictly.
+        fn record(&self) -> ApprovalRecord {
+            self.record_in(SESSION)
+        }
+
+        /// The one approval record of the session at `path`, read strictly.
+        fn record_in(&self, path: &str) -> ApprovalRecord {
+            let mut records: Vec<PathBuf> = std::fs::read_dir(self.dir(path).join("approvals"))
+                .expect("approvals")
+                .map(|entry| entry.expect("entry").path())
+                .filter(|path| {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    name.ends_with(".json")
+                        && !name.ends_with(".decision.json")
+                        && !name.ends_with(".round.json")
+                })
+                .collect();
+            assert_eq!(records.len(), 1, "{records:?}");
+            parse_record(&std::fs::read_to_string(records.remove(0)).expect("read"))
+                .expect("a strict record")
+        }
+
+        /// Rewrite the record on disk, as only a test does.
+        fn rewrite(&self, record: &ApprovalRecord) {
+            std::fs::write(
+                self.approvals().join(format!("{}.json", record.id)),
+                serde_json::to_string(record).expect("json"),
+            )
+            .expect("rewrite");
+        }
+
+        fn decision(&mut self, record: &ApprovalRecord, decision: Decision) -> Arrived {
+            self.event(
+                TGORKA,
+                Arrival::Decision { verified: true },
+                decision_content(record, decision, None),
+            )
+        }
+
+        fn approval_lines(&self) -> Vec<ApprovalBody> {
+            kinds(&self.lines(SESSION), LineKind::Approval)
+                .iter()
+                .map(|line| match &line.body {
+                    LineBody::Approval(body) => body.clone(),
+                    _ => unreachable!(),
+                })
+                .collect()
+        }
+
+        fn note(&self) -> Option<String> {
+            std::fs::read_to_string(self.tgdrive.join(NOTE)).ok()
+        }
+    }
+
+    /// Park Nixi on a write of `content`, the turn's next completions
+    /// `after`.
+    async fn parked(
+        content: &str,
+        after: Vec<Completion>,
+    ) -> (World, Arc<Approvals>, ServedSession, ApprovalRecord) {
+        let mut script = vec![calls(&[write_note("w1", content)])];
+        script.extend(after);
+        let (mut world, approvals) = deciding(script);
+        let mut served = open(&world, &approvals);
+        let report = report(world.ask(&mut served, "write a note").await);
+        assert_eq!(report.ending, TurnEnding::Parked);
+        let record = world.record();
+        (world, approvals, served, record)
+    }
+
+    fn results(world: &World) -> Vec<ToolResultBody> {
+        tool_results(&world.lines(SESSION))
+    }
+
+    /// 93.2 AC1: the record is on disk, strict, before the request is sent;
+    /// its checkpoint is the SHA-256 of the chunk through the named line;
+    /// the call has no result and nothing ran; no thread waits — the worker
+    /// returned and `busy` is clear.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_that_needs_a_person_parks_and_holds_nothing() {
+        let (mut world, approvals) = deciding(vec![calls(&[write_note("w1", "after approval")])]);
+        *world.room.witness.lock().expect("lock") = Some(world.approvals());
+        let mut served = open(&world, &approvals);
+        let (queue, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+        queue
+            .send(world.arrived(TGORKA, "write a note"))
+            .expect("queued");
+        drop(queue);
+        let busy = keeper_agent::agent::Activity::default();
+        let (_handle, signal) = chat::cancellation();
+        served
+            .serve_arrivals(
+                &world.deps,
+                world.room.clone(),
+                Vec::new(),
+                &mut arrivals,
+                signal,
+                &busy,
+            )
+            .await;
+        assert!(
+            !busy.busy.load(Ordering::SeqCst),
+            "the worker holds nothing"
+        );
+        assert!(served.waiting());
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL), "nothing ran");
+
+        let record = world.record();
+        assert_eq!(
+            record.action.summary,
+            "Write `10-notes/a.md` in tgdrive (14 bytes)"
+        );
+        assert_eq!(record.risk.tier, 2);
+        assert_eq!(
+            record.preconditions.files[0].sha256.as_deref(),
+            Some(sha256_hex(ORIGINAL.as_bytes()).as_str())
+        );
+        assert_eq!(
+            *world.room.records_at_request.lock().expect("lock"),
+            Some(2),
+            "the round file and the record were on disk when the request went out"
+        );
+        let requests = world.sent_of(APPROVAL_REQUEST);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["id"], record.id.as_str());
+        assert_eq!(
+            requests[0]["binding_digest"],
+            record.binding_digest.as_str()
+        );
+
+        let chunk =
+            std::fs::read(world.dir(SESSION).join(&record.checkpoint.chunk)).expect("chunk");
+        let named = format!("\"id\":\"{}\"", record.checkpoint.through);
+        let at = String::from_utf8_lossy(&chunk)
+            .find(&named)
+            .expect("the named line");
+        let end = at
+            + chunk[at..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .expect("its end")
+            + 1;
+        assert_eq!(sha256_hex(&chunk[..end]), record.checkpoint.sha256);
+
+        assert!(results(&world).is_empty(), "the parked call has no result");
+        let approvals_logged = world.approval_lines();
+        assert_eq!(approvals_logged.len(), 1);
+        assert_eq!(approvals_logged[0].state, ApprovalState::Requested);
+        let status = world.sent_of(keeper_core::agents::events::STATUS);
+        assert_eq!(status.last().expect("a status")["run"], "blocked");
+    }
+
+    /// 93.2 AC2: a valid decision runs the action once; the same decision
+    /// again, or a second one, runs nothing; a restart runs nothing more.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_approval_is_consumed_exactly_once() {
+        let (mut world, approvals, mut served, record) =
+            parked("once", vec![prose("Written.")]).await;
+        let decided = world.decision(&record, Decision::Approve);
+        assert!(matches!(
+            world.serve(&mut served, decided.clone()).await,
+            Outcome::Decided
+        ));
+        assert_eq!(world.note().as_deref(), Some("once"));
+        assert_eq!(approvals.events().len(), 1);
+        assert!(world
+            .approvals()
+            .join(format!("{}.decision.json", record.id))
+            .exists());
+        let logged = world.approval_lines();
+        let states: Vec<ApprovalState> = logged.iter().map(|body| body.state).collect();
+        assert_eq!(
+            states,
+            [
+                ApprovalState::Requested,
+                ApprovalState::Decided,
+                ApprovalState::Consumed
+            ]
+        );
+        assert_eq!(logged[1].decision.as_deref(), Some("approve"));
+        let consumed_line = kinds(&world.lines(SESSION), LineKind::Approval)[2].clone();
+        assert_eq!(
+            consumed_line.matrix_event.as_deref().map(|e| e.as_str()),
+            Some(approvals.events()[0].event.as_str())
+        );
+        let results = results(&world);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, ToolOutcomeWord::Ok);
+        assert!(!served.waiting());
+        // The park's row is the run's row, closed `ok` (R172).
+        let rows = rows_of(&world, &served, "drive_write");
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.outcome, row.approval.as_deref()))
+                .collect::<Vec<_>>(),
+            [(
+                keeper_core::bots::audit::AuditOutcome::Ok,
+                Some(record.id.as_str())
+            )]
+        );
+
+        // The file is touched by hand: nothing below may write it again.
+        std::fs::write(world.tgdrive.join(NOTE), "touched").expect("touch");
+        assert!(matches!(
+            world.serve(&mut served, decided).await,
+            Outcome::Duplicate
+        ));
+        let again = world.decision(&record, Decision::Approve);
+        assert!(matches!(
+            world.serve(&mut served, again).await,
+            Outcome::Ignored(NO_SUCH_APPROVAL)
+        ));
+        let mut restarted = open(&world, &approvals);
+        let (_handle, signal) = chat::cancellation();
+        restarted
+            .resume_approvals(&world.deps, world.room.clone(), signal)
+            .await;
+        assert_eq!(world.note().as_deref(), Some("touched"));
+        assert_eq!(approvals.events().len(), 1);
+        assert_eq!(tool_results(&world.lines(SESSION)).len(), 1);
+    }
+
+    /// A `drive_write` to a note that is not there classifies by where it
+    /// would land (T2 outside the session) and parks, its record pinning
+    /// the file as absent; the call's one audit row waits pending, marked
+    /// with the approval. Approved, the drive refuses it — `drive_write`
+    /// never creates a file (AD-102) — and that same row closes refused
+    /// (R172): nothing is created and no second row is written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_approved_write_to_a_missing_note_keeps_its_one_row() {
+        use keeper_core::bots::audit::AuditOutcome;
+        const NEW: &str = "10-notes/fresh/b.md";
+        let (mut world, approvals) = deciding(vec![
+            calls(&[(
+                "w1",
+                "drive_write",
+                json!({"profile": "tgdrive", "path": NEW, "content": "brand new"}),
+            )]),
+            prose("It is not there."),
+        ]);
+        let mut served = open(&world, &approvals);
+        let report = report(world.ask(&mut served, "write a new note").await);
+        assert_eq!(report.ending, TurnEnding::Parked);
+        let record = world.record();
+        assert_eq!(record.risk.tier, 2);
+        assert_eq!(record.preconditions.files[0].sha256, None);
+        let parked = rows_of(&world, &served, "drive_write");
+        assert_eq!(
+            parked
+                .iter()
+                .map(|row| (row.outcome, row.approval.as_deref()))
+                .collect::<Vec<_>>(),
+            [(AuditOutcome::Pending, Some(record.id.as_str()))]
+        );
+
+        let decided = world.decision(&record, Decision::Approve);
+        assert!(matches!(
+            world.serve(&mut served, decided).await,
+            Outcome::Decided
+        ));
+        assert!(!world.tgdrive.join(NEW).exists());
+        let results = results(&world);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, ToolOutcomeWord::Refused, "{results:?}");
+        let rows = rows_of(&world, &served, "drive_write");
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.id, row.outcome, row.approval.as_deref()))
+                .collect::<Vec<_>>(),
+            [(
+                parked[0].id,
+                AuditOutcome::Refused,
+                Some(record.id.as_str())
+            )]
+        );
+    }
+
+    /// R172 through the session tools: a `card_update` that sets a schedule
+    /// (T3) parks with its row pending; approved, it lands, and the run
+    /// closes that same row `ok` — one row for the call, marked with its
+    /// approval.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_approved_card_update_closes_the_row_its_park_left() {
+        use keeper_core::bots::audit::AuditOutcome;
+        let mut world = world(
+            ProviderKind::OpenAi,
+            &["drive_read", "card_update"],
+            vec![
+                calls(&[(
+                    "c1",
+                    "card_update",
+                    json!({"card": "card.md", "fields": {"schedule": "@daily"}}),
+                )]),
+                prose("Scheduled."),
+            ],
+        );
+        world.deps.decisions = Some(Arc::new(Admit));
+        let approvals = Arc::new(Approvals::default());
+        write(&world.dir(SESSION), "card.md", CARD);
+        let mut served = open(&world, &approvals);
+        let report = report(world.ask(&mut served, "run it daily").await);
+        assert_eq!(report.ending, TurnEnding::Parked);
+        let record = world.record();
+        assert_eq!(record.risk.tier, 3);
+        let parked = rows_of(&world, &served, "card_update");
+        assert_eq!(
+            parked
+                .iter()
+                .map(|row| (row.outcome, row.approval.as_deref()))
+                .collect::<Vec<_>>(),
+            [(AuditOutcome::Pending, Some(record.id.as_str()))]
+        );
+
+        let decided = world.decision(&record, Decision::Approve);
+        assert!(matches!(
+            world.serve(&mut served, decided).await,
+            Outcome::Decided
+        ));
+        let card = std::fs::read_to_string(world.dir(SESSION).join("card.md")).expect("card");
+        assert!(card.contains("@daily"), "{card}");
+        let rows = rows_of(&world, &served, "card_update");
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.id, row.outcome, row.approval.as_deref()))
+                .collect::<Vec<_>>(),
+            [(parked[0].id, AuditOutcome::Ok, Some(record.id.as_str()))]
+        );
+    }
+
+    /// R85: a request its room may not carry — Eve was invited, and the
+    /// label reaches only tgorka and Marta — is not sent into the room; it
+    /// goes to each approver's proxy DM this host has a door to (tgorka's;
+    /// Marta's proxy is not run here), and the room's status says only
+    /// R64's fixed sentence, never what waits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_the_room_may_not_carry_goes_to_the_approvers_dms() {
+        use keeper_agent::sinks::NARROWED_STATUS;
+        let (mut world, approvals) = deciding(vec![calls(&[write_note("w1", "after")])]);
+        nixis_dm(&world);
+        let delegations = Delegations::over(known_with_proxy());
+        let doors = Arc::new(Doors::default());
+        let mut served = world.delegating(&delegations);
+        served.approval_room = Some(Arc::clone(&approvals) as Arc<dyn ApprovalRoom>);
+        served.doors = Some(doors.clone());
+        world
+            .room
+            .set_members(&[TGORKA, MARTA, NIXI, "@eve:example.org"]);
+        let report = report(world.ask(&mut served, "write a note").await);
+        assert_eq!(report.ending, TurnEnding::Parked);
+        let record = world.record();
+
+        assert!(world.sent_of(APPROVAL_REQUEST).is_empty());
+        let requests = doors.of(APPROVAL_REQUEST);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0]["id"], record.id.as_str());
+        assert_eq!(
+            requests[0]["binding_digest"],
+            record.binding_digest.as_str()
+        );
+        let status = world.sent_of(STATUS).last().cloned().expect("a status");
+        assert_eq!(status["title"], NARROWED_STATUS, "{status}");
+        assert!(!status.to_string().contains(NOTE), "{status}");
+    }
+
+    /// 93.4 AC4, the hand-off, with a decision source: the twin of
+    /// `a_delegated_schedule_is_refused_before_epic_93`. A card with a
+    /// schedule needs a person (T3), so the `delegate` call parks on a
+    /// record once its own sinks passed — no room is made, nothing is sent
+    /// to Tola, and the call has neither a result nor a refused line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delegated_schedule_parks_with_a_source() {
+        let mut world = world(
+            ProviderKind::OpenAi,
+            &["drive_read", "delegate"],
+            vec![
+                delegate_call(
+                    "d1",
+                    json!({"agent": "tola", "brief": "Every morning.", "card": {"title": "Digest", "schedule": "@daily"}}),
+                ),
+                prose("It needs you."),
+            ],
+        );
+        world.deps.decisions = Some(Arc::new(Admit));
+        let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+        let mut nixi = world.delegating(&rooms);
+        let report = report(world.ask(&mut nixi, "a daily digest from Tola").await);
+        assert_eq!(report.ending, TurnEnding::Parked);
+        assert!(nixi.waiting());
+        assert!(rooms.made().is_empty());
+        assert!(rooms.sent().is_empty());
+        let lines = world.lines(SESSION);
+        assert!(tool_results(&lines).is_empty());
+        assert!(delegate_lines(&lines).is_empty());
+        let record = world.record();
+        assert_eq!(
+            (record.action.tool.as_str(), record.risk.tier),
+            ("delegate", 3)
+        );
+        assert_eq!(world.sent_of(APPROVAL_REQUEST).len(), 1);
+    }
+
+    /// 93.4 AC4, inside the child, with a decision source: the twin of
+    /// `an_action_needing_a_person_in_a_delegated_session_is_refused`.
+    /// Tola's write outside her session is T2 raised to T3 `[delegated]`;
+    /// it parks in her session — its record there, its request into her
+    /// room — and the file is never written while it waits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_action_needing_a_person_in_a_delegated_session_parks_with_a_source() {
+        let mut world = world(
+            ProviderKind::OpenAi,
+            &["drive_read", "delegate"],
+            vec![
+                hand_inbox(),
+                prose("Handed on."),
+                calls(&[(
+                    "w1",
+                    "drive_write",
+                    json!({"profile": "tgdrive", "path": "notes/sorted.md", "content": "after approval"}),
+                )]),
+                prose("That needs tgorka."),
+            ],
+        );
+        let mut tola = tolas(&world, &["drive_read", "drive_write"]);
+        tola.decisions = Some(Arc::new(Admit));
+        let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+        let (_nixi, child, brief) = handed_over(&mut world, &rooms).await;
+        let path = world.create_child(&tola, &child, &read_brief(&brief).expect("a brief"));
+        let mut tolas_session = world.child(&tola, &path, &rooms);
+        let arrived = world.brief(&brief);
+        let room = Arc::new(Room::default());
+        let report = report(serve_as(&tola, &mut tolas_session, &room, arrived).await);
+        assert_eq!(report.ending, TurnEnding::Parked);
+        assert!(tolas_session.waiting());
+        assert!(!world.tgdrive.join("notes/sorted.md").exists());
+        assert!(tool_results(&world.lines(&path)).is_empty());
+        let record = world.record_in(&path);
+        assert_eq!(
+            (
+                record.risk.tier,
+                record.risk.base_tier,
+                record.risk.raised_by.clone()
+            ),
+            (3, 2, vec!["delegated".to_owned()])
+        );
+        let requests = room
+            .sent()
+            .into_iter()
+            .filter(|(kind, _)| kind == APPROVAL_REQUEST)
+            .count();
+        assert_eq!(requests, 1);
+    }
+
+    /// 93.2 AC2/AC5: a host that does not hold the claim never consumes; the
+    /// host that takes over, given the decision, reads the room first and
+    /// finds another copy's `consumed` — though no chunk it has says so —
+    /// and runs nothing, reporting the effect unknown.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_consume_that_never_pushed_is_seen_by_the_host_that_takes_over() {
+        let (mut world, approvals, mut served, record) =
+            parked("hers", vec![prose("I will check.")]).await;
+        approvals.elsewhere.store(true, Ordering::SeqCst);
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided.clone()).await;
+        assert!(approvals.events().is_empty(), "no claim, no consume");
+        assert!(served.waiting());
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+
+        // Hesperia consumed it, ran it and died before pushing its chunk.
+        approvals.consumed_by(&record.id, "hesperia");
+        std::fs::write(world.tgdrive.join(NOTE), "hers").expect("its effect");
+        approvals.elsewhere.store(false, Ordering::SeqCst);
+        let mut taker = open(&world, &approvals);
+        world.serve(&mut taker, decided).await;
+        assert_eq!(approvals.events().len(), 1, "nothing consumed twice");
+        let results = results(&world);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, ToolOutcomeWord::Refused);
+        assert!(results[0].content.contains(&effect_unknown("hesperia")));
+        let consumed = world.approval_lines().pop().expect("a line");
+        assert_eq!(
+            (
+                consumed.state,
+                consumed.result.as_deref(),
+                consumed.by.as_deref()
+            ),
+            (ApprovalState::Consumed, Some("unknown"), Some("hesperia"))
+        );
+        assert!(!taker.waiting());
+    }
+
+    /// 93.2 AC3: a `consumed` the server did not accept runs nothing and the
+    /// run stays parked; after a restart the decision beside the record
+    /// runs it, once. A crash after the local `consumed` line is never a
+    /// second run: the effect is reported unknown.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crash_before_the_consumed_event_is_accepted_runs_it_once_after_restart() {
+        let (mut world, approvals, mut served, record) =
+            parked("after", vec![prose("Written.")]).await;
+        approvals.down.store(true, Ordering::SeqCst);
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+        assert!(served.waiting());
+        approvals.down.store(false, Ordering::SeqCst);
+        drop(served);
+        let mut restarted = open(&world, &approvals);
+        let (_handle, signal) = chat::cancellation();
+        restarted
+            .resume_approvals(&world.deps, world.room.clone(), signal)
+            .await;
+        assert_eq!(world.note().as_deref(), Some("after"));
+        assert_eq!(approvals.events().len(), 1);
+        assert_eq!(results(&world).len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crash_after_the_consumed_event_never_runs_it_again() {
+        let (world, approvals, mut served, record) =
+            parked("never", vec![prose("I do not know if it was written.")]).await;
+        // The host consumed and logged it, then died before the effect.
+        let ServedSession {
+            context, writer, ..
+        } = &mut served;
+        let call_line = context.parked[&record.id].call_line;
+        writer
+            .write(
+                context,
+                Some(call_line),
+                Some(OwnedEventId::try_from("$mine:example.org").expect("id")),
+                LineBody::Approval(ApprovalBody {
+                    id: record.id.clone(),
+                    state: ApprovalState::Consumed,
+                    decision: None,
+                    by: Some("electra".to_owned()),
+                    result: None,
+                    reason: None,
+                    scope: None,
+                }),
+            )
+            .expect("line");
+        writer.sync().expect("sync");
+        drop(served);
+        let mut restarted = open(&world, &approvals);
+        let (_handle, signal) = chat::cancellation();
+        restarted
+            .resume_approvals(&world.deps, world.room.clone(), signal)
+            .await;
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+        assert!(approvals.events().is_empty());
+        let results = results(&world);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains(&effect_unknown("electra")));
+    }
+
+    /// 93.2 AC4: a pinned file that changed, `max_staleness_s` passed, a
+    /// sink the label now blocks, and an expired record each refuse, log
+    /// what drifted and run nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drift_refuses_and_says_what_moved() {
+        let refused = |world: &World, what: &str| {
+            let results = results(world);
+            assert_eq!(results.len(), 1, "{what}");
+            assert_eq!(results[0].outcome, ToolOutcomeWord::Refused, "{what}");
+            results[0].content.clone()
+        };
+
+        // The file it would write changed meanwhile.
+        let (mut world, _, mut served, record) = parked("mine", vec![prose("Moved.")]).await;
+        std::fs::write(world.tgdrive.join(NOTE), "someone else's").expect("write");
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert_eq!(world.note().as_deref(), Some("someone else's"));
+        let line = world.approval_lines().pop().expect("a line");
+        assert_eq!(line.state, ApprovalState::Refused);
+        assert!(line
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("tgdrive/10-notes/a.md")));
+        assert!(refused(&world, "file").contains("tgdrive/10-notes/a.md changed"));
+
+        // What it relied on is older than it may be.
+        let (mut world, _, mut served, mut record) = parked("mine", vec![prose("Stale.")]).await;
+        record.preconditions.max_staleness_s = Some(0);
+        record.created_at = "2026-01-01T00:00:00.000Z".to_owned();
+        record.binding_digest = record
+            .recomputed_digest(&record.action.args)
+            .expect("digest");
+        world.rewrite(&record);
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+        assert!(refused(&world, "stale").contains("passed since what it relied on was read"));
+
+        // The label no longer lets the write reach its drive.
+        let (mut world, _, mut served, record) = parked("mine", vec![prose("Blocked.")]).await;
+        narrow(&mut served, &[TGORKA]);
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+        let line = world.approval_lines().pop().expect("a line");
+        assert_eq!(line.state, ApprovalState::Refused);
+        refused(&world, "sink");
+
+        // Expired: the decision does not count, and the record expires.
+        let (mut world, approvals, mut served, mut record) =
+            parked("mine", vec![prose("Too late.")]).await;
+        record.expires_at = "2026-01-01T00:00:00.000Z".to_owned();
+        world.rewrite(&record);
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        let ignored = world.approval_lines().pop().expect("a line");
+        assert_eq!(
+            (ignored.state, ignored.decision.as_deref()),
+            (ApprovalState::Decided, None)
+        );
+        assert!(ignored
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("expired")));
+        drop(served);
+        let mut restarted = open(&world, &approvals);
+        let (_handle, signal) = chat::cancellation();
+        restarted
+            .resume_approvals(&world.deps, world.room.clone(), signal)
+            .await;
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+        assert_eq!(
+            world.approval_lines().pop().expect("a line").state,
+            ApprovalState::Expired
+        );
+        assert!(refused(&world, "expired").contains(EXPIRED));
+        assert!(approvals.events().is_empty());
+    }
+
+    /// A person's deny: the call is refused, their note is a `peer` line
+    /// the model reads after it, and nothing ran.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deny_refuses_and_passes_the_note() {
+        let (mut world, approvals, mut served, record) =
+            parked("mine", vec![prose("Understood.")]).await;
+        let mut denied = world.decision(&record, Decision::Deny);
+        denied.content["note"] = json!("Put it in 10-notes instead.");
+        world.serve(&mut served, denied).await;
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+        assert!(approvals.events().is_empty());
+        let results = results(&world);
+        assert!(results[0].content.contains(DENIED));
+        let lines = world.lines(SESSION);
+        let peers = kinds(&lines, LineKind::Peer);
+        assert_eq!(peers.len(), 1);
+        let asked = world.stub.requests().last().expect("a request").to_string();
+        assert!(
+            asked.find(DENIED) < asked.find("Put it in 10-notes instead."),
+            "{asked}"
+        );
+    }
+
+    /// 93.2 AC6: of the calls in a round the first runs, the second parks,
+    /// the later ones wait unrun; after approval the second's result and
+    /// then the third's reach the model in order, nothing run twice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_round_with_several_calls_resumes_where_it_parked() {
+        let (mut world, approvals) = deciding(vec![
+            calls(&[
+                (
+                    "r1",
+                    "drive_read",
+                    json!({"profile": "tgdrive", "path": "notes/hello.md"}),
+                ),
+                write_note("w2", "second"),
+                (
+                    "r3",
+                    "drive_read",
+                    json!({"profile": "tgdrive", "path": "notes/secret-plan.md"}),
+                ),
+                (
+                    "r4",
+                    "drive_read",
+                    json!({"profile": "tgdrive", "path": "00-inbox/x.md"}),
+                ),
+            ]),
+            prose("All three."),
+        ]);
+        let mut served = open(&world, &approvals);
+        let report = report(world.ask(&mut served, "do three things").await);
+        assert_eq!(report.ending, TurnEnding::Parked);
+        let ids = |world: &World| -> Vec<String> {
+            results(world).iter().map(|r| r.call_id.clone()).collect()
+        };
+        assert_eq!(ids(&world), ["r1"]);
+        assert_eq!(kinds(&world.lines(SESSION), LineKind::ToolCall).len(), 4);
+        let record = world.record();
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert_eq!(ids(&world), ["r1", "w2", "r3", "r4"]);
+        assert_eq!(world.note().as_deref(), Some("second"));
+        let asked = world.stub.requests().last().expect("a request").to_string();
+        let at = |id: &str| asked.find(&format!("\"tool_call_id\":\"{id}\"")).expect(id);
+        assert!(at("w2") < at("r3") && at("r3") < at("r4"), "{asked}");
+        assert!(asked.contains("the plan"), "the third call ran");
+        assert_eq!(kinds(&world.lines(SESSION), LineKind::ToolCall).len(), 4);
+    }
+
+    /// R74 in the person's own conversation: their new message denies what
+    /// waits, superseded, and then runs as a turn over a whole transcript.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_message_from_the_person_supersedes_what_waits() {
+        let (mut world, approvals, mut served, _) =
+            parked("mine", vec![prose("Not writing it, then.")]).await;
+        let report = report(world.ask(&mut served, "never mind").await);
+        assert_eq!(report.ending, TurnEnding::Complete);
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+        assert!(approvals.events().is_empty());
+        let line = world.approval_lines().pop().expect("a line");
+        assert_eq!(
+            (line.state, line.decision.as_deref(), line.reason.as_deref()),
+            (ApprovalState::Decided, Some("deny"), Some(SUPERSEDED))
+        );
+        assert!(results(&world)[0].content.contains(SUPERSEDED_RESULT));
+        assert!(!served.waiting());
+        let asked = world.stub.requests().last().expect("a request").to_string();
+        assert!(asked.contains(SUPERSEDED_RESULT), "{asked}");
+    }
+
+    /// R74 for what is not the person's message: held, not served, while a
+    /// call waits, said once in the status; served once it ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_arrives_while_a_call_waits_is_held() {
+        let (mut world, _, mut served, record) = parked("mine", vec![prose("Denied.")]).await;
+        let statuses = world.sent_of(keeper_core::agents::events::STATUS).len();
+        let scope = world.scope(TGORKA, &["tgdrive"], None);
+        assert!(matches!(
+            world.serve(&mut served, scope).await,
+            Outcome::Held
+        ));
+        let again = world.scope(TGORKA, &["tgdrive"], None);
+        assert!(matches!(
+            world.serve(&mut served, again).await,
+            Outcome::Held
+        ));
+        assert_eq!(
+            world.sent_of(keeper_core::agents::events::STATUS).len(),
+            statuses + 1,
+            "said once"
+        );
+        assert!(kinds(&world.lines(SESSION), LineKind::Scope).is_empty());
+        let denied = world.decision(&record, Decision::Deny);
+        world.serve(&mut served, denied).await;
+        assert!(!served.waiting());
+    }
+
+    /// R74/C6: after a restart a parked turn is waiting, not cut off: no
+    /// `error` line, nothing said in the room, still parked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_keeps_a_parked_run_parked() {
+        let (world, approvals, served, _) = parked("mine", vec![]).await;
+        drop(served);
+        let sent = world.room.sent().len();
+        let mut restarted = open(&world, &approvals);
+        assert!(!restarted
+            .recover(&world.deps, world.room.clone(), &Trail::default())
+            .await
+            .expect("recover"));
+        assert!(restarted.waiting());
+        assert!(kinds(&world.lines(SESSION), LineKind::Error).is_empty());
+        assert_eq!(world.room.sent().len(), sent);
+    }
+
+    /// R84: nothing decided by `expires_at` — the worker's own timer
+    /// expires it, with no arrival, and the turn goes on refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_approval_nobody_decides_expires_on_the_workers_timer() {
+        let (world, approvals, served, mut record) =
+            parked("mine", vec![prose("It expired.")]).await;
+        drop(served);
+        record.expires_at = keeper_core::agents::approval::stamp(
+            chrono::Utc::now() + chrono::Duration::milliseconds(300),
+        );
+        world.rewrite(&record);
+        let mut restarted = open(&world, &approvals);
+        let (_queue, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let busy = keeper_agent::agent::Activity::default();
+        let (_handle, signal) = chat::cancellation();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            restarted.serve_arrivals(
+                &world.deps,
+                world.room.clone(),
+                Vec::new(),
+                &mut arrivals,
+                signal,
+                &busy,
+            ),
+        )
+        .await;
+        assert_eq!(
+            world.approval_lines().pop().expect("a line").state,
+            ApprovalState::Expired
+        );
+        assert!(results(&world)[0].content.contains(EXPIRED));
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+    }
+
+    /// 93.2 AC9: two hosts consume one approval at once — the one whose
+    /// claim was just taken and its taker. Only the host whose `consumed`
+    /// is first in the room's order runs it; the other logs it spent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_hosts_consuming_at_once_run_it_once() {
+        let (mut world, approvals, mut served, record) =
+            parked("once", vec![prose("Done."), prose("Spent.")]).await;
+        // The holder wrote the decision beside the record, and its consume
+        // was not accepted: nobody consumed yet.
+        approvals.down.store(true, Ordering::SeqCst);
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        approvals.down.store(false, Ordering::SeqCst);
+        drop(served);
+        let mut deps_b = tolas_free_deps(&world);
+        deps_b.host = keeper_core::agents::log::HostSlug::new("hesperia").expect("slug");
+        let mut a = open(&world, &approvals);
+        let mut b = world.open_as(&deps_b, SESSION);
+        b.approval_room = Some(Arc::clone(&approvals) as Arc<dyn ApprovalRoom>);
+        let (_ha, sa) = chat::cancellation();
+        let (_hb, sb) = chat::cancellation();
+        tokio::join!(
+            a.resume_approvals(&world.deps, world.room.clone(), sa),
+            b.resume_approvals(&deps_b, world.room.clone(), sb),
+        );
+        let events = approvals.events();
+        assert_eq!(events.len(), 2, "both sent");
+        assert_eq!(world.note().as_deref(), Some("once"));
+        let lines = world.lines(SESSION);
+        let ran = tool_results(&lines)
+            .iter()
+            .filter(|r| r.outcome == ToolOutcomeWord::Ok)
+            .count();
+        assert_eq!(ran, 1, "run once");
+        let spent = world
+            .approval_lines()
+            .into_iter()
+            .filter(|line| line.state == ApprovalState::Refused)
+            .count();
+        assert_eq!(spent, 1);
+        let _ = NOT_RUN;
+    }
+
+    /// R84 / 93.2 AC1 for a scheduled run with a source: the action parks
+    /// (T3: unattended), the card reads `run: blocked`, and the host's next
+    /// arrival for the session is held while the approval waits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scheduled_run_parks_and_holds_its_next_window() {
+        use keeper_agent::agent::scheduled_arrival;
+        use keeper_agent::cards::Scheduled;
+        use keeper_core::agents::card::{CardAgent, Field, Run};
+        const SCHEDULED: &str = "active/2026-10-05-sort";
+        let (world, approvals) = deciding(vec![calls(&[write_note("w1", "sorted")])]);
+        session_of(
+            &world.tgdrive,
+            SCHEDULED,
+            &decl("tgdrive", &[TGORKA, MARTA], false),
+            "nixi",
+            SessionKind::Scheduled,
+            "!sort:example.org",
+        );
+        let card = "---\ntags: [task]\ntitle: Sort the inbox\nstatus: todo\nassignee: nixi\nschedule: \"@hourly\"\nlast_run: \"2026-10-05T08:00:00Z\"\n---\n\nWrite a note about what came in.\n";
+        write(
+            &world.tgdrive,
+            &format!("60-sessions/{SCHEDULED}/card.md"),
+            card,
+        );
+        let mut served = world.open(SCHEDULED);
+        served.approval_room = Some(Arc::clone(&approvals) as Arc<dyn ApprovalRoom>);
+        let arrival = |window: &str, now: &str| {
+            scheduled_arrival(
+                &user("@nixi:example.org"),
+                &Scheduled::Run {
+                    card: "card.md".to_owned(),
+                    window: window.to_owned(),
+                    now_ms: chrono::DateTime::parse_from_rfc3339(now)
+                        .expect("an instant")
+                        .timestamp_millis(),
+                    utc_offset_minutes: 0,
+                },
+            )
+            .expect("an arrival")
+        };
+        let report = report(
+            world
+                .serve(
+                    &mut served,
+                    arrival("2026-10-05T09:00:00.000Z", "2026-10-05T09:30:00Z"),
+                )
+                .await,
+        );
+        assert_eq!(report.ending, TurnEnding::Parked);
+        assert!(served.waiting());
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+        let text = std::fs::read_to_string(world.dir(SCHEDULED).join("card.md")).expect("card");
+        let keys = CardAgent::of_text(&text).expect("keys");
+        assert_eq!(keys.run, Some(Field::Read(Run::Blocked)), "{text}");
+        let record = world.record_in(SCHEDULED);
+        assert_eq!(
+            (record.risk.tier, record.risk.raised_by.clone()),
+            (3, vec!["unattended".to_owned()])
+        );
+        assert!(matches!(
+            world
+                .serve(
+                    &mut served,
+                    arrival("2026-10-05T10:00:00.000Z", "2026-10-05T10:30:00Z")
+                )
+                .await,
+            Outcome::Held
+        ));
+    }
+
+    /// Nixi's deps again, for a second host of the same agent.
+    fn tolas_free_deps(world: &World) -> AgentDeps {
+        AgentDeps {
+            env: TurnEnv {
+                drive: world.deps.env.drive.as_ref().map(|drive| DrivePorts {
+                    profiles: Arc::clone(&drive.profiles),
+                    vault: None,
+                    approval: None,
+                }),
+                ..TurnEnv::new(Arc::new(DataDir(world.deps.data_dir.clone())))
+            },
+            data_dir: world.deps.data_dir.clone(),
+            row: world.deps.row.clone(),
+            bot: world.deps.bot.clone(),
+            home: world.deps.home.clone(),
+            host: world.deps.host.clone(),
+            drives: world.deps.drives.clone(),
+            sessions_zone: world.deps.sessions_zone.clone(),
+            sessions_subfolder: world.deps.sessions_subfolder.clone(),
+            lfs_threshold_bytes: world.deps.lfs_threshold_bytes,
+            decisions: world.deps.decisions.clone(),
+        }
+    }
+
+    /// Every audit row on `data_dir` carrying `approval`, oldest first.
+    fn approval_rows(
+        data_dir: &Path,
+        approval: &str,
+    ) -> Vec<keeper_core::bots::audit::AuditOutcome> {
+        let mut rows = keeper_core::bots::audit::list_audit(data_dir, None, None).expect("audit");
+        rows.reverse();
+        rows.into_iter()
+            .filter(|row| row.approval.as_deref() == Some(approval))
+            .map(|row| row.outcome)
+            .collect()
+    }
+
+    /// The log as a stop right after the record left it: the chunk cut
+    /// after the line the checkpoint names, before `approval requested`.
+    fn stopped_after_the_record(world: &World, record: &ApprovalRecord) {
+        let chunk = world.dir(SESSION).join(&record.checkpoint.chunk);
+        let bytes = std::fs::read(&chunk).expect("chunk");
+        let named = format!("\"id\":\"{}\"", record.checkpoint.through);
+        let at = String::from_utf8_lossy(&bytes).find(&named).expect("named");
+        let end = at + bytes[at..].iter().position(|b| *b == b'\n').expect("end") + 1;
+        assert_eq!(sha256_hex(&bytes[..end]), record.checkpoint.sha256);
+        std::fs::write(&chunk, &bytes[..end]).expect("cut");
+    }
+
+    /// R93P-01 / R174: what runs after approval is the record's exact
+    /// bytes — a secret-shaped argument the log redacts is written as the
+    /// person saw it — and a log changed under the checkpoint is drift.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_approval_runs_the_bytes_it_bound_never_the_logs_copy() {
+        const SECRET: &str = "key AKIAIOSFODNN7EXAMPLE here";
+        let (mut world, _, mut served, record) = parked(SECRET, vec![prose("Written.")]).await;
+        let logged: Vec<String> = kinds(&world.lines(SESSION), LineKind::ToolCall)
+            .iter()
+            .map(|line| match &line.body {
+                LineBody::ToolCall(call) => call.args.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert!(
+            !logged[0].contains("AKIAIOSFODNN7EXAMPLE"),
+            "the log redacts it: {logged:?}"
+        );
+        assert_eq!(record.action.args["content"], SECRET);
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert_eq!(world.note().as_deref(), Some(SECRET));
+
+        let (mut world, approvals, mut served, record) =
+            parked("mine", vec![prose("Changed.")]).await;
+        let chunk = world.dir(SESSION).join(&record.checkpoint.chunk);
+        let text = std::fs::read_to_string(&chunk).expect("chunk");
+        assert!(text.contains("write a note"));
+        std::fs::write(&chunk, text.replace("write a note", "WRITE A NOTE")).expect("edit");
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+        assert!(approvals.events().is_empty(), "drift consumes nothing");
+        let results = results(&world);
+        assert_eq!(results[0].outcome, ToolOutcomeWord::Refused);
+        assert!(
+            results[0].content.contains("the session's log changed"),
+            "{}",
+            results[0].content
+        );
+    }
+
+    /// R93P-02 / R174: the record pins where a write's alias landed; the
+    /// alias retargeted to another file of the same bytes is drift, and
+    /// neither file is written.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_alias_retargeted_between_equal_files_is_drift() {
+        const ALIAS: &str = "10-notes/current.md";
+        let (mut world, approvals) = deciding(vec![
+            calls(&[(
+                "w1",
+                "drive_write",
+                json!({"profile": "tgdrive", "path": ALIAS, "content": "through the alias"}),
+            )]),
+            prose("Moved."),
+        ]);
+        let b = world.tgdrive.join("10-notes/b.md");
+        std::fs::write(&b, ORIGINAL).expect("b");
+        let link = world.tgdrive.join(ALIAS);
+        std::os::unix::fs::symlink("a.md", &link).expect("link");
+        let mut served = open(&world, &approvals);
+        let report = report(world.ask(&mut served, "write through the alias").await);
+        assert_eq!(report.ending, TurnEnding::Parked);
+        let record = world.record();
+        let pin = &record.preconditions.files[0];
+        assert_eq!(
+            (pin.path.as_str(), pin.landing.as_deref()),
+            (ALIAS, Some(NOTE))
+        );
+        std::fs::remove_file(&link).expect("unlink");
+        std::os::unix::fs::symlink("b.md", &link).expect("relink");
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+        assert_eq!(std::fs::read_to_string(&b).expect("b"), ORIGINAL);
+        assert!(approvals.events().is_empty());
+        let results = results(&world);
+        assert_eq!(results[0].outcome, ToolOutcomeWord::Refused);
+        assert!(
+            results[0]
+                .content
+                .contains("tgdrive/10-notes/current.md changed"),
+            "{}",
+            results[0].content
+        );
+    }
+
+    /// R93P-03 / R175: the request's first send is rate-limited and Eve
+    /// joins before the retry. The retry asks the room again: the request
+    /// never enters the widened room, it goes to the approvers' DMs, and
+    /// the status says only the fixed sentence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_retried_after_the_room_widened_goes_to_the_doors() {
+        use keeper_agent::sinks::NARROWED_STATUS;
+        let (mut world, approvals) = deciding(vec![calls(&[write_note("w1", "after")])]);
+        nixis_dm(&world);
+        let delegations = Delegations::over(known_with_proxy());
+        let doors = Arc::new(Doors::default());
+        let mut served = world.delegating(&delegations);
+        served.approval_room = Some(Arc::clone(&approvals) as Arc<dyn ApprovalRoom>);
+        served.doors = Some(doors.clone());
+        world.room.set_members(&[TGORKA, MARTA, NIXI]);
+        *world.room.limited_request.lock().expect("lock") =
+            Some(vec![TGORKA, MARTA, NIXI, "@eve:example.org"]);
+        let report = report(world.ask(&mut served, "write a note").await);
+        assert_eq!(report.ending, TurnEnding::Parked);
+        assert!(
+            world.room.limited_request.lock().expect("lock").is_none(),
+            "the first send was refused"
+        );
+        let record = world.record();
+        assert!(world.sent_of(APPROVAL_REQUEST).is_empty());
+        let requests = doors.of(APPROVAL_REQUEST);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0]["id"], record.id.as_str());
+        let status = world.sent_of(STATUS).last().cloned().expect("a status");
+        assert_eq!(status["title"], NARROWED_STATUS, "{status}");
+        assert!(!status.to_string().contains(NOTE), "{status}");
+        assert!(served.waiting());
+    }
+
+    /// R93P-04 / R176: a host that does not hold the session's claim
+    /// writes no decision — neither a deny nor an approve — and no line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_without_the_claim_writes_no_decision() {
+        use keeper_agent::approvals::NOT_HOLDER;
+        let (mut world, approvals, mut served, record) =
+            parked("mine", vec![prose("Never.")]).await;
+        approvals.elsewhere.store(true, Ordering::SeqCst);
+        for decision in [Decision::Deny, Decision::Approve] {
+            let decided = world.decision(&record, decision);
+            assert!(matches!(
+                world.serve(&mut served, decided).await,
+                Outcome::Ignored(NOT_HOLDER)
+            ));
+        }
+        assert!(!world
+            .approvals()
+            .join(format!("{}.decision.json", record.id))
+            .exists());
+        let states: Vec<ApprovalState> = world
+            .approval_lines()
+            .iter()
+            .map(|body| body.state)
+            .collect();
+        assert_eq!(states, [ApprovalState::Requested]);
+        assert!(results(&world).is_empty());
+        assert!(served.waiting());
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+    }
+
+    /// R93P-05 / R176: a stop after the record and before its `approval
+    /// requested` line loses nothing: after a restart the turn is not cut
+    /// off, the request is announced again and the approval runs once; a
+    /// record past its time expires instead, its call answered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_record_whose_requested_line_was_lost_is_announced_again() {
+        let (mut world, approvals, served, record) = parked("again", vec![prose("Written.")]).await;
+        drop(served);
+        stopped_after_the_record(&world, &record);
+        assert!(world.approval_lines().is_empty());
+        let requests = world.sent_of(APPROVAL_REQUEST).len();
+        let mut restarted = open(&world, &approvals);
+        assert!(!restarted
+            .recover(&world.deps, world.room.clone(), &Trail::default())
+            .await
+            .expect("recover"));
+        assert!(kinds(&world.lines(SESSION), LineKind::Error).is_empty());
+        let (_handle, signal) = chat::cancellation();
+        restarted
+            .resume_approvals(&world.deps, world.room.clone(), signal)
+            .await;
+        assert_eq!(world.sent_of(APPROVAL_REQUEST).len(), requests + 1);
+        let states: Vec<ApprovalState> = world
+            .approval_lines()
+            .iter()
+            .map(|body| body.state)
+            .collect();
+        assert_eq!(states, [ApprovalState::Requested]);
+        assert!(restarted.waiting());
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut restarted, decided).await;
+        assert_eq!(world.note().as_deref(), Some("again"));
+        assert_eq!(approvals.events().len(), 1);
+        assert_eq!(results(&world).len(), 1);
+
+        let (world, approvals, served, mut record) = parked("late", vec![prose("Too late.")]).await;
+        drop(served);
+        stopped_after_the_record(&world, &record);
+        record.expires_at = "2026-01-01T00:00:00.000Z".to_owned();
+        world.rewrite(&record);
+        let mut restarted = open(&world, &approvals);
+        let (_handle, signal) = chat::cancellation();
+        restarted
+            .resume_approvals(&world.deps, world.room.clone(), signal)
+            .await;
+        assert_eq!(
+            world.approval_lines().pop().expect("a line").state,
+            ApprovalState::Expired
+        );
+        let results = results(&world);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains(EXPIRED));
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+        assert!(!restarted.waiting());
+    }
+
+    /// R93P-06 / R176: a stop after the approved call's result and before
+    /// the rest of its round: after a restart the call that may have run
+    /// is told so and never run again, the next runs, and the model reads
+    /// a result for every call. A stop inside a deny's answers likewise
+    /// leaves no call of the round unanswered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_continuation_a_stop_cut_answers_every_call_of_its_round() {
+        use keeper_agent::approvals::INTERRUPTED;
+        let round = || {
+            calls(&[
+                write_note("w1", "first"),
+                (
+                    "r2",
+                    "drive_read",
+                    json!({"profile": "tgdrive", "path": "notes/hello.md"}),
+                ),
+                (
+                    "r3",
+                    "drive_read",
+                    json!({"profile": "tgdrive", "path": "notes/secret-plan.md"}),
+                ),
+            ])
+        };
+        let cut = |served: &mut ServedSession, record: &ApprovalRecord, approval: ApprovalBody| {
+            let ServedSession {
+                context, writer, ..
+            } = served;
+            let call_line = context.parked[&record.id].call_line;
+            writer
+                .write(context, Some(call_line), None, LineBody::Approval(approval))
+                .expect("line");
+            let label = context.label.clone();
+            writer
+                .write(
+                    context,
+                    Some(call_line),
+                    None,
+                    LineBody::ToolResult(ToolResultBody {
+                        call_id: "w1".to_owned(),
+                        outcome: ToolOutcomeWord::Ok,
+                        content: "Wrote it.".to_owned(),
+                        truncated: None,
+                        label,
+                    }),
+                )
+                .expect("result");
+            writer.sync().expect("sync");
+        };
+        let ids = |world: &World| -> Vec<String> {
+            results(world).iter().map(|r| r.call_id.clone()).collect()
+        };
+
+        // Consumed here and run; the stop came before r2's result.
+        let (mut world, approvals) = deciding(vec![round(), prose("Two of three.")]);
+        let mut served = open(&world, &approvals);
+        report(world.ask(&mut served, "do three things").await);
+        let record = world.record();
+        let mut consumed = line_of(&record.id, ApprovalState::Consumed);
+        consumed.by = Some("electra".to_owned());
+        cut(&mut served, &record, consumed);
+        drop(served);
+        let mut restarted = open(&world, &approvals);
+        let (_handle, signal) = chat::cancellation();
+        restarted
+            .resume_approvals(&world.deps, world.room.clone(), signal)
+            .await;
+        assert_eq!(ids(&world), ["w1", "r2", "r3"]);
+        let answered = results(&world);
+        assert!(
+            answered[1].content.contains(INTERRUPTED),
+            "{}",
+            answered[1].content
+        );
+        assert_eq!(answered[2].outcome, ToolOutcomeWord::Ok);
+        let asked = world.stub.requests().last().expect("a request").to_string();
+        for id in ["w1", "r2", "r3"] {
+            assert!(
+                asked.contains(&format!("\"tool_call_id\":\"{id}\"")),
+                "{id}: {asked}"
+            );
+        }
+        assert!(asked.contains("the plan"), "r3 ran");
+        assert!(restarted.context.parked.is_empty());
+
+        // Denied; the stop came between the parked call's answer and r2's.
+        let (mut world, approvals) = deciding(vec![round(), prose("Not done.")]);
+        let mut served = open(&world, &approvals);
+        report(world.ask(&mut served, "do three things").await);
+        let record = world.record();
+        let mut denied = line_of(&record.id, ApprovalState::Decided);
+        denied.decision = Some("deny".to_owned());
+        cut(&mut served, &record, denied);
+        drop(served);
+        let mut restarted = open(&world, &approvals);
+        let (_handle, signal) = chat::cancellation();
+        restarted
+            .resume_approvals(&world.deps, world.room.clone(), signal)
+            .await;
+        assert_eq!(ids(&world), ["w1", "r2", "r3"]);
+        let answered = results(&world);
+        assert!(answered[1].content.contains(NOT_RUN));
+        assert!(answered[2].content.contains(NOT_RUN));
+        assert!(restarted.context.parked.is_empty());
+    }
+
+    fn line_of(id: &str, state: ApprovalState) -> ApprovalBody {
+        ApprovalBody {
+            id: id.to_owned(),
+            state,
+            decision: None,
+            by: None,
+            result: None,
+            reason: None,
+            scope: None,
+        }
+    }
+
+    /// R93P-07 / R176: every end of a parked call closes its one audit row
+    /// — a deny, an expiry, a supersede, drift, an effect another copy
+    /// spent, a refusal before the executor took the row — and a host that
+    /// took over writes exactly one row of its own carrying the approval.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_end_of_a_parked_call_closes_its_one_row() {
+        use keeper_core::bots::audit::AuditOutcome::{Pending, Refused};
+        let one_refused = |world: &World, served: &ServedSession, id: &str, what: &str| {
+            assert_eq!(approval_rows(&world.deps.data_dir, id), [Refused], "{what}");
+            assert_eq!(rows_of(world, served, "drive_write").len(), 1, "{what}");
+        };
+
+        let (mut world, _, mut served, record) = parked("mine", vec![prose("No.")]).await;
+        assert_eq!(approval_rows(&world.deps.data_dir, &record.id), [Pending]);
+        let denied = world.decision(&record, Decision::Deny);
+        world.serve(&mut served, denied).await;
+        one_refused(&world, &served, &record.id, "deny");
+
+        let (world, approvals, served, mut record) = parked("mine", vec![prose("Late.")]).await;
+        drop(served);
+        record.expires_at = "2026-01-01T00:00:00.000Z".to_owned();
+        world.rewrite(&record);
+        let mut restarted = open(&world, &approvals);
+        let (_handle, signal) = chat::cancellation();
+        restarted
+            .resume_approvals(&world.deps, world.room.clone(), signal)
+            .await;
+        one_refused(&world, &restarted, &record.id, "expiry");
+
+        let (mut world, _, mut served, record) = parked("mine", vec![prose("Fine.")]).await;
+        world.ask(&mut served, "never mind").await;
+        one_refused(&world, &served, &record.id, "supersede");
+
+        let (mut world, _, mut served, record) = parked("mine", vec![prose("Moved.")]).await;
+        std::fs::write(world.tgdrive.join(NOTE), "someone else's").expect("write");
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        one_refused(&world, &served, &record.id, "drift");
+
+        let (mut world, approvals, mut served, record) =
+            parked("mine", vec![prose("Spent.")]).await;
+        approvals.consumed_by(&record.id, "hesperia");
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        one_refused(&world, &served, &record.id, "spent elsewhere");
+
+        let (mut world, _, mut served, record) = parked("mine", vec![prose("Gone.")]).await;
+        world
+            .deps
+            .home
+            .config
+            .allow
+            .retain(|tool| tool != "drive_write");
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+        assert_eq!(results(&world)[0].outcome, ToolOutcomeWord::Refused);
+        one_refused(&world, &served, &record.id, "refused before the executor");
+
+        // A host that took over, on a machine of its own, denies it.
+        let (mut world, approvals, served, record) = parked("mine", vec![prose("No.")]).await;
+        drop(served);
+        let theirs = tempfile::tempdir().expect("tmp");
+        let mut deps_b = tolas_free_deps(&world);
+        deps_b.host = keeper_core::agents::log::HostSlug::new("hesperia").expect("slug");
+        deps_b.data_dir = theirs.path().to_path_buf();
+        let mut taker = world.open_as(&deps_b, SESSION);
+        taker.approval_room = Some(Arc::clone(&approvals) as Arc<dyn ApprovalRoom>);
+        let denied = world.decision(&record, Decision::Deny);
+        let (_handle, signal) = chat::cancellation();
+        taker
+            .serve(&deps_b, world.room.clone(), denied, signal)
+            .await
+            .expect("served");
+        assert_eq!(approval_rows(theirs.path(), &record.id), [Refused]);
+    }
+
+    /// Run `served`'s worker for `secs`, nothing arriving, under `activity`.
+    async fn worker_for(
+        world: &World,
+        served: &mut ServedSession,
+        activity: &keeper_agent::agent::Activity,
+        secs: u64,
+    ) {
+        let (_queue, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let (_handle, signal) = chat::cancellation();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(secs),
+            served.serve_arrivals(
+                &world.deps,
+                world.room.clone(),
+                Vec::new(),
+                &mut arrivals,
+                signal,
+                activity,
+            ),
+        )
+        .await;
+    }
+
+    /// `record`'s expiry moved `ms` from now, as only a test does.
+    fn expiring(world: &World, record: &mut ApprovalRecord, ms: i64) {
+        record.expires_at = keeper_core::agents::approval::stamp(
+            chrono::Utc::now() + chrono::Duration::milliseconds(ms),
+        );
+        world.rewrite(record);
+    }
+
+    /// R93P-08 / R177, the worker's half: it says a run waits for a person
+    /// before it clears busy — after the park and again after a restart
+    /// found it at serve start — and says it no longer waits once the
+    /// approval ended.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_worker_says_its_run_waits_before_it_is_idle() {
+        let (world, approvals, served, mut record) =
+            parked("mine", vec![prose("It expired.")]).await;
+        drop(served);
+        let mut restarted = open(&world, &approvals);
+        let activity = keeper_agent::agent::Activity::starting();
+        worker_for(&world, &mut restarted, &activity, 1).await;
+        assert!(!activity.busy.load(Ordering::SeqCst));
+        assert!(
+            activity.parked.load(Ordering::SeqCst),
+            "found at serve start"
+        );
+        expiring(&world, &mut record, 200);
+        let mut again = open(&world, &approvals);
+        worker_for(&world, &mut again, &activity, 3).await;
+        assert!(results(&world)[0].content.contains(EXPIRED));
+        assert!(!activity.parked.load(Ordering::SeqCst), "it ended");
+    }
+
+    /// R93P-12 / R177: what a worker does outside an arrival — the
+    /// continuation of a decision found at serve start, a settlement tried
+    /// again, an expiry — runs with busy set, so no hand-back and no
+    /// window happens under it; busy clears when it is done.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn continuations_outside_an_arrival_run_busy() {
+        let (mut world, approvals, mut served, record) = parked("once", vec![prose("Done.")]).await;
+        approvals.down.store(true, Ordering::SeqCst);
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        approvals.down.store(false, Ordering::SeqCst);
+        drop(served);
+        let activity = Arc::new(keeper_agent::agent::Activity::default());
+        *approvals.probe.lock().expect("lock") = Some(Arc::clone(&activity));
+        let mut restarted = open(&world, &approvals);
+        worker_for(&world, &mut restarted, &activity, 1).await;
+        assert_eq!(world.note().as_deref(), Some("once"), "it ran at start");
+        let seen = approvals.busy_seen.lock().expect("lock").clone();
+        assert!(
+            !seen.is_empty() && seen.iter().all(|busy| *busy),
+            "{seen:?}"
+        );
+        assert!(!activity.busy.load(Ordering::SeqCst));
+
+        // The timer's expiry, on a worker that is otherwise idle.
+        let (world, approvals, served, mut record) =
+            parked("mine", vec![prose("It expired.")]).await;
+        drop(served);
+        expiring(&world, &mut record, 300);
+        let activity = Arc::new(keeper_agent::agent::Activity::default());
+        *approvals.probe.lock().expect("lock") = Some(Arc::clone(&activity));
+        let mut restarted = open(&world, &approvals);
+        worker_for(&world, &mut restarted, &activity, 3).await;
+        assert!(results(&world)[0].content.contains(EXPIRED));
+        let seen = approvals.busy_seen.lock().expect("lock").clone();
+        assert!(
+            !seen.is_empty() && seen.iter().all(|busy| *busy),
+            "{seen:?}"
+        );
+        assert!(!activity.busy.load(Ordering::SeqCst));
+    }
+
+    /// R93P-11 / R179: the server took this copy's `consumed` but the read
+    /// back failed; the network comes back, and the same worker — no
+    /// restart — tries again on its clock, finds its own event first and
+    /// runs the write once, sending no second `consumed`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_settlement_whose_read_failed_runs_once_when_the_network_returns() {
+        let (mut world, approvals, mut served, record) =
+            parked("once", vec![prose("Written.")]).await;
+        approvals.unread_after_consume.store(true, Ordering::SeqCst);
+        let decided = world.decision(&record, Decision::Approve);
+        assert!(matches!(
+            world.serve(&mut served, decided).await,
+            Outcome::Decided
+        ));
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL), "nothing ran yet");
+        assert_eq!(approvals.events().len(), 1, "accepted");
+        approvals
+            .unread_after_consume
+            .store(false, Ordering::SeqCst);
+        // The worker runs on while reads still fail — its serve start's
+        // try fails too — and the network comes back under it.
+        let activity = keeper_agent::agent::Activity::default();
+        let back = async {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            assert_eq!(
+                world.note().as_deref(),
+                Some(ORIGINAL),
+                "not while it is down"
+            );
+            approvals.unread.store(false, Ordering::SeqCst);
+        };
+        tokio::join!(worker_for(&world, &mut served, &activity, 4), back);
+        assert_eq!(world.note().as_deref(), Some("once"));
+        assert_eq!(approvals.events().len(), 1, "no second consumed");
+        let results = results(&world);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, ToolOutcomeWord::Ok);
+        assert!(!served.waiting());
+    }
+
+    /// R93P-11 / R179: another copy's `consumed` was accepted and never
+    /// mirrored here; the record expires. The room is read first: the
+    /// model is told the effect is unknown — never that nothing changed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expiry_after_a_remote_consume_says_the_effect_is_unknown() {
+        let (world, approvals, served, mut record) = parked("mine", vec![prose("Unknown.")]).await;
+        drop(served);
+        approvals.consumed_by(&record.id, "electra");
+        expiring(&world, &mut record, 300);
+        let mut restarted = open(&world, &approvals);
+        let activity = keeper_agent::agent::Activity::default();
+        worker_for(&world, &mut restarted, &activity, 3).await;
+        let last = world.approval_lines().pop().expect("a line");
+        assert_eq!(last.state, ApprovalState::Consumed);
+        assert_eq!(last.result.as_deref(), Some("unknown"));
+        let said = &results(&world)[0].content;
+        assert!(said.contains(&effect_unknown("electra")), "{said}");
+        assert!(!said.contains(EXPIRED), "{said}");
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+    }
+
+    /// R93P-14 / R179: a read of the room that stops at its bound finding
+    /// nothing is no evidence: a decision sends no `consumed` over it and
+    /// runs nothing; at expiry the call ends refused, its effect unknown.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_cut_at_its_bound_never_counts_as_nothing_consumed() {
+        use keeper_agent::approvals::{HISTORY_UNREAD, HISTORY_UNREAD_RESULT};
+        let (mut world, approvals, mut served, mut record) =
+            parked("mine", vec![prose("Unknown.")]).await;
+        approvals.truncated.store(true, Ordering::SeqCst);
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert!(approvals.events().is_empty(), "no consumed sent blind");
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+        assert!(served.waiting());
+        drop(served);
+        expiring(&world, &mut record, 300);
+        let mut restarted = open(&world, &approvals);
+        let activity = keeper_agent::agent::Activity::default();
+        worker_for(&world, &mut restarted, &activity, 3).await;
+        let last = world.approval_lines().pop().expect("a line");
+        assert_eq!(
+            (last.state, last.reason.as_deref()),
+            (ApprovalState::Refused, Some(HISTORY_UNREAD))
+        );
+        assert!(results(&world)[0].content.contains(HISTORY_UNREAD_RESULT));
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+    }
+
+    /// R93P-14 / R179: a request that went to the approvers' DMs has no
+    /// event in the session room; its `approval requested` line names the
+    /// status sent into the room before it, and every read of the room for
+    /// it starts there — never at the room's start.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dm_routed_request_is_read_from_the_status_before_it() {
+        let (mut world, approvals) =
+            deciding(vec![calls(&[write_note("w1", "after")]), prose("Written.")]);
+        nixis_dm(&world);
+        let delegations = Delegations::over(known_with_proxy());
+        let doors = Arc::new(Doors::default());
+        let mut served = world.delegating(&delegations);
+        served.approval_room = Some(Arc::clone(&approvals) as Arc<dyn ApprovalRoom>);
+        served.doors = Some(doors.clone());
+        world
+            .room
+            .set_members(&[TGORKA, MARTA, NIXI, "@eve:example.org"]);
+        let report = report(world.ask(&mut served, "write a note").await);
+        assert_eq!(report.ending, TurnEnding::Parked);
+        let record = world.record();
+        assert!(world.sent_of(APPROVAL_REQUEST).is_empty());
+        let requested = kinds(&world.lines(SESSION), LineKind::Approval)[0].clone();
+        let cursor = requested.matrix_event.clone().expect("a cursor");
+        let sent = world.room.sent();
+        let at: usize = cursor
+            .as_str()
+            .trim_start_matches("$sent")
+            .trim_end_matches(":example.org")
+            .parse()
+            .expect("one of the room's sends");
+        assert_eq!(sent[at - 1].0, STATUS, "the cursor is the status event");
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        let froms = approvals.froms.lock().expect("lock").clone();
+        assert!(!froms.is_empty());
+        assert!(
+            froms.iter().all(|from| from.as_ref() == Some(&cursor)),
+            "{froms:?}"
+        );
+        assert_eq!(world.note().as_deref(), Some("after"));
+    }
+
+    /// R93P-13 / R180: arguments over 16 KiB go as an encrypted file; when
+    /// the upload fails no request is sent anywhere — one without them
+    /// could be approved unseen — and the call is refused, its turn
+    /// closed saying why.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_whose_arguments_did_not_upload_is_never_sent() {
+        use keeper_agent::approvals::UNATTACHED;
+        let large = "x".repeat(20 * 1024);
+        let (mut world, approvals) = deciding(vec![calls(&[write_note("w1", &large)])]);
+        approvals.no_uploads.store(true, Ordering::SeqCst);
+        let mut served = open(&world, &approvals);
+        let _ = world.ask(&mut served, "write a long note").await;
+        assert!(world.sent_of(APPROVAL_REQUEST).is_empty());
+        assert!(world
+            .approval_lines()
+            .iter()
+            .all(|line| line.state != ApprovalState::Requested));
+        assert!(!served.waiting());
+        let results = results(&world);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, ToolOutcomeWord::Refused);
+        let errors = kinds(&world.lines(SESSION), LineKind::Error)
+            .iter()
+            .map(|line| match &line.body {
+                LineBody::Error(error) => error.sentence.clone(),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert!(errors.iter().any(|e| e.contains(UNATTACHED)), "{errors:?}");
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+    }
+
+    /// R93P-15 / R180: a synced session whose `approvals/` — or whose
+    /// `approvals/blobs/` — is a link out of the session gets nothing
+    /// written through it: the park is refused and the folder it points at
+    /// stays empty.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_approvals_folder_linked_out_of_the_session_is_refused() {
+        for blobs in [false, true] {
+            let content = if blobs {
+                "y".repeat(20 * 1024)
+            } else {
+                "small".to_owned()
+            };
+            let (mut world, approvals) = deciding(vec![calls(&[write_note("w1", &content)])]);
+            let outside = tempfile::tempdir().expect("outside");
+            if blobs {
+                std::fs::create_dir(world.approvals()).expect("approvals");
+                std::os::unix::fs::symlink(outside.path(), world.approvals().join("blobs"))
+                    .expect("link");
+            } else {
+                std::os::unix::fs::symlink(outside.path(), world.approvals()).expect("link");
+            }
+            let mut served = open(&world, &approvals);
+            let _ = world.ask(&mut served, "write a note").await;
+            assert_eq!(
+                std::fs::read_dir(outside.path()).expect("outside").count(),
+                0,
+                "nothing written out of the session (blobs: {blobs})"
+            );
+            assert!(world.sent_of(APPROVAL_REQUEST).is_empty());
+            assert!(!served.waiting());
+            assert_eq!(results(&world)[0].outcome, ToolOutcomeWord::Refused);
+        }
+    }
+
+    /// The run lines of the session at `path`, in order.
+    fn run_lines(world: &World, path: &str) -> Vec<keeper_core::agents::log::RunState> {
+        world
+            .lines(path)
+            .iter()
+            .filter_map(|line| match &line.body {
+                LineBody::Run(run) => Some(run.state),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// R93P-09 and R93P-10 / R178: a scheduled run's `card_update` of its
+    /// own card parks — the card says `run: blocked` before the park pins
+    /// it, so the host's own write is no drift — and, approved, the change
+    /// lands and the continuation ends the run: the card reads
+    /// `run: review` and the log `running, blocked, review`. A denied one
+    /// ends it too, its change not made.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scheduled_runs_own_card_update_is_approved_and_ends_the_run() {
+        use keeper_agent::agent::scheduled_arrival;
+        use keeper_agent::cards::Scheduled;
+        use keeper_core::agents::card::{CardAgent, Field, Run};
+        use keeper_core::agents::log::RunState as LogRun;
+        const SCHEDULED: &str = "active/2026-10-05-sort";
+        for decision in [Decision::Approve, Decision::Deny] {
+            let mut world = world(
+                ProviderKind::OpenAi,
+                &["drive_read", "card_update"],
+                vec![
+                    calls(&[(
+                        "c1",
+                        "card_update",
+                        json!({"card": "card.md", "fields": {"schedule": "@daily"}}),
+                    )]),
+                    prose("Done."),
+                ],
+            );
+            world.deps.decisions = Some(Arc::new(Admit));
+            let approvals = Arc::new(Approvals::default());
+            session_of(
+                &world.tgdrive,
+                SCHEDULED,
+                &decl("tgdrive", &[TGORKA, MARTA], false),
+                "nixi",
+                SessionKind::Scheduled,
+                "!sort:example.org",
+            );
+            let card = "---\ntags: [task]\ntitle: Sort the inbox\nstatus: todo\nassignee: nixi\nschedule: \"@hourly\"\nlast_run: \"2026-10-05T08:00:00Z\"\n---\n\nSort what came in.\n";
+            write(
+                &world.tgdrive,
+                &format!("60-sessions/{SCHEDULED}/card.md"),
+                card,
+            );
+            let mut served = world.open(SCHEDULED);
+            served.approval_room = Some(Arc::clone(&approvals) as Arc<dyn ApprovalRoom>);
+            let arrival = scheduled_arrival(
+                &user("@nixi:example.org"),
+                &Scheduled::Run {
+                    card: "card.md".to_owned(),
+                    window: "2026-10-05T09:00:00.000Z".to_owned(),
+                    now_ms: chrono::DateTime::parse_from_rfc3339("2026-10-05T09:30:00Z")
+                        .expect("an instant")
+                        .timestamp_millis(),
+                    utc_offset_minutes: 0,
+                },
+            )
+            .expect("an arrival");
+            let parked = report(world.serve(&mut served, arrival).await);
+            assert_eq!(parked.ending, TurnEnding::Parked);
+            let card_at = world.dir(SCHEDULED).join("card.md");
+            let card_now = || {
+                let text = std::fs::read_to_string(&card_at).expect("card");
+                (CardAgent::of_text(&text).expect("keys"), text)
+            };
+            assert_eq!(card_now().0.run, Some(Field::Read(Run::Blocked)));
+            let record = world.record_in(SCHEDULED);
+            let decided = world.event(
+                TGORKA,
+                Arrival::Decision { verified: true },
+                decision_content(&record, decision, None),
+            );
+            assert!(matches!(
+                world.serve(&mut served, decided).await,
+                Outcome::Decided
+            ));
+            let (keys, text) = card_now();
+            assert_eq!(keys.run, Some(Field::Read(Run::Review)), "{text}");
+            let results = tool_results(&world.lines(SCHEDULED));
+            if decision == Decision::Approve {
+                assert_eq!(results[0].outcome, ToolOutcomeWord::Ok, "{results:?}");
+                assert!(text.contains("@daily"), "{text}");
+            } else {
+                assert!(results[0].content.contains(DENIED), "{results:?}");
+                assert!(!text.contains("@daily"), "{text}");
+            }
+            assert_eq!(
+                run_lines(&world, SCHEDULED),
+                [LogRun::Running, LogRun::Blocked, LogRun::Review]
+            );
+            assert!(!served.waiting());
+        }
+    }
 }

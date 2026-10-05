@@ -8,6 +8,7 @@
 //! `keeper_sync::browse::resolve`, AD-65) — except the session log's writer and
 //! reader and the `.keeper/` index, which own their own files (AD-366).
 pub mod agentd;
+pub mod approval;
 pub mod card;
 pub mod claim;
 pub mod copy;

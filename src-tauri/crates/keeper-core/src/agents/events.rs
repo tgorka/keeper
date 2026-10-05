@@ -27,8 +27,13 @@ pub const STATUS: &str = "dev.keeper.agent.status";
 pub const TURN: &str = "dev.keeper.agent.turn";
 /// The drives in scope and the label (people may send it in a proxy's rooms).
 pub const SCOPE: &str = "dev.keeper.agent.scope";
+/// An action that waits for a person: the record's payload (AD-393).
+pub const APPROVAL_REQUEST: &str = "dev.keeper.agent.approval.request";
 /// A person's decision on an approval.
 pub const APPROVAL_DECISION: &str = "dev.keeper.agent.approval.decision";
+/// An approval used (state, key = the approval's id, unencrypted; R75):
+/// the first one in the room's order is the consumption.
+pub const APPROVAL_CONSUMED: &str = "dev.keeper.agent.approval.consumed";
 /// Where a spoken answer stopped.
 pub const HEARD: &str = "dev.keeper.agent.heard";
 /// A device's answer to a surface call.
@@ -201,6 +206,66 @@ pub struct ClaimContent {
     /// The start of the scheduled-card window the holder runs (S-25).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<String>,
+}
+
+/// The action inside an approval request: exactly what will run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestAction {
+    pub tool: String,
+    /// `null` when the canonical arguments are over 16 KiB: they are the
+    /// request's encrypted `file` instead (R86).
+    pub args: Value,
+    pub exec_binding: Value,
+}
+
+/// `dev.keeper.agent.approval.request` (encrypted): one record's payload
+/// for the card — its summary keeper's own, never the model's words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalRequestContent {
+    pub v: u32,
+    pub id: String,
+    /// Drive-relative.
+    pub session: String,
+    pub tier: u8,
+    pub summary: String,
+    pub action: RequestAction,
+    /// The canonical arguments as an encrypted file (`EncryptedFile`), and
+    /// their SHA-256, when they are too large to carry inline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_sha256: Option<String>,
+    pub binding_digest: String,
+    pub scopes: Vec<String>,
+    pub expires_at: String,
+    pub approvers: Vec<String>,
+}
+
+/// `dev.keeper.agent.approval.decision` (encrypted): a person's answer to
+/// exactly one record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalDecisionContent {
+    pub id: String,
+    pub binding_digest: String,
+    pub decision: crate::agents::approval::Decision,
+    pub scope: crate::agents::approval::Scope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// `dev.keeper.agent.approval.consumed` (state, key = the approval's id,
+/// unencrypted; R75): sent, and accepted, before the approved call runs.
+/// The class of a claim: an id, an epoch and a host slug, nothing more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsumedContent {
+    pub v: u32,
+    pub id: String,
+    pub epoch: u64,
+    pub host: String,
 }
 
 /// `dev.keeper.agent.presence` (state, key = the device id, unencrypted):

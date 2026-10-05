@@ -6666,7 +6666,7 @@ impl BotToolCallVm {
                 vm.refusal = Some(reason.clone());
             }
             Some(ToolOutcome::Refused { .. }) => {}
-            Some(ToolOutcome::Answered { .. }) => {}
+            Some(ToolOutcome::Answered { .. } | ToolOutcome::Parked { .. }) => {}
             None => {}
         }
         vm
@@ -6706,9 +6706,11 @@ impl BotToolOutcomeKind {
             ToolOutcome::NotMaterialized { .. } => Self::NotMaterialized,
             ToolOutcome::Wrote { .. } => Self::Wrote,
             ToolOutcome::Refused { .. } => Self::Refused,
-            // No ⌘9 row holds one (only an agent's host answers so); its
-            // words are text.
+            // No ⌘9 row holds either (only an agent's host answers so, or
+            // parks); an answer's words are text, and a park did not happen
+            // yet.
             ToolOutcome::Answered { .. } => Self::Text,
+            ToolOutcome::Parked { .. } => Self::Refused,
         }
     }
 }

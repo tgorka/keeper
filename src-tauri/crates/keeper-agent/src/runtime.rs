@@ -36,7 +36,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -444,6 +443,7 @@ pub(crate) fn deps_over(
             .map(|sessions| sessions.subfolder.clone())
             .unwrap_or_default(),
         lfs_threshold_bytes: home_drive.profile.lfs_threshold_bytes,
+        decisions: None,
     })
 }
 
@@ -601,8 +601,9 @@ pub(crate) struct Claimed {
     pub(crate) from_host: Option<String>,
     /// The `claim` line the worker writes when it stops.
     pub(crate) ending: Arc<Mutex<ClaimAction>>,
-    /// Set while a turn runs: a hand-back waits for it to clear.
-    pub(crate) busy: Arc<AtomicBool>,
+    /// Busy while the worker works — starting included — and whether a
+    /// call waits for a person (R177).
+    pub(crate) activity: Arc<crate::agent::Activity>,
 }
 
 /// How the engine's supervisor ended.
@@ -1024,6 +1025,8 @@ async fn serve_session(
     stop: CancelSignal,
     claimed: Claimed,
 ) {
+    // A worker that ends — or never starts — holds nothing busy.
+    let _idle = Idle(Arc::clone(&claimed.activity));
     let room_id = agent.room.clone();
     let Some(room) = copy.client.client().get_room(&room_id) else {
         return;
@@ -1076,7 +1079,13 @@ async fn serve_session(
         room: room_id.clone(),
         known: Arc::clone(&copy.known),
     }));
-    let port: Arc<dyn EditPort> = Arc::new(RoomPort::new(copy.client.clone(), room_id));
+    let port: Arc<dyn EditPort> = Arc::new(RoomPort::new(copy.client.clone(), room_id.clone()));
+    served.approval_room = Some(Arc::new(ClientApprovals::new(
+        copy.client.clone(),
+        room_id,
+        me.clone(),
+        deps.host.as_str(),
+    )));
     let (events, mut backlog) = read_back(&room, &mut served, me).await;
     // A taker's log may not hold the last holder's lines yet: what another
     // copy of this agent already answered is not asked again.
@@ -1098,7 +1107,7 @@ async fn serve_session(
     // What this session's delegations did while no worker served it.
     backlog.extend(served.resume_delegations(deps).await);
     served
-        .serve_arrivals(deps, port, backlog, &mut arrivals, stop, &claimed.busy)
+        .serve_arrivals(deps, port, backlog, &mut arrivals, stop, &claimed.activity)
         .await;
     let ending = *claimed.ending.lock().unwrap_or_else(|p| p.into_inner());
     if let Err(error) = served
@@ -1107,6 +1116,116 @@ async fn serve_session(
         .and_then(|_| served.writer.sync())
     {
         tracing::warn!(session = %session.path, %error, "agentd: the claim's last line could not be written");
+    }
+}
+
+/// Clears a worker's busy flag when it ends, however it ends.
+struct Idle(Arc<crate::agent::Activity>);
+
+impl Drop for Idle {
+    fn drop(&mut self) {
+        self.0
+            .busy
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The session room's approval reads over the copy's own client (R75,
+/// R86): `consumed` as unencrypted state, read forward in room order. A
+/// live test drives it as a worker does.
+pub struct ClientApprovals {
+    client: AgentClient,
+    room: OwnedRoomId,
+    agent: OwnedUserId,
+    host: String,
+}
+
+impl ClientApprovals {
+    /// `client`'s approvals in `room`, its agent user `agent`, on `host`.
+    pub fn new(client: AgentClient, room: OwnedRoomId, agent: OwnedUserId, host: &str) -> Self {
+        ClientApprovals {
+            client,
+            room,
+            agent,
+            host: host.to_owned(),
+        }
+    }
+}
+
+impl crate::approvals::ApprovalRoom for ClientApprovals {
+    fn upload(&self, bytes: Vec<u8>) -> crate::approvals::RoomFuture<'_, Value> {
+        Box::pin(async move { self.client.upload_encrypted(&bytes).await })
+    }
+
+    fn consume(
+        &self,
+        content: keeper_core::agents::events::ConsumedContent,
+    ) -> crate::approvals::RoomFuture<'_, OwnedEventId> {
+        Box::pin(async move {
+            let value = serde_json::to_value(&content).map_err(|err| {
+                keeper_core::agents::matrix::AgentMatrixError::Other(err.to_string())
+            })?;
+            crate::claims::bounded(self.client.send_state(
+                &self.room,
+                keeper_core::agents::events::APPROVAL_CONSUMED,
+                &content.id,
+                &value,
+            ))
+            .await
+        })
+    }
+
+    fn consumed<'a>(
+        &'a self,
+        id: &'a str,
+        from: Option<&'a matrix_sdk::ruma::EventId>,
+    ) -> crate::approvals::RoomFuture<'a, crate::approvals::ConsumedRead> {
+        Box::pin(async move {
+            let read = crate::claims::bounded(self.client.state_events_from(
+                &self.room,
+                from,
+                keeper_core::agents::events::APPROVAL_CONSUMED,
+                id,
+            ))
+            .await?;
+            // Only the session's agent user counts: a person cannot send
+            // state here, and another agent's would not be ours.
+            Ok(crate::approvals::ConsumedRead {
+                consumed: read
+                    .found
+                    .into_iter()
+                    .filter(|state| state.sender == self.agent)
+                    .filter_map(|state| {
+                        Some(crate::approvals::Consumed {
+                            event: state.event_id,
+                            content: serde_json::from_value(state.content).ok()?,
+                        })
+                    })
+                    .collect(),
+                complete: read.complete,
+            })
+        })
+    }
+
+    fn holds(&self, epoch: u64) -> crate::approvals::RoomFuture<'_, bool> {
+        Box::pin(async move {
+            let state = crate::claims::bounded(self.client.server_state(
+                &self.room,
+                keeper_core::agents::events::CLAIM,
+                "",
+            ))
+            .await?;
+            Ok(state
+                .and_then(|state| {
+                    serde_json::from_value::<keeper_core::agents::events::ClaimContent>(
+                        state.content,
+                    )
+                    .ok()
+                })
+                .is_some_and(|claim| {
+                    claim.host == self.host && claim.epoch == epoch && !claim.released
+                }))
+        })
     }
 }
 

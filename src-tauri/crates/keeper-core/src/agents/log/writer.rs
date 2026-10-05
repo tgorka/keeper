@@ -72,7 +72,10 @@ pub struct ChunkWriter {
     current: Option<Current>,
 }
 
-fn refuse_symlink(path: &Path) -> Result<bool, LogError> {
+/// Whether `path` is a real directory (`Ok(false)`: absent); a link or
+/// anything else there is refused. Every folder of a session keeper writes
+/// in — `log/`, `approvals/` — is checked this way, never followed.
+pub fn refuse_symlink(path: &Path) -> Result<bool, LogError> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => Err(LogError::Symlink {
             path: path.display().to_string(),
@@ -86,10 +89,17 @@ fn refuse_symlink(path: &Path) -> Result<bool, LogError> {
     }
 }
 
-/// A real directory at `path`, made if absent; a link or a file is refused.
-fn real_dir(path: &Path) -> Result<(), LogError> {
+/// A real directory at `path`, made if absent; a link or a file is refused,
+/// one that appears while it is made too.
+pub fn real_dir(path: &Path) -> Result<(), LogError> {
     if !refuse_symlink(path)? {
-        fs::create_dir(path).map_err(|e| LogError::io(path, e))?;
+        match fs::create_dir(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                refuse_symlink(path)?;
+            }
+            Err(error) => return Err(LogError::io(path, error)),
+        }
     }
     Ok(())
 }

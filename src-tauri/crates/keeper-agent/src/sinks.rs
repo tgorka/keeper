@@ -37,6 +37,7 @@ use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, UserId};
 use serde_json::Value;
 
 use crate::delegate::MembersFuture;
+use crate::host::Approval;
 use crate::matrix_sink::{EditPort, SendFuture};
 use crate::rooms::Known;
 use crate::sessions::verbs;
@@ -439,13 +440,57 @@ enum CallRow {
     Closed,
 }
 
+/// What a classified call comes to once its sinks have passed (R82).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gated {
+    /// It runs; on this consumed approval, when one let it.
+    Run(Option<Approval>),
+    /// It waits for a person on this approval record (R73).
+    Park(ulid::Ulid),
+    /// It does not run and says this: an integrity block, T5, or an
+    /// approval nobody can give.
+    Refuse(String),
+}
+
+impl Gated {
+    /// The sentence it is refused with, and the record it parks on or was
+    /// approved by.
+    pub fn split(self) -> (Option<String>, Option<Approval>) {
+        match self {
+            Gated::Run(approval) => (None, approval),
+            Gated::Park(approval) => (None, Some(Approval::Park(approval))),
+            Gated::Refuse(reason) => (Some(reason), None),
+        }
+    }
+}
+
+/// What a call its audit did not admit answers instead of running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Withheld {
+    /// It is refused with this sentence.
+    Refused(String),
+    /// It waits for a person on this approval record.
+    Parked(ulid::Ulid),
+}
+
+impl From<Withheld> for ToolOutcome {
+    fn from(withheld: Withheld) -> ToolOutcome {
+        match withheld {
+            Withheld::Refused(reason) => ToolOutcome::Refused { reason },
+            Withheld::Parked(approval) => ToolOutcome::Parked { approval },
+        }
+    }
+}
+
 /// One classified agent call's audit row (R90): exactly one, whichever
 /// way the call ends. A sink that blocks it writes the row with the
 /// block's sentence and destination ([`CallAudit::blocked`]); a call whose
 /// sinks passed is admitted, its row written before any effect with what
 /// the integrity rule and the tier answer then (R82, [`CallAudit::admit`]);
 /// a call that ends before either has its row written as it ends
-/// ([`CallAudit::finish`]) — it had no effect.
+/// ([`CallAudit::finish`]) — it had no effect. A parked call's row waits,
+/// pending and marked with its approval, for the run after approval, which
+/// closes that same row (R172).
 pub struct CallAudit<'s> {
     sinks: &'s Sinks,
     tool: &'s str,
@@ -454,6 +499,8 @@ pub struct CallAudit<'s> {
     /// What the call answers once its sinks have passed: an integrity
     /// block, T5, an approval nobody can give; `None` runs it.
     refusal: Option<String>,
+    /// The record it parks on, or the consumed one it runs on.
+    approval: Option<Approval>,
     /// Where the row says the call went until the call names it.
     drive: String,
     at: String,
@@ -466,15 +513,17 @@ impl<'s> CallAudit<'s> {
         tool: &'s str,
         effect: Effect,
         classification: &'s Classification,
-        refusal: Option<String>,
+        gated: Gated,
         (drive, at): (&str, &str),
     ) -> CallAudit<'s> {
+        let (refusal, approval) = gated.split();
         CallAudit {
             sinks,
             tool,
             effect,
             classification,
             refusal,
+            approval,
             drive: drive.to_owned(),
             at: at.to_owned(),
             row: Mutex::new(CallRow::Unwritten),
@@ -490,14 +539,7 @@ impl<'s> CallAudit<'s> {
     pub fn blocked(&self, blocked: Blocked) -> String {
         let mut row = self.row();
         if matches!(*row, CallRow::Unwritten) {
-            if let Err(error) = self.sinks.classified(
-                self.tool,
-                &blocked.drive,
-                &blocked.at,
-                self.effect,
-                self.classification,
-                Some(&blocked.sentence),
-            ) {
+            if let Err(error) = self.refused_row(&blocked.drive, &blocked.at, &blocked.sentence) {
                 tracing::warn!(%error, tool = self.tool, "agents: a blocked call's audit row could not be written");
             }
             *row = CallRow::Closed;
@@ -505,24 +547,83 @@ impl<'s> CallAudit<'s> {
         blocked.sentence
     }
 
-    /// The call's sinks passed for the effect at `drive` and `at`: its row,
-    /// before the effect. `Err` is what the call says instead — the
-    /// integrity rule's or the tier's sentence, or a row that could not be
-    /// written.
-    pub fn admit(&self, drive: &str, at: &str) -> Result<(), String> {
-        let mut row = self.row();
-        let written = self.sinks.classified(
+    /// The row of a call refused before its sinks admitted it, closed
+    /// refused: an approved call's is the one its park left pending here,
+    /// or — on a host that took over — a new one carrying the approval, so
+    /// the call keeps one row whichever way it ends (R172).
+    fn refused_row(&self, drive: &str, at: &str, sentence: &str) -> Result<(), String> {
+        let Some(Approval::Approved(approval)) = self.approval else {
+            return self
+                .sinks
+                .classified(
+                    self.tool,
+                    drive,
+                    at,
+                    self.effect,
+                    self.classification,
+                    Some(sentence),
+                )
+                .map(drop);
+        };
+        let approval = approval.to_string();
+        if let Some(row) = audit::parked_row(&self.sinks.data_dir, &approval).unwrap_or(None) {
+            self.sinks.close(row, AuditOutcome::Refused);
+            return Ok(());
+        }
+        let row = self.sinks.classified(
             self.tool,
             drive,
             at,
             self.effect,
             self.classification,
-            self.refusal.as_deref(),
-        );
+            Some(sentence),
+        )?;
+        audit::mark_approval(&self.sinks.data_dir, row, &approval)
+            .map(drop)
+            .map_err(|error| error.to_string())
+    }
+
+    /// The call's sinks passed for the effect at `drive` and `at`: its row,
+    /// before the effect — the one its park left pending on this machine
+    /// when it runs approved, else a new one. `Err` is what the call
+    /// answers instead: the integrity rule's or the tier's sentence, a row
+    /// that could not be written, or its park.
+    pub fn admit(&self, drive: &str, at: &str) -> Result<(), Withheld> {
+        let mut row = self.row();
         *row = CallRow::Closed;
-        let id = written?;
+        let parked = match self.approval {
+            Some(Approval::Approved(id)) => {
+                audit::parked_row(&self.sinks.data_dir, &id.to_string()).unwrap_or(None)
+            }
+            _ => None,
+        };
+        let id = match parked {
+            Some(id) => id,
+            None => self
+                .sinks
+                .classified(
+                    self.tool,
+                    drive,
+                    at,
+                    self.effect,
+                    self.classification,
+                    self.refusal.as_deref(),
+                )
+                .map_err(Withheld::Refused)?,
+        };
         if let Some(sentence) = &self.refusal {
-            return Err(sentence.clone());
+            return Err(Withheld::Refused(sentence.clone()));
+        }
+        if let Some(approval) = self.approval {
+            audit::mark_approval(&self.sinks.data_dir, id, &approval.id()).map_err(|error| {
+                Withheld::Refused(format!(
+                    "keeper could not record this tool call, so it did not run: {error}"
+                ))
+            })?;
+        }
+        // A parked call's row waits, pending, for its run after approval.
+        if let Some(Approval::Park(approval)) = self.approval {
+            return Err(Withheld::Parked(approval));
         }
         *row = CallRow::Open(id);
         Ok(())
@@ -536,23 +637,24 @@ impl<'s> CallAudit<'s> {
             CallRow::Open(id) => self.sinks.close(id, audit_outcome(outcome)),
             CallRow::Closed => {}
             CallRow::Unwritten => {
-                let refusal = match outcome {
-                    ToolOutcome::Refused { reason } => Some(reason.as_str()),
-                    _ => None,
-                };
-                match self.sinks.classified(
-                    self.tool,
-                    &self.drive,
-                    &self.at,
-                    self.effect,
-                    self.classification,
-                    refusal,
-                ) {
-                    Ok(id) if refusal.is_none() => self.sinks.close(id, audit_outcome(outcome)),
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::warn!(%error, tool = self.tool, "agents: a call's audit row could not be written");
+                let written = match outcome {
+                    ToolOutcome::Refused { reason } => {
+                        self.refused_row(&self.drive, &self.at, reason)
                     }
+                    _ => self
+                        .sinks
+                        .classified(
+                            self.tool,
+                            &self.drive,
+                            &self.at,
+                            self.effect,
+                            self.classification,
+                            None,
+                        )
+                        .map(|id| self.sinks.close(id, audit_outcome(outcome))),
+                };
+                if let Err(error) = written {
+                    tracing::warn!(%error, tool = self.tool, "agents: a call's audit row could not be written");
                 }
             }
         }
@@ -587,9 +689,14 @@ pub trait ProxyDoors: Send + Sync {
     /// the proxy itself left out: it is the door the detail goes through,
     /// as the session's own agent is in its room.
     fn members<'a>(&'a self, person: &'a UserId) -> MembersFuture<'a>;
-    /// Send `content` as an `m.room.message` into `person`'s proxy DM, as
-    /// the proxy.
-    fn tell<'a>(&'a self, person: &'a UserId, content: Value) -> SendFuture<'a>;
+    /// Send `content` as an `event_type` event into `person`'s proxy DM, as
+    /// the proxy: a notice, or an approval's request (R85).
+    fn tell<'a>(
+        &'a self,
+        person: &'a UserId,
+        event_type: &'a str,
+        content: Value,
+    ) -> SendFuture<'a>;
 }
 
 /// One proxy this host runs.
@@ -664,14 +771,19 @@ impl ProxyDoors for ClientDoors {
         })
     }
 
-    fn tell<'a>(&'a self, person: &'a UserId, content: Value) -> SendFuture<'a> {
+    fn tell<'a>(
+        &'a self,
+        person: &'a UserId,
+        event_type: &'a str,
+        content: Value,
+    ) -> SendFuture<'a> {
         Box::pin(async move {
             let Some((client, _, dm)) = self.door(person) else {
                 return Err(AgentMatrixError::Other(
                     "this host runs no proxy of theirs".to_owned(),
                 ));
             };
-            client.send(&dm, "m.room.message", content, None).await
+            client.send(&dm, event_type, content, None).await
         })
     }
 }

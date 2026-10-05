@@ -7750,3 +7750,52 @@ origin: epic 92, story 92.6 review fixes (rung `agents-92-labels`, 2026-10-05; R
 location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`logged_label`, called by `HostRuntime::show`)
 reason: `show` takes the session's current label from its last `label` line, and `logged_label` gets it with `read_session(dir)` — every chunk of the log, parsed — on each status placement says (a wait, a lost claim, a refused card, a conflict). `show` returns early when the same status was already said only after that read. A long-lived session waiting on an absent host pays a whole-log read on every tick that reaches `show`. Revisit when a session's log grows past a few MB or a host serves many waiting sessions: read the label from the index's session projection, or keep the last label per slot and read only chunks that grew (`Index::refresh_session`'s rule, R62).
 status: open
+
+### DW-485: A request the room may not carry reaches only the approvers whose proxy this host runs, and a decision made in their DM does not reach the session yet.
+
+origin: epic 93, story 93.2 (rung `agents-93-park`, 2026-10-05; R85)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`ServedSession::request_by_doors`), `src-tauri/crates/keeper-agent/src/approvals.rs` (`park`)
+reason: R85 sends a request the room's gate blocks to each approver's proxy DM through `ProxyDoors` — the proxies this host runs, the same doors as R169's narrowed detail (DW-460). An approver whose proxy runs on another host has no door here and is not asked (logged); a send that fails is not tried again — the record expires undecided after its 24 h or 1 h. A decision sent in the DM arrives at the proxy's `main` worker, not the parked session's: the forward is Q17/R89's route, built with the declassify card in rung 6 (`agents-93-decide`); until then nothing installs a decision source, so nothing parks in production. Close in rung 6: the DM's worker forwards a decision carrying `{session}` to the parked session's worker on whichever host serves it, the cross-host door replaces the local-only one, and a failed DM send joins the worker's `Retry`.
+status: open
+
+### DW-486: An approved `drive_write` to a missing note is refused with the delete's sentence.
+
+origin: epic 93, story 93.2 (rung `agents-93-park`, 2026-10-05; the restack's regression check)
+location: `src-tauri/crates/keeper-sync/src/files_write.rs` (`WriteRefusal::Missing`, `WriteScope::route`)
+reason: `drive_write` never creates a file (its tool description says so; `route` refuses a missing path through `resolve_existing` since epic 46, AD-102), so an approved write to a note that is not there is refused at the run — correctly, with its one audit row closed `refused` (`an_approved_write_to_a_missing_note_keeps_its_one_row`). The sentence the model reads is `WriteRefusal::Missing`'s, written for a delete: "… is no longer in this folder, so nothing was deleted." Close by giving `route`'s refusal a write's own sentence ("… is not in this folder, and `drive_write` changes only a file that exists"), or by refusing a missing path before it parks so nobody is asked to approve a call that cannot run. Whether an agent may create a file outside its session is a product question for AD-102, not this rung's.
+status: open
+
+### DW-487: 93.2 acceptance 5's takeover is proved over the claim double, not two host runtimes.
+
+origin: epic 93, story 93.2 (rung `agents-93-park`, 2026-10-05; acceptance 5 and 10)
+location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`parks::a_consume_that_never_pushed_is_seen_by_the_host_that_takes_over`), `src-tauri/crates/keeper-agentd/tests/live_approvals.rs`
+reason: The takeover test serves the session as host B over the approvals-room double, with A's `consumed` event in the room and no `consumed` line in B's chunks; the live tests send two copies' `consumed` sequentially and, since R181, race them concurrently through `consume_once` with one observable effect. Neither runs two `HostRuntime`s that claim, park, crash, expire and take over end to end. Close with a `live_claims`-style pair (its `Pair` harness) that parks on A, kills it after the accepted `consumed` and before a push, lets B's claim take over after expiry, and asserts one effect — a test runtime may inject its own decision source; production installs one only at rung 6 (R92). See DW-503.
+status: open
+
+### DW-500: After a takeover, the parked machine's pending audit row stays pending there.
+
+origin: epic 93, story 93.2 review fixes R93P-07 (rung `agents-93-park`, 2026-10-05; ruling R176)
+location: `src-tauri/crates/keeper-agent/src/approvals.rs` (`ServedSession::close_row`)
+reason: Every terminal path closes the call's one row on the machine that runs it — its own pending row, or, on a host that took over, a row of its own carrying the approval. The machine that parked and lost the session keeps its `pending` row (its `keeper.db` is not the taker's) until something on that machine settles it; nothing does once the session's log records the round whole. Close with a sweep at serve start that closes this machine's `pending` rows whose approval's round the log shows answered, with the outcome the log's `approval` line names.
+status: open
+
+### DW-501: A continuation a stop cut reports its first open call as possibly run even when it never began.
+
+origin: epic 93, story 93.2 review fixes R93P-06 (rung `agents-93-park`, 2026-10-05; ruling R176)
+location: `src-tauri/crates/keeper-agent/src/approvals.rs` (`continue_parked`, `INTERRUPTED`)
+reason: Nothing is logged when a later call of a resumed round starts, so after a stop the first call without a result may or may not have run; keeper answers it `INTERRUPTED` and never re-runs it (safe), even a read that is harmless to repeat or a call that never began. Close with a per-call start mark (or replaying calls whose effect is read-only) if the conservative answer proves costly.
+status: open
+
+### DW-502: A same-host consume this worker sent before a restart is reported as effect unknown.
+
+origin: epic 93, story 93.2 review fixes R93P-11 (rung `agents-93-park`, 2026-10-05; ruling R179)
+location: `src-tauri/crates/keeper-agent/src/approvals.rs` (`ServedSession::settling`, `settle`)
+reason: The `consumed` event a worker's server took is remembered in memory only, so the same worker's retry runs the call once its read-back succeeds, but after a restart that event looks like any other copy's and the call is told its effect is unknown — safe (nothing runs twice) though the effect is known not to have happened (it runs only after the local mirror line). Close by logging the accepted event before the read-back (a `consumed` line with `result: "pending"`) if the conservative answer proves costly.
+status: open
+
+### DW-503: 93.2 acceptance 10 is proved live at the transport and effect level, not with two full hosts.
+
+origin: epic 93, story 93.2 review fixes R93P-16 (rung `agents-93-park`, 2026-10-05; ruling R181)
+location: `src-tauri/crates/keeper-agentd/tests/live_approvals.rs` (`two_copies_racing_run_the_effect_once`)
+reason: Two clients race `consume_once` through the production `ClientApprovals` on delectra and exactly one performs the counted effect, five approvals in a row. Not driven: two `HostRuntime`s with an injected decision source, lease expiry and takeover, and cuts between the server's acceptance, the local mirror line and a push. Close with DW-487's `Pair` harness running both hosts' workers over one drive and one homeserver, the effect a file write, and a kill between acceptance and mirror.
+status: open

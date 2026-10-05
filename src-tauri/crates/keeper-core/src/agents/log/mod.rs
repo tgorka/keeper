@@ -384,7 +384,9 @@ pub struct ToolResultBody {
     pub label: Label,
 }
 
-/// Where an approval stands.
+/// Where an approval stands (R80). Terminal: `consumed`, `expired`,
+/// `refused`, and `decided` with `decision: "deny"`; a `decided` line
+/// without a `decision` is a decision ignored, its `reason` saying why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalState {
@@ -392,6 +394,8 @@ pub enum ApprovalState {
     Decided,
     Consumed,
     Expired,
+    /// It will never run: what it relied on drifted, or it was spent.
+    Refused,
 }
 
 /// `approval`.
@@ -406,6 +410,23 @@ pub struct ApprovalBody {
     pub by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// What drifted, why a decision was ignored or a record refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The scope a decision gave (`once`, `session`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+impl ApprovalBody {
+    /// Whether this line ends its approval.
+    pub fn is_terminal(&self) -> bool {
+        match self.state {
+            ApprovalState::Requested => false,
+            ApprovalState::Decided => self.decision.as_deref() == Some("deny"),
+            ApprovalState::Consumed | ApprovalState::Expired | ApprovalState::Refused => true,
+        }
+    }
 }
 
 /// The session a delegation opened.
@@ -980,6 +1001,8 @@ mod tests {
                 decision: Some("approve".into()),
                 by: Some("@tgorka:h".into()),
                 result: None,
+                reason: Some("the file moved".into()),
+                scope: Some("once".into()),
             }),
             LineBody::Delegate(DelegateBody {
                 id: "d1".into(),

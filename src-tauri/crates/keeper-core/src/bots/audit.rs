@@ -405,6 +405,50 @@ pub fn complete(
     Ok(changed > 0)
 }
 
+/// Name on row `audit_id` the approval record its call waits on, or was
+/// approved by (R90's `approval` column).
+pub fn mark_approval(data_dir: &Path, audit_id: i64, approval: &str) -> Result<bool, CoreError> {
+    let conn = open(data_dir)?;
+    let changed = conn
+        .execute(
+            "UPDATE bot_audit SET approval = ?2 WHERE id = ?1",
+            rusqlite::params![audit_id, approval],
+        )
+        .map_err(|e| CoreError::Internal(format!("could not mark an audit row: {e}")))?;
+    Ok(changed > 0)
+}
+
+/// The row of a call parked on `approval` that is still pending on this
+/// machine: the one its run after approval closes, so a call keeps one row.
+pub fn parked_row(data_dir: &Path, approval: &str) -> Result<Option<i64>, CoreError> {
+    let conn = open(data_dir)?;
+    conn.query_row(
+        "SELECT id FROM bot_audit WHERE approval = ?1 AND outcome = ?2 ORDER BY id DESC LIMIT 1",
+        rusqlite::params![approval, AuditOutcome::Pending.as_registry_str()],
+        |row| row.get(0),
+    )
+    .map(Some)
+    .or_else(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        error => Err(CoreError::Internal(format!(
+            "could not read the audit log: {error}"
+        ))),
+    })
+}
+
+/// Whether this machine holds a row of a call on `approval` at all, pending
+/// or closed: a terminal path writes a row of its own only when it has none,
+/// so a call keeps one row (R172).
+pub fn approval_rowed(data_dir: &Path, approval: &str) -> Result<bool, CoreError> {
+    let conn = open(data_dir)?;
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bot_audit WHERE approval = ?1)",
+        rusqlite::params![approval],
+        |row| row.get(0),
+    )
+    .map_err(|error| CoreError::Internal(format!("could not read the audit log: {error}")))
+}
+
 /// One row of the audit log, as stored (Story 61.10, FR-388).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditRow {

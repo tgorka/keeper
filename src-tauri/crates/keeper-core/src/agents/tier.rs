@@ -65,6 +65,13 @@ impl Tier {
         }
     }
 
+    /// The tier the number `n` stores, when it is one.
+    pub fn from_u8(n: u8) -> Option<Tier> {
+        [Tier::T0, Tier::T1, Tier::T2, Tier::T3, Tier::T4, Tier::T5]
+            .into_iter()
+            .find(|tier| tier.as_u8() == n)
+    }
+
     /// One tier stricter; T5 is the ceiling.
     fn raised(self) -> Tier {
         match self {
@@ -236,6 +243,18 @@ impl Raise {
             Raise::Untrusted => "untrusted",
             Raise::Kvm => "kvm",
         }
+    }
+
+    /// The raise `word` names, when it names one.
+    pub fn from_word(word: &str) -> Option<Raise> {
+        [
+            Raise::Delegated,
+            Raise::Unattended,
+            Raise::Untrusted,
+            Raise::Kvm,
+        ]
+        .into_iter()
+        .find(|raise| raise.as_word() == word)
     }
 }
 

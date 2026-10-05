@@ -45,6 +45,18 @@ pub struct SessionWriter {
     lease: Option<Arc<Lease>>,
     ids: ulid::Generator,
     last_ts: DateTime<Utc>,
+    /// Where the last line this writer wrote went: its chunk, its id, and
+    /// the chunk's length through it (an approval's checkpoint, AD-393).
+    last_place: Option<LastPlace>,
+}
+
+/// Where a line landed: its chunk's file name, its id, and how many bytes
+/// of that chunk run through it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastPlace {
+    pub chunk: String,
+    pub line: Ulid,
+    pub through_bytes: u64,
 }
 
 impl SessionWriter {
@@ -80,6 +92,7 @@ impl SessionWriter {
             lease,
             ids: ulid::Generator::new(),
             last_ts: DateTime::<Utc>::MIN_UTC,
+            last_place: None,
         })
     }
 
@@ -184,8 +197,18 @@ impl SessionWriter {
         };
         let receipt = self.chunks.append(&line)?;
         self.index.apply(&self.session, &receipt)?;
+        self.last_place = Some(LastPlace {
+            chunk: receipt.chunk.to_string(),
+            line: id,
+            through_bytes: receipt.offset + receipt.bytes,
+        });
         context.push(&receipt.line);
         Ok(receipt.line)
+    }
+
+    /// Where the last line this writer wrote went, if it wrote one.
+    pub fn last_place(&self) -> Option<&LastPlace> {
+        self.last_place.as_ref()
     }
 
     /// `fsync` what this writer wrote since the last sync: the end of a turn.
