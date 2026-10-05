@@ -47,6 +47,7 @@ pub mod phrase;
 pub mod platform;
 pub mod speech;
 pub mod turn;
+pub mod turn_models;
 
 use std::sync::Arc;
 

@@ -86,6 +86,20 @@ fn voice_sources() -> Vec<PathBuf> {
         "voice on-device scan: no voice*.rs under {} — the iOS port is the file this guard exists for",
         shell_src.display()
     );
+    // The floor: the files that hold the turn models (D-36) are read by name,
+    // so renaming one out of the scan fails here instead of passing quietly.
+    for required in [
+        core_voice.join("turn_models.rs"),
+        shell_src.join("voice_turn_models.rs"),
+        shell_src.join("voice_ios.rs"),
+        shell_src.join("voice_macos.rs"),
+    ] {
+        assert!(
+            files.contains(&required),
+            "voice on-device scan: {} is not scanned — the guard must cover it",
+            required.display()
+        );
+    }
     files
 }
 
@@ -107,6 +121,9 @@ fn voice_sources_carry_no_server_path() {
     let reqwest = format!("req{}", "west");
     let nw_connection = format!("nwconnec{}", "tion");
     let http = format!("ht{}", "tp");
+    // ONNX Runtime's own model download (`SessionBuilder::commit_from_url`):
+    // turn models load from the hydrated `_models/` by path, never by address.
+    let model_download = format!("commit_from_{}", "url");
     let forbidden = [
         flag_false_setter.as_str(),
         flag_false_assign.as_str(),
@@ -116,6 +133,7 @@ fn voice_sources_carry_no_server_path() {
         reqwest.as_str(),
         nw_connection.as_str(),
         http.as_str(),
+        model_download.as_str(),
     ];
 
     for file in voice_sources() {

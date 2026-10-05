@@ -325,6 +325,14 @@ build if a recognition request is ever built without the on-device flag, if the 
 to `false`, or if a network API appears in any voice module (NFR-50). The decision is recorded
 as `docs/decisions.md` D-5.
 
+The turn models (Epic 97, D-36) do not change that conclusion. The voice activity and end-of-turn
+models are files from the account's config repository, fetched with the transcription models'
+client from that repository's own LFS endpoint (*Transcription adds no egress*) — the phone now
+makes that fetch too, for the turn models only, to the same host — and run on the device by
+ONNX Runtime, loaded by path; nothing they are given leaves the device. ONNX Runtime's library
+is downloaded from `cdn.pyke.io` by the build, never by the app
+(`docs/constraints-and-limitations.md`).
+
 ### On this Mac
 
 The macOS port (`crates/keeper/src/voice_macos.rs`, Epic 63, Story 63.4) adds no destination

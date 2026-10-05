@@ -460,6 +460,30 @@ objc2-natural-language = { version = "0.3.2", default-features = false, features
     "NLLanguage",
     "NLLanguageRecognizer",
 ] }
+# ONNX Runtime for the two turn models voice loads from the account's `_models/`
+# (Epic 97, D-36, AD-410): Silero VAD and Smart Turn, run on the CPU in
+# `voice_turn_models.rs`. Only pre-releases of 2.0 exist and they break between
+# each other, so the pin is exact. Default features off: no `fetch-models` (the
+# runtime never downloads a model), no `ndarray`, no `copy-dylibs`, no execution
+# provider (so nothing shares the Neural Engine with transcription), and rustls
+# rather than native TLS for the build script. `download-binaries` makes the
+# build script fetch ONNX Runtime 1.28.0 as one static `libonnxruntime.a` from
+# pyke's CDN (`cdn.pyke.io`), checked against the sha256 `ort-sys` pins for the
+# target, at build time only — keeper itself never contacts it. That library
+# is MIT (microsoft/onnxruntime v1.28.0), is not a cargo package, and carries
+# no licence file of its own, so its licence is recorded in `NOTICE` and
+# `docs/constraints-and-limitations.md`. `ort`/`ort-sys` are MIT OR Apache-2.0.
+# Consumed by the `keeper` crate on Apple silicon macOS and the iPhone (arm64
+# iOS, not the simulator) only — the two targets whose library and hash
+# `NOTICE` records; the iOS link also needs CoreML and libc++ in
+# `gen/apple/project.yml`. The library's licence and ThirdPartyNotices ship
+# inside both apps (`licenses/onnxruntime-1.28.0/`).
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "download-binaries",
+    "tls-rustls",
+    "api-24",
+] }
 
 # tao, the window layer under Tauri, from `tools/tao`: 0.35.3 as crates.io serves
 # it plus one hunk in `ios/app_state.rs`'s `connect_scene`, so a URL that LAUNCHED

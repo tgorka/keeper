@@ -68,6 +68,7 @@ use keeper_core::transcription::{
     VoiceSample,
 };
 use keeper_core::vm::{IpcError, IpcErrorCode};
+use keeper_core::voice::turn_models::TurnFetch;
 use keeper_sync::SyncProfile;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
@@ -193,13 +194,14 @@ fn data_dir(platform: &dyn Platform) -> Result<PathBuf, IpcError> {
     platform.data_dir().map_err(to_ipc_error)
 }
 
-fn models_root(data_dir: &Path) -> PathBuf {
+/// `<data_dir>/models`, where every hydration group lands.
+pub(crate) fn models_root(data_dir: &Path) -> PathBuf {
     data_dir.join(MODELS_DIR)
 }
 
 /// The model set the hydrated `models.toml` names, or the default set when
 /// there is none yet. A file that does not parse is refused, not guessed at.
-fn repo_model_set(models_root: &Path) -> Result<ModelSet, String> {
+pub(crate) fn repo_model_set(models_root: &Path) -> Result<ModelSet, String> {
     match std::fs::read_to_string(models_root.join(MODELS_TOML)) {
         Ok(raw) => ModelSet::from_toml(&raw).map_err(|error| error.to_string()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ModelSet::default()),
@@ -239,7 +241,9 @@ fn load_models(engine: &dyn SpeechEngine, data_dir: &Path) -> Result<ModelSet, S
     if !missing.is_empty() {
         return Err(EngineUnavailable::ModelsMissing { missing }.sentence());
     }
-    if keeper_sync::config_repo::completion_digest(&root).is_none() {
+    if keeper_sync::config_repo::completion_digest(&root, model_files::TRANSCRIPTION_GROUP)
+        .is_none()
+    {
         return Err(MODELS_UPDATING.to_owned());
     }
     engine
@@ -253,7 +257,15 @@ fn load_models(engine: &dyn SpeechEngine, data_dir: &Path) -> Result<ModelSet, S
 fn models_ready(data_dir: &Path) -> bool {
     let root = models_root(data_dir);
     model_set(data_dir).is_ok_and(|set| model_files::missing(&root, &set).is_empty())
-        && crate::account_ipc::models_current(data_dir, &root)
+        && crate::account_ipc::models_current(data_dir, &root, &transcription_group(data_dir))
+}
+
+/// Transcription's hydration group as the account's clone and the turn
+/// model picks name it now: every folder but the turn models'.
+fn transcription_group(data_dir: &Path) -> model_files::FetchGroup {
+    let (clone, repo) = crate::account_ipc::clone_models(data_dir);
+    let (vad, smart_turn) = registry::get_turn_models(data_dir).unwrap_or_default();
+    model_files::transcription_group(&clone, &repo, &vad, &smart_turn)
 }
 
 /// A fresh staging name beside a target: the house shape keeper-sync never
@@ -476,7 +488,8 @@ fn models_vm(data_dir: &Path) -> ModelsStateVm {
             }
         }
     };
-    let current = missing.is_empty() && crate::account_ipc::models_current(data_dir, &root);
+    let current = missing.is_empty()
+        && crate::account_ipc::models_current(data_dir, &root, &transcription_group(data_dir));
     models_state(
         missing,
         current,
@@ -517,43 +530,106 @@ fn models_state(missing: Vec<String>, current: bool, fetch: Fetch, account: bool
 }
 
 /// Bring the models up to date from the config repository, in the
-/// background and one fetch at a time. A machine that cannot transcribe
-/// fetches nothing: hundreds of megabytes it would never load.
+/// background and one fetch at a time: the groups of the roles this machine
+/// can run (`model_files::fetch_groups`). A machine that runs neither
+/// transcription nor turn models fetches nothing; the phone fetches only the
+/// turn models (11 MB), never the hundreds of megabytes it would not load.
+/// The turn models are then loaded, whatever the fetch did: models already
+/// in place are used while the account is unreachable.
 pub fn spawn_models_fetch(platform: Arc<dyn Platform>) {
-    if !transcription_supported() {
+    let transcribes = transcription_supported();
+    let takes_turns = crate::voice_turn_models::supported();
+    if !transcribes && !takes_turns {
         return;
     }
-    let dest = match platform.data_dir() {
-        Ok(dir) => models_root(&dir),
+    let data_dir = match platform.data_dir() {
+        Ok(dir) => dir,
         Err(error) => {
-            tracing::warn!(%error, "transcription: no data directory for the models");
+            tracing::warn!(%error, "models: no data directory for the models");
             return;
         }
     };
     let Some(fetching) = begin_fetch() else {
         return;
     };
+    if takes_turns {
+        *lock(&TURN_FETCH) = TurnFetch::Fetching;
+    }
     tauri::async_runtime::spawn(async move {
         let _fetching = fetching;
-        let next = match crate::account_ipc::hydrate_models(platform, dest).await {
-            Ok(report) => {
-                tracing::info!(
-                    fetched = report.downloaded,
-                    copied = report.copied,
-                    kept = report.skipped,
-                    bytes = report.downloaded_bytes + report.copied_bytes,
-                    "transcription: the models are up to date"
-                );
-                Fetch::Idle
+        let dest = models_root(&data_dir);
+        let (clone, repo) = crate::account_ipc::clone_models(&data_dir);
+        let (vad, smart_turn) = registry::get_turn_models(&data_dir).unwrap_or_else(|error| {
+            tracing::warn!(%error, "models: the turn model picks could not be read");
+            Default::default()
+        });
+        // `FETCH` is also the one-run-at-a-time mark (two runs into `dest`
+        // would share its object store), so transcription's outcome is
+        // written only once every group is done.
+        let mut transcription = None;
+        let groups =
+            model_files::fetch_groups(transcribes, takes_turns, &clone, &repo, &vad, &smart_turn);
+        for group in groups {
+            let outcome =
+                crate::account_ipc::hydrate_models(Arc::clone(&platform), dest.clone(), &group)
+                    .await;
+            let next = match outcome {
+                Ok(report) => {
+                    tracing::info!(
+                        group = group.name,
+                        fetched = report.downloaded,
+                        copied = report.copied,
+                        kept = report.skipped,
+                        bytes = report.downloaded_bytes + report.copied_bytes,
+                        "models: up to date"
+                    );
+                    Fetch::Idle
+                }
+                Err(crate::account_ipc::ModelsFetchError::NoAccount) => Fetch::NoAccount,
+                Err(crate::account_ipc::ModelsFetchError::Failed(sentence)) => {
+                    tracing::warn!(group = group.name, %sentence, "models: could not be fetched");
+                    Fetch::Failed(sentence)
+                }
+            };
+            if group.name == model_files::TURN_GROUP {
+                // Loaded before the fetch reads as over, so the line never
+                // says "missing" between the files landing and the load.
+                let loaded = tokio::task::spawn_blocking({
+                    let data_dir = data_dir.clone();
+                    move || crate::voice_turn_models::refresh(&data_dir)
+                })
+                .await;
+                if let Err(error) = loaded {
+                    tracing::warn!(%error, "voice: the turn models load ended unexpectedly");
+                }
+                *lock(&TURN_FETCH) = next.into_turn();
+            } else {
+                transcription = Some(next);
             }
-            Err(crate::account_ipc::ModelsFetchError::NoAccount) => Fetch::NoAccount,
-            Err(crate::account_ipc::ModelsFetchError::Failed(sentence)) => {
-                tracing::warn!(%sentence, "transcription: the models could not be fetched");
-                Fetch::Failed(sentence)
-            }
-        };
-        *lock(&FETCH) = next;
+        }
+        if let Some(next) = transcription {
+            *lock(&FETCH) = next;
+        }
     });
+}
+
+/// What the last fetch of the turn group left behind, for the voice
+/// settings' line (`keeper_core::voice::turn_models::turn_models_state`).
+pub fn turn_fetch() -> TurnFetch {
+    lock(&TURN_FETCH).clone()
+}
+
+static TURN_FETCH: Mutex<TurnFetch> = Mutex::new(TurnFetch::Idle);
+
+impl Fetch {
+    fn into_turn(self) -> TurnFetch {
+        match self {
+            Self::Idle => TurnFetch::Idle,
+            Self::Fetching => TurnFetch::Fetching,
+            Self::Failed(sentence) => TurnFetch::Failed(sentence),
+            Self::NoAccount => TurnFetch::NoAccount,
+        }
+    }
 }
 
 /// Marks a fetch under way; `None` when one already is.
@@ -568,7 +644,7 @@ fn begin_fetch() -> Option<FetchingGuard> {
 
 /// Held by the fetch task: a task that panics, or is dropped with the
 /// runtime, still lets the next fetch start instead of leaving `Fetching`
-/// behind for good.
+/// behind for good. A group the run never reached reads as `Idle`.
 struct FetchingGuard;
 
 impl Drop for FetchingGuard {
@@ -576,6 +652,10 @@ impl Drop for FetchingGuard {
         let mut fetch = lock(&FETCH);
         if *fetch == Fetch::Fetching {
             *fetch = Fetch::Idle;
+        }
+        let mut turn = lock(&TURN_FETCH);
+        if *turn == TurnFetch::Fetching {
+            *turn = TurnFetch::Idle;
         }
     }
 }

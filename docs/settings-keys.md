@@ -116,6 +116,10 @@ file-controlled instead, and says which file.
 | | | | | The speaker model transcription loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`_models/models.toml`); a model that is missing or incomplete on this Mac is refused, never replaced. |
 | `transcription.language` | user-global | one of `auto`, `en`, `pl` | `auto` | `"transcription.language" = "pl"` |
 | | | | | The spoken language transcription expects; `auto` lets the model decide. |
+| `transcription.smart_turn_model` | user-global | text | *(absent)* | `"transcription.smart_turn_model" = "smart-turn-v3"` |
+| | | | | The end-of-turn model voice loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`[smart_turn]` in `_models/models.toml`); every device that runs turn models fetches the folder named here, and one that is missing or incomplete on the device is refused, never replaced. |
+| `transcription.vad_model` | user-global | text | *(absent)* | `"transcription.vad_model" = "silero-vad"` |
+| | | | | The voice activity model voice loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`[vad]` in `_models/models.toml`); every device that runs turn models fetches the folder named here, and one that is missing or incomplete on the device is refused, never replaced. |
 | `undo_send.window` | user-global | integer 0..=60 | `10` | `"undo_send.window" = 10` |
 | | | | | How long a sent message is held before it dispatches, in seconds. |
 | `update.auto` | user-global | boolean (`1`/`0`) | `1` | `"update.auto" = false` |

@@ -7516,6 +7516,13 @@ pub struct VoiceWakeVm {
     /// conversations ([`VoiceAgentTargetVm::target`]); `None` means "the
     /// pinned bot most recently talked to".
     pub voice_target: Option<String>,
+    /// The turn models' line under the voice switch (UX-DR142, D-36):
+    /// `keeper_core::voice::turn_models::turn_models_state` as transcription's
+    /// model-state shape. Absent where this device's voice runs no turn
+    /// models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub turn_models: Option<crate::transcription::vm::ModelsStateVm>,
 }
 
 /// How fast a pinned bot starts answering (Epic 68, Story 68.4, AD-216),
