@@ -1,0 +1,12 @@
+{
+  "missing config path": "missing config value `a.b`",
+  "missing short key": "missing config value `nokey`",
+  "ambiguous short key": "ambiguous config value `key` found at: a.key, b.key",
+  "undeclared snapshot": "snapshot reference targets undeclared source: nope.md",
+  "unsupported default type": "customization.workflow.flag has unsupported default type bool",
+  "review layer without instruction": "customization.workflow.layers[0].instruction must be a string, got NoneType",
+  "duplicate review layer id": "duplicate review layer id `a`",
+  "string expected": "customization.workflow.word must be a string, got int",
+  "customization without customize.toml": "customization tokens require customize.toml",
+  "relative project root": "config.core.name must resolve to an absolute path: x/fixture-root"
+}

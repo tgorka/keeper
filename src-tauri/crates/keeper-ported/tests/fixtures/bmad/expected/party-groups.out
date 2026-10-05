@@ -1,0 +1,16 @@
+{
+  "party_mode": "session",
+  "default_party": "",
+  "groups": [
+    {
+      "id": "code-review-crew",
+      "name": "Code Review Crew",
+      "member_count": 5
+    },
+    {
+      "id": "anti-consensus-club",
+      "name": "Anti-Consensus Club",
+      "member_count": 4
+    }
+  ]
+}

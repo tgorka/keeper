@@ -1,0 +1,33 @@
+# Team / enterprise overrides for _bmad/config.toml.
+# Committed to the repo — applies to every developer on the project.
+# Tables deep-merge over base config; keyed entries merge by key.
+#
+# WHY THIS FILE HAS CONTENT: `_bmad/config.toml`, `_bmad/config.user.toml`
+# and every `_bmad/<module>/config.yaml` are installer-managed — `/bmad:init`
+# REFRESHES them from the plugin template (since plugin v6.11.0.0), so a
+# value pinned there is lost on the next run. This layer is the only one the
+# installer never touches, so the project's non-default answers live here.
+#
+# The module `config.yaml` files still carry the same values because ~110 of
+# the 111 v6.11 skills read YAML directly and never see this TOML; only the
+# newer render_skill.py-based skills resolve these four TOML layers. Both
+# copies are asserted in tests/bmad-structure.test.ts, which is what catches
+# the drift after a future `/bmad:init`.
+
+[core]
+# `basename $(pwd)` is what init writes, so a run from a git worktree stamps
+# the worktree's directory name (that is how "wt-bmad" got committed once).
+# CLAUDE.md: talk to the operator in Polish, write artifacts in English.
+communication_language = "Polish"
+
+[modules.bmb]
+# Upstream defaults these to {project-root}/skills; this repo keeps every
+# BMAD artifact under the single _bmad-output/ root.
+bmad_builder_output_folder = "{project-root}/_bmad-output/bmb-creations"
+bmad_builder_reports = "{project-root}/_bmad-output/bmb-creations/reports"
+
+[modules.tea]
+test_artifacts = "{project-root}/_bmad-output/test-artifacts"
+test_design_output = "_bmad-output/test-artifacts/test-design"
+test_review_output = "_bmad-output/test-artifacts/test-reviews"
+trace_output = "_bmad-output/test-artifacts/traceability"

@@ -107,7 +107,7 @@ impl DriveDeclRefusal {
 
 /// Read a `_drive.toml`.
 pub fn parse(text: &str) -> Result<DriveDecl, DriveDeclRefusal> {
-    let table: toml::Table = toml::from_str(text)
+    let table: toml::Table = crate::toml_order::from_str(text)
         .map_err(|error| DriveDeclRefusal::Syntax(first_line(error.message())))?;
     if let Some(key) = table.keys().find(|key| !ROOT_KEYS.contains(&key.as_str())) {
         return Err(DriveDeclRefusal::UnknownKey { key: key.clone() });

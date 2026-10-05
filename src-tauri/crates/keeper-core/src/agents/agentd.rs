@@ -304,7 +304,7 @@ impl AgentdConfig {
             |error: toml::de::Error| ConfigRefusal::Syntax(error.message().trim().to_owned());
         // The version first, from the loose table: a file of another version
         // is refused as that, not for a key this build does not know.
-        let mut loose: toml::Table = toml::from_str(text).map_err(syntax)?;
+        let mut loose: toml::Table = crate::toml_order::from_str(text).map_err(syntax)?;
         match loose.remove("version") {
             Some(toml::Value::Integer(GRAMMAR_VERSION)) => {}
             Some(toml::Value::Integer(found)) => return Err(ConfigRefusal::Version { found }),

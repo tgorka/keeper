@@ -4,7 +4,9 @@
     "title": "System Architect",
     "icon": "🏗️",
     "activation_steps_prepend": [],
-    "activation_steps_append": ["Read docs/architecture.md before answering."],
+    "activation_steps_append": [
+      "Read docs/architecture.md before answering."
+    ],
     "persistent_facts": [
       "file:{project-root}/docs/standards.md",
       "keeper's crates never link tauri below the shell."

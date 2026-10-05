@@ -1,0 +1,19 @@
+{
+  "{{.implementation_artifacts}}": "/fixture-root/_bmad-output/implementation-artifacts",
+  "{{config.core.output_folder}}": "_bmad-output",
+  "{workflow.persistent_facts}": "- file:{project-root}/docs/house-rules.md\n- Line one of a fact,\n  and its second line.\n- Ünïcode fact 🧭",
+  "{{.communication_language}}": "English",
+  "{{.user_name}}": "Tomasz Gorka",
+  "{{.document_output_language}}": "English",
+  "{{config.core.project_name}}": "keeper",
+  "{{config.modules.bmm.planning_artifacts}}": "/fixture-root/_bmad-output/planning-artifacts",
+  "{{config.modules.bmm.project_knowledge}}": "/fixture-root/docs",
+  "{{config.modules.tea.test_design_output}}": "skills/test-artifacts/test-design",
+  "{workflow.activation_steps_prepend}": "- Load {skill-root}/steps/step-01-gather.md first.",
+  "{workflow.activation_steps_append}": "_None._",
+  "{workflow.implementation_handoff}": "Hand the spec at {skill-root}/out/spec.md to the implementer.\nKeep {project-root} literal here: only {skill-root} is bound.",
+  "{workflow.open_spec}": "{skill-root}/open.md",
+  "{workflow.on_complete}": "",
+  "{workflow.review_layers}": "#### blind (`blind`)\n\nReview the diff with no context; name each finding's line.\n\n#### edge (`edge`)\n\nRun only when: the change has a branch\n\nWalk every branch.\n  Then every boundary.",
+  "{workflow.oneshot_review_layers}": "No active review layers. HALT with blocking condition `no active review layers`."
+}

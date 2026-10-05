@@ -503,8 +503,8 @@ pub fn parse_agent_toml(
             folder: folder.to_owned(),
         });
     }
-    let table: Table =
-        toml::from_str(text).map_err(|error| HomeRefusal::Syntax(error.message().to_owned()))?;
+    let table: Table = crate::toml_order::from_str(text)
+        .map_err(|error| HomeRefusal::Syntax(error.message().to_owned()))?;
     let root = Section::new("", &table, ROOT_KEYS)?;
 
     match root.table.get("version") {
@@ -944,6 +944,20 @@ readers = ["@marta:example.org", "@tgorka:example.org"]
 
     fn sentence(result: Result<AgentConfig, HomeRefusal>) -> String {
         result.expect_err("refused").to_string()
+    }
+
+    /// Two unknown keys: the first in key order is named, wherever it is
+    /// written (R170).
+    #[test]
+    fn an_agent_file_names_its_first_unknown_key_in_key_order() {
+        assert_eq!(
+            sentence(parse_agent_toml(
+                "zeta = 1\nalpha = 2\n",
+                "nixi",
+                &tgdrive()
+            )),
+            HomeRefusal::UnknownKey("alpha".to_owned()).to_string()
+        );
     }
 
     fn minimal(kind: &str, extra: &str) -> String {

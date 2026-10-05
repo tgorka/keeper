@@ -1,0 +1,16 @@
+{
+  "error": "unknown_group",
+  "requested": "no-such-room",
+  "available": [
+    {
+      "id": "code-review-crew",
+      "name": "Code Review Crew",
+      "member_count": 5
+    },
+    {
+      "id": "anti-consensus-club",
+      "name": "Anti-Consensus Club",
+      "member_count": 4
+    }
+  ]
+}

@@ -47,6 +47,7 @@ pub mod tasks;
 pub mod telemetry;
 pub mod text_file;
 pub mod timeline;
+pub mod toml_order;
 pub mod transcription;
 pub mod update;
 pub mod vault_link;

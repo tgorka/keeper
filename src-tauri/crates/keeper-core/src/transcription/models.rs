@@ -80,8 +80,8 @@ impl ModelSet {
     /// `[embedding] id`). A missing section keeps that default; every name
     /// must be one plain path segment, because each becomes a directory.
     pub fn from_toml(raw: &str) -> Result<Self, ModelsTomlError> {
-        let file: ModelsFile =
-            toml::from_str(raw).map_err(|error| ModelsTomlError(error.message().to_owned()))?;
+        let file: ModelsFile = crate::toml_order::from_str(raw)
+            .map_err(|error| ModelsTomlError(error.message().to_owned()))?;
         let defaults = Self::default();
         let set = Self {
             asr_dir: file.asr.map_or(defaults.asr_dir, |section| section.dir),

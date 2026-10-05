@@ -441,7 +441,7 @@ fn limits(table: &toml::Table) -> Result<Option<SessionLimits>, SessionRefusal> 
 
 /// Read a session `agent.toml`.
 pub fn parse_session_agent_toml(text_in: &str) -> Result<SessionAgent, SessionRefusal> {
-    let table: toml::Table = toml::from_str(text_in).map_err(|error| {
+    let table: toml::Table = crate::toml_order::from_str(text_in).map_err(|error| {
         SessionRefusal::Syntax(error.message().lines().next().unwrap_or("").to_owned())
     })?;
     unknown_keys(&table, &ROOT_KEYS, "")?;

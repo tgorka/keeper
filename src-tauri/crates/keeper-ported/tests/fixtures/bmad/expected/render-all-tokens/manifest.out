@@ -1,0 +1,70 @@
+{
+  "generation_hash": "3e3f65023e3a0fb5c53e",
+  "inputs": {
+    "project_root": "/fixture-root",
+    "renderer_sha256": "8496d0d8b449d64c21b42a9aab3b13fc8a813a430c0695ffd84ad75bb1da7942",
+    "resolved_values": {
+      "config.core.communication_language": "English",
+      "config.core.document_output_language": "English",
+      "config.core.output_folder": "_bmad-output",
+      "config.core.project_name": "keeper",
+      "config.core.user_name": "Tomasz Gorka",
+      "config.modules.bmm.implementation_artifacts": "/fixture-root/_bmad-output/implementation-artifacts",
+      "config.modules.bmm.planning_artifacts": "/fixture-root/_bmad-output/planning-artifacts",
+      "config.modules.bmm.project_knowledge": "/fixture-root/docs",
+      "config.modules.tea.test_design_output": "skills/test-artifacts/test-design",
+      "customization.workflow.activation_steps_append": [],
+      "customization.workflow.activation_steps_prepend": [
+        "Load {skill-root}/steps/step-01-gather.md first."
+      ],
+      "customization.workflow.implementation_handoff": "Hand the spec at {skill-root}/out/spec.md to the implementer.\nKeep {project-root} literal here: only {skill-root} is bound.",
+      "customization.workflow.on_complete": "",
+      "customization.workflow.oneshot_review_layers": [
+        {
+          "id": "only",
+          "instruction": "",
+          "name": "only"
+        }
+      ],
+      "customization.workflow.open_spec": "{skill-root}/open.md",
+      "customization.workflow.persistent_facts": [
+        "file:{project-root}/docs/house-rules.md",
+        "Line one of a fact,\nand its second line.",
+        "Ünïcode fact 🧭"
+      ],
+      "customization.workflow.review_layers": [
+        {
+          "id": "blind",
+          "instruction": "Review the diff with no context; name each finding's line.",
+          "name": "blind"
+        },
+        {
+          "id": "edge",
+          "instruction": "Walk every branch.\n  Then every boundary.",
+          "name": "edge",
+          "when": "the change has a branch"
+        },
+        {
+          "id": "off",
+          "instruction": "   ",
+          "name": "Switched off"
+        }
+      ]
+    },
+    "source_sha256": {
+      "steps-notes.md": "47451b79f339e31d2c799be3e1ba6a734a9cc0f6ab00a2dcf85dab7b1ba0eb64",
+      "steps/step-01-gather.md": "c50b2dd4aaa6f426b94f7bd3c106ed4c6d6fe09dd0b8504527937ca77f8a104d",
+      "workflow.md": "ae43389b054e5dceb45cca491d7c62c53fca948b36e95b45baa8e271bdfb5553"
+    }
+  },
+  "outputs": {
+    "steps-notes.md": "3b4f77a26a55dcbe43bb022574b4f20c3b2cf9b38a4cf3eff420d95f4a79ed8f",
+    "steps/step-01-gather.md": "27fed6eaf7de552b2b9963fca7132f1181e191b23e8a7279303a34319c7e87e4",
+    "workflow.md": "8313c7a5407669eac15d8ddde5e8fca7403fe2ea519059a74f8af646dc587170"
+  },
+  "project_root": "/fixture-root",
+  "project_slug": "fixture-root",
+  "root_hash": "e20c9e97488f",
+  "schema_version": 1,
+  "skill": "all-tokens"
+}

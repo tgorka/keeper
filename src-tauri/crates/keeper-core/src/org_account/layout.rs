@@ -112,7 +112,7 @@ fn read_table(files: &dyn RepoFiles, rel: &str) -> Option<Result<toml::Table, ()
     Some(
         std::str::from_utf8(&bytes)
             .map_err(|_| ())
-            .and_then(|text| toml::from_str(text).map_err(|_| ())),
+            .and_then(|text| crate::toml_order::from_str(text).map_err(|_| ())),
     )
 }
 

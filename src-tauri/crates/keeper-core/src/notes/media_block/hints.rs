@@ -246,9 +246,11 @@ enum Place {
 /// The byte range of `body` that `refusal` is about.
 fn problem_span(body: &str, refusal: &BlockRefusal) -> Option<Range<usize>> {
     if let BlockRefusal::Syntax(_) = refusal {
-        return toml::from_str::<toml::Table>(body).err()?.span();
+        return crate::toml_order::from_str::<toml::Table>(body)
+            .err()?
+            .span();
     }
-    let table: toml::Table = toml::from_str(body).ok()?;
+    let table: toml::Table = crate::toml_order::from_str(body).ok()?;
     let (place, key) = offender(&table, refusal)?;
     let document = Document::parse(body).ok()?;
     let root = document.as_table();

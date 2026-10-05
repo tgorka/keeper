@@ -493,19 +493,19 @@ struct Salvage {
 ///
 /// # Order
 ///
-/// `toml::Table` is sorted, so keys are tried alphabetically. That is
-/// deterministic — the same file gives the same answer on every clone, which is
-/// the property that matters — and it happens to be the order `validate`'s
-/// cross-field rules want: `notes` before `recordings` before `sessions` is
-/// exactly the sequence its overlap checks are written in.
+/// Keys are tried alphabetically ([`sorted_keys`]). That is deterministic —
+/// the same file gives the same answer on every clone and in every build,
+/// whether or not `toml` keeps document order there — and it is the order
+/// `validate`'s cross-field rules want: `notes` before `recordings` before
+/// `sessions` is exactly the sequence its overlap checks are written in.
 ///
 /// Keys outside `[folder]` are not retried. They are not profile fields, they
 /// were already reported by the whole-layer pass, and the whole point of this
 /// retry is that a misspelled top-level key must stop taking `[folder]` with
 /// it.
 fn salvage_keys(profile: &SyncProfile, table: &toml::Table, is_main: bool) -> Salvage {
-    let Some(fields) = table
-        .iter()
+    let Some(fields) = sorted_keys(table)
+        .into_iter()
         .find(|(key, _)| canonical_key(key) == "folder")
         .and_then(|(_, value)| value.as_table())
     else {
@@ -518,7 +518,7 @@ fn salvage_keys(profile: &SyncProfile, table: &toml::Table, is_main: bool) -> Sa
     let mut current = profile.clone();
     let mut keys = BTreeSet::new();
     let mut problems = Vec::new();
-    for (key, value) in fields {
+    for (key, value) in sorted_keys(fields) {
         let mut one = toml::Table::new();
         let mut folder = toml::Table::new();
         folder.insert(key.clone(), value.clone());
@@ -574,7 +574,7 @@ fn overlay(
 ) -> std::result::Result<Option<Applied>, Vec<String>> {
     let mut problems = Vec::new();
     let mut requested = None;
-    for (key, value) in table {
+    for (key, value) in sorted_keys(table) {
         match canonical_key(key).as_str() {
             "folder" => requested = Some(value),
             // The main folder's `[settings]` belongs to keeper-core's layer
@@ -715,7 +715,12 @@ fn overlay(
 fn settings_refusal(value: &toml::Value) -> String {
     let keys: Vec<&str> = value
         .as_table()
-        .map(|table| table.keys().map(String::as_str).collect())
+        .map(|table| {
+            sorted_keys(table)
+                .into_iter()
+                .map(|(key, _)| key.as_str())
+                .collect()
+        })
         .unwrap_or_default();
     let named = if keys.is_empty() {
         "an empty `[settings]` table".to_owned()
@@ -727,6 +732,16 @@ fn settings_refusal(value: &toml::Value) -> String {
          keys about itself, or two folders would fight over one app-wide setting. Move \
          them to `~/.keeper/keeper.toml` or to the main sync folder's file"
     )
+}
+
+/// A table's entries in key order. `toml::Table` iterates in document order
+/// when any crate in the build enables `toml`'s `preserve_order` (keeper-ported
+/// does, so the app and the agent hosts do) and alphabetically otherwise
+/// (`keeper-syncd`); a folder file must mean the same in both.
+fn sorted_keys(table: &toml::Table) -> Vec<(&String, &toml::Value)> {
+    let mut entries: Vec<_> = table.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries
 }
 
 /// Overlay `overlay` onto `base`, recursing into tables.
@@ -1236,6 +1251,25 @@ mod tests {
             "{}",
             fault.message
         );
+    }
+
+    /// The app links keeper-ported, whose `toml` keeps document order, and
+    /// `keeper-syncd` does not: a folder file must be read in one order in
+    /// both, so its problems come out alphabetically however it is written.
+    /// (Run with `--features toml/preserve_order` to see the app's build.)
+    #[test]
+    fn a_folder_file_reads_in_key_order_whatever_order_it_is_written_in() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let table: toml::Table =
+            toml::from_str("zeta = 1\nalpha = 2\n[settings]\nz = 1\na = 2\n").expect("parses");
+        let problems = match overlay(&profile(dir.path()), &table, false) {
+            Err(problems) => problems,
+            Ok(_) => panic!("refused"),
+        };
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(problems[0].contains("`alpha`"), "{problems:?}");
+        assert!(problems[1].contains("key(s) a, z:"), "{problems:?}");
+        assert!(problems[2].contains("`zeta`"), "{problems:?}");
     }
 
     /// The tier exists for these. Repository policy has to be the same on both

@@ -1,0 +1,7 @@
+[workflow]
+persistent_facts = ["Line one of a fact,\nand its second line.", "Ünïcode fact 🧭"]
+open_spec = "{skill-root}/open.md"
+
+[[workflow.review_layers]]
+id = "blind"
+instruction = "Review the diff with no context; name each finding's line."
