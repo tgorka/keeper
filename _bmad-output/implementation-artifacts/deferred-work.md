@@ -9729,3 +9729,39 @@ origin: epic 96, story 96.5 (rung `agents-96-kvm`, review-96kvm-1.md R96K1-11b, 
 location: `src-tauri/crates/keeper-core/src/agents/mcp.rs` (`check`, the `McpRole::Kvm` arm)
 reason: the `[[mcp]]` entry takes its readers, fingerprint and credential from the `[[kvm]]` entry but keeps its own `url`; the pinned certificate keeps the credential from reaching anyone else, so this is hygiene, and `docs/agents.md` says the `[[mcp]]` URL is the one spoken to. Close by refusing a `role = "kvm:<id>"` whose URL host differs from its `[[kvm]]`'s.
 status: open
+
+### DW-490: The turn-model picks have settings keys but no picker in Settings.
+
+origin: epic 97, story 97.1 (rung `agents-97-models`, 2026-10-05; acceptance 4, Q6)
+location: `src-tauri/crates/keeper-core/src/config/keys.rs` (`transcription.vad_model`, `transcription.smart_turn_model`), `src/components/settings/` (Settings › Transcription)
+reason: 97.1 builds the keys, `choose_turn`'s refusal and the fetch of a picked folder; the rung plan gives the UI only UX-DR142's line, so a pick is made by writing the key in a settings file. `models::available` scans the transcription roles only, so nothing lists turn-model folders yet. Until then a refused pick names the key and says to set it to another folder of `_models/` in the account's `settings.toml`, or remove it. Revisit when the turn models have a second folder worth choosing: a picker beside Speech model / Speaker model, fed by `available` with the two turn roles.
+status: open
+
+### DW-491: The models directory keeps the pre-group state and marker files after the update.
+
+origin: epic 97, story 97.1 (rung `agents-97-models`, 2026-10-05; Q5)
+location: `src-tauri/crates/keeper-sync/src/config_repo/hydrate.rs` (`state_file`, `complete_file`)
+reason: Hydration state and completion are per group now (`.keeper-hydrate.<group>.json`, `.keeper-models-complete.<group>.json`). A Mac hydrated before the update keeps `.keeper-hydrate.json` and `.keeper-models-complete.json`, which nothing reads; its first run hashes the transcription set once (about 480 MB) to adopt what is already in place, and transcription reads "updating" until that run ends. Revisit if a stale file ever confuses a reader: remove the two names in the hydration's first run.
+status: open
+
+### DW-492: ONNX Runtime arrives as pyke's prebuilt library, downloaded by the build.
+
+origin: epic 97, story 97.1 (rung `agents-97-models`, 2026-10-05; acceptance 7, Q2)
+location: `src-tauri/Cargo.toml` (`ort`, `download-binaries`), `NOTICE`
+reason: `ort-sys`'s build script fetches `libonnxruntime.a` (ONNX Runtime 1.28.0) from `cdn.pyke.io`, hash-pinned per target, on CI and hesperia; the bytes are pyke's build of Microsoft's release, not one we built or attested. `ort` is a dependency only of Apple silicon macOS and the arm64 iPhone (`target_env` not `sim`): no Intel macOS library exists, and the simulator's is not recorded in `NOTICE`, so an Intel Mac and the iOS simulator (arm64 or Intel) compile the runtime-less port and have no turn models (`voice_turn_models::supported`). Revisit when the build must be offline or attested, or an Intel Mac needs turn models: build ONNX Runtime for the two Apple targets in CI and point `ORT_LIB_LOCATION`/`ORT_IOS_XCFWK_PATH` at it (Q2 option c).
+status: open
+
+### DW-493: The app bundle does not carry ONNX Runtime's licence text.
+
+origin: epic 97, story 97.1 (rung `agents-97-models`, 2026-10-05; acceptance 7)
+location: `NOTICE`, the macOS and iOS bundles
+reason: ONNX Runtime's MIT licence asks that its notice travel with copies of the software. It was recorded in the repository's `NOTICE` only, neither bundle carried it, and the ThirdPartyNotices of the components ONNX Runtime bundles were not reproduced.
+status: closed 2026-10-05
+resolution: Fixed by the rung's review fixes (R97-01): ONNX Runtime's LICENSE and ThirdPartyNotices.txt at v1.28.0 (and FluidAudio's LICENSE, the other native code `NOTICE` names) are in `licenses/`, with their sha256 in `NOTICE`; `tauri.conf.json` (`bundle.macOS.files`) puts `NOTICE` and `licenses/` in `keeper.app/Contents/Resources/`, `gen/apple/project.yml` at the top of the iPhone app. `scripts/bundle-notices.test.ts` pins both configurations, and the bundle guard every install runs (`scripts/lib/bundle-guard.sh`) refuses a built app that lacks any of them. Settings › About shows none yet; a person reads them in the bundle.
+
+### DW-494: The voice settings read the turn group's currency on every read.
+
+origin: epic 97, story 97.1 (rung `agents-97-models`, 2026-10-05; acceptance 9)
+location: `src-tauri/crates/keeper/src/voice_turn_models.rs` (`state_vm`, called by `voice_ipc::wake_vm`)
+reason: `voice_wake_get` is a synchronous command, and its turn-models line asks `hydration_is_current`, which walks the clone's turn folders and hashes their plain files (`models.toml`, the licence files) each time. That is a few small files today. Revisit if the turn folders grow plain files of size or the read shows on a profile: cache the answer per clone commit, or read it off the main thread.
+status: open

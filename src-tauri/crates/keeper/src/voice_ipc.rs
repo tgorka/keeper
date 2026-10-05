@@ -592,11 +592,22 @@ pub fn boot(app: &AppHandle, data_dir: &Path) {
             voice.turn.set_stop(None);
         }
     }
+    // The turn models already on disk load now, off the boot path, so they
+    // are ready after a launch without the network too; every models fetch
+    // loads them again when the set changes.
+    let models_dir = data_dir.to_owned();
+    if let Err(error) = std::thread::Builder::new()
+        .name("keeper-turn-models-load".into())
+        .spawn(move || crate::voice_turn_models::refresh(&models_dir))
+    {
+        tracing::warn!(%error, "voice: the turn models could not be loaded at launch");
+    }
 }
 
 /// The wake VM as persisted plus what the port knows about locales: the
 /// one in force is core's answer, the list is the port's cache. The stop
-/// phrase and the voice target are read as stored.
+/// phrase and the voice target are read as stored; the turn models' line is
+/// `voice_turn_models`'s (none where voice runs no turn models).
 fn wake_vm(
     data_dir: &std::path::Path,
     enabled: bool,
@@ -629,6 +640,7 @@ fn wake_vm(
         on_device_locales: on_device,
         stop_phrase,
         voice_target,
+        turn_models: crate::voice_turn_models::state_vm(data_dir),
     })
 }
 

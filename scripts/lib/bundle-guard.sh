@@ -25,7 +25,14 @@
 #      there; a `--debug` build ships the folder with nothing in it),
 #   2. that folder has no `index.html`,
 #   3. the executable embeds no frontend — and, when it also carries
-#      `build.devUrl`, says so, because that is the webview's destination.
+#      `build.devUrl`, says so, because that is the webview's destination,
+#   4. a `.app` lacks the third-party notices it must carry: `NOTICE` and every
+#      licence text under `licenses/` at the repository root, at the top of an
+#      iOS bundle and in a macOS bundle's `Contents/Resources/`. ONNX Runtime's
+#      MIT licence asks that its notice accompany every copy, and the bundle
+#      configuration (`tauri.conf.json`, `gen/apple/project.yml`) is only a
+#      promise until the built app is looked at. A bare executable is not
+#      distributed and is not asked.
 #
 # On what "contains the dev-server URL" can and cannot prove: tauri-codegen
 # compiles the WHOLE of tauri.conf.json into every keeper binary, `devUrl`
@@ -84,10 +91,23 @@ _keeper_bundle_refuse() {
   return 1
 }
 
+# Refuse `$1` (a bundle's resources directory) when it lacks NOTICE or any
+# file under the checkout's licenses/, naming each absent one.
+_keeper_check_notices() {
+  local dir="$1" rel missing=""
+  for rel in NOTICE $(cd "$KEEPER_REPO_ROOT" && find licenses -type f 2>/dev/null | LC_ALL=C sort); do
+    [ -f "$dir/$rel" ] || missing="$missing $rel"
+  done
+  if [ -n "$missing" ]; then
+    echo "error: $dir lacks the third-party notices the app must carry:$missing. They are bundled by tauri.conf.json (macOS) and gen/apple/project.yml (iOS); see NOTICE." >&2
+    return 1
+  fi
+}
+
 # Check one unpacked `.app` (or a bare executable). Internal: the public entry
 # point below unpacks an .ipa and cleans up around this.
 _keeper_check_unpacked() {
-  local app="$1" name bin frontend html recipe marker dev_url pointed
+  local app="$1" name bin frontend html recipe marker dev_url pointed notices
   dev_url="$(keeper_dev_url)" || return 1
 
   if [ -f "$app" ]; then
@@ -96,6 +116,7 @@ _keeper_check_unpacked() {
     # chunk to look for.
     bin="$app"
     frontend=""
+    notices=""
     html="$KEEPER_REPO_ROOT/dist/index.html"
     recipe="bun run tauri:build"
   elif [ -d "$app/Contents/MacOS" ]; then
@@ -104,6 +125,7 @@ _keeper_check_unpacked() {
     name="$(basename "$app" .app)"
     bin="$app/Contents/MacOS/$name"
     frontend=""
+    notices="$app/Contents/Resources"
     html="$KEEPER_REPO_ROOT/dist/index.html"
     recipe="bun run tauri:build:signed"
   elif [ -d "$app" ]; then
@@ -118,6 +140,7 @@ _keeper_check_unpacked() {
     name="$(basename "$app" .app)"
     bin="$app/$name"
     frontend=""
+    notices="$app"
     html="$KEEPER_REPO_ROOT/dist/index.html"
     recipe="bun run tauri ios build --export-method debugging"
   else
@@ -160,7 +183,11 @@ _keeper_check_unpacked() {
     return 1
   fi
 
-  echo "==> Bundle renders: $bin embeds $marker${frontend:+, and $frontend carries index.html}."
+  if [ -n "$notices" ]; then
+    _keeper_check_notices "$notices" || return 1
+  fi
+
+  echo "==> Bundle renders: $bin embeds $marker${frontend:+, and $frontend carries index.html}${notices:+; it carries NOTICE and licenses/}."
 }
 
 # Public entry point. Unpacks an .ipa into a temporary directory for the

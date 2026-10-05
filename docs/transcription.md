@@ -139,22 +139,33 @@ leaves it for this, there is no transcription server, no NAS option and no cloud
 
 keeper's bundle carries no model weights (D-5). The organisation that runs the account
 distributes them through its config repository (`docs/account.md` § *The config repository*),
-under `_models/`, tracked by git LFS. keeper's clone of that repository holds LFS pointers. On
-a Mac that can transcribe, after each config sync and on *Fetch models*, keeper hydrates
-`_models/` into `<data_dir>/models/` with its own LFS client and the account's credential,
-checking every object against its sha256 and size. The LFS endpoint is derived from the
-repository's own URL and nothing else: a `.lfsconfig` in the config repository is ignored, so
-the credential never goes to a host the repository names. A file already in place is not
-fetched again.
+under `_models/`, tracked by git LFS. keeper's clone of that repository holds LFS pointers.
+After each config sync and on *Fetch models*, keeper hydrates into `<data_dir>/models/`, with
+its own LFS client and the account's credential, the part of `_models/` this machine runs: a
+Mac that can transcribe takes every folder but the turn models' (the **transcription group**);
+a device whose voice runs the turn models — an Apple silicon Mac, the iPhone — takes the turn
+models' folders (the **turn group**, *The turn models* below). No folder is in both: the turn
+models' are the ones `models.toml` and the turn picks name and any other folder holding a
+`model.onnx` (an older version kept beside the new one), except a folder `[asr]` or `[diarizer]`
+names, which stays transcription's. Both take the plain files at the top of `_models/`
+(`models.toml`). A device that does neither fetches nothing; the phone fetches
+only the turn group (about 11 MB). Every object is checked against its sha256 and size. The LFS
+endpoint is derived from the repository's own URL and nothing else: a `.lfsconfig` in the
+config repository is ignored, so the credential never goes to a host the repository names. A
+file already in place is not fetched again.
 
-A set is complete, or it is not used. keeper removes
-`<data_dir>/models/.keeper-models-complete.json` before it changes anything there and writes it
-last, only when every file is in place; it records a digest of what every file holds (its LFS
-object id, or a plain file's sha256). The set is ready only when every file it needs is present
-and that digest matches what the clone names now, so a half-updated set (a new encoder beside
-an old decoder) is never loaded. A changed set is loaded at the next job's start, never in the
-middle of one. The engine loads a set only by path — it never downloads, and keeper never
-contacts Hugging Face.
+A group is complete, or it is not used. keeper removes the group's
+`<data_dir>/models/.keeper-models-complete.<group>.json` before it changes anything of that
+group and writes it last, only when every file of the group is in place; it records a digest of
+what every file holds (its LFS object id, or a plain file's sha256). A set is ready only when
+every file it needs is present and its group's digest matches what the clone names now, so a
+half-updated set (a new encoder beside an old decoder) is never loaded — and because each group
+keeps its own marker (and its own `.keeper-hydrate.<group>.json`), a new turn model never makes
+transcription's set look half-updated. `models.toml` counts in each group's digest only by the
+sections of that group's roles, so switching `[smart_turn] dir` to a new folder leaves
+transcription current, and an unavailable picked turn model fails only the turn group. A changed set is loaded at the next job's start, never
+in the middle of one. The engine loads a set only by path — it never downloads, and keeper
+never contacts Hugging Face.
 
 ### Layout
 
@@ -176,6 +187,12 @@ keeper-config.git/
       Embedding.mlmodelc/
       PldaRho.mlmodelc/
       plda-parameters.json
+    silero-vad/                  # voice activity (the turn group)
+      model.onnx
+      LICENSE
+    smart-turn-v3/               # end of turn (the turn group)
+      model.onnx
+      LICENSE
 ```
 
 The `.mlmodelc` folders are precompiled Core ML models; nothing is compiled on the Mac. Their
@@ -184,7 +201,8 @@ sources are FluidInference's `parakeet-tdt-0.6b-v3-coreml` (int8 encoder) and
 attribution to pyannote, WeSpeaker, BUT Speech@FIT and Fluid Inference, so copy the licence
 and NOTICE files into `_models/` beside them (DW-341).
 
-`models.toml` names the set; every section is optional and falls back to the default shown:
+`models.toml` names the set; every transcription section is optional and falls back to the
+default shown, and the turn sections are optional and name no turn model when absent:
 
 ```toml
 [asr]
@@ -195,9 +213,46 @@ dir = "speaker-diarization"
 
 [embedding]
 id = "pyannote-community-1"      # the voices bank's embeddings/<id>/ folder
+
+[vad]
+dir = "silero-vad"               # no default
+
+[smart_turn]
+dir = "smart-turn-v3"            # no default
 ```
 
-Each value must be one plain folder name (no `/`, `..` or `:`). An unknown key is refused.
+Each value must be one plain folder name (no `/`, `..` or `:`). An unknown key is refused — by
+the whole file, so a keeper older than the turn models refuses a `models.toml` that has `[vad]`
+or `[smart_turn]`, and with it transcription (*The turn models*, the order of the steps).
+
+### The turn models
+
+Voice can end a spoken turn when the sentence is finished rather than after a fixed pause
+(D-36, AD-410). That takes two small models, run on the device by ONNX Runtime
+(`docs/constraints-and-limitations.md`) and never sent audio: a voice activity model (`vad`,
+Silero VAD, `silero_vad.onnx` from snakers4/silero-vad, MIT) and an end-of-turn model
+(`smart_turn`, Smart Turn v3, `smart-turn-v3.2-cpu.onnx` from Hugging Face
+pipecat-ai/smart-turn-v3, BSD-2-Clause, trained on data under CC-BY-4.0). Each folder holds the
+model renamed `model.onnx` and **its licence file** — keeper reads no licence; the owner's
+repository is where it lives, as DW-341 records for the transcription models (a
+`PROVENANCE.md` with the source, the commit and the sha256 is a good habit).
+
+- **What keeper needs:** `<folder>/model.onnx` for each role `models.toml` names. Transcription
+  never waits for them: a repository with a half turn set still transcribes.
+- **Who fetches them:** every device whose voice runs them (Apple silicon Macs and the iPhone),
+  the turn group only, plus any turn model picked by its settings key. An Intel Mac and the iOS
+  simulator have no runtime and no turn models.
+- **When they load:** only for an account, from a complete turn group whose marker the clone
+  names now — the same facts the line below is computed from. Forgetting the account unloads
+  them; with the server unreachable, models already here keep working.
+- **What voice shows:** one line under the voice switch — *Turn models ready*, *Turn models
+  missing: `silero-vad/model.onnx` — keeper waits 1.8 s after you stop*, or a refusal; without
+  an account there are no turn models, and the line says so. Without them a turn ends 1.8 s after
+  the person stops, as before.
+- **The order of the steps.** Add the two folders (with the `.gitattributes` rule in place, so
+  they go to LFS) and push; then, **only once every signed-in Mac runs a keeper with the turn
+  models** (Epic 97), add `[vad]` and `[smart_turn]` to `models.toml` and push. A Mac on an older
+  keeper refuses the whole file and stops transcribing until it is updated.
 
 ### Adding or upgrading a model set
 
@@ -219,10 +274,17 @@ diarizer's own `Embedding.mlmodelc`, so a diarizer change is an embedding-model 
 
 ### Choosing the models
 
-`models.toml` is the organisation's choice. A person can pick another model folder for either
-role in Settings › Transcription, to try a new model before it becomes the set or to keep an
-older one:
+`models.toml` is the organisation's choice. A person can pick another model folder for a role
+— the speech and speaker models in Settings › Transcription, the turn models by their settings
+keys — to try a new model before it becomes the set or to keep an older one:
 
+- **Turn models** (`transcription.vad_model`, `transcription.smart_turn_model`) are text
+  settings of the same kind, travelling to every device; a device that runs the turn models
+  fetches the picked folder too, so a pick works on the phone. A pick that is missing or
+  incomplete is refused naming *this device*, the key, and the way out — "Set
+  `transcription.vad_model` in your account's settings.toml to another folder of _models/, or
+  remove it to use the one [vad] in models.toml names." — never replaced by the repository's.
+  (The keys exist; Settings has no picker for them yet, DW-490.)
 - **Speech model** (`transcription.asr_model`) and **Speaker model**
   (`transcription.diarization_model`) are text settings, user-global, so they travel through
   the account's `settings.toml` to every device (`docs/settings-keys.md`). Blank, the default,

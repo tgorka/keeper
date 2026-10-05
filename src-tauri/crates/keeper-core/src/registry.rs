@@ -2961,6 +2961,22 @@ pub fn set_transcription_diarization_model(data_dir: &Path, id: &str) -> Result<
     set_setting(data_dir, TRANSCRIPTION_DIARIZATION_MODEL_KEY, id.trim())
 }
 
+/// The `settings` keys holding the turn models picked in Settings (D-36),
+/// shaped like the speech and speaker model's.
+pub(crate) const TRANSCRIPTION_VAD_MODEL_KEY: &str = "transcription.vad_model";
+pub(crate) const TRANSCRIPTION_SMART_TURN_MODEL_KEY: &str = "transcription.smart_turn_model";
+
+/// The picked voice activity and end-of-turn model, each `""` when the
+/// config repository's choice stands. Surrounding whitespace is not part of
+/// a name.
+pub fn get_turn_models(data_dir: &Path) -> Result<(String, String), CoreError> {
+    let name = |raw: Option<String>| raw.map(|raw| raw.trim().to_owned()).unwrap_or_default();
+    Ok((
+        name(get_setting(data_dir, TRANSCRIPTION_VAD_MODEL_KEY)?),
+        name(get_setting(data_dir, TRANSCRIPTION_SMART_TURN_MODEL_KEY)?),
+    ))
+}
+
 /// The `settings` key holding an explicit path to the `git` binary folder sync
 /// drives (Story 34.14). Stored as the raw absolute path string; absent / empty
 /// ⇒ automatic resolution, which is the default and what almost every install

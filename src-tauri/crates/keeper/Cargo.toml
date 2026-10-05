@@ -174,6 +174,21 @@ objc2-natural-language = { workspace = true }
 # needs Xcode (Swift 6.2+) and fetches FluidAudio through SwiftPM.
 fluidaudio-rs = { path = "../../../tools/fluidaudio-rs" }
 
+# The turn models (Epic 97, D-36): ONNX Runtime, statically linked, reached
+# only from `voice_turn_models.rs`. Apple silicon only — pyke publishes no
+# Intel macOS library, and keeper ships for aarch64 alone; an Intel build keeps
+# voice's pause rule. See the workspace entry for what the build downloads.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+ort = { workspace = true }
+
+# The same on the iPhone itself, the one iOS target `NOTICE` records a runtime
+# for: the simulator (arm64 or Intel) keeps voice's pause rule and shows no
+# turn-models line (`voice_turn_models::supported`). Xcode links `libapp.a`,
+# so the CoreML framework and libc++ the library needs are named in
+# `gen/apple/project.yml`.
+[target.'cfg(all(target_os = "ios", target_arch = "aarch64", not(target_env = "sim")))'.dependencies]
+ort = { workspace = true }
+
 [target.'cfg(target_os = "ios")'.dependencies]
 security-framework = { workspace = true }
 # iOS backup exclusion (Story 14.7, FR-65). The single audited `#[allow(unsafe_code)]`

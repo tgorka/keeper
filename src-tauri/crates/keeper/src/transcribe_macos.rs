@@ -229,7 +229,10 @@ impl Worker {
     }
 
     fn load(&mut self, root: PathBuf, set: ModelSet) -> Result<(), EngineError> {
-        let digest = keeper_sync::config_repo::completion_digest(&root);
+        let digest = keeper_sync::config_repo::completion_digest(
+            &root,
+            keeper_core::transcription::models::TRANSCRIPTION_GROUP,
+        );
         if self.holds(&root, &set, digest.as_deref()) {
             return Ok(());
         }

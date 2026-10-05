@@ -141,6 +141,11 @@ mod voice_log;
 // hotkey's commands. Every target, because the deep link is every target's;
 // the hotkey commands answer `unsupported` off desktop.
 mod voice_reach;
+// The turn models (D-36, AD-410): Silero VAD and Smart Turn from the
+// account's `_models/`, run through ONNX Runtime where it is linked (Apple
+// silicon Macs, the iPhone). Every target, so the voice settings say the
+// same thing everywhere; elsewhere it answers "none here".
+mod voice_turn_models;
 // The voice pill (Story 64.4, AD-185): the floating window that shows a
 // turn hearing while keeper is behind another app. Desktop-only, and
 // created only when the port is a real answer — see the module doc.

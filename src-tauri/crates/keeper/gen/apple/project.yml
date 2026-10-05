@@ -35,6 +35,15 @@ targets:
       - path: assets
         buildPhase: resources
         type: folder
+      # Third-party notices (NOTICE at the repository root): ONNX Runtime's
+      # licence and ThirdPartyNotices must travel with the app that links it.
+      # `licenses` is a folder reference, so the bundle holds `licenses/…`
+      # beside `NOTICE`; `scripts/bundle-notices.test.ts` pins both lines.
+      - path: ../../../../../NOTICE
+        buildPhase: resources
+      - path: ../../../../../licenses
+        buildPhase: resources
+        type: folder
       - path: LaunchScreen.storyboard
       # The island (Story 65.5): the one file both targets compile. ActivityKit
       # matches the app's request to the extension's card by this type, so the
@@ -172,6 +181,13 @@ targets:
       # is linked by this line or not at all — without it the sheet's class is
       # missing at run time and sign-in cannot start.
       - sdk: AuthenticationServices.framework
+      # The turn models (Epic 97): ONNX Runtime is a static library inside libapp.a
+      # (`ort-sys`), built against CoreML and the C++ standard library. rustc's
+      # link directives for both never reach this link line, as for Speech above,
+      # so without these two lines `install:ios` fails to link — and CI's iOS job,
+      # a `cargo check`, cannot see it. No CoreML execution provider is used.
+      - sdk: CoreML.framework
+      - sdk: libc++.tbd
       # The widget extension that draws the Live Activity, embedded under
       # PlugIns/ (XcodeGen's `embed` defaults to true on an application target;
       # ProjectSpec.md, "Dependency"). Its shared attributes file is compiled
