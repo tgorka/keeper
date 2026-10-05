@@ -92,9 +92,11 @@
  */
 import { GripVertical, TriangleAlert } from "lucide-react";
 import { useRef, useState } from "react";
+import { BoardCardAgent } from "@/components/notes/board-card-agent";
 import { Badge } from "@/components/ui/badge";
 import { type PointerDragDelta, usePointerDrag } from "@/hooks/use-pointer-drag";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
+import type { CardAgentVm } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
@@ -165,6 +167,10 @@ export interface BoardCard {
   tags: readonly string[];
   /** keeper tracks this file by path because it has no `id:`. */
   unstableIdentity: boolean;
+  /** Who works the card and where (AD-386): a session board's card with agent
+   *  keys. A note-widget board never sets it. Drawn beside the title; the
+   *  column is still `status:` alone. */
+  agent?: CardAgentVm | null;
 }
 
 /**
@@ -331,6 +337,7 @@ export function TaskBoard({
   onOpen,
   onMove,
   moveFailed = BOARD_MOVE_FAILED,
+  onAllow,
 }: {
   /** The section's own heading, which is also its accessible name. */
   heading: string;
@@ -345,6 +352,9 @@ export function TaskBoard({
   onMove: (key: string, status: string, index: number) => Promise<void>;
   /** What to say when a refusal carries no sentence of its own. */
   moveFailed?: string;
+  /** A person's *Allow* on a card whose schedule an agent wrote, then re-read.
+   *  Absent where the host has no such verb; the mark is drawn either way. */
+  onAllow?: (key: string) => Promise<void>;
 }) {
   const [notice, setNotice] = useState<string | null>(null);
   /**
@@ -520,6 +530,13 @@ export function TaskBoard({
           >
             {card.title}
           </button>
+          {card.agent != null && (
+            <BoardCardAgent
+              agent={card.agent}
+              title={card.title}
+              onAllow={onAllow === undefined ? undefined : () => onAllow(card.key)}
+            />
+          )}
           {(card.tags.length > 1 || !card.orderIsOwn || card.unstableIdentity) && (
             <div className="flex flex-wrap items-center gap-1">
               {/* `task` itself is what put the card here — repeating it on every
@@ -592,7 +609,7 @@ export function TaskBoard({
       onPointerMove={drag.handlers.onPointerMove}
       onPointerUp={drag.handlers.onPointerUp}
       onPointerCancel={drag.handlers.onPointerCancel}
-      className="flex flex-col gap-1"
+      className="@container flex flex-col gap-1"
     >
       <h3 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
         {heading}
@@ -605,7 +622,11 @@ export function TaskBoard({
       {cards.length === 0 ? (
         <p className="text-muted-foreground text-xs">{empty}</p>
       ) : (
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        // The columns follow the board's own width, not the window's: the board
+        // sits in a pane beside the session list (and in a note), so `lg:` won
+        // on every desktop window and drew four ~84 px columns in a ~360 px box,
+        // a word per line. Two columns from 32rem, four from 48rem (~186 px each).
+        <div className="grid grid-cols-1 gap-2 @lg:grid-cols-2 @3xl:grid-cols-4">
           {BOARD_COLUMNS.map((column) => {
             const inColumn = columnOf(cards, column.status);
             return (

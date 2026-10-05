@@ -793,7 +793,8 @@ one whose user owns the drive by its `_drive.toml`, else the only one; otherwise
 <owner> to allow this schedule." A card without the mark is refused. The write is guarded on the
 card's exact bytes; a card changed meanwhile is read and allowed once more, then refused. A
 person's move of a card is guarded the same way, so it never writes back over a host's newer
-`run:`.
+`run:`. The board shows the refusal on the card; on the phone it shows the mark and no
+button, since the command is the Mac's.
 
 ## What a session costs the drive
 

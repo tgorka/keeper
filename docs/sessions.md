@@ -968,6 +968,12 @@ computed from, so a card the host changed meanwhile (its `run:`) is refused rath
 back, and moving it again reads it afresh. A key written twice, or in a form the reader does not
 model, shows as unreadable rather than missing. The keys and who writes them are in
 `docs/agents.md` (*Cards*).
+On the card, under its title: the run as a badge with its word (a value keeper cannot read
+says *run unreadable* with what the file holds), a line naming the agent, where it runs or
+why it waits, and who asked, the schedule (or *schedule unreadable*), the *outside content*
+mark, and a schedule an agent wrote ("Scheduled by … — not running until you allow it") with
+an *Allow* button on the Mac — keeper's refusal, such as whom to sign in as, is shown on the
+card. *Details* lists every agent key as the file spells it, the `host:` pin among them.
 
 **The board follows the pool, not the shape.** It used to be drawn for flat sessions
 only, and the reason was true at the time: a folder-shaped session had no pool to tag, so

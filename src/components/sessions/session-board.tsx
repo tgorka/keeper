@@ -29,7 +29,8 @@ import {
   TaskBoard,
 } from "@/components/notes/task-board";
 import type { SessionTaskVm } from "@/lib/ipc/client";
-import { sessionsTaskMove } from "@/lib/ipc/client";
+import { sessionsTaskAllowSchedule, sessionsTaskMove } from "@/lib/ipc/client";
+import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 
 /** The section's own heading. */
 export const SESSION_BOARD_HEADING = "Tasks";
@@ -80,6 +81,7 @@ function cardOf(task: SessionTaskVm): BoardCard {
     orderIsOwn: task.orderIsOwn,
     tags: task.tags,
     unstableIdentity: task.unstableIdentity,
+    agent: task.agent,
   };
 }
 
@@ -98,6 +100,10 @@ export function SessionBoard({
   /** Re-read after a write; this component keeps no order of its own. */
   onChanged: () => void;
 }) {
+  // *Allow* is a desktop command (`unsupported` on the phone), so the phone
+  // draws the mark and says where to allow it instead of offering a button
+  // that can only be refused.
+  const phone = useIsReducedCapabilityPlatform();
   return (
     <TaskBoard
       heading={SESSION_BOARD_HEADING}
@@ -111,6 +117,16 @@ export function SessionBoard({
         onChanged();
       }}
       moveFailed={SESSION_BOARD_MOVE_FAILED}
+      onAllow={
+        phone
+          ? undefined
+          : async (relPath) => {
+              // Rust picks the person who allows it (R118) and refuses with a
+              // sentence naming whom to sign in as; the board shows it.
+              await sessionsTaskAllowSchedule(rootId, sessionId, relPath);
+              onChanged();
+            }
+      }
     />
   );
 }
