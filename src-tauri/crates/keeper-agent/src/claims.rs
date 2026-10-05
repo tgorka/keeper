@@ -59,19 +59,32 @@ pub trait ClaimPort: Send + Sync {
     fn next_sync(&self) -> ClaimFuture<'_, Duration>;
 }
 
-/// The real port: one copy's client in one session room, with its sync
-/// loop's round counter.
+/// The real port: one copy's client in one room, with its sync loop's round
+/// counter. A session's claim has the state key `""`; a steward duty's
+/// creation claim, in the control room, its session's id (R165).
 pub struct RoomClaims {
     client: AgentClient,
     room: OwnedRoomId,
+    key: String,
     syncs: watch::Receiver<u64>,
 }
 
 impl RoomClaims {
     pub fn new(client: AgentClient, room: OwnedRoomId, syncs: watch::Receiver<u64>) -> RoomClaims {
+        RoomClaims::keyed(client, room, "", syncs)
+    }
+
+    /// The claim under the state key `key` of `room`.
+    pub fn keyed(
+        client: AgentClient,
+        room: OwnedRoomId,
+        key: &str,
+        syncs: watch::Receiver<u64>,
+    ) -> RoomClaims {
         RoomClaims {
             client,
             room,
+            key: key.to_owned(),
             syncs,
         }
     }
@@ -93,13 +106,19 @@ pub(crate) async fn bounded<T>(
 
 impl ClaimPort for RoomClaims {
     fn send(&self, content: Value) -> ClaimFuture<'_, Result<OwnedEventId, AgentMatrixError>> {
-        Box::pin(
-            async move { bounded(self.client.send_state(&self.room, CLAIM, "", &content)).await },
-        )
+        Box::pin(async move {
+            bounded(
+                self.client
+                    .send_state(&self.room, CLAIM, &self.key, &content),
+            )
+            .await
+        })
     }
 
     fn read(&self) -> ClaimFuture<'_, Result<Option<ServerState>, AgentMatrixError>> {
-        Box::pin(async move { bounded(self.client.server_state(&self.room, CLAIM, "")).await })
+        Box::pin(
+            async move { bounded(self.client.server_state(&self.room, CLAIM, &self.key)).await },
+        )
     }
 
     fn next_sync(&self) -> ClaimFuture<'_, Duration> {

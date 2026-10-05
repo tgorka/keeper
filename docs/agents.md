@@ -1628,6 +1628,86 @@ read back as far as that host's newest brief in the room, however many pages. A 
 like a `user` line, is a question a restart closes rather than reruns; a `delegate replied` line
 whose `peer` line a crash lost gets it back from the receipt first.
 
+## The stewards
+
+Dr Tola Grey (tgdrive) and Dr Lucyna Novak (neuradrive) are stewards: an agent of one drive whose
+tools are a specialist's plus `delegate` and nothing a person's surface needs. Neither is a master
+agent; each sorts her drive's incoming work and hands it to the agent whose work it is.
+
+**Her two sessions.** When `keeper-agentd` starts and serves a steward, it makes her two sessions
+once across every host: `triage` and `harvest`, each `kind = scheduled`, owned by her, under an id
+derived from (drive, agent, `triage` or `harvest`) as a proxy's `main` is, so every start of every
+host names the same one. The folder is looked for first. With none, the host takes the claim keyed by
+that id in the principal's control room (`dev.keeper.agent.claim`), so only one host makes it; the
+holder makes a scheduled session room — her drive's readers invited, to watch — records it under the
+same key (`dev.keeper.agent.steward.room`), writes the folder naming it with its `agent.toml` and its
+card in one plan, and hands the claim back. A released claim beside a record means the session was
+made and its folder is on its way; a host that stopped between its room and its folder leaves the
+record, and the next holder adopts that room instead of making a second. Any other room made for the
+duty is left and its invites revoked. The work runs beside the lease clock, never ahead of it: each
+duty may take 60 s before it is tried again, 5 s after the last round. A host with no control room
+makes neither session and says so once in its log, since nothing else could stop a second host making
+them again. The Mac makes neither: a steward prefers an always-on host; it serves them once they sync.
+
+**Her cards.** Each session holds one card, `triage.md` or `harvest.md`: `@daily`, `assignee` her,
+`requested_by` the drive's owner, its body her home's menu prompts — `TR` then `DS` for triage, `HV`
+for harvest (`steward-menu.toml`, seeded with her home; the prompts are her instructions, and what
+she reads from the drive while following them is data). keeper writes the card only with the folder:
+an owner's edit is kept, and a card the owner deletes stays deleted. It is the seeded configuration
+— a person's choice — so it carries no `scheduled_by` and runs on its schedule without an *Allow*,
+as § *Cards that run on a schedule* says; a card that never ran runs at once.
+
+**Triage and hand-on.** The triage turn reads the inbox and the sessions that changed with her drive
+tools, writes one card per piece of work into her triage session with `session_write` (`assignee`,
+`requested_by`, a body), and hands each card that has an assignee and no `run` on with `delegate`,
+the card's file name as its `source`. The source card goes `run: running` when it is handed on and
+`run: review` when the agent replies; handing the same card on again, on any later day, answers with
+the delegation it already has. The inbox reads `untrusted` (`_drive.toml [integrity]`), so the cards
+she writes after reading it carry `integrity: untrusted`, and the session she delegates into opens
+`untrusted`. A schedule she asks for is a person's to give: `card_update` and `delegate` refuse it,
+and a card she writes with one carries `scheduled_by` and waits for an *Allow*.
+
+**Harvest.** A session of her drive found under `archive/` — closed — is one turn in her harvest
+session: its brief is her `HV` prompt naming the closed session's drive path and id, and its `peer`
+line carries an event id made from that session id. A closed session is known by its `agent.toml` id
+or its README's id, never by its path; one whose identity cannot be read yet is read again a minute
+later. Only her harvest session's claim holder reads the archive: each step re-lists only the year
+folders that changed, reads at most 16 folders and keeps at most 4 waiting for her worker, which
+answers for each. One that failed before its turn began is handed again a minute later, one left
+unanswered for 15 minutes is handed again, and a harvest begun on any host — a pushed log line or an
+answer it left in the room — is never a second turn, after a restart, an index rebuild or a takeover.
+What was already archived when her harvest session was made is listed in its `harvest-baseline.txt`
+and is not news; anything closed after that is harvested whenever it opened. Her own triage and
+harvest sessions are never harvested. The turn carries the closed session's label — its
+`agent.toml` label joined with every `label` line of its log — and joins it before the model sees
+anything; a closed session whose readers do not reach her harvest room, or that is `local_only`
+while her model is not local, is refused and logged, and nothing is written or sent. The turn
+replies with what the drive should keep and where; it writes nothing.
+
+**Her questions.** Until a steward can ask a person (`ask_human`), her question is her `reply` to
+the agent that asked her — Nixi or Dixi — never a message to the person.
+
+**Lucyna is shared.** neuradrive's principal is `neuraffica`, so only that principal's hosts serve
+her: placement never places a session on another principal's host, and the desktop hosts only its
+signed-in login's drives. `agentd-neuraffica` never mounts tgdrive (the mount rule), and a hand-off
+from Nixi's private session to her is refused by the label, naming the readers it would add.
+
+**Proven:** `a_stewards_own_cards_are_made_once_and_kept_as_the_owner_left_them`,
+`what_closes_after_her_harvest_began_is_harvested_whenever_it_opened`,
+`an_archive_without_its_identity_yet_is_read_again_and_keyed_by_its_id`,
+`a_large_archive_is_read_in_bounded_steps_and_every_new_one_handed_once`,
+`a_stewards_session_is_made_once_across_two_hosts`,
+`a_room_made_before_a_crash_is_adopted_and_an_unnamed_one_left`,
+`a_host_with_no_control_room_makes_no_stewards_session_until_it_has_one`,
+`a_stalled_steward_bootstrap_does_not_hold_the_lease_clock` and
+`a_harvest_that_failed_before_it_began_is_handed_again` (keeper-agent);
+`triage_writes_cards_and_dispatch_hands_them_on`, `a_closed_session_wakes_its_stewards_harvest_once`,
+`a_harvest_carries_the_closed_sessions_label_and_refuses_what_it_cannot_reach` and
+`a_harvest_another_host_began_is_never_run_again_here` (`agent_turns.rs`); and against Synapse,
+`a_stewards_triage_runs_on_a_real_homeserver` (the stub model) and
+`a_stewards_triage_runs_on_a_real_model` (CLIProxyAPI) in `live_stewards.rs`.
+**Owed:** a real `@daily` triage of tgdrive on its host.
+
 ## Which host answers
 
 An agent can have a copy on several hosts — `nixi@electra` on the server, `nixi@hesperia` on the

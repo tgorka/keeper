@@ -30,6 +30,8 @@
 //!   file, and makes a proxy's DM with its `main` session.
 //! - [`surface`] names a note the person looks at by its drive.
 //! - [`delegate`] hands work to another agent and answers a delegation.
+//! - [`stewards`] makes a steward's triage and harvest sessions and says
+//!   which closed sessions wake her harvest.
 //! - [`doorbell`] rings the hosts that should fetch a push of agent work,
 //!   and fetches when it is rung.
 
@@ -59,6 +61,7 @@ pub mod rooms;
 pub mod runtime;
 pub mod seed;
 pub mod sessions;
+pub mod stewards;
 pub mod surface;
 pub mod task;
 pub mod turn;

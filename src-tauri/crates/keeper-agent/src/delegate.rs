@@ -111,7 +111,8 @@ pub fn specs(delegate: bool, reply: bool) -> Vec<ToolSpec> {
                         "required": ["title"],
                         "additionalProperties": false
                     },
-                    "session": {"type": "string", "description": "An open delegation's id, to say more in its exchange."}
+                    "session": {"type": "string", "description": "An open delegation's id, to say more in its exchange."},
+                    "source": {"type": "string", "description": "The card in this session whose work this hands on, e.g. answer-x.md: it shows the delegation's progress, and handing it on again names the delegation it went to."}
                 },
                 "required": ["agent", "brief"],
                 "additionalProperties": false
@@ -225,6 +226,8 @@ pub struct Delegator {
 pub trait TurnView: Sync {
     fn label(&self) -> Label;
     fn delegation(&self, id: &str) -> Option<Delegation>;
+    /// The delegation the card `source` of this session was handed to.
+    fn handed(&self, source: &str) -> Option<Delegation>;
     /// Whether the session's claim lets this host write now (NFR-120):
     /// asked by every file writer right before its effect (R120).
     fn may_write(&self) -> bool;
@@ -254,10 +257,22 @@ struct DelegateArgs {
     card: Option<CardArgs>,
     #[serde(default)]
     session: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
 }
 
 fn parse_args(raw: &str) -> Result<DelegateArgs, String> {
     serde_json::from_str(raw).map_err(|error| format!("delegate's arguments do not read: {error}"))
+}
+
+/// The card a delegation's `delegate` call `args` handed on: its path in
+/// the delegating session, as the call named it.
+pub fn source_of(args: Option<&str>) -> Option<String> {
+    parse_args(args?)
+        .ok()?
+        .source
+        .map(|source| source.trim().to_owned())
+        .filter(|source| !source.is_empty())
 }
 
 /// The agent `name` names (R67): `<drive>/<id>`, or a bare id only when
@@ -437,6 +452,20 @@ pub fn artifact_in(zone: &Path, session: &str, rel: &str) -> Result<(), String> 
     }
 }
 
+/// Whether `rel`, session-relative, names a file of the session at
+/// `session` — through keeper-sync's containment (AD-65), so a path or a
+/// link that leads out of it is refused.
+fn card_in(zone: &Path, session: &str, rel: &str) -> Result<(), String> {
+    let refused = || format!("{rel} is not a card in this session.");
+    let root = browse::lexical_join(zone, session).map_err(|refusal| refusal.to_string())?;
+    let here = root.canonicalize().map_err(|_| refused())?;
+    match browse::resolve(&root, rel) {
+        Ok(Some(file)) if file.starts_with(&here) && file.is_file() => Ok(()),
+        Ok(_) => Err(refused()),
+        Err(refusal) => Err(refusal.to_string()),
+    }
+}
+
 /// Set the card of the session at `session` (zone-relative) to `run`,
 /// through the host's run writer, on a transition only: whether it wrote.
 /// A session without its card writes nothing; neither does a host whose
@@ -551,6 +580,26 @@ impl<'t> DelegateTools<'t> {
         if let Some(id) = &args.session {
             return self.next_round(port.as_ref(), id, &args.brief);
         }
+        let source = args
+            .source
+            .as_deref()
+            .map(str::trim)
+            .filter(|source| !source.is_empty());
+        if let Some(source) = source {
+            // A card handed on already names its delegation, whichever day
+            // asks again: its exchange goes on there.
+            if let Some(open) = self.view.handed(source) {
+                return Some(ToolOutcome::Answered {
+                    text: format!(
+                        "{source} was handed on already, as delegation {}. To say more in that exchange, call delegate with session = {}.",
+                        open.id, open.id
+                    ),
+                });
+            }
+            if let Err(sentence) = card_in(&self.from.zone, &self.from.session, source) {
+                return refused(sentence);
+            }
+        }
         let id = Ulid::new().to_string();
         let known = port.known();
         let target = match resolve(&known, &args.agent) {
@@ -619,6 +668,17 @@ impl<'t> DelegateTools<'t> {
             reason: None,
             reply: None,
         }));
+        // The card it hands on says so, and is not handed on again.
+        if let Some(source) = source {
+            let (zone, session) = (&self.from.zone, &self.from.session);
+            if let Err(error) =
+                crate::cards::write_run(zone, session, source, Run::Running, None, &|| {
+                    self.view.may_write()
+                })
+            {
+                tracing::warn!(%session, card = source, %error, "agents: a handed-on card could not be marked");
+            }
+        }
         // The id is what a later round names: the result says it, and a
         // replay of the session says it again.
         Some(ToolOutcome::Answered {

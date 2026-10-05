@@ -24,7 +24,7 @@
 //! final `assistant` line naming the anchor its answer edited — or an `error`
 //! line when the turn could not finish.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -71,7 +71,7 @@ use keeper_core::bots::tools::{
 use keeper_core::bots::{http, Bot};
 use keeper_core::error::CoreError;
 use keeper_sync::SyncProfile;
-use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
+use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -220,6 +220,10 @@ pub struct SessionContext {
     /// A delegation's reply whose receipt is logged and whose `peer` line
     /// is not: the receipt's line, its event, and the receipt.
     reply_unpeered: Option<(Ulid, Option<OwnedEventId>, DelegateBody)>,
+    /// The harvests this session began, by arrival id: from its log's
+    /// `peer` lines, every host's, and from the anchors another copy left
+    /// in the room ([`Self::started`]). Never a second turn (R61).
+    harvested: HashSet<String>,
 }
 
 impl SessionContext {
@@ -273,6 +277,7 @@ impl SessionContext {
             accepted: false,
             run: None,
             reply_unpeered: None,
+            harvested: HashSet::new(),
         };
         for stored in &log.lines {
             match &stored.body {
@@ -385,6 +390,13 @@ impl SessionContext {
                     self.exchange_rounds += 1;
                 }
                 self.reply_unpeered = None;
+                if let Some(event) = line
+                    .matrix_event
+                    .as_ref()
+                    .filter(|event| is_harvest_event(event.as_str()))
+                {
+                    self.harvested.insert(event.to_string());
+                }
             }
             LineBody::Run(run) => self.run = Some(run.state),
             LineBody::Delegate(body) => match body.state {
@@ -446,6 +458,29 @@ impl SessionContext {
             },
             _ => {}
         }
+    }
+
+    /// The harvests among `answered` — the questions another copy of this
+    /// agent already answered in the room — count as begun.
+    pub fn started<'a>(&mut self, answered: impl Iterator<Item = &'a str>) {
+        self.harvested.extend(
+            answered
+                .filter(|event| is_harvest_event(event))
+                .map(str::to_owned),
+        );
+    }
+
+    /// Whether the harvest `event` began in this session, here or elsewhere.
+    pub fn harvest_began(&self, event: &EventId) -> bool {
+        self.harvested.contains(event.as_str())
+    }
+
+    /// The delegation this session handed its card `source` to.
+    pub fn handed(&self, source: &str) -> Option<&Delegation> {
+        let source = source.trim();
+        self.delegations
+            .values()
+            .find(|open| delegate::source_of(open.args.as_deref()).as_deref() == Some(source))
     }
 
     /// Why a brief arriving now is not a turn: this delegated session's
@@ -698,11 +733,19 @@ pub struct ServedSession {
     /// Where this session's delegations go (92.1); `None`: `delegate` is
     /// refused, a joined target is not told and a brief is not taken.
     pub delegations: Option<Arc<dyn DelegationPort>>,
+    /// Where the worker says what became of each closed session it was
+    /// handed (R61); `None`: nobody asks.
+    pub harvests: Option<HarvestAcks>,
     /// Work on this session's delegations that failed and is tried again on
     /// the host's clock while the worker runs: briefs a joined target has
     /// not been sent, child rooms whose replies could not be read back.
     retry: Retry,
 }
+
+/// What a harvest worker made of each closed session it was handed, by id:
+/// `true` once it is settled — a turn ran or began, it was one already, or
+/// it was refused — and `false` when it failed before it began.
+pub type HarvestAcks = Arc<std::sync::Mutex<Vec<(String, bool)>>>;
 
 /// What a worker tries again every [`crate::runtime::TICK`].
 #[derive(Debug, Default)]
@@ -890,6 +933,40 @@ pub fn scheduled_arrival(agent: &UserId, scheduled: &Scheduled) -> Option<Arrive
     })
 }
 
+/// A harvest arrival whose content is not a closed session.
+pub const NOT_A_HARVEST: &str = "the host sent no closed session this host reads";
+/// A harvest arrival outside the agent's harvest session, or for an agent
+/// whose menu has no `HV` prompt.
+pub const NO_HARVEST: &str = "only a steward's harvest session with an HV prompt harvests";
+/// A closed session the harvest session's label does not let in (R166).
+pub const HARVEST_REFUSED: &str = "a closed session's label keeps it out of this harvest";
+
+/// The opaque part every harvest arrival's id starts with.
+const HARVEST_EVENT: &str = "$harvest-";
+
+/// Whether `event` is a harvest arrival's id.
+fn is_harvest_event(event: &str) -> bool {
+    event.starts_with(HARVEST_EVENT)
+}
+
+/// The arrival a steward's harvest session's holder routes for `closed`
+/// (R61), in the agent's own name. Its id is the closed session's id,
+/// hex-encoded so any id is an event id's opaque part: routed again, after a
+/// restart or an index rebuild, it is the event the session logged already.
+pub fn harvest_arrival(agent: &UserId, closed: &crate::stewards::Closed) -> Option<Arrived> {
+    let key: String = closed.id.bytes().map(|b| format!("{b:02x}")).collect();
+    Some(Arrived {
+        event_id: OwnedEventId::try_from(format!("{HARVEST_EVENT}{key}:keeper.invalid")).ok()?,
+        sender: agent.to_owned(),
+        arrival: Arrival::Harvest,
+        text: String::new(),
+        content: serde_json::to_value(closed).ok()?,
+        received_at: Instant::now(),
+        replay: false,
+        via: None,
+    })
+}
+
 /// What became of an arrival.
 #[derive(Debug)]
 pub enum Outcome {
@@ -961,6 +1038,9 @@ pub enum ServeError {
     /// A reply's turn opens on its logged receipt, and there was none.
     #[error("a delegation's reply has no logged receipt to open its turn")]
     NoReceipt,
+    /// A harvest's turn opens on the closed session it carries.
+    #[error("a harvest arrival carries no closed session")]
+    NotAHarvest,
 }
 
 /// `<drive>/<path>` of each file a reply's content hands over.
@@ -1064,6 +1144,7 @@ impl ServedSession {
             conversations: None,
             surface: None,
             delegations: None,
+            harvests: None,
             retry: Retry::default(),
         })
     }
@@ -1165,11 +1246,27 @@ impl ServedSession {
                 },
             };
             let session = self.context.session.path.clone();
+            let harvest = (arrived.arrival == Arrival::Harvest).then(|| {
+                let id = arrived.content["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                (id, arrived.event_id.clone())
+            });
             busy.store(true, Ordering::Relaxed);
             let outcome = self
                 .serve(deps, Arc::clone(&port), arrived, stop.clone())
                 .await;
             busy.store(false, Ordering::Relaxed);
+            // The host hands a harvest again only when it failed before it
+            // began: one that began and then failed is the interrupted
+            // turn's, never run twice.
+            if let (Some((id, event)), Some(acks)) = (harvest, &self.harvests) {
+                let done = outcome.is_ok() || self.context.harvest_began(&event);
+                acks.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((id, done));
+            }
             match outcome {
                 Ok(Outcome::Answered(report)) => tracing::info!(
                     %session,
@@ -1246,7 +1343,52 @@ impl ServedSession {
             }
             Disposition::Delegation => self.delegation_moved(deps, port, arrived, stop).await,
             Disposition::Scheduled => self.scheduled(deps, port, arrived, stop).await,
+            Disposition::Harvest => self.harvest(deps, port, arrived, stop).await,
         }
+    }
+
+    /// A closed session of the drive wakes the steward's harvest session
+    /// (R61): one turn whose brief is her `HV` prompt naming the closed
+    /// session, opened by its label's join and a `peer` line in her own name
+    /// carrying the arrival's id — the closed session's — so it is never a
+    /// second turn, here or after another copy began it. A closed session
+    /// whose readers do not reach the harvest room's, or that may go only to
+    /// a model of its readers' while hers is not, is refused before anything
+    /// of it is logged or sent (R166).
+    async fn harvest(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        mut arrived: Arrived,
+        stop: CancelSignal,
+    ) -> Result<Outcome, ServeError> {
+        let Ok(closed) = serde_json::from_value::<crate::stewards::Closed>(arrived.content.clone())
+        else {
+            return Ok(Outcome::Ignored(NOT_A_HARVEST));
+        };
+        if !crate::stewards::is_harvest(&self.context.agent) {
+            return Ok(Outcome::Ignored(NO_HARVEST));
+        }
+        if self.context.harvest_began(&arrived.event_id) {
+            return Ok(Outcome::Duplicate);
+        }
+        if let Some(reason) = crate::stewards::refusal(
+            &closed,
+            &self.context.agent.label.readers,
+            deps.model_is_local(),
+        ) {
+            tracing::warn!(session = %self.context.session.path, closed = %closed.id, reason, "agents: a closed session is not harvested");
+            return Ok(Outcome::Ignored(HARVEST_REFUSED));
+        }
+        let Some(brief) =
+            crate::stewards::harvest_brief(&deps.home.config, &deps.sessions_subfolder, &closed)
+        else {
+            return Ok(Outcome::Ignored(NO_HARVEST));
+        };
+        arrived.text = brief;
+        self.turn(deps, port, arrived, stop)
+            .await
+            .map(Outcome::Answered)
     }
 
     /// The host's clock asked about the session's scheduled card (92.3).
@@ -1509,6 +1651,17 @@ impl ServedSession {
                         }),
                     }),
                 )?;
+                // The card it was handed on for goes to review with it.
+                if let Some(source) = delegate::source_of(open.args.as_deref()) {
+                    let lease = self.writer.lease();
+                    let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
+                    let (zone, session) = (&deps.sessions_zone, &self.context.session.path);
+                    if let Err(error) = off_the_runtime(|| {
+                        cards::write_run(zone, session, &source, Run::Review, None, &may_write)
+                    }) {
+                        tracing::warn!(%session, card = %source, %error, "agents: a handed-on card could not be set to review");
+                    }
+                }
                 self.turn(deps, port, arrived, stop)
                     .await
                     .map(Outcome::Answered)
@@ -2096,7 +2249,7 @@ impl ServedSession {
                     }),
                 )
             }
-            // The card's body, in the agent's own name: no person spoke.
+            // The card's body in the agent's own name: no person spoke.
             Arrival::Scheduled => (
                 self.context.label.clone(),
                 LabelCauseKind::AgentMessage,
@@ -2107,6 +2260,23 @@ impl ServedSession {
                     artifacts: None,
                 }),
             ),
+            // The harvest brief names a session of the drive: its label is
+            // joined before the model reads a word of it (R166).
+            Arrival::Harvest => {
+                let closed =
+                    serde_json::from_value::<crate::stewards::Closed>(arrived.content.clone())
+                        .map_err(|_| ServeError::NotAHarvest)?;
+                (
+                    self.context.label.join(&closed.label),
+                    LabelCauseKind::DriveRead,
+                    LineBody::Peer(PeerBody {
+                        sender: arrived.sender.clone(),
+                        text: arrived.text.clone(),
+                        ask: None,
+                        artifacts: None,
+                    }),
+                )
+            }
             _ => {
                 let person = deps
                     .home
@@ -2452,6 +2622,14 @@ impl TurnView for Mutex<TurnLog<'_>> {
             .context
             .delegations
             .get(id)
+            .cloned()
+    }
+
+    fn handed(&self, source: &str) -> Option<Delegation> {
+        self.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .context
+            .handed(source)
             .cloned()
     }
 }

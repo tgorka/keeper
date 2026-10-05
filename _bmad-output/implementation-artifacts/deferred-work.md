@@ -7701,3 +7701,24 @@ origin: epic 92, story 92.3 (rung `agents-92-schedule`, 2026-10-05; acceptances 
 location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`tick_schedule`), `src-tauri/crates/keeper-agentd/tests/live_claims.rs` (`a_scheduled_card_claim_race_on_a_real_homeserver`)
 reason: Two `keeper-agentd` processes over one bare drive on Synapse prove only the initial-run race: an `every 24h` card that never ran is run once, by the one claim holder, its window named in the claim and written as `last_run`. The pin's wait, the takeover's settlement (R163), the settlement of a run left running (R164), a holder that placement no longer picks, and a window judged on the card as it reads now are proved by `hosts::tests` over the claim double and the real zone, not by real processes; the desktop host runs the same `HostRuntime::tick`, but no test drives the app. Revisit when electra and hesperia run this build: the operator gives Nixi a `kind = scheduled` session with an `@hourly` card pinned to hesperia, closes hesperia's lid across two windows and checks electra writes `run: waiting` with `hesperia — a live host`, then that hesperia runs one window on waking and its `last_run` reaches electra; then kills hesperia's agentd mid-turn and checks electra settles the card `review`, "ran on hesperia, effect unknown", without running it.
 status: open
+
+### DW-470: A steward duty session whose maker stops after its folder or its release but before it pushes leaves the other hosts waiting.
+
+origin: story 92.5 review fixes (rung `agents-92-stewards`, 2026-10-05; ruling R165, STW-01/STW-02)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`make_steward`: a released claim beside a `dev.keeper.agent.steward.room` record reads as made)
+reason: The creation claim keyed by the duty's id in the control room decides one maker, and its room record lets the next winner adopt a room whose folder was never written. But once the maker has written the folder and released the claim, every other host takes "released beside a record" as made and waits for the folder to sync. If the maker stops before its commit is pushed, and stays down, no folder arrives and no host makes it again — the same residue as DW-435 for delegated sessions. Revisit when a synced folder can be asked for by id (the doorbell's commit, or a pushed marker the record names): a host that has waited past a bound for a released claim's folder takes the claim and writes the folder for the recorded room itself.
+status: open
+
+### DW-471: A steward's harvester keeps one name per archived folder, and a takeover reads the archive again.
+
+origin: story 92.5 review fixes (rung `agents-92-stewards`, 2026-10-05; STW-09)
+location: `src-tauri/crates/keeper-agent/src/stewards.rs` (`Harvester`: the folder names it has seen, the year folders' mtimes)
+reason: The harvester reads at most `READS_PER_STEP` folders a step and re-lists only year folders whose mtime changed, but it remembers every archived folder's name for the life of the claim, so its memory grows with the archive (names only, not contents). A host that takes the harvest session over starts with no memory and reads the whole archive again in bounded steps; what was already harvested is kept to one turn by the session's log (`SessionContext.harvested`), so this costs reads, not duplicate turns. Revisit if an archive reaches tens of thousands of sessions: keep a high-water mark per year folder in the harvest session (beside `harvest-baseline.txt`) so a takeover resumes instead of re-reading.
+status: open
+
+### DW-472: A real model's daily triage can spend its eight tool rounds before it writes a card.
+
+origin: story 92.5 review fixes (rung `agents-92-stewards`, 2026-10-05; STW-11, the real-model smoke)
+location: `src-tauri/crates/keeper-core/src/bots/tools.rs` (`MAX_TOOL_ROUNDS` = 8), `src-tauri/crates/keeper-core/src/agents/seed/zone/steward-menu.toml` (the `TR`/`DS` prompts)
+reason: `a_stewards_triage_runs_on_a_real_model` (claude-haiku-4-5 through CLIProxyAPI) passed 1 of 3 runs: in a failing run the model listed and read the inbox, then also browsed its own sessions and `80-agents/`, reached the round budget, and its `session_write` calls were refused. The stub-model smoke passes every time; the protocol holds (nothing ran that should not). A turn that ends by round exhaustion gets no continuation outside workflow sessions (epic 94's R106 continues only `kind = workflow`). Close by extending R106's bounded continuation to `kind = scheduled` steward sessions in epic 94, or by a per-kind round budget, and by narrowing the `TR` prompt to the inbox; re-run the real-model smoke until it passes repeatedly.
+status: open

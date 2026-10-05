@@ -33,6 +33,7 @@ use keeper_core::agents::claim::{self, Claimant, ServerClaim, RENEW_EVERY};
 use keeper_core::agents::delegation::{session_title, DelegateContent};
 use keeper_core::agents::events::{
     RunState, StatusContent, CLAIM, CONTENT_VERSION, CONTROL_ROOM_TYPE, DOORBELL, HOST, STATUS,
+    STEWARD_ROOM,
 };
 use keeper_core::agents::home::AgentConfig;
 use keeper_core::agents::host::{accept, bot_id, HostDrive, HostManifest, Materialized};
@@ -58,6 +59,7 @@ use crate::doorbell::{RingDrive, Round};
 use crate::matrix_sink::{EditPort, RoomPort};
 use crate::runtime::{self, spawn_worker, Claimed, Copy, DriveView, PENDING_ROOMS};
 
+use crate::stewards::{self, Closed, Duty, Harvester};
 use crate::zone::FoundSession;
 
 /// The time a card's schedule is read at, epoch ms, and the machine's UTC
@@ -235,6 +237,9 @@ pub(crate) trait CopyPort: Send + Sync {
     ) -> ClaimFuture<'a, Result<Option<ServerState>, AgentMatrixError>>;
     /// The claim of the session room `room`.
     fn claims<'a>(&'a self, room: &'a OwnedRoomId) -> Box<dyn ClaimPort + 'a>;
+    /// The claim under the state key `key` of `room`: a steward duty's
+    /// creation claim in the control room (R165).
+    fn keyed_claims<'a>(&'a self, room: &'a OwnedRoomId, key: &'a str) -> Box<dyn ClaimPort + 'a>;
     /// Send a session status into `room`.
     fn send_status<'a>(
         &'a self,
@@ -282,6 +287,26 @@ pub(crate) trait CopyPort: Send + Sync {
     fn doorbells(&self) -> ClaimFuture<'_, Vec<(OwnedUserId, String, Value)>>;
     /// Hand `scheduled` to `room`'s worker as a scheduled arrival.
     fn route_scheduled(&self, room: &RoomId, scheduled: Scheduled);
+    /// Hand `closed` to `room`'s worker, a steward's harvest session (R61).
+    fn route_harvest(&self, room: &RoomId, closed: Closed);
+    /// What this copy's harvest worker made of the closed sessions it was
+    /// handed since the last call, by id: `true` once it is settled.
+    fn harvest_acks(&self) -> Vec<(String, bool)>;
+    /// Whether this copy's sessions zone holds its steward's `duty` session.
+    fn steward_found(&self, duty: Duty) -> ClaimFuture<'_, Result<bool, String>>;
+    /// A new room for its steward's `duty` session, the drive's readers
+    /// invited to watch.
+    fn steward_room(&self, duty: Duty) -> ClaimFuture<'_, Result<OwnedRoomId, String>>;
+    /// Its steward's `duty` session folder, naming `room`, with its files:
+    /// whether this call made it.
+    fn steward_folder<'a>(
+        &'a self,
+        duty: Duty,
+        room: &'a RoomId,
+    ) -> ClaimFuture<'a, Result<bool, String>>;
+    /// Leave every room this copy is in that was made for its steward's
+    /// `duty` session, but `keep`, revoking the drive's readers' invites.
+    fn steward_orphans<'a>(&'a self, duty: Duty, keep: Option<&'a RoomId>) -> ClaimFuture<'a, ()>;
 }
 
 impl CopyPort for Copy {
@@ -358,6 +383,15 @@ impl CopyPort for Copy {
         Box::new(RoomClaims::new(
             self.client.clone(),
             room.clone(),
+            self.syncs.clone(),
+        ))
+    }
+
+    fn keyed_claims<'a>(&'a self, room: &'a OwnedRoomId, key: &'a str) -> Box<dyn ClaimPort + 'a> {
+        Box::new(RoomClaims::keyed(
+            self.client.clone(),
+            room.clone(),
+            key,
             self.syncs.clone(),
         ))
     }
@@ -478,6 +512,95 @@ impl CopyPort for Copy {
         })
     }
 
+    fn route_harvest(&self, room: &RoomId, closed: Closed) {
+        match crate::agent::harvest_arrival(&self.deps.home.config.matrix_user, &closed) {
+            Some(arrived) => self.router.route(room, arrived),
+            None => {
+                tracing::warn!(%room, session = %closed.id, "agents: a closed session's id makes no harvest arrival");
+                self.harvest_acks
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((closed.id, false));
+            }
+        }
+    }
+
+    fn harvest_acks(&self) -> Vec<(String, bool)> {
+        std::mem::take(&mut *self.harvest_acks.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn steward_found(&self, duty: Duty) -> ClaimFuture<'_, Result<bool, String>> {
+        Box::pin(async move {
+            let zone = self.deps.sessions_zone.clone();
+            let id = stewards::session_id(self.config(), duty).to_string();
+            tokio::task::spawn_blocking(move || {
+                zone.is_dir() && crate::sessions::verbs::find(&zone, &id).is_some()
+            })
+            .await
+            .map_err(|error| error.to_string())
+        })
+    }
+
+    fn steward_room(&self, duty: Duty) -> ClaimFuture<'_, Result<OwnedRoomId, String>> {
+        Box::pin(async move {
+            let config = self.config();
+            let readers = self.deps.home.drive.readers.iter().cloned().collect();
+            bounded(self.client.create_room(
+                keeper_core::agents::matrix::RoomKind::Session(SessionKind::Scheduled),
+                &stewards::room_name(config, duty),
+                readers,
+                &[],
+            ))
+            .await
+            .map_err(|error| error.to_string())
+        })
+    }
+
+    fn steward_folder<'a>(
+        &'a self,
+        duty: Duty,
+        room: &'a RoomId,
+    ) -> ClaimFuture<'a, Result<bool, String>> {
+        Box::pin(async move {
+            let (config, decl) = (self.config().clone(), self.deps.home.drive.clone());
+            let (zone, room) = (self.deps.sessions_zone.clone(), room.to_owned());
+            tokio::task::spawn_blocking(move || {
+                let now = chrono::Local::now();
+                let files = stewards::folder_files(&config, &decl, duty, &zone)?;
+                let agent = stewards::session(&config, &decl, duty, &room, now);
+                crate::seed::make_folder(&zone, &agent, files, false, now)
+                    .map(|settled| settled.folder_made)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|made| made)
+        })
+    }
+
+    fn steward_orphans<'a>(&'a self, duty: Duty, keep: Option<&'a RoomId>) -> ClaimFuture<'a, ()> {
+        Box::pin(async move {
+            let name = stewards::room_name(self.config(), duty);
+            let invited: Vec<OwnedUserId> = self.deps.home.drive.readers.iter().cloned().collect();
+            let orphans: Vec<OwnedRoomId> = self
+                .client
+                .client()
+                .joined_rooms()
+                .into_iter()
+                .filter(|room| {
+                    room.room_type().map(|kind| kind.to_string()).as_deref()
+                        == Some(keeper_core::agents::events::SESSION_ROOM_TYPE)
+                        && room.name().as_deref() == Some(name.as_str())
+                        && keep != Some(room.room_id())
+                })
+                .map(|room| room.room_id().to_owned())
+                .collect();
+            for orphan in orphans {
+                tracing::info!(room = %orphan, duty = duty.name(), "agents: a steward's room no folder will name is left");
+                crate::seed::discard(&self.client, &orphan, &invited).await;
+            }
+        })
+    }
+
     fn route_scheduled(&self, room: &RoomId, scheduled: Scheduled) {
         match crate::agent::scheduled_arrival(&self.deps.home.config.matrix_user, &scheduled) {
             Some(arrived) => self.router.route(room, arrived),
@@ -508,11 +631,10 @@ pub fn create_delegated(
     use keeper_core::agents::delegation::{child_card, child_session, CARD_FILE};
     let agent = child_session(brief, &config.id, &config.drive, room, at)
         .ok_or_else(|| "the brief's id is not a ULID".to_owned())?;
-    crate::sessions::verbs::create_delegated_session(
+    crate::sessions::verbs::create_carded_session(
         zone,
         &agent,
-        CARD_FILE,
-        child_card(brief, &config.id),
+        vec![(CARD_FILE.to_owned(), child_card(brief, &config.id))],
         at.with_timezone(&chrono::Local),
     )
     .map(|_| ())
@@ -579,14 +701,120 @@ pub struct HostRuntime {
     principal_agents: Vec<OwnedUserId>,
     copies: Vec<Arc<dyn CopyPort>>,
     slots: HashMap<OwnedRoomId, Slot>,
-    clock: ServerClock,
-    rtt: Rtt,
+    clock: Arc<ServerClock>,
+    rtt: Arc<Rtt>,
     manifest_sent: Option<Instant>,
     /// When this host's manifest first reached the control room.
     first_published: Option<Instant>,
     /// What each pending delegation's room was last told it waits for.
     pending_shown: HashMap<OwnedRoomId, String>,
     calendar: Calendar,
+    /// Each held harvest session's view of the archive (R61).
+    harvesters: HashMap<OwnedRoomId, Harvester>,
+    stewards: Stewarding,
+}
+
+/// The steward duty sessions this host still has to see made (R66, R165),
+/// and the one bootstrap task working on them beside the lease clock.
+#[derive(Default)]
+struct Stewarding {
+    due: Vec<(Arc<dyn CopyPort>, Duty)>,
+    task: Option<(JoinHandle<()>, tokio::sync::oneshot::Receiver<StewardsLeft>)>,
+    next: Option<Instant>,
+    /// The missing control room was said.
+    no_control_said: bool,
+}
+
+/// The duties a bootstrap task did not see made.
+type StewardsLeft = Vec<(Arc<dyn CopyPort>, Duty)>;
+
+/// How long one steward duty's bootstrap may take before it is given up
+/// for this round.
+pub(crate) const STEWARD_DEADLINE: Duration = Duration::from_secs(60);
+/// How long after one bootstrap round the next starts.
+pub(crate) const STEWARD_AGAIN: Duration = Duration::from_secs(5);
+
+/// Make `copy`'s steward's `duty` session once across every host (R165):
+/// `true` once its folder is in this checkout. The claim keyed by the
+/// session's id in the control room decides who makes it, and its holder
+/// names the room it made in the room record ([`STEWARD_ROOM`], same key)
+/// before it writes the folder. A released claim beside a record means the
+/// session was made, and its folder is on its way. A winner adopts the room
+/// a record names — a maker that stopped between the room and the folder —
+/// or makes one; once the folder is written, the claim is handed back. Any
+/// other room made for the duty is left, its invites revoked.
+async fn make_steward(
+    copy: &dyn CopyPort,
+    control: &OwnedRoomId,
+    host: &HostSlug,
+    clock: &ServerClock,
+    rtt: &Rtt,
+    duty: Duty,
+) -> Result<bool, String> {
+    if copy.steward_found(duty).await? {
+        return Ok(true);
+    }
+    let key = stewards::session_id(copy.config(), duty).to_string();
+    let me = claimant(host, copy);
+    let port = copy.keyed_claims(control, &key);
+    let recorded = || async {
+        bounded(copy.server_state(control, STEWARD_ROOM, &key))
+            .await
+            .map(|state| {
+                state.and_then(|state| {
+                    state.content["room"]
+                        .as_str()
+                        .and_then(|room| OwnedRoomId::try_from(room).ok())
+                })
+            })
+            .map_err(|error| error.to_string())
+    };
+    let released = bounded(port.read())
+        .await
+        .map_err(|error| error.to_string())?
+        .as_ref()
+        .and_then(|state| ServerClaim::read(state).ok())
+        .is_some_and(|claim| claim.content.released);
+    if released {
+        if let Some(room) = recorded().await? {
+            copy.steward_orphans(duty, Some(&room)).await;
+            return Ok(false);
+        }
+    }
+    let lease = match acquire(port.as_ref(), &me, clock, rtt, None)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        Acquired::Won { lease, .. } => lease,
+        Acquired::HeldElsewhere | Acquired::Yielded => return Ok(false),
+    };
+    let adopted = recorded().await?;
+    copy.steward_orphans(duty, adopted.as_deref()).await;
+    let room = match adopted {
+        Some(room) => room,
+        None => {
+            // A room made and never recorded is left by the next winner.
+            let room = copy.steward_room(duty).await?;
+            if !renew(port.as_ref(), &me, &lease, clock, rtt)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return Err("the creation claim was lost before the room was recorded".to_owned());
+            }
+            let record = json!({ "v": CONTENT_VERSION, "room": room });
+            bounded(copy.send_state(control, STEWARD_ROOM, &key, &record))
+                .await
+                .map_err(|error| error.to_string())?;
+            room
+        }
+    };
+    // A folder that could not be written leaves the claim to lapse beside
+    // the record: the next winner adopts the room.
+    copy.steward_folder(duty, &room).await?;
+    if let Err(error) = release(port.as_ref(), &me, &lease, clock, rtt).await {
+        tracing::warn!(%room, %error, "agents: a steward's creation claim could not be handed back");
+    }
+    Ok(true)
 }
 
 impl HostRuntime {
@@ -627,12 +855,14 @@ impl HostRuntime {
                 .map(|copy| copy as Arc<dyn CopyPort>)
                 .collect(),
             slots: HashMap::new(),
-            clock: ServerClock::default(),
-            rtt: Rtt::default(),
+            clock: Arc::default(),
+            rtt: Arc::default(),
             manifest_sent: None,
             first_published: None,
             pending_shown: HashMap::new(),
             calendar: server_calendar(),
+            harvesters: HashMap::new(),
+            stewards: Stewarding::default(),
         }
     }
 
@@ -667,12 +897,14 @@ impl HostRuntime {
                 .map(|copy| copy as Arc<dyn CopyPort>)
                 .collect(),
             slots: HashMap::new(),
-            clock: ServerClock::default(),
-            rtt: Rtt::default(),
+            clock: Arc::default(),
+            rtt: Arc::default(),
             manifest_sent: None,
             first_published: None,
             pending_shown: HashMap::new(),
             calendar: server_calendar(),
+            harvesters: HashMap::new(),
+            stewards: Stewarding::default(),
         }
     }
 
@@ -800,6 +1032,7 @@ impl HostRuntime {
 
     /// One tick: the manifest, then every session this host can see.
     pub async fn tick(&mut self, stop: &CancelSignal) {
+        self.tick_stewards();
         self.join_control_room().await;
         if self
             .manifest_sent
@@ -821,8 +1054,139 @@ impl HostRuntime {
         for room in rooms {
             self.tick_session(&room, &hosts, stop).await;
         }
+        self.tick_harvest().await;
         self.recover_briefs().await;
         self.tick_pending(&hosts).await;
+    }
+
+    /// Make `copies`' steward duty sessions from now on (R66): only the
+    /// duties whose card her menu can make are tried; the rest are said once.
+    pub(crate) fn make_stewards(&mut self, copies: Vec<Arc<dyn CopyPort>>) {
+        for copy in copies {
+            for duty in Duty::ALL {
+                let config = copy.config();
+                match stewards::prompts(config, duty) {
+                    Ok(_) => self.stewards.due.push((Arc::clone(&copy), duty)),
+                    Err(sentence) => {
+                        tracing::warn!(agent = %config.id, %sentence, "agents: a steward's session is not made")
+                    }
+                }
+            }
+        }
+    }
+
+    /// The steward bootstrap (R66, R165), beside the lease clock and never
+    /// ahead of it: a finished round's leftovers are taken, and a
+    /// new round starts as one task, each duty bounded by
+    /// [`STEWARD_DEADLINE`], [`STEWARD_AGAIN`] after the last.
+    fn tick_stewards(&mut self) {
+        let now = Instant::now();
+        if let Some((_, done)) = &mut self.stewards.task {
+            match done.try_recv() {
+                Ok(left) => self.stewards.due = left,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+            }
+            self.stewards.task = None;
+            self.stewards.next = Some(now + STEWARD_AGAIN);
+        }
+        if self.stewards.due.is_empty() || self.stewards.next.is_some_and(|at| now < at) {
+            return;
+        }
+        let Some(control) = self.control_room.clone() else {
+            // Without the room, no host can claim a duty, and a session made
+            // anyway would be made again on every other host.
+            if !self.stewards.no_control_said {
+                self.stewards.no_control_said = true;
+                tracing::warn!("agents: this host has no control room, so no steward's triage or harvest session is made here until it has one");
+            }
+            return;
+        };
+        let (host, clock, rtt) = (
+            self.host.clone(),
+            Arc::clone(&self.clock),
+            Arc::clone(&self.rtt),
+        );
+        let due = self.stewards.due.clone();
+        let (tell, told) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut left = Vec::new();
+            for (copy, duty) in due {
+                let agent = copy.config().id.clone();
+                let made = tokio::time::timeout(
+                    STEWARD_DEADLINE,
+                    make_steward(copy.as_ref(), &control, &host, &clock, &rtt, duty),
+                )
+                .await;
+                match made {
+                    Ok(Ok(true)) => {
+                        tracing::info!(%agent, duty = duty.name(), "agents: a steward's session is in this checkout");
+                        continue;
+                    }
+                    Ok(Ok(false)) => {}
+                    Ok(Err(sentence)) => {
+                        tracing::warn!(%agent, duty = duty.name(), %sentence, "agents: a steward's session could not be made; trying again")
+                    }
+                    Err(_) => {
+                        tracing::warn!(%agent, duty = duty.name(), "agents: a steward's session was not made in time; trying again")
+                    }
+                }
+                left.push((copy, duty));
+            }
+            let _ = tell.send(left);
+        });
+        self.stewards.task = Some((task, told));
+    }
+
+    /// Each held harvest session's worker is handed the closed sessions its
+    /// [`Harvester`]'s bounded step found (R61), and what the worker said of
+    /// the ones it was handed is taken first. A session handed back drops
+    /// its harvester; the next holder starts from the archive again.
+    async fn tick_harvest(&mut self) {
+        let slots = &self.slots;
+        self.harvesters.retain(|room, _| {
+            slots
+                .get(room)
+                .is_some_and(|slot| slot.claim.is_some() && slot.draining.is_none())
+        });
+        let held: Vec<OwnedRoomId> = self
+            .slots
+            .iter()
+            .filter(|(_, slot)| {
+                slot.claim.is_some() && slot.draining.is_none() && stewards::is_harvest(&slot.agent)
+            })
+            .map(|(room, _)| room.clone())
+            .collect();
+        for room in held {
+            let Some(slot) = self.slots.get(&room) else {
+                continue;
+            };
+            let (copy, session, agent) = (
+                Arc::clone(&slot.copy),
+                slot.session.clone(),
+                slot.agent.clone(),
+            );
+            let mut harvester = self.harvesters.remove(&room).unwrap_or_default();
+            let now = Instant::now();
+            for (id, done) in copy.harvest_acks() {
+                harvester.acknowledged(&id, done, now);
+            }
+            let Some(zone) = zone_of(&session) else {
+                continue;
+            };
+            let stepped = tokio::task::spawn_blocking(move || {
+                let handed = harvester.step(&zone, &session.path, &agent, now);
+                (harvester, handed)
+            })
+            .await;
+            let Ok((harvester, handed)) = stepped else {
+                continue;
+            };
+            for closed in handed {
+                copy.route_harvest(&room, closed);
+            }
+            self.harvesters.insert(room, harvester);
+        }
     }
 
     /// Each copy, once it has synced, reads back the delegated rooms it
@@ -1672,6 +2036,11 @@ impl HostRuntime {
     /// withdrawn and every claim written `released: true` (AD-378), a claim
     /// handed back and not yet released among them.
     pub async fn release_all(&mut self) {
+        // A steward's room or folder half made stays named by its claim,
+        // which the next start's winner adopts.
+        if let Some((task, _)) = self.stewards.task.take() {
+            task.abort();
+        }
         // The manifest first: a taker that sees a released claim must not
         // still place the session on this host.
         if !matches!(
@@ -1736,6 +2105,17 @@ fn principal_agents<'a>(
     agents.sort();
     agents.dedup();
     agents
+}
+
+/// The sessions zone `session` was found in: its folder less its
+/// zone-relative path.
+fn zone_of(session: &FoundSession) -> Option<PathBuf> {
+    let depth = std::path::Path::new(&session.path).components().count();
+    session
+        .dir
+        .ancestors()
+        .nth(depth)
+        .map(std::path::Path::to_path_buf)
 }
 
 /// Who `copy` claims as on `host`.
@@ -2159,6 +2539,10 @@ mod tests {
         stall_doorbells: AtomicBool,
         /// A claim send fails.
         fail_claims: AtomicBool,
+        /// Every room the steward's user made for a duty, as every copy of
+        /// her sees it, and the ones a copy left.
+        steward_rooms: Mutex<Vec<OwnedRoomId>>,
+        left: Mutex<Vec<OwnedRoomId>>,
     }
 
     impl Server {
@@ -2220,6 +2604,7 @@ mod tests {
     struct FakeClaims<'a> {
         server: &'a Server,
         room: OwnedRoomId,
+        key: String,
         sender: OwnedUserId,
     }
 
@@ -2231,12 +2616,12 @@ mod tests {
                 }
                 Ok(self
                     .server
-                    .put(&self.room, CLAIM, "", &self.sender, content))
+                    .put(&self.room, CLAIM, &self.key, &self.sender, content))
             })
         }
 
         fn read(&self) -> ClaimFuture<'_, Result<Option<ServerState>, AgentMatrixError>> {
-            Box::pin(async move { Ok(self.server.get(&self.room, CLAIM, "")) })
+            Box::pin(async move { Ok(self.server.get(&self.room, CLAIM, &self.key)) })
         }
 
         fn next_sync(&self) -> ClaimFuture<'_, Duration> {
@@ -2288,6 +2673,15 @@ mod tests {
         /// A turn that begins never ends: the host dies in it, its card
         /// left `run: running`.
         turns_die: AtomicBool,
+        /// Each closed session handed to a harvest session's worker.
+        harvests: Mutex<Vec<(OwnedRoomId, String)>>,
+        /// What the harvest worker said, as [`Copy`]'s acks hold it.
+        acks: Mutex<Vec<(String, bool)>>,
+        /// A steward room's creation never answers.
+        stall_steward_rooms: bool,
+        /// A steward folder cannot be written: the host stops between its
+        /// room and its folder.
+        fail_steward_folders: bool,
     }
 
     impl CopyPort for FakeCopy {
@@ -2368,9 +2762,18 @@ mod tests {
         }
 
         fn claims<'a>(&'a self, room: &'a OwnedRoomId) -> Box<dyn ClaimPort + 'a> {
+            self.keyed_claims(room, "")
+        }
+
+        fn keyed_claims<'a>(
+            &'a self,
+            room: &'a OwnedRoomId,
+            key: &'a str,
+        ) -> Box<dyn ClaimPort + 'a> {
             Box::new(FakeClaims {
                 server: &self.server,
                 room: room.clone(),
+                key: key.to_owned(),
                 sender: self.config.matrix_user.clone(),
             })
         }
@@ -2569,6 +2972,80 @@ mod tests {
             };
             self.routed.lock().expect("lock").push((scheduled, begun));
         }
+
+        fn route_harvest(&self, room: &RoomId, closed: Closed) {
+            self.harvests
+                .lock()
+                .expect("lock")
+                .push((room.to_owned(), closed.id));
+        }
+
+        fn harvest_acks(&self) -> Vec<(String, bool)> {
+            std::mem::take(&mut *self.acks.lock().expect("lock"))
+        }
+
+        fn steward_found(&self, duty: Duty) -> ClaimFuture<'_, Result<bool, String>> {
+            Box::pin(async move {
+                let id = stewards::session_id(&self.config, duty).to_string();
+                Ok(self
+                    .zone
+                    .as_ref()
+                    .is_some_and(|zone| crate::sessions::verbs::find(zone, &id).is_some()))
+            })
+        }
+
+        fn steward_room(&self, _duty: Duty) -> ClaimFuture<'_, Result<OwnedRoomId, String>> {
+            Box::pin(async move {
+                if self.stall_steward_rooms {
+                    std::future::pending::<()>().await;
+                }
+                let mut rooms = self.server.steward_rooms.lock().expect("lock");
+                let room = OwnedRoomId::try_from(format!("!duty{}:example.org", rooms.len()))
+                    .expect("room");
+                rooms.push(room.clone());
+                Ok(room)
+            })
+        }
+
+        fn steward_folder<'a>(
+            &'a self,
+            duty: Duty,
+            room: &'a RoomId,
+        ) -> ClaimFuture<'a, Result<bool, String>> {
+            Box::pin(async move {
+                if self.fail_steward_folders {
+                    return Err("the disk is full".to_owned());
+                }
+                let zone = self.zone.as_ref().ok_or("no zone")?;
+                let decl = keeper_core::agents::drive::parse(&drive_toml()).expect("decl");
+                let now = chrono::Local::now();
+                let agent = stewards::session(&self.config, &decl, duty, room, now);
+                crate::seed::make_folder(
+                    zone,
+                    &agent,
+                    vec![(duty.card_file(), "card\n".to_owned())],
+                    false,
+                    now,
+                )
+                .map(|settled| settled.folder_made)
+            })
+        }
+
+        fn steward_orphans<'a>(
+            &'a self,
+            _duty: Duty,
+            keep: Option<&'a RoomId>,
+        ) -> ClaimFuture<'a, ()> {
+            Box::pin(async move {
+                let made = self.server.steward_rooms.lock().expect("lock").clone();
+                let mut left = self.server.left.lock().expect("lock");
+                for room in made {
+                    if keep != Some(room.as_ref()) && !left.contains(&room) {
+                        left.push(room);
+                    }
+                }
+            })
+        }
     }
 
     struct World {
@@ -2610,12 +3087,14 @@ mod tests {
             principal_agents: vec![copy.config.matrix_user.clone()],
             copies: vec![Arc::clone(&copy) as Arc<dyn CopyPort>],
             slots: HashMap::new(),
-            clock: ServerClock::default(),
-            rtt: Rtt::default(),
+            clock: Arc::default(),
+            rtt: Arc::default(),
             manifest_sent: None,
             first_published: None,
             pending_shown: HashMap::new(),
             calendar: server_calendar(),
+            harvesters: HashMap::new(),
+            stewards: Stewarding::default(),
         };
         let (cancel, stop) = cancellation();
         let now = Arc::new(std::sync::atomic::AtomicI64::new(wall_ms() as i64));
@@ -2746,6 +3225,290 @@ mod tests {
         assert!(w.held_by_me(&b));
     }
 
+    impl World {
+        /// The rescan finds Nixi's harvest session serving `room`, its
+        /// folder in the zone `zone` with an empty baseline.
+        fn offer_harvest(&mut self, room: &OwnedRoomId, zone: &Path) {
+            self.copy.joined.lock().expect("lock").insert(room.clone());
+            let decl = keeper_core::agents::drive::parse(&drive_toml()).expect("decl");
+            let agent = stewards::session(
+                &self.copy.config,
+                &decl,
+                Duty::Harvest,
+                room,
+                chrono::Local::now(),
+            );
+            let path = "active/2026-10-05-harvest".to_owned();
+            let dir = zone.join(&path);
+            std::fs::create_dir_all(&dir).expect("dir");
+            std::fs::write(dir.join(stewards::BASELINE), "\n").expect("baseline");
+            let session = FoundSession {
+                path,
+                dir,
+                agent: Ok(agent.clone()),
+                scheduled: cards::ScheduledScan::default(),
+            };
+            self.rt.offer(&self.copy, &session, &agent);
+        }
+
+        fn handed(&self) -> Vec<String> {
+            self.copy
+                .harvests
+                .lock()
+                .expect("lock")
+                .iter()
+                .map(|(_, id)| id.clone())
+                .collect()
+        }
+    }
+
+    /// A person's session `id`, archived in `zone`.
+    fn archived(zone: &Path, id: &str) {
+        let dir = zone.join(format!("archive/2026/2026-10-06-{id}"));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("README.md"),
+            format!("---\nid: {id}\n---\n\n# {id}\n"),
+        )
+        .expect("record");
+    }
+
+    /// R61 with acknowledgement: a closed session is handed to the held
+    /// harvest session's worker once; when the worker says it failed before
+    /// its turn began (an index or log error) it is handed again after
+    /// [`stewards::RETRY`], while the same worker and claim stay; once it
+    /// says the harvest is settled it is never handed again.
+    #[tokio::test(start_paused = true)]
+    async fn a_harvest_that_failed_before_it_began_is_handed_again() {
+        let zone = tempfile::tempdir().expect("zone");
+        let mut w = world(Duration::ZERO, true);
+        let mine = room(1);
+        w.offer_harvest(&mine, zone.path());
+        archived(zone.path(), "taxes");
+        w.tick().await;
+        assert!(w.held_by_me(&mine));
+        w.tick().await;
+        assert_eq!(w.handed(), ["taxes"]);
+
+        w.copy
+            .acks
+            .lock()
+            .expect("lock")
+            .push(("taxes".to_owned(), false));
+        w.tick().await;
+        assert_eq!(w.handed(), ["taxes"], "not before the retry");
+        tokio::time::advance(stewards::RETRY).await;
+        w.tick().await;
+        assert_eq!(w.handed(), ["taxes", "taxes"]);
+
+        w.copy
+            .acks
+            .lock()
+            .expect("lock")
+            .push(("taxes".to_owned(), true));
+        for _ in 0..3 {
+            tokio::time::advance(stewards::RETRY).await;
+            w.tick().await;
+        }
+        assert_eq!(w.handed(), ["taxes", "taxes"]);
+    }
+
+    /// Two hosts of the steward, each with its own checkout, `fake` making
+    /// what each copy does.
+    fn steward_hosts(
+        server: &Arc<Server>,
+        zones: [&Path; 2],
+        fake: impl Fn(FakeCopy) -> FakeCopy,
+    ) -> [World; 2] {
+        zones.map(|zone| {
+            let copy = Arc::new(fake(FakeCopy {
+                server: Arc::clone(server),
+                zone: Some(zone.to_owned()),
+                ..fake_copy()
+            }));
+            let mut w = world_over(Arc::clone(&copy), true);
+            w.rt.stewards
+                .due
+                .push((copy as Arc<dyn CopyPort>, Duty::Triage));
+            w
+        })
+    }
+
+    /// The creation claim of Nixi's triage session, in the control room,
+    /// and the room its record names.
+    fn duty_claim(server: &Server) -> Option<(ServerClaim, Option<String>)> {
+        let key = stewards::session_id(&config(), Duty::Triage).to_string();
+        let record = server
+            .get(&control(), STEWARD_ROOM, &key)
+            .and_then(|state| state.content["room"].as_str().map(str::to_owned));
+        server
+            .get(&control(), CLAIM, &key)
+            .map(|state| (ServerClaim::read(&state).expect("claim"), record))
+    }
+
+    /// Ticks both hosts at once, `rounds` bootstrap rounds.
+    async fn tick_both(hosts: &mut [World; 2], rounds: usize) {
+        for _ in 0..rounds {
+            let [a, b] = hosts;
+            tokio::join!(a.tick(), b.tick());
+            tokio::time::advance(STEWARD_AGAIN).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// R165: two hosts of a steward, each with its own checkout and
+    /// neither seeing the other's folder, start together. The claim keyed
+    /// by her triage session's id in the control room lets one make the
+    /// room and the folder; the other makes nothing, however often it
+    /// tries — one room, one folder, the claim handed back, the room named.
+    #[tokio::test(start_paused = true)]
+    async fn a_stewards_session_is_made_once_across_two_hosts() {
+        let server = Arc::new(Server::default());
+        let (here, there) = (
+            tempfile::tempdir().expect("zone"),
+            tempfile::tempdir().expect("zone"),
+        );
+        let mut hosts = steward_hosts(&server, [here.path(), there.path()], |copy| copy);
+        hosts[1].rt.host = HostSlug::new(OTHER).expect("slug");
+        tick_both(&mut hosts, 4).await;
+
+        let rooms = server.steward_rooms.lock().expect("lock").clone();
+        assert_eq!(rooms.len(), 1, "{rooms:?}");
+        let made = [here.path(), there.path()]
+            .iter()
+            .filter(|zone| !folders(zone).is_empty())
+            .count();
+        assert_eq!(made, 1);
+        let (claim, record) = duty_claim(&server).expect("the creation claim");
+        assert!(claim.content.released);
+        assert_eq!(record.as_deref(), Some(rooms[0].as_str()));
+        assert!(server.left.lock().expect("lock").is_empty());
+    }
+
+    /// R165: a host with no control room has nowhere to claim a duty, so it
+    /// makes no room and no folder however long it runs, and keeps the duty
+    /// due; once it has the room, the session is made.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_with_no_control_room_makes_no_stewards_session_until_it_has_one() {
+        let server = Arc::new(Server::default());
+        let zone = tempfile::tempdir().expect("zone");
+        let [mut w, _] = steward_hosts(&server, [zone.path(), zone.path()], |copy| copy);
+        w.rt.control_room = None;
+        for _ in 0..4 {
+            w.tick().await;
+            tokio::time::advance(STEWARD_AGAIN).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(server.steward_rooms.lock().expect("lock").is_empty());
+        assert!(folders(zone.path()).is_empty());
+        assert_eq!(w.rt.stewards.due.len(), 1, "still due");
+
+        w.rt.set_control_room(control());
+        for _ in 0..4 {
+            w.tick().await;
+            tokio::time::advance(STEWARD_AGAIN).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(server.steward_rooms.lock().expect("lock").len(), 1);
+        assert_eq!(folders(zone.path()).len(), 1);
+    }
+
+    /// R165, a crash: electra made the room, recorded it and stopped
+    /// before the folder; an earlier attempt's room was never recorded.
+    /// Once electra's claim lapsed, hesperia adopts the recorded room — its
+    /// folder names it — leaves the other, and makes no third.
+    #[tokio::test(start_paused = true)]
+    async fn a_room_made_before_a_crash_is_adopted_and_an_unnamed_one_left() {
+        let server = Arc::new(Server::default());
+        let zone = tempfile::tempdir().expect("zone");
+        let (named, unnamed) = (
+            OwnedRoomId::try_from("!named:example.org").expect("room"),
+            OwnedRoomId::try_from("!unnamed:example.org").expect("room"),
+        );
+        server
+            .steward_rooms
+            .lock()
+            .expect("lock")
+            .extend([unnamed.clone(), named.clone()]);
+        let key = stewards::session_id(&config(), Duty::Triage).to_string();
+        let lapsed = wall_ms() - 600_000;
+        let electra = Claimant {
+            host: OTHER.to_owned(),
+            device: "ELECTRA1".to_owned(),
+            agent: user("@nixi:example.org"),
+        };
+        server.put(
+            &control(),
+            CLAIM,
+            &key,
+            &user("@nixi:example.org"),
+            serde_json::to_value(electra.content(1, lapsed, lapsed, false, None)).expect("claim"),
+        );
+        server.put(
+            &control(),
+            STEWARD_ROOM,
+            &key,
+            &user("@nixi:example.org"),
+            json!({ "v": 1, "room": named }),
+        );
+        server
+            .states
+            .lock()
+            .expect("lock")
+            .get_mut(&(control(), CLAIM.to_owned(), key))
+            .expect("the claim")
+            .origin_server_ts = MilliSecondsSinceUnixEpoch(UInt::new(lapsed).expect("ts"));
+        let [mut w, _] = steward_hosts(&server, [zone.path(), zone.path()], |copy| copy);
+        for _ in 0..3 {
+            w.tick().await;
+            tokio::time::advance(STEWARD_AGAIN).await;
+            tokio::task::yield_now().await;
+        }
+
+        let toml = std::fs::read_to_string(folders(zone.path())[0].join("agent.toml"))
+            .expect("the folder");
+        let agent = keeper_core::agents::session::parse_session_agent_toml(&toml).expect("parse");
+        assert_eq!(agent.room, named);
+        assert_eq!(*server.left.lock().expect("lock"), [unnamed]);
+        assert_eq!(server.steward_rooms.lock().expect("lock").len(), 2);
+        let (claim, _) = duty_claim(&server).expect("claim");
+        assert!(claim.content.released && claim.content.host == ME);
+    }
+
+    /// A steward's room whose creation never answers holds neither the
+    /// tick nor the claims it renews: the bootstrap runs beside them, and
+    /// a shutdown does not wait for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_steward_bootstrap_does_not_hold_the_lease_clock() {
+        let server = Arc::new(Server::default());
+        let zone = tempfile::tempdir().expect("zone");
+        let [mut w, _] = steward_hosts(&server, [zone.path(), zone.path()], |copy| FakeCopy {
+            stall_steward_rooms: true,
+            ..copy
+        });
+        let a = room(1);
+        w.offer(&a, None);
+        w.tick().await;
+        tokio::time::advance(STEWARD_AGAIN).await;
+        for _ in 0..4 {
+            let started = Instant::now();
+            w.tick().await;
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "the tick waited"
+            );
+            tokio::time::advance(RENEW_EVERY).await;
+        }
+        assert!(w.held_by_me(&a));
+        assert!(
+            w.rt.stewards.task.is_some(),
+            "the bootstrap is still waiting"
+        );
+        tokio::time::timeout(Duration::from_secs(1), w.rt.release_all())
+            .await
+            .expect("the shutdown does not wait for the bootstrap");
+    }
+
     /// A waiting session is said again after another host served it and
     /// went away, and after its claim changed hands; between, it is said
     /// once. Every status edits the session's own status anchor.
@@ -2828,6 +3591,10 @@ mod tests {
             routed: Mutex::default(),
             refuse_writes: Default::default(),
             turns_die: AtomicBool::new(false),
+            harvests: Mutex::default(),
+            acks: Mutex::default(),
+            stall_steward_rooms: false,
+            fail_steward_folders: false,
         }
     }
 

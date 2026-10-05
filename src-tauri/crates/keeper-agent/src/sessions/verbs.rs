@@ -126,18 +126,24 @@ pub fn create_agent_session(
     )
 }
 
-/// [`create_agent_session`] for a delegated session (AD-385): its
-/// `agent.toml` and its card, `card_name` at the session's root, in the same
-/// journaled plan. Only the host placement chose calls it, and a second call
-/// — a replayed brief, a racing copy — finds the first's folder.
-pub fn create_delegated_session(
+/// [`create_agent_session`] with files beside its `agent.toml` — a card,
+/// each `(name, text)` at the session's root — in the same journaled plan.
+/// A delegated session is made so by the host placement chose (AD-385), a
+/// steward's own by the host that won its creation claim (R66, R165); a
+/// second call — a replayed brief, a racing copy, a restart — finds the
+/// first's folder and writes none of them.
+pub fn create_carded_session(
     zone: &Path,
     agent: &keeper_core::agents::session::SessionAgent,
-    card_name: &str,
-    card: String,
+    files: Vec<(String, String)>,
     now: chrono::DateTime<chrono::Local>,
 ) -> Result<CreateOutcome, VerbError> {
     use keeper_core::agents::session;
+    let mut extra = vec![(
+        session::FILE_NAME.to_owned(),
+        session::compose_session_agent_toml(agent),
+    )];
+    extra.extend(files);
     create_with(
         zone,
         CreateReq {
@@ -146,13 +152,7 @@ pub fn create_delegated_session(
             pattern_id: None,
             now,
         },
-        vec![
-            (
-                session::FILE_NAME.to_owned(),
-                session::compose_session_agent_toml(agent),
-            ),
-            (card_name.to_owned(), card),
-        ],
+        extra,
     )
 }
 

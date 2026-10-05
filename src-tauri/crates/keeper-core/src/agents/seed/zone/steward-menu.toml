@@ -11,7 +11,7 @@ Leave out what you cannot place, and say why in your reply. Reply with one line 
 code        = "DS"
 description = "Hand the cards on"
 prompt      = """
-For each card in this session that has an assignee and no run state, hand its work to that agent with delegate: the card's body as the brief, the card's title as the new card's title, and only the drives the work needs.
+For each card in this session that has an assignee and no run state, hand its work to that agent with delegate: the card's body as the brief, the card's title as the new card's title, the card's file name as source, and only the drives the work needs.
 Reply with what you handed on, to whom, and anything you held back because a bound or a label stopped it.
 """
 

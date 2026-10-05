@@ -901,6 +901,9 @@ mod tests {
         fn delegation(&self, _: &str) -> Option<Delegation> {
             None
         }
+        fn handed(&self, _: &str) -> Option<Delegation> {
+            None
+        }
         fn may_write(&self) -> bool {
             self.1.load(std::sync::atomic::Ordering::SeqCst)
         }

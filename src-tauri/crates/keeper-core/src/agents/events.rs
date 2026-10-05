@@ -33,8 +33,13 @@ pub const APPROVAL_DECISION: &str = "dev.keeper.agent.approval.decision";
 pub const HEARD: &str = "dev.keeper.agent.heard";
 /// A device's answer to a surface call.
 pub const SURFACE_RESULT: &str = "dev.keeper.agent.surface.result";
-/// The claim on a session (state, key `""`).
+/// The claim on a session (state, key `""`); in the principal's control
+/// room, the claim on making a steward's duty session (key = its id, R165).
 pub const CLAIM: &str = "dev.keeper.agent.claim";
+/// The room a steward's duty session was made with (state in the
+/// principal's control room, key = the session's id, content `{v, room}`;
+/// R165): written by the creation claim's holder before the folder.
+pub const STEWARD_ROOM: &str = "dev.keeper.agent.steward.room";
 /// A host's manifest (state, key = the host slug).
 pub const HOST: &str = "dev.keeper.agent.host";
 /// A person's ask, in their proxy's `main` DM, for a new conversation

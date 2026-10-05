@@ -2327,8 +2327,11 @@ fn deps_of(world: &World, folder: &str, agent_toml: &str) -> AgentDeps {
     );
     let name = agent_toml
         .lines()
-        .find_map(|line| line.strip_prefix("name = \""))
-        .and_then(|rest| rest.strip_suffix('"'))
+        .find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "name").then(|| value.trim())
+        })
+        .and_then(|value| value.strip_prefix('"')?.strip_suffix('"'))
         .expect("a name");
     write(
         &world.tgdrive,
@@ -4160,4 +4163,498 @@ async fn a_scheduled_run_refuses_what_needs_a_person_before_epic_93() {
         Outcome::Duplicate
     ));
     assert_eq!(world.stub.requests().len(), 2);
+}
+
+/// Dr Tola Grey as the seed writes her into tgdrive — her menu is 91.5's
+/// and she has no `[tools].allow`, so her tools are the steward's defaults
+/// — beside Nixi, on the world's provider.
+fn seeded_tola(world: &World) -> AgentDeps {
+    use keeper_core::agents::seed::{self, SeedChoices, CATALOGUE};
+    let choices = SeedChoices::new(
+        "tgdrive",
+        "tgorka",
+        TGORKA,
+        &[TGORKA.to_owned(), MARTA.to_owned()],
+        false,
+        Some("bot:openai:http://127.0.0.1:9#model"),
+        &CATALOGUE
+            .iter()
+            .map(|a| a.id.to_owned())
+            .collect::<Vec<_>>(),
+    )
+    .expect("choices");
+    let toml = seed::files(&choices)
+        .into_iter()
+        .find(|file| file.path.ends_with("tola-grey/agent.toml"))
+        .expect("Tola's home")
+        .text;
+    deps_of(world, "tola-grey", &toml)
+}
+
+/// Her `duty` session, made as the host that won its creation claim makes
+/// it, without the room: its zone path.
+fn stewards_session(world: &World, tola: &AgentDeps, duty: keeper_agent::stewards::Duty) -> String {
+    use keeper_agent::sessions::verbs::{create_carded_session, CreateOutcome};
+    use keeper_agent::stewards::{folder_files, session};
+    let decl = &tola.home.drive;
+    let room = OwnedRoomId::try_from(format!("!{}:example.org", duty.name())).expect("room");
+    let now = chrono::Local::now();
+    let agent = session(&tola.home.config, decl, duty, &room, now);
+    let files =
+        folder_files(&tola.home.config, decl, duty, &world.deps.sessions_zone).expect("her files");
+    match create_carded_session(&world.deps.sessions_zone, &agent, files, now).expect("made") {
+        CreateOutcome::Created { path, .. } => path,
+        CreateOutcome::Existed { path, .. } => path,
+    }
+}
+
+/// 92.5 acceptance 2: Dr Tola Grey's triage card runs on its schedule as
+/// one turn whose brief is her `TR` then `DS` prompts. She reads the inbox
+/// (`untrusted`), writes a card into her triage session with
+/// `session_write` — `assignee`, `requested_by`, a body, and
+/// `integrity: untrusted` from the stamp — and hands it to Nixi with
+/// `delegate`, naming it as the source: the child is opened at her
+/// session's label, `untrusted`, the session Nixi's host makes from it
+/// carries that label and its card, and her card says `run: running`. Her
+/// triage card ends `review`. Nixi's reply sets her card `review`, and the
+/// next day's window, the inbox unchanged, hands nothing on again: the
+/// card names the delegation it went to.
+#[tokio::test(flavor = "multi_thread")]
+async fn triage_writes_cards_and_dispatch_hands_them_on() {
+    use keeper_agent::agent::scheduled_arrival;
+    use keeper_agent::cards::Scheduled;
+    use keeper_agent::stewards::Duty;
+    use keeper_core::agents::card::{CardAgent, Field, Run};
+    let card = "---\ntags: [task]\ntitle: Answer x\nstatus: todo\nassignee: nixi\nrequested_by: \"@tgorka:example.org\"\n---\n\nAnswer the letter in 00-inbox/x.md; done is a reply sent.\n";
+    let hand_x = || {
+        delegate_call(
+            "d1",
+            json!({"agent": "tgdrive/nixi", "brief": "Answer the letter in 00-inbox/x.md.", "card": {"title": "Answer x"}, "source": "answer-x.md"}),
+        )
+    };
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![
+            calls(&[(
+                "r1",
+                "drive_read",
+                json!({"profile": "tgdrive", "path": "00-inbox/x.md"}),
+            )]),
+            calls(&[(
+                "w1",
+                "session_write",
+                json!({"path": "answer-x.md", "content": card}),
+            )]),
+            hand_x(),
+            prose("Answer x, nixi, @tgorka:example.org. Handed Answer x to Nixi."),
+            prose("Nixi answered x."),
+            hand_x(),
+            prose("Nothing new to hand on."),
+        ],
+    );
+    let tola = seeded_tola(&world);
+    let triage = stewards_session(&world, &tola, Duty::Triage);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let mut served = world.open_as(&tola, &triage);
+    served.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+
+    let run = scheduled_arrival(
+        &tola.home.config.matrix_user,
+        &Scheduled::Run {
+            card: Duty::Triage.card_file(),
+            window: "2026-10-05T00:00:00.000Z".to_owned(),
+            now_ms: chrono::DateTime::parse_from_rfc3339("2026-10-05T00:00:00.000Z")
+                .expect("a time")
+                .timestamp_millis(),
+            utc_offset_minutes: 0,
+        },
+    )
+    .expect("an arrival");
+    let report = report(serve_as(&tola, &mut served, &world.room, run).await);
+    assert_eq!(report.ending, TurnEnding::Complete);
+    let lines = world.lines(&triage);
+    let peers = kinds(&lines, LineKind::Peer);
+    let LineBody::Peer(brief) = &peers[0].body else {
+        panic!("a peer line")
+    };
+    assert!(brief.text.contains("Triage what came in"), "{}", brief.text);
+    assert!(brief.text.contains("hand its work"), "{}", brief.text);
+
+    // TR: the card she wrote, stamped from the inbox she read.
+    let written =
+        std::fs::read_to_string(world.dir(&triage).join("answer-x.md")).expect("her card");
+    let keys = CardAgent::of_text(&written).expect("keys");
+    assert_eq!(keys.assignee, Some(Field::Read("nixi".to_owned())));
+    assert_eq!(keys.requested_by, Some(Field::Read(user(TGORKA))));
+    assert_eq!(keys.integrity, Some(Field::Read(Integrity::Untrusted)));
+    assert!(written.contains("done is a reply sent"), "{written}");
+
+    // DS: one room for Nixi, and the brief carries the untrusted label.
+    let made = rooms.made();
+    assert_eq!(made.len(), 1);
+    assert_eq!(made[0].2, vec![user(NIXI)]);
+    let child = made[0].3.clone();
+    let opened = delegate_lines(&world.lines(&triage));
+    assert_eq!(opened[0].state, DelegateState::Opened);
+    let mut joined = world.event(NIXI, Arrival::Joined, json!({"membership": "join"}));
+    joined.via = Some(child.clone());
+    assert!(matches!(
+        serve_as(&tola, &mut served, &world.room, joined).await,
+        Outcome::BriefSent(_)
+    ));
+    let sent = rooms.sent().last().expect("the brief").1.clone();
+    let handed = read_brief(&sent).expect("a brief");
+    assert_eq!(handed.label.integrity, Integrity::Untrusted);
+    let path = world.create_child(&world.deps, &child, &handed);
+    let text = std::fs::read_to_string(world.dir(&path).join("agent.toml")).expect("agent.toml");
+    let agent = keeper_core::agents::session::parse_session_agent_toml(&text).expect("parse");
+    assert_eq!(agent.label.integrity, Integrity::Untrusted);
+    assert_eq!(agent.agent, "nixi");
+    assert_eq!(
+        card_field(&world, &path, "assignee").as_deref(),
+        Some("nixi")
+    );
+
+    let triage_card = std::fs::read_to_string(world.dir(&triage).join(Duty::Triage.card_file()))
+        .expect("the triage card");
+    let keys = CardAgent::of_text(&triage_card).expect("keys");
+    assert_eq!(keys.run, Some(Field::Read(Run::Review)), "{triage_card}");
+
+    let source_run = |world: &World| {
+        let text =
+            std::fs::read_to_string(world.dir(&triage).join("answer-x.md")).expect("her card");
+        CardAgent::of_text(&text).expect("keys").run
+    };
+    assert_eq!(source_run(&world), Some(Field::Read(Run::Running)));
+
+    // Nixi replies: her card goes to review with it.
+    let reply = keeper_agent::delegate::reply_content("x answered.", Vec::new(), &handed.label);
+    let event = json!({
+        "type": "m.room.message",
+        "sender": NIXI,
+        "event_id": "$nixi-reply:example.org",
+        "content": reply,
+    });
+    let replied =
+        reply_of(&event, &user(NIXI), &child, tokio::time::Instant::now()).expect("a reply");
+    let _ = serve_as(&tola, &mut served, &world.room, replied).await;
+    assert_eq!(source_run(&world), Some(Field::Read(Run::Review)));
+
+    // The next day's window: the same card is not handed on again.
+    let next = scheduled_arrival(
+        &tola.home.config.matrix_user,
+        &Scheduled::Run {
+            card: Duty::Triage.card_file(),
+            window: "2026-10-06T00:00:00.000Z".to_owned(),
+            now_ms: chrono::DateTime::parse_from_rfc3339("2026-10-06T00:00:00.000Z")
+                .expect("a time")
+                .timestamp_millis(),
+            utc_offset_minutes: 0,
+        },
+    )
+    .expect("an arrival");
+    let _ = serve_as(&tola, &mut served, &world.room, next).await;
+    assert_eq!(rooms.made().len(), 1, "one child, however many windows");
+    let results = tool_results(&world.lines(&triage));
+    let again = results.last().expect("the second delegate");
+    assert!(
+        again.content.contains("was handed on already"),
+        "{}",
+        again.content
+    );
+    assert_eq!(source_run(&world), Some(Field::Read(Run::Review)));
+}
+
+/// What the holder of the harvest session at `harvest` hands its worker
+/// now: one step of a harvester that has seen nothing yet.
+fn closed_now(world: &World, harvest: &str) -> Vec<keeper_agent::stewards::Closed> {
+    let text = std::fs::read_to_string(world.dir(harvest).join("agent.toml")).expect("agent.toml");
+    let agent = keeper_core::agents::session::parse_session_agent_toml(&text).expect("parse");
+    keeper_agent::stewards::Harvester::default().step(
+        &world.deps.sessions_zone,
+        harvest,
+        &agent,
+        tokio::time::Instant::now(),
+    )
+}
+
+/// A person's session of tgdrive `title`, archived: its id and path.
+fn archived_session(world: &World, title: &str) -> (String, String) {
+    use keeper_agent::sessions::verbs::{self, CreateReq};
+    let zone = &world.deps.sessions_zone;
+    let id = ulid::Ulid::new();
+    verbs::create(
+        zone,
+        CreateReq {
+            id,
+            title: title.to_owned(),
+            pattern_id: None,
+            now: chrono::Local::now(),
+        },
+    )
+    .expect("created");
+    verbs::archive(zone, &id.to_string(), Vec::new(), false, 2026).expect("closed");
+    let path = verbs::find(zone, &id.to_string()).expect("found").path;
+    (id.to_string(), path)
+}
+
+/// 92.5 acceptance 3, the turn (R61): a session of tgdrive closed — found
+/// under `archive/` — is one turn in Dr Tola Grey's harvest session, its
+/// brief her `HV` prompt naming the closed session's path, its `peer` line
+/// carrying the closed session's id. Routed again, after the index is
+/// rebuilt and the session reopened, it is no second turn; routed into any
+/// session but her harvest one it is no turn at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_session_wakes_its_stewards_harvest_once() {
+    use keeper_agent::agent::{harvest_arrival, NO_HARVEST};
+    use keeper_agent::stewards::Duty;
+    let world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![prose(
+            "It learned the tax office's new address; it belongs in notes/taxes.md.",
+        )],
+    );
+    let tola = seeded_tola(&world);
+    let harvest = stewards_session(&world, &tola, Duty::Harvest);
+    let triage = stewards_session(&world, &tola, Duty::Triage);
+    let zone = world.deps.sessions_zone.clone();
+    let (taxes, _) = archived_session(&world, "taxes");
+
+    let closed = closed_now(&world, &harvest);
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].id, taxes);
+    let arrival = || harvest_arrival(&tola.home.config.matrix_user, &closed[0]).expect("arrival");
+
+    let mut elsewhere = world.open_as(&tola, &triage);
+    assert!(matches!(
+        serve_as(&tola, &mut elsewhere, &world.room, arrival()).await,
+        Outcome::Ignored(note) if note == NO_HARVEST
+    ));
+
+    let mut served = world.open_as(&tola, &harvest);
+    let report = report(serve_as(&tola, &mut served, &world.room, arrival()).await);
+    assert_eq!(report.ending, TurnEnding::Complete);
+    let lines = world.lines(&harvest);
+    let peers = kinds(&lines, LineKind::Peer);
+    assert_eq!(peers.len(), 1);
+    let LineBody::Peer(peer) = &peers[0].body else {
+        panic!("a peer line")
+    };
+    assert!(
+        peer.text.contains("A session of this drive has closed"),
+        "{}",
+        peer.text
+    );
+    assert!(
+        peer.text
+            .contains(&format!("60-sessions/{}", closed[0].path)),
+        "{}",
+        peer.text
+    );
+    assert!(peer.text.contains(&taxes), "{}", peer.text);
+    assert_eq!(peers[0].matrix_event.as_ref(), Some(&arrival().event_id));
+
+    assert!(matches!(
+        serve_as(&tola, &mut served, &world.room, arrival()).await,
+        Outcome::Duplicate
+    ));
+    keeper_core::agents::index::Index::open(&zone)
+        .and_then(|mut index| index.rebuild())
+        .expect("rebuilt");
+    let mut reopened = world.open_as(&tola, &harvest);
+    assert!(matches!(
+        serve_as(&tola, &mut reopened, &world.room, arrival()).await,
+        Outcome::Duplicate
+    ));
+    assert_eq!(world.stub.requests().len(), 1);
+}
+
+/// Write `agent` as the `agent.toml` of the archived session at `path`.
+fn as_agents(world: &World, path: &str, agent: &keeper_core::agents::session::SessionAgent) {
+    std::fs::write(
+        world.dir(path).join("agent.toml"),
+        keeper_core::agents::session::compose_session_agent_toml(agent),
+    )
+    .expect("agent.toml");
+}
+
+/// R166: the harvest session carries the closed session's label. A closed
+/// session read by tgorka alone — by its `agent.toml`, or narrowed so by a
+/// `label` line of its log — and one that may go only to a local model,
+/// are refused before anything of them is logged, sent to the room or to
+/// the (remote) provider. An untrusted one is harvested, its integrity
+/// joined by a `label` line before the `peer` line, before the model reads
+/// a word.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_harvest_carries_the_closed_sessions_label_and_refuses_what_it_cannot_reach() {
+    use keeper_agent::agent::{harvest_arrival, HARVEST_REFUSED};
+    use keeper_agent::stewards::{session, Duty};
+    use keeper_core::agents::label::{LabelBody, LabelCause, LabelCauseKind};
+    let world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![prose("It learned nothing the drive should keep.")],
+    );
+    let tola = seeded_tola(&world);
+    let harvest = stewards_session(&world, &tola, Duty::Harvest);
+    let decl = &tola.home.drive;
+    let room = OwnedRoomId::try_from("!closed:example.org").expect("room");
+    let theirs = |id: &str, label: Label| keeper_core::agents::session::SessionAgent {
+        id: id.parse().expect("ulid"),
+        kind: SessionKind::Delegated,
+        label,
+        ..session(
+            &tola.home.config,
+            decl,
+            Duty::Triage,
+            &room,
+            chrono::Local::now(),
+        )
+    };
+    let wide = Label::opening(decl, Integrity::Owner);
+    let tgorka_only = Label {
+        readers: Readers::Only([user(TGORKA)].into_iter().collect()),
+        ..wide.clone()
+    };
+
+    let (narrow_id, narrow) = archived_session(&world, "narrow");
+    as_agents(&world, &narrow, &theirs(&narrow_id, tgorka_only.clone()));
+    let (narrowed_id, narrowed) = archived_session(&world, "narrowed later");
+    as_agents(&world, &narrowed, &theirs(&narrowed_id, wide.clone()));
+    forced(
+        &world.dir(&narrowed),
+        "electra",
+        1,
+        "$c1:example.org",
+        acquired(1, "$c1:example.org"),
+    );
+    forced(
+        &world.dir(&narrowed),
+        "electra",
+        1,
+        "$c1:example.org",
+        LineBody::Label(LabelBody::new(
+            &tgorka_only,
+            LabelCause {
+                kind: LabelCauseKind::DriveRead,
+                reference: "a private note".to_owned(),
+            },
+        )),
+    );
+    let (local_id, local) = archived_session(&world, "local");
+    let local_only = Label {
+        local_only: true,
+        ..wide.clone()
+    };
+    as_agents(&world, &local, &theirs(&local_id, local_only));
+    let (outside_id, outside) = archived_session(&world, "outside");
+    let untrusted = Label {
+        integrity: Integrity::Untrusted,
+        ..wide.clone()
+    };
+    as_agents(&world, &outside, &theirs(&outside_id, untrusted));
+
+    let closed = closed_now(&world, &harvest);
+    assert_eq!(closed.len(), 4);
+    let mut served = world.open_as(&tola, &harvest);
+    for id in [&narrow_id, &narrowed_id, &local_id] {
+        let source = closed.iter().find(|c| &c.id == id).expect("found");
+        let arrived = harvest_arrival(&tola.home.config.matrix_user, source).expect("arrival");
+        assert!(matches!(
+            serve_as(&tola, &mut served, &world.room, arrived).await,
+            Outcome::Ignored(note) if note == HARVEST_REFUSED
+        ));
+    }
+    assert!(world.lines(&harvest).is_empty());
+    assert!(world.stub.requests().is_empty());
+    assert_eq!(anchors(&world.room), 0);
+
+    let source = closed.iter().find(|c| c.id == outside_id).expect("found");
+    let arrived = harvest_arrival(&tola.home.config.matrix_user, source).expect("arrival");
+    report(serve_as(&tola, &mut served, &world.room, arrived).await);
+    let lines = world.lines(&harvest);
+    let label_at = lines
+        .iter()
+        .position(|line| matches!(&line.body, LineBody::Label(body) if body.label().integrity == Integrity::Untrusted))
+        .expect("the untrusted join");
+    let peer_at = lines
+        .iter()
+        .position(|line| line.kind() == LineKind::Peer)
+        .expect("the peer line");
+    assert!(label_at < peer_at);
+    assert_eq!(served.context.label.integrity, Integrity::Untrusted);
+    assert_eq!(world.stub.requests().len(), 1);
+}
+
+/// The line `host` wrote for the harvest `event` straight into its own
+/// chunk under its claim: pushed here, never seen by this host's index.
+fn begun_on(dir: &Path, host: &str, event: &OwnedEventId, sender: &OwnedUserId) {
+    forced(
+        dir,
+        host,
+        1,
+        "$c1:example.org",
+        acquired(1, "$c1:example.org"),
+    );
+    let mut chunks = ChunkWriter::open(
+        dir,
+        &HostSlug::new(host).expect("slug"),
+        rotate_at(1 << 20),
+        chrono::Utc::now().date_naive(),
+    )
+    .expect("chunk");
+    let now = chrono::Utc::now();
+    chunks
+        .append(&LogLine {
+            v: LINE_VERSION,
+            id: ulid::Ulid::new(),
+            parent: None,
+            ts: chrono::DateTime::from_timestamp_millis(now.timestamp_millis()).expect("ts"),
+            host: HostSlug::new(host).expect("slug"),
+            epoch: 1,
+            claim: Some("$c1:example.org".to_owned()),
+            matrix_event: Some(event.clone()),
+            body: LineBody::Peer(PeerBody {
+                sender: sender.clone(),
+                text: "harvest".to_owned(),
+                ask: None,
+                artifacts: None,
+            }),
+        })
+        .expect("append");
+}
+
+/// A harvest another host began is never a second turn here: one whose
+/// `peer` line arrived in electra's chunk — this host's index never saw
+/// it — and one whose anchor electra left in the room before it stopped
+/// without pushing (the worker's read-back names it).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_harvest_another_host_began_is_never_run_again_here() {
+    use keeper_agent::agent::harvest_arrival;
+    use keeper_agent::stewards::Duty;
+    let world = world(ProviderKind::OpenAi, &["drive_read"], vec![]);
+    let tola = seeded_tola(&world);
+    let harvest = stewards_session(&world, &tola, Duty::Harvest);
+    archived_session(&world, "pushed");
+    archived_session(&world, "unpushed");
+    let closed = closed_now(&world, &harvest);
+    let me = &tola.home.config.matrix_user;
+    let arrival = |n: usize| harvest_arrival(me, &closed[n]).expect("arrival");
+
+    begun_on(&world.dir(&harvest), "electra", &arrival(0).event_id, me);
+    let mut served = world.open_as(&tola, &harvest);
+    assert!(matches!(
+        serve_as(&tola, &mut served, &world.room, arrival(0)).await,
+        Outcome::Duplicate
+    ));
+
+    let anchored = arrival(1).event_id.to_string();
+    served.context.started([anchored.as_str()].into_iter());
+    assert!(matches!(
+        serve_as(&tola, &mut served, &world.room, arrival(1)).await,
+        Outcome::Duplicate
+    ));
+    assert!(world.stub.requests().is_empty());
 }

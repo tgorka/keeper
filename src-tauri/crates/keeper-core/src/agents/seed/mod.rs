@@ -383,8 +383,19 @@ pub fn from_template(
 /// agent, `main`), so every run of `agents init` and every host names the
 /// same session (AD-368's caller-supplied id).
 pub fn main_session_id(drive: &str, agent: &str) -> Ulid {
+    derived_session_id(drive, agent, "main")
+}
+
+/// The id of a steward's own `duty` session (`triage`, `harvest`) in
+/// `drive`, derived as [`main_session_id`] is, so every start of every host
+/// serving her names the same one (R66).
+pub fn steward_session_id(drive: &str, agent: &str, duty: &str) -> Ulid {
+    derived_session_id(drive, agent, duty)
+}
+
+fn derived_session_id(drive: &str, agent: &str, name: &str) -> Ulid {
     let digest =
-        Sha256::digest(format!("keeper.agents.session\n{drive}\n{agent}\nmain").as_bytes());
+        Sha256::digest(format!("keeper.agents.session\n{drive}\n{agent}\n{name}").as_bytes());
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     Ulid::from_bytes(bytes)

@@ -184,13 +184,27 @@ fn the_main_dm_is_the_room_its_folder_names() {
     let zone = root.path().join("60-sessions");
     let now = chrono::Local::now();
 
-    let made = make_folder(&zone, &main_session("!first:example.org"), true, now).expect("first");
+    let made = make_folder(
+        &zone,
+        &main_session("!first:example.org"),
+        Vec::new(),
+        true,
+        now,
+    )
+    .expect("first");
     assert_eq!(made.room.as_str(), "!first:example.org");
     assert!(made.folder_made);
     assert_eq!(made.discard, None);
 
     // Another checkout's run wrote the folder while this one made a room.
-    let raced = make_folder(&zone, &main_session("!second:example.org"), true, now).expect("raced");
+    let raced = make_folder(
+        &zone,
+        &main_session("!second:example.org"),
+        Vec::new(),
+        true,
+        now,
+    )
+    .expect("raced");
     assert_eq!(raced.room.as_str(), "!first:example.org");
     assert_eq!(raced.path, made.path);
     assert!(!raced.folder_made);
@@ -199,8 +213,14 @@ fn the_main_dm_is_the_room_its_folder_names() {
         Some("!second:example.org")
     );
 
-    let adopted =
-        make_folder(&zone, &main_session("!adopted:example.org"), false, now).expect("adopted");
+    let adopted = make_folder(
+        &zone,
+        &main_session("!adopted:example.org"),
+        Vec::new(),
+        false,
+        now,
+    )
+    .expect("adopted");
     assert_eq!(adopted.room.as_str(), "!first:example.org");
     assert_eq!(adopted.discard, None);
 }

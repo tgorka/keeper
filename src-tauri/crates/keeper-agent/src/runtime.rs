@@ -585,6 +585,9 @@ pub(crate) struct Copy {
     pub(crate) pending: Mutex<PendingBriefs>,
     /// The host's receiver: doorbells this copy hears are answered by it.
     pub(crate) doorbell: Arc<Doorbell>,
+    /// What the harvest worker made of each closed session it was handed:
+    /// the host's clock takes them (R61).
+    pub(crate) harvest_acks: crate::agent::HarvestAcks,
 }
 
 /// The claim a worker writes under (story 90.6).
@@ -692,6 +695,7 @@ pub(crate) fn start_copy(
         children: Arc::default(),
         pending: Mutex::default(),
         doorbell,
+        harvest_acks: Arc::default(),
     });
     register_handlers(&copy);
     let sync_client = copy.client.client().clone();
@@ -832,6 +836,17 @@ pub async fn run(
         copies.clone(),
     );
     doorbell.set_principal_agents(hosts.principal_agents());
+    // Each steward's triage and harvest sessions are made from the first
+    // tick on, beside the lease clock (R66, R165).
+    hosts.make_stewards(
+        copies
+            .iter()
+            .filter(|copy| {
+                copy.deps.home.config.kind == keeper_core::agents::home::AgentKind::Steward
+            })
+            .map(|copy| Arc::clone(copy) as Arc<dyn crate::hosts::CopyPort>)
+            .collect(),
+    );
 
     // Tapped before the supervisor runs, so its first push is seen.
     let mut ringer = Ringer::new(Arc::clone(&agentd.engine) as Arc<dyn DriveEngine>);
@@ -1040,6 +1055,7 @@ async fn serve_session(
     });
     served.conversations = Some(Arc::clone(&rooms) as Arc<dyn ConversationPort>);
     served.delegations = Some(rooms);
+    served.harvests = Some(Arc::clone(&copy.harvest_acks));
     served.surface = Some(Arc::new(ClientSurface {
         client: copy.client.clone(),
         room: room_id.clone(),
@@ -1051,6 +1067,9 @@ async fn serve_session(
     // copy of this agent already answered is not asked again.
     let answered = answered_by(&events, me);
     backlog.retain(|arrived| !answered.contains(arrived.event_id.as_str()));
+    // A harvest another copy started — its anchor is in the room — is not
+    // started again, though its `peer` line never reached this log.
+    served.context.started(answered.iter().map(String::as_str));
     let trail = trail_of(&events, me, served.context.unanswered);
     match served.recover(deps, port.as_ref(), &trail).await {
         Ok(true) => {
@@ -1386,16 +1405,26 @@ pub(crate) async fn latest_status(room: &Room, me: &UserId) -> Option<OwnedEvent
 }
 
 /// The questions among `events` (oldest first) that a copy of `me` already
-/// started answering. A room's turns run in order, so each answer's anchor
-/// `me` sent answers the oldest question before it no anchor answered yet.
+/// started answering. An answer's anchor names its question; one that does
+/// not answers the oldest question before it no anchor answered yet, as a
+/// room's turns run in order. A question no person asked in the room — a
+/// harvest's, a scheduled run's — is answered by the anchor naming it.
 fn answered_by(events: &[Value], me: &UserId) -> HashSet<String> {
     let mut open: VecDeque<&str> = VecDeque::new();
     let mut answered = HashSet::new();
     for event in events {
         if event["sender"] == me.as_str() {
             if event["content"][TURN].is_object() {
-                if let Some(question) = open.pop_front() {
-                    answered.insert(question.to_owned());
+                match event["content"][TURN]["question"].as_str() {
+                    Some(question) => {
+                        open.retain(|asked| *asked != question);
+                        answered.insert(question.to_owned());
+                    }
+                    None => {
+                        if let Some(question) = open.pop_front() {
+                            answered.insert(question.to_owned());
+                        }
+                    }
                 }
             }
             continue;

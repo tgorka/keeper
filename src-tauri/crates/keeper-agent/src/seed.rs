@@ -443,6 +443,10 @@ pub fn result_vm(profile_id: &str, choices: &SeedChoices, applied: Applied) -> A
 // The proxy's DM
 // ---------------------------------------------------------------------------
 
+#[cfg(all(unix, test))]
+pub(crate) use dm::Settled;
+#[cfg(unix)]
+pub(crate) use dm::{discard, make_folder};
 #[cfg(unix)]
 pub use dm::{main_dm, main_session, Made, MainDm};
 
@@ -592,22 +596,23 @@ mod dm {
         };
         let agent = main_session(proxy, decl, &human, &room, now);
         let folder = sessions.to_owned();
-        let settled =
-            tokio::task::spawn_blocking(move || make_folder(&folder, &agent, made_room, now))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|settled| settled);
+        let settled = tokio::task::spawn_blocking(move || {
+            make_folder(&folder, &agent, Vec::new(), made_room, now)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|settled| settled);
         let settled = match settled {
             Ok(settled) => settled,
             Err(sentence) => {
                 if made_room {
-                    discard(client, &room, &human).await;
+                    discard(client, &room, std::slice::from_ref(&human)).await;
                 }
                 return Err(sentence);
             }
         };
         if let Some(orphan) = &settled.discard {
-            discard(client, orphan, &human).await;
+            discard(client, orphan, std::slice::from_ref(&human)).await;
         }
         let made = match (made_room, settled.folder_made) {
             (true, true) => Made::RoomAndFolder,
@@ -619,10 +624,10 @@ mod dm {
         Ok(MainDm { room, path, made })
     }
 
-    /// Where [`make_folder`] leaves the DM.
+    /// Where [`make_folder`] leaves a session made with its room.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct Settled {
-        /// The room the folder names: the DM.
+        /// The room the folder names.
         pub room: OwnedRoomId,
         pub path: String,
         /// Whether this call wrote the folder.
@@ -631,19 +636,26 @@ mod dm {
         pub discard: Option<OwnedRoomId>,
     }
 
-    /// The `main` session folder for `agent`, made under the zone's lock
-    /// unless a session with its id is there by then; `made_room` says
-    /// whether `agent.room` was made by this call (and so is discarded when
-    /// another folder won).
+    /// The session folder for `agent` — with `files` (each name and text,
+    /// a card first) in the same plan — made under the zone's lock unless a
+    /// session with its id is there by then; `made_room` says whether
+    /// `agent.room` was made by this call (and so is discarded when another
+    /// folder won).
     pub(crate) fn make_folder(
         sessions: &Path,
         agent: &SessionAgent,
+        files: Vec<(String, String)>,
         made_room: bool,
         now: chrono::DateTime<chrono::Local>,
     ) -> Result<Settled, String> {
         std::fs::create_dir_all(sessions)
             .map_err(|error| format!("{} could not be made: {error}", sessions.display()))?;
-        match verbs::create_agent_session(sessions, agent, now).map_err(|e| e.to_string())? {
+        let outcome = if files.is_empty() {
+            verbs::create_agent_session(sessions, agent, now)
+        } else {
+            verbs::create_carded_session(sessions, agent, files, now)
+        };
+        match outcome.map_err(|e| e.to_string())? {
             CreateOutcome::Created { path, .. } => Ok(Settled {
                 room: agent.room.clone(),
                 path,
@@ -652,7 +664,10 @@ mod dm {
             }),
             CreateOutcome::Existed { .. } => {
                 let (path, room) = existing(sessions, &agent.id.to_string())?.ok_or_else(|| {
-                    format!("{}'s main session vanished while it was read.", agent.agent)
+                    format!(
+                        "{}'s {} session vanished while it was read.",
+                        agent.agent, agent.title
+                    )
                 })?;
                 let discard = (made_room && room != agent.room).then(|| agent.room.clone());
                 Ok(Settled {
@@ -754,32 +769,34 @@ mod dm {
         None
     }
 
-    /// Leave and forget a room no folder names, first revoking the person's
-    /// invite so they are not left one to a room nobody serves. Each step is
-    /// tried and logged; none of them undoes the DM.
-    async fn discard(client: &AgentClient, room: &RoomId, human: &UserId) {
+    /// Leave and forget a room no folder names, first revoking the invites
+    /// of `invited` so no one is left one to a room nobody serves. Each step
+    /// is tried and logged; none of them undoes the session.
+    pub(crate) async fn discard(client: &AgentClient, room: &RoomId, invited: &[OwnedUserId]) {
         let Some(joined) = client.client().get_room(room) else {
             return;
         };
-        if let Err(error) = joined
-            .kick_user(
-                human,
-                Some("This room was made twice; the DM is the other one."),
-            )
-            .await
-        {
-            tracing::warn!(%room, %error, "seed: the invite to a discarded DM could not be revoked");
+        for person in invited {
+            if let Err(error) = joined
+                .kick_user(
+                    person,
+                    Some("This room was made twice; the session is the other one."),
+                )
+                .await
+            {
+                tracing::warn!(%room, %error, "seed: the invite to a discarded room could not be revoked");
+            }
         }
         if let Err(error) = joined.leave().await {
-            tracing::warn!(%room, %error, "seed: a discarded DM could not be left");
+            tracing::warn!(%room, %error, "seed: a discarded room could not be left");
             return;
         }
         if let Err(error) = joined.forget().await {
-            tracing::warn!(%room, %error, "seed: a discarded DM could not be forgotten");
+            tracing::warn!(%room, %error, "seed: a discarded room could not be forgotten");
         }
     }
 
-    /// The `main` session with `id` and the room its `agent.toml` names.
+    /// The session with `id` and the room its `agent.toml` names.
     fn existing(sessions: &Path, id: &str) -> Result<Option<(String, OwnedRoomId)>, String> {
         if !sessions.is_dir() {
             return Ok(None);
@@ -790,7 +807,7 @@ mod dm {
         let rel = format!("{}/{}", row.path, session::FILE_NAME);
         let text = crate::zone::read_text(sessions, &rel)?.ok_or_else(|| {
             format!(
-                "{} is the main session, but it has no {}: restore it from the drive's history.",
+                "{} is an agent's session, but it has no {}: restore it from the drive's history.",
                 row.path,
                 session::FILE_NAME
             )
@@ -837,7 +854,7 @@ mod dm {
 }
 
 #[cfg(all(unix, test))]
-use dm::{is_main_dm, make_folder};
+use dm::is_main_dm;
 
 #[cfg(test)]
 mod tests;
