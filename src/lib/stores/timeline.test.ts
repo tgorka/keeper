@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type {
   AgentRoomHeaderVm,
+  ApprovalVm,
   TimelineBatch,
   TimelineItemVm,
   TimelineOp,
@@ -133,5 +134,26 @@ describe("timelineStore header", () => {
     timelineStore.getState().applyBatch({ ops: [], header: header("a") });
     timelineStore.getState().clear();
     expect(timelineStore.getState().header).toBeNull();
+  });
+});
+
+describe("timelineStore approvals", () => {
+  const approvals = (state: "pending" | "consumed"): ApprovalVm[] => [
+    { id: "01A", cards: [{ id: "01A", state: { state } } as ApprovalVm["cards"][number]] },
+  ];
+
+  it("keeps the last cards through batches that carry none, and the room's clear drops them", () => {
+    timelineStore.getState().applyBatch({
+      ops: [{ op: "reset", items: [{ kind: "approval", key: "k", id: "01A" }] }],
+      approvals: approvals("pending"),
+    });
+    timelineStore.getState().applyBatch(batch([{ op: "pushBack", item: message("b") }]));
+    expect(timelineStore.getState().approvals).toEqual(approvals("pending"));
+    // A change beside the stream arrives as a batch with no ops.
+    timelineStore.getState().applyBatch({ ops: [], approvals: approvals("consumed") });
+    expect(timelineStore.getState().approvals).toEqual(approvals("consumed"));
+    expect(keys()).toEqual(["k", "b"]);
+    timelineStore.getState().clear();
+    expect(timelineStore.getState().approvals).toEqual([]);
   });
 });

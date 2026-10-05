@@ -9,6 +9,7 @@
 //! reader and the `.keeper/` index, which own their own files (AD-366).
 pub mod agentd;
 pub mod approval;
+pub mod approval_card;
 pub mod card;
 pub mod claim;
 pub mod copy;

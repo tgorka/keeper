@@ -586,20 +586,45 @@ mod tests {
              second caller is an invariant breach requiring a planning decision."
         );
 
-        // The dock's agent events (story 91.2) go out through `Room::send_raw`,
-        // which takes any event type: exactly one call site may exist in
-        // production `account.rs` — the private `send_agent_event`, whose input
-        // is the closed `AgentOutbound` (a scope, a request for a
-        // conversation, or the device's surface result — `agents::device`
-        // sends its `expired` answers through it too, so no other file holds
-        // a `send_raw`). A second one would be an open door for any event type
-        // — a status, a claim, an approval decision — outside this airlock.
+        // The person's agent events (stories 91.2, 93.3) go out through
+        // `Room::send_raw`, which takes any event type: exactly one call site
+        // may exist in production `account.rs` — the private
+        // `send_agent_event`, whose input is the closed `AgentOutbound` (a
+        // scope, a request for a conversation, the device's surface result —
+        // `agents::device` sends its `expired` answers through it too, so no
+        // other file holds a `send_raw` — and an approval decision). A second
+        // one would be an open door for any event type — a status, a claim, a
+        // `consumed` — outside this airlock.
         let raw_calls = normalized.matches(".send_raw(").count();
         assert_eq!(
             raw_calls, 1,
             "AD-13: `.send_raw(` must have exactly one production call site in \
              account.rs (`send_agent_event`, over the closed `AgentOutbound`); \
              found {raw_calls}."
+        );
+        // And the set is exactly these four: a new variant is a new door, a
+        // planning decision, not a refactor.
+        let proxy = include_str!("agents/proxy.rs");
+        let outbound = proxy
+            .split("pub enum AgentOutbound {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("AgentOutbound is declared in agents/proxy.rs");
+        let variants: Vec<&str> = outbound
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(
+            variants,
+            [
+                "Scope(ScopeContent),",
+                "ConversationRequest(ConversationRequestContent),",
+                "SurfaceResult(SurfaceResultContent),",
+                "Decision(ApprovalDecisionContent),",
+            ],
+            "AD-13: `AgentOutbound` is the closed set of what the person's device sends into \
+             an agent's room"
         );
     }
 

@@ -57,29 +57,7 @@ use serde_json::{json, Value};
 
 mod common;
 
-use common::Smoke;
-
-/// A fresh device makes the person's cross-signing identity and signs
-/// itself with it, replacing the one a previous run left. The account keeps
-/// an identity between runs, so the server asks for the password.
-async fn bootstrap(client: &AgentClient, user: &OwnedUserId, password: &str) {
-    use matrix_sdk::ruma::api::client::uiaa;
-    let encryption = client.client().encryption();
-    if let Err(error) = encryption.bootstrap_cross_signing(None).await {
-        let Some(challenge) = error.as_uiaa_response() else {
-            panic!("cross-signing: {error}");
-        };
-        let mut auth = uiaa::Password::new(
-            uiaa::UserIdentifier::Matrix(uiaa::MatrixUserIdentifier::new(user.to_string())),
-            password.to_owned(),
-        );
-        auth.session = challenge.session.clone();
-        encryption
-            .bootstrap_cross_signing(Some(uiaa::AuthData::Password(auth)))
-            .await
-            .expect("cross-signing with the password");
-    }
-}
+use common::{bootstrap, Smoke};
 
 /// The person resets their cross-signing identity from `client`: a new
 /// master key is published.

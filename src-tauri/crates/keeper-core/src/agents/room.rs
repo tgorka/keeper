@@ -18,6 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Mutex, RwLock};
 
+use chrono::{DateTime, Utc};
+use matrix_sdk::deserialized_responses::{EncryptionInfo, VerificationLevel, VerificationState};
 use matrix_sdk::event_cache::RoomEventCacheUpdate;
 use matrix_sdk::ruma::events::room::power_levels::RoomPowerLevels;
 use matrix_sdk::ruma::events::AnySyncTimelineEvent;
@@ -34,10 +36,11 @@ use serde_json::Value;
 use tokio::sync::watch;
 use ts_rs::TS;
 
+use crate::agents::approval_card::{ApprovalFold, ApprovalVm, Senders, Viewer};
 use crate::agents::delegation::{enveloped_brief, trusted_brief, DelegateContent};
 use crate::agents::events::{
-    RunState, StatusContent, CLAIM, CONTENT_VERSION, CONTROL_ROOM_TYPE, DELEGATE, HOST, SCOPE,
-    SESSION_ROOM_TYPE, STATUS, TURN,
+    RunState, StatusContent, APPROVAL_CONSUMED, APPROVAL_DECISION, APPROVAL_REQUEST, CLAIM,
+    CONTENT_VERSION, CONTROL_ROOM_TYPE, DELEGATE, HOST, SCOPE, SESSION_ROOM_TYPE, STATUS, TURN,
 };
 use crate::agents::label::{Label, LabelVm, Readers};
 use crate::agents::proxy::ProxyListEventContent;
@@ -108,22 +111,62 @@ impl AgentRoomKindVm {
 
 /// The timeline filter of a room of `kind` (ruling R33): the SDK's default
 /// everywhere, and in an agent room also without the claim and host state
-/// a host renews every minute, which would otherwise each add an item.
+/// a host renews every minute, which would otherwise each add an item. A
+/// session room also keeps an approval request, the one custom type its
+/// timeline draws (93.3; the item reads it, an edit of it is drawn as
+/// nothing).
 pub fn agent_event_filter(
     kind: Option<AgentRoomKind>,
 ) -> impl Fn(&AnySyncTimelineEvent, &RoomVersionRules) -> bool + Send + Sync + 'static {
     move |event, rules| {
         if kind.is_some() {
-            if let AnySyncTimelineEvent::State(state) = event {
-                // `StateEventType` has no `&str` view; this runs only for state
-                // events in agent rooms.
-                if matches!(state.event_type().to_string().as_str(), CLAIM | HOST) {
+            match event {
+                // `StateEventType` has no `&str` view; this runs only for
+                // state events in agent rooms.
+                AnySyncTimelineEvent::State(state)
+                    if matches!(state.event_type().to_string().as_str(), CLAIM | HOST) =>
+                {
                     return false;
                 }
+                AnySyncTimelineEvent::MessageLike(message)
+                    if kind == Some(AgentRoomKind::Session)
+                        && message.event_type().to_string() == APPROVAL_REQUEST =>
+                {
+                    return true;
+                }
+                _ => {}
             }
         }
         default_event_filter(event, rules)
     }
+}
+
+/// Whether a decrypted event was sealed by a device the SDK links to the
+/// sender its envelope names: an event that came in clear, whose Megolm
+/// session belongs to another user's device (`MismatchedSender`), or that
+/// the SDK cannot link to any device of the sender — an unknown device, or
+/// a key from an insecure source such as a backup or a forward
+/// (`None(_)`) — may be the server's or anyone's forgery (R185). Whether
+/// the device is trusted is a separate question.
+pub fn sealed_by_sender(encryption: Option<&EncryptionInfo>) -> bool {
+    encryption.is_some_and(|info| {
+        !matches!(
+            info.verification_state,
+            VerificationState::Unverified(
+                VerificationLevel::MismatchedSender | VerificationLevel::None(_)
+            )
+        )
+    })
+}
+
+/// Whether this device of `client`'s account is signed by its owner's
+/// cross-signing identity: what deciding an approval needs (93.3). A store
+/// that cannot be read says no.
+pub async fn own_device_cross_signed(client: &matrix_sdk::Client) -> bool {
+    matches!(
+        client.encryption().get_own_device().await,
+        Ok(Some(device)) if device.is_cross_signed_by_owner()
+    )
 }
 
 #[derive(Deserialize)]
@@ -219,6 +262,35 @@ impl TurnTrust<'_> {
         let brief = enveloped_brief(&event.kind, &event.content)
             .and_then(|brief| trusted_brief(brief, sender, self.creators))?;
         Some(BriefVm::of(&brief, self.roster))
+    }
+
+    /// The id the approval request in `sender`'s event names (93.3), read
+    /// by `own`, with `json` its original event and `sealed` whether the
+    /// sender's own device sealed it: in a session room, from a sender at
+    /// an agent's power who is not the own user, and not an edit (an edit
+    /// of a coalesced card changes its rows, never its place). Anything else
+    /// is no card.
+    pub fn approval(
+        &self,
+        own: &UserId,
+        sender: &UserId,
+        json: Option<&str>,
+        sealed: bool,
+    ) -> Option<String> {
+        if self.kind != Some(AgentRoomKind::Session)
+            || sender == own
+            || !sealed
+            || !holds_agent_power(self.levels, sender)
+        {
+            return None;
+        }
+        let event: EventProbe = serde_json::from_str(json?).ok()?;
+        if event.kind != APPROVAL_REQUEST
+            || event.content["m.relates_to"]["rel_type"] == "m.replace"
+        {
+            return None;
+        }
+        crate::agents::events::request_records(&event.content).map(|records| records[0].id.clone())
     }
 }
 
@@ -1006,6 +1078,12 @@ pub struct HeaderReader {
     trust: Trust,
     /// The display names the header resolved, until a member event.
     names: HashMap<OwnedUserId, String>,
+    /// The room's approval cards' requests, decisions and `consumed`, in
+    /// the room's order.
+    approvals: ApprovalFold,
+    /// Whether the event cache changed under the fold other than by an
+    /// append it took: it is folded again from the cache before it is read.
+    approvals_stale: bool,
 }
 
 impl HeaderReader {
@@ -1023,6 +1101,8 @@ impl HeaderReader {
             },
             room,
             names: HashMap::new(),
+            approvals: ApprovalFold::default(),
+            approvals_stale: false,
         };
         if let Ok((cache, _handles)) = reader.room.event_cache().await {
             if let Ok(events) = cache.events().await {
@@ -1033,6 +1113,7 @@ impl HeaderReader {
                 }
             }
         }
+        reader.approvals = approvals_of(&reader.room).await;
         if !reader.state.has_status()
             && !kinds.searched_empty(reader.room.room_id())
             && reader.page_back().await
@@ -1178,6 +1259,10 @@ impl HeaderReader {
                 }
             }
         }
+        if approvals_touched(&diffs.diffs) {
+            self.approvals_stale = true;
+            changed = true;
+        }
         self.remember(kinds);
         changed
     }
@@ -1189,7 +1274,31 @@ impl HeaderReader {
         icons: &AgentIcons,
         newest_turn: Option<&str>,
     ) -> AgentRoomHeaderVm {
-        for user in self.state.named() {
+        self.resolve(self.state.named()).await;
+        let names = &self.names;
+        let name = |user: &UserId| names.get(user).cloned().unwrap_or_else(|| user.to_string());
+        self.state.header(&name, icons, newest_turn)
+    }
+
+    /// The room's approval cards as `viewer` reads them at `now`.
+    pub async fn approvals(&mut self, viewer: &Viewer, now: DateTime<Utc>) -> Vec<ApprovalVm> {
+        if std::mem::take(&mut self.approvals_stale) {
+            self.approvals = approvals_of(&self.room).await;
+        }
+        self.resolve(self.approvals.named()).await;
+        let names = &self.names;
+        let name = |user: &UserId| names.get(user).cloned().unwrap_or_else(|| user.to_string());
+        self.approvals.approvals(viewer, now, &name)
+    }
+
+    /// When the next waiting card turns expired, after `now`.
+    pub fn next_expiry(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.approvals.next_expiry(now)
+    }
+
+    /// Resolve the display names of `users` not resolved yet.
+    async fn resolve(&mut self, users: Vec<OwnedUserId>) {
+        for user in users {
             if self.names.contains_key(&user) {
                 continue;
             }
@@ -1204,10 +1313,109 @@ impl HeaderReader {
                 .unwrap_or_else(|| user.to_string());
             self.names.insert(user, name);
         }
-        let names = &self.names;
-        let name = |user: &UserId| names.get(user).cloned().unwrap_or_else(|| user.to_string());
-        self.state.header(&name, icons, newest_turn)
     }
+}
+
+/// Whether event-cache `diffs` may change a room's approvals: anything but
+/// appending events none of which is an approval's, a claim or the power
+/// levels. An insert, a prepend from back-pagination, a replacement, a
+/// removal or a reset moves the room's order the fold follows (R187).
+pub fn approvals_touched(
+    diffs: &[VectorDiff<matrix_sdk::deserialized_responses::TimelineEvent>],
+) -> bool {
+    diffs.iter().any(|diff| match diff {
+        VectorDiff::Append { values } => values.iter().any(|event| approval_input(event.raw())),
+        VectorDiff::PushBack { value } => approval_input(value.raw()),
+        _ => true,
+    })
+}
+
+fn approval_input(raw: &Raw<AnySyncTimelineEvent>) -> bool {
+    matches!(
+        event_type(raw),
+        Some(
+            APPROVAL_REQUEST
+                | APPROVAL_DECISION
+                | APPROVAL_CONSUMED
+                | CLAIM
+                | "m.room.power_levels"
+        )
+    )
+}
+
+/// The session's own agents as the last sync left them (R185): the room's
+/// creators, and every agent a claim in the room names who sent it. Who of
+/// them holds an agent's power is asked where they are used.
+pub async fn session_agents(room: &Room) -> Vec<OwnedUserId> {
+    use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
+    use matrix_sdk::ruma::events::StateEventType;
+    let mut agents = room.creators().unwrap_or_default();
+    let claims = room
+        .get_state_events(StateEventType::from(CLAIM))
+        .await
+        .unwrap_or_default();
+    for claim in claims {
+        let RawAnySyncOrStrippedState::Sync(raw) = claim else {
+            continue;
+        };
+        let Ok(value) = raw.deserialize_as::<Value>() else {
+            continue;
+        };
+        let sender = value["sender"].as_str();
+        if sender.is_some() && sender == value["content"]["agent"].as_str() {
+            if let Some(user) = sender.and_then(|sender| UserId::parse(sender).ok()) {
+                if !agents.contains(&user) {
+                    agents.push(user);
+                }
+            }
+        }
+    }
+    agents
+}
+
+/// `events`, in the room's order, folded into their approvals as `own`
+/// reads them, under `levels`, with `owners` the session's own agents.
+pub fn fold_events<'a>(
+    events: impl IntoIterator<Item = &'a matrix_sdk::deserialized_responses::TimelineEvent>,
+    own: &UserId,
+    levels: Option<&RoomPowerLevels>,
+    owners: &[OwnedUserId],
+) -> ApprovalFold {
+    let agent = |user: &UserId| holds_agent_power(levels, user);
+    let owner = |user: &UserId| owners.iter().any(|owner| owner == user);
+    let senders = Senders {
+        own,
+        agent: &agent,
+        owner: &owner,
+    };
+    let mut fold = ApprovalFold::default();
+    for event in events {
+        if !matches!(
+            event_type(event.raw()),
+            Some(APPROVAL_REQUEST | APPROVAL_DECISION | APPROVAL_CONSUMED)
+        ) {
+            continue;
+        }
+        let Ok(value) = event.raw().deserialize_as::<Value>() else {
+            continue;
+        };
+        let sealed = sealed_by_sender(event.encryption_info().map(|info| &**info));
+        fold.apply(&value, sealed, &senders);
+    }
+    fold
+}
+
+/// A room's approvals as its event cache holds them now, in the room's
+/// order: what a card shows and a decision is checked against before it
+/// is sent.
+pub async fn approvals_of(room: &Room) -> ApprovalFold {
+    let levels = room.power_levels().await.ok();
+    let owners = session_agents(room).await;
+    let Ok((cache, _handles)) = room.event_cache().await else {
+        return ApprovalFold::default();
+    };
+    let events = cache.events().await.unwrap_or_default();
+    fold_events(&events, room.own_user_id(), levels.as_ref(), &owners)
 }
 
 /// Power levels holding `users` at their levels, everyone else at 0.
@@ -1397,6 +1605,10 @@ mod tests {
             ),
             ("host", event(state(HOST, "electra", json!({"v": 1})))),
             (
+                "approval.request",
+                event(base(APPROVAL_REQUEST, json!({"v": 1}))),
+            ),
+            (
                 "topic",
                 event(state("m.room.topic", "", json!({"topic": "t"}))),
             ),
@@ -1433,13 +1645,15 @@ mod tests {
     }
 
     #[test]
-    fn agent_rooms_drop_claim_and_host_state_and_admit_no_agent_event() {
+    fn agent_rooms_drop_claim_and_host_state_and_admit_only_an_approval_request() {
         let rules = RoomVersionRules::V11;
         for kind in [AgentRoomKind::Session, AgentRoomKind::Control] {
             let filter = agent_event_filter(Some(kind));
             for (name, event) in fixtures() {
-                let expected = match name {
-                    "claim" | "host" => false,
+                let expected = match (name, kind) {
+                    ("claim" | "host", _) => false,
+                    // The one custom type a session room draws (93.3).
+                    ("approval.request", AgentRoomKind::Session) => true,
                     _ => default_event_filter(&event, &rules),
                 };
                 assert_eq!(filter(&event, &rules), expected, "{kind:?} {name}");
@@ -2175,5 +2389,186 @@ mod tests {
         assert!(!is_agent_turn(&plain.to_string()));
         let outside = json!({"type": "m.room.message", TURN: {}, "content": {"body": "hi"}});
         assert!(!is_agent_turn(&outside.to_string()));
+    }
+
+    /// 93.3: a request is a card only from an agent of the room, sealed,
+    /// not the own user's and not an edit; a coalesced card is placed by
+    /// its first record.
+    #[test]
+    fn an_approval_item_is_an_agents_sealed_original_request() {
+        let levels = power_levels_for(&[(NIXI, 50), (MARTA, 0)]);
+        let trust = TurnTrust {
+            kind: Some(AgentRoomKind::Session),
+            levels: Some(&levels),
+            ..TurnTrust::default()
+        };
+        let record = |id: &str| {
+            json!({
+                "v": 1, "id": id, "session": "s", "room": "!s:example.org", "agent": "nixi",
+                "tier": 2, "summary": "s",
+                "action": {"tool": "drive_write", "args": {}, "exec_binding": null},
+                "checkpoint_sha256": "0",
+                "preconditions": {"files": [], "workspace": null, "screen": null, "max_staleness_s": null},
+                "binding_digest": "sha256:0", "scopes": ["once"],
+                "expires_at": "2026-10-06T00:00:00.000Z", "approvers": [], "dispatch_chain": [],
+            })
+        };
+        let request = |content: Value| {
+            json!({"type": APPROVAL_REQUEST, "sender": NIXI, "content": content}).to_string()
+        };
+        let one = request(record("01A"));
+        let nixi = user(NIXI);
+        let me = own();
+        assert_eq!(
+            trust.approval(&me, &nixi, Some(&one), true).as_deref(),
+            Some("01A")
+        );
+        assert_eq!(
+            trust.approval(&me, &nixi, Some(&one), false),
+            None,
+            "not sealed"
+        );
+        assert_eq!(
+            trust.approval(&me, &user(MARTA), Some(&one), true),
+            None,
+            "a person"
+        );
+        assert_eq!(
+            trust.approval(&nixi, &nixi, Some(&one), true),
+            None,
+            "the own user"
+        );
+        let control = TurnTrust {
+            kind: Some(AgentRoomKind::Control),
+            ..trust
+        };
+        assert_eq!(control.approval(&me, &nixi, Some(&one), true), None);
+        let edit = request(json!({
+            "m.new_content": {"v": 1, "records": [record("01A"), record("01B")]},
+            "m.relates_to": {"rel_type": "m.replace", "event_id": "$r"},
+        }));
+        assert_eq!(
+            trust.approval(&me, &nixi, Some(&edit), true),
+            None,
+            "an edit"
+        );
+        let coalesced = request(json!({"v": 1, "records": [record("01C"), record("01D")]}));
+        assert_eq!(
+            trust
+                .approval(&me, &nixi, Some(&coalesced), true)
+                .as_deref(),
+            Some("01C")
+        );
+        let unreadable = request(json!({"v": 1, "id": "01E"}));
+        assert_eq!(trust.approval(&me, &nixi, Some(&unreadable), true), None);
+    }
+
+    fn encrypted(state: VerificationState) -> EncryptionInfo {
+        use matrix_sdk::deserialized_responses::AlgorithmInfo;
+        EncryptionInfo {
+            sender: user(NIXI),
+            sender_device: None,
+            forwarder: None,
+            algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                curve25519_key: String::new(),
+                sender_claimed_keys: std::collections::BTreeMap::new(),
+                session_id: None,
+            },
+            verification_state: state,
+        }
+    }
+
+    /// R185 (R4-02): a seal is a device the SDK links to the sender, its
+    /// trust aside; a session it cannot link to any device of the sender
+    /// is none.
+    #[test]
+    fn only_a_device_the_sdk_links_to_the_sender_seals_an_event() {
+        use matrix_sdk::deserialized_responses::DeviceLinkProblem;
+        let unverified = |level| encrypted(VerificationState::Unverified(level));
+        for (info, seals) in [
+            (Some(encrypted(VerificationState::Verified)), true),
+            (
+                Some(unverified(VerificationLevel::UnverifiedIdentity)),
+                true,
+            ),
+            (Some(unverified(VerificationLevel::UnsignedDevice)), true),
+            (
+                Some(unverified(VerificationLevel::VerificationViolation)),
+                true,
+            ),
+            (Some(unverified(VerificationLevel::MismatchedSender)), false),
+            (
+                Some(unverified(VerificationLevel::None(
+                    DeviceLinkProblem::MissingDevice,
+                ))),
+                false,
+            ),
+            (
+                Some(unverified(VerificationLevel::None(
+                    DeviceLinkProblem::InsecureSource,
+                ))),
+                false,
+            ),
+            (None, false),
+        ] {
+            let state = info.as_ref().map(|info| info.verification_state.clone());
+            assert_eq!(sealed_by_sender(info.as_ref()), seals, "{state:?}");
+        }
+    }
+
+    /// R187 (R4-05): only appending events that are none of an approval's,
+    /// a claim or the power levels leaves the approvals as folded; any
+    /// other change of the cache folds them again from its order.
+    #[test]
+    fn a_cache_change_other_than_an_unrelated_append_folds_the_approvals_again() {
+        use matrix_sdk::deserialized_responses::TimelineEvent;
+        use matrix_sdk_ui::eyeball_im::Vector;
+        let of = |kind: &str| {
+            TimelineEvent::from_plaintext(Raw::from_json(
+                serde_json::value::to_raw_value(&json!({
+                    "type": kind, "event_id": "$e", "sender": NIXI,
+                    "origin_server_ts": 1, "content": {},
+                }))
+                .expect("raw"),
+            ))
+        };
+        let message = of("m.room.message");
+        let append = |kind: &str| VectorDiff::Append {
+            values: Vector::from(vec![of("m.room.message"), of(kind)]),
+        };
+        assert!(!approvals_touched(&[append("m.room.message")]));
+        assert!(!approvals_touched(&[VectorDiff::PushBack {
+            value: message.clone()
+        }]));
+        for kind in [
+            APPROVAL_REQUEST,
+            APPROVAL_DECISION,
+            APPROVAL_CONSUMED,
+            CLAIM,
+            "m.room.power_levels",
+        ] {
+            assert!(approvals_touched(&[append(kind)]), "{kind}");
+        }
+        for diff in [
+            VectorDiff::PushFront {
+                value: message.clone(),
+            },
+            VectorDiff::Insert {
+                index: 0,
+                value: message.clone(),
+            },
+            VectorDiff::Set {
+                index: 0,
+                value: message.clone(),
+            },
+            VectorDiff::Remove { index: 0 },
+            VectorDiff::Clear,
+            VectorDiff::Truncate { length: 0 },
+            VectorDiff::Reset {
+                values: Vector::new(),
+            },
+        ] {
+            assert!(approvals_touched(&[diff]));
+        }
     }
 }

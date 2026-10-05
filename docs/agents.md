@@ -742,7 +742,9 @@ decision is written); the first that fails is logged as `approval decided` with 
 that reason, and nothing moves:
 
 - the sender is a person, not an agent, and reads the session now and when the action parked;
-- the event was sealed by the sender's own device;
+- the event was sealed by a device of the sender's that keeper can link it to: not one whose key
+  came from another user's device, from a backup or a forward, or from a device the sender's keys
+  do not list;
 - that device is signed by the sender's own cross-signing identity, as their homeserver publishes it
   when the decision arrives: keeper asks for the sender's keys afresh for each decision and judges
   that one answer alone — the device's signature by the self-signing key, and that key's by the
@@ -768,6 +770,46 @@ and published fingerprints and whether they match; it reads them from the runnin
 asks the homeserver every five minutes, and never writes `agentd.toml`. The pin it prints is the
 one the running host judged; a pin changed in `agentd.toml` since is printed after it, "used after
 a restart".
+
+**On a person's device.** The request (`dev.keeper.agent.approval.request`) carries the record's
+id, the session, its own room and the agent, tier, keeper's summary, the exact arguments (over
+16 KiB the request's encrypted file instead, which the card names as attached, never cut), the
+checkpoint's hash and the preconditions, the digest, the scopes, the expiry, the approvers (the
+label's readers when it parked; none listed: anyone reading the room) and the `dispatch_chain`.
+A keeper client draws it as a card only when the session's own agent sent it — the room's
+creator, or the agent a claim in the room names, at power ≥ 50, not the person themself — sealed
+by a device keeper can link to it as above: a person can send an encrypted look-alike at power 0,
+and another agent in the room has the same power, and neither is a card. The device then works
+the digest out again over everything the request shows, and keeper's summary over the arguments;
+when either differs, the card shows no decide buttons ("what the card shows is not what was sent
+for approval"). An attached action is opened on the card: keeper fetches and decrypts the file,
+checks it is the file the request names and the action its digest binds, and shows it, or says it
+cannot; an attached action is approved only after this device showed it. Each way of approving
+says what it grants: once, this action exactly as shown; for this session, the same tool again in
+the same drive on anything in the approved path's folder, without asking, until the session
+closes and for at most 24 hours.
+
+The card's state is read beside the stream, in the room's order (whatever order the events
+reached the device in, and again after the timeline pages back or the server replaces an event):
+a person's decision on that record from someone the card says may decide (an approver; at T4 the
+requester), with its digest and a scope it offers, shows as *decided* — but the card stays
+decidable, on every device, because the host may not count it (a device it does not trust, an
+action that drifted); the agent's own `consumed` state event makes it *consumed* (another agent's
+changes nothing); past `expires_at` it is *expired*, whatever was decided, unless the agent used
+it first. A gate's coalesced card is one request listing several records; an edit from the same
+agent that keeps every listed record byte for byte adds rows, any other edit is ignored, and each
+row is decided on its own.
+
+The decide buttons appear only where a decision would be sent: the card shows what was sent for
+approval, the person is an approver, at T4 the requester ("Only <them> can decide this. This cannot
+be undone." shows to everyone), this device is signed by the person's own cross-signing identity
+(otherwise the card says how to verify it, with the way into Settings), and at T4 this app does not
+host the agent of the session that asked — wherever the card is shown, a proxy DM included
+("Decide on another device"). The same checks run again when the person decides, before anything
+is sent; the decision then goes out as `dev.keeper.agent.approval.decision` through the device's
+one agent-event sender, beside a scope, a focus and a surface result. keeper also reads the
+account's own fingerprint, in the same groups of four `keeper-agentd status` prints, for the
+person to compare before pinning it (Settings' Encryption section draws it with the card).
 
 ## A session an agent works in
 

@@ -64,6 +64,9 @@ import type {
   AgentSeedPlanVm,
   AgentSeedReq,
   AgentSeedResultVm,
+  ApprovalCardVm,
+  ApprovalDecideReq,
+  ApprovalVm,
   AutoUpdateRestartVm,
   AutoUpdateVm,
   BotAttachmentVm,
@@ -4518,6 +4521,327 @@ const AGENT_ROOM_TIMELINES: Record<string, { header: AgentRoomHeaderVm; items: T
     },
   };
 
+// ---------------------------------------------------------------------------
+// Approval cards (93.3, UX-DR136), in Nixi's reading-list conversation, as
+// Rust draws them: one `approval` item in the timeline and its cards beside
+// the stream (`TimelineBatch.approvals`). `?approval=` picks the card:
+// `pending` (T2: once or for this session), `main` (T2 in a proxy's DM: once
+// only), `t3`, `t4` (the person asked: they decide), `t4-other` (Marta asked:
+// "Only Marta…"), `t4-hosted` (this app runs the agent: "Decide on another
+// device…"), `declassify`, `large` (the action attached: approving needs
+// `agent_approval_payload` first), `unverified` (no buttons, the way into
+// verification), `not-approver`, `approved`, `denied` (a decision in the room:
+// the card stays decidable, R187), `expired`, `consumed`, `coalesced` (three
+// rows, the second approved).
+// `agent_approval_decide` answers as Rust does: refused with the card's own
+// sentence where it shows no buttons, for another digest or a scope the card
+// does not offer, and for an attached action not shown yet; else the card
+// shows the person's decision half a second later and stays decidable
+// (`?approval-host=offline`: the decision is sent and the card stays
+// pending, as when the room never echoes it).
+// `agent_approval_payload` answers the `large` card's action, verified;
+// `?approval-payload=refused` refuses it as not the action sent for approval.
+// `agent_own_fingerprint` answers a fixed key; `?fingerprint=none` answers
+// `null` (no cross-signing identity).
+// ---------------------------------------------------------------------------
+
+const approvalParam = new URLSearchParams(window.location.search).get("approval");
+const approvalHostParam = new URLSearchParams(window.location.search).get("approval-host");
+const approvalPayloadParam = new URLSearchParams(window.location.search).get("approval-payload");
+const fingerprintParam = new URLSearchParams(window.location.search).get("fingerprint");
+const APPROVAL_ROOM = "!nixi-reading:example.org";
+const MARTA = "@marta:example.org";
+const PEOPLE: Record<string, string> = { [PERSON]: "harness", [MARTA]: "Marta", [NIXI]: "Nixi" };
+const person = (user: string) => ({ user, name: PEOPLE[user] ?? user });
+/** Rust's sentences (`keeper_core::agents::approval_card`), verbatim. */
+const APPROVAL_SENTENCES = {
+  unverified:
+    "This device cannot decide: it is not verified. Verify it from another of your devices in Settings › Encryption, then decide here.",
+  notApprover: "You are not one of the people who can decide this.",
+  thisDevice:
+    "Decide on another device: this app runs the agent that asks, so it cannot be the one that agrees.",
+  attached: "The action is too large to show here: it is attached to the request, whole.",
+  notWaiting: "This approval is no longer waiting for a decision.",
+  notFound: "keeper cannot find this approval in the room.",
+  otherAction: "This decision is for something other than what the card shows.",
+  scopeNotOffered: "This approval does not offer that.",
+  unseen: "Open the attached action first: keeper approves only what it has shown you.",
+  payloadRefused: "keeper cannot show the attached action: it is not the one sent for approval.",
+  notAttached: "This action is shown on its card; nothing is attached.",
+  onceReach: "Lets this one action run once, exactly as shown.",
+  sessionReach:
+    "Also lets this session run `drive_write` again in tgdrive, on anything in `notes/`, without asking, until the session closes and for at most 24 hours.",
+  attachedReach:
+    "Also lets this session run the same tool again in the same drive, on anything in the attached action's folder, without asking, until the session closes and for at most 24 hours.",
+};
+const TIER_WORDS: Record<number, string> = {
+  2: "T2: it changes something that can be put back",
+  3: "T3: it reaches beyond this session: it sends, or changes what runs",
+  4: "T4: it cannot be undone",
+};
+
+function approvalCard(
+  id: string,
+  tier: number,
+  over: Partial<ApprovalCardVm> = {},
+): ApprovalCardVm {
+  const session = tier <= 2;
+  return {
+    id,
+    bindingDigest: `sha256:${id.toLowerCase()}`,
+    tier,
+    tierWord: TIER_WORDS[tier],
+    summary: "Write `notes/reading.md` in tgdrive (412 bytes)",
+    tool: "drive_write",
+    payload: JSON.stringify(
+      { profile: "tgdrive", path: "notes/reading.md", content: "# Reading list\n\n- Synapse…" },
+      null,
+      2,
+    ),
+    attachment: null,
+    approvers: [person(PERSON), person(MARTA)],
+    anyone: false,
+    chain: [person(PERSON), person(NIXI)],
+    scopes: session
+      ? [
+          { scope: "once", label: "Approve once", detail: APPROVAL_SENTENCES.onceReach },
+          {
+            scope: "session",
+            label: "Approve for this session",
+            detail: APPROVAL_SENTENCES.sessionReach,
+          },
+        ]
+      : [{ scope: "once", label: "Approve", detail: APPROVAL_SENTENCES.onceReach }],
+    expiresAt: MOCK_NOW + (tier >= 4 ? 1 : 24) * 3_600_000,
+    state: { state: "pending" },
+    canDecide: true,
+    cannotDecide: null,
+    verify: false,
+    only: tier >= 4 ? "Only harness can decide this. This cannot be undone." : null,
+    declassify: null,
+    ...over,
+  };
+}
+
+function decidedBy(decision: "approve" | "deny", user: string): ApprovalCardVm["state"] {
+  return { state: "decided", decision, scope: "once", by: user, byName: PEOPLE[user] ?? user };
+}
+
+const noButtons = { canDecide: false, cannotDecide: null, verify: false };
+
+function mockApprovalCards(): ApprovalCardVm[] {
+  const id = "01JAPPROVAL0000000000000001";
+  switch (approvalParam) {
+    case "pending":
+      return [approvalCard(id, 2)];
+    case "main":
+      return [
+        approvalCard(id, 2, {
+          scopes: [{ scope: "once", label: "Approve", detail: APPROVAL_SENTENCES.onceReach }],
+        }),
+      ];
+    case "t3":
+      return [
+        approvalCard(id, 3, {
+          summary: "Hand work to @tola:example.org",
+          tool: "delegate",
+          payload: JSON.stringify({ agent: "@tola:example.org", brief: "Review…" }, null, 2),
+        }),
+      ];
+    case "t4":
+      return [approvalCard(id, 4)];
+    case "t4-other":
+      return [
+        approvalCard(id, 4, {
+          chain: [person(MARTA), person(NIXI)],
+          only: "Only Marta can decide this. This cannot be undone.",
+          canDecide: false,
+          cannotDecide: "Only Marta can decide this.",
+        }),
+      ];
+    case "t4-hosted":
+      return [
+        approvalCard(id, 4, { canDecide: false, cannotDecide: APPROVAL_SENTENCES.thisDevice }),
+      ];
+    case "declassify": {
+      const sha = "9f2c4be1a7d03e55c6b8f1a2d4e6c8b0a1f3e5d7c9b1a3f5e7d9c1b3a5f7e9d1";
+      return [
+        approvalCard(id, 3, {
+          summary: `Let @lucyna:example.org read the brief (${sha.slice(0, 12)})`,
+          tool: "declassify",
+          payload: JSON.stringify(
+            { readers: ["@lucyna:example.org"], what: "the brief", sha256: sha },
+            null,
+            2,
+          ),
+          declassify: {
+            readers: [{ user: "@lucyna:example.org", name: "Dr Lucyna Novak" }],
+            what: "the brief",
+            sha256: sha,
+            sentence: `Approving lets Dr Lucyna Novak read the brief: exactly these bytes (SHA-256 ${sha.slice(0, 12)}), once. Nothing else of this session reaches them.`,
+          },
+        }),
+      ];
+    }
+    case "large":
+      return [
+        approvalCard(id, 2, {
+          summary: "Write `notes/archive.md` in tgdrive (48213 bytes)",
+          payload: null,
+          attachment: `${APPROVAL_SENTENCES.attached} SHA-256 3b7e…`,
+          scopes: [
+            { scope: "once", label: "Approve once", detail: APPROVAL_SENTENCES.onceReach },
+            {
+              scope: "session",
+              label: "Approve for this session",
+              detail: APPROVAL_SENTENCES.attachedReach,
+            },
+          ],
+        }),
+      ];
+    case "unverified":
+      return [
+        approvalCard(id, 2, {
+          canDecide: false,
+          cannotDecide: APPROVAL_SENTENCES.unverified,
+          verify: true,
+        }),
+      ];
+    case "not-approver":
+      return [
+        approvalCard(id, 2, {
+          approvers: [person(MARTA)],
+          canDecide: false,
+          cannotDecide: APPROVAL_SENTENCES.notApprover,
+        }),
+      ];
+    case "approved":
+      return [approvalCard(id, 2, { state: decidedBy("approve", MARTA) })];
+    case "denied":
+      return [approvalCard(id, 2, { state: decidedBy("deny", PERSON) })];
+    case "expired":
+      return [
+        approvalCard(id, 2, {
+          expiresAt: MOCK_NOW - 60_000,
+          state: { state: "expired" },
+          ...noButtons,
+        }),
+      ];
+    case "consumed":
+      return [approvalCard(id, 2, { state: { state: "consumed" }, ...noButtons })];
+    case "coalesced":
+      return [
+        "01JGATE0000000000000000001",
+        "01JGATE0000000000000000002",
+        "01JGATE0000000000000000003",
+      ].map((gate, n) =>
+        approvalCard(gate, 3, {
+          summary: `Hand work to @tola:example.org (ticket ${n + 1})`,
+          tool: "delegate",
+          ...(n === 1 ? { state: decidedBy("approve", PERSON) } : {}),
+        }),
+      );
+    default:
+      return [];
+  }
+}
+
+/** The reading-list room's approvals, as the stream last sent them. */
+let mockApprovals: ApprovalVm[] = (() => {
+  const cards = mockApprovalCards();
+  return cards.length > 0 ? [{ id: cards[0].id, cards }] : [];
+})();
+if (mockApprovals.length > 0) {
+  AGENT_ROOM_TIMELINES[APPROVAL_ROOM].items.push({
+    kind: "approval",
+    key: "reading-approval",
+    id: mockApprovals[0].id,
+  });
+}
+
+/** The attached actions `agent_approval_payload` has shown, by card id. */
+const shownPayloads = new Set<string>();
+
+function mockApprovalPayload(payload: Record<string, unknown>): Promise<string> {
+  const card = mockApprovals
+    .flatMap((approval) => approval.cards)
+    .find((c) => c.id === String(payload.id));
+  if (String(payload.roomId) !== APPROVAL_ROOM || !card) {
+    return Promise.reject({ code: "unsupported", message: APPROVAL_SENTENCES.notFound });
+  }
+  if (card.attachment === null) {
+    return Promise.reject({ code: "unsupported", message: APPROVAL_SENTENCES.notAttached });
+  }
+  if (approvalPayloadParam === "refused") {
+    return Promise.reject({ code: "unsupported", message: APPROVAL_SENTENCES.payloadRefused });
+  }
+  return later(400, () => {
+    shownPayloads.add(card.id);
+    return JSON.stringify(
+      { profile: "tgdrive", path: "notes/archive.md", content: "# Archive\n\n- …".repeat(400) },
+      null,
+      2,
+    );
+  });
+}
+
+function mockApprovalDecide(payload: Record<string, unknown>): Promise<null> {
+  const roomId = String(payload.roomId);
+  const req = payload.req as ApprovalDecideReq;
+  const card = mockApprovals.flatMap((approval) => approval.cards).find((c) => c.id === req.id);
+  const refuse = (message: string) => Promise.reject({ code: "unsupported", message });
+  if (roomId !== APPROVAL_ROOM || !card) {
+    return refuse(APPROVAL_SENTENCES.notFound);
+  }
+  if (card.state.state !== "pending" && card.state.state !== "decided") {
+    return refuse(APPROVAL_SENTENCES.notWaiting);
+  }
+  if (req.bindingDigest !== card.bindingDigest) {
+    return refuse(APPROVAL_SENTENCES.otherAction);
+  }
+  if (!card.scopes.some((offer) => offer.scope === req.scope)) {
+    return refuse(APPROVAL_SENTENCES.scopeNotOffered);
+  }
+  if (!card.canDecide) {
+    return refuse(card.cannotDecide ?? "");
+  }
+  if (req.decision === "approve" && card.attachment !== null && !shownPayloads.has(card.id)) {
+    return refuse(APPROVAL_SENTENCES.unseen);
+  }
+  return later(300, () => {
+    // A decision already in the room stays the one shown (the first).
+    if (approvalHostParam !== "offline" && card.state.state === "pending") {
+      setTimeout(() => {
+        mockApprovals = mockApprovals.map((approval) => ({
+          ...approval,
+          cards: approval.cards.map((c) =>
+            c.id === req.id
+              ? {
+                  ...c,
+                  state: {
+                    state: "decided" as const,
+                    decision: req.decision,
+                    scope: req.scope,
+                    by: PERSON,
+                    byName: PEOPLE[PERSON],
+                  },
+                }
+              : c,
+          ),
+        }));
+        for (const open of dockChannels.values()) {
+          if (open.roomId === APPROVAL_ROOM) {
+            open.channel.onmessage?.({ ops: [], approvals: mockApprovals });
+          }
+        }
+      }, 500);
+    }
+    return null;
+  });
+}
+
+const OWN_FINGERPRINT = "nKr8 3Ffq Wd9u Lx2T b7Qe Rm4Z sV1c Ah6P yJ0o Gk5N tX3i";
+
 /** Nixi's answer as it grows: each step is one `set` op on the anchor. */
 const NIXI_ANSWER_STEPS = [
   "Synapse",
@@ -4546,7 +4870,11 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
     });
     return id;
   }
-  channel.onmessage?.({ ops: [{ op: "reset", items: agent.items }], header: agent.header });
+  channel.onmessage?.({
+    ops: [{ op: "reset", items: agent.items }],
+    header: agent.header,
+    ...(roomId === APPROVAL_ROOM && mockApprovals.length > 0 ? { approvals: mockApprovals } : {}),
+  });
   dockChannels.set(id, { roomId, channel });
   if (roomId !== "!nixi-dm:example.org" || dockParam !== null) {
     return id;
@@ -4827,6 +5155,9 @@ function mockSurfaceSubscribe(payload: Record<string, unknown>): null {
 
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   inbox_subscribe: subscribeMockInbox,
+  agent_approval_decide: mockApprovalDecide,
+  agent_approval_payload: mockApprovalPayload,
+  agent_own_fingerprint: () => (fingerprintParam === "none" ? null : OWN_FINGERPRINT),
   agent_rooms_list: (payload) =>
     payload.accountId === MOCK_ACCOUNT_ID && Date.now() >= dockListedFrom ? proxyRooms : [],
   agent_scope_set: mockScopeSet,

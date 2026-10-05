@@ -20,6 +20,7 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use ts_rs::TS;
 
 use crate::agents::label::Label;
 use crate::agents::session::SessionKind;
@@ -40,8 +41,9 @@ pub const NEWER_RECORD: &str =
 /// What a person may give: this one call, or calls like it for the rest of
 /// the session (at T2, outside a `main` session, at most 24 hours). There is
 /// never an "always": a durable rule is a grant edit in Settings (AD-158).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "lowercase")]
+#[ts(export, rename = "ApprovalScope")]
 pub enum Scope {
     Once,
     Session,
@@ -75,6 +77,25 @@ pub fn session_scope_ends(
 ) -> DateTime<Utc> {
     let day = decided_at + Duration::hours(24);
     session_closed_at.map_or(day, |closed| closed.min(day))
+}
+
+/// What approving `tool` with `args` for the session grants (R78), in a
+/// person's words: the same tool, in the same drive, on any path under
+/// the approved path's folder, until the session closes and for at most
+/// 24 hours after the decision.
+pub fn session_reach(tool: &str, args: &Value) -> String {
+    let drive = args["profile"]
+        .as_str()
+        .or_else(|| args["drive"].as_str())
+        .unwrap_or("this session's files");
+    let path = args["path"].as_str().unwrap_or("");
+    let folder = match path.trim_end_matches('/').rsplit_once('/') {
+        Some((folder, _)) if !folder.is_empty() => format!("`{folder}/`"),
+        _ => "the top folder".to_owned(),
+    };
+    format!(
+        "Also lets this session run `{tool}` again in {drive}, on anything in {folder}, without asking, until the session closes and for at most 24 hours."
+    )
 }
 
 /// How long a record waits for its decision: an hour at T4, a day below.
@@ -611,8 +632,9 @@ pub fn parse_record(text: &str) -> Result<ApprovalRecord, RecordRefusal> {
 }
 
 /// A person's answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "lowercase")]
+#[ts(export, rename = "ApprovalDecision")]
 pub enum Decision {
     Approve,
     Deny,

@@ -1003,6 +1003,7 @@ async fn an_agent_room_reads_as_one_header_and_one_growing_answer() {
         }),
         Arc::clone(&kinds),
         Arc::new(AgentIcons::default()),
+        Arc::new(keeper_core::agents::approval_card::HostedRooms::default()),
     ));
     let deadline = Instant::now() + Duration::from_secs(30);
     while batches.lock().expect("lock").is_empty() {

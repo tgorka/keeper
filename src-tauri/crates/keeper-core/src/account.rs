@@ -45,9 +45,11 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
+use crate::agents::approval_card::{self, ApprovalDecideReq, HostedRooms, Viewer, NOTE_MAX};
 use crate::agents::device::{self as agent_device, AccountAgents, AgentDevice};
 use crate::agents::events::{
-    ConversationRequestContent, Focus, ScopeContent, ScopeDrive, CONTENT_VERSION,
+    ApprovalDecisionContent, ConversationRequestContent, Focus, ScopeContent, ScopeDrive,
+    CONTENT_VERSION,
 };
 use crate::agents::events::{PresencePlatform, SurfaceResultContent};
 use crate::agents::focus::{FocusLanes, FocusPort, Named, SendFuture};
@@ -631,6 +633,13 @@ pub struct AccountManager {
     /// The app's agents on this device (91.3): whether keeper is in front,
     /// which view it shows, and the surface requests its accounts admit.
     agent_device: Arc<AgentDevice>,
+    /// The session rooms whose agent this app hosts (93.3): the desktop's
+    /// agents host replaces them on each tick; empty on the phone.
+    agent_hosted: Arc<HostedRooms>,
+    /// The attached actions this app showed and found bound to their
+    /// digest, by `(account, room, binding digest)` (R186): only these are
+    /// approved.
+    agent_shown: Arc<std::sync::Mutex<std::collections::HashSet<(String, String, String)>>>,
 }
 
 /// Monotonic source of subscription ids handed back to the frontend.
@@ -726,6 +735,8 @@ impl AccountManager {
             agent_proxies: Arc::new(AgentProxies::default()),
             agent_focus: Arc::new(FocusLanes::default()),
             agent_device: Arc::new(AgentDevice::default()),
+            agent_hosted: Arc::new(HostedRooms::default()),
+            agent_shown: Arc::default(),
         }
     }
 
@@ -1407,11 +1418,12 @@ impl AccountManager {
         let room_id_log = room_id.clone();
         let kinds = self.agent_kinds.clone();
         let icons = self.agent_icons.clone();
+        let hosted = self.agent_hosted.clone();
         let span =
             tracing::info_span!("timeline_producer", account_id = %account_id, room_id = %room_id);
         let task = tokio::spawn(
             async move {
-                timeline::forward_timeline(open, room_id_task, sink, kinds, icons).await;
+                timeline::forward_timeline(open, room_id_task, sink, kinds, icons, hosted).await;
                 // A naturally-completed producer reaps its own subscription entry
                 // and drops its stored `Arc<Timeline>` so nothing leaks (AD-19).
                 reaper_subs.lock().await.remove(&subscription_id);
@@ -4034,6 +4046,74 @@ impl AccountManager {
         send_agent_event(&room, AgentOutbound::ConversationRequest(content)).await
     }
 
+    /// Send the person's decision `req` on the approval card it names in the
+    /// session room `room_id` (93.3), from this device: [`decide_approval`]
+    /// with the rooms this app hosts and the attached actions it has shown
+    /// ([`Self::agent_approval_payload`], R186).
+    pub async fn agent_approval_decide(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        req: ApprovalDecideReq,
+    ) -> Result<(), CoreError> {
+        let room = self.session_room(account_id, room_id).await?;
+        let shown = |digest: &str| {
+            self.agent_shown
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&(account_id.to_owned(), room_id.to_owned(), digest.to_owned()))
+        };
+        decide_approval(&room, &self.agent_hosted, &shown, req).await
+    }
+
+    /// The attached action of the approval `id` in the session room
+    /// `room_id`: [`approval_payload`]. Once shown, it may be approved from
+    /// this app (R186).
+    pub async fn agent_approval_payload(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        id: &str,
+    ) -> Result<String, CoreError> {
+        let room = self.session_room(account_id, room_id).await?;
+        let (shown, digest) = approval_payload(&room, id).await?;
+        self.agent_shown
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((account_id.to_owned(), room_id.to_owned(), digest));
+        Ok(shown)
+    }
+
+    /// This account's own master key as a person compares it with what
+    /// `keeper-agentd status` prints (93.3 acceptance 7): the base64 in
+    /// groups of four; `None` while the account publishes no
+    /// cross-signing identity.
+    pub async fn agent_own_fingerprint(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<String>, CoreError> {
+        let client = self.client_for(account_id).await?;
+        let Some(user) = client.user_id().map(ToOwned::to_owned) else {
+            return Ok(None);
+        };
+        let identity = client
+            .encryption()
+            .get_user_identity(&user)
+            .await
+            .map_err(|error| CoreError::Internal(error.to_string()))?;
+        Ok(identity
+            .as_ref()
+            .and_then(crate::agents::matrix::master_key_of)
+            .map(|key| crate::agents::trust::fingerprint(&key)))
+    }
+
+    /// The rooms whose agent this app hosts, shared with the desktop's
+    /// agents host, which replaces them on each tick; empty on the phone. A
+    /// T4 card in one of them is never decided from this app (S-22).
+    pub fn agent_hosted(&self) -> Arc<HostedRooms> {
+        self.agent_hosted.clone()
+    }
+
     /// Every live account's proxy conversations, by account id (AD-384): the
     /// rooms a spoken question may go to.
     pub async fn agent_rooms_everywhere(&self) -> Vec<(String, ProxyRoomVm)> {
@@ -5266,6 +5346,101 @@ where
     .into_iter()
     .flatten()
     .collect()
+}
+
+/// The attached action of the approval `id` in the session room `room`, as
+/// pretty-printed JSON, and the binding digest it was checked against
+/// (R186): its encrypted file fetched and decrypted through the media
+/// cache, and refused with a sentence unless its bytes are the file the
+/// request names and the action its digest and summary bind.
+pub async fn approval_payload(room: &Room, id: &str) -> Result<(String, String), CoreError> {
+    use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
+    use matrix_sdk::ruma::events::room::{EncryptedFile, MediaSource};
+    let refused = |sentence: &str| CoreError::Unsupported(sentence.to_owned());
+    let fold = agent_room::approvals_of(room).await;
+    let record = fold
+        .record(id)
+        .ok_or_else(|| refused(approval_card::NOT_FOUND))?;
+    if approval_card::binding(record) != approval_card::Binding::Attached {
+        return Err(refused(match record.file {
+            Some(_) => approval_card::PAYLOAD_REFUSED,
+            None => approval_card::NOT_ATTACHED,
+        }));
+    }
+    let file: EncryptedFile = record
+        .file
+        .clone()
+        .and_then(|file| serde_json::from_value(file).ok())
+        .ok_or_else(|| refused(approval_card::PAYLOAD_REFUSED))?;
+    let bytes = crate::media::fetch_source(
+        &room.client(),
+        MediaRequestParameters {
+            source: MediaSource::Encrypted(Box::new(file)),
+            format: MediaFormat::File,
+        },
+    )
+    .await
+    .map_err(|_| refused(approval_card::PAYLOAD_UNAVAILABLE))?;
+    let args = approval_card::verify_attached(record, &bytes).map_err(CoreError::Unsupported)?;
+    let shown = serde_json::to_string_pretty(&args)
+        .map_err(|error| CoreError::Internal(error.to_string()))?;
+    Ok((shown, record.binding_digest.clone()))
+}
+
+/// Send the person's decision `req` on the approval card it names in the
+/// session room `room`, from this device, through the one airlock
+/// ([`send_agent_event`]); `hosted` are the session rooms whose agent this
+/// app hosts and `shown` whether this app has shown the attached action
+/// with a binding digest. Refused at once, with the card's sentence, when
+/// the card would show no buttons: its digest does not bind what it shows,
+/// this device is not signed by its owner's cross-signing identity, the
+/// person is not an approver, at T4 not the requester or on the app that
+/// hosts the requesting session's agent; when the request is not in the
+/// room as the card shows it (another digest, a scope it does not offer,
+/// used or expired); or an approve of an attached action not shown (R186).
+/// A decision already in the room does not close the card: whether one
+/// counts is the owning host's (R187).
+pub async fn decide_approval(
+    room: &Room,
+    hosted: &HostedRooms,
+    shown: &(dyn Fn(&str) -> bool + Sync),
+    req: ApprovalDecideReq,
+) -> Result<(), CoreError> {
+    let viewer = Viewer {
+        own: room.own_user_id().to_owned(),
+        device_cross_signed: agent_room::own_device_cross_signed(&room.client()).await,
+        hosted: hosted.rooms(),
+    };
+    let fold = agent_room::approvals_of(room).await;
+    let record = fold
+        .check(
+            &viewer,
+            &req.id,
+            &req.binding_digest,
+            req.scope,
+            chrono::Utc::now(),
+            &|user| user.to_string(),
+        )
+        .map_err(CoreError::Unsupported)?;
+    if req.decision == crate::agents::approval::Decision::Approve
+        && approval_card::binding(record) == approval_card::Binding::Attached
+        && !shown(&record.binding_digest)
+    {
+        return Err(CoreError::Unsupported(approval_card::UNSEEN.to_owned()));
+    }
+    let content = ApprovalDecisionContent {
+        id: req.id,
+        binding_digest: req.binding_digest,
+        decision: req.decision,
+        scope: req.scope,
+        note: req
+            .note
+            .map(|note| note.trim().chars().take(NOTE_MAX).collect::<String>())
+            .filter(|note| !note.is_empty()),
+    };
+    send_agent_event(room, AgentOutbound::Decision(content))
+        .await
+        .map(|_| ())
 }
 
 /// Send one of the device's agent events ([`AgentOutbound`]: a scope, a

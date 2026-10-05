@@ -51,6 +51,7 @@ use keeper_core::agents::log::{ClaimAction, HostSlug};
 use keeper_core::agents::matrix::{self, AgentClient, RoomKind};
 use keeper_core::agents::mount;
 use keeper_core::agents::presence::Published;
+use keeper_core::agents::room::sealed_by_sender;
 use keeper_core::agents::session::{SessionAgent, SessionKind};
 use keeper_core::agents::trust::PinState;
 use keeper_core::auth::StoredSession;
@@ -1970,18 +1971,6 @@ fn child_arrival(
         return None;
     }
     reply_of(value, &sender, room, received_at)
-}
-
-/// Whether a decrypted event's sender is who its envelope says: an event
-/// that came in clear, or whose Megolm session belongs to another user's
-/// device (`MismatchedSender`), may be the server's forgery.
-fn sealed_by_sender(encryption: Option<&EncryptionInfo>) -> bool {
-    encryption.is_some_and(|info| {
-        !matches!(
-            info.verification_state,
-            VerificationState::Unverified(VerificationLevel::MismatchedSender)
-        )
-    })
 }
 
 /// Whether a decrypted event came from a device its sender's cross-signing

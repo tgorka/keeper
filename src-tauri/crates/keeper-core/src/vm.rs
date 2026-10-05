@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::agents::approval_card::ApprovalVm;
 use crate::agents::room::{AgentRoomHeaderVm, AgentRoomKindVm, BriefVm};
 use crate::bots::{BotHealthState, ProviderKind};
 use crate::notes::export::NoteExportPlan;
@@ -1342,6 +1343,16 @@ pub enum TimelineItemVm {
         #[ts(type = "number")]
         timestamp: i64,
     },
+    /// An approval request an agent of this session room sent (93.3): drawn
+    /// as its card, whose content and state ride beside the stream in
+    /// [`TimelineBatch::approvals`] under `id`. A request from anyone
+    /// without an agent's power, or an edit of one, is an `Other`.
+    Approval {
+        /// Stable opaque render key (the item's `unique_id`).
+        key: String,
+        /// The request's first record's id: its [`ApprovalVm`]'s `id`.
+        id: String,
+    },
     /// Any non-text item (non-text msgtype, state/membership/profile change, or a
     /// virtual date-divider/read-marker item).
     /// Carried only to keep diff indices aligned; the frontend renders nothing.
@@ -1435,6 +1446,14 @@ pub struct TimelineBatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub header: Option<AgentRoomHeaderVm>,
+    /// An agent session room's approval cards, every one, in the room's
+    /// order: sent on the first batch when there are any and on every
+    /// batch after they changed — a decision, a `consumed`, an expiry, this
+    /// device's verification or whether this app hosts the session. Absent
+    /// where nothing changed; the last list stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub approvals: Option<Vec<ApprovalVm>>,
 }
 
 /// One member currently typing in the open room (Story 3.9, typing, AD-14,
@@ -9265,6 +9284,7 @@ mod tests {
                 },
             ],
             header: None,
+            approvals: None,
         };
         let json = serde_json::to_string(&batch).expect("serialize batch");
         assert!(json.contains("\"ops\":"), "json was: {json}");

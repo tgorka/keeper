@@ -13,6 +13,7 @@ use matrix_sdk::Client;
 use serde_json::{json, Value};
 
 use super::{forward_timeline, open_timeline};
+use crate::agents::approval_card::HostedRooms;
 use crate::agents::delegation::{
     brief_content, DelegateCard, DelegateContent, DelegateFrom, DelegateLimits,
 };
@@ -283,6 +284,7 @@ impl Device {
             }),
             Arc::new(AgentKinds::default()),
             icons,
+            Arc::new(HostedRooms::default()),
         ));
         Drawn { batches, producer }
     }

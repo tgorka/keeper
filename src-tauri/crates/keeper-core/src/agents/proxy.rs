@@ -33,8 +33,8 @@ use ts_rs::TS;
 use ulid::Ulid;
 
 use crate::agents::events::{
-    ConversationRequestContent, ScopeContent, SurfaceResultContent, CONTENT_VERSION,
-    CONVERSATION_REQUEST, SCOPE, SURFACE_RESULT,
+    ApprovalDecisionContent, ConversationRequestContent, ScopeContent, SurfaceResultContent,
+    APPROVAL_DECISION, CONTENT_VERSION, CONVERSATION_REQUEST, SCOPE, SURFACE_RESULT,
 };
 use crate::agents::room::ScopeDriveVm;
 use crate::agents::session::SessionKind;
@@ -343,16 +343,18 @@ pub fn is_own_control_room(creators: &[OwnedUserId], own: &BTreeSet<OwnedUserId>
     matches!(creators, [creator] if own.contains(creator))
 }
 
-/// What the dock may send into a proxy room: a closed set, each with its
-/// fixed event type. A scope (with or without drives, with the focus or
-/// none), a request for a conversation, and a surface result for a request
-/// this device was handed (91.3) — never a status, a claim, a turn or an
-/// approval decision, which are the agent's or the reader's own.
+/// What the person's device may send into an agent's room: a closed set,
+/// each with its fixed event type. A scope (with or without drives, with the
+/// focus or none), a request for a conversation, a surface result for a
+/// request this device was handed (91.3), and the person's decision on an
+/// approval card (93.3) — never a status, a claim, a turn or a `consumed`,
+/// which are the agent's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentOutbound {
     Scope(ScopeContent),
     ConversationRequest(ConversationRequestContent),
     SurfaceResult(SurfaceResultContent),
+    Decision(ApprovalDecisionContent),
 }
 
 impl AgentOutbound {
@@ -362,6 +364,7 @@ impl AgentOutbound {
             AgentOutbound::Scope(_) => SCOPE,
             AgentOutbound::ConversationRequest(_) => CONVERSATION_REQUEST,
             AgentOutbound::SurfaceResult(_) => SURFACE_RESULT,
+            AgentOutbound::Decision(_) => APPROVAL_DECISION,
         }
     }
 
@@ -371,6 +374,7 @@ impl AgentOutbound {
             AgentOutbound::Scope(content) => serde_json::to_value(content),
             AgentOutbound::ConversationRequest(content) => serde_json::to_value(content),
             AgentOutbound::SurfaceResult(content) => serde_json::to_value(content),
+            AgentOutbound::Decision(content) => serde_json::to_value(content),
         }
     }
 }

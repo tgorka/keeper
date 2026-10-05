@@ -14,6 +14,7 @@
 use std::sync::Mutex;
 
 use keeper_agent::surface::{drive_of, locate, Located};
+use keeper_core::agents::approval_card::ApprovalDecideReq;
 use keeper_core::agents::events::{Focus, PresencePlatform, SurfaceOutcome};
 use keeper_core::agents::proxy::{AgentFocusReq, ProxyRoomVm};
 use keeper_core::agents::spoken::{FollowSlot, SpokenStep};
@@ -299,6 +300,57 @@ pub async fn agent_conversation_new(
     state
         .accounts
         .agent_conversation_new(&account_id, &room_id, title)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// The person's decision on the approval card `req` names in the session
+/// room `room_id` (93.3), sent from this device. Refused at once, with the
+/// card's sentence, where the card shows no decide buttons; whether it
+/// counts is the owning host's (`keeper_core`'s `agent_approval_decide`).
+#[tauri::command]
+pub async fn agent_approval_decide(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    req: ApprovalDecideReq,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .agent_approval_decide(&account_id, &room_id, req)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// The attached action of the approval `id` in the session room `room_id`,
+/// as pretty-printed JSON, fetched, decrypted and checked against its
+/// digest; refused with a sentence when it is not the action sent for
+/// approval (R186, `keeper_core`'s `agent_approval_payload`). Once shown,
+/// it may be approved from this app.
+#[tauri::command]
+pub async fn agent_approval_payload(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    id: String,
+) -> Result<String, IpcError> {
+    state
+        .accounts
+        .agent_approval_payload(&account_id, &room_id, &id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// `account_id`'s own master key, in groups of four, for the person to
+/// compare with `keeper-agentd status`; `None` while it publishes none.
+#[tauri::command]
+pub async fn agent_own_fingerprint(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Option<String>, IpcError> {
+    state
+        .accounts
+        .agent_own_fingerprint(&account_id)
         .await
         .map_err(to_ipc_error)
 }

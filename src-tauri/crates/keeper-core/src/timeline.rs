@@ -25,8 +25,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use eyeball::Subscriber;
 use futures_util::{FutureExt, Stream, StreamExt};
+use matrix_sdk::encryption::VerificationState;
 use matrix_sdk::event_cache::PaginationStatus;
 use matrix_sdk::event_cache::{RoomEventCacheSubscriber, RoomEventCacheUpdate};
 use matrix_sdk::ruma::events::room::message::MessageType;
@@ -42,6 +44,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::watch;
 
 use crate::account::{PaginationSink, TimelineSink};
+use crate::agents::approval_card::{ApprovalVm, HostedRooms, Viewer};
 use crate::agents::events::FINAL_CUT_BYTES;
 use crate::agents::room::{
     self, AgentIcons, AgentKinds, AgentRoomHeaderVm, AgentRoomKind, HeaderReader, TurnTrust,
@@ -463,6 +466,16 @@ pub fn item_to_vm(
             sender_display_name,
             timestamp: i64::from(ev.timestamp().0),
         },
+        // A custom event the agent filter admits: an approval request, drawn
+        // as its card when an agent of the room sealed it.
+        MsgLikeKind::Other(_) => {
+            let json = ev.original_json().map(|raw| raw.json().get());
+            let sealed = room::sealed_by_sender(ev.encryption_info());
+            match turns.approval(own_user_id, ev.sender(), json, sealed) {
+                Some(id) => TimelineItemVm::Approval { key, id },
+                None => TimelineItemVm::Other { key },
+            }
+        }
         _ => TimelineItemVm::Other { key },
     }
 }
@@ -662,6 +675,46 @@ struct AgentHeader {
     kinds: Arc<AgentKinds>,
     icons: Arc<AgentIcons>,
     loaded: Vector<Arc<TimelineItem>>,
+    /// The approval cards last sent; `None` before the first read.
+    approvals_sent: Option<Vec<ApprovalVm>>,
+    /// Whether this device is cross-signed by its owner, as last read.
+    cross_signed: bool,
+    /// The rooms whose agent this app hosts.
+    hosted: Arc<HostedRooms>,
+}
+
+/// What redraws the approval cards without an event in the room: this
+/// device's verification and the rooms this app hosts changing.
+struct Recheck {
+    verification: Subscriber<VerificationState>,
+    hosted: watch::Receiver<u64>,
+}
+
+/// The next change [`Recheck`] watches, or `expiry` passing; never when
+/// there is nothing to watch.
+async fn next_recheck(recheck: &mut Option<Recheck>, expiry: Option<DateTime<Utc>>) {
+    let Some(recheck) = recheck else {
+        return std::future::pending().await;
+    };
+    let expired = async {
+        match expiry {
+            Some(at) => tokio::time::sleep((at - Utc::now()).to_std().unwrap_or_default()).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        state = recheck.verification.next() => {
+            if state.is_none() {
+                std::future::pending::<()>().await;
+            }
+        }
+        changed = recheck.hosted.changed() => {
+            if changed.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        () = expired => {}
+    }
 }
 
 impl AgentHeader {
@@ -720,6 +773,23 @@ impl AgentHeader {
         }
         self.sent = Some(header.clone());
         Some(header)
+    }
+
+    /// The room's approval cards when they differ from the ones last sent;
+    /// a room with none sends none until it has one.
+    async fn approvals_changed(&mut self) -> Option<Vec<ApprovalVm>> {
+        let viewer = Viewer {
+            own: self.own_user_id.clone(),
+            device_cross_signed: self.cross_signed,
+            hosted: self.hosted.rooms(),
+        };
+        let approvals = self.reader.approvals(&viewer, Utc::now()).await;
+        let first = self.approvals_sent.is_none();
+        if self.approvals_sent.as_ref() == Some(&approvals) {
+            return None;
+        }
+        self.approvals_sent = Some(approvals.clone());
+        (!(first && approvals.is_empty())).then_some(approvals)
     }
 
     /// Read again whose brief to draw and who reads it; the positions of
@@ -885,6 +955,7 @@ pub async fn forward_timeline(
     sink: TimelineSink,
     kinds: Arc<AgentKinds>,
     icons: Arc<AgentIcons>,
+    hosted: Arc<HostedRooms>,
 ) {
     let OpenTimeline {
         timeline,
@@ -904,7 +975,7 @@ pub async fn forward_timeline(
     // Each is taken before the room is read, so no change falls between the
     // read and the first wait.
     let mut fetch: Option<MemberFetch> = None;
-    let (mut header, mut updates, mut marks, mut info, _cache_handles) =
+    let (mut header, mut updates, mut marks, mut info, mut recheck, _cache_handles) =
         if agent == Some(AgentRoomKind::Session) {
             let (updates, handles) = match room.event_cache().await {
                 Ok((cache, handles)) => match cache.subscribe().await {
@@ -915,6 +986,10 @@ pub async fn forward_timeline(
             };
             let marks = icons.subscribe();
             let info = room.subscribe_info();
+            let recheck = Recheck {
+                verification: room.client().encryption().verification_state(),
+                hosted: hosted.subscribe(),
+            };
             let mut reader = HeaderReader::open(room.clone(), &kinds).await;
             reader.refresh(&icons).await;
             fetch_members(&mut fetch, &reader, &room);
@@ -926,10 +1001,20 @@ pub async fn forward_timeline(
                 kinds,
                 icons,
                 loaded: initial.clone(),
+                approvals_sent: None,
+                cross_signed: room::own_device_cross_signed(&room.client()).await,
+                hosted,
             };
-            (Some(header), updates, Some(marks), Some(info), handles)
+            (
+                Some(header),
+                updates,
+                Some(marks),
+                Some(info),
+                Some(recheck),
+                handles,
+            )
         } else {
-            (None, None, None, None, None)
+            (None, None, None, None, None, None)
         };
 
     // The producer-owned `event_id → unique_id` index. Built from the snapshot,
@@ -949,24 +1034,30 @@ pub async fn forward_timeline(
             .map(|i| item_to_vm(i, &index, &own_user_id, &account_id, &room_id_str, turns))
             .collect(),
     };
-    let first_header = match &mut header {
+    let (first_header, first_approvals) = match &mut header {
         Some(header) => {
             header.see(&initial.iter().collect::<Vec<_>>(), true);
-            header.changed().await
+            (header.changed().await, header.approvals_changed().await)
         }
-        None => None,
+        None => (None, None),
     };
     if !sink(TimelineBatch {
         ops: vec![reset],
         header: first_header,
+        approvals: first_approvals,
     }) {
         tracing::info!(room_id = %room_id, "timeline channel closed before first batch");
         return;
     }
 
     loop {
+        // When the next waiting approval card expires: it is drawn again then.
+        let expiry = header
+            .as_ref()
+            .and_then(|header| header.reader.next_expiry(Utc::now()));
         // What a branch sends: the briefs drawn again, then its own ops,
-        // and the header when it changed; an empty batch is not sent.
+        // and the header and the approval cards when they changed; an empty
+        // batch is not sent.
         let batch = tokio::select! {
             diffs = stream.next() => {
                 let Some(diffs) = diffs else {
@@ -1002,7 +1093,7 @@ pub async fn forward_timeline(
                     Some(header) => header.changed().await,
                     None => None,
                 };
-                TimelineBatch { ops, header: changed }
+                TimelineBatch { ops, header: changed, approvals: None }
             }
             update = next_update(&mut updates) => {
                 let Some(header) = &mut header else {
@@ -1033,7 +1124,12 @@ pub async fn forward_timeline(
                     }
                 };
                 let changed = if folded { header.changed().await } else { None };
-                TimelineBatch { ops, header: changed }
+                let approvals = if folded {
+                    header.approvals_changed().await
+                } else {
+                    None
+                };
+                TimelineBatch { ops, header: changed, approvals }
             }
             () = next_info(&mut info) => {
                 let Some(header) = &mut header else {
@@ -1042,7 +1138,7 @@ pub async fn forward_timeline(
                 let positions = header.rebrief().await;
                 fetch_members(&mut fetch, &header.reader, &room);
                 let ops = header.redraw(positions, &index, &account_id, &room_id_str);
-                TimelineBatch { ops, header: None }
+                TimelineBatch { ops, header: None, approvals: None }
             }
             () = next_fetch(&mut fetch) => {
                 // A fetch that completes the list marks the room's members
@@ -1058,10 +1154,21 @@ pub async fn forward_timeline(
                 // The agents this device knows may have changed with them.
                 let positions = header.rebrief().await;
                 let ops = header.redraw(positions, &index, &account_id, &room_id_str);
-                TimelineBatch { ops, header: header.changed().await }
+                TimelineBatch { ops, header: header.changed().await, approvals: None }
+            }
+            () = next_recheck(&mut recheck, expiry) => {
+                let Some(header) = &mut header else {
+                    continue;
+                };
+                header.cross_signed = room::own_device_cross_signed(&room.client()).await;
+                TimelineBatch {
+                    ops: Vec::new(),
+                    header: None,
+                    approvals: header.approvals_changed().await,
+                }
             }
         };
-        if batch.ops.is_empty() && batch.header.is_none() {
+        if batch.ops.is_empty() && batch.header.is_none() && batch.approvals.is_none() {
             continue;
         }
         if !sink(batch) {

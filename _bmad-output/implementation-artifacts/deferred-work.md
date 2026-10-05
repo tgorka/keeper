@@ -7835,3 +7835,52 @@ location: `src-tauri/crates/keeper-core/src/agents/trust.rs` (`published_in`), `
 reason: The adapter now asks one `/keys/query` per decision and judges that answer alone; `live_trust` proves the whole-answer cases on delectra (A and C count, B and a reset do not). An HTTP-200 answer with `failures`, and an identity replaced between two answers, are proved by `trust::tests` on signed key material and by the `agent_turns` double, because delectra federates with nobody. Close with a second homeserver in the harness that is stopped mid-test.
 status: open
 
+
+### DW-505: A device cannot tell a decided card the host refused (drift, an ignored device) from one it is acting on.
+
+origin: epic 93, story 93.3 (rung `agents-93-card-vm`, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/approval_card.rs` (`ApprovalFold::state`), `src-tauri/crates/keeper-agent/src/approvals.rs` (`decided`, `settle`)
+reason: The card's state comes from what the room shows: the request, people's decisions, the agent's `consumed`. A decision the host ignores (an unsigned device, a key that moved) or refuses for drift writes only a log line and the run's refusal; nothing in the room names the record, so the card shows that decision as `decided` until it is consumed or expires — still decidable since R187 (review fix R4-03), so a corrective decision from a trusted device is never blocked, but the card cannot say the first one was not counted. 93.3 acceptance 8's "drifted" card needs a host echo per record (an edit of the request, or a state event beside `consumed` naming `refused` and why), which rung 6 adds with the install; until then the mock's states are pending, decided (decidable), expired and consumed.
+status: open
+
+### DW-506: Approval requests older than the event cache's loaded events are folded only once the timeline pages back to them.
+
+origin: epic 93, story 93.3 (rung `agents-93-card-vm`, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/room.rs` (`HeaderReader::open`, `page_back`, `approvals_of`)
+reason: The cards are folded from the event cache, as the header is; `page_back` searches history only for a status. A card whose request, decision or `consumed` lies before the loaded window is drawn once pagination loads it (the item and the fold move together), but `agent_approval_decide` checks against the cache as it is and refuses a card it cannot see ("keeper cannot find this approval in the room"). A loaded approval item is also not redrawn when the room's power levels change (only briefs are, R117). Close with a bounded history search for pending requests at open, and a redraw of approval items on a power change.
+status: open
+
+### DW-507: A request naming no approvers reads as "anyone in the room may decide", which an empty reader set would also produce.
+
+origin: epic 93, story 93.3 (rung `agents-93-card-vm`, 2026-10-05)
+location: `src-tauri/crates/keeper-agent/src/approvals.rs` (`park`, `approvers`), `src-tauri/crates/keeper-core/src/agents/approval_card.rs` (`may_decide`, `refusal`)
+reason: `approvers` is the label's readers, or `[]` for `Readers::Anyone`; `Readers::Only(∅)` (nobody) also serialises as `[]`. The device then shows decide buttons the host will ignore (AD-27). No session label is empty today; close by carrying `anyone: bool` on the request when the wire next changes.
+status: open
+
+### DW-515: A card in an approver's proxy DM never sees the host's `consumed`, which goes to the session's own room.
+
+origin: epic 93, story 93.3 (rung `agents-93-card-vm`, review fix R4-06, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/approval_card.rs` (`ApprovalFold::state`), `src-tauri/crates/keeper-agent/src/agent.rs` (`request_by_doors`), `src-tauri/crates/keeper-agent/src/runtime.rs` (the `consumed` sender)
+reason: R185 counts a `consumed` only from the agent that sent the request, in the room the card is in. A request R85 routed to a proxy DM is sent there by the proxy; the requesting session's agent writes its `consumed` in the session's room. The DM card therefore stays open (decidable, R187) until its expiry even after the action ran; a decision sent then is logged by the host as `APPROVAL_ENDED` and changes nothing. Closing it needs the host to forward an authenticated verdict into each DM it asked (the proxy's own state event per id, counted only from the DM's creator), R4-06's "explicitly preserve the origin and authenticate any forwarded host verdict".
+status: open
+
+### DW-516: The timeline's approval item admits any sealed sender at agent power; only the card beside the stream is limited to the session's own agent.
+
+origin: epic 93, story 93.3 (rung `agents-93-card-vm`, review fix R4-02, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/room.rs` (`TurnTrust::approval`), `src-tauri/crates/keeper-core/src/timeline.rs` (`TimelineItemVm::Approval`)
+reason: `TurnTrust` carries the room's creators but not the claim-named agents `session_agents` reads, so the item that places a card in the timeline still takes a request from any agent at power ≥ 50. The card itself (`TimelineBatch.approvals`) comes from the fold, which R185 limits to the session's own agent, so another agent's request places an item naming an id no card has; rung 5 must draw nothing for an item without a card. Close by giving `TurnTrust` the session's agents and dropping the item when its sender is not one.
+status: open
+
+### DW-517: The approvals are folded again from the whole event cache on every change that touches them, and the whole card list crosses IPC.
+
+origin: epic 93, story 93.3 (rung `agents-93-card-vm`, review fix R4-05, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/room.rs` (`approvals_touched`, `HeaderReader::approvals`, `fold_events`), `src-tauri/crates/keeper-core/src/timeline.rs` (`approvals_changed`)
+reason: R187's fold follows the room's order by being rebuilt from the cache whenever the cache changes other than by an unrelated append — an approval's own append included — so each such change costs one pass over the loaded events, and every card of the loaded window (terminal ones included) is projected and sent when the list differs. That is bounded by the event cache, not by an explicit number of cards; review R4-05's "keep only the active/visible cards plus bounded terminal metadata" is not done. Close with an incremental fold keyed by event position and a cap on terminal cards sent.
+status: open
+
+### DW-518: An event decrypted before its sender's device is known stays unsealed in the event cache.
+
+origin: epic 93, story 93.3 (rung `agents-93-card-vm`, review fix R4-02 / R185, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/room.rs` (`sealed_by_sender`), `src-tauri/crates/keeper-agent/src/runtime.rs` (`arrival_of`, `hold_brief`, `reply_of`)
+reason: R185 makes `VerificationLevel::None(MissingDevice)` no seal, on the device and in host intake. The SDK records an event's encryption info when it decrypts it; if the sender's device keys were not yet downloaded then, the cached copy says `MissingDevice` even after they arrive (not observed; read from the SDK's model, not reproduced). Such a request is no card, and such a brief, reply or decision is not taken, until the event is decrypted again. Close by re-deriving the verification state from the crypto store for unsealed approval/agent events when the sender's devices change, or by asking the SDK to redecrypt them.
+status: open

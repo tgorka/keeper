@@ -352,7 +352,14 @@ export type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 export type { AgentSeedReq } from "./gen/AgentSeedReq";
 export type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
 export type { AgentStatusVm } from "./gen/AgentStatusVm";
+export type { ApprovalCardVm } from "./gen/ApprovalCardVm";
+export type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
+export type { ApprovalDecision } from "./gen/ApprovalDecision";
 export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
+export type { ApprovalPersonVm } from "./gen/ApprovalPersonVm";
+export type { ApprovalScope } from "./gen/ApprovalScope";
+export type { ApprovalStateVm } from "./gen/ApprovalStateVm";
+export type { ApprovalVm } from "./gen/ApprovalVm";
 export type { AuditOutcome } from "./gen/AuditOutcome";
 export type { AuditVerdict } from "./gen/AuditVerdict";
 export type { AutoUpdateHold } from "./gen/AutoUpdateHold";
@@ -432,6 +439,7 @@ export type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
 export type { CredentialChoicesVm } from "./gen/CredentialChoicesVm";
 export type { CredentialChoiceVm } from "./gen/CredentialChoiceVm";
 export type { DaemonPresence } from "./gen/DaemonPresence";
+export type { DeclassifyVm } from "./gen/DeclassifyVm";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
 export type { DeviceClassVm } from "./gen/DeviceClassVm";
@@ -618,6 +626,7 @@ export type { RoomListOp } from "./gen/RoomListOp";
 export type { RoomVm } from "./gen/RoomVm";
 export type { SasEmojiVm } from "./gen/SasEmojiVm";
 export type { ScopeDriveVm } from "./gen/ScopeDriveVm";
+export type { ScopeOfferVm } from "./gen/ScopeOfferVm";
 export type { ScreenRecordingAccess } from "./gen/ScreenRecordingAccess";
 export type { SearchFilterVm } from "./gen/SearchFilterVm";
 export type { SearchHitVm } from "./gen/SearchHitVm";
@@ -738,6 +747,7 @@ import type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
 import type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 import type { AgentSeedReq } from "./gen/AgentSeedReq";
 import type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
+import type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
 import type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 import type { BackupStatus } from "./gen/BackupStatus";
 import type { BbctlAvailabilityVm } from "./gen/BbctlAvailabilityVm";
@@ -7453,6 +7463,55 @@ export async function agentConversationNew(
   title: string | null,
 ): Promise<string> {
   return await invoke<string>("agent_conversation_new", { accountId, roomId, title });
+}
+
+/**
+ * The person's decision on an approval card (93.3), sent from this device
+ * into the session room `roomId`: `req.id` and `req.bindingDigest` are the
+ * card's, `req.scope` one of its `scopes` (`once` with a deny). A decision in
+ * the room is shown on the card (`decided`) but never closes it: the card
+ * stays decidable until the agent uses an approval (`consumed`) or it
+ * expires (`TimelineBatch.approvals`); whether a decision counts is the
+ * agent's host's.
+ *
+ * Rejects with: `unsupported` and the card's own sentence where the card
+ * shows no decide buttons (`cannotDecide`) or no longer matches the room, or
+ * when approving an attached action (`attachment`) this app has not shown
+ * through {@link agentApprovalPayload}; `sendFailed` (no such room, or the
+ * send failed).
+ */
+export async function agentApprovalDecide(
+  accountId: string,
+  roomId: string,
+  req: ApprovalDecideReq,
+): Promise<void> {
+  await invoke<void>("agent_approval_decide", { accountId, roomId, req });
+}
+
+/**
+ * The attached action of the approval card `id` in the session room
+ * `roomId` (a card whose `attachment` is set), as pretty-printed JSON: its
+ * encrypted file fetched and checked against the card's digest in Rust.
+ * Once shown, the action may be approved from this app.
+ *
+ * Rejects with `unsupported` and a sentence when the attachment is not the
+ * action sent for approval, cannot be fetched now, or the card has none.
+ */
+export async function agentApprovalPayload(
+  accountId: string,
+  roomId: string,
+  id: string,
+): Promise<string> {
+  return await invoke<string>("agent_approval_payload", { accountId, roomId, id });
+}
+
+/**
+ * `accountId`'s own cross-signing master key, base64 in groups of four, for
+ * the person to compare with `keeper-agentd status` before pinning it;
+ * `null` while the account publishes no cross-signing identity.
+ */
+export async function agentOwnFingerprint(accountId: string): Promise<string | null> {
+  return await invoke<string | null>("agent_own_fingerprint", { accountId });
 }
 
 /**

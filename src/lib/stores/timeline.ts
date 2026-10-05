@@ -14,12 +14,14 @@
  * never disturbs the chat's.
  *
  * In an agent room the stream also carries the room's header beside the ops
- * ({@link AgentRoomHeaderVm}). Rust sends it on the first batch and again only
- * when it changed, so a batch without one leaves the last header standing.
+ * ({@link AgentRoomHeaderVm}) and its approval cards ({@link ApprovalVm}, the
+ * `approval` items name them by `id`). Rust sends each on the first batch and
+ * again only when it changed, so a batch without one leaves the last standing.
  */
 import { createStore, type StoreApi } from "zustand/vanilla";
 import type {
   AgentRoomHeaderVm,
+  ApprovalVm,
   TimelineBatch,
   TimelineItemVm,
   TimelineOp,
@@ -41,6 +43,8 @@ export interface TimelineState {
   items: TimelineItemVm[];
   /** The agent room's header, or `null` in every other room. */
   header: AgentRoomHeaderVm | null;
+  /** The agent room's approval cards, every one; empty in every other room. */
+  approvals: ApprovalVm[];
   /** Apply one streamed batch (its ops in sequence). */
   applyBatch: (batch: TimelineBatch) => void;
   /** Reset to the empty state (on room change / unsubscribe). */
@@ -52,12 +56,14 @@ export function createTimelineStore(): StoreApi<TimelineState> {
   return createStore<TimelineState>()((set) => ({
     items: [],
     header: null,
+    approvals: [],
     applyBatch: (batch) =>
       set((state) => ({
         items: batch.ops.reduce(applyOp, state.items),
         header: batch.header ?? state.header,
+        approvals: batch.approvals ?? state.approvals,
       })),
-    clear: () => set({ items: [], header: null }),
+    clear: () => set({ items: [], header: null, approvals: [] }),
   }));
 }
 

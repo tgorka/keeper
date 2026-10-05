@@ -127,7 +127,15 @@ senderDisplayName: string | null,
 /**
  * The event origin timestamp: ms since the Unix epoch (UTC).
  */
-timestamp: number, } | { "kind": "other", 
+timestamp: number, } | { "kind": "approval", 
+/**
+ * Stable opaque render key (the item's `unique_id`).
+ */
+key: string, 
+/**
+ * The request's first record's id: its [`ApprovalVm`]'s `id`.
+ */
+id: string, } | { "kind": "other", 
 /**
  * Stable opaque render key (the item's `unique_id`).
  */

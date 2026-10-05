@@ -653,6 +653,16 @@ fn raw<T>(value: &Value) -> Result<Raw<T>, AgentMatrixError> {
         .map_err(|err| AgentMatrixError::Other(format!("could not encode the event: {err}")))
 }
 
+/// `identity`'s master key, `ed25519:<unpadded base64>`: the form
+/// `[[trust]].master_key` is written in.
+pub(crate) fn master_key_of(
+    identity: &matrix_sdk::encryption::identities::UserIdentity,
+) -> Option<String> {
+    identity
+        .master_key()
+        .get_first_key()
+        .map(|key| format!("ed25519:{}", key.to_base64()))
+}
 /// The `createRoom` request for a typed, encrypted room, inviting `invite`,
 /// with `creator` at 100 and `agents` at 50: a session room's power levels
 /// from [`events::power_levels`], a control room's from

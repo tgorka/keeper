@@ -805,6 +805,7 @@ pub fn run() {
                     std::sync::Arc::clone(&state.platform),
                     state.accounts.agent_icons(),
                     state.accounts.agent_proxies(),
+                    state.accounts.agent_hosted(),
                 );
             }
             #[cfg(not(desktop))]
@@ -1020,6 +1021,11 @@ pub fn run() {
                 agents_ipc::agent_scope_set,
                 agents_ipc::agent_focus,
                 agents_ipc::agent_conversation_new,
+                // Story 93.3: the approval card's decision and the own
+                // fingerprint, every target (the phone decides too).
+                agents_ipc::agent_approval_decide,
+                agents_ipc::agent_approval_payload,
+                agents_ipc::agent_own_fingerprint,
                 // Story 91.3: surface requests and presence, every target.
                 agents_ipc::agent_surface_subscribe,
                 agents_ipc::agent_surface_result,

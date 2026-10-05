@@ -220,7 +220,9 @@ pub struct RequestAction {
 }
 
 /// `dev.keeper.agent.approval.request` (encrypted): one record's payload
-/// for the card — its summary keeper's own, never the model's words.
+/// for the card — its summary keeper's own, never the model's words — and
+/// every field its `binding_digest` is over, so a device recomputes the
+/// digest over what it shows (R185).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalRequestContent {
@@ -228,6 +230,12 @@ pub struct ApprovalRequestContent {
     pub id: String,
     /// Drive-relative.
     pub session: String,
+    /// The requesting session's own room: the room a T4 card's hosting is
+    /// judged by, wherever the request is shown (a proxy DM, R85).
+    pub room: String,
+    /// The agent's id in its home drive, as the record and its digest name
+    /// it.
+    pub agent: String,
     pub tier: u8,
     pub summary: String,
     pub action: RequestAction,
@@ -237,10 +245,62 @@ pub struct ApprovalRequestContent {
     pub file: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_sha256: Option<String>,
+    /// The SHA-256 of the session's log through the checkpoint (digested).
+    pub checkpoint_sha256: String,
+    /// What must still hold when the approval is used (digested).
+    pub preconditions: crate::agents::approval::Preconditions,
     pub binding_digest: String,
     pub scopes: Vec<String>,
     pub expires_at: String,
+    /// The label's readers when the action parked; empty when anyone reads.
     pub approvers: Vec<String>,
+    /// Who asked, the person who started it first (R76): at T4 its head
+    /// alone decides.
+    pub dispatch_chain: Vec<String>,
+}
+
+impl ApprovalRequestContent {
+    /// Whether `binding_digest` is the digest of this request over `args`
+    /// — the inline arguments, or the attached file's (R185, R186).
+    pub fn binds(&self, args: &Value) -> bool {
+        crate::agents::approval::binding_digest(
+            &self.id,
+            &self.session,
+            &self.agent,
+            &self.action.tool,
+            args,
+            &self.action.exec_binding,
+            &self.checkpoint_sha256,
+            &serde_json::to_value(&self.preconditions).unwrap_or(Value::Null),
+        )
+        .is_ok_and(|digest| digest == self.binding_digest)
+    }
+}
+
+/// A gate's coalesced card (99.1, R28 S-23): `{v, records: [<request>, …]}`
+/// in one request event; later records arrive as `m.replace` edits whose
+/// `m.new_content` is the whole list. Every record is decided on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoalescedRequestContent {
+    pub v: u32,
+    pub records: Vec<ApprovalRequestContent>,
+}
+
+/// The records a request content carries: one, or a coalesced card's list;
+/// `None` when it reads as neither, or a record is of another version.
+pub fn request_records(content: &Value) -> Option<Vec<ApprovalRequestContent>> {
+    let records = if content.get("records").is_some() {
+        let coalesced = CoalescedRequestContent::deserialize(content).ok()?;
+        if coalesced.v != CONTENT_VERSION {
+            return None;
+        }
+        coalesced.records
+    } else {
+        vec![ApprovalRequestContent::deserialize(content).ok()?]
+    };
+    (!records.is_empty() && records.iter().all(|record| record.v == CONTENT_VERSION))
+        .then_some(records)
 }
 
 /// `dev.keeper.agent.approval.decision` (encrypted): a person's answer to

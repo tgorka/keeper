@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use keeper_agent::desktop::{self, DesktopFacts, DesktopHost, TickGate};
 use keeper_agent::seed as seeding;
+use keeper_core::agents::approval_card::HostedRooms;
 use keeper_core::agents::copy::{self, AgentCopyVm, AgentPinReq};
 use keeper_core::agents::pins;
 use keeper_core::agents::proxy::AgentProxies;
@@ -57,6 +58,9 @@ struct Runtime {
     /// The account manager's proxies — person and allowed drives — replaced
     /// from the agents' `agent.toml`s on each scan (91.2's dock).
     proxies: OnceLock<Arc<AgentProxies>>,
+    /// The account manager's rooms this app hosts, replaced after each
+    /// tick from the claims the host holds (93.3).
+    hosted: OnceLock<Arc<HostedRooms>>,
     /// The host; also held across a sign-in, so no tick rebuilds it while
     /// a copy's store is open for the sign-in.
     host: tokio::sync::Mutex<Option<DesktopHost>>,
@@ -80,7 +84,12 @@ fn refusal(message: impl Into<String>) -> IpcError {
 
 /// Start hosting at app start, after the sync supervisor: the first scan
 /// is the next tick's.
-pub fn start(platform: Arc<dyn Platform>, icons: Arc<AgentIcons>, proxies: Arc<AgentProxies>) {
+pub fn start(
+    platform: Arc<dyn Platform>,
+    icons: Arc<AgentIcons>,
+    proxies: Arc<AgentProxies>,
+    hosted: Arc<HostedRooms>,
+) {
     let data_dir = match platform.data_dir() {
         Ok(dir) => dir,
         Err(error) => {
@@ -92,6 +101,7 @@ pub fn start(platform: Arc<dyn Platform>, icons: Arc<AgentIcons>, proxies: Arc<A
     let host = DesktopHost::new(base, data_dir, env!("CARGO_PKG_VERSION"));
     let _ = RUNTIME.icons.set(icons);
     let _ = RUNTIME.proxies.set(proxies);
+    let _ = RUNTIME.hosted.set(hosted);
     if RUNTIME.platform.set(platform).is_ok() {
         if let Ok(mut slot) = RUNTIME.host.try_lock() {
             *slot = Some(host);
@@ -153,6 +163,12 @@ pub fn tick() {
                     .problems
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = host.problems().clone();
+                // The rooms whose claim this Mac holds: a T4 card there is
+                // never decided from this app (93.3, S-22).
+                if let Some(hosted) = RUNTIME.hosted.get() {
+                    let held = host.held();
+                    hosted.replace(held.iter().filter_map(|held| held["room"].as_str()));
+                }
             }
         }
     });

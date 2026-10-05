@@ -708,6 +708,8 @@ impl ServedSession {
             v: CONTENT_VERSION,
             id: record.id.clone(),
             session: record.session.clone(),
+            room: self.context.agent.room.to_string(),
+            agent: record.agent.clone(),
             tier: record.risk.tier,
             summary: record.action.summary.clone(),
             action: RequestAction {
@@ -717,6 +719,8 @@ impl ServedSession {
             },
             file_sha256: file.as_ref().and(record.action.args_blob.clone()),
             file,
+            checkpoint_sha256: record.checkpoint.sha256.clone(),
+            preconditions: record.preconditions.clone(),
             binding_digest: record.binding_digest.clone(),
             scopes: record
                 .scopes
@@ -725,6 +729,7 @@ impl ServedSession {
                 .collect(),
             expires_at: record.expires_at.clone(),
             approvers,
+            dispatch_chain: record.dispatch_chain.clone(),
         };
         let value = serde_json::to_value(&content).map_err(failed)?;
         let gate = self.gate(deps, port);
