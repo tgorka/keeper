@@ -44,6 +44,7 @@
  * is present, so `tauri dev` is never quietly served fixtures.
  */
 
+import { emit } from "@tauri-apps/api/event";
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { IDLE_RECORDING_STATUS } from "@/hooks/use-recording-session";
 import { remoteOnSourceHost } from "@/lib/forge-repos";
@@ -144,6 +145,7 @@ import type {
   VoiceUnavailableVm,
   VoiceWakeVm,
 } from "@/lib/ipc/client";
+import { VOICE_WAKE_EVENT } from "@/lib/ipc/client";
 import { DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import {
   MEDIA_BLOCK_FRONTMATTER,
@@ -3250,6 +3252,75 @@ function voiceUnavailable(): VoiceUnavailableVm | null {
   };
 }
 
+/** What a spoken turn does without the turn models, as Rust words it from
+ *  `END_OF_UTTERANCE_PAUSE` (`keeper_core::voice::turn_models`). */
+const TURN_FALLBACK = "keeper waits 1.8 s after you stop";
+/**
+ * The turn models' line (Epic 97, UX-DR142): every `TurnModelsState` as
+ * `TurnModelsState::vm` sends it, chosen with `?turnModels=<state>` on the dev
+ * URL. `missing` — the default — is the owner's account today: `models.toml`
+ * names no turn model yet. `files` is a hydration that lacks a file, `stale`
+ * one the account has moved on from, `none` a device whose voice runs no turn
+ * models (the field absent). `fetching` lands as `ready` eight seconds after
+ * the first read and is sent on `keeper://voice-wake`, as the shell's
+ * `voice_ipc::announce_wake` sends a fetch's end, so the line can be watched
+ * moving with nothing re-reading it.
+ */
+const TURN_MODELS: Record<string, VoiceWakeVm["turnModels"]> = {
+  ready: { state: "ready", sentence: "Turn models ready", missing: [] },
+  missing: {
+    state: "missing",
+    sentence: `Turn models missing: [vad] in models.toml, [smart_turn] in models.toml — ${TURN_FALLBACK}`,
+    missing: ["[vad] in models.toml", "[smart_turn] in models.toml"],
+  },
+  files: {
+    state: "missing",
+    sentence: `Turn models missing: silero-vad/model.onnx — ${TURN_FALLBACK}`,
+    missing: ["silero-vad/model.onnx"],
+  },
+  stale: {
+    state: "missing",
+    sentence: `Turn models out of date — keeper brings them up to date after the next sync, and ${TURN_FALLBACK} until then`,
+    missing: [],
+  },
+  refused: {
+    state: "failed",
+    sentence: `The speech detection model “silero-v5” set by \`transcription.vad_model\` is not on this device. Set \`transcription.vad_model\` in your account's settings.toml to another folder of _models/, or remove it to use the one [vad] in models.toml names. Until then, ${TURN_FALLBACK}.`,
+    missing: [],
+  },
+  failed: {
+    state: "failed",
+    sentence: `The turn models could not be fetched: the config repository did not answer — ${TURN_FALLBACK}`,
+    missing: [],
+  },
+  noAccount: {
+    state: "noAccount",
+    sentence: `No turn models without an account — ${TURN_FALLBACK}. They come from your account's settings repository (Settings → Account).`,
+    missing: [],
+  },
+  fetching: {
+    state: "fetching",
+    sentence: `Fetching the turn models from your account… ${TURN_FALLBACK} until they are here`,
+    missing: [],
+  },
+  none: undefined,
+};
+const turnModelsParam = new URLSearchParams(window.location.search).get("turnModels") ?? "missing";
+let turnModelsKey = turnModelsParam in TURN_MODELS ? turnModelsParam : "missing";
+let turnModelsLanding = false;
+/** The wake VM as `wake_vm` answers every voice settings command: the
+ *  stored settings with the turn models' line as it is now. */
+function voiceWakeVm(): VoiceWakeVm {
+  if (turnModelsKey === "fetching" && !turnModelsLanding) {
+    turnModelsLanding = true;
+    window.setTimeout(() => {
+      turnModelsKey = "ready";
+      void emit(VOICE_WAKE_EVENT, voiceWakeVm());
+    }, 8_000);
+  }
+  return { ...voiceWake, turnModels: TURN_MODELS[turnModelsKey] };
+}
+
 /**
  * Story 62.5's wake phrase, faked. The switch starts off and the phrase is the
  * shipped default, and both round-trip, because the flow worth looking at is
@@ -5538,7 +5609,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     }
     return null;
   },
-  voice_wake_get: () => voiceWake,
+  voice_wake_get: () => voiceWakeVm(),
   voice_wake_set: (payload) => {
     const phrase = String(payload.phrase ?? "").trim();
     // A crude stand-in for `WakePhrase::parse`: the real refusal sentence is
@@ -5555,7 +5626,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     voiceWake = { ...voiceWake, enabled: payload.enabled === true, phrase, stopPhrase };
     listeningDecided();
     voiceWatcher?.onmessage?.(voiceIdle());
-    return voiceWake;
+    return voiceWakeVm();
   },
   // Epic 68 (AD-218): the one listening verb, flipped from the stored switch.
   voice_wake_toggle: () => {
@@ -5564,7 +5635,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     if (voiceWake.enabled) {
       listeningDecided();
     }
-    return voiceWake;
+    return voiceWakeVm();
   },
   voice_locale_set: (payload) => {
     const chosen = typeof payload.locale === "string" ? payload.locale : null;
@@ -5577,7 +5648,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       };
     }
     voiceWake = { ...voiceWake, localeChosen: chosen, locale: chosen ?? VOICE_SYSTEM_LOCALE };
-    return voiceWake;
+    return voiceWakeVm();
   },
   // Epic 67 (AD-206), 91.4 (AD-384): where a spoken turn goes — a bot id or
   // an `agent:<room id>` from `voice_agent_targets`, stored as given; whether
@@ -5589,7 +5660,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       voiceTarget:
         typeof payload.target === "string" && payload.target !== "" ? payload.target : null,
     };
-    return voiceWake;
+    return voiceWakeVm();
   },
   // 91.4: the proxy conversations "Speak to" lists after the pinned bots —
   // the dock's rooms (`?dock=none` lists none, `?dock=late` none for eight
@@ -6919,19 +6990,24 @@ export function installMockShell(): void {
     markFreshTranscribed(String(payload.path));
     return startJob(payload);
   };
-  mockIPC((command, payload) => {
-    const handler = HANDLERS[command];
-    const answer =
-      handler !== undefined
-        ? handler((payload ?? {}) as Record<string, unknown>)
-        : command in ANSWERS
-          ? ANSWERS[command]
-          : fallback(command);
-    // One line per call, so a screen that looks wrong can be traced to the
-    // command it asked for rather than guessed at.
-    console.debug("[mock-shell]", command, payload ?? "", "→", answer);
-    return answer;
-  });
+  // Events are the mocks' own: a listener registers, and `emit` here reaches
+  // it the way the shell's `app.emit` reaches the webview.
+  mockIPC(
+    (command, payload) => {
+      const handler = HANDLERS[command];
+      const answer =
+        handler !== undefined
+          ? handler((payload ?? {}) as Record<string, unknown>)
+          : command in ANSWERS
+            ? ANSWERS[command]
+            : fallback(command);
+      // One line per call, so a screen that looks wrong can be traced to the
+      // command it asked for rather than guessed at.
+      console.debug("[mock-shell]", command, payload ?? "", "→", answer);
+      return answer;
+    },
+    { shouldMockEvents: true },
+  );
   // The conversation pane listens for file drops on the current webview, which
   // reads the window's label from the shell's metadata; without it opening any
   // room throws before the timeline draws.

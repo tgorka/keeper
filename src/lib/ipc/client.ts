@@ -8146,12 +8146,31 @@ export async function listenVoiceState(
  * The wake switch and phrase as persisted (`bots.wake_enabled`,
  * `bots.wake_phrase`), plus the sentence about what listening costs on this
  * phone — decided once per platform in `VoicePlatform::limits` and rendered
- * beside the switch (FR-406). Off on a fresh install.
+ * beside the switch (FR-406). Off on a fresh install. `turnModels` is the
+ * turn models' line (UX-DR142), absent where this device's voice runs none;
+ * when it moves without a voice command, the shell sends the whole VM again
+ * on {@link VOICE_WAKE_EVENT}.
  *
  * Rejects with: `internal`.
  */
 export async function voiceWakeGet(): Promise<VoiceWakeVm> {
   return await invoke<VoiceWakeVm>("voice_wake_get");
+}
+
+/**
+ * The Tauri event the shell sends the {@link VoiceWakeVm} on, to every
+ * window, when the turn models' line may have moved with no voice command
+ * asking: a models fetch began or ended, the launch load finished, a synced
+ * model pick landed, the account was forgotten (`voice_ipc::announce_wake`).
+ * Never sent where voice runs no turn models.
+ */
+export const VOICE_WAKE_EVENT = "keeper://voice-wake";
+
+/** Subscribe to {@link VOICE_WAKE_EVENT}. Resolves with an unlisten function. */
+export async function listenVoiceWake(onWake: (wake: VoiceWakeVm) => void): Promise<() => void> {
+  return await listen<VoiceWakeVm>(VOICE_WAKE_EVENT, (event) => {
+    onWake(event.payload);
+  });
 }
 
 /**

@@ -62,7 +62,7 @@ use keeper_core::voice::{
 #[cfg(not(any(target_os = "ios", target_os = "macos")))]
 use keeper_core::voice::{VoicePlatform, VoiceUnavailable};
 use tauri::ipc::Channel;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::ipc::{to_ipc_error, AppState};
 
@@ -598,7 +598,10 @@ pub fn boot(app: &AppHandle, data_dir: &Path) {
     let models_dir = data_dir.to_owned();
     if let Err(error) = std::thread::Builder::new()
         .name("keeper-turn-models-load".into())
-        .spawn(move || crate::voice_turn_models::refresh(&models_dir))
+        .spawn(move || {
+            crate::voice_turn_models::refresh(&models_dir);
+            announce_wake();
+        })
     {
         tracing::warn!(%error, "voice: the turn models could not be loaded at launch");
     }
@@ -644,6 +647,13 @@ fn wake_vm(
     })
 }
 
+/// The wake VM from the persisted switch and phrase.
+fn persisted_wake_vm(data_dir: &Path, port: &dyn VoicePort) -> Result<VoiceWakeVm, IpcError> {
+    let enabled = registry::get_bots_wake_enabled(data_dir).map_err(to_ipc_error)?;
+    let phrase = registry::get_bots_wake_phrase(data_dir).map_err(to_ipc_error)?;
+    wake_vm(data_dir, enabled, phrase, port)
+}
+
 /// The wake switch and phrase as persisted (FR-404, FR-405), with the
 /// sentence about what listening costs (FR-406) and the recogniser's
 /// language (Epic 63). Reads only: whether the device is open is the
@@ -651,10 +661,44 @@ fn wake_vm(
 #[tauri::command]
 pub fn voice_wake_get(state: State<'_, AppState>) -> Result<VoiceWakeVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    let enabled = registry::get_bots_wake_enabled(&data_dir).map_err(to_ipc_error)?;
-    let phrase = registry::get_bots_wake_phrase(&data_dir).map_err(to_ipc_error)?;
     let port = Arc::clone(&voice().port);
-    wake_vm(&data_dir, enabled, phrase, port.as_ref())
+    persisted_wake_vm(&data_dir, port.as_ref())
+}
+
+/// The event every window hears the wake VM on when the turn models' line
+/// may have moved with no voice command asking: a models fetch began or
+/// ended, the launch load finished, a synced pick landed, the account was
+/// forgotten. The webview's voice store mirrors it, so nothing there polls.
+pub const VOICE_WAKE_EVENT: &str = "keeper://voice-wake";
+
+/// Send the wake VM as it reads now on [`VOICE_WAKE_EVENT`]. What the line
+/// says is `keeper_core::voice::turn_models`'s; this only says it may have
+/// moved. Blocking — the line hashes the turn group's files — so a caller on
+/// the async runtime runs it through `spawn_blocking`. Nothing before
+/// [`boot`], and nothing where voice runs no turn models: that wake VM
+/// carries no line to move.
+pub fn announce_wake() {
+    if !crate::voice_turn_models::supported() {
+        return;
+    }
+    let (app, data_dir, port) = {
+        let voice = voice();
+        let (Some(app), Some(data_dir)) = (voice.app.clone(), voice.data_dir.clone()) else {
+            return;
+        };
+        (app, data_dir, Arc::clone(&voice.port))
+    };
+    match persisted_wake_vm(&data_dir, port.as_ref()) {
+        Ok(vm) => {
+            if let Err(error) = app.emit(VOICE_WAKE_EVENT, vm) {
+                tracing::warn!(%error, "voice: the turn models' line could not be announced");
+            }
+        }
+        Err(error) => tracing::warn!(
+            message = %error.message,
+            "voice: the wake settings could not be read to announce the turn models' line"
+        ),
+    }
 }
 
 /// Arm or disarm the turn for `wake` and carry the effects out on the port.
@@ -722,10 +766,8 @@ pub fn voice_target_set(
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     let chosen = target.as_deref().map(str::trim).filter(|id| !id.is_empty());
     registry::set_bots_voice_target(&data_dir, chosen).map_err(to_ipc_error)?;
-    let enabled = registry::get_bots_wake_enabled(&data_dir).map_err(to_ipc_error)?;
-    let phrase = registry::get_bots_wake_phrase(&data_dir).map_err(to_ipc_error)?;
     let port = Arc::clone(&voice().port);
-    wake_vm(&data_dir, enabled, phrase, port.as_ref())
+    persisted_wake_vm(&data_dir, port.as_ref())
 }
 
 /// Flip the wake switch (Epic 68, Story 68.4, AD-218): the one command the
