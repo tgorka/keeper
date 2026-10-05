@@ -652,8 +652,9 @@ message (above), so a turn they started there raises nothing.
 ## When an action waits
 
 On a keeper host with a decision source installed (none is installed yet: a person cannot decide
-from a keeper client until the approval card exists, so every host still refuses as above), a call
-that needs a person does not wait in a thread — it **parks**:
+from a keeper client until the approval card exists, so every host still refuses as above, and a
+decision that arrives is logged ignored — nothing waits for it), a call that needs a person does
+not wait in a thread — it **parks**:
 
 1. The round's earlier calls have run; the parked call and the round's later calls keep their
    `tool_call` lines and get no result yet.
@@ -728,6 +729,45 @@ host's own write is not drift when its own card is what waits; while it waits it
 no later window is named or begun, on this host or a host that takes the session over — and the
 run after the decision, a deny or an expiry ends it on the card (`review`, `failed`, or `blocked`
 again) and in the log.
+
+### Deciding
+
+A decision is a `dev.keeper.agent.approval.decision` event in the session room — or in an
+approver's proxy DM, when the request went there: the DM's worker hands a decision on exactly that
+request back to the session that asked, once, and a decision handed on is never handed on again; a
+session's own approval is always decided in its own room. It counts only when every one of these
+holds, checked by the host that holds the session's claim (a host without the claim writes nothing,
+not even why; the claim is read again after the sender's keys are fetched, right before the
+decision is written); the first that fails is logged as `approval decided` with no decision and
+that reason, and nothing moves:
+
+- the sender is a person, not an agent, and reads the session now and when the action parked;
+- the event was sealed by the sender's own device;
+- that device is signed by the sender's own cross-signing identity, as their homeserver publishes it
+  when the decision arrives: keeper asks for the sender's keys afresh for each decision and judges
+  that one answer alone — the device's signature by the self-signing key, and that key's by the
+  master key in the same answer (a fresh login nobody verified does not count). An answer that is
+  not whole — the sender's homeserver could not be reached — is "unknown", and the decision is
+  logged ignored with that reason, never decided on an earlier answer;
+- the sender's master key is the one this host trusts for them: on a Linux host the
+  `[[trust]].master_key` a person wrote into `agentd.toml` ("not pinned" otherwise, however well
+  their device is verified — keeper never pins by itself); on a Mac, the signed-in account while
+  its own identity is verified there. A reset identity no longer matches its pin until a person
+  pins the new key;
+- at T4, the sender is the person who asked (the head of the record's `dispatch_chain`: "only
+  <them> can decide this"), deciding from a device that is not this app's own ("decide on another
+  device");
+- the decision names this record and its digest, a scope the record offers, before it expires. One
+  keeper cannot read is logged "this decision could not be read", never with what it said.
+
+A second decision after the first is logged and changes nothing, and so is one after the approval
+ended — ran, was denied or expired. A decision that could not be stored is not logged at all, so
+the same event is taken when it comes again. A key is compared as its fingerprint: the base64
+after `ed25519:` in groups of four. `keeper-agentd status` prints each `[[trust]]` person's pinned
+and published fingerprints and whether they match; it reads them from the running host, which
+asks the homeserver every five minutes, and never writes `agentd.toml`. The pin it prints is the
+one the running host judged; a pin changed in `agentd.toml` since is printed after it, "used after
+a restart".
 
 ## A session an agent works in
 
@@ -1180,7 +1220,7 @@ the bots' URL rules; an `[[agents]] drive` must be a `[[drives]] id`. Two `[[dri
 one `remote`. `[[trust]]` needs `user`;
 `master_key` (`ed25519:<unpadded base64>`) is written by a person after comparing the fingerprint
 with the person's own device, never by keeper, and without it the person is not pinned and no
-decision of theirs is accepted. `[[mcp]]`, `[[kvm]]` and `[sandbox]` are read and checked now and
+decision of theirs is accepted (*Deciding*). `[[mcp]]`, `[[kvm]]` and `[sandbox]` are read and checked now and
 used by later epics; an `[[mcp]] role = "kvm:<id>"` must name a `[[kvm]] id`. `[sandbox]
 read_exec` must be absolute; that it names nothing inside a drive's checkout and nothing holding
 this host's secrets is checked by the sandbox that mounts it, in a later release.
@@ -1248,9 +1288,9 @@ room that is not a proxy's, the host also keeps a person's free text out of the 
 homeserver cannot stop a person in a session room from sending what looks like the agent's own
 status, scope or turn reference, or an `m.replace` of the agent's anchor. The host, which decrypts,
 checks the sender of each one: a `dev.keeper.agent.*` event or an edit counts only from the agent's
-own user, and anyone else's is ignored and not logged; a decision on an approval counts only from a
-reader of the session on a device this host has verified — and since nothing on the host verifies
-a device before Epic 93, every decision is ignored until then. Free text becomes a turn only in a
+own user, and anyone else's is ignored and not logged; a decision on an approval goes on to the
+approval path only from a reader of the session and sealed by the sender's own device, where the
+device itself is judged (*Deciding*, above). Free text becomes a turn only in a
 proxy's `main` or `conversation` session, from its person, and only as an `m.text` sealed by one of
 the sender's own devices: a message sent in clear, or one whose Megolm session belongs to someone
 else's device (`MismatchedSender`, the sign of a forged envelope), is never a turn, and neither is
@@ -1347,7 +1387,7 @@ keys, so nothing sent before its first `run` can be decrypted by it: run the hos
 | `keeper-agentd agents init <drive> --owner <@user> --reader <@user>… --bot <bot> [--local-only] [--with <ids>] [--principal <p>] [--into <dir>]` | seeds the drive's agents zone, never over a file, refusing an owner, readers or `local_only` that differ from the pin, and a bot that is not local on a `local_only` drive; against agentd's own checkout — refused while `run` serves the principal — makes the seeded proxy's DM and `main` session once its copy is signed in, adopting the DM when the copy is already in it (§ *Setting up the agents zone*) |
 | `keeper-agentd agents new <id> [--name <name>] [--from-bmad <dir>] [--drive <drive>] [--into <dir>]` | copies the zone's `_template/` to a new agent's folder, refusing one that is there and a link in the template; `--from-bmad` writes the BMAD agent's soul and lists what it did not import |
 | `keeper-agentd run` | serves the agents until `SIGTERM`, holding `agentd.lock` in its data folder so no second `run` or `agents init` opens the copies beside it |
-| `keeper-agentd status [--session <drive>/<session> [--no-probe]]` | the host, each drive's engine state and mount verdict, each copy, the sessions served (and a session not served because another names its room), and the tools each agent is and is not offered here; with `--session`, what that session's agent is told and whether its digest is the last `open` line's. Composing it asks an `ollama` provider which tools its model supports, as a turn does; `--no-probe` asks nothing and composes as if that were unknown |
+| `keeper-agentd status [--session <drive>/<session> [--no-probe]]` | the host, each drive's engine state and mount verdict, each copy, the sessions served (and a session not served because another names its room), the tools each agent is and is not offered here, and each `[[trust]]` person's pin against the master key their homeserver publishes (`matches`, `differs`, `not pinned`, `not published`; read by the running host, "not running" without one); with `--session`, what that session's agent is told and whether its digest is the last `open` line's. Composing it asks an `ollama` provider which tools its model supports, as a turn does; `--no-probe` asks nothing and composes as if that were unknown |
 
 `--config <path>` (or `KEEPER_AGENTD_CONFIG`) names another configuration file. The exit codes are
 `keeper-syncd`'s: `0` done, `1` a failure while running (a sync engine that stopped, panicked or

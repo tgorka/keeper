@@ -7756,7 +7756,7 @@ status: open
 origin: epic 93, story 93.2 (rung `agents-93-park`, 2026-10-05; R85)
 location: `src-tauri/crates/keeper-agent/src/agent.rs` (`ServedSession::request_by_doors`), `src-tauri/crates/keeper-agent/src/approvals.rs` (`park`)
 reason: R85 sends a request the room's gate blocks to each approver's proxy DM through `ProxyDoors` — the proxies this host runs, the same doors as R169's narrowed detail (DW-460). An approver whose proxy runs on another host has no door here and is not asked (logged); a send that fails is not tried again — the record expires undecided after its 24 h or 1 h. A decision sent in the DM arrives at the proxy's `main` worker, not the parked session's: the forward is Q17/R89's route, built with the declassify card in rung 6 (`agents-93-decide`); until then nothing installs a decision source, so nothing parks in production. Close in rung 6: the DM's worker forwards a decision carrying `{session}` to the parked session's worker on whichever host serves it, the cross-host door replaces the local-only one, and a failed DM send joins the worker's `Retry`.
-status: open
+status: open — narrowed 2026-10-05 (rung `agents-93-trust`, R89): a decision made in the DM of an approver whose proxy *this* host runs now goes home to the parked session (`deciding::Forwards`, `a_decision_in_the_approvers_dm_goes_home_to_the_session_that_asked`). What stays open: an approver whose proxy runs on another host is neither asked nor heard, a failed DM send is not retried, and the declassify card (rung 6).
 
 ### DW-486: An approved `drive_write` to a missing note is refused with the delete's sentence.
 
@@ -7799,3 +7799,39 @@ origin: epic 93, story 93.2 review fixes R93P-16 (rung `agents-93-park`, 2026-10
 location: `src-tauri/crates/keeper-agentd/tests/live_approvals.rs` (`two_copies_racing_run_the_effect_once`)
 reason: Two clients race `consume_once` through the production `ClientApprovals` on delectra and exactly one performs the counted effect, five approvals in a row. Not driven: two `HostRuntime`s with an injected decision source, lease expiry and takeover, and cuts between the server's acceptance, the local mirror line and a push. Close with DW-487's `Pair` harness running both hosts' workers over one drive and one homeserver, the effect a file write, and a kill between acceptance and mirror.
 status: open
+
+### DW-488: 93.3 acceptance 3 is proved live up to the verdict, not to `decision.json` and the run on a host.
+
+origin: epic 93, story 93.3 (rung `agents-93-trust`, 2026-10-05; R92)
+location: `src-tauri/crates/keeper-agentd/tests/live_trust.rs`, `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`parks::a_decision_from_a_cross_signed_device_counts_and_one_from_a_new_device_does_not`)
+reason: The live test makes the person's devices with matrix-sdk 0.18 (A bootstrapped, B a fresh login, C signed by A), sends four real decisions, and runs keeper's own `arrival_of`, `classify` and the production adapter (`deciding::ClientDecisions` over the agent's client) with `judge`: A and C count, B does not, an unpinned person does not, the desktop's own device does not at T4, and a reset no longer matches its pin. What a counted decision then does — `decision.json` by the claim holder, the consume, the resume — is proved over the same `DecisionSource` seam in `agent_turns::parks`, not on a running `keeper-agentd`: no production host installs a source until rung 6 (R92). Close in rung 6 with a `live_claims`-style host run once agentd installs `ClientDecisions` (together with DW-487).
+status: open
+
+### DW-489: A decision made in a proxy DM before the parked session's worker re-registers after a restart is dropped.
+
+origin: epic 93, story 93.3 (rung `agents-93-trust`, 2026-10-05; R89)
+location: `src-tauri/crates/keeper-agent/src/deciding.rs` (`Forwards`, `ServedSession::expect_decisions`), `src-tauri/crates/keeper-agent/src/agent.rs` (`serve_arrivals`)
+reason: The DM → session route is an in-memory table on the host: a request registers it when sent, and a restarted session's worker registers it again at serve start for every pending record whose request went by doors. A decision the DM's worker serves before that — the proxy's `main` worker starting first after a restart — finds no route, is answered `no approval of this session waits for this decision` in the DM (no line), and is never replayed into the session's room; the record then expires undecided and the person must ask again. Close by registering routes from `approvals/*.json` of every served session before any worker serves, or by having the DM's worker hold an unrouted decision until the next rescan.
+status: open
+
+### DW-510: An unattended run's action raised to T4 names nobody who may decide it.
+
+origin: epic 93, story 93.3 restack onto the reviewed `agents-93-park` (rung `agents-93-trust`, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/trust.rs` (`decide_trust`, `NO_REQUESTER`), `src-tauri/crates/keeper-agent/src/approvals.rs` (the park's `dispatch_chain`)
+reason: R171 raises a scheduled run's T3 call (a `card_update` setting `schedule`) to T4, and at T4 only the head of the record's `dispatch_chain` decides (S-28). A scheduled run's record carries an empty chain, so every such decision is logged `nobody can decide this: it names nobody who asked` and the run waits until it expires. Rung 2's `a_scheduled_runs_own_card_update_is_approved_and_ends_the_run` names tgorka in the record by hand to keep proving the card's lifecycle. Close with a ruling on who asked an unattended run — the card's assignee's owner, or the session's `requested_by` — written into the chain at park.
+status: open
+
+### DW-511: The proxy DM's record of forwarded decision events is never pruned.
+
+origin: epic 93, story 93.3 review fixes R3-04 (rung `agents-93-trust`, 2026-10-05; ruling R184)
+location: `src-tauri/crates/keeper-agent/src/deciding.rs` (`Forwards.forwarded`)
+reason: Each decision event a DM hands home is remembered so its redelivery is not handed home again; the set lives as long as the host and grows by one event id per forwarded decision. Small (decisions are made by people), but unbounded. Close by dropping an entry with its route once the approval ends.
+status: open
+
+### DW-512: A federation failure in a live `/keys/query` answer is proved over the verifier, not against a homeserver.
+
+origin: epic 93, story 93.3 review fixes R3-01/R3-02 (rung `agents-93-trust`, 2026-10-05; ruling R182)
+location: `src-tauri/crates/keeper-core/src/agents/trust.rs` (`published_in`), `src-tauri/crates/keeper-core/src/agents/matrix.rs` (`AgentClient::keys_answer`), `src-tauri/crates/keeper-agentd/tests/live_trust.rs`
+reason: The adapter now asks one `/keys/query` per decision and judges that answer alone; `live_trust` proves the whole-answer cases on delectra (A and C count, B and a reset do not). An HTTP-200 answer with `failures`, and an identity replaced between two answers, are proved by `trust::tests` on signed key material and by the `agent_turns` double, because delectra federates with nobody. Close with a second homeserver in the harness that is stopped mid-test.
+status: open
+

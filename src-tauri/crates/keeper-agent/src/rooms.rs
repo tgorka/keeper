@@ -157,7 +157,7 @@ fn visitor_decision(invite: &Invite, known: &Known) -> InviteDecision {
     }
 }
 
-fn reads(readers: &Readers, user: &UserId) -> bool {
+pub(crate) fn reads(readers: &Readers, user: &UserId) -> bool {
     match readers {
         Readers::Anyone => true,
         Readers::Only(set) => set.contains(user),
@@ -288,10 +288,11 @@ pub enum Arrival {
     Text,
     /// An `m.replace` of an earlier event.
     Edit,
-    /// A `dev.keeper.agent.approval.decision`.
+    /// A `dev.keeper.agent.approval.decision`. Its device's trust is the
+    /// worker's to decide ([`keeper_core::agents::trust::decide_trust`]).
     Decision {
-        /// Whether the sender's device is verified for this host.
-        verified: bool,
+        /// Whether the sender's own device sealed it (R30).
+        sealed: bool,
     },
     /// A `dev.keeper.agent.scope`: the drives in scope and the docked
     /// note's focus, from the proxy's person.
@@ -332,7 +333,8 @@ pub enum Arrival {
 pub enum Disposition {
     /// The proxy's person spoke in its conversation: a turn.
     Turn,
-    /// A reader decided, from a verified device: the approval path's.
+    /// A reader's decision, sealed by their own device: the approval
+    /// path's, which decides whether that device is trusted.
     Decision,
     /// The proxy's person set the scope or the focus in its conversation.
     Scope,
@@ -368,10 +370,10 @@ pub const OBSERVER_TEXT: &str =
 pub const NOT_THE_PERSON: &str = "only the proxy's person starts a turn in its conversation";
 /// The agent's own events, echoed by sync.
 pub const OWN_EVENT: &str = "the agent's own event";
-/// A decision from someone who does not read the session, or from an
-/// unverified device.
+/// A decision from someone who does not read the session, or one its
+/// sender's own device did not seal.
 pub const UNTRUSTED_DECISION: &str =
-    "a decision is accepted only from a reader of the session on a verified device";
+    "a decision is taken only from a reader of the session, sealed by their own device";
 /// An agent's event or an edit sent by anyone but the agent itself.
 pub const FORGED: &str =
     "an agent's event or an edit is the agent's own to send; from anyone else it is ignored";
@@ -450,8 +452,8 @@ pub fn classify(served: &Served<'_>, sender: &UserId, arrival: Arrival) -> Dispo
                 Disposition::Ignored(NOT_THE_DM)
             }
         }
-        Arrival::Decision { verified } => {
-            if verified && reads(served.readers, sender) {
+        Arrival::Decision { sealed } => {
+            if sealed && reads(served.readers, sender) {
                 Disposition::Decision
             } else {
                 Disposition::Ignored(UNTRUSTED_DECISION)
@@ -834,22 +836,18 @@ mod tests {
             classify(&scheduled, &tgorka, Arrival::Text),
             Disposition::Ignored(OBSERVER_TEXT)
         );
-        // The same reader's decision from a verified device is accepted
-        // there, and from an unverified one is not.
+        // The same reader's decision, sealed by their own device, goes to
+        // the approval path there, and one in clear does not.
         assert_eq!(
-            classify(&delegated, &tgorka, Arrival::Decision { verified: true }),
+            classify(&delegated, &tgorka, Arrival::Decision { sealed: true }),
             Disposition::Decision
         );
         assert_eq!(
-            classify(&delegated, &tgorka, Arrival::Decision { verified: false }),
+            classify(&delegated, &tgorka, Arrival::Decision { sealed: false }),
             Disposition::Ignored(UNTRUSTED_DECISION)
         );
         assert_eq!(
-            classify(
-                &delegated,
-                &user(MARTA),
-                Arrival::Decision { verified: true }
-            ),
+            classify(&delegated, &user(MARTA), Arrival::Decision { sealed: true }),
             Disposition::Ignored(UNTRUSTED_DECISION)
         );
     }

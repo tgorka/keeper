@@ -31,7 +31,7 @@ use matrix_sdk::ruma::api::error::{ErrorKind, RetryAfter};
 use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{
-    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId,
+    DeviceId, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId,
     TransactionId, UInt, UserId,
 };
 use matrix_sdk::{Client, RoomState};
@@ -569,6 +569,72 @@ impl AgentClient {
             .map_err(from_sdk)?;
         serde_json::to_value(&file)
             .map_err(|err| AgentMatrixError::Other(format!("could not encode the file: {err}")))
+    }
+
+    /// What `user`'s homeserver publishes now of their `device` and their
+    /// identity (93.3's adapter, R182): one `/keys/query` asked for this
+    /// call alone, judged on its own answer by
+    /// [`crate::agents::trust::published_in`] — the master key and the
+    /// device's signature chain from the same answer, never the crypto
+    /// store, which keeps an earlier identity when an answer lacks one. An
+    /// answer that is not whole is an error naming
+    /// [`crate::agents::trust::KEYS_UNKNOWN`].
+    pub async fn published(
+        &self,
+        user: &UserId,
+        device: &DeviceId,
+    ) -> Result<crate::agents::trust::Published, AgentMatrixError> {
+        let answer = self.keys_answer(user, Some(device)).await?;
+        crate::agents::trust::published_in(&answer, user, Some(device.as_str()))
+            .map_err(|unknown| AgentMatrixError::Other(unknown.to_owned()))
+    }
+
+    /// `user`'s master key as their homeserver publishes it now, asked for
+    /// fresh; `None` when they publish no cross-signing identity (R88).
+    pub async fn published_master_key(
+        &self,
+        user: &UserId,
+    ) -> Result<Option<String>, AgentMatrixError> {
+        let answer = self.keys_answer(user, None).await?;
+        crate::agents::trust::published_in(&answer, user, None)
+            .map(|published| published.master_key)
+            .map_err(|unknown| AgentMatrixError::Other(unknown.to_owned()))
+    }
+
+    /// One `/keys/query` for `user` (their `device` alone, or none), as its
+    /// answer came.
+    async fn keys_answer(
+        &self,
+        user: &UserId,
+        device: Option<&DeviceId>,
+    ) -> Result<crate::agents::trust::KeysAnswer, AgentMatrixError> {
+        use matrix_sdk::ruma::api::client::keys::get_keys;
+        let mut request = get_keys::v3::Request::new();
+        request.timeout = Some(std::time::Duration::from_secs(10));
+        request.device_keys = std::collections::BTreeMap::from([(
+            user.to_owned(),
+            device.map(ToOwned::to_owned).into_iter().collect(),
+        )]);
+        let response = self.client.send(request).await.map_err(from_http)?;
+        let value = |raw: &serde_json::value::RawValue| serde_json::from_str(raw.get()).ok();
+        Ok(crate::agents::trust::KeysAnswer {
+            failed: !response.failures.is_empty(),
+            master_key: response
+                .master_keys
+                .get(user)
+                .and_then(|raw| value(raw.json())),
+            self_signing_key: response
+                .self_signing_keys
+                .get(user)
+                .and_then(|raw| value(raw.json())),
+            device: device.and_then(|device| {
+                response
+                    .device_keys
+                    .get(user)
+                    .and_then(|devices| devices.get(device))
+                    .and_then(|raw| value(raw.json()))
+            }),
+        })
     }
 
     fn joined(&self, room: &RoomId) -> Result<matrix_sdk::Room, AgentMatrixError> {

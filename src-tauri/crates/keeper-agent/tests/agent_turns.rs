@@ -569,6 +569,7 @@ impl World {
             received_at: tokio::time::Instant::now(),
             replay: false,
             via: None,
+            device: None,
         }
     }
 
@@ -4878,6 +4879,7 @@ fn nixis_dm(world: &World) {
 struct Doors {
     told: Mutex<Vec<(String, Value)>>,
     failing: AtomicUsize,
+    forwards: keeper_agent::deciding::Forwards,
 }
 
 impl keeper_agent::sinks::ProxyDoors for Doors {
@@ -4903,6 +4905,10 @@ impl keeper_agent::sinks::ProxyDoors for Doors {
                 .push((event_type.to_owned(), content));
             Ok(OwnedEventId::try_from("$told:example.org").expect("id"))
         })
+    }
+
+    fn forwards(&self) -> &keeper_agent::deciding::Forwards {
+        &self.forwards
     }
 }
 
@@ -6736,24 +6742,117 @@ mod parks {
     use super::*;
     use keeper_agent::approvals::{
         decision_content, effect_unknown, ApprovalRoom, Consumed, ConsumedRead, DecisionSource,
-        RoomFuture, DENIED, EXPIRED, NOT_RUN, NO_SUCH_APPROVAL, SUPERSEDED, SUPERSEDED_RESULT,
+        RoomFuture, ALREADY_DECIDED, APPROVAL_ENDED, DECISION_UNWRITTEN, DENIED, EXPIRED,
+        NOT_HOLDER, NOT_RUN, SUPERSEDED, SUPERSEDED_RESULT, UNREADABLE_DECISION,
     };
-    use keeper_core::agents::approval::{
-        parse_record, sha256_hex, ApprovalRecord, DecidedBy, Decision,
-    };
+    use keeper_core::agents::agentd::TrustEntry;
+    use keeper_core::agents::approval::{parse_record, sha256_hex, ApprovalRecord, Decision};
     use keeper_core::agents::events::{ConsumedContent, APPROVAL_REQUEST};
     use keeper_core::agents::log::{ApprovalBody, ApprovalState};
     use keeper_core::agents::matrix::AgentMatrixError;
+    use keeper_core::agents::trust::{
+        Anchor, OwnAccount, Published, KEYS_UNKNOWN, KEY_MOVED, NOT_AN_APPROVER, THIS_DEVICE,
+        UNSIGNED_DEVICE,
+    };
+    use matrix_sdk::ruma::DeviceId;
 
-    /// An in-test decision source: a reader's decision counts.
-    struct Admit;
+    /// tgorka's master key, as pinned and as published.
+    const KEY: &str = "ed25519:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE";
+    /// Marta's.
+    const MARTAS: &str = "ed25519:MaRtAfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE";
+    /// tgorka's after he reset his identity.
+    const RESET: &str = "ed25519:ZZZZEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE";
+    /// A device of tgorka's that nobody signed: a fresh login.
+    const NEW: &str = "NEW";
+
+    /// The trust adapter's double: what each person's homeserver publishes
+    /// (every device cross-signed by its owner but [`NEW`]; each person's
+    /// key, which a test may move) under this host's anchor.
+    struct Admit {
+        anchor: Anchor,
+        keys: Mutex<std::collections::HashMap<String, String>>,
+        /// The homeserver's answer is not whole: the lookup fails, with an
+        /// error that quotes [`SECRET`].
+        unknown: std::sync::atomic::AtomicBool,
+        /// Run once while the next lookup is in flight.
+        during: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    /// A value a sender or a server wrote that keeper must never repeat in
+    /// its own logs.
+    const SECRET: &str = "SECRET-7f3a9c";
+
+    impl Admit {
+        fn over(anchor: Anchor) -> Arc<Admit> {
+            Arc::new(Admit {
+                anchor,
+                keys: Mutex::new(
+                    [(TGORKA, KEY), (MARTA, MARTAS)]
+                        .map(|(user, key)| (user.to_owned(), key.to_owned()))
+                        .into(),
+                ),
+                unknown: Default::default(),
+                during: Mutex::new(None),
+            })
+        }
+
+        /// A headless host with tgorka and Marta pinned.
+        fn pinned() -> Arc<Admit> {
+            Admit::over(Anchor::Pinned(
+                [(TGORKA, KEY), (MARTA, MARTAS)]
+                    .map(|(person, key)| TrustEntry {
+                        user: user(person),
+                        master_key: Some(key.to_owned()),
+                        proxy: None,
+                    })
+                    .into(),
+            ))
+        }
+
+        /// The desktop signed in as tgorka, verified, its messenger device
+        /// `MAC` (R87).
+        fn desktop() -> Arc<Admit> {
+            Admit::over(Anchor::Desktop(vec![OwnAccount {
+                user: user(TGORKA),
+                device_id: "MAC".to_owned(),
+                own_identity_verified: true,
+                master_key: Some(KEY.to_owned()),
+            }]))
+        }
+
+        fn publish(&self, person: &str, key: &str) {
+            self.keys
+                .lock()
+                .expect("lock")
+                .insert(person.to_owned(), key.to_owned());
+        }
+    }
 
     impl DecisionSource for Admit {
-        fn decided_by(&self, _: &ApprovalRecord, arrived: &Arrived) -> Result<DecidedBy, String> {
-            Ok(DecidedBy {
-                user: arrived.sender.to_string(),
-                device: "PHONE".to_owned(),
-                verified: true,
+        fn anchor(&self) -> &Anchor {
+            &self.anchor
+        }
+
+        fn published<'a>(
+            &'a self,
+            user: &'a UserId,
+            device: &'a DeviceId,
+        ) -> RoomFuture<'a, Published> {
+            Box::pin(async move {
+                let during = self.during.lock().expect("lock").take();
+                if let Some(during) = during {
+                    tokio::task::yield_now().await;
+                    during();
+                }
+                if self.unknown.load(Ordering::SeqCst) {
+                    return Err(AgentMatrixError::Other(format!(
+                        "federation failed: {SECRET}"
+                    )));
+                }
+                Ok(Published {
+                    cross_signed_by_owner: device.as_str() != NEW,
+                    master_key: self.keys.lock().expect("lock").get(user.as_str()).cloned(),
+                })
             })
         }
     }
@@ -6902,7 +7001,7 @@ mod parks {
     /// Nixi with a decision source, and the room double her sessions use.
     fn deciding(script: Vec<Completion>) -> (World, Arc<Approvals>) {
         let mut world = world(ProviderKind::OpenAi, &["drive_read", "drive_write"], script);
-        world.deps.decisions = Some(Arc::new(Admit));
+        world.deps.decisions = Some(Admit::pinned());
         (world, Arc::new(Approvals::default()))
     }
 
@@ -6948,12 +7047,16 @@ mod parks {
             .expect("rewrite");
         }
 
+        /// tgorka's decision on `record`, from his cross-signed phone.
         fn decision(&mut self, record: &ApprovalRecord, decision: Decision) -> Arrived {
-            self.event(
-                TGORKA,
-                Arrival::Decision { verified: true },
-                decision_content(record, decision, None),
-            )
+            self.decision_from(TGORKA, "PHONE", decision_content(record, decision, None))
+        }
+
+        /// A decision with `content`, sealed by `sender`'s `device`.
+        fn decision_from(&mut self, sender: &str, device: &str, content: Value) -> Arrived {
+            let mut arrived = self.event(sender, Arrival::Decision { sealed: true }, content);
+            arrived.device = Some(device.into());
+            arrived
         }
 
         fn approval_lines(&self) -> Vec<ApprovalBody> {
@@ -7124,11 +7227,22 @@ mod parks {
             world.serve(&mut served, decided).await,
             Outcome::Duplicate
         ));
+        // Another decision after it ran is logged ignored and runs nothing
+        // (R80).
         let again = world.decision(&record, Decision::Approve);
         assert!(matches!(
             world.serve(&mut served, again).await,
-            Outcome::Ignored(NO_SUCH_APPROVAL)
+            Outcome::Duplicate
         ));
+        assert_eq!(
+            world
+                .approval_lines()
+                .pop()
+                .expect("a line")
+                .reason
+                .as_deref(),
+            Some(APPROVAL_ENDED)
+        );
         let mut restarted = open(&world, &approvals);
         let (_handle, signal) = chat::cancellation();
         restarted
@@ -7213,7 +7327,7 @@ mod parks {
                 prose("Scheduled."),
             ],
         );
-        world.deps.decisions = Some(Arc::new(Admit));
+        world.deps.decisions = Some(Admit::pinned());
         let approvals = Arc::new(Approvals::default());
         write(&world.dir(SESSION), "card.md", CARD);
         let mut served = open(&world, &approvals);
@@ -7299,7 +7413,7 @@ mod parks {
                 prose("It needs you."),
             ],
         );
-        world.deps.decisions = Some(Arc::new(Admit));
+        world.deps.decisions = Some(Admit::pinned());
         let rooms = Delegations::over(known(&[TGORKA, MARTA]));
         let mut nixi = world.delegating(&rooms);
         let report = report(world.ask(&mut nixi, "a daily digest from Tola").await);
@@ -7340,7 +7454,7 @@ mod parks {
             ],
         );
         let mut tola = tolas(&world, &["drive_read", "drive_write"]);
-        tola.decisions = Some(Arc::new(Admit));
+        tola.decisions = Some(Admit::pinned());
         let rooms = Delegations::over(known(&[TGORKA, MARTA]));
         let (_nixi, child, brief) = handed_over(&mut world, &rooms).await;
         let path = world.create_child(&tola, &child, &read_brief(&brief).expect("a brief"));
@@ -7369,17 +7483,20 @@ mod parks {
         assert_eq!(requests, 1);
     }
 
-    /// 93.2 AC2/AC5: a host that does not hold the claim never consumes; the
-    /// host that takes over, given the decision, reads the room first and
-    /// finds another copy's `consumed` — though no chunk it has says so —
-    /// and runs nothing, reporting the effect unknown.
+    /// 93.2 AC2/AC5: a host that does not hold the claim takes no decision
+    /// and never consumes; the host that takes over, given the decision,
+    /// reads the room first and finds another copy's `consumed` — though no
+    /// chunk it has says so — and runs nothing, reporting the effect unknown.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_consume_that_never_pushed_is_seen_by_the_host_that_takes_over() {
         let (mut world, approvals, mut served, record) =
             parked("hers", vec![prose("I will check.")]).await;
         approvals.elsewhere.store(true, Ordering::SeqCst);
         let decided = world.decision(&record, Decision::Approve);
-        world.serve(&mut served, decided.clone()).await;
+        assert!(matches!(
+            world.serve(&mut served, decided.clone()).await,
+            Outcome::Ignored(NOT_HOLDER)
+        ));
         assert!(approvals.events().is_empty(), "no claim, no consume");
         assert!(served.waiting());
         assert_eq!(world.note().as_deref(), Some(ORIGINAL));
@@ -7727,11 +7844,12 @@ mod parks {
     async fn two_hosts_consuming_at_once_run_it_once() {
         let (mut world, approvals, mut served, record) =
             parked("once", vec![prose("Done."), prose("Spent.")]).await;
-        // The holder wrote the decision beside the record, and its consume
-        // was not accepted: nobody consumed yet.
+        // The decision is written beside the record by the holder, whose
+        // `consumed` the server did not take; nobody consumed yet.
         approvals.down.store(true, Ordering::SeqCst);
         let decided = world.decision(&record, Decision::Approve);
         world.serve(&mut served, decided).await;
+        assert!(approvals.events().is_empty());
         approvals.down.store(false, Ordering::SeqCst);
         drop(served);
         let mut deps_b = tolas_free_deps(&world);
@@ -7831,6 +7949,508 @@ mod parks {
                 .await,
             Outcome::Held
         ));
+    }
+
+    /// The one `decided` line written for a decision that did not count:
+    /// no decision, its reason.
+    fn ignored(world: &World) -> ApprovalBody {
+        let last = world.approval_lines().pop().expect("a line");
+        assert_eq!(last.state, ApprovalState::Decided, "{last:?}");
+        assert_eq!(last.decision, None, "{last:?}");
+        last
+    }
+
+    fn decision_file(world: &World, record: &ApprovalRecord) -> bool {
+        world
+            .approvals()
+            .join(format!("{}.decision.json", record.id))
+            .exists()
+    }
+
+    /// 93.3 AC2: a host without the claim writes nothing — no file, no
+    /// line; a decision with another digest or a scope there is no such
+    /// thing as (`always`) writes no file and is logged; the first valid
+    /// decision is written once, and a second valid one after it writes
+    /// nothing more and is logged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_decision_file_is_written_once_by_the_claim_holder() {
+        use keeper_core::agents::approval::DecisionRefusal;
+        let (mut world, approvals, mut served, record) =
+            parked("once", vec![prose("Written.")]).await;
+
+        approvals.elsewhere.store(true, Ordering::SeqCst);
+        let elsewhere = world.decision(&record, Decision::Approve);
+        assert!(matches!(
+            world.serve(&mut served, elsewhere).await,
+            Outcome::Ignored(NOT_HOLDER)
+        ));
+        assert!(!decision_file(&world, &record));
+        assert_eq!(world.approval_lines().len(), 1, "only the request's line");
+        approvals.elsewhere.store(false, Ordering::SeqCst);
+
+        let mut other = decision_content(&record, Decision::Approve, None);
+        other["binding_digest"] = json!(sha256_hex(b"something else"));
+        let other = world.decision_from(TGORKA, "PHONE", other);
+        assert!(matches!(
+            world.serve(&mut served, other).await,
+            Outcome::Decided
+        ));
+        assert_eq!(
+            ignored(&world).reason,
+            Some(DecisionRefusal::Digest.to_string())
+        );
+        let mut always = decision_content(&record, Decision::Approve, None);
+        always["scope"] = json!("always");
+        let always = world.decision_from(TGORKA, "PHONE", always);
+        world.serve(&mut served, always).await;
+        assert_eq!(ignored(&world).reason.as_deref(), Some(UNREADABLE_DECISION));
+        assert!(!decision_file(&world, &record));
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+
+        // The first valid decision is written; its consume fails, so the
+        // run stays parked and a second valid decision arrives.
+        approvals.down.store(true, Ordering::SeqCst);
+        let first = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, first).await;
+        assert!(decision_file(&world, &record));
+        let written = std::fs::read(
+            world
+                .approvals()
+                .join(format!("{}.decision.json", record.id)),
+        )
+        .expect("decision");
+        assert!(served.waiting());
+        let second = world.decision(&record, Decision::Deny);
+        assert!(matches!(
+            world.serve(&mut served, second).await,
+            Outcome::Duplicate
+        ));
+        assert_eq!(ignored(&world).reason.as_deref(), Some(ALREADY_DECIDED));
+        assert_eq!(
+            std::fs::read(
+                world
+                    .approvals()
+                    .join(format!("{}.decision.json", record.id))
+            )
+            .expect("decision"),
+            written,
+            "the first decision stands"
+        );
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+    }
+
+    /// R183: the claim moves while the decision's trust is being looked
+    /// up. The holder's read before the lookup said yes; the one after it
+    /// says no, so no decision file, no line and no consume.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claim_lost_during_the_trust_lookup_writes_no_decision() {
+        let (mut world, approvals, mut served, record) =
+            parked("once", vec![prose("Written.")]).await;
+        let admit = Admit::pinned();
+        world.deps.decisions = Some(admit.clone());
+        let taken = Arc::clone(&approvals);
+        *admit.during.lock().expect("lock") = Some(Box::new(move || {
+            taken.elsewhere.store(true, Ordering::SeqCst);
+        }));
+        let decided = world.decision(&record, Decision::Approve);
+        assert!(matches!(
+            world.serve(&mut served, decided).await,
+            Outcome::Ignored(NOT_HOLDER)
+        ));
+        assert!(admit.during.lock().expect("lock").is_none(), "it was asked");
+        assert!(!decision_file(&world, &record));
+        assert_eq!(world.approval_lines().len(), 1, "only the request's line");
+        assert!(approvals.events().is_empty());
+        assert!(served.waiting());
+    }
+
+    /// Every write of the process log, kept.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    /// R182, R3-05: keys the sender's homeserver could not give whole are
+    /// "unknown" — the decision is logged ignored with that reason, and
+    /// the server's error is not repeated; a decision whose scope is text a
+    /// sender chose is unreadable, and that text reaches neither the
+    /// session's log nor the process log.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_keys_and_unreadable_decisions_are_logged_without_what_they_quote() {
+        let (mut world, approvals, mut served, record) =
+            parked("once", vec![prose("Written.")]).await;
+        let admit = Admit::pinned();
+        world.deps.decisions = Some(admit.clone());
+        let captured = Captured::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish(),
+        );
+
+        admit.unknown.store(true, Ordering::SeqCst);
+        let unknown = world.decision(&record, Decision::Approve);
+        assert!(matches!(
+            world.serve(&mut served, unknown).await,
+            Outcome::Decided
+        ));
+        assert_eq!(ignored(&world).reason.as_deref(), Some(KEYS_UNKNOWN));
+        admit.unknown.store(false, Ordering::SeqCst);
+
+        let mut scoped = decision_content(&record, Decision::Approve, None);
+        scoped["scope"] = json!(SECRET);
+        let scoped = world.decision_from(TGORKA, "PHONE", scoped);
+        world.serve(&mut served, scoped).await;
+        assert_eq!(ignored(&world).reason.as_deref(), Some(UNREADABLE_DECISION));
+
+        let process = String::from_utf8(captured.0.lock().expect("lock").clone()).expect("utf-8");
+        assert!(process.contains("a decision is ignored"), "{process}");
+        assert!(!process.contains(SECRET), "{process}");
+        assert!(!format!("{:?}", world.lines(SESSION)).contains(SECRET));
+        assert!(!decision_file(&world, &record));
+        assert!(approvals.events().is_empty());
+        assert!(served.waiting());
+    }
+
+    /// R3-06: what is at the decision's name but no decision — a partial
+    /// file — and a folder that takes no file are faults, not a decision
+    /// taken already: no line, the event stays unseen, and its redelivery
+    /// is taken once the fault clears.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_decision_that_could_not_be_stored_is_taken_once_the_fault_clears() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut world, approvals, mut served, record) =
+            parked("once", vec![prose("Written.")]).await;
+        let name = world
+            .approvals()
+            .join(format!("{}.decision.json", record.id));
+        let first = world.decision(&record, Decision::Approve);
+
+        std::fs::write(&name, "{\"v\":").expect("a partial file");
+        assert!(matches!(
+            world.serve(&mut served, first.clone()).await,
+            Outcome::Ignored(DECISION_UNWRITTEN)
+        ));
+        assert_eq!(world.approval_lines().len(), 1, "only the request's line");
+        std::fs::remove_file(&name).expect("cleared");
+
+        let mode = |mode| {
+            std::fs::set_permissions(world.approvals(), std::fs::Permissions::from_mode(mode))
+                .expect("mode");
+        };
+        mode(0o555);
+        let unwritable = world.serve(&mut served, first.clone()).await;
+        mode(0o755);
+        assert!(matches!(unwritable, Outcome::Ignored(DECISION_UNWRITTEN)));
+        assert!(!name.exists());
+        assert_eq!(world.approval_lines().len(), 1, "only the request's line");
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+
+        assert!(matches!(
+            world.serve(&mut served, first).await,
+            Outcome::Decided
+        ));
+        assert!(parse_decision_file(&world, &record).decided_by.verified);
+        assert_eq!(world.note().as_deref(), Some("once"));
+        assert_eq!(approvals.events().len(), 1);
+    }
+
+    /// R3-07 (R80): after an approval ran, or was denied, a later decision
+    /// on it — another event — is logged ignored and changes nothing; that
+    /// event's redelivery writes nothing more.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_later_decision_on_an_ended_approval_is_logged_and_changes_nothing() {
+        for (first, then) in [
+            (Decision::Approve, Decision::Deny),
+            (Decision::Deny, Decision::Approve),
+        ] {
+            let (mut world, approvals, mut served, record) =
+                parked("once", vec![prose("Written.")]).await;
+            let decided = world.decision(&record, first);
+            assert!(matches!(
+                world.serve(&mut served, decided).await,
+                Outcome::Decided
+            ));
+            assert!(!served.waiting());
+            let lines = world.approval_lines().len();
+            let later = world.decision(&record, then);
+            assert!(matches!(
+                world.serve(&mut served, later.clone()).await,
+                Outcome::Duplicate
+            ));
+            let line = ignored(&world);
+            assert_eq!(line.reason.as_deref(), Some(APPROVAL_ENDED));
+            assert_eq!(line.id, record.id.to_string());
+            assert_eq!(world.approval_lines().len(), lines + 1);
+            world.serve(&mut served, later).await;
+            assert_eq!(world.approval_lines().len(), lines + 1, "seen once");
+            let ran = first == Decision::Approve;
+            assert_eq!(
+                world.note().as_deref(),
+                Some(if ran { "once" } else { ORIGINAL })
+            );
+            assert_eq!(approvals.events().len(), usize::from(ran));
+            assert_eq!(parse_decision_file(&world, &record).decision, first);
+        }
+    }
+
+    /// 93.3 AC2: a `session` scope on a T3 record is not admitted, and is
+    /// logged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_scope_at_t3_writes_nothing() {
+        use keeper_core::agents::approval::DecisionRefusal;
+        let mut world = world(
+            ProviderKind::OpenAi,
+            &["drive_read", "card_update"],
+            vec![calls(&[(
+                "c1",
+                "card_update",
+                json!({"card": "card.md", "fields": {"schedule": "@daily"}}),
+            )])],
+        );
+        world.deps.decisions = Some(Admit::pinned());
+        let approvals = Arc::new(Approvals::default());
+        write(&world.dir(SESSION), "card.md", CARD);
+        let mut served = open(&world, &approvals);
+        report(world.ask(&mut served, "run it daily").await);
+        let record = world.record();
+        assert_eq!(record.risk.tier, 3);
+        let mut session = decision_content(&record, Decision::Approve, None);
+        session["scope"] = json!("session");
+        let session = world.decision_from(TGORKA, "PHONE", session);
+        world.serve(&mut served, session).await;
+        assert_eq!(
+            ignored(&world).reason,
+            Some(DecisionRefusal::Scope("session").to_string())
+        );
+        assert!(!decision_file(&world, &record));
+        assert!(served.waiting());
+    }
+
+    /// 93.3 AC3 over the trust adapter's double: tgorka's decision from a
+    /// fresh login nobody signed is logged ignored with why, and so is one
+    /// after his master key moved; neither runs anything. One in clear is
+    /// not even a decision. From his cross-signed phone, with his pinned
+    /// key published, it counts and the run resumes, once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_decision_from_a_cross_signed_device_counts_and_one_from_a_new_device_does_not() {
+        let (mut world, approvals, mut served, record) =
+            parked("once", vec![prose("Written.")]).await;
+        let admit = Admit::pinned();
+        world.deps.decisions = Some(admit.clone());
+
+        let fresh = world.decision_from(
+            TGORKA,
+            NEW,
+            decision_content(&record, Decision::Approve, None),
+        );
+        assert!(matches!(
+            world.serve(&mut served, fresh).await,
+            Outcome::Decided
+        ));
+        let line = ignored(&world);
+        assert_eq!(line.reason.as_deref(), Some(UNSIGNED_DEVICE));
+        assert_eq!(line.by.as_deref(), Some(TGORKA));
+
+        admit.publish(TGORKA, RESET);
+        let moved = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, moved).await;
+        assert_eq!(ignored(&world).reason.as_deref(), Some(KEY_MOVED));
+
+        let mut clear = world.decision(&record, Decision::Approve);
+        clear.arrival = Arrival::Decision { sealed: false };
+        assert!(matches!(
+            world.serve(&mut served, clear).await,
+            Outcome::Ignored(keeper_agent::rooms::UNTRUSTED_DECISION)
+        ));
+        assert!(!decision_file(&world, &record));
+        assert!(approvals.events().is_empty());
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+        assert!(served.waiting());
+
+        admit.publish(TGORKA, KEY);
+        // A reader now who did not read the label the action parked under
+        // is not one of its approvers.
+        let mut narrowed = record.clone();
+        narrowed.label.readers = Readers::Only(BTreeSet::from([user(MARTA)]));
+        world.rewrite(&narrowed);
+        let before = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, before).await;
+        assert_eq!(ignored(&world).reason.as_deref(), Some(NOT_AN_APPROVER));
+        world.rewrite(&record);
+
+        let phone = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, phone).await;
+        assert_eq!(world.note().as_deref(), Some("once"));
+        assert_eq!(approvals.events().len(), 1);
+        let decided = parse_decision_file(&world, &record);
+        assert_eq!(
+            (
+                decided.decided_by.user.as_str(),
+                decided.decided_by.device.as_str(),
+                decided.decided_by.verified
+            ),
+            (TGORKA, "PHONE", true)
+        );
+        assert!(!served.waiting());
+    }
+
+    fn parse_decision_file(
+        world: &World,
+        record: &ApprovalRecord,
+    ) -> keeper_core::agents::approval::DecisionRecord {
+        keeper_core::agents::approval::parse_decision(
+            &std::fs::read_to_string(
+                world
+                    .approvals()
+                    .join(format!("{}.decision.json", record.id)),
+            )
+            .expect("decision"),
+        )
+        .expect("a strict decision")
+    }
+
+    /// 93.3 AC9 with the desktop's anchor (R87): on a T4 record the
+    /// requester's approval from this app's own device writes nothing and
+    /// logs "decide on another device"; from his cross-signed phone it
+    /// counts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_t4_decision_needs_the_requester_on_another_device() {
+        use keeper_core::agents::approval::Scope;
+        let (mut world, approvals, mut served, mut record) =
+            parked("asked", vec![prose("Written.")]).await;
+        world.deps.decisions = Some(Admit::desktop());
+        // Neither the tier nor the chain is bound: the record is made T4,
+        // asked by tgorka, as an irreversible action's would be.
+        record.risk.tier = 4;
+        record.scopes = vec![Scope::Once];
+        record.dispatch_chain = vec![TGORKA.to_owned()];
+        world.rewrite(&record);
+
+        let mac = world.decision_from(
+            TGORKA,
+            "MAC",
+            decision_content(&record, Decision::Approve, None),
+        );
+        world.serve(&mut served, mac).await;
+        assert_eq!(ignored(&world).reason.as_deref(), Some(THIS_DEVICE));
+        assert!(!decision_file(&world, &record));
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+
+        let phone = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, phone).await;
+        assert!(decision_file(&world, &record));
+        assert_eq!(world.note().as_deref(), Some("asked"));
+        assert_eq!(approvals.events().len(), 1);
+    }
+
+    /// R89: a request its room may not carry went to tgorka's proxy DM;
+    /// his decision there reaches the DM's worker, which hands it — and
+    /// only a decision on that request — to the session that asked. That
+    /// session alone writes the decision and runs the call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_decision_in_the_approvers_dm_goes_home_to_the_session_that_asked() {
+        let (mut world, approvals) =
+            deciding(vec![calls(&[write_note("w1", "after")]), prose("Written.")]);
+        nixis_dm(&world);
+        let delegations = Delegations::over(known_with_proxy());
+        let doors = Arc::new(Doors::default());
+        let mut served = world.delegating(&delegations);
+        served.approval_room = Some(Arc::clone(&approvals) as Arc<dyn ApprovalRoom>);
+        served.doors = Some(doors.clone());
+        let (home, mut inbox) = tokio::sync::mpsc::unbounded_channel::<Arrived>();
+        served.inbox = Some(Arc::new(move |arrived| {
+            let _ = home.send(arrived);
+        }));
+        world
+            .room
+            .set_members(&[TGORKA, MARTA, NIXI, "@eve:example.org"]);
+        report(world.ask(&mut served, "write a note").await);
+        let record = world.record();
+        assert_eq!(doors.of(APPROVAL_REQUEST).len(), 1);
+
+        let mut dm = world.open(DM);
+        dm.doors = Some(doors.clone());
+        let mut elsewhere = decision_content(&record, Decision::Approve, None);
+        elsewhere["id"] = json!(ulid::Ulid::new().to_string());
+        let elsewhere = world.decision_from(TGORKA, "PHONE", elsewhere);
+        assert!(!matches!(
+            world.serve(&mut dm, elsewhere).await,
+            Outcome::Forwarded
+        ));
+        assert!(inbox.try_recv().is_err(), "nothing else goes home");
+
+        let decided = world.decision(&record, Decision::Approve);
+        assert!(matches!(
+            world.serve(&mut dm, decided.clone()).await,
+            Outcome::Forwarded
+        ));
+        assert!(!decision_file(&world, &record), "the DM writes nothing");
+        let forwarded = inbox.try_recv().expect("the decision went home");
+        assert_eq!(
+            forwarded.via.as_ref().map(|room| room.as_str()),
+            Some("!dm:example.org")
+        );
+        // R184: the same event again is not handed home a second time, and
+        // a decision that was forwarded is never forwarded on.
+        assert!(matches!(
+            world.serve(&mut dm, decided).await,
+            Outcome::Forwarded
+        ));
+        assert!(!matches!(
+            world.serve(&mut dm, forwarded.clone()).await,
+            Outcome::Forwarded
+        ));
+        assert!(inbox.try_recv().is_err(), "handed home once");
+        assert!(matches!(
+            world.serve(&mut served, forwarded).await,
+            Outcome::Decided
+        ));
+        assert!(decision_file(&world, &record));
+        assert_eq!(world.note().as_deref(), Some("after"));
+    }
+
+    /// R184: a proxy's `main` session is its person's DM, so a route from
+    /// that DM to that session's own inbox would hand a decision back to
+    /// the worker it came from, forever. No such route is kept, and a
+    /// decision there is the session's own to take.
+    #[tokio::test]
+    async fn a_dm_never_forwards_a_decision_to_its_own_session() {
+        let mut world = world(ProviderKind::OpenAi, &[], vec![]);
+        let forwards = keeper_agent::deciding::Forwards::default();
+        let room = matrix_sdk::ruma::room_id!("!dm:example.org");
+        forwards.expect(
+            room,
+            "01J0000000000000000000000X",
+            room,
+            Arc::new(|_| panic!("circled")),
+        );
+        let mut arrived = world.event(
+            TGORKA,
+            Arrival::Decision { sealed: true },
+            json!({"id": "01J0000000000000000000000X"}),
+        );
+        assert!(!forwards.forward(room, &arrived));
+        arrived.via = Some(room.to_owned());
+        assert!(!forwards.forward(room, &arrived));
     }
 
     /// Nixi's deps again, for a second host of the same agent.
@@ -8617,7 +9237,7 @@ mod parks {
                     prose("Done."),
                 ],
             );
-            world.deps.decisions = Some(Arc::new(Admit));
+            world.deps.decisions = Some(Admit::pinned());
             let approvals = Arc::new(Approvals::default());
             session_of(
                 &world.tgdrive,
@@ -8655,12 +9275,19 @@ mod parks {
                 (CardAgent::of_text(&text).expect("keys"), text)
             };
             assert_eq!(card_now().0.run, Some(Field::Read(Run::Blocked)));
-            let record = world.record_in(SCHEDULED);
-            let decided = world.event(
-                TGORKA,
-                Arrival::Decision { verified: true },
-                decision_content(&record, decision, None),
-            );
+            // An unattended run raises the card change to T4, which only the
+            // person at the head of the record's `dispatch_chain` decides; a
+            // scheduled run names none (DW-510), so the test names tgorka.
+            let mut record = world.record_in(SCHEDULED);
+            record.dispatch_chain = vec![TGORKA.to_owned()];
+            std::fs::write(
+                world
+                    .dir(SCHEDULED)
+                    .join(format!("approvals/{}.json", record.id)),
+                serde_json::to_string(&record).expect("json"),
+            )
+            .expect("rewrite");
+            let decided = world.decision(&record, decision);
             assert!(matches!(
                 world.serve(&mut served, decided).await,
                 Outcome::Decided

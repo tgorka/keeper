@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use keeper_core::agents::approval::{
-    self, parse_decision, parse_record, ApprovalRecord, CallRef, Checkpoint, DecidedBy, Decision,
+    self, parse_decision, parse_record, ApprovalRecord, CallRef, Checkpoint, Decision,
     DecisionRecord, FilePin, Parking as RecordParking, Preconditions, WrittenBy,
 };
 use keeper_core::agents::events::{
@@ -48,12 +48,13 @@ use keeper_core::agents::label::{check_sink, Readers, Sink, SinkVerdict};
 use keeper_core::agents::log::{ApprovalBody, ApprovalState, LineBody, PeerBody};
 use keeper_core::agents::matrix::AgentMatrixError;
 use keeper_core::agents::tier::{AgentTool, Classification, APPROVALS_DIR};
+use keeper_core::agents::trust::{Anchor, Published};
 use keeper_core::bots::audit::{self, AuditIntent, AuditOutcome};
 use keeper_core::bots::chat::{self, CancelSignal};
 use keeper_core::bots::grant::{Effect, GrantVerdict, ToolTarget};
 use keeper_core::bots::tools::{render_result, ToolOutcome};
 use keeper_sync::SyncProfile;
-use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedUserId};
+use matrix_sdk::ruma::{DeviceId, EventId, OwnedEventId, OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::Instant;
@@ -88,6 +89,13 @@ pub const NO_SUCH_APPROVAL: &str = "no approval of this session waits for this d
 pub const NOT_HOLDER: &str = "this host does not hold the session's claim";
 /// Why a decision arrival is ignored when its file could not be written.
 pub const DECISION_UNWRITTEN: &str = "the decision could not be written";
+/// Why a decision whose content keeper cannot read is ignored.
+pub const UNREADABLE_DECISION: &str = "this decision could not be read";
+/// Why a decision after the one already taken is ignored.
+pub const ALREADY_DECIDED: &str = "this approval was decided already";
+/// Why a decision on an approval that ended already — run, denied,
+/// expired, superseded — is ignored (R80).
+pub const APPROVAL_ENDED: &str = "this approval has ended; a later decision changes nothing";
 /// What a call of a parked round is told when a stop cut its round's
 /// continuation while it may have been running.
 pub const INTERRUPTED: &str = "keeper stopped while this ran, so it does not know whether it took effect, and it will not run it again. Check, and ask again if it is still needed.";
@@ -109,14 +117,17 @@ pub const HISTORY_UNREAD: &str =
 /// unknown.
 pub const HISTORY_UNREAD_RESULT: &str = "keeper could not read the room far enough back to know whether this approval was used, so it does not know whether it took effect, and it will not run it. Check, and propose it again if it is still needed.";
 
-/// Who may decide an approval and from which device (R77; the trust
-/// adapter is 93.3's). Installed, every call that needs a person parks;
-/// absent, it is refused as before Epic 93. Production installs none until
-/// the card can be decided on (R92).
+/// Who may decide an approval and from which device (R77; 93.3's trust
+/// adapter, [`crate::deciding::ClientDecisions`]). Installed, every call
+/// that needs a person parks; absent, it is refused as before Epic 93.
+/// Production installs none until the card can be decided on (R92).
 pub trait DecisionSource: Send + Sync {
-    /// Who decided `arrived` (a `dev.keeper.agent.approval.decision`) on
-    /// `record`, when it counts; the reason it is ignored when it does not.
-    fn decided_by(&self, record: &ApprovalRecord, arrived: &Arrived) -> Result<DecidedBy, String>;
+    /// Where this host's trusted master keys come from.
+    fn anchor(&self) -> &Anchor;
+    /// What `user`'s homeserver publishes now of their `device` and their
+    /// cross-signing identity.
+    fn published<'a>(&'a self, user: &'a UserId, device: &'a DeviceId)
+        -> RoomFuture<'a, Published>;
 }
 
 /// A boxed room request.
@@ -356,17 +367,25 @@ fn read_text_in(dir: &Path, name: &str) -> std::io::Result<String> {
     String::from_utf8(read_in(dir, name)?).map_err(std::io::Error::other)
 }
 
-/// Write `bytes` as `dir/name` (a folder [`contained`] made), once:
-/// create-new — which never follows a link left at `name` — `fsync` the
-/// file, then the folder (`write_blob`'s discipline; `rename` would
-/// overwrite).
+/// Write `bytes` as `dir/name` (a folder [`contained`] made), once and
+/// whole: into a create-new file beside it, `fsync`ed, then hard-linked to
+/// `name` — which fails when anything, a link included, is there already
+/// (`rename` would overwrite) — then the folder `fsync`ed. A write that
+/// fails leaves nothing at `name`, so a later try is not refused by a
+/// partial file.
 fn write_once(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dir.join(name))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    let part = dir.join(format!(".{name}.{}.part", Ulid::new()));
+    let written = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::hard_link(&part, dir.join(name))
+    })();
+    let _ = fs::remove_file(&part);
+    written?;
     File::open(dir)?.sync_all()
 }
 
@@ -1044,10 +1063,14 @@ impl ServedSession {
         written.is_ok()
     }
 
-    /// A person's decision arrived (R77): with a source installed, it is
-    /// taken when it counts — written as `<ulid>.decision.json` by this
-    /// holder of the claim — and the parked run resumes; one that does not
-    /// count is logged `decided` with why, and nothing moves.
+    /// A person's decision arrived (R77): with a source installed, the
+    /// holder of the claim — and only it — takes it when it counts
+    /// (93.3: [`crate::deciding`]'s trust, then the record's
+    /// admissibility), writes it as `<ulid>.decision.json` and the parked
+    /// run resumes; one that does not count is logged `decided` with why,
+    /// and nothing moves. One on an approval of this session's that ended
+    /// already — run, denied, expired — is logged too (R80), and changes
+    /// nothing.
     pub(crate) async fn decided(
         &mut self,
         deps: &AgentDeps,
@@ -1058,52 +1081,81 @@ impl ServedSession {
         let Some(source) = deps.decisions.clone() else {
             return Ok(Outcome::Ignored(NO_SUCH_APPROVAL));
         };
-        let Ok(content) =
-            serde_json::from_value::<ApprovalDecisionContent>(arrived.content.clone())
+        let Some(id) = arrived.content["id"]
+            .as_str()
+            .filter(|id| Ulid::from_string(id).is_ok())
+            .map(str::to_owned)
         else {
             return Ok(Outcome::Ignored(NO_SUCH_APPROVAL));
         };
-        let Some(pending) = self
-            .context
-            .parked
-            .get(&content.id)
-            .filter(|pending| pending.ended.is_none())
-            .cloned()
-        else {
+        let known = self.context.parked.get(&id).cloned();
+        let pending = known.clone().filter(|pending| pending.ended.is_none());
+        if pending.is_none() && known.is_none() && self.read_record(deps, &id).is_err() {
             return Ok(Outcome::Ignored(NO_SUCH_APPROVAL));
-        };
+        }
+        // A host that does not hold the claim writes nothing, not even why.
+        if !self.holds_claim().await {
+            tracing::info!(approval = %id, "agents: this host does not hold the claim; a decision is not taken here");
+            return Ok(Outcome::Ignored(NOT_HOLDER));
+        }
         let ignored = |reason: String| {
-            let mut body = line(&content.id, ApprovalState::Decided);
+            let mut body = line(&id, ApprovalState::Decided);
             body.by = Some(arrived.sender.to_string());
             body.reason = Some(reason);
             LineBody::Approval(body)
         };
-        let decision = self.read_record(deps, &content.id).and_then(|(record, _)| {
-            let decided_by = source.decided_by(&record, &arrived)?;
-            let decision = DecisionRecord {
-                v: approval::RECORD_VERSION,
-                id: content.id.clone(),
-                decision: content.decision,
-                scope: content.scope,
-                note: content.note.clone(),
-                binding_digest: content.binding_digest.clone(),
-                decided_by,
-                decided_at: approval::stamp(Utc::now()),
-                matrix_event: Some(arrived.event_id.to_string()),
-                written_by: WrittenBy {
-                    host: deps.host.as_str().to_owned(),
-                    epoch: self.context.epoch,
+        let Some(pending) = pending else {
+            tracing::info!(approval = %id, "agents: a decision on an approval that ended is ignored");
+            self.writer.write(
+                &mut self.context,
+                known.map(|known| known.call_line),
+                Some(arrived.event_id.clone()),
+                ignored(APPROVAL_ENDED.to_owned()),
+            )?;
+            crate::agent::off_the_runtime(|| self.writer.sync())?;
+            return Ok(Outcome::Duplicate);
+        };
+        let decision =
+            match serde_json::from_value::<ApprovalDecisionContent>(arrived.content.clone()) {
+                // Never the parser's words: they quote what the sender wrote.
+                Err(_) => Err(UNREADABLE_DECISION.to_owned()),
+                Ok(content) => match self.read_record(deps, &id) {
+                    Err(reason) => Err(reason),
+                    Ok((record, _)) => {
+                        match self
+                            .decided_by(deps, source.as_ref(), &record, &arrived)
+                            .await
+                        {
+                            Err(reason) => Err(reason),
+                            Ok(decided_by) => {
+                                let decision = DecisionRecord {
+                                    v: approval::RECORD_VERSION,
+                                    id: content.id.clone(),
+                                    decision: content.decision,
+                                    scope: content.scope,
+                                    note: content.note.clone(),
+                                    binding_digest: content.binding_digest.clone(),
+                                    decided_by,
+                                    decided_at: approval::stamp(Utc::now()),
+                                    matrix_event: Some(arrived.event_id.to_string()),
+                                    written_by: WrittenBy {
+                                        host: deps.host.as_str().to_owned(),
+                                        epoch: self.context.epoch,
+                                    },
+                                };
+                                decision
+                                    .admissible(&record, Utc::now())
+                                    .map(|()| decision)
+                                    .map_err(|refusal| refusal.to_string())
+                            }
+                        }
+                    }
                 },
             };
-            decision
-                .admissible(&record, Utc::now())
-                .map(|()| decision)
-                .map_err(|refusal| refusal.to_string())
-        });
         let decision = match decision {
             Ok(decision) => decision,
             Err(reason) => {
-                tracing::info!(approval = %content.id, %reason, "agents: a decision is ignored");
+                tracing::info!(approval = %id, %reason, "agents: a decision is ignored");
                 self.writer.write(
                     &mut self.context,
                     Some(pending.call_line),
@@ -1115,33 +1167,55 @@ impl ServedSession {
             }
         };
         // Only the holder of the session's claim publishes a decision, a
-        // deny as an approve (R176): a host that lost it writes nothing.
+        // deny as an approve (R176) — read again now that the trust lookup
+        // has returned, since the claim may have moved while it was asked
+        // (R183): a host that lost it writes nothing.
         if !self.holds_claim().await {
-            tracing::info!(approval = %content.id, "agents: this host does not hold the claim; it writes no decision");
+            tracing::info!(approval = %id, "agents: this host does not hold the claim; it writes no decision");
             return Ok(Outcome::Ignored(NOT_HOLDER));
         }
-        // Written once: a second decision finds the file and changes nothing.
+        // Written once: a second decision finds the file, is logged, and
+        // changes nothing.
         let text = serde_json::to_string_pretty(&decision).unwrap_or_default();
         let dir = match self.approvals(deps, false) {
             Ok(dir) => dir,
             Err(error) => {
-                tracing::error!(approval = %content.id, %error, "agents: the approvals folder is not the session's own; no decision is written");
+                tracing::error!(approval = %id, %error, "agents: the approvals folder is not the session's own; no decision is written");
                 return Ok(Outcome::Ignored(DECISION_UNWRITTEN));
             }
         };
-        let name = format!("{}.decision.json", content.id);
+        let name = format!("{id}.decision.json");
+        // The lease, asked last with nothing awaited after it: the claim
+        // read above awaited the server.
+        if !self.writer.may_write() {
+            tracing::info!(approval = %id, "agents: this host's lease lapsed; it writes no decision");
+            return Ok(Outcome::Ignored(NOT_HOLDER));
+        }
         match crate::agent::off_the_runtime(|| write_once(&dir, &name, text.as_bytes())) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                tracing::info!(approval = %content.id, "agents: a decision was written already");
+            // Only a whole decision there is one taken already; anything
+            // else at that name is a fault, and the event stays unseen so
+            // its redelivery is taken once the fault clears.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && self.read_decision(deps, &id).is_some() =>
+            {
+                tracing::info!(approval = %id, "agents: a decision was written already");
+                self.writer.write(
+                    &mut self.context,
+                    Some(pending.call_line),
+                    Some(arrived.event_id.clone()),
+                    ignored(ALREADY_DECIDED.to_owned()),
+                )?;
+                crate::agent::off_the_runtime(|| self.writer.sync())?;
                 return Ok(Outcome::Duplicate);
             }
             Err(error) => {
-                tracing::error!(approval = %content.id, %error, "agents: a decision could not be written; the run stays parked");
+                tracing::error!(approval = %id, error = ?error.kind(), "agents: a decision could not be written; the run stays parked");
                 return Ok(Outcome::Ignored(DECISION_UNWRITTEN));
             }
         }
-        let mut body = line(&content.id, ApprovalState::Decided);
+        let mut body = line(&id, ApprovalState::Decided);
         body.decision = Some(decision.decision.as_word().to_owned());
         body.by = Some(decision.decided_by.user.clone());
         body.scope = Some(decision.scope.as_word().to_owned());

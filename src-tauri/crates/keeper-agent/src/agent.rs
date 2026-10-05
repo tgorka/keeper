@@ -1234,6 +1234,9 @@ pub struct ServedSession {
     /// The proxies this host runs, through which a narrowed session's
     /// person is told (R169); `None`: no one is.
     pub doors: Option<Arc<dyn ProxyDoors>>,
+    /// This session's way in through the host's router, for a decision
+    /// made in a proxy's DM (R89); `None`: none is forwarded here.
+    pub inbox: Option<crate::deciding::Inbox>,
     /// Work on this session's delegations that failed and is tried again on
     /// the host's clock while the worker runs: briefs a joined target has
     /// not been sent, child rooms whose replies could not be read back, a
@@ -1391,6 +1394,9 @@ pub struct Arrived {
     /// For an arrival the host routed here from another room — a target's
     /// join or reply in a room this session delegated into — that room.
     pub via: Option<OwnedRoomId>,
+    /// The device that sent it, as its encryption names it: whose trust a
+    /// decision is judged on (93.3).
+    pub device: Option<matrix_sdk::ruma::OwnedDeviceId>,
 }
 
 /// A brief whose delegation is not this session's.
@@ -1437,6 +1443,7 @@ pub fn reply_of(
         received_at,
         replay: false,
         via: Some(room.to_owned()),
+        device: None,
     })
 }
 
@@ -1472,6 +1479,7 @@ pub fn scheduled_arrival(agent: &UserId, scheduled: &Scheduled) -> Option<Arrive
         received_at: Instant::now(),
         replay: false,
         via: None,
+        device: None,
     })
 }
 
@@ -1516,6 +1524,7 @@ pub fn harvest_arrival(agent: &UserId, closed: &crate::stewards::Closed) -> Opti
         received_at: Instant::now(),
         replay: false,
         via: None,
+        device: None,
     })
 }
 
@@ -1547,6 +1556,9 @@ pub enum Outcome {
     /// A call of this session waits for a person: the arrival is held,
     /// and served once the approval ends (R74).
     Held,
+    /// A decision on a request another session sent into this DM, handed
+    /// to that session (R89).
+    Forwarded,
 }
 
 /// How a turn ended.
@@ -1707,6 +1719,7 @@ impl ServedSession {
             delegations: None,
             harvests: None,
             doors: None,
+            inbox: None,
             retry: Retry::default(),
             approval_room: None,
             due: BTreeMap::new(),
@@ -1825,6 +1838,9 @@ impl ServedSession {
         // first: an approval decided or expired meanwhile (93.2 AC5, R84).
         self.resume_approvals(deps, Arc::clone(&port), stop.clone())
             .await;
+        // What still waits, with its request in a proxy's DM, is heard
+        // there again (R89).
+        self.expect_decisions();
         self.idle(activity);
         loop {
             if stop.is_cancelled() {
@@ -1943,22 +1959,27 @@ impl ServedSession {
                 tracing::info!(session = %self.context.session.path, sender = %arrived.sender, note, "agents: an observer's event is not a turn");
                 Ok(Outcome::Ignored(note))
             }
+            // A decision on a request another session sent into this DM
+            // goes home to that session (R89).
+            Disposition::Decision if self.forward(&arrived) => Ok(Outcome::Forwarded),
             Disposition::Decision if deps.decisions.is_some() => {
                 self.decided(deps, port, arrived, stop).await
             }
+            // Nothing parks without a source, so nothing waits for this: it
+            // is logged ignored, with why (R80).
             Disposition::Decision => {
-                let field = |key: &str| arrived.content[key].as_str().map(str::to_owned);
+                let id = arrived.content["id"].as_str().map(str::to_owned);
                 self.writer.write(
                     &mut self.context,
                     None,
                     Some(arrived.event_id.clone()),
                     LineBody::Approval(ApprovalBody {
-                        id: field("id").unwrap_or_else(|| arrived.event_id.to_string()),
+                        id: id.unwrap_or_else(|| arrived.event_id.to_string()),
                         state: ApprovalState::Decided,
-                        decision: field("decision"),
+                        decision: None,
                         by: Some(arrived.sender.to_string()),
                         result: None,
-                        reason: None,
+                        reason: Some(crate::approvals::NO_SUCH_APPROVAL.to_owned()),
                         scope: None,
                     }),
                 )?;
@@ -3660,8 +3681,17 @@ impl ServedSession {
             if refused.is_err() {
                 continue;
             }
-            if let Err(error) = doors.tell(person, event_type, content.clone()).await {
-                tracing::warn!(%dm, %error, "agents: an approval's request could not reach its approver's DM");
+            match doors.tell(person, event_type, content.clone()).await {
+                // Its decision comes home from that DM (R89).
+                Ok(_) => {
+                    if let (Some(id), Some(inbox)) = (content["id"].as_str(), &self.inbox) {
+                        let home = &self.context.agent.room;
+                        doors.forwards().expect(&dm, id, home, Arc::clone(inbox));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%dm, %error, "agents: an approval's request could not reach its approver's DM");
+                }
             }
         }
     }

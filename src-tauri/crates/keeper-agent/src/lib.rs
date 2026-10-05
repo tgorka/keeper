@@ -43,6 +43,7 @@ pub mod approval;
 pub mod approvals;
 pub mod cards;
 pub mod claims;
+pub mod deciding;
 pub mod delegate;
 #[cfg(unix)]
 pub mod desktop;

@@ -697,6 +697,8 @@ pub trait ProxyDoors: Send + Sync {
         event_type: &'a str,
         content: Value,
     ) -> SendFuture<'a>;
+    /// The decisions this host waits for in its proxies' DMs (R89).
+    fn forwards(&self) -> &crate::deciding::Forwards;
 }
 
 /// One proxy this host runs.
@@ -713,6 +715,7 @@ struct Door {
 #[derive(Default)]
 pub struct ClientDoors {
     proxies: RwLock<Vec<Door>>,
+    forwards: crate::deciding::Forwards,
 }
 
 impl ClientDoors {
@@ -785,5 +788,9 @@ impl ProxyDoors for ClientDoors {
             };
             client.send(&dm, event_type, content, None).await
         })
+    }
+
+    fn forwards(&self) -> &crate::deciding::Forwards {
+        &self.forwards
     }
 }

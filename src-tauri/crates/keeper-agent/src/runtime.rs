@@ -39,7 +39,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use keeper_core::agents::agentd::{AgentdConfig, DrivePin};
+use keeper_core::agents::agentd::{AgentdConfig, DrivePin, TrustEntry};
 use keeper_core::agents::drive::{self, DriveDecl};
 use keeper_core::agents::events::{
     control_levels, ControlLevels, APPROVAL_DECISION, CONTROL_ROOM_TYPE, CONVERSATION_REQUEST,
@@ -52,6 +52,7 @@ use keeper_core::agents::matrix::{self, AgentClient, RoomKind};
 use keeper_core::agents::mount;
 use keeper_core::agents::presence::Published;
 use keeper_core::agents::session::{SessionAgent, SessionKind};
+use keeper_core::agents::trust::PinState;
 use keeper_core::auth::StoredSession;
 use keeper_core::bots::chat::{self, CancelSignal};
 use keeper_core::bots::store;
@@ -870,6 +871,12 @@ pub async fn run(
     let mut supervisor = tokio::spawn(async move { engine.run(engine_shutdown).await });
 
     let mut status = StatusFile::new(dirs.state.join(STATUS_FILE));
+    let trust = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let trust_reader = tokio::spawn(read_trust(
+        config.trust.clone(),
+        copies.clone(),
+        Arc::clone(&trust),
+    ));
     let mut drives = Arc::new(drives);
     let mut shadowed: Vec<(String, Value)> = Vec::new();
     let mut reported: HashSet<String> = HashSet::new();
@@ -960,8 +967,17 @@ pub async fn run(
                 }
             }
         }
-        status.publish(&config, &agentd.engine, &copies, &shadowed, &hosts);
+        let trust_lines = trust.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        status.publish(
+            &config,
+            &agentd.engine,
+            &copies,
+            &shadowed,
+            &hosts,
+            &trust_lines,
+        );
     }
+    trust_reader.abort();
 
     tracing::info!("agentd: stopping; running turns get their final edits");
     stop_turns.cancel();
@@ -1074,6 +1090,8 @@ async fn serve_session(
     served.delegations = Some(rooms);
     served.harvests = Some(Arc::clone(&copy.harvest_acks));
     served.doors = Some(Arc::clone(&copy.doors) as Arc<dyn ProxyDoors>);
+    let (router, inbox_room) = (Arc::clone(&copy.router), room_id.clone());
+    served.inbox = Some(Arc::new(move |arrived| router.route(&inbox_room, arrived)));
     served.surface = Some(Arc::new(ClientSurface {
         client: copy.client.clone(),
         room: room_id.clone(),
@@ -1945,6 +1963,7 @@ fn child_arrival(
             received_at,
             replay: false,
             via: Some(room.to_owned()),
+            device: None,
         });
     }
     if !sealed_by_sender(encryption) {
@@ -2012,8 +2031,7 @@ pub fn arrival_of(
         }
     } else if event_type == APPROVAL_DECISION {
         Arrival::Decision {
-            verified: encryption
-                .is_some_and(|info| matches!(info.verification_state, VerificationState::Verified)),
+            sealed: sealed_by_sender(encryption),
         }
     } else if event_type == SCOPE {
         Arrival::Scope {
@@ -2037,7 +2055,64 @@ pub fn arrival_of(
         received_at,
         replay: false,
         via: None,
+        device: encryption.and_then(|info| info.sender_device.clone()),
     })
+}
+
+/// How often the running host asks for each `[[trust]]` person's master
+/// key (R88).
+const TRUST_READ: Duration = Duration::from_secs(300);
+
+/// Ask, through the first copy that has synced, for each `[[trust]]`
+/// person's published master key, every [`TRUST_READ`], and keep the
+/// status file's trust lines. Nothing here writes `agentd.toml`: a pin is a
+/// person's to write.
+async fn read_trust(
+    entries: Vec<TrustEntry>,
+    copies: Vec<Arc<Copy>>,
+    lines: Arc<Mutex<Vec<Value>>>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    loop {
+        let synced = copies.iter().find(|copy| *copy.syncs.borrow() > 0);
+        let Some(copy) = synced else {
+            tokio::time::sleep(TICK).await;
+            continue;
+        };
+        let mut read = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let published = copy
+                .client
+                .published_master_key(&entry.user)
+                .await
+                .map_err(|error| error.to_string());
+            read.push(trust_line(entry, published));
+        }
+        *lines.lock().unwrap_or_else(|p| p.into_inner()) = read;
+        tokio::time::sleep(TRUST_READ).await;
+    }
+}
+
+/// One `[[trust]]` person's line in the status file: the key published
+/// now, the pinned one, and how they stand (R88).
+fn trust_line(entry: &TrustEntry, published: Result<Option<String>, String>) -> Value {
+    let pinned = entry.master_key.as_deref();
+    let (published, state, error) = match &published {
+        Ok(key) => (key.as_deref(), PinState::of(key.as_deref(), pinned), None),
+        Err(error) => (None, PinState::Unknown, Some(error.as_str())),
+    };
+    let mut line = json!({
+        "user": entry.user,
+        "published": published,
+        "pinned": pinned,
+        "state": state.as_word(),
+    });
+    if let Some(error) = error {
+        line["error"] = json!(error);
+    }
+    line
 }
 
 /// What `status` prints about the running host, written to [`STATUS_FILE`]
@@ -2054,7 +2129,9 @@ impl StatusFile {
     }
 
     /// Each drive's engine state, each copy, the sessions it serves and the
-    /// ones it does not because another session names their room.
+    /// ones it does not because another session names their room, and each
+    /// `[[trust]]` person's pin against what their homeserver publishes
+    /// (R88).
     fn publish(
         &mut self,
         config: &AgentdConfig,
@@ -2062,6 +2139,7 @@ impl StatusFile {
         copies: &[Arc<Copy>],
         shadowed: &[(String, Value)],
         hosts: &HostRuntime,
+        trust: &[Value],
     ) {
         let drives: Vec<Value> = match engine.statuses() {
             Ok(statuses) => statuses
@@ -2106,6 +2184,7 @@ impl StatusFile {
             "drives": drives,
             "copies": copies,
             "claims": hosts.held(),
+            "trust": trust,
         });
         let body = status.to_string();
         let fresh = self

@@ -40,3 +40,6 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # A served session's second turn opens no file under log/: counted by inotify.
 notify = { workspace = true }
+# What a decision path writes to the process log, captured: a rejected
+# value never reaches it.
+tracing-subscriber = { workspace = true }

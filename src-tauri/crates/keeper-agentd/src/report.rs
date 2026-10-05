@@ -8,9 +8,11 @@ use keeper_agent::claims::{conflict_line, conflict_of};
 use keeper_agent::headless::{HeadlessPlatform, SecretMap};
 use keeper_agent::runtime::{agent_deps, inspect, Inspection, STATUS_FILE};
 use keeper_agent::zone::{skills_of, AgentHome};
+use keeper_core::agents::agentd::TrustEntry;
 use keeper_core::agents::log::HostSlug;
 use keeper_core::agents::matrix;
 use keeper_core::agents::prompt;
+use keeper_core::agents::trust::fingerprint;
 use keeper_core::bots::store;
 use keeper_core::bots::tools::ToolName;
 use serde_json::Value;
@@ -223,7 +225,59 @@ pub fn status(host: &Host, session: Option<&str>, probe: bool) -> Result<(), Cli
             println!("  not offered on this host: {}", missing.join(", "));
         }
     }
+    for line in trust_lines(&config.trust, live.as_ref()) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// Each `[[trust]]` person as `status` prints them (R88): the running
+/// host's reading of the master key their homeserver publishes, as a
+/// fingerprint, against the pin that reading was judged on — the running
+/// host's own, beside `agentd.toml`'s when a person changed it since the
+/// host started. `status` itself reaches nothing and writes nothing:
+/// without a running host it says so.
+fn trust_lines(entries: &[TrustEntry], live: Option<&Value>) -> Vec<String> {
+    let print = |key: &Value| key.as_str().map_or("none".to_owned(), fingerprint);
+    entries
+        .iter()
+        .map(|entry| {
+            let read = live
+                .and_then(|status| status["trust"].as_array())
+                .and_then(|lines| {
+                    lines
+                        .iter()
+                        .find(|line| line["user"] == entry.user.as_str())
+                });
+            let pinned = entry
+                .master_key
+                .as_deref()
+                .map_or("none".to_owned(), fingerprint);
+            match (live, read) {
+                (None, _) => format!("trust {}: not running (pinned {pinned})", entry.user),
+                (Some(_), None) => format!("trust {}: not read yet (pinned {pinned})", entry.user),
+                (Some(_), Some(line)) => {
+                    let configured = entry.master_key.as_deref();
+                    let restart = if line["pinned"].as_str() == configured {
+                        String::new()
+                    } else {
+                        format!("; agentd.toml now pins {pinned}, used after a restart")
+                    };
+                    format!(
+                        "trust {}: {}; published {}, pinned {}{}{restart}",
+                        entry.user,
+                        line["state"].as_str().unwrap_or("unknown"),
+                        print(&line["published"]),
+                        print(&line["pinned"]),
+                        line["error"]
+                            .as_str()
+                            .map(|error| format!(" ({error})"))
+                            .unwrap_or_default(),
+                    )
+                }
+            }
+        })
+        .collect()
 }
 
 /// `status --session <drive>/<path>`: what the session's agent is told, as
@@ -307,4 +361,84 @@ fn told(
         ),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use matrix_sdk::ruma::OwnedUserId;
+    use serde_json::json;
+
+    use super::*;
+
+    const KEY: &str = "ed25519:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE";
+    const RESET: &str = "ed25519:ZZZZEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE";
+
+    fn entry(user: &str, key: Option<&str>) -> TrustEntry {
+        TrustEntry {
+            user: OwnedUserId::try_from(user).expect("user"),
+            master_key: key.map(str::to_owned),
+            proxy: None,
+        }
+    }
+
+    /// 93.3 AC7 (R88): `status` prints each pin against what the running
+    /// host read — matches, differs after a reset, not pinned with the
+    /// fingerprint published now — and says when no host runs.
+    #[test]
+    fn status_says_whether_each_pin_still_matches() {
+        let entries = [
+            entry("@tgorka:h", Some(KEY)),
+            entry("@marta:h", Some(KEY)),
+            entry("@nobody:h", None),
+        ];
+        let live = json!({"trust": [
+            {"user": "@tgorka:h", "published": KEY, "pinned": KEY, "state": "matches"},
+            {"user": "@marta:h", "published": RESET, "pinned": KEY, "state": "differs"},
+            {"user": "@nobody:h", "published": KEY, "pinned": null, "state": "not pinned"},
+        ]});
+        let pinned = fingerprint(KEY);
+        assert_eq!(
+            trust_lines(&entries, Some(&live)),
+            [
+                format!("trust @tgorka:h: matches; published {pinned}, pinned {pinned}"),
+                format!(
+                    "trust @marta:h: differs; published {}, pinned {pinned}",
+                    fingerprint(RESET)
+                ),
+                format!("trust @nobody:h: not pinned; published {pinned}, pinned none"),
+            ]
+        );
+        assert_eq!(
+            trust_lines(&entries[..1], None),
+            [format!("trust @tgorka:h: not running (pinned {pinned})")]
+        );
+        assert_eq!(
+            trust_lines(&entries[..1], Some(&json!({}))),
+            [format!("trust @tgorka:h: not read yet (pinned {pinned})")]
+        );
+    }
+
+    /// R3-08: a person re-pins in `agentd.toml` while the host runs. The
+    /// verdict printed is the running host's, beside the pin it judged —
+    /// never the edited file's — and the edited pin is named as waiting for
+    /// a restart.
+    #[test]
+    fn status_prints_the_pin_the_running_host_judged() {
+        let live = json!({"trust": [
+            {"user": "@tgorka:h", "published": KEY, "pinned": KEY, "state": "matches"},
+        ]});
+        let (old, new) = (fingerprint(KEY), fingerprint(RESET));
+        assert_eq!(
+            trust_lines(&[entry("@tgorka:h", Some(RESET))], Some(&live)),
+            [format!(
+                "trust @tgorka:h: matches; published {old}, pinned {old}; agentd.toml now pins {new}, used after a restart"
+            )]
+        );
+        assert_eq!(
+            trust_lines(&[entry("@tgorka:h", None)], Some(&live)),
+            [format!(
+                "trust @tgorka:h: matches; published {old}, pinned {old}; agentd.toml now pins none, used after a restart"
+            )]
+        );
+    }
 }
