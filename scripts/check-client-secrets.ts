@@ -6,7 +6,12 @@ import { basename, join, relative } from "node:path";
 // tokens are intentionally allowed: they are not authorization credentials.
 const patterns = [
   { name: "PostHog personal key", value: /phx_[A-Za-z0-9_-]{20,}/ },
-  { name: "PostHog secure flag key", value: /phs_[A-Za-z0-9_-]{20,}/ },
+  // A secure flag key's body is random base62; a snake_case identifier that merely
+  // contains "phs_" (ONNX Runtime's `subgraphs_kernel_create_info_maps`) is not one.
+  {
+    name: "PostHog secure flag key",
+    value: /phs_(?=[A-Za-z0-9_-]{20})(?=[A-Za-z0-9_-]*[A-Z0-9])[A-Za-z0-9_-]+/,
+  },
   // Encoded JSON capsules distinguish service tokens from ordinary ops_ identifiers.
   { name: "1Password service credential", value: /ops_eyJ[A-Za-z0-9+/_-]{250,}={0,3}/ },
   { name: "GitHub credential", value: /(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/ },

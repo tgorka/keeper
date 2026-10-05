@@ -309,3 +309,29 @@ safe binding. Current inventory:
   (`swift-tools-version: 6.2`), and SwiftPM fetches FluidAudio from github.com at build
   time. Linux, Windows and iOS have no engine: the dependency is target-gated, and
   `transcribe_ipc`'s `AbsentEngine` answers `Unsupported` there (DW-335).
+- The turn models, Apple silicon macOS and the iPhone (Epic 97, D-36, AD-410): **no new entry in the
+  shell crate.** ONNX Runtime 1.28.0 is reached through `ort` 2.0.0-rc.13 (MIT OR Apache-2.0,
+  exact pin, default features off, no execution provider), whose own `unsafe` stays in that
+  crate; `crates/keeper/src/voice_turn_models.rs` uses its safe API and carries no
+  `#[allow(unsafe_code)]`. The runtime itself is not a cargo package: `ort-sys`'s build
+  script downloads one static `libonnxruntime.a` per target from pyke (`cdn.pyke.io`,
+  `ms@1.28.0/aarch64-apple-darwin+coreml` and `ms@1.28.0/aarch64-apple-ios+coreml`, each
+  checked against the sha256 `ort-sys` pins) **at build time** on CI and hesperia — the app
+  never contacts that host. It is Microsoft's ONNX Runtime, **MIT** (microsoft/onnxruntime tag
+  `v1.28.0`, commit `da9b5e36`, licence read 2026-10-05); the archive carries no licence file,
+  so the licence and the artefacts' hashes are recorded in the repository's `NOTICE`, and its
+  LICENSE and `ThirdPartyNotices.txt` at that tag (what it bundles: Eigen, MPL-2.0, among them)
+  are copied into `licenses/onnxruntime-1.28.0/`. Both apps carry `NOTICE` and `licenses/`
+  (`keeper.app/Contents/Resources/` through `tauri.conf.json`, the top of the iPhone app through
+  `gen/apple/project.yml`); `scripts/bundle-notices.test.ts` pins the two configurations and the
+  install paths' bundle guard refuses a built app without them. `cargo deny` sees `ort`, `ort-sys` and their build-time crates, not this
+  library. The library is linked statically into keeper on both platforms; its minimum OS
+  (macOS 13.4, iOS 15.1) is below keeper's (14.0, 16.2). The iOS app links `libapp.a`
+  through Xcode, so `gen/apple/project.yml` names `CoreML.framework` and `libc++.tbd`, which
+  the library needs; only `bun run install:ios` proves that link. No Intel macOS library is
+  published, and only the device's iOS library is recorded, so `ort` is a dependency of Apple
+  silicon macOS and the arm64 iPhone alone (`target_env` not `sim`): an Intel Mac and the iOS
+  simulator build without it, have no turn models and keep voice's pause rule. The models
+  load only by path from `<data_dir>/models/` after the turn group's completion marker; the
+  runtime's model download (`fetch-models`) is not compiled in, and its call is a forbidden
+  token in `keeper-core/tests/voice_on_device.rs`.

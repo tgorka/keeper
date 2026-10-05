@@ -54,8 +54,9 @@
 mod hydrate;
 
 pub use hydrate::{
-    completion_digest, hydrate_lfs_dir, hydration_is_current, HydrateReport,
-    COMPLETE_FILE as HYDRATE_COMPLETE_FILE, STATE_FILE as HYDRATE_STATE_FILE,
+    complete_file as hydrate_complete_file, completion_digest, hydrate_lfs_dir,
+    hydration_is_current, state_file as hydrate_state_file, Folders, HydrateGroup, HydrateReport,
+    Manifest,
 };
 
 use std::{

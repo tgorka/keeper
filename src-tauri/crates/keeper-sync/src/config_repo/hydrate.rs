@@ -12,22 +12,30 @@
 //! # What it promises
 //!
 //! * Only `<clone>/<rel_dir>` is read, and no symbolic link is followed on the
-//!   way there or inside it.
+//!   way there or inside it. Of its top-level folders, only those the run's
+//!   [`HydrateGroup`] takes are read; its plain top-level files belong to
+//!   every group.
 //! * An object is published only after its digest and length matched its
 //!   pointer, and every file is published by rename: a reader of `dest` sees
 //!   the old file or the whole new one, never a torn one.
-//! * A file already in place is not fetched again. [`STATE_FILE`] remembers
-//!   which object each path holds, so a launch does not re-hash hundreds of
-//!   megabytes of models to find that nothing changed; a path it does not
-//!   remember is hashed once and adopted when it matches.
+//! * A file already in place is not fetched again. The group's
+//!   [`state_file`] remembers which object each path holds, so a launch does
+//!   not re-hash hundreds of megabytes of models to find that nothing
+//!   changed; a path it does not remember is hashed once and adopted when it
+//!   matches.
 //! * Files in `dest` the source no longer names are left alone.
 //! * Objects come from the LFS endpoint of the remote URL and nowhere else: a
 //!   `.lfsconfig` in the repository is ignored, so the repository credential
 //!   is never sent to a host someone with write access to it named.
-//! * A set is either complete or not ready: [`COMPLETE_FILE`] is removed
-//!   before the first change to `dest` and written last, after everything is
-//!   in place, and [`hydration_is_current`] checks it against the copy — so a
-//!   half-updated set (new encoder beside an old decoder) is never loaded.
+//! * A group is either complete or not ready: its [`complete_file`] is
+//!   removed before the run's first change to `dest` and written last, after
+//!   everything is in place, and [`hydration_is_current`] checks it against
+//!   the copy — so a half-updated set (new encoder beside an old decoder) is
+//!   never loaded. Each group keeps its own marker and state, so a change to
+//!   one group's folders never makes another group's set look half-updated;
+//!   and a shared plain file a group names as its [`Manifest`] counts in its
+//!   digest only by what the group reads of it, so editing another group's
+//!   part of `models.toml` does not either.
 
 use std::{
     collections::BTreeMap,
@@ -56,14 +64,107 @@ use crate::{
     },
 };
 
-/// The record, inside `dest`, of which object each hydrated path holds.
-pub const STATE_FILE: &str = ".keeper-hydrate.json";
+/// What every name this module keeps in `dest` itself starts with: the
+/// groups' state and completion files and the object store. Never hydrated.
+const RESERVED_PREFIXES: [&str; 2] = [".keeper-hydrate", ".keeper-models-complete"];
 
-/// The completion marker, inside `dest`: `{ "digest": … }` over every file
-/// the source directory names and what it holds, written last and only by a
-/// run that placed everything. Its absence means `dest` may hold a mix of two
-/// sets; see [`hydration_is_current`].
-pub const COMPLETE_FILE: &str = ".keeper-models-complete.json";
+/// The record, inside `dest`, of which object each path of `group` holds.
+pub fn state_file(group: &str) -> String {
+    format!(".keeper-hydrate.{group}.json")
+}
+
+/// The completion marker of `group`, inside `dest`: `{ "digest": … }` over
+/// every file the group names and what it holds, written last and only by a
+/// run that placed everything. Its absence means `dest` may hold a mix of
+/// two sets of the group; see [`hydration_is_current`].
+pub fn complete_file(group: &str) -> String {
+    format!(".keeper-models-complete.{group}.json")
+}
+
+/// Which top-level folders of the hydrated directory one run takes. The plain
+/// files directly under it (`models.toml`, a README) belong to every group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Folders<'a> {
+    /// These folders and no other.
+    Only(&'a [String]),
+    /// Every folder but these.
+    AllBut(&'a [String]),
+}
+
+impl Folders<'_> {
+    fn takes(self, folder: &str) -> bool {
+        match self {
+            Self::Only(names) => names.iter().any(|name| name == folder),
+            Self::AllBut(names) => !names.iter().any(|name| name == folder),
+        }
+    }
+}
+
+/// The part of the hydrated directory one run brings up to date, as a unit:
+/// one completion marker and one state file per group. Runs of two groups
+/// into one `dest` must not overlap — they share the object store.
+#[derive(Debug, Clone, Copy)]
+pub struct HydrateGroup<'a> {
+    /// Lowercase ASCII letters; names the group's marker and state file.
+    pub name: &'a str,
+    pub folders: Folders<'a>,
+    /// A plain top-level file every group copies but each reads only part
+    /// of; `None` when every plain file counts whole.
+    pub manifest: Option<Manifest<'a>>,
+}
+
+/// A plain top-level file (`models.toml`) whose meaning to a group is
+/// narrower than its bytes. The file is still copied whole; only what the
+/// group's digest records of it is the fingerprint, so a change to another
+/// group's part neither makes this group stale nor unmarks it when copied.
+#[derive(Clone, Copy)]
+pub struct Manifest<'a> {
+    /// Its name directly under the hydrated directory.
+    pub file: &'a str,
+    /// What of its bytes this group depends on; `None` (it does not parse)
+    /// counts the bytes whole.
+    pub fingerprint: fn(&[u8]) -> Option<String>,
+}
+
+impl std::fmt::Debug for Manifest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Manifest")
+            .field("file", &self.file)
+            .finish()
+    }
+}
+
+impl HydrateGroup<'_> {
+    /// What the group's digest records for the plain file `entry`: the sha256
+    /// of its fingerprint when it is the group's manifest and parses, else of
+    /// its bytes.
+    fn plain_oid(&self, entry: &Entry) -> Result<String> {
+        if let Some(fingerprint) = self.fingerprint_of(&entry.rel, &entry.path)? {
+            return LfsStore::digest_of(fingerprint.as_bytes()).map(|(oid, _)| oid);
+        }
+        digest(&entry.path)
+    }
+
+    /// `path`'s fingerprint when `rel` is the group's manifest and it parses.
+    fn fingerprint_of(&self, rel: &str, path: &Path) -> Result<Option<String>> {
+        let Some(manifest) = self.manifest.filter(|manifest| manifest.file == rel) else {
+            return Ok(None);
+        };
+        let bytes = std::fs::read(path)
+            .map_err(|err| SyncError::io("read a file to hydrate", path, err))?;
+        Ok((manifest.fingerprint)(&bytes))
+    }
+
+    /// Whether replacing `target` with `source` leaves the group as it was:
+    /// both are its manifest and mean the same to it.
+    fn same_meaning(&self, rel: &str, source: &Path, target: &Path) -> Result<bool> {
+        if !std::fs::symlink_metadata(target).is_ok_and(|meta| meta.is_file()) {
+            return Ok(false);
+        }
+        let theirs = self.fingerprint_of(rel, source)?;
+        Ok(theirs.is_some() && theirs == self.fingerprint_of(rel, target)?)
+    }
+}
 
 /// The object store downloads land in before they are moved into place.
 ///
@@ -107,9 +208,10 @@ struct Entry {
     pointer: Option<Pointer>,
 }
 
-/// Bring `dest` up to date with `<clone_dir>/<rel_dir>`: pointer files become
-/// their LFS objects, fetched from the LFS server of `remote_url` with
-/// `auth`; other files are copied as they are.
+/// Bring `dest` up to date with `group`'s part of `<clone_dir>/<rel_dir>`:
+/// pointer files become their LFS objects, fetched from the LFS server of
+/// `remote_url` with `auth`; other files are copied as they are. A folder the
+/// group does not take is neither read nor asked for.
 ///
 /// `rel_dir` is repository-relative and must be plain (no `..`, not absolute,
 /// not empty). The endpoint is derived from `remote_url` alone
@@ -123,24 +225,27 @@ struct Entry {
 /// An object whose content does not match its pointer is
 /// [`SyncError::Integrity`] and nothing is written for it.
 ///
-/// [`COMPLETE_FILE`] is removed before `dest` is first changed and on any
-/// failure or cancel, and written — last — only when every file is in place.
+/// The group's [`complete_file`] is removed before `dest` is first changed and
+/// on any failure or cancel, and written — last — only when every file of the
+/// group is in place.
 ///
 /// Blocking filesystem work runs through the module's `blocking` door, so this
 /// is safe to await on a multi-threaded runtime or to `block_on` from the
 /// blocking pool.
+#[allow(clippy::too_many_arguments)]
 pub async fn hydrate_lfs_dir(
     client: &reqwest::Client,
     clone_dir: &Path,
     rel_dir: &str,
+    group: HydrateGroup<'_>,
     remote_url: &str,
     auth: &RepoAuth,
     dest: &Path,
     interrupt: &AtomicBool,
 ) -> Result<HydrateReport> {
-    let complete = dest.join(COMPLETE_FILE);
+    let complete = dest.join(complete_file(group.name));
     let outcome = hydrate(
-        client, clone_dir, rel_dir, remote_url, auth, dest, interrupt,
+        client, clone_dir, rel_dir, group, remote_url, auth, dest, interrupt,
     )
     .await;
     if outcome.is_err() {
@@ -151,27 +256,35 @@ pub async fn hydrate_lfs_dir(
     outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn hydrate(
     client: &reqwest::Client,
     clone_dir: &Path,
     rel_dir: &str,
+    group: HydrateGroup<'_>,
     remote_url: &str,
     auth: &RepoAuth,
     dest: &Path,
     interrupt: &AtomicBool,
 ) -> Result<HydrateReport> {
+    if group.name.is_empty() || !group.name.bytes().all(|b| b.is_ascii_lowercase()) {
+        return Err(SyncError::Config(format!(
+            "a hydration group is named with lowercase letters, not {:?}",
+            group.name
+        )));
+    }
     let rel_dir = tree_path(Path::new(rel_dir))?;
     let root = contained_dir(clone_dir, &rel_dir)?;
     let (entries, set) = blocking(|| -> Result<_> {
-        let entries = walk(&root)?;
-        let set = set_digest(&entries)?;
+        let entries = walk(&root, group.folders)?;
+        let set = set_digest(&entries, group)?;
         Ok((entries, set))
     })?;
     std::fs::create_dir_all(dest)
         .map_err(|err| SyncError::io("create the hydration destination", dest, err))?;
 
-    let complete = dest.join(COMPLETE_FILE);
-    let state_path = dest.join(STATE_FILE);
+    let complete = dest.join(complete_file(group.name));
+    let state_path = dest.join(state_file(group.name));
     let previous = read_state(&state_path);
     let mut next = State {
         version: STATE_VERSION,
@@ -193,7 +306,9 @@ async fn hydrate(
                     if same_content(&entry.path, &target)? {
                         report.skipped += 1;
                     } else {
-                        unmark(&complete)?;
+                        if !group.same_meaning(&entry.rel, &entry.path, &target)? {
+                            unmark(&complete)?;
+                        }
                         report.copied_bytes += copy_atomic(&entry.path, &target)?;
                         report.copied += 1;
                     }
@@ -249,45 +364,51 @@ async fn hydrate(
     Ok(report)
 }
 
-/// What [`COMPLETE_FILE`] holds.
+/// What a group's [`complete_file`] holds.
 #[derive(Debug, Serialize, Deserialize)]
 struct Complete {
     digest: String,
 }
 
-/// Whether `dest` holds, completely, the set `<clone_dir>/<rel_dir>` names
-/// now: its [`COMPLETE_FILE`] records the digest this copy's directory has
+/// Whether `dest` holds, completely, what `group` takes of `<clone_dir>/<rel_dir>`
+/// now: its [`complete_file`] records the digest this copy's directory has
 /// today. `false` when the marker is absent or unreadable, or the copy
-/// cannot be walked. Blocking: it hashes every non-pointer file of the set.
-pub fn hydration_is_current(clone_dir: &Path, rel_dir: &str, dest: &Path) -> bool {
-    let Some(recorded) = completion_digest(dest) else {
+/// cannot be walked. Blocking: it hashes every non-pointer file of the group.
+pub fn hydration_is_current(
+    clone_dir: &Path,
+    rel_dir: &str,
+    group: HydrateGroup<'_>,
+    dest: &Path,
+) -> bool {
+    let Some(recorded) = completion_digest(dest, group.name) else {
         return false;
     };
     let current = tree_path(Path::new(rel_dir))
         .and_then(|rel| contained_dir(clone_dir, &rel))
-        .and_then(|root| walk(&root))
-        .and_then(|entries| set_digest(&entries));
+        .and_then(|root| walk(&root, group.folders))
+        .and_then(|entries| set_digest(&entries, group));
     current.is_ok_and(|digest| digest == recorded)
 }
 
-/// The set digest the last complete hydration of `dest` recorded, or `None`
-/// while `dest` is not known to be complete — what a model loader keys on,
-/// so a changed set is loaded afresh.
-pub fn completion_digest(dest: &Path) -> Option<String> {
-    let bytes = std::fs::read(dest.join(COMPLETE_FILE)).ok()?;
+/// The digest the last complete hydration of `group` into `dest` recorded,
+/// or `None` while that group is not known to be complete — what a model
+/// loader keys on, so a changed set is loaded afresh.
+pub fn completion_digest(dest: &Path, group: &str) -> Option<String> {
+    let bytes = std::fs::read(dest.join(complete_file(group))).ok()?;
     serde_json::from_slice::<Complete>(&bytes)
         .ok()
         .map(|complete| complete.digest)
 }
 
 /// sha256 over `"<path>\t<oid>\n"` for every file of the set in path order:
-/// a pointer's oid, or the sha256 of a file that is not one.
-fn set_digest(entries: &[Entry]) -> Result<String> {
+/// a pointer's oid, or for a file that is not one the sha256 of what the
+/// group reads of it ([`HydrateGroup::plain_oid`]).
+fn set_digest(entries: &[Entry], group: HydrateGroup<'_>) -> Result<String> {
     let mut listing = String::new();
     for entry in entries {
         let oid = match &entry.pointer {
             Some(pointer) => pointer.oid.clone(),
-            None => digest(&entry.path)?,
+            None => group.plain_oid(entry)?,
         };
         listing.push_str(&entry.rel);
         listing.push('\t');
@@ -297,7 +418,7 @@ fn set_digest(entries: &[Entry]) -> Result<String> {
     LfsStore::digest_of(listing.as_bytes()).map(|(oid, _)| oid)
 }
 
-/// Remove [`COMPLETE_FILE`]; absent already is fine.
+/// Remove a group's completion marker; absent already is fine.
 fn unmark(complete: &Path) -> Result<()> {
     match std::fs::remove_file(complete) {
         Ok(()) => Ok(()),
@@ -404,10 +525,12 @@ fn contained_dir(clone_dir: &Path, rel: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Every regular file below `root`, sorted by relative path. Symbolic links
-/// and other non-regular entries are left out, never followed; so are names
-/// that are not UTF-8 and the two names this module keeps in `dest` itself.
-fn walk(root: &Path) -> Result<Vec<Entry>> {
+/// Every regular file below `root` that `folders` takes, sorted by relative
+/// path: the plain files directly under `root`, and everything below the
+/// top-level folders it takes. Symbolic links and other non-regular entries
+/// are left out, never followed; so are names that are not UTF-8 and the
+/// names this module keeps in `dest` itself.
+fn walk(root: &Path, folders: Folders<'_>) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
     let mut pending = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, prefix)) = pending.pop() {
@@ -421,7 +544,10 @@ fn walk(root: &Path) -> Result<Vec<Entry>> {
                 tracing::warn!(path = %path.display(), "name is not UTF-8; not hydrated");
                 continue;
             };
-            if prefix.is_empty() && [STATE_FILE, STORE_DIR, COMPLETE_FILE].contains(&name.as_str())
+            if prefix.is_empty()
+                && RESERVED_PREFIXES
+                    .iter()
+                    .any(|reserved| name.starts_with(reserved))
             {
                 tracing::warn!(name = %name, "name is reserved in the destination; not hydrated");
                 continue;
@@ -436,6 +562,9 @@ fn walk(root: &Path) -> Result<Vec<Entry>> {
                 .file_type()
                 .map_err(|err| SyncError::io("inspect a file to hydrate", &path, err))?;
             if kind.is_dir() {
+                if prefix.is_empty() && !folders.takes(&rel) {
+                    continue;
+                }
                 pending.push((path, rel));
             } else if kind.is_file() {
                 let pointer = read_pointer(&path)?;

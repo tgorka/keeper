@@ -65,6 +65,7 @@ use keeper_core::org_account::state::{
 use keeper_core::org_account::{oidc, AccountError};
 use keeper_core::platform::Platform;
 use keeper_core::registry;
+use keeper_core::transcription::models as model_files;
 use keeper_core::vm::{IpcError, IpcErrorCode};
 use keeper_sync::config_repo::{self, Author, PushResult, RepoAuth, RepoSpec, Write};
 use keeper_sync::SyncError;
@@ -221,12 +222,14 @@ pub enum ModelsFetchError {
     Failed(String),
 }
 
-/// Hydrate the config repository's `_models/` into `dest` (AD-341) with the
-/// repository's own credential, from the clone the last sync left. Only the
-/// config repository's host is reached; nothing else is asked for models.
+/// Hydrate `group`'s part of the config repository's `_models/` into `dest`
+/// (AD-341) with the repository's own credential, from the clone the last
+/// sync left. Only the config repository's host is reached; nothing else is
+/// asked for models.
 pub async fn hydrate_models(
     platform: Arc<dyn Platform>,
     dest: PathBuf,
+    group: &model_files::FetchGroup,
 ) -> Result<config_repo::HydrateReport, ModelsFetchError> {
     let Some(d) = descriptor() else {
         return Err(ModelsFetchError::NoAccount);
@@ -252,11 +255,12 @@ pub async fn hydrate_models(
     // of megabytes would hold every sync and settings push for its length.
     // Only `models_interrupt` stops this one.
     let hydrated = with_forge_retry(platform.as_ref(), http, &d, &mut auth, |auth| {
-        let (clone, dest, url, interrupt) = (
+        let (clone, dest, url, interrupt, group) = (
             clone.clone(),
             dest.clone(),
             d.config.url.clone(),
             Arc::clone(&interrupt),
+            group.clone(),
         );
         let handle = tokio::runtime::Handle::current();
         async move {
@@ -265,7 +269,8 @@ pub async fn hydrate_models(
                     config_repo::hydrate_lfs_dir(
                         transfer,
                         &clone,
-                        keeper_core::transcription::CONFIG_MODELS_DIR,
+                        model_files::CONFIG_MODELS_DIR,
+                        hydrate_group(&group),
                         &url,
                         &auth,
                         &dest,
@@ -286,18 +291,52 @@ pub async fn hydrate_models(
     }
 }
 
-/// Whether `dest` holds exactly what the account's clone names for the
-/// models (S2): the last hydration finished and the clone has not moved on
+/// keeper-sync's view of a group core decided on, reading `models.toml` as
+/// core says the group reads it.
+fn hydrate_group(group: &model_files::FetchGroup) -> config_repo::HydrateGroup<'_> {
+    config_repo::HydrateGroup {
+        name: group.name,
+        folders: match &group.folders {
+            model_files::Folders::Only(names) => config_repo::Folders::Only(names),
+            model_files::Folders::AllBut(names) => config_repo::Folders::AllBut(names),
+        },
+        manifest: Some(config_repo::Manifest {
+            file: model_files::MODELS_TOML,
+            fingerprint: group.manifest_fingerprint(),
+        }),
+    }
+}
+
+/// Whether `dest` holds exactly what the account's clone names for `group`
+/// (S2): the group's last hydration finished and the clone has not moved on
 /// since. No account, or no clone, is never current. Blocking: it hashes
-/// the set's non-pointer files in the clone.
-pub fn models_current(data_dir: &Path, dest: &Path) -> bool {
+/// the group's non-pointer files in the clone.
+pub fn models_current(data_dir: &Path, dest: &Path, group: &model_files::FetchGroup) -> bool {
     descriptor().is_some_and(|d| {
         config_repo::hydration_is_current(
             &clone_dir(data_dir, &d.id),
-            keeper_core::transcription::CONFIG_MODELS_DIR,
+            model_files::CONFIG_MODELS_DIR,
+            hydrate_group(group),
             dest,
         )
     })
+}
+
+/// The account clone's `_models/` and the model set its `models.toml` names
+/// now — what the next hydration brings and what currency is measured
+/// against. Without an account no folder and the default set; without the
+/// file, or with one that does not parse, the default set too, here: the
+/// hydrated copy's refusal is what the person is shown.
+pub fn clone_models(data_dir: &Path) -> (PathBuf, model_files::ModelSet) {
+    let Some(d) = descriptor() else {
+        return (PathBuf::new(), model_files::ModelSet::default());
+    };
+    let dir = clone_dir(data_dir, &d.id).join(model_files::CONFIG_MODELS_DIR);
+    let set = std::fs::read_to_string(dir.join(model_files::MODELS_TOML))
+        .ok()
+        .and_then(|raw| model_files::ModelSet::from_toml(&raw).ok())
+        .unwrap_or_default();
+    (dir, set)
 }
 
 /// The configured account, if any — for the credential paths that may use it.
@@ -3398,7 +3437,11 @@ pub async fn account_forget(state: State<'_, AppState>) -> Result<AccountVm, Ipc
     }
     layers::install_account_layers(None);
     layers::set_account_faults(Vec::new());
-    Ok(update(|inner| *inner = Inner::default()))
+    let vm = update(|inner| *inner = Inner::default());
+    // No turn models without an account (D-36): the loaded ones go now, and
+    // a load still under way is dropped instead of published.
+    crate::voice_turn_models::unload();
+    Ok(vm)
 }
 
 /// The configured account's id, the only one a credential choice can bind

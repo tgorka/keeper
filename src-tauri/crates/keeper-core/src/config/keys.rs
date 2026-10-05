@@ -989,6 +989,26 @@ pub const KEYS: &[KeySpec] = &[
         summary: "The spoken language transcription expects; `auto` lets the model decide.",
         example: "\"pl\"",
     },
+    KeySpec {
+        key: "transcription.smart_turn_model",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Text,
+        default: "",
+        summary: "The end-of-turn model voice loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`[smart_turn]` in `_models/models.toml`); every device that runs turn models fetches the folder named here, and one that is missing or incomplete on the device is refused, never replaced.",
+        example: "\"smart-turn-v3\"",
+    },
+    KeySpec {
+        key: "transcription.vad_model",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Text,
+        default: "",
+        summary: "The voice activity model voice loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`[vad]` in `_models/models.toml`); every device that runs turn models fetches the folder named here, and one that is missing or incomplete on the device is refused, never replaced.",
+        example: "\"silero-vad\"",
+    },
     // ---- ui --------------------------------------------------------------
     KeySpec {
         key: "ui.first_run_setup_skipped",

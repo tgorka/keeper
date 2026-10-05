@@ -1916,6 +1916,38 @@ them, download them from anyone else, send audio anywhere, or start the micropho
   on-device recogniser in segmented sessions with echo-cancelled capture and, where `ort` has no
   runtime, no turn models (DW-413); continuous duplex on Android is a documented limitation, not a
   promise. (AD-410, AD-411, AD-414; FR-814…FR-816, FR-820; NFR-114, NFR-119; Epics 97, 98)
+- **A complete set, per group (as built, 97.1):** hydration runs per role group into
+  `<data_dir>/models/` — `transcription` (every folder but the turn models') and `turn` (the
+  turn models' folders and any picked in Settings) — each with its own completion marker over
+  what it holds, written last; the turn models load only when their group's marker matches what
+  the clone names now, so a turn-model update never makes transcription "updating", and a phone
+  that fetches only the turn group is complete. No folder is in both groups: a picked turn folder,
+  and any folder holding a turn model's `model.onnx`, is never transcription's (a folder
+  `[asr]`/`[diarizer]` names stays transcription's). `models.toml` is copied by both groups, but
+  each group's marker records only its own sections of it, so switching `[smart_turn] dir` leaves
+  transcription current.
+- **One rule loads them (as built, 97.1):** `keeper_core::voice::turn_models::TurnDisk::load`
+  decides whether the turn models may be loaded — an account, a complete turn group whose marker
+  the clone names now, both files there — and the voice settings' line is computed from the same
+  facts, so the line and the loaded models never disagree. Forgetting the account unloads them;
+  an unreachable server leaves the clone, and the loaded models, as they were. Loads at launch
+  and after each fetch race; only the newest load is published (`LoadSlot`), and one whose files
+  were replaced while it read them is dropped. A model file whose tensors are not named as keeper
+  feeds and reads them is refused at load, and a worker that stops is an error to every caller,
+  never a wait.
+- **The runtime is linked, not a model (as built, 97.1):** `ort` 2.0.0-rc.13 links ONNX Runtime
+  1.28.0 statically into keeper on Apple silicon Macs and the iPhone — a library, not model
+  weights, so "nothing bundled" still holds of models. It is MIT; pyke's artefact carries no
+  licence file, so the licence, its ThirdPartyNotices and the artefacts' hashes are in `NOTICE`
+  and `licenses/`, which both apps carry (`keeper.app/Contents/Resources/`, the top of the
+  iPhone app). The build downloads it from `cdn.pyke.io`; keeper never does. CPU only: no
+  execution provider is registered. Intel Macs and the iOS simulator have no turn models.
+- **The picks reach every device (as built, 97.1):** `transcription.vad_model` and
+  `transcription.smart_turn_model` are user-global, so a pick reaches the phone; every device
+  that runs the turn models fetches the picked folder as well, and a pick missing there is
+  refused, never replaced by the repository's. Settings has no picker for the two keys yet
+  (DW-490), so the refusal names the key and says to set it to another folder of `_models/` in
+  the account's `settings.toml` or remove it.
 - **Why from `_models/` and not bundled:** D-5's reason still holds — a model's terms are not
   keeper's to imply, and every byte keeper ships is keeper's. The organisation that runs the
   account chooses to distribute the models, as D-29 records for transcription. Without an account
