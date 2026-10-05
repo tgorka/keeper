@@ -7786,3 +7786,24 @@ origin: epic 97, story 97.1 (rung `agents-97-models`, 2026-10-05; acceptance 9)
 location: `src-tauri/crates/keeper/src/voice_turn_models.rs` (`state_vm`, called by `voice_ipc::wake_vm`)
 reason: `voice_wake_get` is a synchronous command, and its turn-models line asks `hydration_is_current`, which walks the clone's turn folders and hashes their plain files (`models.toml`, the licence files) each time. That is a few small files today. Revisit if the turn folders grow plain files of size or the read shows on a profile: cache the answer per clone commit, or read it off the main thread.
 status: open
+
+### DW-495: End of turn by meaning has not run on a Mac or a phone.
+
+origin: epic 97, story 97.2 (rung `agents-97-turns`, 2026-10-05; acceptance 6 and 8)
+location: `src-tauri/crates/keeper/src/voice_macos.rs`, `voice_ios.rs`, `voice_turn_models.rs`, `voice_ipc.rs`; `docs/agents.md` § *Measured: a spoken turn's end*
+reason: The shell half (the taps' copy into `end_of_turn::Ear`, `finish_recognition`'s `endAudio`, the listener over the ONNX sessions, the `turn_end` log line) was written on Linux and compiled by inspection only. Owed, after merge: CI's macOS job and iOS `cargo check`; `check:rust:macos` on hesperia; `bun run install:ios` to kalypso; then the device run of 97.2 #8 on both — twenty or more spoken questions each with debug mode on, `measure_a_device_run` over each `keeper.log`, the rows in § *Measured*. Not established either: the voice-processing input's sample rate on each device (the resampler takes any), the Smart Turn and Silero latency on Apple silicon and the A-series, and whether `endAudio` alone delivers the final words within 600 ms.
+status: open
+
+### DW-496: A frame's time is its tap buffer's.
+
+origin: epic 97, story 97.2 (rung `agents-97-turns`, 2026-10-05; acceptance 7; narrowed by the rung's review fixes, R97-R3-02)
+location: `src-tauri/crates/keeper-core/src/voice/end_of_turn.rs` (`Ear::hear`, `Listener::hear`)
+reason: Every 32 ms frame completed inside one tap buffer carries that buffer's delivery time, so `speech_end_ms` is late by up to one buffer (~21 ms at 48 kHz on the Mac, ~64 ms if the phone's input runs at 16 kHz), which counts against NFR-114's 300 ms. Revisit if the device run's `finish_recognition_ms − speech_end_ms` sits near 300 ms: interpolate the frame's time inside its buffer from the sample count. The second half of this entry as first filed — the listener's onset, speech end and utterance end reaching the turn as separate spawned tasks, in any order — was not a latency matter but a corruption of the record (a late onset could erase a finished turn's speech end, a late speech end land on the next turn), and is fixed: the listener's thread delivers its events to `voice_ipc::heard` one at a time in the order heard, each stamped with its listening's generation, and `Ear::admit` checks the generation, writes the clock and names the move under one hold of the voice lock (`ear_keeps_late_clock_points_off_the_turn`).
+status: open
+
+### DW-497: A model turn whose port never said it ended the audio is in neither NFR-114 figure.
+
+origin: epic 97, story 97.2 review fixes (rung `agents-97-turns`, 2026-10-05; R97-R3-05)
+location: `src-tauri/crates/keeper-core/src/voice/timings.rs` (`measure`)
+reason: `finish_recognition_ms` is now the moment the port reports `endAudio` ran, and is absent when it never reported it (no request to end, or no report within the 600 ms the turn waits for one). `measure` takes both figures over model turns that have the point, so such a turn is counted in `model_turns` but in neither p95. On a device run that is a failure the figures hide. Revisit with the device run (DW-495): if `model_turns` exceeds the turns with the point, list those turns' `sent_ms` the way `early_pauses` lists early pauses, and count them against NFR-114.
+status: open

@@ -85,6 +85,7 @@ impl VoicePort for FakePort {
     fn stop_speaking(&self) {
         self.record(Call::StopSpeaking);
     }
+    fn finish_recognition(&self, _finish: u64) {}
 }
 
 fn phrase() -> WakePhrase {
@@ -570,6 +571,7 @@ fn voice_turn_failure_reason_uses_the_turn_platform() {
             Ok(())
         }
         fn stop_speaking(&self) {}
+        fn finish_recognition(&self, _finish: u64) {}
     }
     let port = Refusing;
     let mut turn = Turn::new(port.platform());

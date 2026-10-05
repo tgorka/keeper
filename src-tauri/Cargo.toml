@@ -484,6 +484,13 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = [
     "tls-rustls",
     "api-24",
 ] }
+# The FFT under Smart Turn's log-mel front end (`keeper-ported::smart_turn`,
+# Epic 97, story 97.2): a 400-point transform per 10 ms frame, which is not a
+# power of two, so a mixed-radix library rather than a hand-written radix-2.
+# Pure Rust, no network, no build script. rustfft and its dependencies
+# (`num-complex`, `num-integer`, `num-traits`, `primal-check`, `strength_reduce`,
+# `transpose`) are MIT OR Apache-2.0 — on deny.toml's allow-list.
+rustfft = "6.4"
 
 # tao, the window layer under Tauri, from `tools/tao`: 0.35.3 as crates.io serves
 # it plus one hunk in `ios/app_state.rs`'s `connect_scene`, so a URL that LAUNCHED

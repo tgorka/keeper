@@ -13,6 +13,7 @@ workspace = true
 # AD-396: no keeper dependency, no network, no async runtime, no tauri.
 # `bun run check:ported-pure` asserts it over `cargo tree`.
 [dependencies]
+rustfft = { workspace = true }
 toml = { workspace = true }
 unicode-normalization = { workspace = true }
 

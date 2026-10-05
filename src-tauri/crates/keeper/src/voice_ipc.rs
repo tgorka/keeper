@@ -28,15 +28,21 @@
 //! through [`deliver`], which does **not** take the lock: it spawns the
 //! transition onto the async runtime. A port method called from inside the
 //! lock (`stop_listening` cancelling a task whose handler answers
-//! synchronously with an error) would otherwise re-enter it.
+//! synchronously with an error) would otherwise re-enter it. The
+//! end-of-turn listener's thread is the exception: nothing under the lock
+//! waits on it, so [`heard`] takes the lock there, in the order the
+//! listener heard, and checks and applies each event in one hold.
 //!
 //! # The clock
 //!
-//! `Listening` has a silence budget ([`keeper_core::voice::silence_budget`]);
-//! this module owns the timer that spends it. Every transition bumps a
-//! generation and, where the new state has a budget, arms one sleep stamped
-//! with that generation. A sleep that wakes to find the generation moved on
-//! does nothing — the person spoke, or stopped, before it mattered.
+//! `Listening` has a silence budget ([`keeper_core::voice::silence_budget`]),
+//! and so has `Finishing`, the wait for the recogniser's last words; this
+//! module owns the timer that spends it. Every move core says restarts the
+//! clock ([`keeper_core::voice::restarts_budget`]) gives the turn a new
+//! [`Turn::budget`] and, where the new state has a budget, arms one sleep
+//! stamped with it. A sleep that wakes to find the budget replaced does
+//! nothing — the person spoke, or stopped, before it mattered — and the
+//! check and the `Silence` it feeds are one hold of the lock.
 //!
 //! # Every target
 //!
@@ -52,7 +58,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use keeper_core::registry;
 use keeper_core::vm::{IpcError, IpcErrorCode, VoiceStateVm, VoiceUnavailableVm, VoiceWakeVm};
+use keeper_core::voice::end_of_turn::Heard;
 use keeper_core::voice::events::VoiceEventKind;
+use keeper_core::voice::timings::TurnClock;
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 use keeper_core::voice::EventSink;
 use keeper_core::voice::{
@@ -77,8 +85,9 @@ struct Voice {
     /// Which registration `watcher` is, so `voice_unwatch` from an unmount
     /// that lost the race to a remount is a no-op rather than a silencing.
     watch_serial: u64,
-    /// Bumped on every transition; the silence timer checks it before firing.
-    generation: u64,
+    /// The clock points of the spoken turn in progress (AD-411, NFR-114),
+    /// written to the voice ring and the app log when it sends.
+    clock: TurnClock,
     /// Where the registry is, kept from [`boot`] for the re-arm hooks
     /// (Epic 65, AD-190): a lifecycle event and the port's own resume arrive
     /// with no `State` in hand. `None` only before boot.
@@ -98,7 +107,7 @@ fn voice() -> MutexGuard<'static, Voice> {
             port,
             watcher: None,
             watch_serial: 0,
-            generation: 0,
+            clock: TurnClock::default(),
             data_dir: None,
             app: None,
         })
@@ -209,6 +218,8 @@ impl VoicePort for AbsentPort {
         Err(VoiceUnavailable::Unsupported)
     }
     fn stop_speaking(&self) {}
+    /// No recogniser, so nothing to finish.
+    fn finish_recognition(&self, _finish: u64) {}
 }
 
 #[cfg(not(any(target_os = "ios", target_os = "macos")))]
@@ -247,7 +258,7 @@ fn deliver(event: TurnEvent) {
 
 /// Record one level reading and stream the snapshot if it changed.
 ///
-/// Not a transition: the generation is not bumped and the silence clock is
+/// Not a transition: the turn's budget is not replaced and the silence clock is
 /// not touched. A level that moved would otherwise re-arm the
 /// end-of-utterance pause on every reading, and a room with any noise in it
 /// would never let a sentence end.
@@ -271,16 +282,37 @@ fn meter(level: f32) {
 /// anything is awaited: every report of the send carries it back, and only
 /// the turn's current question's moves the turn ([`Turn::owns_answer`]).
 fn transition(event: TurnEvent) {
-    let mut voice = voice();
+    transition_locked(voice(), event);
+}
+
+/// [`transition`] under a hold of the lock the caller already took — and
+/// checked something under — so nothing moves the turn in between.
+fn transition_locked(mut voice: MutexGuard<'static, Voice>, event: TurnEvent) {
     let port = Arc::clone(&voice.port);
-    let before = VoiceEventKind::turn(voice.turn.state());
+    let state_before = voice.turn.state().clone();
+    let budget_before = voice.turn.budget();
+    let before = VoiceEventKind::turn(&state_before);
     let logged = event.clone();
     let effects = voice.turn.drive(event, port.as_ref());
     crate::voice_log::transition(before, &logged, voice.turn.state(), &effects);
+    let ended = {
+        let Voice { turn, clock, .. } = &mut *voice;
+        clock.observe(
+            &state_before,
+            &logged,
+            turn.state(),
+            &effects,
+            crate::voice_log::now_ms(),
+        )
+    };
+    if let Some(ended) = ended {
+        crate::voice_log::turn_end(&ended);
+    }
     #[cfg(target_os = "ios")]
     crate::voice_notify::answer(&effects);
     tracing::debug!(state = ?voice.turn.state(), ?effects, "voice: transition");
-    after_change(&mut voice);
+    let restarts = voice.turn.budget() != budget_before;
+    after_change(&mut voice, restarts);
     let heard = effects.into_iter().find_map(|effect| match effect {
         Effect::SendText(text) => Some(text),
         _ => None,
@@ -426,20 +458,61 @@ pub fn spoken_turn(data_dir: &std::path::Path) -> Option<String> {
     Some(locale::in_force(chosen.as_deref(), &system, &on_device))
 }
 
-/// What every change does once the turn has moved: bump the generation,
-/// push the snapshot, and spend the new state's silence budget if it has one.
-fn after_change(state: &mut Voice) {
-    state.generation = state.generation.wrapping_add(1);
+/// What every change does once the turn has moved: push the snapshot, tell
+/// the end-of-turn listener what the turn is doing now, and — when the move
+/// gave the turn a new [`Turn::budget`] — spend the new state's silence
+/// budget if it has one.
+fn after_change(state: &mut Voice, restarts: bool) {
     push(state);
-    if let Some(budget) = silence_budget(state.turn.state()) {
-        let generation = state.generation;
+    crate::voice_turn_models::ear().follow(state.turn.state());
+    if !restarts {
+        return;
+    }
+    if let Some(wait) = silence_budget(state.turn.state(), crate::voice_log::now_ms()) {
+        let budget = state.turn.budget();
         tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(budget).await;
-            let stale = voice().generation != generation;
-            if !stale {
-                transition(TurnEvent::Silence);
+            tokio::time::sleep(wait).await;
+            // Checked and spent in one hold: a move in between — a finished
+            // sentence taking `Listening` to `Finishing` — would otherwise
+            // let this spent budget end the turn that replaced it.
+            let voice = voice();
+            if voice.turn.budget() == budget {
+                transition_locked(voice, TurnEvent::Silence);
             }
         });
+    }
+}
+
+/// What the end-of-turn listener heard in listening `generation` (AD-411),
+/// on its own thread, one event at a time in the order heard: core's
+/// [`keeper_core::voice::end_of_turn::Ear::admit`] decides, under the
+/// lock, whether that listening is still the turn's, writes the clock
+/// points to the turn's record, and names the move a finished sentence
+/// makes, which is made in the same hold. An unfinished sentence or a
+/// failed model is only logged, and the pause decides.
+pub fn heard(generation: u64, event: Heard) {
+    match &event {
+        Heard::Unfinished {
+            speech_end_ms,
+            score,
+        } => {
+            tracing::debug!(speech_end_ms, score, "voice: the sentence is not finished");
+            return;
+        }
+        Heard::Failed(error) => {
+            tracing::warn!(%error, "voice: the end-of-turn models failed; the pause decides");
+            return;
+        }
+        Heard::UtteranceEnd {
+            speech_end_ms,
+            score,
+        } => tracing::debug!(speech_end_ms, score, "voice: the sentence is finished"),
+        Heard::Onset { .. } | Heard::SpeechEnd { .. } => {}
+    }
+    let mut voice = voice();
+    let admitted = crate::voice_turn_models::ear().admit(generation, &event, &mut voice.clock);
+    if let Some(event) = admitted {
+        transition_locked(voice, event);
     }
 }
 
@@ -721,7 +794,7 @@ fn arm(voice: &mut Voice, wake: Option<WakePhrase>) {
             );
         }
     }
-    after_change(voice);
+    after_change(voice, true);
 }
 
 /// Set the wake switch, phrase and stop phrase (FR-404, FR-405; Epic 67,
@@ -867,8 +940,8 @@ pub fn voice_locale_set(
     voice.port.set_locale(requested);
     // Only the device held for the phrase is restarted here. Mid-turn the
     // new language reaches the request the turn's own end re-arms; a
-    // `set_wake` there would touch nothing but bump the generation, and
-    // orphan the silence clock of the turn in progress.
+    // `set_wake` there would touch nothing but replace the turn's budget,
+    // and restart the silence clock of the turn in progress.
     if matches!(voice.turn.state(), TurnState::Idle) && voice.turn.armed() {
         let wake = voice.turn.wake().cloned();
         arm(&mut voice, wake);
@@ -1074,6 +1147,7 @@ mod tests {
         fn stop_speaking(&self) {
             self.stopped_speaking.fetch_add(1, Ordering::SeqCst);
         }
+        fn finish_recognition(&self, _finish: u64) {}
     }
 
     /// Put `port` behind the process-wide state with a fresh, armed turn,
