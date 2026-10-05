@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   AccountVm,
   AgentRunVm,
+  ApprovalCardVm,
   IpcError,
   TimelineBatch,
   TimelineItemVm,
@@ -281,6 +282,150 @@ describe("ConversationPane", () => {
     });
     // The `Other` item is not rendered as a bubble.
     expect(screen.getByLabelText("Messages")).toBeInTheDocument();
+  });
+
+  it("draws an agent's approval request where it arrived, and follows the room's state beside the stream", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+    const card: ApprovalCardVm = {
+      id: "01A",
+      bindingDigest: "sha256:aa",
+      tier: 2,
+      tierWord: "T2: it changes something that can be put back",
+      summary: "Write `a.md` in tgdrive (3 bytes)",
+      tool: "drive_write",
+      payload: '{\n  "path": "a.md"\n}',
+      attachment: null,
+      approvers: [{ user: "@alice:example.org", name: "Alice" }],
+      anyone: false,
+      chain: [{ user: "@alice:example.org", name: "Alice" }],
+      scopes: [{ scope: "once", label: "Approve once", detail: "This action once." }],
+      expiresAt: 4_000_000_000_000,
+      state: { state: "pending" },
+      canDecide: true,
+      cannotDecide: null,
+      verify: false,
+      only: null,
+      declassify: null,
+    };
+
+    await waitFor(() => expect(captured.onBatch).not.toBeNull());
+    act(() => {
+      captured.onBatch?.({
+        ops: [
+          {
+            op: "reset",
+            items: [
+              messageItem("k1", "@nixi:example.org", "before"),
+              { kind: "approval", key: "ap", id: "01A" },
+              messageItem("k2", "@nixi:example.org", "after"),
+            ],
+          },
+        ],
+        approvals: [{ id: "01A", cards: [card] }],
+      });
+    });
+
+    const request = await screen.findByRole("article", {
+      name: "Approval request: Write a.md in tgdrive (3 bytes)",
+    });
+    const rows = within(screen.getByRole("list", { name: "Messages" })).getAllByRole("listitem");
+    const at = rows.findIndex((row) => row.contains(request));
+    expect(rows[at - 1]).toHaveTextContent("before");
+    expect(rows[at + 1]).toHaveTextContent("after");
+    expect(within(request).getByRole("button", { name: "Approve once" })).toBeInTheDocument();
+
+    // A decision echoed by the room arrives beside the stream, with no ops.
+    act(() => {
+      captured.onBatch?.({
+        ops: [],
+        approvals: [
+          {
+            id: "01A",
+            cards: [
+              {
+                ...card,
+                canDecide: false,
+                state: {
+                  state: "decided",
+                  decision: "deny",
+                  scope: "once",
+                  by: "@alice:example.org",
+                  byName: "Alice",
+                },
+              },
+            ],
+          },
+        ],
+      });
+    });
+    expect(await within(request).findByText("Denied by Alice.")).toBeInTheDocument();
+    expect(within(request).queryByRole("button", { name: "Approve once" })).toBeNull();
+  });
+
+  it("draws each approval request in the stream as its own request, whatever order the room lists them in", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+    const request = (id: string, summary: string): ApprovalCardVm => ({
+      id,
+      bindingDigest: `sha256:${id}`,
+      tier: 2,
+      tierWord: "T2: it changes something that can be put back",
+      summary,
+      tool: "drive_write",
+      payload: null,
+      attachment: null,
+      approvers: [{ user: "@alice:example.org", name: "Alice" }],
+      anyone: false,
+      chain: [{ user: "@alice:example.org", name: "Alice" }],
+      scopes: [{ scope: "once", label: "Approve once", detail: "This action once." }],
+      expiresAt: 4_000_000_000_000,
+      state: { state: "pending" },
+      canDecide: true,
+      cannotDecide: null,
+      verify: false,
+      only: null,
+      declassify: null,
+    });
+
+    await waitFor(() => expect(captured.onBatch).not.toBeNull());
+    act(() => {
+      captured.onBatch?.({
+        ops: [
+          {
+            op: "reset",
+            items: [
+              { kind: "approval", key: "ap1", id: "01A" },
+              messageItem("k1", "@nixi:example.org", "between"),
+              { kind: "approval", key: "ap2", id: "01B" },
+            ],
+          },
+        ],
+        approvals: [
+          { id: "01B", cards: [request("01B", "Write b.md in tgdrive")] },
+          { id: "01A", cards: [request("01A", "Write a.md in tgdrive")] },
+        ],
+      });
+    });
+
+    const first = await screen.findByRole("article", {
+      name: "Approval request: Write a.md in tgdrive",
+    });
+    const second = screen.getByRole("article", { name: "Approval request: Write b.md in tgdrive" });
+    const rows = within(screen.getByRole("list", { name: "Messages" })).getAllByRole("listitem");
+    expect(rows.findIndex((row) => row.contains(first))).toBe(0);
+    expect(rows[1]).toHaveTextContent("between");
+    expect(rows.findIndex((row) => row.contains(second))).toBe(2);
   });
 
   it("consumes Escape only when there is composer context to clear (phone-shell cascade)", async () => {

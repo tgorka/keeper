@@ -651,10 +651,10 @@ message (above), so a turn they started there raises nothing.
 
 ## When an action waits
 
-On a keeper host with a decision source installed (none is installed yet: a person cannot decide
-from a keeper client until the approval card exists, so every host still refuses as above, and a
-decision that arrives is logged ignored — nothing waits for it), a call that needs a person does
-not wait in a thread — it **parks**:
+On a keeper host with a decision source installed (none is installed yet: keeper draws the
+approval card and sends a person's decision, but no host acts on one, so every host still refuses
+as above, and a decision that arrives is logged ignored — nothing waits for it), a call that needs
+a person does not wait in a thread — it **parks**:
 
 1. The round's earlier calls have run; the parked call and the round's later calls keep their
    `tool_call` lines and get no result yet.
@@ -810,6 +810,43 @@ is sent; the decision then goes out as `dev.keeper.agent.approval.decision` thro
 one agent-event sender, beside a scope, a focus and a surface result. keeper also reads the
 account's own fingerprint, in the same groups of four `keeper-agentd status` prints, for the
 person to compare before pinning it (Settings' Encryption section draws it with the card).
+
+**What the person sees.** The card sits in the room's timeline where the request arrived, in the
+room view and in the notes dock alike, on the Mac and the iPhone:
+
+- the tier in words ("T3: it reaches beyond this session: …"), with a weight beside it — an icon
+  and the card's left edge, quiet at T2, amber at T3, red at T4 — and its state: *Waiting*,
+  *Approved*, *Denied*, *Used* or *Expired*;
+- keeper's one-sentence summary; for a declassification its question instead ("Let this one
+  message reach Marta?") and what exactly would reach them;
+- the exact action under *What will run: <tool>*, whole: a long one (over 16 lines or 1200
+  characters) scrolls in its box with *Show all N lines* (or *N characters*), and one too large
+  to travel inline says it is attached, with *Show the full action*, which fetches it and shows
+  it once keeper has checked it against the digest (or says why it cannot);
+- *Asked by* (the person, then each agent it went through), *Can decide* (the approvers by name,
+  or anyone who reads the room) and, while it waits, *Waits until* with a date and time;
+- while it waits (including a decision seen in the room) and this device decides: *Approve once*,
+  *Approve for this session* where the card offers it, and *Deny*, which opens an optional note for
+  the agent. Each approve button has Rust's full grant description beside it and as its accessible
+  description: the action once, or the tool, drive, folder and lifetime for the session allowance.
+  A sent decision reads "Your decision was sent. The card changes when the room has it."; a refusal
+  is shown in keeper's own words and the buttons stay. An attached action must be opened first;
+- when this device cannot decide, the card's own sentence instead of buttons, with *Verify this
+  device* (keeper's verification flow) when that is the remedy; at T4 "Only <them> can decide
+  this. This cannot be undone." is shown to everyone;
+- a decision seen in the room: "Approved once by Marta.", "Approved for this session by …" or
+  "Denied by …"; the card stays decidable until consumption or expiry;
+- once closed: "Approved and used once. This does not confirm the action's outcome; that shows in
+  the session." or "Expired at … before it was used, so it did not run." Consumption spends the
+  approval before the effect; it does not prove that the action happened.
+
+A gate's coalesced request is one frame of rows, each with its own buttons and state. Appending
+another row keeps the first row's draft note, in-flight decision and sent status. The own
+fingerprint is a line under each account in Settings › Encryption, *Your identity fingerprint*,
+or "No cross-signing identity yet, so there is no fingerprint to compare." It refreshes on that
+account's encryption-status or verification-flow changes, clearing the old value while reading;
+a superseded read cannot restore an old fingerprint. A failed read says keeper could not read it,
+never that no identity exists.
 
 ## A session an agent works in
 

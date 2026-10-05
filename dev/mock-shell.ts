@@ -108,6 +108,7 @@ import type {
   HotkeyVm,
   InboxBatch,
   InboxRoomVm,
+  IpcError,
   NetworksSnapshot,
   NoteBodyBatch,
   OrgAccountVm,
@@ -4762,18 +4763,28 @@ if (mockApprovals.length > 0) {
 /** The attached actions `agent_approval_payload` has shown, by card id. */
 const shownPayloads = new Set<string>();
 
+/** The same envelope the real IPC decoder accepts, so Rust's sentence survives. */
+function refuseApproval(message: string): Promise<never> {
+  return Promise.reject({
+    code: "unsupported",
+    message,
+    accountId: null,
+    retriable: false,
+  } satisfies IpcError);
+}
+
 function mockApprovalPayload(payload: Record<string, unknown>): Promise<string> {
   const card = mockApprovals
     .flatMap((approval) => approval.cards)
     .find((c) => c.id === String(payload.id));
   if (String(payload.roomId) !== APPROVAL_ROOM || !card) {
-    return Promise.reject({ code: "unsupported", message: APPROVAL_SENTENCES.notFound });
+    return refuseApproval(APPROVAL_SENTENCES.notFound);
   }
   if (card.attachment === null) {
-    return Promise.reject({ code: "unsupported", message: APPROVAL_SENTENCES.notAttached });
+    return refuseApproval(APPROVAL_SENTENCES.notAttached);
   }
   if (approvalPayloadParam === "refused") {
-    return Promise.reject({ code: "unsupported", message: APPROVAL_SENTENCES.payloadRefused });
+    return refuseApproval(APPROVAL_SENTENCES.payloadRefused);
   }
   return later(400, () => {
     shownPayloads.add(card.id);
@@ -4789,24 +4800,23 @@ function mockApprovalDecide(payload: Record<string, unknown>): Promise<null> {
   const roomId = String(payload.roomId);
   const req = payload.req as ApprovalDecideReq;
   const card = mockApprovals.flatMap((approval) => approval.cards).find((c) => c.id === req.id);
-  const refuse = (message: string) => Promise.reject({ code: "unsupported", message });
   if (roomId !== APPROVAL_ROOM || !card) {
-    return refuse(APPROVAL_SENTENCES.notFound);
+    return refuseApproval(APPROVAL_SENTENCES.notFound);
   }
   if (card.state.state !== "pending" && card.state.state !== "decided") {
-    return refuse(APPROVAL_SENTENCES.notWaiting);
+    return refuseApproval(APPROVAL_SENTENCES.notWaiting);
   }
   if (req.bindingDigest !== card.bindingDigest) {
-    return refuse(APPROVAL_SENTENCES.otherAction);
+    return refuseApproval(APPROVAL_SENTENCES.otherAction);
   }
   if (!card.scopes.some((offer) => offer.scope === req.scope)) {
-    return refuse(APPROVAL_SENTENCES.scopeNotOffered);
+    return refuseApproval(APPROVAL_SENTENCES.scopeNotOffered);
   }
   if (!card.canDecide) {
-    return refuse(card.cannotDecide ?? "");
+    return refuseApproval(card.cannotDecide ?? "");
   }
   if (req.decision === "approve" && card.attachment !== null && !shownPayloads.has(card.id)) {
-    return refuse(APPROVAL_SENTENCES.unseen);
+    return refuseApproval(APPROVAL_SENTENCES.unseen);
   }
   return later(300, () => {
     // A decision already in the room stays the one shown (the first).

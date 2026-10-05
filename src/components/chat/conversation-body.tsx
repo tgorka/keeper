@@ -31,6 +31,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { ApprovalRequest } from "@/components/agents/approval-card";
 import { AgentRoomHeader } from "@/components/chat/agent-room-header";
 import { Composer } from "@/components/chat/composer";
 import { DeleteMessageDialog } from "@/components/chat/delete-message-dialog";
@@ -45,6 +46,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import type {
   AgentRoomHeaderVm,
+  ApprovalVm,
   PaginationStatusBatch,
   TimelineBatch,
   TimelineItemVm,
@@ -152,18 +154,24 @@ type UtdVm = Extract<TimelineItemVm, { kind: "utd" }>;
 /** The `redacted`-variant of {@link TimelineItemVm} (rendered as an honest stub). */
 type RedactedVm = Extract<TimelineItemVm, { kind: "redacted" }>;
 
+/** The `approval`-variant of {@link TimelineItemVm}: where an agent's request arrived. */
+type ApprovalItemVm = Extract<TimelineItemVm, { kind: "approval" }>;
+
 /**
  * A renderable timeline row. A `message` row is a text bubble paired with whether
  * it continues a same-sender run (`grouped`) and whether it ends one (`groupTail`
  * — the transient send-state caption renders only on the tail). A `utd` row is an
  * undecryptable-event stub and a `redacted` row is a deleted-message stub (Story
  * 3.8); both are never grouped, break same-sender runs, and are emitted (not
- * skipped like `other`), so they render inline and never blank.
+ * skipped like `other`), so they render inline and never blank. An `approval`
+ * row is an agent's request with its cards, drawn where it arrived (UX-DR136),
+ * and breaks a run the same way.
  */
 type RenderedRow =
   | { kind: "message"; item: MessageVm; grouped: boolean; groupTail: boolean }
   | { kind: "utd"; item: UtdVm }
-  | { kind: "redacted"; item: RedactedVm };
+  | { kind: "redacted"; item: RedactedVm }
+  | { kind: "approval"; item: ApprovalItemVm; approval: ApprovalVm };
 
 /**
  * Project the streamed timeline into the renderable row sequence, computing
@@ -175,7 +183,7 @@ type RenderedRow =
  * break a run (an interleaved non-text item ungroups the next message and ends
  * the current run).
  */
-function toRenderedRows(items: TimelineItemVm[]): RenderedRow[] {
+function toRenderedRows(items: TimelineItemVm[], approvals: ApprovalVm[]): RenderedRow[] {
   const rendered: RenderedRow[] = [];
   let prevSender: string | null = null;
 
@@ -200,6 +208,16 @@ function toRenderedRows(items: TimelineItemVm[]): RenderedRow[] {
       // rendered (never blank, never silently removed) (Story 3.8, FR-15).
       closeRun();
       rendered.push({ kind: "redacted", item });
+      continue;
+    }
+    if (item.kind === "approval") {
+      // Its cards travel beside the stream, in the batch that placed it; an
+      // item whose cards are not here draws nothing, but still ends the run.
+      closeRun();
+      const approval = approvals.find((a) => a.id === item.id);
+      if (approval !== undefined) {
+        rendered.push({ kind: "approval", item, approval });
+      }
       continue;
     }
     if (item.kind !== "message") {
@@ -243,6 +261,9 @@ export function ConversationBody({
   // every other room. Drawn on the phone too: it is not part of the pane's
   // own header row.
   const agentHeader = useConversationTimeline((s) => s.header);
+  // An agent room's approval requests, by id; the stream's `approval` items say
+  // where each is drawn.
+  const approvals = useConversationTimeline((s) => s.approvals);
   // The answer that draws the growing caret: Rust names it only while the run
   // is `running`, and the run is checked here as well so a header that moved
   // on to `done` can never leave a caret behind.
@@ -623,7 +644,7 @@ export function ConversationBody({
     prevItemCount.current = items.length;
   }, [items]);
 
-  const rows = toRenderedRows(items);
+  const rows = toRenderedRows(items, approvals);
   const roomLoaded = accountId !== null && roomId !== null && loaded && !errored;
   const hasRows = rows.length > 0;
 
@@ -1273,6 +1294,14 @@ export function ConversationBody({
               ) : row.kind === "redacted" ? (
                 <li key={row.item.key}>
                   <RedactedStub />
+                </li>
+              ) : row.kind === "approval" ? (
+                <li key={row.item.key}>
+                  <ApprovalRequest
+                    approval={row.approval}
+                    accountId={accountId ?? ""}
+                    roomId={roomId}
+                  />
                 </li>
               ) : (
                 <li key={row.item.key}>
