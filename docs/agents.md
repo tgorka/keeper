@@ -587,11 +587,67 @@ titled `<agent> <date>`, so its folder names no subject either.
   label (a person, a room, an address, an agent no mounted drive homes, an agent whose audience is
   wider) is refused: the outside content may have chosen it. A later round goes to the agent its
   exchange was opened with; a call naming another agent with that exchange is refused;
-- a `drive_write` or `drive_edit` needs a person's approval, and is refused until approvals exist.
+- any call whose tier (below) is T3 or more — a write outside the session, raised by the outside
+  content to T3 — needs a person's approval, and is refused until approvals exist.
 
 A proxy's DM (`main`) starts each of its person's turns at their own word: the integrity goes back
 to `owner` at their next message, while who may read stays as narrow as before. Every other
 session keeps its lowest integrity for good.
+
+## How risky an action is
+
+Every call an agent makes has a tier, from a fixed table in keeper (never from the model), and the
+tier decides whether it runs:
+
+| tier | calls | what keeper does |
+| --- | --- | --- |
+| T0 | `drive_list`, `drive_read`, `drive_glob`, `drive_grep`, `drive_stat` | runs it |
+| T1 | `session_write`; `card_update` on a card of the session; a `drive_write` or `drive_edit` inside the session's own folder; `delegate` and its later rounds; `reply`; the five `surface_*` tools | runs it |
+| T2 | `drive_write` or `drive_edit` outside the session; `card_update` on another session's card; any write the agent's grant asks a person about | asks a person |
+| T3 | `card_update` that sets `schedule` or `workflow`, and a `delegate` whose card carries either — in every session, the person's own DM included; letting a blocked flow through (a declassification) | asks a person, for that one action |
+| T5 | a write — `drive_write`, `drive_edit`, `session_write` or `card_update` — that lands on any `agent.toml`, any `_drive.toml`, or anything in a session's `approvals/`, on any drive | never: "keeper never lets an agent do this: it would change the agent's own configuration or the approvals that guard its work. A person can do it themselves. Nothing was changed." |
+
+A write's tier is decided by where it lands on the disk, not how the call spelled it: keeper
+follows every folder link on the way and compares names as the Mac's volume does, so
+`Approvals/x.json`, `80-agents/nixi/Agent.toml` and `workspace/back/approvals/x.json` (with
+`workspace/back` a link to the session) are T5, and a link from the session into another session
+lands outside it (T2). T5 is never an approval's to give: in a session that read outside content
+it is still refused with the sentence above, not with the approval sentence.
+
+No tool of this build is T4 (irreversible: deletes, credentials, running downloaded code). The
+grant still answers every drive call: a write the grant asks about is at least T2, and the higher
+of the two wins, so a grant alone never lets a write through. Until a person can approve from a
+keeper client, every call that asks a person is refused with "This needs a person's approval, and
+there is no one here to ask, so keeper did not do it. Nothing was changed." — the model reads it,
+and nothing ran.
+
+Each call's tier is on its `tool_call` line (`tier`), and in the bot audit log: every call an agent
+makes has exactly one row, written before anything happens — `tier`, `base_tier` (the table's, or
+the grant's when that is higher), `raised_by` (below) and, once approvals exist, `approval`. A
+drive call's row carries its grant's verdict; any other call's row says `allow` under
+`agent:<tool>`, or `deny` with the sentence it was refused with. A call refused before it reached
+anything — a tool the agent was not given, a folder keeper does not hold, a send the label
+blocks — has that one row too, naming where it was bound: a `reply` its room, a `delegate` its
+agent, a `card_update` its card. When the row cannot be written the call is refused and nothing
+runs. A ⌘9 bot's rows leave the four columns empty. A `keeper.db` from an older keeper gains the
+columns when it is next opened — two sessions opening it at once both do, without error; its rows
+keep them empty.
+
+## Work nobody is watching
+
+A call that already needs a person (T2 or more) is held one tier stricter when:
+
+- the session was handed on: `kind = "delegated"`, or any hop of 1 or more (`delegated`);
+- nobody watches it run: `kind = "scheduled"` or `"gate"` (`unattended`);
+- the session read outside content: its label's integrity is `untrusted` (`untrusted`);
+- its target is reached through a KVM (`kvm`; no tool of this build is).
+
+The raise is one tier however many of these hold: a `drive_write` outside the session is T2 in
+tgorka's DM, and T3 in a delegated session, in a scheduled run, and in a session that is all three.
+A T4 raised is T5, and refused. A T0 or T1 call is not raised — reads, `reply`, `delegate`, the
+surface and the session's own files work in every session — but its audit row still names the
+reasons that held, in `raised_by`, as a comma list. The person's own DM resets to `owner` at their
+message (above), so a turn they started there raises nothing.
 
 ## A session an agent works in
 
@@ -817,7 +873,9 @@ names them; its `drive_write` and `drive_edit` are refused anywhere in the sessi
 the sessions zone, which an agent writes only through its session tools …"). A ⌘9 bot is offered
 neither tool and keeps its fences as they were.
 
-- `card_update(card, fields)` sets a card of the session the turn runs in: `status` (one of the
+- `card_update(card, fields)` sets a card of the session the turn runs in, and takes no other
+  argument (a `path` beside `card` is refused: the card named is the file changed and the file its
+  audit row names): `status` (one of the
   four), `order`, `assignee`, `host`. `schedule` is checked by keeper's schedule parser and refused
   with its sentence; a readable `schedule`, or any `workflow`, needs a person, so it is refused with
   "This needs a person's approval, and there is no one here to ask, so keeper did not do it.

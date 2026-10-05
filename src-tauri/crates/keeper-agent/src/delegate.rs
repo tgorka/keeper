@@ -11,8 +11,10 @@
 //! A `delegate` call checks, before anything is sent: the bounds
 //! ([`Limits::check`]), the drives against the target's `[tools].drives`,
 //! the label against the target's audience and the room's members
-//! (`check_sink(Delegation)`, `check_sink(Room)`), and a card's schedule or
-//! workflow, which needs a person (Q16) and so is refused before Epic 93.
+//! (`check_sink(Delegation)`, `check_sink(Room)`), then the integrity rule
+//! and its tier (AD-392, R82): a card with a schedule or a workflow is T3,
+//! which needs a person and so is refused until a decision source is
+//! installed. A block or a refusal is the call's one audit row (R90).
 //! Then it makes the room — the target and the label's readers invited — and
 //! returns at once with a `delegate opened` line. The brief is not sent yet:
 //! an invited device may be outside the room's key, so the host sends it once
@@ -61,19 +63,15 @@ use serde_json::{json, Value};
 use ulid::Ulid;
 
 use crate::agent::RoomFuture;
-use crate::host::UNATTENDED_REFUSAL;
 use crate::matrix_sink::{EditPort, SendFuture};
 use crate::rooms::{BriefRoom, Known, KnownAgent};
 use crate::sessions::verbs::VerbError;
-use crate::sinks::{room_audience, Sinks};
+use crate::sinks::{room_audience, Blocked, CallAudit, Sinks};
 
 /// The tool that hands work on.
 pub const DELEGATE: &str = "delegate";
 /// The tool a delegated session answers with.
 pub const REPLY: &str = "reply";
-/// Both tools' tier: each sends into a room another agent acts on, which a
-/// person can see and undo by talking (AD-392's recoverable mutation).
-pub const TIER: u8 = 2;
 
 /// What `reply` says outside a delegated session.
 pub const NOT_DELEGATED: &str =
@@ -462,14 +460,32 @@ pub async fn admit_reply(
     label: &Label,
     content: &Value,
 ) -> Result<(), String> {
-    let sink = match room_now(port, room, agents, Vec::new()).await {
-        Ok(sink) => sink,
-        Err(unread) => {
-            sinks.refused(REPLY, "", room.as_str(), &unread);
-            return Err(unread);
-        }
-    };
-    sinks.check(
+    reply_verdict(port, sinks, room, agents, label, content)
+        .await
+        .map_err(|blocked| {
+            sinks.refused(REPLY, &blocked.drive, &blocked.at, &blocked.sentence);
+            blocked.sentence
+        })
+}
+
+/// [`admit_reply`] without its row: the model's `reply` audits its block in
+/// its one classified row (R90).
+async fn reply_verdict(
+    port: &dyn DelegationPort,
+    sinks: &Sinks,
+    room: &RoomId,
+    agents: [&UserId; 2],
+    label: &Label,
+    content: &Value,
+) -> Result<(), Blocked> {
+    let sink = room_now(port, room, agents, Vec::new())
+        .await
+        .map_err(|unread| Blocked {
+            drive: String::new(),
+            at: room.to_string(),
+            sentence: unread,
+        })?;
+    sinks.verdict(
         REPLY,
         &Destination::Room {
             room: room.to_owned(),
@@ -617,15 +633,45 @@ impl<'t> DelegateTools<'t> {
     }
 
     /// Run `wire` when it is `delegate` or `reply`; `None` for any other name.
-    pub fn run(&self, wire: &WireToolCall) -> Option<ToolOutcome> {
+    /// `audit` is the call's one row (R90): a sink's block is written in it,
+    /// and once the sinks pass it is admitted — the integrity rule and the
+    /// tier answer only then, before any room is made or sent into (R82).
+    pub fn run(&self, wire: &WireToolCall, audit: &CallAudit<'_>) -> Option<ToolOutcome> {
         match wire.name.as_str() {
             DELEGATE if !self.offer_delegate => {
                 refused(format!("{DELEGATE} is not one of this agent's tools."))
             }
-            DELEGATE => self.delegate(&wire.arguments_raw),
+            DELEGATE => self.delegate(&wire.arguments_raw, audit),
             REPLY if !self.offer_reply => refused(NOT_DELEGATED),
-            REPLY => self.reply(wire.arguments.as_ref()),
+            REPLY => self.reply(wire.arguments.as_ref(), audit),
             _ => None,
+        }
+    }
+
+    /// Where a call `wire` goes, as its audit row names it before the call
+    /// says: a `reply` into this session's own room, a `delegate` to the
+    /// agent [`DelegateTools::recipient`] resolves (its home drive, when
+    /// known).
+    pub fn destination(&self, wire: &WireToolCall) -> (String, String) {
+        if wire.name == REPLY {
+            return (String::new(), self.from.room.to_string());
+        }
+        let Some((name, _)) = self.recipient(wire) else {
+            return Default::default();
+        };
+        let Some(known) = self.port.as_ref().map(|port| port.known()) else {
+            return (String::new(), name);
+        };
+        // A next round names its delegation's agent by user, a new one by
+        // the name the call gave.
+        let target = known
+            .agents
+            .iter()
+            .find(|agent| agent.matrix_user.as_str() == name)
+            .or_else(|| resolve(&known, &name).ok());
+        match target {
+            Some(target) => (target.drive.clone(), target.matrix_user.to_string()),
+            None => (String::new(), name),
         }
     }
 
@@ -652,7 +698,7 @@ impl<'t> DelegateTools<'t> {
         Some((args.agent, audience))
     }
 
-    fn delegate(&self, raw: &str) -> Option<ToolOutcome> {
+    fn delegate(&self, raw: &str, audit: &CallAudit<'_>) -> Option<ToolOutcome> {
         let args = match parse_args(raw) {
             Ok(args) => args,
             Err(sentence) => return refused(sentence),
@@ -661,7 +707,7 @@ impl<'t> DelegateTools<'t> {
             return refused(NO_ROOMS);
         };
         if let Some(id) = &args.session {
-            return self.next_round(port.as_ref(), id, &args.agent, &args.brief);
+            return self.next_round(port.as_ref(), id, &args.agent, &args.brief, audit);
         }
         let source = args
             .source
@@ -723,20 +769,18 @@ impl<'t> DelegateTools<'t> {
                 agent_audiences: vec![target.home_readers.clone()],
             },
         ] {
-            if let Err(sentence) =
+            if let Err(blocked) =
                 self.sinks
-                    .check(DELEGATE, &destination, &content.label, &sink, &effect, None)
+                    .verdict(DELEGATE, &destination, &content.label, &sink, &effect, None)
             {
-                return self.refuse(&id, &to, None, sentence);
+                return self.refuse(&id, &to, None, audit.blocked(blocked));
             }
         }
-        // A schedule or a workflow is a person's to allow (Q16, T3).
-        if content
-            .card
-            .as_ref()
-            .is_some_and(|card| card.schedule.is_some() || card.workflow.is_some())
-        {
-            return self.refuse(&id, &to, None, UNATTENDED_REFUSAL.to_owned());
+        // The label's say first, then the integrity rule's and the tier's: a
+        // card with a schedule or a workflow is a person's to allow (S-21,
+        // T3).
+        if let Err(sentence) = audit.admit(&target.drive, &to) {
+            return self.refuse(&id, &to, None, sentence);
         }
         let name = session_title(&target.id, chrono::Utc::now());
         let room = match block_on(port.create(&name, invites, vec![target.matrix_user.clone()])) {
@@ -789,6 +833,7 @@ impl<'t> DelegateTools<'t> {
         id: &str,
         agent: &str,
         brief: &str,
+        audit: &CallAudit<'_>,
     ) -> Option<ToolOutcome> {
         let Some(delegation) = self.view.delegation(id) else {
             return refused(format!("No delegation of this session has the id {id}."));
@@ -838,12 +883,13 @@ impl<'t> DelegateTools<'t> {
             [&self.from.user, &delegation.to],
             vec![target.home_readers.clone()],
         ))
-        .inspect_err(|unread| {
-            self.sinks
-                .refused(DELEGATE, &target.drive, delegation.to.as_str(), unread)
+        .map_err(|unread| Blocked {
+            drive: target.drive.clone(),
+            at: to.clone(),
+            sentence: unread,
         })
         .and_then(|sink| {
-            self.sinks.check(
+            self.sinks.verdict(
                 DELEGATE,
                 &Destination::Agent {
                     drive: target.drive.clone(),
@@ -855,7 +901,9 @@ impl<'t> DelegateTools<'t> {
                 &brief_effect(&content),
                 None,
             )
-        });
+        })
+        .map_err(|blocked| audit.blocked(blocked))
+        .and_then(|()| audit.admit(&target.drive, &to));
         if let Err(reason) = checked {
             return self.refuse(id, &to, Some(delegation.room.clone()), reason);
         }
@@ -877,7 +925,7 @@ impl<'t> DelegateTools<'t> {
         })
     }
 
-    fn reply(&self, args: Option<&Value>) -> Option<ToolOutcome> {
+    fn reply(&self, args: Option<&Value>, audit: &CallAudit<'_>) -> Option<ToolOutcome> {
         let Some(text) = args.and_then(|args| args["text"].as_str()) else {
             return refused("reply needs a \"text\" argument.");
         };
@@ -904,14 +952,17 @@ impl<'t> DelegateTools<'t> {
         let (me, requester) = (&self.from.user, &self.from.requester);
         let label = self.view.label();
         let content = reply_content(text, handed, &label);
-        if let Err(reason) = block_on(admit_reply(
+        let admitted = block_on(reply_verdict(
             port.as_ref(),
             self.sinks,
             &self.from.room,
             [me, requester],
             &label,
             &content,
-        )) {
+        ))
+        .map_err(|blocked| audit.blocked(blocked))
+        .and_then(|()| audit.admit("", self.from.room.as_str()));
+        if let Err(reason) = admitted {
             return self.refuse(
                 &self.from.id,
                 requester.as_str(),

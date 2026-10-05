@@ -24,6 +24,9 @@
 //! 2. [`GrantSource::verdict`] — **every call, never once per conversation**.
 //!    A grant revoked while a turn is in flight must stop the next call in
 //!    that turn, which is only true if the source is asked again here (FR-386).
+//!    An agent's host then classifies the call on that answer (AD-392,
+//!    [`AgentDrive`]): its tier goes into the row, and a call that needs a
+//!    person nobody can be asked, or is T5, is refused once the row exists.
 //! 3. `audit::append_intent` — **before the effect**, so a crash mid-write
 //!    leaves a row saying a write was starting. A row written afterwards
 //!    records only the calls that survived, which is the opposite of an audit.
@@ -45,6 +48,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use keeper_core::agents::tier::Classification;
 use keeper_core::bots::audit::{self, AuditIntent, AuditOutcome};
 use keeper_core::bots::chat::CancelSignal;
 use keeper_core::bots::context_files::{self, ContextBundle, LoadedContext};
@@ -116,10 +120,35 @@ pub trait TurnHost: Send + Sync {
         signal: CancelSignal,
     ) -> Box<dyn ToolHost>;
 
-    /// The same host, for an agent's turn: its writes never reach the
-    /// sessions zone, which the agent writes through its session tools only
-    /// (R51). A ⌘9 bot's host is never asked.
-    fn for_agent(self: Box<Self>) -> Box<dyn TurnHost>;
+    /// The host for an agent's turn: its writes never reach the sessions
+    /// zone, which the agent writes through its session tools only (R51),
+    /// and every call is classified before its audit row (93.4). A ⌘9 bot's
+    /// host is never built this way.
+    fn agent_host(
+        &self,
+        ids: HostIds,
+        profiles: Vec<SyncProfile>,
+        signal: CancelSignal,
+    ) -> Box<dyn AgentDrive>;
+}
+
+/// What an agent's host made of one drive call once its grant answered:
+/// the call's classification (AD-392), and the sentence refusing it when it
+/// does not run — a block, a person's approval nobody can give, or T5.
+pub struct Classified {
+    pub classification: Classification,
+    pub refusal: Option<String>,
+}
+
+/// An agent's drive host. `classify` is asked once per call, after the
+/// grant and before the audit row, which carries its tier (R90); a refusal
+/// closes that row `refused` and nothing runs.
+pub trait AgentDrive: Send + Sync {
+    fn run_classified(
+        &self,
+        call: &ToolCall,
+        classify: &dyn Fn(&GrantVerdict) -> Classified,
+    ) -> Result<ToolOutcome, BotsError>;
 }
 
 /// The drive port on a host with no drive.
@@ -136,8 +165,8 @@ impl TurnHost for NoDrive {
         Box::new(NoDrive)
     }
 
-    fn for_agent(self: Box<Self>) -> Box<dyn TurnHost> {
-        self
+    fn agent_host(&self, _: HostIds, _: Vec<SyncProfile>, _: CancelSignal) -> Box<dyn AgentDrive> {
+        Box::new(NoDrive)
     }
 }
 
@@ -152,13 +181,22 @@ impl ToolHost for NoDrive {
     }
 }
 
+impl AgentDrive for NoDrive {
+    fn run_classified(
+        &self,
+        call: &ToolCall,
+        _: &dyn Fn(&GrantVerdict) -> Classified,
+    ) -> Result<ToolOutcome, BotsError> {
+        self.run(call)
+    }
+}
+
 /// The drive port on a host with a drive: the vault writer and the approval
 /// port, held until the turn's task exists and the host can be built.
 pub struct DriveTurnHost {
     vault: Option<Arc<dyn VaultWriter>>,
     approval: Option<Arc<dyn ApprovalPort>>,
     grants: Arc<dyn GrantSource>,
-    sessions_closed: bool,
 }
 
 impl TurnHost for DriveTurnHost {
@@ -176,7 +214,30 @@ impl TurnHost for DriveTurnHost {
                 ids.bot_id.clone(),
             )
         });
-        Box::new(DriveToolHost {
+        Box::new(self.drive_host(ids, profiles, approve, false))
+    }
+
+    /// No approver: an agent's call needing a person is decided by its
+    /// classification, never by ⌘9's port.
+    fn agent_host(
+        &self,
+        ids: HostIds,
+        profiles: Vec<SyncProfile>,
+        _: CancelSignal,
+    ) -> Box<dyn AgentDrive> {
+        Box::new(self.drive_host(ids, profiles, None, true))
+    }
+}
+
+impl DriveTurnHost {
+    fn drive_host(
+        &self,
+        ids: HostIds,
+        profiles: Vec<SyncProfile>,
+        approve: Option<Arc<Approver>>,
+        sessions_closed: bool,
+    ) -> DriveToolHost {
+        DriveToolHost {
             data_dir: ids.data_dir,
             provider_id: ids.provider_id,
             bot_id: Some(ids.bot_id),
@@ -186,13 +247,8 @@ impl TurnHost for DriveTurnHost {
             vault: self.vault.clone(),
             approve,
             grants: Arc::clone(&self.grants),
-            sessions_closed: self.sessions_closed,
-        })
-    }
-
-    fn for_agent(mut self: Box<Self>) -> Box<dyn TurnHost> {
-        self.sessions_closed = true;
-        self
+            sessions_closed,
+        }
     }
 }
 
@@ -236,7 +292,6 @@ pub fn arm_drive(
             vault: ports.vault.clone(),
             approval: ports.approval.clone(),
             grants: source,
-            sessions_closed: false,
         }),
     }
 }
@@ -301,6 +356,30 @@ impl DriveToolHost {
 
 impl ToolHost for DriveToolHost {
     fn run(&self, call: &ToolCall) -> Result<ToolOutcome, BotsError> {
+        self.run_with(call, None)
+    }
+}
+
+impl AgentDrive for DriveToolHost {
+    fn run_classified(
+        &self,
+        call: &ToolCall,
+        classify: &dyn Fn(&GrantVerdict) -> Classified,
+    ) -> Result<ToolOutcome, BotsError> {
+        self.run_with(call, Some(classify))
+    }
+}
+
+impl DriveToolHost {
+    /// The one sequence both kinds of host run; `classify` is an agent's
+    /// (step 2½), `None` for a ⌘9 bot, whose rows and behaviour it leaves
+    /// as they were.
+    fn run_with(
+        &self,
+        call: &ToolCall,
+        classify: Option<&dyn Fn(&GrantVerdict) -> Classified>,
+    ) -> Result<ToolOutcome, BotsError> {
+        let effect = call.name.effect();
         let Some(profile) = self.profile(&call.target.profile_id) else {
             // Named rather than silently empty: a model that asked about a
             // folder keeper does not hold should be told so, and told what it
@@ -311,78 +390,61 @@ impl ToolHost for DriveToolHost {
                 .map(|profile| profile.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Ok(ToolOutcome::Refused {
-                reason: format!(
-                    "keeper holds no sync folder called \"{}\". The folders it holds are: {known}.",
-                    call.target.profile_id
-                ),
-            });
+            let reason = format!(
+                "keeper holds no sync folder called \"{}\". The folders it holds are: {known}.",
+                call.target.profile_id
+            );
+            self.unanswered(call, classify, &reason, AuditOutcome::Refused)?;
+            return Ok(ToolOutcome::Refused { reason });
         };
 
-        let effect = call.name.effect();
         // Step 2 — every call, never once per conversation (FR-386).
-        let verdict =
-            self.grants
-                .verdict(&call.target, effect)
-                .map_err(|error| BotsError::Tool {
-                    detail: error.to_string(),
-                })?;
+        let verdict = match self.grants.verdict(&call.target, effect) {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                let detail = error.to_string();
+                self.unanswered(call, classify, &detail, AuditOutcome::Failed)?;
+                return Err(BotsError::Tool { detail });
+            }
+        };
+
+        // Step 2½ — an agent's call is classified on the grant's answer, so
+        // its row carries the tier (R90).
+        let classified = classify.map(|classify| classify(&verdict));
 
         // Step 3 — before the effect (NFR-47). A row that cannot be written is
         // a refusal and never a silent proceed: an unauditable effect is one
         // this app does not perform.
-        let started_ms = now_ms();
-        let audit_id = audit::append_intent(
-            &self.data_dir,
-            &AuditIntent {
-                started_ms,
-                provider_id: &self.provider_id,
-                bot_id: self.bot_id.as_deref(),
-                session_id: &self.session_id,
-                message_id: self.message_id.as_deref(),
-                tool: call.name.as_wire(),
-                target: &call.target,
-                effect,
-                verdict: &verdict,
-            },
-        )
-        .map_err(|error| BotsError::Tool {
-            detail: format!("keeper could not record this tool call, so it did not run: {error}"),
-        })?;
-
+        let audit_id = self.intent(
+            call,
+            &verdict,
+            classified.as_ref().map(|c| &c.classification),
+        )?;
         let close = |outcome: AuditOutcome, bytes: Option<i64>, truncated: bool| {
-            if let Err(error) = audit::complete(
-                &self.data_dir,
-                audit_id,
-                outcome,
-                bytes,
-                truncated,
-                now_ms(),
-            ) {
-                tracing::warn!(%error, "bots: could not close a tool-call audit row");
-            }
+            self.close(audit_id, outcome, bytes, truncated);
         };
 
-        match &verdict {
-            GrantVerdict::Allow { .. } => {}
-            GrantVerdict::Ask { reason, .. } => {
-                // No one to ask is not a "no": the model is told there was
-                // nobody here, while a person's no keeps the grant's sentence.
-                let refusal = match &self.approve {
-                    None => Some(UNATTENDED_REFUSAL.to_owned()),
-                    Some(approve) if !approve(call, reason) => Some((*reason).to_owned()),
-                    Some(_) => None,
-                };
-                if let Some(reason) = refusal {
-                    close(AuditOutcome::Refused, None, false);
-                    return Err(BotsError::GrantDenied { reason });
-                }
-            }
-            GrantVerdict::Deny { reason } => {
+        if let GrantVerdict::Deny { reason } = &verdict {
+            close(AuditOutcome::Refused, None, false);
+            return Err(BotsError::GrantDenied {
+                reason: reason.clone(),
+            });
+        }
+        if let Some(reason) = classified.and_then(|classified| classified.refusal) {
+            close(AuditOutcome::Refused, None, false);
+            return Err(BotsError::GrantDenied { reason });
+        }
+        if let GrantVerdict::Ask { reason, .. } = &verdict {
+            // No one to ask is not a "no": the model is told there was
+            // nobody here, while a person's no keeps the grant's sentence.
+            let refusal = match &self.approve {
+                None => Some(UNATTENDED_REFUSAL.to_owned()),
+                Some(approve) if !approve(call, reason) => Some((*reason).to_owned()),
+                Some(_) => None,
+            };
+            if let Some(reason) = refusal {
                 close(AuditOutcome::Refused, None, false);
-                return Err(BotsError::GrantDenied {
-                    reason: reason.clone(),
-                });
+                return Err(BotsError::GrantDenied { reason });
             }
         }
 
@@ -412,6 +474,64 @@ impl ToolHost for DriveToolHost {
             Err(_) => close(AuditOutcome::Failed, None, false),
         }
         outcome
+    }
+
+    /// The audit row of `call` before any effect (NFR-47): its grant's
+    /// `verdict`, and an agent's `classification`.
+    fn intent(
+        &self,
+        call: &ToolCall,
+        verdict: &GrantVerdict,
+        classification: Option<&Classification>,
+    ) -> Result<i64, BotsError> {
+        audit::append_intent(
+            &self.data_dir,
+            &AuditIntent {
+                started_ms: now_ms(),
+                provider_id: &self.provider_id,
+                bot_id: self.bot_id.as_deref(),
+                session_id: &self.session_id,
+                message_id: self.message_id.as_deref(),
+                tool: call.name.as_wire(),
+                target: &call.target,
+                effect: call.name.effect(),
+                verdict,
+                classified: classification,
+            },
+        )
+        .map_err(|error| BotsError::Tool {
+            detail: format!("keeper could not record this tool call, so it did not run: {error}"),
+        })
+    }
+
+    fn close(&self, row: i64, outcome: AuditOutcome, bytes: Option<i64>, truncated: bool) {
+        if let Err(error) =
+            audit::complete(&self.data_dir, row, outcome, bytes, truncated, now_ms())
+        {
+            tracing::warn!(%error, "bots: could not close a tool-call audit row");
+        }
+    }
+
+    /// An agent's call that ends before its grant answers still has its one
+    /// row (R90): `Deny` with `reason`, classified on that, closed
+    /// `outcome`. A ⌘9 bot's (`classify` is `None`) has none, as before.
+    fn unanswered(
+        &self,
+        call: &ToolCall,
+        classify: Option<&dyn Fn(&GrantVerdict) -> Classified>,
+        reason: &str,
+        outcome: AuditOutcome,
+    ) -> Result<(), BotsError> {
+        let Some(classify) = classify else {
+            return Ok(());
+        };
+        let verdict = GrantVerdict::Deny {
+            reason: reason.to_owned(),
+        };
+        let classified = classify(&verdict);
+        let row = self.intent(call, &verdict, Some(&classified.classification))?;
+        self.close(row, outcome, None, false);
+        Ok(())
     }
 }
 

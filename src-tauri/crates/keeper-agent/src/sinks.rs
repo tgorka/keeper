@@ -4,7 +4,8 @@
 //! asks `check_sink` before it acts; a block sends and writes nothing, and
 //! leaves an audit row naming the sink (R65) — beside the `tool_result`
 //! line a tool call's reporter writes `refused`; a send of the host's own
-//! has the row alone.
+//! has the row alone. An agent's tool call has exactly one row however it
+//! ends, its tier in it (R90): its block is that row ([`CallAudit`]).
 //!
 //! A room is checked as it is at the send (R160, R168): its joined and
 //! invited members, a known agent through its own audience and anyone else
@@ -28,8 +29,10 @@ use keeper_core::agents::matrix::{AgentClient, AgentMatrixError};
 use keeper_core::agents::room::room_members;
 use keeper_core::agents::seed::main_session_id;
 use keeper_core::agents::session::parse_session_agent_toml;
+use keeper_core::agents::tier::Classification;
 use keeper_core::bots::audit::{self, AuditIntent, AuditOutcome};
 use keeper_core::bots::grant::{Effect, GrantVerdict, ToolTarget};
+use keeper_core::bots::tools::ToolOutcome;
 use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, UserId};
 use serde_json::Value;
 
@@ -139,17 +142,33 @@ impl RoomGate {
     /// the label now, with its audit row and declassification on a block;
     /// an unreadable room is refused and audited too.
     pub async fn admit(&self, tool: &str, effect: &[u8]) -> Result<(), String> {
+        self.verdict(tool, effect).await.map_err(|blocked| {
+            if let Some((sinks, _)) = &self.audit {
+                sinks.refused(tool, &blocked.drive, &blocked.at, &blocked.sentence);
+            }
+            blocked.sentence
+        })
+    }
+
+    /// [`RoomGate::admit`] without its row: the block, its declassification
+    /// computed, for the classified row of the call that made it (R90).
+    pub async fn verdict(&self, tool: &str, effect: &[u8]) -> Result<(), Blocked> {
         let label = self.label();
         let Some((sinks, room)) = &self.audit else {
-            return self.check(&label).await;
+            return self.check(&label).await.map_err(|sentence| Blocked {
+                drive: String::new(),
+                at: String::new(),
+                sentence,
+            });
         };
         let destination = Destination::Room { room: room.clone() };
         match self.audience().await {
-            Ok(sink) => sinks.check(tool, &destination, &label, &sink, effect, None),
-            Err(unread) => {
-                sinks.refused(tool, "", room.as_str(), &unread);
-                Err(unread)
-            }
+            Ok(sink) => sinks.verdict(tool, &destination, &label, &sink, effect, None),
+            Err(unread) => Err(Blocked {
+                drive: String::new(),
+                at: room.to_string(),
+                sentence: unread,
+            }),
         }
     }
 
@@ -194,6 +213,18 @@ impl RoomGate {
             .unwrap_or_else(|| MEMBERS_UNREAD.to_owned());
         sinks.refused(tool, "", room.as_str(), &reason);
     }
+}
+
+/// A flow refused at a sink, its declassification computed and logged:
+/// where it would have gone and the sentence said instead. Whoever made the
+/// flow audits it — a send of the host's own as its R65 row
+/// ([`Sinks::refused`]), an agent's call in its one classified row
+/// ([`CallAudit::blocked`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blocked {
+    pub drive: String,
+    pub at: String,
+    pub sentence: String,
 }
 
 /// One session's sinks: the ids its audit rows name, and what the host
@@ -241,6 +272,7 @@ impl Sinks {
                 target: &target,
                 effect: Effect::Write,
                 verdict: &verdict,
+                classified: None,
             },
         )
         .and_then(|id| {
@@ -258,6 +290,63 @@ impl Sinks {
         }
     }
 
+    /// The audit row of an agent's call no grant answers (R90), written
+    /// before any effect: `Allow` under `agent:<tool>`, or `Deny` with
+    /// `refusal`, closed `refused` at once; either carries the call's
+    /// tier. `Err` is the sentence the call is refused with when the row
+    /// cannot be written: an unauditable effect is not performed (NFR-47).
+    fn classified(
+        &self,
+        tool: &str,
+        drive: &str,
+        at: &str,
+        effect: Effect,
+        classification: &Classification,
+        refusal: Option<&str>,
+    ) -> Result<i64, String> {
+        let verdict = match refusal {
+            Some(reason) => GrantVerdict::Deny {
+                reason: reason.to_owned(),
+            },
+            None => GrantVerdict::Allow {
+                grant_id: format!("agent:{tool}"),
+            },
+        };
+        let target = ToolTarget {
+            profile_id: drive.to_owned(),
+            subpath: at.to_owned(),
+        };
+        let row = audit::append_intent(
+            &self.data_dir,
+            &AuditIntent {
+                started_ms: now_ms(),
+                provider_id: &self.provider_id,
+                bot_id: Some(&self.bot_id),
+                session_id: &self.session_id,
+                message_id: None,
+                tool,
+                target: &target,
+                effect,
+                verdict: &verdict,
+                classified: Some(classification),
+            },
+        )
+        .map_err(|error| {
+            format!("keeper could not record this tool call, so it did not run: {error}")
+        })?;
+        if refusal.is_some() {
+            self.close(row, AuditOutcome::Refused);
+        }
+        Ok(row)
+    }
+
+    /// Close a row [`Sinks::classified`] opened with what became of the call.
+    fn close(&self, row: i64, outcome: AuditOutcome) {
+        if let Err(error) = audit::complete(&self.data_dir, row, outcome, None, false, now_ms()) {
+            tracing::warn!(%error, "agents: a tool call's audit row could not be closed");
+        }
+    }
+
     /// Whether the effect whose canonical bytes are `effect` (the file
     /// `artifact`, when it is one), labelled `label`, may go to `sink` for
     /// `tool` at `destination`. A block writes the audit row, computes the
@@ -272,16 +361,16 @@ impl Sinks {
         effect: &[u8],
         artifact: Option<&str>,
     ) -> Result<(), String> {
-        let SinkVerdict::Block { reason, .. } = check_sink(label, sink) else {
-            return Ok(());
-        };
-        self.block(tool, destination, label, sink, effect, artifact, &reason)
+        self.verdict(tool, destination, label, sink, effect, artifact)
+            .map_err(|blocked| {
+                self.refused(tool, &blocked.drive, &blocked.at, &blocked.sentence);
+                blocked.sentence
+            })
     }
 
-    /// A flow to `destination` already found beyond `label` for `reason`:
-    /// its audit row and declassification, and the sentence said instead.
-    #[allow(clippy::too_many_arguments)]
-    pub fn block(
+    /// [`Sinks::check`] without its row: an agent's call audits its block in
+    /// its own classified row ([`CallAudit::blocked`]).
+    pub fn verdict(
         &self,
         tool: &str,
         destination: &Destination,
@@ -289,8 +378,10 @@ impl Sinks {
         sink: &Sink,
         effect: &[u8],
         artifact: Option<&str>,
-        reason: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), Blocked> {
+        let SinkVerdict::Block { reason, .. } = check_sink(label, sink) else {
+            return Ok(());
+        };
         let sentence = format!("{reason} {NEEDS_APPROVAL}");
         let request = declassify_request(effect, artifact, destination, sink, label, &|person| {
             self.proxy_dm(person)
@@ -305,8 +396,11 @@ impl Sinks {
             "agents: a flow beyond the label was refused; letting it through needs an approval"
         );
         let (drive, at) = destination.target();
-        self.refused(tool, drive, at, &sentence);
-        Err(sentence)
+        Err(Blocked {
+            drive: drive.to_owned(),
+            at: at.to_owned(),
+            sentence,
+        })
     }
 
     /// `person`'s proxy DM, by this host's own lookup: through the proxy
@@ -326,6 +420,150 @@ impl Sinks {
                     && agent.human.as_deref() == Some(person)
             })
             .find_map(|proxy| main_dm(&self.zone, &proxy.drive, &proxy.id))
+    }
+}
+
+/// What an audit row closes with for `outcome`.
+pub fn audit_outcome(outcome: &ToolOutcome) -> AuditOutcome {
+    match outcome {
+        ToolOutcome::Refused { .. } => AuditOutcome::Refused,
+        _ => AuditOutcome::Ok,
+    }
+}
+
+/// Where a [`CallAudit`]'s row is.
+#[derive(Debug, Clone, Copy)]
+enum CallRow {
+    Unwritten,
+    Open(i64),
+    Closed,
+}
+
+/// One classified agent call's audit row (R90): exactly one, whichever
+/// way the call ends. A sink that blocks it writes the row with the
+/// block's sentence and destination ([`CallAudit::blocked`]); a call whose
+/// sinks passed is admitted, its row written before any effect with what
+/// the integrity rule and the tier answer then (R82, [`CallAudit::admit`]);
+/// a call that ends before either has its row written as it ends
+/// ([`CallAudit::finish`]) — it had no effect.
+pub struct CallAudit<'s> {
+    sinks: &'s Sinks,
+    tool: &'s str,
+    effect: Effect,
+    classification: &'s Classification,
+    /// What the call answers once its sinks have passed: an integrity
+    /// block, T5, an approval nobody can give; `None` runs it.
+    refusal: Option<String>,
+    /// Where the row says the call went until the call names it.
+    drive: String,
+    at: String,
+    row: Mutex<CallRow>,
+}
+
+impl<'s> CallAudit<'s> {
+    pub fn new(
+        sinks: &'s Sinks,
+        tool: &'s str,
+        effect: Effect,
+        classification: &'s Classification,
+        refusal: Option<String>,
+        (drive, at): (&str, &str),
+    ) -> CallAudit<'s> {
+        CallAudit {
+            sinks,
+            tool,
+            effect,
+            classification,
+            refusal,
+            drive: drive.to_owned(),
+            at: at.to_owned(),
+            row: Mutex::new(CallRow::Unwritten),
+        }
+    }
+
+    fn row(&self) -> std::sync::MutexGuard<'_, CallRow> {
+        self.row.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A sink blocked the call: its row, `Deny` with the block's sentence
+    /// at the block's destination, and the sentence the call says.
+    pub fn blocked(&self, blocked: Blocked) -> String {
+        let mut row = self.row();
+        if matches!(*row, CallRow::Unwritten) {
+            if let Err(error) = self.sinks.classified(
+                self.tool,
+                &blocked.drive,
+                &blocked.at,
+                self.effect,
+                self.classification,
+                Some(&blocked.sentence),
+            ) {
+                tracing::warn!(%error, tool = self.tool, "agents: a blocked call's audit row could not be written");
+            }
+            *row = CallRow::Closed;
+        }
+        blocked.sentence
+    }
+
+    /// The call's sinks passed for the effect at `drive` and `at`: its row,
+    /// before the effect. `Err` is what the call says instead — the
+    /// integrity rule's or the tier's sentence, or a row that could not be
+    /// written.
+    pub fn admit(&self, drive: &str, at: &str) -> Result<(), String> {
+        let mut row = self.row();
+        let written = self.sinks.classified(
+            self.tool,
+            drive,
+            at,
+            self.effect,
+            self.classification,
+            self.refusal.as_deref(),
+        );
+        *row = CallRow::Closed;
+        let id = written?;
+        if let Some(sentence) = &self.refusal {
+            return Err(sentence.clone());
+        }
+        *row = CallRow::Open(id);
+        Ok(())
+    }
+
+    /// The call ended with `outcome`: its admitted row closed with it, or —
+    /// a call that ended before its sinks were asked — its row written now.
+    pub fn finish(&self, outcome: &ToolOutcome) {
+        let mut row = self.row();
+        match *row {
+            CallRow::Open(id) => self.sinks.close(id, audit_outcome(outcome)),
+            CallRow::Closed => {}
+            CallRow::Unwritten => {
+                let refusal = match outcome {
+                    ToolOutcome::Refused { reason } => Some(reason.as_str()),
+                    _ => None,
+                };
+                match self.sinks.classified(
+                    self.tool,
+                    &self.drive,
+                    &self.at,
+                    self.effect,
+                    self.classification,
+                    refusal,
+                ) {
+                    Ok(id) if refusal.is_none() => self.sinks.close(id, audit_outcome(outcome)),
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, tool = self.tool, "agents: a call's audit row could not be written");
+                    }
+                }
+            }
+        }
+        *row = CallRow::Closed;
+    }
+
+    /// Refuse the call with `reason` before its sinks were asked.
+    pub fn refuse(&self, reason: String) -> ToolOutcome {
+        let outcome = ToolOutcome::Refused { reason };
+        self.finish(&outcome);
+        outcome
     }
 }
 

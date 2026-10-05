@@ -50,7 +50,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::delegate::{Delegator, TurnView};
-use crate::host::UNATTENDED_REFUSAL;
 use crate::sessions::exec::{self, ExecError};
 use crate::sessions::lock::ZoneLock;
 use crate::sessions::verbs::VerbError;
@@ -60,9 +59,6 @@ use crate::sessions::write::{landing, session_write_with, NO_CLAIM};
 pub const CARD_UPDATE: &str = "card_update";
 /// The tool that writes a file of the agent's own session.
 pub const SESSION_WRITE: &str = "session_write";
-/// Both tools' tier: a write into the agent's own session, undone by a
-/// person's edit (AD-392).
-pub const TIER: u8 = 1;
 
 /// What refuses `run` and `last_run`.
 pub const HOST_WRITES: &str = "is written by the host that runs the card, never by a tool.";
@@ -699,7 +695,6 @@ fn checked_fields(fields: &Map<String, Value>) -> Result<Vec<(&str, FieldValue)>
             .ok_or_else(|| format!("{key} is a non-empty string."))
     };
     let mut out = Vec::new();
-    let mut needs_person = false;
     for (key, value) in fields {
         let set = match key.as_str() {
             "status" => {
@@ -728,12 +723,10 @@ fn checked_fields(fields: &Map<String, Value>) -> Result<Vec<(&str, FieldValue)>
             card::SCHEDULE => {
                 let schedule = text(key, value)?;
                 TaskSchedule::parse(&schedule).map_err(|refusal| refusal.to_string())?;
-                needs_person = true;
                 FieldValue::Str(schedule)
             }
             card::WORKFLOW => {
                 text(key, value)?;
-                needs_person = true;
                 continue;
             }
             card::RUN | card::LAST_RUN => return Err(format!("{key} {HOST_WRITES}")),
@@ -751,10 +744,6 @@ fn checked_fields(fields: &Map<String, Value>) -> Result<Vec<(&str, FieldValue)>
             }
         };
         out.push((key.as_str(), set));
-    }
-    // A schedule or a workflow is a person's to give (Q16, T3).
-    if needs_person {
-        return Err(UNATTENDED_REFUSAL.to_owned());
     }
     Ok(out)
 }
@@ -781,6 +770,16 @@ impl CardTools<'_> {
         }
         match wire.name.as_str() {
             CARD_UPDATE => {
+                // The card it names is the file it changes and the file its
+                // audit row names: no other key may name another.
+                if let Some(other) = args.and_then(Value::as_object).and_then(|keys| {
+                    keys.keys()
+                        .find(|key| !["card", "fields"].contains(&key.as_str()))
+                }) {
+                    return refused(format!(
+                        "card_update takes \"card\" and \"fields\"; {other} is neither."
+                    ));
+                }
                 let (Some(rel), Some(fields)) = (
                     text("card"),
                     args.and_then(|args| args["fields"].as_object()),
@@ -1049,8 +1048,9 @@ mod tests {
         );
     }
 
-    /// AC5: a schedule is checked where it is written, and a readable one —
-    /// or any workflow — needs a person, so before Epic 93 nothing is written.
+    /// AC5: a schedule is checked where it is written; one that does not
+    /// read writes nothing. Whether a readable one may be set at all is its
+    /// tier's (T3, AD-392), decided before this tool runs.
     #[test]
     fn the_schedule_is_checked_where_it_is_written() {
         let zone = zone();
@@ -1065,8 +1065,6 @@ mod tests {
         };
         assert!(update(json!({"schedule": "every 30s"})).contains("more often than once a minute"));
         assert!(update(json!({"schedule": "0 0 30 2 *"})).contains("matches no instant"));
-        assert_eq!(update(json!({"schedule": "@daily"})), UNATTENDED_REFUSAL);
-        assert_eq!(update(json!({"workflow": "triage"})), UNATTENDED_REFUSAL);
         assert_eq!(card_text(zone.path()), CARD);
     }
 

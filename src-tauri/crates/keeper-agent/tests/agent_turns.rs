@@ -3114,6 +3114,20 @@ async fn a_reply_closes_the_exchange() {
         reply["dev.keeper.agent.artifacts"],
         json!([{"drive": "tgdrive", "path": artifact}])
     );
+    // The reply's one row names the room it went into (R90).
+    let replies: Vec<_> = audit_list(&world, &tolas_session)
+        .into_iter()
+        .filter(|row| row.tool == "reply")
+        .collect();
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert_eq!(
+        replies[0].subpath,
+        tolas_session.context.agent.room.as_str()
+    );
+    assert_eq!(
+        replies[0].outcome,
+        keeper_core::bots::audit::AuditOutcome::Ok
+    );
     assert_eq!(card_field(&world, &path, "run").as_deref(), Some("review"));
     let childs = world.lines(&path);
     assert_eq!(delegate_lines(&childs)[0].state, DelegateState::Accepted);
@@ -3861,6 +3875,27 @@ async fn a_round_or_a_reply_the_label_no_longer_lets_in_is_refused() {
     assert_eq!(reply.outcome, ToolOutcomeWord::Refused);
     assert!(reply.content.contains(MARTA), "{}", reply.content);
     assert_eq!(tolas_session.context.exchange_rounds, 1);
+    // R90: each blocked call is one classified row, never a sink row
+    // beside it; the reply's names the room it was bound for.
+    let delegates: Vec<_> = audit_list(&world, &nixi)
+        .into_iter()
+        .filter(|row| row.tool == "delegate")
+        .collect();
+    assert_eq!(delegates.len(), 2, "{delegates:?}");
+    assert!(delegates.iter().all(|row| row.tier == Some(1)));
+    assert_eq!(
+        delegates[1].outcome,
+        keeper_core::bots::audit::AuditOutcome::Refused
+    );
+    let replies: Vec<_> = audit_list(&world, &tolas_session)
+        .into_iter()
+        .filter(|row| row.tool == "reply")
+        .collect();
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert_eq!(
+        (replies[0].tier, replies[0].subpath.as_str()),
+        (Some(1), child.as_str())
+    );
 }
 
 /// R94 at the delegating side: a reply's label is joined into the session
@@ -4740,20 +4775,39 @@ async fn a_harvest_another_host_began_is_never_run_again_here() {
 
 const CARD: &str = "---\ntags: [task]\ntitle: Inbox\nstatus: todo\n---\n\nSort the inbox.\n";
 
-/// The audit rows of `served`'s session, by tool.
-fn audit_rows(
-    world: &World,
-    served: &ServedSession,
-) -> BTreeMap<String, keeper_core::bots::audit::AuditRow> {
-    keeper_core::bots::audit::list_audit(
+/// The audit rows of `served`'s session, oldest first.
+fn audit_list(world: &World, served: &ServedSession) -> Vec<keeper_core::bots::audit::AuditRow> {
+    let mut rows = keeper_core::bots::audit::list_audit(
         &world.deps.data_dir,
         Some(&served.context.agent.id.to_string()),
         None,
     )
-    .expect("audit")
-    .into_iter()
-    .map(|row| (row.tool.clone(), row))
-    .collect()
+    .expect("audit");
+    rows.reverse();
+    rows
+}
+
+/// The audit rows of `served`'s session by tool, the newest of each. A
+/// tool any classified row names has exactly one row: a call has one
+/// however it ended (R90), never a sink's own row beside it. A send of the
+/// host's (no tier) has one per refusal (R65), so may repeat.
+fn audit_rows(
+    world: &World,
+    served: &ServedSession,
+) -> BTreeMap<String, keeper_core::bots::audit::AuditRow> {
+    let rows = audit_list(world, served);
+    let mut by_tool = BTreeMap::new();
+    for row in rows {
+        let classified = row.tier.is_some();
+        if let Some(earlier) = by_tool.insert(row.tool.clone(), row) {
+            assert!(
+                !classified && earlier.tier.is_none(),
+                "two audit rows for {}: {earlier:?}",
+                earlier.tool
+            );
+        }
+    }
+    by_tool
 }
 
 /// Nixi as tgorka's proxy, Dr Tola Grey and Dr Lucyna Novak.
@@ -5104,6 +5158,16 @@ fn a_read_narrows_every_send_of_its_turn() -> Scenario {
             assert_eq!(row.outcome, AuditOutcome::Refused, "{tool}");
             assert_eq!(row.effect, Some(Effect::Write), "{tool}");
         }
+        // An agent's call: its one row carries its tier (R90).
+        for tool in [
+            "drive_write",
+            "drive_edit",
+            "session_write",
+            "card_update",
+            "delegate",
+        ] {
+            assert!(rows[tool].tier.is_some(), "{tool}");
+        }
         assert_eq!(rows["delegate"].profile_id, "neuradrive");
         assert_eq!(rows["delegate"].subpath, LUCYNA);
         assert_eq!(rows["drive_edit"].profile_id, "tgdrive");
@@ -5377,6 +5441,11 @@ fn a_surface_request_into_a_wider_room_is_refused() -> Scenario {
         assert_eq!(
             rows["surface_highlight"].verdict,
             Some(keeper_core::bots::audit::AuditVerdict::Deny)
+        );
+        assert_eq!(
+            rows["surface_highlight"].tier,
+            Some(1),
+            "one classified row (R90)"
         );
     })
 }
@@ -5826,10 +5895,29 @@ async fn the_same_sinks_pass_when_the_audience_fits() {
     assert_eq!(made.len(), 1);
     assert!(made[0].1.contains(&user(MARTA)));
     assert_eq!(final_edit(&world.room), "done.");
+    // R90: every call that passed has its row, allowed under the agent's
+    // own word for the tool, with its tier; the answer is no call.
     let rows = audit_rows(&world, &served);
-    for tool in ["session_write", "delegate", "answer"] {
-        assert!(!rows.contains_key(tool), "{tool}");
+    for tool in ["session_write", "delegate"] {
+        let row = &rows[tool];
+        assert_eq!(
+            row.verdict,
+            Some(keeper_core::bots::audit::AuditVerdict::Allow),
+            "{tool}"
+        );
+        assert_eq!(
+            row.grant_id.as_deref(),
+            Some(format!("agent:{tool}").as_str())
+        );
+        assert_eq!((row.tier, row.base_tier), (Some(1), Some(1)), "{tool}");
+        assert_eq!(
+            row.outcome,
+            keeper_core::bots::audit::AuditOutcome::Ok,
+            "{tool}"
+        );
     }
+    assert_eq!(rows["drive_write"].tier, Some(2));
+    assert!(!rows.contains_key("answer"));
 }
 
 /// 92.6 acceptance 4 through a turn: after an inbox read the session is
@@ -5958,4 +6046,644 @@ async fn a_main_sessions_integrity_resets_at_the_persons_turn() {
     );
     report(world.ask(&mut conversation, "thanks").await);
     assert_eq!(conversation.context.label.integrity, Integrity::Untrusted);
+}
+
+// ---------------------------------------------------------------------------
+// 93.1 and 93.4: every call has a tier, one stricter when nobody watches
+// ---------------------------------------------------------------------------
+
+const ELSEWHERE: &str = "active/2026-10-05-elsewhere";
+
+/// A session of Nixi's of `kind` at `path`, `hop` deep, its label at
+/// `integrity`.
+fn session_kind(world: &World, path: &str, kind: SessionKind, hop: u8, integrity: Integrity) {
+    let tg_decl = world.deps.drives["tgdrive"].clone();
+    let mut agent = session_of(
+        &world.tgdrive,
+        path,
+        &tg_decl,
+        "nixi",
+        kind,
+        "!elsewhere:example.org",
+    );
+    agent.hop = hop;
+    agent.label.integrity = integrity;
+    write(
+        &world.tgdrive,
+        &format!("60-sessions/{path}/agent.toml"),
+        &compose_session_agent_toml(&agent),
+    );
+}
+
+/// One turn in the session of `kind` at `path`: tgorka's message where he
+/// talks with Nixi, else the session card's scheduled window.
+async fn one_turn(world: &mut World, path: &str, kind: SessionKind) -> ServedSession {
+    use keeper_agent::agent::scheduled_arrival;
+    use keeper_agent::cards::Scheduled;
+    if kind == SessionKind::Scheduled {
+        write(
+            &world.tgdrive,
+            &format!("60-sessions/{path}/card.md"),
+            "---\ntags: [task]\ntitle: Notes\nstatus: todo\nassignee: nixi\nschedule: \"@hourly\"\nlast_run: \"2026-10-05T08:00:00Z\"\n---\n\nDo it.\n",
+        );
+    }
+    let mut served = world.open(path);
+    let arrived = if kind == SessionKind::Scheduled {
+        scheduled_arrival(
+            &user(NIXI),
+            &Scheduled::Run {
+                card: "card.md".to_owned(),
+                window: "2026-10-05T09:00:00.000Z".to_owned(),
+                now_ms: chrono::DateTime::parse_from_rfc3339("2026-10-05T09:30:00Z")
+                    .expect("an instant")
+                    .timestamp_millis(),
+                utc_offset_minutes: 0,
+            },
+        )
+        .expect("an arrival")
+    } else {
+        world.arrived(TGORKA, "do it")
+    };
+    report(world.serve(&mut served, arrived).await);
+    served
+}
+
+/// The `tool_call` line's tier of call `id`.
+fn line_tier(lines: &[LogLine], id: &str) -> u8 {
+    kinds(lines, LineKind::ToolCall)
+        .into_iter()
+        .find_map(|line| match &line.body {
+            LineBody::ToolCall(body) if body.call_id == id => Some(body.tier),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a tool_call line for {id}"))
+}
+
+/// 93.4 acceptance 1 and 2: one `drive_write` outside the session, in four
+/// sessions. In Nixi's DM, at a turn tgorka started, it is T2 with no
+/// reason; handed on it is T3 `[delegated]`; in a scheduled run T3
+/// `[unattended]`; in a session that is all three T3 once, with all three
+/// reasons. Each is refused — nobody can approve yet — the file is never
+/// written, and the audit row and the `tool_call` line say the tier.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_write_is_stricter_when_nobody_watches() {
+    use keeper_core::agents::label::NEEDS_APPROVAL;
+    let script = || {
+        vec![
+            calls(&[(
+                "w1",
+                "drive_write",
+                json!({"profile":"tgdrive","path":"notes/out.md","content":"must not land"}),
+            )]),
+            prose("It needs a person."),
+        ]
+    };
+    for (kind, hop, integrity, tier, raised, refusal) in [
+        (
+            SessionKind::Main,
+            0,
+            Integrity::Owner,
+            2,
+            None,
+            UNATTENDED_REFUSAL,
+        ),
+        // Handed on: a hop of 1 in the person's own conversation.
+        (
+            SessionKind::Conversation,
+            1,
+            Integrity::Agent,
+            3,
+            Some("delegated"),
+            UNATTENDED_REFUSAL,
+        ),
+        (
+            SessionKind::Scheduled,
+            0,
+            Integrity::Agent,
+            3,
+            Some("unattended"),
+            UNATTENDED_REFUSAL,
+        ),
+        // A scheduled session's kind is not delegated, but its hop is.
+        (
+            SessionKind::Scheduled,
+            1,
+            Integrity::Untrusted,
+            3,
+            Some("delegated,unattended,untrusted"),
+            NEEDS_APPROVAL,
+        ),
+    ] {
+        let mut world = world(
+            ProviderKind::OpenAi,
+            &["drive_read", "drive_write"],
+            script(),
+        );
+        let path = if kind == SessionKind::Main {
+            nixis_dm(&world);
+            DM
+        } else {
+            session_kind(&world, ELSEWHERE, kind, hop, integrity);
+            ELSEWHERE
+        };
+        let served = one_turn(&mut world, path, kind).await;
+        assert!(!world.tgdrive.join("notes/out.md").exists(), "{kind:?}");
+        let lines = world.lines(path);
+        let result = result_of(&tool_results(&lines), "w1").clone();
+        assert_eq!(result.content, format!("Refused: {refusal}"), "{kind:?}");
+        assert_eq!(line_tier(&lines, "w1"), tier, "{kind:?}");
+        let row = &audit_rows(&world, &served)["drive_write"];
+        assert_eq!(
+            (row.tier, row.base_tier, row.raised_by.as_deref()),
+            (Some(tier), Some(2), raised),
+            "{kind:?}"
+        );
+        assert_eq!(row.outcome, keeper_core::bots::audit::AuditOutcome::Refused);
+    }
+}
+
+/// 93.4 acceptance 6: in a scheduled run a write to the agent's own
+/// machine file is T5 and never done; the model is told why, for the
+/// person, and the row says T5.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forbidden_action_is_never_done() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "drive_write"],
+        vec![
+            calls(&[(
+                "w1",
+                "drive_write",
+                json!({"profile":"tgdrive","path":"80-agents/nixi/agent.toml","content":"version = 1\n"}),
+            )]),
+            prose("I may not."),
+        ],
+    );
+    let before = std::fs::read_to_string(world.tgdrive.join("80-agents/nixi/agent.toml"))
+        .expect("agent.toml");
+    session_kind(
+        &world,
+        ELSEWHERE,
+        SessionKind::Scheduled,
+        0,
+        Integrity::Agent,
+    );
+    let served = one_turn(&mut world, ELSEWHERE, SessionKind::Scheduled).await;
+    assert_eq!(
+        std::fs::read_to_string(world.tgdrive.join("80-agents/nixi/agent.toml"))
+            .expect("agent.toml"),
+        before
+    );
+    let lines = world.lines(ELSEWHERE);
+    let result = result_of(&tool_results(&lines), "w1").clone();
+    assert_eq!(
+        result.content,
+        format!("Refused: {}", keeper_core::agents::tier::FORBIDDEN)
+    );
+    assert_eq!(line_tier(&lines, "w1"), 5);
+    let second = world.stub.requests()[1].to_string();
+    assert!(
+        second.contains("keeper never lets an agent do this"),
+        "{second}"
+    );
+    let row = &audit_rows(&world, &served)["drive_write"];
+    assert_eq!(
+        (row.tier, row.base_tier, row.raised_by.as_deref()),
+        (Some(5), Some(5), Some("unattended"))
+    );
+}
+
+/// 93.4 acceptance 1 (R171) and 3: T0 and T1 calls run in a session that
+/// is delegated, unattended and untrusted at once — not raised, their row
+/// naming the reasons that held — each audited before it ran; and when
+/// the audit row cannot be written, the call is refused and nothing runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_classification_is_audited_before_the_effect() {
+    let script = || {
+        vec![
+            calls(&[
+                (
+                    "r1",
+                    "drive_read",
+                    json!({"profile":"tgdrive","path":"notes/hello.md"}),
+                ),
+                (
+                    "s1",
+                    "session_write",
+                    json!({"path":"notes.md","content":"kept"}),
+                ),
+            ]),
+            prose("done."),
+        ]
+    };
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "session_write"],
+        script(),
+    );
+    session_kind(
+        &world,
+        ELSEWHERE,
+        SessionKind::Scheduled,
+        1,
+        Integrity::Untrusted,
+    );
+    let served = one_turn(&mut world, ELSEWHERE, SessionKind::Scheduled).await;
+    let lines = world.lines(ELSEWHERE);
+    let results = tool_results(&lines);
+    assert_eq!(result_of(&results, "r1").outcome, ToolOutcomeWord::Ok);
+    assert_eq!(result_of(&results, "s1").outcome, ToolOutcomeWord::Ok);
+    assert!(world.dir(ELSEWHERE).join("notes.md").exists());
+    assert_eq!((line_tier(&lines, "r1"), line_tier(&lines, "s1")), (0, 1));
+    let rows = audit_rows(&world, &served);
+    for (tool, tier) in [("drive_read", 0), ("session_write", 1)] {
+        let row = &rows[tool];
+        assert_eq!(
+            (row.tier, row.base_tier, row.raised_by.as_deref()),
+            (
+                Some(tier),
+                Some(tier),
+                Some("delegated,unattended,untrusted")
+            ),
+            "{tool}"
+        );
+        assert_eq!(row.outcome, keeper_core::bots::audit::AuditOutcome::Ok);
+    }
+
+    // `keeper.db` is a folder now: no row can be written, so nothing runs.
+    let mut world = crate::world(
+        ProviderKind::OpenAi,
+        &["drive_read", "session_write"],
+        script(),
+    );
+    session_kind(
+        &world,
+        ELSEWHERE,
+        SessionKind::Scheduled,
+        1,
+        Integrity::Untrusted,
+    );
+    let broken = world.tgdrive.with_file_name("broken");
+    std::fs::create_dir_all(broken.join("keeper.db")).expect("a folder");
+    world.deps.data_dir = broken;
+    one_turn(&mut world, ELSEWHERE, SessionKind::Scheduled).await;
+    let results = tool_results(&world.lines(ELSEWHERE));
+    for call in ["r1", "s1"] {
+        let result = result_of(&results, call);
+        assert_eq!(result.outcome, ToolOutcomeWord::Refused, "{call}");
+        assert!(
+            result.content.contains("could not record this tool call"),
+            "{call}: {}",
+            result.content
+        );
+    }
+    assert!(!world.dir(ELSEWHERE).join("notes.md").exists());
+}
+
+/// 93.1 acceptance 1 through a turn (S-21): a `card_update` that sets a
+/// schedule is T3 even in the person's own conversation, so it asks a
+/// person and — with nobody to ask — is refused; the card is unchanged.
+/// A status change of the same card is T1 and lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schedule_an_agent_sets_needs_a_person() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "card_update"],
+        vec![
+            calls(&[
+                (
+                    "c1",
+                    "card_update",
+                    json!({"card": "card.md", "fields": {"schedule": "@daily"}}),
+                ),
+                (
+                    "c2",
+                    "card_update",
+                    json!({"card": "card.md", "fields": {"status": "done"}}),
+                ),
+            ]),
+            prose("Scheduling needs you."),
+        ],
+    );
+    write(&world.dir(SESSION), "card.md", CARD);
+    let mut served = world.open(SESSION);
+    report(world.ask(&mut served, "run it daily, and close it").await);
+    let lines = world.lines(SESSION);
+    let results = tool_results(&lines);
+    assert_eq!(
+        result_of(&results, "c1").content,
+        format!("Refused: {UNATTENDED_REFUSAL}")
+    );
+    assert_eq!(result_of(&results, "c2").outcome, ToolOutcomeWord::Ok);
+    assert_eq!((line_tier(&lines, "c1"), line_tier(&lines, "c2")), (3, 1));
+    let card = std::fs::read_to_string(world.dir(SESSION).join("card.md")).expect("card");
+    assert!(
+        card.contains("status: done") && !card.contains("schedule"),
+        "{card}"
+    );
+}
+
+/// The rows of `tool` in `served`'s session, oldest first.
+fn rows_of(
+    world: &World,
+    served: &ServedSession,
+    tool: &str,
+) -> Vec<keeper_core::bots::audit::AuditRow> {
+    audit_list(world, served)
+        .into_iter()
+        .filter(|row| row.tool == tool)
+        .collect()
+}
+
+/// AD-392 T5 where the write lands: keeper's own files are forbidden
+/// whatever the call spelled — another case of the name, a folder link
+/// inside the session that leads to its `approvals/`, a second mounted
+/// drive — and a link from this session into another session is a write
+/// outside it (T2). Each is refused, nothing lands, and its one row says
+/// the tier the landing gave.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_is_classified_where_it_lands() {
+    use keeper_core::agents::tier::FORBIDDEN;
+    let other = format!("60-sessions/{SESSION}/workspace/other/x.md");
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "drive_write", "session_write"],
+        vec![
+            calls(&[
+                (
+                    "w1",
+                    "drive_write",
+                    json!({"profile":"tgdrive","path":"80-agents/nixi/Agent.toml","content":"x"}),
+                ),
+                (
+                    "s1",
+                    "session_write",
+                    json!({"path":"Approvals/01J.json","content":"{}"}),
+                ),
+                (
+                    "s2",
+                    "session_write",
+                    json!({"path":"workspace/back/approvals/01J.json","content":"{}"}),
+                ),
+                (
+                    "w2",
+                    "drive_write",
+                    json!({"profile":"private","path":"60-sessions/active/2026-10-05-x/approvals/01J.json","content":"{}"}),
+                ),
+                (
+                    "w3",
+                    "drive_write",
+                    json!({"profile":"tgdrive","path": other,"content":"x"}),
+                ),
+            ]),
+            prose("None of it was mine to do."),
+        ],
+    );
+    session_kind(
+        &world,
+        ELSEWHERE,
+        SessionKind::Conversation,
+        0,
+        Integrity::Agent,
+    );
+    let here = world.dir(SESSION);
+    std::fs::create_dir_all(here.join("workspace")).expect("workspace");
+    std::os::unix::fs::symlink("..", here.join("workspace/back")).expect("a link to the session");
+    std::os::unix::fs::symlink(world.dir(ELSEWHERE), here.join("workspace/other"))
+        .expect("a link to another session");
+    let mut served = world.open(SESSION);
+    report(world.ask(&mut served, "write them").await);
+    let lines = world.lines(SESSION);
+    let results = tool_results(&lines);
+    for call in ["w1", "s1", "s2"] {
+        assert_eq!(
+            result_of(&results, call).content,
+            format!("Refused: {FORBIDDEN}"),
+            "{call}"
+        );
+        assert_eq!(line_tier(&lines, call), 5, "{call}");
+    }
+    assert_eq!(result_of(&results, "w2").outcome, ToolOutcomeWord::Refused);
+    assert_eq!(line_tier(&lines, "w2"), 5);
+    assert_eq!(
+        result_of(&results, "w3").content,
+        format!("Refused: {UNATTENDED_REFUSAL}")
+    );
+    assert_eq!(line_tier(&lines, "w3"), 2);
+    assert!(!here.join("approvals").exists());
+    assert!(!world.dir(ELSEWHERE).join("x.md").exists());
+    let writes: Vec<_> = rows_of(&world, &served, "drive_write")
+        .iter()
+        .map(|row| (row.tier, row.outcome))
+        .collect();
+    use keeper_core::bots::audit::AuditOutcome::Refused;
+    assert_eq!(
+        writes,
+        [(Some(5), Refused), (Some(5), Refused), (Some(2), Refused)]
+    );
+    let sessions: Vec<_> = rows_of(&world, &served, "session_write")
+        .iter()
+        .map(|row| (row.tier, row.outcome))
+        .collect();
+    assert_eq!(sessions, [(Some(5), Refused), (Some(5), Refused)]);
+}
+
+/// R90 on every branch: a drive verb the agent was not given, a read of a
+/// folder keeper does not hold and a card tool it was not given are each
+/// refused with exactly one row carrying the call's tier.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_refused_before_its_grant_has_one_classified_row() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![
+            calls(&[
+                (
+                    "w1",
+                    "drive_write",
+                    json!({"profile":"tgdrive","path":"notes/x.md","content":"x"}),
+                ),
+                (
+                    "r1",
+                    "drive_read",
+                    json!({"profile":"nowhere","path":"a.md"}),
+                ),
+                (
+                    "c1",
+                    "card_update",
+                    json!({"card":"card.md","fields":{"status":"done"}}),
+                ),
+            ]),
+            prose("I could not."),
+        ],
+    );
+    let mut served = world.open(SESSION);
+    report(world.ask(&mut served, "try").await);
+    let results = tool_results(&world.lines(SESSION));
+    for call in ["w1", "r1", "c1"] {
+        assert_eq!(
+            result_of(&results, call).outcome,
+            ToolOutcomeWord::Refused,
+            "{call}"
+        );
+    }
+    let rows: Vec<_> = audit_list(&world, &served)
+        .iter()
+        .map(|row| (row.tool.clone(), row.tier, row.outcome))
+        .collect();
+    use keeper_core::bots::audit::AuditOutcome::Refused;
+    assert_eq!(
+        rows,
+        [
+            ("drive_write".to_owned(), Some(2), Refused),
+            ("drive_read".to_owned(), Some(0), Refused),
+            ("card_update".to_owned(), Some(1), Refused),
+        ]
+    );
+}
+
+/// R82: T5 is never an approval's to give. In an `untrusted` session a
+/// write to the agent's own `agent.toml` and a `session_write` into
+/// `approvals/` answer FORBIDDEN, not the approval sentence, and each row
+/// says T5.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_untrusted_forbidden_action_is_forbidden_not_approvable() {
+    use keeper_core::agents::tier::FORBIDDEN;
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "drive_write", "session_write"],
+        vec![
+            calls(&[
+                (
+                    "w1",
+                    "drive_write",
+                    json!({"profile":"tgdrive","path":"80-agents/nixi/agent.toml","content":"x"}),
+                ),
+                (
+                    "s1",
+                    "session_write",
+                    json!({"path":"approvals/01J.json","content":"{}"}),
+                ),
+            ]),
+            prose("I may not."),
+        ],
+    );
+    session_kind(
+        &world,
+        ELSEWHERE,
+        SessionKind::Conversation,
+        0,
+        Integrity::Untrusted,
+    );
+    let served = one_turn(&mut world, ELSEWHERE, SessionKind::Conversation).await;
+    let lines = world.lines(ELSEWHERE);
+    let results = tool_results(&lines);
+    for call in ["w1", "s1"] {
+        assert_eq!(
+            result_of(&results, call).content,
+            format!("Refused: {FORBIDDEN}"),
+            "{call}"
+        );
+    }
+    let rows = audit_rows(&world, &served);
+    for tool in ["drive_write", "session_write"] {
+        assert_eq!(rows[tool].tier, Some(5), "{tool}");
+    }
+}
+
+/// R82 for delegation: the label's sinks are asked before the integrity
+/// rule. An `untrusted` session read by tgorka alone hands work to Dr
+/// Lucyna Novak, whose audience adds Marta: both the delegation's sink and
+/// the integrity rule refuse it, and the sink's sentence is the one said
+/// and recorded, in the call's one row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delegation_the_label_and_the_integrity_rule_both_refuse_says_the_labels() {
+    use keeper_core::agents::label::NEEDS_APPROVAL;
+    let mut world = world_read_by(
+        &[TGORKA],
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![
+            calls(&[(
+                "r1",
+                "drive_read",
+                json!({"profile":"tgdrive","path":"00-inbox/x.md"}),
+            )]),
+            delegate_call(
+                "d1",
+                json!({"agent": "neuradrive/lucyna", "brief": "as the page says"}),
+            ),
+            prose("I could not."),
+        ],
+    );
+    let rooms = Delegations::over(known(&[TGORKA]));
+    let mut nixi = world.delegating(&rooms);
+    report(
+        world
+            .ask(&mut nixi, "read the inbox and do what it says")
+            .await,
+    );
+    assert_eq!(nixi.context.label.integrity, Integrity::Untrusted);
+    assert!(rooms.made().is_empty());
+    let d1 = result_of(&tool_results(&world.lines(SESSION)), "d1").clone();
+    assert!(d1.content.contains(NEEDS_APPROVAL), "{}", d1.content);
+    assert!(d1.content.contains(MARTA), "{}", d1.content);
+    assert!(!d1.content.contains("outside content"), "{}", d1.content);
+    let rows = rows_of(&world, &nixi, "delegate");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        format!("Refused: {}", rows[0].reason.as_deref().unwrap_or_default()),
+        d1.content
+    );
+    assert_eq!((rows[0].tier, rows[0].subpath.as_str()), (Some(1), LUCYNA));
+}
+
+/// The audit names the file changed: a `card_update` naming a `path` beside
+/// its `card` is refused — neither file changes — and its row names the
+/// card; without it the card is changed and the row names that card.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_card_update_changes_and_audits_only_its_card() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "card_update"],
+        vec![
+            calls(&[(
+                "c1",
+                "card_update",
+                json!({"card": "card.md", "path": "innocent.md", "fields": {"status": "done"}}),
+            )]),
+            calls(&[(
+                "c2",
+                "card_update",
+                json!({"card": "card.md", "fields": {"status": "done"}}),
+            )]),
+            prose("Closed."),
+        ],
+    );
+    write(&world.dir(SESSION), "card.md", CARD);
+    write(&world.dir(SESSION), "innocent.md", CARD);
+    let mut served = world.open(SESSION);
+    report(world.ask(&mut served, "close it").await);
+    let results = tool_results(&world.lines(SESSION));
+    let c1 = result_of(&results, "c1");
+    assert_eq!(c1.outcome, ToolOutcomeWord::Refused);
+    assert!(c1.content.contains("path"), "{}", c1.content);
+    assert_eq!(result_of(&results, "c2").outcome, ToolOutcomeWord::Ok);
+    let read = |name: &str| std::fs::read_to_string(world.dir(SESSION).join(name)).expect("file");
+    assert_eq!(read("innocent.md"), CARD);
+    assert!(read("card.md").contains("status: done"));
+    let card = format!("60-sessions/{SESSION}/card.md");
+    let rows: Vec<_> = rows_of(&world, &served, "card_update")
+        .iter()
+        .map(|row| (row.subpath.clone(), row.outcome))
+        .collect();
+    use keeper_core::bots::audit::AuditOutcome;
+    assert_eq!(
+        rows,
+        [
+            (card.clone(), AuditOutcome::Refused),
+            (card, AuditOutcome::Ok)
+        ]
+    );
 }

@@ -61,9 +61,13 @@ use keeper_core::agents::redact::redact_secrets;
 use keeper_core::agents::session::{SessionAgent, SessionKind};
 use keeper_core::agents::skills::SkillsIndex;
 use keeper_core::agents::soul::{self, Fact, Soul};
+use keeper_core::agents::tier::{
+    self, AgentTool, CallFacts, Classification, Context, Gate, GrantWord, Place, Tier, FORBIDDEN,
+};
 use keeper_core::bots::chat::{self, CancelSignal, ChatEvent, ChatMessage, ChatOptions, Role};
 use keeper_core::bots::context_files::ContextBundle;
 use keeper_core::bots::error::BotsError;
+use keeper_core::bots::grant::Effect;
 use keeper_core::bots::store::ProviderRow;
 use keeper_core::bots::tools::{
     self, ToolCall, ToolCallRecord, ToolHost, ToolLoop, ToolLoopEvent, ToolLoopOptions, ToolName,
@@ -71,7 +75,7 @@ use keeper_core::bots::tools::{
 };
 use keeper_core::bots::{http, Bot};
 use keeper_core::error::CoreError;
-use keeper_sync::SyncProfile;
+use keeper_sync::{browse, names, SyncProfile};
 use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -83,7 +87,7 @@ use crate::claims::Lease;
 use crate::delegate::{self, DelegateTools, Delegation, DelegationPort, Delegator, TurnView};
 use crate::drive::finish_word;
 use crate::grants::AgentGrants;
-use crate::host::HostIds;
+use crate::host::{AgentDrive, Classified, HostIds, UNATTENDED_REFUSAL};
 use crate::matrix_sink::{
     anchor_content, cut, cut_to_log, deliver, deliver_gated, deliver_unless_narrowed,
     notice_content, status_content, EditPort, MatrixSink, SendFuture, StatusBoard, ToolProgress,
@@ -92,7 +96,9 @@ use crate::ports::ProfileSource;
 use crate::rooms::{self, Arrival, BriefEvent, Disposition, Served};
 use crate::sessions::verbs::{self, CreateOutcome};
 use crate::sessions::write::session_write;
-use crate::sinks::{room_audience, ProxyDoors, RoomGate, Sinks, MEMBERS_UNREAD, NARROWED_STATUS};
+use crate::sinks::{
+    room_audience, CallAudit, ProxyDoors, RoomGate, Sinks, MEMBERS_UNREAD, NARROWED_STATUS,
+};
 use crate::turn::{arm_turn_probing, endpoint_of, read_timeout_of, TurnEnv, TurnOrigin};
 use crate::writer::{SessionWriter, WriterError};
 use crate::zone::{read_text, AgentHome};
@@ -136,15 +142,6 @@ pub fn cut_off_sentence(host: &str) -> String {
 /// The words a turn stopped by shutdown ends with.
 pub fn shutdown_suffix(host: &str) -> String {
     format!(" … (stopped: {host} is shutting down)")
-}
-
-/// The tool tier a drive call is (AD-392's table): a read observes (T0), a
-/// write outside the session is a recoverable mutation (T2).
-fn tier(name: Option<ToolName>) -> u8 {
-    match name.map(ToolName::effect) {
-        Some(keeper_core::bots::grant::Effect::Write) => 2,
-        _ => 0,
-    }
 }
 
 /// Why a session's context could not be loaded; the session is not served.
@@ -712,11 +709,13 @@ impl AgentDeps {
 
 /// A tool host that refuses any tool outside `[tools].allow`, and serves the
 /// agent's surface, `delegate`, `reply`, `card_update` and `session_write`
-/// tools itself (R38, R50: no ⌘9 host has them). Every call that writes or
-/// sends is checked first against the label at its sink and against the
-/// integrity rule (AD-391), before its own host decides anything.
+/// tools itself (R38, R50: no ⌘9 host has them). Every call is classified
+/// (AD-392) on where it lands and audited in exactly one row with its tier
+/// (R90), before any effect; one that writes or sends is checked first
+/// against the label at its sink, then against the integrity rule over its
+/// tier, then its tier decides whether it runs (R82's precedence).
 struct AllowedTools<'t> {
-    inner: Box<dyn ToolHost>,
+    inner: Box<dyn AgentDrive>,
     allow: Vec<String>,
     surface: Option<crate::surface::SurfaceTools>,
     delegation: DelegateTools<'t>,
@@ -729,26 +728,107 @@ struct AllowedTools<'t> {
     home: &'t DriveDecl,
     /// The session's folder, drive-relative: where its session tools land.
     session_dir: String,
+    /// The same folder as it lands on the disk, by name.
+    session_landed: Vec<String>,
+    /// The mounted drives, where a write's landing is read.
+    profiles: Vec<SyncProfile>,
+    /// The session's `agent.toml`: whose work this is (R83).
+    agent: SessionAgent,
+    /// Each classified call's tier by call id, for its `tool_call` line.
+    tiers: Mutex<HashMap<String, Tier>>,
+}
+
+/// Where `subpath` of the drive checked out at `profile` lands, as
+/// drive-relative names: keeper-sync's landing, every link followed. The
+/// requested names where it cannot be landed — a drive this host does not
+/// hold, or a path its executor refuses whatever its tier.
+fn landed_names(profile: Option<&SyncProfile>, subpath: &str) -> Vec<String> {
+    profile
+        .and_then(|profile| browse::landing(&profile.local_path, subpath).ok())
+        .unwrap_or_else(|| {
+            subpath
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
 }
 
 impl AllowedTools<'_> {
-    /// The integrity rule over one call to `recipients` (R167, R82): a
-    /// block, or a call that needs a person, is refused with its audit row
-    /// (R65) at `drive` and `at`.
-    fn integrity(
+    /// Classify call `id` in this session now, and keep its tier for the
+    /// call's line.
+    fn classify(
+        &self,
+        id: &str,
+        tool: AgentTool,
+        facts: &CallFacts,
+        grant: Option<GrantWord>,
+    ) -> Classification {
+        let context = Context {
+            grant,
+            ..Context::of_session(&self.agent, self.view.label().integrity)
+        };
+        let classification = tier::classify(tool, facts, &context);
+        self.tiers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id.to_owned(), classification.tier);
+        classification
+    }
+
+    /// The tier call `id`'s line says; T0 for a call never classified — a
+    /// name with no row, or arguments that do not read.
+    fn tier_of(&self, id: &str) -> u8 {
+        self.tiers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(id)
+            .map_or(0, Tier::as_u8)
+    }
+
+    /// The facts of a write to `subpath` of `drive`, from where it lands —
+    /// names compared as keeper-sync's fence compares them.
+    fn landed_facts(&self, drive: &str, subpath: &str) -> CallFacts {
+        let profile = self.profiles.iter().find(|profile| profile.id == drive);
+        let place = Place {
+            home_drive: &self.home.id,
+            session_dir: &self.session_landed,
+        };
+        tier::landed_facts(
+            drive,
+            &landed_names(profile, subpath),
+            &place,
+            &names::same_entry_folded,
+        )
+    }
+
+    /// What a call to `recipients` answers instead of its effect once its
+    /// sinks have passed (R82): the integrity rule's block; else, at T5,
+    /// [`FORBIDDEN`] — never an approval's to give; else the integrity
+    /// rule's approval; else the tier's own gate. `None` runs it.
+    fn refusal_of(
         &self,
         tool: &str,
-        drive: &str,
-        at: &str,
+        classification: &Classification,
         recipients: &[Recipient],
-    ) -> Result<(), String> {
-        let sentence = match check_call(&self.view.label(), tool, recipients) {
-            CallVerdict::Allow => return Ok(()),
-            CallVerdict::NeedsApproval => NEEDS_APPROVAL.to_owned(),
-            CallVerdict::Block { reason } => reason,
-        };
-        self.sinks.refused(tool, drive, at, &sentence);
-        Err(sentence)
+    ) -> Option<String> {
+        match check_call(&self.view.label(), tool, classification.tier, recipients) {
+            CallVerdict::Block { reason } => Some(reason),
+            _ if classification.gate() == Gate::Refuse => Some(FORBIDDEN.to_owned()),
+            CallVerdict::NeedsApproval => Some(NEEDS_APPROVAL.to_owned()),
+            CallVerdict::Allow => gate_refusal(classification),
+        }
+    }
+}
+
+/// What a call's tier answers instead of its effect: nothing at T0–T1; at
+/// T2–T4 a person's approval, which nobody can give until a decision source
+/// is installed (epic 93's Q3); never at T5.
+fn gate_refusal(classification: &Classification) -> Option<String> {
+    match classification.gate() {
+        Gate::Run => None,
+        Gate::Person => Some(UNATTENDED_REFUSAL.to_owned()),
+        Gate::Refuse => Some(FORBIDDEN.to_owned()),
     }
 }
 
@@ -773,22 +853,32 @@ fn write_effect(call: &ToolCall) -> String {
 impl ToolHost for AllowedTools<'_> {
     fn run(&self, call: &ToolCall) -> Result<ToolOutcome, BotsError> {
         let name = call.name.as_wire();
+        let Some(tool) = AgentTool::from_wire(name) else {
+            return Ok(refusal(format!("{name} is not one of this agent's tools.")));
+        };
+        let drive = call.target.profile_id.as_str();
+        let path = call.target.subpath.as_str();
+        let effect = call.name.effect();
+        let facts = if effect == Effect::Write {
+            self.landed_facts(drive, path)
+        } else {
+            CallFacts::default()
+        };
+        // The table's tier before the grant answers: what the line and the
+        // row say of a call refused before it reaches the drive.
+        let table = self.classify(&call.id, tool, &facts, None);
+        let audit = CallAudit::new(self.sinks, name, effect, &table, None, (drive, path));
         if !self.allow.iter().any(|allowed| allowed == name) {
-            return Ok(ToolOutcome::Refused {
-                reason: format!("{name} is not one of this agent's tools."),
-            });
+            return Ok(audit.refuse(format!("{name} is not one of this agent's tools.")));
         }
-        if call.name.effect() == keeper_core::bots::grant::Effect::Write {
-            let drive = call.target.profile_id.as_str();
-            let path = call.target.subpath.as_str();
+        if effect == Effect::Write {
             // A drive keeper holds no declaration for is read by anyone:
             // the lower bound, never the higher.
             let drive_readers = self
                 .drives
                 .get(drive)
                 .map_or(Readers::Anyone, |decl| Readers::Only(decl.readers.clone()));
-            let effect = write_effect(call);
-            if let Err(sentence) = self.sinks.check(
+            if let Err(blocked) = self.sinks.verdict(
                 name,
                 &Destination::Drive {
                     drive: drive.to_owned(),
@@ -796,21 +886,30 @@ impl ToolHost for AllowedTools<'_> {
                 },
                 &self.view.label(),
                 &Sink::DriveWrite { drive_readers },
-                effect.as_bytes(),
+                write_effect(call).as_bytes(),
                 Some(path),
             ) {
-                return Ok(refusal(sentence));
-            }
-            if let Err(sentence) = self.integrity(name, drive, path, &[]) {
-                return Ok(refusal(sentence));
+                return Ok(refusal(audit.blocked(blocked)));
             }
         }
-        self.inner.run(call)
+        // Its sinks passed: the drive host writes the row, on the grant's
+        // answer.
+        self.inner.run_classified(call, &|verdict| {
+            let classification = self.classify(&call.id, tool, &facts, Some(verdict.into()));
+            let refusal = self.refusal_of(name, &classification, &[]);
+            Classified {
+                classification,
+                refusal,
+            }
+        })
     }
 
     fn run_named(&self, wire: &chat::ToolCall) -> Option<ToolOutcome> {
         let args = wire.arguments.as_ref().unwrap_or(&Value::Null);
         if delegate::is_delegation(&wire.name) {
+            let tool = AgentTool::from_wire(&wire.name)?;
+            let facts = tier::named_facts(tool, args, CallFacts::default());
+            let classification = self.classify(&wire.id, tool, &facts, None);
             let recipient = self.delegation.recipient(wire);
             let recipients: Vec<Recipient> = recipient
                 .iter()
@@ -819,51 +918,111 @@ impl ToolHost for AllowedTools<'_> {
                     audience: audience.as_ref(),
                 })
                 .collect();
-            let at = recipient.as_ref().map_or("", |(name, _)| name.as_str());
-            if let Err(sentence) = self.integrity(&wire.name, "", at, &recipients) {
-                return Some(refusal(sentence));
+            // Decided now, said only once the delegation's own sinks have
+            // passed (R82).
+            let withheld = self.refusal_of(&wire.name, &classification, &recipients);
+            let (drive, at) = self.delegation.destination(wire);
+            let audit = CallAudit::new(
+                self.sinks,
+                &wire.name,
+                Effect::Write,
+                &classification,
+                withheld,
+                (&drive, &at),
+            );
+            let outcome = self.delegation.run(wire, &audit);
+            if let Some(outcome) = &outcome {
+                audit.finish(outcome);
             }
-            return self.delegation.run(wire);
+            return outcome;
         }
         if crate::cards::is_card_tool(&wire.name) {
-            let checked = || {
-                let rel = args["path"]
-                    .as_str()
-                    .or(args["card"].as_str())
-                    .unwrap_or("");
-                self.sinks.check(
-                    &wire.name,
-                    &Destination::Drive {
-                        drive: self.home.id.clone(),
-                        path: format!("{}/{rel}", self.session_dir),
-                    },
-                    &self.view.label(),
-                    &Sink::DriveWrite {
-                        drive_readers: Readers::Only(self.home.readers.clone()),
-                    },
-                    wire.arguments_raw.as_bytes(),
-                    None,
-                )
+            let tool = AgentTool::from_wire(&wire.name)?;
+            // The file the tool changes, as it runs it: `card_update`'s
+            // card, `session_write`'s path.
+            let key = if tool == AgentTool::CardUpdate {
+                "card"
+            } else {
+                "path"
             };
+            let at = format!("{}/{}", self.session_dir, args[key].as_str().unwrap_or(""));
+            let landed = self.landed_facts(&self.home.id, &at);
+            let facts = tier::named_facts(tool, args, landed);
+            let classification = self.classify(&wire.id, tool, &facts, None);
+            let withheld = self.refusal_of(&wire.name, &classification, &[]);
+            let audit = CallAudit::new(
+                self.sinks,
+                &wire.name,
+                Effect::Write,
+                &classification,
+                withheld,
+                (&self.home.id, &at),
+            );
             // A tool the agent was not given is refused by the card tools.
-            if self.allow.contains(&wire.name) {
-                if let Err(sentence) = checked() {
-                    return Some(refusal(sentence));
+            let outcome = if !self.allow.contains(&wire.name) {
+                self.cards.run(wire)
+            } else {
+                let admitted = self
+                    .sinks
+                    .verdict(
+                        &wire.name,
+                        &Destination::Drive {
+                            drive: self.home.id.clone(),
+                            path: at.clone(),
+                        },
+                        &self.view.label(),
+                        &Sink::DriveWrite {
+                            drive_readers: Readers::Only(self.home.readers.clone()),
+                        },
+                        wire.arguments_raw.as_bytes(),
+                        None,
+                    )
+                    .map_err(|blocked| audit.blocked(blocked))
+                    .and_then(|()| audit.admit(&self.home.id, &at));
+                match admitted {
+                    Ok(()) => self.cards.run(wire),
+                    Err(sentence) => Some(refusal(sentence)),
                 }
+            };
+            if let Some(outcome) = &outcome {
+                audit.finish(outcome);
             }
-            return self.cards.run(wire);
+            return outcome;
         }
         if !crate::surface::is_surface(&wire.name) {
             return None;
         }
-        match &self.surface {
+        let tool = AgentTool::from_wire(&wire.name)?;
+        let facts = tier::named_facts(tool, args, CallFacts::default());
+        let classification = self.classify(&wire.id, tool, &facts, None);
+        let withheld = self.refusal_of(&wire.name, &classification, &[]);
+        let audit = CallAudit::new(
+            self.sinks,
+            &wire.name,
+            Effect::Read,
+            &classification,
+            withheld,
+            (
+                args["drive"].as_str().unwrap_or(""),
+                args["path"].as_str().unwrap_or(""),
+            ),
+        );
+        let outcome = match &self.surface {
             // The request is checked against the room it goes into, at its
-            // send, by the surface tools' own `admit`.
-            Some(surface) => surface.run(wire),
+            // send, and its row written then.
+            Some(surface) => surface.run(wire, &|verdict, (drive, path)| {
+                verdict
+                    .map_err(|blocked| audit.blocked(blocked))
+                    .and_then(|()| audit.admit(drive, path))
+            }),
             None => Some(ToolOutcome::Refused {
                 reason: format!("{} is not one of this agent's tools.", wire.name),
             }),
+        };
+        if let Some(outcome) = &outcome {
+            audit.finish(outcome);
         }
+        outcome
     }
 }
 
@@ -3197,8 +3356,6 @@ pub async fn arm_agent(
         probe == Probe::Ask,
     )
     .await;
-    // An agent writes its sessions through its session tools only (R51).
-    armed.drive = armed.drive.for_agent();
     // Whether this model is offered tools at all: the surface tools ride on
     // the same offer, and a model that cannot call tools is told of none.
     let tools_offered = !armed.request.tools.is_empty();
@@ -3322,13 +3479,17 @@ async fn run_agent_turn(
             lines: Mutex::new(Vec::new()),
             admit: Some(Arc::new(move |tool: &str, effect: &[u8]| {
                 tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(room_gate.admit(tool, effect))
+                    tokio::runtime::Handle::current().block_on(room_gate.verdict(tool, effect))
                 })
             })),
         });
     // A read's label is read from the files it named (R119).
     let read_profiles = armed.profiles.clone();
-    let drive_host = armed.drive.host(
+    // A write is classified where it lands on these drives.
+    let profiles = armed.profiles.clone();
+    // An agent writes its sessions through its session tools only (R51),
+    // and every drive call is classified before its audit row.
+    let drive_host = armed.drive.agent_host(
         HostIds {
             data_dir: deps.data_dir.clone(),
             provider_id: deps.row.provider.id.clone(),
@@ -3341,6 +3502,13 @@ async fn run_agent_turn(
     );
 
     let session_dir = format!("{}/{}", deps.sessions_subfolder, context.session.path);
+    let session_landed = landed_names(
+        profiles
+            .iter()
+            .find(|profile| profile.id == deps.home.drive.id),
+        &session_dir,
+    );
+    let agent = context.agent.clone();
     let log = Mutex::new(TurnLog {
         context,
         writer,
@@ -3378,6 +3546,10 @@ async fn run_agent_turn(
         drives: &deps.drives,
         home: &deps.home.drive,
         session_dir,
+        session_landed,
+        profiles,
+        agent,
+        tiers: Mutex::new(HashMap::new()),
     };
     let tool_loop = ToolLoop {
         client: &client,
@@ -3437,15 +3609,7 @@ async fn run_agent_turn(
                 call_id: wire.id.clone(),
                 tool: wire.name.clone(),
                 args: wire.arguments_raw.clone(),
-                tier: if crate::surface::is_surface(&wire.name) {
-                    crate::surface::TIER
-                } else if delegate::is_delegation(&wire.name) {
-                    delegate::TIER
-                } else if crate::cards::is_card_tool(&wire.name) {
-                    crate::cards::TIER
-                } else {
-                    tier(record.name)
-                },
+                tier: host.tier_of(&wire.id),
                 grant_id: None,
             }),
         );

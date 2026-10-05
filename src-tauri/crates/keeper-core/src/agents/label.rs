@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::agents::drive::DriveDecl;
+use crate::agents::tier::Tier;
 use crate::notes::frontmatter::Frontmatter;
 use crate::notes::okf;
 
@@ -355,12 +356,6 @@ pub fn check_sink(label: &Label, sink: &Sink) -> SinkVerdict {
 pub const NEEDS_APPROVAL: &str =
     "Letting this through needs an approval, which this keeper cannot take yet.";
 
-/// The calls that are consequential under `untrusted` integrity (R82): the
-/// tools a person's approval stands behind once the session read outside
-/// content — a write outside the session, which 93.1's raise takes to T3.
-/// Epic 93 replaces this list with its tier table.
-pub const CONSEQUENTIAL: [&str; 2] = ["drive_write", "drive_edit"];
-
 /// What the integrity rule says of one call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallVerdict {
@@ -388,9 +383,10 @@ pub struct Recipient<'a> {
 /// host cannot name, or whose audience is wider than the label's readers —
 /// is blocked, since the outside content may have chosen it; a known agent
 /// whose audience is within the label passes, and its session opens
-/// `untrusted` (R94 joins the labels). A consequential call
-/// ([`CONSEQUENTIAL`]) needs approval. A block is decided first.
-pub fn check_call(label: &Label, tool: &str, recipients: &[Recipient]) -> CallVerdict {
+/// `untrusted` (R94 joins the labels). A consequential call — `tier`, the
+/// call's classified tier, at T3 or above (R82) — needs approval. A block
+/// is decided first.
+pub fn check_call(label: &Label, tool: &str, tier: Tier, recipients: &[Recipient]) -> CallVerdict {
     if label.integrity > Integrity::Untrusted {
         return CallVerdict::Allow;
     }
@@ -406,7 +402,7 @@ pub fn check_call(label: &Label, tool: &str, recipients: &[Recipient]) -> CallVe
             ),
         };
     }
-    if CONSEQUENTIAL.contains(&tool) {
+    if tier >= Tier::T3 {
         return CallVerdict::NeedsApproval;
     }
     CallVerdict::Allow
@@ -1328,34 +1324,45 @@ mod tests {
             name: "neuradrive/lucyna",
             audience: Some(&shared),
         };
+        let t1 = Tier::T1;
         assert!(matches!(
-            check_call(&untrusted, "delegate", &[unnamed]),
+            check_call(&untrusted, "delegate", t1, &[unnamed]),
             CallVerdict::Block { reason } if reason.contains("evil/exfil")
         ));
         assert!(matches!(
-            check_call(&untrusted, "delegate", &[wider]),
+            check_call(&untrusted, "delegate", t1, &[wider]),
             CallVerdict::Block { reason } if reason.contains("neuradrive/lucyna")
         ));
         assert_eq!(
-            check_call(&untrusted, "delegate", &[known]),
+            check_call(&untrusted, "delegate", t1, &[known]),
             CallVerdict::Allow
         );
         assert!(matches!(
-            check_call(&untrusted, "delegate", &[known, unnamed]),
+            check_call(&untrusted, "delegate", t1, &[known, unnamed]),
             CallVerdict::Block { .. }
         ));
+        // R82: consequential is the classified tier at T3 or above — a
+        // write outside the session raised by `untrusted`.
         assert_eq!(
-            check_call(&untrusted, "drive_write", &[]),
+            check_call(&untrusted, "drive_write", Tier::T3, &[]),
             CallVerdict::NeedsApproval
         );
+        assert_eq!(
+            check_call(&untrusted, "card_update", Tier::T4, &[]),
+            CallVerdict::NeedsApproval
+        );
+        assert_eq!(
+            check_call(&untrusted, "delegate", Tier::T2, &[known]),
+            CallVerdict::Allow
+        );
         assert!(matches!(
-            check_call(&untrusted, "drive_edit", &[unnamed]),
+            check_call(&untrusted, "drive_edit", Tier::T3, &[unnamed]),
             CallVerdict::Block { .. }
         ));
         for integrity in [Integrity::Agent, Integrity::Peer, Integrity::Owner] {
             for tool in ["delegate", "drive_write", "drive_edit"] {
                 assert_eq!(
-                    check_call(&at(integrity), tool, &[unnamed, wider]),
+                    check_call(&at(integrity), tool, Tier::T3, &[unnamed, wider]),
                     CallVerdict::Allow
                 );
             }

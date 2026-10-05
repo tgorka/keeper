@@ -47,11 +47,9 @@ use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde_json::{json, Value};
 
 use crate::matrix_sink::SendFuture;
+use crate::sinks::Blocked;
 use crate::zone::read_text;
 
-/// A surface call's tier: it acts at once on the person's own screen and
-/// changes no byte (AD-392).
-pub const TIER: u8 = 1;
 /// How often a waiting call looks at its turn's cancel signal.
 const POLL: Duration = Duration::from_millis(250);
 /// The longest device detail the model is told.
@@ -397,9 +395,14 @@ pub struct SurfaceTools {
     pub admit: Option<SurfaceAdmit>,
 }
 
-/// [`SurfaceTools::admit`]: the tool's name and the request's bytes, or the
-/// sentence the call is refused with.
-pub type SurfaceAdmit = Arc<dyn Fn(&str, &[u8]) -> Result<(), String> + Send + Sync>;
+/// [`SurfaceTools::admit`]: the room's verdict on the tool's name and the
+/// request's bytes, the block not yet audited.
+pub type SurfaceAdmit = Arc<dyn Fn(&str, &[u8]) -> Result<(), Blocked> + Send + Sync>;
+
+/// What the call's audit makes of the room's verdict on its request to the
+/// note at `(drive, path)`: nothing to say, its row written before the
+/// request is sent, or the sentence refusing it (R90).
+pub type Admission<'a> = &'a dyn Fn(Result<(), Blocked>, (&str, &str)) -> Result<(), String>;
 
 fn refused(reason: String) -> Option<ToolOutcome> {
     Some(ToolOutcome::Refused { reason })
@@ -447,7 +450,8 @@ impl SurfaceTools {
     }
 
     /// Run `wire` when it names a surface tool; `None` for any other name.
-    pub fn run(&self, wire: &WireToolCall) -> Option<ToolOutcome> {
+    /// `admission` decides, once the request is made, whether it is sent.
+    pub fn run(&self, wire: &WireToolCall, admission: Admission<'_>) -> Option<ToolOutcome> {
         let tool = SurfaceTool::from_wire(&wire.name)?;
         let name = tool.wire();
         if !self.offered.contains(&tool) {
@@ -535,10 +539,12 @@ impl SurfaceTools {
         };
         // The request goes into the session's room, not to the device: the
         // room's audience is its audience.
-        if let Some(admit) = &self.admit {
-            if let Err(sentence) = admit(name, content.to_string().as_bytes()) {
-                return refused(sentence);
-            }
+        let verdict = match &self.admit {
+            Some(admit) => admit(name, content.to_string().as_bytes()),
+            None => Ok(()),
+        };
+        if let Err(sentence) = admission(verdict, (&call.drive, &call.path)) {
+            return refused(sentence);
         }
         let (answer, answers) = std::sync::mpsc::sync_channel::<SurfaceResultContent>(1);
         waiting().insert(
@@ -813,6 +819,11 @@ mod tests {
         }
     }
 
+    /// The room's verdict as the call's answer, with no audit row.
+    fn unaudited(verdict: Result<(), Blocked>, _: (&str, &str)) -> Result<(), String> {
+        verdict.map_err(|blocked| blocked.sentence)
+    }
+
     fn said(outcome: Option<ToolOutcome>) -> String {
         match outcome.expect("a surface tool") {
             ToolOutcome::Answered { text } => text,
@@ -841,7 +852,7 @@ mod tests {
         let text = said(bench.tools.run(&wire(
             "surface_propose_edit",
             json!({"drive": "tgdrive", "path": "notes/plan.md", "range": {"from": 5, "to": 6}, "text": "1st\n2nd"}),
-        )));
+        ), &unaudited));
         assert_eq!(text, "done (applied)");
         assert_eq!(
             *bench.room.taken.lock().expect("lock"),
@@ -874,7 +885,7 @@ mod tests {
             Device::Silent,
             SURFACE_WAIT,
         );
-        let call = |name: &str, args: Value| said(bench.tools.run(&wire(name, args)));
+        let call = |name: &str, args: Value| said(bench.tools.run(&wire(name, args), &unaudited));
         // Backwards, in the frontmatter, past the end, out of scope.
         assert!(call(
             "surface_highlight",
@@ -918,18 +929,28 @@ mod tests {
         // A tool this agent is not offered.
         let mut narrow = bench;
         narrow.tools.offered = vec![SurfaceTool::Open];
-        assert!(said(narrow.tools.run(&wire("surface_point", json!({}))))
-            .contains("not one of this agent's tools"));
+        assert!(said(
+            narrow
+                .tools
+                .run(&wire("surface_point", json!({})), &unaudited)
+        )
+        .contains("not one of this agent's tools"));
         // Not a surface tool at all: the drive verbs' business.
-        assert_eq!(narrow.tools.run(&wire("drive_read", json!({}))), None);
+        assert_eq!(
+            narrow.tools.run(&wire("drive_read", json!({})), &unaudited),
+            None
+        );
 
         // No live, focused device: `unavailable`, and no event.
         let away = bench_away();
         assert_eq!(
-            said(away.tools.run(&wire(
-                "surface_open",
-                json!({"drive": "tgdrive", "path": "notes/plan.md"})
-            ))),
+            said(away.tools.run(
+                &wire(
+                    "surface_open",
+                    json!({"drive": "tgdrive", "path": "notes/plan.md"})
+                ),
+                &unaudited
+            )),
             "unavailable"
         );
         assert!(away.room.sent.lock().expect("lock").is_empty());
@@ -951,10 +972,13 @@ mod tests {
             Duration::from_millis(400),
         );
         let started = Instant::now();
-        let text = said(bench.tools.run(&wire(
-            "surface_open",
-            json!({"drive": "tgdrive", "path": "notes/plan.md", "heading": "q3"}),
-        )));
+        let text = said(bench.tools.run(
+            &wire(
+                "surface_open",
+                json!({"drive": "tgdrive", "path": "notes/plan.md", "heading": "q3"}),
+            ),
+            &unaudited,
+        ));
         assert_eq!(text, "expired");
         assert!(started.elapsed() >= Duration::from_millis(400));
         let sent = bench.room.sent.lock().expect("lock").clone();
@@ -966,10 +990,13 @@ mod tests {
         );
 
         let open = bench_answering(vec![result(TGORKA, true, "KALYPSO", "done")]);
-        let text = said(open.tools.run(&wire(
-            "surface_open",
-            json!({"drive": "tgdrive", "path": "notes/plan.md", "heading": "Budget"}),
-        )));
+        let text = said(open.tools.run(
+            &wire(
+                "surface_open",
+                json!({"drive": "tgdrive", "path": "notes/plan.md", "heading": "Budget"}),
+            ),
+            &unaudited,
+        ));
         assert_eq!(text, "done: no such heading");
         let sent = open.room.sent.lock().expect("lock").clone();
         assert!(sent[0]["args"].get("range").is_none(), "opened at the top");

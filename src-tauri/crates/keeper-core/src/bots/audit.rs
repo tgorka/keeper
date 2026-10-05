@@ -51,6 +51,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use super::grant::{Effect, GrantVerdict, ToolTarget};
+use crate::agents::tier::Classification;
 use crate::error::{CoreError, PlatformError};
 
 /// How long a contended writer waits for the write lock — [`super::store`]'s
@@ -76,7 +77,7 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
             "could not create data dir: {e}"
         )))
     })?;
-    let conn = Connection::open(data_dir.join("keeper.db"))
+    let mut conn = Connection::open(data_dir.join("keeper.db"))
         .map_err(|e| CoreError::Internal(format!("could not open keeper.db: {e}")))?;
     conn.busy_timeout(BUSY_TIMEOUT)
         .map_err(|e| CoreError::Internal(format!("could not set busy timeout: {e}")))?;
@@ -125,7 +126,68 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
         [],
     )
     .map_err(|e| CoreError::Internal(format!("could not ensure bot_audit index: {e}")))?;
+    ensure_tier_columns(&mut conn)?;
     Ok(conn)
+}
+
+/// The agent columns (R90): `tier`, `base_tier`, `raised_by` (a comma
+/// list) and `approval` (the approval record's id), each nullable — a ⌘9
+/// bot's row and every row written before them say nothing there.
+const TIER_COLUMNS: [(&str, &str); 4] = [
+    ("tier", "INTEGER"),
+    ("base_tier", "INTEGER"),
+    ("raised_by", "TEXT"),
+    ("approval", "TEXT"),
+];
+
+/// Add the agent columns to a `bot_audit` an older build made. Every call
+/// opens its own connection, so two first calls can both find a column
+/// missing: the columns are added under the writer's reservation and
+/// looked for again inside it, so the second finds them there and adds
+/// nothing.
+fn ensure_tier_columns(conn: &mut Connection) -> Result<(), CoreError> {
+    if missing_tier_columns(conn)?.is_empty() {
+        return Ok(());
+    }
+    add_tier_columns(conn)
+}
+
+/// The agent columns `bot_audit` does not have, as `conn` reads it now.
+fn missing_tier_columns(conn: &Connection) -> Result<Vec<(&'static str, &'static str)>, CoreError> {
+    let inspect = |e: rusqlite::Error| {
+        CoreError::Internal(format!("could not inspect bot_audit schema: {e}"))
+    };
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(bot_audit)")
+        .map_err(inspect)?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(inspect)?
+        .collect::<Result<_, _>>()
+        .map_err(inspect)?;
+    Ok(TIER_COLUMNS
+        .into_iter()
+        .filter(|(column, _)| !existing.iter().any(|c| c == column))
+        .collect())
+}
+
+/// One `BEGIN IMMEDIATE` transaction: the writer's reservation first, then
+/// the columns still missing under it, each added.
+fn add_tier_columns(conn: &mut Connection) -> Result<(), CoreError> {
+    let migrate = |e: rusqlite::Error| {
+        CoreError::Internal(format!("could not add the bot_audit tier columns: {e}"))
+    };
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(migrate)?;
+    for (column, kind) in missing_tier_columns(&tx)? {
+        tx.execute(
+            &format!("ALTER TABLE bot_audit ADD COLUMN {column} {kind}"),
+            [],
+        )
+        .map_err(migrate)?;
+    }
+    tx.commit().map_err(migrate)
 }
 
 /// What the grant check concluded, as the log stores it (Story 61.10, FR-388).
@@ -252,6 +314,9 @@ pub struct AuditIntent<'a> {
     pub effect: Effect,
     /// The verdict the grant check reached.
     pub verdict: &'a GrantVerdict,
+    /// An agent's call: its tier, base tier and reasons (R90). `None` for a
+    /// ⌘9 bot's call, whose row keeps those columns NULL.
+    pub classified: Option<&'a Classification>,
 }
 
 /// Append the intent row and commit it, returning its id (Story 61.10,
@@ -272,11 +337,13 @@ pub fn append_intent(data_dir: &Path, intent: &AuditIntent<'_>) -> Result<i64, C
         GrantVerdict::Deny { reason } => (None, Some(reason.as_str())),
     };
     let conn = open(data_dir)?;
+    let classified = intent.classified;
     conn.execute(
         "INSERT INTO bot_audit(started_ms, finished_ms, provider_id, bot_id, session_id, \
              message_id, tool, profile_id, subpath, display_path, effect, verdict, reason, \
-             grant_id, outcome, bytes, truncated) \
-         VALUES(?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, 0)",
+             grant_id, outcome, bytes, truncated, tier, base_tier, raised_by) \
+         VALUES(?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, 0, \
+             ?15, ?16, ?17)",
         rusqlite::params![
             intent.started_ms,
             intent.provider_id,
@@ -292,6 +359,11 @@ pub fn append_intent(data_dir: &Path, intent: &AuditIntent<'_>) -> Result<i64, C
             reason,
             grant_id,
             AuditOutcome::Pending.as_registry_str(),
+            classified.map(|c| c.tier.as_u8()),
+            classified.map(|c| c.base_tier.as_u8()),
+            classified
+                .map(Classification::raised_by_words)
+                .filter(|words| !words.is_empty()),
         ],
     )
     .map_err(|e| CoreError::Internal(format!("could not append audit intent: {e}")))?;
@@ -375,12 +447,21 @@ pub struct AuditRow {
     pub bytes: Option<i64>,
     /// Whether the result was cut short at a cap.
     pub truncated: bool,
+    /// An agent's call: its tier after the raise (R90); `None` for a ⌘9
+    /// bot's row and every row older than the column.
+    pub tier: Option<u8>,
+    /// Its tier before the raise.
+    pub base_tier: Option<u8>,
+    /// Why it was raised, a comma list; `None` when nothing held.
+    pub raised_by: Option<String>,
+    /// The approval record it waited on.
+    pub approval: Option<String>,
 }
 
 /// The `SELECT` column list every audit read shares.
 const AUDIT_COLUMNS: &str = "id, started_ms, finished_ms, provider_id, bot_id, session_id, \
      message_id, tool, profile_id, subpath, display_path, effect, verdict, reason, grant_id, \
-     outcome, bytes, truncated";
+     outcome, bytes, truncated, tier, base_tier, raised_by, approval";
 
 /// Read the audit log newest-first, optionally for one conversation (Story
 /// 61.10, FR-388).
@@ -445,6 +526,10 @@ fn map_audit_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRow> {
         outcome: AuditOutcome::from_registry_str(&outcome),
         bytes: r.get(16)?,
         truncated: truncated != 0,
+        tier: r.get(18)?,
+        base_tier: r.get(19)?,
+        raised_by: r.get(20)?,
+        approval: r.get(21)?,
     })
 }
 
@@ -481,5 +566,145 @@ mod tests {
             AuditOutcome::Pending,
             "an outcome keeper cannot read is an outcome keeper does not know"
         );
+    }
+
+    /// R90: a `keeper.db` an older build made gains the four agent columns
+    /// in place; its rows read with them NULL, an agent's row carries its
+    /// tier, base tier and reasons, a ⌘9 row keeps them NULL.
+    #[test]
+    fn an_older_audit_table_gains_the_tier_columns() {
+        let dir = std::env::temp_dir().join(format!(
+            "keeper-audit-tier-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let old = Connection::open(dir.join("keeper.db")).expect("db");
+        old.execute_batch(
+            "CREATE TABLE bot_audit(id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                started_ms INTEGER NOT NULL, finished_ms INTEGER, provider_id TEXT NOT NULL, \
+                bot_id TEXT, session_id TEXT NOT NULL, message_id TEXT, tool TEXT NOT NULL, \
+                profile_id TEXT NOT NULL, subpath TEXT NOT NULL, display_path TEXT NOT NULL, \
+                effect TEXT NOT NULL, verdict TEXT NOT NULL, reason TEXT, grant_id TEXT, \
+                outcome TEXT NOT NULL, bytes INTEGER, truncated INTEGER NOT NULL); \
+             INSERT INTO bot_audit(started_ms, provider_id, session_id, tool, profile_id, \
+                subpath, display_path, effect, verdict, outcome, truncated) \
+             VALUES(1, 'p', 's', 'drive_read', 'tgdrive', 'a.md', 'tgdrive/a.md', 'read', \
+                'allow', 'ok', 0);",
+        )
+        .expect("old schema");
+        drop(old);
+
+        let target = ToolTarget {
+            profile_id: "tgdrive".to_owned(),
+            subpath: "10-notes/a.md".to_owned(),
+        };
+        let verdict = GrantVerdict::Ask {
+            grant_id: "g".to_owned(),
+            reason: "asks",
+        };
+        let classified = crate::agents::tier::classify(
+            crate::agents::tier::AgentTool::DriveWrite,
+            &crate::agents::tier::CallFacts::default(),
+            &crate::agents::tier::Context {
+                delegated: true,
+                unattended: true,
+                integrity: crate::agents::label::Integrity::Agent,
+                via_kvm: false,
+                grant: Some(crate::agents::tier::GrantWord::Ask),
+            },
+        );
+        let intent = |classified| AuditIntent {
+            started_ms: 2,
+            provider_id: "p",
+            bot_id: None,
+            session_id: "s",
+            message_id: None,
+            tool: "drive_write",
+            target: &target,
+            effect: Effect::Write,
+            verdict: &verdict,
+            classified,
+        };
+        append_intent(&dir, &intent(Some(&classified))).expect("agent row");
+        append_intent(&dir, &intent(None)).expect("bot row");
+        let rows = list_audit(&dir, Some("s"), None).expect("rows");
+        let tiers: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.tier,
+                    row.base_tier,
+                    row.raised_by.as_deref(),
+                    row.approval.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            tiers,
+            vec![
+                (None, None, None, None),
+                (Some(3), Some(2), Some("delegated,unattended"), None),
+                (None, None, None, None),
+            ]
+        );
+        assert_eq!(rows[2].tool, "drive_read");
+        // A second open finds the columns there and adds nothing.
+        append_intent(&dir, &intent(None)).expect("reopened");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R90 under concurrency: two first opens of an older `keeper.db` that
+    /// both find the agent columns missing — each inspected before either
+    /// adds one — both migrate without a `duplicate column` error, and the
+    /// older row is kept.
+    #[test]
+    fn two_first_opens_that_both_saw_the_old_schema_both_succeed() {
+        let dir = std::env::temp_dir().join(format!(
+            "keeper-audit-race-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = dir.join("keeper.db");
+        Connection::open(&db)
+            .expect("db")
+            .execute_batch(
+                "CREATE TABLE bot_audit(id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                    started_ms INTEGER NOT NULL, finished_ms INTEGER, provider_id TEXT NOT NULL, \
+                    bot_id TEXT, session_id TEXT NOT NULL, message_id TEXT, tool TEXT NOT NULL, \
+                    profile_id TEXT NOT NULL, subpath TEXT NOT NULL, display_path TEXT NOT NULL, \
+                    effect TEXT NOT NULL, verdict TEXT NOT NULL, reason TEXT, grant_id TEXT, \
+                    outcome TEXT NOT NULL, bytes INTEGER, truncated INTEGER NOT NULL); \
+                 INSERT INTO bot_audit(started_ms, provider_id, session_id, tool, profile_id, \
+                    subpath, display_path, effect, verdict, outcome, truncated) \
+                 VALUES(1, 'p', 's', 'drive_read', 'tgdrive', 'a.md', 'tgdrive/a.md', 'read', \
+                    'allow', 'ok', 0);",
+            )
+            .expect("old schema");
+        let contender = || {
+            let conn = Connection::open(&db).expect("contender");
+            conn.busy_timeout(BUSY_TIMEOUT).expect("busy timeout");
+            conn
+        };
+        let (mut first, mut second) = (contender(), contender());
+        assert_eq!(missing_tier_columns(&first).expect("first looks").len(), 4);
+        assert_eq!(
+            missing_tier_columns(&second).expect("second looks").len(),
+            4
+        );
+        add_tier_columns(&mut first).expect("the first adds them");
+        add_tier_columns(&mut second).expect("the second finds them added");
+        assert!(missing_tier_columns(&second).expect("after").is_empty());
+        let rows = list_audit(&dir, Some("s"), None).expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].tool.as_str(), rows[0].tier), ("drive_read", None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
