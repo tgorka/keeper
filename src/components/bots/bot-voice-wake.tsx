@@ -5,13 +5,13 @@
  *
  * # Where the affordance exists at all
  *
- * Three conditions, and every failing one is an AD-27 *absence*, never a
- * disabled control:
+ * Two conditions, and every failing one is an AD-27 *absence*, never a
+ * disabled control — and no capability flag is one of them: a voice surface
+ * exists on `voice_availability`'s answer alone (AD-179):
  *
- * 1. **`capabilities.bots` must be on.** No pane, no phrase.
- * 2. **`voice_availability` must have answered.** `undefined` is a question
+ * 1. **`voice_availability` must have answered.** `undefined` is a question
  *    not yet asked, and absence must not be decided from it.
- * 3. **The answer must not be `unsupported`.** That is every build without a
+ * 2. **The answer must not be `unsupported`.** That is every build without a
  *    voice port — the desktop today — and the reason a person would look for
  *    is the platform disclosure in Settings (62.3), not a band in the pane
  *    saying a feature is missing on a machine that never offered it.
@@ -43,6 +43,19 @@
  * `keeper_core::voice::WakePhrase::parse_stop`, and matched by Rust on the
  * barge-in transcript; nothing here listens. Any other speech mid-answer
  * still asks a question (FR-403).
+ *
+ * # The turn models' line (Epic 97, UX-DR142, D-36)
+ *
+ * One line under the switch: `VoiceWakeVm.turnModels.sentence`, Rust's
+ * words for whether this device ends a turn by meaning, and, in every
+ * state but ready, what a turn does instead. No control: the models are the
+ * account's `_models/`. Absent where Rust sends none — a device whose voice
+ * runs no turn models — and with the whole block wherever it is absent.
+ * The line moves on its own — a models fetch starts or ends, the account
+ * goes — and the shell then sends the whole wake VM on `keeper://voice-wake`.
+ * {@link useVoiceWakeMirror} keeps the store current while the line is in
+ * view: one listener for every open host, a read when a host opens or
+ * unfolds and when the document comes back into view, and no timer.
  *
  * # Nothing here decides
  *
@@ -97,9 +110,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { useVoiceWakeMirror } from "@/hooks/use-voice-facts";
 import type { VoiceUnavailableVm, VoiceWakeVm } from "@/lib/ipc/client";
 import { voiceAuthorize, voiceAvailability, voiceLocaleSet, voiceWakeSet } from "@/lib/ipc/client";
-import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { isListening, useVoiceStore, voiceStore } from "@/lib/stores/voice";
 import { cn } from "@/lib/utils";
@@ -116,6 +129,9 @@ export const STOP_PHRASE_LABEL = "Stop word";
 export const STOP_SAVE_LABEL = "Save stop word";
 /** What the stop word does, in one sentence. */
 export const STOP_PHRASE_NOTE = "Said while keeper is answering, it ends the answer.";
+/** The turn models' line's accessible name: a refusal is Rust's sentence,
+ *  which need not open with what it is about. */
+export const TURN_MODELS_LABEL = "Turn models";
 /** The chip while the microphone is open for the phrase. */
 export function wakeListeningLabel(phrase: string | null): string {
   return phrase === null ? "Listening" : `Listening for "${phrase}"`;
@@ -205,7 +221,6 @@ export function BotVoiceWake({
   className?: string;
   fold?: { folded: boolean; onToggle: () => void };
 } = {}) {
-  const bots = useCapabilitiesStore((s) => s.capabilities.bots);
   const unavailable = useVoiceStore((s) => s.unavailable);
   const wake = useVoiceStore((s) => s.wake);
   const state = useVoiceStore((s) => s.state);
@@ -233,8 +248,15 @@ export function BotVoiceWake({
       setStopDraft(heldStop);
     }
   }, [heldStop]);
+  // Kept current only while the block is drawn and unfolded: a folded band
+  // shows no turn models' line, and reads again when it opens.
+  useVoiceWakeMirror(
+    unavailable !== undefined &&
+      unavailable?.kind !== "unsupported" &&
+      (fold === undefined || !fold.folded),
+  );
 
-  if (!bots || unavailable === undefined || unavailable?.kind === "unsupported" || wake === null) {
+  if (unavailable === undefined || unavailable?.kind === "unsupported" || wake === null) {
     return null;
   }
 
@@ -317,6 +339,13 @@ export function BotVoiceWake({
           onCheckedChange={(checked) => save(checked)}
         />
       </div>
+      {wake.turnModels !== undefined && (
+        // `status`: the line changes when a fetch lands, and that is worth
+        // hearing. Named, because a refusal's sentence is Rust's own.
+        <p role="status" aria-label={TURN_MODELS_LABEL} className="text-muted-foreground text-xs">
+          {wake.turnModels.sentence}
+        </p>
+      )}
       <form
         className="flex items-center gap-2"
         onSubmit={(event) => {
