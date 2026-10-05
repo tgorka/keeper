@@ -3441,6 +3441,10 @@ pub async fn account_forget(state: State<'_, AppState>) -> Result<AccountVm, Ipc
     // No turn models without an account (D-36): the loaded ones go now, and
     // a load still under way is dropped instead of published.
     crate::voice_turn_models::unload();
+    if let Err(error) = tauri::async_runtime::spawn_blocking(crate::voice_ipc::announce_wake).await
+    {
+        tracing::warn!(%error, "account: the turn models' line was not announced");
+    }
     Ok(vm)
 }
 

@@ -15,8 +15,9 @@
  * 5. **Absent on `unsupported`, present-with-a-prompt on `notAuthorized`** —
  *    the one is no control at all; the other keeps the switch and shows the
  *    sentence saying what to allow.
- * 6. **The section is absent where `capabilities.bots` is off**, and while the
- *    availability question has not been answered.
+ * 6. **The section exists on `voice_availability`'s answer alone (AD-179)**:
+ *    absent while that question has not been answered, whatever
+ *    `capabilities.bots` says.
  * 7. **The language control (Epic 63)** — offers exactly what the device can
  *    run on-device plus "Choose for me", sends the choice (or `null`) through
  *    Rust and re-asks availability; is absent on an empty list with Rust's
@@ -35,16 +36,24 @@
  * 10. **The stop word (Epic 67, Story 67.3, AD-208)** — one line under the
  *    phrase shows `VoiceWakeVm.stopPhrase` and saves it through the same
  *    `voiceWakeSet` as the phrase; a refused word renders Rust's sentence.
+ * 11. **The turn models' line (Epic 97, UX-DR142)** — under the switch, each
+ *    state's sentence letter for letter from `VoiceWakeVm.turnModels`, named
+ *    for what it is; absent where Rust sends none or voice is unsupported.
+ *    It follows the shell's `keeper://voice-wake` event through one listener
+ *    however many hosts are open, is read again when a host opens or the
+ *    document comes back, sets no timer, and a read answered after a newer
+ *    VM landed never puts the older one back.
  */
 
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BotVoiceWake,
   STOP_PHRASE_LABEL,
   STOP_SAVE_LABEL,
+  TURN_MODELS_LABEL,
   VOICE_FOLDED_OFF,
   VOICE_LOCALE_AUTO_LABEL,
   VOICE_LOCALE_LABEL,
@@ -66,6 +75,17 @@ const voiceWakeSet =
 const voiceAuthorize = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
 const voiceAvailability = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
 const voiceLocaleSet = vi.fn<(locale: string | null) => Promise<VoiceWakeVm>>();
+const voiceWakeGet = vi.fn<() => Promise<VoiceWakeVm>>();
+/** What the shell's `keeper://voice-wake` reaches: every live listener. */
+let wakeListeners: ((wake: VoiceWakeVm) => void)[] = [];
+const unlistenVoiceWake = vi.fn();
+const listenVoiceWake = vi.fn((onWake: (wake: VoiceWakeVm) => void) => {
+  wakeListeners.push(onWake);
+  return Promise.resolve(() => {
+    unlistenVoiceWake();
+    wakeListeners = wakeListeners.filter((each) => each !== onWake);
+  });
+});
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
   return {
@@ -75,8 +95,28 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     voiceAuthorize: () => voiceAuthorize(),
     voiceAvailability: () => voiceAvailability(),
     voiceLocaleSet: (locale: string | null) => voiceLocaleSet(locale),
+    voiceWakeGet: () => voiceWakeGet(),
+    listenVoiceWake: (onWake: (wake: VoiceWakeVm) => void) => listenVoiceWake(onWake),
   };
 });
+
+/** The shell sends `wake` on `keeper://voice-wake`. */
+function shellSends(wake: VoiceWakeVm) {
+  act(() => {
+    for (const listener of wakeListeners) {
+      listener(wake);
+    }
+  });
+}
+
+/** A promise the test settles when it chooses. */
+function deferred<T>() {
+  let resolve: (value: T) => void = () => {};
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
 
 /** iOS's `VoicePlatform::limits` as `keeper-core` holds it, so the fixture is the real sentence. */
 function rustLimits(): string {
@@ -154,6 +194,11 @@ beforeEach(() => {
   voiceAuthorize.mockReset();
   voiceAvailability.mockReset();
   voiceLocaleSet.mockReset();
+  voiceWakeGet.mockReset();
+  listenVoiceWake.mockClear();
+  unlistenVoiceWake.mockClear();
+  // Unanswered unless a test answers it: the seeded VM is what is drawn.
+  voiceWakeGet.mockReturnValue(new Promise<never>(() => {}));
   voiceAuthorize.mockResolvedValue(null);
   voiceAvailability.mockResolvedValue(null);
   voiceStore.setState({ state: null, unavailable: undefined, wake: null });
@@ -161,10 +206,10 @@ beforeEach(() => {
 });
 
 describe("BotVoiceWake — where it exists", () => {
-  it("is absent where capabilities.bots is off", () => {
+  it("exists on the availability answer alone, whatever capabilities.bots says (AD-179)", () => {
     seed({ bots: false });
-    const { container } = render(<BotVoiceWake />);
-    expect(container).toBeEmptyDOMElement();
+    render(<BotVoiceWake />);
+    expect(screen.getByRole("switch", { name: WAKE_SWITCH_LABEL })).toBeInTheDocument();
   });
 
   it("is absent while the availability question has not been answered", () => {
@@ -577,5 +622,199 @@ describe("BotVoiceWake — folded to one line (Story 64.1)", () => {
     seed({ unavailable: UNSUPPORTED });
     const { container } = render(<BotVoiceWake fold={{ folded: true, onToggle: vi.fn() }} />);
     expect(container).toBeEmptyDOMElement();
+  });
+});
+
+/** `TurnModelsState::vm` for each state, the sentences as `keeper_core::voice::turn_models` words them. */
+const FALLBACK = "keeper waits 1.8 s after you stop";
+const TURN_READY: NonNullable<VoiceWakeVm["turnModels"]> = {
+  state: "ready",
+  sentence: "Turn models ready",
+  missing: [],
+};
+const TURN_FETCHING: NonNullable<VoiceWakeVm["turnModels"]> = {
+  state: "fetching",
+  sentence: `Fetching the turn models from your account… ${FALLBACK} until they are here`,
+  missing: [],
+};
+const TURN_STATES: NonNullable<VoiceWakeVm["turnModels"]>[] = [
+  TURN_READY,
+  {
+    state: "missing",
+    sentence: `Turn models missing: silero-vad/model.onnx — ${FALLBACK}`,
+    missing: ["silero-vad/model.onnx"],
+  },
+  {
+    state: "missing",
+    sentence: `Turn models out of date — keeper brings them up to date after the next sync, and ${FALLBACK} until then`,
+    missing: [],
+  },
+  {
+    state: "failed",
+    sentence: `The speech detection model “silero-v5” set by \`transcription.vad_model\` is not on this device. Set \`transcription.vad_model\` in your account's settings.toml to another folder of _models/, or remove it to use the one [vad] in models.toml names. Until then, ${FALLBACK}.`,
+    missing: [],
+  },
+  {
+    state: "failed",
+    sentence: `The turn models could not be fetched: the config repository did not answer — ${FALLBACK}`,
+    missing: [],
+  },
+  {
+    state: "noAccount",
+    sentence: `No turn models without an account — ${FALLBACK}. They come from your account's settings repository (Settings → Account).`,
+    missing: [],
+  },
+  TURN_FETCHING,
+];
+
+describe("BotVoiceWake — the turn models' line (UX-DR142)", () => {
+  it.each(
+    TURN_STATES.map((turnModels) => [turnModels.sentence, turnModels]),
+  )("says %s, letter for letter, as the line named for the turn models", (_, turnModels) => {
+    seed({ wake: { ...OFF, turnModels } });
+    render(<BotVoiceWake />);
+    const line = screen.getByRole("status", { name: TURN_MODELS_LABEL });
+    expect(line.textContent).toBe(turnModels.sentence);
+  });
+
+  it("sits under the switch, before the phrase", () => {
+    seed({ wake: { ...OFF, turnModels: TURN_READY } });
+    render(<BotVoiceWake />);
+    const line = screen.getByRole("status", { name: TURN_MODELS_LABEL });
+    const toggle = screen.getByRole("switch", { name: WAKE_SWITCH_LABEL });
+    const phrase = screen.getByLabelText(WAKE_PHRASE_LABEL, { selector: "input" });
+    expect(toggle.compareDocumentPosition(line) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(line.compareDocumentPosition(phrase) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("is absent where Rust sends no turn models: no line, nothing in its place", () => {
+    seed({ wake: OFF });
+    render(<BotVoiceWake />);
+    expect(screen.queryByRole("status", { name: TURN_MODELS_LABEL })).toBeNull();
+    expect(screen.queryByText(/turn models/i)).toBeNull();
+  });
+
+  it("is absent with the block where voice is unsupported", () => {
+    seed({ wake: { ...OFF, turnModels: TURN_READY }, unavailable: UNSUPPORTED });
+    const { container } = render(<BotVoiceWake />);
+    expect(container).toBeEmptyDOMElement();
+  });
+});
+
+describe("BotVoiceWake — the turn models' line follows the shell", () => {
+  const MISSING = TURN_STATES[1];
+  const FAILED = TURN_STATES[4];
+  const lineText = () => screen.getByRole("status", { name: TURN_MODELS_LABEL }).textContent;
+
+  it.each([
+    ["missing", MISSING],
+    ["failed", FAILED],
+  ])("goes %s → fetching → ready on the shell's events alone, with no timer", (_, first) => {
+    const interval = vi.spyOn(window, "setInterval");
+    seed({ wake: { ...OFF, turnModels: first } });
+    render(<BotVoiceWake />);
+    expect(lineText()).toBe(first.sentence);
+    shellSends({ ...OFF, turnModels: TURN_FETCHING });
+    expect(lineText()).toBe(TURN_FETCHING.sentence);
+    shellSends({ ...OFF, turnModels: TURN_READY });
+    expect(lineText()).toBe(TURN_READY.sentence);
+    expect(interval).not.toHaveBeenCalled();
+    expect(voiceWakeGet).toHaveBeenCalledTimes(1);
+    interval.mockRestore();
+  });
+
+  it("holds one listener for every open host and lets it go with the last", async () => {
+    seed({ wake: { ...OFF, turnModels: MISSING } });
+    const settings = render(<BotVoiceWake />);
+    const pane = render(<BotVoiceWake fold={{ folded: false, onToggle: vi.fn() }} />);
+    await act(() => Promise.resolve());
+    expect(listenVoiceWake).toHaveBeenCalledTimes(1);
+    shellSends({ ...OFF, turnModels: TURN_READY });
+    for (const line of screen.getAllByRole("status", { name: TURN_MODELS_LABEL })) {
+      expect(line.textContent).toBe(TURN_READY.sentence);
+    }
+    settings.unmount();
+    expect(unlistenVoiceWake).not.toHaveBeenCalled();
+    pane.unmount();
+    expect(unlistenVoiceWake).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads when a host opens and when it unfolds; folded, it reads and listens to nothing", () => {
+    seed({ wake: { ...OFF, turnModels: MISSING } });
+    const { rerender } = render(<BotVoiceWake fold={{ folded: true, onToggle: vi.fn() }} />);
+    expect(voiceWakeGet).not.toHaveBeenCalled();
+    expect(listenVoiceWake).not.toHaveBeenCalled();
+    rerender(<BotVoiceWake fold={{ folded: false, onToggle: vi.fn() }} />);
+    expect(voiceWakeGet).toHaveBeenCalledTimes(1);
+    expect(listenVoiceWake).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads again when the document comes back into view, once however many hosts are open", () => {
+    seed({ wake: { ...OFF, turnModels: MISSING } });
+    render(<BotVoiceWake />);
+    render(<BotVoiceWake fold={{ folded: false, onToggle: vi.fn() }} />);
+    expect(voiceWakeGet).toHaveBeenCalledTimes(2);
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(voiceWakeGet).toHaveBeenCalledTimes(3);
+  });
+
+  it("drops a read answered after the shell's newer VM", async () => {
+    const read = deferred<VoiceWakeVm>();
+    voiceWakeGet.mockReturnValueOnce(read.promise);
+    seed({ wake: { ...OFF, turnModels: MISSING } });
+    render(<BotVoiceWake />);
+    shellSends({ ...OFF, turnModels: TURN_READY });
+    await act(async () => read.resolve({ ...OFF, turnModels: TURN_FETCHING }));
+    expect(lineText()).toBe(TURN_READY.sentence);
+  });
+
+  it("keeps the later read when two answer out of order", async () => {
+    const older = deferred<VoiceWakeVm>();
+    const newer = deferred<VoiceWakeVm>();
+    voiceWakeGet.mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise);
+    seed({ wake: { ...OFF, turnModels: MISSING } });
+    render(<BotVoiceWake />);
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await act(async () => newer.resolve({ ...OFF, turnModels: TURN_READY }));
+    await act(async () => older.resolve({ ...OFF, turnModels: TURN_FETCHING }));
+    expect(lineText()).toBe(TURN_READY.sentence);
+  });
+
+  it("keeps a saved phrase over a read asked before the save", async () => {
+    const read = deferred<VoiceWakeVm>();
+    voiceWakeGet.mockReturnValueOnce(read.promise);
+    voiceWakeSet.mockResolvedValue({ ...OFF, phrase: "hey keeper", turnModels: TURN_FETCHING });
+    seed({ wake: { ...OFF, turnModels: TURN_FETCHING } });
+    render(<BotVoiceWake />);
+    const box = screen.getByLabelText(WAKE_PHRASE_LABEL, { selector: "input" });
+    fireEvent.change(box, { target: { value: "hey keeper" } });
+    fireEvent.click(screen.getByRole("button", { name: WAKE_SAVE_LABEL }));
+    await waitFor(() => expect(voiceStore.getState().wake?.phrase).toBe("hey keeper"));
+    await act(async () => read.resolve({ ...OFF, turnModels: TURN_FETCHING }));
+    expect(voiceStore.getState().wake?.phrase).toBe("hey keeper");
+  });
+
+  it("drops a read left pending by a closed host once the reopened host's read landed", async () => {
+    const closed = deferred<VoiceWakeVm>();
+    const reopened = deferred<VoiceWakeVm>();
+    voiceWakeGet.mockReturnValueOnce(closed.promise).mockReturnValueOnce(reopened.promise);
+    seed({ wake: { ...OFF, turnModels: MISSING } });
+    render(<BotVoiceWake />).unmount();
+    render(<BotVoiceWake />);
+    await act(async () => reopened.resolve({ ...OFF, turnModels: TURN_READY }));
+    await act(async () => closed.resolve({ ...OFF, turnModels: TURN_FETCHING }));
+    expect(lineText()).toBe(TURN_READY.sentence);
+  });
+
+  it("lets the listener go when the host closed before it was registered", async () => {
+    seed({ wake: { ...OFF, turnModels: MISSING } });
+    render(<BotVoiceWake />).unmount();
+    await act(() => Promise.resolve());
+    expect(wakeListeners).toHaveLength(0);
+    expect(unlistenVoiceWake).toHaveBeenCalledTimes(1);
   });
 });

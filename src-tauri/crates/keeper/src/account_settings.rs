@@ -466,6 +466,7 @@ pub(crate) fn apply(
     let mut unapplied = Unapplied::default();
     let mut voice = false;
     let mut embedding = false;
+    let mut turn_picks = false;
     for (key, value) in changes {
         let Some(stored) = settings_sync::stored_key(key, catalog) else {
             // Its base takes this device's value, so the file's is pulled
@@ -504,6 +505,10 @@ pub(crate) fn apply(
             Ok(true) => {
                 voice |= route == Route::Voice;
                 embedding |= route == Route::EmbeddingModel;
+                turn_picks |= matches!(
+                    stored.as_str(),
+                    "transcription.vad_model" | "transcription.smart_turn_model"
+                );
             }
             Ok(false) => {
                 unapplied.moved.insert(key.clone());
@@ -519,6 +524,11 @@ pub(crate) fn apply(
     }
     if embedding {
         crate::notes_ipc::embedding_model_applied();
+    }
+    // The turn models' line names the picks (a refused one, say); it is read
+    // again and sent, since no voice command asked.
+    if turn_picks {
+        crate::voice_ipc::announce_wake();
     }
     unapplied
 }

@@ -557,6 +557,9 @@ pub fn spawn_models_fetch(platform: Arc<dyn Platform>) {
     }
     tauri::async_runtime::spawn(async move {
         let _fetching = fetching;
+        if takes_turns {
+            announce_turn_models().await;
+        }
         let dest = models_root(&data_dir);
         let (clone, repo) = crate::account_ipc::clone_models(&data_dir);
         let (vad, smart_turn) = registry::get_turn_models(&data_dir).unwrap_or_else(|error| {
@@ -603,6 +606,7 @@ pub fn spawn_models_fetch(platform: Arc<dyn Platform>) {
                     tracing::warn!(%error, "voice: the turn models load ended unexpectedly");
                 }
                 *lock(&TURN_FETCH) = next.into_turn();
+                announce_turn_models().await;
             } else {
                 transcription = Some(next);
             }
@@ -611,6 +615,15 @@ pub fn spawn_models_fetch(platform: Arc<dyn Platform>) {
             *lock(&FETCH) = next;
         }
     });
+}
+
+/// Tell every window the turn models' line moved (`voice_ipc::announce_wake`),
+/// off the async workers: reading the line hashes files. Awaited, so the
+/// fetch's start is announced before its end.
+async fn announce_turn_models() {
+    if let Err(error) = tokio::task::spawn_blocking(crate::voice_ipc::announce_wake).await {
+        tracing::warn!(%error, "voice: the turn models' line announce ended unexpectedly");
+    }
 }
 
 /// What the last fetch of the turn group left behind, for the voice
