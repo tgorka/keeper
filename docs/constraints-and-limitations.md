@@ -124,12 +124,12 @@ safe binding. Current inventory:
   `AVAudioEngineConfigurationChangeNotification` and, since Epic 65,
   `AVAudioSessionRouteChangeNotification`, `removeObserver:`) via objc2-speech,
   objc2-avf-audio and objc2-foundation, behind `keeper_core::voice::VoicePort` and
-  `keeper_core::voice::ConsentPort` — twenty-eight function-level `#[allow(unsafe_code)]`
+  `keeper_core::voice::ConsentPort` — twenty-nine function-level `#[allow(unsafe_code)]`
   fns in `crates/keeper/src/voice_ios.rs`, one per concern (`speech_authorization`,
   `microphone`, `microphone_consent`, `ask_speech`, `ask_microphone`,
   `on_device_locales`, `recognizer_for`, `configure_session`, `set_session_options`,
   `release_session`, `start_capture`, `stop_capture`, `engine_running`, `start_request`,
-  `end_request`, `read_result`, `observe_session`, `route_change_reason`,
+  `end_request`, `finish_request`, `read_result`, `observe_session`, `route_change_reason`,
   `interruption_notice`, `forget_observer`, `new_synthesizer`, `voice_languages`,
   `voice_for_language`, `voice_name`, `detect_language`, `speak_text`, `stop_speech`,
   `is_speaking`), each
@@ -205,15 +205,20 @@ safe binding. Current inventory:
   (`addObserverForName:object:queue:usingBlock:` for
   `AVAudioEngineConfigurationChangeNotification`, `removeObserver:`) and `NSProcessInfo`
   (`endActivity:` for the App Nap assertion; `beginActivityWithOptions:reason:` is a safe
-  binding) via objc2-speech, objc2-avf-audio and objc2-foundation, behind
-  `keeper_core::voice::VoicePort` and `keeper_core::voice::ConsentPort` — twenty-two
-  function-level `#[allow(unsafe_code)]` fns in `crates/keeper/src/voice_macos.rs`, one per
-  concern (`speech_authorization`, `microphone_consent`, `ask_speech`, `ask_microphone`,
-  `input_present`, `on_device_locales`, `recognizer_for`, `start_capture`, `stop_capture`,
-  `engine_running`, `start_request`, `end_request`, `read_result`, `forget_observer`,
-  `new_synthesizer`, `voice_languages`, `voice_for_language`, `voice_name`,
-  `detect_language`, `speak_text`, `stop_speech`, `is_speaking`), each with a `// SAFETY:`
-  comment citing the Apple contract it relies on. `start_capture` also carries
+  binding) via objc2-speech, objc2-avf-audio and objc2-foundation, plus CoreAudio's
+  `AudioObjectGetPropertyData` (declared in the file; the default input device, then its
+  `kAudioObjectPropertyName` as a +1 `CFStringRef` the fn takes ownership of and releases
+  once), behind `keeper_core::voice::VoicePort` and `keeper_core::voice::ConsentPort` —
+  twenty-four function-level `#[allow(unsafe_code)]` fns in
+  `crates/keeper/src/voice_macos.rs`, one per concern (`speech_authorization`,
+  `microphone_consent`, `ask_speech`, `ask_microphone`, `input_present`,
+  `on_device_locales`, `recognizer_for`, `start_capture`, `default_input_device_name` —
+  read only after voice processing was refused, for the half-duplex sentence (AD-213) —
+  `stop_capture`, `engine_running`, `start_request`, `end_request`, `finish_request`,
+  `read_result`, `forget_observer`, `new_synthesizer`, `voice_languages`,
+  `voice_for_language`, `voice_name`, `detect_language`, `speak_text`, `stop_speech`,
+  `is_speaking`), each with a `// SAFETY:` comment citing the Apple contract it relies on.
+  `start_capture` also carries
   `#[allow(clippy::arc_with_non_send_sync)]` for the same request slot as the iOS port. No
   `AVAudioSession` call exists in the file — the class does not exist on macOS — so there
   is no category, no ducking and no interruption observer; half-duplex is
@@ -258,6 +263,18 @@ safe binding. Current inventory:
   second and never one per buffer. Only a number in `0.0..=1.0` leaves the tap; no sample
   does. There is no second tap: `installTapOnBus:` allows one per bus, and the level shares
   the recogniser's.
+- End of turn by meaning, both ports (Epic 97, Story 97.2, AD-411): `AVAudioFormat
+  sampleRate` read once in `start_capture` (already counted), and one new audited fn per
+  port, `finish_request` — `SFSpeechAudioBufferRecognitionRequest endAudio` alone, after the
+  worker took the request out of the tap's slot, so the task delivers its final words
+  instead of being cancelled (`keeper_core::voice::VoicePort::finish_recognition`, counted
+  in the totals above); the port then tells the turn when `endAudio` ran. The tap also
+  copies channel 0 into a buffer from a fixed pool held by
+  `keeper_core::voice::end_of_turn::Ear` for one listener thread, which runs the turn
+  models (`voice_turn_models.rs`, ONNX Runtime) while the turn is `Listening`; the samples
+  go nowhere else. The tap never allocates and never waits: it only tries the lock on the
+  pool's line, and with the lock held (a listener being attached or detached) or no free
+  buffer, the audio is dropped, counted (`Ear::dropped`) and the listener starts afresh.
 - The account sign-in sheet, iOS (Epic 82, AD-311; macOS dropped it for the default browser):
   `ASWebAuthenticationSession` (`initWithURL:callback:completionHandler:` with
   `ASWebAuthenticationSessionCallback callbackWithCustomScheme:` behind

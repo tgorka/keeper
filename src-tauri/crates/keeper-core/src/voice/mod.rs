@@ -39,13 +39,16 @@
 
 pub mod authorization;
 pub mod banner;
+pub mod end_of_turn;
 pub mod events;
 pub mod island;
 pub mod level;
 pub mod locale;
 pub mod phrase;
 pub mod platform;
+pub mod request;
 pub mod speech;
+pub mod timings;
 pub mod turn;
 pub mod turn_models;
 
@@ -55,8 +58,8 @@ pub use authorization::{authorize, next_ask, Ask, Consent, ConsentPort, Permissi
 pub use phrase::{PhraseRefused, WakePhrase};
 pub use platform::VoicePlatform;
 pub use turn::{
-    advance, may_record, silence_budget, Effect, TurnEvent, TurnState, END_OF_UTTERANCE_PAUSE,
-    NOTHING_HEARD_TIMEOUT,
+    advance, may_record, restarts_budget, silence_budget, Effect, TurnEvent, TurnState,
+    END_OF_UTTERANCE_PAUSE, FINAL_WORDS_WAIT, NOTHING_HEARD_TIMEOUT,
 };
 
 use crate::vm::{VoiceStateVm, VoiceUnavailableVm};
@@ -311,6 +314,18 @@ pub trait VoicePort: Send + Sync {
     /// Idempotent.
     fn stop_speaking(&self);
 
+    /// Tell the recogniser the audio of this utterance has ended, so it
+    /// delivers the final transcript of what it already heard as
+    /// [`TurnEvent::FinalHeard`] (AD-411). The request stops receiving
+    /// audio, and its task is not cancelled; the microphone stays open.
+    /// Once `endAudio` has actually run the port delivers
+    /// [`TurnEvent::AudioEnded`] with `finish` and that moment, or
+    /// [`TurnEvent::NothingToFinish`] when it had no request to end — the
+    /// turn decides what either means. The port starts a fresh request
+    /// when [`request::rolls`] says so. A port with no recogniser has
+    /// nothing to finish. Idempotent.
+    fn finish_recognition(&self, finish: u64);
+
     /// The name of the input device this port could not get voice
     /// processing on for the capture it has up — the Mac's fact for
     /// `VoicePlatform::half_duplex_sentence` (AD-213). `None` on every port
@@ -346,7 +361,7 @@ pub trait VoicePort: Send + Sync {
 /// allows every state the table opens the device in, so nothing there
 /// changes. **Level** (Story 64.3, AD-186): a [`TurnEvent::Level`] is not a
 /// transition. It is recorded while the device is open for a turn —
-/// `Listening` and `Heard` — and cleared when the turn moves anywhere else,
+/// `Listening`, `Finishing` and `Heard` — and cleared when the turn moves anywhere else,
 /// so a snapshot never carries a level from a microphone that is closed.
 /// **Closing** (Epic 68, AD-214): the table ends `Speaking` on the
 /// synthesiser's [`TurnEvent::Silence`], but while the answer is still
@@ -370,7 +385,7 @@ pub struct Turn {
     /// Whether the last effect touching the device opened it. What the
     /// surface's "listening for the phrase" indicator reads.
     microphone_open: bool,
-    /// The last level the port reported while `Listening` or `Heard`;
+    /// The last level the port reported while `Listening`, `Finishing` or `Heard`;
     /// `None` before the first reading and in every other state.
     level: Option<f32>,
     /// The answer being read aloud, as a stream (AD-214).
@@ -390,6 +405,9 @@ pub struct Turn {
     question: Option<u64>,
     /// The last generation handed out.
     questions: u64,
+    /// Bumped by every move that starts the silence budget afresh
+    /// ([`restarts_budget`]): a timer stamped with an older one is spent.
+    budget: u64,
 }
 
 /// What the driver knows about the answer's stream that the table does not.
@@ -432,6 +450,7 @@ impl Turn {
             last_wait_ms: None,
             question: None,
             questions: 0,
+            budget: 0,
         }
     }
 
@@ -443,6 +462,15 @@ impl Turn {
     /// Where the turn is.
     pub fn state(&self) -> &TurnState {
         &self.state
+    }
+
+    /// The silence budget the turn is spending now. The shell stamps its
+    /// timer with this, and feeds [`TurnEvent::Silence`] only if it is
+    /// still the budget when the timer fires — checked under the same lock
+    /// as the move it then makes, so a budget a later move replaced (a
+    /// `Listening` pause overtaken by `Finishing`) can never end the turn.
+    pub fn budget(&self) -> u64 {
+        self.budget
     }
 
     /// The phrase set, if any.
@@ -558,9 +586,11 @@ impl Turn {
     /// phrase too and moves to `Idle`: that is how a refusal at arming is
     /// tried again once it clears (AD-190), and how turning the switch off
     /// takes the stale reason with it. Mid-turn the phrase is only recorded;
-    /// the turn's own end decides whether to re-arm.
+    /// the turn's own end decides whether to re-arm. Either way the silence
+    /// budget starts afresh: the shell arms its timer again after every set.
     pub fn set_wake(&mut self, wake: Option<WakePhrase>) -> Vec<Effect> {
         self.wake = wake;
+        self.budget = self.budget.wrapping_add(1);
         let effects = if matches!(self.state, TurnState::Idle | TurnState::Failed { .. }) {
             self.state = TurnState::Idle;
             if self.wake.is_some() {
@@ -624,7 +654,11 @@ impl Turn {
                 | TurnEvent::Abandoned
                 | TurnEvent::StopHeard
         );
+        let clock_before = turn::finishing_clock(&self.state);
         let (next, mut effects) = advance(std::mem::take(&mut self.state), event);
+        if turn::restarts(clock_before, turn::finishing_clock(&next)) {
+            self.budget = self.budget.wrapping_add(1);
+        }
         if matches!(next, TurnState::Idle)
             && turn_ended
             && self.wake.is_some()
@@ -721,10 +755,14 @@ impl Turn {
                 listening_for_wake: self.wake.is_some() && self.microphone_open,
                 last_wait_ms: self.last_wait_ms,
             },
-            TurnState::Listening { heard } => VoiceStateVm::Listening {
-                heard: heard.clone(),
-                level: self.level,
-            },
+            // The surface draws the wait for the last words as listening: the
+            // microphone is still open and the words are still the partials.
+            TurnState::Listening { heard } | TurnState::Finishing { heard, .. } => {
+                VoiceStateVm::Listening {
+                    heard: heard.clone(),
+                    level: self.level,
+                }
+            }
             TurnState::Heard { text } => VoiceStateVm::Heard {
                 text: text.clone(),
                 level: self.level,
@@ -747,7 +785,7 @@ impl Turn {
     fn meters(&self) -> bool {
         matches!(
             self.state,
-            TurnState::Listening { .. } | TurnState::Heard { .. }
+            TurnState::Listening { .. } | TurnState::Finishing { .. } | TurnState::Heard { .. }
         )
     }
 
@@ -805,6 +843,7 @@ pub fn perform(
                 *language = Some(chosen);
             }
             Effect::StopSpeaking => port.stop_speaking(),
+            Effect::FinishRecognition(finish) => port.finish_recognition(*finish),
         }
     }
     Ok(())

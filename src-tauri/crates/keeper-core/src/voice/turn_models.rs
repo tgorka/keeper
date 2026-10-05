@@ -402,7 +402,9 @@ fn worker_gone() -> TurnModelError {
     TurnModelError("the turn models worker stopped".to_owned())
 }
 
-/// [`spawn_turn_models`]'s answer.
+/// [`spawn_turn_models`]'s answer. A clone is another handle on the same
+/// worker.
+#[derive(Clone)]
 pub struct WorkerTurnModels {
     requests: mpsc::Sender<Request>,
 }

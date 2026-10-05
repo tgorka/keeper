@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use keeper_core::vm::{IpcError, VoiceEventVm};
 use keeper_core::voice::events::{self, VoiceEventKind, VoiceEvents};
+use keeper_core::voice::timings::TurnEnd;
 use keeper_core::voice::{Effect, TurnEvent, TurnState, WakePhrase};
 
 /// The one ring for the process. Every target: a desktop with no port
@@ -107,6 +108,16 @@ pub fn transition(
     {
         record(VoiceEventKind::AnswerClosed, None);
     }
+}
+
+/// A spoken turn sent its question (AD-411, NFR-114): its clock points go
+/// into the ring as a `turn_end` row and, as the same line, into the app log
+/// — written while debug mode is on — which is the file a device run is
+/// measured from (`keeper_core::voice::timings::from_log`). The ring keeps
+/// two hundred rows; the log keeps a whole run.
+pub fn turn_end(ended: &TurnEnd) {
+    tracing::info!(target: "keeper::voice::timings", "{}", ended.log_line());
+    record(VoiceEventKind::TurnEnd, Some(ended.detail()));
 }
 
 /// The switch took effect on the port: armed for `wake`, or disarmed when

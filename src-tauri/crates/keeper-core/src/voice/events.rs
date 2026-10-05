@@ -93,6 +93,9 @@ pub enum VoiceEventKind {
     /// hotkey, the pill (Epic 68, Story 68.1, AD-212). Mid-answer this is the
     /// stop that stops the voice.
     Abandoned,
+    /// A spoken turn sent its question (AD-411, NFR-114): the clock points
+    /// of how it ended, as [`super::timings::TurnEnd::detail`] writes them.
+    TurnEnd,
 }
 
 impl VoiceEventKind {
@@ -101,6 +104,7 @@ impl VoiceEventKind {
         Self::Turn(match state {
             TurnState::Idle => "idle",
             TurnState::Listening { .. } => "listening",
+            TurnState::Finishing { .. } => "finishing",
             TurnState::Heard { .. } => "heard",
             TurnState::Sending { .. } => "sending",
             TurnState::Speaking => "speaking",
@@ -132,6 +136,7 @@ impl VoiceEventKind {
             Self::AnswerClosed => "answer_closed".to_owned(),
             Self::Enqueued => "enqueued".to_owned(),
             Self::Abandoned => "abandoned".to_owned(),
+            Self::TurnEnd => "turn_end".to_owned(),
         }
     }
 }

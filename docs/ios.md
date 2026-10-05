@@ -1012,6 +1012,53 @@ documented Tauri precedent for a Live Activity reports it working under `tauri i
 build` and not under `tauri ios dev` (tauri-apps discussion #14555, read 2026-09-05),
 which the scripted path — a `build` — sidesteps rather than answers.
 
+### How a spoken turn ends
+
+Without turn models a spoken question is sent 1.8 s after the recogniser's last partial
+(`keeper_core::voice::END_OF_UTTERANCE_PAUSE`) — on the phone and the Mac alike. With the
+account's turn models loaded (Epic 97, story 97.1: Silero VAD and Smart Turn v3.2 from
+`_models/`, run through ONNX Runtime on the arm64 iPhone) a finished sentence ends the turn
+sooner (AD-411, story 97.2):
+
+1. **The tap's copy.** The capture's one tap (`start_capture`, `voice_ios.rs`) still appends
+   every buffer to the recognition request and meters it; it also copies channel 0 into a
+   buffer from a fixed pool (`keeper_core::voice::end_of_turn::Ear`), stamped with
+   `voice_log::now_ms` as the tap delivers it, and only while the turn is `Listening`. The
+   audio thread never allocates or waits for this: it only tries the pool's lock, and with the
+   lock busy or no free buffer the audio is dropped, counted, and the listener starts afresh, so
+   the pause decides that turn. Each buffer carries the listening it was heard in; one heard
+   in a listening that is over — the turn abandoned, barged in on, the models replaced, the
+   capture rebuilt — is skipped, and nothing made of it reaches the turn.
+2. **The listener.** One thread (`keeper-end-of-turn`) resamples the input node's rate to
+   16 kHz (windowed sinc), feeds 32 ms frames to the voice activity model, and runs
+   `EndOfTurn`: an onset is three frames at ≥ 0.5; speech ends at the first frame under 0.35
+   after ≥ 250 ms of speech; 224 ms later (the 200 ms hangover in whole frames) it asks the
+   end-of-turn model, unless speech started again. That model hears the turn from 500 ms before
+   its first onset, at most the last 8 s, as Smart Turn's log-mel features
+   (`keeper_ported::smart_turn`). A score ≥ 0.5 is `UtteranceEnd`; below, nothing happens and
+   the pause decides. The thread hands its events to the turn one at a time, in order, and the
+   turn takes each under its lock only if it is from the listening still under way.
+3. **The last words.** `UtteranceEnd` takes a `Listening` turn that heard words to `Finishing`
+   and the port carries out `FinishRecognition`: the request leaves the tap's slot and gets
+   `endAudio` — not `cancel` — so the recogniser delivers its final transcript, which is sent.
+   The port reports the moment `endAudio` ran; if the final transcript has not come within
+   600 ms (`FINAL_WORDS_WAIT`) of that moment, the last partial is sent. A port with no request
+   to end says so and the partial is sent at once; one that has not reported within 600 ms of
+   the decision is waited for no longer. Partials meanwhile do not extend the wait. The port
+   rolls to a fresh request on the final words, or 600 ms after `endAudio` — its routine rolls
+   (after 45 s at a quiet moment, at 58 s regardless) wait for that. The microphone and the
+   audio session stay up throughout, and the surface draws `Finishing` as listening.
+
+**Reading it back.** Every sent question leaves one `turn_end` row in the ring, its detail a JSON
+record — `ended_by` (`model`, `pause` or `recogniser`), `speech_end_ms`, `utterance_end_ms`
+(the decision), `finish_recognition_ms` (when `endAudio` ran, as the port reported it),
+`final_words_ms` (absent when the 600 ms ran out), `sent_ms` — and the
+same line, `voice turn_end {…}`, in the app log while debug mode is on
+(`<container>/Library/Logs/keeper/keeper.log`). A device run is measured from that file:
+`KEEPER_VOICE_LOG=<keeper.log> cargo test -p keeper-core --test voice_timings
+measure_a_device_run -- --ignored --nocapture` prints NFR-114's figures and refuses fewer than
+twenty turns ([agents.md](agents.md) § *Measured: a spoken turn's end*).
+
 ### A turn that finishes without the screen
 
 Epics 62 to 65 designed the hands-free turn with the screen as a participant, and nobody
