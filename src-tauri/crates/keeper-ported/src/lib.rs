@@ -12,3 +12,4 @@
 
 pub mod agentskills;
 pub mod bmad;
+pub mod smart_turn;

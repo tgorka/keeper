@@ -1574,6 +1574,37 @@ as chosen ("not listed yet") and is looked for again, never rewritten. What happ
   move nothing, whichever finishes first; the earlier one's send and watch are stopped.
 - **The wake phrase is unchanged.** Naming the proxy "Nixi" renames nothing; the wake phrase is
   the one you set.
+- **When your question ends.** Without the account's turn models it ends 1.8 s after the
+  recogniser's last words, as it always has. With them (Silero VAD and Smart Turn v3.2 from
+  `_models/`, on an Apple-silicon Mac and the iPhone) a finished sentence ends it about a quarter
+  of a second after you stop: the voice activity model hears speech stop, the end-of-turn model
+  judges the sentence finished, and the recogniser is asked for its last words — sent when they
+  come, or what it had heard 600 ms after the recogniser was told the audio ended. A sentence
+  the model judges unfinished ("and the second one is…") waits for the 1.8 s pause. On the Mac
+  this is the same as on the phone
+  ([ios.md](ios.md) § *How a spoken turn ends*): the tap's copy, the listener thread, the models,
+  `FinishRecognition`'s `endAudio`; a capture without voice processing (an aggregate input,
+  AD-213) ends turns the same way, since the models listen only while the turn is listening, not
+  while keeper speaks. The audio goes from the tap to the models and nowhere else.
+
+### Measured: a spoken turn's end
+
+NFR-114's end-of-turn half, per device, over at least twenty spoken questions with the turn
+models present — about half complete sentences, half trailing off — from the app log of the run
+(debug mode on; `KEEPER_VOICE_LOG=<keeper.log> cargo test -p keeper-core --test voice_timings
+measure_a_device_run -- --ignored --nocapture`): the p95 of `finish_recognition_ms −
+speech_end_ms` over the turns the model ended (≤ 300 ms; `finish_recognition_ms` is when the
+port ran `endAudio`, as it reported it), the p95 of `sent_ms − finish_recognition_ms`
+(≤ 600 ms), and the pause turns sent less than 1.8 s after their speech end
+(none). Each sent text is also compared by hand with what was said: no question may lose its last
+word.
+
+| device | OS | build | date | n | model turns | finish p95 | send p95 | early pauses | last words lost |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| hesperia | — | — | owed | — | — | — | — | — | — |
+| kalypso | — | — | owed | — | — | — | — | — | — |
+
+Both rows are owed: story 97.2 is done only when they are filled from real runs (97.2 #8).
 
 ## Handing work on
 

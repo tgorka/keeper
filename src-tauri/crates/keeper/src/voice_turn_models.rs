@@ -16,10 +16,12 @@
 //! the iOS simulator) voice keeps its pause rule and shows no turn-models line.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use keeper_core::registry;
 use keeper_core::transcription::models::{self as model_files, TURN_GROUP};
 use keeper_core::transcription::vm::ModelsStateVm;
+use keeper_core::voice::end_of_turn::Ear;
 use keeper_core::voice::turn_models::{
     turn_models_state, LoadSlot, Ticket, TurnDisk, TurnGeneration, TurnLoad, TurnModelsFacts,
 };
@@ -48,6 +50,50 @@ struct Loaded {
 }
 
 static LOADED: LoadSlot<Loaded> = LoadSlot::new();
+
+/// Where both capture taps put their audio for the end-of-turn models
+/// (AD-411): listened to while models are loaded and the turn listens.
+static EAR: Ear = Ear::new();
+
+/// The hydration the ear is listening through, if any.
+static HEARING: Mutex<Option<(PathBuf, TurnGeneration)>> = Mutex::new(None);
+
+/// The ear the capture taps feed, on the audio thread.
+pub fn ear() -> &'static Ear {
+    &EAR
+}
+
+/// Put the ear on what is published now: a listener over the loaded models,
+/// replaced when another generation is published, none when nothing is.
+/// Run under the slot's lock, so two loads finishing together cannot leave
+/// the older one listening.
+fn follow_published() {
+    LOADED.read(|loaded| {
+        let loaded = loaded.and_then(|loaded| {
+            let models = loaded.models.as_ref().ok()?;
+            Some((loaded, models))
+        });
+        let wanted = loaded.map(|(loaded, _)| (loaded.root.clone(), loaded.generation.clone()));
+        let mut hearing = HEARING.lock().unwrap_or_else(PoisonError::into_inner);
+        if *hearing == wanted {
+            return;
+        }
+        match loaded {
+            Some((_, models)) => {
+                if let Err(error) =
+                    EAR.attach(runtime::share(models), Arc::new(crate::voice_ipc::heard))
+                {
+                    tracing::warn!(%error, "voice: the end-of-turn listener did not start");
+                    EAR.detach();
+                    *hearing = None;
+                    return;
+                }
+            }
+            None => EAR.detach(),
+        }
+        *hearing = wanted;
+    });
+}
 
 /// The turn models' line under the voice switch, or `None` where voice runs
 /// none. Blocking: it reads the settings and hashes the turn group's plain
@@ -85,6 +131,7 @@ pub fn refresh(data_dir: &Path) {
         TurnLoad::Load(generation) => load(ticket, &root, generation),
         TurnLoad::Unload => {
             LOADED.publish(ticket, None);
+            follow_published();
         }
     }
 }
@@ -92,6 +139,7 @@ pub fn refresh(data_dir: &Path) {
 /// Drop the loaded turn models and any load under way: the account is gone.
 pub fn unload() {
     LOADED.clear();
+    follow_published();
 }
 
 /// The facts core decides on, read once: the models root and what is there.
@@ -173,7 +221,9 @@ fn load(ticket: Ticket, root: &Path, generation: TurnGeneration) {
             models,
         }),
     );
-    if !published {
+    if published {
+        follow_published();
+    } else {
         tracing::info!("voice: a newer turn models load overtook this one; not published");
     }
 }
@@ -184,12 +234,19 @@ fn load(ticket: Ticket, root: &Path, generation: TurnGeneration) {
 )))]
 mod runtime {
     use std::path::Path;
+    use std::sync::Arc;
+
+    use keeper_core::voice::turn_models::TurnModels;
 
     /// No runtime is linked here, so nothing is ever loaded.
     pub type Models = std::convert::Infallible;
 
     pub fn open(_vad: &Path, _smart_turn: &Path) -> Result<Models, String> {
         Err("ONNX Runtime is not part of this build".to_owned())
+    }
+
+    pub fn share(models: &Models) -> Arc<dyn TurnModels> {
+        match *models {}
     }
 }
 
@@ -208,6 +265,13 @@ mod runtime {
     use ort::value::TensorRef;
 
     pub type Models = WorkerTurnModels;
+
+    /// Another handle on the loaded models' worker, for the ear's listener.
+    pub fn share(
+        models: &Models,
+    ) -> std::sync::Arc<dyn keeper_core::voice::turn_models::TurnModels> {
+        std::sync::Arc::new(models.clone())
+    }
 
     /// Both sessions from their files, on the CPU and one thread each: no
     /// execution provider is registered, so nothing shares the Neural Engine

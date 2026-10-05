@@ -15,6 +15,19 @@
 //! - **A turn cannot record forever.** `Listening` has a silence budget
 //!   ([`silence_budget`]); when the shell's timer fires it feeds [`Silence`],
 //!   and the turn either sends what it heard or ends.
+//! - **A finished sentence ends the turn before the pause does** (AD-411).
+//!   With the turn models loaded, [`super::end_of_turn`] hears speech stop
+//!   and the end-of-turn model judge the sentence finished, and reports
+//!   [`UtteranceEnd`] stamped with the listening it was heard in: a
+//!   `Listening` turn that heard words moves to `Finishing` and asks the
+//!   recogniser for its last words ([`Effect::FinishRecognition`]). The port
+//!   answers [`AudioEnded`] once the request's audio has actually ended, and
+//!   [`FINAL_WORDS_WAIT`] runs from that moment; [`NothingToFinish`] — no
+//!   request to end — sends what was heard at once. Their final transcript
+//!   is sent; if it has not come within the wait, what was heard is sent.
+//!   Without the models, or when the model hears an unfinished sentence,
+//!   nothing reports `UtteranceEnd` and [`END_OF_UTTERANCE_PAUSE`] ends the
+//!   turn as it always has.
 //! - **Barge-in stops speech first.** `SpeechDetected` while `Speaking`
 //!   yields [`Effect::StopSpeaking`] before any other effect, because the
 //!   person started talking and nothing should still be talking over them.
@@ -46,6 +59,9 @@
 //! [`AnswerDone`]: TurnEvent::AnswerDone
 //! [`Silence`]: TurnEvent::Silence
 //! [`StopHeard`]: TurnEvent::StopHeard
+//! [`UtteranceEnd`]: TurnEvent::UtteranceEnd
+//! [`AudioEnded`]: TurnEvent::AudioEnded
+//! [`NothingToFinish`]: TurnEvent::NothingToFinish
 
 use std::time::Duration;
 
@@ -65,6 +81,10 @@ pub const NOTHING_HEARD_TIMEOUT: Duration = Duration::from_secs(8);
 /// sent message without a button.
 pub const END_OF_UTTERANCE_PAUSE: Duration = Duration::from_millis(1800);
 
+/// How long `Finishing` waits for the recogniser's final transcript after
+/// the request's audio ended, before it sends the last partial instead.
+pub const FINAL_WORDS_WAIT: Duration = Duration::from_millis(600);
+
 /// Where a turn is.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TurnState {
@@ -76,6 +96,20 @@ pub enum TurnState {
         /// The latest partial transcript, shown to the person as it forms and
         /// promoted to the sent text when the pause ends the utterance.
         heard: String,
+    },
+    /// The end-of-turn model judged the sentence finished; the recogniser
+    /// has been told the audio ended and its final words are awaited.
+    Finishing {
+        /// The latest partial transcript, sent if the final one does not
+        /// come within [`FINAL_WORDS_WAIT`].
+        heard: String,
+        /// The listening the finished sentence was heard in, which the
+        /// port's acknowledgement must carry back.
+        finish: u64,
+        /// When the port ended the request's audio, milliseconds since the
+        /// Unix epoch: where [`FINAL_WORDS_WAIT`] runs from. `None` until
+        /// it says so.
+        audio_ended_ms: Option<i64>,
     },
     /// What was said is text, handed to the conversation, not yet sent.
     Heard {
@@ -108,6 +142,17 @@ pub enum TurnEvent {
     PartialHeard(String),
     /// The recogniser has a final transcript for this utterance.
     FinalHeard(String),
+    /// The end-of-turn models heard a finished sentence (AD-411): speech
+    /// stopped and the end-of-turn model scored what was said as complete,
+    /// in the listening this generation names. Reported by the shell's
+    /// turn-models listener, never by a port.
+    UtteranceEnd(u64),
+    /// The port ended the request's audio for [`Effect::FinishRecognition`]
+    /// of `finish`, at `at_ms` (milliseconds since the Unix epoch).
+    AudioEnded { finish: u64, at_ms: i64 },
+    /// The port had no request to end for `finish`: no final words will
+    /// come.
+    NothingToFinish(u64),
     /// The conversation accepted the text and the request went out.
     Sent,
     /// A piece of the answer arrived.
@@ -162,6 +207,11 @@ pub enum Effect {
     Enqueue(String),
     /// Stop reading aloud, now, mid-word.
     StopSpeaking,
+    /// Tell the recogniser the audio has ended, so it delivers its final
+    /// transcript of what it already heard. The microphone stays open. The
+    /// port acknowledges with [`TurnEvent::AudioEnded`] or
+    /// [`TurnEvent::NothingToFinish`] carrying this generation back.
+    FinishRecognition(u64),
 }
 
 /// The transition table.
@@ -171,10 +221,11 @@ pub enum Effect {
 /// `Sent` while nothing was heard — and leave the state and the device as
 /// they were.
 pub fn advance(state: TurnState, event: TurnEvent) -> (TurnState, Vec<Effect>) {
-    use Effect::{OpenMicrophone, ReleaseMicrophone, StopSpeaking};
+    use Effect::{FinishRecognition, OpenMicrophone, ReleaseMicrophone, StopSpeaking};
     use TurnEvent::{
-        Abandoned, AnswerChunk, AnswerDone, AnswerSentence, Failed, FinalHeard, PartialHeard, Sent,
-        Silence, SpeechDetected, StopHeard, WakeMatched,
+        Abandoned, AnswerChunk, AnswerDone, AnswerSentence, AudioEnded, Failed, FinalHeard,
+        NothingToFinish, PartialHeard, Sent, Silence, SpeechDetected, StopHeard, UtteranceEnd,
+        WakeMatched,
     };
 
     match (state, event) {
@@ -210,7 +261,78 @@ pub fn advance(state: TurnState, event: TurnEvent) -> (TurnState, Vec<Effect>) {
         }
         (TurnState::Listening { .. }, FinalHeard(text)) => send_or_end(text),
         (TurnState::Listening { heard }, Silence) => send_or_end(heard),
+        // The models heard a finished sentence. Only words end a turn this
+        // way: speech the recogniser has not transcribed yet is left to the
+        // pause.
+        (TurnState::Listening { heard }, UtteranceEnd(finish)) if !heard.trim().is_empty() => (
+            TurnState::Finishing {
+                heard,
+                finish,
+                audio_ended_ms: None,
+            },
+            vec![FinishRecognition(finish)],
+        ),
         (state @ TurnState::Listening { .. }, _) => (state, Vec::new()),
+
+        // -- Finishing --------------------------------------------------------
+        // A partial that arrives while the last words are awaited is the
+        // better fallback; a blank one is not.
+        (
+            TurnState::Finishing {
+                heard,
+                finish,
+                audio_ended_ms,
+            },
+            PartialHeard(partial),
+        ) => {
+            let heard = if partial.trim().is_empty() {
+                heard
+            } else {
+                partial
+            };
+            (
+                TurnState::Finishing {
+                    heard,
+                    finish,
+                    audio_ended_ms,
+                },
+                Vec::new(),
+            )
+        }
+        // The port ended this finish's audio: the wait for the last words
+        // runs from then. An acknowledgement of another finish, or a second
+        // one, is nothing.
+        (
+            TurnState::Finishing {
+                heard,
+                finish,
+                audio_ended_ms: None,
+            },
+            AudioEnded {
+                finish: ended,
+                at_ms,
+            },
+        ) if ended == finish => (
+            TurnState::Finishing {
+                heard,
+                finish,
+                audio_ended_ms: Some(at_ms),
+            },
+            Vec::new(),
+        ),
+        // No request was ended, so no final words are coming.
+        (TurnState::Finishing { heard, finish, .. }, NothingToFinish(nothing))
+            if nothing == finish =>
+        {
+            send_or_end(heard)
+        }
+        // The final words are the message; a blank final does not erase what
+        // the partials already heard.
+        (TurnState::Finishing { heard, .. }, FinalHeard(text)) => {
+            send_or_end(if text.trim().is_empty() { heard } else { text })
+        }
+        (TurnState::Finishing { heard, .. }, Silence) => send_or_end(heard),
+        (state @ TurnState::Finishing { .. }, _) => (state, Vec::new()),
 
         // -- Heard ------------------------------------------------------------
         (TurnState::Heard { .. }, Sent) => (TurnState::Sending { answering: false }, Vec::new()),
@@ -297,18 +419,57 @@ fn enqueue(text: String) -> Vec<Effect> {
 }
 
 /// How long the shell may let `state` sit without a new event before it feeds
-/// [`TurnEvent::Silence`] — `None` where silence means nothing.
+/// [`TurnEvent::Silence`], counted at `now_ms` (milliseconds since the Unix
+/// epoch) — `None` where silence means nothing.
 ///
-/// `Listening` is the only state with a budget: [`NOTHING_HEARD_TIMEOUT`]
-/// until the first word, [`END_OF_UTTERANCE_PAUSE`] after it. `Speaking`'s
-/// `Silence` comes from the synthesiser finishing, not from a clock, and
-/// `Sending` is bounded by the conversation's own read timeout.
-pub fn silence_budget(state: &TurnState) -> Option<Duration> {
+/// `Listening` has a budget: [`NOTHING_HEARD_TIMEOUT`] until the first word,
+/// [`END_OF_UTTERANCE_PAUSE`] after it. So has `Finishing`:
+/// [`FINAL_WORDS_WAIT`] for the port to end the request's audio, then
+/// [`FINAL_WORDS_WAIT`] from the moment it did — the port's own wait
+/// before it rolls the request runs from that same moment, so the two
+/// clocks end together however late the acknowledgement reached the turn.
+/// `Speaking`'s `Silence` comes from the synthesiser finishing, not from a
+/// clock, and `Sending` is bounded by the conversation's own read timeout.
+pub fn silence_budget(state: &TurnState, now_ms: i64) -> Option<Duration> {
     match state {
         TurnState::Listening { heard } if heard.trim().is_empty() => Some(NOTHING_HEARD_TIMEOUT),
         TurnState::Listening { .. } => Some(END_OF_UTTERANCE_PAUSE),
+        TurnState::Finishing {
+            audio_ended_ms: None,
+            ..
+        } => Some(FINAL_WORDS_WAIT),
+        TurnState::Finishing {
+            audio_ended_ms: Some(ended),
+            ..
+        } => {
+            let spent = u64::try_from(now_ms.saturating_sub(*ended)).unwrap_or(0);
+            Some(FINAL_WORDS_WAIT.saturating_sub(Duration::from_millis(spent)))
+        }
         _ => None,
     }
+}
+
+/// Whether a move from `before` to `after` starts the silence budget
+/// afresh. Every move does — a partial in `Listening` is the person still
+/// talking — except one that stays in `Finishing` on the same clock: the
+/// wait for the last words runs from the moment the port ended the
+/// request's audio, and the partials it delivers meanwhile do not extend
+/// it. The acknowledgement itself starts that wait.
+pub fn restarts_budget(before: &TurnState, after: &TurnState) -> bool {
+    restarts(finishing_clock(before), finishing_clock(after))
+}
+
+/// When `state` is `Finishing`, the moment its wait runs from.
+pub(crate) fn finishing_clock(state: &TurnState) -> Option<Option<i64>> {
+    match state {
+        TurnState::Finishing { audio_ended_ms, .. } => Some(*audio_ended_ms),
+        _ => None,
+    }
+}
+
+/// [`restarts_budget`] over the two states' [`finishing_clock`]s.
+pub(crate) fn restarts(before: Option<Option<i64>>, after: Option<Option<i64>>) -> bool {
+    !matches!((before, after), (Some(was), Some(now)) if was == now)
 }
 
 /// AD-175, the half-duplex rule: whether the port may have the microphone
@@ -329,6 +490,7 @@ pub fn may_record(platform: &VoicePlatform, state: &TurnState) -> bool {
         TurnState::Speaking => platform.full_duplex,
         TurnState::Idle
         | TurnState::Listening { .. }
+        | TurnState::Finishing { .. }
         | TurnState::Heard { .. }
         | TurnState::Sending { .. } => true,
     }
