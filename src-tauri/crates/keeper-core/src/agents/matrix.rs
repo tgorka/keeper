@@ -36,6 +36,7 @@ use matrix_sdk::{Client, RoomState};
 use serde_json::{json, Value};
 
 use crate::agents::events::{self, CONTROL_ROOM_TYPE, SESSION_ROOM_TYPE};
+use crate::agents::label::{check_sink, Label, Readers, Sink, SinkVerdict};
 use crate::agents::session::SessionKind;
 use crate::auth::StoredSession;
 
@@ -109,6 +110,10 @@ pub enum AgentMatrixError {
     /// The request never got an answer.
     #[error("the homeserver could not be reached: {0}")]
     Network(String),
+    /// Refused before any request: the session's label does not reach whom
+    /// it would add (AD-391); the sentence says who.
+    #[error("{0}")]
+    Label(String),
     #[error("{0}")]
     Other(String),
 }
@@ -307,7 +312,30 @@ impl AgentClient {
         Ok(room.room_id().to_owned())
     }
 
-    pub async fn invite(&self, room: &RoomId, user: &UserId) -> Result<(), AgentMatrixError> {
+    /// Invite `user` into `room` — the one door an invite takes besides a
+    /// room's creation — when what the room holds, labelled `label`, may
+    /// reach them (AD-391, R160): a known agent through its own `audience`,
+    /// anyone else as a person. A refusal sends nothing.
+    pub async fn invite(
+        &self,
+        room: &RoomId,
+        user: &UserId,
+        label: &Label,
+        audience: Option<Readers>,
+    ) -> Result<(), AgentMatrixError> {
+        let sink = match audience {
+            Some(audience) => Sink::Room {
+                humans: Default::default(),
+                agent_audiences: vec![audience],
+            },
+            None => Sink::Room {
+                humans: [user.to_owned()].into(),
+                agent_audiences: Vec::new(),
+            },
+        };
+        if let SinkVerdict::Block { reason, .. } = check_sink(label, &sink) {
+            return Err(AgentMatrixError::Label(reason));
+        }
         self.joined(room)?
             .invite_user_by_id(user)
             .await

@@ -546,6 +546,7 @@ claims — is a log line, and the `.keeper/` index projects the current value (A
 | `scope` | `{drives, set_by}` — drives in scope changed by the person (AD-382) |
 | `run` | `{state: "queued" \| "running" \| "waiting" \| "blocked" \| "review" \| "failed" \| "idle", detail?}` — `waiting`'s detail names the host and the need (ruling R25) |
 | `surface` | `{id, tool, device, outcome?}` |
+| `told` | `{person, room}` — a narrowed session's detail sent to its person through their proxy's own client, into the proxy DM `room` (ruling R169); written once, after the send succeeded |
 | `heard` | `{assistant: <line id>, heard_until: <char offset>, sentence: <n>, reason: "barge_in" \| "stop"}` (AD-411) |
 | `memory` | `{op: "journal" \| "proposal", ref: <path>}` |
 | `compact` | `{summary, replaces_through: <line id>}` — a context compaction; replay substitutes it for the lines it replaces |

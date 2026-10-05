@@ -42,15 +42,16 @@ use keeper_core::agents::events::{
 use keeper_core::agents::focus::FOCUS_TTL;
 use keeper_core::agents::home::{serves_local_models, MenuItem};
 use keeper_core::agents::label::{
-    check_sink, label_drive_read, label_person_message, okf_label_facts, Author, Integrity, Label,
-    LabelBody, LabelCause, LabelCauseKind, ReadFacts, Sink, SinkVerdict,
+    check_call, check_sink, label_drive_read, label_person_message, okf_label_facts, Author,
+    CallVerdict, Destination, Integrity, Label, LabelBody, LabelCause, LabelCauseKind, ReadFacts,
+    Readers, Recipient, Sink, SinkVerdict, NEEDS_APPROVAL,
 };
 use keeper_core::agents::log::reader::{hydrate_blob, read_session};
 use keeper_core::agents::log::replay::{message_for, ReplayRefusal};
 use keeper_core::agents::log::{
     ApprovalBody, ApprovalState, AssistantBody, ChildSession, DelegateBody, DelegateReply,
     DelegateState, ErrorBody, HostSlug, LineBody, LogLine, OpenBody, PeerBody, RunBody, ScopeBody,
-    ToolCallBody, ToolOutcomeWord, ToolResultBody, Truncated, Usage, UserBody,
+    ToldBody, ToolCallBody, ToolOutcomeWord, ToolResultBody, Truncated, Usage, UserBody,
 };
 use keeper_core::agents::matrix::AgentMatrixError;
 use keeper_core::agents::memory::{self, MemorySnapshot};
@@ -72,7 +73,7 @@ use keeper_core::bots::{http, Bot};
 use keeper_core::error::CoreError;
 use keeper_sync::SyncProfile;
 use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use ulid::Ulid;
@@ -84,13 +85,14 @@ use crate::drive::finish_word;
 use crate::grants::AgentGrants;
 use crate::host::HostIds;
 use crate::matrix_sink::{
-    anchor_content, cut, cut_to_log, deliver, notice_content, EditPort, MatrixSink, SendFuture,
-    StatusBoard, ToolProgress,
+    anchor_content, cut, cut_to_log, deliver, deliver_gated, deliver_unless_narrowed,
+    notice_content, status_content, EditPort, MatrixSink, SendFuture, StatusBoard, ToolProgress,
 };
 use crate::ports::ProfileSource;
 use crate::rooms::{self, Arrival, BriefEvent, Disposition, Served};
 use crate::sessions::verbs::{self, CreateOutcome};
 use crate::sessions::write::session_write;
+use crate::sinks::{room_audience, ProxyDoors, RoomGate, Sinks, MEMBERS_UNREAD, NARROWED_STATUS};
 use crate::turn::{arm_turn_probing, endpoint_of, read_timeout_of, TurnEnv, TurnOrigin};
 use crate::writer::{SessionWriter, WriterError};
 use crate::zone::{read_text, AgentHome};
@@ -115,8 +117,11 @@ pub const TURN_FAILED: &str =
 /// What the room is told instead of an answer when the session's label no
 /// longer reaches everyone the session's `agent.toml` names (S-16): the
 /// answer drew on something narrower than the room. The log keeps the whole
-/// answer, with an `error` line whose code is `label`.
+/// answer, with an `error` line whose code is [`LABEL_CODE`].
 pub const NARROWER_THAN_ROOM: &str = "This answer drew on something not everyone in this room may read, so it is not shown here. It is in this session's log.";
+
+/// The code of the `error` line of an answer withheld from its room.
+const LABEL_CODE: &str = "label";
 
 /// The `finish` of an `assistant` line written for a round that called
 /// tools: the turn goes on after it, so it answers nothing yet.
@@ -224,6 +229,12 @@ pub struct SessionContext {
     /// `peer` lines, every host's, and from the anchors another copy left
     /// in the room ([`Self::started`]). Never a second turn (R61).
     harvested: HashSet<String>,
+    /// Whether the session's person was told, in their proxy's DM, that
+    /// its work went on where only some of its room may read it (R169).
+    pub told: bool,
+    /// Whether an answer of the session was withheld from its room as the
+    /// room then was — an `error` line coded [`LABEL_CODE`] (R168).
+    pub withheld: bool,
 }
 
 impl SessionContext {
@@ -278,6 +289,8 @@ impl SessionContext {
             run: None,
             reply_unpeered: None,
             harvested: HashSet::new(),
+            told: false,
+            withheld: false,
         };
         for stored in &log.lines {
             match &stored.body {
@@ -399,6 +412,8 @@ impl SessionContext {
                 }
             }
             LineBody::Run(run) => self.run = Some(run.state),
+            LineBody::Told(_) => self.told = true,
+            LineBody::Error(error) if error.code == LABEL_CODE => self.withheld = true,
             LineBody::Delegate(body) => match body.state {
                 DelegateState::Opened => {
                     let (Some(room), Ok(to)) =
@@ -510,9 +525,31 @@ impl SessionContext {
         self.delegations.values().find(|open| open.room == room)
     }
 
+    /// The agents this session's room sends pass between, left out of its
+    /// audience (R94): its own agent `me`, and a delegated session's
+    /// requester, whose session joins the label a reply carries.
+    pub fn room_own(&self, me: &UserId) -> Vec<OwnedUserId> {
+        let mut own = vec![me.to_owned()];
+        if self.agent.kind == SessionKind::Delegated {
+            own.push(self.agent.requested_by.clone());
+        }
+        own
+    }
+
+    /// Whether its person is owed word, once, in their proxy's DM, that the
+    /// session goes on where only some of its room may read it (R64,
+    /// R169): its label no longer reaches everyone it was opened for
+    /// (`agent.toml`'s label), or an answer was withheld from its room as
+    /// the room is now — the label unchanged and the room wider.
+    pub fn narrowed(&self) -> bool {
+        self.withheld || !self.label.may_reach(&self.agent.label.readers)
+    }
+
     /// A person's message joins the label (`label_person_message`); the new
-    /// label when it changed. Epic 92.6 adds the per-turn integrity reset of
-    /// a proxy conversation here (S-09).
+    /// label when it changed. In a `main` session a line of its person's
+    /// resets the integrity to that line's instead (R28 S-09): each of
+    /// their turns starts at their own word, while the readers stay
+    /// cumulative. Every other session only narrows.
     pub fn on_user_line(
         &self,
         sender: &OwnedUserId,
@@ -520,12 +557,15 @@ impl SessionContext {
         readers: &Label,
     ) -> Option<Label> {
         let room = match &readers.readers {
-            keeper_core::agents::label::Readers::Only(set) => set.clone(),
-            keeper_core::agents::label::Readers::Anyone => Default::default(),
+            Readers::Only(set) => set.clone(),
+            Readers::Anyone => Default::default(),
         };
-        let joined = self
-            .label
-            .join(&label_person_message(sender, person, &room));
+        let said = label_person_message(sender, person, &room);
+        let joined = if self.agent.kind == SessionKind::Main && sender == person {
+            self.label.at_persons_turn(&said)
+        } else {
+            self.label.join(&said)
+        };
         (joined != self.label).then_some(joined)
     }
 
@@ -672,13 +712,62 @@ impl AgentDeps {
 
 /// A tool host that refuses any tool outside `[tools].allow`, and serves the
 /// agent's surface, `delegate`, `reply`, `card_update` and `session_write`
-/// tools itself (R38, R50: no ⌘9 host has them).
+/// tools itself (R38, R50: no ⌘9 host has them). Every call that writes or
+/// sends is checked first against the label at its sink and against the
+/// integrity rule (AD-391), before its own host decides anything.
 struct AllowedTools<'t> {
     inner: Box<dyn ToolHost>,
     allow: Vec<String>,
     surface: Option<crate::surface::SurfaceTools>,
     delegation: DelegateTools<'t>,
     cards: crate::cards::CardTools<'t>,
+    view: &'t dyn TurnView,
+    sinks: &'t Sinks,
+    /// The declarations of the drives this host mounts: a write's audience.
+    drives: &'t BTreeMap<String, DriveDecl>,
+    /// The agent's home drive: where its session tools write.
+    home: &'t DriveDecl,
+    /// The session's folder, drive-relative: where its session tools land.
+    session_dir: String,
+}
+
+impl AllowedTools<'_> {
+    /// The integrity rule over one call to `recipients` (R167, R82): a
+    /// block, or a call that needs a person, is refused with its audit row
+    /// (R65) at `drive` and `at`.
+    fn integrity(
+        &self,
+        tool: &str,
+        drive: &str,
+        at: &str,
+        recipients: &[Recipient],
+    ) -> Result<(), String> {
+        let sentence = match check_call(&self.view.label(), tool, recipients) {
+            CallVerdict::Allow => return Ok(()),
+            CallVerdict::NeedsApproval => NEEDS_APPROVAL.to_owned(),
+            CallVerdict::Block { reason } => reason,
+        };
+        self.sinks.refused(tool, drive, at, &sentence);
+        Err(sentence)
+    }
+}
+
+fn refusal(reason: String) -> ToolOutcome {
+    ToolOutcome::Refused { reason }
+}
+
+/// A drive write's or edit's canonical bytes for its declassification: the
+/// drive and path it lands at with the whole new file, or with the edit's
+/// change, so equal text bound for two files is two effects (FR-795).
+fn write_effect(call: &ToolCall) -> String {
+    json!({
+        "drive": call.target.profile_id,
+        "path": call.target.subpath,
+        "content": call.args.content,
+        "old_text": call.args.old_text,
+        "new_text": call.args.new_text,
+    })
+    .to_string()
 }
 
 impl ToolHost for AllowedTools<'_> {
@@ -689,20 +778,87 @@ impl ToolHost for AllowedTools<'_> {
                 reason: format!("{name} is not one of this agent's tools."),
             });
         }
+        if call.name.effect() == keeper_core::bots::grant::Effect::Write {
+            let drive = call.target.profile_id.as_str();
+            let path = call.target.subpath.as_str();
+            // A drive keeper holds no declaration for is read by anyone:
+            // the lower bound, never the higher.
+            let drive_readers = self
+                .drives
+                .get(drive)
+                .map_or(Readers::Anyone, |decl| Readers::Only(decl.readers.clone()));
+            let effect = write_effect(call);
+            if let Err(sentence) = self.sinks.check(
+                name,
+                &Destination::Drive {
+                    drive: drive.to_owned(),
+                    path: path.to_owned(),
+                },
+                &self.view.label(),
+                &Sink::DriveWrite { drive_readers },
+                effect.as_bytes(),
+                Some(path),
+            ) {
+                return Ok(refusal(sentence));
+            }
+            if let Err(sentence) = self.integrity(name, drive, path, &[]) {
+                return Ok(refusal(sentence));
+            }
+        }
         self.inner.run(call)
     }
 
     fn run_named(&self, wire: &chat::ToolCall) -> Option<ToolOutcome> {
+        let args = wire.arguments.as_ref().unwrap_or(&Value::Null);
         if delegate::is_delegation(&wire.name) {
+            let recipient = self.delegation.recipient(wire);
+            let recipients: Vec<Recipient> = recipient
+                .iter()
+                .map(|(name, audience)| Recipient {
+                    name,
+                    audience: audience.as_ref(),
+                })
+                .collect();
+            let at = recipient.as_ref().map_or("", |(name, _)| name.as_str());
+            if let Err(sentence) = self.integrity(&wire.name, "", at, &recipients) {
+                return Some(refusal(sentence));
+            }
             return self.delegation.run(wire);
         }
         if crate::cards::is_card_tool(&wire.name) {
+            let checked = || {
+                let rel = args["path"]
+                    .as_str()
+                    .or(args["card"].as_str())
+                    .unwrap_or("");
+                self.sinks.check(
+                    &wire.name,
+                    &Destination::Drive {
+                        drive: self.home.id.clone(),
+                        path: format!("{}/{rel}", self.session_dir),
+                    },
+                    &self.view.label(),
+                    &Sink::DriveWrite {
+                        drive_readers: Readers::Only(self.home.readers.clone()),
+                    },
+                    wire.arguments_raw.as_bytes(),
+                    None,
+                )
+            };
+            // A tool the agent was not given is refused by the card tools.
+            if self.allow.contains(&wire.name) {
+                if let Err(sentence) = checked() {
+                    return Some(refusal(sentence));
+                }
+            }
             return self.cards.run(wire);
         }
         if !crate::surface::is_surface(&wire.name) {
             return None;
         }
         match &self.surface {
+            // The request is checked against the room it goes into, at its
+            // send, by the surface tools' own `admit`.
             Some(surface) => surface.run(wire),
             None => Some(ToolOutcome::Refused {
                 reason: format!("{} is not one of this agent's tools.", wire.name),
@@ -712,12 +868,15 @@ impl ToolHost for AllowedTools<'_> {
 }
 
 /// What a turn's own tools reach beyond the drive: the person's device,
-/// the rooms delegations go through, this session's room.
+/// the rooms delegations go through, this session's room, and its sinks.
 struct TurnTools {
     surface: Option<Arc<dyn crate::surface::SurfacePort>>,
     delegations: Option<Arc<dyn DelegationPort>>,
     room: Arc<dyn EditPort>,
     from: Delegator,
+    sinks: Sinks,
+    /// The session room's boundary, which the surface's requests pass too.
+    gate: Arc<RoomGate>,
 }
 
 /// One served session: its context and its writer.
@@ -736,9 +895,13 @@ pub struct ServedSession {
     /// Where the worker says what became of each closed session it was
     /// handed (R61); `None`: nobody asks.
     pub harvests: Option<HarvestAcks>,
+    /// The proxies this host runs, through which a narrowed session's
+    /// person is told (R169); `None`: no one is.
+    pub doors: Option<Arc<dyn ProxyDoors>>,
     /// Work on this session's delegations that failed and is tried again on
     /// the host's clock while the worker runs: briefs a joined target has
-    /// not been sent, child rooms whose replies could not be read back.
+    /// not been sent, child rooms whose replies could not be read back, a
+    /// person not yet told their work narrowed.
     retry: Retry,
 }
 
@@ -754,11 +917,13 @@ struct Retry {
     briefs: std::collections::BTreeSet<String>,
     /// Delegations whose room could not be read back for a reply.
     replies: std::collections::BTreeSet<String>,
+    /// The session's person was not told yet that its work narrowed.
+    tell: bool,
 }
 
 impl Retry {
     fn is_empty(&self) -> bool {
-        self.briefs.is_empty() && self.replies.is_empty()
+        self.briefs.is_empty() && self.replies.is_empty() && !self.tell
     }
 }
 
@@ -940,9 +1105,19 @@ pub const NOT_A_HARVEST: &str = "the host sent no closed session this host reads
 pub const NO_HARVEST: &str = "only a steward's harvest session with an HV prompt harvests";
 /// A closed session the harvest session's label does not let in (R166).
 pub const HARVEST_REFUSED: &str = "a closed session's label keeps it out of this harvest";
+/// The tool a harvest's audit row names when a closed session's label keeps
+/// it out of the harvest room (R65, R166).
+pub const HARVEST: &str = "harvest";
 
 /// The opaque part every harvest arrival's id starts with.
 const HARVEST_EVENT: &str = "$harvest-";
+
+/// The question a harvest's anchor names in a room its label no longer
+/// reaches: no closed session's id, and no person's message an answer of
+/// another copy would take for answered.
+fn unnamed_harvest() -> &'static EventId {
+    matrix_sdk::ruma::event_id!("$harvest:keeper.invalid")
+}
 
 /// Whether `event` is a harvest arrival's id.
 fn is_harvest_event(event: &str) -> bool {
@@ -1041,6 +1216,9 @@ pub enum ServeError {
     /// A harvest's turn opens on the closed session it carries.
     #[error("a harvest arrival carries no closed session")]
     NotAHarvest,
+    /// A harvest's room's members could not be read: it is handed again.
+    #[error("the harvest room's members could not be read")]
+    MembersUnread,
 }
 
 /// `<drive>/<path>` of each file a reply's content hands over.
@@ -1145,6 +1323,7 @@ impl ServedSession {
             surface: None,
             delegations: None,
             harvests: None,
+            doors: None,
             retry: Retry::default(),
         })
     }
@@ -1158,7 +1337,7 @@ impl ServedSession {
     pub async fn recover(
         &mut self,
         deps: &AgentDeps,
-        port: &dyn EditPort,
+        port: Arc<dyn EditPort>,
         trail: &Trail,
     ) -> Result<bool, ServeError> {
         if let Some((status, _)) = &trail.status {
@@ -1183,18 +1362,17 @@ impl ServedSession {
             Some(anchor) => edit_content(anchor, &sentence),
             None => notice_content(&sentence),
         };
-        deliver(port, "m.room.message", told, Instant::now()).await;
+        deliver(port.as_ref(), "m.room.message", told, Instant::now()).await;
         if let Some((status, true)) = &trail.status {
-            let mut idle = self.status_base(deps);
-            idle.run = RunState::Idle;
-            idle.anchor = Some(status.clone());
-            let content = serde_json::to_value(idle).unwrap_or(Value::Null);
-            deliver(port, STATUS, content, Instant::now()).await;
+            self.context.status_anchor = Some(status.clone());
+            self.send_status(deps, &port, RunState::Idle, None).await;
         }
         Ok(true)
     }
 
-    /// The status every edit of this session's status anchor carries.
+    /// The status every edit of this session's status anchor carries; a
+    /// send under a narrowed room makes its title the fixed sentence and
+    /// drops its detail ([`status_content`], R64).
     fn status_base(&self, deps: &AgentDeps) -> StatusContent {
         StatusContent {
             v: CONTENT_VERSION,
@@ -1208,6 +1386,20 @@ impl ServedSession {
             detail: None,
             waiting: None,
             anchor: None,
+        }
+    }
+
+    /// This session's sinks: its audit ids, and what routes a declassification.
+    fn sinks(&self, deps: &AgentDeps) -> Sinks {
+        Sinks {
+            data_dir: deps.data_dir.clone(),
+            provider_id: deps.row.provider.id.clone(),
+            bot_id: deps.bot.id.clone(),
+            session_id: self.context.agent.id.to_string(),
+            known: self.delegations.as_ref().map(|rooms| rooms.known()),
+            home_drive: deps.home.config.drive.clone(),
+            zone: deps.sessions_zone.clone(),
+            doors: self.doors.clone(),
         }
     }
 
@@ -1226,6 +1418,8 @@ impl ServedSession {
         busy: &AtomicBool,
     ) {
         let mut backlog: std::collections::VecDeque<Arrived> = backlog.into();
+        // A person not told before a restart is told now.
+        self.tell_the_requester(deps).await;
         loop {
             if stop.is_cancelled() {
                 return;
@@ -1337,10 +1531,8 @@ impl ServedSession {
                 .turn(deps, port, arrived, stop)
                 .await
                 .map(Outcome::Answered),
-            Disposition::Scope => self.scope(deps, port.as_ref(), arrived).await,
-            Disposition::NewConversation => {
-                self.new_conversation(deps, port.as_ref(), arrived).await
-            }
+            Disposition::Scope => self.scope(deps, &port, arrived).await,
+            Disposition::NewConversation => self.new_conversation(deps, &port, arrived).await,
             Disposition::Delegation => self.delegation_moved(deps, port, arrived, stop).await,
             Disposition::Scheduled => self.scheduled(deps, port, arrived, stop).await,
             Disposition::Harvest => self.harvest(deps, port, arrived, stop).await,
@@ -1352,9 +1544,12 @@ impl ServedSession {
     /// session, opened by its label's join and a `peer` line in her own name
     /// carrying the arrival's id — the closed session's — so it is never a
     /// second turn, here or after another copy began it. A closed session
-    /// whose readers do not reach the harvest room's, or that may go only to
-    /// a model of its readers' while hers is not, is refused before anything
-    /// of it is logged or sent (R166).
+    /// whose readers do not reach the harvest room's, that may go only to a
+    /// model of its readers' while hers is not, or whose label, joined, does
+    /// not reach the room as it is now — its members, a known agent through
+    /// its audience — is refused before anything of it is logged or sent
+    /// (R166, R168), and the refusal audited (R65). A room whose members
+    /// cannot be read refuses it too, and the host hands it again.
     async fn harvest(
         &mut self,
         deps: &AgentDeps,
@@ -1372,12 +1567,37 @@ impl ServedSession {
         if self.context.harvest_began(&arrived.event_id) {
             return Ok(Outcome::Duplicate);
         }
-        if let Some(reason) = crate::stewards::refusal(
+        let room = self.context.agent.room.clone();
+        if let Some(refusal) = crate::stewards::refusal(
             &closed,
             &self.context.agent.label.readers,
             deps.model_is_local(),
         ) {
+            let reason = refusal.reason();
             tracing::warn!(session = %self.context.session.path, closed = %closed.id, reason, "agents: a closed session is not harvested");
+            let sinks = self.sinks(deps);
+            match refusal {
+                crate::stewards::Refusal::Readers => {
+                    sinks.refused(HARVEST, "", room.as_str(), reason)
+                }
+                crate::stewards::Refusal::Model => {
+                    sinks.refused("model", "", &deps.bot.target, reason)
+                }
+            }
+            return Ok(Outcome::Ignored(HARVEST_REFUSED));
+        }
+        // The turn's anchor names the arrival: the room as it is now hears
+        // of it only when the joined label reaches it.
+        let gate = self.gate(deps, &port);
+        gate.set_label(self.context.label.join(&closed.label));
+        if let Err(reason) = gate
+            .admit(HARVEST, arrived.event_id.as_str().as_bytes())
+            .await
+        {
+            tracing::warn!(session = %self.context.session.path, closed = %closed.id, %reason, "agents: a closed session is not harvested into this room");
+            if reason == MEMBERS_UNREAD {
+                return Err(ServeError::MembersUnread);
+            }
             return Ok(Outcome::Ignored(HARVEST_REFUSED));
         }
         let Some(brief) =
@@ -1754,10 +1974,30 @@ impl ServedSession {
             }
         };
         let me = deps.home.config.matrix_user.clone();
-        let checked = match delegate::audience_of(&known, &open.to) {
-            Some(audience) => {
-                delegate::check_room(&content.label, members, [&me, &open.to], vec![audience])
-            }
+        let checked = match known
+            .agents
+            .iter()
+            .find(|agent| agent.matrix_user == open.to)
+        {
+            Some(target) => self.sinks(deps).check(
+                delegate::DELEGATE,
+                &Destination::Agent {
+                    drive: target.drive.clone(),
+                    agent: open.to.clone(),
+                    room: Some(open.room.clone()),
+                },
+                &content.label,
+                &delegate::room_of(
+                    members,
+                    &known,
+                    [&me, &open.to],
+                    vec![target.home_readers.clone()],
+                ),
+                keeper_core::agents::delegation::brief_content(&content)
+                    .to_string()
+                    .as_bytes(),
+                None,
+            ),
             None => Err(format!("{} is no longer known on this host.", open.to)),
         };
         if let Err(reason) = checked {
@@ -1890,6 +2130,9 @@ impl ServedSession {
             let open = open.clone();
             replies.extend(self.read_replies(&open, &me).await);
         }
+        if self.retry.tell {
+            self.tell_the_requester(deps).await;
+        }
         replies
     }
 
@@ -1901,7 +2144,7 @@ impl ServedSession {
     async fn scope(
         &mut self,
         deps: &AgentDeps,
-        port: &dyn EditPort,
+        port: &Arc<dyn EditPort>,
         arrived: Arrived,
     ) -> Result<Outcome, ServeError> {
         let request = match serde_json::from_value::<ScopeContent>(arrived.content) {
@@ -1938,20 +2181,18 @@ impl ServedSession {
                 // A scope read back on start that changed nothing was echoed
                 // when it first arrived; echoing it again on every restart
                 // would only make the chips flicker through old answers.
+                // Under a narrowed room no scope is echoed: it names drives
+                // and the label to everyone in the room (R64).
                 if changed || !arrived.replay {
-                    let echo = self.scope_echo(deps);
-                    deliver(port, SCOPE, echo, Instant::now()).await;
+                    self.echo_scope(deps, port).await;
                 }
                 Ok(Outcome::Scoped(scope))
             }
             Err(refusal) => {
                 let sentence = refusal.to_string();
-                let mut status = self.status_base(deps);
-                status.run = RunState::Idle;
-                status.detail = Some(sentence.clone());
-                status.anchor = self.context.status_anchor.clone();
-                let content = serde_json::to_value(status).unwrap_or(Value::Null);
-                let (sent, _) = deliver(port, STATUS, content, Instant::now()).await;
+                let sent = self
+                    .send_status(deps, port, RunState::Idle, Some(&sentence))
+                    .await;
                 if self.context.status_anchor.is_none() {
                     self.context.status_anchor = Some(sent);
                 }
@@ -1994,7 +2235,7 @@ impl ServedSession {
     async fn new_conversation(
         &mut self,
         deps: &AgentDeps,
-        port: &dyn EditPort,
+        port: &Arc<dyn EditPort>,
         arrived: Arrived,
     ) -> Result<Outcome, ServeError> {
         let (Some(rooms), Ok(request)) = (
@@ -2021,6 +2262,24 @@ impl ServedSession {
             });
         }
         let person = arrived.sender;
+        // The new room carries the conversation's opening label to its
+        // person: the one door a conversation's invite takes (AD-391).
+        if let Err(sentence) = self.sinks(deps).check(
+            "conversation",
+            &Destination::Person {
+                user: person.clone(),
+            },
+            &self.context.agent.label,
+            &Sink::Room {
+                humans: [person.clone()].into(),
+                agent_audiences: Vec::new(),
+            },
+            title.as_bytes(),
+            None,
+        ) {
+            tracing::info!(session = %self.context.session.path, %sentence, "agents: a conversation was not opened");
+            return Ok(Outcome::Ignored(UNSERVED_CONVERSATION));
+        }
         // The room is named after the proxy: its name is clear state, and
         // the title the person typed goes only in the encrypted status.
         let room = match rooms.create(&config.name, &person).await {
@@ -2028,7 +2287,7 @@ impl ServedSession {
             Err(error) => {
                 tracing::warn!(session = %self.context.session.path, %error, "agents: a conversation's room could not be made");
                 deliver(
-                    port,
+                    port.as_ref(),
                     "m.room.message",
                     notice_content(CONVERSATION_FAILED),
                     Instant::now(),
@@ -2068,7 +2327,7 @@ impl ServedSession {
                 tracing::warn!(session = %self.context.session.path, %error, "agents: a conversation's session could not be made");
                 rooms.discard(&room, &person).await;
                 deliver(
-                    port,
+                    port.as_ref(),
                     "m.room.message",
                     notice_content(CONVERSATION_FAILED),
                     Instant::now(),
@@ -2104,10 +2363,23 @@ impl ServedSession {
                 tracing::warn!(%room, %error, "agents: a new conversation's status anchor could not be sent");
             }
         }
-        deliver(
-            port,
+        // The title is the person's words, said here: the DM hears it back
+        // unless the label no longer reaches the DM as it is at the send
+        // (R64, R168), which is audited (R65).
+        let gate = self.gate(deps, port);
+        let told = format!("I opened a new conversation, “{title}”.");
+        deliver_gated(
+            port.as_ref(),
             "m.room.message",
-            notice_content(&format!("I opened a new conversation, “{title}”.")),
+            Some(&gate),
+            &|narrowed| {
+                if narrowed {
+                    gate.suppressed("notice");
+                    notice_content("I opened a new conversation.")
+                } else {
+                    notice_content(&told)
+                }
+            },
             Instant::now(),
         )
         .await;
@@ -2124,7 +2396,7 @@ impl ServedSession {
     async fn after_delegated_turn(
         &mut self,
         deps: &AgentDeps,
-        port: &dyn EditPort,
+        port: &Arc<dyn EditPort>,
         bound: Option<BoundReached>,
     ) -> Result<(), ServeError> {
         if self.context.agent.kind != SessionKind::Delegated
@@ -2134,11 +2406,12 @@ impl ServedSession {
         }
         let detail = match (bound, &self.context.agent.limits) {
             (Some(bound), _) => {
-                // The host's own sentence, no word the session read: it
-                // carries the label so the delegating session takes it.
-                let told =
-                    delegate::reply_content(&bound.sentence(), Vec::new(), &self.context.label);
-                deliver(port, "m.room.message", told, Instant::now()).await;
+                // The host's own sentence, no word the session read; it
+                // carries the label so the delegating session takes it, and
+                // so it passes the reply's own guard first (R94, R169): a
+                // room the label no longer reaches hears nothing, and the
+                // refusal is audited (R65).
+                self.reply_bound(deps, port, &bound).await;
                 bound.word()
             }
             (None, Some(limits)) if self.context.exchange_rounds >= limits.rounds_per_exchange => {
@@ -2172,7 +2445,7 @@ impl ServedSession {
 
     /// While a delegation this session opened waits for its target to join,
     /// the session's status says so (AD-385, R29 F5).
-    async fn say_waiting(&mut self, port: &dyn EditPort, deps: &AgentDeps) {
+    async fn say_waiting(&mut self, port: &Arc<dyn EditPort>, deps: &AgentDeps) {
         let waiting: Vec<&Delegation> = self
             .context
             .delegations
@@ -2197,13 +2470,55 @@ impl ServedSession {
                     .map_or_else(|| open.to.to_string(), |agent| agent.name.clone())
             })
             .collect();
-        let mut status = self.status_base(deps);
-        status.run = RunState::Idle;
-        status.detail = Some(format!("waiting for {} to join", names.join(", ")));
-        status.anchor = self.context.status_anchor.clone();
-        let content = serde_json::to_value(status).unwrap_or(Value::Null);
-        let (sent, _) = deliver(port, STATUS, content, Instant::now()).await;
+        let detail = format!("waiting for {} to join", names.join(", "));
+        let sent = self
+            .send_status(deps, port, RunState::Idle, Some(&detail))
+            .await;
         self.context.status_anchor.get_or_insert(sent);
+    }
+
+    /// A delegated session's budget reply: the bound's sentence, sent
+    /// through the reply's guard over the room as it is now.
+    async fn reply_bound(
+        &mut self,
+        deps: &AgentDeps,
+        port: &Arc<dyn EditPort>,
+        bound: &BoundReached,
+    ) {
+        let label = &self.context.label;
+        let told = delegate::reply_content(&bound.sentence(), Vec::new(), label);
+        let me = &deps.home.config.matrix_user;
+        let sinks = self.sinks(deps);
+        let admitted = match &self.delegations {
+            Some(rooms) => {
+                delegate::admit_reply(
+                    rooms.as_ref(),
+                    &sinks,
+                    &self.context.agent.room,
+                    [me, &self.context.agent.requested_by],
+                    label,
+                    &told,
+                )
+                .await
+            }
+            None => {
+                sinks.refused(
+                    delegate::REPLY,
+                    "",
+                    self.context.agent.room.as_str(),
+                    delegate::NO_ROOMS,
+                );
+                Err(delegate::NO_ROOMS.to_owned())
+            }
+        };
+        match admitted {
+            Ok(()) => {
+                deliver(port.as_ref(), "m.room.message", told, Instant::now()).await;
+            }
+            Err(reason) => {
+                tracing::info!(session = %self.context.session.path, %reason, "agents: a budget reply was not sent");
+            }
+        }
     }
 
     /// The lines that open a turn, and the one its answer answers: for a
@@ -2335,23 +2650,42 @@ impl ServedSession {
         stop: CancelSignal,
     ) -> Result<TurnReport, ServeError> {
         let label_before = self.context.label.clone();
+        let sinks = self.sinks(deps);
         let user = self.open_turn(deps, &arrived)?;
-        let (anchor, anchor_at) = deliver(
+        // Every send of the turn into the room asks this gate, against the
+        // room's members at that send (R168).
+        let gate = self.gate(deps, &port);
+        // A harvest's anchor names its arrival, the closed session: each
+        // attempt asks the room as it is then, and a room its label no
+        // longer reaches hears only that a harvest ran (R166).
+        let harvest = arrived.arrival == Arrival::Harvest;
+        let (session, line) = (&self.context.session.path, user.id.to_string());
+        let (anchor, anchor_at, _) = deliver_gated(
             port.as_ref(),
             "m.room.message",
-            anchor_content(
-                &self.context.session.path,
-                &user.id.to_string(),
-                &arrived.event_id,
-            ),
+            harvest.then_some(gate.as_ref()),
+            &|narrowed| {
+                let question = if narrowed {
+                    unnamed_harvest()
+                } else {
+                    &arrived.event_id
+                };
+                anchor_content(session, &line, question)
+            },
             Instant::now(),
         )
         .await;
-        let sink = MatrixSink::start(Arc::clone(&port), anchor.clone(), anchor_at);
+        let sink = MatrixSink::start(
+            Arc::clone(&port),
+            anchor.clone(),
+            anchor_at,
+            Some(Arc::clone(&gate)),
+        );
         let board = StatusBoard::start(
             Arc::clone(&port),
             self.context.status_anchor.clone(),
             self.status_base(deps),
+            Some(Arc::clone(&gate)),
         );
 
         let tools = TurnTools {
@@ -2359,6 +2693,8 @@ impl ServedSession {
             delegations: self.delegations.clone(),
             room: Arc::clone(&port),
             from: self.delegator(deps),
+            sinks: sinks.clone(),
+            gate: Arc::clone(&gate),
         };
         let ran = run_agent_turn(
             &mut self.context,
@@ -2372,16 +2708,15 @@ impl ServedSession {
         .await;
         let stream_end = Instant::now();
 
-        // S-16's room half: once a read narrowed the label below the readers
-        // the session's `agent.toml` names, the room gets one fixed sentence
-        // and the log the whole answer (D-31). The details reaching the
-        // requester's proxy DM is 92.6's.
+        // S-16's room half: once the label no longer reaches the room as it
+        // is now, the room gets one fixed sentence and the log the whole
+        // answer (D-31); the suppression is audited (R65).
         let shown = sink.text();
-        let withheld = !shown.trim().is_empty()
-            && !self
-                .context
-                .label
-                .may_reach(&self.context.agent.label.readers);
+        gate.set_label(self.context.label.clone());
+        let withheld = !shown.trim().is_empty() && gate.narrowed().await;
+        if withheld {
+            gate.suppressed("answer");
+        }
         let visible = if withheld {
             NARROWER_THAN_ROOM.to_owned()
         } else {
@@ -2412,15 +2747,36 @@ impl ServedSession {
                 let path = self.context.session.path.clone();
                 let lease = self.writer.lease();
                 let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
-                match off_the_runtime(|| {
-                    session_write(
-                        &deps.sessions_zone,
-                        &path,
-                        &artifact,
-                        &final_text,
-                        &may_write,
+                let home = &deps.home.drive;
+                // The file it would be, drive-relative, and its bytes.
+                let in_drive = format!("{}/{path}/{artifact}", deps.sessions_subfolder);
+                let written = sinks
+                    .check(
+                        "session_write",
+                        &Destination::Drive {
+                            drive: home.id.clone(),
+                            path: in_drive.clone(),
+                        },
+                        &self.context.label,
+                        &Sink::DriveWrite {
+                            drive_readers: Readers::Only(home.readers.clone()),
+                        },
+                        final_text.as_bytes(),
+                        Some(&in_drive),
                     )
-                }) {
+                    .and_then(|()| {
+                        off_the_runtime(|| {
+                            session_write(
+                                &deps.sessions_zone,
+                                &path,
+                                &artifact,
+                                &final_text,
+                                &may_write,
+                            )
+                        })
+                        .map_err(|error| error.to_string())
+                    });
+                match written {
                     Ok(_) => message,
                     Err(error) => {
                         tracing::warn!(%error, session = %path, "agents: the long answer's artifact could not be written; the room is pointed at the log");
@@ -2430,7 +2786,19 @@ impl ServedSession {
             }
             None => final_text.clone(),
         };
-        let delivered = sink.finish(&message).await;
+        // A room that narrows while the final edit is retried gets the
+        // fixed sentence at that attempt; a turn that streamed nothing has
+        // only the host's own note to say.
+        let narrowed_text = if shown.trim().is_empty() {
+            message.as_str()
+        } else {
+            NARROWER_THAN_ROOM
+        };
+        let delivered = sink.finish(&message, narrowed_text).await;
+        let withheld = withheld || (delivered.narrowed && !shown.trim().is_empty());
+        if withheld {
+            gate.suppressed("answer");
+        }
         // Only now is the status `idle`: a device following the answer takes
         // that as the answer being whole (AD-384).
         if let Some(anchor) = board.finish(&delivered).await {
@@ -2513,23 +2881,23 @@ impl ServedSession {
                 None,
                 LineBody::Error(ErrorBody {
                     sentence: NARROWER_THAN_ROOM.to_owned(),
-                    code: "label".to_owned(),
+                    code: LABEL_CODE.to_owned(),
                 }),
             )?;
         }
         off_the_runtime(|| self.writer.sync())?;
         // A `label` line changes the label chip: the room is told, as after
-        // a `scope` line.
+        // a `scope` line — unless the label no longer reaches the room, whose
+        // members the chip's drives and readers would then reach (R64).
         if self.context.label != label_before {
-            let echo = self.scope_echo(deps);
-            deliver(port.as_ref(), SCOPE, echo, Instant::now()).await;
+            self.echo_scope(deps, &port).await;
         }
+        self.tell_the_requester(deps).await;
         // The closing line counts the last completion's tokens too: a budget
         // it crossed parks the session as one the gate stopped would.
         let bound = ran.bound.or_else(|| self.context.token_bound());
-        self.after_delegated_turn(deps, port.as_ref(), bound)
-            .await?;
-        self.say_waiting(port.as_ref(), deps).await;
+        self.after_delegated_turn(deps, &port, bound).await?;
+        self.say_waiting(&port, deps).await;
 
         Ok(TurnReport {
             user_line: user.id,
@@ -2543,6 +2911,145 @@ impl ServedSession {
             prompt_sha256: ran.prompt_sha256,
             answer,
         })
+    }
+
+    /// This session's room gate over `port` (R168): the room's members at
+    /// each send, the known agents through their audiences, the session's
+    /// own agents left out, under the label now; a suppression audited.
+    fn gate(&self, deps: &AgentDeps, port: &Arc<dyn EditPort>) -> Arc<RoomGate> {
+        Arc::new(RoomGate::new(
+            Arc::clone(port),
+            self.delegations.as_ref().map(|rooms| rooms.known()),
+            self.context.room_own(&deps.home.config.matrix_user),
+            self.context.label.clone(),
+            Some((self.sinks(deps), self.context.agent.room.clone())),
+        ))
+    }
+
+    /// Echo the scope into the room, unless the label no longer reaches it
+    /// now: the echo names drives and the label (R64), and its suppression
+    /// is audited (R65). Asked again at every attempt.
+    async fn echo_scope(&mut self, deps: &AgentDeps, port: &Arc<dyn EditPort>) {
+        let gate = self.gate(deps, port);
+        let echo = self.scope_echo(deps);
+        let sent = deliver_unless_narrowed(
+            port.as_ref(),
+            SCOPE,
+            &gate,
+            &|narrowed| (!narrowed).then(|| echo.clone()),
+            Instant::now(),
+        )
+        .await;
+        if sent.is_none() {
+            gate.suppressed("scope");
+        }
+    }
+
+    /// Send this session's status — `run`, `detail` — into the room as an
+    /// edit of its anchor, each attempt under the room as it is then (R64,
+    /// R168): narrowed, the fixed title and no detail, audited (R65).
+    async fn send_status(
+        &mut self,
+        deps: &AgentDeps,
+        port: &Arc<dyn EditPort>,
+        run: RunState,
+        detail: Option<&str>,
+    ) -> OwnedEventId {
+        let gate = self.gate(deps, port);
+        let base = self.status_base(deps);
+        let anchor = self.context.status_anchor.clone();
+        let (sent, ..) = deliver_gated(
+            port.as_ref(),
+            STATUS,
+            Some(&gate),
+            &|narrowed| {
+                if narrowed {
+                    gate.suppressed("status");
+                }
+                status_content(&base, anchor.as_ref(), run, detail, narrowed)
+            },
+            Instant::now(),
+        )
+        .await;
+        sent
+    }
+
+    /// The person this session's work is for: the head of its dispatch
+    /// chain, else whoever asked for it.
+    fn person(&self) -> &OwnedUserId {
+        let agent = &self.context.agent;
+        agent.dispatch_chain.first().unwrap_or(&agent.requested_by)
+    }
+
+    /// Once the label no longer reaches everyone the session was opened
+    /// for, or an answer was withheld from a room grown wider than the
+    /// label ([`SessionContext::narrowed`]), its person is told — once,
+    /// through their proxy's own client, in their proxy's DM — which work
+    /// it is and where its answers are
+    /// (R64, R169). A `told` line marks it done; a send that failed is
+    /// tried again on the host's clock and after a restart. A DM the label
+    /// does not reach is refused and audited (R65), and not tried again.
+    async fn tell_the_requester(&mut self, deps: &AgentDeps) {
+        if self.context.told || !self.context.narrowed() {
+            self.retry.tell = false;
+            return;
+        }
+        let person = self.person().clone();
+        let sinks = self.sinks(deps);
+        // A host that runs no proxy of theirs has no door to them: the next
+        // turn, or a host that does, tells them (DW-460).
+        let Some(doors) = self.doors.clone() else {
+            tracing::info!(session = %self.context.session.path, "agents: a narrowed session's person has no proxy on this host");
+            self.retry.tell = false;
+            return;
+        };
+        let Some(dm) = doors.dm(&person) else {
+            tracing::info!(session = %self.context.session.path, "agents: a narrowed session's person has no DM this host can name");
+            self.retry.tell = false;
+            return;
+        };
+        let agent = &self.context.agent;
+        let detail = format!(
+            "“{}” ({}/{}) read something not everyone in its room may read. It goes on there under “{NARROWED_STATUS}”, and its answers are in its log.",
+            agent.title, deps.sessions_subfolder, self.context.session.path
+        );
+        let members = match doors.members(&person).await {
+            Ok(members) => members,
+            Err(error) => {
+                tracing::warn!(%dm, %error, "agents: a narrowed session's person's DM could not be read; telling them waits");
+                self.retry.tell = true;
+                return;
+            }
+        };
+        // The proxy is its person's door: its audience is theirs.
+        let known = self.delegations.as_ref().map(|rooms| rooms.known());
+        let refused = sinks.check(
+            "status",
+            &Destination::Room { room: dm.clone() },
+            &self.context.label,
+            &room_audience(members, known.as_deref(), &[]),
+            detail.as_bytes(),
+            None,
+        );
+        if refused.is_err() {
+            self.retry.tell = false;
+            return;
+        }
+        if let Err(error) = doors.tell(&person, notice_content(&detail)).await {
+            tracing::warn!(%dm, %error, "agents: a narrowed session's detail could not reach its person's DM; it is sent again");
+            self.retry.tell = true;
+            return;
+        }
+        self.retry.tell = false;
+        let told = self.writer.write(
+            &mut self.context,
+            None,
+            None,
+            LineBody::Told(ToldBody { person, room: dm }),
+        );
+        if let Err(error) = told.and_then(|_| off_the_runtime(|| self.writer.sync())) {
+            tracing::warn!(session = %self.context.session.path, %error, "agents: a told line could not be written");
+        }
     }
 }
 
@@ -2755,9 +3262,6 @@ async fn run_agent_turn(
     let config = &deps.home.config;
     let local = deps.model_is_local();
     let mut armed = arm_agent(context, deps, Probe::Ask).await;
-    // The readers the room was opened for: once the label no longer reaches
-    // them, no more of the answer is streamed into the room (S-16).
-    let audience = context.agent.label.readers.clone();
     let failed = |error: String| Ran {
         ending: TurnEnding::Failed,
         outcome: None,
@@ -2769,6 +3273,13 @@ async fn run_agent_turn(
         bound: None,
     };
 
+    // What the prompt carries beyond the conversation — the home's frozen
+    // files and the drives' context files — joins the label before it is
+    // composed, so the first round's gate sees it (R168).
+    if let Err(error) = join_prompt_sources(context, writer, deps, &mut armed) {
+        return failed(error.to_string());
+    }
+    board.relabel(&context.label);
     let mut composed = context.compose(deps, armed.context.as_ref());
     if context.open.as_ref().map(|open| &open.prompt_sha256) != Some(&composed.prompt_sha256) {
         // What the model is told changed (or was never recorded): the frame
@@ -2797,6 +3308,7 @@ async fn run_agent_turn(
         Err(error) => return failed(error.to_string()),
     };
     let offered = crate::surface::offered(config);
+    let room_gate = Arc::clone(&tools.gate);
     let surface = crate::surface::person(config)
         .filter(|_| !offered.is_empty())
         .map(|person| crate::surface::SurfaceTools {
@@ -2808,6 +3320,11 @@ async fn run_agent_turn(
             stop: stop.clone(),
             wait: keeper_core::agents::events::SURFACE_WAIT,
             lines: Mutex::new(Vec::new()),
+            admit: Some(Arc::new(move |tool: &str, effect: &[u8]| {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(room_gate.admit(tool, effect))
+                })
+            })),
         });
     // A read's label is read from the files it named (R119).
     let read_profiles = armed.profiles.clone();
@@ -2823,6 +3340,7 @@ async fn run_agent_turn(
         stop.clone(),
     );
 
+    let session_dir = format!("{}/{}", deps.sessions_subfolder, context.session.path);
     let log = Mutex::new(TurnLog {
         context,
         writer,
@@ -2843,9 +3361,7 @@ async fn run_agent_turn(
         surface,
         cards: crate::cards::CardTools {
             from: tools.from.clone(),
-            drive_readers: keeper_core::agents::label::Readers::Only(
-                deps.home.drive.readers.clone(),
-            ),
+            drive_readers: Readers::Only(deps.home.drive.readers.clone()),
             view: &log,
             allow: &config.allow,
         },
@@ -2855,7 +3371,13 @@ async fn run_agent_turn(
             tools.room,
             &log,
             config.allow.iter().any(|name| name == delegate::DELEGATE),
+            &tools.sinks,
         ),
+        view: &log,
+        sinks: &tools.sinks,
+        drives: &deps.drives,
+        home: &deps.home.drive,
+        session_dir,
     };
     let tool_loop = ToolLoop {
         client: &client,
@@ -2883,11 +3405,10 @@ async fn run_agent_turn(
             };
         }
         ToolLoopEvent::Chat(ChatEvent::ContentDelta(text)) => {
-            let mut log = lock();
-            log.round_text.push_str(&text);
-            if !log.context.label.may_reach(&audience) {
-                sink.withhold();
-            }
+            lock().round_text.push_str(&text);
+            // Each paced edit asks the room's gate first: once the label no
+            // longer reaches the room, no more of the answer is streamed
+            // into it and its status says only the fixed sentence (S-16).
             sink.push(&text);
         }
         ToolLoopEvent::Chat(ChatEvent::Failed { error }) => {
@@ -2985,6 +3506,8 @@ async fn run_agent_turn(
             log.progress.reads += 1;
         }
         log.progress.calls += 1;
+        // The room's gate checks the label as it is now from the next send.
+        board.relabel(&log.context.label);
         board.update(log.progress);
     };
     let mut gate = |_round: usize| {
@@ -2994,8 +3517,11 @@ async fn run_agent_turn(
                 detail: "the session's log could not be written".to_owned(),
             });
         }
-        if let SinkVerdict::Block { .. } = check_sink(&log.context.label, &Sink::Model { local }) {
+        if let SinkVerdict::Block { reason, .. } =
+            check_sink(&log.context.label, &Sink::Model { local })
+        {
             log.local_only = true;
+            tools.sinks.refused("model", "", &deps.bot.target, &reason);
             return Err(BotsError::Tool {
                 detail: LOCAL_ONLY_REFUSAL.to_owned(),
             });
@@ -3139,6 +3665,76 @@ fn drive_read_label(
     }
 }
 
+/// Join what the prompt carries beyond the conversation into the label,
+/// writing a `label` line for each source that changed it (R168):
+/// the home's frozen files — soul, facts, memory — under the home drive's
+/// declaration, and each context file arming loaded, under its drive's
+/// declaration and its own facts, as a read of it would be. A context file
+/// of a drive this host holds no declaration for is left out of the prompt.
+fn join_prompt_sources(
+    context: &mut SessionContext,
+    writer: &mut SessionWriter,
+    deps: &AgentDeps,
+    armed: &mut crate::turn::Armed,
+) -> Result<(), WriterError> {
+    let home = &deps.home.drive;
+    let mut sources = vec![(
+        Label {
+            readers: Readers::Only(home.readers.clone()),
+            integrity: Integrity::Owner,
+            local_only: home.local_only,
+        },
+        format!("{}/{}", deps.home.config.drive, deps.home.config.id),
+    )];
+    if let Some(bundle) = armed.context.as_mut() {
+        let profiles = &armed.profiles;
+        bundle.files.retain(|file| {
+            let (drive, path) = file.subpath.split_once('/').unwrap_or((&file.subpath, ""));
+            let Some(decl) = deps.drives.get(drive) else {
+                tracing::info!(file = %file.subpath, "agents: a context file of a drive with no declaration is left out");
+                return false;
+            };
+            let head = file_head(profiles, drive, path).unwrap_or_else(|| file.text.clone());
+            let okf = okf_label_facts(&head);
+            let label = label_drive_read(
+                decl,
+                &ReadFacts {
+                    path: path.to_owned(),
+                    last_author: Author::Unknown,
+                    okf_human_reviewed: okf.human_reviewed,
+                    okf_external_source: okf.external_source,
+                    card_untrusted: keeper_core::agents::card::marked_untrusted(&head),
+                },
+            );
+            sources.push((label, file.subpath.clone()));
+            true
+        });
+        bundle.total_bytes = bundle
+            .files
+            .iter()
+            .map(|file| usize::try_from(file.bytes).unwrap_or(usize::MAX))
+            .sum();
+    }
+    for (label, reference) in sources {
+        let joined = context.label.join(&label);
+        if joined != context.label {
+            writer.write(
+                context,
+                None,
+                None,
+                LineBody::Label(LabelBody::new(
+                    &joined,
+                    LabelCause {
+                        kind: LabelCauseKind::DriveRead,
+                        reference,
+                    },
+                )),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// How much of a file its read's label is read from: where its frontmatter is.
 const LABEL_HEAD_BYTES: u64 = 64 * 1024;
 
@@ -3260,5 +3856,48 @@ mod read_label_tests {
             label(ToolName::Grep, "60-sessions", "no hits\n"),
             Integrity::Untrusted
         );
+    }
+
+    /// FR-795: a declassification names a write by where it lands as well
+    /// as what it says, so the same replacement in two files — or two
+    /// drives — is two effects with two digests; the same edit twice is one.
+    #[test]
+    fn equal_snippets_in_two_files_are_two_effects() {
+        use keeper_core::agents::label::{declassify_request, Destination, Sink};
+        use keeper_core::bots::grant::ToolTarget;
+        use keeper_core::bots::tools::ToolArgs;
+        let edit = |drive: &str, path: &str| ToolCall {
+            id: "e1".to_owned(),
+            name: ToolName::Edit,
+            target: ToolTarget {
+                profile_id: drive.to_owned(),
+                subpath: path.to_owned(),
+            },
+            args: ToolArgs {
+                old_text: Some("draft".to_owned()),
+                new_text: Some("sell in March".to_owned()),
+                ..ToolArgs::default()
+            },
+        };
+        let digest = |call: &ToolCall| {
+            declassify_request(
+                write_effect(call).as_bytes(),
+                Some(&call.target.subpath),
+                &Destination::Drive {
+                    drive: call.target.profile_id.clone(),
+                    path: call.target.subpath.clone(),
+                },
+                &Sink::DriveWrite {
+                    drive_readers: Readers::Anyone,
+                },
+                &Label::top(),
+                &|_| None,
+            )
+            .effect_sha256
+        };
+        let plan = digest(&edit("tgdrive", "notes/plan.md"));
+        assert_eq!(plan, digest(&edit("tgdrive", "notes/plan.md")));
+        assert_ne!(plan, digest(&edit("tgdrive", "notes/other.md")));
+        assert_ne!(plan, digest(&edit("neuradrive", "notes/plan.md")));
     }
 }

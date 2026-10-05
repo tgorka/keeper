@@ -37,8 +37,9 @@ use keeper_core::agents::events::{
 };
 use keeper_core::agents::home::AgentConfig;
 use keeper_core::agents::host::{accept, bot_id, HostDrive, HostManifest, Materialized};
+use keeper_core::agents::label::{check_sink, Label, SinkVerdict};
 use keeper_core::agents::log::reader::ClaimConflict;
-use keeper_core::agents::log::{ClaimAction, HostSlug};
+use keeper_core::agents::log::{ClaimAction, HostSlug, LineBody};
 use keeper_core::agents::matrix::{AgentMatrixError, ServerState};
 use keeper_core::agents::placement::{place, Ask, Placement};
 use keeper_core::agents::room::room_members;
@@ -59,8 +60,23 @@ use crate::doorbell::{RingDrive, Round};
 use crate::matrix_sink::{EditPort, RoomPort};
 use crate::runtime::{self, spawn_worker, Claimed, Copy, DriveView, PENDING_ROOMS};
 
+use crate::sinks::{room_audience, ProxyDoors, Sinks, MEMBERS_UNREAD, NARROWED_STATUS};
 use crate::stewards::{self, Closed, Duty, Harvester};
 use crate::zone::FoundSession;
+
+/// The session at `dir`'s label as its log says now: its last `label`
+/// line's, else `opening` (`agent.toml`'s).
+fn logged_label(dir: &std::path::Path, opening: &Label) -> Label {
+    keeper_core::agents::log::reader::read_session(dir)
+        .lines
+        .iter()
+        .rev()
+        .find_map(|line| match &line.body {
+            LineBody::Label(body) => Some(body.label()),
+            _ => None,
+        })
+        .unwrap_or_else(|| opening.clone())
+}
 
 /// The time a card's schedule is read at, epoch ms, and the machine's UTC
 /// offset then in minutes, given the server's time now.
@@ -246,6 +262,9 @@ pub(crate) trait CopyPort: Send + Sync {
         room: &'a RoomId,
         status: Value,
     ) -> ClaimFuture<'a, Result<OwnedEventId, AgentMatrixError>>;
+    /// The sinks of `session`, as its worker holds them: its audit ids and
+    /// the known agents now (R65, R160).
+    fn sinks(&self, session: &SessionAgent) -> Sinks;
     /// The anchor of the latest status this copy's agent sent in `room`.
     fn latest_status<'a>(&'a self, room: &'a RoomId) -> ClaimFuture<'a, Option<OwnedEventId>>;
     /// Drop what was kept for `room`'s worker.
@@ -405,6 +424,22 @@ impl CopyPort for Copy {
             let port = RoomPort::new(self.client.clone(), room.to_owned());
             port.send(STATUS, status, TransactionId::new()).await
         })
+    }
+
+    fn sinks(&self, session: &SessionAgent) -> Sinks {
+        let deps = &self.deps;
+        Sinks {
+            data_dir: deps.data_dir.clone(),
+            provider_id: deps.row.provider.id.clone(),
+            bot_id: deps.bot.id.clone(),
+            session_id: session.id.to_string(),
+            known: Some(Arc::clone(
+                &self.known.read().unwrap_or_else(|p| p.into_inner()),
+            )),
+            home_drive: deps.home.config.drive.clone(),
+            zone: deps.sessions_zone.clone(),
+            doors: Some(Arc::clone(&self.doors) as Arc<dyn ProxyDoors>),
+        }
     }
 
     fn latest_status<'a>(&'a self, room: &'a RoomId) -> ClaimFuture<'a, Option<OwnedEventId>> {
@@ -1909,7 +1944,12 @@ impl HostRuntime {
     }
 
     /// Send the session's status when it says something new, as an edit of
-    /// the session's own status anchor when the room has one.
+    /// the session's own status anchor when the room has one. Like every
+    /// status a worker sends (R64, R160, R169): when the session's label, as
+    /// its log says now, does not reach the room's members now — a known
+    /// agent through its audience, anyone else as a person — or they cannot
+    /// be read, it keeps `session` and says the fixed sentence with no
+    /// detail, and each such status sent is audited (R65).
     async fn show(
         &mut self,
         room: &OwnedRoomId,
@@ -1919,14 +1959,36 @@ impl HostRuntime {
         detail: Option<String>,
     ) {
         let me = self.host.as_str().to_owned();
+        let Some(slot) = self.slots.get(room) else {
+            return;
+        };
+        let copy = Arc::clone(&slot.copy);
+        let label = logged_label(&slot.session.dir, &slot.agent.label);
+        let mut own = vec![copy.config().matrix_user.clone()];
+        if slot.agent.kind == SessionKind::Delegated {
+            own.push(slot.agent.requested_by.clone());
+        }
+        let sinks = copy.sinks(&slot.agent);
+        let suppressed = match copy.members(room).await {
+            Some(members) => {
+                match check_sink(
+                    &label,
+                    &room_audience(members, sinks.known.as_deref(), &own),
+                ) {
+                    SinkVerdict::Allow => None,
+                    SinkVerdict::Block { reason, .. } => Some(reason),
+                }
+            }
+            None => Some(MEMBERS_UNREAD.to_owned()),
+        };
+        let narrowed = suppressed.is_some();
         let Some(slot) = self.slots.get_mut(room) else {
             return;
         };
-        let said = format!("{run:?} {waiting:?} {detail:?}");
+        let said = format!("{run:?} {waiting:?} {detail:?} {narrowed}");
         if slot.shown.as_deref() == Some(said.as_str()) {
             return;
         }
-        let copy = Arc::clone(&slot.copy);
         if !slot.anchor_read {
             // The worker adopts the room's latest status anchor too, so both
             // edit one.
@@ -1939,12 +2001,16 @@ impl HostRuntime {
             v: CONTENT_VERSION,
             session: format!("{}/{}", copy.sessions_subfolder(), slot.session.path),
             kind: slot.agent.kind,
-            title: slot.agent.title.clone(),
+            title: if narrowed {
+                NARROWED_STATUS.to_owned()
+            } else {
+                slot.agent.title.clone()
+            },
             agent: copy.config().matrix_user.clone(),
             host: me,
             epoch,
             run,
-            detail,
+            detail: detail.filter(|_| !narrowed),
             waiting,
             anchor: slot.status_anchor.clone(),
         };
@@ -1955,6 +2021,9 @@ impl HostRuntime {
             Ok(event) => {
                 slot.status_anchor.get_or_insert(event);
                 slot.shown = Some(said);
+                if let Some(reason) = &suppressed {
+                    sinks.refused("status", "", room.as_str(), reason);
+                }
             }
             Err(error) => {
                 tracing::warn!(%room, %error, "agents: the session's status was not sent")
@@ -2682,6 +2751,10 @@ mod tests {
         /// A steward folder cannot be written: the host stops between its
         /// room and its folder.
         fail_steward_folders: bool,
+        /// The agents this host knows, as [`Copy`] reads them now.
+        known: Option<Arc<crate::rooms::Known>>,
+        /// Where its sessions' audit rows are written.
+        data_dir: tempfile::TempDir,
     }
 
     impl CopyPort for FakeCopy {
@@ -2787,6 +2860,19 @@ mod tests {
                 self.server.statuses.lock().expect("lock").push(status);
                 Ok(self.server.event())
             })
+        }
+
+        fn sinks(&self, session: &SessionAgent) -> Sinks {
+            Sinks {
+                data_dir: self.data_dir.path().to_path_buf(),
+                provider_id: "provider".to_owned(),
+                bot_id: "bot".to_owned(),
+                session_id: session.id.to_string(),
+                known: self.known.clone(),
+                home_drive: "tgdrive".to_owned(),
+                zone: PathBuf::new(),
+                doors: None,
+            }
         }
 
         fn latest_status<'a>(&'a self, _room: &'a RoomId) -> ClaimFuture<'a, Option<OwnedEventId>> {
@@ -3122,6 +3208,12 @@ mod tests {
         /// The rescan finds the session of `room`, pinned to `pin`.
         fn offer(&mut self, room: &OwnedRoomId, pin: Option<&str>) {
             self.copy.joined.lock().expect("lock").insert(room.clone());
+            self.copy
+                .members
+                .lock()
+                .expect("lock")
+                .entry(room.clone())
+                .or_insert_with(|| [user(PERSON)].into());
             let decl = keeper_core::agents::drive::parse(&drive_toml()).expect("decl");
             let agent = SessionAgent {
                 id: ulid::Ulid::new(),
@@ -3595,6 +3687,8 @@ mod tests {
             acks: Mutex::default(),
             stall_steward_rooms: false,
             fail_steward_folders: false,
+            known: None,
+            data_dir: tempfile::tempdir().expect("data directory"),
         }
     }
 
@@ -4168,6 +4262,212 @@ mod tests {
         assert!(w.rt.held().is_empty());
     }
 
+    /// R160 and R65 through placement: a known agent whose audience is
+    /// within the label counts through it — the blocked status keeps its
+    /// title and detail, and nothing is audited — while a known agent with
+    /// a wider audience, or an account no one knows, narrows it; each
+    /// narrowed status sent leaves one `status` row for its session and
+    /// room, and a status not sent again leaves none.
+    #[tokio::test(start_paused = true)]
+    async fn a_placement_status_counts_known_agents_and_audits_its_suppression() {
+        use keeper_core::bots::audit::{list_audit, AuditOutcome, AuditVerdict};
+        let within = lucyna(&[PERSON]);
+        let wider = KnownAgent {
+            matrix_user: user("@wide:example.org"),
+            ..lucyna(&[PERSON, "@eve:example.org"])
+        };
+        let copy = Arc::new(FakeCopy {
+            known: Some(Arc::new(crate::rooms::Known {
+                agents: vec![within.clone(), wider.clone()],
+                trust: Vec::new(),
+            })),
+            ..fake_copy()
+        });
+        let mut w = world_over(copy, true);
+        let rooms = [
+            (room(1), within.matrix_user.clone()),
+            (room(2), wider.matrix_user.clone()),
+            (room(3), user("@stranger:example.org")),
+        ];
+        for (room, other) in &rooms {
+            w.copy
+                .members
+                .lock()
+                .expect("lock")
+                .insert(room.clone(), [user(PERSON), other.clone()].into());
+            w.offer(room, None);
+        }
+        w.tick().await;
+        w.server().fail_claims.store(true, Ordering::Relaxed);
+        for _ in 0..4 {
+            tokio::time::advance(RENEW_EVERY).await;
+            w.tick().await;
+        }
+        let statuses = w.server().statuses();
+        let rows = list_audit(w.copy.data_dir.path(), None, None).expect("audit");
+        for (n, (room, _)) in rooms.iter().enumerate() {
+            let session = format!("60-sessions/active/{room}");
+            let of_room: Vec<&Value> = statuses
+                .iter()
+                .filter(|s| s["session"] == session)
+                .collect();
+            assert!(
+                of_room.iter().any(|s| s["run"] == "blocked"),
+                "{statuses:?}"
+            );
+            let narrowed = of_room
+                .iter()
+                .filter(|s| s["title"] == NARROWED_STATUS)
+                .count();
+            let audited: Vec<_> = rows.iter().filter(|r| r.subpath == room.as_str()).collect();
+            if n == 0 {
+                assert_eq!(narrowed, 0, "{of_room:?}");
+                assert!(of_room
+                    .iter()
+                    .all(|s| s["detail"] == LOST_DETAIL || s["run"] != "blocked"));
+            } else {
+                assert!(narrowed > 0, "{of_room:?}");
+                assert!(of_room
+                    .iter()
+                    .all(|s| s.get("detail").is_none_or(Value::is_null)));
+            }
+            assert_eq!(audited.len(), narrowed, "{room}: {audited:?}");
+            let id = w.copy.served.lock().expect("lock")[room].1.id.to_string();
+            for row in audited {
+                assert_eq!(row.tool, "status");
+                assert_eq!(row.session_id, id);
+                assert_eq!(row.verdict, Some(AuditVerdict::Deny));
+                assert_eq!(row.outcome, AuditOutcome::Refused);
+            }
+        }
+    }
+
+    /// R169 (R64 for placement): the same blocked status, in a room the
+    /// session's label does not reach now — someone outside the drive's
+    /// readers joined — keeps `session`, says the fixed sentence and no
+    /// detail; a room whose members cannot be read is treated so too.
+    #[tokio::test(start_paused = true)]
+    async fn a_placement_status_follows_the_label_too() {
+        let mut w = world(Duration::ZERO, true);
+        let a = room(1);
+        w.copy
+            .members
+            .lock()
+            .expect("lock")
+            .insert(a.clone(), [user(PERSON), user("@stranger:h")].into());
+        w.offer(&a, None);
+        w.tick().await;
+        w.server().fail_claims.store(true, Ordering::Relaxed);
+        tokio::time::advance(RENEW_EVERY).await;
+        w.tick().await;
+        tokio::time::advance(RENEW_EVERY).await;
+        w.tick().await;
+        let statuses = w.server().statuses();
+        assert_eq!(statuses.len(), 1, "{statuses:?}");
+        assert_eq!(statuses[0]["run"], "blocked");
+        assert_eq!(statuses[0]["title"], NARROWED_STATUS);
+        assert!(statuses[0].get("detail").is_none_or(Value::is_null));
+        assert_eq!(statuses[0]["session"], format!("60-sessions/active/{a}"));
+    }
+
+    /// R64 through placement (R169): a session whose own log narrowed its
+    /// label below the room — a read its worker made here — keeps the fixed
+    /// title and no detail on every status placement says after: handed
+    /// back to another host, waiting for it, and again once another host's
+    /// claim took it over. Its `session` stays, and so does the anchor.
+    #[tokio::test(start_paused = true)]
+    async fn a_narrowed_session_stays_fixed_through_a_hand_back_a_wait_and_a_takeover() {
+        use keeper_core::agents::label::{LabelBody, LabelCause, LabelCauseKind, Readers};
+        let copy = Arc::new(FakeCopy {
+            latest_status: Some(OwnedEventId::try_from(ANCHOR).expect("anchor")),
+            ..fake_copy()
+        });
+        let mut w = world_over(copy, true);
+        let a = room(1);
+        w.offer(&a, None);
+        w.rt.scanned();
+        w.tick().await;
+        assert!(w.held_by_me(&a), "its worker serves it here");
+
+        // The worker read a file the room's person may not read.
+        let slug = HostSlug::new(ME).expect("slug");
+        let mut chunks = ChunkWriter::open(
+            &w.dir(&a),
+            &slug,
+            rotate_at(1 << 20),
+            chrono::Utc::now().date_naive(),
+        )
+        .expect("chunk");
+        let narrowed = Label {
+            readers: Readers::Only(Default::default()),
+            integrity: Integrity::Owner,
+            local_only: false,
+        };
+        let now = chrono::Utc::now();
+        chunks
+            .append(&LogLine {
+                v: LINE_VERSION,
+                id: ulid::Ulid::new(),
+                parent: None,
+                ts: chrono::DateTime::from_timestamp_millis(now.timestamp_millis()).expect("ts"),
+                host: slug,
+                epoch: 0,
+                claim: None,
+                matrix_event: None,
+                body: LineBody::Label(LabelBody::new(
+                    &narrowed,
+                    LabelCause {
+                        kind: LabelCauseKind::DriveRead,
+                        reference: "otherdrive/plan.md".to_owned(),
+                    },
+                )),
+            })
+            .expect("append");
+        drop(chunks);
+
+        // Pinned to electra, which is not live: handed back, then waiting.
+        w.offer(&a, Some(OTHER));
+        w.rt.scanned();
+        w.tick().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        w.tick().await;
+        assert!(w.released(&a));
+        tokio::time::advance(ANNOUNCE_AFTER).await;
+        w.tick().await;
+        w.tick().await;
+        let waiting = |w: &World| {
+            w.server()
+                .statuses()
+                .iter()
+                .filter(|s| s["run"] == "waiting")
+                .count()
+        };
+        assert_eq!(waiting(&w), 1, "{:?}", w.server().statuses());
+
+        // Another host's claim took it over: said again, still fixed.
+        let other = Claimant {
+            host: OTHER.to_owned(),
+            device: "ELECTRA1".to_owned(),
+            agent: w.copy.config.matrix_user.clone(),
+        };
+        let now = w.rt.clock.now();
+        w.server().put(
+            &a,
+            CLAIM,
+            "",
+            &w.copy.config.matrix_user,
+            serde_json::to_value(other.content(5, now, now, false, None)).expect("claim"),
+        );
+        w.tick().await;
+        assert_eq!(waiting(&w), 2);
+        for status in w.server().statuses() {
+            assert_eq!(status["title"], NARROWED_STATUS, "{status}");
+            assert!(status.get("detail").is_none_or(Value::is_null), "{status}");
+            assert_eq!(status["session"], format!("60-sessions/active/{a}"));
+            assert_eq!(status["anchor"], ANCHOR, "{status}");
+        }
+    }
+
     /// A worker that ends by itself gives its claim back at once and is not
     /// started again before RETRY_AFTER.
     #[tokio::test(start_paused = true)]
@@ -4340,6 +4640,12 @@ mod tests {
         /// [`World::offer_scheduled`], the session needing `needs`.
         fn offer_scheduled_needing(&mut self, room: &OwnedRoomId, needs: Option<Vec<String>>) {
             self.copy.joined.lock().expect("lock").insert(room.clone());
+            self.copy
+                .members
+                .lock()
+                .expect("lock")
+                .entry(room.clone())
+                .or_insert_with(|| [user(PERSON)].into());
             let zone = self.copy.zone.clone().expect("a zone");
             let decl = keeper_core::agents::drive::parse(&drive_toml()).expect("decl");
             let agent = SessionAgent {

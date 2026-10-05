@@ -180,6 +180,7 @@ pub enum LineKind {
     Run,
     Surface,
     Heard,
+    Told,
     Memory,
     Compact,
     Error,
@@ -188,7 +189,7 @@ pub enum LineKind {
 
 impl LineKind {
     /// Every kind, in the documented order.
-    pub const ALL: [LineKind; 18] = [
+    pub const ALL: [LineKind; 19] = [
         Self::Open,
         Self::Claim,
         Self::User,
@@ -203,6 +204,7 @@ impl LineKind {
         Self::Run,
         Self::Surface,
         Self::Heard,
+        Self::Told,
         Self::Memory,
         Self::Compact,
         Self::Error,
@@ -226,6 +228,7 @@ impl LineKind {
             Self::Run => "run",
             Self::Surface => "surface",
             Self::Heard => "heard",
+            Self::Told => "told",
             Self::Memory => "memory",
             Self::Compact => "compact",
             Self::Error => "error",
@@ -570,6 +573,17 @@ pub struct ErrorBody {
     pub code: String,
 }
 
+/// `told`: the session's person was told, in their proxy's DM, that its
+/// work went on where only some of its room may read it (R64, R169); the
+/// host tells them once, and a session with no such line is told again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToldBody {
+    pub person: OwnedUserId,
+    /// The proxy DM it went to.
+    pub room: OwnedRoomId,
+}
+
 /// Why a session closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -615,6 +629,7 @@ pub enum LineBody {
     Run(RunBody),
     Surface(SurfaceBody),
     Heard(HeardBody),
+    Told(ToldBody),
     Memory(MemoryBody),
     Compact(CompactBody),
     Error(ErrorBody),
@@ -641,6 +656,7 @@ impl LineBody {
             Self::Run(_) => LineKind::Run,
             Self::Surface(_) => LineKind::Surface,
             Self::Heard(_) => LineKind::Heard,
+            Self::Told(_) => LineKind::Told,
             Self::Memory(_) => LineKind::Memory,
             Self::Compact(_) => LineKind::Compact,
             Self::Error(_) => LineKind::Error,
@@ -667,6 +683,7 @@ impl LineBody {
             LineKind::Run => Self::Run(from(value)?),
             LineKind::Surface => Self::Surface(from(value)?),
             LineKind::Heard => Self::Heard(from(value)?),
+            LineKind::Told => Self::Told(from(value)?),
             LineKind::Memory => Self::Memory(from(value)?),
             LineKind::Compact => Self::Compact(from(value)?),
             LineKind::Error => Self::Error(from(value)?),
@@ -692,6 +709,7 @@ impl Serialize for LineBody {
             Self::Run(b) => b.serialize(s),
             Self::Surface(b) => b.serialize(s),
             Self::Heard(b) => b.serialize(s),
+            Self::Told(b) => b.serialize(s),
             Self::Memory(b) => b.serialize(s),
             Self::Compact(b) => b.serialize(s),
             Self::Error(b) => b.serialize(s),
@@ -1005,6 +1023,10 @@ mod tests {
                 heard_until: 42,
                 sentence: 2,
                 reason: HeardReason::BargeIn,
+            }),
+            LineBody::Told(ToldBody {
+                person: user("@tgorka:h"),
+                room: OwnedRoomId::try_from("!dm:h").expect("room"),
             }),
             LineBody::Memory(MemoryBody {
                 op: MemoryOp::Journal,

@@ -391,7 +391,15 @@ pub struct SurfaceTools {
     pub wait: Duration,
     /// The `surface` lines of calls that sent a request, for the turn's log.
     pub lines: Mutex<Vec<SurfaceBody>>,
+    /// Whether a request — its whole content, the replaced text a proposed
+    /// edit carries included — may go into the room it is sent into, as
+    /// the room is at the send (R168); `None` sends unchecked.
+    pub admit: Option<SurfaceAdmit>,
 }
+
+/// [`SurfaceTools::admit`]: the tool's name and the request's bytes, or the
+/// sentence the call is refused with.
+pub type SurfaceAdmit = Arc<dyn Fn(&str, &[u8]) -> Result<(), String> + Send + Sync>;
 
 fn refused(reason: String) -> Option<ToolOutcome> {
     Some(ToolOutcome::Refused { reason })
@@ -525,6 +533,13 @@ impl SurfaceTools {
         let Ok(content) = serde_json::to_value(&request) else {
             return refused("unavailable: the request could not be written".to_owned());
         };
+        // The request goes into the session's room, not to the device: the
+        // room's audience is its audience.
+        if let Some(admit) = &self.admit {
+            if let Err(sentence) = admit(name, content.to_string().as_bytes()) {
+                return refused(sentence);
+            }
+        }
         let (answer, answers) = std::sync::mpsc::sync_channel::<SurfaceResultContent>(1);
         waiting().insert(
             id.clone(),
@@ -783,6 +798,7 @@ mod tests {
                 stop: signal,
                 wait,
                 lines: Mutex::new(Vec::new()),
+                admit: None,
             },
             _stop: stop,
         }

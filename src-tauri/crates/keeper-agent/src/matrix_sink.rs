@@ -11,10 +11,14 @@
 //!
 //! Every send goes through an [`EditPort`], so the pacing is tested against a
 //! fake port on tokio's paused clock; [`RoomPort`] is the real one.
+//!
+//! A send that carries what the session read asks its [`RoomGate`] first,
+//! at every attempt: the room's members as they are then, against the
+//! label as it is then (R168). Narrowed, an answer's edits stop and a
+//! status says only [`NARROWED_STATUS`] (R64).
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,6 +27,7 @@ use keeper_core::agents::events::{
 };
 use keeper_core::agents::matrix::{AgentClient, AgentMatrixError};
 use keeper_core::agents::redact::redact_secrets;
+use keeper_core::agents::room::room_members;
 use keeper_core::vm::BotStreamEvent;
 use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedTransactionId, TransactionId};
 use serde_json::{json, Value};
@@ -30,7 +35,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, sleep_until, Instant};
 
+use crate::delegate::MembersFuture;
 use crate::ports::TurnSink;
+use crate::sinks::{RoomGate, NARROWED_STATUS};
 
 /// No two edits of one anchor are closer than this (R18, NFR-113).
 pub const MIN_EDIT_GAP: Duration = Duration::from_millis(400);
@@ -63,6 +70,9 @@ pub trait EditPort: Send + Sync {
         content: Value,
         txn: OwnedTransactionId,
     ) -> SendFuture<'a>;
+    /// Who is in the room or invited to it now, any power (R160); an
+    /// error when that cannot be read.
+    fn members(&self) -> MembersFuture<'_>;
 }
 
 /// The real port: one copy's client in one room.
@@ -98,6 +108,21 @@ impl EditPort for RoomPort {
                     SEND_TIMEOUT.as_secs()
                 ))),
             }
+        })
+    }
+
+    fn members(&self) -> MembersFuture<'_> {
+        Box::pin(async move {
+            let room = self
+                .client
+                .client()
+                .get_room(&self.room)
+                .ok_or_else(|| "this copy is not in the room".to_owned())?;
+            tokio::time::timeout(SEND_TIMEOUT, room_members(&room))
+                .await
+                .ok()
+                .flatten()
+                .ok_or_else(|| "the room's members could not be read".to_owned())
         })
     }
 }
@@ -165,13 +190,77 @@ pub async fn deliver(
     content: Value,
     not_before: Instant,
 ) -> (OwnedEventId, Instant) {
+    let (event, at, _) =
+        deliver_gated(port, event_type, None, &|_| content.clone(), not_before).await;
+    (event, at)
+}
+
+/// [`deliver`], with each attempt's content made by `build` from whether
+/// `gate` finds the session narrowed below its room at that attempt (R168,
+/// R169): a retry never sends what an earlier attempt was made from.
+/// Returns the event, when it was accepted, and whether it was narrowed.
+pub async fn deliver_gated(
+    port: &dyn EditPort,
+    event_type: &str,
+    gate: Option<&RoomGate>,
+    build: &(dyn Fn(bool) -> Value + Sync),
+    not_before: Instant,
+) -> (OwnedEventId, Instant, bool) {
+    let sent = attempt(
+        port,
+        event_type,
+        gate,
+        &|narrowed| Ok::<_, std::convert::Infallible>(build(narrowed)),
+        not_before,
+    )
+    .await;
+    match sent {
+        Ok(sent) => sent,
+        Err(never) => match never {},
+    }
+}
+
+/// [`deliver_gated`] of what may not be sent at all under a narrowed room:
+/// `build` answers `None` for that, and nothing more is attempted.
+pub async fn deliver_unless_narrowed(
+    port: &dyn EditPort,
+    event_type: &str,
+    gate: &RoomGate,
+    build: &(dyn Fn(bool) -> Option<Value> + Sync),
+    not_before: Instant,
+) -> Option<(OwnedEventId, Instant)> {
+    attempt(
+        port,
+        event_type,
+        Some(gate),
+        &|narrowed| build(narrowed).ok_or(()),
+        not_before,
+    )
+    .await
+    .ok()
+    .map(|(event, at, _)| (event, at))
+}
+
+/// The attempts of one send that must arrive: each asks `gate`, then
+/// `build` for its content — or for why it is not sent.
+async fn attempt<E>(
+    port: &dyn EditPort,
+    event_type: &str,
+    gate: Option<&RoomGate>,
+    build: &(dyn Fn(bool) -> Result<Value, E> + Sync),
+    not_before: Instant,
+) -> Result<(OwnedEventId, Instant, bool), E> {
     let txn = TransactionId::new();
     let mut not_before = not_before;
     let mut backoff = BACKOFF_FIRST;
     loop {
         sleep_until(not_before).await;
-        match port.send(event_type, content.clone(), txn.clone()).await {
-            Ok(event) => return (event, Instant::now()),
+        let narrowed = match gate {
+            Some(gate) => gate.narrowed().await,
+            None => false,
+        };
+        match port.send(event_type, build(narrowed)?, txn.clone()).await {
+            Ok(event) => return Ok((event, Instant::now(), narrowed)),
             Err(AgentMatrixError::RateLimited { retry_after_ms }) => {
                 let wait = retry_after_ms.map_or(RATE_LIMIT_DEFAULT, Duration::from_millis);
                 tracing::info!(wait_ms = wait.as_millis() as u64, %event_type, "agents: the homeserver asked to wait");
@@ -186,8 +275,9 @@ pub async fn deliver(
     }
 }
 
-/// Makes an edit's content from the anchor and the text.
-type EditContent = Arc<dyn Fn(&OwnedEventId, &str) -> Value + Send + Sync>;
+/// Makes an edit's content from the anchor, the text and whether the
+/// session is narrowed below its room now; `None` sends nothing.
+type EditContent = Arc<dyn Fn(&OwnedEventId, &str, bool) -> Option<Value> + Send + Sync>;
 
 /// What the pacer last did.
 #[derive(Debug, Clone)]
@@ -205,17 +295,23 @@ struct Progress {
 
 /// Edit `anchor` with the newest progress, no closer than [`MIN_EDIT_GAP`],
 /// until the progress says the turn is over. `content` makes an edit from
-/// the anchor and the text.
+/// the anchor, the text and whether `gate` finds the session narrowed
+/// below its room at that edit; `shown` is what the room already has. The
+/// narrowing is part of what was sent, so a change of it alone is an edit
+/// (R169), and every attempt, a retry too, is made from it as it is then.
+#[allow(clippy::too_many_arguments)]
 async fn pace(
     port: Arc<dyn EditPort>,
     event_type: &'static str,
     anchor: OwnedEventId,
     content: EditContent,
+    gate: Option<Arc<RoomGate>>,
+    shown: (String, bool),
     mut last_send: Instant,
     mut progress: watch::Receiver<Progress>,
 ) -> Paced {
     let mut edits = 0;
-    let mut sent = String::new();
+    let mut sent = shown;
     // After a 429 the whole text goes out once, whether or not it grew
     // during the wait.
     let mut owed = false;
@@ -234,17 +330,29 @@ async fn pace(
             }
             now.text.clone()
         };
-        if text == sent {
+        let narrowed = match &gate {
+            Some(gate) => gate.narrowed().await,
+            None => false,
+        };
+        // Narrowed, no text is shown, so a new count is no new edit.
+        let now = if narrowed {
+            (String::new(), true)
+        } else {
+            (text, false)
+        };
+        if now == sent {
             owed = false;
             continue;
         }
-        match port
-            .send(event_type, content(&anchor, &text), TransactionId::new())
-            .await
-        {
+        let Some(edit) = content(&anchor, &now.0, narrowed) else {
+            sent = now;
+            owed = false;
+            continue;
+        };
+        match port.send(event_type, edit, TransactionId::new()).await {
             Ok(_) => {
                 last_send = Instant::now();
-                sent = text;
+                sent = now;
                 edits += 1;
                 owed = false;
             }
@@ -281,6 +389,9 @@ pub struct Delivered {
     pub accepted_at: Instant,
     /// How many edits went out before it.
     pub edits: usize,
+    /// Whether the room was found narrowed below the label at the accepted
+    /// attempt, so the final edit said only the narrowed sentence.
+    pub narrowed: bool,
 }
 
 /// One answer's sink: deltas in, paced edits of its anchor out.
@@ -290,24 +401,32 @@ pub struct MatrixSink {
     text: Mutex<String>,
     progress: watch::Sender<Progress>,
     pacer: Mutex<Option<JoinHandle<Paced>>>,
-    /// No more of the text reaches the room before the final edit.
-    withheld: AtomicBool,
+    /// The room's boundary: once narrowed, no more of the text reaches it.
+    gate: Option<Arc<RoomGate>>,
 }
 
 impl MatrixSink {
     /// Start pacing edits of `anchor`, which the homeserver accepted at
-    /// `anchor_at`.
-    pub fn start(port: Arc<dyn EditPort>, anchor: OwnedEventId, anchor_at: Instant) -> MatrixSink {
+    /// `anchor_at`, each one past `gate` when there is one.
+    pub fn start(
+        port: Arc<dyn EditPort>,
+        anchor: OwnedEventId,
+        anchor_at: Instant,
+        gate: Option<Arc<RoomGate>>,
+    ) -> MatrixSink {
         let (progress, receiver) = watch::channel(Progress::default());
         // An edit carries the log's redaction (S-17): the room never shows
-        // a secret the log does not.
-        let content: EditContent =
-            Arc::new(|anchor, text| events::edit_content(anchor, &redact_secrets(text).text));
+        // a secret the log does not. Narrowed, the text stops (S-16).
+        let content: EditContent = Arc::new(|anchor, text, narrowed| {
+            (!narrowed).then(|| events::edit_content(anchor, &redact_secrets(text).text))
+        });
         let pacer = tokio::spawn(pace(
             Arc::clone(&port),
             "m.room.message",
             anchor.clone(),
             content,
+            gate.clone(),
+            (String::new(), false),
             anchor_at,
             receiver,
         ));
@@ -317,7 +436,7 @@ impl MatrixSink {
             text: Mutex::new(String::new()),
             progress,
             pacer: Mutex::new(Some(pacer)),
-            withheld: AtomicBool::new(false),
+            gate,
         }
     }
 
@@ -326,17 +445,8 @@ impl MatrixSink {
     pub fn push(&self, delta: &str) {
         let mut text = self.text.lock().unwrap_or_else(|p| p.into_inner());
         text.push_str(delta);
-        if self.withheld.load(Ordering::Relaxed) {
-            return;
-        }
         let shown = prefix(&text, FINAL_CUT_BYTES).to_owned();
         self.progress.send_modify(|progress| progress.text = shown);
-    }
-
-    /// Stop sending the text as it grows: it is still kept, and the final
-    /// edit is the only send left.
-    pub fn withhold(&self) {
-        self.withheld.store(true, Ordering::Relaxed);
     }
 
     /// The text streamed so far.
@@ -345,8 +455,9 @@ impl MatrixSink {
     }
 
     /// Stop the paced edits and deliver `final_text` as the final edit,
-    /// retried until accepted.
-    pub async fn finish(&self, final_text: &str) -> Delivered {
+    /// retried until accepted — or `narrowed_text` at an attempt the gate
+    /// finds the room narrowed below the label.
+    pub async fn finish(&self, final_text: &str, narrowed_text: &str) -> Delivered {
         self.progress
             .send_modify(|progress| progress.finished = true);
         let pacer = self.pacer.lock().unwrap_or_else(|p| p.into_inner()).take();
@@ -360,10 +471,14 @@ impl MatrixSink {
                 edits: 0,
             },
         };
-        let (final_event, accepted_at) = deliver(
+        let (final_event, accepted_at, narrowed) = deliver_gated(
             self.port.as_ref(),
             "m.room.message",
-            events::edit_content(&self.anchor, final_text),
+            self.gate.as_deref(),
+            &|narrowed| {
+                let text = if narrowed { narrowed_text } else { final_text };
+                events::edit_content(&self.anchor, text)
+            },
             paced.last_send + MIN_EDIT_GAP,
         )
         .await;
@@ -371,6 +486,7 @@ impl MatrixSink {
             final_event,
             accepted_at,
             edits: paced.edits,
+            narrowed,
         }
     }
 }
@@ -416,10 +532,13 @@ impl ToolProgress {
 /// leaving `running` as "the answer is whole" (AD-384). A board dropped
 /// without that — the turn cancelled, or unwinding — stops its task where it
 /// is and publishes nothing more: never an `idle` for an answer that did
-/// not land.
+/// not land. Every attempt asks the gate: narrowed below its room, the
+/// status keeps `session` and says [`NARROWED_STATUS`] with no detail
+/// (R64), and the suppression is audited (R65).
 pub struct StatusBoard {
     progress: watch::Sender<Progress>,
     task: Mutex<Option<JoinHandle<Option<OwnedEventId>>>>,
+    gate: Option<Arc<RoomGate>>,
 }
 
 /// A task that is aborted when its holder goes.
@@ -431,44 +550,72 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+/// `base` as a status saying `run` and `detail`, an edit of `anchor` when
+/// there is one: under a narrowed room the fixed title and no detail (R64).
+pub fn status_content(
+    base: &StatusContent,
+    anchor: Option<&OwnedEventId>,
+    run: RunState,
+    detail: Option<&str>,
+    narrowed: bool,
+) -> Value {
+    let mut content = base.clone();
+    content.v = CONTENT_VERSION;
+    content.run = run;
+    content.detail = detail.filter(|text| !text.is_empty()).map(str::to_owned);
+    if narrowed {
+        NARROWED_STATUS.clone_into(&mut content.title);
+        content.detail = None;
+    }
+    content.anchor = anchor.cloned();
+    serde_json::to_value(content).unwrap_or(Value::Null)
+}
+
 impl StatusBoard {
     /// Start a board for one turn: a `running` status at once, as an edit
     /// of `anchor` — the session's status anchor — or as the anchor itself
     /// when the session has none yet. `base` is the status every edit
-    /// carries, `detail` and `anchor` aside.
+    /// carries, `detail` and `anchor` aside; `gate` is the room's boundary.
     pub fn start(
         port: Arc<dyn EditPort>,
         anchor: Option<OwnedEventId>,
         base: StatusContent,
+        gate: Option<Arc<RoomGate>>,
     ) -> StatusBoard {
         let (progress, receiver) = watch::channel(Progress::default());
+        let board_gate = gate.clone();
         let task = tokio::spawn(async move {
-            let status = move |anchor: Option<&OwnedEventId>, run: RunState, detail: &str| {
-                let mut content = base.clone();
-                content.v = CONTENT_VERSION;
-                content.run = run;
-                content.detail = (!detail.is_empty()).then(|| detail.to_owned());
-                content.anchor = anchor.cloned();
-                serde_json::to_value(content).unwrap_or(Value::Null)
+            let audited = gate.clone();
+            let status = move |anchor: Option<&OwnedEventId>, run, detail: &str, narrowed| {
+                if narrowed {
+                    if let Some(gate) = &audited {
+                        gate.suppressed("status");
+                    }
+                }
+                status_content(&base, anchor, run, Some(detail), narrowed)
             };
             let detail = receiver.borrow().text.clone();
-            let (sent, started) = deliver(
+            let (sent, started, narrowed) = deliver_gated(
                 port.as_ref(),
                 STATUS,
-                status(anchor.as_ref(), RunState::Running, &detail),
+                gate.as_deref(),
+                &|narrowed| status(anchor.as_ref(), RunState::Running, &detail, narrowed),
                 Instant::now(),
             )
             .await;
             let anchor = anchor.unwrap_or(sent);
             let status = Arc::new(status);
             let running = Arc::clone(&status);
-            let content: EditContent =
-                Arc::new(move |anchor, detail| running(Some(anchor), RunState::Running, detail));
+            let content: EditContent = Arc::new(move |anchor, detail, narrowed| {
+                Some(running(Some(anchor), RunState::Running, detail, narrowed))
+            });
             let paced = pace(
                 Arc::clone(&port),
                 STATUS,
                 anchor.clone(),
                 content,
+                gate.clone(),
+                (if narrowed { String::new() } else { detail }, narrowed),
                 started,
                 receiver.clone(),
             )
@@ -483,10 +630,11 @@ impl StatusBoard {
                 return None;
             }
             // The turn is over: the status says so, with the last counts.
-            deliver(
+            deliver_gated(
                 port.as_ref(),
                 STATUS,
-                status(Some(&anchor), RunState::Idle, &detail),
+                gate.as_deref(),
+                &|narrowed| status(Some(&anchor), RunState::Idle, &detail, narrowed),
                 paced.last_send + MIN_EDIT_GAP,
             )
             .await;
@@ -495,6 +643,7 @@ impl StatusBoard {
         StatusBoard {
             progress,
             task: Mutex::new(Some(task)),
+            gate: board_gate,
         }
     }
 
@@ -502,6 +651,15 @@ impl StatusBoard {
     pub fn update(&self, progress: ToolProgress) {
         let detail = progress.detail();
         self.progress.send_modify(|now| now.text = detail);
+    }
+
+    /// The session's label is `label` now: the gate checks it from the next
+    /// attempt on, and the pacer looks again even if no count changed.
+    pub fn relabel(&self, label: &keeper_core::agents::label::Label) {
+        if let Some(gate) = &self.gate {
+            gate.set_label(label.clone());
+        }
+        self.progress.send_modify(|_| {});
     }
 
     /// The answer's final edit was accepted (`delivered`, which only
@@ -543,10 +701,12 @@ mod tests {
         accepted: bool,
     }
 
-    /// A port answering from a script, then accepting everything.
+    /// A port answering from a script, then accepting everything; its room
+    /// holds `members`.
     struct FakePort {
         sent: Mutex<Vec<Sent>>,
         script: Mutex<Vec<Option<AgentMatrixError>>>,
+        members: Mutex<std::collections::BTreeSet<matrix_sdk::ruma::OwnedUserId>>,
     }
 
     impl FakePort {
@@ -554,7 +714,15 @@ mod tests {
             Arc::new(FakePort {
                 sent: Mutex::new(Vec::new()),
                 script: Mutex::new(script.into_iter().rev().collect()),
+                members: Mutex::default(),
             })
+        }
+
+        fn join(&self, user: &str) {
+            self.members
+                .lock()
+                .expect("lock")
+                .insert(matrix_sdk::ruma::OwnedUserId::try_from(user).expect("user"));
         }
 
         fn sent(&self) -> Vec<Sent> {
@@ -588,6 +756,82 @@ mod tests {
                 }
             })
         }
+
+        fn members(&self) -> MembersFuture<'_> {
+            Box::pin(async move { Ok(self.members.lock().expect("lock").clone()) })
+        }
+    }
+
+    /// A {tgorka} label's gate over `port`, its room holding tgorka.
+    fn gate(port: &Arc<FakePort>) -> Arc<RoomGate> {
+        use keeper_core::agents::label::{Integrity, Label, Readers};
+        port.join("@tgorka:h");
+        let tgorka = matrix_sdk::ruma::OwnedUserId::try_from("@tgorka:h").expect("user");
+        Arc::new(RoomGate::new(
+            Arc::clone(port) as Arc<dyn EditPort>,
+            None,
+            Vec::new(),
+            Label {
+                readers: Readers::Only([tgorka].into()),
+                integrity: Integrity::Owner,
+                local_only: false,
+            },
+            None,
+        ))
+    }
+
+    fn statuses(port: &FakePort) -> Vec<Value> {
+        port.sent()
+            .into_iter()
+            .filter(|s| s.event_type == STATUS && s.accepted)
+            .map(|s| s.content)
+            .collect()
+    }
+
+    /// R169: a room that widens past the label before any count was sent
+    /// is a change of its own — the running status says the fixed sentence
+    /// with no detail while the turn is still open, and a later count adds
+    /// no detail back.
+    #[tokio::test(start_paused = true)]
+    async fn a_status_narrowed_before_any_count_says_so_while_the_turn_runs() {
+        let port = FakePort::new(Vec::new());
+        let gate = gate(&port);
+        let board = StatusBoard::start(port.clone(), None, base(), Some(Arc::clone(&gate)));
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!(statuses(&port).last().expect("running")["title"], "Nixi");
+        port.join("@marta:h");
+        board.relabel(&gate.label());
+        sleep(Duration::from_secs(1)).await;
+        let last = statuses(&port).last().cloned().expect("a status");
+        assert_eq!(last["title"], NARROWED_STATUS, "{last}");
+        assert_eq!(last["run"], "running");
+        assert!(last.get("detail").is_none_or(Value::is_null), "{last}");
+        board.update(ToolProgress { reads: 1, calls: 2 });
+        sleep(Duration::from_secs(1)).await;
+        for status in statuses(&port).iter().skip(1) {
+            assert_eq!(status["title"], NARROWED_STATUS, "{status}");
+        }
+        drop(board);
+    }
+
+    /// R169: the first status, retried after a 429, is made at its retry:
+    /// a room that widened during the wait gets the fixed sentence, never
+    /// the title the first attempt was made with.
+    #[tokio::test(start_paused = true)]
+    async fn a_retried_status_is_made_from_the_room_as_it_is_then() {
+        let port = FakePort::new(vec![Some(AgentMatrixError::RateLimited {
+            retry_after_ms: Some(2000),
+        })]);
+        let gate = gate(&port);
+        let board = StatusBoard::start(port.clone(), None, base(), Some(gate));
+        sleep(Duration::from_millis(500)).await;
+        assert_eq!(port.sent()[0].content["title"], "Nixi");
+        port.join("@marta:h");
+        sleep(Duration::from_secs(3)).await;
+        let accepted = statuses(&port);
+        assert_eq!(accepted.len(), 1, "{accepted:?}");
+        assert_eq!(accepted[0]["title"], NARROWED_STATUS);
+        drop(board);
     }
 
     fn anchor() -> OwnedEventId {
@@ -607,7 +851,7 @@ mod tests {
     async fn edits_are_never_closer_than_400_ms() {
         let port = FakePort::new(Vec::new());
         let anchor_at = Instant::now();
-        let sink = MatrixSink::start(port.clone(), anchor(), anchor_at);
+        let sink = MatrixSink::start(port.clone(), anchor(), anchor_at, None);
         let mut answer = String::new();
         for n in 0..200 {
             sleep(Duration::from_millis(10)).await;
@@ -615,7 +859,7 @@ mod tests {
             answer.push_str(&delta);
             sink.event(BotStreamEvent::Delta { text: delta });
         }
-        let delivered = sink.finish(&answer).await;
+        let delivered = sink.finish(&answer, "").await;
 
         let sent = port.sent();
         let (edits, last) = sent.split_at(sent.len() - 1);
@@ -643,7 +887,7 @@ mod tests {
                 retry_after_ms: Some(2000),
             }),
         ]);
-        let sink = MatrixSink::start(port.clone(), anchor(), Instant::now());
+        let sink = MatrixSink::start(port.clone(), anchor(), Instant::now(), None);
         let mut answer = String::new();
         for n in 0..300 {
             sleep(Duration::from_millis(10)).await;
@@ -651,7 +895,7 @@ mod tests {
             answer.push_str(&delta);
             sink.push(&delta);
         }
-        sink.finish(&answer).await;
+        sink.finish(&answer, "").await;
 
         let sent = port.sent();
         let limited = sent
@@ -683,8 +927,8 @@ mod tests {
                 "no answer within 10 s".to_owned(),
             )),
         ]);
-        let sink = MatrixSink::start(port.clone(), anchor(), Instant::now());
-        let delivered = sink.finish("the whole answer").await;
+        let sink = MatrixSink::start(port.clone(), anchor(), Instant::now(), None);
+        let delivered = sink.finish("the whole answer", "").await;
 
         let sent = port.sent();
         assert_eq!(sent.len(), 4, "{sent:?}");
@@ -699,11 +943,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_fallback_body_is_at_most_1_kib_and_the_new_content_is_whole() {
         let port = FakePort::new(Vec::new());
-        let sink = MatrixSink::start(port.clone(), anchor(), Instant::now());
+        let sink = MatrixSink::start(port.clone(), anchor(), Instant::now(), None);
         let answer = "ż".repeat(5000);
         sink.push(&answer);
         sleep(Duration::from_secs(1)).await;
-        sink.finish(&answer).await;
+        sink.finish(&answer, "").await;
         let sent = port.sent();
         assert_eq!(sent.len(), 2);
         for edit in &sent {
@@ -762,11 +1006,11 @@ mod tests {
         let mut script = vec![None];
         script.extend(failing(40));
         let port = FakePort::new(script);
-        let sink = MatrixSink::start(port.clone(), anchor(), Instant::now());
-        let board = StatusBoard::start(port.clone(), None, base());
+        let sink = MatrixSink::start(port.clone(), anchor(), Instant::now(), None);
+        let board = StatusBoard::start(port.clone(), None, base(), None);
         sink.push("Half an answer");
         let turn = async move {
-            let delivered = sink.finish("Half an answer").await;
+            let delivered = sink.finish("Half an answer", "").await;
             board.finish(&delivered).await
         };
         assert!(
@@ -792,7 +1036,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_dropped_board_stops_its_task() {
         let port = FakePort::new(failing(200));
-        let board = StatusBoard::start(port.clone(), None, base());
+        let board = StatusBoard::start(port.clone(), None, base(), None);
         sleep(Duration::from_secs(3)).await;
         assert!(!port.sent().is_empty());
         drop(board);

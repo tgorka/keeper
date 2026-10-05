@@ -45,7 +45,7 @@ use keeper_core::agents::delegation::{
 };
 use keeper_core::agents::events::{ARTIFACTS, CONTENT_VERSION, REPLY_LABEL};
 use keeper_core::agents::home;
-use keeper_core::agents::label::{check_sink, Label, Readers, Sink, SinkVerdict};
+use keeper_core::agents::label::{check_sink, Destination, Label, Readers, Sink, SinkVerdict};
 use keeper_core::agents::log::{DelegateBody, DelegateState, LineBody, RunBody, RunState};
 use keeper_core::agents::proxy::ScopeRequest;
 use keeper_core::agents::session::SessionKind;
@@ -65,6 +65,7 @@ use crate::host::UNATTENDED_REFUSAL;
 use crate::matrix_sink::{EditPort, SendFuture};
 use crate::rooms::{BriefRoom, Known, KnownAgent};
 use crate::sessions::verbs::VerbError;
+use crate::sinks::{room_audience, Sinks};
 
 /// The tool that hands work on.
 pub const DELEGATE: &str = "delegate";
@@ -394,42 +395,90 @@ pub fn audience_of(known: &Known, user: &UserId) -> Option<Readers> {
         .map(|agent| agent.home_readers.clone())
 }
 
-/// Whether what `label` covers may go into a room whose members — joined
-/// or invited — are `members` (R94): to its people, everyone but the two
-/// agents of the delegation, `agents`, and to `audiences`, the agents' own
-/// beyond them. `Err` is the sentence a refusal says.
+/// A delegation's room as a sink (R94, R160): its members — joined or
+/// invited, any power — but `agents`, the two agents of the delegation;
+/// each other agent `known` names through its own audience, everyone else
+/// as a person; and `audiences`, the delegation's agents' own, beyond them.
+pub fn room_of(
+    members: BTreeSet<OwnedUserId>,
+    known: &Known,
+    agents: [&UserId; 2],
+    audiences: Vec<Readers>,
+) -> Sink {
+    let own: Vec<OwnedUserId> = agents.iter().map(|agent| (*agent).to_owned()).collect();
+    match room_audience(members, Some(known), &own) {
+        Sink::Room {
+            humans,
+            mut agent_audiences,
+        } => {
+            agent_audiences.extend(audiences);
+            Sink::Room {
+                humans,
+                agent_audiences,
+            }
+        }
+        other => other,
+    }
+}
+
+/// Whether what `label` covers may go into a room whose members are
+/// `members` ([`room_of`]). `Err` is the sentence a refusal says.
 pub fn check_room(
     label: &Label,
     members: BTreeSet<OwnedUserId>,
+    known: &Known,
     agents: [&UserId; 2],
     audiences: Vec<Readers>,
 ) -> Result<(), String> {
-    let humans = members
-        .into_iter()
-        .filter(|member| agents.iter().all(|agent| agent.as_str() != member.as_str()))
-        .collect();
-    let sink = Sink::Room {
-        humans,
-        agent_audiences: audiences,
-    };
-    match check_sink(label, &sink) {
+    match check_sink(label, &room_of(members, known, agents, audiences)) {
         SinkVerdict::Allow => Ok(()),
         SinkVerdict::Block { reason, .. } => Err(reason),
     }
 }
 
-/// [`check_room`] over `room`'s members as they are now.
-pub async fn may_send(
+/// `room` as [`room_of`] reads it now; `Err` when its members cannot be.
+pub async fn room_now(
     port: &dyn DelegationPort,
     room: &RoomId,
-    label: &Label,
     agents: [&UserId; 2],
     audiences: Vec<Readers>,
-) -> Result<(), String> {
+) -> Result<Sink, String> {
     let members = port.members(room).await.map_err(|error| {
         format!("Who is in the delegation's room could not be read, so nothing was sent: {error}")
     })?;
-    check_room(label, members, agents, audiences)
+    Ok(room_of(members, &port.known(), agents, audiences))
+}
+
+/// Whether a reply `content` labelled `label` may go into the delegated
+/// session's `room` now (R94, R168): to its people, everyone but the two
+/// `agents` of the delegation — the requester's session joins the label
+/// the reply carries. A block, or a room that cannot be read, is audited
+/// (R65) with what the reply's declassification would name.
+pub async fn admit_reply(
+    port: &dyn DelegationPort,
+    sinks: &Sinks,
+    room: &RoomId,
+    agents: [&UserId; 2],
+    label: &Label,
+    content: &Value,
+) -> Result<(), String> {
+    let sink = match room_now(port, room, agents, Vec::new()).await {
+        Ok(sink) => sink,
+        Err(unread) => {
+            sinks.refused(REPLY, "", room.as_str(), &unread);
+            return Err(unread);
+        }
+    };
+    sinks.check(
+        REPLY,
+        &Destination::Room {
+            room: room.to_owned(),
+        },
+        label,
+        &sink,
+        content.to_string().as_bytes(),
+        None,
+    )
 }
 
 /// Whether `rel`, session-relative, names a file under the session's
@@ -483,6 +532,13 @@ pub fn set_card_run(
     crate::cards::write_run(zone, session, CARD_FILE, run, None, may_write)
 }
 
+/// A delegation's canonical bytes for its declassification: the whole
+/// brief event — the card and the drives with it, not the brief's text
+/// alone — so one brief with two cards is two effects (FR-795).
+pub(crate) fn brief_effect(content: &DelegateContent) -> Vec<u8> {
+    brief_content(content).to_string().into_bytes()
+}
+
 fn block_on<F: Future>(fut: F) -> F::Output {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
 }
@@ -496,6 +552,8 @@ pub struct DelegateTools<'t> {
     pub view: &'t dyn TurnView,
     pub offer_delegate: bool,
     pub offer_reply: bool,
+    /// Where a send the label refuses is audited (R65).
+    pub sinks: &'t Sinks,
     lines: Mutex<Vec<LineBody>>,
 }
 
@@ -512,6 +570,7 @@ impl<'t> DelegateTools<'t> {
         room: Arc<dyn EditPort>,
         view: &'t dyn TurnView,
         offer_delegate: bool,
+        sinks: &'t Sinks,
     ) -> DelegateTools<'t> {
         DelegateTools {
             offer_reply: from.kind == SessionKind::Delegated,
@@ -520,6 +579,7 @@ impl<'t> DelegateTools<'t> {
             room,
             view,
             offer_delegate,
+            sinks,
             lines: Mutex::new(Vec::new()),
         }
     }
@@ -569,6 +629,29 @@ impl<'t> DelegateTools<'t> {
         }
     }
 
+    /// The agent a `delegate` call `wire` sends to, as the host resolves it
+    /// (R167): an open delegation's own target for a next round — whatever
+    /// `agent` says, which [`DelegateTools::run`] refuses when it differs —
+    /// or the agent `agent` names, with its audience when it is known.
+    /// `None` for a call that names no one: a `reply`, which goes to the
+    /// session's own requester, or arguments that do not read.
+    pub fn recipient(&self, wire: &WireToolCall) -> Option<(String, Option<Readers>)> {
+        if wire.name != DELEGATE {
+            return None;
+        }
+        let args = parse_args(&wire.arguments_raw).ok()?;
+        let known = self.port.as_ref()?.known();
+        if let Some(id) = &args.session {
+            let delegation = self.view.delegation(id)?;
+            let audience = audience_of(&known, &delegation.to);
+            return Some((delegation.to.to_string(), audience));
+        }
+        let audience = resolve(&known, &args.agent)
+            .ok()
+            .map(|target| target.home_readers.clone());
+        Some((args.agent, audience))
+    }
+
     fn delegate(&self, raw: &str) -> Option<ToolOutcome> {
         let args = match parse_args(raw) {
             Ok(args) => args,
@@ -578,7 +661,7 @@ impl<'t> DelegateTools<'t> {
             return refused(NO_ROOMS);
         };
         if let Some(id) = &args.session {
-            return self.next_round(port.as_ref(), id, &args.brief);
+            return self.next_round(port.as_ref(), id, &args.agent, &args.brief);
         }
         let source = args
             .source
@@ -624,6 +707,12 @@ impl<'t> DelegateTools<'t> {
         };
         let invites = room_invites(&target.matrix_user, &self.from.user, &content.label);
         let members = observers(&invites, &target.matrix_user);
+        let effect = brief_effect(&content);
+        let destination = Destination::Agent {
+            drive: target.drive.clone(),
+            agent: target.matrix_user.clone(),
+            room: None,
+        };
         for sink in [
             Sink::Delegation {
                 target_audience: target.home_readers.clone(),
@@ -634,8 +723,11 @@ impl<'t> DelegateTools<'t> {
                 agent_audiences: vec![target.home_readers.clone()],
             },
         ] {
-            if let SinkVerdict::Block { reason, .. } = check_sink(&content.label, &sink) {
-                return self.refuse(&id, &to, None, reason);
+            if let Err(sentence) =
+                self.sinks
+                    .check(DELEGATE, &destination, &content.label, &sink, &effect, None)
+            {
+                return self.refuse(&id, &to, None, sentence);
             }
         }
         // A schedule or a workflow is a person's to allow (Q16, T3).
@@ -689,12 +781,39 @@ impl<'t> DelegateTools<'t> {
         })
     }
 
-    /// The next round of an open delegation's exchange (R49).
-    fn next_round(&self, port: &dyn DelegationPort, id: &str, brief: &str) -> Option<ToolOutcome> {
+    /// The next round of an open delegation's exchange (R49), to the agent
+    /// it was opened with: a call naming another `agent` is refused.
+    fn next_round(
+        &self,
+        port: &dyn DelegationPort,
+        id: &str,
+        agent: &str,
+        brief: &str,
+    ) -> Option<ToolOutcome> {
         let Some(delegation) = self.view.delegation(id) else {
             return refused(format!("No delegation of this session has the id {id}."));
         };
         let to = delegation.to.to_string();
+        let known = port.known();
+        let Some(target) = known
+            .agents
+            .iter()
+            .find(|known| known.matrix_user == delegation.to)
+        else {
+            return refused(format!("{to} is no longer known on this host."));
+        };
+        if resolve(&known, agent).map(|named| &named.matrix_user) != Ok(&delegation.to) {
+            return self.refuse(
+                id,
+                &to,
+                Some(delegation.room.clone()),
+                format!(
+                    "Delegation {id} is an exchange with {}, not {}; name it to send it more.",
+                    target.name_in_drive(),
+                    agent.trim()
+                ),
+            );
+        }
         if !delegation.sent {
             return refused(format!(
                 "{to} has not joined yet; the brief goes in once it does."
@@ -705,25 +824,39 @@ impl<'t> DelegateTools<'t> {
             let bound = BoundReached::Rounds { limit };
             return self.refuse(id, &to, Some(delegation.room.clone()), bound.sentence());
         }
-        let known = port.known();
         let mut content = match content_for(&delegation, &self.from, &self.view.label(), &known) {
             Ok(content) => content,
             Err(sentence) => return refused(sentence),
         };
         content.brief = brief.to_owned();
         content.card = None;
-        let Some(audience) = audience_of(&known, &delegation.to) else {
-            return refused(format!("{to} is no longer known on this host."));
-        };
         // Its answer comes back here whatever this copy was told before.
         port.watch(&delegation.room, &self.from.room);
-        if let Err(reason) = block_on(may_send(
+        let checked = block_on(room_now(
             port,
             &delegation.room,
-            &content.label,
             [&self.from.user, &delegation.to],
-            vec![audience],
-        )) {
+            vec![target.home_readers.clone()],
+        ))
+        .inspect_err(|unread| {
+            self.sinks
+                .refused(DELEGATE, &target.drive, delegation.to.as_str(), unread)
+        })
+        .and_then(|sink| {
+            self.sinks.check(
+                DELEGATE,
+                &Destination::Agent {
+                    drive: target.drive.clone(),
+                    agent: delegation.to.clone(),
+                    room: Some(delegation.room.clone()),
+                },
+                &content.label,
+                &sink,
+                &brief_effect(&content),
+                None,
+            )
+        });
+        if let Err(reason) = checked {
             return self.refuse(id, &to, Some(delegation.room.clone()), reason);
         }
         let txn = TransactionId::new();
@@ -770,14 +903,14 @@ impl<'t> DelegateTools<'t> {
         };
         let (me, requester) = (&self.from.user, &self.from.requester);
         let label = self.view.label();
-        // The room's people read the reply as it is; the delegating session
-        // joins the label it carries, so no agent's audience is added here.
-        if let Err(reason) = block_on(may_send(
+        let content = reply_content(text, handed, &label);
+        if let Err(reason) = block_on(admit_reply(
             port.as_ref(),
+            self.sinks,
             &self.from.room,
-            &label,
             [me, requester],
-            Vec::new(),
+            &label,
+            &content,
         )) {
             return self.refuse(
                 &self.from.id,
@@ -786,7 +919,6 @@ impl<'t> DelegateTools<'t> {
                 reason,
             );
         }
-        let content = reply_content(text, handed, &label);
         if let Err(error) = block_on(self.room.send(
             "m.room.message",
             content,
@@ -871,6 +1003,68 @@ mod tests {
             "{both}"
         );
         assert!(resolve(&known, "tgdrive/winston").is_err());
+    }
+
+    /// FR-795: a declassification names the whole brief event, so
+    /// the same brief to the same agent with two different cards is two
+    /// effects with two digests; the same one twice is one.
+    #[test]
+    fn one_brief_with_two_cards_is_two_effects() {
+        use keeper_core::agents::delegation::{DelegateCard, DelegateFrom, DelegateLimits};
+        use keeper_core::agents::label::{declassify_request, Destination, Sink};
+        let tgorka = OwnedUserId::try_from("@tgorka:h").expect("user");
+        let with_card = |title: &str| DelegateContent {
+            v: 1,
+            id: "01J00000000000000000000000".to_owned(),
+            from: DelegateFrom {
+                agent: OwnedUserId::try_from("@nixi:h").expect("user"),
+                drive: "tgdrive".to_owned(),
+                session: "active/s".to_owned(),
+                room: OwnedRoomId::try_from("!s:h").expect("room"),
+            },
+            to: OwnedUserId::try_from("@lucyna:h").expect("user"),
+            brief: "Sort the inbox.".to_owned(),
+            drives: vec!["neuradrive".to_owned()],
+            label: Label {
+                readers: Readers::Only([tgorka.clone()].into()),
+                integrity: Integrity::Owner,
+                local_only: false,
+            },
+            hop: 1,
+            limits: DelegateLimits {
+                rounds_per_exchange: 3,
+                tokens: 1000,
+            },
+            card: Some(DelegateCard {
+                title: title.to_owned(),
+                schedule: None,
+                workflow: None,
+            }),
+            dispatch_chain: Vec::new(),
+        };
+        let destination = Destination::Agent {
+            drive: "neuradrive".to_owned(),
+            agent: OwnedUserId::try_from("@lucyna:h").expect("user"),
+            room: None,
+        };
+        let sink = Sink::Delegation {
+            target_audience: Readers::Anyone,
+            room_members: Default::default(),
+        };
+        let digest = |content: &DelegateContent| {
+            declassify_request(
+                &brief_effect(content),
+                None,
+                &destination,
+                &sink,
+                &content.label,
+                &|_| None,
+            )
+            .effect_sha256
+        };
+        let inbox = with_card("Inbox");
+        assert_eq!(digest(&inbox), digest(&with_card("Inbox")));
+        assert_ne!(digest(&inbox), digest(&with_card("Payroll")));
     }
 
     /// A reply hands over only files under its session's `artifacts/`:

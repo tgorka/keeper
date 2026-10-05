@@ -524,9 +524,74 @@ is refused.
 
 Run state, claims, presence and manifests carry no content, so they are not labelled.
 
-Keeping labelled content out of the wrong room, drive, memory file or model is the job of each
-place that sends it, which later releases add; what this release does is compute the label and
-say it.
+## Who may read what an agent writes
+
+Every place a session's work goes is checked against the session's label before anything is sent
+or written: a place whose audience is wider than the label's readers is refused.
+
+| where it goes | its audience |
+| --- | --- |
+| the answer in the session's room, its status edits, its scope echo, a host notice, a surface request | everyone in the room at that send |
+| a new proxy conversation | the person |
+| an invite into a room | the invited person, or a known agent's own audience |
+| `delegate` (the hand-off and each later round), `reply` (the model's, or the host's when a budget is spent) | the target agent's audience and every person in the room at that send |
+| `drive_write`, `drive_edit` | the drive's readers (a drive with no declaration counts as anyone) |
+| `session_write`, `card_update`, a long answer's artifact | the home drive's readers |
+| a model round | only `local_only` binds a model: a non-local model is refused while it is set |
+
+A room is read when something is sent into it, every time — a retried edit too: its joined and
+invited members, whatever their power, a known agent counted through its own audience and
+everyone else as a person. A room whose members cannot be read is refused. So a person invited
+since the last turn stops the next answer, and a surface request — which goes into the session's
+room, not to the device alone — is refused once anyone besides the person is in it.
+
+What the prompt carries is read too. Before the first model round of a turn, the agent's own
+files (soul, facts, memory) join the label as a read of the home drive, and each context file
+(`AGENTS.md` and the like) as a read of its drive and its own frontmatter; each one that changes
+the label writes a `label` line. A context file of a drive this host has no declaration for is left
+out of the prompt. A `local_only` drive's `AGENTS.md` therefore never reaches a remote model: the
+turn is refused before it is asked.
+
+A refused call sends and writes nothing. The model is told why — "This would let @marta:h read
+what only @tgorka:h may read." followed by "Letting this through needs an approval, which this
+keeper cannot take yet." — the session's log has a `tool_result` line with `outcome: refused`,
+and the bot audit log has a row: the tool's name (`answer`, `model`, `status`, `scope`, `notice`
+and `reply` for the host's own sends), the drive (or nothing) and the room, person or path it would
+have reached, `write`, `deny` and the sentence. A person may one day let one such flow through: the
+request is computed already — the SHA-256 of the exact effect (a write's drive, path and new text;
+an edit's drive, path and change; a hand-off's whole brief event, its card included), the file's
+path when it is one, where it would go, the label's readers as approvers, and each one's proxy DM
+— and epic 93 is what asks it.
+
+**When the label narrows below the room.** Once a session read something not everyone in its room
+may read, the room no longer sees its words: the answer is replaced by "This answer drew on
+something not everyone in this room may read, so it is not shown here. It is in this session's
+log.", the status keeps naming the session but its title becomes "This work continues where only
+some of you can read it." with no detail — the statuses a host says while no worker serves the
+session (waiting for a host, handed back, taken over) too — no scope event (which names drives and
+the label) is sent, and a new conversation's notice says one was opened, not its title. Each send
+left out or replaced writes its audit row, once per turn, and once per status a host sends while
+no worker serves it; a known agent in the room counts through its own audience there too. The
+session's person is told which session it was, and that its answers are in its log — also when
+the label is unchanged and the room grew wider than it, once an answer was withheld — in their
+proxy's DM, by the proxy itself — the session's own agent need not be in that DM — when this host
+runs that proxy and the label reaches the DM. A `told` line marks it done; a send that failed is
+tried again on the host's clock and when the session's worker starts. A delegated session is
+titled `<agent> <date>`, so its folder names no subject either.
+
+**Outside content narrows trust, and trust gates actions.** After a session reads something
+`untrusted` (an inbox file, a page, a stranger's message):
+
+- a `delegate` or `reply` to a known agent of a mounted drive whose audience is within the label
+  still goes — its session opens `untrusted`; a recipient that is not already a reader of the
+  label (a person, a room, an address, an agent no mounted drive homes, an agent whose audience is
+  wider) is refused: the outside content may have chosen it. A later round goes to the agent its
+  exchange was opened with; a call naming another agent with that exchange is refused;
+- a `drive_write` or `drive_edit` needs a person's approval, and is refused until approvals exist.
+
+A proxy's DM (`main`) starts each of its person's turns at their own word: the integrity goes back
+to `owner` at their next message, while who may read stays as narrow as before. Every other
+session keeps its lowest integrity for good.
 
 ## A session an agent works in
 
@@ -637,6 +702,7 @@ per date and host, compared as a number. Each host writes only its own chunks an
 | `scope` | `drives, set_by` |
 | `run` | `state` (`queued`, `running`, `waiting`, `blocked`, `review`, `failed`, `idle`), optional `detail` |
 | `surface` | `id, tool, device`, optional `outcome` |
+| `told` | `person, room` — the person a narrowed session's detail was sent to, and their proxy DM it went into |
 | `heard` | `assistant, heard_until, sentence, reason` (`barge_in`, `stop`) |
 | `memory` | `op` (`journal`, `proposal`), `ref` |
 | `compact` | `summary, replaces_through` |
@@ -1680,9 +1746,13 @@ What was already archived when her harvest session was made is listed in its `ha
 and is not news; anything closed after that is harvested whenever it opened. Her own triage and
 harvest sessions are never harvested. The turn carries the closed session's label — its
 `agent.toml` label joined with every `label` line of its log — and joins it before the model sees
-anything; a closed session whose readers do not reach her harvest room, or that is `local_only`
-while her model is not local, is refused and logged, and nothing is written or sent. The turn
-replies with what the drive should keep and where; it writes nothing.
+anything; a closed session whose readers do not reach her harvest room, that is `local_only` while
+her model is not local, or whose label, joined, does not reach the harvest room as it is now (its
+members, a known agent through its audience), is refused, logged and audited, and nothing is
+written or sent — not even the answer's placeholder, which would name the closed session. A room
+whose members cannot be read hands it again; a room that widens while the placeholder is retried
+gets one naming no session. The turn replies with what the drive should keep and where; it writes
+nothing.
 
 **Her questions.** Until a steward can ask a person (`ask_human`), her question is her `reply` to
 the agent that asked her — Nixi or Dixi — never a message to the person.

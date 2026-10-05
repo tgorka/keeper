@@ -199,14 +199,32 @@ pub struct Closed {
     pub label: Label,
 }
 
-/// Why a harvest session does not take `closed` in (R166): its readers do
-/// not reach everyone the harvest room is for, or it may go only to a
-/// model on the readers' own machines and hers is not. `None`: it may.
-pub fn refusal(closed: &Closed, audience: &Readers, local_model: bool) -> Option<&'static str> {
+/// Why a harvest session does not take a closed session in (R166).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Its readers do not reach everyone the harvest room is for.
+    Readers,
+    /// It may go only to a model on its readers' own machines, and hers is
+    /// not.
+    Model,
+}
+
+impl Refusal {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Refusal::Readers => "its readers are fewer than the harvest room's",
+            Refusal::Model => "it may go only to a model on its readers' own machines",
+        }
+    }
+}
+
+/// Why a harvest session does not take `closed` in, its room being for
+/// `audience` and its model `local` or not. `None`: it may.
+pub fn refusal(closed: &Closed, audience: &Readers, local_model: bool) -> Option<Refusal> {
     if !closed.label.may_reach(audience) {
-        Some("its readers are fewer than the harvest room's")
+        Some(Refusal::Readers)
     } else if !closed.label.may_use_model(local_model) {
-        Some("it may go only to a model on its readers' own machines")
+        Some(Refusal::Model)
     } else {
         None
     }

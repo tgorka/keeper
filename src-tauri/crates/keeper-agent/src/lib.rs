@@ -61,6 +61,7 @@ pub mod rooms;
 pub mod runtime;
 pub mod seed;
 pub mod sessions;
+pub mod sinks;
 pub mod stewards;
 pub mod surface;
 pub mod task;

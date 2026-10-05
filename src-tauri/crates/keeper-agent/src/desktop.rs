@@ -54,6 +54,7 @@ use crate::runtime::{
     deps_over, known_agents, known_with, open_copy, sessions_of, start_copy, view, Copy, DriveView,
     RoomSessions, TURNS_FINISH,
 };
+use crate::sinks::ClientDoors;
 use crate::surface::declared;
 use crate::turn::TurnEnv;
 use crate::zone::{read_text, read_zone, AgentHome, ZoneRead};
@@ -753,6 +754,7 @@ impl DesktopHost {
         ))));
         let mut copies = Vec::new();
         let mut syncs = Vec::new();
+        let doors = Arc::new(ClientDoors::default());
         for home in &signed {
             let user = home.config.matrix_user.clone();
             let Some(homeserver) = homeserver_for(&user, &facts.homeservers) else {
@@ -781,8 +783,13 @@ impl DesktopHost {
                     continue;
                 }
             };
-            let (copy, sync) =
-                start_copy(deps, client, Arc::clone(&known), Arc::clone(&self.doorbell));
+            let (copy, sync) = start_copy(
+                deps,
+                client,
+                Arc::clone(&known),
+                Arc::clone(&self.doorbell),
+                Arc::clone(&doors),
+            );
             copies.push(copy);
             syncs.push(sync);
         }

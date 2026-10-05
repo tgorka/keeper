@@ -89,6 +89,7 @@ use crate::matrix_sink::{EditPort, RoomPort, SendFuture};
 use crate::rooms::{
     self, Arrival, BriefEvent, BriefRoom, Invite, InviteDecision, Known, KnownAgent,
 };
+use crate::sinks::{ClientDoors, ProxyDoors};
 use crate::surface::{self, PresenceFuture, SurfacePort};
 use crate::turn::{DrivePorts, TurnEnv};
 use crate::zone::{active_sessions, read_text, read_zone, AgentHome, FoundSession, ZoneRead};
@@ -572,7 +573,7 @@ pub(crate) struct Copy {
     pub(crate) deps: Arc<AgentDeps>,
     pub(crate) client: AgentClient,
     /// Read again with every scan, so a home that arrives by sync counts.
-    known: Arc<RwLock<Arc<Known>>>,
+    pub(crate) known: Arc<RwLock<Arc<Known>>>,
     pub(crate) router: Arc<Router>,
     /// Counts the copy's completed `/sync` rounds: a taker's settle waits one.
     pub(crate) syncs: watch::Receiver<u64>,
@@ -588,6 +589,9 @@ pub(crate) struct Copy {
     /// What the harvest worker made of each closed session it was handed:
     /// the host's clock takes them (R61).
     pub(crate) harvest_acks: crate::agent::HarvestAcks,
+    /// The proxies every copy of this host runs: a narrowed session's
+    /// person is told through theirs (R169).
+    pub(crate) doors: Arc<ClientDoors>,
 }
 
 /// The claim a worker writes under (story 90.6).
@@ -684,8 +688,10 @@ pub(crate) fn start_copy(
     client: AgentClient,
     known: Arc<RwLock<Arc<Known>>>,
     doorbell: Arc<Doorbell>,
+    doors: Arc<ClientDoors>,
 ) -> (Arc<Copy>, JoinHandle<()>) {
     let (rounds, rounds_seen) = watch::channel(0u64);
+    doors.add(&client, &deps.home.config, &deps.sessions_zone);
     let copy = Arc::new(Copy {
         deps,
         client,
@@ -696,6 +702,7 @@ pub(crate) fn start_copy(
         pending: Mutex::default(),
         doorbell,
         harvest_acks: Arc::default(),
+        doors,
     });
     register_handlers(&copy);
     let sync_client = copy.client.client().clone();
@@ -792,6 +799,7 @@ pub async fn run(
 
     let (stop_turns, stop_signal) = chat::cancellation();
     let doorbell = Arc::new(Doorbell::default());
+    let doors = Arc::new(ClientDoors::default());
     doorbell.set_engine(Arc::clone(&agentd.engine) as Arc<dyn DriveEngine>);
     doorbell.set_drives(
         mounted(&drives),
@@ -823,7 +831,13 @@ pub async fn run(
                 continue;
             }
         };
-        let (copy, sync) = start_copy(deps, client, Arc::clone(&known), Arc::clone(&doorbell));
+        let (copy, sync) = start_copy(
+            deps,
+            client,
+            Arc::clone(&known),
+            Arc::clone(&doorbell),
+            Arc::clone(&doors),
+        );
         syncs.push(sync);
         copies.push(copy);
     }
@@ -1056,6 +1070,7 @@ async fn serve_session(
     served.conversations = Some(Arc::clone(&rooms) as Arc<dyn ConversationPort>);
     served.delegations = Some(rooms);
     served.harvests = Some(Arc::clone(&copy.harvest_acks));
+    served.doors = Some(Arc::clone(&copy.doors) as Arc<dyn ProxyDoors>);
     served.surface = Some(Arc::new(ClientSurface {
         client: copy.client.clone(),
         room: room_id.clone(),
@@ -1071,7 +1086,7 @@ async fn serve_session(
     // started again, though its `peer` line never reached this log.
     served.context.started(answered.iter().map(String::as_str));
     let trail = trail_of(&events, me, served.context.unanswered);
-    match served.recover(deps, port.as_ref(), &trail).await {
+    match served.recover(deps, Arc::clone(&port), &trail).await {
         Ok(true) => {
             tracing::info!(session = %session.path, "agentd: an interrupted turn was closed, not re-run")
         }

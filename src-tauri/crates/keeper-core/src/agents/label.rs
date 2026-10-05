@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use globset::{GlobBuilder, GlobSetBuilder};
-use matrix_sdk::ruma::{OwnedUserId, UserId};
+use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, UserId};
 use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
@@ -227,6 +227,18 @@ impl Label {
         }
         out
     }
+
+    /// A `main` session's label at its person's next turn (R28 S-09): the
+    /// integrity is the one `said` carries — what the person said is the
+    /// turn's own standing — while the readers keep narrowing and
+    /// `local_only` sticks. Every other session only narrows ([`Label::join`]).
+    pub fn at_persons_turn(&self, said: &Label) -> Label {
+        Label {
+            readers: self.readers.meet(&said.readers),
+            integrity: said.integrity,
+            local_only: self.local_only || said.local_only,
+        }
+    }
 }
 
 /// Where content goes (AD-391): every place an agent sends what it read
@@ -334,6 +346,153 @@ pub fn check_sink(label: &Label, sink: &Sink) -> SinkVerdict {
             reason: format!("This would let anyone read what only {only} may read."),
             wider: BTreeSet::new(),
         },
+    }
+}
+
+/// What an action that needs a person's approval answers until approvals
+/// exist (AD-391, epic 93): a declassification, and a consequential call
+/// decided under `untrusted` integrity.
+pub const NEEDS_APPROVAL: &str =
+    "Letting this through needs an approval, which this keeper cannot take yet.";
+
+/// The calls that are consequential under `untrusted` integrity (R82): the
+/// tools a person's approval stands behind once the session read outside
+/// content — a write outside the session, which 93.1's raise takes to T3.
+/// Epic 93 replaces this list with its tier table.
+pub const CONSEQUENTIAL: [&str; 2] = ["drive_write", "drive_edit"];
+
+/// What the integrity rule says of one call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallVerdict {
+    Allow,
+    /// Not done: a person must let it through ([`NEEDS_APPROVAL`]).
+    NeedsApproval,
+    /// Not done: the sentence the caller says instead.
+    Block {
+        reason: String,
+    },
+}
+
+/// Whom one call sends to, as the host resolved it (R167): the name the
+/// call gave, and its audience — a known agent's own (its home drive's
+/// readers), a person's `{them}` — or `None` when the host cannot name it:
+/// an external address, an agent no mounted drive homes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recipient<'a> {
+    pub name: &'a str,
+    pub audience: Option<&'a Readers>,
+}
+
+/// The integrity rule (AD-391, Q11, R167): under `untrusted` integrity a
+/// call to a recipient that is not already a reader of the label — one the
+/// host cannot name, or whose audience is wider than the label's readers —
+/// is blocked, since the outside content may have chosen it; a known agent
+/// whose audience is within the label passes, and its session opens
+/// `untrusted` (R94 joins the labels). A consequential call
+/// ([`CONSEQUENTIAL`]) needs approval. A block is decided first.
+pub fn check_call(label: &Label, tool: &str, recipients: &[Recipient]) -> CallVerdict {
+    if label.integrity > Integrity::Untrusted {
+        return CallVerdict::Allow;
+    }
+    if let Some(outside) = recipients.iter().find(|recipient| {
+        !recipient
+            .audience
+            .is_some_and(|audience| label.may_reach(audience))
+    }) {
+        return CallVerdict::Block {
+            reason: format!(
+                "This session has read outside content, and {} is not already a reader of it, so {tool} was not called.",
+                outside.name.trim()
+            ),
+        };
+    }
+    if CONSEQUENTIAL.contains(&tool) {
+        return CallVerdict::NeedsApproval;
+    }
+    CallVerdict::Allow
+}
+
+/// Where a blocked flow would have gone: the concrete drive and
+/// path, room, person or agent, so one request names one effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Destination {
+    /// A file of a drive, drive-relative.
+    Drive { drive: String, path: String },
+    /// A room, as it is.
+    Room { room: OwnedRoomId },
+    /// A person: an invite, a new conversation.
+    Person { user: OwnedUserId },
+    /// An agent homed in `drive`, through `room` when the room exists.
+    Agent {
+        drive: String,
+        agent: OwnedUserId,
+        room: Option<OwnedRoomId>,
+    },
+}
+
+impl Destination {
+    /// The audit row's target (R65): the drive (or `""`) and the path,
+    /// room or user.
+    pub fn target(&self) -> (&str, &str) {
+        match self {
+            Destination::Drive { drive, path } => (drive, path),
+            Destination::Room { room } => ("", room.as_str()),
+            Destination::Person { user } => ("", user.as_str()),
+            Destination::Agent { drive, agent, .. } => (drive, agent.as_str()),
+        }
+    }
+}
+
+/// A request to let one blocked flow through (AD-391, FR-795): the effect
+/// that would happen — by the SHA-256 of its canonical bytes and, for a
+/// file, its drive-relative path, never the bytes — where exactly, who may
+/// allow it, and the DM of each one's proxy it is asked in. Epic 93 sends
+/// it and records the decision; until then it is refused with
+/// [`NEEDS_APPROVAL`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclassifyRequest {
+    /// The SHA-256 of the blocked effect's canonical bytes, hex: what the
+    /// producer would have sent or written, whole (a delegation's whole
+    /// brief event, a write's file content, an edit's target and change).
+    pub effect_sha256: String,
+    /// The file those bytes are, drive-relative, when they are one.
+    pub artifact: Option<String>,
+    pub destination: Destination,
+    pub sink: Sink,
+    /// Who may let it through: the label's readers.
+    pub approvers: BTreeSet<OwnedUserId>,
+    /// Each approver's proxy DM, where the host found one.
+    pub route: Vec<(OwnedUserId, Option<OwnedRoomId>)>,
+}
+
+/// The [`DeclassifyRequest`] for the effect whose canonical bytes are
+/// `effect` (the file `artifact`, when it is one) labelled `label` going to
+/// `sink` at `destination`; `proxy_dm` is the host's own lookup of a
+/// person's proxy DM.
+pub fn declassify_request(
+    effect: &[u8],
+    artifact: Option<&str>,
+    destination: &Destination,
+    sink: &Sink,
+    label: &Label,
+    proxy_dm: &dyn Fn(&UserId) -> Option<OwnedRoomId>,
+) -> DeclassifyRequest {
+    use sha2::{Digest, Sha256};
+    let approvers = match &label.readers {
+        Readers::Only(set) => set.clone(),
+        Readers::Anyone => BTreeSet::new(),
+    };
+    let route = approvers
+        .iter()
+        .map(|approver| (approver.clone(), proxy_dm(approver)))
+        .collect();
+    DeclassifyRequest {
+        effect_sha256: format!("{:x}", Sha256::digest(effect)),
+        artifact: artifact.map(str::to_owned),
+        destination: destination.clone(),
+        sink: sink.clone(),
+        approvers,
+        route,
     }
 }
 
@@ -1108,5 +1267,185 @@ mod tests {
             ),
             SinkVerdict::Block { .. }
         ));
+    }
+
+    /// 92.6 acceptance 3: a {tgorka, Marta} session that reads a tgdrive
+    /// file is {tgorka} from then on, so its next neuradrive write is
+    /// blocked naming Marta; the join never widens it back.
+    #[test]
+    fn a_read_narrows_the_next_write() {
+        let shared = only(&["@marta:h", "@tgorka:h"]);
+        let session = Label {
+            readers: shared.clone(),
+            integrity: Integrity::Owner,
+            local_only: false,
+        };
+        let neuradrive = Sink::DriveWrite {
+            drive_readers: shared.clone(),
+        };
+        assert_eq!(check_sink(&session, &neuradrive), SinkVerdict::Allow);
+        let tgdrive_read = Label {
+            readers: only(&["@tgorka:h"]),
+            integrity: Integrity::Owner,
+            local_only: false,
+        };
+        let after = session.join(&tgdrive_read);
+        let SinkVerdict::Block { wider, .. } = check_sink(&after, &neuradrive) else {
+            panic!("blocked")
+        };
+        assert_eq!(wider, BTreeSet::from([user("@marta:h")]));
+        let reread = after.join(&session);
+        assert!(matches!(
+            check_sink(&reread, &neuradrive),
+            SinkVerdict::Block { .. }
+        ));
+    }
+
+    /// 92.6 acceptance 4 as R167 restates it: under `untrusted`, a
+    /// recipient the host cannot name, or whose audience is wider than the
+    /// label, is blocked whatever the tool; a known agent whose audience is
+    /// within the label passes; a consequential call needs approval; above
+    /// `untrusted` the rule allows everything it is asked.
+    #[test]
+    fn a_recipient_taken_from_outside_content_is_blocked() {
+        let at = |integrity| Label {
+            readers: only(&["@tgorka:h"]),
+            integrity,
+            local_only: false,
+        };
+        let untrusted = at(Integrity::Untrusted);
+        let tola = only(&["@tgorka:h"]);
+        let shared = only(&["@marta:h", "@tgorka:h"]);
+        let unnamed = Recipient {
+            name: "evil/exfil",
+            audience: None,
+        };
+        let known = Recipient {
+            name: "tola-grey",
+            audience: Some(&tola),
+        };
+        let wider = Recipient {
+            name: "neuradrive/lucyna",
+            audience: Some(&shared),
+        };
+        assert!(matches!(
+            check_call(&untrusted, "delegate", &[unnamed]),
+            CallVerdict::Block { reason } if reason.contains("evil/exfil")
+        ));
+        assert!(matches!(
+            check_call(&untrusted, "delegate", &[wider]),
+            CallVerdict::Block { reason } if reason.contains("neuradrive/lucyna")
+        ));
+        assert_eq!(
+            check_call(&untrusted, "delegate", &[known]),
+            CallVerdict::Allow
+        );
+        assert!(matches!(
+            check_call(&untrusted, "delegate", &[known, unnamed]),
+            CallVerdict::Block { .. }
+        ));
+        assert_eq!(
+            check_call(&untrusted, "drive_write", &[]),
+            CallVerdict::NeedsApproval
+        );
+        assert!(matches!(
+            check_call(&untrusted, "drive_edit", &[unnamed]),
+            CallVerdict::Block { .. }
+        ));
+        for integrity in [Integrity::Agent, Integrity::Peer, Integrity::Owner] {
+            for tool in ["delegate", "drive_write", "drive_edit"] {
+                assert_eq!(
+                    check_call(&at(integrity), tool, &[unnamed, wider]),
+                    CallVerdict::Allow
+                );
+            }
+        }
+    }
+
+    /// 92.6 acceptance 8 (pure): at the person's turn a `main` session's
+    /// integrity is that of the person's line, however low the last turn
+    /// went, while its readers keep narrowing and `local_only` sticks.
+    #[test]
+    fn a_main_sessions_integrity_resets_at_the_persons_turn() {
+        for before in all_labels() {
+            for said in all_labels() {
+                let next = before.at_persons_turn(&said);
+                assert_eq!(next.integrity, said.integrity, "{before:?} {said:?}");
+                assert_eq!(next.readers, before.readers.meet(&said.readers));
+                assert!(next.readers.is_within(&before.readers));
+                assert_eq!(next.local_only, before.local_only || said.local_only);
+            }
+        }
+        let relayed = Label {
+            readers: only(&["@tgorka:h"]),
+            integrity: Integrity::Untrusted,
+            local_only: false,
+        };
+        let tgorka = Label {
+            readers: only(&["@tgorka:h"]),
+            integrity: Integrity::Owner,
+            local_only: false,
+        };
+        assert_eq!(relayed.at_persons_turn(&tgorka).integrity, Integrity::Owner);
+        assert_eq!(relayed.join(&tgorka).integrity, Integrity::Untrusted);
+    }
+
+    /// 92.6 acceptance 5: a block in a {tgorka} session asks tgorka, in
+    /// Nixi's DM, about the exact effect by its SHA-256 and its destination
+    /// — the request carries a digest, a path and where, never the content.
+    #[test]
+    fn a_declassification_goes_to_the_owners_proxy() {
+        let label = Label {
+            readers: only(&["@tgorka:h"]),
+            integrity: Integrity::Owner,
+            local_only: false,
+        };
+        let sink = Sink::Delegation {
+            target_audience: only(&["@marta:h", "@tgorka:h"]),
+            room_members: BTreeSet::from([user("@tgorka:h")]),
+        };
+        let lucyna = Destination::Agent {
+            drive: "neuradrive".to_owned(),
+            agent: user("@lucyna:h"),
+            room: None,
+        };
+        let nixis_dm = OwnedRoomId::try_from("!nixi-dm:h").expect("room");
+        let route = |person: &UserId| (person == "@tgorka:h").then(|| nixis_dm.clone());
+        let content = b"the plan: sell in March";
+        let request = declassify_request(content, None, &lucyna, &sink, &label, &route);
+        assert_eq!(request.approvers, BTreeSet::from([user("@tgorka:h")]));
+        assert_eq!(
+            request.route,
+            vec![(user("@tgorka:h"), Some(nixis_dm.clone()))]
+        );
+        assert_eq!(
+            request.effect_sha256,
+            "743952fca51d2205792eab844091bc4bb29df579c77a8ec8668a04f9b42007bc"
+        );
+        assert_eq!(request.sink, sink);
+        assert_eq!(request.destination, lucyna);
+        assert_eq!(lucyna.target(), ("neuradrive", "@lucyna:h"));
+        assert!(!format!("{request:?}").contains("sell in March"));
+        let at = Destination::Drive {
+            drive: "tgdrive".to_owned(),
+            path: "60-sessions/active/s/artifacts/plan.md".to_owned(),
+        };
+        let file = declassify_request(
+            content,
+            Some("60-sessions/active/s/artifacts/plan.md"),
+            &at,
+            &sink,
+            &label,
+            &route,
+        );
+        assert_eq!(
+            file.artifact.as_deref(),
+            Some("60-sessions/active/s/artifacts/plan.md")
+        );
+        assert_eq!(
+            file.destination.target(),
+            ("tgdrive", "60-sessions/active/s/artifacts/plan.md")
+        );
+        assert_eq!(file.effect_sha256, request.effect_sha256);
     }
 }

@@ -7721,4 +7721,32 @@ status: open
 origin: story 92.5 review fixes (rung `agents-92-stewards`, 2026-10-05; STW-11, the real-model smoke)
 location: `src-tauri/crates/keeper-core/src/bots/tools.rs` (`MAX_TOOL_ROUNDS` = 8), `src-tauri/crates/keeper-core/src/agents/seed/zone/steward-menu.toml` (the `TR`/`DS` prompts)
 reason: `a_stewards_triage_runs_on_a_real_model` (claude-haiku-4-5 through CLIProxyAPI) passed 1 of 3 runs: in a failing run the model listed and read the inbox, then also browsed its own sessions and `80-agents/`, reached the round budget, and its `session_write` calls were refused. The stub-model smoke passes every time; the protocol holds (nothing ran that should not). A turn that ends by round exhaustion gets no continuation outside workflow sessions (epic 94's R106 continues only `kind = workflow`). Close by extending R106's bounded continuation to `kind = scheduled` steward sessions in epic 94, or by a per-kind round budget, and by narrowing the `TR` prompt to the inbox; re-run the real-model smoke until it passes repeatedly.
+
+### DW-460: A narrowed session's detail reaches its person only from a host that runs their proxy.
+
+origin: epic 92, story 92.6 (rung `agents-92-labels`, 2026-10-05; acceptance 9, UX-DR135; restated by the rung's review fixes, R169, LB-08)
+location: `src-tauri/crates/keeper-agent/src/sinks.rs` (`ClientDoors`, `Sinks::proxy_dm`), `src-tauri/crates/keeper-agent/src/agent.rs` (`tell_the_requester`)
+reason: The detail now goes through the person's proxy's own client (`ClientDoors`), so a steward's session reaches the person's DM without joining it, a failed send is tried again on the clock and at the worker's start, and a `told` line marks it done. The door is a proxy copy this host runs: a session served on electra whose person's proxy runs only on hesperia has no door there, keeps its detail in its log, and says so in `tracing` until a turn of it runs where the proxy does. Epic 93's R89 route (the DM request carrying `{session}`, forwarded by the DM's worker on whichever host serves it) is the cross-host door; revisit with 93.3 and route the same detail through it.
+status: open
+
+### DW-461: A doorbell the label refuses leaves no audit row and no refused line.
+
+origin: epic 92, story 92.6 (rung `agents-92-labels`, 2026-10-05; acceptance 1)
+location: `src-tauri/crates/keeper-agent/src/doorbell.rs` (`ring`)
+reason: The doorbell is the host's own send after a push, not a call of any session: there is no session log to write a `tool_result` line in and no provider or session id for a `bot_audit` row. A refused ring is checked with `check_sink(Room)` and logged by `tracing`; its content is a drive id, a commit and a closed reason word, never what a session read. Revisit if the doorbell ever carries session content, or when the audit log gains host-level rows.
+status: open
+
+### DW-462: The host's placement status names the session's own title whatever its label became.
+
+origin: epic 92, story 92.6 (rung `agents-92-labels`, 2026-10-05; acceptance 9, R64)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`show`)
+reason: While no worker serves a session (waiting for a host, handed back), `HostRuntime::show` wrote its status from `agent.toml` — the opening title — without reading the log's current label.
+status: closed 2026-10-05
+resolution: Fixed by the rung's review fixes (R169, LB-07): `show` reads the label from the session's log (`logged_label`) and the room's members now; narrowed, it keeps `session`, says the fixed title and drops the detail. Proved by `a_placement_status_follows_the_label_too` and `a_narrowed_session_stays_fixed_through_a_hand_back_a_wait_and_a_takeover` (`hosts::tests`). The cost of that read is DW-463.
+
+### DW-463: A placement status reads the session's whole log to find its label.
+
+origin: epic 92, story 92.6 review fixes (rung `agents-92-labels`, 2026-10-05; R169, LB-07)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`logged_label`, called by `HostRuntime::show`)
+reason: `show` takes the session's current label from its last `label` line, and `logged_label` gets it with `read_session(dir)` — every chunk of the log, parsed — on each status placement says (a wait, a lost claim, a refused card, a conflict). `show` returns early when the same status was already said only after that read. A long-lived session waiting on an absent host pays a whole-log read on every tick that reaches `show`. Revisit when a session's log grows past a few MB or a host serves many waiting sessions: read the label from the index's session projection, or keep the last label per slot and read only chunks that grew (`Index::refresh_session`'s rule, R62).
 status: open

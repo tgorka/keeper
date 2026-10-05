@@ -7,8 +7,10 @@
 #![cfg(unix)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -103,14 +105,30 @@ impl Platform for DataDir {
 }
 
 /// A room that accepts every send and remembers it; with `stop` set, its
-/// first send cancels the turn.
+/// first send cancels the turn. Its members are whom the test says, now.
 #[derive(Default)]
 struct Room {
     sent: Mutex<Vec<(String, Value)>>,
     stop: Mutex<Option<CancelHandle>>,
+    members: Mutex<BTreeSet<OwnedUserId>>,
+    /// Its members cannot be read.
+    unread: std::sync::atomic::AtomicBool,
+    /// Its next send is asked to wait, and meanwhile its members become
+    /// these.
+    limited: Mutex<Option<Vec<&'static str>>>,
 }
 
 impl Room {
+    fn of(members: &[&str]) -> Room {
+        let room = Room::default();
+        room.set_members(members);
+        room
+    }
+
+    fn set_members(&self, members: &[&str]) {
+        *self.members.lock().expect("lock") = members.iter().map(|m| user(m)).collect();
+    }
+
     fn sent(&self) -> Vec<(String, Value)> {
         self.sent.lock().expect("lock").clone()
     }
@@ -127,9 +145,24 @@ impl EditPort for Room {
             if let Some(stop) = self.stop.lock().expect("lock").take() {
                 stop.cancel();
             }
+            if let Some(members) = self.limited.lock().expect("lock").take() {
+                self.set_members(&members);
+                return Err(keeper_core::agents::matrix::AgentMatrixError::RateLimited {
+                    retry_after_ms: Some(1),
+                });
+            }
             let mut sent = self.sent.lock().expect("lock");
             sent.push((event_type.to_owned(), content));
             Ok(OwnedEventId::try_from(format!("$sent{}:example.org", sent.len())).expect("id"))
+        })
+    }
+
+    fn members(&self) -> MembersFuture<'_> {
+        Box::pin(async move {
+            if self.unread.load(Ordering::SeqCst) {
+                return Err("unreadable".to_owned());
+            }
+            Ok(self.members.lock().expect("lock").clone())
         })
     }
 }
@@ -417,7 +450,13 @@ fn world_read_by(
         tgdrive,
         deps,
         stub,
-        room: Arc::new(Room::default()),
+        room: Arc::new(Room::of(
+            &readers
+                .iter()
+                .copied()
+                .chain(["@nixi:example.org"])
+                .collect::<Vec<_>>(),
+        )),
         next: 0,
     }
 }
@@ -708,12 +747,12 @@ async fn an_interrupted_turn_is_not_rerun_after_a_restart() {
     }
     let mut served = world.open(SESSION);
     assert!(served
-        .recover(&world.deps, world.room.as_ref(), &Trail::default())
+        .recover(&world.deps, world.room.clone(), &Trail::default())
         .await
         .expect("recover"));
     let mut again = world.open(SESSION);
     assert!(!again
-        .recover(&world.deps, world.room.as_ref(), &Trail::default())
+        .recover(&world.deps, world.room.clone(), &Trail::default())
         .await
         .expect("recover"));
 
@@ -816,7 +855,7 @@ async fn a_turn_cut_off_mid_tool_loop_is_closed_by_editing_its_anchor() {
     let mut served = world.open(SESSION);
     assert_eq!(served.context.unanswered, Some(user_line));
     assert!(served
-        .recover(&world.deps, world.room.as_ref(), &trail)
+        .recover(&world.deps, world.room.clone(), &trail)
         .await
         .expect("recover"));
 
@@ -1973,7 +2012,9 @@ async fn drives_in_scope_are_the_persons_choice_within_the_agents_allow() {
     assert_eq!(scope_lines(&world).len(), 2);
     report(world.ask(&mut served, "read both again").await);
     // Each turn changed the label — the person's message, then the diary's
-    // read — and the chips were told, as after each `scope` line.
+    // read — and the chips were told, as after each `scope` line; but the
+    // diary narrowed the label below the room, so that last change is not
+    // echoed into a room Marta reads (R64).
     let echoes = world.sent_of(SCOPE);
     let labels: Vec<(Value, Value)> = echoes
         .iter()
@@ -1984,10 +2025,12 @@ async fn drives_in_scope_are_the_persons_choice_within_the_agents_allow() {
             )
         })
         .collect();
-    assert_eq!(labels.len(), 4, "{echoes:?}");
+    assert_eq!(labels.len(), 3, "{echoes:?}");
     assert_eq!(labels[0].0, "owner");
     assert_eq!(labels[1].0, "agent", "after the first turn");
-    assert_eq!(labels[3].1, json!([TGORKA]), "after the diary's read");
+    assert!(labels
+        .iter()
+        .all(|(_, readers)| *readers != json!([TGORKA])));
 
     // A host that restarts reads the scope from the log.
     drop(served);
@@ -1995,7 +2038,9 @@ async fn drives_in_scope_are_the_persons_choice_within_the_agents_allow() {
     assert_eq!(again.context.scope, ["tgdrive", "private"]);
 
     // F5: read back on that start, a scope that changes nothing was echoed
-    // when it first arrived and is not echoed again; sent live, it is.
+    // when it first arrived and is not echoed again. Sent live it would be,
+    // but this session read the diary: its label is below the room, so no
+    // scope is echoed into it at all (R64).
     let echoed = world.sent_of(SCOPE).len();
     let mut replayed = world.scope(TGORKA, &["private"], None);
     replayed.replay = true;
@@ -2006,7 +2051,7 @@ async fn drives_in_scope_are_the_persons_choice_within_the_agents_allow() {
     assert_eq!(world.sent_of(SCOPE).len(), echoed);
     let live = world.scope(TGORKA, &["private"], None);
     world.serve(&mut again, live).await;
-    assert_eq!(world.sent_of(SCOPE).len(), echoed + 1);
+    assert_eq!(world.sent_of(SCOPE).len(), echoed);
 }
 
 /// R41: the docked note's focus is held in memory and stated in the next
@@ -3616,7 +3661,7 @@ async fn an_unanswered_peer_line_is_closed_after_a_restart() {
     }
     let mut again = world.open(SESSION);
     assert!(again
-        .recover(&world.deps, world.room.as_ref(), &Trail::default())
+        .recover(&world.deps, world.room.clone(), &Trail::default())
         .await
         .expect("recover"));
     assert_eq!(kinds(&world.lines(SESSION), LineKind::Error).len(), 1);
@@ -3978,7 +4023,7 @@ async fn a_reply_whose_peer_line_was_lost_is_restored_from_its_receipt() {
 
     let mut again = world.delegating(&rooms);
     assert!(again
-        .recover(&world.deps, world.room.as_ref(), &Trail::default())
+        .recover(&world.deps, world.room.clone(), &Trail::default())
         .await
         .expect("recover"));
     let lines = world.lines(SESSION);
@@ -4433,6 +4478,8 @@ async fn a_closed_session_wakes_its_stewards_harvest_once() {
         Outcome::Ignored(note) if note == NO_HARVEST
     ));
 
+    // Her harvest room: the drive's readers, and no agent she does not know.
+    world.room.set_members(&[TGORKA, MARTA]);
     let mut served = world.open_as(&tola, &harvest);
     let report = report(serve_as(&tola, &mut served, &world.room, arrival()).await);
     assert_eq!(report.ending, TurnEnding::Complete);
@@ -4484,14 +4531,17 @@ fn as_agents(world: &World, path: &str, agent: &keeper_core::agents::session::Se
 /// session read by tgorka alone — by its `agent.toml`, or narrowed so by a
 /// `label` line of its log — and one that may go only to a local model,
 /// are refused before anything of them is logged, sent to the room or to
-/// the (remote) provider. An untrusted one is harvested, its integrity
-/// joined by a `label` line before the `peer` line, before the model reads
-/// a word.
+/// the (remote) provider, each refusal audited (R65): the harvest room or
+/// the model it was kept from. An untrusted one is harvested, its
+/// integrity joined by a `label` line before the `peer` line, before the
+/// model reads a word.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_harvest_carries_the_closed_sessions_label_and_refuses_what_it_cannot_reach() {
-    use keeper_agent::agent::{harvest_arrival, HARVEST_REFUSED};
+    use keeper_agent::agent::{harvest_arrival, HARVEST, HARVEST_REFUSED};
     use keeper_agent::stewards::{session, Duty};
     use keeper_core::agents::label::{LabelBody, LabelCause, LabelCauseKind};
+    use keeper_core::bots::audit::{AuditOutcome, AuditVerdict};
+    use keeper_core::bots::grant::Effect;
     let world = world(
         ProviderKind::OpenAi,
         &["drive_read"],
@@ -4558,6 +4608,7 @@ async fn a_harvest_carries_the_closed_sessions_label_and_refuses_what_it_cannot_
 
     let closed = closed_now(&world, &harvest);
     assert_eq!(closed.len(), 4);
+    world.room.set_members(&[TGORKA, MARTA]);
     let mut served = world.open_as(&tola, &harvest);
     for id in [&narrow_id, &narrowed_id, &local_id] {
         let source = closed.iter().find(|c| &c.id == id).expect("found");
@@ -4570,6 +4621,29 @@ async fn a_harvest_carries_the_closed_sessions_label_and_refuses_what_it_cannot_
     assert!(world.lines(&harvest).is_empty());
     assert!(world.stub.requests().is_empty());
     assert_eq!(anchors(&world.room), 0);
+    let rows = keeper_core::bots::audit::list_audit(
+        &world.deps.data_dir,
+        Some(&served.context.agent.id.to_string()),
+        None,
+    )
+    .expect("audit");
+    let of = |tool: &str| rows.iter().filter(|row| row.tool == tool).count();
+    assert_eq!(
+        (of(HARVEST), of("model"), rows.len()),
+        (2, 1, 3),
+        "{rows:?}"
+    );
+    for row in &rows {
+        assert_eq!(row.verdict, Some(AuditVerdict::Deny), "{row:?}");
+        assert_eq!(row.outcome, AuditOutcome::Refused, "{row:?}");
+        assert_eq!(row.effect, Some(Effect::Write), "{row:?}");
+        let at = if row.tool == HARVEST {
+            served.context.agent.room.as_str()
+        } else {
+            tola.bot.target.as_str()
+        };
+        assert_eq!(row.subpath, at, "{row:?}");
+    }
 
     let source = closed.iter().find(|c| c.id == outside_id).expect("found");
     let arrived = harvest_arrival(&tola.home.config.matrix_user, source).expect("arrival");
@@ -4644,6 +4718,7 @@ async fn a_harvest_another_host_began_is_never_run_again_here() {
     let arrival = |n: usize| harvest_arrival(me, &closed[n]).expect("arrival");
 
     begun_on(&world.dir(&harvest), "electra", &arrival(0).event_id, me);
+    world.room.set_members(&[TGORKA, MARTA]);
     let mut served = world.open_as(&tola, &harvest);
     assert!(matches!(
         serve_as(&tola, &mut served, &world.room, arrival(0)).await,
@@ -4657,4 +4732,1230 @@ async fn a_harvest_another_host_began_is_never_run_again_here() {
         Outcome::Duplicate
     ));
     assert!(world.stub.requests().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 92.6: labels enforced at every sink
+// ---------------------------------------------------------------------------
+
+const CARD: &str = "---\ntags: [task]\ntitle: Inbox\nstatus: todo\n---\n\nSort the inbox.\n";
+
+/// The audit rows of `served`'s session, by tool.
+fn audit_rows(
+    world: &World,
+    served: &ServedSession,
+) -> BTreeMap<String, keeper_core::bots::audit::AuditRow> {
+    keeper_core::bots::audit::list_audit(
+        &world.deps.data_dir,
+        Some(&served.context.agent.id.to_string()),
+        None,
+    )
+    .expect("audit")
+    .into_iter()
+    .map(|row| (row.tool.clone(), row))
+    .collect()
+}
+
+/// Nixi as tgorka's proxy, Dr Tola Grey and Dr Lucyna Novak.
+fn known_with_proxy() -> Known {
+    let mut known = known(&[TGORKA, MARTA]);
+    let nixi = &mut known.agents[0];
+    nixi.kind = keeper_core::agents::home::AgentKind::Proxy;
+    nixi.human = Some(user(TGORKA));
+    known
+}
+
+/// Nixi's DM with tgorka: her `main` session, under its derived id.
+fn nixis_dm(world: &World) {
+    let tg_decl = world.deps.drives["tgdrive"].clone();
+    let mut agent = session_of(
+        &world.tgdrive,
+        DM,
+        &tg_decl,
+        "nixi",
+        SessionKind::Main,
+        "!dm:example.org",
+    );
+    agent.id = keeper_core::agents::seed::main_session_id("tgdrive", "nixi");
+    write(
+        &world.tgdrive,
+        &format!("60-sessions/{DM}/agent.toml"),
+        &compose_session_agent_toml(&agent),
+    );
+    write(
+        &world.tgdrive,
+        &format!("60-sessions/{DM}/README.md"),
+        &format!("---\nid: {}\n---\n\n# Nixi\n", agent.id),
+    );
+}
+
+/// tgorka's proxy DM as this host runs it: what was told through it, and
+/// how many sends fail before one goes.
+#[derive(Default)]
+struct Doors {
+    told: Mutex<Vec<Value>>,
+    failing: AtomicUsize,
+}
+
+impl keeper_agent::sinks::ProxyDoors for Doors {
+    fn dm(&self, person: &UserId) -> Option<OwnedRoomId> {
+        (person.as_str() == TGORKA).then(|| OwnedRoomId::try_from("!dm:example.org").expect("dm"))
+    }
+
+    fn members<'a>(&'a self, _: &'a UserId) -> MembersFuture<'a> {
+        Box::pin(async { Ok(BTreeSet::from([user(TGORKA)])) })
+    }
+
+    fn tell<'a>(&'a self, _: &'a UserId, content: Value) -> SendFuture<'a> {
+        Box::pin(async move {
+            if self.failing.load(Ordering::SeqCst) > 0 {
+                self.failing.fetch_sub(1, Ordering::SeqCst);
+                return Err(keeper_core::agents::matrix::AgentMatrixError::Network(
+                    "unreachable".to_owned(),
+                ));
+            }
+            self.told.lock().expect("lock").push(content);
+            Ok(OwnedEventId::try_from("$told:example.org").expect("id"))
+        })
+    }
+}
+
+impl Doors {
+    fn bodies(&self) -> Vec<String> {
+        self.told
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|content| content["body"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+}
+
+fn result_of<'l>(results: &'l [ToolResultBody], call: &str) -> &'l ToolResultBody {
+    results
+        .iter()
+        .find(|result| result.call_id == call)
+        .unwrap_or_else(|| panic!("a result for {call}"))
+}
+
+/// One producer of a sink, driven past the label in a world of its own: it
+/// asserts that nothing left the session and that the refusal was recorded.
+type Scenario = Pin<Box<dyn Future<Output = ()>>>;
+type Producer = fn() -> Scenario;
+
+/// Who produces into one kind of sink.
+enum Producers {
+    Driven(Vec<(&'static str, Producer)>),
+    /// Nothing produces into it yet; the epic that adds a producer adds it
+    /// here.
+    NotImplemented(&'static str),
+}
+
+fn by(what: &'static str, producer: Producer) -> (&'static str, Producer) {
+    (what, producer)
+}
+
+/// Every producer of each kind of sink (92.6 acceptance 1). A new `Sink`
+/// variant does not compile until it has an arm here: its producers, or
+/// the decision that it has none yet.
+fn producers(sink: &keeper_core::agents::label::Sink) -> Producers {
+    use keeper_core::agents::label::Sink;
+    match sink {
+        Sink::Room { .. } => Producers::Driven(vec![
+            by(
+                "a turn's answer, status and scope echo after a read",
+                a_read_narrows_every_send_of_its_turn,
+            ),
+            by(
+                "an answer after an outsider was invited",
+                an_invite_since_the_last_turn_blocks_the_next_answer,
+            ),
+            by(
+                "a harvest's anchor naming its closed session",
+                a_harvest_into_a_wider_room_names_no_closed_session,
+            ),
+            by(
+                "a surface request",
+                a_surface_request_into_a_wider_room_is_refused,
+            ),
+            by(
+                "a new conversation's notice",
+                a_new_conversations_notice_leaves_out_its_title,
+            ),
+            by(
+                "a delegated session's budget reply",
+                a_budget_reply_into_a_wider_room_is_refused,
+            ),
+        ]),
+        Sink::Delegation { .. } => Producers::Driven(vec![
+            by("an opening brief", a_read_narrows_every_send_of_its_turn),
+            by(
+                "a next round naming another agent",
+                a_next_round_naming_another_agent_is_refused,
+            ),
+        ]),
+        Sink::DriveWrite { .. } => Producers::Driven(vec![
+            by(
+                "drive_write, drive_edit, session_write and card_update",
+                a_read_narrows_every_send_of_its_turn,
+            ),
+            by(
+                "a long answer's artifact",
+                a_long_answer_wider_than_its_drive_writes_no_artifact,
+            ),
+        ]),
+        Sink::MemoryWrite { .. } => {
+            Producers::NotImplemented("no agent tool writes memory before epic 95")
+        }
+        Sink::Model { .. } => Producers::Driven(vec![
+            by(
+                "a round after a local_only read",
+                a_local_only_read_stops_a_remote_round,
+            ),
+            by(
+                "a local_only context file",
+                a_local_only_context_file_never_reaches_a_remote_model,
+            ),
+        ]),
+        Sink::External { .. } => Producers::NotImplemented("no MCP server or KVM before epic 96"),
+    }
+}
+
+/// 92.6 acceptance 1: every producer of every kind of sink, driven past
+/// the label, sends and writes nothing and records its refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_sink_refuses_a_wider_audience() {
+    use keeper_core::agents::label::Sink;
+    let mut driven = BTreeSet::new();
+    for sink in [
+        Sink::Room {
+            humans: BTreeSet::new(),
+            agent_audiences: Vec::new(),
+        },
+        Sink::Delegation {
+            target_audience: Readers::Anyone,
+            room_members: BTreeSet::new(),
+        },
+        Sink::DriveWrite {
+            drive_readers: Readers::Anyone,
+        },
+        Sink::MemoryWrite {
+            home_readers: Readers::Anyone,
+        },
+        Sink::Model { local: false },
+        Sink::External {
+            readers: Readers::Anyone,
+        },
+    ] {
+        let producers = match producers(&sink) {
+            Producers::Driven(producers) => producers,
+            Producers::NotImplemented(why) => {
+                eprintln!("{sink:?}: {why}");
+                continue;
+            }
+        };
+        assert!(!producers.is_empty(), "{sink:?}");
+        for (what, producer) in producers {
+            if driven.insert(producer as usize) {
+                eprintln!("producer: {what}");
+                producer().await;
+            }
+        }
+    }
+}
+
+/// A session opened for tgorka and Marta reads tgorka's diary, so it is
+/// {tgorka} in a room with Marta. Every sink its turn tries is refused —
+/// a drive write and an edit into tgdrive (read by both), a session file,
+/// a card, a delegation to Dr Lucyna Novak, the answer — nothing reaches
+/// the disk or the rooms, each leaves its audit row (R65) and its refused
+/// line; every status says only the fixed sentence (UX-DR135), no scope is
+/// echoed, each suppression is audited, and the detail goes once to
+/// tgorka's DM with Nixi (92.6 acceptance 9).
+fn a_read_narrows_every_send_of_its_turn() -> Scenario {
+    Box::pin(async {
+        use keeper_agent::sinks::NARROWED_STATUS;
+        use keeper_core::bots::audit::{AuditOutcome, AuditVerdict};
+        use keeper_core::bots::grant::Effect;
+        let script = vec![
+            calls(&[(
+                "r1",
+                "drive_read",
+                json!({"profile":"private","path":"diary.md"}),
+            )]),
+            calls(&[
+                (
+                    "w1",
+                    "drive_write",
+                    json!({"profile":"tgdrive","path":"notes/out.md","content":"dear diary"}),
+                ),
+                (
+                    "e1",
+                    "drive_edit",
+                    json!({"profile":"tgdrive","path":"notes/hello.md","old_text":"first line","new_text":"dear diary"}),
+                ),
+                (
+                    "s1",
+                    "session_write",
+                    json!({"path":"notes.md","content":"dear diary"}),
+                ),
+                (
+                    "c1",
+                    "card_update",
+                    json!({"card":"card.md","fields":{"status":"done"}}),
+                ),
+                (
+                    "d1",
+                    "delegate",
+                    json!({"agent":"neuradrive/lucyna","brief":"dear diary"}),
+                ),
+            ]),
+            prose("the diary says hello."),
+        ];
+        let mut world = world(
+            ProviderKind::Ollama,
+            &[
+                "drive_read",
+                "drive_write",
+                "drive_edit",
+                "session_write",
+                "card_update",
+                "delegate",
+            ],
+            script,
+        );
+        write(&world.dir(SESSION), "card.md", CARD);
+        nixis_dm(&world);
+        let delegations = Delegations::over(known_with_proxy());
+        let doors = Arc::new(Doors::default());
+        let mut served = world.delegating(&delegations);
+        served.doors = Some(doors.clone());
+        let turn = report(world.ask(&mut served, "read my diary").await);
+        assert_eq!(turn.ending, TurnEnding::Complete);
+
+        let lines = world.lines(SESSION);
+        let results = tool_results(&lines);
+        for call in ["w1", "e1", "s1", "c1", "d1"] {
+            let result = result_of(&results, call);
+            assert_eq!(result.outcome, ToolOutcomeWord::Refused, "{call}");
+            assert!(
+                result.content.contains(MARTA)
+                    && result
+                        .content
+                        .contains(keeper_core::agents::label::NEEDS_APPROVAL),
+                "{call}: {}",
+                result.content
+            );
+        }
+        // Nothing reached the disk or a room.
+        assert!(!world.tgdrive.join("notes/out.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(world.tgdrive.join("notes/hello.md")).expect("hello"),
+            "first line\nsecond line\n"
+        );
+        assert!(!world.dir(SESSION).join("notes.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(world.dir(SESSION).join("card.md")).expect("card"),
+            CARD
+        );
+        assert!(delegations.made().is_empty());
+        assert!(delegations.sent().is_empty());
+        assert_eq!(final_edit(&world.room), NARROWER_THAN_ROOM);
+        assert!(world
+            .room
+            .sent()
+            .iter()
+            .all(|(_, content)| !content.to_string().contains("diary says hello")));
+
+        // Once narrowed, every status says the fixed sentence, no detail.
+        let statuses = world.sent_of(STATUS);
+        let first = statuses
+            .iter()
+            .position(|status| status["title"] == NARROWED_STATUS)
+            .expect("a narrowed status");
+        for status in &statuses[first..] {
+            assert_eq!(status["title"], NARROWED_STATUS, "{status}");
+            assert!(status.get("detail").is_none_or(Value::is_null), "{status}");
+        }
+        // A scope the person sets now is taken, and not echoed.
+        let narrower = world.scope(TGORKA, &["tgdrive"], None);
+        assert!(matches!(
+            world.serve(&mut served, narrower).await,
+            Outcome::Scoped(_)
+        ));
+        assert!(world.sent_of(SCOPE).is_empty());
+
+        // Each sink's audit row (R65), the suppressed sends' too.
+        let rows = audit_rows(&world, &served);
+        for tool in [
+            "drive_write",
+            "drive_edit",
+            "session_write",
+            "card_update",
+            "delegate",
+            "answer",
+            "status",
+            "scope",
+        ] {
+            let row = rows
+                .get(tool)
+                .unwrap_or_else(|| panic!("an audit row for {tool}"));
+            assert_eq!(row.verdict, Some(AuditVerdict::Deny), "{tool}");
+            assert_eq!(row.outcome, AuditOutcome::Refused, "{tool}");
+            assert_eq!(row.effect, Some(Effect::Write), "{tool}");
+        }
+        assert_eq!(rows["delegate"].profile_id, "neuradrive");
+        assert_eq!(rows["delegate"].subpath, LUCYNA);
+        assert_eq!(rows["drive_edit"].profile_id, "tgdrive");
+        assert_eq!(rows["drive_edit"].subpath, "notes/hello.md");
+        for tool in ["answer", "status", "scope"] {
+            assert_eq!(rows[tool].subpath, "!room:example.org", "{tool}");
+        }
+
+        // The detail went to tgorka's DM with Nixi, once, never the room.
+        let told = doors.bodies();
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert_eq!(kinds(&world.lines(SESSION), LineKind::Told).len(), 1);
+        assert!(
+            told[0].contains(&format!("60-sessions/{SESSION}")),
+            "{}",
+            told[0]
+        );
+        assert!(world.room.sent().iter().all(|(_, content)| !content
+            .to_string()
+            .contains(&format!("60-sessions/{SESSION})"))));
+
+        // The next turn's status is narrowed from its first edit.
+        let before = world.sent_of(STATUS).len();
+        let _ = world.ask(&mut served, "and now?").await;
+        for status in &world.sent_of(STATUS)[before..] {
+            assert_eq!(status["title"], NARROWED_STATUS, "{status}");
+        }
+        // Outside a turn too: a refused scope's status says no drive.
+        let elsewhere = world.scope(TGORKA, &["marta-drive"], None);
+        assert!(matches!(
+            world.serve(&mut served, elsewhere).await,
+            Outcome::ScopeRefused(_)
+        ));
+        let refused = world.sent_of(STATUS).last().expect("a status").clone();
+        assert_eq!(refused["title"], NARROWED_STATUS, "{refused}");
+        assert!(
+            refused.get("detail").is_none_or(Value::is_null),
+            "{refused}"
+        );
+        assert!(world.sent_of(SCOPE).is_empty());
+    })
+}
+
+/// R168: the room is read at the send. A {tgorka, Marta} session answers
+/// in its room; then an outsider is invited, and the next turn's answer
+/// is the fixed sentence, audited — the room as it opened is not the
+/// room it is now.
+fn an_invite_since_the_last_turn_blocks_the_next_answer() -> Scenario {
+    Box::pin(async {
+        let mut world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![prose("first."), prose("the plan is to sell in March.")],
+        );
+        let mut served = world.open(SESSION);
+        report(world.ask(&mut served, "hi").await);
+        assert_eq!(final_edit(&world.room), "first.");
+        world
+            .room
+            .set_members(&[TGORKA, MARTA, NIXI, "@eve:example.org"]);
+        report(world.ask(&mut served, "and the plan?").await);
+        assert_eq!(final_edit(&world.room), NARROWER_THAN_ROOM);
+        assert!(world
+            .room
+            .sent()
+            .iter()
+            .all(|(_, content)| !content.to_string().contains("sell in March")));
+        let rows = audit_rows(&world, &served);
+        assert_eq!(
+            rows["answer"].verdict,
+            Some(keeper_core::bots::audit::AuditVerdict::Deny)
+        );
+        assert_eq!(rows["answer"].subpath, "!room:example.org");
+    })
+}
+
+/// R166 under R168: a harvest's anchor names its closed session, so the
+/// harvest room as it is now must be one the joined label reaches. With
+/// an outsider invited, with a known agent whose audience is wider, and
+/// with members no one can read, the closed session is refused before
+/// anything is logged, asked of the model or sent — no anchor, no id,
+/// hex or plain — and each refusal is audited; an unreadable room is
+/// handed again. A known agent within the label lets it run, once. A
+/// room that widens while the anchor waits out a 429 hears only that a
+/// harvest ran, and its answer is withheld.
+fn a_harvest_into_a_wider_room_names_no_closed_session() -> Scenario {
+    Box::pin(async {
+        use keeper_agent::agent::{harvest_arrival, ServeError, HARVEST, HARVEST_REFUSED};
+        use keeper_agent::stewards::Duty;
+        const EVE: &str = "@eve:example.org";
+        let world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![prose("Nothing to keep."), prose("The pension plan.")],
+        );
+        let tola = seeded_tola(&world);
+        let harvest = stewards_session(&world, &tola, Duty::Harvest);
+        let (taxes, _) = archived_session(&world, "taxes");
+        let (pension, _) = archived_session(&world, "pension");
+        let closed = closed_now(&world, &harvest);
+        let arrival = |id: &str| {
+            let source = closed.iter().find(|c| c.id == id).expect("found");
+            harvest_arrival(&tola.home.config.matrix_user, source).expect("arrival")
+        };
+        let named = |id: &str, sent: &[(String, Value)]| {
+            let hex: String = id.bytes().map(|b| format!("{b:02x}")).collect();
+            sent.iter().any(|(_, content)| {
+                let text = content.to_string();
+                text.contains(&hex) || text.contains(id)
+            })
+        };
+        let rooms = Delegations::over(known(&[TGORKA, MARTA, EVE]));
+        let mut served = world.open_as(&tola, &harvest);
+        served.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+
+        for members in [[TGORKA, MARTA, EVE], [TGORKA, MARTA, NIXI]] {
+            world.room.set_members(&members);
+            assert!(matches!(
+                serve_as(&tola, &mut served, &world.room, arrival(&taxes)).await,
+                Outcome::Ignored(note) if note == HARVEST_REFUSED
+            ));
+        }
+        world.room.unread.store(true, Ordering::SeqCst);
+        let (_stop, signal) = chat::cancellation();
+        assert!(matches!(
+            served
+                .serve(&tola, world.room.clone(), arrival(&taxes), signal)
+                .await,
+            Err(ServeError::MembersUnread)
+        ));
+        world.room.unread.store(false, Ordering::SeqCst);
+        assert!(world.lines(&harvest).is_empty());
+        assert!(world.stub.requests().is_empty());
+        assert!(world.room.sent().is_empty(), "{:?}", world.room.sent());
+        let rows = keeper_core::bots::audit::list_audit(
+            &world.deps.data_dir,
+            Some(&served.context.agent.id.to_string()),
+            None,
+        )
+        .expect("audit");
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        for row in &rows {
+            assert_eq!(row.tool, HARVEST);
+            assert_eq!(row.subpath, served.context.agent.room.as_str());
+            assert_eq!(
+                row.verdict,
+                Some(keeper_core::bots::audit::AuditVerdict::Deny)
+            );
+        }
+
+        // Nixi's audience within the label: she counts through it.
+        *rooms.known.lock().expect("lock") = Arc::new(known(&[TGORKA, MARTA]));
+        report(serve_as(&tola, &mut served, &world.room, arrival(&taxes)).await);
+        assert_eq!(world.stub.requests().len(), 1);
+        assert_eq!(anchors(&world.room), 1);
+        assert!(matches!(
+            serve_as(&tola, &mut served, &world.room, arrival(&taxes)).await,
+            Outcome::Duplicate
+        ));
+
+        // Eve is invited while the anchor waits out a 429.
+        let before = world.room.sent().len();
+        *world.room.limited.lock().expect("lock") = Some(vec![TGORKA, MARTA, NIXI, EVE]);
+        report(serve_as(&tola, &mut served, &world.room, arrival(&pension)).await);
+        let sent = world.room.sent()[before..].to_vec();
+        assert!(!named(&pension, &sent), "{sent:?}");
+        assert_eq!(anchors(&world.room), 2);
+        assert_eq!(final_edit(&world.room), NARROWER_THAN_ROOM);
+        assert!(sent
+            .iter()
+            .all(|(_, content)| !content.to_string().contains("pension plan")));
+    })
+}
+
+/// R169 for a room that widened: a session whose label still reaches
+/// everyone it was opened for has an outsider invited; its answer is
+/// withheld and its status fixed, and its person is told once through
+/// their proxy — the first send failing, the worker's restart sending it
+/// again — with one `told` line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_room_grown_wider_than_the_label_tells_its_person() {
+    use keeper_agent::sinks::NARROWED_STATUS;
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![prose("first."), prose("the plan is to sell in March.")],
+    );
+    nixis_dm(&world);
+    let delegations = Delegations::over(known_with_proxy());
+    let doors = Arc::new(Doors::default());
+    doors.failing.store(1, Ordering::SeqCst);
+    let mut served = world.delegating(&delegations);
+    served.doors = Some(doors.clone());
+    let opening = served.context.label.clone();
+    report(world.ask(&mut served, "hi").await);
+    world
+        .room
+        .set_members(&[TGORKA, MARTA, NIXI, "@eve:example.org"]);
+    report(world.ask(&mut served, "and the plan?").await);
+    assert_eq!(served.context.label, opening);
+    assert_eq!(final_edit(&world.room), NARROWER_THAN_ROOM);
+    assert!(world
+        .room
+        .sent()
+        .iter()
+        .all(|(_, content)| !content.to_string().contains("sell in March")));
+    let last = world.sent_of(STATUS).last().cloned().expect("a status");
+    assert_eq!(last["title"], NARROWED_STATUS, "{last}");
+    assert!(doors.bodies().is_empty());
+    assert!(kinds(&world.lines(SESSION), LineKind::Told).is_empty());
+    drop(served);
+
+    let mut served = world.delegating(&delegations);
+    served.doors = Some(doors.clone());
+    let (keep, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let (_stop, signal) = chat::cancellation();
+    let busy = std::sync::atomic::AtomicBool::new(false);
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        served.serve_arrivals(
+            &world.deps,
+            world.room.clone(),
+            Vec::new(),
+            &mut arrivals,
+            signal,
+            &busy,
+        ),
+    )
+    .await;
+    drop(keep);
+    let told = doors.bodies();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(told[0].contains(&format!("60-sessions/{SESSION}")));
+    assert_eq!(kinds(&world.lines(SESSION), LineKind::Told).len(), 1);
+}
+
+/// R168: a surface request goes into the session's room, not to the
+/// device — once Marta is invited to tgorka's room, a request carrying
+/// his note's line is refused, nothing is sent, and it is audited.
+fn a_surface_request_into_a_wider_room_is_refused() -> Scenario {
+    Box::pin(async {
+        let script = vec![
+            calls(&[(
+                "c1",
+                "surface_highlight",
+                json!({"drive": "tgdrive", "path": "notes/hello.md", "range": {"from": 2, "to": 2}}),
+            )]),
+            prose("Highlighted."),
+        ];
+        let mut world = world_read_by(
+            &[TGORKA],
+            ProviderKind::OpenAi,
+            &["drive_read", "surface_highlight"],
+            script,
+        );
+        world.room.set_members(&[TGORKA, NIXI, MARTA]);
+        let mut served = world.open(SESSION);
+        let surface = Arc::new(Surface {
+            room: room_id(),
+            requests: Mutex::new(Vec::new()),
+        });
+        served.surface = Some(surface.clone());
+        report(world.ask(&mut served, "show me the second line").await);
+
+        assert!(surface.requests.lock().expect("lock").is_empty());
+        let c1 = result_of(&tool_results(&world.lines(SESSION)), "c1").clone();
+        assert_eq!(c1.outcome, ToolOutcomeWord::Refused);
+        assert!(c1.content.contains(MARTA), "{}", c1.content);
+        assert!(kinds(&world.lines(SESSION), LineKind::Surface).is_empty());
+        let rows = audit_rows(&world, &served);
+        assert_eq!(
+            rows["surface_highlight"].verdict,
+            Some(keeper_core::bots::audit::AuditVerdict::Deny)
+        );
+    })
+}
+
+/// R64, R65: Nixi's DM read tgorka's diary, so it is {tgorka} with Marta
+/// in the room; a new conversation he asks for is made, and the DM hears
+/// only that one was opened — not its title — and the notice is audited.
+fn a_new_conversations_notice_leaves_out_its_title() -> Scenario {
+    Box::pin(async {
+        let mut world = world(
+            ProviderKind::Ollama,
+            &["drive_read"],
+            vec![
+                calls(&[(
+                    "r1",
+                    "drive_read",
+                    json!({"profile":"private","path":"diary.md"}),
+                )]),
+                prose("read."),
+            ],
+        );
+        nixis_dm(&world);
+        let rooms = Arc::new(Rooms::default());
+        let mut dm = world.open(DM);
+        dm.conversations = Some(rooms.clone());
+        report(world.ask(&mut dm, "read my diary").await);
+        let before = world.sent_of("m.room.message").len();
+        let ask = world.event(
+            TGORKA,
+            Arrival::ConversationRequest { owner_signed: true },
+            json!({"v": 1, "title": "Trip to Lisbon"}),
+        );
+        assert!(matches!(
+            world.serve(&mut dm, ask).await,
+            Outcome::Conversation { made: true, .. }
+        ));
+        let notices = world.sent_of("m.room.message");
+        assert_eq!(notices.len(), before + 1);
+        let notice = notices.last().expect("a notice").to_string();
+        assert!(!notice.contains("Lisbon"), "{notice}");
+        let rows = audit_rows(&world, &dm);
+        assert_eq!(
+            rows["notice"].verdict,
+            Some(keeper_core::bots::audit::AuditVerdict::Deny)
+        );
+        assert_eq!(rows["notice"].subpath, "!dm:example.org");
+    })
+}
+
+/// R94 for the host's own reply: Tola's delegated session spends its
+/// budget in a room someone outside its label has joined; the reply that
+/// says so — it carries the session's label — is refused and audited like
+/// a reply of the model's, and nothing goes into the room.
+fn a_budget_reply_into_a_wider_room_is_refused() -> Scenario {
+    Box::pin(async {
+        let mut round = calls(&[(
+            "r1",
+            "drive_read",
+            json!({"profile": "tgdrive", "path": "notes/hello.md"}),
+        )]);
+        round.push(json!({"choices": [], "usage": {"prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200}}));
+        let mut world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![round, prose("never asked")],
+        );
+        let tola = tolas(&world, &["drive_read"]);
+        let content = DelegateContent {
+            v: 1,
+            id: ulid::Ulid::new().to_string(),
+            from: keeper_core::agents::delegation::DelegateFrom {
+                agent: user(NIXI),
+                drive: "tgdrive".to_owned(),
+                session: SESSION.to_owned(),
+                room: room_id(),
+            },
+            to: user(TOLA),
+            brief: "Read hello.".to_owned(),
+            drives: vec!["tgdrive".to_owned()],
+            label: Label::opening(&world.deps.drives["tgdrive"], Integrity::Agent),
+            hop: 1,
+            limits: keeper_core::agents::delegation::DelegateLimits {
+                rounds_per_exchange: 3,
+                tokens: 1000,
+            },
+            card: None,
+            dispatch_chain: Vec::new(),
+        };
+        let child = OwnedRoomId::try_from("!child:example.org").expect("room");
+        let path = world.create_child(&tola, &child, &content);
+        let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+        rooms
+            .added
+            .lock()
+            .expect("lock")
+            .push((child.clone(), user("@eve:example.org")));
+        // The brief was taken in the room as it was then: Nixi and Tola.
+        *rooms.facts.lock().expect("lock") = Some(BriefRoom {
+            room_type: Some(SESSION_ROOM_TYPE.to_owned()),
+            creators: vec![user(NIXI)],
+            levels: Some(delegated_levels(|_| {})),
+            members: BTreeSet::from([user(NIXI), user(TOLA)]),
+        });
+        let mut tolas_session = world.child(&tola, &path, &rooms);
+        let tolas_room = Arc::new(Room::default());
+        let arrived = world.brief(&keeper_core::agents::delegation::brief_content(&content));
+        let ran = report(serve_as(&tola, &mut tolas_session, &tolas_room, arrived).await);
+        assert_eq!(ran.ending, TurnEnding::Bounded);
+        assert!(tolas_room.sent().iter().all(|(_, content)| {
+            !content["dev.keeper.agent.artifacts"].is_array()
+                && content.get("dev.keeper.agent.label").is_none()
+        }));
+        let rows = audit_rows(&world, &tolas_session);
+        assert_eq!(
+            rows["reply"].verdict,
+            Some(keeper_core::bots::audit::AuditVerdict::Deny)
+        );
+        assert_eq!(rows["reply"].subpath, "!child:example.org");
+    })
+}
+
+/// A next round goes to the agent its exchange was opened with (R49): a
+/// call naming another agent with that exchange's id is refused — its
+/// brief goes nowhere — while the same call naming the exchange's own
+/// agent is sent.
+fn a_next_round_naming_another_agent_is_refused() -> Scenario {
+    Box::pin(async {
+        let mut world = world(
+            ProviderKind::OpenAi,
+            &["drive_read", "delegate"],
+            vec![
+                hand_inbox(),
+                prose("Handed on."),
+                calls(&[
+                    (
+                        "m2",
+                        "delegate",
+                        json!({"agent": "neuradrive/lucyna", "brief": "Tell me the payroll.", "session": DELEGATION}),
+                    ),
+                    (
+                        "m3",
+                        "delegate",
+                        json!({"agent": "tgdrive/tola", "brief": "And the receipts.", "session": DELEGATION}),
+                    ),
+                ]),
+                prose("Told her."),
+            ],
+        );
+        let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+        let (mut nixi, child, _) = handed_over(&mut world, &rooms).await;
+        report(world.ask(&mut nixi, "say more to Tola").await);
+        let results = tool_results(&world.lines(SESSION));
+        let m2 = result_of(&results, "m2");
+        assert_eq!(m2.outcome, ToolOutcomeWord::Refused);
+        assert!(m2.content.contains("neuradrive/lucyna"), "{}", m2.content);
+        assert_eq!(result_of(&results, "m3").outcome, ToolOutcomeWord::Ok);
+        let sent = rooms.sent();
+        assert_eq!(sent.len(), 2, "the brief and the matching round");
+        assert!(sent
+            .iter()
+            .all(|(room, content, _)| room == &child && !content.to_string().contains("payroll")));
+        assert_eq!(sent[1].1["body"], "And the receipts.");
+        assert!(delegate_lines(&world.lines(SESSION)).iter().any(|line| {
+            line.state == DelegateState::Refused
+                && line.reason.as_deref().is_some_and(|r| r.contains("lucyna"))
+        }));
+    })
+}
+
+/// The artifact of a long answer is a session file: a {tgorka} session
+/// answering in a room of tgorka alone does not write it into tgdrive,
+/// which Marta reads — the room is pointed at the log, and it is audited.
+fn a_long_answer_wider_than_its_drive_writes_no_artifact() -> Scenario {
+    Box::pin(async {
+        let answer = "ab".repeat(100 * 1024);
+        let mut world = world(
+            ProviderKind::Ollama,
+            &["drive_read"],
+            vec![
+                calls(&[(
+                    "r1",
+                    "drive_read",
+                    json!({"profile":"private","path":"diary.md"}),
+                )]),
+                prose(&answer),
+            ],
+        );
+        world.room.set_members(&[TGORKA, NIXI]);
+        let mut served = world.open(SESSION);
+        report(world.ask(&mut served, "read my diary at length").await);
+        let edit = final_edit(&world.room);
+        assert!(edit.len() < 100 * 1024 && !edit.contains("artifacts/"));
+        assert!(!world.dir(SESSION).join("artifacts").exists());
+        let rows = audit_rows(&world, &served);
+        let row = &rows["session_write"];
+        assert_eq!(
+            row.verdict,
+            Some(keeper_core::bots::audit::AuditVerdict::Deny)
+        );
+        assert!(
+            row.subpath
+                .starts_with(&format!("60-sessions/{SESSION}/artifacts/answer-")),
+            "{}",
+            row.subpath
+        );
+    })
+}
+
+/// A `local_only` label stops a model round on a provider that is not
+/// local: the diary read in the first round never reaches a second.
+fn a_local_only_read_stops_a_remote_round() -> Scenario {
+    Box::pin(async {
+        let mut remote = world_of_remote();
+        let mut served = remote.open(SESSION);
+        let turn = report(remote.ask(&mut served, "read my diary").await);
+        assert_eq!(turn.ending, TurnEnding::LocalOnly);
+        assert_eq!(remote.stub.requests().len(), 1);
+        let rows = audit_rows(&remote, &served);
+        assert_eq!(
+            rows["model"].verdict,
+            Some(keeper_core::bots::audit::AuditVerdict::Deny)
+        );
+    })
+}
+
+/// R168: a context file the prompt carries is a read of it. tgorka's
+/// `local_only` drive has an `AGENTS.md`; a session with that drive in
+/// scope on a remote provider never sends it — no request carries it, the
+/// session is `local_only` from the turn's start, and the round is
+/// refused and audited.
+fn a_local_only_context_file_never_reaches_a_remote_model() -> Scenario {
+    Box::pin(async {
+        const SENTINEL: &str = "kalypso-4471-never-remote";
+        let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("never.")]);
+        write(
+            &world._root.path().join("private"),
+            "AGENTS.md",
+            &format!("Answer in Polish. {SENTINEL}\n"),
+        );
+        let mut served = world.open(SESSION);
+        let turn = report(world.ask(&mut served, "hello").await);
+        assert_eq!(turn.ending, TurnEnding::LocalOnly);
+        assert!(served.context.label.local_only);
+        assert!(world
+            .stub
+            .requests()
+            .iter()
+            .all(|request| !request.to_string().contains(SENTINEL)));
+        let rows = audit_rows(&world, &served);
+        assert_eq!(
+            rows["model"].verdict,
+            Some(keeper_core::bots::audit::AuditVerdict::Deny)
+        );
+    })
+}
+
+/// R169: the detail of a narrowed session whose first send into its
+/// person's DM failed is not marked told; the worker's start sends it
+/// again, once, and only then is the `told` line written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_narrowed_detail_whose_first_send_failed_is_sent_again() {
+    let mut world = world(
+        ProviderKind::Ollama,
+        &["drive_read"],
+        vec![
+            calls(&[(
+                "r1",
+                "drive_read",
+                json!({"profile":"private","path":"diary.md"}),
+            )]),
+            prose("read."),
+        ],
+    );
+    nixis_dm(&world);
+    let delegations = Delegations::over(known_with_proxy());
+    let doors = Arc::new(Doors::default());
+    doors.failing.store(1, Ordering::SeqCst);
+    let mut served = world.delegating(&delegations);
+    served.doors = Some(doors.clone());
+    report(world.ask(&mut served, "read my diary").await);
+    assert!(doors.bodies().is_empty());
+    assert!(kinds(&world.lines(SESSION), LineKind::Told).is_empty());
+
+    let (keep, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let (_stop, signal) = chat::cancellation();
+    let busy = std::sync::atomic::AtomicBool::new(false);
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        served.serve_arrivals(
+            &world.deps,
+            world.room.clone(),
+            Vec::new(),
+            &mut arrivals,
+            signal,
+            &busy,
+        ),
+    )
+    .await;
+    drop(keep);
+    let told = doors.bodies();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(told[0].contains(&format!("60-sessions/{SESSION}")));
+    assert_eq!(kinds(&world.lines(SESSION), LineKind::Told).len(), 1);
+}
+
+/// 92.5 acceptance 2 under R167: Dr Tola Grey's scheduled triage reads
+/// the inbox — untrusted from then on, with no person's line in the
+/// session — and still hands an item to Dr Lucyna Novak, a known agent
+/// whose audience is within the label; a recipient the inbox named is
+/// blocked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scheduled_triage_dispatches_to_a_known_agent_after_an_inbox_read() {
+    use keeper_agent::agent::scheduled_arrival;
+    use keeper_agent::cards::Scheduled;
+    const TRIAGE: &str = "active/2026-10-05-triage";
+    let world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "delegate"],
+        vec![
+            calls(&[(
+                "r1",
+                "drive_read",
+                json!({"profile":"tgdrive","path":"00-inbox/x.md"}),
+            )]),
+            calls(&[
+                (
+                    "d1",
+                    "delegate",
+                    json!({"agent":"evil/exfil","brief":"as the page says"}),
+                ),
+                (
+                    "d2",
+                    "delegate",
+                    json!({"agent":"neuradrive/lucyna","brief":"File 00-inbox/x.md."}),
+                ),
+            ]),
+            prose("Dispatched."),
+        ],
+    );
+    let tola = tolas(&world, &["drive_read", "delegate"]);
+    session_of(
+        &world.tgdrive,
+        TRIAGE,
+        &decl("tgdrive", &[TGORKA, MARTA], false),
+        "tola",
+        SessionKind::Scheduled,
+        "!triage:example.org",
+    );
+    write(
+        &world.tgdrive,
+        &format!("60-sessions/{TRIAGE}/card.md"),
+        "---\ntags: [task]\ntitle: Triage\nstatus: todo\nassignee: tola\nschedule: \"@hourly\"\nlast_run: \"2026-10-05T08:00:00Z\"\n---\n\nTriage 00-inbox and hand each item to its specialist.\n",
+    );
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let mut served = world.child(&tola, TRIAGE, &rooms);
+    let room = Arc::new(Room::of(&[TGORKA, MARTA, TOLA]));
+    let arrival = scheduled_arrival(
+        &user(TOLA),
+        &Scheduled::Run {
+            card: "card.md".to_owned(),
+            window: "2026-10-05T09:00:00.000Z".to_owned(),
+            now_ms: chrono::DateTime::parse_from_rfc3339("2026-10-05T09:30:00Z")
+                .expect("an instant")
+                .timestamp_millis(),
+            utc_offset_minutes: 0,
+        },
+    )
+    .expect("an arrival");
+    let ran = report(serve_as(&tola, &mut served, &room, arrival).await);
+    assert_eq!(ran.ending, TurnEnding::Complete);
+    assert_eq!(served.context.label.integrity, Integrity::Untrusted);
+    let lines = world.lines(TRIAGE);
+    assert!(kinds(&lines, LineKind::User).is_empty());
+    let results = tool_results(&lines);
+    let d1 = result_of(&results, "d1");
+    assert_eq!(d1.outcome, ToolOutcomeWord::Refused);
+    assert!(d1.content.contains("evil/exfil"), "{}", d1.content);
+    assert_eq!(result_of(&results, "d2").outcome, ToolOutcomeWord::Ok);
+    let made = rooms.made();
+    assert_eq!(made.len(), 1);
+    assert!(made[0].2.contains(&user(LUCYNA)));
+}
+
+fn world_of_remote() -> World {
+    world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![
+            calls(&[(
+                "r1",
+                "drive_read",
+                json!({"profile":"private","path":"diary.md"}),
+            )]),
+            prose("never."),
+        ],
+    )
+}
+
+/// 92.6 acceptance 2: the same sinks pass when the audience fits — a
+/// {tgorka, Marta} session writes its session file, hands work to Dr
+/// Lucyna Novak (read by both) and answers in a room of both. Its drive
+/// write is past the label and stops only at the grant's first-write ask.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_sinks_pass_when_the_audience_fits() {
+    let script = vec![
+        calls(&[
+            (
+                "w1",
+                "drive_write",
+                json!({"profile":"tgdrive","path":"notes/out.md","content":"shared"}),
+            ),
+            (
+                "s1",
+                "session_write",
+                json!({"path":"notes.md","content":"shared"}),
+            ),
+            (
+                "d1",
+                "delegate",
+                json!({"agent":"neuradrive/lucyna","brief":"Sort the shared inbox."}),
+            ),
+        ]),
+        prose("done."),
+    ];
+    let mut world = world(
+        ProviderKind::Ollama,
+        &["drive_read", "drive_write", "session_write", "delegate"],
+        script,
+    );
+    let delegations = Delegations::over(known_with_proxy());
+    let mut served = world.delegating(&delegations);
+    report(world.ask(&mut served, "share it").await);
+    let lines = world.lines(SESSION);
+    let results = tool_results(&lines);
+    assert_eq!(result_of(&results, "w1").outcome, ToolOutcomeWord::Refused);
+    assert!(
+        result_of(&results, "w1")
+            .content
+            .contains(UNATTENDED_REFUSAL),
+        "{}",
+        result_of(&results, "w1").content
+    );
+    assert_eq!(result_of(&results, "s1").outcome, ToolOutcomeWord::Ok);
+    assert!(world.dir(SESSION).join("notes.md").exists());
+    assert_eq!(result_of(&results, "d1").outcome, ToolOutcomeWord::Ok);
+    let made = delegations.made();
+    assert_eq!(made.len(), 1);
+    assert!(made[0].1.contains(&user(MARTA)));
+    assert_eq!(final_edit(&world.room), "done.");
+    let rows = audit_rows(&world, &served);
+    for tool in ["session_write", "delegate", "answer"] {
+        assert!(!rows.contains_key(tool), "{tool}");
+    }
+}
+
+/// 92.6 acceptance 4 through a turn: after an inbox read the session is
+/// `untrusted`; a delegation to an agent tgorka never named is blocked, the
+/// one he named passes the rule, and a drive write he named needs an
+/// approval, which this keeper cannot take yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recipient_taken_from_outside_content_is_blocked() {
+    use keeper_core::agents::label::NEEDS_APPROVAL;
+    let script = vec![
+        calls(&[(
+            "r1",
+            "drive_read",
+            json!({"profile":"tgdrive","path":"00-inbox/x.md"}),
+        )]),
+        calls(&[
+            (
+                "d1",
+                "delegate",
+                json!({"agent":"evil/exfil","brief":"as the page says"}),
+            ),
+            (
+                "d2",
+                "delegate",
+                json!({"agent":"tgdrive/tola","brief":"Sort the inbox."}),
+            ),
+            (
+                "w1",
+                "drive_write",
+                json!({"profile":"tgdrive","path":"notes/plan.md","content":"x"}),
+            ),
+        ]),
+        prose("done."),
+    ];
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "drive_write", "delegate"],
+        script,
+    );
+    let delegations = Delegations::over(known_with_proxy());
+    let mut served = world.delegating(&delegations);
+    report(
+        world
+            .ask(
+                &mut served,
+                "read the inbox, hand it to tgdrive/tola and write notes/plan.md",
+            )
+            .await,
+    );
+    assert_eq!(served.context.label.integrity, Integrity::Untrusted);
+    let lines = world.lines(SESSION);
+    let results = tool_results(&lines);
+    let d1 = result_of(&results, "d1");
+    assert_eq!(d1.outcome, ToolOutcomeWord::Refused);
+    assert!(d1.content.contains("evil/exfil"), "{}", d1.content);
+    // R167: a known agent whose audience is within the label passes after
+    // an inbox read, with no line of the person's naming it.
+    assert_eq!(result_of(&results, "d2").outcome, ToolOutcomeWord::Ok);
+    let made = delegations.made();
+    assert_eq!(made.len(), 1);
+    assert!(made[0].2.contains(&user(TOLA)));
+    let w1 = result_of(&results, "w1");
+    assert_eq!(w1.outcome, ToolOutcomeWord::Refused);
+    assert!(w1.content.contains(NEEDS_APPROVAL), "{}", w1.content);
+    assert!(!world.tgdrive.join("notes/plan.md").exists());
+}
+
+/// 92.6 acceptance 8 through `SessionContext`: in Nixi's DM a turn that
+/// read the inbox is `untrusted`, and its write needs an approval; at
+/// tgorka's next message the DM is `owner` again with its readers as they
+/// were. A conversation keeps `untrusted` for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_main_sessions_integrity_resets_at_the_persons_turn() {
+    use keeper_core::agents::label::NEEDS_APPROVAL;
+    let script = || {
+        vec![
+            calls(&[(
+                "r1",
+                "drive_read",
+                json!({"profile":"tgdrive","path":"00-inbox/x.md"}),
+            )]),
+            calls(&[(
+                "w1",
+                "drive_write",
+                json!({"profile":"tgdrive","path":"notes/plan.md","content":"x"}),
+            )]),
+            prose("read."),
+            prose("you are welcome."),
+        ]
+    };
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "drive_write"],
+        script(),
+    );
+    nixis_dm(&world);
+    let mut dm = world.open(DM);
+    report(
+        world
+            .ask(&mut dm, "read the inbox and write notes/plan.md")
+            .await,
+    );
+    assert_eq!(dm.context.label.integrity, Integrity::Untrusted);
+    let readers = dm.context.label.readers.clone();
+    let lines = world.lines(DM);
+    let w1 = result_of(&tool_results(&lines), "w1").clone();
+    assert!(w1.content.contains(NEEDS_APPROVAL), "{}", w1.content);
+    report(world.ask(&mut dm, "thanks").await);
+    assert_eq!(dm.context.label.integrity, Integrity::Owner);
+    assert_eq!(dm.context.label.readers, readers);
+    // The reset is a `label` line, so a reload reads the same.
+    let reloaded = world.open(DM);
+    assert_eq!(reloaded.context.label, dm.context.label);
+
+    let mut world = world_read_by(
+        &[TGORKA, MARTA],
+        ProviderKind::OpenAi,
+        &["drive_read", "drive_write"],
+        script(),
+    );
+    let mut conversation = world.open(SESSION);
+    report(
+        world
+            .ask(&mut conversation, "read the inbox and write notes/plan.md")
+            .await,
+    );
+    report(world.ask(&mut conversation, "thanks").await);
+    assert_eq!(conversation.context.label.integrity, Integrity::Untrusted);
 }
