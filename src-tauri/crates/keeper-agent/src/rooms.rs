@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 
 use keeper_core::agents::agentd::TrustEntry;
 use keeper_core::agents::delegation::{enveloped_brief, trusted_brief, DelegateContent};
-use keeper_core::agents::events::SESSION_ROOM_TYPE;
+use keeper_core::agents::events::{CONTROL_ROOM_TYPE, SESSION_ROOM_TYPE};
 use keeper_core::agents::home::AgentKind;
 use keeper_core::agents::label::{check_sink, Label, Readers, Sink, SinkVerdict};
 use keeper_core::agents::room::holds_agent_power;
@@ -82,8 +82,8 @@ pub enum InviteDecision {
 
 /// Whether to join the room `invite` names.
 ///
-/// Only a session room (`dev.keeper.agent.session`) is ever joined, and only
-/// when the inviter is:
+/// Besides a visited control room (below), only a session room
+/// (`dev.keeper.agent.session`) is ever joined, and only when the inviter is:
 /// - **(a)** the `human` of the invited proxy, hosted here — a new proxy
 ///   conversation;
 /// - **(b)** the user of an agent homed in a drive this host mounts, when
@@ -94,7 +94,16 @@ pub enum InviteDecision {
 ///   when `check_sink(Room)` lets the opening label reach that person.
 ///
 /// The desktop has no `[[trust]]`, so there only (a) and (b) join (R63).
+///
+/// A control room (`dev.keeper.agent.control`) is joined only as a
+/// visitor: by a steward hosted here, invited by someone who is not an
+/// agent this host knows and who reads the steward's home drive by this
+/// host's pins — a person bringing the steward into another principal's
+/// control room, so a drive both mount rings there (Q15, R29 F19).
 pub fn invite_decision(invite: &Invite, known: &Known) -> InviteDecision {
+    if invite.room_type.as_deref() == Some(CONTROL_ROOM_TYPE) {
+        return visitor_decision(invite, known);
+    }
     if invite.room_type.as_deref() != Some(SESSION_ROOM_TYPE) {
         return InviteDecision::Pending;
     }
@@ -128,6 +137,23 @@ pub fn invite_decision(invite: &Invite, known: &Known) -> InviteDecision {
         InviteDecision::Join
     } else {
         InviteDecision::Pending
+    }
+}
+
+/// The control-room arm of [`invite_decision`].
+fn visitor_decision(invite: &Invite, known: &Known) -> InviteDecision {
+    let steward = known.agents.iter().find(|agent| {
+        agent.hosted && agent.kind == AgentKind::Steward && agent.matrix_user == invite.invited
+    });
+    let an_agent = known
+        .agents
+        .iter()
+        .any(|agent| agent.matrix_user == invite.inviter);
+    match steward {
+        Some(steward) if !an_agent && reads(&steward.home_readers, &invite.inviter) => {
+            InviteDecision::Join
+        }
+        _ => InviteDecision::Pending,
     }
 }
 
@@ -594,6 +620,75 @@ mod tests {
                 &known
             ),
             InviteDecision::Pending
+        );
+
+        // 92.4 acceptance 9: a control room is joined only as a visitor — a
+        // steward hosted here, brought in by a person who reads its home.
+        let control = |inviter: &str, invited: &str| Invite {
+            room_type: Some(CONTROL_ROOM_TYPE.to_owned()),
+            inviter: user(inviter),
+            invited: user(invited),
+        };
+        let visiting = Known {
+            agents: vec![
+                agent(LUCYNA, AgentKind::Steward, None, &[TGORKA, MARTA], true),
+                agent(
+                    "@amelia:example.org",
+                    AgentKind::Specialist,
+                    None,
+                    &[TGORKA, MARTA],
+                    true,
+                ),
+                agent(
+                    "@nixi:example.org",
+                    AgentKind::Proxy,
+                    Some(TGORKA),
+                    &[TGORKA],
+                    false,
+                ),
+            ],
+            trust: Vec::new(),
+        };
+        assert_eq!(
+            invite_decision(&control(TGORKA, LUCYNA), &visiting),
+            InviteDecision::Join,
+            "a reader of her home brings the steward into his control room"
+        );
+        for (case, why) in [
+            (
+                control("@stranger:example.org", LUCYNA),
+                "a person who does not read her home",
+            ),
+            (
+                control(TGORKA, "@amelia:example.org"),
+                "a specialist is never a visitor",
+            ),
+            (
+                control("@nixi:example.org", LUCYNA),
+                "an agent's invite is not a person's",
+            ),
+            (
+                control(TGORKA, "@tola:example.org"),
+                "a steward this host does not serve",
+            ),
+        ] {
+            assert_eq!(
+                invite_decision(&case, &visiting),
+                InviteDecision::Pending,
+                "{why}"
+            );
+        }
+        // On a drive anyone reads, an agent still brings no steward in: only
+        // a person does.
+        let mut public = visiting.clone();
+        public.agents[0].home_readers = Readers::Anyone;
+        assert_eq!(
+            invite_decision(&control("@nixi:example.org", LUCYNA), &public),
+            InviteDecision::Pending
+        );
+        assert_eq!(
+            invite_decision(&control("@stranger:example.org", LUCYNA), &public),
+            InviteDecision::Join
         );
 
         // 92.1 acceptance 11: a delegation's room. On Dr Lucyna Novak's host,

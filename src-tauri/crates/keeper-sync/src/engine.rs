@@ -1020,6 +1020,36 @@ const CONFLICT_COPY_ORDINALS: u32 = 64;
 /// and more correct than making the engine wait for it.
 const WATCH_TAP_CAPACITY: usize = 1_024;
 
+/// How many pushes [`Engine::push_tap`] buffers for a slow subscriber. A push
+/// is one per pass per profile, so a subscriber that lags this far has
+/// stopped reading; it is told so and loses only rings.
+const PUSH_TAP_CAPACITY: usize = 64;
+
+/// One push that reached the remote: the profile, the remote branch's tip
+/// this copy last knew before it (`None` when it knew none — a first push),
+/// and the commit it published. The range is what
+/// [`Engine::changed_paths`] reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pushed {
+    pub profile_id: String,
+    pub from: Option<String>,
+    pub to: String,
+}
+
+/// What [`Engine::pull_now`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullNow {
+    /// A `Pull` is queued (or one already queued covers it).
+    Queued,
+    /// This commit was already asked for; nothing more is queued.
+    AlreadyAsked,
+    /// A parked `Pull` waits for a person's retry: a remote that refuses
+    /// this copy is not asked again by a peer's say-so.
+    Parked,
+    /// The profile never pulls.
+    NotPulled,
+}
+
 /// How many unapplied "this path is finished" assertions
 /// [`Engine::finished_tap`] holds before it starts dropping them.
 ///
@@ -1554,6 +1584,13 @@ pub struct Engine {
     /// and a `LazyLock` answers that question by initializing — there is no way
     /// to look without becoming the first caller.
     watch_tap: OnceLock<tokio::sync::broadcast::Sender<(String, PathBuf)>>,
+    /// The sender behind [`Engine::push_tap`]; `OnceLock` for
+    /// [`Self::watch_tap`]'s reason: an engine nobody taps sends nothing.
+    push_tap: OnceLock<tokio::sync::broadcast::Sender<Pushed>>,
+    /// The last commit [`Engine::pull_now`] was asked for, per profile: a
+    /// commit rung twice — two rooms, a replay, a restart's read-back — is
+    /// fetched once.
+    pull_asked: Mutex<HashMap<String, String>>,
     /// The inbound queue behind [`Engine::finished_tap`], created by the first
     /// producer that asks for a handle.
     ///
@@ -2023,6 +2060,8 @@ impl Engine {
             lfs_moved: Mutex::new(HashSet::new()),
             next_prune_ms: Mutex::new(HashMap::new()),
             watch_tap: OnceLock::new(),
+            push_tap: OnceLock::new(),
+            pull_asked: Mutex::new(HashMap::new()),
             finished_tap: OnceLock::new(),
             counters: Mutex::new(HashMap::new()),
             walk_report_interval: WALK_REPORT_INTERVAL,
@@ -6583,6 +6622,90 @@ impl Engine {
             .subscribe()
     }
 
+    /// Every push that reached a remote, as it lands: which profile, and the
+    /// range it published ([`Pushed`]).
+    ///
+    /// The same contract as [`Self::watch_tap`]: it never affects sync, it is
+    /// lossy past [`PUSH_TAP_CAPACITY`] (a lagging subscriber is told so), and
+    /// it says what happened, not what anyone should do about it. A push that
+    /// published nothing new — the remote already held the tip — is not sent.
+    pub fn push_tap(&self) -> tokio::sync::broadcast::Receiver<Pushed> {
+        self.push_tap
+            .get_or_init(|| tokio::sync::broadcast::channel(PUSH_TAP_CAPACITY).0)
+            .subscribe()
+    }
+
+    /// Whether profile `profile_id`'s copy holds the commit `commit` (a full
+    /// hex object id). A local read: no fetch.
+    pub fn has_commit(&self, profile_id: &str, commit: &str) -> Result<bool> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
+            return Err(SyncError::Config(format!(
+                "no such sync profile: {profile_id}"
+            )));
+        };
+        git::history::holds_commit(&profile.local_path, commit)
+    }
+
+    /// The files a range of this copy's history touched,
+    /// repository-relative and `/`-separated: what a [`Pushed`] published.
+    /// `from` = `None` reads the whole of `to`.
+    pub fn changed_paths(
+        &self,
+        profile_id: &str,
+        from: Option<&str>,
+        to: &str,
+    ) -> Result<Vec<String>> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
+            return Err(SyncError::Config(format!(
+                "no such sync profile: {profile_id}"
+            )));
+        };
+        git::history::changed_between(&profile.local_path, from, to)
+    }
+
+    /// A peer said it pushed `commit`: fetch now, once.
+    ///
+    /// One `Pull` ([`db::enqueue_doorbell_pull`]) and nothing else: no walk
+    /// is opened — unlike [`Self::wake_now`], which is a request to *look* —
+    /// and a quiet copy's pull skips its pre-fetch commit. The paced poll is
+    /// re-armed, because a fetch is about to happen. The same commit asked
+    /// twice queues once, even from two threads at once and while the first
+    /// pull runs: the last commit asked is checked and recorded under one
+    /// lock, around the enqueue. A newer commit during a running pull queues
+    /// its successor. A parked `Pull` (a remote that refused this copy) is
+    /// never re-queued by a peer's say-so, only by a person's retry — and
+    /// that check is the enqueue's own statement. The caller checks
+    /// [`Self::has_commit`] first: a commit already here costs nothing.
+    pub fn pull_now(&self, profile_id: &str, commit: &str) -> Result<PullNow> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
+            return Err(SyncError::Config(format!(
+                "no such sync profile: {profile_id}"
+            )));
+        };
+        if !profile.enabled || !profile.direction.pulls() {
+            return Ok(PullNow::NotPulled);
+        }
+        let mut asked = Self::lock(&self.pull_asked);
+        if asked.get(profile_id).map(String::as_str) == Some(commit) {
+            return Ok(PullNow::AlreadyAsked);
+        }
+        let now = self.platform.now_ms();
+        let outcome = self.with_db(|conn| db::enqueue_doorbell_pull(conn, profile_id, now))?;
+        if outcome == db::DoorbellPull::Parked {
+            return Ok(PullNow::Parked);
+        }
+        asked.insert(profile_id.to_owned(), commit.to_owned());
+        drop(asked);
+        tracing::info!(
+            profile = profile.name,
+            reason = "doorbell",
+            "remote poll queued"
+        );
+        self.arm_remote_poll(&profile, now);
+        self.refresh_pending(profile_id);
+        Ok(PullNow::Queued)
+    }
+
     /// Mint a producer handle for asserting that a path is finished
     /// (Story 41.4, AD-68).
     ///
@@ -10368,10 +10491,19 @@ impl Engine {
         // session that claims "one push at the end" has to be able to show it
         // even when that push failed (Story 41.5).
         self.bump_counters(&profile.id, |counters| counters.pushes += 1);
+        // The range's start is read before the push moves it: after a push
+        // the tracking ref is the tip just published. Read only when tapped.
+        let tapped = self.push_tap.get().is_some();
+        let from = tapped
+            .then(|| self.tracking_tip(profile, &working))
+            .flatten();
         let pushed = self.push_once(profile, &refspec).await;
         if let Err(err) = pushed {
             self.reconcile_and_retry_push(profile, source, &refspec, err, tree)
                 .await?;
+        }
+        if tapped {
+            self.tell_push_tap(profile, from);
         }
         tracing::info!(
             profile = profile.name,
@@ -10398,6 +10530,44 @@ impl Engine {
             self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now).map(drop))?;
         }
         Ok(RemoteContact::Reached)
+    }
+
+    /// `refs/remotes/origin/<branch>` as this copy last knew it, if at all.
+    fn tracking_tip(&self, profile: &SyncProfile, branch: &str) -> Option<String> {
+        let repo = self.open_repo(profile).ok()?;
+        git::repo::resolve_reference(&repo, &format!("refs/remotes/origin/{branch}"))
+            .ok()
+            .flatten()
+            .map(|id| id.to_hex().to_string())
+    }
+
+    /// Send what a push just published to [`Self::push_tap`]'s subscribers.
+    /// After a reconcile the range also holds the peer's commits it merged;
+    /// a subscriber that rings for them rings for what is already rung.
+    fn tell_push_tap(&self, profile: &SyncProfile, from: Option<String>) {
+        let Some(sender) = self.push_tap.get() else {
+            return;
+        };
+        let to = match self
+            .open_repo(profile)
+            .and_then(|repo| git::repo::head_commit_id(&repo))
+        {
+            Ok(Some(id)) => id.to_hex().to_string(),
+            Ok(None) => return,
+            Err(err) => {
+                tracing::debug!(profile = profile.name, %err, "the pushed tip could not be read; no push is told");
+                return;
+            }
+        };
+        if from.as_deref() == Some(to.as_str()) {
+            return;
+        }
+        // No receiver is not an error: nobody is listening right now.
+        let _ = sender.send(Pushed {
+            profile_id: profile.id.clone(),
+            from,
+            to,
+        });
     }
 
     /// Pass untracked entries through, refusing anything that is not a file.
@@ -36980,6 +37150,347 @@ mod tests {
         assert!(
             engine.counters(&p.id).status_walks - before >= 19,
             "degraded, the profile's own 15 s is the cadence the warning names"
+        );
+    }
+
+    /// A profile publishing to a fresh local bare remote, its first commit
+    /// (`root.md`) pushed. `None` where this host cannot make a bare repo.
+    async fn publishing_fixture(
+        engine: &Engine,
+        platform: &TestPlatform,
+        dir: &Path,
+        remote_dir: &Path,
+    ) -> Option<SyncProfile> {
+        gix::init_bare(remote_dir).ok()?;
+        let mut p = adoptable(dir);
+        p.remote_url = remote_dir.to_string_lossy().into_owned();
+        engine.upsert_profile(&p).expect("upsert");
+        std::fs::write(p.local_path.join("root.md"), b"root").expect("write");
+        assert_eq!(commit_after_settling(engine, platform, &p), 1);
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("publish the root to the local bare remote");
+        Some(p)
+    }
+
+    fn remote_main(remote_dir: &Path) -> String {
+        gix::open(remote_dir)
+            .expect("open bare remote")
+            .find_reference("refs/heads/main")
+            .expect("main")
+            .id()
+            .to_hex()
+            .to_string()
+    }
+
+    fn pulls_waiting(engine: &Engine, id: &str) -> u32 {
+        engine
+            .with_db(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM journal WHERE profile_id = ?1 AND kind = 'pull'
+                       AND state IN ('pending','deferred')",
+                    [id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(SyncError::from)
+            })
+            .expect("the journal is readable") as u32
+    }
+
+    /// The push tap says what each push published, from the tip the remote
+    /// had to the one it has now, and `changed_paths` reads that range.
+    #[tokio::test]
+    async fn a_push_tells_its_tap_the_range_it_published() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut tap = engine.push_tap();
+        let Some(p) = publishing_fixture(&engine, &platform, dir.path(), remote_dir.path()).await
+        else {
+            return;
+        };
+        let first = tap.try_recv().expect("the first push is told");
+        let root = remote_main(remote_dir.path());
+        assert_eq!(
+            first,
+            Pushed {
+                profile_id: p.id.clone(),
+                from: None,
+                to: root.clone(),
+            }
+        );
+        assert_eq!(
+            engine.changed_paths(&p.id, None, &root).expect("range"),
+            vec!["root.md".to_owned()]
+        );
+
+        platform.advance_ms(1_000);
+        std::fs::create_dir_all(p.local_path.join("s")).expect("dir");
+        std::fs::write(p.local_path.join("s/card.md"), b"card").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("push the card");
+        let second = tap.try_recv().expect("the second push is told");
+        let tip = remote_main(remote_dir.path());
+        assert_eq!(
+            second.from.as_deref(),
+            Some(root.as_str()),
+            "from the tip the remote had"
+        );
+        assert_eq!(second.to, tip);
+        assert_eq!(
+            engine
+                .changed_paths(&p.id, second.from.as_deref(), &second.to)
+                .expect("range"),
+            vec!["s/card.md".to_owned()],
+            "only what this push published"
+        );
+
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("a pass with nothing to publish");
+        assert!(
+            tap.try_recv().is_err(),
+            "a push that published nothing is not told"
+        );
+    }
+
+    /// 92.4 acceptance 3: a doorbell costs one fetch. Two asks for one commit
+    /// queue one `Pull`; the tick that drains it brings the commit with no
+    /// walk under a live watcher; a parked pull is never re-queued by a peer.
+    #[tokio::test]
+    async fn pull_now_fetches_once_and_walks_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let Some(p) = publishing_fixture(&engine, &platform, dir.path(), remote_dir.path()).await
+        else {
+            return;
+        };
+        let _watch = arm_watcher(&engine, &p);
+        // First sight walks and asks the remote; let it, then go quiet.
+        for _ in 0..3 {
+            platform.advance_ms(1_000);
+            engine.tick_profile(&p).await.expect("a tick never raises");
+        }
+        assert_eq!(
+            pulls_waiting(&engine, &p.id),
+            0,
+            "nothing is asked before the doorbell"
+        );
+
+        advance_remote(remote_dir.path(), "peer.md", "peer");
+        let peer = remote_main(remote_dir.path());
+        assert!(!engine.has_commit(&p.id, &peer).expect("read"));
+        let walks = engine.counters(&p.id).status_walks;
+
+        assert_eq!(engine.pull_now(&p.id, &peer).expect("ask"), PullNow::Queued);
+        assert_eq!(
+            engine.pull_now(&p.id, &peer).expect("ask again"),
+            PullNow::AlreadyAsked
+        );
+        assert_eq!(pulls_waiting(&engine, &p.id), 1, "two rings, one pull");
+
+        platform.advance_ms(1_000);
+        engine.tick_profile(&p).await.expect("a tick never raises");
+        assert!(
+            engine.has_commit(&p.id, &peer).expect("read"),
+            "the tick after the doorbell fetched the commit"
+        );
+        assert_eq!(
+            engine.counters(&p.id).status_walks,
+            walks,
+            "a doorbell fetches; it does not walk"
+        );
+
+        // A remote that refused this copy: its parked pull waits for a person.
+        engine
+            .with_db(|conn| {
+                db::enqueue(conn, &p.id, &WorkKind::Pull, 0, 0)?;
+                conn.execute(
+                    "UPDATE journal SET state = 'parked' WHERE profile_id = ?1 AND kind = 'pull'",
+                    [&p.id],
+                )
+                .map(drop)
+                .map_err(SyncError::from)
+            })
+            .expect("park a pull");
+        advance_remote(remote_dir.path(), "later.md", "later");
+        let later = remote_main(remote_dir.path());
+        assert_eq!(
+            engine.pull_now(&p.id, &later).expect("ask"),
+            PullNow::Parked
+        );
+        assert_eq!(
+            pulls_waiting(&engine, &p.id),
+            0,
+            "a parked pull is not asked again"
+        );
+    }
+
+    /// R161 (review DB-06): one ask per commit, atomically. Two threads
+    /// ringing one commit at once: one is queued, the other is told it was
+    /// asked. While that pull runs the same commit asks nothing and a newer
+    /// one queues its successor; once a pull is parked no ready one joins it.
+    #[test]
+    fn a_doorbell_asks_once_per_commit_under_racing_rings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let clear = || {
+            engine
+                .with_db(|conn| {
+                    conn.execute("DELETE FROM journal", [])
+                        .map(drop)
+                        .map_err(SyncError::from)
+                })
+                .expect("clear");
+        };
+        for round in 0..16u32 {
+            clear();
+            let commit = format!("{round:040x}");
+            let barrier = std::sync::Barrier::new(2);
+            let answers: Vec<PullNow> = std::thread::scope(|scope| {
+                let ring = || {
+                    barrier.wait();
+                    engine.pull_now(&p.id, &commit).expect("ask")
+                };
+                let (a, b) = (scope.spawn(ring), scope.spawn(ring));
+                vec![a.join().expect("a"), b.join().expect("b")]
+            });
+            assert_eq!(
+                answers.iter().filter(|a| **a == PullNow::Queued).count(),
+                1,
+                "round {round}: {answers:?}"
+            );
+            assert!(answers.contains(&PullNow::AlreadyAsked), "{answers:?}");
+        }
+
+        let set_state = |state: &str| {
+            engine
+                .with_db(|conn| {
+                    conn.execute(
+                        "UPDATE journal SET state = ?2 WHERE profile_id = ?1 AND kind = 'pull'",
+                        (&p.id, state),
+                    )
+                    .map(drop)
+                    .map_err(SyncError::from)
+                })
+                .expect("state");
+        };
+        clear();
+        let (first, newer, last) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        assert_eq!(
+            engine.pull_now(&p.id, &first).expect("ask"),
+            PullNow::Queued
+        );
+        set_state("running");
+        assert_eq!(
+            engine.pull_now(&p.id, &first).expect("ask"),
+            PullNow::AlreadyAsked,
+            "the running pull is this commit's"
+        );
+        assert_eq!(pulls_waiting(&engine, &p.id), 0);
+        assert_eq!(
+            engine.pull_now(&p.id, &newer).expect("ask"),
+            PullNow::Queued
+        );
+        assert_eq!(
+            pulls_waiting(&engine, &p.id),
+            1,
+            "a newer commit during a running pull queues its successor"
+        );
+        set_state("parked");
+        assert_eq!(engine.pull_now(&p.id, &last).expect("ask"), PullNow::Parked);
+        assert_eq!(
+            pulls_waiting(&engine, &p.id),
+            0,
+            "parked waits for a person"
+        );
+    }
+
+    /// 92.4 acceptance 6, NFR-122 in this repository: two engines in one
+    /// process over one local bare remote. A pushes; what its push tap says
+    /// is the doorbell; B, quiet under a live watcher, has the commit within
+    /// two of its ticks of hearing it, with no walk.
+    #[tokio::test]
+    async fn a_doorbell_brings_the_commit_within_two_ticks() {
+        let a_dir = tempfile::tempdir().expect("tempdir");
+        let b_dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        let a_platform = Arc::new(TestPlatform::new(a_dir.path()));
+        let b_platform = Arc::new(TestPlatform::new(b_dir.path()));
+        let (Ok(a), Ok(b)) = (
+            Engine::open(Arc::clone(&a_platform) as Arc<dyn SyncPlatform>),
+            Engine::open(Arc::clone(&b_platform) as Arc<dyn SyncPlatform>),
+        ) else {
+            return;
+        };
+        let mut tap = a.push_tap();
+        let Some(pa) = publishing_fixture(&a, &a_platform, a_dir.path(), remote_dir.path()).await
+        else {
+            return;
+        };
+        let _ = tap.try_recv();
+        let mut pb = adoptable(b_dir.path());
+        pb.remote_url = pa.remote_url.clone();
+        b.upsert_profile(&pb).expect("upsert");
+        b.sync_once(&pb.id, SyncSource::Manual)
+            .await
+            .expect("B checks the drive out");
+        pb = b
+            .with_db(|conn| db::get_profile(conn, &pb.id))
+            .expect("read")
+            .expect("profile");
+        let _watch = arm_watcher(&b, &pb);
+        for _ in 0..3 {
+            b_platform.advance_ms(1_000);
+            b.tick_profile(&pb).await.expect("a tick never raises");
+        }
+
+        a_platform.advance_ms(1_000);
+        std::fs::write(pa.local_path.join("from-a.md"), b"session work").expect("write");
+        assert_eq!(commit_after_settling(&a, &a_platform, &pa), 1);
+        a.sync_once(&pa.id, SyncSource::Manual)
+            .await
+            .expect("A pushes");
+        let rung = tap.try_recv().expect("A's push is told");
+        assert!(!b.has_commit(&pb.id, &rung.to).expect("read"));
+        let walks = b.counters(&pb.id).status_walks;
+
+        assert_eq!(b.pull_now(&pb.id, &rung.to).expect("ring"), PullNow::Queued);
+        let mut ticks = 0;
+        while !b.has_commit(&pb.id, &rung.to).expect("read") && ticks < 2 {
+            b_platform.advance_ms(1_000);
+            b.tick_profile(&pb).await.expect("a tick never raises");
+            ticks += 1;
+        }
+        assert!(
+            b.has_commit(&pb.id, &rung.to).expect("read"),
+            "B has A's commit within two ticks of the doorbell"
+        );
+        assert_eq!(
+            b.counters(&pb.id).status_walks,
+            walks,
+            "and walked for none of it"
+        );
+        assert_eq!(
+            std::fs::read(pb.local_path.join("from-a.md")).expect("applied"),
+            b"session work"
         );
     }
 

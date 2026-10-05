@@ -7674,3 +7674,17 @@ origin: epic 96's amendment, 2026-10-02 (story 96.1; R28 S-03)
 location: `src-tauri/crates/keeper-core/src/agents/run.rs` (`SandboxPlan` without drives when `network`; the workspace's SHA-256 set in `ExecBinding`), `src-tauri/crates/keeper-agent/src/run/`
 reason: A run with network mounts only the session's `workspace/`, so a command that needs a drive's file and the network — uploading a note, building against a file kept in the drive — needs the file copied into the workspace first, as a separate step. The approval then releases every file in the workspace as the card listed it (each path and SHA-256), not only the bytes the command will send: the sandbox cannot tell which files a program reads, so the declassified object is the whole set. A large workspace makes a long card, and a person who approves it releases files the command may never touch. Revisit if networked runs over large workspaces become common: a per-run staging directory holding only the files the agent names for that run, mounted in place of the workspace and released alone.
 status: open
+
+### DW-452: NFR-122's doorbell p95 on the tailnet is not measured yet.
+
+origin: epic 92, story 92.4 (rung `agents-92-doorbell`, 2026-10-05; acceptance 7)
+location: `docs/agents.md` § *How another host finds out* and § *Measured*; `src-tauri/crates/keeper-agent/src/doorbell.rs`, `keeper-sync/src/engine.rs` (`pull_now`, `push_tap`)
+reason: In this repository two engines over one local bare remote prove the commit arrives within two ticks of the bell with no walk (`a_doorbell_brings_the_commit_within_two_ticks`), and Synapse accepts a level-0 visitor's doorbell (`live_doorbell.rs`). The NFR's number — p95 ≤ 15 s from a push on electra (`agentd-tgorka`) or hesperia to the other host holding the commit, over 100 session changes, and a quiet folder's pull interval ≤ 5 min without bells — needs both real hosts, the tailnet and the Forgejo remote, which no test here reaches. Revisit when both hosts run this build: the operator pushes 100 session changes from each side, reads the two hosts' `remote poll queued reason=doorbell` and `pushed` log lines, and records the p95 in § *Measured*.
+status: open
+
+### DW-453: One macOS run of keeper-sync failed a sweep test this rung does not touch.
+
+origin: epic 92, story 92.4 review fixes (rung `agents-92-doorbell`, 2026-10-05)
+location: `src-tauri/crates/keeper-sync/src/engine.rs` (`a_file_the_sweep_found_is_committed_once_it_settles`)
+reason: `scripts/check-macos.sh mac` on the review-fix tree passed fmt, workspace clippy and every test of keeper, keeper-agent, keeper-agentd and keeper-core, then failed this one keeper-sync test (1382 of 1383 passed) at its "a walk finished" log assertion; `cargo test --workspace` stopped there, so later crates did not run on the Mac. The test counts walk log lines under a live watcher; the fixes change only `pull_now`'s enqueue (`db::enqueue_doorbell_pull`) in keeper-sync, and the test passes on Linux in the full suite. Re-run on the Mac or macOS CI; if it fails again, it is a watcher-timing defect of its own.
+status: open

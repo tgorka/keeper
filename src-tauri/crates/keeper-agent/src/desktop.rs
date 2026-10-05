@@ -8,7 +8,8 @@
 //! What differs is where the facts come from:
 //!
 //! - the drives are the app's flagged sync profiles, synced by the app's own
-//!   engine; this host never fetches or opens an engine;
+//!   engine; this host never opens one, and rings and answers doorbells over
+//!   the app's once it is handed over ([`DesktopHost::attach_engine`]);
 //! - each pin is `keeper.db`'s ([`keeper_core::agents::pins`]), and a zone
 //!   whose `_drive.toml` differs from it hosts nothing;
 //! - each copy's session and store passphrase are in the app's keychain
@@ -46,15 +47,16 @@ use matrix_sdk::RoomState;
 use tokio::task::JoinHandle;
 
 use crate::agent::bot_for;
+use crate::doorbell::{Doorbell, DriveEngine, Ringer, RING_FINISH};
 use crate::hosts::{HostRuntime, RELEASE_BOUND};
-use crate::rooms::Known;
+use crate::rooms::{Known, KnownAgent};
 use crate::runtime::{
-    deps_over, known_with, open_copy, sessions_of, start_copy, view, Copy, DriveView, RoomSessions,
-    TURNS_FINISH,
+    deps_over, known_agents, known_with, open_copy, sessions_of, start_copy, view, Copy, DriveView,
+    RoomSessions, TURNS_FINISH,
 };
 use crate::surface::declared;
 use crate::turn::TurnEnv;
-use crate::zone::{read_text, read_zone, AgentHome};
+use crate::zone::{read_text, read_zone, AgentHome, ZoneRead};
 
 /// Why a pinnable drive hosts nothing before its first sign-in.
 pub const UNPINNED: &str =
@@ -114,6 +116,11 @@ pub struct DesktopDrive {
     pub profile_id: String,
     pub view: DriveView,
     pub materialized: Materialized,
+    /// The zone as this Mac's pin reads it, whoever the drive's principal:
+    /// what a doorbell for a drive mounted here but hosted elsewhere is
+    /// heard by (R162). `None` unpinned, or a `_drive.toml` that differs
+    /// from the pin.
+    pub pinned: Option<ZoneRead>,
 }
 
 /// How much of `profile`'s content the app keeps on disk: a sparse cone or
@@ -161,13 +168,43 @@ pub fn desktop_drives(
             let id = decl
                 .as_ref()
                 .map_or_else(|_| profile.id.clone(), |decl| decl.id.clone());
+            let view = view(&id, profile.clone(), hosts);
+            let pinned = match (&view.hosts, &decl, pins.get(&profile.id)) {
+                (Ok(_), _, _) => Some(view.zone.clone()),
+                (Err(_), Ok(decl), Some(pin)) if pin_matches(decl, pin).is_ok() => {
+                    Some(read_zone(&pin.id, profile, Some(decl)))
+                }
+                _ => None,
+            };
             DesktopDrive {
                 profile_id: profile.id.clone(),
-                view: view(&id, profile.clone(), hosts),
+                view,
                 materialized: materialized(profile),
+                pinned,
             }
         })
         .collect()
+}
+
+/// What the doorbell is set with (R162): each pinned drive by its pin's id
+/// — never a `_drive.toml` the pin refused — and its profile, and every
+/// agent the pinned zones home, `hosted` among them hosted here.
+pub(crate) fn doorbell_roster(
+    drives: &[DesktopDrive],
+    hosted: &[AgentHome],
+) -> (Vec<(String, String)>, Vec<KnownAgent>) {
+    let pinned: Vec<(&DesktopDrive, &ZoneRead)> = drives
+        .iter()
+        .filter_map(|drive| drive.pinned.as_ref().map(|zone| (drive, zone)))
+        .collect();
+    let mounted = pinned
+        .iter()
+        .map(|(drive, zone)| (zone.drive.clone(), drive.profile_id.clone()))
+        .collect();
+    (
+        mounted,
+        known_agents(pinned.iter().map(|(_, zone)| *zone), hosted),
+    )
 }
 
 /// The URL of the homeserver `user` is on, from a signed-in account on the
@@ -519,6 +556,11 @@ pub struct DesktopHost {
     version: String,
     built: Option<Built>,
     problems: HashMap<OwnedUserId, String>,
+    /// The receiver every copy answers doorbells with.
+    doorbell: Arc<Doorbell>,
+    /// The doorbells' work over the app's engine, once handed over
+    /// ([`Self::attach_engine`]).
+    engine: Option<Ringer>,
 }
 
 impl DesktopHost {
@@ -530,7 +572,24 @@ impl DesktopHost {
             version: version.to_owned(),
             built: None,
             problems: HashMap::new(),
+            doorbell: Arc::default(),
+            engine: None,
         }
+    }
+
+    /// Ring and answer doorbells over the app's sync engine, from now on.
+    /// This host never opens an engine of its own; handing the same one
+    /// again changes nothing.
+    pub fn attach_engine(&mut self, engine: Arc<dyn DriveEngine>) {
+        if self
+            .engine
+            .as_ref()
+            .is_some_and(|ringer| Arc::ptr_eq(ringer.engine(), &engine))
+        {
+            return;
+        }
+        self.doorbell.set_engine(Arc::clone(&engine));
+        self.engine = Some(Ringer::new(engine));
     }
 
     /// What the running host found about each copy, for the listing.
@@ -559,6 +618,10 @@ impl DesktopHost {
         let Some(built) = self.built.as_mut() else {
             return;
         };
+        // Bells are answered whether or not the control room is found yet.
+        if let Some(ringer) = self.engine.as_mut() {
+            ringer.tick(&built.runtime.round(&built.drives), &self.doorbell);
+        }
         let users = built
             .copies
             .iter()
@@ -644,6 +707,8 @@ impl DesktopHost {
         };
 
         let views: Vec<DriveView> = drives.iter().map(|drive| drive.view.clone()).collect();
+        let (mounted, agents) = doorbell_roster(&drives, &signed);
+        self.doorbell.set_drives(mounted, agents);
         if self.built.as_ref().is_some_and(|built| built.key == key) {
             if let Some(built) = self.built.as_mut() {
                 *built.known.write().unwrap_or_else(|p| p.into_inner()) =
@@ -716,7 +781,8 @@ impl DesktopHost {
                     continue;
                 }
             };
-            let (copy, sync) = start_copy(deps, client, Arc::clone(&known));
+            let (copy, sync) =
+                start_copy(deps, client, Arc::clone(&known), Arc::clone(&self.doorbell));
             copies.push(copy);
             syncs.push(sync);
         }
@@ -728,6 +794,8 @@ impl DesktopHost {
             .map(|drive| (drive.view, drive.materialized))
             .collect();
         let runtime = HostRuntime::desktop(host, login, &self.version, &manifest, copies.clone());
+        self.doorbell
+            .set_principal_agents(runtime.principal_agents());
         let (stop, signal) = chat::cancellation();
         tracing::info!(host = %key.host, copies = copies.len(), "agents: this Mac hosts its agents");
         let mut built = Built {
@@ -771,6 +839,16 @@ impl DesktopHost {
             return;
         };
         built.stop.cancel();
+        // What the last pushes published is rung before the copies go quiet.
+        if let Some(ringer) = self.engine.as_mut() {
+            ringer
+                .finish(
+                    &built.runtime.round(&built.drives),
+                    &self.doorbell,
+                    RING_FINISH,
+                )
+                .await;
+        }
         if tokio::time::timeout(RELEASE_BOUND * 2, built.runtime.release_all())
             .await
             .is_err()
@@ -1178,5 +1256,105 @@ mod tests {
         let deps = deps_over(&base, &data, &host, &views, &rows, &home).expect("served");
         let ports = deps.env.drive.expect("the hosting drives");
         assert!(ports.vault.is_none());
+    }
+
+    /// R162 (review DB-04, DB-05): the doorbell hears by this Mac's pins.
+    /// tgorka's Mac mounts tgdrive (its own, hosted) and neuradrive
+    /// (another principal's, pinned, never hosted here): Lucyna, homed in
+    /// neuradrive and not hosted here, is heard for it. A third folder whose
+    /// `_drive.toml` now claims `tgdrive` against its pin maps nothing, so
+    /// tgdrive's bell still fetches tgdrive's folder.
+    #[test]
+    fn the_doorbell_hears_by_the_pins() {
+        use crate::doorbell::fake::FakeEngine;
+        use crate::doorbell::Answer;
+
+        let (tg, neura, third) = (
+            tempfile::tempdir().expect("tg"),
+            tempfile::tempdir().expect("neura"),
+            tempfile::tempdir().expect("third"),
+        );
+        nixi_drive(tg.path());
+        let flagged = |id: &str, name: &str, root: &Path| {
+            let mut profile =
+                SyncProfile::new(id, name, root, format!("git@forge:tgorka/{name}.git"));
+            profile.agents = Some(Default::default());
+            profile.sessions = Some(Default::default());
+            profile
+        };
+        let drive_file = |id: &str, principal: &str| {
+            format!(
+                "version = 1\nid = \"{id}\"\nprincipal = \"{principal}\"\nowner = \"{TG}\"\nreaders = [\"{TG}\", \"{MARTA}\"]\nlocal_only = false\n"
+            )
+        };
+        write(
+            neura.path(),
+            "80-agents/_drive.toml",
+            &drive_file("neuradrive", "neuraffica"),
+        );
+        write(
+            neura.path(),
+            "80-agents/lucyna-novak/agent.toml",
+            &format!(
+                "version = 1\nid = \"lucyna-novak\"\nname = \"Lucyna\"\nkind = \"proxy\"\nmatrix_user = \"@lucyna-novak:example.org\"\nhuman = \"{MARTA}\"\n\n[model]\nbot = \"bot:ollama:{NIXI_BOT}#model\"\n"
+            ),
+        );
+        write(
+            third.path(),
+            "80-agents/_drive.toml",
+            &drive_file("shared", "tgorka"),
+        );
+        let profiles = [
+            profile(tg.path()),
+            flagged("p-neura", "neuradrive", neura.path()),
+            flagged("p3", "shared", third.path()),
+        ];
+        let mut pins = BTreeMap::new();
+        for profile in &profiles {
+            pins.extend(pin_now(profile, &shown(&[TG, MARTA], false)));
+        }
+        // The third folder's file changes after its pin.
+        write(
+            third.path(),
+            "80-agents/_drive.toml",
+            &drive_file("tgdrive", "tgorka"),
+        );
+
+        let drives = desktop_drives(&profiles, &pins, "tgorka");
+        assert!(
+            drives[1].view.hosts.is_err(),
+            "neuradrive is hosted elsewhere"
+        );
+        let (mut mounted, agents) = doorbell_roster(&drives, &[]);
+        mounted.sort();
+        assert_eq!(
+            mounted,
+            vec![
+                ("neuradrive".to_owned(), "p-neura".to_owned()),
+                ("tgdrive".to_owned(), "p1".to_owned()),
+            ]
+        );
+
+        let engine = Arc::new(FakeEngine::default());
+        let doorbell = Doorbell::default();
+        doorbell.set_engine(Arc::clone(&engine) as Arc<dyn DriveEngine>);
+        doorbell.set_drives(mounted, agents);
+        doorbell.set_principal_agents(&[OwnedUserId::try_from("@nixi:example.org").expect("nixi")]);
+        let bell = |drive: &str, commit: &str| serde_json::json!({"v": 1, "drive": drive, "commit": commit, "reason": "memory"});
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let lucyna = OwnedUserId::try_from("@lucyna-novak:example.org").expect("lucyna");
+        let nixi = OwnedUserId::try_from("@nixi:example.org").expect("nixi");
+        assert_eq!(
+            doorbell.hear(&lucyna, "neuradrive", &bell("neuradrive", &a)),
+            Answer::Heard
+        );
+        assert_eq!(
+            doorbell.hear(&nixi, "tgdrive", &bell("tgdrive", &b)),
+            Answer::Heard
+        );
+        doorbell.deliver(std::time::Instant::now(), 4);
+        let mut pulls = engine.pulls.lock().expect("lock").clone();
+        pulls.sort();
+        assert_eq!(pulls, vec![("p-neura".to_owned(), a), ("p1".to_owned(), b)]);
     }
 }

@@ -3218,6 +3218,39 @@ Two things worth setting deliberately for an agent workspace:
 - **`excludes`**. Agent tooling leaves scratch files around. The built-in tier-0
   set covers editor and download conventions but not your build outputs.
 
+### Fetch now, and what a push published
+
+Two engine calls let a host that is told a peer pushed fetch at once, and let
+the host that pushed say what it published. They serve the agents' doorbell
+(`docs/agents.md` § *How another host finds out*); nothing in the engine knows
+about agents, and `keeper-syncd` neither taps nor is rung.
+
+- **`Engine::push_tap()`** — a broadcast of every push that reached a remote:
+  the profile, the remote branch's tip this copy knew before the push (`None`
+  for a first push) and the commit it published. Same contract as `watch_tap`:
+  it never affects sync, a subscriber that lags past 64 pushes is told it
+  lagged, and an engine nobody tapped reads nothing extra. A push that published
+  nothing new is not sent. After a push that had to reconcile first (§5), the
+  range also holds the peer's commits it merged.
+- **`Engine::changed_paths(profile, from, to)`** — the files that differ
+  between two commits, repository-relative and `/`-separated (renames as both
+  paths); `from = None` reads the whole of `to`.
+- **`Engine::has_commit(profile, sha)`** — whether this copy holds a commit; a
+  local read.
+- **`Engine::pull_now(profile, sha)`** — fetch now, for one commit a peer named.
+  One `Pull` (`db::enqueue_doorbell_pull`) and nothing else: no walk is opened,
+  and a quiet folder's pull skips its pre-fetch commit, so it costs one fetch.
+  The paced remote poll is re-armed (a fetch is about to happen). The same
+  commit asked again queues nothing — even from two threads at once, or while
+  its pull runs: the last commit asked is checked and recorded under one lock
+  around the enqueue. A `pending` or `deferred` `Pull` covers a newer commit; a
+  `running` one does not, so a newer commit during a fetch queues its
+  successor. A parked `Pull` — a remote that refused this copy — is never
+  joined by this call, only by a person's retry, and that check is the insert's
+  own statement (`INSERT … WHERE NOT EXISTS`). A paused or push-only folder is
+  not pulled. Logged as `remote poll queued reason=doorbell`. `wake_now` is not
+  this: it is a request to *look*, and opens the next walk over the whole index.
+
 ## 16. Security posture
 
 - Credentials live in the OS keychain (or, headless, a `0600` file). Everything

@@ -1699,3 +1699,96 @@ the app's own facts in place of `agentd.toml`:
   With no other host running, nothing takes over while the Mac sleeps.
 - **Quit.** Running turns get their final edits, the drives are committed and pushed, and then the
   manifest is withdrawn and every claim released. Closing the window keeps hosting.
+- **The doorbell.** The Mac rings and answers doorbells over the app's own sync engine, handed to the
+  host once the sync supervisor has opened it (§ *How another host finds out*); it opens no engine
+  of its own.
+
+## How another host finds out
+
+A host that pushes agent work rings the hosts that should fetch it, and a host that hears the bell
+fetches that drive at once instead of at its five-minute remote poll. The bell is a Matrix **state**
+event, unencrypted even in an encrypted room:
+
+```json
+{"type": "dev.keeper.agent.doorbell", "state_key": "<drive id>",
+ "content": {"v": 1, "drive": "<drive id>", "commit": "<full sha>", "reason": "session|artifact|card|memory"}}
+```
+
+It names a drive, a commit and one of four words — no path, no title, nothing a person wrote —
+which is what every member of a control room already reads in the hosts' manifests. Being state,
+the last bell is the room's: it is "the latest commit", not a queue.
+
+**Ringing.** After each push of a drive whose zone hosts, the engine says what it published — the
+remote's previous tip and the new one (`Engine::push_tap`) — and which files that range changed
+(`Engine::changed_paths`). keeper-core sorts the files:
+
+| what the push changed | reason | rung in |
+| --- | --- | --- |
+| a session's `agent.toml` (a new session) | `session` | that session's room |
+| a card of an active session (any `.md` outside `artifacts/`, `log/`, `workspace/`) | `card` | that session's room |
+| a file under a session's `artifacts/` | `artifact` | that session's room |
+| anything under the agents zone (`80-agents/`) | `memory` | the principal's control room, and every other control room a copy here is in whose hosts' manifests list the drive |
+| anything else (notes, a log chunk, the workspace, an archived session) | — | nothing |
+
+A session rung for several reasons in one push is rung once, for the first in the table. A room is
+rung only when the drive's readers may reach every member of it, joined or invited, whatever power
+the room gives them (R160): an agent this host knows — homed in a drive it mounts by its pins,
+hosted here or not, a visiting steward at power 0 included — counts through its own audience, and
+every other member, an account at agent power included, counts as a person who must be a reader. A
+room whose members cannot be read is not rung. A session's room is read from its `agent.toml`
+through the zone's containment: a link out of the sessions zone, or anything but a regular file,
+names no room.
+
+Pushes are coalesced per drive (a later push widens the range) and rung off the host's tick: at most
+one ringing is in flight, each send is bounded, and a tick never waits on the network, so claim
+renewal and stopping are never held behind a slow homeserver. When the host stops — agentd after
+its engine's last push, the Mac on quit after the app has pushed the drives — what the last pushes
+published is rung within five seconds, before the copies go quiet.
+
+**Answering.** A copy hears a bell however its sync carries it — in a room's timeline or in its
+state section (a first sync, a room just joined, a gappy sync) — and, whenever what admits a bell
+changes (the drives read, the engine handed over, another copy synced), reads every room's cached
+bells again, so a bell that arrived before the host was ready is not lost. A bell is admitted when
+it reads — this version, keyed by the drive it names, a full commit id — names a drive this host
+mounts by its device-local pin (agentd's `[[drives]]`, the Mac's pinned folders, another
+principal's included; an id two folders claim, or a `_drive.toml` the pin refused, maps nothing),
+and comes from one of the principal's agents or an agent the pinned zone of that drive homes. An
+admitted bell becomes its drive's one pending bell, the last commit winning; each tick answers a
+few drives off the clock. If the commit is not here, the engine is asked once: `Engine::pull_now`
+queues one `Pull` — no walk, the paced poll re-armed. The same commit asked twice, from two copies
+at once or while its pull runs, queues once; a newer commit during a running pull queues its
+successor; a `Pull` parked by a remote that refused this copy is not asked again by a bell (a
+person's *Retry* is) — the parked check and the insert are one journal statement. A sender whose
+last fetch of a drive has not brought its commit gets at most one fetch of that drive a minute; its
+latest bell waits, and the poll still runs. Anything else is ignored.
+
+**A drive several principals mount.** neuradrive is mounted by `agentd-tgorka` and
+`agentd-neuraffica`, whose control rooms differ. A person who reads neuradrive invites its steward
+(`@lucyna-novak`) into their own control room from keeper or any Matrix client; the steward's host
+joins a control-room invite only from someone who is not an agent it knows and who reads the
+steward's home drive by its pins, and leaves every other control-room invite pending. In the visited
+room the steward has power 0: it may set a doorbell, and nothing else — a host manifest from it is
+refused by the server. Every control room `keeper-agentd init` makes opens the doorbell at 0; a room
+made before that is brought up to date at start by the host of its creator (or any agent with the
+power), as presence was, and a host that may not says so once in its log.
+
+**What it costs.** One fetch of one branch per new commit, on the host that was rung — and at most
+one a minute per drive from a sender whose commits do not arrive. A bell never walks the folder:
+`wake_now`, which opens the next walk over the whole index, is not a doorbell.
+
+**Proven:** `pull_now_fetches_once_and_walks_nothing`, `a_doorbell_asks_once_per_commit_under_racing_rings`,
+`a_push_tells_its_tap_the_range_it_published` and `a_doorbell_brings_the_commit_within_two_ticks`
+(two engines over one bare remote: the commit is there within two ticks of the bell, with no walk)
+in keeper-sync; `a_push_rings_only_for_agent_work`, `a_shared_drive_rings_every_control_room_that_lists_it`,
+`a_doorbell_is_not_rung_past_the_drive_s_readers`, `a_bell_cached_before_the_host_was_ready_is_answered_once_it_is`,
+`a_stalled_doorbell_never_holds_the_tick`, `the_last_push_is_rung_when_the_host_stops`,
+`a_doorbell_pulls_its_drive_once`, `a_sender_whose_commits_never_arrive_is_paced`,
+`a_drive_two_folders_claim_is_not_answered`, `a_session_linked_out_of_the_zone_names_no_room`,
+`the_doorbell_hears_by_the_pins` and the control-room rows of `invite_decision_table` in
+keeper-agent; and against Synapse 1.156, `live_doorbell.rs`: a level-0 visitor's doorbell is
+accepted and its manifest refused, a room without the row refuses the bell until its creator's
+update, a host syncing the room for the first time hears the bell through `doorbell::listen` and
+asks one pull, and the room's real members — the visitor at power 0 among them — pass the audience
+check only with the visitor known as an agent. **Owed:** NFR-122 on the tailnet — p95 from a push
+on electra or hesperia to the other host holding the commit, by doorbell, at most 15 s over 100
+session changes — is an operator measurement on the two hosts (DW-452).

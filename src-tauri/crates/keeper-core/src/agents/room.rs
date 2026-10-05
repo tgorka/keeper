@@ -914,6 +914,22 @@ pub fn holds_agent_power(levels: Option<&RoomPowerLevels>, user: &UserId) -> boo
     levels.is_some_and(|levels| levels.for_user(user) >= Int::from(AGENT_POWER as i32))
 }
 
+/// Everyone in `room` or invited to it as its server lists them now,
+/// whatever power the room gives them: who an event sent there reaches.
+/// `None` when the members cannot be read — an audience nobody can name.
+pub async fn room_members(room: &Room) -> Option<std::collections::BTreeSet<OwnedUserId>> {
+    let members = room
+        .members(RoomMemberships::JOIN | RoomMemberships::INVITE)
+        .await
+        .ok()?;
+    Some(
+        members
+            .iter()
+            .map(|member| member.user_id().to_owned())
+            .collect(),
+    )
+}
+
 /// An event's `type`, read without parsing the rest of it.
 fn event_type(raw: &Raw<AnySyncTimelineEvent>) -> Option<&str> {
     raw.get_field::<&str>("type").ok().flatten()

@@ -14,7 +14,7 @@
 //! a claim handed back is released once its worker has finished, at a later
 //! tick, so every other claim is renewed on time meanwhile.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,13 +24,16 @@ use std::time::Duration;
 use keeper_core::agents::agentd::AgentdConfig;
 use keeper_core::agents::claim::{self, Claimant, ServerClaim, RENEW_EVERY};
 use keeper_core::agents::delegation::{session_title, DelegateContent};
-use keeper_core::agents::events::{RunState, StatusContent, CLAIM, CONTENT_VERSION, HOST, STATUS};
+use keeper_core::agents::events::{
+    RunState, StatusContent, CLAIM, CONTENT_VERSION, CONTROL_ROOM_TYPE, DOORBELL, HOST, STATUS,
+};
 use keeper_core::agents::home::AgentConfig;
 use keeper_core::agents::host::{accept, bot_id, HostDrive, HostManifest, Materialized};
 use keeper_core::agents::log::reader::ClaimConflict;
 use keeper_core::agents::log::{ClaimAction, HostSlug};
 use keeper_core::agents::matrix::{AgentMatrixError, ServerState};
 use keeper_core::agents::placement::{place, Ask, Placement};
+use keeper_core::agents::room::room_members;
 use keeper_core::agents::session::{SessionAgent, SessionKind};
 use keeper_core::bots::chat::CancelSignal;
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, TransactionId};
@@ -43,6 +46,7 @@ use crate::claims::{
     self, acquire, blocked_status, bounded, conflict_of, release, renew, wall_ms, Acquired,
     ClaimFuture, ClaimPort, Lease, Moment, RoomClaims, Rtt, ServerClock, Step, REQUEST_TIMEOUT,
 };
+use crate::doorbell::{RingDrive, Round};
 use crate::matrix_sink::{EditPort, RoomPort};
 use crate::runtime::{self, spawn_worker, Claimed, Copy, DriveView, PENDING_ROOMS};
 
@@ -243,6 +247,16 @@ pub(crate) trait CopyPort: Send + Sync {
     /// delegated room it joined that no session among `served` names and
     /// that was not read back yet (R54).
     fn recover_briefs<'a>(&'a self, served: HashSet<OwnedRoomId>) -> ClaimFuture<'a, ()>;
+    /// The control rooms (`dev.keeper.agent.control`) this copy is in.
+    fn control_rooms(&self) -> Vec<OwnedRoomId>;
+    /// Everyone in `room` or invited to it, whatever their power, as the
+    /// server lists them now; `None` when they cannot be read.
+    fn members<'a>(&'a self, room: &'a RoomId) -> ClaimFuture<'a, Option<BTreeSet<OwnedUserId>>>;
+    /// Whether this copy has synced at least once.
+    fn synced(&self) -> bool;
+    /// Every doorbell in the state of the rooms this copy is in, as the
+    /// last sync left it: `(sender, state key, content)`.
+    fn doorbells(&self) -> ClaimFuture<'_, Vec<(OwnedUserId, String, Value)>>;
 }
 
 impl CopyPort for Copy {
@@ -398,6 +412,45 @@ impl CopyPort for Copy {
 
     fn recover_briefs<'a>(&'a self, served: HashSet<OwnedRoomId>) -> ClaimFuture<'a, ()> {
         Box::pin(runtime::recover_briefs(self, served))
+    }
+
+    fn control_rooms(&self) -> Vec<OwnedRoomId> {
+        self.client
+            .client()
+            .joined_rooms()
+            .into_iter()
+            .filter(|room| {
+                room.room_type()
+                    .is_some_and(|kind| kind.to_string() == CONTROL_ROOM_TYPE)
+            })
+            .map(|room| room.room_id().to_owned())
+            .collect()
+    }
+
+    fn members<'a>(&'a self, room: &'a RoomId) -> ClaimFuture<'a, Option<BTreeSet<OwnedUserId>>> {
+        Box::pin(async move {
+            let room = self.client.client().get_room(room)?;
+            tokio::time::timeout(REQUEST_TIMEOUT, room_members(&room))
+                .await
+                .ok()
+                .flatten()
+        })
+    }
+
+    fn synced(&self) -> bool {
+        *self.syncs.borrow() > 0
+    }
+
+    fn doorbells(&self) -> ClaimFuture<'_, Vec<(OwnedUserId, String, Value)>> {
+        Box::pin(async move {
+            let mut bells = Vec::new();
+            for room in self.client.client().joined_rooms() {
+                for (key, state) in self.client.cached_states(room.room_id(), DOORBELL).await {
+                    bells.push((state.sender, key, state.content));
+                }
+            }
+            bells
+        })
     }
 }
 
@@ -590,6 +643,16 @@ impl HostRuntime {
     /// The agent users whose manifests this host believes.
     pub(crate) fn principal_agents(&self) -> &[OwnedUserId] {
         &self.principal_agents
+    }
+
+    /// What a ringing over `drives` needs of this host: the drives whose
+    /// zones host, the copies, the principal's control room.
+    pub(crate) fn round(&self, drives: &[DriveView]) -> Round {
+        Round {
+            drives: drives.iter().filter_map(RingDrive::of).collect(),
+            copies: self.copies.clone(),
+            control: self.control_room.clone(),
+        }
     }
 
     /// This host's manifest at `server_now`; `live: false` withdraws it.
@@ -1479,6 +1542,11 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::doorbell::fake::FakeEngine;
+    use crate::doorbell::{Answer, Doorbell, DriveEngine, Ringer, RING_FINISH};
+    use crate::rooms::KnownAgent;
+    use keeper_core::agents::events::DoorbellReason;
+    use keeper_core::agents::label::Readers;
 
     const ME: &str = "hesperia";
     const OTHER: &str = "electra";
@@ -1848,6 +1916,8 @@ mod tests {
         events: AtomicU64,
         /// A manifest send never answers.
         stall_manifests: AtomicBool,
+        /// A doorbell send never answers.
+        stall_doorbells: AtomicBool,
         /// A claim send fails.
         fail_claims: AtomicBool,
     }
@@ -1960,6 +2030,10 @@ mod tests {
         zone: Option<PathBuf>,
         /// Every room a delegated session was made for, in order.
         created: Mutex<Vec<OwnedRoomId>>,
+        /// The control rooms this copy is in, beside its principal's.
+        controls: Mutex<Vec<OwnedRoomId>>,
+        /// Each room's members, as the server would list them.
+        members: Mutex<HashMap<OwnedRoomId, BTreeSet<OwnedUserId>>>,
     }
 
     impl CopyPort for FakeCopy {
@@ -2012,7 +2086,12 @@ mod tests {
             content: &'a Value,
         ) -> ClaimFuture<'a, Result<OwnedEventId, AgentMatrixError>> {
             Box::pin(async move {
-                if self.server.stall_manifests.load(Ordering::Relaxed) {
+                let stall = if event_type == DOORBELL {
+                    &self.server.stall_doorbells
+                } else {
+                    &self.server.stall_manifests
+                };
+                if stall.load(Ordering::Relaxed) {
                     std::future::pending::<()>().await;
                 }
                 Ok(self.server.put(
@@ -2132,6 +2211,37 @@ mod tests {
                     std::future::ready(next)
                 })
                 .await;
+            })
+        }
+
+        fn control_rooms(&self) -> Vec<OwnedRoomId> {
+            self.controls.lock().expect("lock").clone()
+        }
+
+        fn members<'a>(
+            &'a self,
+            room: &'a RoomId,
+        ) -> ClaimFuture<'a, Option<BTreeSet<OwnedUserId>>> {
+            Box::pin(async move { self.members.lock().expect("lock").get(room).cloned() })
+        }
+
+        fn synced(&self) -> bool {
+            true
+        }
+
+        fn doorbells(&self) -> ClaimFuture<'_, Vec<(OwnedUserId, String, Value)>> {
+            Box::pin(async move {
+                let joined = self.joined.lock().expect("lock").clone();
+                self.server
+                    .states
+                    .lock()
+                    .expect("lock")
+                    .iter()
+                    .filter(|((room, kind, _), _)| kind == DOORBELL && joined.contains(room))
+                    .map(|((_, _, key), state)| {
+                        (state.sender.clone(), key.clone(), state.content.clone())
+                    })
+                    .collect()
             })
         }
     }
@@ -2379,7 +2489,493 @@ mod tests {
             reads: Mutex::default(),
             zone: None,
             created: Mutex::default(),
+            controls: Mutex::default(),
+            members: Mutex::default(),
         }
+    }
+
+    /// A drive's checkout at `root`, its zones at their defaults, read by
+    /// `readers`.
+    fn drive_view(root: &Path, id: &str, readers: &[&str]) -> DriveView {
+        let mut profile = keeper_sync::SyncProfile::new(
+            id.to_owned(),
+            id.to_owned(),
+            root.to_path_buf(),
+            String::new(),
+        );
+        profile.sessions = Some(Default::default());
+        profile.agents = Some(Default::default());
+        let readers: Vec<String> = readers.iter().map(|r| format!("\"{r}\"")).collect();
+        let decl = keeper_core::agents::drive::parse(&format!(
+            "version = 1\nid = \"{id}\"\ntitle = \"{id}\"\nprincipal = \"tgorka\"\nowner = \"{PERSON}\"\nreaders = [{}]\n",
+            readers.join(", ")
+        ))
+        .expect("decl");
+        runtime::view(id, profile, Ok(decl))
+    }
+
+    /// A git repository at `dir`, committed by hand: `commit` writes files
+    /// and answers the new commit's id. `None` with no `git`.
+    struct Repo<'a> {
+        dir: &'a Path,
+    }
+
+    impl Repo<'_> {
+        fn git(&self, args: &[&str]) -> Option<String> {
+            let out = std::process::Command::new("git")
+                .current_dir(self.dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .args(args)
+                .output()
+                .ok()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        }
+
+        fn init(dir: &Path) -> Option<Repo<'_>> {
+            let repo = Repo { dir };
+            repo.git(&["init", "-q", "-b", "main"])?;
+            Some(repo)
+        }
+
+        fn commit(&self, files: &[(&str, &str)]) -> String {
+            for (rel, text) in files {
+                let path = self.dir.join(rel);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+                std::fs::write(path, text).expect("write");
+            }
+            self.git(&["add", "-A"]).expect("add");
+            self.git(&["commit", "-q", "-m", "c"]).expect("commit");
+            self.git(&["rev-parse", "HEAD"]).expect("head")
+        }
+    }
+
+    /// A session `agent.toml` naming `room`.
+    fn session_toml(room: &OwnedRoomId) -> String {
+        let decl = keeper_core::agents::drive::parse(&drive_toml()).expect("decl");
+        keeper_core::agents::session::compose_session_agent_toml(&SessionAgent {
+            id: ulid::Ulid::new(),
+            agent: "nixi".to_owned(),
+            drive: "tgdrive".to_owned(),
+            kind: SessionKind::Conversation,
+            title: "work".to_owned(),
+            requested_by: user(PERSON),
+            parent: None,
+            room: room.clone(),
+            drives: vec!["tgdrive".to_owned()],
+            label: Label::opening(&decl, Integrity::Owner),
+            needs: None,
+            pin: None,
+            hop: 0,
+            dispatch_chain: Vec::new(),
+            limits: None,
+            workflow: None,
+            created_at: chrono::Utc::now(),
+        })
+    }
+
+    fn ringing_runtime(copy: &Arc<FakeCopy>, control: OwnedRoomId) -> HostRuntime {
+        let mut w = world_over(Arc::clone(copy), false);
+        w.rt.control_room = Some(control);
+        w.rt
+    }
+
+    fn doorbells(server: &Server) -> usize {
+        server
+            .sends
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|send| send.starts_with(DOORBELL))
+            .count()
+    }
+
+    /// 92.4 acceptance 4: who rings, and where.
+    #[tokio::test]
+    async fn a_push_rings_only_for_agent_work() {
+        let root = tempfile::tempdir().expect("root");
+        let Some(repo) = Repo::init(root.path()) else {
+            return;
+        };
+        let (session, shared) = (room(1), room(2));
+        let copy = Arc::new(fake_copy());
+        for (room, people) in [
+            (&session, vec![PERSON]),
+            (&shared, vec![PERSON, "@marta:example.org"]),
+            (&control(), vec![PERSON]),
+        ] {
+            copy.joined.lock().expect("lock").insert(room.clone());
+            copy.members
+                .lock()
+                .expect("lock")
+                .insert(room.clone(), people.into_iter().map(user).collect());
+        }
+        let rt = ringing_runtime(&copy, control());
+        let drives = [drive_view(root.path(), "tgdrive", &[PERSON])];
+        let engine: Arc<dyn DriveEngine> = Arc::new(FakeEngine {
+            repo: Some(root.path().to_path_buf()),
+            ..FakeEngine::default()
+        });
+        let mut from = repo.commit(&[("README.md", "seed")]);
+        let toml = session_toml(&session);
+        let shared_toml = session_toml(&shared);
+        // What one push writes, and the rooms it must ring.
+        type Step<'a> = (&'a [(&'a str, &'a str)], Vec<(OwnedRoomId, DoorbellReason)>);
+        let steps: [Step; 6] = [
+            (
+                &[
+                    ("60-sessions/active/a/agent.toml", toml.as_str()),
+                    ("60-sessions/active/a/brief.md", "card"),
+                ],
+                vec![(session.clone(), DoorbellReason::Session)],
+            ),
+            (
+                &[("60-sessions/active/a/artifacts/out.md", "out")],
+                vec![(session.clone(), DoorbellReason::Artifact)],
+            ),
+            (
+                &[("60-sessions/active/a/brief.md", "card, moved")],
+                vec![(session.clone(), DoorbellReason::Card)],
+            ),
+            (
+                &[("80-agents/nixi/MEMORY.md", "remembered")],
+                vec![(control(), DoorbellReason::Memory)],
+            ),
+            (&[("10-notes/today.md", "a note")], Vec::new()),
+            // A session whose room holds Marta, who does not read tgdrive.
+            (
+                &[
+                    ("60-sessions/active/b/agent.toml", shared_toml.as_str()),
+                    ("60-sessions/active/b/brief.md", "card"),
+                ],
+                Vec::new(),
+            ),
+        ];
+        for (files, expected) in steps {
+            let to = repo.commit(files);
+            let pushed = keeper_sync::engine::Pushed {
+                profile_id: "tgdrive".to_owned(),
+                from: Some(from.clone()),
+                to: to.clone(),
+            };
+            assert_eq!(
+                rt.round(&drives).ring(&pushed, &engine, &[]).await,
+                expected,
+                "{files:?}"
+            );
+            for (room, reason) in &expected {
+                let rung = copy.server.get(room, DOORBELL, "tgdrive").expect("rung");
+                assert_eq!(
+                    rung.content,
+                    json!({"v": 1, "drive": "tgdrive", "commit": to, "reason": reason})
+                );
+            }
+            from = to;
+        }
+        assert!(
+            copy.server.get(&shared, DOORBELL, "tgdrive").is_none(),
+            "nothing reached the room with a person outside the readers"
+        );
+    }
+
+    fn lucyna(readers: &[&str]) -> KnownAgent {
+        KnownAgent {
+            id: "lucyna-novak".to_owned(),
+            drive: "neuradrive".to_owned(),
+            name: "Dr Lucyna Novak".to_owned(),
+            matrix_user: user("@lucyna-novak:example.org"),
+            kind: keeper_core::agents::home::AgentKind::Steward,
+            human: None,
+            hosted: false,
+            home_readers: Readers::Only(readers.iter().map(|r| user(r)).collect()),
+            opening: Label::top(),
+            drives: vec!["neuradrive".to_owned()],
+        }
+    }
+
+    /// A host manifest of `host` listing `drive`.
+    fn listing(host: &str, drive: &str) -> Value {
+        serde_json::to_value(HostManifest {
+            v: 1,
+            host: host.to_owned(),
+            principal: "tgorka".to_owned(),
+            version: "0.92.0".to_owned(),
+            always_on: true,
+            tools: Vec::new(),
+            drives: vec![HostDrive {
+                id: drive.to_owned(),
+                present: true,
+                materialized: Materialized::Full,
+            }],
+            bots: Vec::new(),
+            agents: Vec::new(),
+            renewed_at: "2026-10-05T00:00:00Z".to_owned(),
+            expires_at: "2026-10-05T00:03:00Z".to_owned(),
+        })
+        .expect("manifest")
+    }
+
+    /// `copy` in the control room `room` with `members`, a manifest there
+    /// listing `drive`.
+    fn in_control_room(copy: &FakeCopy, room: &OwnedRoomId, members: &[&str], drive: &str) {
+        copy.joined.lock().expect("lock").insert(room.clone());
+        copy.controls.lock().expect("lock").push(room.clone());
+        copy.members
+            .lock()
+            .expect("lock")
+            .insert(room.clone(), members.iter().map(|m| user(m)).collect());
+        copy.server.put(
+            room,
+            HOST,
+            "electra",
+            &user("@nixi:example.org"),
+            listing("electra", drive),
+        );
+    }
+
+    /// A pushed memory change of neuradrive in a fresh repository, with
+    /// an engine reading it; `None` with no `git`.
+    fn neuradrive_push(root: &Path) -> Option<(Arc<dyn DriveEngine>, keeper_sync::engine::Pushed)> {
+        let repo = Repo::init(root)?;
+        let from = repo.commit(&[("README.md", "seed")]);
+        let to = repo.commit(&[("80-agents/lucyna-novak/MEMORY.md", "consolidated")]);
+        let engine: Arc<dyn DriveEngine> = Arc::new(FakeEngine {
+            repo: Some(root.to_path_buf()),
+            ..FakeEngine::default()
+        });
+        let pushed = keeper_sync::engine::Pushed {
+            profile_id: "neuradrive".to_owned(),
+            from: Some(from),
+            to,
+        };
+        Some((engine, pushed))
+    }
+
+    /// 92.4 acceptance 9 (the routing; the server's half is the live test),
+    /// R160 (review DB-01): Dr Lucyna Novak's host pushes a memory change
+    /// to neuradrive. Its own control room and agentd-tgorka's, which she
+    /// visits at power 0 and whose manifests list neuradrive, each get one
+    /// doorbell — the visiting steward counts through her audience, not as
+    /// a person — and no other room does; the tgorka host's receiver hears
+    /// it and pulls once.
+    #[tokio::test]
+    async fn a_shared_drive_rings_every_control_room_that_lists_it() {
+        let root = tempfile::tempdir().expect("root");
+        let Some((engine, pushed)) = neuradrive_push(root.path()) else {
+            return;
+        };
+        let marta = "@marta:example.org";
+        let visitor = "@lucyna-novak:example.org";
+        let room_of =
+            |name: &str| OwnedRoomId::try_from(format!("!{name}:example.org")).expect("room");
+        let (own, visited, other) = (room_of("neuraffica"), room_of("tgorka"), room_of("other"));
+        let copy = Arc::new(fake_copy());
+        in_control_room(&copy, &own, &[marta, visitor], "neuradrive");
+        in_control_room(&copy, &visited, &[PERSON, visitor], "neuradrive");
+        in_control_room(&copy, &other, &[PERSON, visitor], "tgdrive");
+        let rt = ringing_runtime(&copy, own.clone());
+        let drives = [drive_view(root.path(), "neuradrive", &[PERSON, marta])];
+        let agents = [lucyna(&[PERSON, marta])];
+        let mut rung = rt.round(&drives).ring(&pushed, &engine, &agents).await;
+        rung.sort();
+        let mut expected = vec![
+            (own.clone(), DoorbellReason::Memory),
+            (visited.clone(), DoorbellReason::Memory),
+        ];
+        expected.sort();
+        assert_eq!(rung, expected);
+        assert_eq!(
+            doorbells(&copy.server),
+            2,
+            "one doorbell per room, none elsewhere"
+        );
+
+        // agentd-tgorka hears it in its control room: one pull.
+        let heard = copy
+            .server
+            .get(&visited, DOORBELL, "neuradrive")
+            .expect("rung");
+        let tgorka_engine = Arc::new(FakeEngine::default());
+        let receiver = Doorbell::default();
+        receiver.set_engine(Arc::clone(&tgorka_engine) as Arc<dyn DriveEngine>);
+        receiver.set_drives(
+            [("neuradrive".to_owned(), "neuradrive".to_owned())],
+            agents.to_vec(),
+        );
+        receiver.set_principal_agents(&[user("@nixi:example.org")]);
+        assert_eq!(
+            receiver.hear(&heard.sender, "neuradrive", &heard.content),
+            Answer::Heard
+        );
+        assert_eq!(
+            receiver.deliver(std::time::Instant::now(), 4),
+            vec![("neuradrive".to_owned(), Answer::Pulled)]
+        );
+        assert_eq!(
+            *tgorka_engine.pulls.lock().expect("lock"),
+            vec![("neuradrive".to_owned(), pushed.to)]
+        );
+    }
+
+    /// R160 (review DB-02): a room listing the drive is not rung when any
+    /// member is outside its readers, whatever power the room gives them —
+    /// an outsider, an account this host cannot name as an agent, or an
+    /// agent whose own audience is wider than the readers.
+    #[tokio::test]
+    async fn a_doorbell_is_not_rung_past_the_drive_s_readers() {
+        let root = tempfile::tempdir().expect("root");
+        let Some((engine, pushed)) = neuradrive_push(root.path()) else {
+            return;
+        };
+        let marta = "@marta:example.org";
+        let visitor = "@lucyna-novak:example.org";
+        let wide = "@tola-grey:example.org";
+        let copy = Arc::new(fake_copy());
+        let (outsider, unnamed, wider, fine) = (room(1), room(2), room(3), room(4));
+        in_control_room(
+            &copy,
+            &outsider,
+            &[PERSON, visitor, "@mallory:example.org"],
+            "neuradrive",
+        );
+        in_control_room(
+            &copy,
+            &unnamed,
+            &[PERSON, visitor, "@bot:example.org"],
+            "neuradrive",
+        );
+        in_control_room(&copy, &wider, &[PERSON, visitor, wide], "neuradrive");
+        in_control_room(&copy, &fine, &[PERSON, marta, visitor], "neuradrive");
+        let mut tola = lucyna(&[PERSON, "@eve:example.org"]);
+        tola.matrix_user = user(wide);
+        tola.drive = "tgdrive".to_owned();
+        let rt = ringing_runtime(&copy, fine.clone());
+        let drives = [drive_view(root.path(), "neuradrive", &[PERSON, marta])];
+        let rung = rt
+            .round(&drives)
+            .ring(&pushed, &engine, &[lucyna(&[PERSON, marta]), tola])
+            .await;
+        assert_eq!(rung, vec![(fine, DoorbellReason::Memory)]);
+        assert_eq!(doorbells(&copy.server), 1);
+    }
+
+    /// R161 (review DB-03): a bell the copy's sync left in a room's state
+    /// while the host could not yet admit it — no drives read — is heard
+    /// again from the cached state once it can, and answered with a pull.
+    #[tokio::test]
+    async fn a_bell_cached_before_the_host_was_ready_is_answered_once_it_is() {
+        let copy = Arc::new(fake_copy());
+        let visited = room(7);
+        in_control_room(&copy, &visited, &[PERSON], "neuradrive");
+        let commit = "d".repeat(40);
+        let bell = json!({"v": 1, "drive": "neuradrive", "commit": commit, "reason": "memory"});
+        copy.server.put(
+            &visited,
+            DOORBELL,
+            "neuradrive",
+            &user("@lucyna-novak:example.org"),
+            bell.clone(),
+        );
+        let engine = Arc::new(FakeEngine::default());
+        let doorbell = Arc::new(Doorbell::default());
+        doorbell.set_engine(Arc::clone(&engine) as Arc<dyn DriveEngine>);
+        assert_eq!(
+            doorbell.hear(&user("@lucyna-novak:example.org"), "neuradrive", &bell),
+            Answer::UnknownDrive,
+            "heard before the drives were read"
+        );
+        let rt = ringing_runtime(&copy, control());
+        let round = rt.round(&[]);
+        let (_tx, rx) = tokio::sync::broadcast::channel(4);
+        let mut ringer = Ringer::over(Arc::clone(&engine) as Arc<dyn DriveEngine>, rx);
+        ringer.tick(&round, &doorbell);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(engine.pulls.lock().expect("lock").is_empty());
+
+        doorbell.set_drives(
+            [("neuradrive".to_owned(), "p-neura".to_owned())],
+            vec![lucyna(&[PERSON])],
+        );
+        for _ in 0..100 {
+            ringer.tick(&round, &doorbell);
+            if !engine.pulls.lock().expect("lock").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            *engine.pulls.lock().expect("lock"),
+            vec![("p-neura".to_owned(), commit)]
+        );
+    }
+
+    /// R161 (review DB-08): a doorbell send that never answers, under a
+    /// stream of pushes, never holds the host's tick: each tick returns at
+    /// once, the pushes wait coalesced, and stopping is bounded.
+    #[tokio::test]
+    async fn a_stalled_doorbell_never_holds_the_tick() {
+        let root = tempfile::tempdir().expect("root");
+        let Some((engine, pushed)) = neuradrive_push(root.path()) else {
+            return;
+        };
+        let copy = Arc::new(fake_copy());
+        copy.server.stall_doorbells.store(true, Ordering::Relaxed);
+        let own = control();
+        in_control_room(&copy, &own, &[PERSON], "neuradrive");
+        let rt = ringing_runtime(&copy, own);
+        let drives = [drive_view(root.path(), "neuradrive", &[PERSON])];
+        let round = rt.round(&drives);
+        let doorbell = Arc::new(Doorbell::default());
+        let (tx, rx) = tokio::sync::broadcast::channel(64);
+        let mut ringer = Ringer::over(engine, rx);
+        for _ in 0..20 {
+            for _ in 0..3 {
+                tx.send(pushed.clone()).expect("send");
+            }
+            tokio::time::timeout(Duration::from_millis(20), async {
+                ringer.tick(&round, &doorbell);
+            })
+            .await
+            .expect("a tick returns at once while a send stalls");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            ringer.finish(&round, &doorbell, Duration::from_millis(200)),
+        )
+        .await
+        .expect("stopping is bounded");
+        assert_eq!(doorbells(&copy.server), 0);
+    }
+
+    /// R161 (review DB-10): a push that completes after the host's last
+    /// tick is rung when the host stops.
+    #[tokio::test]
+    async fn the_last_push_is_rung_when_the_host_stops() {
+        let root = tempfile::tempdir().expect("root");
+        let Some((engine, pushed)) = neuradrive_push(root.path()) else {
+            return;
+        };
+        let copy = Arc::new(fake_copy());
+        let own = control();
+        in_control_room(&copy, &own, &[PERSON], "neuradrive");
+        let rt = ringing_runtime(&copy, own.clone());
+        let drives = [drive_view(root.path(), "neuradrive", &[PERSON])];
+        let round = rt.round(&drives);
+        let doorbell = Arc::new(Doorbell::default());
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        let mut ringer = Ringer::over(engine, rx);
+        ringer.tick(&round, &doorbell);
+        tx.send(pushed.clone()).expect("the final push");
+        ringer.finish(&round, &doorbell, RING_FINISH).await;
+        let rung = copy.server.get(&own, DOORBELL, "neuradrive").expect("rung");
+        assert_eq!(rung.content["commit"], pushed.to);
     }
 
     /// A pin written into a served session's `agent.toml` reaches placement

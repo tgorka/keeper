@@ -2236,6 +2236,59 @@ pub fn enqueue_paced_pull(conn: &Connection, profile_id: &str, now_ms: i64) -> R
     })
 }
 
+/// What [`enqueue_doorbell_pull`] did with one peer's doorbell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoorbellPull {
+    /// A new `Pull` row was written.
+    Queued,
+    /// A `pending` or `deferred` `Pull` already covers it, backoff and all.
+    Covered,
+    /// A `parked` `Pull` waits for a person's retry.
+    Parked,
+}
+
+/// A peer's doorbell's enqueue: one `Pull` unless a `pending` or `deferred`
+/// one covers it or a `parked` one waits for a person.
+///
+/// Unlike [`enqueue_paced_pull`], a `running` pull is not cover: a doorbell
+/// during a fetch names a commit that fetch may have missed, so a successor
+/// is queued (the caller never asks twice for one commit). A `parked` pull
+/// is, for the poll's reason: a remote that refused this copy is not asked
+/// again on a peer's say-so. One `INSERT … WHERE NOT EXISTS`, so a pull
+/// parked by another connection cannot slip between a check and the insert.
+pub fn enqueue_doorbell_pull(
+    conn: &Connection,
+    profile_id: &str,
+    now_ms: i64,
+) -> Result<DoorbellPull> {
+    let kind = WorkKind::Pull;
+    let payload = serde_json::to_string(&kind)
+        .map_err(|e| SyncError::Journal(format!("work item is not serializable: {e}")))?;
+    let inserted = conn.execute(
+        "INSERT INTO journal (profile_id, kind, payload, state, not_before_ms, created_ms)
+         SELECT ?1, ?2, ?3, 'pending', ?4, ?4
+          WHERE NOT EXISTS (
+                SELECT 1 FROM journal
+                 WHERE profile_id = ?1 AND payload = ?3
+                   AND state IN ('pending','deferred','parked'))",
+        (profile_id, kind.tag(), &payload, now_ms),
+    )?;
+    if inserted > 0 {
+        return Ok(DoorbellPull::Queued);
+    }
+    let parked: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM journal
+                         WHERE profile_id = ?1 AND payload = ?2 AND state = 'parked')",
+        (profile_id, &payload),
+        |r| r.get(0),
+    )?;
+    Ok(if parked {
+        DoorbellPull::Parked
+    } else {
+        DoorbellPull::Covered
+    })
+}
+
 /// Claim the ready units for one profile, marking them `running` so two
 /// supervisors can never take the same row.
 ///

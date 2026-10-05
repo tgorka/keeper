@@ -30,6 +30,8 @@
 //!   file, and makes a proxy's DM with its `main` session.
 //! - [`surface`] names a note the person looks at by its drive.
 //! - [`delegate`] hands work to another agent and answers a delegation.
+//! - [`doorbell`] rings the hosts that should fetch a push of agent work,
+//!   and fetches when it is rung.
 
 // matrix-sdk's sync future is deep enough to need it, as in keeper-core.
 #![recursion_limit = "256"]
@@ -41,6 +43,8 @@ pub mod claims;
 pub mod delegate;
 #[cfg(unix)]
 pub mod desktop;
+#[cfg(unix)]
+pub mod doorbell;
 pub mod drive;
 pub mod grants;
 #[cfg(unix)]

@@ -13,6 +13,9 @@
 //! * [`unified_diff`] — the `@@` hunks between two revisions, or a revision
 //!   and the working tree, in the format `git diff --unified=3` prints;
 //! * [`dirty_paths`] — the paths under a prefix whose bytes differ from `HEAD`.
+//! * [`changed_between`] and [`holds_commit`] — what a pushed range touched,
+//!   and whether a commit a peer named is here yet: what a doorbell is rung
+//!   from and answered with, on every platform.
 //!
 //! One deliberate difference from the desktop: [`file_log`] does not follow
 //! renames (`git log --follow`). A note's identity is its ULID and survives a
@@ -204,6 +207,58 @@ pub fn recent_commits(repo_path: &Path, prefix: &str, limit: usize) -> Result<Ve
         });
     }
     Ok(out)
+}
+
+/// The commit `rev` names, read from a full hex id; `None` when this copy
+/// does not hold it as a commit.
+fn commit_by_id<'repo>(repo: &'repo gix::Repository, rev: &str) -> Option<gix::Commit<'repo>> {
+    let id = gix::ObjectId::from_hex(rev.as_bytes()).ok()?;
+    repo.find_object(id).ok()?.try_into_commit().ok()
+}
+
+/// Whether this copy holds the commit `id` (a full hex object id).
+pub fn holds_commit(repo_path: &Path, id: &str) -> Result<bool> {
+    let repo = open(repo_path)?;
+    let held = commit_by_id(&repo, id).is_some();
+    Ok(held)
+}
+
+/// The files that differ between the trees of commits `from` and `to`,
+/// repository-relative and `/`-separated, each once. `from` = `None` is the
+/// empty tree: everything `to` holds. A rename is both paths, as on
+/// [`recent_commits`].
+pub fn changed_between(repo_path: &Path, from: Option<&str>, to: &str) -> Result<Vec<String>> {
+    let repo = open(repo_path)?;
+    let missing = |id: &str| SyncError::Git(format!("this copy does not hold the commit {id}"));
+    let to_tree = commit_by_id(&repo, to)
+        .ok_or_else(|| missing(to))?
+        .tree()
+        .map_err(|err| walk_error(&err))?;
+    let from_tree = match from {
+        Some(from) => commit_by_id(&repo, from)
+            .ok_or_else(|| missing(from))?
+            .tree()
+            .map_err(|err| walk_error(&err))?,
+        None => repo.empty_tree(),
+    };
+    let mut paths = Vec::new();
+    from_tree
+        .changes()
+        .map_err(|err| walk_error(&err))?
+        .options(|options| {
+            options.track_path();
+            options.track_rewrites(None);
+        })
+        .for_each_to_obtain_tree(&to_tree, |change| {
+            if !change.entry_mode().is_tree() {
+                paths.push(change.location().to_str_lossy().into_owned());
+            }
+            Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(()))
+        })
+        .map_err(|err| walk_error(&err))?;
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 /// One path's bytes as of `rev`, or `None` where that revision does not hold

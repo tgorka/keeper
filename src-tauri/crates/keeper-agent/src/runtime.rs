@@ -43,8 +43,8 @@ use std::time::Duration;
 use keeper_core::agents::agentd::{AgentdConfig, DrivePin};
 use keeper_core::agents::drive::{self, DriveDecl};
 use keeper_core::agents::events::{
-    presence_levels, PresenceLevels, APPROVAL_DECISION, CONTROL_ROOM_TYPE, CONVERSATION_REQUEST,
-    DELEGATE, PRESENCE, SCOPE, SESSION_ROOM_TYPE, SURFACE_REQUEST, SURFACE_RESULT, TURN,
+    control_levels, ControlLevels, APPROVAL_DECISION, CONTROL_ROOM_TYPE, CONVERSATION_REQUEST,
+    DELEGATE, DOORBELL, PRESENCE, SCOPE, SESSION_ROOM_TYPE, SURFACE_REQUEST, SURFACE_RESULT, TURN,
 };
 use keeper_core::agents::index::Index;
 use keeper_core::agents::label::{Label, Readers};
@@ -79,6 +79,7 @@ use crate::agent::{
 };
 use crate::claims::Lease;
 use crate::delegate::{BoolFuture, BriefRoomFuture, DelegationPort, EventsFuture, MembersFuture};
+use crate::doorbell::{self as bells, Doorbell, DriveEngine, Ringer, RING_FINISH};
 use crate::headless::{
     apply_providers, drive_path, open_engine, zone_verdicts, HeadlessError, HeadlessPlatform,
     HeadlessSyncPlatform, SecretMap,
@@ -267,9 +268,20 @@ pub(crate) fn known_with(
     drives: &[DriveView],
     hosted: &[AgentHome],
 ) -> Known {
+    Known {
+        agents: known_agents(drives.iter().map(|drive| &drive.zone), hosted),
+        trust,
+    }
+}
+
+/// Every agent `zones` home, each `hosted` when an entry of `hosted` is it.
+pub(crate) fn known_agents<'a>(
+    zones: impl IntoIterator<Item = &'a ZoneRead>,
+    hosted: &[AgentHome],
+) -> Vec<KnownAgent> {
     let mut agents = Vec::new();
-    for drive in drives {
-        for (_, home) in &drive.zone.homes {
+    for zone in zones {
+        for (_, home) in &zone.homes {
             let Ok(home) = home else { continue };
             let readers = Readers::Only(home.config.audience.clone());
             agents.push(KnownAgent {
@@ -290,7 +302,16 @@ pub(crate) fn known_with(
             });
         }
     }
-    Known { agents, trust }
+    agents
+}
+
+/// Each drive's id and its engine's profile id: what a doorbell is mapped
+/// by. agentd's ids are its pins'.
+pub(crate) fn mounted(drives: &[DriveView]) -> Vec<(String, String)> {
+    drives
+        .iter()
+        .map(|drive| (drive.id.clone(), drive.profile.id.clone()))
+        .collect()
 }
 
 /// A copy's client, restored from its stored session; `None` when `login`
@@ -562,6 +583,8 @@ pub(crate) struct Copy {
     /// yet, addressed to this agent: placement decides which host makes the
     /// session (R54). Bounded like the router's rooms.
     pub(crate) pending: Mutex<PendingBriefs>,
+    /// The host's receiver: doorbells this copy hears are answered by it.
+    pub(crate) doorbell: Arc<Doorbell>,
 }
 
 /// The claim a worker writes under (story 90.6).
@@ -657,6 +680,7 @@ pub(crate) fn start_copy(
     deps: Arc<AgentDeps>,
     client: AgentClient,
     known: Arc<RwLock<Arc<Known>>>,
+    doorbell: Arc<Doorbell>,
 ) -> (Arc<Copy>, JoinHandle<()>) {
     let (rounds, rounds_seen) = watch::channel(0u64);
     let copy = Arc::new(Copy {
@@ -667,6 +691,7 @@ pub(crate) fn start_copy(
         syncs: rounds_seen,
         children: Arc::default(),
         pending: Mutex::default(),
+        doorbell,
     });
     register_handlers(&copy);
     let sync_client = copy.client.client().clone();
@@ -762,6 +787,16 @@ pub async fn run(
     let rows = store::list_providers(&dirs.data)?.rows;
 
     let (stop_turns, stop_signal) = chat::cancellation();
+    let doorbell = Arc::new(Doorbell::default());
+    doorbell.set_engine(Arc::clone(&agentd.engine) as Arc<dyn DriveEngine>);
+    doorbell.set_drives(
+        mounted(&drives),
+        known
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .agents
+            .clone(),
+    );
     let mut copies: Vec<Arc<Copy>> = Vec::new();
     let mut syncs: Vec<JoinHandle<()>> = Vec::new();
     for home in hosted.iter() {
@@ -784,7 +819,7 @@ pub async fn run(
                 continue;
             }
         };
-        let (copy, sync) = start_copy(deps, client, Arc::clone(&known));
+        let (copy, sync) = start_copy(deps, client, Arc::clone(&known), Arc::clone(&doorbell));
         syncs.push(sync);
         copies.push(copy);
     }
@@ -796,7 +831,10 @@ pub async fn run(
         &drives,
         copies.clone(),
     );
+    doorbell.set_principal_agents(hosts.principal_agents());
 
+    // Tapped before the supervisor runs, so its first push is seen.
+    let mut ringer = Ringer::new(Arc::clone(&agentd.engine) as Arc<dyn DriveEngine>);
     let (engine_stop, engine_shutdown) = watch::channel(false);
     let engine = Arc::clone(&agentd.engine);
     let mut supervisor = tokio::spawn(async move { engine.run(engine_shutdown).await });
@@ -836,6 +874,7 @@ pub async fn run(
             match tokio::task::spawn_blocking(move || rescan(&config, &before, &homes)).await {
                 Ok((fresh, now_known)) => {
                     drives = Arc::new(fresh);
+                    doorbell.set_drives(mounted(&drives), now_known.agents.clone());
                     *known.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(now_known);
                 }
                 Err(error) => tracing::error!(%error, "agentd: the zones could not be read again"),
@@ -869,8 +908,9 @@ pub async fn run(
             hosts.scanned();
         }
         hosts.tick(&stop_signal).await;
-        // Once a copy has synced, a control room made before presence
-        // existed is brought up to date (R37).
+        ringer.tick(&hosts.round(&drives), &doorbell);
+        // Once a copy has synced, a control room made before presence or
+        // the doorbell existed is brought up to date (R37, R59).
         if !control_checked && copies.iter().any(|copy| *copy.syncs.borrow() > 0) {
             control_checked = true;
             if let Some(room) = &config.homeserver.control_room {
@@ -885,7 +925,7 @@ pub async fn run(
                 if !settled {
                     tracing::warn!(
                         %room,
-                        "agentd: the control room does not let people publish their presence, and no agent here may change it; its creator's host must, or surface calls find no device"
+                        "agentd: the control room does not let people publish their presence or a visiting agent ring, and no agent here may change it; its creator's host must, or surface calls find no device and a shared drive's doorbell is not heard"
                     );
                 }
             }
@@ -906,6 +946,10 @@ pub async fn run(
             Finalize::TimedOut
         }
     };
+    // What the last pushes published is rung before the copies go quiet.
+    ringer
+        .finish(&hosts.round(&drives), &doorbell, RING_FINISH)
+        .await;
     // The log is pushed: now another host may take the sessions (AD-378).
     hosts.release_all().await;
     for sync in syncs {
@@ -1228,9 +1272,10 @@ impl SurfacePort for ClientSurface {
     }
 }
 
-/// Bring the control room `room` up to date with R37 — the person's
-/// devices publish their presence at 0 — when `me` may. Whether that is
-/// settled: `false` only when `me` may not change the room's power levels.
+/// Bring the control room `room` up to date with R37 and R59 — the person's
+/// devices publish their presence at 0, a visiting agent rings at 0 — when
+/// `me` may. Whether that is settled: `false` only when `me` may not change
+/// the room's power levels.
 async fn update_control_room(client: &AgentClient, room: &RoomId, me: &UserId) -> bool {
     let levels = match client.server_state(room, "m.room.power_levels", "").await {
         Ok(Some(state)) => state.content,
@@ -1240,15 +1285,15 @@ async fn update_control_room(client: &AgentClient, room: &RoomId, me: &UserId) -
             return true;
         }
     };
-    match presence_levels(&levels, me) {
-        PresenceLevels::UpToDate => true,
-        PresenceLevels::Update(updated) => {
+    match control_levels(&levels, me) {
+        ControlLevels::UpToDate => true,
+        ControlLevels::Update(updated) => {
             match client
                 .send_state(room, "m.room.power_levels", "", &updated)
                 .await
             {
                 Ok(_) => {
-                    tracing::info!(%room, "agentd: the control room now takes the person's presence")
+                    tracing::info!(%room, "agentd: the control room now takes the person's presence and a visitor's doorbell")
                 }
                 Err(error) => {
                     tracing::warn!(%room, %error, "agentd: the control room's power levels could not be updated")
@@ -1256,7 +1301,7 @@ async fn update_control_room(client: &AgentClient, room: &RoomId, me: &UserId) -
             }
             true
         }
-        PresenceLevels::NoPower => false,
+        ControlLevels::NoPower => false,
     }
 }
 
@@ -1365,9 +1410,10 @@ fn answered_by(events: &[Value], me: &UserId) -> HashSet<String> {
     answered
 }
 
-/// The copy's invite and timeline handlers.
+/// The copy's invite, doorbell and timeline handlers.
 fn register_handlers(copy: &Arc<Copy>) {
     let client = copy.client.client();
+    bells::listen(client, Arc::clone(&copy.doorbell));
     let invites = Arc::clone(copy);
     client.add_event_handler(move |event: StrippedRoomMemberEvent, room: Room| {
         let copy = Arc::clone(&invites);
@@ -1404,6 +1450,12 @@ fn register_handlers(copy: &Arc<Copy>) {
                 let Ok(value) = event.deserialize_as::<Value>() else {
                     return;
                 };
+                // A doorbell is the host's, never a session's: heard by the
+                // state handler (`doorbell::listen`), which a timeline's
+                // state event reaches as well, and never routed (R59).
+                if value["type"] == DOORBELL {
+                    return;
+                }
                 // A device's answer to a surface call goes to the call
                 // waiting on it, never to the session's worker, which that
                 // call is holding (R39).

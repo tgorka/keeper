@@ -56,6 +56,11 @@ pub const ARTIFACTS: &str = "dev.keeper.agent.artifacts";
 /// as it is when it replies (ruling R94): what the delegating session joins.
 pub const REPLY_LABEL: &str = "dev.keeper.agent.label";
 
+/// A host pushed a commit of a drive that another host should fetch now
+/// (state, key = the drive id, unencrypted; ruling R59): in a session's room
+/// for that session's work, in control rooms for the agents zone's.
+pub const DOORBELL: &str = "dev.keeper.agent.doorbell";
+
 /// The contents' schema version, `"v": 1`.
 pub const CONTENT_VERSION: u32 = 1;
 
@@ -224,6 +229,50 @@ pub enum PresencePlatform {
 /// The device counts it from when the server received the request — the one
 /// clock both sides read — never from `expires_at`, the host's own clock.
 pub const SURFACE_WAIT: Duration = Duration::from_secs(60);
+
+/// `dev.keeper.agent.doorbell` (state, key = the drive id, unencrypted;
+/// R59): which drive moved, to which commit, and the closed reason. No path,
+/// no title, no text — what any member of the room may already know from the
+/// hosts' manifests, which name the drive ids in clear. Last writer wins,
+/// which is "the latest commit".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DoorbellContent {
+    pub v: u32,
+    pub drive: String,
+    /// The pushed commit, a full hex object id.
+    pub commit: String,
+    pub reason: DoorbellReason,
+}
+
+/// What a push changed, as a doorbell says it: one of four words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DoorbellReason {
+    /// A new session folder.
+    Session,
+    /// A session's `artifacts/`.
+    Artifact,
+    /// A card of a session.
+    Card,
+    /// The agents zone: homes, souls, memory.
+    Memory,
+}
+
+impl DoorbellContent {
+    /// The doorbell a state event under `state_key` carries, when it reads:
+    /// this version, keyed by the drive it names, and a full hex commit id.
+    pub fn accept(state_key: &str, content: &Value) -> Option<DoorbellContent> {
+        let bell: DoorbellContent = serde_json::from_value(content.clone()).ok()?;
+        let hex = |id: &str| {
+            matches!(id.len(), 40 | 64)
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        (bell.v == CONTENT_VERSION && bell.drive == state_key && hex(&bell.commit)).then_some(bell)
+    }
+}
 
 /// `dev.keeper.agent.surface.request` (timeline, encrypted): one surface
 /// call, for the device `device` only; `expires_at` is when the host says it
@@ -421,10 +470,11 @@ pub fn power_levels(kind: SessionKind, creator: &UserId, agents: &[OwnedUserId])
 
 /// A principal's control room's power levels (AD-374): the creating agent
 /// 100, every other agent user of the principal 50 — so any of them writes
-/// its host's manifest, `dev.keeper.agent.host` at 50 — and people 0. A
-/// person writes one state there: each of their devices' presence,
-/// `dev.keeper.agent.presence` at 0 (R37). `events_default` and
-/// `state_default` are 50.
+/// its host's manifest, `dev.keeper.agent.host` at 50 — and people 0. Two
+/// state events are open at 0: each of a person's devices' presence,
+/// `dev.keeper.agent.presence` (R37), and a drive's doorbell,
+/// `dev.keeper.agent.doorbell`, which a visiting agent rings (R59).
+/// `events_default` and `state_default` are 50.
 pub fn control_power_levels(creator: &UserId, agents: &[OwnedUserId]) -> Value {
     let mut users = Map::new();
     for agent in agents {
@@ -434,7 +484,7 @@ pub fn control_power_levels(creator: &UserId, agents: &[OwnedUserId]) -> Value {
     json!({
         "users": users,
         "users_default": 0,
-        "events": { HOST: 50, PRESENCE: 0 },
+        "events": { HOST: 50, PRESENCE: 0, DOORBELL: 0 },
         "events_default": 50,
         "state_default": 50,
         "ban": 50,
@@ -444,23 +494,31 @@ pub fn control_power_levels(creator: &UserId, agents: &[OwnedUserId]) -> Value {
     })
 }
 
-/// What a control room made before R37 needs so its people can publish
-/// their presence.
+/// The rows a control room made before them lacks: each state event open
+/// at 0 that [`control_power_levels`] names.
+const OPEN_ROWS: [&str; 2] = [PRESENCE, DOORBELL];
+
+/// What a control room made before R37 or R59 needs so its people can
+/// publish their presence and a visiting agent can ring.
 #[derive(Debug, Clone, PartialEq)]
-pub enum PresenceLevels {
-    /// `dev.keeper.agent.presence` is already at 0.
+pub enum ControlLevels {
+    /// Every open row is already at 0.
     UpToDate,
-    /// These levels: the room's, with the presence row added.
+    /// These levels: the room's, with the missing rows added.
     Update(Value),
     /// `me` may not change the room's power levels.
     NoPower,
 }
 
 /// Whether the control room whose `m.room.power_levels` content is
-/// `levels` needs the presence row, and whether `me` may write it.
-pub fn presence_levels(levels: &Value, me: &UserId) -> PresenceLevels {
-    if levels["events"][PRESENCE] == json!(0) {
-        return PresenceLevels::UpToDate;
+/// `levels` needs an open row, and whether `me` may write it.
+pub fn control_levels(levels: &Value, me: &UserId) -> ControlLevels {
+    let missing: Vec<&str> = OPEN_ROWS
+        .into_iter()
+        .filter(|row| levels["events"][*row] != json!(0))
+        .collect();
+    if missing.is_empty() {
+        return ControlLevels::UpToDate;
     }
     let level = |value: &Value, default: i64| value.as_i64().unwrap_or(default);
     let mine = level(
@@ -472,16 +530,18 @@ pub fn presence_levels(levels: &Value, me: &UserId) -> PresenceLevels {
         level(&levels["state_default"], 50),
     );
     if mine < needed {
-        return PresenceLevels::NoPower;
+        return ControlLevels::NoPower;
     }
     let mut updated = levels.clone();
-    match updated["events"].as_object_mut() {
-        Some(events) => {
-            events.insert(PRESENCE.to_owned(), json!(0));
-        }
-        None => updated["events"] = json!({ PRESENCE: 0 }),
+    if !updated["events"].is_object() {
+        updated["events"] = json!({});
     }
-    PresenceLevels::Update(updated)
+    if let Some(events) = updated["events"].as_object_mut() {
+        for row in missing {
+            events.insert(row.to_owned(), json!(0));
+        }
+    }
+    ControlLevels::Update(updated)
 }
 
 #[cfg(test)]
@@ -647,37 +707,89 @@ mod tests {
         assert!(level("@tgorka:example.org").as_i64() < levels["events"][HOST].as_i64());
         assert_eq!(levels["events"][PRESENCE], 0);
         assert!(level("@tgorka:example.org").as_i64() >= levels["events"][PRESENCE].as_i64());
+        // A visiting agent holds no power here (users_default) and may ring
+        // a drive's doorbell, and nothing else (R59).
+        let visitor = level("@lucyna-novak:example.org");
+        assert_eq!(levels["events"][DOORBELL], 0);
+        assert!(visitor.as_i64() >= levels["events"][DOORBELL].as_i64());
+        assert!(visitor.as_i64() < levels["events"][HOST].as_i64());
+        assert!(visitor.as_i64() < levels["events_default"].as_i64());
     }
 
     #[test]
-    fn a_control_room_made_before_presence_is_brought_up_to_date_by_its_creator() {
+    fn a_control_room_made_before_presence_or_the_doorbell_is_brought_up_to_date() {
         let creator = user("@nixi:example.org");
         let amelia = user("@amelia:example.org");
-        let mut old = control_power_levels(&creator, std::slice::from_ref(&amelia));
-        old["events"]
-            .as_object_mut()
-            .expect("events")
-            .remove(PRESENCE);
-        let PresenceLevels::Update(updated) = presence_levels(&old, &creator) else {
-            panic!("the creator updates the room");
+        let current = control_power_levels(&creator, std::slice::from_ref(&amelia));
+        let without = |rows: &[&str]| {
+            let mut old = current.clone();
+            for row in rows {
+                old["events"].as_object_mut().expect("events").remove(*row);
+            }
+            old
         };
-        assert_eq!(updated["events"][PRESENCE], 0);
-        // Everything else is the room's own.
-        let mut back = updated.clone();
-        back["events"]
-            .as_object_mut()
-            .expect("events")
-            .remove(PRESENCE);
-        assert_eq!(back, old);
+        for rows in [&[PRESENCE][..], &[DOORBELL], &[PRESENCE, DOORBELL]] {
+            let old = without(rows);
+            let ControlLevels::Update(updated) = control_levels(&old, &creator) else {
+                panic!("the creator updates a room without {rows:?}");
+            };
+            // Exactly the missing rows are added; everything else is the room's own.
+            assert_eq!(updated, current, "{rows:?}");
+        }
         // An agent at 50 may not change the power levels (state_default 50
         // is reached, but a room naming the levels' own row at 100 is not).
+        let mut old = without(&[DOORBELL]);
         old["events"]["m.room.power_levels"] = json!(100);
-        assert_eq!(presence_levels(&old, &amelia), PresenceLevels::NoPower);
+        assert_eq!(control_levels(&old, &amelia), ControlLevels::NoPower);
         assert!(matches!(
-            presence_levels(&old, &creator),
-            PresenceLevels::Update(_)
+            control_levels(&old, &creator),
+            ControlLevels::Update(_)
         ));
-        assert_eq!(presence_levels(&updated, &amelia), PresenceLevels::UpToDate);
+        assert_eq!(control_levels(&current, &amelia), ControlLevels::UpToDate);
+    }
+
+    #[test]
+    fn a_doorbell_reads_only_as_its_closed_shape() {
+        let commit = "a".repeat(40);
+        let bell = json!({"v": 1, "drive": "neuradrive", "commit": commit, "reason": "memory"});
+        assert_eq!(
+            DoorbellContent::accept("neuradrive", &bell),
+            Some(DoorbellContent {
+                v: CONTENT_VERSION,
+                drive: "neuradrive".to_owned(),
+                commit: commit.clone(),
+                reason: DoorbellReason::Memory,
+            })
+        );
+        let refused = [
+            // Keyed by another drive than it names.
+            ("tgdrive", bell.clone()),
+            // A reason outside the four, a path smuggled in, a short commit,
+            // another version.
+            (
+                "neuradrive",
+                json!({"v": 1, "drive": "neuradrive", "commit": commit, "reason": "notes"}),
+            ),
+            (
+                "neuradrive",
+                json!({"v": 1, "drive": "neuradrive", "commit": commit, "reason": "card", "path": "x.md"}),
+            ),
+            (
+                "neuradrive",
+                json!({"v": 1, "drive": "neuradrive", "commit": "abc", "reason": "card"}),
+            ),
+            (
+                "neuradrive",
+                json!({"v": 2, "drive": "neuradrive", "commit": commit, "reason": "card"}),
+            ),
+        ];
+        for (key, content) in refused {
+            assert_eq!(
+                DoorbellContent::accept(key, &content),
+                None,
+                "{key} {content}"
+            );
+        }
     }
 
     #[test]

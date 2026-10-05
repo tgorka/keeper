@@ -143,6 +143,11 @@ pub fn tick() {
         {
             let mut slot = RUNTIME.host.lock().await;
             if let Some(host) = slot.as_mut() {
+                // The doorbell rings and answers over the app's own engine,
+                // once the sync supervisor has opened it.
+                if let Some(engine) = crate::sync::engine_if_open() {
+                    host.attach_engine(engine);
+                }
                 host.tick(facts).await;
                 *RUNTIME
                     .problems

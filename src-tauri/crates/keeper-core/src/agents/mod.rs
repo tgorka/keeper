@@ -13,6 +13,7 @@ pub mod claim;
 pub mod copy;
 pub mod delegation;
 pub mod device;
+pub mod doorbell;
 pub mod drive;
 pub mod events;
 pub mod focus;

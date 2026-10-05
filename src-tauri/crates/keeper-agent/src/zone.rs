@@ -52,9 +52,11 @@ pub struct FoundSession {
 }
 
 /// A file's text under `root`, reached through `browse::resolve`; `None`
-/// when it is not there.
+/// when it is not there. A link out of `root`, or anything but a regular
+/// file (a pipe would never end a read), is refused.
 pub fn read_text(root: &Path, rel: &str) -> Result<Option<String>, String> {
     match browse::resolve(root, rel) {
+        Ok(Some(path)) if !path.is_file() => Err(format!("{rel} is not a file")),
         Ok(Some(path)) => match std::fs::read_to_string(&path) {
             Ok(text) => Ok(Some(text)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
