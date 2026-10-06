@@ -17,8 +17,8 @@
 //!
 //! What runs after a decision counts — `decision.json`, the consume, the
 //! resume — is the session worker's, proved over the same source by
-//! `agent_turns::parks`; production installs no source until rung 6 (R92),
-//! so no running host decides here.
+//! `agent_turns::parks` and through a whole agentd host by `live_delegate`;
+//! no running host decides here.
 //!
 //! `#[ignore]`; endpoints and secrets come from the environment:
 //!

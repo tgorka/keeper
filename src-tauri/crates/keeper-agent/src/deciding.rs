@@ -12,7 +12,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use keeper_core::agents::approval::{ApprovalRecord, DecidedBy};
-use keeper_core::agents::label::Readers;
 use keeper_core::agents::matrix::AgentClient;
 use keeper_core::agents::trust::{
     decide_trust, Anchor, Published, Trust, TrustFacts, KEYS_UNKNOWN,
@@ -94,8 +93,8 @@ impl Forwards {
 }
 
 /// The decision source over an agent's own Matrix client: the trust
-/// adapter. Production installs it only once the card can be decided on
-/// (R92); tests and live harnesses install it now.
+/// adapter both production hosts install (R92) — agentd under
+/// [`Anchor::Pinned`], the desktop under [`Anchor::Desktop`].
 pub struct ClientDecisions {
     pub client: AgentClient,
     pub anchor: Anchor,
@@ -129,35 +128,25 @@ impl ServedSession {
             .is_some_and(|doors| doors.forwards().forward(&self.context.agent.room, arrived))
     }
 
-    /// Wait, in each approver's proxy DM, for the decision on every pending
-    /// approval whose request went there (R85, R89): at serve start, as at
-    /// the request.
-    pub(crate) fn expect_decisions(&self) {
-        let pending: Vec<String> = self
-            .context
-            .parked
-            .values()
-            .filter(|pending| pending.ended.is_none() && pending.request_event.is_none())
-            .map(|pending| pending.id.clone())
-            .collect();
-        for id in pending {
-            self.expect_decision(&id);
-        }
-    }
-
-    /// Wait in each approver's proxy DM this host runs for the decision on
-    /// approval `id`.
-    pub(crate) fn expect_decision(&self, id: &str) {
-        let (Some(doors), Some(inbox), Readers::Only(approvers)) =
-            (&self.doors, &self.inbox, &self.context.label.readers)
-        else {
+    /// Wait, in each proxy DM a pending approval's request went to, for its
+    /// decision (R85, R89): at serve start, from the DMs kept beside each
+    /// record — never inferred from the room's read cursor — so a restart
+    /// hears every one still waiting there again.
+    pub(crate) fn expect_decisions(&self, deps: &AgentDeps) {
+        let (Some(doors), Some(inbox)) = (&self.doors, &self.inbox) else {
             return;
         };
-        for person in approvers {
-            if let Some(dm) = doors.dm(person) {
-                doors
-                    .forwards()
-                    .expect(&dm, id, &self.context.agent.room, Arc::clone(inbox));
+        for pending in self.context.parked.values() {
+            if pending.ended.is_some() {
+                continue;
+            }
+            for (_, dm) in self.asked(deps, &pending.id) {
+                doors.forwards().expect(
+                    &dm,
+                    &pending.id,
+                    &self.context.agent.room,
+                    Arc::clone(inbox),
+                );
             }
         }
     }

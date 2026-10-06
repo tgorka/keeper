@@ -98,8 +98,7 @@ use crate::rooms::{self, Arrival, BriefEvent, Disposition, Served};
 use crate::sessions::verbs::{self, CreateOutcome};
 use crate::sessions::write::session_write;
 use crate::sinks::{
-    room_audience, CallAudit, Gated, ProxyDoors, RoomGate, Sinks, Withheld, MEMBERS_UNREAD,
-    NARROWED_STATUS,
+    room_audience, CallAudit, Gated, ProxyDoors, RoomGate, Sinks, MEMBERS_UNREAD, NARROWED_STATUS,
 };
 use crate::turn::{arm_turn_probing, endpoint_of, read_timeout_of, TurnEnv, TurnOrigin};
 use crate::writer::{SessionWriter, WriterError};
@@ -237,6 +236,9 @@ pub struct SessionContext {
     /// The approvals whose call has no result yet, by id (93.2): a turn
     /// parked on one is waiting, not unanswered, and `recover` leaves it.
     pub parked: BTreeMap<String, crate::approvals::Pending>,
+    /// The approvals consumed here and run, by id, from their `consumed`
+    /// lines with no result — never one mirrored from another copy.
+    pub(crate) consumed: HashSet<String>,
     /// Every `tool_call` line with no result yet, in order: a parked
     /// round's call and the calls after it.
     open_calls: Vec<(Ulid, chat::ToolCall)>,
@@ -297,6 +299,7 @@ impl SessionContext {
             told: false,
             withheld: false,
             parked: BTreeMap::new(),
+            consumed: HashSet::new(),
             open_calls: Vec::new(),
         };
         for stored in &log.lines {
@@ -440,12 +443,15 @@ impl SessionContext {
                     }
                 }
                 _ if body.is_terminal() => {
+                    // Consumed here, not mirrored from another copy: it
+                    // runs here, and the rest of its round with it.
+                    let ran = body.state == ApprovalState::Consumed && body.result.is_none();
+                    if ran {
+                        self.consumed.insert(body.id.clone());
+                    }
                     if let Some(pending) = self.parked.get_mut(&body.id) {
                         pending.ended.get_or_insert(body.state);
-                        // Consumed here, not mirrored from another copy:
-                        // it runs here, and the rest of its round with it.
-                        pending.ran |=
-                            body.state == ApprovalState::Consumed && body.result.is_none();
+                        pending.ran |= ran;
                     }
                 }
                 _ => {}
@@ -786,10 +792,11 @@ pub struct AgentDeps {
     /// Its folder inside the drive, for the frame's drive-relative path.
     pub sessions_subfolder: String,
     pub lfs_threshold_bytes: u64,
-    /// Who may decide an approval (R77): installed, a call that needs a
-    /// person parks and waits for a decision; `None` refuses it with
-    /// [`UNATTENDED_REFUSAL`], as every host does until the card can be
-    /// decided on (R92).
+    /// Who may decide an approval (R77): installed — agentd over its
+    /// `[[trust]]` pins, the desktop over its verified accounts (R92) — a
+    /// call that needs a person parks and waits for a decision; `None`, as
+    /// a test world or agentd's prompt preview has it, refuses it with
+    /// [`UNATTENDED_REFUSAL`].
     pub decisions: Option<Arc<dyn crate::approvals::DecisionSource>>,
 }
 
@@ -832,12 +839,27 @@ struct AllowedTools<'t> {
     /// Whether a call that needs a person parks: a decision source is
     /// installed (R77).
     parks: bool,
-    /// The call a consumed approval lets run, by its wire id, and the
-    /// record (taken by that call).
-    approved: Mutex<Option<(String, Ulid)>>,
+    /// The consumed approval the call it bound runs on, handed to that one
+    /// execution and cleared as it ends ([`AllowedTools::run_bound`]):
+    /// nothing else in the turn, whatever its wire id, runs on it.
+    bound: Mutex<Option<Bound>>,
     /// The call this turn parked on.
     parked: Mutex<Option<Parking>>,
 }
+
+/// A consumed approval as the one execution of its call holds it: the
+/// call's wire id and tool, the record, and the flow a `declassify`
+/// approval releases (R89).
+struct Bound {
+    call: String,
+    tool: String,
+    approval: Ulid,
+    released: Option<crate::approvals::Released>,
+}
+
+/// Why a bound call that would now reach someone its approval did not name
+/// does not run.
+const AUDIENCE_MOVED: &str = "who it would reach changed after it was approved";
 
 /// Where `subpath` of the drive checked out at `profile` lands, as
 /// drive-relative names: keeper-sync's landing, every link followed. The
@@ -903,6 +925,39 @@ impl AllowedTools<'_> {
         )
     }
 
+    /// Run `run`, the one execution of the call a consumed approval bound
+    /// — `call`, exactly as its record holds it — with that approval handed
+    /// to it, then take it back, whatever became of the call: no later
+    /// call of the turn, even one under the same wire id, runs on it.
+    fn run_bound<R>(
+        &self,
+        call: &chat::ToolCall,
+        approval: Ulid,
+        released: Option<crate::approvals::Released>,
+        run: impl FnOnce() -> R,
+    ) -> R {
+        *self.bound.lock().unwrap_or_else(|p| p.into_inner()) = Some(Bound {
+            call: call.id.clone(),
+            tool: call.name.clone(),
+            approval,
+            released,
+        });
+        let ran = run();
+        *self.bound.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        ran
+    }
+
+    /// The consumed approval call `id` of `tool` runs on, while it is the
+    /// bound call's execution.
+    fn bound_approval(&self, id: &str, tool: &str) -> Option<Ulid> {
+        self.bound
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .filter(|bound| bound.call == id && bound.tool == tool)
+            .map(|bound| bound.approval)
+    }
+
     /// What classified call `id` to `recipients` comes to once its sinks
     /// have passed (R82): the integrity rule's block; else, at T5,
     /// [`FORBIDDEN`] — never an approval's to give; else a call that needs
@@ -927,10 +982,7 @@ impl AllowedTools<'_> {
             CallVerdict::Allow if classification.gate() == Gate::Run => return Gated::Run(None),
             CallVerdict::Allow => UNATTENDED_REFUSAL,
         };
-        let mut approved = self.approved.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((_, approval)) = approved.as_ref().filter(|(call, _)| call == id) {
-            let approval = *approval;
-            *approved = None;
+        if let Some(approval) = self.bound_approval(id, tool) {
             return Gated::Run(Some(Approval::Approved(approval)));
         }
         if !self.parks {
@@ -942,6 +994,7 @@ impl AllowedTools<'_> {
             call_id: id.to_owned(),
             classification: classification.clone(),
             pins,
+            declassify: None,
         });
         Gated::Park(approval)
     }
@@ -981,6 +1034,82 @@ impl AllowedTools<'_> {
     }
 }
 
+impl crate::sinks::Lift for AllowedTools<'_> {
+    /// A flow of call `call` the label blocks (R89). The call a consumed
+    /// approval bound never parks again: its flow goes through when that
+    /// approval is a `declassify` naming these very bytes and the sink, as
+    /// it is now, is within the session's label widened only by the
+    /// readers it names (R193); anything else — other bytes, an audience
+    /// grown or unknown, an approval of another kind — is drift, and the
+    /// call ends refused on that same approval. Any other call, with a
+    /// decision source installed and someone who could let it through,
+    /// parks on a new `declassify` record at that action's tier, the file
+    /// it writes pinned; else it is refused.
+    fn lift(
+        &self,
+        call: &str,
+        flow: &keeper_core::agents::label::DeclassifyRequest,
+        delegation: Option<&str>,
+    ) -> crate::sinks::Lifted {
+        let bound = self
+            .bound
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .filter(|bound| bound.call == call)
+            .map(|bound| (bound.approval, bound.released.clone()));
+        if let Some((approval, released)) = bound {
+            let moved = match released {
+                Some(released) if released.sha256 != flow.effect_sha256 => {
+                    crate::approvals::CHANGED
+                }
+                Some(released) => {
+                    let approved = keeper_core::agents::label::approved_label(
+                        &self.view.label(),
+                        &released.readers,
+                    );
+                    if check_sink(&approved, &flow.sink) == SinkVerdict::Allow {
+                        return crate::sinks::Lifted::Released(approval);
+                    }
+                    AUDIENCE_MOVED
+                }
+                None => AUDIENCE_MOVED,
+            };
+            return crate::sinks::Lifted::Drift(approval, crate::approvals::not_done(moved));
+        }
+        let Some(mut args) = flow.args().filter(|_| self.parks) else {
+            return crate::sinks::Lifted::Refused;
+        };
+        if let Some(delegation) = delegation {
+            args["delegation"] = Value::from(delegation);
+        }
+        let context = Context::of_session(&self.agent, self.view.label().integrity);
+        let classification = tier::classify(AgentTool::Declassify, &CallFacts::default(), &context);
+        let pins = match &flow.destination {
+            Destination::Drive { drive, path } => vec![(drive.clone(), path.clone())],
+            _ => Vec::new(),
+        };
+        let approval = Ulid::new();
+        *self.parked.lock().unwrap_or_else(|p| p.into_inner()) = Some(Parking {
+            approval,
+            call_id: call.to_owned(),
+            classification,
+            pins,
+            declassify: Some(args),
+        });
+        crate::sinks::Lifted::Parked(approval)
+    }
+
+    fn delegation(&self, call: &str) -> Option<String> {
+        self.bound
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .filter(|bound| bound.call == call)
+            .and_then(|bound| bound.released.as_ref()?.delegation.clone())
+    }
+}
+
 fn refusal(reason: String) -> ToolOutcome {
     ToolOutcome::Refused { reason }
 }
@@ -1017,13 +1146,7 @@ impl ToolHost for AllowedTools<'_> {
         // row say of a call refused before it reaches the drive.
         let table = self.classify(&call.id, tool, &facts, None);
         // An approved call refused here closes the row its park left (R172).
-        let approved = self
-            .approved
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .filter(|(id, _)| *id == call.id)
-            .map(|(_, approval)| Approval::Approved(*approval));
+        let approved = self.bound_approval(&call.id, name).map(Approval::Approved);
         let audit = CallAudit::new(
             self.sinks,
             name,
@@ -1031,7 +1154,8 @@ impl ToolHost for AllowedTools<'_> {
             &table,
             Gated::Run(approved),
             (drive, path),
-        );
+        )
+        .lifting(self, &call.id);
         if !self.allow.iter().any(|allowed| allowed == name) {
             return Ok(audit.refuse(format!("{name} is not one of this agent's tools.")));
         }
@@ -1053,7 +1177,10 @@ impl ToolHost for AllowedTools<'_> {
                 write_effect(call).as_bytes(),
                 Some(path),
             ) {
-                return Ok(refusal(audit.blocked(blocked)));
+                // Released, it goes on to its grant under the approval.
+                if let Err(withheld) = audit.blocked(blocked) {
+                    return Ok(withheld.into());
+                }
             }
         }
         // Its sinks passed: the drive host writes the row, on the grant's
@@ -1107,7 +1234,8 @@ impl ToolHost for AllowedTools<'_> {
                 &classification,
                 gated,
                 (&drive, &at),
-            );
+            )
+            .lifting(self, &wire.id);
             let outcome = self.delegation.run(wire, &audit);
             if let Some(outcome) = &outcome {
                 audit.finish(outcome);
@@ -1134,7 +1262,8 @@ impl ToolHost for AllowedTools<'_> {
                 &classification,
                 gated,
                 (&self.home.id, &at),
-            );
+            )
+            .lifting(self, &wire.id);
             // A tool the agent was not given is refused by the card tools.
             let outcome = if !self.allow.contains(&wire.name) {
                 self.cards.run(wire)
@@ -1154,7 +1283,7 @@ impl ToolHost for AllowedTools<'_> {
                         wire.arguments_raw.as_bytes(),
                         None,
                     )
-                    .map_err(|blocked| Withheld::Refused(audit.blocked(blocked)))
+                    .or_else(|blocked| audit.blocked(blocked))
                     .and_then(|()| audit.admit(&self.home.id, &at));
                 match admitted {
                     Ok(()) => self.cards.run(wire),
@@ -1173,6 +1302,9 @@ impl ToolHost for AllowedTools<'_> {
         let facts = tier::named_facts(tool, args, CallFacts::default());
         let classification = self.classify(&wire.id, tool, &facts, None);
         let gated = self.gated(&wire.id, &wire.name, &classification, &[], Vec::new());
+        // A request the label blocks is refused, never parked: each send
+        // mints its own id and expiry, so no approval could name its bytes
+        // again (DW-521).
         let audit = CallAudit::new(
             self.sinks,
             &wire.name,
@@ -1189,7 +1321,7 @@ impl ToolHost for AllowedTools<'_> {
             // send, and its row written then.
             Some(surface) => surface.run(wire, &|verdict, (drive, path)| {
                 verdict
-                    .map_err(|blocked| Withheld::Refused(audit.blocked(blocked)))
+                    .or_else(|blocked| audit.blocked(blocked))
                     .and_then(|()| audit.admit(drive, path))
             }),
             None => Some(ToolOutcome::Refused {
@@ -1840,7 +1972,7 @@ impl ServedSession {
             .await;
         // What still waits, with its request in a proxy's DM, is heard
         // there again (R89).
-        self.expect_decisions();
+        self.expect_decisions(deps);
         self.idle(activity);
         loop {
             if stop.is_cancelled() {
@@ -2477,6 +2609,17 @@ impl ServedSession {
                 return Ok(Outcome::Ignored(NOT_A_DELEGATION));
             }
         };
+        // A brief a person let through carries the label they approved, and
+        // goes in only as those very bytes (R191a, R193).
+        let content = self
+            .declassified(deps, open)
+            .and_then(|released| {
+                delegate::approved_brief(&self.context.label, &released.readers, |approved| {
+                    delegate::content_for(open, &self.delegator(deps), approved, &known)
+                })
+                .filter(|(_, sha)| *sha == released.sha256)
+            })
+            .map_or(content, |(widened, _)| widened);
         let members = match rooms.members(&open.room).await {
             Ok(members) => members,
             Err(error) => {
@@ -2486,30 +2629,40 @@ impl ServedSession {
             }
         };
         let me = deps.home.config.matrix_user.clone();
+        let effect = keeper_core::agents::delegation::brief_content(&content).to_string();
+        let sinks = self.sinks(deps);
         let checked = match known
             .agents
             .iter()
             .find(|agent| agent.matrix_user == open.to)
         {
-            Some(target) => self.sinks(deps).check(
-                delegate::DELEGATE,
-                &Destination::Agent {
-                    drive: target.drive.clone(),
-                    agent: open.to.clone(),
-                    room: Some(open.room.clone()),
-                },
-                &content.label,
-                &delegate::room_of(
-                    members,
-                    &known,
-                    [&me, &open.to],
-                    vec![target.home_readers.clone()],
-                ),
-                keeper_core::agents::delegation::brief_content(&content)
-                    .to_string()
-                    .as_bytes(),
-                None,
-            ),
+            Some(target) => sinks
+                .verdict(
+                    delegate::DELEGATE,
+                    &Destination::Agent {
+                        drive: target.drive.clone(),
+                        agent: open.to.clone(),
+                        room: Some(open.room.clone()),
+                    },
+                    &content.label,
+                    &delegate::room_of(
+                        members,
+                        &known,
+                        [&me, &open.to],
+                        vec![target.home_readers.clone()],
+                    ),
+                    effect.as_bytes(),
+                    None,
+                )
+                .map_err(|blocked| {
+                    sinks.refused(
+                        delegate::DELEGATE,
+                        &blocked.drive,
+                        &blocked.at,
+                        &blocked.sentence,
+                    );
+                    blocked.sentence
+                }),
             None => Err(format!("{} is no longer known on this host.", open.to)),
         };
         if let Err(reason) = checked {
@@ -3639,30 +3792,40 @@ impl ServedSession {
         }
     }
 
+    /// The approvers of this session — each reader of its label — whom this
+    /// host can ask: those whose proxy it runs, with the DM it names.
+    pub(crate) fn askable(&self) -> Vec<(OwnedUserId, OwnedRoomId)> {
+        let (Some(doors), Readers::Only(approvers)) = (&self.doors, &self.context.label.readers)
+        else {
+            return Vec::new();
+        };
+        approvers
+            .iter()
+            .filter_map(|person| Some((person.clone(), doors.dm(person)?)))
+            .collect()
+    }
+
     /// An approval's request `content` that its room may not carry (R85):
-    /// to each approver — each reader of the session's label — through
+    /// to each approver this host can ask ([`Self::askable`]) through
     /// their proxy's DM, as the proxy, each DM checked against the label as
     /// it is now and a refusal audited (R65). An approver no door on this
     /// host reaches is not asked from here (DW-485); the room's status
-    /// says only R64's fixed sentence.
-    pub(crate) async fn request_by_doors(&mut self, deps: &AgentDeps, content: &Value) {
+    /// says only R64's fixed sentence. Who it reached, and in which DM.
+    pub(crate) async fn request_by_doors(
+        &mut self,
+        deps: &AgentDeps,
+        content: &Value,
+    ) -> Vec<(OwnedUserId, OwnedRoomId)> {
         let event_type = keeper_core::agents::events::APPROVAL_REQUEST;
-        let Readers::Only(approvers) = &self.context.label.readers else {
-            return;
-        };
         let Some(doors) = self.doors.clone() else {
-            tracing::info!(session = %self.context.session.path, "agents: an approval's approvers have no proxy on this host");
-            return;
+            return Vec::new();
         };
         let sinks = self.sinks(deps);
         let known = self.delegations.as_ref().map(|rooms| rooms.known());
         let effect = content.to_string();
-        for person in approvers {
-            let Some(dm) = doors.dm(person) else {
-                tracing::info!(session = %self.context.session.path, %person, "agents: an approver has no DM this host can name");
-                continue;
-            };
-            let members = match doors.members(person).await {
+        let mut asked = Vec::new();
+        for (person, dm) in self.askable() {
+            let members = match doors.members(&person).await {
                 Ok(members) => members,
                 Err(error) => {
                     tracing::warn!(%dm, %error, "agents: an approver's DM could not be read; the request is not sent there");
@@ -3681,19 +3844,21 @@ impl ServedSession {
             if refused.is_err() {
                 continue;
             }
-            match doors.tell(person, event_type, content.clone()).await {
+            match doors.tell(&person, event_type, content.clone()).await {
                 // Its decision comes home from that DM (R89).
                 Ok(_) => {
                     if let (Some(id), Some(inbox)) = (content["id"].as_str(), &self.inbox) {
                         let home = &self.context.agent.room;
                         doors.forwards().expect(&dm, id, home, Arc::clone(inbox));
                     }
+                    asked.push((person, dm));
                 }
                 Err(error) => {
                     tracing::warn!(%dm, %error, "agents: an approval's request could not reach its approver's DM");
                 }
             }
         }
+        asked
     }
 }
 
@@ -4050,7 +4215,7 @@ async fn run_agent_turn(
         agent,
         tiers: Mutex::new(HashMap::new()),
         parks: deps.decisions.is_some(),
-        approved: Mutex::new(None),
+        bound: Mutex::new(None),
         parked: Mutex::new(None),
     };
     let tool_loop = ToolLoop {
@@ -4217,11 +4382,15 @@ async fn run_agent_turn(
             let (call, (record, outcome)) = match resume.settled {
                 // What runs is what the record bound, not the log's
                 // redacted copy (R174).
-                crate::approvals::Settled::Run(bound) => {
-                    *host.approved.lock().unwrap_or_else(|p| p.into_inner()) =
-                        Some((bound.id.clone(), resume.approval));
-                    let ran = match tools::run_call(&host, &default_profile, &bound, &mut events) {
-                        // Its approval is spent: it never waits again.
+                crate::approvals::Settled::Run(bound, released) => {
+                    // The approval — and the flow a `declassify` one lets
+                    // through — is this one execution's alone (R89).
+                    let ran = host.run_bound(&bound, resume.approval, released, || {
+                        tools::run_call(&host, &default_profile, &bound, &mut events)
+                    });
+                    let ran = match ran {
+                        // A bound call never parks again (its drift is
+                        // refused); were it to, it would not wait either.
                         (_, ToolOutcome::Parked { .. }) => refused(&bound, UNATTENDED_REFUSAL),
                         ran => ran,
                     };
@@ -4346,12 +4515,21 @@ async fn run_agent_turn(
     drop(host);
     let log = log.into_inner().unwrap_or_else(|p| p.into_inner());
     let parked = match (parking, log.parked) {
-        (Some(parking), Some((Some(call_line), wire))) => {
+        (Some(mut parking), Some((Some(call_line), wire))) => {
             let files = crate::approvals::pin_files(&read_profiles, &parking.pins);
+            // A declassification binds the blocked call as the model sent
+            // it, beside what it would let through (R89).
+            let args = match parking.declassify.take() {
+                Some(mut args) => {
+                    args["call"] = json!({"tool": wire.name, "arguments": wire.arguments_raw});
+                    args
+                }
+                None => wire.arguments.unwrap_or(Value::Null),
+            };
             Some(crate::approvals::ParkedTurn {
                 parking,
                 call_line,
-                args: wire.arguments.unwrap_or(Value::Null),
+                args,
                 preconditions: keeper_core::agents::approval::Preconditions {
                     files,
                     ..Default::default()

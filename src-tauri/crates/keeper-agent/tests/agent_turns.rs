@@ -5972,7 +5972,7 @@ async fn the_same_sinks_pass_when_the_audience_fits() {
 /// 92.6 acceptance 4 through a turn: after an inbox read the session is
 /// `untrusted`; a delegation to an agent tgorka never named is blocked, the
 /// one he named passes the rule, and a drive write he named needs an
-/// approval, which this keeper cannot take yet.
+/// approval, which a host with no decision source cannot ask for.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_recipient_taken_from_outside_content_is_blocked() {
     use keeper_core::agents::label::NEEDS_APPROVAL;
@@ -7031,6 +7031,7 @@ mod parks {
                     name.ends_with(".json")
                         && !name.ends_with(".decision.json")
                         && !name.ends_with(".round.json")
+                        && !name.ends_with(".asked.json")
                 })
                 .collect();
             assert_eq!(records.len(), 1, "{records:?}");
@@ -7949,6 +7950,851 @@ mod parks {
                 .await,
             Outcome::Held
         ));
+    }
+
+    /// The `@daily` card of a scheduled session, last run yesterday.
+    fn night_session(world: &World) -> &'static str {
+        const NIGHT: &str = "active/2026-10-05-night";
+        session_of(
+            &world.tgdrive,
+            NIGHT,
+            &decl("tgdrive", &[TGORKA, MARTA], false),
+            "nixi",
+            SessionKind::Scheduled,
+            "!night:example.org",
+        );
+        let card = "---\ntags: [task]\ntitle: Night note\nstatus: todo\nassignee: nixi\nschedule: \"@daily\"\nlast_run: \"2026-10-04T00:00:00Z\"\n---\n\nWrite the night's note.\n";
+        write(
+            &world.tgdrive,
+            &format!("60-sessions/{NIGHT}/card.md"),
+            card,
+        );
+        NIGHT
+    }
+
+    /// Tonight's run of `night_session`'s card, its window midnight, taken at
+    /// 03:00 (a fixture clock).
+    fn three_am() -> Arrived {
+        use keeper_agent::agent::scheduled_arrival;
+        use keeper_agent::cards::Scheduled;
+        scheduled_arrival(
+            &user("@nixi:example.org"),
+            &Scheduled::Run {
+                card: "card.md".to_owned(),
+                window: "2026-10-05T00:00:00.000Z".to_owned(),
+                now_ms: chrono::DateTime::parse_from_rfc3339("2026-10-05T03:00:00Z")
+                    .expect("an instant")
+                    .timestamp_millis(),
+                utc_offset_minutes: 0,
+            },
+        )
+        .expect("an arrival")
+    }
+
+    /// 93.4 AC5: a `@daily` card's run at 03:00 needs a T2 write, which
+    /// nobody watching makes T3; it parks for a day and holds nothing. A
+    /// verified approval in the morning resumes it on the host holding the
+    /// claim, the write done once; with no decision, the record expires a
+    /// day after it was made and the run is denied and logged, the note
+    /// untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scheduled_write_at_night_waits_for_the_morning() {
+        for decided in [true, false] {
+            let (mut world, approvals) = deciding(vec![
+                calls(&[write_note("w1", "the night's note")]),
+                prose("Written."),
+            ]);
+            let night = night_session(&world);
+            let mut served = world.open(night);
+            served.approval_room = Some(Arc::clone(&approvals) as Arc<dyn ApprovalRoom>);
+            let report = report(world.serve(&mut served, three_am()).await);
+            assert_eq!(report.ending, TurnEnding::Parked);
+            assert!(served.waiting());
+            assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+            let mut record = world.record_in(night);
+            assert_eq!(
+                (
+                    record.risk.tier,
+                    record.risk.base_tier,
+                    record.risk.raised_by.clone()
+                ),
+                (3, 2, vec!["unattended".to_owned()])
+            );
+            let made = chrono::DateTime::parse_from_rfc3339(&record.created_at).expect("made");
+            assert_eq!(
+                record.expires() - made.with_timezone(&chrono::Utc),
+                chrono::Duration::hours(24)
+            );
+            let lines = |world: &World| {
+                kinds(&world.lines(night), LineKind::Approval)
+                    .iter()
+                    .filter_map(|line| match &line.body {
+                        LineBody::Approval(body) => Some(body.state),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if decided {
+                // The morning: tgorka approves from his phone.
+                let decision = world.decision(&record, Decision::Approve);
+                assert!(matches!(
+                    world.serve(&mut served, decision).await,
+                    Outcome::Decided
+                ));
+                assert_eq!(world.note().as_deref(), Some("the night's note"));
+                assert_eq!(approvals.events().len(), 1, "consumed once");
+                assert_eq!(
+                    lines(&world),
+                    [
+                        ApprovalState::Requested,
+                        ApprovalState::Decided,
+                        ApprovalState::Consumed
+                    ]
+                );
+                continue;
+            }
+            // Nobody decides: a day passes (the expiry moved near, as only
+            // a test does), and the worker's own timer ends it.
+            drop(served);
+            record.expires_at = keeper_core::agents::approval::stamp(
+                chrono::Utc::now() + chrono::Duration::milliseconds(300),
+            );
+            std::fs::write(
+                world
+                    .dir(night)
+                    .join("approvals")
+                    .join(format!("{}.json", record.id)),
+                serde_json::to_string(&record).expect("json"),
+            )
+            .expect("rewrite");
+            let mut restarted = world.open(night);
+            restarted.approval_room = Some(Arc::clone(&approvals) as Arc<dyn ApprovalRoom>);
+            let (_queue, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+            let busy = keeper_agent::agent::Activity::default();
+            let (_handle, signal) = chat::cancellation();
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                restarted.serve_arrivals(
+                    &world.deps,
+                    world.room.clone(),
+                    Vec::new(),
+                    &mut arrivals,
+                    signal,
+                    &busy,
+                ),
+            )
+            .await;
+            assert_eq!(
+                lines(&world),
+                [ApprovalState::Requested, ApprovalState::Expired]
+            );
+            assert!(tool_results(&world.lines(night))[0]
+                .content
+                .contains(EXPIRED));
+            assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+            assert!(approvals.events().is_empty());
+        }
+    }
+
+    /// 93.4 AC4, 92.6's `NeedsApproval` with a decision source: after an
+    /// inbox read the session is `untrusted`, so a write outside it is T3
+    /// `[untrusted]` and parks for the label's readers instead of being
+    /// refused; nothing is written while it waits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_untrusted_consequential_write_parks_with_a_source() {
+        let (mut world, approvals) = deciding(vec![
+            calls(&[(
+                "r1",
+                "drive_read",
+                json!({"profile":"tgdrive","path":"00-inbox/x.md"}),
+            )]),
+            calls(&[(
+                "w1",
+                "drive_write",
+                json!({"profile":"tgdrive","path":NOTE,"content":"from the inbox"}),
+            )]),
+        ]);
+        let mut served = open(&world, &approvals);
+        let report = report(world.ask(&mut served, "read the inbox, then note it").await);
+        assert_eq!(report.ending, TurnEnding::Parked);
+        assert_eq!(served.context.label.integrity, Integrity::Untrusted);
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+        let record = world.record();
+        assert_eq!(
+            (
+                record.action.tool.as_str(),
+                record.risk.tier,
+                record.risk.raised_by.clone()
+            ),
+            ("drive_write", 3, vec!["untrusted".to_owned()])
+        );
+        assert_eq!(world.sent_of(APPROVAL_REQUEST).len(), 1);
+    }
+
+    /// Every approval record of the session at `path`, by id.
+    fn records_in(world: &World, path: &str) -> Vec<ApprovalRecord> {
+        let mut records: Vec<ApprovalRecord> = std::fs::read_dir(world.dir(path).join("approvals"))
+            .expect("approvals")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                name.ends_with(".json")
+                    && !name.ends_with(".decision.json")
+                    && !name.ends_with(".round.json")
+                    && !name.ends_with(".asked.json")
+            })
+            .map(|path| {
+                parse_record(&std::fs::read_to_string(path).expect("read")).expect("strict")
+            })
+            .collect();
+        records.sort_by(|a, b| a.id.cmp(&b.id));
+        records
+    }
+
+    /// 93.3 AC6 (the host's half; live in `live_delegate`): Nixi's hand-off
+    /// to Dr Lucyna Novak, whose drive Marta reads, is beyond Nixi's
+    /// {tgorka} label. With a decision source it parks as a `declassify`
+    /// card — T3, once — sent to tgorka's proxy DM and never into the
+    /// session's room, naming Marta, the brief's SHA-256 and the call
+    /// itself. tgorka's approval lets exactly that brief through once: the
+    /// delegation opens under the id the bytes carried, the session's label
+    /// is unchanged, and the record, the `consumed` event and line are the
+    /// audit. The exchange's next round is other bytes: it parks again, and
+    /// its approval sends it into the same child room under the label
+    /// approved for it, as the opening brief was (R193).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_declassification_decided_in_the_proxy_dm_lets_one_flow_through() {
+        let mut world = world_read_by(
+            &[TGORKA],
+            ProviderKind::OpenAi,
+            &["drive_read", "delegate"],
+            vec![
+                delegate_call(
+                    "d1",
+                    json!({"agent": "neuradrive/lucyna", "brief": "Summarise my diary."}),
+                ),
+                prose("Handed to Lucyna."),
+                delegate_call(
+                    "d2",
+                    json!({"agent": "neuradrive/lucyna", "brief": "And my plans.", "session": DELEGATION}),
+                ),
+                prose("Sent to Lucyna."),
+            ],
+        );
+        world.deps.decisions = Some(Admit::pinned());
+        let approvals = Arc::new(Approvals::default());
+        let rooms = Delegations::over(known(&[TGORKA]));
+        let doors = Arc::new(Doors::default());
+        let mut nixi = world.delegating(&rooms);
+        nixi.approval_room = Some(Arc::clone(&approvals) as Arc<dyn ApprovalRoom>);
+        nixi.doors = Some(doors.clone());
+        let label = nixi.context.label.clone();
+
+        let first = report(world.ask(&mut nixi, "ask Lucyna").await);
+        assert_eq!(first.ending, TurnEnding::Parked);
+        assert!(rooms.made().is_empty());
+        assert!(rooms.sent().is_empty());
+        let record = world.record();
+        assert_eq!(
+            (record.action.tool.as_str(), record.risk.tier),
+            ("declassify", 3)
+        );
+        assert_eq!(record.scopes.len(), 1, "once only");
+        let args = &record.action.args;
+        assert_eq!(args["readers"], json!([MARTA]));
+        assert_eq!(args["call"]["tool"], "delegate");
+        let sha = args["sha256"].as_str().expect("a digest").to_owned();
+        let delegation = args["delegation"].as_str().expect("its id").to_owned();
+        assert!(
+            world.sent_of(APPROVAL_REQUEST).is_empty(),
+            "not in the room"
+        );
+        let requests = doors.of(APPROVAL_REQUEST);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0]["id"], record.id.as_str());
+
+        // tgorka approves from his phone; the brief goes once.
+        let decided = world.decision(&record, Decision::Approve);
+        assert!(matches!(
+            world.serve(&mut nixi, decided).await,
+            Outcome::Decided
+        ));
+        let made = rooms.made();
+        assert_eq!(made.len(), 1, "one room for the one brief");
+        // Lucyna joins: that brief, those bytes, goes in — once.
+        let mut joined = world.event(LUCYNA, Arrival::Joined, json!({"membership": "join"}));
+        joined.via = Some(made[0].3.clone());
+        world.serve(&mut nixi, joined).await;
+        let sent = rooms.sent();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let brief = read_brief(&sent[0].1).expect("a brief");
+        assert_eq!(brief.id, delegation);
+        // R193: the label the person approved rides in the bound bytes.
+        assert_eq!(
+            brief.label.readers,
+            Readers::Only(BTreeSet::from([user(TGORKA), user(MARTA)]))
+        );
+        assert_eq!(brief.label.integrity, label.integrity);
+        assert_eq!(
+            keeper_core::agents::approval::sha256_hex(sent[0].1.to_string().as_bytes()),
+            sha,
+            "exactly the approved bytes"
+        );
+        let lines = world.lines(SESSION);
+        let opened = delegate_lines(&lines);
+        let states: Vec<DelegateState> = opened.iter().map(|line| line.state).collect();
+        assert_eq!(states, [DelegateState::Opened, DelegateState::Sent]);
+        assert!(
+            opened.iter().all(|line| line.id == delegation),
+            "the bytes it approved"
+        );
+        assert_eq!(
+            result_of(&tool_results(&lines), "d1").outcome,
+            ToolOutcomeWord::Ok
+        );
+        assert_eq!(approvals.events().len(), 1);
+        assert_eq!(nixi.context.label, label, "the label is unchanged");
+        assert!(world
+            .approval_lines()
+            .iter()
+            .any(|line| line.state == ApprovalState::Consumed));
+
+        // The next round is other bytes: it waits again.
+        let again = report(world.ask(&mut nixi, "and my plans").await);
+        assert_eq!(again.ending, TurnEnding::Parked);
+        assert_eq!(rooms.sent().len(), 1, "nothing more while it waits");
+        let records = records_in(&world, SESSION);
+        assert_eq!(records.len(), 2);
+        let again = records
+            .iter()
+            .find(|r| r.id != record.id)
+            .expect("a second")
+            .clone();
+        assert_eq!(again.action.tool, "declassify");
+        assert_eq!(again.action.args["readers"], json!([MARTA]));
+        let round_sha = again.action.args["sha256"]
+            .as_str()
+            .expect("a digest")
+            .to_owned();
+        assert_ne!(round_sha, sha);
+
+        // Approved, the round goes into the same room under the label the
+        // person approved, as exactly those bytes — a label Lucyna's host
+        // admits (`rooms::admit_brief`'s rule: it reaches her audience).
+        let decided = world.decision(&again, Decision::Approve);
+        assert!(matches!(
+            world.serve(&mut nixi, decided).await,
+            Outcome::Decided
+        ));
+        assert_eq!(rooms.made().len(), 1, "the same child session");
+        let sent = rooms.sent();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[1].0, made[0].3);
+        let round = read_brief(&sent[1].1).expect("a round");
+        assert_eq!(round.id, delegation);
+        assert_eq!(round.brief, "And my plans.");
+        assert_eq!(
+            round.label.readers,
+            Readers::Only(BTreeSet::from([user(TGORKA), user(MARTA)]))
+        );
+        let lucynas = keeper_core::agents::label::Sink::Delegation {
+            target_audience: Readers::Only(BTreeSet::from([user(TGORKA), user(MARTA)])),
+            room_members: BTreeSet::from([user(TGORKA)]),
+        };
+        assert_eq!(
+            keeper_core::agents::label::check_sink(&round.label, &lucynas),
+            keeper_core::agents::label::SinkVerdict::Allow
+        );
+        assert_eq!(
+            keeper_core::agents::approval::sha256_hex(sent[1].1.to_string().as_bytes()),
+            round_sha,
+            "exactly the approved bytes"
+        );
+        assert_eq!(
+            result_of(&tool_results(&world.lines(SESSION)), "d2").outcome,
+            ToolOutcomeWord::Ok
+        );
+        assert_eq!(nixi.context.label, label, "the label is unchanged");
+    }
+
+    /// Nixi's hand-off to Dr Lucyna Novak parked on its `declassify` card
+    /// (Nixi reads `allow`; the turn's later completions are `after`): the
+    /// world, the delegation rooms, Nixi's session, the record, and the
+    /// doors the card went through.
+    async fn parked_hand_off(
+        allow: &[&str],
+        after: Vec<Completion>,
+    ) -> (
+        World,
+        Arc<Delegations>,
+        ServedSession,
+        ApprovalRecord,
+        Arc<Doors>,
+    ) {
+        let mut script = vec![delegate_call(
+            "d1",
+            json!({"agent": "neuradrive/lucyna", "brief": "Summarise my diary."}),
+        )];
+        script.extend(after);
+        let mut world = world_read_by(&[TGORKA], ProviderKind::OpenAi, allow, script);
+        world.deps.decisions = Some(Admit::pinned());
+        let rooms = Delegations::over(known(&[TGORKA]));
+        let doors = Arc::new(Doors::default());
+        let mut nixi = world.delegating(&rooms);
+        nixi.approval_room = Some(Arc::new(Approvals::default()) as Arc<dyn ApprovalRoom>);
+        nixi.doors = Some(doors.clone());
+        let parked = report(world.ask(&mut nixi, "ask Lucyna").await);
+        assert_eq!(parked.ending, TurnEnding::Parked);
+        let record = world.record();
+        assert_eq!(record.action.tool, "declassify");
+        (world, rooms, nixi, record, doors)
+    }
+
+    /// R194 (R6-01): an approval authorises exactly the call it bound, for
+    /// that one execution. The approved hand-off runs; the model's next
+    /// call reuses its wire id — a write, or a scheduled hand-off to Tola —
+    /// and waits on a card of its own: the spent approval runs nothing else.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_approval_authorises_only_the_call_it_bound() {
+        let reusing = [
+            ("drive_write", calls(&[write_note("d1", "never approved")])),
+            (
+                "delegate",
+                delegate_call(
+                    "d1",
+                    json!({"agent": "tgdrive/tola", "brief": "Every morning.", "card": {"title": "Digest", "schedule": "@daily"}}),
+                ),
+            ),
+        ];
+        for (tool, next) in reusing {
+            let (mut world, rooms, mut nixi, record, _) =
+                parked_hand_off(&["drive_read", "delegate", "drive_write"], vec![next]).await;
+            let decided = world.decision(&record, Decision::Approve);
+            assert!(matches!(
+                world.serve(&mut nixi, decided).await,
+                Outcome::Decided
+            ));
+            assert_eq!(rooms.made().len(), 1, "the approved hand-off ran ({tool})");
+            assert!(nixi.waiting(), "{tool} waits on its own");
+            let records = records_in(&world, SESSION);
+            assert_eq!(records.len(), 2, "{tool}");
+            let own = records
+                .iter()
+                .find(|r| r.id != record.id)
+                .expect("its own record");
+            assert_eq!(
+                (own.call.call_id.as_str(), own.action.tool.as_str()),
+                ("d1", tool)
+            );
+            assert_eq!(world.note().as_deref(), Some(ORIGINAL), "{tool}");
+        }
+    }
+
+    /// R194 (R6-02), a drive: Nixi's {tgorka} session writes a note into a
+    /// drive Marta reads too; tgorka approves letting Marta read it. When
+    /// Eve becomes a reader of the drive before the approval is used, the
+    /// same bytes would reach someone the card never named: refused on that
+    /// approval, its one row closed, the note untouched. Unchanged, it is
+    /// written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_release_never_reaches_a_drive_reader_added_after_the_approval() {
+        use keeper_core::bots::audit::AuditOutcome;
+        for grown in [false, true] {
+            let mut world = world_read_by(
+                &[TGORKA],
+                ProviderKind::OpenAi,
+                &["drive_read", "drive_write"],
+                vec![calls(&[write_note("w1", "for Marta")]), prose("Done.")],
+            );
+            world.deps.decisions = Some(Admit::pinned());
+            world.deps.drives.insert(
+                "tgdrive".to_owned(),
+                decl("tgdrive", &[TGORKA, MARTA], false),
+            );
+            let approvals = Arc::new(Approvals::default());
+            let mut served = open(&world, &approvals);
+            served.doors = Some(Arc::new(Doors::default()));
+            let parked = report(world.ask(&mut served, "write it for Marta").await);
+            assert_eq!(parked.ending, TurnEnding::Parked);
+            let record = world.record();
+            assert_eq!(record.action.tool, "declassify");
+            assert_eq!(record.action.args["readers"], json!([MARTA]));
+            if grown {
+                world.deps.drives.insert(
+                    "tgdrive".to_owned(),
+                    decl("tgdrive", &[TGORKA, MARTA, "@eve:example.org"], false),
+                );
+            }
+            let decided = world.decision(&record, Decision::Approve);
+            assert!(matches!(
+                world.serve(&mut served, decided).await,
+                Outcome::Decided
+            ));
+            let w1 = result_of(&results(&world), "w1").clone();
+            if grown {
+                assert_eq!(w1.outcome, ToolOutcomeWord::Refused);
+                assert!(
+                    w1.content.contains("who it would reach changed"),
+                    "{}",
+                    w1.content
+                );
+                assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+                assert_eq!(
+                    approval_rows(&world.deps.data_dir, &record.id),
+                    [AuditOutcome::Refused]
+                );
+            } else {
+                assert_eq!(w1.outcome, ToolOutcomeWord::Ok, "{}", w1.content);
+                assert_eq!(world.note().as_deref(), Some("for Marta"));
+            }
+            assert!(!served.waiting());
+        }
+    }
+
+    /// R194 (R6-02), a room: Tola's {tgorka} session replies into the room
+    /// Nixi made, where Marta watches; tgorka approves letting Marta read
+    /// it. When Eve joins the room before the approval is used, the reply —
+    /// the same bytes — is not sent: refused on that approval, its one row
+    /// closed. With the room unchanged it goes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_released_reply_never_reaches_someone_who_joined_after_the_approval() {
+        use keeper_core::bots::audit::AuditOutcome;
+        for grown in [false, true] {
+            let mut world = world(
+                ProviderKind::OpenAi,
+                &["drive_read", "delegate"],
+                vec![
+                    hand_inbox(),
+                    prose("Handed on."),
+                    calls(&[("r1", "reply", json!({"text": "Done."}))]),
+                    prose("Replied."),
+                ],
+            );
+            let mut tola = tolas(&world, &["drive_read"]);
+            tola.decisions = Some(Admit::pinned());
+            let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+            let (_nixi, child, brief) = handed_over(&mut world, &rooms).await;
+            let path = world.create_child(&tola, &child, &read_brief(&brief).expect("a brief"));
+            let mut tolas_session = world.child(&tola, &path, &rooms);
+            tolas_session.approval_room =
+                Some(Arc::new(Approvals::default()) as Arc<dyn ApprovalRoom>);
+            tolas_session.doors = Some(Arc::new(Doors::default()));
+            narrow(&mut tolas_session, &[TGORKA]);
+            let room = Arc::new(Room::default());
+            let arrived = world.brief(&brief);
+            let parked = report(serve_as(&tola, &mut tolas_session, &room, arrived).await);
+            assert_eq!(parked.ending, TurnEnding::Parked);
+            let record = world.record_in(&path);
+            assert_eq!(record.action.tool, "declassify");
+            assert_eq!(record.action.args["readers"], json!([MARTA]));
+            if grown {
+                rooms
+                    .added
+                    .lock()
+                    .expect("lock")
+                    .push((child.clone(), user("@eve:example.org")));
+            }
+            let decided = world.decision(&record, Decision::Approve);
+            assert!(matches!(
+                serve_as(&tola, &mut tolas_session, &room, decided).await,
+                Outcome::Decided
+            ));
+            let replied = room
+                .sent()
+                .iter()
+                .any(|(kind, content)| kind == "m.room.message" && content["body"] == "Done.");
+            assert_eq!(replied, !grown, "grown: {grown}");
+            let r1 = result_of(&tool_results(&world.lines(&path)), "r1").clone();
+            if grown {
+                assert_eq!(r1.outcome, ToolOutcomeWord::Refused);
+                assert!(
+                    r1.content.contains("who it would reach changed"),
+                    "{}",
+                    r1.content
+                );
+                assert_eq!(
+                    approval_rows(&world.deps.data_dir, &record.id),
+                    [AuditOutcome::Refused]
+                );
+            } else {
+                assert_eq!(r1.outcome, ToolOutcomeWord::Ok, "{}", r1.content);
+            }
+        }
+    }
+
+    /// R194 (R6-03): the brief goes in at the target's join, after its
+    /// approval was spent, so its binding is checked again there. The
+    /// record's arguments edited on disk between the room's making and
+    /// Lucyna's join — its readers and digest untouched — no longer
+    /// recompute to the digest tgorka approved: nothing goes in, and the
+    /// delegation ends refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_brief_whose_approval_was_edited_before_the_join_is_not_sent() {
+        let (mut world, rooms, mut nixi, record, _) = parked_hand_off(
+            &["drive_read", "delegate"],
+            vec![prose("Handed to Lucyna.")],
+        )
+        .await;
+        let decided = world.decision(&record, Decision::Approve);
+        assert!(matches!(
+            world.serve(&mut nixi, decided).await,
+            Outcome::Decided
+        ));
+        let made = rooms.made();
+        assert_eq!(made.len(), 1);
+        let mut edited = world.record();
+        edited.action.args["what"] = json!("the work handed to someone else");
+        world.rewrite(&edited);
+        let mut joined = world.event(LUCYNA, Arrival::Joined, json!({"membership": "join"}));
+        joined.via = Some(made[0].3.clone());
+        world.serve(&mut nixi, joined).await;
+        assert!(
+            rooms.sent().is_empty(),
+            "nothing the person did not approve"
+        );
+        let states: Vec<DelegateState> = delegate_lines(&world.lines(SESSION))
+            .iter()
+            .map(|line| line.state)
+            .collect();
+        assert_eq!(states, [DelegateState::Opened, DelegateState::Refused]);
+    }
+
+    /// R194 (R6-06): a resumed call whose bytes, recomposed, are no longer
+    /// those its approval names ends as drift — never a new park. Nixi's
+    /// delegation limits change between the park and tgorka's decision, so
+    /// the brief she would send is other bytes: the call is refused with
+    /// the drift sentence on its one row, no second record or card is made,
+    /// no room is opened, and nothing waits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_call_whose_bytes_moved_ends_as_drift_on_its_one_row() {
+        use keeper_agent::approvals::CHANGED;
+        use keeper_core::bots::audit::AuditOutcome;
+        let (mut world, rooms, mut nixi, record, doors) =
+            parked_hand_off(&["drive_read", "delegate"], vec![prose("It changed.")]).await;
+        world.deps.home.config.limits.tokens_per_delegation += 1;
+        let decided = world.decision(&record, Decision::Approve);
+        assert!(matches!(
+            world.serve(&mut nixi, decided).await,
+            Outcome::Decided
+        ));
+        assert!(rooms.made().is_empty());
+        let d1 = result_of(&tool_results(&world.lines(SESSION)), "d1").clone();
+        assert_eq!(d1.outcome, ToolOutcomeWord::Refused);
+        assert!(d1.content.contains(CHANGED), "{}", d1.content);
+        assert!(!nixi.waiting());
+        assert_eq!(records_in(&world, SESSION).len(), 1, "no second record");
+        assert_eq!(doors.of(APPROVAL_REQUEST).len(), 1, "no second card");
+        assert_eq!(
+            approval_rows(&world.deps.data_dir, &record.id),
+            [AuditOutcome::Refused]
+        );
+        let delegates: Vec<AuditOutcome> = audit_list(&world, &nixi)
+            .into_iter()
+            .filter(|row| row.tool == "delegate")
+            .map(|row| row.outcome)
+            .collect();
+        assert_eq!(
+            delegates,
+            [AuditOutcome::Refused],
+            "one row for the one call"
+        );
+    }
+
+    /// R194 (R6-05): a surface request the label blocks is not declassified
+    /// in this rung — each send mints its own id and expiry, so no approval
+    /// could name its bytes again (DW-521). With a decision source and
+    /// tgorka's proxy here, it is still refused as before: no record, one
+    /// audit row, nothing sent to the device, nothing waits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_surface_request_the_label_blocks_is_refused_never_parked() {
+        use keeper_core::agents::label::NEEDS_APPROVAL;
+        let mut world = world_read_by(
+            &[TGORKA],
+            ProviderKind::OpenAi,
+            &["drive_read", "surface_highlight"],
+            vec![
+                calls(&[(
+                    "c1",
+                    "surface_highlight",
+                    json!({"drive": "tgdrive", "path": "notes/hello.md", "range": {"from": 2, "to": 2}}),
+                )]),
+                prose("I could not."),
+            ],
+        );
+        world.deps.decisions = Some(Admit::pinned());
+        world.room.set_members(&[TGORKA, NIXI, MARTA]);
+        let approvals = Arc::new(Approvals::default());
+        let mut served = open(&world, &approvals);
+        served.doors = Some(Arc::new(Doors::default()));
+        let surface = Arc::new(Surface {
+            room: room_id(),
+            requests: Mutex::new(Vec::new()),
+        });
+        served.surface = Some(surface.clone());
+        let ran = report(world.ask(&mut served, "show me the second line").await);
+        assert_ne!(ran.ending, TurnEnding::Parked);
+        assert!(!served.waiting());
+        assert!(surface.requests.lock().expect("lock").is_empty());
+        let c1 = result_of(&results(&world), "c1").clone();
+        assert_eq!(c1.outcome, ToolOutcomeWord::Refused);
+        assert!(c1.content.contains(MARTA), "{}", c1.content);
+        assert!(c1.content.contains(NEEDS_APPROVAL), "{}", c1.content);
+        assert_eq!(
+            std::fs::read_dir(world.approvals()).map_or(0, Iterator::count),
+            0,
+            "no record"
+        );
+        let rows: Vec<_> = audit_list(&world, &served)
+            .into_iter()
+            .filter(|row| row.tool == "surface_highlight")
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0].verdict,
+            Some(keeper_core::bots::audit::AuditVerdict::Deny)
+        );
+    }
+
+    /// R194 (R6-07): a request its room could not carry went to tgorka's
+    /// proxy DM from Nixi's own session — not the DM itself. The host
+    /// restarts before anyone decides: its routes are gone with it, and the
+    /// status cursor of the request says nothing of the DM. Serve start
+    /// rebuilds the route from what was kept beside the record, so the
+    /// decision in the DM goes home to the session that asked, which runs
+    /// the write exactly once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dm_routed_request_is_heard_again_after_a_restart() {
+        let (mut world, approvals) =
+            deciding(vec![calls(&[write_note("w1", "after")]), prose("Written.")]);
+        nixis_dm(&world);
+        let delegations = Delegations::over(known_with_proxy());
+        let serving = |world: &World, doors: &Arc<Doors>| {
+            let mut served = world.delegating(&delegations);
+            served.approval_room = Some(Arc::clone(&approvals) as Arc<dyn ApprovalRoom>);
+            served.doors = Some(doors.clone());
+            let (home, inbox) = tokio::sync::mpsc::unbounded_channel::<Arrived>();
+            served.inbox = Some(Arc::new(move |arrived| {
+                let _ = home.send(arrived);
+            }));
+            (served, inbox)
+        };
+        world
+            .room
+            .set_members(&[TGORKA, MARTA, NIXI, "@eve:example.org"]);
+        let (mut served, _) = serving(&world, &Arc::new(Doors::default()));
+        let parked = report(world.ask(&mut served, "write a note").await);
+        assert_eq!(parked.ending, TurnEnding::Parked);
+        let record = world.record();
+        drop(served);
+
+        // A new process: new doors, no route, the same session.
+        let doors = Arc::new(Doors::default());
+        let (mut served, mut inbox) = serving(&world, &doors);
+        let activity = keeper_agent::agent::Activity::default();
+        worker_for(&world, &mut served, &activity, 1).await;
+        assert!(served.waiting());
+        let mut dm = world.open(DM);
+        dm.doors = Some(doors.clone());
+        let decided = world.decision(&record, Decision::Approve);
+        assert!(matches!(
+            world.serve(&mut dm, decided).await,
+            Outcome::Forwarded
+        ));
+        let forwarded = inbox.try_recv().expect("the decision went home");
+        assert!(matches!(
+            world.serve(&mut served, forwarded).await,
+            Outcome::Decided
+        ));
+        assert_eq!(world.note().as_deref(), Some("after"));
+        assert_eq!(approvals.events().len(), 1, "consumed once");
+        assert!(inbox.try_recv().is_err(), "handed home once");
+    }
+
+    /// R194 (R6-08): a declassification is asked only in the approvers'
+    /// proxy DMs this host runs. With none of them here — Nixi's {tgorka}
+    /// session writing for Marta on a host without tgorka's proxy — nobody
+    /// can be asked: the write does not wait, no record is left, no
+    /// request is announced, and the model is told why. With some of them
+    /// here — a {tgorka, Marta} session writing for Eve, tgorka's proxy
+    /// alone on this host — only tgorka is asked, and what is kept beside
+    /// the record says so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_approvers_this_host_can_ask_are_asked_and_nobody_refuses() {
+        use keeper_agent::approvals::NOBODY_TO_ASK;
+        use keeper_core::bots::audit::AuditOutcome;
+        let mut world = world_read_by(
+            &[TGORKA],
+            ProviderKind::OpenAi,
+            &["drive_read", "drive_write"],
+            vec![
+                calls(&[write_note("w1", "for Marta")]),
+                prose("I could not."),
+            ],
+        );
+        world.deps.decisions = Some(Admit::pinned());
+        world.deps.drives.insert(
+            "tgdrive".to_owned(),
+            decl("tgdrive", &[TGORKA, MARTA], false),
+        );
+        let approvals = Arc::new(Approvals::default());
+        let mut served = open(&world, &approvals);
+        report(world.ask(&mut served, "write it for Marta").await);
+        assert!(!served.waiting());
+        let w1 = result_of(&results(&world), "w1").clone();
+        assert_eq!(w1.outcome, ToolOutcomeWord::Refused);
+        assert!(w1.content.contains(NOBODY_TO_ASK), "{}", w1.content);
+        assert!(world
+            .approval_lines()
+            .iter()
+            .all(|line| line.state != ApprovalState::Requested));
+        let left: Vec<_> = std::fs::read_dir(world.approvals())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.ends_with(".json"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(left.is_empty(), "{left:?}");
+        let writes: Vec<AuditOutcome> = audit_list(&world, &served)
+            .into_iter()
+            .filter(|row| row.tool == "drive_write")
+            .map(|row| row.outcome)
+            .collect();
+        assert_eq!(writes, [AuditOutcome::Refused]);
+        assert_eq!(world.note().as_deref(), Some(ORIGINAL));
+
+        let mut world = world_read_by(
+            &[TGORKA, MARTA],
+            ProviderKind::OpenAi,
+            &["drive_read", "drive_write"],
+            vec![calls(&[write_note("w1", "for Eve")])],
+        );
+        world.deps.decisions = Some(Admit::pinned());
+        world.deps.drives.insert(
+            "tgdrive".to_owned(),
+            decl("tgdrive", &[TGORKA, MARTA, "@eve:example.org"], false),
+        );
+        let approvals = Arc::new(Approvals::default());
+        let doors = Arc::new(Doors::default());
+        let mut served = open(&world, &approvals);
+        served.doors = Some(doors.clone());
+        let parked = report(world.ask(&mut served, "write it for Eve").await);
+        assert_eq!(parked.ending, TurnEnding::Parked);
+        let record = world.record();
+        assert_eq!(record.action.tool, "declassify");
+        let requests = doors.of(APPROVAL_REQUEST);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        let asked: Value = serde_json::from_str(
+            &std::fs::read_to_string(world.approvals().join(format!("{}.asked.json", record.id)))
+                .expect("who was asked"),
+        )
+        .expect("json");
+        assert_eq!(
+            asked["asked"],
+            json!([{"person": TGORKA, "dm": "!dm:example.org"}])
+        );
     }
 
     /// The one `decided` line written for a decision that did not count:

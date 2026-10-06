@@ -13,8 +13,10 @@
 //!
 //! A block is what a person could let through (FR-795): the request is
 //! computed here — the blocked effect's digest, its destination, the sink,
-//! the label's readers and each one's proxy DM — and, until approvals exist
-//! (epic 93), refused with [`NEEDS_APPROVAL`].
+//! the label's readers and each one's proxy DM. An agent's call whose host
+//! has a decision source parks on it as a `declassify` approval, decided in
+//! the approvers' proxy DMs, which lets exactly those bytes through once
+//! ([`Lift`], R89); anything else is refused with [`NEEDS_APPROVAL`].
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -23,7 +25,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use keeper_core::agents::home::{AgentConfig, AgentKind};
 use keeper_core::agents::label::{
-    check_sink, declassify_request, Destination, Label, Sink, SinkVerdict, NEEDS_APPROVAL,
+    check_sink, declassify_request, DeclassifyRequest, Destination, Label, Sink, SinkVerdict,
+    NEEDS_APPROVAL,
 };
 use keeper_core::agents::matrix::{AgentClient, AgentMatrixError};
 use keeper_core::agents::room::room_members;
@@ -160,6 +163,7 @@ impl RoomGate {
                 drive: String::new(),
                 at: String::new(),
                 sentence,
+                flow: None,
             });
         };
         let destination = Destination::Room { room: room.clone() };
@@ -169,6 +173,7 @@ impl RoomGate {
                 drive: String::new(),
                 at: room.to_string(),
                 sentence: unread,
+                flow: None,
             }),
         }
     }
@@ -220,12 +225,44 @@ impl RoomGate {
 /// where it would have gone and the sentence said instead. Whoever made the
 /// flow audits it — a send of the host's own as its R65 row
 /// ([`Sinks::refused`]), an agent's call in its one classified row
-/// ([`CallAudit::blocked`]).
+/// ([`CallAudit::blocked`]), which may park on it instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocked {
     pub drive: String,
     pub at: String,
     pub sentence: String,
+    /// What a person would let through, when the label blocked it; `None`
+    /// for a room whose members could not be read.
+    pub flow: Option<Box<DeclassifyRequest>>,
+}
+
+/// What a blocked flow of an agent's call comes to (R89).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lifted {
+    /// A consumed `declassify` approval of this call names exactly these
+    /// bytes, and the sink is within the readers it names: it goes
+    /// through, under that approval.
+    Released(ulid::Ulid),
+    /// The call a consumed approval bound would now let through something
+    /// that approval did not name: it is refused with this sentence on
+    /// that approval, its one row closed — never parked again.
+    Drift(ulid::Ulid, String),
+    /// The call waits for a person on this new `declassify` record.
+    Parked(ulid::Ulid),
+    /// Nobody can let it through here: it is refused.
+    Refused,
+}
+
+/// Who decides whether a blocked flow of call `call` parks, goes through
+/// on an approval, or is refused: the turn's tools, which know whether a
+/// decision source is installed and what a resumed call was approved for.
+pub trait Lift {
+    /// `flow`, blocked for call `call` (whose delegation is `delegation`,
+    /// when it is one: its id is part of the bytes).
+    fn lift(&self, call: &str, flow: &DeclassifyRequest, delegation: Option<&str>) -> Lifted;
+    /// The delegation id a resumed call `call` was approved with: the same
+    /// brief, byte for byte, needs the same id.
+    fn delegation(&self, call: &str) -> Option<String>;
 }
 
 /// One session's sinks: the ids its audit rows name, and what the host
@@ -394,13 +431,14 @@ impl Sinks {
             destination = ?request.destination,
             artifact = ?request.artifact,
             route = ?request.route,
-            "agents: a flow beyond the label was refused; letting it through needs an approval"
+            "agents: a flow beyond the label was blocked; letting it through needs an approval"
         );
         let (drive, at) = destination.target();
         Err(Blocked {
             drive: drive.to_owned(),
             at: at.to_owned(),
             sentence,
+            flow: Some(Box::new(request)),
         })
     }
 
@@ -499,12 +537,17 @@ pub struct CallAudit<'s> {
     /// What the call answers once its sinks have passed: an integrity
     /// block, T5, an approval nobody can give; `None` runs it.
     refusal: Option<String>,
-    /// The record it parks on, or the consumed one it runs on.
-    approval: Option<Approval>,
+    /// The record it parks on, or the consumed one it runs on — a
+    /// `declassify` approval that released its flow included.
+    approval: Mutex<Option<Approval>>,
     /// Where the row says the call went until the call names it.
     drive: String,
     at: String,
     row: Mutex<CallRow>,
+    /// Who decides on a flow its sinks block, and the call's wire id.
+    lift: Option<(&'s dyn Lift, &'s str)>,
+    /// The delegation id the call's bytes carry, when it is one.
+    delegation: Mutex<Option<String>>,
 }
 
 impl<'s> CallAudit<'s> {
@@ -523,28 +566,107 @@ impl<'s> CallAudit<'s> {
             effect,
             classification,
             refusal,
-            approval,
+            approval: Mutex::new(approval),
             drive: drive.to_owned(),
             at: at.to_owned(),
             row: Mutex::new(CallRow::Unwritten),
+            lift: None,
+            delegation: Mutex::new(None),
         }
+    }
+
+    /// The same audit, a flow its sinks block decided by `lift` for the
+    /// call `call` (R89).
+    pub fn lifting(self, lift: &'s dyn Lift, call: &'s str) -> CallAudit<'s> {
+        CallAudit {
+            lift: Some((lift, call)),
+            ..self
+        }
+    }
+
+    /// The delegation id this call sends under: the one a resumed call was
+    /// approved with, so its brief is the same bytes; else `fresh`.
+    pub fn delegation_id(&self, fresh: String) -> String {
+        let id = self
+            .lift
+            .and_then(|(lift, call)| lift.delegation(call))
+            .unwrap_or(fresh);
+        *self.delegation.lock().unwrap_or_else(|p| p.into_inner()) = Some(id.clone());
+        id
     }
 
     fn row(&self) -> std::sync::MutexGuard<'_, CallRow> {
         self.row.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// A sink blocked the call: its row, `Deny` with the block's sentence
-    /// at the block's destination, and the sentence the call says.
-    pub fn blocked(&self, blocked: Blocked) -> String {
+    fn approval(&self) -> Option<Approval> {
+        *self.approval.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A sink blocked the call. A `declassify` approval consumed for exactly
+    /// these bytes and this audience lets it go on (`Ok`), under that
+    /// approval; an approved call whose flow moved since is refused on its
+    /// approval, its parked row closed; a host with a decision source parks
+    /// it on a new one, its row pending and marked (R89); else its row is
+    /// `Deny` with the block's sentence at the block's destination, and the
+    /// call says that sentence.
+    pub fn blocked(&self, blocked: Blocked) -> Result<(), Withheld> {
+        let lifted = match (self.lift, &blocked.flow) {
+            (Some((lift, call)), Some(flow)) => {
+                let delegation = self
+                    .delegation
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                lift.lift(call, flow, delegation.as_deref())
+            }
+            _ => Lifted::Refused,
+        };
         let mut row = self.row();
+        let sentence = match lifted {
+            Lifted::Released(approval) => {
+                *self.approval.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(Approval::Approved(approval));
+                return Ok(());
+            }
+            Lifted::Drift(approval, sentence) => {
+                *self.approval.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(Approval::Approved(approval));
+                sentence
+            }
+            Lifted::Parked(approval) if matches!(*row, CallRow::Unwritten) => {
+                *row = CallRow::Closed;
+                let written = self
+                    .sinks
+                    .classified(
+                        self.tool,
+                        &blocked.drive,
+                        &blocked.at,
+                        self.effect,
+                        self.classification,
+                        None,
+                    )
+                    .and_then(|id| {
+                        audit::mark_approval(&self.sinks.data_dir, id, &approval.to_string())
+                            .map_err(|error| error.to_string())
+                    });
+                return match written {
+                    Ok(_) => Err(Withheld::Parked(approval)),
+                    // Unauditable, it does not wait either (NFR-47).
+                    Err(error) => Err(Withheld::Refused(format!(
+                        "keeper could not record this tool call, so it did not run: {error}"
+                    ))),
+                };
+            }
+            _ => blocked.sentence,
+        };
         if matches!(*row, CallRow::Unwritten) {
-            if let Err(error) = self.refused_row(&blocked.drive, &blocked.at, &blocked.sentence) {
+            if let Err(error) = self.refused_row(&blocked.drive, &blocked.at, &sentence) {
                 tracing::warn!(%error, tool = self.tool, "agents: a blocked call's audit row could not be written");
             }
             *row = CallRow::Closed;
         }
-        blocked.sentence
+        Err(Withheld::Refused(sentence))
     }
 
     /// The row of a call refused before its sinks admitted it, closed
@@ -552,7 +674,7 @@ impl<'s> CallAudit<'s> {
     /// or — on a host that took over — a new one carrying the approval, so
     /// the call keeps one row whichever way it ends (R172).
     fn refused_row(&self, drive: &str, at: &str, sentence: &str) -> Result<(), String> {
-        let Some(Approval::Approved(approval)) = self.approval else {
+        let Some(Approval::Approved(approval)) = self.approval() else {
             return self
                 .sinks
                 .classified(
@@ -591,7 +713,8 @@ impl<'s> CallAudit<'s> {
     pub fn admit(&self, drive: &str, at: &str) -> Result<(), Withheld> {
         let mut row = self.row();
         *row = CallRow::Closed;
-        let parked = match self.approval {
+        let approval = self.approval();
+        let parked = match approval {
             Some(Approval::Approved(id)) => {
                 audit::parked_row(&self.sinks.data_dir, &id.to_string()).unwrap_or(None)
             }
@@ -614,7 +737,7 @@ impl<'s> CallAudit<'s> {
         if let Some(sentence) = &self.refusal {
             return Err(Withheld::Refused(sentence.clone()));
         }
-        if let Some(approval) = self.approval {
+        if let Some(approval) = approval {
             audit::mark_approval(&self.sinks.data_dir, id, &approval.id()).map_err(|error| {
                 Withheld::Refused(format!(
                     "keeper could not record this tool call, so it did not run: {error}"
@@ -622,7 +745,7 @@ impl<'s> CallAudit<'s> {
             })?;
         }
         // A parked call's row waits, pending, for its run after approval.
-        if let Some(Approval::Park(approval)) = self.approval {
+        if let Some(Approval::Park(approval)) = approval {
             return Err(Withheld::Parked(approval));
         }
         *row = CallRow::Open(id);

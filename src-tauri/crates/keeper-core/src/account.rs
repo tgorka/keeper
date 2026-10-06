@@ -4114,6 +4114,50 @@ impl AccountManager {
         self.agent_hosted.clone()
     }
 
+    /// Every live account as the desktop's agents host trusts it (R87): its
+    /// user, this app's device of it, whether its own identity is verified
+    /// here and this device cross-signed by it, and its master key — what a
+    /// decision on a session this Mac hosts is judged against. Read again on
+    /// each scan; nothing is pinned or written.
+    pub async fn agent_own_accounts(&self) -> Vec<crate::agents::trust::OwnAccount> {
+        let clients: Vec<matrix_sdk::Client> = self
+            .accounts
+            .lock()
+            .await
+            .values()
+            .map(|handle| handle.client.clone())
+            .collect();
+        let mut own = Vec::with_capacity(clients.len());
+        for client in clients {
+            let (Some(user), Some(device)) = (
+                client.user_id().map(ToOwned::to_owned),
+                client.device_id().map(ToString::to_string),
+            ) else {
+                continue;
+            };
+            let identity = client
+                .encryption()
+                .get_user_identity(&user)
+                .await
+                .ok()
+                .flatten();
+            let cross_signed = crate::agents::room::own_device_cross_signed(&client).await;
+            own.push(crate::agents::trust::OwnAccount::read(
+                user,
+                device,
+                identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.is_verified()),
+                cross_signed,
+                identity
+                    .as_ref()
+                    .and_then(crate::agents::matrix::master_key_of),
+            ));
+        }
+        own.sort_by(|a, b| a.user.cmp(&b.user));
+        own
+    }
+
     /// Every live account's proxy conversations, by account id (AD-384): the
     /// rooms a spoken question may go to.
     pub async fn agent_rooms_everywhere(&self) -> Vec<(String, ProxyRoomVm)> {

@@ -7751,12 +7751,12 @@ location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`logged_label`, called b
 reason: `show` takes the session's current label from its last `label` line, and `logged_label` gets it with `read_session(dir)` — every chunk of the log, parsed — on each status placement says (a wait, a lost claim, a refused card, a conflict). `show` returns early when the same status was already said only after that read. A long-lived session waiting on an absent host pays a whole-log read on every tick that reaches `show`. Revisit when a session's log grows past a few MB or a host serves many waiting sessions: read the label from the index's session projection, or keep the last label per slot and read only chunks that grew (`Index::refresh_session`'s rule, R62).
 status: open
 
-### DW-485: A request the room may not carry reaches only the approvers whose proxy this host runs, and a decision made in their DM does not reach the session yet.
+### DW-485: An approver whose proxy runs on another host is never asked: there is no cross-host request and decision relay.
 
 origin: epic 93, story 93.2 (rung `agents-93-park`, 2026-10-05; R85)
 location: `src-tauri/crates/keeper-agent/src/agent.rs` (`ServedSession::request_by_doors`), `src-tauri/crates/keeper-agent/src/approvals.rs` (`park`)
 reason: R85 sends a request the room's gate blocks to each approver's proxy DM through `ProxyDoors` — the proxies this host runs, the same doors as R169's narrowed detail (DW-460). An approver whose proxy runs on another host has no door here and is not asked (logged); a send that fails is not tried again — the record expires undecided after its 24 h or 1 h. A decision sent in the DM arrives at the proxy's `main` worker, not the parked session's: the forward is Q17/R89's route, built with the declassify card in rung 6 (`agents-93-decide`); until then nothing installs a decision source, so nothing parks in production. Close in rung 6: the DM's worker forwards a decision carrying `{session}` to the parked session's worker on whichever host serves it, the cross-host door replaces the local-only one, and a failed DM send joins the worker's `Retry`.
-status: open — narrowed 2026-10-05 (rung `agents-93-trust`, R89): a decision made in the DM of an approver whose proxy *this* host runs now goes home to the parked session (`deciding::Forwards`, `a_decision_in_the_approvers_dm_goes_home_to_the_session_that_asked`). What stays open: an approver whose proxy runs on another host is neither asked nor heard, a failed DM send is not retried, and the declassify card (rung 6).
+status: open — rewritten 2026-10-06 (rung `agents-93-decide`, R194 on review R6-08). Built: a decision in the DM of an approver whose proxy *this* host runs goes home to the parked session (`deciding::Forwards`, R89); who was asked and through which DM is kept beside the record (`approvals/<ulid>.asked.json`) and that route is rebuilt at serve start (R6-07); and the host fails closed — when it runs none of the approvers' proxies, or the request reached none of them, the call does not park: its record is removed, nothing is announced, and the model is told `approvals::NOBODY_TO_ASK` (`parks::only_approvers_this_host_can_ask_are_asked_and_nobody_refuses`). What stays open is the relay itself: a request carried to the host that runs an approver's proxy (agentd ↔ the Mac), the decision carried back to the requesting session, whose record and consume authority stay where it parked, and a delivery state that retries a DM send that failed rather than refusing. Until then an action whose only approvers' proxies run elsewhere is refused on this host, never parked.
 
 ### DW-486: An approved `drive_write` to a missing note is refused with the delete's sentence.
 
@@ -7883,4 +7883,54 @@ status: open
 origin: epic 93, story 93.3 (rung `agents-93-card-vm`, review fix R4-02 / R185, 2026-10-05)
 location: `src-tauri/crates/keeper-core/src/agents/room.rs` (`sealed_by_sender`), `src-tauri/crates/keeper-agent/src/runtime.rs` (`arrival_of`, `hold_brief`, `reply_of`)
 reason: R185 makes `VerificationLevel::None(MissingDevice)` no seal, on the device and in host intake. The SDK records an event's encryption info when it decrypts it; if the sender's device keys were not yet downloaded then, the cached copy says `MissingDevice` even after they arrive (not observed; read from the SDK's model, not reproduced). Such a request is no card, and such a brief, reply or decision is not taken, until the event is decrypted again. Close by re-deriving the verification state from the crypto store for unsealed approval/agent events when the sender's devices change, or by asking the SDK to redecrypt them.
+status: open
+
+### DW-519: A host's own send that the label blocks — an answer, a status, a notice — is refused, never offered for declassification.
+
+origin: epic 93, story 93.3 (rung `agents-93-decide`, R191, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/sinks.rs` (`Sinks::check`, `RoomGate::admit`), `src-tauri/crates/keeper-agent/src/matrix_sink.rs`
+reason: Only an agent's tool call can park: its turn ends and resumes at the call. An answer streamed into a room grown wider than the label, a status or a notice is the host's own send with no call to resume, so it keeps 92.6's refusal (now R192's sentence) and R64's replacement text. Revisit if a person wants to let a withheld answer reach the room: park the answer's final text as a `declassify` record of the turn and send it on approval.
+status: open
+
+### DW-520: A change of the Mac's trust anchor rebuilds the whole desktop host.
+
+origin: epic 93, story 93.3 (rung `agents-93-decide`, R189, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/desktop.rs` (`BuildKey.trust`, `DesktopHost::scan`)
+reason: `DecisionSource::anchor` returns a borrowed `Anchor`, so the desktop's sources are rebuilt rather than updated: verifying this device, or an identity moving, stops the running turns (each gets its final edit), releases every claim and builds the host again on the next scan. Parked runs survive (they are files) and resume at serve start; a running turn is cut. Close with an anchor shared behind a lock (the trait returning an owned or guarded anchor) so only the judgement changes.
+status: open
+
+### DW-521: Surface declassification needs a durable, replayable request (fixed id/expiry) — not built.
+
+origin: epic 93, story 93.3 (rung `agents-93-decide`, R191, 2026-10-06); rewritten by R194 on review R6-05
+location: `src-tauri/crates/keeper-agent/src/surface.rs` (`SurfaceTools::run`, the request's `id` and `expires_at`), `src-tauri/crates/keeper-agent/src/agent.rs` (`ToolHost::run_named`, the surface branch)
+reason: An approval releases exactly the SHA-256 it names, and a surface request mints a fresh ULID and expiry on every send and is hashed whole, so a re-run after approval can never reproduce the approved bytes: the approval would be spent and the action never sent. So a `surface_*` call the label blocks is not declassifiable in this rung: it is refused as before (R192's sentence), never parked, with one audit row and no record (`parks::a_surface_request_the_label_blocks_is_refused_never_parked`). Close by giving a surface approval a durable action of its own — the target, the payload, and a request id and expiry fixed at park and replayed by the run after approval (or a hash over the action without them, with the transport identity bound separately) — proved to complete after approval, after a restart and after a realistic decision delay.
+status: open
+
+### DW-522: One `declassify` approval also passes the blocked call's own tier gate.
+
+origin: epic 93, story 93.3 (rung `agents-93-decide`, R191, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`AllowedTools::gated`, `bound_approval`)
+reason: A call both beyond the label and needing a person by its tier (a `drive_write` to a wider drive is T2; a `delegate` whose card carries a schedule is T3) parks once, on the `declassify` record, whose arguments carry the blocked call whole; the resumed call's tier gate sees the consumed approval and runs. The card shows the exact call, but its tier word is the declassification's (T3), and a T2 write's `session` scope is not offered. Revisit if the two should be decided separately: park on the tier first, then on the flow, two cards.
+status: open
+
+### DW-523: The target's host refuses a declassified brief: its label still names only the delegating session's readers.
+
+origin: epic 93, story 93.3 (rung `agents-93-decide`, live AC6 run, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/runtime.rs` (the brief intake: "a brief whose label does not reach this agent's audience and the room's people is not taken"), `src-tauri/crates/keeper-agent/src/delegate.rs` (`compose`, `content_for`), `src-tauri/crates/keeper-agent/src/agent.rs` (`Lift for AllowedTools`)
+reason: Live on delectra (`live_delegate::a_declassification_decided_in_the_proxy_dm_lets_one_flow_through`): Nixi's hand-off parks as a `declassify` card in tgorka's DM, tgorka's decision from his bootstrapped device counts under the pinned key, the approval is consumed, the delegation opens under the approved id and its brief goes in at Tola's join (`BriefSent`, the approved SHA-256) — and Tola's host ignores it, because the brief's `label` is still {tgorka} while Tola's audience is {tgorka, marta}: the receiving host's own check (defence in depth) does not know a person let it through. The turns test passes because its delegation double has no receiving host. Close (a ruling is needed): a declassified brief carries the label the person approved — the session's label widened by the card's `readers`, part of the bytes the digest binds, so the release still matches exactly — and the receiving host takes a brief whose label reaches its audience as before; or the receiving host accepts a brief that names a consumed `declassify` approval it can verify in the sender's room.
+status: closed 2026-10-06
+resolution: Fixed by R193: the declassified brief carries `label::approved_label` (the session's readers ∪ the record's), inside the bytes whose SHA-256 the record binds; the park computes them so and the join send (`send_brief`, the one place the sent brief is composed) composes them again and sends only on a hash match. Proved by `parks::a_declassification_decided_in_the_proxy_dm_lets_one_flow_through` (turns) and live on delectra by `live_delegate::a_declassification_decided_in_the_proxy_dm_lets_one_flow_through` end to end (Tola's host takes the brief, makes the session once and replies; one `consumed` event; other bytes park again); the join's `approved_label` mutated away is killed by both.
+
+### DW-524: A declassified brief whose `delegate` arguments the log redacts is never let through at the join.
+
+origin: epic 93, story 93.3 review fixes (rung `agents-93-decide`, R194 on review R6-03, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/approvals.rs` (`ServedSession::declassified`), `src-tauri/crates/keeper-agent/src/delegate.rs` (`content_for`)
+reason: The brief sent at the target's join is composed from the delegation's `delegate` arguments as the log holds them, and its approval now binds only when the record's call arguments equal that copy byte for byte. A brief holding secret-shaped text is redacted in the log (R174), so its record (the exact bytes) and the log's copy differ: the join refuses it — fail-safe, the delegation ends `refused` and nothing goes in — though the person approved it. Close by composing the join's brief from the record's bound call (as the run after approval does) rather than from the log's copy.
+status: open
+
+### DW-525: A park nobody could be asked about leaves its large arguments' blob behind.
+
+origin: epic 93, story 93.3 review fixes (rung `agents-93-decide`, R194 on review R6-08, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/approvals.rs` (`ServedSession::forget`)
+reason: When no approver can be asked from this host, the park's record, round file and asked file are removed so nothing waits or is announced again; a record whose arguments were over 16 KiB also wrote `approvals/blobs/<sha256>.json`, which is content-addressed and may be another record's too, so it is left. It is inert — nothing reads a blob without a record naming it — but it stays in the synced session. Close with a sweep of blobs no record names.
 status: open

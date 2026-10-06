@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use keeper_core::agents::approval::sha256_hex;
 use keeper_core::agents::card::Run;
 use keeper_core::agents::delegation::{
     self, brief_content, child_label, observers, room_invites, session_title, BoundReached,
@@ -47,7 +48,9 @@ use keeper_core::agents::delegation::{
 };
 use keeper_core::agents::events::{ARTIFACTS, CONTENT_VERSION, REPLY_LABEL};
 use keeper_core::agents::home;
-use keeper_core::agents::label::{check_sink, Destination, Label, Readers, Sink, SinkVerdict};
+use keeper_core::agents::label::{
+    approved_label, check_sink, Destination, Label, Readers, Sink, SinkVerdict,
+};
 use keeper_core::agents::log::{DelegateBody, DelegateState, LineBody, RunBody, RunState};
 use keeper_core::agents::proxy::ScopeRequest;
 use keeper_core::agents::session::SessionKind;
@@ -484,6 +487,7 @@ async fn reply_verdict(
             drive: String::new(),
             at: room.to_string(),
             sentence: unread,
+            flow: None,
         })?;
     sinks.verdict(
         REPLY,
@@ -553,6 +557,22 @@ pub fn set_card_run(
 /// alone — so one brief with two cards is two effects (FR-795).
 pub(crate) fn brief_effect(content: &DelegateContent) -> Vec<u8> {
     brief_content(content).to_string().into_bytes()
+}
+
+/// The brief a person lets through when they let `readers` read what only
+/// `label`'s readers may (R193): composed by `compose` under the label they
+/// approve — the session's own never changes — and the SHA-256 of its
+/// event, the bytes their approval binds. The one place a declassified
+/// brief is composed, whether it opens a delegation, is sent at the
+/// target's join, or is a later round of the exchange.
+pub(crate) fn approved_brief(
+    label: &Label,
+    readers: &BTreeSet<OwnedUserId>,
+    compose: impl FnOnce(&Label) -> Result<DelegateContent, String>,
+) -> Option<(DelegateContent, String)> {
+    let content = compose(&approved_label(label, readers)).ok()?;
+    let sha = sha256_hex(&brief_effect(&content));
+    Some((content, sha))
 }
 
 fn block_on<F: Future>(fut: F) -> F::Output {
@@ -744,7 +764,8 @@ impl<'t> DelegateTools<'t> {
                 return refused(sentence);
             }
         }
-        let id = Ulid::new().to_string();
+        // A resumed call approved for these bytes sends under the same id.
+        let id = audit.delegation_id(Ulid::new().to_string());
         let known = port.known();
         let target = match resolve(&known, &args.agent) {
             Ok(target) => target,
@@ -762,11 +783,14 @@ impl<'t> DelegateTools<'t> {
         if let Err(bound) = Limits::of(&self.from.limits).check(self.from.hop, 0, 0) {
             return self.refuse(&id, &to, None, bound.sentence());
         }
-        let content = match compose(&args, &self.from, target, &self.view.label(), &id) {
+        let label = self.view.label();
+        let content = match compose(&args, &self.from, target, &label, &id) {
             Ok(content) => content,
             Err(sentence) => return self.refuse(&id, &to, None, sentence),
         };
-        let invites = room_invites(&target.matrix_user, &self.from.user, &content.label);
+        // The room's observers are the session's readers; a declassified
+        // brief's wider readers read it through the target's own sessions.
+        let invites = room_invites(&target.matrix_user, &self.from.user, &label);
         let members = observers(&invites, &target.matrix_user);
         let effect = brief_effect(&content);
         let destination = Destination::Agent {
@@ -784,11 +808,23 @@ impl<'t> DelegateTools<'t> {
                 agent_audiences: vec![target.home_readers.clone()],
             },
         ] {
-            if let Err(blocked) =
+            if let Err(mut blocked) =
                 self.sinks
                     .verdict(DELEGATE, &destination, &content.label, &sink, &effect, None)
             {
-                return self.refuse(&id, &to, None, audit.blocked(blocked));
+                // What a person would let through is the brief under the
+                // label they would approve: those are its bytes (R193).
+                if let Some(flow) = blocked.flow.as_mut() {
+                    let widened = approved_brief(&label, &flow.readers, |approved| {
+                        compose(&args, &self.from, target, approved, &id)
+                    });
+                    if let Some((_, sha)) = widened {
+                        flow.effect_sha256 = sha;
+                    }
+                }
+                if let Err(withheld) = audit.blocked(blocked) {
+                    return self.withheld(&id, &to, None, withheld);
+                }
             }
         }
         // The label's say first, then the integrity rule's and the tier's: a
@@ -884,12 +920,21 @@ impl<'t> DelegateTools<'t> {
             let bound = BoundReached::Rounds { limit };
             return self.refuse(id, &to, Some(delegation.room.clone()), bound.sentence());
         }
-        let mut content = match content_for(&delegation, &self.from, &self.view.label(), &known) {
+        let label = self.view.label();
+        let round = |label: &Label| {
+            content_for(&delegation, &self.from, label, &known).map(|mut content| {
+                content.brief = brief.to_owned();
+                content.card = None;
+                content
+            })
+        };
+        let content = match round(&label) {
             Ok(content) => content,
             Err(sentence) => return refused(sentence),
         };
-        content.brief = brief.to_owned();
-        content.card = None;
+        // A round a person lets through goes as the brief under the label
+        // they approve, as the opening brief does (R193).
+        let mut approved = None;
         // Its answer comes back here whatever this copy was told before.
         port.watch(&delegation.room, &self.from.room);
         let checked = block_on(room_now(
@@ -902,6 +947,7 @@ impl<'t> DelegateTools<'t> {
             drive: target.drive.clone(),
             at: to.clone(),
             sentence: unread,
+            flow: None,
         })
         .and_then(|sink| {
             self.sinks.verdict(
@@ -917,11 +963,21 @@ impl<'t> DelegateTools<'t> {
                 None,
             )
         })
-        .map_err(|blocked| Withheld::Refused(audit.blocked(blocked)))
+        .or_else(|mut blocked| {
+            if let Some(flow) = blocked.flow.as_mut() {
+                if let Some((widened, sha)) = approved_brief(&label, &flow.readers, round) {
+                    flow.effect_sha256 = sha;
+                    approved = Some(widened);
+                }
+            }
+            audit.blocked(blocked)
+        })
         .and_then(|()| audit.admit(&target.drive, &to));
         if let Err(withheld) = checked {
             return self.withheld(id, &to, Some(delegation.room.clone()), withheld);
         }
+        // Released, the approved bytes go; nothing blocked, the round's own.
+        let content = approved.unwrap_or(content);
         let txn = TransactionId::new();
         if let Err(error) = block_on(port.send(&delegation.room, brief_content(&content), txn)) {
             return refused(format!("The message could not be sent: {error}"));
@@ -975,7 +1031,7 @@ impl<'t> DelegateTools<'t> {
             &label,
             &content,
         ))
-        .map_err(|blocked| Withheld::Refused(audit.blocked(blocked)))
+        .or_else(|blocked| audit.blocked(blocked))
         .and_then(|()| audit.admit("", self.from.room.as_str()));
         if let Err(withheld) = admitted {
             return self.withheld(

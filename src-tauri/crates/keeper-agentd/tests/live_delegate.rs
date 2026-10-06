@@ -1,5 +1,7 @@
 //! A delegation between two hosts of one principal against a real
-//! homeserver (story 92.1, acceptance 9).
+//! homeserver (story 92.1, acceptance 9), and the same hand-off beyond the
+//! delegating session's label let through by its person (story 93.3,
+//! acceptance 6).
 //!
 //! `#[ignore]`: it needs the Synapse test homeserver and its users, from
 //! the environment as `live_turn.rs` reads them:
@@ -22,6 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use keeper_core::agents::approval::{Decision, Scope};
+use keeper_core::agents::events::{ApprovalDecisionContent, APPROVAL_DECISION, APPROVAL_REQUEST};
 use keeper_core::agents::label::{Integrity, Label, Readers};
 use keeper_core::agents::matrix::RoomKind;
 use keeper_core::agents::session::{compose_session_agent_toml, SessionAgent, SessionKind};
@@ -30,7 +34,7 @@ use serde_json::{json, Value};
 
 mod common;
 
-use common::{bare_drive, record, syncing, tool_then, Smoke};
+use common::{bare_drive, bootstrap, calls_at, record, syncing, tool_then, Smoke};
 
 const BIN: &str = env!("CARGO_BIN_EXE_keeper-agentd");
 const SESSION: &str = "active/2026-10-04-smoke";
@@ -134,7 +138,10 @@ fn find_dirs(root: &Path, name: &str) -> Vec<PathBuf> {
     out
 }
 
-/// A host named `slug` hosting `agent` of the drive at `bare`, signed in.
+/// A host named `slug` hosting `agent` of the drive at `bare`, signed in;
+/// the drive read by `readers` (a TOML array's items) and `extra` appended
+/// to its `agentd.toml`.
+#[allow(clippy::too_many_arguments)]
 fn host(
     smoke: &Smoke,
     slug: &str,
@@ -143,10 +150,12 @@ fn host(
     bare: &Path,
     model: &str,
     person: &OwnedUserId,
+    readers: &str,
+    extra: &str,
 ) -> Host {
     let root = tempfile::tempdir().expect("tempdir");
     let config = format!(
-        "version = 1\nprincipal = \"tgorka\"\nhost = \"{slug}\"\n\n[homeserver]\nurl = \"{}\"\n\n[[drives]]\nid = \"smoke\"\nremote = \"{}\"\nowner = \"{person}\"\nreaders = [\"{person}\"]\n\n[[providers]]\nkind = \"openai\"\nbase_url = \"{model}\"\n\n[[agents]]\ndrive = \"smoke\"\nids = [\"{agent}\"]\n",
+        "version = 1\nprincipal = \"tgorka\"\nhost = \"{slug}\"\n\n[homeserver]\nurl = \"{}\"\n\n[[drives]]\nid = \"smoke\"\nremote = \"{}\"\nowner = \"{person}\"\nreaders = [{readers}]\n\n[[providers]]\nkind = \"openai\"\nbase_url = \"{model}\"\n\n[[agents]]\ndrive = \"smoke\"\nids = [\"{agent}\"]\n{extra}",
         smoke.homeserver,
         bare.display(),
     );
@@ -331,6 +340,7 @@ async fn a_delegation_round_trip_on_a_real_homeserver() {
         ),
     ];
     let bare = bare_drive(scratch.path(), &files);
+    let readers = format!("\"{person}\"");
     let mut nixis_host = host(
         &smoke,
         "smoke-a",
@@ -339,6 +349,8 @@ async fn a_delegation_round_trip_on_a_real_homeserver() {
         &bare,
         &nixis_model.url,
         &person,
+        &readers,
+        "",
     );
     let mut tolas_host = host(
         &smoke,
@@ -348,6 +360,8 @@ async fn a_delegation_round_trip_on_a_real_homeserver() {
         &bare,
         &tolas_model.url,
         &person,
+        &readers,
+        "",
     );
     nixis_host.start();
     tolas_host.start();
@@ -452,4 +466,335 @@ async fn a_delegation_round_trip_on_a_real_homeserver() {
         .any(|l| l["kind"] == "tool_call" && l["body"]["tool"] == "reply"));
     let card = std::fs::read_to_string(made[0].join("brief.md")).expect("the card");
     assert!(card.contains("run: review"), "{card}");
+}
+
+/// The approval records under every `approvals/` of this host's checkout.
+fn records(host: &Host) -> Vec<Value> {
+    find_dirs(host.root.path(), "active")
+        .into_iter()
+        .flat_map(|active| std::fs::read_dir(active).into_iter().flatten().flatten())
+        .flat_map(|session| {
+            std::fs::read_dir(session.path().join("approvals"))
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.ends_with(".json")
+                && !name.ends_with(".decision.json")
+                && !name.ends_with(".round.json")
+                && !name.ends_with(".asked.json")
+        })
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .filter_map(|text| serde_json::from_str(&text).ok())
+        .collect()
+}
+
+/// The rooms Nixi's delegations opened, as its log says.
+fn delegated_rooms(host: &Host) -> BTreeSet<String> {
+    host.lines()
+        .iter()
+        .filter(|l| l["kind"] == "delegate")
+        .filter_map(|l| l["body"]["room"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// 93.3 acceptance 6 on agentd hosts (R89, DW-434): Tola's drive is read
+/// by tgorka and Marta, so Nixi's hand-off from tgorka's {tgorka} DM is a
+/// declassification. Nixi's host — tgorka's master key pinned in its
+/// `[[trust]]` — parks it as a `declassify` card in that DM, the only room
+/// it reaches; tgorka's approval from his cross-signed device lets that one
+/// brief through: Tola's host joins, makes the session once and replies,
+/// and the `consumed` event and line are the audit. A second hand-off, other
+/// bytes, waits again; no line ever widens Nixi's label.
+#[ignore = "live: Synapse on delectra"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declassification_decided_in_the_proxy_dm_lets_one_flow_through() {
+    let smoke = Smoke::from_env();
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let person = smoke.user("tgorka-smoke");
+    let marta = smoke.user("marta-smoke");
+    let nixi = smoke.user("nixi-smoke");
+    let tola = smoke.user("tola-smoke");
+    let tola_password = ulid::Ulid::new().to_string();
+    smoke
+        .admin(
+            reqwest::Method::PUT,
+            &format!("/_synapse/admin/v2/users/{tola}"),
+            Some(json!({ "password": tola_password, "admin": false })),
+        )
+        .await;
+    for agent in [&nixi, &tola] {
+        smoke.clear_devices(agent).await;
+        smoke.set_ratelimit(agent, 0, 0).await;
+    }
+
+    // tgorka's device A makes his identity and signs itself: the pin.
+    smoke.clear_devices(&person).await;
+    let device_a = smoke
+        .client(
+            &scratch.path().join("person"),
+            "tgorka-smoke",
+            smoke.secret("TGORKA_SMOKE_PASSWORD"),
+        )
+        .await;
+    bootstrap(&device_a, &person, smoke.secret("TGORKA_SMOKE_PASSWORD")).await;
+    let pin = device_a
+        .published_master_key(&person)
+        .await
+        .expect("the homeserver answers")
+        .expect("tgorka publishes an identity");
+
+    // Nixi hands the diary to Tola; its next turns — Tola's reply coming
+    // home, then tgorka asking again — hand on the plans.
+    let plans =
+        || json!({"agent": "smoke/tola", "brief": "Now the plans.", "card": {"title": "Plans"}});
+    let nixis_model = calls_at(
+        vec![
+            (
+                1,
+                "delegate",
+                json!({"agent": "smoke/tola", "brief": "Summarise the diary.", "card": {"title": "Diary"}}),
+            ),
+            (3, "delegate", plans()),
+            (4, "delegate", plans()),
+        ],
+        "Over to Tola.",
+    );
+    let tolas_model = tool_then("reply", json!({"text": "Summarised."}), "Replied.");
+
+    let maker = smoke
+        .client(
+            &scratch.path().join("maker"),
+            "nixi-smoke",
+            smoke.secret("NIXI_SMOKE_PASSWORD"),
+        )
+        .await;
+    let dm = maker
+        .create_room(
+            RoomKind::Session(SessionKind::Main),
+            "smoke",
+            vec![person.clone()],
+            &[],
+        )
+        .await
+        .expect("room");
+    let readers = format!("\"{person}\", \"{marta}\"");
+    let drive_toml = format!(
+        "version = 1\nid = \"smoke\"\ntitle = \"smoke\"\nprincipal = \"tgorka\"\nowner = \"{person}\"\nreaders = [{readers}]\n"
+    );
+    let decl = keeper_core::agents::drive::parse(&drive_toml).expect("decl");
+    // Nixi's DM is its `main` session, under the id its door is found by.
+    let main = SessionAgent {
+        id: keeper_core::agents::seed::main_session_id("smoke", "nixi"),
+        agent: "nixi".to_owned(),
+        drive: "smoke".to_owned(),
+        kind: SessionKind::Main,
+        title: "smoke".to_owned(),
+        requested_by: person.clone(),
+        parent: None,
+        room: dm.clone(),
+        drives: vec!["smoke".to_owned()],
+        label: Label {
+            readers: Readers::Only(BTreeSet::from([person.clone()])),
+            ..Label::opening(&decl, Integrity::Owner)
+        },
+        needs: None,
+        pin: None,
+        hop: 0,
+        dispatch_chain: Vec::new(),
+        limits: None,
+        workflow: None,
+        created_at: chrono::Utc::now(),
+    };
+    let files = vec![
+        ("80-agents/_drive.toml".to_owned(), drive_toml.clone()),
+        (
+            "80-agents/nixi/agent.toml".to_owned(),
+            agent_toml(
+                "nixi",
+                "Nixi",
+                "proxy",
+                &nixi,
+                Some(&person),
+                "\"drive_read\", \"delegate\"",
+                &nixis_model.url,
+            ),
+        ),
+        ("80-agents/nixi/SOUL.md".to_owned(), soul("Nixi")),
+        (
+            "80-agents/tola/agent.toml".to_owned(),
+            agent_toml(
+                "tola",
+                "Dr Tola Grey",
+                "steward",
+                &tola,
+                None,
+                "\"drive_read\"",
+                &tolas_model.url,
+            ),
+        ),
+        ("80-agents/tola/SOUL.md".to_owned(), soul("Dr Tola Grey")),
+        (
+            format!("60-sessions/{SESSION}/agent.toml"),
+            compose_session_agent_toml(&main),
+        ),
+        // The session's id, as the board and the door read it.
+        (
+            format!("60-sessions/{SESSION}/README.md"),
+            format!("---\nid: {}\ntitle: smoke\n---\n", main.id),
+        ),
+    ];
+    let bare = bare_drive(scratch.path(), &files);
+    let trust = format!("\n[[trust]]\nuser = \"{person}\"\nmaster_key = \"{pin}\"\n");
+    let mut nixis_host = host(
+        &smoke,
+        "smoke-a",
+        "nixi",
+        smoke.secret("NIXI_SMOKE_PASSWORD"),
+        &bare,
+        &nixis_model.url,
+        &person,
+        &readers,
+        &trust,
+    );
+    let mut tolas_host = host(
+        &smoke,
+        "smoke-b",
+        "tola",
+        &tola_password,
+        &bare,
+        &tolas_model.url,
+        &person,
+        &readers,
+        &trust,
+    );
+    nixis_host.start();
+    tolas_host.start();
+
+    device_a.join(&dm).await.expect("join");
+    let seen = record(&device_a);
+    let _sync = syncing(&device_a);
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    // Every card tgorka's device received.
+    let cards = || -> Vec<Value> {
+        seen.lock()
+            .expect("lock")
+            .iter()
+            .filter(|(_, event)| event["type"] == APPROVAL_REQUEST)
+            .map(|(_, event)| event.clone())
+            .collect()
+    };
+    let wait = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(240);
+        while !done() {
+            assert!(
+                Instant::now() < deadline,
+                "{what}.\nnixi's host:\n{}\ntola's host:\n{}",
+                nixis_host.log_text(),
+                tolas_host.log_text()
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+    device_a
+        .send(
+            &dm,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": "Hand the diary to Tola."}),
+            None,
+        )
+        .await
+        .expect("ask");
+    wait("no declassify card reached the DM", &|| cards().len() == 1);
+    let card = cards().remove(0);
+    assert_eq!(card["sender"], nixi.as_str());
+    let content = card["content"].clone();
+    assert_eq!(content["action"]["tool"], "declassify", "{content}");
+    assert_eq!(
+        content["action"]["args"]["readers"],
+        json!([marta.as_str()])
+    );
+    assert!(
+        delegated_rooms(&nixis_host).is_empty(),
+        "nothing handed on yet"
+    );
+
+    // tgorka approves from device A, sealed by it.
+    let decision = ApprovalDecisionContent {
+        id: content["id"].as_str().expect("id").to_owned(),
+        binding_digest: content["binding_digest"]
+            .as_str()
+            .expect("digest")
+            .to_owned(),
+        decision: Decision::Approve,
+        scope: Scope::Once,
+        note: None,
+    };
+    device_a
+        .send(
+            &dm,
+            APPROVAL_DECISION,
+            serde_json::to_value(&decision).expect("json"),
+            None,
+        )
+        .await
+        .expect("decide");
+    wait("the brief was not replied to", &|| {
+        nixis_host
+            .lines()
+            .iter()
+            .any(|l| l["kind"] == "delegate" && l["body"]["state"] == "replied")
+    });
+    let lines = nixis_host.lines();
+    let states: Vec<&str> = lines
+        .iter()
+        .filter(|l| l["kind"] == "approval" && l["body"]["id"] == decision.id.as_str())
+        .filter_map(|l| l["body"]["state"].as_str())
+        .collect();
+    assert_eq!(states, ["requested", "decided", "consumed"], "{lines:#?}");
+    // R193: the reply joins its label into Nixi's, which only narrows.
+    for line in lines.iter().filter(|l| l["kind"] == "label") {
+        assert_eq!(
+            line["body"]["readers"],
+            json!([person.as_str()]),
+            "Nixi's label never widened: {line}"
+        );
+    }
+    assert_eq!(delegated_rooms(&nixis_host).len(), 1);
+    assert_eq!(tolas_host.delegated().len(), 1, "Tola's session made once");
+    // The DM holds the one `consumed` state event, from Nixi.
+    let consumed: Vec<Value> = timeline(&smoke, &dm)
+        .await
+        .into_iter()
+        .filter(|e| e["type"] == keeper_core::agents::events::APPROVAL_CONSUMED)
+        .collect();
+    assert_eq!(consumed.len(), 1, "{consumed:#?}");
+    assert_eq!(consumed[0]["sender"], nixi.as_str());
+    assert_eq!(consumed[0]["state_key"], decision.id.as_str());
+
+    // Other bytes wait again: another card, never a second room.
+    device_a
+        .send(
+            &dm,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": "And the plans, too."}),
+            None,
+        )
+        .await
+        .expect("ask");
+    wait("the second hand-off did not wait", &|| cards().len() >= 2);
+    for later in cards().iter().skip(1) {
+        let later = &later["content"];
+        assert_eq!(later["action"]["tool"], "declassify", "{later}");
+        assert_ne!(later["id"], content["id"]);
+        assert_ne!(
+            later["action"]["args"]["sha256"],
+            content["action"]["args"]["sha256"]
+        );
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(delegated_rooms(&nixis_host).len(), 1);
+    assert!(records(&nixis_host).len() >= 2);
 }

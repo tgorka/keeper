@@ -53,7 +53,7 @@ use keeper_core::agents::mount;
 use keeper_core::agents::presence::Published;
 use keeper_core::agents::room::sealed_by_sender;
 use keeper_core::agents::session::{SessionAgent, SessionKind};
-use keeper_core::agents::trust::PinState;
+use keeper_core::agents::trust::{Anchor, PinState};
 use keeper_core::auth::StoredSession;
 use keeper_core::bots::chat::{self, CancelSignal};
 use keeper_core::bots::store;
@@ -79,6 +79,7 @@ use crate::agent::{
     ServedSession, SessionRef,
 };
 use crate::claims::Lease;
+use crate::deciding::ClientDecisions;
 use crate::delegate::{BoolFuture, BriefRoomFuture, DelegationPort, EventsFuture, MembersFuture};
 use crate::doorbell::{self as bells, Doorbell, DriveEngine, Ringer, RING_FINISH};
 use crate::headless::{
@@ -828,7 +829,16 @@ pub async fn run(
             }
         };
         let deps = match agent_deps(&platform, &dirs.data, &host, &drives, &rows, home) {
-            Ok(deps) => Arc::new(deps),
+            // Every call that needs a person parks, decided only by a
+            // person whose master key `[[trust]]` pins: a pin that differs,
+            // or none, accepts nothing (R77, R92; no trust on first use).
+            Ok(deps) => Arc::new(AgentDeps {
+                decisions: Some(Arc::new(ClientDecisions {
+                    client: client.clone(),
+                    anchor: Anchor::Pinned(config.trust.clone()),
+                })),
+                ..deps
+            }),
             Err(sentence) => {
                 tracing::error!(agent = %home.config.id, %sentence, "agentd: this agent is not served");
                 continue;

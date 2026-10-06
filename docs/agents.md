@@ -552,16 +552,47 @@ the label writes a `label` line. A context file of a drive this host has no decl
 out of the prompt. A `local_only` drive's `AGENTS.md` therefore never reaches a remote model: the
 turn is refused before it is asked.
 
-A refused call sends and writes nothing. The model is told why — "This would let @marta:h read
-what only @tgorka:h may read." followed by "Letting this through needs an approval, which this
-keeper cannot take yet." — the session's log has a `tool_result` line with `outcome: refused`,
-and the bot audit log has a row: the tool's name (`answer`, `model`, `status`, `scope`, `notice`
-and `reply` for the host's own sends), the drive (or nothing) and the room, person or path it would
-have reached, `write`, `deny` and the sentence. A person may one day let one such flow through: the
-request is computed already — the SHA-256 of the exact effect (a write's drive, path and new text;
-an edit's drive, path and change; a hand-off's whole brief event, its card included), the file's
-path when it is one, where it would go, the label's readers as approvers, and each one's proxy DM
-— and epic 93 is what asks it.
+A refused flow sends and writes nothing. The model is told why — "This would let @marta:h read
+what only @tgorka:h may read." followed by "Letting this through needs a person's approval, and
+keeper cannot ask for one here, so it was not done." — the session's log has a `tool_result` line
+with `outcome: refused`, and the bot audit log has a row: the tool's name (`answer`, `model`,
+`status`, `scope`, `notice` and `reply` for the host's own sends), the drive (or nothing) and the
+room, person or path it would have reached, `write`, `deny` and the sentence. A host's own send
+(an answer, a status) is always refused so: nothing waits for a person there.
+
+**Letting one flow through.** An agent's call the label blocks — a hand-off to an agent whose
+audience is wider, a later round of that hand-off, a write to a drive more people read, a `reply`,
+a card — is what a person may let through, once. On agentd and on the Mac it does not fail: it
+parks (§ *When an action waits*) as a `declassify` approval at T3, for that one action. Its record
+names who it would let read beyond the label (by Matrix id), keeper's words for what ("the work
+handed to @lucyna:h", "`notes/plan.md` in tgdrive"), the SHA-256 of the exact effect (a write's
+drive, path and new text; an edit's drive, path and change; a hand-off's whole brief event, its
+card, its delegation id and the label it would carry included) and the blocked call exactly as the
+model sent it; the digest binds them all. Its card goes to each approver's proxy DM that this host
+runs, never into the session's room — the room's status says only that the session waits — and is
+decided there (§ *Deciding*). When none of the approvers' proxies runs on this host, nobody can be
+asked from here: the call does not wait, no record is left behind, and the model is told "This
+needs a person's approval, but nobody who can approve this can be asked from this host — none of
+their proxies runs here — so keeper did not do it. Nothing was changed."
+
+An approval belongs to the one run of the call it bound and is taken back when that run ends: a
+later call of the turn, even one the model gives the same id, waits for its own. In that run
+exactly the bytes the approval names pass the label, and only to the people it named: the sink,
+as it is then, must fit the session's label widened by those readers alone — a room someone joined
+since, or a drive someone was made a reader of since, is not let through. A brief a person lets
+through, the opening one or a later round, carries the label they approved (the session's readers
+and the ones they named); the session's own label does not change. A hand-off goes under the
+delegation id it was approved with, and its brief goes into the room at the target's join only when
+the record that opened that delegation still binds it: this session's and agent's, naming that very
+`delegate` call, its arguments recomputing to the digest the decision approved, and that approval
+used here. An approved call whose bytes or audience moved since — anything else to say, a brief
+recomposed differently — is not asked about again: it ends refused ("This was not done: the action
+changed after it was approved. Nothing was changed.", or "who it would reach changed after it was
+approved"), on its one audit row. The record, the `consumed` event and line, and the call's one
+audit row are the trail. Nobody can let through what would reach anyone, or a model a
+`local_only` label forbids, and a session nobody reads has no one to ask: those are refused as
+above. A `surface_*` request the label blocks is refused too, never offered: each request carries
+its own id and expiry, so no approval could name its bytes again.
 
 **When the label narrows below the room.** Once a session read something not everyone in its room
 may read, the room no longer sees its words: the answer is replaced by "This answer drew on
@@ -588,7 +619,7 @@ titled `<agent> <date>`, so its folder names no subject either.
   wider) is refused: the outside content may have chosen it. A later round goes to the agent its
   exchange was opened with; a call naming another agent with that exchange is refused;
 - any call whose tier (below) is T3 or more — a write outside the session, raised by the outside
-  content to T3 — needs a person's approval, and is refused until approvals exist.
+  content to T3 — needs a person's approval: it parks for the label's readers.
 
 A proxy's DM (`main`) starts each of its person's turns at their own word: the integrity goes back
 to `owner` at their next message, while who may read stays as narrow as before. Every other
@@ -616,10 +647,10 @@ it is still refused with the sentence above, not with the approval sentence.
 
 No tool of this build is T4 (irreversible: deletes, credentials, running downloaded code). The
 grant still answers every drive call: a write the grant asks about is at least T2, and the higher
-of the two wins, so a grant alone never lets a write through. Until a person can approve from a
-keeper client, every call that asks a person is refused with "This needs a person's approval, and
-there is no one here to ask, so keeper did not do it. Nothing was changed." — the model reads it,
-and nothing ran.
+of the two wins, so a grant alone never lets a write through. On agentd and on the Mac a call that
+asks a person parks for one (§ *When an action waits*); a host with no decision source — none of
+keeper's hosts is — refuses it with "This needs a person's approval, and there is no one here to
+ask, so keeper did not do it. Nothing was changed.", and nothing runs.
 
 Each call's tier is on its `tool_call` line (`tier`), and in the bot audit log: every call an agent
 makes has exactly one row, written before anything happens — `tier`, `base_tier` (the table's, or
@@ -649,11 +680,18 @@ surface and the session's own files work in every session — but its audit row 
 reasons that held, in `raised_by`, as a comma list. The person's own DM resets to `owner` at their
 message (above), so a turn they started there raises nothing.
 
+A raised call parks like any other, and its approvers are the session label's readers, who are in
+its room and see its card there (a declassification's card goes to their proxy DMs). A `@daily`
+card whose run, taken at 03:00, needs a write outside its session parks at T3 `[unattended]`; the record
+expires 24 hours after it was made. An approval in the morning resumes the run on the host that
+holds the session's claim then, the write done once; with no decision by the expiry the run is
+refused, its card says so, and the log has `approval expired`. Until it ends, the card's later
+windows are not begun.
+
 ## When an action waits
 
-On a keeper host with a decision source installed (none is installed yet: keeper draws the
-approval card and sends a person's decision, but no host acts on one, so every host still refuses
-as above, and a decision that arrives is logged ignored — nothing waits for it), a call that needs
+On agentd and on the Mac — each installs a decision source: agentd over the master keys its
+`[[trust]]` pins, the Mac over its own signed-in accounts while verified there — a call that needs
 a person does not wait in a thread — it **parks**:
 
 1. The round's earlier calls have run; the parked call and the round's later calls keep their
@@ -677,7 +715,13 @@ a person does not wait in a thread — it **parks**:
    label does not get the request: the room's status is sent first, saying only "This work
    continues where only some of you can read it.", and the request goes to each approver's proxy DM
    that this host runs, each DM checked against the label; the room is read for that approval from
-   that status on. An approver whose proxy runs on another host is not asked from here. A host
+   that status on. An approver whose proxy runs on another host is not asked from here; who was
+   asked, and in which DM, is kept beside the record (`approvals/<ulid>.asked.json`), apart from
+   that read position, so a host that restarts listens in those DMs again for every approval still
+   waiting. When this host runs none of the approvers' proxies, or the request reached none of
+   them, nobody was asked: the record is removed, nothing is announced, and the call is refused
+   with "This needs a person's approval, but nobody who can approve this can be asked from this
+   host — none of their proxies runs here — so keeper did not do it. Nothing was changed." A host
    stopped after the record and before `approval requested` asks again when it starts — or, past
    its time, expires it. `approvals/` and `approvals/blobs/` must be real folders of the session: a
    link there is refused and nothing is written or read through it.
@@ -770,6 +814,36 @@ and published fingerprints and whether they match; it reads them from the runnin
 asks the homeserver every five minutes, and never writes `agentd.toml`. The pin it prints is the
 one the running host judged; a pin changed in `agentd.toml` since is printed after it, "used after
 a restart".
+
+**Pinning a person on a Linux host.** Until a person is pinned, agentd parks every call that needs
+them and accepts none of their decisions: the card waits and expires. To pin, on the host:
+
+1. Add the person to `agentd.toml` with no key, and restart the unit:
+   ```toml
+   [[trust]]
+   user = "@tgorka:electra.siren-alsephina.ts.net"
+   ```
+2. `keeper-agentd status` prints them `not pinned`, with the master-key fingerprint their
+   homeserver publishes now (once the running host has read it: within five minutes).
+3. The person opens Settings › Encryption on a device of theirs that is verified, and reads
+   *Your identity fingerprint* under the account. Compare the two, group by group, by eye or over a
+   channel you trust — never by copying from the host to the device.
+4. Only if they match, write the published key — `ed25519:` and the base64, as `status` names it —
+   into the entry as `master_key = "ed25519:…"`, and restart the unit. `status` then says
+   `matches`.
+
+keeper never writes a pin and never trusts on first use. When `status` says `differs` (the person
+reset their identity, or someone else's key is published under their name) that host accepts no
+decision of theirs until a person compares and pins again.
+
+**On the Mac** there is nothing to pin: the app trusts exactly its signed-in accounts, each only
+while its own identity is verified on this Mac and this Mac's device is signed by it — the state
+Settings › Encryption calls verified — and reads that again on each scan of its host (every five
+seconds); a change stops the host before anything else of that scan is read — a drive or the
+provider list that cannot be read then does not keep it running — and the next scan that reads
+whole builds it again, so no decision is judged on what was true before. Hosting a
+room trusts nobody; another person's decision never counts on a Mac (a shared session's other
+reader decides on agentd). ⌘9's bots are unchanged: their asks still need the open window.
 
 **On a person's device.** The request (`dev.keeper.agent.approval.request`) carries the record's
 id, the session, its own room and the agent, tier, keeper's summary, the exact arguments (over

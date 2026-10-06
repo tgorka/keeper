@@ -38,6 +38,7 @@ use keeper_core::agents::mount::pin_matches;
 use keeper_core::agents::proxy::ProxyFacts;
 use keeper_core::agents::room::ScopeDriveVm;
 use keeper_core::agents::soul;
+use keeper_core::agents::trust::{Anchor, OwnAccount};
 use keeper_core::bots::chat::{self, CancelHandle, CancelSignal};
 use keeper_core::bots::store::{self, ProviderRow};
 use keeper_core::platform::Platform;
@@ -46,7 +47,8 @@ use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, UserId};
 use matrix_sdk::RoomState;
 use tokio::task::JoinHandle;
 
-use crate::agent::bot_for;
+use crate::agent::{bot_for, AgentDeps};
+use crate::deciding::ClientDecisions;
 use crate::doorbell::{Doorbell, DriveEngine, Ringer, RING_FINISH};
 use crate::hosts::{HostRuntime, RELEASE_BOUND};
 use crate::rooms::{Known, KnownAgent};
@@ -109,6 +111,10 @@ pub struct DesktopFacts {
     /// Each signed-in Matrix account's user id and homeserver URL: a copy
     /// reaches its homeserver through the person's account on its server.
     pub homeservers: Vec<(String, String)>,
+    /// Each signed-in Matrix account as this app's device reads it: the
+    /// Mac's trust anchor (R87). Only these people decide a run this Mac
+    /// hosts, each while verified here; hosting a room trusts nobody.
+    pub accounts: Vec<OwnAccount>,
 }
 
 /// One flagged folder as this host reads it.
@@ -533,6 +539,10 @@ struct BuildKey {
     hosting: Vec<(String, String)>,
     /// The agents with a signed-in copy, by `(drive, agent)`.
     signed_in: Vec<(String, String)>,
+    /// The trust anchor its decision sources judge under: a person who
+    /// verifies this device, or whose identity moves, rebuilds the host, so
+    /// no copy decides on what was true before (R87).
+    trust: Vec<OwnAccount>,
 }
 
 /// A running desktop host.
@@ -658,6 +668,18 @@ impl DesktopHost {
             self.stop().await;
             return;
         };
+        // The trust anchor before anything that can fail: a person signed
+        // out, no longer verified here, or whose identity moved stops the
+        // host now, so no decision is judged on the anchor that was — a
+        // zone or provider read that fails below must not keep it (R87).
+        if self
+            .built
+            .as_ref()
+            .is_some_and(|built| built.key.trust != facts.accounts)
+        {
+            tracing::info!("agents: this Mac's verified accounts changed; its host stops before it is built again");
+            self.stop().await;
+        }
         let platform = Arc::clone(&self.platform);
         let data_dir = self.data_dir.clone();
         let read = tokio::task::spawn_blocking(move || {
@@ -705,6 +727,7 @@ impl DesktopHost {
             principal: login.clone(),
             hosting,
             signed_in: signed_keys,
+            trust: facts.accounts.clone(),
         };
 
         let views: Vec<DriveView> = drives.iter().map(|drive| drive.view.clone()).collect();
@@ -776,7 +799,15 @@ impl DesktopHost {
                 }
             };
             let deps = match deps_over(&self.base, &self.data_dir, &host, &views, rows, home) {
-                Ok(deps) => Arc::new(deps),
+                // Every call that needs a person parks, decided under this
+                // Mac's own verified accounts, never a pin (R87, R92).
+                Ok(deps) => Arc::new(AgentDeps {
+                    decisions: Some(Arc::new(ClientDecisions {
+                        client: client.clone(),
+                        anchor: Anchor::Desktop(key.trust.clone()),
+                    })),
+                    ..deps
+                }),
                 Err(sentence) => {
                     tracing::error!(agent = %home.config.id, %sentence, "agents: this agent is not served on this Mac");
                     self.problems.insert(user.clone(), sentence);
@@ -1209,6 +1240,70 @@ mod tests {
         }));
         assert!(panicked.is_err());
         assert!(gate.enter().is_some(), "the gate is open after the panic");
+    }
+
+    /// A host built under `trust`, hosting nothing: what a scan finds
+    /// running.
+    fn built_under(trust: Vec<OwnAccount>) -> Built {
+        let host = HostSlug::new("hesperia").expect("slug");
+        let (stop, signal) = chat::cancellation();
+        Built {
+            key: BuildKey {
+                host: host.as_str().to_owned(),
+                principal: "tgorka".to_owned(),
+                hosting: Vec::new(),
+                signed_in: Vec::new(),
+                trust,
+            },
+            drives: Vec::new(),
+            copies: Vec::new(),
+            syncs: Vec::new(),
+            known: Arc::default(),
+            runtime: HostRuntime::desktop(host, "tgorka", "test", &[], Vec::new()),
+            stop,
+            signal,
+        }
+    }
+
+    /// R87, R194: the trust anchor is judged before anything a scan reads
+    /// can fail. tgorka losing this Mac's verification, or signing out,
+    /// stops the host even when the provider rows cannot be read in the
+    /// same scan — no decision is judged on the anchor that was; the same
+    /// failing read with the anchor unchanged keeps the host as it is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoked_anchor_stops_the_host_however_the_scan_fails() {
+        let tgorka = |verified: bool| OwnAccount {
+            user: OwnedUserId::try_from(TG).expect("user"),
+            device_id: "MAC".to_owned(),
+            own_identity_verified: verified,
+            master_key: Some("ed25519:tgorkas".to_owned()),
+        };
+        for (accounts, kept, what) in [
+            (vec![tgorka(false)], false, "no longer verified here"),
+            (Vec::new(), false, "signed out"),
+            (vec![tgorka(true)], true, "unchanged"),
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            // `keeper.db` cannot be opened under a file: the provider rows
+            // do not read, and the scan returns there.
+            let data_dir = root.path().join("not-a-folder");
+            std::fs::write(&data_dir, "").expect("a file");
+            let mut host = DesktopHost::new(
+                TurnEnv::new(Arc::new(platform(root.path()))),
+                data_dir.clone(),
+                "test",
+            );
+            assert!(store::list_providers(&data_dir).is_err(), "{what}");
+            host.built = Some(built_under(vec![tgorka(true)]));
+            host.scan(DesktopFacts {
+                login: Some("tgorka".to_owned()),
+                device: Some("hesperia".to_owned()),
+                accounts,
+                ..DesktopFacts::default()
+            })
+            .await;
+            assert_eq!(host.built.is_some(), kept, "{what}");
+        }
     }
 
     struct Vault;

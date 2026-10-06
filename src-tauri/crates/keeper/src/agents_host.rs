@@ -30,7 +30,7 @@ use keeper_core::bots::store;
 use keeper_core::platform::Platform;
 use keeper_core::registry;
 use keeper_core::vm::{IpcError, IpcErrorCode};
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::ipc::{to_ipc_error, AppState};
 
@@ -111,7 +111,7 @@ pub fn start(
 
 /// Called from the app's 1 Hz interval (AD-62): the host's tick runs off
 /// the interval, and a tick still running skips this one.
-pub fn tick() {
+pub fn tick(app: &tauri::AppHandle) {
     let Some(platform) = RUNTIME.platform.get() else {
         return;
     };
@@ -123,11 +123,18 @@ pub fn tick() {
         .fetch_add(1, Ordering::Relaxed)
         .is_multiple_of(SCAN_EVERY_TICKS);
     let platform = Arc::clone(platform);
+    let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let _pass = pass;
         let facts = if scan {
+            // The trust anchor: each signed-in account as this device reads
+            // it, verified here or not (R87). Nothing is pinned.
+            let accounts = app.state::<AppState>().accounts.agent_own_accounts().await;
             let scanned = tokio::task::spawn_blocking(move || {
-                let facts = facts(platform.as_ref());
+                let facts = DesktopFacts {
+                    accounts,
+                    ..facts(platform.as_ref())
+                };
                 let icons = desktop::zone_agents(&facts);
                 let proxies = desktop::agent_proxies(&facts);
                 (facts, icons, proxies)
@@ -202,7 +209,9 @@ pub fn release_for_quit() {
     });
 }
 
-/// The app's facts now. Blocking: `keeper.db`, the engine's profiles.
+/// The app's facts now, but for the trust anchor, which is the account
+/// manager's (async): [`tick`] adds it. Blocking: `keeper.db`, the engine's
+/// profiles.
 fn facts(platform: &dyn Platform) -> DesktopFacts {
     let (login, device) = crate::account_ipc::host_identity();
     let profiles = crate::sync::engine_if_open()
@@ -231,6 +240,7 @@ fn facts(platform: &dyn Platform) -> DesktopFacts {
         profiles,
         pins,
         homeservers,
+        accounts: Vec::new(),
     }
 }
 

@@ -350,11 +350,13 @@ pub fn check_sink(label: &Label, sink: &Sink) -> SinkVerdict {
     }
 }
 
-/// What an action that needs a person's approval answers until approvals
-/// exist (AD-391, epic 93): a declassification, and a consequential call
-/// decided under `untrusted` integrity.
+/// What an action that needs a person's approval answers when nobody can
+/// be asked for one (AD-391, epic 93): a declassification or a consequential
+/// call decided under `untrusted` integrity on a host with no decision
+/// source, a declassification no reader could let through, or a send of the
+/// host's own, which never waits for a person.
 pub const NEEDS_APPROVAL: &str =
-    "Letting this through needs an approval, which this keeper cannot take yet.";
+    "Letting this through needs a person's approval, and keeper cannot ask for one here, so it was not done.";
 
 /// What the integrity rule says of one call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,9 +444,9 @@ impl Destination {
 /// A request to let one blocked flow through (AD-391, FR-795): the effect
 /// that would happen — by the SHA-256 of its canonical bytes and, for a
 /// file, its drive-relative path, never the bytes — where exactly, who may
-/// allow it, and the DM of each one's proxy it is asked in. Epic 93 sends
-/// it and records the decision; until then it is refused with
-/// [`NEEDS_APPROVAL`].
+/// allow it, and the DM of each one's proxy it is asked in. Where a decision
+/// source is installed it becomes a `declassify` approval ([`Self::args`]);
+/// elsewhere it is refused with [`NEEDS_APPROVAL`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclassifyRequest {
     /// The SHA-256 of the blocked effect's canonical bytes, hex: what the
@@ -459,6 +461,44 @@ pub struct DeclassifyRequest {
     pub approvers: BTreeSet<OwnedUserId>,
     /// Each approver's proxy DM, where the host found one.
     pub route: Vec<(OwnedUserId, Option<OwnedRoomId>)>,
+    /// Who the flow would let read beyond the label, by name; empty when
+    /// the sink reaches anyone or is a model.
+    pub readers: BTreeSet<OwnedUserId>,
+}
+
+impl DeclassifyRequest {
+    /// The arguments of the `declassify` approval that lets exactly this
+    /// flow through once (93.3, R89): the people it lets read, keeper's
+    /// words for what, and the effect's SHA-256 — all bound by the record's
+    /// digest, with the blocked call the host adds. `None` when no person
+    /// can let it through: nobody reads the label, or the sink's audience is
+    /// anyone or a model, which no approval names.
+    pub fn args(&self) -> Option<serde_json::Value> {
+        if self.approvers.is_empty() || self.readers.is_empty() {
+            return None;
+        }
+        let what = match &self.destination {
+            Destination::Drive { drive, path } => format!("`{path}` in {drive}"),
+            Destination::Room { room } => format!("what this session sends into {room}"),
+            Destination::Person { user } => format!("what this session sends to {user}"),
+            Destination::Agent { agent, .. } => format!("the work handed to {agent}"),
+        };
+        Some(serde_json::json!({
+            "readers": self.readers.iter().map(|user| user.as_str()).collect::<Vec<_>>(),
+            "what": what,
+            "sha256": self.effect_sha256,
+        }))
+    }
+}
+
+/// The label a declassified flow carries (R193): `label`'s readers with
+/// `readers`, those a person let read it, added; integrity and
+/// `local_only` stay the session's. The session's own label never changes.
+pub fn approved_label(label: &Label, readers: &BTreeSet<OwnedUserId>) -> Label {
+    Label {
+        readers: label.readers.union(&Readers::Only(readers.clone())),
+        ..label.clone()
+    }
 }
 
 /// The [`DeclassifyRequest`] for the effect whose canonical bytes are
@@ -482,6 +522,10 @@ pub fn declassify_request(
         .iter()
         .map(|approver| (approver.clone(), proxy_dm(approver)))
         .collect();
+    let readers = match check_sink(label, sink) {
+        SinkVerdict::Block { wider, .. } => wider,
+        SinkVerdict::Allow => BTreeSet::new(),
+    };
     DeclassifyRequest {
         effect_sha256: format!("{:x}", Sha256::digest(effect)),
         artifact: artifact.map(str::to_owned),
@@ -489,6 +533,7 @@ pub fn declassify_request(
         sink: sink.clone(),
         approvers,
         route,
+        readers,
     }
 }
 
@@ -1433,6 +1478,32 @@ mod tests {
         assert_eq!(request.destination, lucyna);
         assert_eq!(lucyna.target(), ("neuradrive", "@lucyna:h"));
         assert!(!format!("{request:?}").contains("sell in March"));
+        // The approval names who it lets read, what, and those bytes.
+        assert_eq!(request.readers, BTreeSet::from([user("@marta:h")]));
+        assert_eq!(
+            request.args(),
+            Some(serde_json::json!({
+                "readers": ["@marta:h"],
+                "what": "the work handed to @lucyna:h",
+                "sha256": "743952fca51d2205792eab844091bc4bb29df579c77a8ec8668a04f9b42007bc",
+            }))
+        );
+        // Nobody can let content reach anyone, or a session nobody reads.
+        let anyone = Sink::DriveWrite {
+            drive_readers: Readers::Anyone,
+        };
+        assert_eq!(
+            declassify_request(content, None, &lucyna, &anyone, &label, &route).args(),
+            None
+        );
+        let unread = Label {
+            readers: only(&[]),
+            ..label.clone()
+        };
+        assert_eq!(
+            declassify_request(content, None, &lucyna, &sink, &unread, &route).args(),
+            None
+        );
         let at = Destination::Drive {
             drive: "tgdrive".to_owned(),
             path: "60-sessions/active/s/artifacts/plan.md".to_owned(),

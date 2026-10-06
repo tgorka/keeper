@@ -15,9 +15,8 @@
 //! and counts; the agent's `consumed` then closes the card live.
 //!
 //! What the host does after a decision counts is the session worker's
-//! (`agent_turns::parks`); production installs no decision source until
-//! rung 6 (R92), so the agent's client and its trust adapter stand in for
-//! the host here.
+//! (`agent_turns::parks`, and a whole agentd host in `live_delegate`); here
+//! the agent's client and its trust adapter stand in for the host.
 //!
 //! `#[ignore]`; endpoints and secrets come from the environment:
 //!

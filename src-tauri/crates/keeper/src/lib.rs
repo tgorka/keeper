@@ -717,8 +717,9 @@ pub fn run() {
                         ipc::recordings_reconcile_tick(&handle);
                         // This Mac's agents host rides the same clock (AD-62,
                         // story 90.6): manifests, placement and claims, spawned
-                        // off the tick, a tick still running skipping this one.
-                        agents_host::tick();
+                        // off the tick, a tick still running skipping this one;
+                        // its scan reads the accounts' trust anchor (R87).
+                        agents_host::tick(&handle);
                         // Voice rides the same clock (Story 63.5, FR-421): the
                         // tray's status line and verb follow Rust's own turn —
                         // `voice_snapshot`, not the webview's mirror — so the

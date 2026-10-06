@@ -257,6 +257,28 @@ pub struct OwnAccount {
     pub master_key: Option<String>,
 }
 
+impl OwnAccount {
+    /// The account `user`, whose messenger device here is `device_id`, as
+    /// this device reads it: its identity counts as verified only when the
+    /// SDK verified it here *and* this device is cross-signed by it — the
+    /// state Settings shows as verified — so a device that has not finished
+    /// verifying, or an identity reset elsewhere, trusts nobody (R87).
+    pub fn read(
+        user: matrix_sdk::ruma::OwnedUserId,
+        device_id: String,
+        identity_verified: bool,
+        device_cross_signed: bool,
+        master_key: Option<String>,
+    ) -> OwnAccount {
+        OwnAccount {
+            user,
+            device_id,
+            own_identity_verified: identity_verified && device_cross_signed,
+            master_key,
+        }
+    }
+}
+
 /// Where a host's trusted master keys come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Anchor {
@@ -493,6 +515,32 @@ mod tests {
 
         let unverified = Anchor::Desktop(vec![account(false)]);
         assert_eq!(unverified.pinned(&user(TGORKA)), None);
+
+        // Verified here only with both halves: a device still verifying,
+        // or an identity this device has not verified, trusts nobody, so
+        // even the phone's decision is not pinned.
+        for (identity, device, trusted) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let read = OwnAccount::read(
+                user(TGORKA),
+                "MAC".to_owned(),
+                identity,
+                device,
+                Some(KEY.to_owned()),
+            );
+            let anchor = Anchor::Desktop(vec![read]);
+            let mut phone = verified();
+            phone.device = Some("PHONE".to_owned());
+            phone.pinned_master_key = anchor.pinned(&user(TGORKA)).map(str::to_owned);
+            assert_eq!(
+                decide_trust(&phone, 3) == Trust::Verified,
+                trusted,
+                "{identity} {device}"
+            );
+        }
     }
 
     /// 93.3 AC7 (pure): a fingerprint is the key's own base64 in fours, and

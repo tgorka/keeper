@@ -54,7 +54,7 @@ use keeper_core::bots::chat::{self, CancelSignal};
 use keeper_core::bots::grant::{Effect, GrantVerdict, ToolTarget};
 use keeper_core::bots::tools::{render_result, ToolOutcome};
 use keeper_sync::SyncProfile;
-use matrix_sdk::ruma::{DeviceId, EventId, OwnedEventId, OwnedUserId, UserId};
+use matrix_sdk::ruma::{DeviceId, EventId, OwnedEventId, OwnedRoomId, OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::Instant;
@@ -116,11 +116,25 @@ pub const HISTORY_UNREAD: &str =
 /// What the model is told of such a call: never run again, its effect
 /// unknown.
 pub const HISTORY_UNREAD_RESULT: &str = "keeper could not read the room far enough back to know whether this approval was used, so it does not know whether it took effect, and it will not run it. Check, and propose it again if it is still needed.";
+/// Why an approved call does not run when what it would do now is not the
+/// action its approval names.
+pub const CHANGED: &str = "the action changed after it was approved";
+/// What the model is told of a call that needs a person when none of the
+/// people who could approve it can be asked from this host: it does not
+/// wait, and no request is left behind (R194; a relay through another host
+/// is DW-485).
+pub const NOBODY_TO_ASK: &str = "This needs a person's approval, but nobody who can approve this can be asked from this host — none of their proxies runs here — so keeper did not do it. Nothing was changed.";
+
+/// What the model is told of an approved call that did not run because
+/// `reason` moved after its approval.
+pub fn not_done(reason: &str) -> String {
+    format!("This was not done: {reason}. Nothing was changed.")
+}
 
 /// Who may decide an approval and from which device (R77; 93.3's trust
 /// adapter, [`crate::deciding::ClientDecisions`]). Installed, every call
 /// that needs a person parks; absent, it is refused as before Epic 93.
-/// Production installs none until the card can be decided on (R92).
+/// Both production hosts install one (R92).
 pub trait DecisionSource: Send + Sync {
     /// Where this host's trusted master keys come from.
     fn anchor(&self) -> &Anchor;
@@ -229,6 +243,9 @@ pub(crate) struct Parking {
     pub classification: Classification,
     /// The files it relies on, `(drive, drive-relative path)`.
     pub pins: Vec<(String, String)>,
+    /// A flow its sinks blocked: the `declassify` action's arguments, the
+    /// call itself added once its wire is known (R89).
+    pub declassify: Option<Value>,
 }
 
 /// A parked turn, handed from the tool loop to the worker.
@@ -243,13 +260,25 @@ pub(crate) struct ParkedTurn {
     pub rest: Vec<(Ulid, chat::ToolCall)>,
 }
 
+/// What a consumed `declassify` approval lets through (R89): exactly the
+/// effect whose canonical bytes have this SHA-256, for the call it bound,
+/// while that call runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Released {
+    pub sha256: String,
+    /// The delegation id the blocked brief carried, sent under again.
+    pub delegation: Option<String>,
+    /// Who it let read: the readers the approved label adds (R193).
+    pub readers: std::collections::BTreeSet<OwnedUserId>,
+}
+
 /// What became of a parked call when it was settled.
 #[derive(Debug, Clone)]
 pub(crate) enum Settled {
     /// Its approval was consumed here: it runs as its record bound it —
     /// the tool and the exact arguments, never the log's redacted copy
-    /// (R174).
-    Run(chat::ToolCall),
+    /// (R174) — with the flow a `declassify` approval releases.
+    Run(chat::ToolCall, Option<Released>),
     /// It does not run; the model is told this.
     Refuse(String),
 }
@@ -332,6 +361,26 @@ struct RoundFile {
     scheduled: Option<String>,
 }
 
+/// One approver a request that its room could not carry reached, and the
+/// proxy DM it went into.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AskedDm {
+    person: OwnedUserId,
+    dm: OwnedRoomId,
+}
+
+/// `approvals/<ulid>.asked.json`: who a request sent to proxy DMs reached
+/// and where (R85, R89), kept apart from the room's read cursor — the
+/// return route a restart rebuilds for every approval still waiting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AskedFile {
+    v: u32,
+    id: String,
+    asked: Vec<AskedDm>,
+}
+
 /// `<session>/approvals`, a real folder of the session — made when `make` —
 /// whose link to anywhere else is refused, never followed (the log's own
 /// discipline, R180): a record or a blob holds the exact action.
@@ -385,6 +434,27 @@ fn write_once(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
         fs::hard_link(&part, dir.join(name))
     })();
     let _ = fs::remove_file(&part);
+    written?;
+    File::open(dir)?.sync_all()
+}
+
+/// Write `bytes` as `dir/name` whole, replacing what is there: into a
+/// create-new file beside it, `fsync`ed, renamed over `name`, then the
+/// folder `fsync`ed.
+fn write_replacing(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let part = dir.join(format!(".{name}.{}.part", Ulid::new()));
+    let written = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&part, dir.join(name))
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&part);
+    }
     written?;
     File::open(dir)?.sync_all()
 }
@@ -512,6 +582,121 @@ impl ServedSession {
         let dir = self.approvals(deps, false).ok()?;
         let text = read_text_in(&dir, &format!("{id}.decision.json")).ok()?;
         parse_decision(&text).ok()
+    }
+
+    /// The proxy DMs the request of `id` reached, by approver; none when its
+    /// request went into the room, or its asked file does not read.
+    pub(crate) fn asked(&self, deps: &AgentDeps, id: &str) -> Vec<(OwnedUserId, OwnedRoomId)> {
+        let Ok(dir) = self.approvals(deps, false) else {
+            return Vec::new();
+        };
+        read_text_in(&dir, &format!("{id}.asked.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<AskedFile>(&text).ok())
+            .filter(|file| file.v == approval::RECORD_VERSION && file.id == id)
+            .map(|file| {
+                file.asked
+                    .into_iter()
+                    .map(|asked| (asked.person, asked.dm))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Keep who the request of `id` reached, and in which DM, beside its
+    /// record: whole, replacing what an earlier announcement of it kept.
+    fn keep_asked(
+        &self,
+        deps: &AgentDeps,
+        id: &str,
+        asked: &[(OwnedUserId, OwnedRoomId)],
+    ) -> std::io::Result<()> {
+        let dir = self.approvals(deps, false)?;
+        let text = serde_json::to_string_pretty(&AskedFile {
+            v: approval::RECORD_VERSION,
+            id: id.to_owned(),
+            asked: asked
+                .iter()
+                .map(|(person, dm)| AskedDm {
+                    person: person.clone(),
+                    dm: dm.clone(),
+                })
+                .collect(),
+        })
+        .map_err(std::io::Error::other)?;
+        crate::agent::off_the_runtime(|| {
+            write_replacing(&dir, &format!("{id}.asked.json"), text.as_bytes())
+        })
+    }
+
+    /// Leave nothing of the park `id` nobody could be asked about: its
+    /// record, round and asked files, and its timer — no pending record
+    /// stays to be announced again or expired (R194).
+    fn forget(&mut self, deps: &AgentDeps, id: &str) {
+        self.due.remove(id);
+        let Ok(dir) = self.approvals(deps, false) else {
+            return;
+        };
+        for name in [
+            format!("{id}.json"),
+            format!("{id}.round.json"),
+            format!("{id}.asked.json"),
+        ] {
+            match fs::remove_file(dir.join(&name)) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    tracing::warn!(%error, approval = id, file = %name, "agents: a park nobody could be asked about left a file");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// What a person let the brief of delegation `open` carry (R191a,
+    /// R193): the readers its approved label adds and the SHA-256 of the
+    /// bytes they approved, from the `declassify` record of this session
+    /// that opened it. The brief goes in at the target's join, after the
+    /// approval was spent, so the binding is checked again here: the record
+    /// is this session's and agent's under its own id, it binds this
+    /// delegation's very `delegate` call, the decision beside it approves
+    /// the digest the record's arguments recompute to, and that approval
+    /// was consumed here. Any drift lets nothing through: the brief goes
+    /// under the session's own label, which the room's check then refuses.
+    pub(crate) fn declassified(
+        &self,
+        deps: &AgentDeps,
+        open: &crate::delegate::Delegation,
+    ) -> Option<Released> {
+        let session = format!("{}/{}", deps.sessions_subfolder, self.context.session.path);
+        let entries = self.approvals(deps, false).and_then(fs::read_dir).ok()?;
+        entries.filter_map(Result::ok).find_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let id = name
+                .strip_suffix(".json")
+                .filter(|id| Ulid::from_string(id).is_ok())?;
+            let (record, args) = self.read_record(deps, id).ok()?;
+            if record.action.tool != AgentTool::Declassify.as_wire()
+                || args["delegation"].as_str() != Some(open.id.as_str())
+            {
+                return None;
+            }
+            let digest = record.recomputed_digest(&args).ok();
+            let held = record.id == id
+                && record.session == session
+                && record.agent == deps.home.config.id
+                && args["call"]["tool"].as_str() == Some(crate::delegate::DELEGATE)
+                && args["call"]["arguments"].as_str() == open.args.as_deref()
+                && self.context.consumed.contains(id)
+                && self.read_decision(deps, id).is_some_and(|decision| {
+                    decision.id == id
+                        && decision.decision == Decision::Approve
+                        && Some(&decision.binding_digest) == digest.as_ref()
+                });
+            if !held {
+                tracing::warn!(approval = id, delegation = %open.id, "agents: a declassified brief's approval no longer binds it; it is not let through");
+                return None;
+            }
+            bound_call(&record, args).1
+        })
     }
 
     /// Park `parked`, the call its turn ended on (93.2 AC1): a scheduled
@@ -733,9 +918,14 @@ impl ServedSession {
         };
         let value = serde_json::to_value(&content).map_err(failed)?;
         let gate = self.gate(deps, port);
-        let admitted = gate
-            .admit(APPROVAL_REQUEST, value.to_string().as_bytes())
-            .await;
+        // A declassification is decided in its approvers' proxy DMs, never
+        // in the session's room (AD-391, R89).
+        let admitted = if record.action.tool == AgentTool::Declassify.as_wire() {
+            Err(String::new())
+        } else {
+            gate.admit(APPROVAL_REQUEST, value.to_string().as_bytes())
+                .await
+        };
         let request_event = match &admitted {
             Ok(()) => crate::matrix_sink::deliver_unless_narrowed(
                 port.as_ref(),
@@ -758,7 +948,12 @@ impl ServedSession {
                 // sentence. That status is sent first: a decision comes only
                 // after the request, so any `consumed` of it is after this
                 // event in the room — the read forward begins here, never at
-                // the room's start (R179).
+                // the room's start (R179). Where no approver's proxy runs on
+                // this host nobody can be asked, and nothing waits (R194).
+                if self.askable().is_empty() {
+                    self.forget(deps, &record.id);
+                    return Err(NOBODY_TO_ASK.to_owned());
+                }
                 if admitted.is_ok() {
                     gate.suppressed(APPROVAL_REQUEST);
                 }
@@ -766,7 +961,18 @@ impl ServedSession {
                 let cursor = self
                     .send_status(deps, port, RunState::Blocked, Some(&detail))
                     .await;
-                self.request_by_doors(deps, &value).await;
+                let asked = self.request_by_doors(deps, &value).await;
+                // Nobody it reached is nobody asked: it is not announced.
+                if asked.is_empty() {
+                    self.forget(deps, &record.id);
+                    return Err(NOBODY_TO_ASK.to_owned());
+                }
+                // Where each decision comes home from, kept apart from the
+                // room's read cursor so a restart hears those DMs again.
+                if let Err(error) = self.keep_asked(deps, &record.id, &asked) {
+                    self.forget(deps, &record.id);
+                    return Err(error.to_string());
+                }
                 (cursor, true)
             }
         };
@@ -883,13 +1089,14 @@ impl ServedSession {
                     if let Err(error) = self.announce(deps, &port, record, pending.call_line).await
                     {
                         tracing::error!(approval = %pending.id, %error, "agents: a parked call's request could not be announced again");
-                        if error == UNATTACHED {
-                            // Nobody can be asked without what it asks:
-                            // refused, and its turn goes on (R180).
+                        if error == UNATTACHED || error == NOBODY_TO_ASK {
+                            // Nobody can be asked — without what it asks, or
+                            // with no approver's proxy here: refused, and
+                            // its turn goes on (R180, R194).
                             let mut body = line(&pending.id, ApprovalState::Refused);
-                            body.reason = Some(error);
+                            body.reason = Some(error.clone());
                             if self.end(&pending, body) {
-                                let settled = Settled::Refuse(UNATTACHED.to_owned());
+                                let settled = Settled::Refuse(error);
                                 self.continue_parked(
                                     deps,
                                     &port,
@@ -1281,7 +1488,7 @@ impl ServedSession {
             None if !read.complete => return unknown(self, sent),
             _ => {}
         }
-        let checked: Result<chat::ToolCall, (String, ApprovalState)> =
+        let checked: Result<(chat::ToolCall, Option<Released>), (String, ApprovalState)> =
             match self.read_record(deps, id) {
                 Err(reason) => Err((reason, ApprovalState::Refused)),
                 Ok((record, args)) => self
@@ -1302,7 +1509,7 @@ impl ServedSession {
                 let said = if state == ApprovalState::Expired {
                     reason
                 } else {
-                    format!("This was not done: {reason}. Nothing was changed.")
+                    not_done(&reason)
                 };
                 return Some(Settled::Refuse(said));
             }
@@ -1344,7 +1551,7 @@ impl ServedSession {
                 match mirrored {
                     Ok(()) => {
                         self.settling.remove(id);
-                        Some(Settled::Run(call))
+                        Some(Settled::Run(call.0, call.1))
                     }
                     Err(_) => unknown(self, Some(ours)),
                 }
@@ -1388,7 +1595,7 @@ impl ServedSession {
         }
         if record.recomputed_digest(args).ok().as_deref() != Some(decision.binding_digest.as_str())
         {
-            return drift("the action changed after it was approved".to_owned());
+            return drift(CHANGED.to_owned());
         }
         let session_dir = deps.sessions_zone.join(&self.context.session.path);
         if !checkpoint_holds(&session_dir, &record.checkpoint) {
@@ -1539,9 +1746,10 @@ impl ServedSession {
         }
     }
 
-    /// A call that could not be parked (its record not written): refused as
-    /// when nobody can be asked, the round's rest not run, and the turn of
-    /// `user_line` closed with why.
+    /// A call that could not be parked (its record not written, or nobody
+    /// who could approve it askable from here): refused as when nobody can
+    /// be asked — saying so, when that is why — the round's rest not run,
+    /// and the turn of `user_line` closed with why.
     pub(crate) fn refuse_parked(
         &mut self,
         deps: &AgentDeps,
@@ -1564,7 +1772,12 @@ impl ServedSession {
             announced: false,
             ran: false,
         };
-        self.answer_unrun(deps, &pending, crate::host::UNATTENDED_REFUSAL);
+        let said = if error == NOBODY_TO_ASK {
+            NOBODY_TO_ASK
+        } else {
+            crate::host::UNATTENDED_REFUSAL
+        };
+        self.answer_unrun(deps, &pending, said);
         self.writer.write(
             &mut self.context,
             Some(user_line),
@@ -1680,7 +1893,7 @@ impl ServedSession {
         };
         let (settled, run_rest, uncertain) = match (&call, settled) {
             (Some(_), Some(settled)) => {
-                let ran = matches!(settled, Settled::Run(_));
+                let ran = matches!(settled, Settled::Run(..));
                 (settled, ran, None)
             }
             (Some(_), None) => return,
@@ -1753,14 +1966,37 @@ impl ServedSession {
 }
 
 /// The call `record` binds, as it runs after approval: its call id, its
-/// tool and its arguments — never the log's redacted copy (R174).
-fn bound_call(record: &ApprovalRecord, args: Value) -> chat::ToolCall {
-    chat::ToolCall {
+/// tool and its arguments — never the log's redacted copy (R174). A
+/// `declassify` record binds the blocked call as the model sent it, byte
+/// for byte, and releases exactly the bytes it names (R89).
+fn bound_call(record: &ApprovalRecord, args: Value) -> (chat::ToolCall, Option<Released>) {
+    if record.action.tool == AgentTool::Declassify.as_wire() {
+        let raw = args["call"]["arguments"].as_str().unwrap_or("").to_owned();
+        let call = chat::ToolCall {
+            id: record.call.call_id.clone(),
+            name: args["call"]["tool"].as_str().unwrap_or("").to_owned(),
+            arguments: serde_json::from_str(&raw).ok(),
+            arguments_raw: raw,
+        };
+        let released = Released {
+            sha256: args["sha256"].as_str().unwrap_or("").to_owned(),
+            delegation: args["delegation"].as_str().map(str::to_owned),
+            readers: args["readers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|user| OwnedUserId::try_from(user.as_str()?).ok())
+                .collect(),
+        };
+        return (call, Some(released));
+    }
+    let call = chat::ToolCall {
         id: record.call.call_id.clone(),
         name: record.action.tool.clone(),
         arguments_raw: args.to_string(),
         arguments: Some(args),
-    }
+    };
+    (call, None)
 }
 
 /// What the model is told of an approval consumed on `host` whose call has

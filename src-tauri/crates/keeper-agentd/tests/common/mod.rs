@@ -237,15 +237,23 @@ pub fn stub(answer: &'static str, pieces: usize, over: Duration) -> Stub {
 /// A model that answers its first chat request with one call of the tool
 /// `name` with `args`, and every later one with `answer`.
 pub fn tool_then(name: &'static str, args: Value, answer: &'static str) -> Stub {
+    calls_at(vec![(1, name, args)], answer)
+}
+
+/// A model that answers its `n`th chat request (from 1) with one call of
+/// the tool each `(n, name, args)` of `calls` names, and every other one
+/// with `answer`.
+pub fn calls_at(calls: Vec<(usize, &'static str, Value)>, answer: &'static str) -> Stub {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("addr"));
     let requests = Arc::new(Mutex::new(0));
     let counted = Arc::clone(&requests);
+    let calls = Arc::new(calls);
     std::thread::spawn(move || {
         for socket in listener.incoming() {
             let Ok(mut socket) = socket else { continue };
             let counted = Arc::clone(&counted);
-            let args = args.clone();
+            let calls = Arc::clone(&calls);
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(socket.try_clone().expect("clone"));
                 let mut first = String::new();
@@ -275,10 +283,13 @@ pub fn tool_then(name: &'static str, args: Value, answer: &'static str) -> Stub 
                     *count
                 };
                 let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
-                let frame = if n == 1 {
-                    json!({"model":"stub","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]})
-                } else {
-                    json!({"model":"stub","choices":[{"index":0,"delta":{"content":answer},"finish_reason":"stop"}]})
+                let frame = match calls.iter().find(|(at, ..)| *at == n) {
+                    Some((_, name, args)) => {
+                        json!({"model":"stub","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":format!("call_{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]})
+                    }
+                    None => {
+                        json!({"model":"stub","choices":[{"index":0,"delta":{"content":answer},"finish_reason":"stop"}]})
+                    }
                 };
                 let _ = write!(socket, "data: {frame}\n\ndata: [DONE]\n\n");
             });
