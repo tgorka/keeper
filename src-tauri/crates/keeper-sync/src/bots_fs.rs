@@ -752,6 +752,632 @@ fn walk(
 }
 
 // ---------------------------------------------------------------------------
+// search
+// ---------------------------------------------------------------------------
+
+/// What a search walk's visitor says of one entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// A folder: walk into it. A file: it is a candidate — open it while
+    /// the budget lasts, count it either way.
+    Enter,
+    /// Never descended, never opened, not counted.
+    Skip,
+    /// End the walk here.
+    Stop,
+}
+
+/// What one walked entry is, in the frame the visitor decides on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchEntry {
+    /// Profile-relative, `/`-joined.
+    pub subpath: String,
+    pub is_dir: bool,
+}
+
+/// What a search reads of a file it opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scanned {
+    /// The file is text, whole.
+    Text(String),
+    /// The file is an LFS pointer: its content is not on this disk and is
+    /// never fetched; this is its real size. Its pointer text is not handed
+    /// over.
+    Pointer { size: u64 },
+}
+
+/// Why a search read handed nothing over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unread {
+    /// Not a regular file, not on this disk (dataless: never opened),
+    /// larger than the largest file read, not text, unreadable, or not the
+    /// file it was a moment ago — replaced, moved, a link put in its or a
+    /// folder's place, or changed while it was read.
+    Skipped,
+    /// The call's files, bytes or time are spent, or its bytes left are
+    /// fewer than the file holds: never opened.
+    Capped,
+}
+
+/// Where `subpath` of `root` lands: its drive-relative name through every
+/// link, as [`browse::resolve`] finds it, `/`-joined. A search admits a path
+/// where it is asked for AND where it lands, then reads the landing alone
+/// ([`ScanBudget::read`]).
+///
+/// `Ok(None)` only where the disk says nothing is there (`NotFound`) and no
+/// dangling link names it: a name the disk cannot be asked about — a folder
+/// on the way that may not be searched, an I/O error — is refused, never
+/// taken for an absence, since what is there is unknown.
+pub fn search_landing(root: &Path, subpath: &str) -> Result<Option<String>, FsRefusal> {
+    let target = browse::lexical_join(root, subpath)?;
+    let unreadable = |error: std::io::Error| FsRefusal::Unreadable {
+        subpath: subpath.to_owned(),
+        reason: error.to_string(),
+    };
+    let canonical_root = root.canonicalize().map_err(unreadable)?;
+    let resolved = match target.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling link is no absence: what it names is unknown.
+            browse::landing(root, subpath)?;
+            return Ok(None);
+        }
+        Err(error) => return Err(unreadable(error)),
+    };
+    let inside = resolved.strip_prefix(&canonical_root).map_err(|_| {
+        BrowseRefusal::EscapesAfterResolution {
+            subpath: subpath.to_owned(),
+        }
+    })?;
+    let names: Option<Vec<&str>> = inside
+        .components()
+        .map(|part| part.as_os_str().to_str())
+        .collect();
+    let names = names.ok_or_else(|| BrowseRefusal::Unspellable {
+        subpath: subpath.to_owned(),
+    })?;
+    Ok(Some(names.join("/")))
+}
+
+/// What tells a search's time is up: the instant now.
+pub type Clock = std::sync::Arc<dyn Fn() -> std::time::Instant + Send + Sync>;
+
+/// One call's bounds, shared by every read and walk it makes: the files it
+/// may open, the bytes it may read, the instant it stops (by `clock`), the
+/// largest file it reads, and the entries it may look at.
+#[derive(Clone)]
+pub struct ScanBudget {
+    pub max_files: usize,
+    pub max_bytes: u64,
+    pub max_file_bytes: u64,
+    pub deadline: std::time::Instant,
+    pub clock: Clock,
+    pub max_entries: usize,
+    /// Files opened so far: walked candidates and direct reads alike.
+    pub opened: usize,
+    /// Bytes read so far, by every read: text, a pointer, a binary or
+    /// invalid file, a config, a listing, the vault index's rows.
+    pub bytes: u64,
+    /// Entries looked at so far.
+    pub entries: usize,
+    /// Whether a bound stopped the opening.
+    pub capped: bool,
+}
+
+impl ScanBudget {
+    /// Whether the deadline has passed; once it has, nothing more opens.
+    fn timed_out(&mut self) -> bool {
+        let out = (self.clock)() >= self.deadline;
+        if out {
+            self.capped = true;
+        }
+        out
+    }
+
+    /// Whether nothing more may be opened — the files, the bytes or the
+    /// time spent — asked without opening or counting anything: where a
+    /// search stops between candidates, before it resolves the next.
+    pub fn exhausted(&mut self) -> bool {
+        if self.opened >= self.max_files || self.bytes >= self.max_bytes || self.timed_out() {
+            self.capped = true;
+        }
+        self.capped
+    }
+
+    /// Whether a walk may look at nothing more — the time or the entries
+    /// spent — asked without looking at anything: where a search stops
+    /// before it resolves the next folder to walk. The files and bytes
+    /// spent stop what is opened, not what a walk counts.
+    pub fn walk_spent(&mut self) -> bool {
+        self.timed_out() || self.entries >= self.max_entries
+    }
+
+    /// Admit one more read — the call's one admission, a walked candidate's
+    /// and a direct read's alike: none once the files, the bytes or the
+    /// time are spent; one admitted counts as opened, once.
+    fn admit(&mut self) -> bool {
+        if self.exhausted() {
+            return false;
+        }
+        self.opened += 1;
+        true
+    }
+
+    /// Admit one open a reader outside [`Self::read`] makes — the vault's
+    /// index database — as every read is admitted, and counted as opened.
+    /// No file-size limit applies to it: what it hands over is counted by
+    /// its own meter ([`Self::charge`]).
+    pub fn admit_open(&mut self) -> bool {
+        self.admit()
+    }
+
+    /// The bytes the next read may take: the largest file, or what is left.
+    fn cap(&self) -> u64 {
+        self.max_file_bytes
+            .min(self.max_bytes.saturating_sub(self.bytes))
+    }
+
+    /// Read by `read` (given the largest file and the bytes it may take)
+    /// once admitted, its bytes counted whatever it came to.
+    fn take(
+        &mut self,
+        read: impl FnOnce(u64, u64) -> (Result<Scanned, Unread>, u64),
+    ) -> Result<Scanned, Unread> {
+        if !self.admit() {
+            return Err(Unread::Capped);
+        }
+        let (got, read) = read(self.max_file_bytes, self.cap());
+        self.bytes += read;
+        if got == Err(Unread::Capped) {
+            self.capped = true;
+        }
+        got
+    }
+
+    /// Read `landed` ([`search_landing`]) of `root` as a search reads
+    /// anything — a candidate, a drive's config, a listing, a ranked or
+    /// listed document: admitted as a walked candidate is, then opened from
+    /// the root a name at a time, no link followed, so what is read is the
+    /// landing that was admitted or nothing; a regular file on this disk,
+    /// checked on the handle that is read; a pointer by its size alone;
+    /// text of at most [`Self::max_file_bytes`] and of the call's bytes
+    /// left, whole.
+    pub fn read(&mut self, root: &Path, landed: &str) -> Result<Scanned, Unread> {
+        self.take(|max, cap| read_landed(root, landed, max, cap))
+    }
+
+    /// The bytes the call may still read.
+    pub fn bytes_left(&self) -> u64 {
+        self.max_bytes.saturating_sub(self.bytes)
+    }
+
+    /// Count `bytes` read outside [`Self::read`] — the vault index's rows.
+    pub fn charge(&mut self, bytes: u64) {
+        self.bytes += bytes;
+    }
+
+    /// Whether the call's time is up, by its clock: what a reader outside
+    /// [`Self::read`] stops on.
+    pub fn expiry(&self) -> impl FnMut() -> bool + Send + 'static {
+        let (clock, deadline) = (std::sync::Arc::clone(&self.clock), self.deadline);
+        move || clock() >= deadline
+    }
+
+    /// The time the call has left, by its clock.
+    pub fn time_left(&self) -> std::time::Duration {
+        self.deadline.saturating_duration_since((self.clock)())
+    }
+}
+
+#[cfg(unix)]
+fn read_landed(root: &Path, landed: &str, max: u64, cap: u64) -> (Result<Scanned, Unread>, u64) {
+    let skipped = (Err(Unread::Skipped), 0);
+    let Ok(segments) = browse::plain_segments(landed) else {
+        return skipped;
+    };
+    let Some((name, folders)) = segments.split_last() else {
+        return skipped;
+    };
+    match nofollow::descend(root, folders) {
+        Ok(dir) => nofollow::read_in(std::os::fd::AsFd::as_fd(&dir), name, max, cap),
+        Err(_) => skipped,
+    }
+}
+
+#[cfg(not(unix))]
+fn read_landed(_: &Path, _: &str, _: u64, _: u64) -> (Result<Scanned, Unread>, u64) {
+    // No `O_NOFOLLOW` open to bind a read to its landing: nothing is read.
+    (Err(Unread::Skipped), 0)
+}
+
+/// The absolute path of `landed` ([`search_landing`]) of `root`, for a
+/// search's reader that opens it by path — the vault's SQLite index — where
+/// it is a file [`ScanBudget::read`] would open: reached from the root a
+/// name at a time with no link followed, a regular file, its content on
+/// this disk (a dataless file is never handed over: opening it would
+/// materialize it).
+#[cfg(unix)]
+pub fn search_file(root: &Path, landed: &str) -> Result<PathBuf, Unread> {
+    let segments = browse::plain_segments(landed).map_err(|_| Unread::Skipped)?;
+    let (name, folders) = segments.split_last().ok_or(Unread::Skipped)?;
+    let dir = nofollow::descend(root, folders).map_err(|_| Unread::Skipped)?;
+    if !nofollow::file_at(std::os::fd::AsFd::as_fd(&dir), name, nofollow::dataless) {
+        return Err(Unread::Skipped);
+    }
+    Ok(root
+        .canonicalize()
+        .map_err(|_| Unread::Skipped)?
+        .join(landed))
+}
+
+#[cfg(not(unix))]
+pub fn search_file(_: &Path, _: &str) -> Result<PathBuf, Unread> {
+    // No `O_NOFOLLOW` descent to check a file by: nothing is handed over.
+    Err(Unread::Skipped)
+}
+
+/// What one search walk met.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchWalk {
+    /// Candidates the visitor entered, opened or not.
+    pub candidates: usize,
+    /// Candidates opened and handed over.
+    pub searched: usize,
+    /// Candidates opened and not handed over: binary, too large, not on
+    /// this disk as content, unreadable, or not the file that was met.
+    pub skipped: usize,
+    /// Whether the walk stopped on [`ScanBudget::max_entries`] or the
+    /// deadline before it had met every entry, so `candidates` is not the
+    /// total.
+    pub walk_capped: bool,
+    /// Folders entered that could not be listed whole — not opened, not
+    /// enumerated, enumeration failing part way, or an entry whose kind
+    /// could not be asked — and so may hold candidates never met. One that
+    /// was gone by the time it was opened is an absence, not counted.
+    pub unreadable: usize,
+}
+
+/// Walk `start`'s subtree (a landing, [`search_landing`]) for a search: in
+/// name order, depth first, each entry — `start` first — offered to
+/// `visit` before anything of it is opened: a folder it skips is never
+/// opened, a file it skips never read. Every folder is opened by its name
+/// in the folder it was met in and every file read there as
+/// [`ScanBudget::read`] reads, no link followed, so a link put in an
+/// entry's place after it was offered is never followed. A file it enters
+/// is read while `budget` lasts and handed to `found`. The deadline and
+/// [`ScanBudget::max_entries`] stop the walk itself, while a folder is
+/// being read.
+pub fn search_walk(
+    root: &Path,
+    start: &str,
+    budget: &mut ScanBudget,
+    visit: &mut dyn FnMut(&SearchEntry) -> Step,
+    found: &mut dyn FnMut(&str, Scanned),
+) -> Result<SearchWalk, FsRefusal> {
+    let segments = browse::plain_segments(start)?;
+    let mut report = SearchWalk::default();
+    let entry = SearchEntry {
+        subpath: start.to_owned(),
+        is_dir: true,
+    };
+    if visit(&entry) != Step::Enter {
+        return Ok(report);
+    }
+    #[cfg(unix)]
+    {
+        nofollow::walk(
+            root,
+            &segments,
+            entry.subpath,
+            budget,
+            &mut report,
+            visit,
+            found,
+        )
+        .map_err(|error| FsRefusal::Unreadable {
+            subpath: start.to_owned(),
+            reason: error.to_string(),
+        })?;
+        Ok(report)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, segments, budget, found);
+        Err(FsRefusal::Unreadable {
+            subpath: start.to_owned(),
+            reason: "a search walk needs a Unix filesystem".to_owned(),
+        })
+    }
+}
+
+/// The search's opens, every one relative to a folder already open and
+/// none following a link (`O_NOFOLLOW` at each name, AD-65's containment
+/// held at the open rather than once for a path).
+#[cfg(unix)]
+mod nofollow {
+    use std::ffi::OsStr;
+    use std::io::Read as _;
+    use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+    use std::path::Path;
+    use std::rc::Rc;
+
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
+
+    use super::{join, ScanBudget, Scanned, SearchEntry, SearchWalk, Step, Unread};
+    use crate::lfs::pointer::{self, Pointer};
+
+    /// The folder `name` of `parent`, never through a link.
+    fn folder(parent: BorrowedFd<'_>, name: &OsStr) -> std::io::Result<OwnedFd> {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        Ok(rustix::fs::openat(parent, name, flags, Mode::empty())?)
+    }
+
+    /// The folder at `folders` under `root`'s canonical form, a name at a
+    /// time.
+    pub(super) fn descend(root: &Path, folders: &[&OsStr]) -> std::io::Result<OwnedFd> {
+        let mut dir = rustix::fs::open(
+            root.canonicalize()?,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        for name in folders {
+            dir = folder(dir.as_fd(), name)?;
+        }
+        Ok(dir)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn dataless(stat: &Stat) -> bool {
+        stat.st_flags & crate::stability::SF_DATALESS != 0
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn dataless(_: &Stat) -> bool {
+        // As `stability::is_dataless`: no such state off macOS.
+        false
+    }
+
+    fn plain_file(stat: &Stat) -> bool {
+        plain_by(stat, dataless)
+    }
+
+    /// A regular file whose content `dataless` does not say is elsewhere.
+    fn plain_by(stat: &Stat, dataless: impl Fn(&Stat) -> bool) -> bool {
+        FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile && !dataless(stat)
+    }
+
+    /// Whether `name` of `dir`, never through a link, is a regular file
+    /// whose content `dataless` does not say is elsewhere — asked of its
+    /// `stat` alone, nothing opened.
+    pub(super) fn file_at(
+        dir: BorrowedFd<'_>,
+        name: &OsStr,
+        dataless: impl Fn(&Stat) -> bool,
+    ) -> bool {
+        rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|stat| plain_by(&stat, dataless))
+    }
+
+    /// Read the file `name` of `dir` as a search reads it, at most `cap`
+    /// bytes, with the bytes read. Its type and materialization are asked
+    /// before it is opened (a dataless file is never opened, a FIFO never
+    /// waited on) and again of the handle, which must be the very file
+    /// asked about; the pointer test and the text are the same bytes of
+    /// that handle.
+    pub(super) fn read_in(
+        dir: BorrowedFd<'_>,
+        name: &OsStr,
+        max_file_bytes: u64,
+        cap: u64,
+    ) -> (Result<Scanned, Unread>, u64) {
+        let skipped = (Err(Unread::Skipped), 0);
+        let Ok(asked) = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) else {
+            return skipped;
+        };
+        let len = u64::try_from(asked.st_size).unwrap_or(u64::MAX);
+        if !plain_file(&asked) || len > max_file_bytes {
+            return skipped;
+        }
+        if len > cap {
+            return (Err(Unread::Capped), 0);
+        }
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let Ok(handle) = rustix::fs::openat(dir, name, flags, Mode::empty()) else {
+            return skipped;
+        };
+        let Ok(held) = rustix::fs::fstat(&handle) else {
+            return skipped;
+        };
+        if !plain_file(&held) || (held.st_dev, held.st_ino) != (asked.st_dev, asked.st_ino) {
+            return skipped;
+        }
+        let mut bytes = Vec::new();
+        let whole = std::fs::File::from(handle)
+            .take(cap)
+            .read_to_end(&mut bytes)
+            .is_ok();
+        let read = bytes.len() as u64;
+        if !whole || read != len {
+            return (Err(Unread::Skipped), read);
+        }
+        if bytes.len() <= pointer::MAX_POINTER_BYTES && pointer::is_pointer_candidate(&bytes) {
+            if let Some(pointer) = Pointer::parse(&bytes) {
+                return (Ok(Scanned::Pointer { size: pointer.size }), read);
+            }
+        }
+        if bytes.contains(&0) {
+            return (Err(Unread::Skipped), read);
+        }
+        match String::from_utf8(bytes) {
+            Ok(text) => (Ok(Scanned::Text(text)), read),
+            Err(_) => (Err(Unread::Skipped), read),
+        }
+    }
+
+    /// Whether `error` says nothing is there, rather than that what is
+    /// there could not be asked about.
+    fn gone(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::NotFound
+    }
+
+    /// The folders and regular files of `dir` by name, links left out;
+    /// `None` when the deadline or the entry bound stopped the reading. A
+    /// folder that could not be listed whole counts in `report` as
+    /// unreadable, with what of it was listed.
+    fn children(
+        dir: &OwnedFd,
+        budget: &mut ScanBudget,
+        report: &mut SearchWalk,
+    ) -> Option<Vec<(String, bool)>> {
+        let mut out = Vec::new();
+        let Ok(mut entries) = rustix::fs::Dir::read_from(dir) else {
+            report.unreadable += 1;
+            return Some(out);
+        };
+        let mut whole = true;
+        while let Some(entry) = entries.read() {
+            let Ok(entry) = entry else {
+                whole = false;
+                break;
+            };
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if budget.timed_out() || budget.entries >= budget.max_entries {
+                return None;
+            }
+            budget.entries += 1;
+            let Ok(name) = std::str::from_utf8(name) else {
+                continue;
+            };
+            let kind = match entry.file_type() {
+                FileType::Unknown => {
+                    match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+                        Ok(stat) => FileType::from_raw_mode(stat.st_mode),
+                        Err(error) => {
+                            whole &= gone(&error.into());
+                            continue;
+                        }
+                    }
+                }
+                kind => kind,
+            };
+            match kind {
+                FileType::Directory => out.push((name.to_owned(), true)),
+                FileType::RegularFile => out.push((name.to_owned(), false)),
+                _ => {}
+            }
+        }
+        if !whole {
+            report.unreadable += 1;
+        }
+        out.sort();
+        Some(out)
+    }
+
+    pub(super) fn walk(
+        root: &Path,
+        start: &[&OsStr],
+        subpath: String,
+        budget: &mut ScanBudget,
+        report: &mut SearchWalk,
+        visit: &mut dyn FnMut(&SearchEntry) -> Step,
+        found: &mut dyn FnMut(&str, Scanned),
+    ) -> std::io::Result<()> {
+        // A folder still to walk holds the folder it was met in open, and
+        // is opened by its name there.
+        let mut pending: Vec<(Rc<OwnedFd>, String, String)> = Vec::new();
+        let mut next = Some((descend(root, start)?, subpath));
+        loop {
+            let (dir, here) = match next.take() {
+                Some(first) => first,
+                None => {
+                    let Some((parent, name, subpath)) = pending.pop() else {
+                        return Ok(());
+                    };
+                    match folder(parent.as_fd(), OsStr::new(&name)) {
+                        Ok(dir) => (dir, subpath),
+                        Err(error) => {
+                            report.unreadable += usize::from(!gone(&error));
+                            continue;
+                        }
+                    }
+                }
+            };
+            let Some(children) = children(&dir, budget, report) else {
+                report.walk_capped = true;
+                return Ok(());
+            };
+            let dir = Rc::new(dir);
+            let mut folders = Vec::new();
+            for (name, is_dir) in children {
+                if budget.timed_out() {
+                    report.walk_capped = true;
+                    return Ok(());
+                }
+                let entry = SearchEntry {
+                    subpath: join(&here, &name),
+                    is_dir,
+                };
+                match visit(&entry) {
+                    Step::Skip => continue,
+                    Step::Stop => return Ok(()),
+                    Step::Enter => {}
+                }
+                if is_dir {
+                    folders.push((Rc::clone(&dir), name, entry.subpath));
+                    continue;
+                }
+                report.candidates += 1;
+                let read =
+                    budget.take(|max, cap| read_in(dir.as_fd(), OsStr::new(&name), max, cap));
+                match read {
+                    Ok(scanned) => {
+                        report.searched += 1;
+                        found(&entry.subpath, scanned);
+                    }
+                    Err(Unread::Skipped) => report.skipped += 1,
+                    Err(Unread::Capped) => {}
+                }
+            }
+            // Depth first, in name order: the first folder is walked next.
+            pending.extend(folders.into_iter().rev());
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// What a search hands a reader that opens by path (the vault's
+        /// index) passes the materialization check the content reader
+        /// makes: under a `dataless` that says a file's content is
+        /// elsewhere (macOS's `SF_DATALESS`, which Linux has not), the file
+        /// is not handed over; a FIFO and a link never are.
+        #[test]
+        fn a_file_whose_content_is_elsewhere_is_never_handed_over() {
+            let dir = tempfile::tempdir().expect("root");
+            std::fs::write(dir.path().join("search.db"), b"db").expect("write");
+            std::os::unix::fs::symlink(dir.path().join("search.db"), dir.path().join("link.db"))
+                .expect("link");
+            let made = std::process::Command::new("mkfifo")
+                .arg(dir.path().join("pipe.db"))
+                .status()
+                .expect("mkfifo");
+            assert!(made.success());
+            let held = descend(dir.path(), &[]).expect("root");
+            let at = |name: &str, elsewhere: bool| {
+                file_at(held.as_fd(), OsStr::new(name), |_: &Stat| elsewhere)
+            };
+            assert!(at("search.db", false));
+            assert!(!at("search.db", true), "a dataless file was handed over");
+            assert!(!at("pipe.db", false) && !at("link.db", false));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // write and edit
 // ---------------------------------------------------------------------------
 

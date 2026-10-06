@@ -40,6 +40,7 @@ pub mod proposal;
 pub mod proxy;
 pub mod redact;
 pub mod room;
+pub mod search;
 pub mod seed;
 pub mod session;
 pub mod skills;

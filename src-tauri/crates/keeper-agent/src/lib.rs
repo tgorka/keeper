@@ -73,6 +73,7 @@ pub mod ports;
 pub mod rooms;
 #[cfg(unix)]
 pub mod runtime;
+pub mod search;
 pub mod seed;
 pub mod sessions;
 pub mod sinks;

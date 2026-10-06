@@ -3,9 +3,9 @@
 //! layers run.
 //!
 //! - [`TOOLS`]: what a helper may be offered, of what its session is
-//!   offered: the drive's reads and `skill_view`. Anything else it calls is
-//!   answered with [`REFUSAL`]; it inherits the session's label and grants
-//!   and never widens them.
+//!   offered: the drive's reads, `drive_search` and `skill_view`. Anything
+//!   else it calls is answered with [`REFUSAL`]; it inherits the session's
+//!   label and grants and never widens them.
 //! - [`spec`] and [`parse`]: `helper({brief, lens?, skill?, inputs?})`.
 //! - [`lens_of`]: a review layer by id in the run's merged
 //!   `[[workflow.review_layers]]`, then `[[workflow.oneshot_review_layers]]`,
@@ -29,13 +29,14 @@ use crate::bots::chat::ToolSpec;
 pub const HELPER: &str = "helper";
 
 /// What a helper may be offered, of what its session is offered: the five
-/// drive reads and `skill_view` (`drive_search` joins them with 95.4).
-pub const TOOLS: [&str; 6] = [
+/// drive reads, `drive_search` and `skill_view`.
+pub const TOOLS: [&str; 7] = [
     "drive_list",
     "drive_read",
     "drive_glob",
     "drive_grep",
     "drive_stat",
+    super::search::DRIVE_SEARCH,
     super::workflow::SKILL_VIEW,
 ];
 

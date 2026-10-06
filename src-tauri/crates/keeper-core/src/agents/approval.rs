@@ -257,6 +257,18 @@ pub fn summary_of(tool: AgentTool, args: &Value) -> String {
         }
         AgentTool::DriveGrep => format!("Search `{path}` in {drive} for `{}`", arg(args, "needle")),
         AgentTool::DriveStat => format!("Look up `{path}` in {drive}"),
+        AgentTool::DriveSearch => {
+            let drives: Vec<&str> = args["drives"]
+                .as_array()
+                .map(|drives| drives.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let scope = if drives.is_empty() {
+                "the drives in scope".to_owned()
+            } else {
+                drives.join(", ")
+            };
+            format!("Search {scope} for `{}`", arg(args, "query"))
+        }
         AgentTool::DriveWrite => format!(
             "Write `{path}` in {drive} ({} bytes)",
             bytes_of(args, "content")

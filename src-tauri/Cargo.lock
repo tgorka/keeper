@@ -4280,6 +4280,7 @@ dependencies = [
  "matrix-sdk",
  "notify",
  "reqwest",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",

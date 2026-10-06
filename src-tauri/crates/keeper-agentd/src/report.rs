@@ -113,6 +113,7 @@ fn tools(home: &AgentHome) -> (Vec<&str>, Vec<&str>) {
                 || keeper_agent::cards::is_card_tool(name)
                 || keeper_agent::bmad::serves(name)
                 || keeper_agent::memory::serves(name)
+                || keeper_agent::search::serves(name)
                 || *name == keeper_core::agents::workflow::ASK_HUMAN
                 || *name == keeper_core::agents::workflow::WORKFLOW_START
                 || *name == keeper_core::agents::helper::HELPER

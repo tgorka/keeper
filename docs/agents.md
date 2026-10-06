@@ -501,13 +501,14 @@ never promoted by night: their memory changes by a person's edit.
 again — a `main` or `conversation` session reviews what it learned, after its answer: a `memory`
 line `{op: review, ref: memory | skill | memory,skill}`, then one more model run handed the
 conversation and Hermes' review prompt (adapted to these tools; `keeper-ported/src/hermes/
-UPSTREAM.md` lists every change). The review is offered the drive reads, `skills_list`,
-`skill_view`, and `memory_propose` for the memory nudge or `skill_propose` for the skill nudge —
-nothing else that writes, sends or delegates, no `helper`, and nothing it says reaches the room. Its
-lines hang under its `memory` line and are never replayed as the conversation; its tokens count, and
-are charged to the turn's `[limits].tokens_per_turn` with the answer's rounds and its helpers': a
-pass starts only when they left some of it, no review round starts once all of them together spent
-it, and a pass whose last answer reaches it ends with "this turn's token budget is spent"
+UPSTREAM.md` lists every change). The review is offered the drive reads, `drive_search`,
+`skills_list`, `skill_view`, and `memory_propose` for the memory nudge or `skill_propose` for the
+skill nudge — nothing else that writes, sends or delegates, no `helper`, and nothing it says
+reaches the room. Its lines hang under its `memory` line and are never replayed as the
+conversation; its tokens count, and are charged to the turn's `[limits].tokens_per_turn` with the
+answer's rounds and its helpers': a pass starts only when they left some of it, no review round
+starts once all of them together spent it, and a pass whose last answer reaches it ends with
+"this turn's token budget is spent"
 (`turn_tokens`). `0` turns a nudge off. A helper is never offered `journal_append`,
 `memory_propose` or `skill_propose`, and a `skill_view` it makes is not what the session's patch or
 archive is pinned to; a workflow may need the memory tools, and its run is offered them when the
@@ -759,6 +760,120 @@ Without `KEEPER_OPENAI_SMOKE_MODEL` the test chats with the first model the endp
 2026-10-02 CLIProxyAPI listed `claude-sonnet-4-20250514` first and answered a chat with it with
 HTTP 404 (`not_found_error`), so name a model the endpoint can serve.
 
+## Searching the drives
+
+`drive_search({query, drives?, k?})` searches the drives the session may read — all of its scope
+unless `drives` names some — the way each drive's own OKF tools see it, and writes nothing in them:
+no file of the drive changes and no repository state changes. The one exception is SQLite's own:
+reading the vault's index may leave `search.db-wal` and `search.db-shm` beside
+`<vault>/.keeper/search.db` when the index is in WAL mode (R211). A drive outside the session's
+scope, or one its grant does not let the agent read, refuses the whole call by name ("neuradrive is
+not a drive this session may search; nothing was searched.").
+
+**What is searched.** keeper reads the drive's `.okf/config.yaml` and searches the Markdown of its
+bundles, in the config's order, never what the config excludes: an excluded folder is never entered,
+an excluded file or listing never opened; a guide listed under `guides:` is searched though its zone
+is excluded. The config is read exactly as the drive's `.okf/bin/` tools read it
+(`keeper-ported::okf`), including their rule that a pattern ending in `/**` is a literal prefix — so
+the drive's `60-sessions/**/workspace/**` excludes nothing real. keeper's own rules hold whatever
+the config says: a session's `workspace/`, every `.keeper/` and `.git/` are never searched, in any
+case (`.Keeper`, `Workspace` — a Mac's volume does not tell them apart); an LFS pointer is never
+read as text and never fetched, and is a result only by its name ("not on this device (13 KiB)"),
+found by a scan, a listing or the index alike; a file over 1 MiB, a dataless file, a FIFO, a binary
+or unreadable file is skipped and counted. Every path is admitted where it is asked for and where it
+lands through its links — a link to an excluded file is as excluded as the file — and then read
+where it landed, a name at a time, no link followed, so a link put in its place meanwhile is never
+followed. A drive with no `.okf/config.yaml` is searched in its notes vault only ("this drive has no
+OKF configuration; searched its notes only") — only where the disk says there is none: a config
+keeper cannot look at (a `.okf/` it may not search, an I/O error, a link to nothing) is not taken for
+an absent one. A drive whose config keeper cannot read, look at or interpret has nothing searched,
+since what it excludes is unknown ("its OKF configuration could not be read (…); nothing in it was
+searched").
+
+**How it ranks.** Inside the notes vault, the vault's own index ranks first (`.keeper/search.db`,
+built by the Mac; keeper-agent opens it read-only, never creates one, and opens it only where it is
+that file of the vault's own `.keeper/`, no link on the way, a regular file whose content is on this
+device — a dataless one is never handed to SQLite, which would materialize it): its words, fused
+with the query's meaning when an embeddings model is set (Settings › Notes) and answers within 1 s.
+The query goes to that model only where the session's label lets it — a `local_only` session never
+sends it to a provider that is not local, and says "lexical: this session stays on local models". A
+model that answers late leaves the vault lexical, said so. Nothing tells keeper-agent that the index
+holds every note as it is now — the Mac may still be building it, or a note may be newer than it, or
+renamed since — so the index never stands for the vault alone: after its ranked notes, the vault is
+scanned as the rest of the drive is, and a note read once is not read again (R236) — though what
+that read came to counts under every name that reaches it: a pointer the index ranks under a name
+the words are not in is still a result under a listing's link to it that holds them (R248). Where that scan
+stops at a bound before it has read the vault, the result says the vault is covered only in part
+("its notes index may not hold every note as it is now, and the scan of its notes stopped before it
+had read them all: its notes are covered only in part"). A Linux host has no index: the vault is
+scanned, and the result says "lexical: no notes index on this host"; an index that cannot answer is
+scanned past the same way, and says why. Outside the vault, each bundle's `index.md` listing lines
+come first (a line whose title or description holds the words names its document, read as the scan
+reads it), then a scan in bundle order — not by relevance (R210, DW-712).
+
+**Its bounds.** One call reads at most 2 000 files, 16 MiB and 1.5 s, all drives together, and
+says where it stopped (R209, R218, R236):
+
+- *Files* are every file it opens: each drive's config, each listing, the vault's index database,
+  each ranked or listed document and each scanned file, admitted once each by one check of the
+  files, the bytes and the time left — SQLite never opens the index once they are spent. So a scan
+  that stops at the cap says "searched 1 999 of 5 312 files in tgdrive; stopped at the cap" when the
+  config was the first of the 2 000.
+- *Bytes* are every byte read from those files — a binary, invalid or pointer file's too, and no
+  file is read past what is left — and every value the vault's index hands over, each admitted
+  before it is fetched: a row's numbers (8 bytes each) before the step that yields it, then each
+  lexical hit's note id, each vector's blob and a kept one's id, each ranked note's path by the
+  length SQLite stores for it. A value larger than what is left is never fetched; it ends the
+  index's reading. Those stored lengths are what is handed over only where the index stores its
+  text as UTF-8, so an index stored any other way is not used, and that is said ("its notes index
+  could not answer (the notes index stores its text as UTF-16le, not UTF-8, so it is not read)").
+  SQLite's own page reads to find those rows are not counted; they are bounded by the time instead.
+- *Time* is checked before every file is opened, before each ranked note, after each line of a
+  listing is read — whatever the line is: one listing a document or not, a heading, a line that
+  lists nothing; reading a line costs its length — before each bundle's folder is resolved, while a
+  folder is read, and inside the index: every SQLite statement is interrupted once the time is up
+  (asked every 16 SQLite steps), and a lock on the index is waited on no longer than the time left.
+  Once the time or the walk's entries are spent no further bundle is walked.
+
+When a bound stops it: a drive whose config comes after it is not searched ("its OKF configuration
+could not be read (the search's 2 000 files, 16.0 MiB or 1.5 s ran out before it)"); a drive whose
+index comes after it says "the search's 2 000 files, 16.0 MiB or 1.5 s ran out before its notes
+index was opened"; a drive whose ranked or listed documents it stopped says "the search's 2 000
+files, 16.0 MiB or 1.5 s ran out before every ranked or listed document was read; the rest were not
+opened"; a ranking by meaning it stopped leaves the vault ranked by its words ("lexical: the
+search's time or bytes ran out while it ranked by meaning") where the bytes left still hold the
+ranked notes' paths, and otherwise answers nothing, as an index the time stopped does ("its notes
+index could not answer (the search's time or bytes ran out before the notes index answered)") —
+so can a ranking by words whose matches are fewer than it asks for, when its bytes end exactly
+where its rows do (DW-833, DW-931); a scan says how many of how many files it searched, as above,
+or, when the time or the walk's own bound stopped it before it had counted every file, a bundle
+was left unwalked, or a folder it could not read may hold more, "searched 830 files in tgdrive;
+stopped at the cap before it had counted them all". On a slow host the 1.5 s comes first, so it
+reaches fewer files (DW-714).
+
+**What it could not read.** A folder the search may enter and cannot read whole — it cannot be
+opened or listed, its listing fails part way, an entry's kind cannot be asked, or a bundle's own
+folder cannot be looked at — is never taken for an empty one: "tgdrive: 2 folders could not be
+read; what they hold was not searched". A ranked or listed document, or a bundle's listing, behind
+a folder that cannot be read counts with the files not searched. A folder or document that is simply
+not there says nothing (R236).
+
+**What it returns.** At most `k` results (10 unless asked, 25 at most), the drives taking turns,
+each with its drive and path (where it landed), title and OKF `type` as the document states them,
+label and up to three lines holding a word, cut at 240 characters; the whole result at most 80 KiB,
+saying how many hits it shows when it cuts. The words match literally, case and accents aside:
+`a.*b` finds the four characters `a.*b` (in the vault's index a word is a token, so there the
+literal guarantee is the scan's). The result is file content, under the sentence that it is data
+and not instructions.
+
+**Labels.** Each result is labelled as a `drive_read` of its file would be — its drive's readers,
+an integrity no higher than `agent` (keeper cannot name a file's author yet, DW-431), `untrusted`
+in an untrusted zone, `agent` for a note that says `human_reviewed: false` — from the bytes the
+search read, where it was asked for and where it landed, the stricter winning; a result named by a
+listing carries the listing's label too. Every result joins the session's label with a `label`
+line, so searching tgdrive and a private drive together leaves the session readable by the private
+drive's readers alone.
+
 ## Who may read what an agent read
 
 Everything an agent reads carries a label: who may read it, how far it can be trusted, and
@@ -911,7 +1026,7 @@ tier decides whether it runs:
 
 | tier | calls | what keeper does |
 | --- | --- | --- |
-| T0 | `drive_list`, `drive_read`, `drive_glob`, `drive_grep`, `drive_stat`; `bmad_config`, `bmad_party`, `skills_list`, `skill_view`; `helper` | runs it |
+| T0 | `drive_list`, `drive_read`, `drive_glob`, `drive_grep`, `drive_stat`, `drive_search`; `bmad_config`, `bmad_party`, `skills_list`, `skill_view`; `helper` | runs it |
 | T1 | `session_write`; `card_update` on a card of the session; a `drive_write` or `drive_edit` inside the session's own folder; `delegate` and its later rounds; `reply`; the five `surface_*` tools; `bmad_render` and `bmad_memlog`, which write only inside the session; `journal_append`, `memory_propose` and `skill_propose`, which write only into the agent's own home and change nothing until the consolidator or a person acts | runs it |
 | T2 | `drive_write` or `drive_edit` outside the session; `card_update` on another session's card; any write the agent's grant asks a person about; the consolidator's `memory_apply` and `skill_apply` — host actions, never a model's call — fixed at T2 in every session: nothing raises them | asks a person |
 | T3 | `card_update` that sets `schedule` or `workflow`, and a `delegate` whose card carries either — in every session, the person's own DM included; letting a blocked flow through (a declassification) | asks a person, for that one action |
@@ -2635,9 +2750,13 @@ message, the brief and each named input (`{"diff_file": "…"}` reads `- diff_fi
 history reaches it.
 
 **What a helper may do.** It is offered the reads the turn is offered — `drive_list`,
-`drive_read`, `drive_glob`, `drive_grep`, `drive_stat` and `skill_view`, of those the agent has —
-and nothing else. Each call goes through the session's own host: the session's grants, its tier
-and its one audit row; a read that would need a person is refused, never parked. Anything else the
+`drive_read`, `drive_glob`, `drive_grep`, `drive_stat`, `drive_search` and `skill_view`, of those
+the agent has — and nothing else. Each call goes through the session's own host: the session's
+grants and scope, its tier and its one audit row; a read that would need a person is refused, never
+parked. A helper's `drive_search` searches only the drives the session may read, each hit joins
+the session's label as the session's own search's would, and its query is sent to an embeddings
+model only where the session's label joined with everything the helper has read so far lets it
+(a helper that read a `local_only` file never sends its query to a remote one). Anything else the
 helper's model calls — a write, `session_write`, `card_update`, `delegate`, `reply`, `ask_human`,
 another `helper`, a tool the agent has or not — is answered "a helper cannot write, send, delegate
 or start another helper", and nothing happens. Each such refusal has its one audit row, refused,

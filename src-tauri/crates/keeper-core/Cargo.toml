@@ -46,7 +46,7 @@ reqwest = { workspace = true }
 openidconnect = { workspace = true }
 oauth2-reqwest = { workspace = true }
 # Account registry (keeper.db, WAL) and opaque ULID account ids.
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["hooks"] }
 # Derived notes chunk identities; already locked transitively (AD-261).
 blake3 = { workspace = true }
 ulid = { workspace = true }

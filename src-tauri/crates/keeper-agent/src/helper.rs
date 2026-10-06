@@ -5,7 +5,8 @@
 //! lens, the brief and its inputs — nothing of the conversation — and is
 //! offered only the reads its session is offered ([`helper::TOOLS`]). Each
 //! call it makes goes through the session's own host: the session's grants,
-//! tiers and audit rows, the session's label; anything but a read is
+//! tiers and audit rows, the session's label — a `drive_search` is made by
+//! that label joined with what the helper has read; anything but a read is
 //! answered with [`helper::REFUSAL`]. Its model, the lens's bot or the
 //! agent's, is checked as a sink of the session's label before every round
 //! (S-04), and the turn's token budget — and a delegated session's or a
@@ -59,6 +60,11 @@ pub(crate) trait Parent: Sync {
     /// A helper's `skill_view`, run as the session's own read but never
     /// what a patch or archive the session proposes is pinned to (R227).
     fn view_skill(&self, wire: &chat::ToolCall) -> Option<ToolOutcome>;
+    /// A helper's `drive_search`, run as the session's own under its
+    /// grants, scope and audit rows, made by what the session and the
+    /// helper have read so far (`label`): its query reaches an embeddings
+    /// model only where that label lets it.
+    fn search(&self, wire: &chat::ToolCall, label: &Label) -> Option<ToolOutcome>;
     /// What the call `record` just read, each with its label and path.
     fn reads(&self, record: &ToolCallRecord, outcome: &ToolOutcome) -> Vec<(Label, String)>;
     /// Step `id` of the helper call `helper`, `tool` at `at` (a drive and
@@ -226,12 +232,14 @@ impl<'t> Helpers<'t> {
     }
 }
 
-/// The session's host as a helper may use it: its reads and `skill_view`,
-/// nothing else.
+/// The session's host as a helper may use it: its reads, `drive_search`
+/// and `skill_view`, nothing else.
 struct Reads<'a> {
     parent: &'a dyn Parent,
     /// The `helper` call it reads for.
     helper: &'a str,
+    /// The helper's state: its `drive_search` is made by its label.
+    state: &'a Mutex<State>,
 }
 
 fn refused(reason: &str) -> ToolOutcome {
@@ -269,6 +277,15 @@ impl ToolHost for Reads<'_> {
             Some(_) => None,
             None if wire.name == keeper_core::agents::workflow::SKILL_VIEW => {
                 self.parent.view_skill(wire).map(unparked)
+            }
+            None if crate::search::serves(&wire.name) => {
+                let label = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .label
+                    .clone();
+                self.parent.search(wire, &label).map(unparked)
             }
             None => {
                 self.parent.refused(
@@ -359,16 +376,6 @@ pub(crate) async fn run(helpers: &Helpers<'_>, parent: &dyn Parent, launch: Laun
     };
     let local = Helpers::is_local(&row);
     let budget = helpers.deps.home.config.limits.tokens_per_turn;
-    let host = Reads {
-        parent,
-        helper: &id,
-    };
-    let tool_loop = ToolLoop {
-        client: &client,
-        endpoint: &endpoint,
-        host: &host,
-        default_profile_id: &helpers.default_profile_id,
-    };
     let state = Mutex::new(State {
         label,
         text: String::new(),
@@ -378,6 +385,17 @@ pub(crate) async fn run(helpers: &Helpers<'_>, parent: &dyn Parent, launch: Laun
         reads,
         stopped: None,
     });
+    let host = Reads {
+        parent,
+        helper: &id,
+        state: &state,
+    };
+    let tool_loop = ToolLoop {
+        client: &client,
+        endpoint: &endpoint,
+        host: &host,
+        default_profile_id: &helpers.default_profile_id,
+    };
     // Each round of each helper counted once, as it ends.
     let count = |usage: Usage| helpers.spent.fetch_add(tokens(usage), Ordering::SeqCst);
     let lock = || state.lock().unwrap_or_else(|p| p.into_inner());

@@ -1,0 +1,49 @@
+{"base": "10-notes", "kind": "path", "target": "a.md", "value": "10-notes/a.md"}
+{"base": "10-notes", "kind": "path", "target": "sub/", "value": "10-notes/sub"}
+{"base": "10-notes", "kind": "path", "target": "../x.md", "value": "x.md"}
+{"base": "10-notes", "kind": "path", "target": "/20-records/y.md", "value": "20-records/y.md"}
+{"base": "", "kind": "path", "target": "a%20b.md", "value": "a b.md"}
+{"base": "10-notes", "kind": "path", "target": "a.md#h", "value": "10-notes/a.md"}
+{"base": "10-notes", "kind": "external", "target": "https://x.y/z", "value": "https://x.y/z"}
+{"base": "10-notes", "kind": "path", "target": "./a.md", "value": "10-notes/a.md"}
+{"base": "a/b", "kind": "path", "target": "../../../x.md", "value": "../x.md"}
+{"base": "10-notes", "kind": "external", "target": "mailto:q", "value": "mailto:q"}
+{"base": "10-notes", "kind": "path", "target": "a.md?x=1", "value": "10-notes/a.md"}
+{"base": "", "kind": null, "target": "#frag", "value": null}
+{"base": "10-notes", "kind": "path", "target": "a%2Fb.md", "value": "10-notes/a%2Fb.md"}
+{"base": "10-notes", "kind": "path", "target": "", "value": ""}
+{"base": "a", "kind": "path", "target": "b/../c.md", "value": "a/c.md"}
+{"base": "a", "kind": "path", "target": "//x/y", "value": "x/y"}
+{"base": "a", "kind": "external", "target": "x:y.md", "value": "x:y.md"}
+{"base": "a", "kind": "path", "target": "a b.md", "value": "a/a b.md"}
+{"base": "10-notes/a.md", "kind": "path", "target": "b.md", "value": "10-notes/a.md/b.md"}
+{"base": ".", "kind": "path", "target": "x.md", "value": "x.md"}
+{"base": "a", "kind": "path", "target": "%41.md", "value": "a/%41.md"}
+{"base": "a", "kind": "path", "target": "%25.md", "value": "a/%25.md"}
+{"base": "a", "kind": "path", "target": "b%20c%2C.md", "value": "a/b c%2C.md"}
+{"base": "a", "kind": "external", "target": "C:x", "value": "C:x"}
+{"base": "a", "kind": "path", "target": "1:x", "value": "a/1:x"}
+{"base": "a", "kind": "path", "target": "a+b.md", "value": "a/a+b.md"}
+{"base": "a", "kind": "path", "target": "x.md#a%20b", "value": "a/x.md"}
+{"base": "a", "kind": "path", "target": "..", "value": "."}
+{"base": "a", "kind": "path", "target": ".", "value": "a"}
+{"base": "a", "kind": "path", "target": "/", "value": ""}
+{"base": "a", "kind": "path", "target": "./", "value": "a"}
+{"base": "a", "kind": "path", "target": "b//c.md", "value": "a/b/c.md"}
+{"base": "a", "kind": "external", "target": "HTTP://x", "value": "HTTP://x"}
+{"base": "a", "kind": "path", "target": "b.md?", "value": "a/b.md"}
+{"base": "", "kind": "path", "target": "x/../../y", "value": "../y"}
+{"base": "a", "kind": "path", "target": " x.md", "value": "a/ x.md"}
+{"base": "a", "kind": "path", "target": "<x.md>", "value": "a/<x.md>"}
+{"base": "a/", "kind": "path", "target": "x.md", "value": "a/x.md"}
+{"base": "a", "kind": "path", "target": "b/./c/", "value": "a/b/c"}
+{"base": "a", "kind": "path", "target": "?q", "value": ""}
+{"base": "a", "kind": "external", "target": "https://x/y?q=1#f", "value": "https://x/y?q=1#f"}
+{"base": "a", "kind": "path", "target": "x.md?q#f", "value": "a/x.md"}
+{"base": "a", "kind": "path", "target": "x.md#f?q", "value": "a/x.md"}
+{"base": "a", "kind": "external", "target": "a-b:c", "value": "a-b:c"}
+{"base": "a", "kind": "external", "target": "a.b:c", "value": "a.b:c"}
+{"base": "", "kind": "path", "target": "/", "value": ""}
+{"base": "", "kind": "path", "target": "", "value": ""}
+{"base": "a b", "kind": "path", "target": "c d.md", "value": "a b/c d.md"}
+{"base": "a", "kind": "path", "target": "%20", "value": "a/ "}

@@ -8181,7 +8181,6 @@ origin: epic 95, story 95.1 (rung `agents-95-memory`, review R95M-10, R204, 2026
 location: `src-tauri/crates/keeper-agent/src/memory/journal.rs` (`append_with`)
 reason: A first append syncs the day file's folder after the entry is written and synced; a failure there is reported as "could not be written" while the entry stays, so a model that retries writes it twice. Close with a refusal that says the entry was written but may not survive a power loss, or a sync before the entry is written.
 status: open
-
 ### DW-585: An archived skill's guard covers its `SKILL.md` only.
 
 origin: epic 95, story 95.3 (rung `agents-95-curate`, 2026-10-06)
@@ -8272,6 +8271,69 @@ origin: epic 95, story 95.2 (rung `agents-95-consolidate`, DW-568, 2026-10-06)
 location: `src-tauri/crates/keeper-agentd/tests/live_consolidate.rs`
 reason: `one_consolidator_per_drive_on_synapse` races two copies through `take_night`, `holding` and `release` on the real homeserver; two `keeper-agentd run` processes consolidating one drive at 03:00 with a real review room are not driven.
 status: open — the live test now races the drive's one maintenance claim between a consolidation and a curator job (R207); a whole agentd night is still not driven
+
+### DW-710: Reading a vault's notes index leaves SQLite's `-wal` and `-shm` beside it.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`search_drive`), `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`open_read_only`)
+reason: `drive_search` opens `<vault>/.keeper/search.db` read-only, never where none exists, but a reader of a WAL database creates its `-wal` and `-shm` when the writer has closed; they land in keeper's own `.keeper/`, which git ignores, so the drive's `git status` stays empty (`drive_search_writes_nothing` measures everything else). Opening `immutable=1` would avoid them but is wrong while the Mac's indexer writes. Decide whether a read-only reader may leave them, or read a snapshot copy.
+status: closed — R211 (2026-10-06): the two SQLite reader files are the one permitted exception to "writes nothing"; `drive_search_writes_nothing` now compares the whole drive, `.keeper/` included, and allows exactly those two names
+
+### DW-711: `drive_search` reads only bundle-root listings.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`listing_hits`)
+reason: Each bundle's root `index.md` is read for its `## Documents` lines; the listings `okf index` writes in every subfolder are not, so a document whose listed title or description holds the query but whose path, title and text do not is found only when it sits at a bundle's root. The scan still opens every such document within its caps.
+status: open
+
+### DW-712: Outside the vault, hits come in bundle and walk order, not by relevance.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`search_drive`), `src-tauri/crates/keeper-core/src/agents/search.rs` (`merge`)
+reason: The vault's index ranks the vault; listing and scan hits keep the order the walk met them (bundles in config order, names sorted, depth first), and `k` cuts there. A file holding the words twenty times ranks with one holding them once. A lexical score over the scanned text (term counts, title hits) would rank without an index.
+status: open
+
+### DW-713: The drive's own OKF config is not a committed fixture.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, R137 option b, OA-95-2, 2026-10-06)
+location: `src-tauri/crates/keeper-ported/src/okf/mod.rs` (`okf_matching_matches_the_drives_own_tools`), `src-tauri/crates/keeper-ported/tests/fixtures/okf/`
+reason: Until the owner states the licence of `tgdrive:.okf/bin/` and whether `.okf/config.yaml` may live in this repository, acceptance 1's config test is `#[ignore]` and reads `$KEEPER_TGDRIVE`; CI proves the port on a config written for the fixture, with the drive's own answers. When OA-95-2 is answered: (a) commit the config and its `load_config` JSON, un-ignore the test, and port the scripts if their licence allows reading them.
+status: open
+
+### DW-714: The scan's time cap makes the files it reaches depend on the host's speed.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`ScanBudget`), `src-tauri/crates/keeper-agent/src/search.rs`
+reason: The scan stops at 2 000 files, 16 MiB or 1.5 s, whichever comes first, and says how many of how many files it searched; on a slow or loaded host the 1.5 s bound comes first, so the same query over the same drive can return fewer hits there. Accepted as a consequence (R-NEW-4, R211's entry); the tests no longer depend on it: `drive_search_is_bounded_and_says_so` and keeper-sync's `a_search_walk_stops_at_its_deadline_and_its_entry_bound` run on an injected clock (`ScanBudget::clock`, `SearchTools::with_clock`), and a walk the time stops says it did not count every file.
+status: open
+
+### DW-715: The macOS-only halves of `drive_search`'s reader are proved by inspection.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, review R95S-04/R95S-06, R209, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`nofollow::dataless`), `src-tauri/crates/keeper-agent/src/search.rs` (`kept_out`)
+reason: A dataless (`SF_DATALESS`) listed, ranked or scanned file is refused before it is opened, and `.Keeper`/`Workspace` spelled against a lowercase folder on a case-insensitive volume are kept out; Linux has neither state, so the tests prove the type check (a FIFO), the size check and mixed-case folders that exist as spelled. Close with a run on hesperia over an APFS volume holding an evicted iCloud file and a `.KEEPER/` listing link.
+status: open
+
+### DW-716: The handle-identity check of a search read has no deterministic test.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, review R95S-03, R209, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`nofollow::read_in`)
+reason: A file is stat'ed by name with `AT_SYMLINK_NOFOLLOW`, opened `O_NOFOLLOW`, and read only when the handle's `(st_dev, st_ino)` is the one stat'ed. A link put in a file's or a folder's place is proved (`a_link_put_in_an_offered_entrys_place_is_never_followed`); a regular file swapped for another regular file between the stat and the open needs a hook inside that window, which the reader has none of, so the mutant that drops the identity comparison survives. Close with a test seam there, or accept.
+status: open
+
+### DW-717: The vault's index is opened by path, after its landing is checked.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, review R95S-02, R209, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`open_index`), `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`open_read_only`)
+reason: `<vault>/.keeper/search.db` is opened only when its landing is exactly that name (no link from the vault's landing) and it is a regular file, but SQLite opens it by its canonical path afterwards, so a link put there in between would be followed. `SQLITE_OPEN_NOFOLLOW` on `open_read_only` would refuse a final link and also changes the Mac's notes search; decide with the shell's owner.
+status: open
+
+### DW-718: `drive_search` reads nothing off Unix.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, R209, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`read_landed`, `search_walk`)
+reason: The no-follow reader is `openat(O_NOFOLLOW)` through `rustix`, a Unix-only dependency of keeper-sync; on any other target every search read is skipped and a walk refused, said as files not searched. No shipped target is affected (macOS, iOS, Linux, Android).
+status: open
 
 ### DW-720: A keeper-sync unit test printed `error: Unrecognized option: 'repo'`.
 
@@ -8427,6 +8489,41 @@ location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`a_night_whose_commit_di
 reason: `run_round` is driven with a real home to `Done`, and with staged proposals whose published commit cannot be finished to `Again` (unrecorded) and then, once the next pull finished it, to `Done`; that proves `night_of` asks `settled`. A consumed approval whose rejection is refused needs a person's decision recorded through the approval store and the agentd harness of `tests/consolidation.rs`, so that branch of `settled` is proven there, at `settled` itself.
 status: open
 
+### DW-830: The vault index's materialization check is proved through a seam, not on a dataless file.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S2, R218, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`search_file`, `nofollow::file_at`), `src-tauri/crates/keeper-agent/src/search.rs` (`open_index`)
+reason: `open_index` hands SQLite the index's path only after `search_file` finds a regular file not marked `SF_DATALESS`; Linux has no such flag, so `a_file_whose_content_is_elsewhere_is_never_handed_over` proves the check through an injected `dataless` and the call from `open_index` is proved by inspection (its mutant survives on Linux). Close with DW-715's run on hesperia over an evicted `search.db`.
+status: open
+
+### DW-831: SQLite's own page reads in the vault's index are bounded by time, not counted in bytes.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S2, R218, 2026-10-07)
+location: `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`Meter`, `open_bounded`)
+reason: A call's 16 MiB counts every value the index hands over (ids, numbers, vector blobs, paths); the b-tree and FTS pages SQLite reads to find them are not, and are bounded by the deadline the progress handler enforces. Counting them needs `sqlite3_db_status(SQLITE_DBSTATUS_CACHE_MISS)`, which rusqlite does not expose safely.
+status: open
+
+### DW-832: The index's lock wait is bounded on the wall clock, with no deterministic test.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S2, R218, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`open_index`), `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`open_bounded`)
+reason: `open_bounded` sets SQLite's busy timeout to the call's time left (by the call's clock, at most 1.5 s), but SQLite sleeps on the wall clock, so an injected clock cannot drive it and a locked-index test would depend on the host's speed. Close with a busy handler that asks the call's clock, if rusqlite's `busy_handler` grows a closure form.
+status: open
+
+### DW-833: Vectors that spend the call's bytes can leave the vault's index answering nothing.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S2, R218, 2026-10-07; reopened and narrowed by R248, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`rank_within`), `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`paths_of`)
+reason: Since R236 a vector is admitted by its stored width before it is extracted, so a vector past the bytes left is never fetched and the meaning ranking stops (said, `Said::MeaningCapped`). That does not keep the lexical ranking in general: the vectors spend the same meter the ranked notes' paths are then read from, and the paths need 8 bytes per row plus each path — a meaning ranking that stops with fewer bytes left than that (zero to seven, or simply fewer than the ranked paths take) makes `paths_of` end with `Bounds`, and the lexical ranking already computed is discarded (said as the index not answering). `the_indexs_rows_count_against_the_calls_bytes` keeps the words' ranking only because its 128 KiB vectors happen to stop with ample headroom; it is no proof for every width. Close by reserving the ranked paths' bytes out of the call's allowance before the vectors are read, or by giving the vectors a share of the 16 MiB; decide the share.
+status: open
+
+### DW-834: A config path through a file where a folder should be refuses the drive.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S2, R218, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`search_landing`)
+reason: Only `NotFound` is taken for an absent config (R218); `ENOTDIR` — a file named `.okf` — is refused as unknown, so that drive is not searched at all where it arguably has no config. Accepted as the strict side; revisit if a drive is found with a `.okf` file.
+status: open
+
 ### DW-885: A file the drive ignores inside an archivable skill folder holds its archive, retried every claim lapse.
 
 origin: epic 95, story 95.3 (rung `agents-95-curate`, R230 / R95U2-03/04, 2026-10-07)
@@ -8476,11 +8573,67 @@ location: `src-tauri/crates/keeper-agent/src/maintain.rs` (`record`, `record_hel
 reason: Matrix state has no compare-and-swap. The completion is read, the claim taken again is asked (`Lease::may_write`) right before the send, and the run is not counted recorded when the claim lapsed before the send or its release was refused after it. That is not unconditional monotonicity: a send held up after the last ask — past the claim's 60 s margin (`claim::STOP_WITHOUT_RENEWAL`), while another host takes the drive and records a later window — can still land after that later completion and replace it with an older window, and that night is then run again. `recorded` is the host's local answer; it says nothing about whether a send already made reached the server. This is the claim protocol's own residual, as for every fenced effect; `docs/agents.md` states these boundaries and cites this entry (R246 / R95C5-03).
 status: open
 
+### DW-930: A listing that fails part way through is proved by inspection only.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S3, R236, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`nofollow::children`)
+reason: A folder whose `getdents` fails after some entries, or one of whose entries' kind `statat` cannot ask (a filesystem without `d_type`), counts as unreadable (`SearchWalk::unreadable`, said as `Said::Unlisted`) and, since R248, makes a capped scan's total unknown (`Said::ScanCapped { of: None }`, built from the same count, so these two branches cannot claim a total either). Neither failure can be produced deterministically on the Linux test host (ext4 always reports `d_type`; a mid-listing I/O error needs a failing device), so those two branches have no mutation-proved test; the not-listed and not-opened branches do (`folders_that_cannot_be_read_are_said_not_taken_for_empty`, `a_folder_not_read_leaves_the_capped_count_unknown`). Close with a fault-injecting `Dir` seam or a FUSE fixture.
+status: open
+
+### DW-931: A bounded reader whose bytes end where its rows do reports the bounds.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S3, R236, 2026-10-07; broadened by R248, 2026-10-08)
+location: `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`Meter::step`, `run_match`, `cosine_top_k_within`)
+reason: R236 checks a row's numbers against what is left before every step, the step that finds no row included. So any reader that steps past its last row ends with `SearchIndexError::Bounds` when fewer than that row's numbers are left, though nothing more was there: the meaning ranking (no `LIMIT`) whose allowance ends at its last row (said as `Said::MeaningCapped`), and equally the lexical ranking whenever its matches are fewer than its `LIMIT` (1 000) — one note with a one-byte id takes 33 bytes, and with exactly 33 allowed the step that would find no second row is refused, so the words' ranking is reported as bounded, not answered. Only a lexical query that fills its `LIMIT` never takes that extra step. Accepted as the strict side: the reader cannot know there is no next row without stepping, and a refusal is said, never an empty answer.
+status: open
+
+### DW-932: The vault's partial coverage is said whenever the drive's scan stopped.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S3, R236, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`search_drive`, `Searching::scan`)
+reason: `Said::IndexPartial` is said when the index ranked and anything of the drive's scan stopped early (a bound, an unreadable folder) or its ranked/listed reading did, without asking whether the vault's own walk had finished before the stop. Accepted as the conservative side; attributing the stop per start would make it exact.
+status: open
+
+### DW-933: The vault is scanned beside its index on every call.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S3, R236, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`search_drive`), `src-tauri/crates/keeper/src/notes_vault.rs` (`sync_search`), `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`meta`)
+reason: Nothing a core/agent reader can see says the index holds the vault's current, completed generation (the desktop's `search_state` phase is in-process; `notes.stat` is the shell's `size:mtime_ns:ino:path` format), so R236 scans the vault after the ranked notes on every call: a vault larger than the call's bounds always says it is covered only in part, and its scan spends files and bytes the index could have saved. Close with a completed-generation marker the reconciler writes into `meta` at the end of a cold pass (and clears when it starts one), read by `open_index`, or with a per-file freshness check against `notes.stat` once its format is a core contract.
+status: open
+
+### DW-934: Exhaustion is said before a listing line or ranked note that would not have been read.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S3, R236, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`Searching::index_hits`, `Searching::listing_hits`)
+reason: R236 asks the bounds before every ranked note, listing and listing line, before it is matched or resolved, so a drive whose bounds ran out exactly as its last read finished says it is incomplete even where every remaining line would not have matched or every remaining note is gone. Accepted as the strict side: matching or resolving is the work the check bounds.
+status: open
+
 ### DW-970: A settling that cannot tell whose a file is holds the folder until a person settles the path.
 
 origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R246 / R95C5-02, 2026-10-08; widened by R250 / R95C6-01…03, R264 / R95C7-01…03 and R268 / R95C8-01…03)
 location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`put_back`), `src-tauri/crates/keeper-sync/src/browse.rs` (`Displaced::holds`)
 reason: accepted by design. A transaction's own new file is told apart from a person's only while it is still linked under its staging name, holds the commit's bytes and has the executable bit the commit gave it; the old file it moved aside is the commit's only while it holds the committed before-image bytes with the before-image entry's executable bit, read by one check (`browse::Displaced::holds`) right before it is dropped — beside an empty path once a deletion was committed, beside a person's file saved at a reversed path, after the commit's own file was dropped — and before the commit's file is moved off the path for it (R268). Recovery completes only when every path's occupant, mode, `HEAD` entry and before-image are attributed (R250), and no mode is ever moved from one file to another (R264): modes are held, never transferred. It holds — nothing moved or dropped, the files as they are, the old file beside the path as `.keeper-displaced-<request>-<n>`, the record kept and the folder's commits held with the reason on its card — where the path holds the commit's bytes without that staging link (a kill after the placement unlinked the staging name, before the old file moved aside was dropped — no `Cut` stops there — then the commit taken back or the path's deletion committed), where `HEAD` holds a third version while the commit's own file or its old file is still there (with or without an old file moved aside), where `HEAD` holds the old bytes with another mode than the entry the commit replaced, where `HEAD` holds the replaced entry again but the old file moved aside is gone (the commit's own file stays at the path rather than leave it empty for a watcher to commit as a deletion), where the commit's own file's executable bit is not the one its committed entry gives it (a person set or cleared it, a new file included), and where the old file moved aside has other bytes or another executable bit than its committed entry when it would go (a person saved over it or set or cleared its bit at any point before that check, beside an empty path, a person's file or the commit's) — or any of these cannot be read. Holding leaves no step for a kill to interrupt between a mode and the file that carries it: a settling run again holds again with every file and bit where the person left it, including one a kill stopped after moving the commit's file off the path (it goes back first) and one a kill stopped after dropping the commit's file (the old file is checked again before it goes) — except a kill inside that move back, between its link and its unlink, which holds until a person removes the alias (DW-1061). A change in the instant between the check and the unlink is DW-1060. A person settles the path by putting there what they want (`git checkout -- <path>` for what `HEAD` holds, removing the file for a deletion, committing the commit's bytes to keep them, or putting a bit back as it was) and removing the old file kept beside it unless it should go back (after a reversal, an empty path and the old file left let the next settling put it back, with whatever bit the person gave it — never removed, so never checked), or putting the old file's bit back so the settling drops it. No automatic choice is made, because either choice can lose a person's file or mode. Proof: `commit_paths::{a_settling_that_cannot_tell_whose_a_file_is_keeps_the_record, a_deletion_committed_over_a_file_nothing_attributes_holds_the_folder, a_third_version_over_the_commits_own_file_holds_the_folder, a_mode_a_settling_cannot_attribute_holds_the_folder, a_reversal_whose_old_file_is_gone_keeps_the_commits_file, an_old_file_whose_bit_a_person_changed_is_never_dropped, an_old_file_changed_while_its_settling_runs_stays}` (the staging name removed by hand stands in for that kill, a rename to `.keeper-taken-<request>-<n>` for the kill after the move off the path, `Cut::Dropped` for the kill after the commit's file was dropped and for a person acting while the settling runs).
+status: open
+
+### DW-990: A text the scan meets again under another bundle's name is evaluated under its first name only.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S4, R248, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`Done`, `Searching::scan`)
+reason: R248 keeps what each landing's one read came to and evaluates a pointer again under every later name that reaches it (`a_landing_read_under_one_name_is_evaluated_under_another`). A text is not kept: read by the index or a listing it is always a result already, but read by the scan it is a result only where the terms are in its names, title or body — so where a bundle's path is a link onto a folder another bundle's walk read first, a text whose terms are only in the second name is not found under it. Keeping every scanned text (up to the call's 16 MiB) or which terms its title and body held would close it.
+status: open
+
+### DW-991: A listing line's linear reading is proved by a time bound, not by counted work.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S4, R248, 2026-10-08)
+location: `src-tauri/crates/keeper-ported/src/okf/index.rs` (`entry_line`)
+reason: `a_line_of_delimiters_reads_in_its_length` reads three lines of half a million `](` each within 2 s; reading them by trying each `](` against the rest of the line takes tens of seconds, so the bound tells the two apart by an order of magnitude on any host the tests run on, but it is the wall clock, not a count of bytes looked at. The interruption between lines is proved on the call's injected clock (`a_listing_is_read_within_the_bounds_a_line_at_a_time`); a single line is never interrupted, only bounded by the 1 MiB file ceiling and its linear reading.
+status: open
+
+### DW-992: An index not stored as UTF-8 is refused by every reader and kept by the writer.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S4, R248, 2026-10-08)
+location: `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`SearchIndex::reader`, `SearchIndex::open`)
+reason: R248 reads `PRAGMA encoding` once when a reader opens and refuses any answer but `UTF-8` (`SearchIndexError::Encoding`), since a value is admitted by the length SQLite stores for it. `open_read_only` shares that reader, so the Mac's own notes search refuses such an index too, while `SearchIndex::open` (the writer) keeps it. keeper's writer only ever creates UTF-8 indexes, so only a foreign tool can produce one; if one is met, the writer should discard it as it discards an incompatible schema.
 status: open
 
 ### DW-1060: A change to the old file in the instant between the settling's last look at it and its unlink is not seen.
@@ -8506,7 +8659,15 @@ status: open
 
 ### DW-1070: A move taken back after a kill leaves a file the commit had already removed deleted on the disk, and the next watcher pass commits it.
 
-origin: epic 95, story 95.3 (restack of `agents-95-curate` onto 419c9a30, R-NEW-1, 2026-10-08)
+origin: epic 95, story 95.3 (restack of `agents-95-curate` onto 419c9a30, R273, 2026-10-08)
 location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`put_back`: `wanted.is_none()` with no old file moved aside returns `Ok(())`; `roll_forward`)
 reason: a move is one deletion at `from/…` and one new file at `to/…` per file. The curator's archive of `_skills/x/{SKILL.md, run.sh}` published, a kill once `_skills/.archive/x/SKILL.md` was linked under its staging name (`Cut::Staged(1, Linked)`), then a person's commit of the index — the commit taken back: the settling drops the archive copy (still the commit's own file) and completes, record gone, but `_skills/x/SKILL.md`, whose deletion the roll-forward had finished (its moved-aside old file already dropped), is not put back — nothing of the commit's is at the path and no old file is aside, so `put_back` returns. `git status` says ` D _skills/x/SKILL.md`, and the next watcher pass commits that deletion over the person's reversal; the bytes stay in history. Seen with a throwaway probe on b9ce3e0f; a kill one change later (`Cut::Displaced(2)`, `Cut::Staged(3, Linked)`) holds instead (DW-970). A consolidation's `proposals/` → `done/` move has the same shape (by reading, not run). Fix (rung 2's `put_back`, final at 419c9a30): where `HEAD` holds the before-image again, the path is empty and this intent's change was the deletion, write the before blob back from the object store with its committed mode, only where nothing is (`Contained::create`); regression: the probe's kill-at-placement case with the skill folder whole afterwards and a watcher pass committing nothing.
 status: open
+
+### DW-1075: A search's bundle listing or configuration read can land on a commit's transient file, and a multi-file commit can be searched half-applied.
+
+origin: epic 95, story 95.4 (restack of `agents-95-search` onto c57046b8, review-95srch-7 R95S7-01, R282, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`Plan::reads_listing` ~334–340 via `read_admitted` ~672–677; configuration reads via `kept_out` ~490–503, which rejects a `.keeper` component but not names beginning `.keeper.`/`.keeper-`); `keeper-sync/src/engine/authored.rs` (~129–145 transient names; ~853–892 final paths materialized one at a time)
+reason: an allowed bundle's `index.md` symlinked to a `.keeper-displaced-<request>-<n>` left by a stopped commit is admitted by `reads_listing` and opened, so a `## Documents` list in those bytes can steer hits. Separately, search can see some of a multi-file commit's final `.md` paths and not others. Search writes nothing, so nothing is lost; the result may be stale or partial. Fix: apply the transient-name families to listing and configuration admission (with a listing-alias regression), and either document or isolate the multi-file-commit read.
+status: open
+

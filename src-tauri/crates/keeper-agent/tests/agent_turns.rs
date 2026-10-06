@@ -1346,6 +1346,84 @@ async fn every_read_and_message_joins_the_session_label() {
     assert_eq!(why.sentence, NARROWER_THAN_ROOM);
 }
 
+/// 95.4 acceptance 8, through a turn: an agent allowed `drive_search` is
+/// offered it; one call over tgdrive (tgorka, marta) and the `local_only`
+/// private drive (tgorka) returns each drive's hit under its own readers,
+/// writes a `label` line per file it joined and leaves the session at
+/// `{tgorka}`; a drive outside the session's scope is refused by name and
+/// joins nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn drive_search_joins_each_hit_into_the_session_label() {
+    let mut world = world(
+        ProviderKind::Ollama,
+        &["drive_search"],
+        vec![
+            calls(&[
+                (
+                    "o1",
+                    "drive_search",
+                    json!({"query": "otter", "drives": ["neuradrive"]}),
+                ),
+                ("s1", "drive_search", json!({"query": "otter"})),
+            ]),
+            prose("found them."),
+        ],
+    );
+    let config = "bundles:\n  - path: \".\"\n    name: root\n";
+    write(&world.tgdrive, ".okf/config.yaml", config);
+    write(&world.tgdrive, "30-work/otter.md", "otter plan\n");
+    let private = world.tgdrive.parent().expect("root").join("private");
+    write(&private, ".okf/config.yaml", config);
+    write(&private, "otter-diary.md", "an otter\n");
+    let mut served = world.open(SESSION);
+    report(world.ask(&mut served, "find otters").await);
+
+    let offered: Vec<String> = world.stub.requests()[0]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+        .collect();
+    assert!(offered.contains(&"drive_search".to_owned()), "{offered:?}");
+    let lines = world.lines(SESSION);
+    let results = tool_results(&lines);
+    assert_eq!(result_of(&results, "o1").outcome, ToolOutcomeWord::Refused);
+    assert!(result_of(&results, "o1")
+        .content
+        .contains("neuradrive is not a drive this session may search"));
+    let found = &result_of(&results, "s1").content;
+    assert!(found.contains("tgdrive/30-work/otter.md"), "{found}");
+    assert!(found.contains("private/otter-diary.md"), "{found}");
+    assert!(
+        found.contains(&format!(
+            "label: read by {MARTA}, {TGORKA}; agent integrity"
+        )),
+        "{found}"
+    );
+    assert!(
+        found.contains(&format!(
+            "label: read by {TGORKA}; agent integrity; local models only"
+        )),
+        "{found}"
+    );
+    let causes: Vec<String> = kinds(&lines, LineKind::Label)
+        .iter()
+        .map(|line| match &line.body {
+            LineBody::Label(body) => body.cause.reference.clone(),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert!(
+        causes.contains(&"private/otter-diary.md".to_owned()),
+        "{causes:?}"
+    );
+    assert_eq!(
+        served.context.label.readers,
+        Readers::Only([user(TGORKA)].into_iter().collect())
+    );
+    assert!(served.context.label.local_only);
+}
+
 /// 94.2 acceptance 5: an agent allowed `skill_view` alone is offered it,
 /// its frame says where BMAD's project root is read and written (R96) and
 /// answers every capability BMAD assumes (R195: a skill-only agent follows
@@ -15443,6 +15521,293 @@ mod helpers {
             result_of(&tool_results(&lines), "h1").label,
             served.context.label
         );
+    }
+
+    /// tgdrive, private and neuradrive mounted with an OKF bundle at each
+    /// root and one file about otters in each; neuradrive (tgorka, marta)
+    /// is not one of Nixi's drives, so her grant never reaches it.
+    fn otters_on_three_drives(world: &mut World) {
+        let root = world.tgdrive.parent().expect("root").to_owned();
+        let config = "bundles:\n  - path: \".\"\n    name: root\n";
+        for (drive, file) in [
+            (world.tgdrive.clone(), "30-work/otter.md"),
+            (root.join("private"), "otter-diary.md"),
+            (root.join("neuradrive"), "otter-notes.md"),
+        ] {
+            write(&drive, ".okf/config.yaml", config);
+            write(&drive, file, "an otter\n");
+        }
+        world.deps.env.drive = Some(DrivePorts {
+            profiles: Arc::new(AgentProfiles::new([
+                ("tgdrive".to_owned(), profile("tgdrive", &world.tgdrive)),
+                (
+                    "private".to_owned(),
+                    profile("private", &root.join("private")),
+                ),
+                (
+                    "neuradrive".to_owned(),
+                    profile("neuradrive", &root.join("neuradrive")),
+                ),
+            ])),
+            vault: None,
+            approval: None,
+        });
+        world.deps.drives.insert(
+            "neuradrive".to_owned(),
+            decl("neuradrive", &[TGORKA, MARTA], false),
+        );
+    }
+
+    /// 95.4 with 94.4 (R209 verdict 1): a helper is offered `drive_search`
+    /// when its session is, and its search runs as the session's own: over
+    /// tgdrive and private it finds both otters, each hit labelled as its
+    /// file, the step's result and the session narrowed to the diary's
+    /// `local_only` `{tgorka}`; neuradrive — in the session's scope but not
+    /// Nixi's drive — is refused by her grant, and nothing of it is found.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_helpers_drive_search_reads_only_what_the_session_may() {
+        let mut world = world(
+            ProviderKind::Ollama,
+            &["drive_search", "helper"],
+            vec![
+                calls(&[("h1", "helper", json!({"brief": "Find the otters."}))]),
+                calls(&[
+                    (
+                        "hs",
+                        "drive_search",
+                        json!({"query": "otter", "drives": ["tgdrive", "private"]}),
+                    ),
+                    (
+                        "hn",
+                        "drive_search",
+                        json!({"query": "otter", "drives": ["neuradrive"]}),
+                    ),
+                ]),
+                prose("Two otters."),
+                prose("Done."),
+            ],
+        );
+        otters_on_three_drives(&mut world);
+        let mut served = world.open(SESSION);
+        served.context.scope = ["tgdrive", "private", "neuradrive"]
+            .map(str::to_owned)
+            .to_vec();
+        assert!(!served.context.label.local_only);
+        report(world.ask(&mut served, "find otters").await);
+
+        let requests = world.stub.requests();
+        assert!(is_helper(&requests[1]));
+        assert_eq!(offered(&requests[1]), ["drive_search"]);
+        let lines = world.lines(SESSION);
+        let results = tool_results(&lines);
+        let found = result_of(&results, "hs");
+        assert_eq!(found.outcome, ToolOutcomeWord::Ok, "{}", found.content);
+        assert!(
+            found.content.contains("tgdrive/30-work/otter.md"),
+            "{}",
+            found.content
+        );
+        assert!(
+            found.content.contains("private/otter-diary.md"),
+            "{}",
+            found.content
+        );
+        assert!(found.label.local_only, "{:?}", found.label);
+        let refused = result_of(&results, "hn");
+        assert_eq!(
+            refused.outcome,
+            ToolOutcomeWord::Refused,
+            "{}",
+            refused.content
+        );
+        assert!(
+            refused
+                .content
+                .contains("neuradrive is not a drive this session may search"),
+            "{}",
+            refused.content
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| !result.content.contains("otter-notes")),
+            "nothing of neuradrive was found"
+        );
+        assert!(
+            kinds(&lines, LineKind::Label).iter().all(|line| !matches!(
+                &line.body,
+                LineBody::Label(body) if body.cause.reference.starts_with("neuradrive/")
+            )),
+            "nothing of neuradrive joined the label"
+        );
+        assert!(served.context.label.local_only);
+        assert_eq!(
+            served.context.label.readers,
+            Readers::Only([user(TGORKA)].into_iter().collect())
+        );
+    }
+
+    /// An OpenAI-shaped embeddings provider answering `[1, 0]`; the count
+    /// is every request it was sent.
+    fn embeddings_stub() -> (String, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for socket in listener.incoming() {
+                let Ok(mut socket) = socket else { continue };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut reader = BufReader::new(socket.try_clone().expect("clone"));
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                let answer = r#"{"data":[{"index":0,"embedding":[1.0,0.0]}]}"#;
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+            }
+        });
+        (url, hits)
+    }
+
+    /// 95.4 with 94.4 (NFR-115's model sink, R28 S-04): a helper's search
+    /// is made by what the helper has read, not only by what the session
+    /// had read when it launched. tgdrive's vault is indexed and the
+    /// embeddings model is remote. The helper's first search embeds its
+    /// query; once it read the `local_only` diary — its own model local, so
+    /// it goes on — its second search never reaches the remote model and
+    /// says it stayed lexical, although the session's label is not narrowed
+    /// until the helper's `tool_call` line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_helpers_search_after_a_local_only_read_never_embeds_remotely() {
+        let search = |id: &'static str| {
+            calls(&[(
+                id,
+                "drive_search",
+                json!({"query": "harbour", "drives": ["tgdrive"]}),
+            )])
+        };
+        let mut world = world(
+            ProviderKind::Ollama,
+            &["drive_read", "drive_search", "helper"],
+            vec![
+                calls(&[("h1", "helper", json!({"brief": "Find the harbour."}))]),
+                search("s1"),
+                calls(&[(
+                    "p1",
+                    "drive_read",
+                    json!({"profile": "private", "path": "diary.md"}),
+                )]),
+                search("s2"),
+                prose("The harbour plan."),
+                prose("Done."),
+            ],
+        );
+        let mut tg = profile("tgdrive", &world.tgdrive);
+        tg.notes = Some(keeper_sync::profile::NotesConfig {
+            subfolder: "10-notes".to_owned(),
+            ..Default::default()
+        });
+        let private = world.tgdrive.parent().expect("root").join("private");
+        world.deps.env.drive = Some(DrivePorts {
+            profiles: Arc::new(AgentProfiles::new([
+                ("tgdrive".to_owned(), tg),
+                ("private".to_owned(), profile("private", &private)),
+            ])),
+            vault: None,
+            approval: None,
+        });
+        let db = world
+            .tgdrive
+            .join("10-notes/.keeper")
+            .join(keeper_core::notes::search_index::SEARCH_DB_FILE);
+        let mut index =
+            keeper_core::notes::search_index::SearchIndex::open(&db, "vault").expect("index");
+        let fields = BTreeMap::new();
+        for (path, body) in [
+            ("port.md", "the harbour plan\n"),
+            ("meaning.md", "about the meaning of docks\n"),
+        ] {
+            write(&world.tgdrive, &format!("10-notes/{path}"), body);
+            let (id, title) = (format!("id-{path}"), format!("Title of {path}"));
+            index
+                .replace_note(&keeper_core::notes::search_index::NoteDoc {
+                    id: &id,
+                    path,
+                    title: &title,
+                    tags: &[],
+                    fields: &fields,
+                    body,
+                    stat: None,
+                })
+                .expect("indexed");
+        }
+        let rows: Vec<(i64, String, Vec<f32>)> = index
+            .chunks_without_vectors("m", 100)
+            .expect("pending")
+            .into_iter()
+            .map(|chunk| {
+                let vector = if chunk.embedding_text.contains("meaning") {
+                    vec![1.0, 0.0]
+                } else {
+                    vec![0.0, 1.0]
+                };
+                (chunk.rowid, chunk.text_hash, vector)
+            })
+            .collect();
+        index.put_vectors("m", &rows).expect("vectors");
+        drop(index);
+        let (url, embedded) = embeddings_stub();
+        store::insert_provider(
+            &world.deps.data_dir,
+            &Provider {
+                id: "embedder".to_owned(),
+                kind: ProviderKind::OpenAi,
+                name: "embedder".to_owned(),
+                base_url: url,
+                created_ms: 2,
+            },
+        )
+        .expect("provider");
+        keeper_core::registry::set_embedding_model(
+            &world.deps.data_dir,
+            Some(keeper_core::registry::EmbeddingModel {
+                provider: "embedder".to_owned(),
+                model: "m".to_owned(),
+            }),
+        )
+        .expect("model");
+        let mut served = world.open(SESSION);
+        report(world.ask(&mut served, "find the harbour").await);
+
+        let results = tool_results(&world.lines(SESSION));
+        // The first search found by meaning: its query was embedded.
+        let first = &result_of(&results, "s1").content;
+        assert!(first.contains("tgdrive/10-notes/meaning.md"), "{first}");
+        let second = &result_of(&results, "s2").content;
+        assert!(
+            second.contains("this session stays on local models"),
+            "{second}"
+        );
+        assert!(!second.contains("tgdrive/10-notes/meaning.md"), "{second}");
+        assert_eq!(
+            embedded.load(Ordering::SeqCst),
+            1,
+            "only the first search reached the remote model"
+        );
+        assert!(served.context.label.local_only);
     }
 
     /// A drive's skill `review` whose customization has two review layers:

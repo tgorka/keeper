@@ -94,6 +94,7 @@ pub enum AgentTool {
     DriveGlob,
     DriveGrep,
     DriveStat,
+    DriveSearch,
     DriveWrite,
     DriveEdit,
     SessionWrite,
@@ -127,12 +128,13 @@ pub enum AgentTool {
 
 impl AgentTool {
     /// Every tool, in the table's order.
-    pub const ALL: [AgentTool; 31] = [
+    pub const ALL: [AgentTool; 32] = [
         AgentTool::DriveList,
         AgentTool::DriveRead,
         AgentTool::DriveGlob,
         AgentTool::DriveGrep,
         AgentTool::DriveStat,
+        AgentTool::DriveSearch,
         AgentTool::DriveWrite,
         AgentTool::DriveEdit,
         AgentTool::SessionWrite,
@@ -169,6 +171,7 @@ impl AgentTool {
             AgentTool::DriveGlob => "drive_glob",
             AgentTool::DriveGrep => "drive_grep",
             AgentTool::DriveStat => "drive_stat",
+            AgentTool::DriveSearch => "drive_search",
             AgentTool::DriveWrite => "drive_write",
             AgentTool::DriveEdit => "drive_edit",
             AgentTool::SessionWrite => "session_write",
@@ -371,6 +374,7 @@ fn row(tool: AgentTool, facts: &CallFacts) -> Tier {
         | AgentTool::DriveGlob
         | AgentTool::DriveGrep
         | AgentTool::DriveStat
+        | AgentTool::DriveSearch
         | AgentTool::BmadConfig
         | AgentTool::BmadParty
         | AgentTool::SkillsList
@@ -600,6 +604,7 @@ mod tests {
                 | AgentTool::DriveGlob
                 | AgentTool::DriveGrep
                 | AgentTool::DriveStat
+                | AgentTool::DriveSearch
                 | AgentTool::BmadConfig
                 | AgentTool::BmadParty
                 | AgentTool::SkillsList

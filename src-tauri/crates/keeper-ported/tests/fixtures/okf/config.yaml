@@ -1,0 +1,63 @@
+# A drive's OKF configuration, written for keeper-ported's okf parity
+# fixture: every key the drive's own tools read, in the shapes the drive's
+# real config uses them, and none of its content.
+
+okf_version: "0.2"
+
+# Bundles nest: a path belongs to the innermost one.
+bundles:
+  - path: "."
+    name: shelf
+    title: shelf
+    description: A test drive — a catalogue of nested bundles.
+    entry: README.md
+
+  - path: notes
+    name: shelf-notes
+    title: Notes
+    description: 'Written thinking, single-quoted: it''s here.'
+    entry: README.md
+
+  - path: notes/deep
+    name: shelf-deep
+    title: Deep notes
+    description: A bundle inside a bundle.
+    entry: README.md
+    index: false
+    log: false
+
+  - path: work # a trailing comment
+    name: shelf-work
+    title: Work
+    description: >-
+      Own output, folded
+      over two lines.
+    entry: README.md
+
+exclude:
+  # the drop zone and its subfolders
+  - inbox/**
+  - tmp/
+  - work/clients/*
+  - sessions/**/workspace/**
+  - "*.sync-conflict-*.md"
+  - notes/.keeper/**
+  - "**/drafts/*.md"
+  - archive?.md
+  - exact/file.md
+
+listed:
+  - path: inbox
+    title: inbox — unsorted
+    description: What waits to be sorted.
+    note: >-
+      A snapshot rather than an inventory:
+      the folder is opened one subtree at a time.
+
+guides:
+  - inbox/README.md
+  - inbox/log.md
+  - tmp/README.md
+
+no_index:
+  - notes/_template

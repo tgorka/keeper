@@ -1,0 +1,27 @@
+{"description": "D1", "error": false, "meta": {"description": "D1", "title": "T1", "type": "Note"}, "name": "a.md", "reserved": false, "text": "---\ntype: Note\ntitle: T1\ndescription: D1\n---\n# H\nbody\n", "title": "T1"}
+{"description": "", "error": false, "meta": {"type": "Note"}, "name": "b.md", "reserved": false, "text": "---\ntype: Note\n---\n\nintro\n# Heading One\n## Sub\n", "title": "Heading One"}
+{"description": "", "error": false, "meta": {"title": null}, "name": "blank.md", "reserved": false, "text": "---\ntitle:\n---\n#   \n# Real\n", "title": ""}
+{"description": "", "error": false, "meta": {"title": "   "}, "name": "blanktitle.md", "reserved": false, "text": "---\ntitle: \"   \"\n---\n# Fallback\n", "title": "Fallback"}
+{"description": "kept lines", "error": false, "meta": {"description": "kept\nlines", "type": "Note"}, "name": "block.md", "reserved": false, "text": "---\ntype: Note\ndescription: |\n  kept\n  lines\n---\n", "title": "block"}
+{"description": "", "error": false, "meta": {"human_reviewed": false, "n": 12, "status": "draft", "type": "Note", "z": null}, "name": "bools.md", "reserved": false, "text": "---\ntype: Note\nhuman_reviewed: false\nstatus: draft\nn: 12\nz: ~\n---\n", "title": "bools"}
+{"description": "", "error": false, "meta": {"title": "It's", "type": "Note"}, "name": "comment.md", "reserved": false, "text": "---\n# a comment\ntype: Note # trailing\ntitle: 'It''s'\n---\n", "title": "It's"}
+{"description": "", "error": false, "meta": {"title": "CR"}, "name": "cr.md", "reserved": false, "text": "---\r\ntitle: CR\r\n---\r\n", "title": "CR"}
+{"description": "", "error": false, "meta": {"description": null, "title": "", "type": "Note"}, "name": "e.md", "reserved": false, "text": "---\ntype: Note\ntitle: \"\"\ndescription: \n---\n", "title": "e"}
+{"description": "folded text", "error": false, "meta": {"description": "folded text", "type": "Note"}, "name": "f.md", "reserved": false, "text": "---\ntype: Note\ndescription: >-\n  folded\n  text\n---\nbody\n", "title": "f"}
+{"description": "", "error": false, "meta": {"tags": ["a", "b c"], "type": "Session", "window": {"from": "x", "to": "y"}}, "name": "flow.md", "reserved": false, "text": "---\ntype: Session\ntags: [a, \"b c\"]\nwindow: {from: x, to: y}\n---\n", "title": "flow"}
+{"description": "", "error": false, "meta": {"type": "Note"}, "name": "h.md", "reserved": false, "text": "---\ntype: Note\n---\n```\n# not a heading\n```\n# Real\n", "title": "not a heading"}
+{"description": "", "error": false, "meta": {"description": 3, "title": ["a", "b"]}, "name": "i.md", "reserved": false, "text": "---\ntitle: [a, b]\ndescription: 3\n---\n", "title": "i"}
+{"description": "", "error": false, "meta": {}, "name": "ind.md", "reserved": false, "text": "  # Indented\n", "title": "ind"}
+{"description": "", "error": false, "meta": {}, "name": "index.md", "reserved": true, "text": "", "title": "index"}
+{"description": "folded para", "error": false, "meta": {"description": "folded\npara", "type": "Note"}, "name": "keep.md", "reserved": false, "text": "---\ntype: Note\ndescription: >\n  folded\n\n  para\n---\n", "title": "keep"}
+{"description": "", "error": false, "meta": {"sources": [{"id": "one", "resource": "/a.md"}, {"id": "two", "resource": "b.md"}], "type": "Note"}, "name": "lists.md", "reserved": false, "text": "---\ntype: Note\nsources:\n  - id: one\n    resource: /a.md\n  - id: two\n    resource: b.md\n---\n", "title": "lists"}
+{"description": "", "error": false, "meta": {}, "name": "log.md", "reserved": true, "text": "## 2026-10-06\n", "title": "log"}
+{"description": "", "error": false, "meta": {}, "name": "my-file_name.md", "reserved": false, "text": "no fm\n#Not\n#  Spaced  Head  \n", "title": "Spaced  Head"}
+{"description": "", "error": false, "meta": {"title": 5}, "name": "n.md", "reserved": false, "text": "---\ntitle: 5\n---\n# H5\n", "title": "H5"}
+{"description": "", "error": false, "meta": {"generated": {"at": "x", "by": "agent:nixi@electra"}, "type": "Note"}, "name": "nested.md", "reserved": false, "text": "---\ntype: Note\ngenerated:\n  by: agent:nixi@electra\n  at: x\n---\n", "title": "nested"}
+{"description": "", "error": true, "meta": {}, "name": "open.md", "reserved": false, "text": "---\ntype: x\n", "title": "open"}
+{"description": "D x", "error": false, "meta": {"description": "  D  x  ", "title": "  T  "}, "name": "s.md", "reserved": false, "text": "---\ntitle: \"  T  \"\ndescription: \"  D  x  \"\n---\n", "title": "T"}
+{"description": "", "error": false, "meta": {}, "name": "tab.md", "reserved": false, "text": "# Tab\there\n", "title": "Tab\there"}
+{"description": "", "error": false, "meta": {}, "name": "two.md", "reserved": false, "text": "# First\n# Second\n", "title": "First"}
+{"description": "line one", "error": false, "meta": {"description": "line\none", "title": "a   b"}, "name": "ws.md", "reserved": false, "text": "---\ntitle: \"a   b\"\ndescription: \"line\\none\"\n---\n", "title": "a   b"}
+{"description": "", "error": false, "meta": {}, "name": "x-y_z.md", "reserved": false, "text": "body only\n", "title": "x y z"}

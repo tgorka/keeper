@@ -49,3 +49,6 @@ notify = { workspace = true }
 # What a decision path writes to the process log, captured: a rejected
 # value never reaches it.
 tracing-subscriber = { workspace = true }
+# An index that opens and cannot answer, made by renaming its table
+# (drive_search). keeper-core already links it: no new crate.
+rusqlite = { workspace = true }

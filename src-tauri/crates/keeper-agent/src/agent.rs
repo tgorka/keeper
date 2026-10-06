@@ -1044,6 +1044,8 @@ struct AllowedTools<'t> {
     workflows: crate::workflow::WorkflowTools<'t>,
     /// `journal_append`, `memory_propose` and `skill_propose` (95.1).
     memory: crate::memory::MemoryTools,
+    /// `drive_search` (95.4).
+    search: crate::search::SearchTools,
     view: &'t dyn TurnView,
     sinks: &'t Sinks,
     /// The declarations of the drives this host mounts: a write's audience.
@@ -1441,10 +1443,18 @@ impl crate::helper::Parent for AllowedTools<'_> {
         self.named(wire, false)
     }
 
+    fn search(&self, wire: &chat::ToolCall, label: &Label) -> Option<ToolOutcome> {
+        if self.view.ended() {
+            return Some(refusal(RUN_ENDED.to_owned()));
+        }
+        self.search_drives(wire, &self.view.label().join(label))
+    }
+
     fn reads(&self, record: &ToolCallRecord, outcome: &ToolOutcome) -> Vec<(Label, String)> {
         let home = self.home;
         read_label(self.helpers.deps, &self.helpers.profiles, record, outcome)
             .into_iter()
+            .chain(self.search.take_reads())
             .chain(
                 self.bmad
                     .take_reads()
@@ -1669,6 +1679,38 @@ impl ToolHost for AllowedTools<'_> {
 }
 
 impl AllowedTools<'_> {
+    /// A `drive_search` call, the session's own or a helper's, made by
+    /// what has read `label`: a read of the drives in scope, each as a
+    /// `drive_read` of its root is granted; what it returns is labelled file
+    /// by file, and its query reaches an embeddings model only where
+    /// `label` lets it.
+    fn search_drives(&self, wire: &chat::ToolCall, label: &Label) -> Option<ToolOutcome> {
+        let tool = AgentTool::from_wire(&wire.name)?;
+        let classification = self.classify(&wire.id, tool, &CallFacts::default(), None);
+        let at = self.search.at(wire);
+        let gated = self.gated(&wire.id, &wire.name, &classification, &[], Vec::new());
+        let audit = CallAudit::new(
+            self.sinks,
+            &wire.name,
+            Effect::Read,
+            &classification,
+            gated,
+            (&at, ""),
+        );
+        let outcome = if !self.allow.contains(&wire.name) {
+            refusal(format!("{} is not one of this agent's tools.", wire.name))
+        } else {
+            match audit.admit(&at, "") {
+                Ok(()) => self.search.run(wire, label, &|drive| {
+                    grant_read(self.grants.as_ref(), drive, "")
+                }),
+                Err(withheld) => withheld.into(),
+            }
+        };
+        audit.finish(&outcome);
+        Some(outcome)
+    }
+
     /// A named call: the session model's own when `own`, else a helper's,
     /// whose `skill_view` pins nothing — the session's patch was written
     /// against what its own model read (R204, R227).
@@ -1871,6 +1913,9 @@ impl AllowedTools<'_> {
             };
             audit.finish(&outcome);
             return Some(outcome);
+        }
+        if crate::search::serves(&wire.name) {
+            return self.search_drives(wire, &self.view.label());
         }
         if crate::bmad::serves(&wire.name) {
             let tool = AgentTool::from_wire(&wire.name)?;
@@ -6045,8 +6090,9 @@ fn reply_offer(session: SessionKind, relays_waiting: bool, kind: AgentKind) -> R
 /// tools where the home drive `home` reads (R195), `helper` as `allow`
 /// says (R105), `ask_human` by the session's kind (R102),
 /// `workflow_start` outside a proxy's own conversation (AD-380) and the
-/// memory tools `allow` names, by the session's kind (R127). Arming and a
-/// workflow's start check both ask it (R202).
+/// memory tools `allow` names, by the session's kind (R127), and
+/// `drive_search` as `allow` says (95.4). Arming and a workflow's start
+/// check both ask it (R202).
 fn agent_offer(
     config: &keeper_core::agents::home::AgentConfig,
     session: SessionKind,
@@ -6089,6 +6135,9 @@ fn agent_offer(
         tools.push(keeper_core::agents::workflow::start_spec());
     }
     tools.extend(crate::memory::specs(&config.allow, session, None));
+    if config.allow.iter().any(|name| crate::search::serves(name)) {
+        tools.push(crate::search::spec());
+    }
     tools
 }
 
@@ -6206,13 +6255,15 @@ struct ReviewPass {
     due: keeper_core::agents::nudge::Due,
 }
 
-/// What a review pass reads with: the drive's reads and the skills.
-const REVIEW_READS: [&str; 7] = [
+/// What a review pass reads with: the drive's reads, `drive_search` and
+/// the skills.
+const REVIEW_READS: [&str; 8] = [
     "drive_list",
     "drive_read",
     "drive_glob",
     "drive_grep",
     "drive_stat",
+    keeper_core::agents::search::DRIVE_SEARCH,
     keeper_core::agents::workflow::SKILLS_LIST,
     keeper_core::agents::workflow::SKILL_VIEW,
 ];
@@ -6449,6 +6500,23 @@ async fn run_agent_turn(
         })
         .and_then(|text| keeper_core::agents::session::parse_session_agent_toml(&text).ok())
         .map(|parent| parent.kind);
+    // The drives this host holds a checkout and a declaration of, as one
+    // search reads them; the session's scope says which it may.
+    let search = crate::search::SearchTools::new(
+        profiles
+            .iter()
+            .filter_map(|profile| {
+                let decl = deps.drives.get(&profile.id)?.clone();
+                Some(crate::search::SearchDrive::of(profile, decl))
+            })
+            .collect(),
+        context.scope.clone(),
+        allow
+            .iter()
+            .any(|name| crate::search::serves(name))
+            .then(|| crate::search::configured_embeddings(&deps.env, &deps.data_dir))
+            .flatten(),
+    );
     let memory = crate::memory::MemoryTools::new(
         crate::memory::MemoryHome {
             agent: config.id.clone(),
@@ -6541,6 +6609,7 @@ async fn run_agent_turn(
         )
         .with_outputs(outputs),
         memory,
+        search,
         view: &log,
         sinks: &tools.sinks,
         drives: &deps.drives,
@@ -6621,6 +6690,7 @@ async fn run_agent_turn(
             .flatten();
         let reads: Vec<(Label, String)> = read_label(deps, &read_profiles, record, outcome)
             .into_iter()
+            .chain(host.search.take_reads())
             .chain(
                 host.bmad
                     .take_reads()
@@ -7080,6 +7150,24 @@ fn drive_relative(root: &Path, dir: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The label of what was read of the file at `path` of the drive `decl`
+/// declares, from `text`, its head: 89.4's `label_drive_read` with an
+/// author this host cannot name (DW-431), the file's OKF keys and its
+/// `integrity:` mark.
+pub(crate) fn file_label(decl: &DriveDecl, path: &str, text: &str) -> Label {
+    let okf = okf_label_facts(text);
+    label_drive_read(
+        decl,
+        &ReadFacts {
+            path: path.to_owned(),
+            last_author: Author::Unknown,
+            okf_human_reviewed: okf.human_reviewed,
+            okf_external_source: okf.external_source,
+            card_untrusted: keeper_core::agents::card::marked_untrusted(text),
+        },
+    )
+}
+
 /// [`read_label`] once the drive is known: what the call at `path` of
 /// `drive` returned is labelled by the files it came from.
 fn drive_read_label(
@@ -7090,19 +7178,7 @@ fn drive_read_label(
     tool: Option<ToolName>,
     outcome: &ToolOutcome,
 ) -> Label {
-    let label_of = |path: &str, text: &str| {
-        let okf = okf_label_facts(text);
-        label_drive_read(
-            decl,
-            &ReadFacts {
-                path: path.to_owned(),
-                last_author: Author::Unknown,
-                okf_human_reviewed: okf.human_reviewed,
-                okf_external_source: okf.external_source,
-                card_untrusted: keeper_core::agents::card::marked_untrusted(text),
-            },
-        )
-    };
+    let label_of = |path: &str, text: &str| file_label(decl, path, text);
     match (tool, outcome) {
         (Some(ToolName::Grep), ToolOutcome::Text { body, .. }) => grep_sources(body)
             .into_iter()
