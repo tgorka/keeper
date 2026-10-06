@@ -8062,3 +8062,38 @@ location: `src-tauri/crates/keeper-agent/src/delegate.rs` (`handed_on`)
 reason: The host's binding of a card to one delegation (`workflow::handoff_id`) is found on the disk: the source session's log for its own `delegate` naming the card, then every session's `agent.toml` for the agent's workflow runs and each such run's log for a `delegate opened` under that id — O(sessions) per `delegate` call with a `<session>:<card>` source, as `verbs::find` already is, plus O(runs × lines). Correct, and bounded by the zone, but it grows with the agent's history. Close with a column in the zone's derived index (`.keeper/agents.db`) mapping a delegation id to the session that opened it, refreshed as the index already is.
 status: open
 
+
+### DW-555: A helper is not offered `drive_search`.
+
+origin: epic 94, story 94.4 (rung `agents-94-helpers`, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/helper.rs` (`TOOLS`)
+reason: The epic lists `drive_search` among a helper's reads "once 95.4 lands"; it is not in this build's vocabulary, so `helper::TOOLS` holds the five drive reads and `skill_view`. Close by adding it to `TOOLS` in the rung that builds `drive_search`.
+status: open
+
+### DW-556: `bmad-build`'s review step is proved over an offered skill, not a workflow session.
+
+origin: epic 94, story 94.4 (rung `agents-94-helpers`, acceptance 8, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`helpers::bmad_build_review_layers_run_as_helpers`)
+reason: The test renders `bmad-build` as an offered skill and names it as each helper's `skill`. The lens lookup without `skill` reads the session's workflow folder the same way (`BmadTools::customization_of`), but no turns test runs it in a workflow session. Rung `agents-94-workflows` (94.3), which opens `workflow` sessions, is below this rung since its restack onto 8671d08e (2026-10-06); the restack proved a helper inside a run against the run's budget and reply (`workflows::a_helper_in_a_run_stops_at_its_budget_and_its_reply`), not a lens read from the run's workflow folder. Close with the same test in a session opened by `workflow_start`.
+status: open
+
+### DW-557: A helper's frame states the session label as it was when the turn was armed.
+
+origin: epic 94, story 94.4 (rung `agents-94-helpers`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`run_agent_turn`, `helper_frame`)
+reason: The helper's system message is composed once per turn, so a read earlier in the turn that narrowed the label is not restated in a later helper's "who may read" sentence. The model check of every helper round uses the live label joined with the helper's reads, so nothing leaves where it may not; only the sentence the helper reads is stale. Close by composing the helper frame at each launch from the turn's current label.
+status: open
+
+### DW-558: The turn's own round whose stream failed is not counted.
+
+origin: epic 94, story 94.4 (rung `agents-94-helpers`, R111, 2026-10-06; narrowed by its review fixes, R203)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`ServedSession::run_turn`, the `failed` partial line)
+reason: A helper's failed or stopped round now has its step line with the usage its stream reported, and that usage counts (R203). The turn's own round whose stream broke still writes its partial `assistant` line with empty usage, so usage a provider reported before the failure is not added to the session's spend or a delegated session's budget. Close by carrying the failed round's reported usage on that line.
+status: open
+
+### DW-559: A helper's reads are audited as the session's, with nothing naming the helper call.
+
+origin: epic 94, story 94.4 (rung `agents-94-helpers`, 2026-10-06; narrowed by its review fixes, R203)
+location: `src-tauri/crates/keeper-agent/src/helper.rs` (`Reads`), `keeper_core::bots::audit`
+reason: A helper's refused step's row now carries the helper's call id as its message (R203). A read it made still gets the session's own classified row with no message, so the audit alone does not say which `helper` call read; the log does (a step's `parent` is the helper's `tool_call`). Close by passing the helper's call id into the drive host's row for its reads.
+status: open

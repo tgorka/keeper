@@ -40,6 +40,7 @@ use keeper_core::agents::events::{
     StatusContent, ARTIFACTS, CONTENT_VERSION, SCOPE, STATUS, TURN,
 };
 use keeper_core::agents::focus::FOCUS_TTL;
+use keeper_core::agents::helper;
 use keeper_core::agents::home::{serves_local_models, AgentKind, MenuItem};
 use keeper_core::agents::label::{
     check_call, check_sink, label_drive_read, label_person_message, okf_label_facts, Author,
@@ -47,7 +48,7 @@ use keeper_core::agents::label::{
     Readers, Recipient, Sink, SinkVerdict, NEEDS_APPROVAL,
 };
 use keeper_core::agents::log::reader::{hydrate_blob, read_session};
-use keeper_core::agents::log::replay::{message_for, ReplayRefusal};
+use keeper_core::agents::log::replay::{message_for, HelperSteps, ReplayRefusal};
 use keeper_core::agents::log::{
     ApprovalBody, ApprovalState, AskBody, AskState, AssistantBody, ChildSession, DelegateBody,
     DelegateReply, DelegateState, ErrorBody, HostSlug, LineBody, LogLine, OpenBody, PeerAnswer,
@@ -92,6 +93,7 @@ use crate::delegate::{
 };
 use crate::drive::finish_word;
 use crate::grants::{AgentGrants, GrantSource};
+use crate::helper::{HelperRun, Step};
 use crate::host::{AgentDrive, Approval, Classified, HostIds, UNATTENDED_REFUSAL};
 use crate::matrix_sink::{
     anchor_content, cut, cut_to_log, deliver, deliver_gated, deliver_unless_narrowed,
@@ -136,7 +138,7 @@ const LABEL_CODE: &str = "label";
 
 /// The `finish` of an `assistant` line written for a round that called
 /// tools: the turn goes on after it, so it answers nothing yet.
-const ROUND_FINISH: &str = "tool_calls";
+pub(crate) const ROUND_FINISH: &str = "tool_calls";
 
 /// The message for a turn cut off by a restart (C6): it is not re-run,
 /// because its tool calls may already have had effects.
@@ -276,6 +278,17 @@ pub struct SessionContext {
     /// `peer` lines, every host's, and from the anchors another copy left
     /// in the room ([`Self::started`]). Never a second turn (R202).
     steps_begun: HashSet<String>,
+    /// The helpers' own steps seen so far: in the log, never in the
+    /// conversation (94.4).
+    helper_steps: HelperSteps,
+    /// `tokens_spent` when the turn under way began: at the last `user` or
+    /// `peer` line that opened one — a person's note with a decision is a
+    /// `peer` line under the result it follows, inside the turn it
+    /// resumes. What a turn has spent counts from here across its parks,
+    /// resumes and restarts (R111, R203).
+    pub(crate) turn_tokens_at: u64,
+    /// The last `tool_result` line of the session's own calls.
+    last_result: Option<Ulid>,
 }
 
 impl SessionContext {
@@ -344,6 +357,9 @@ impl SessionContext {
             pending_step: None,
             cut_off: false,
             steps_begun: HashSet::new(),
+            helper_steps: HelperSteps::default(),
+            turn_tokens_at: 0,
+            last_result: None,
         };
         for stored in &log.lines {
             match &stored.body {
@@ -371,10 +387,15 @@ impl SessionContext {
         Ok(context)
     }
 
-    /// Take one written (or read) line into the context, as `replay` would.
+    /// Take one written (or read) line into the context, as `replay` would:
+    /// a helper's own step only counts its tokens.
     pub fn push(&mut self, line: &LogLine) {
         let position = self.lines.len();
         self.lines.push(line.id);
+        if self.helper_steps.is_step(line) {
+            self.tokens_spent += tokens_of(line);
+            return;
+        }
         self.keep(line);
         self.track(line);
         match &line.body {
@@ -391,7 +412,11 @@ impl SessionContext {
             LineBody::User(_) | LineBody::Peer(_) => {
                 self.unanswered = Some(line.id);
                 self.cut_off = false;
+                if line.parent.is_none() || line.parent != self.last_result {
+                    self.turn_tokens_at = self.tokens_spent;
+                }
             }
+            LineBody::ToolResult(_) => self.last_result = Some(line.id),
             // A round that called tools is the middle of a turn (C6): a crash
             // after it still leaves the person's question unanswered.
             LineBody::Assistant(body) if body.finish == ROUND_FINISH => {}
@@ -528,10 +553,7 @@ impl SessionContext {
     /// exchange, the delegations, the asks, the run.
     fn keep(&mut self, line: &LogLine) {
         match &line.body {
-            LineBody::Assistant(body) => {
-                let used = |n: Option<u32>| u64::from(n.unwrap_or(0));
-                self.tokens_spent += used(body.usage.prompt) + used(body.usage.completion);
-            }
+            LineBody::Assistant(_) => self.tokens_spent += tokens_of(line),
             LineBody::ToolCall(call) if call.tool == delegate::DELEGATE => {
                 self.delegate_calls.insert(line.id, call.args.clone());
             }
@@ -813,14 +835,28 @@ impl SessionContext {
         context: Option<&ContextBundle>,
         tools: &[chat::ToolSpec],
     ) -> ComposedPrompt {
+        prompt::compose(&PromptInput {
+            soul: &self.soul,
+            facts: &self.facts,
+            memory: &self.memory_snapshot,
+            skills: &self.skills,
+            menu: &self.menu,
+            frame: &self.frame(deps, tools),
+            context,
+        })
+    }
+
+    /// The session frame for a turn — or a helper — offered `tools`.
+    pub(crate) fn frame(&self, deps: &AgentDeps, tools: &[chat::ToolSpec]) -> SessionFrame {
         let offered: Vec<&str> = tools.iter().map(|spec| spec.name.as_str()).collect();
         let session_path = format!("{}/{}", deps.sessions_subfolder, self.session.path);
         let bmad = keeper_core::agents::workflow::frame_lines(
             &deps.home.drive.id,
             &format!("{session_path}/artifacts"),
             &offered,
+            deps.home.config.limits.tokens_per_turn,
         );
-        let frame = SessionFrame {
+        SessionFrame {
             agent: deps.home.config.id.clone(),
             host: deps.host.as_str().to_owned(),
             session_path,
@@ -847,16 +883,18 @@ impl SessionContext {
                 .map(|held| held.focus.clone())
                 .filter(|focus| self.scope.contains(&focus.drive)),
             bmad,
-        };
-        prompt::compose(&PromptInput {
-            soul: &self.soul,
-            facts: &self.facts,
-            memory: &self.memory_snapshot,
-            skills: &self.skills,
-            menu: &self.menu,
-            frame: &frame,
-            context,
-        })
+        }
+    }
+}
+
+/// The tokens an `assistant` line reports; none for any other line.
+fn tokens_of(line: &LogLine) -> u64 {
+    match &line.body {
+        LineBody::Assistant(body) => {
+            let used = |n: Option<u32>| u64::from(n.unwrap_or(0));
+            used(body.usage.prompt) + used(body.usage.completion)
+        }
+        _ => 0,
     }
 }
 
@@ -940,6 +978,9 @@ pub struct AgentDeps {
     pub data_dir: PathBuf,
     pub row: ProviderRow,
     pub bot: Bot,
+    /// Every provider this host is configured with: a review layer naming
+    /// its own bot runs on the row that serves it (94.4).
+    pub rows: Vec<ProviderRow>,
     pub home: AgentHome,
     pub host: HostSlug,
     /// The declarations of the drives this host mounts, by id.
@@ -969,7 +1010,7 @@ impl AgentDeps {
 
 /// A tool host that refuses any tool outside `[tools].allow`, and serves the
 /// agent's surface, `delegate`, `reply`, `card_update`, `session_write`,
-/// BMAD and skill tools itself (R38, R50: no ⌘9 host has them). Every call is classified
+/// BMAD, skill and `helper` tools itself (R38, R50: no ⌘9 host has them). Every call is classified
 /// (AD-392) on where it lands and audited in exactly one row with its tier
 /// (R90), before any effect; one that writes or sends is checked first
 /// against the label at its sink, then against the integrity rule over its
@@ -1017,6 +1058,8 @@ struct AllowedTools<'t> {
     /// The session asks a person (R102) and nobody can be asked now: its
     /// calls are classified unattended (R83 as R103 extends it, R202).
     nobody_to_ask: bool,
+    /// `helper`: the round's helpers run side by side (R110).
+    helpers: crate::helper::Helpers<'t>,
 }
 
 /// A consumed approval as the one execution of its call holds it: the
@@ -1164,7 +1207,8 @@ impl AllowedTools<'_> {
         if let Some(approval) = self.bound_approval(id, tool) {
             return Gated::Run(Some(Approval::Approved(approval)));
         }
-        if !self.parks {
+        // A helper's call has no turn of its own to wait in: refused.
+        if !self.parks || self.helpers.running.load(Ordering::SeqCst) {
             return Gated::Refuse(refusal.to_owned());
         }
         let approval = Ulid::new();
@@ -1213,6 +1257,210 @@ impl AllowedTools<'_> {
         };
         let context = self.context();
         tier::classify(tool, &facts, &context).tier.as_u8()
+    }
+
+    /// Run the `helper` calls `wires` side by side and keep what each came
+    /// to (R110). Each is classified and audited in its one row before its
+    /// model is reached, and all of them launch against the turn's spend
+    /// and the session's own budget as they are now: no helper's first
+    /// request waits on another's tokens; each later one counts every round
+    /// they have ended since (R111, R203).
+    fn run_helpers(&self, wires: &[&chat::ToolCall]) {
+        let spend = self.view.turn_spend();
+        let session = self.view.session_budget();
+        self.helpers.spent.store(0, Ordering::SeqCst);
+        let label = self.view.label();
+        let classifications: Vec<Classification> = wires
+            .iter()
+            .map(|wire| self.classify(&wire.id, AgentTool::Helper, &CallFacts::default(), None))
+            .collect();
+        let mut audits = Vec::with_capacity(wires.len());
+        let mut runs: Vec<Option<HelperRun>> = Vec::with_capacity(wires.len());
+        let mut launches = Vec::new();
+        for (index, (wire, classification)) in wires.iter().zip(&classifications).enumerate() {
+            let gated = self.gated(&wire.id, &wire.name, classification, &[], Vec::new());
+            let launch = self.launch(wire, &label, spend, session);
+            let model = launch
+                .as_ref()
+                .map_or_else(|_| String::new(), |launch| launch.target.clone());
+            let audit = CallAudit::new(
+                self.sinks,
+                &wire.name,
+                Effect::Read,
+                classification,
+                gated,
+                ("", &model),
+            );
+            runs.push(match launch {
+                Err(refused) => Some(*refused),
+                Ok(launch) => match audit.admit("", &model) {
+                    Ok(()) => {
+                        launches.push((index, launch));
+                        None
+                    }
+                    Err(withheld) => Some(HelperRun {
+                        outcome: withheld.into(),
+                        steps: Vec::new(),
+                        reads: launch.reads,
+                    }),
+                },
+            });
+            audits.push(audit);
+        }
+        self.helpers.running.store(true, Ordering::SeqCst);
+        let ran = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(futures_util::future::join_all(
+                launches.into_iter().map(|(index, launch)| async move {
+                    (index, crate::helper::run(&self.helpers, self, launch).await)
+                }),
+            ))
+        });
+        self.helpers.running.store(false, Ordering::SeqCst);
+        for (index, run) in ran {
+            runs[index] = Some(run);
+        }
+        for ((wire, audit), run) in wires.iter().zip(&audits).zip(runs) {
+            let run = run.unwrap_or_else(|| HelperRun::refused(TURN_FAILED, Vec::new()));
+            audit.finish(&run.outcome);
+            self.helpers.keep(wire.id.clone(), run);
+        }
+    }
+
+    /// A `helper` call made ready to launch, or what it answers instead: a
+    /// tool the agent was not given, arguments that do not read, a lens not
+    /// found (looked up under the home drive's grant, as `bmad_config`
+    /// reads), or a lens bot no provider here serves. The model the label
+    /// may reach (S-04), the turn's budget (R111) and a delegated session's
+    /// or a workflow's run's own budget (Q12, R214) are the helper's own gate's,
+    /// before its first request as before each later one.
+    fn launch(
+        &self,
+        wire: &chat::ToolCall,
+        label: &Label,
+        spend: u64,
+        session: Option<(u64, u64)>,
+    ) -> Result<crate::helper::Launch, Box<HelperRun>> {
+        let refuse = |reason: String, reads: Vec<(Label, String)>| {
+            Err(Box::new(HelperRun::refused(reason, reads)))
+        };
+        if !self.allow.iter().any(|allowed| allowed == helper::HELPER) {
+            return refuse(
+                format!("{} is not one of this agent's tools.", wire.name),
+                Vec::new(),
+            );
+        }
+        let call = match helper::parse(wire.arguments.as_ref().unwrap_or(&Value::Null)) {
+            Ok(call) => call,
+            Err(sentence) => return refuse(sentence, Vec::new()),
+        };
+        let mut files = Vec::new();
+        let lens = match &call.lens {
+            None => Ok(None),
+            Some(id) => grant_read(self.grants.as_ref(), &self.home.id, &self.bmad.zone)
+                .and_then(|()| {
+                    self.bmad
+                        .customization_of(call.skill.as_deref(), &mut files)
+                })
+                .and_then(|merged| helper::lens_of(&merged, id))
+                .map(Some),
+        };
+        let reads: Vec<(Label, String)> = files
+            .iter()
+            .map(|read| {
+                (
+                    read.label(self.home),
+                    format!("{}/{}", self.home.id, read.path()),
+                )
+            })
+            .collect();
+        let lens = match lens {
+            Ok(lens) => lens,
+            Err(sentence) => return refuse(sentence, reads),
+        };
+        let deps = self.helpers.deps;
+        let (row, target) = match lens.as_ref().and_then(|lens| lens.bot.as_ref()) {
+            None => (deps.row.clone(), deps.bot.target.clone()),
+            Some(bot) => match deps
+                .rows
+                .iter()
+                .find(|row| row.provider.kind == bot.kind && row.provider.base_url == bot.base)
+            {
+                Some(row) => (row.clone(), bot.target.clone()),
+                None => {
+                    return refuse(
+                        format!(
+                            "No provider on this host serves the review layer's bot {} at {}.",
+                            bot.target, bot.base
+                        ),
+                        reads,
+                    )
+                }
+            },
+        };
+        let label = reads
+            .iter()
+            .fold(label.clone(), |joined, (read, _)| joined.join(read));
+        Ok(crate::helper::Launch {
+            id: wire.id.clone(),
+            call,
+            lens,
+            row,
+            target,
+            label,
+            spend,
+            session,
+            reads,
+        })
+    }
+}
+
+impl crate::helper::Parent for AllowedTools<'_> {
+    fn host(&self) -> &dyn ToolHost {
+        self
+    }
+
+    fn tier_of(&self, id: &str) -> u8 {
+        AllowedTools::tier_of(self, id)
+    }
+
+    fn reads(&self, record: &ToolCallRecord, outcome: &ToolOutcome) -> Vec<(Label, String)> {
+        let home = self.home;
+        read_label(self.helpers.deps, &self.helpers.profiles, record, outcome)
+            .into_iter()
+            .chain(
+                self.bmad
+                    .take_reads()
+                    .into_iter()
+                    .map(|read| (read.label(home), format!("{}/{}", home.id, read.path()))),
+            )
+            .collect()
+    }
+
+    fn refused(
+        &self,
+        helper: &str,
+        id: &str,
+        tool: &str,
+        at: Option<(&str, &str)>,
+        args: &Value,
+        reason: &str,
+    ) {
+        // Classified where it would have landed, as the session's own call
+        // would be; its line says the same tier.
+        let classification = AgentTool::from_wire(tool).map(|row| {
+            let facts = match at {
+                Some((drive, path)) => self.landed_facts(drive, path),
+                None if crate::cards::is_card_tool(tool) => {
+                    let landed = self.landed_facts(&self.home.id, &self.card_at(row, args));
+                    tier::named_facts(row, args, landed)
+                }
+                None => tier::named_facts(row, args, CallFacts::default()),
+            };
+            self.classify(id, row, &facts, None)
+        });
+        let (drive, path) = at.unwrap_or(("", ""));
+        self.sinks
+            .helper_refused(tool, (drive, path), classification.as_ref(), reason, helper);
     }
 }
 
@@ -1390,6 +1638,13 @@ impl ToolHost for AllowedTools<'_> {
         })
     }
 
+    /// A round's calls, before any of them runs: its helpers are launched
+    /// as the round reaches them, each with the helpers right after it
+    /// (R110, R203).
+    fn prepare_round(&self, calls: &[chat::ToolCall]) {
+        self.helpers.prepare(calls);
+    }
+
     fn run_named(&self, wire: &chat::ToolCall) -> Option<ToolOutcome> {
         // Asked ahead of every call, a drive verb's too: an ended run's
         // calls never reach `run` (R202).
@@ -1397,6 +1652,13 @@ impl ToolHost for AllowedTools<'_> {
             return Some(refusal(RUN_ENDED.to_owned()));
         }
         let args = wire.arguments.as_ref().unwrap_or(&Value::Null);
+        if wire.name == helper::HELPER {
+            if !self.helpers.ran(&wire.id) {
+                let batch = self.helpers.batch(wire);
+                self.run_helpers(&batch.iter().collect::<Vec<_>>());
+            }
+            return self.helpers.outcome(&wire.id);
+        }
         if delegate::is_delegation(&wire.name) {
             let tool = AgentTool::from_wire(&wire.name)?;
             let facts = tier::named_facts(tool, args, CallFacts::default());
@@ -2167,6 +2429,9 @@ pub enum TurnEnding {
     Parked,
     /// The model or the log failed.
     Failed,
+    /// The turn's token budget, its helpers' tokens included, is spent
+    /// (R111).
+    Spent,
 }
 
 /// What one turn did, for the host's log and the NFR-113 harness.
@@ -2967,6 +3232,7 @@ impl ServedSession {
                 TurnEnding::Stopped
                 | TurnEnding::LocalOnly
                 | TurnEnding::Bounded
+                | TurnEnding::Spent
                 | TurnEnding::Asked,
             ) => (Run::Blocked, LogRun::Blocked),
             Some(TurnEnding::Parked | TurnEnding::Failed) | None => (Run::Failed, LogRun::Failed),
@@ -4269,19 +4535,25 @@ impl ServedSession {
     /// completion — is told to the requester as the reply (the bound and
     /// what was spent), and the card goes `run: blocked` with the bound's
     /// word; so does an exchange whose last round passed without a reply,
-    /// since no more message can come in it (Q12). Once blocked, nothing
-    /// more is said or written.
+    /// since no more message can come in it (Q12), and a turn its own
+    /// `tokens_per_turn` stopped, with `turn_tokens` and no reply (R111,
+    /// R215). Once blocked, nothing more is said or written; nor once a
+    /// workflow's run has ended at its reply, whose `review` stands (R215).
     async fn after_delegated_turn(
         &mut self,
         deps: &AgentDeps,
         port: &Arc<dyn EditPort>,
         bound: Option<BoundReached>,
+        ending: TurnEnding,
     ) -> Result<(), ServeError> {
         let answers = matches!(
             self.context.agent.kind,
             SessionKind::Delegated | SessionKind::Workflow
         );
-        if !answers || self.context.run == Some(keeper_core::agents::log::RunState::Blocked) {
+        if !answers
+            || self.context.run_ended()
+            || self.context.run == Some(keeper_core::agents::log::RunState::Blocked)
+        {
             return Ok(());
         }
         let detail = match (bound, &self.context.agent.limits) {
@@ -4294,6 +4566,9 @@ impl ServedSession {
                 self.reply_bound(deps, port, &bound).await;
                 bound.word()
             }
+            // The turn's own budget stops this turn, not the session: the
+            // requester is not answered, and the run waits blocked.
+            (None, _) if ending == TurnEnding::Spent => "turn_tokens",
             // A workflow's run takes no rounds from its requester: one
             // brief, one reply (R104); only its budget blocks it.
             (None, Some(limits))
@@ -4794,6 +5069,7 @@ impl ServedSession {
                 (format!("{visible}{suffix}"), format!("{shown}{suffix}"))
             }
             TurnEnding::LocalOnly => (join_note(&visible, LOCAL_ONLY_REFUSAL), shown.clone()),
+            TurnEnding::Spent => (join_note(&visible, helper::TURN_SPENT), shown.clone()),
             TurnEnding::Bounded => (
                 join_note(
                     &visible,
@@ -4912,8 +5188,15 @@ impl ServedSession {
                     ran.parent,
                     Some(delivered.final_event.clone()),
                     LineBody::Assistant(AssistantBody {
+                        // A turn stopped between rounds has said the last
+                        // round's prose on that round's line already.
                         text: if ran.ending == TurnEnding::Stopped {
-                            format!("{}{}", ran.round_text, shutdown_suffix(deps.host.as_str()))
+                            let said = if ran.round_logged {
+                                ""
+                            } else {
+                                ran.round_text.as_str()
+                            };
+                            format!("{said}{}", shutdown_suffix(deps.host.as_str()))
                         } else if outcome.is_none() && ran.round_logged {
                             // A run that replied, stopped at the gate: its
                             // last round's prose is on that round's line.
@@ -4937,7 +5220,10 @@ impl ServedSession {
                 )?;
                 Some(line)
             }
-            TurnEnding::LocalOnly | TurnEnding::Bounded | TurnEnding::Failed => {
+            TurnEnding::LocalOnly
+            | TurnEnding::Bounded
+            | TurnEnding::Spent
+            | TurnEnding::Failed => {
                 let mut parent = ran.parent.or(Some(user_id));
                 // The prose the room already saw of the round that failed:
                 // the next turn's model must read what the person read.
@@ -4961,6 +5247,7 @@ impl ServedSession {
                 let (sentence, code) = match (ran.ending, ran.bound) {
                     (TurnEnding::LocalOnly, _) => (LOCAL_ONLY_REFUSAL.to_owned(), "local_only"),
                     (TurnEnding::Bounded, Some(bound)) => (bound.sentence(), bound.word()),
+                    (TurnEnding::Spent, _) => (helper::TURN_SPENT.to_owned(), "turn_tokens"),
                     _ => (
                         ran.error.clone().unwrap_or_else(|| TURN_FAILED.to_owned()),
                         "turn_failed",
@@ -5007,7 +5294,8 @@ impl ServedSession {
         // The closing line counts the last completion's tokens too: a budget
         // it crossed parks the session as one the gate stopped would.
         let bound = ran.bound.or_else(|| self.context.token_bound());
-        self.after_delegated_turn(deps, &port, bound).await?;
+        self.after_delegated_turn(deps, &port, bound, ran.ending)
+            .await?;
         if let Some(step) = self.continue_run(&ran)? {
             let me = &deps.home.config.matrix_user;
             let next = workflow_arrival(me, &self.context.agent.id, step);
@@ -5318,6 +5606,11 @@ struct TurnLog<'a> {
     /// Why the round gate stopped a workflow's run before its next round:
     /// it replied, or an ask read back from its log still waits (R202).
     stopped: Option<TurnEnding>,
+    /// The session's tokens when the turn began: what it has spent since,
+    /// its helpers' steps included, is the turn's (R111).
+    tokens_at_start: u64,
+    /// The turn's token budget stopped it before a round.
+    spent: bool,
 }
 
 impl TurnView for Mutex<TurnLog<'_>> {
@@ -5367,6 +5660,16 @@ impl TurnView for Mutex<TurnLog<'_>> {
             .unwrap_or_else(|p| p.into_inner())
             .context
             .run_ended()
+    }
+
+    fn turn_spend(&self) -> u64 {
+        self.lock().unwrap_or_else(|p| p.into_inner()).turn_spend()
+    }
+
+    fn session_budget(&self) -> Option<(u64, u64)> {
+        let log = self.lock().unwrap_or_else(|p| p.into_inner());
+        let limits = log.context.agent.limits.as_ref()?;
+        Some((log.context.tokens_spent + log.open_round(), limits.tokens))
     }
 }
 
@@ -5430,6 +5733,26 @@ impl TurnLog<'_> {
             }
         }
     }
+
+    /// The tokens of the round under way, whose line the reporter has not
+    /// written yet.
+    fn open_round(&self) -> u64 {
+        if self.round_line.is_none() {
+            u64::from(self.round_usage.prompt.unwrap_or(0))
+                + u64::from(self.round_usage.completion.unwrap_or(0))
+        } else {
+            0
+        }
+    }
+
+    /// The tokens this turn has spent: every line it wrote, and the round
+    /// under way.
+    fn turn_spend(&self) -> u64 {
+        self.context
+            .tokens_spent
+            .saturating_sub(self.tokens_at_start)
+            + self.open_round()
+    }
 }
 
 /// Whether arming may ask the provider which tools its model supports.
@@ -5491,10 +5814,10 @@ fn reply_offer(session: SessionKind, relays_waiting: bool, kind: AgentKind) -> R
 /// tools) under `grants`: the drive verbs `[tools].allow` names, then the
 /// agent's own tools — the surface, `delegate` and the card tools as
 /// `allow` says, `reply` by the session (R48, R100), the BMAD and skill
-/// tools where the home drive `home` reads (R195), `ask_human` by the
-/// session's kind (R102) and `workflow_start` outside a proxy's own
-/// conversation (AD-380). Arming and a workflow's start check both ask it
-/// (R202).
+/// tools where the home drive `home` reads (R195), `helper` as `allow`
+/// says (R105), `ask_human` by the session's kind (R102) and
+/// `workflow_start` outside a proxy's own conversation (AD-380). Arming
+/// and a workflow's start check both ask it (R202).
 fn agent_offer(
     config: &keeper_core::agents::home::AgentConfig,
     session: SessionKind,
@@ -5519,6 +5842,9 @@ fn agent_offer(
     // where its grant would let a `drive_read` of it run (R195).
     if grant_read(grants, home, "").is_ok() {
         tools.extend(keeper_core::agents::workflow::specs(&config.allow));
+    }
+    if config.allow.iter().any(|name| name == helper::HELPER) {
+        tools.push(helper::spec());
     }
     if keeper_core::agents::ask::offered(config.kind, session) {
         tools.push(keeper_core::agents::workflow::ask_spec());
@@ -5693,6 +6019,16 @@ async fn run_agent_turn(
         .request
         .messages
         .insert(0, ChatMessage::text(Role::System, composed.text.clone()));
+    // A helper is offered the reads of this turn's offer, and told this
+    // session's frame for that offer — no soul, no memory (AD-399).
+    let helper_offer: Vec<chat::ToolSpec> = armed
+        .request
+        .tools
+        .iter()
+        .filter(|spec| helper::TOOLS.contains(&spec.name.as_str()))
+        .cloned()
+        .collect();
+    let helper_frame = prompt::frame_text(&context.frame(deps, &helper_offer));
 
     let endpoint = match endpoint_of(&deps.env, &deps.row, Some(&deps.bot.target)).await {
         Ok(endpoint) => endpoint,
@@ -5788,6 +6124,8 @@ async fn run_agent_turn(
         .map(|spec| spec.name.clone())
         .collect();
     let scope = context.scope.clone();
+    // A resumed turn goes on spending the budget it began with (R203).
+    let tokens_at_start = context.turn_tokens_at;
     let log = Mutex::new(TurnLog {
         context,
         writer,
@@ -5803,6 +6141,8 @@ async fn run_agent_turn(
         broken: None,
         parked: None,
         stopped: None,
+        tokens_at_start,
+        spent: false,
     });
     let host = AllowedTools {
         inner: drive_host,
@@ -5867,6 +6207,14 @@ async fn run_agent_turn(
         bound: Mutex::new(None),
         parked: Mutex::new(None),
         nobody_to_ask,
+        helpers: crate::helper::Helpers::new(
+            deps,
+            read_profiles.clone(),
+            armed.default_profile_id.clone(),
+            helper_frame,
+            helper_offer,
+            stop.clone(),
+        ),
     };
     let tool_loop = ToolLoop {
         client: &client,
@@ -5913,8 +6261,12 @@ async fn run_agent_turn(
                   outcome: &ToolOutcome| {
         // What the call read: a drive verb's file, or the home drive's
         // files a BMAD or skill tool read, each labelled by where it landed
-        // and the bytes it returned, as they were at the read (R195).
+        // and the bytes it returned, as they were at the read (R195); a
+        // helper's, everything it read.
         let home = &deps.home.drive;
+        let helped = (wire.name == helper::HELPER)
+            .then(|| host.helpers.take(&wire.id))
+            .flatten();
         let reads: Vec<(Label, String)> = read_label(deps, &read_profiles, record, outcome)
             .into_iter()
             .chain(
@@ -5923,27 +6275,25 @@ async fn run_agent_turn(
                     .into_iter()
                     .map(|read| (read.label(home), format!("{}/{}", home.id, read.path()))),
             )
+            .chain(helped.iter().flat_map(|run| run.reads.iter().cloned()))
             .collect();
-        let result_label = reads
-            .iter()
-            .map(|(label, _)| label.clone())
-            .reduce(|joined, label| joined.join(&label))
-            .unwrap_or_else(|| log.context.label.clone());
-        let (word, truncated) = match outcome {
-            ToolOutcome::Refused { .. } => (ToolOutcomeWord::Refused, None),
-            ToolOutcome::Text {
-                truncated_at: Some(shown),
-                of_bytes: Some(total),
-                ..
-            } => (
-                ToolOutcomeWord::Ok,
-                Some(Truncated {
-                    shown: *shown,
-                    total: *total,
-                }),
-            ),
-            _ => (ToolOutcomeWord::Ok, None),
+        // A helper's answer was drawn from its brief, which this session's
+        // model wrote, and from what it read: it carries the session's
+        // label joined with its reads.
+        let result_label = if helped.is_some() {
+            reads
+                .iter()
+                .fold(log.context.label.clone(), |joined, (label, _)| {
+                    joined.join(label)
+                })
+        } else {
+            reads
+                .iter()
+                .map(|(label, _)| label.clone())
+                .reduce(|joined, label| joined.join(&label))
+                .unwrap_or_else(|| log.context.label.clone())
         };
+        let (word, truncated) = result_word(outcome);
         log.last_line = log.write(
             call_line,
             LineBody::ToolResult(ToolResultBody {
@@ -5967,6 +6317,19 @@ async fn run_agent_turn(
         }
         for line in host.asks.take_lines() {
             log.write(call_line, line);
+        }
+        // A helper's own steps, under its call: in the log, out of every
+        // replay (94.4).
+        for step in helped.map(|run| run.steps).unwrap_or_default() {
+            match step {
+                Step::Round(round) => {
+                    log.write(call_line, LineBody::Assistant(round));
+                }
+                Step::Call(call, result) => {
+                    let at = log.write(call_line, LineBody::ToolCall(call));
+                    log.write(at, LineBody::ToolResult(result));
+                }
+            }
         }
         for (label, path) in reads {
             let joined = log.context.label.join(&label);
@@ -6091,8 +6454,10 @@ async fn run_agent_turn(
             finish(&mut lock(), Some(line), &record, &wire, &outcome);
         }
         if let (Some(note), false) = (resume.note, reparked) {
+            // Under the result it follows: the note opens no turn.
             let mut log = lock();
-            log.last_line = log.write(None, LineBody::Peer(note));
+            let after = log.last_line;
+            log.last_line = log.write(after, LineBody::Peer(note));
         }
         // The model reads the conversation as it is now.
         let mut messages = vec![ChatMessage::text(Role::System, composed.text.clone())];
@@ -6140,6 +6505,13 @@ async fn run_agent_turn(
             log.bound = Some(bound);
             return Err(BotsError::Tool {
                 detail: bound.sentence(),
+            });
+        }
+        // The turn's rounds and helpers so far (R111).
+        if helper::spent(config.limits.tokens_per_turn, log.turn_spend()) {
+            log.spent = true;
+            return Err(BotsError::Tool {
+                detail: helper::TURN_SPENT.to_owned(),
             });
         }
         Ok(())
@@ -6234,6 +6606,7 @@ async fn run_agent_turn(
     let prompt_sha256 = Some(composed.prompt_sha256);
     let bound = log.bound;
     let stopped = log.stopped;
+    let spent = log.spent;
     let waits = parked.is_some();
     let exhausted = matches!(&result, Some(Ok(done)) if done.exhausted);
     let ran =
@@ -6278,8 +6651,28 @@ async fn run_agent_turn(
         Some(Err(error)) => match stopped {
             Some(ending) => ran(ending, None, None),
             None if bound.is_some() => ran(TurnEnding::Bounded, None, None),
+            None if spent => ran(TurnEnding::Spent, None, None),
             None => ran(TurnEnding::Failed, None, Some(error.to_string())),
         },
+    }
+}
+
+/// A `tool_result` line's outcome word and truncation for `outcome`.
+pub(crate) fn result_word(outcome: &ToolOutcome) -> (ToolOutcomeWord, Option<Truncated>) {
+    match outcome {
+        ToolOutcome::Refused { .. } => (ToolOutcomeWord::Refused, None),
+        ToolOutcome::Text {
+            truncated_at: Some(shown),
+            of_bytes: Some(total),
+            ..
+        } => (
+            ToolOutcomeWord::Ok,
+            Some(Truncated {
+                shown: *shown,
+                total: *total,
+            }),
+        ),
+        _ => (ToolOutcomeWord::Ok, None),
     }
 }
 

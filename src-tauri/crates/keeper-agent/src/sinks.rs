@@ -328,6 +328,55 @@ impl Sinks {
         }
     }
 
+    /// The one audit row of a helper's step refused as no read (R203):
+    /// `Deny` with `reason`, closed `refused`, its message the outer
+    /// `helper` call, classified where `tool` has a row of the tier table.
+    /// Nothing ran, so a row that cannot be written is logged only.
+    pub fn helper_refused(
+        &self,
+        tool: &str,
+        (drive, at): (&str, &str),
+        classification: Option<&Classification>,
+        reason: &str,
+        helper: &str,
+    ) {
+        let verdict = GrantVerdict::Deny {
+            reason: reason.to_owned(),
+        };
+        let target = ToolTarget {
+            profile_id: drive.to_owned(),
+            subpath: at.to_owned(),
+        };
+        let row = audit::append_intent(
+            &self.data_dir,
+            &AuditIntent {
+                started_ms: now_ms(),
+                provider_id: &self.provider_id,
+                bot_id: Some(&self.bot_id),
+                session_id: &self.session_id,
+                message_id: Some(helper),
+                tool,
+                target: &target,
+                effect: Effect::Write,
+                verdict: &verdict,
+                classified: classification,
+            },
+        )
+        .and_then(|id| {
+            audit::complete(
+                &self.data_dir,
+                id,
+                AuditOutcome::Refused,
+                None,
+                false,
+                now_ms(),
+            )
+        });
+        if let Err(error) = row {
+            tracing::warn!(%error, tool, "agents: a helper's refused step's audit row could not be written");
+        }
+    }
+
     /// The audit row of an agent's call no grant answers (R90), written
     /// before any effect: `Allow` under `agent:<tool>`, or `Deny` with
     /// `refusal`, closed `refused` at once; either carries the call's

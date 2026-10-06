@@ -351,6 +351,10 @@ pub fn summary_of(tool: AgentTool, args: &Value) -> String {
             Some(file) => format!("Read `{file}` of the skill {}", arg(args, "name")),
             None => format!("Read the skill {}", arg(args, "name")),
         },
+        AgentTool::Helper => match args["lens"].as_str() {
+            Some(lens) => format!("Run the review layer {lens} as a read-only helper"),
+            None => "Hand one piece of work to a read-only helper".to_owned(),
+        },
         AgentTool::Declassify => {
             let readers: Vec<&str> = args["readers"]
                 .as_array()

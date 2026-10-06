@@ -947,6 +947,12 @@ mod tests {
         fn ended(&self) -> bool {
             false
         }
+        fn turn_spend(&self) -> u64 {
+            0
+        }
+        fn session_budget(&self) -> Option<(u64, u64)> {
+            None
+        }
     }
 
     fn view(integrity: Integrity) -> View {

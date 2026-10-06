@@ -114,6 +114,7 @@ fn tools(home: &AgentHome) -> (Vec<&str>, Vec<&str>) {
                 || keeper_agent::bmad::serves(name)
                 || *name == keeper_core::agents::workflow::ASK_HUMAN
                 || *name == keeper_core::agents::workflow::WORKFLOW_START
+                || *name == keeper_core::agents::helper::HELPER
                 || ToolName::ALL.iter().any(|tool| tool.as_wire() == *name)
         })
 }

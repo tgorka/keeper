@@ -201,6 +201,18 @@ pub fn compose(input: &PromptInput<'_>) -> ComposedPrompt {
     }
 }
 
+/// The session frame alone — slot 5 as [`compose`] renders it, without
+/// the home's files: what a helper is told of the session it works for,
+/// with no soul and no core memory (AD-399).
+pub fn frame_text(frame: &SessionFrame) -> String {
+    let mut b = Builder {
+        text: String::new(),
+        sections: Vec::new(),
+    };
+    frame_slot(&mut b, frame, &[]);
+    b.text
+}
+
 fn soul_slot(b: &mut Builder, soul: &Soul, facts: &[RenderedFact]) {
     b.open(1, SOUL);
     b.line(&format!("Name: {}", soul.name));

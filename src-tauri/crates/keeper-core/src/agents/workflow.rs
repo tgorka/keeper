@@ -161,11 +161,17 @@ pub const CAPABILITIES: [Capability; 19] = [
     },
     Capability {
         assumes: "spawn a sync or parallel context-free subagent",
-        tools: &["helper"],
-        said: &[(
-            When::Without(&["helper"]),
-            "`helper` is not offered to this agent; do the work inline, as the skill's fallback says.",
-        )],
+        tools: &[crate::agents::helper::HELPER],
+        said: &[
+            (
+                When::With(crate::agents::helper::HELPER),
+                "A subagent is a `helper`: it starts with no context, only reads, and the helpers of one round run side by side.",
+            ),
+            (
+                When::Without(&[crate::agents::helper::HELPER]),
+                "`helper` is not offered to this agent; do the work inline, as the skill's fallback says.",
+            ),
+        ],
     },
     Capability {
         assumes: "re-address a live subagent by id",
@@ -242,7 +248,7 @@ pub const CAPABILITIES: [Capability; 19] = [
         )],
     },
     Capability {
-        assumes: "token counting, the current date",
+        assumes: TOKEN_COUNTING,
         tools: &[],
         said: &[(When::Always, "The date and time are this frame's `Now:`.")],
     },
@@ -312,13 +318,23 @@ pub fn capability_answer(capability: &Capability, offered: &[&str]) -> Capabilit
     }
 }
 
+/// What row 18 assumes: [`frame_lines`] adds the turn's token bound to it.
+const TOKEN_COUNTING: &str = "token counting, the current date";
+
 /// The session frame's BMAD lines for a turn offered `offered`, in a
 /// session whose `artifacts/` is `artifacts` (drive-relative) on the home
 /// drive `drive`: none unless the turn is offered a tool through which it
 /// follows a BMAD skill or workflow ([`FRAMED`]). Where `{project-root}`
 /// is read and where it is written (R96), then every capability BMAD
-/// assumes with this turn's answer.
-pub fn frame_lines(drive: &str, artifacts: &str, offered: &[&str]) -> Vec<String> {
+/// assumes with this turn's answer; token counting states the turn's bound
+/// `tokens_per_turn` (`0`: none), never what is left of it, so the frame
+/// does not move within a turn (R111).
+pub fn frame_lines(
+    drive: &str,
+    artifacts: &str,
+    offered: &[&str],
+    tokens_per_turn: u64,
+) -> Vec<String> {
     if !FRAMED.iter().any(|tool| offered.contains(tool)) {
         return Vec::new();
     }
@@ -343,7 +359,13 @@ pub fn frame_lines(drive: &str, artifacts: &str, offered: &[&str]) -> Vec<String
             .iter()
             .map(|tool| if *tool == MCP { "your MCP tools" } else { tool })
             .collect();
-        let said = answer.sentences.join(" ");
+        let mut said = answer.sentences.join(" ");
+        if capability.assumes == TOKEN_COUNTING {
+            said.push_str(&match tokens_per_turn {
+                0 => " This turn has no token budget beyond the model's.".to_owned(),
+                bound => format!(" This turn may spend {bound} tokens, its helpers' included."),
+            });
+        }
         let said = match (tools.is_empty(), said.is_empty()) {
             (false, false) => format!("{}; {said}", tools.join(", ")),
             (false, true) => tools.join(", "),
@@ -531,7 +553,7 @@ pub fn specs(allow: &[String]) -> Vec<ToolSpec> {
 }
 
 /// The arguments' object, refusing a key the tool does not take.
-fn object<'a>(
+pub(crate) fn object<'a>(
     tool: &str,
     args: &'a Value,
     takes: &[&str],
@@ -554,7 +576,11 @@ fn object<'a>(
 }
 
 /// A non-empty string argument, when given.
-fn text(tool: &str, keys: &Map<String, Value>, key: &str) -> Result<Option<String>, String> {
+pub(crate) fn text(
+    tool: &str,
+    keys: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, String> {
     match keys.get(key) {
         None => Ok(None),
         Some(Value::String(text)) if !text.trim().is_empty() => Ok(Some(text.clone())),
@@ -1517,13 +1543,14 @@ mod tests {
     /// The frame tells a turn offered a tool through which it follows a
     /// BMAD skill or workflow where `{project-root}` is read and written
     /// (R96) and answers every capability for its offer; a turn offered
-    /// none is told nothing of BMAD.
+    /// none is told nothing of BMAD. Token counting states the turn's
+    /// bound where there is one (R111).
     #[test]
     fn the_frame_states_the_roots_and_the_map_for_its_offer() {
         let artifacts = "60-sessions/active/s/artifacts";
-        assert!(frame_lines("tgdrive", artifacts, &["drive_read", "session_write"]).is_empty());
+        assert!(frame_lines("tgdrive", artifacts, &["drive_read", "session_write"], 0).is_empty());
         for framed in FRAMED {
-            let lines = frame_lines("tgdrive", artifacts, &["drive_read", framed]);
+            let lines = frame_lines("tgdrive", artifacts, &["drive_read", framed], 0);
             let frame = lines.join("\n");
             assert!(frame.contains("tgdrive's root"), "{framed}: {frame}");
             assert!(
@@ -1539,10 +1566,20 @@ mod tests {
             }
         }
         // bmad_config is pointed to only where it is offered.
-        let skill_only = frame_lines("tgdrive", artifacts, &[SKILL_VIEW]).join("\n");
+        let skill_only = frame_lines("tgdrive", artifacts, &[SKILL_VIEW], 0).join("\n");
         assert!(!skill_only.contains(BMAD_CONFIG), "{skill_only}");
-        let with_config = frame_lines("tgdrive", artifacts, &[SKILL_VIEW, BMAD_CONFIG]).join("\n");
+        let with_config =
+            frame_lines("tgdrive", artifacts, &[SKILL_VIEW, BMAD_CONFIG], 0).join("\n");
         assert!(with_config.contains(BMAD_CONFIG), "{with_config}");
+        // The bound, on the token counting row and only where there is one.
+        let counting = |bound: u64| {
+            frame_lines("tgdrive", artifacts, &[SKILL_VIEW], bound)
+                .into_iter()
+                .find(|line| line.contains(TOKEN_COUNTING))
+                .expect("the token counting row")
+        };
+        assert!(counting(2000).contains("2000"), "{}", counting(2000));
+        assert!(!counting(0).contains("2000"), "{}", counting(0));
     }
 
     #[test]

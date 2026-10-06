@@ -492,6 +492,21 @@ impl BmadTools {
         (defaults, overlays)
     }
 
+    /// The merged customization of the offered skill `skill`, else of the
+    /// workflow the session runs, as `resolve_customization.py` merges it,
+    /// the files it read kept in `files`: where a helper's lens is looked
+    /// up (94.4).
+    pub fn customization_of(
+        &self,
+        skill: Option<&str>,
+        files: &mut Vec<FileRead>,
+    ) -> Result<Table, String> {
+        let (folder, name) = self.folder(skill)?;
+        let (defaults, overlays) =
+            self.customization(&folder, &name, Custom::of(&self.root), files);
+        config::merge_customization(defaults, Some(overlays)).map_err(|error| error.to_string())
+    }
+
     /// `bmad_config`: what `resolve_config.py` or
     /// `resolve_customization.py` prints, under `config`, with the
     /// central configuration's roots (R96) and the overlays' absence (R97).

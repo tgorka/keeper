@@ -999,6 +999,11 @@ pub async fn stream_chat(
     let attempts = options.max_attempts.max(1);
 
     for attempt in 0..attempts {
+        // A stopped turn sends nothing more: neither this attempt nor a
+        // retry of one.
+        if cancel.is_cancelled() {
+            return Ok(cancelled_before(sink, 0));
+        }
         let failure = match attempt_stream(
             client,
             endpoint,
@@ -1027,7 +1032,12 @@ pub async fn stream_chat(
                 wait_ms = wait.as_millis() as u64,
                 "bots: retrying a chat request that produced no bytes"
             );
-            tokio::time::sleep(wait).await;
+            let mut stop = cancel.clone();
+            tokio::select! {
+                biased;
+                () = stop.cancelled() => return Ok(cancelled_before(sink, 0)),
+                () = tokio::time::sleep(wait) => {}
+            }
             continue;
         }
 
@@ -1064,6 +1074,20 @@ pub async fn stream_chat(
 fn backoff(base: Duration, attempt: u32) -> Duration {
     let factor = 2u32.saturating_pow(attempt);
     base.saturating_mul(factor)
+}
+
+/// What a request Stop ended before any of its answer arrived: nothing,
+/// [`FinishReason::Cancelled`] — a Stop that waits on a silent connect or a
+/// back-off would not stop anything.
+fn cancelled_before(sink: ChatSink<'_>, total_ms: u64) -> ChatOutcome {
+    sink(ChatEvent::Finished {
+        reason: FinishReason::Cancelled,
+    });
+    ChatOutcome {
+        finish_reason: FinishReason::Cancelled,
+        total_ms,
+        ..ChatOutcome::default()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1107,7 +1131,14 @@ async fn attempt_stream(
         })
     })?;
 
-    let mut response = match request.send().await {
+    let sent = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            return Ok(cancelled_before(sink, started.elapsed().as_millis() as u64));
+        }
+        sent = request.send() => sent,
+    };
+    let mut response = match sent {
         Ok(response) => response,
         Err(err) => {
             return Err(Box::new(AttemptFailure {

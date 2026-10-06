@@ -164,6 +164,10 @@ pub const TOO_MANY_CALLS: &str =
     "keeper runs a limited number of tool calls per round and this one was past it. Ask for it \
      again in your next turn.";
 
+/// What a call of a round Stop ended before it ran is told: nothing of a
+/// stopped turn runs after the Stop.
+pub const STOPPED: &str = "keeper stopped this turn before this call ran.";
+
 // ---------------------------------------------------------------------------
 // The vocabulary
 // ---------------------------------------------------------------------------
@@ -518,6 +522,12 @@ pub trait ToolHost: Send + Sync {
     fn run_named(&self, _wire: &WireToolCall) -> Option<ToolOutcome> {
         None
     }
+
+    /// Told a round's calls once, before the first of them runs — only
+    /// those it will run. A host that runs some of them side by side starts
+    /// them here and answers each from [`Self::run_named`] in the round's
+    /// order (R110: an agent's `helper` calls). No ⌘9 host does anything.
+    fn prepare_round(&self, _calls: &[WireToolCall]) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -1304,6 +1314,20 @@ pub async fn run_tool_loop_gated(
 
     loop {
         let tools_offered = rounds < budget;
+        // A stopped turn sends no further request (R203).
+        if cancel.is_cancelled() {
+            return Ok(ToolLoopOutcome {
+                final_outcome: ChatOutcome {
+                    finish_reason: FinishReason::Cancelled,
+                    ..ChatOutcome::default()
+                },
+                appended,
+                rounds,
+                exhausted: false,
+                calls,
+                parked: None,
+            });
+        }
         gate(rounds)?;
         sink(ToolLoopEvent::RoundStarted {
             round: rounds,
@@ -1338,7 +1362,11 @@ pub async fn run_tool_loop_gated(
         };
         rounds += 1;
 
-        if !tools_offered || outcome.tool_calls.is_empty() {
+        // A stream Stop cut runs none of its calls: what arrived is kept.
+        if !tools_offered
+            || outcome.tool_calls.is_empty()
+            || outcome.finish_reason == FinishReason::Cancelled
+        {
             return Ok(ToolLoopOutcome {
                 final_outcome: outcome,
                 appended,
@@ -1368,6 +1396,13 @@ pub async fn run_tool_loop_gated(
             sink(ToolLoopEvent::RoundsExhausted { rounds });
         }
 
+        if !exhausted {
+            let runs = outcome
+                .tool_calls
+                .len()
+                .min(loop_options.max_calls_per_round);
+            host.prepare_round(&outcome.tool_calls[..runs]);
+        }
         let mut parked = None;
         for (index, wire) in outcome.tool_calls.iter().enumerate() {
             let (record, ran) = if exhausted {
@@ -1388,18 +1423,23 @@ pub async fn run_tool_loop_gated(
                         reason: ROUNDS_EXHAUSTED.to_owned(),
                     },
                 )
-            } else if index >= loop_options.max_calls_per_round {
+            } else if index >= loop_options.max_calls_per_round || cancel.is_cancelled() {
+                let refusal = if cancel.is_cancelled() {
+                    STOPPED
+                } else {
+                    TOO_MANY_CALLS
+                };
                 (
                     ToolCallRecord {
                         id: wire.id.clone(),
                         requested_name: wire.name.clone(),
                         name: ToolName::from_wire(&wire.name),
                         display_path: None,
-                        refusal: Some(TOO_MANY_CALLS.to_owned()),
+                        refusal: Some(refusal.to_owned()),
                         grant_denied: false,
                     },
                     ToolOutcome::Refused {
-                        reason: TOO_MANY_CALLS.to_owned(),
+                        reason: refusal.to_owned(),
                     },
                 )
             } else {

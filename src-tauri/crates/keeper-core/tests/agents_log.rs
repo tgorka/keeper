@@ -1780,3 +1780,94 @@ fn attachments_and_a_peer_question_replay_as_they_were_sent() {
     );
     assert!(!sent[2].contains("Question q0"), "{}", sent[2]);
 }
+
+/// 94.4 acceptance 5, the reader's half: a helper's own steps — its
+/// model's rounds, its calls and their results, under its `tool_call` — are
+/// in the log and out of the replay. The session's messages are its own
+/// model's, the helper's result among them, even where a step's call id is
+/// the helper call's own.
+#[test]
+fn helper_steps_are_in_the_log_and_out_of_the_replay() {
+    let scratch = Scratch::new();
+    let session = &scratch.0;
+    let mut writer = ChunkWriter::open(session, &host("electra"), ROTATE, day()).expect("open");
+    let mut seq = 0u64;
+    let mut next = |parent: Option<Ulid>, body: LineBody| {
+        seq += 1;
+        let mut written = line("electra", 1, at(seq as i64), seq, body);
+        written.parent = parent;
+        writer.append(&written).expect("append");
+        written.id
+    };
+    let assistant = |text: &str, finish: &str, tokens: u32| {
+        LineBody::Assistant(AssistantBody {
+            text: text.to_owned(),
+            model: "m".to_owned(),
+            finish: finish.to_owned(),
+            usage: Usage {
+                prompt: Some(tokens),
+                completion: Some(0),
+            },
+            ttft_ms: None,
+            duration_ms: 0,
+            anchor_event: None,
+        })
+    };
+    let call = |id: &str, tool: &str| {
+        LineBody::ToolCall(ToolCallBody {
+            call_id: id.to_owned(),
+            tool: tool.to_owned(),
+            args: "{}".to_owned(),
+            tier: 0,
+            grant_id: None,
+        })
+    };
+    let result = |id: &str, content: &str| {
+        LineBody::ToolResult(ToolResultBody {
+            call_id: id.to_owned(),
+            outcome: ToolOutcomeWord::Ok,
+            content: content.to_owned(),
+            truncated: None,
+            label: tg_label(),
+        })
+    };
+    next(
+        None,
+        LineBody::User(UserBody {
+            sender: user("@tgorka:h"),
+            text: "review it".to_owned(),
+            attachments: Vec::new(),
+        }),
+    );
+    let round = next(None, assistant("", "tool_calls", 10));
+    let helper = next(Some(round), call("c1", "helper"));
+    let answered = next(
+        Some(helper),
+        result("c1", "The helper answered: one finding."),
+    );
+    next(Some(helper), assistant("", "tool_calls", 1500));
+    let step = next(Some(helper), call("c1", "drive_read"));
+    next(Some(step), result("c1", "the file the helper read"));
+    next(Some(helper), assistant("one finding", "stop", 1500));
+    next(Some(answered), assistant("done.", "stop", 20));
+    writer.sync().expect("sync");
+
+    let log = read_session(session);
+    assert_eq!(log.lines.len(), 9, "every step is in the log");
+    let replayed = replay(&log, &|name| hydrate_blob(session, name)).expect("replay");
+    let shown = format!("{:?}", replayed.messages);
+    assert_eq!(replayed.messages.len(), 4, "{shown}");
+    let calls: Vec<&str> = replayed.messages[1]
+        .tool_calls
+        .iter()
+        .map(|call| call.name.as_str())
+        .collect();
+    assert_eq!(calls, ["helper"]);
+    assert_eq!(replayed.messages[2].tool_call_id.as_deref(), Some("c1"));
+    assert!(
+        shown.contains("The helper answered: one finding."),
+        "{shown}"
+    );
+    assert!(!shown.contains("the file the helper read"), "{shown}");
+    assert!(!shown.contains("drive_read"), "{shown}");
+}

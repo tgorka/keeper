@@ -294,6 +294,14 @@ pub trait TurnView: Sync {
     /// Whether this session is a workflow's run that has ended — replied,
     /// or failed: it takes no more effects (R202).
     fn ended(&self) -> bool;
+    /// The tokens the turn under way has spent so far: its rounds' and its
+    /// helpers' (R111).
+    fn turn_spend(&self) -> u64;
+    /// A delegated session's or a workflow's run's own token budget, when
+    /// it has one: what the session has spent — the round under way
+    /// included — and its limit. A helper stops at it as the run's next
+    /// round would (Q12, R111, R214).
+    fn session_budget(&self) -> Option<(u64, u64)>;
 }
 
 #[derive(Debug, Deserialize)]

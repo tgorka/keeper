@@ -7,11 +7,14 @@
 //! [`SessionLog`] already read: a host serving a session keeps the history in
 //! memory from the writer's receipts and never re-reads the log on a turn.
 
+use std::collections::{HashMap, HashSet};
+
 use serde_json::Value;
 use ulid::Ulid;
 
 use super::reader::SessionLog;
 use super::{LineBody, LogError, LogLine, OpenBody, PeerBody, UserBody};
+use crate::agents::helper::HELPER;
 use crate::bots::chat::{ChatMessage, ContentPart, Role, ToolCall};
 
 /// The heading of the system message a `compact` line becomes.
@@ -150,6 +153,41 @@ struct Placed {
     message: ChatMessage,
 }
 
+/// Which lines are a helper's own steps (94.4): in the log, under the
+/// helper's `tool_call`, and never in the conversation — its model's
+/// rounds, its calls and their results, which the session's model never
+/// saw. A step is a line whose `parent` is a `helper` `tool_call` line
+/// other than that call's own result, or is a step. Only the tokens a
+/// step's round spent still count.
+#[derive(Debug, Clone, Default)]
+pub struct HelperSteps {
+    /// Each `helper` call's line, and its call id.
+    calls: HashMap<Ulid, String>,
+    steps: HashSet<Ulid>,
+}
+
+impl HelperSteps {
+    /// Whether `line`, read in log order, is a helper's step.
+    pub fn is_step(&mut self, line: &LogLine) -> bool {
+        if let Some(parent) = line.parent {
+            let own_result = matches!(
+                &line.body,
+                LineBody::ToolResult(result) if self.calls.get(&parent) == Some(&result.call_id)
+            );
+            if self.steps.contains(&parent) || (self.calls.contains_key(&parent) && !own_result) {
+                self.steps.insert(line.id);
+                return true;
+            }
+        }
+        if let LineBody::ToolCall(call) = &line.body {
+            if call.tool == HELPER {
+                self.calls.insert(line.id, call.call_id.clone());
+            }
+        }
+        false
+    }
+}
+
 /// Replay `log` into the messages the model saw, hydrating blobs through
 /// `blobs` (given a blob's name, its stored JSON).
 pub fn replay(
@@ -161,6 +199,7 @@ pub fn replay(
     }
     let mut placed: Vec<Placed> = Vec::new();
     let mut last_open = None;
+    let mut helpers = HelperSteps::default();
     for (position, stored) in log.lines.iter().enumerate() {
         let hydrated;
         let line = match &stored.body {
@@ -183,6 +222,9 @@ pub fn replay(
             }
             _ => stored,
         };
+        if helpers.is_step(line) {
+            continue;
+        }
 
         match &line.body {
             LineBody::Open(open) => last_open = Some(open.clone()),

@@ -240,6 +240,8 @@ fn broken(text: &str) -> Completion {
 struct Stub {
     url: String,
     requests: Arc<Mutex<Vec<Value>>>,
+    /// When each chat request arrived, in `requests`' order.
+    arrived: Arc<Mutex<Vec<std::time::Instant>>>,
     hits: Arc<AtomicUsize>,
 }
 
@@ -248,8 +250,10 @@ impl Stub {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let url = format!("http://{}", listener.local_addr().expect("addr"));
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let arrived = Arc::new(Mutex::new(Vec::new()));
         let hits = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&requests);
+        let at = Arc::clone(&arrived);
         let counted = Arc::clone(&hits);
         let script = Arc::new(Mutex::new(script.into_iter().rev().collect::<Vec<_>>()));
         std::thread::spawn(move || {
@@ -257,6 +261,7 @@ impl Stub {
                 let Ok(mut socket) = socket else { continue };
                 counted.fetch_add(1, Ordering::SeqCst);
                 let seen = Arc::clone(&seen);
+                let at = Arc::clone(&at);
                 let script = Arc::clone(&script);
                 std::thread::spawn(move || {
                     let _ = socket.set_read_timeout(Some(Duration::from_secs(10)));
@@ -284,9 +289,10 @@ impl Stub {
                         let _ = write!(socket, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                         return;
                     }
-                    seen.lock()
-                        .expect("lock")
-                        .push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+                    let mut seen = seen.lock().expect("lock");
+                    seen.push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+                    at.lock().expect("lock").push(std::time::Instant::now());
+                    drop(seen);
                     let completion = script
                         .lock()
                         .expect("lock")
@@ -304,9 +310,22 @@ impl Stub {
                     };
                     let (named, asked) = (said(DELEGATION_SAID), said(ASK_SAID));
                     // A `{"pause_ms": n}` entry is no frame: the stream
-                    // waits there, so the edits in between are paced.
+                    // waits there, so the edits in between are paced. A
+                    // `{"hold_ms": n}` holds the response's headers that
+                    // long; a `{"status": s, "retry_after": secs}` answers
+                    // with that status and no body at all.
                     let mut parts: Vec<(String, u64)> = Vec::new();
+                    let mut hold = 0;
                     for data in completion {
+                        if let Some(status) = data["status"].as_u64() {
+                            let after = data["retry_after"].as_u64().unwrap_or(0);
+                            let _ = write!(socket, "HTTP/1.1 {status} Unavailable\r\nRetry-After: {after}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                            return;
+                        }
+                        if let Some(ms) = data["hold_ms"].as_u64() {
+                            hold = ms;
+                            continue;
+                        }
                         match data["pause_ms"].as_u64() {
                             Some(pause) => parts.push((String::new(), pause)),
                             None => {
@@ -323,6 +342,7 @@ impl Stub {
                     }
                     parts.push(("data: [DONE]\n\n".to_owned(), 0));
                     let length: usize = parts.iter().map(|(frame, _)| frame.len()).sum();
+                    std::thread::sleep(Duration::from_millis(hold));
                     let _ = write!(
                         socket,
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
@@ -338,12 +358,17 @@ impl Stub {
         Stub {
             url,
             requests,
+            arrived,
             hits,
         }
     }
 
     fn requests(&self) -> Vec<Value> {
         self.requests.lock().expect("lock").clone()
+    }
+
+    fn arrived(&self) -> Vec<std::time::Instant> {
+        self.arrived.lock().expect("lock").clone()
     }
 }
 
@@ -487,6 +512,7 @@ fn world_in(
             ..TurnEnv::new(Arc::new(DataDir(data.clone())))
         },
         data_dir: data,
+        rows: vec![row.clone()],
         row,
         bot: Bot {
             id: "agent:tgdrive/nixi".to_owned(),
@@ -2343,6 +2369,7 @@ fn tolas_deps(world: &World) -> AgentDeps {
         env: world.deps.env.clone(),
         data_dir: world.deps.data_dir.clone(),
         row: world.deps.row.clone(),
+        rows: world.deps.rows.clone(),
         bot: world.deps.bot.clone(),
         home,
         host: world.deps.host.clone(),
@@ -2942,6 +2969,7 @@ fn deps_of(world: &World, folder: &str, agent_toml: &str) -> AgentDeps {
         env: world.deps.env.clone(),
         data_dir: world.deps.data_dir.clone(),
         row: world.deps.row.clone(),
+        rows: world.deps.rows.clone(),
         bot: world.deps.bot.clone(),
         host: world.deps.host.clone(),
         drives: world.deps.drives.clone(),
@@ -8310,6 +8338,166 @@ mod parks {
         assert_eq!(kinds(&world.lines(SESSION), LineKind::ToolCall).len(), 4);
     }
 
+    /// Nixi allowed reads, writes and helpers, `extra` in her `agent.toml`,
+    /// with a decision source.
+    fn helping(script: Vec<Completion>, extra: &str) -> (World, Arc<Approvals>) {
+        let allow = ["drive_read", "drive_write", "helper"];
+        let mut world = world(ProviderKind::OpenAi, &allow, script);
+        world.deps = deps_of(&world, "nixi", &super::helpers::nixi_toml(&allow, extra));
+        world.deps.decisions = Some(Admit::pinned());
+        (world, Arc::new(Approvals::default()))
+    }
+
+    fn helper_requests(world: &World) -> usize {
+        world
+            .stub
+            .requests()
+            .iter()
+            .filter(|r| super::helpers::is_helper(r))
+            .count()
+    }
+
+    /// The round lines under helper call `id`: one per round it ran.
+    fn helper_rounds(world: &World, id: &str) -> usize {
+        let lines = world.lines(SESSION);
+        super::helpers::steps(&lines, super::helpers::call_line(&lines, id))
+            .iter()
+            .filter(|line| line.kind() == LineKind::Assistant)
+            .count()
+    }
+
+    /// R203 (R94H-01): a helper after a call that parks is not launched
+    /// before a person decides. Approved — in this process or after a
+    /// restart — it runs once, its answer and its round's line written
+    /// once; denied, it never runs and is answered as not run. In a round
+    /// helper, parking call, helper, the first runs before the park, once,
+    /// and is not run again on approval; the second runs only after it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_helper_runs_once_on_its_side_of_a_park() {
+        let look = ("h1", "helper", json!({"brief": "Look."}));
+        for (case, decision, restart) in [
+            ("approved", Decision::Approve, false),
+            ("denied", Decision::Deny, false),
+            ("approved after a restart", Decision::Approve, true),
+        ] {
+            let (mut world, approvals) = helping(
+                vec![
+                    calls(&[write_note("w1", "after"), look.clone()]),
+                    prose("helper finding"),
+                    prose("Done."),
+                ],
+                "",
+            );
+            let mut served = open(&world, &approvals);
+            let parked = report(world.ask(&mut served, "write, then look").await);
+            assert_eq!(parked.ending, TurnEnding::Parked, "{case}");
+            assert_eq!(
+                helper_requests(&world),
+                0,
+                "{case}: launched before the decision"
+            );
+            let record = world.record();
+            if restart {
+                drop(served);
+                served = open(&world, &approvals);
+            }
+            let decided = world.decision(&record, decision);
+            world.serve(&mut served, decided).await;
+            let helped = result_of(&results(&world), "h1").clone();
+            if decision == Decision::Approve {
+                assert_eq!(helper_requests(&world), 1, "{case}");
+                assert_eq!(helped.outcome, ToolOutcomeWord::Ok, "{case}");
+                assert!(helped.content.contains("helper finding"), "{case}");
+                assert_eq!(helper_rounds(&world, "h1"), 1, "{case}");
+            } else {
+                assert_eq!(helper_requests(&world), 0, "{case}");
+                assert_eq!(helped.outcome, ToolOutcomeWord::Refused, "{case}");
+                assert!(
+                    helped.content.contains(NOT_RUN),
+                    "{case}: {}",
+                    helped.content
+                );
+                assert_eq!(helper_rounds(&world, "h1"), 0, "{case}");
+            }
+        }
+
+        let (mut world, approvals) = helping(
+            vec![
+                calls(&[
+                    look,
+                    write_note("w2", "after"),
+                    ("h3", "helper", json!({"brief": "Look again."})),
+                ]),
+                prose("helper finding"),
+                prose("second finding"),
+                prose("Done."),
+            ],
+            "",
+        );
+        let mut served = open(&world, &approvals);
+        let parked = report(world.ask(&mut served, "look, then write").await);
+        assert_eq!(parked.ending, TurnEnding::Parked);
+        assert_eq!(
+            helper_requests(&world),
+            1,
+            "only the helper before the park"
+        );
+        let record = world.record();
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert_eq!(world.note().as_deref(), Some("after"));
+        assert_eq!(helper_requests(&world), 2, "the first not run again");
+        assert_eq!(helper_rounds(&world, "h1"), 1);
+        assert_eq!(helper_rounds(&world, "h3"), 1);
+        let results = results(&world);
+        assert!(result_of(&results, "h1").content.contains("helper finding"));
+        assert!(result_of(&results, "h3").content.contains("second finding"));
+    }
+
+    /// R203 (R94H-03): a turn on a 2000-token budget spends 1900 and parks.
+    /// Approved — in this process or after a restart — it goes on with
+    /// that spend: its next round spends 100, so that round's helper
+    /// reaches no model, and the turn ends spent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_turn_keeps_the_spend_it_parked_with() {
+        use keeper_core::agents::helper::TURN_SPENT;
+        let spending = super::helpers::spending;
+        for restart in [false, true] {
+            let (mut world, approvals) = helping(
+                vec![
+                    spending(calls(&[write_note("w1", "after")]), 1900),
+                    spending(
+                        calls(&[("h2", "helper", json!({"brief": "Check it."}))]),
+                        100,
+                    ),
+                    prose("never asked"),
+                    prose("never asked"),
+                ],
+                "\n[limits]\ntokens_per_turn = 2000\n",
+            );
+            let mut served = open(&world, &approvals);
+            let parked = report(world.ask(&mut served, "write a note").await);
+            assert_eq!(parked.ending, TurnEnding::Parked);
+            let record = world.record();
+            if restart {
+                drop(served);
+                served = open(&world, &approvals);
+            }
+            let decided = world.decision(&record, Decision::Approve);
+            world.serve(&mut served, decided).await;
+            assert_eq!(world.note().as_deref(), Some("after"), "{restart}");
+            assert_eq!(helper_requests(&world), 0, "{restart}");
+            assert_eq!(world.stub.requests().len(), 2, "{restart}");
+            let checked = result_of(&results(&world), "h2").clone();
+            assert_eq!(checked.outcome, ToolOutcomeWord::Refused, "{restart}");
+            assert!(
+                checked.content.ends_with(TURN_SPENT),
+                "{restart}: {}",
+                checked.content
+            );
+        }
+    }
+
     /// R74 in the person's own conversation: their new message denies what
     /// waits, superseded, and then runs as a turn over a whole transcript.
     #[tokio::test(flavor = "multi_thread")]
@@ -9949,6 +10137,7 @@ mod parks {
             },
             data_dir: world.deps.data_dir.clone(),
             row: world.deps.row.clone(),
+            rows: world.deps.rows.clone(),
             bot: world.deps.bot.clone(),
             home: world.deps.home.clone(),
             host: world.deps.host.clone(),
@@ -12708,6 +12897,7 @@ mod workflows {
             env: deps.env.clone(),
             data_dir: deps.data_dir.clone(),
             row: deps.row.clone(),
+            rows: deps.rows.clone(),
             bot: deps.bot.clone(),
             home: deps.home.clone(),
             host: HostSlug::new(host).expect("slug"),
@@ -13297,10 +13487,11 @@ mod workflows {
     }
 
     /// R202 (R94W-03): a run is admitted by what its turns would be
-    /// offered, not by `allow`. `helper` is in Tola's `allow` but no turn
-    /// is offered it on this rung: a workflow naming it is refused. `reply`
-    /// is not in her `allow`, but every run is offered it by its kind: a
-    /// workflow naming it starts.
+    /// offered, not by `allow`. `run` is in Tola's `allow` but no turn is
+    /// offered it on this rung: a workflow naming it is refused. `helper`,
+    /// in her `allow`, is offered to a run's turns: a workflow naming it
+    /// starts. `reply` is not in her `allow`, but every run is offered it
+    /// by its kind: a workflow naming it starts.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_run_is_admitted_by_what_its_turns_are_offered() {
         let world = world(
@@ -13308,11 +13499,17 @@ mod workflows {
             &["drive_read"],
             vec![
                 calls(&[
+                    ("x1", "workflow_start", json!({"name": "running"})),
                     ("h1", "workflow_start", json!({"name": "helping"})),
                     ("y1", "workflow_start", json!({"name": "replying"})),
                 ]),
-                prose("One started."),
+                prose("Two started."),
             ],
+        );
+        put(
+            &world,
+            "running",
+            "version = 1\nname = \"running\"\ndescription = \"Runs.\"\ntools = [\"run\"]\n",
         );
         put(
             &world,
@@ -13325,23 +13522,25 @@ mod workflows {
             "version = 1\nname = \"replying\"\ndescription = \"Replies.\"\ntools = [\"reply\"]\n",
         );
         let mut allow = RUNS.to_vec();
-        allow.push("helper");
+        allow.extend(["run", "helper"]);
         let mut desk = desk_of(&world, HOURLY, tolas(&world, &allow));
         report(desk.serve(hour(9)).await);
         let results = tool_results(&world.lines(DESK));
-        let helping = result_of(&results, "h1");
+        let running = result_of(&results, "x1");
         assert_eq!(
-            helping.content,
-            "Refused: `helping` needs `helper`, which `tola` is not allowed."
+            running.content,
+            "Refused: `running` needs `run`, which `tola` is not allowed."
         );
-        let replying = result_of(&results, "y1");
-        assert_eq!(
-            replying.outcome,
-            ToolOutcomeWord::Ok,
-            "{}",
-            replying.content
-        );
-        assert_eq!(desk.rooms.made().len(), 1);
+        for started in ["h1", "y1"] {
+            let result = result_of(&results, started);
+            assert_eq!(
+                result.outcome,
+                ToolOutcomeWord::Ok,
+                "{started}: {}",
+                result.content
+            );
+        }
+        assert_eq!(desk.rooms.made().len(), 2);
         // The started run's audit row names the folder its brief landed in.
         let folder = format!("60-sessions/{}", desk.run_of(&world, "y1"));
         assert!(
@@ -13724,6 +13923,335 @@ mod workflows {
             Some(LogRun::Review)
         );
         assert!(run.workflow_arrivals(&desk.tola).expect("steps").is_empty());
+    }
+
+    /// R111 inside a workflow's run (Q12, R202): a helper obeys the run as
+    /// the run's own next round would. A run whose first round spends its
+    /// 2000-token budget and calls a helper: the helper reaches no model,
+    /// refused with the run's bound, and the turn ends `Bounded`. A run
+    /// whose round replies and then calls a helper: the run ended at its
+    /// reply, so the helper is refused as every later call is and reaches
+    /// no model either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_helper_in_a_run_stops_at_its_budget_and_its_reply() {
+        use super::helpers::{is_helper, spending};
+        let tola_of = |world: &World| {
+            let mut allow = RUNS.to_vec();
+            allow.push("helper");
+            deps_of(
+                world,
+                "tola",
+                &format!(
+                    "{}\n[limits]\ntokens_per_delegation = 2000\n",
+                    steward_toml("tola", "Dr Tola Grey", &allow)
+                ),
+            )
+        };
+        let helper = |id: &'static str| (id, "helper", json!({"brief": "Read on."}));
+
+        let world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                start("w1", EPICS, json!({})),
+                prose("Started."),
+                spending(calls(&[helper("h1")]), 2000),
+                prose("Never asked."),
+            ],
+        );
+        install(&world, EPICS, &as_is);
+        let mut desk = desk_of(&world, HOURLY, tola_of(&world));
+        report(desk.serve(hour(9)).await);
+        let path = desk.run_of(&world, "w1");
+        let (mut run, room) = desk.open_run(&world, &path);
+        let turn = report(begin(&desk.tola, &mut run, &room).await);
+        assert_eq!(turn.ending, TurnEnding::Bounded);
+        let requests = world.stub.requests();
+        assert_eq!(requests.len(), 3, "no helper request, no next round");
+        assert!(!requests.iter().any(is_helper));
+        let refused = result_of(&tool_results(&world.lines(&path)), "h1").clone();
+        let bound = keeper_core::agents::delegation::BoundReached::Tokens {
+            spent: 2000,
+            limit: 2000,
+        }
+        .sentence();
+        assert_eq!(refused.outcome, ToolOutcomeWord::Refused);
+        assert!(refused.content.ends_with(&bound), "{}", refused.content);
+
+        let world = super::world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                start("w1", EPICS, json!({})),
+                prose("Started."),
+                calls(&[("r1", "reply", json!({"text": "Done."})), helper("h2")]),
+                prose("Never asked."),
+            ],
+        );
+        install(&world, EPICS, &as_is);
+        let mut desk = desk_of(&world, HOURLY, tola_of(&world));
+        report(desk.serve(hour(9)).await);
+        let path = desk.run_of(&world, "w1");
+        let (mut run, room) = desk.open_run(&world, &path);
+        report(begin(&desk.tola, &mut run, &room).await);
+        let requests = world.stub.requests();
+        assert_eq!(requests.len(), 3, "no helper request, no next round");
+        assert!(!requests.iter().any(is_helper));
+        let lines = world.lines(&path);
+        assert_eq!(
+            result_of(&tool_results(&lines), "h2").content,
+            format!("Refused: {}", keeper_agent::agent::RUN_ENDED)
+        );
+        assert_eq!(
+            run_states(&lines).last().map(|(state, _)| *state),
+            Some(LogRun::Review)
+        );
+    }
+
+    /// Tola allowed every fixture tool and `helper`, `limits` her
+    /// `[limits]`; her desk has started the format-C fixture as `w1`, and
+    /// the run's first turn is served. `script` follows the desk's two
+    /// requests.
+    async fn a_run_of(
+        limits: &str,
+        script: Vec<Completion>,
+    ) -> (
+        World,
+        Desk,
+        String,
+        ServedSession,
+        Arc<Room>,
+        keeper_agent::agent::TurnReport,
+    ) {
+        let mut all = vec![start("w1", EPICS, json!({})), prose("Started.")];
+        all.extend(script);
+        let world = world(ProviderKind::OpenAi, &["drive_read"], all);
+        install(&world, EPICS, &as_is);
+        let mut allow = RUNS.to_vec();
+        allow.push("helper");
+        let tola = deps_of(
+            &world,
+            "tola",
+            &format!(
+                "{}\n[limits]\n{limits}",
+                steward_toml("tola", "Dr Tola Grey", &allow)
+            ),
+        );
+        let mut desk = desk_of(&world, HOURLY, tola);
+        report(desk.serve(hour(9)).await);
+        let path = desk.run_of(&world, "w1");
+        let (mut run, room) = desk.open_run(&world, &path);
+        let turn = report(begin(&desk.tola, &mut run, &room).await);
+        (world, desk, path, run, room, turn)
+    }
+
+    fn helper_call(id: &'static str) -> (&'static str, &'static str, Value) {
+        (id, "helper", json!({"brief": "Read on."}))
+    }
+
+    fn read_call(id: &'static str) -> Completion {
+        calls(&[(
+            id,
+            "drive_read",
+            json!({"profile": "tgdrive", "path": "notes/hello.md"}),
+        )])
+    }
+
+    fn run_bound(spent: u64) -> String {
+        keeper_core::agents::delegation::BoundReached::Tokens { spent, limit: 2000 }.sentence()
+    }
+
+    /// R215 (R94HM-01, R111): a run whose turn its own `tokens_per_turn`
+    /// stops — its round's 100 tokens and its helper's 1900 — waits
+    /// `blocked` with `turn_tokens`, in its log and on its card, takes no
+    /// continuation, and reads so again once reloaded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_its_turn_budget_stopped_waits_blocked() {
+        use super::helpers::spending;
+        let (world, desk, path, run, _room, turn) = a_run_of(
+            "tokens_per_turn = 2000\n",
+            vec![
+                spending(calls(&[helper_call("h1")]), 100),
+                spending(prose("Found it."), 1900),
+                prose("Never asked."),
+            ],
+        )
+        .await;
+        assert_eq!(turn.ending, TurnEnding::Spent);
+        assert_eq!(world.stub.requests().len(), 4, "no round after the helper");
+        let blocked = Some((LogRun::Blocked, Some("turn_tokens".to_owned())));
+        assert_eq!(run_states(&world.lines(&path)).last().cloned(), blocked);
+        assert_eq!(card_field(&world, &path, "run").as_deref(), Some("blocked"));
+        let mut run = run;
+        assert!(run.workflow_arrivals(&desk.tola).expect("steps").is_empty());
+        drop(run);
+        let (mut reloaded, _) = desk.open_run(&world, &path);
+        assert!(reloaded
+            .workflow_arrivals(&desk.tola)
+            .expect("steps")
+            .is_empty());
+        assert_eq!(run_states(&world.lines(&path)).last().cloned(), blocked);
+        assert_eq!(world.stub.requests().len(), 4);
+    }
+
+    /// R215 (R94HM-02): a run whose helper's 1900 tokens and its round's
+    /// 100 reach its 2000-token budget, and which then replies in the same
+    /// round, ended at that reply: one reply reaches its room, and its run
+    /// and card read `review`, never `blocked`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_that_replied_keeps_review_past_its_budget() {
+        use super::helpers::spending;
+        let (world, _desk, path, _run, room, turn) = a_run_of(
+            "tokens_per_delegation = 2000\n",
+            vec![
+                spending(
+                    calls(&[helper_call("h1"), ("r1", "reply", json!({"text": "Done."}))]),
+                    100,
+                ),
+                spending(prose("Found it."), 1900),
+                prose("Never asked."),
+            ],
+        )
+        .await;
+        assert_eq!(turn.ending, TurnEnding::Complete);
+        assert_eq!(world.stub.requests().len(), 4);
+        let replies = room
+            .sent()
+            .into_iter()
+            .filter(|(_, content)| content["dev.keeper.agent.artifacts"].is_array())
+            .count();
+        assert_eq!(replies, 1, "{:?}", room.sent());
+        assert_eq!(
+            run_states(&world.lines(&path))
+                .last()
+                .map(|(state, _)| *state),
+            Some(LogRun::Review)
+        );
+        assert_eq!(card_field(&world, &path, "run").as_deref(), Some("review"));
+    }
+
+    /// R215 (R94HM-03, R214): with both budgets at 2000, a helper stopped
+    /// where both are spent says the run's bound, as the run's own round
+    /// gate does — at its launch, after its round's 2000, and before its
+    /// second round, after its round's 100 and its own first round's 1900.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_helper_says_the_runs_bound_when_both_budgets_are_spent() {
+        use super::helpers::{is_helper, spending};
+        let both = "tokens_per_turn = 2000\ntokens_per_delegation = 2000\n";
+        let (world, _desk, path, _run, _room, turn) = a_run_of(
+            both,
+            vec![
+                spending(calls(&[helper_call("h1")]), 2000),
+                prose("Never asked."),
+            ],
+        )
+        .await;
+        assert_eq!(turn.ending, TurnEnding::Bounded);
+        assert!(!world.stub.requests().iter().any(is_helper));
+        let refused = result_of(&tool_results(&world.lines(&path)), "h1").clone();
+        assert!(
+            refused.content.ends_with(&run_bound(2000)),
+            "{}",
+            refused.content
+        );
+
+        let (world, _desk, path, _run, _room, turn) = a_run_of(
+            both,
+            vec![
+                spending(calls(&[helper_call("h1")]), 100),
+                spending(read_call("r1"), 1900),
+                prose("Never asked."),
+                prose("Never asked."),
+            ],
+        )
+        .await;
+        assert_eq!(turn.ending, TurnEnding::Bounded);
+        assert_eq!(world.stub.requests().len(), 4, "one helper round");
+        let refused = result_of(&tool_results(&world.lines(&path)), "h1").clone();
+        assert!(
+            refused.content.ends_with(&run_bound(2000)),
+            "{}",
+            refused.content
+        );
+    }
+
+    /// R214, R215 (R94HM-04): helpers that run inside a run are stopped
+    /// mid-way by the run's budget. One helper reads with 1900 tokens on
+    /// its first round, after the round's 100: its second round is never
+    /// sent. Two helpers launched together: one answers at once with 1900,
+    /// the other reads with 200 a moment later, and its next round would
+    /// follow 2200 spent: it is never sent. Each time the helper says the
+    /// bound, no further request leaves, the turn ends `Bounded`, the
+    /// usage stays in the log once reloaded, and no continuation follows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn helpers_in_a_run_stop_mid_way_at_its_budget() {
+        use super::helpers::{call_line, is_helper, spending, steps};
+        let limits = "tokens_per_delegation = 2000\n";
+        let (world, desk, path, run, _room, turn) = a_run_of(
+            limits,
+            vec![
+                spending(calls(&[helper_call("h1")]), 100),
+                spending(read_call("r1"), 1900),
+                prose("Never asked."),
+                prose("Never asked."),
+            ],
+        )
+        .await;
+        assert_eq!(turn.ending, TurnEnding::Bounded);
+        let requests = world.stub.requests();
+        assert_eq!(requests.len(), 4, "one helper round, no parent round");
+        assert_eq!(requests.iter().filter(|r| is_helper(r)).count(), 1);
+        let lines = world.lines(&path);
+        let refused = result_of(&tool_results(&lines), "h1").clone();
+        assert!(
+            refused.content.ends_with(&run_bound(2000)),
+            "{}",
+            refused.content
+        );
+        let spent: u32 = steps(&lines, call_line(&lines, "h1"))
+            .iter()
+            .filter_map(|line| match &line.body {
+                LineBody::Assistant(body) => body.usage.prompt,
+                _ => None,
+            })
+            .sum();
+        assert_eq!(spent, 1900, "the helper's round is in the log");
+        drop(run);
+        let (mut reloaded, _) = desk.open_run(&world, &path);
+        assert_eq!(reloaded.context.tokens_spent, 2000);
+        assert!(reloaded
+            .workflow_arrivals(&desk.tola)
+            .expect("steps")
+            .is_empty());
+
+        let mut slow_read = vec![json!({"pause_ms": 300})];
+        slow_read.extend(spending(read_call("r2"), 200));
+        let (world, _desk, path, _run, _room, turn) = a_run_of(
+            limits,
+            vec![
+                spending(calls(&[helper_call("h1"), helper_call("h2")]), 100),
+                spending(prose("Found it."), 1900),
+                slow_read,
+                prose("Never asked."),
+                prose("Never asked."),
+            ],
+        )
+        .await;
+        assert_eq!(turn.ending, TurnEnding::Bounded);
+        let requests = world.stub.requests();
+        assert_eq!(requests.len(), 5, "two helper requests, nothing after");
+        assert_eq!(requests.iter().filter(|r| is_helper(r)).count(), 2);
+        let results = tool_results(&world.lines(&path));
+        let (ok, stopped): (Vec<_>, Vec<_>) = ["h1", "h2"]
+            .iter()
+            .map(|id| result_of(&results, id).clone())
+            .partition(|result| result.outcome == ToolOutcomeWord::Ok);
+        assert_eq!((ok.len(), stopped.len()), (1, 1));
+        assert!(
+            stopped[0].content.ends_with(&run_bound(2200)),
+            "{}",
+            stopped[0].content
+        );
     }
 
     /// R202 (R94W-14): a run hands on a card of another session as the
@@ -14146,5 +14674,994 @@ mod workflows {
             told.contains("[C] Continue") && told.contains("It picks the choice C."),
             "{told}"
         );
+    }
+}
+
+/// Story 94.4: helpers and review layers, through the turn.
+mod helpers {
+    use std::time::Instant;
+
+    use keeper_core::agents::helper::{REFUSAL, TURN_SPENT};
+    use keeper_core::agents::label::LOCAL_ONLY_SINK;
+
+    use super::*;
+
+    /// Nixi's `agent.toml` allowed `allow`, `extra` after it.
+    pub(super) fn nixi_toml(allow: &[&str], extra: &str) -> String {
+        let allow: Vec<String> = allow.iter().map(|a| format!("\"{a}\"")).collect();
+        format!(
+            "version = 1\nid = \"nixi\"\nname = \"Nixi\"\nkind = \"proxy\"\nmatrix_user = \"@nixi:example.org\"\nhuman = \"{TGORKA}\"\n\n[model]\nbot = \"bot:openai:http://127.0.0.1:9#model\"\n\n[tools]\nallow = [{}]\ndrives = [\"tgdrive\", \"private\"]\n{extra}",
+            allow.join(", ")
+        )
+    }
+
+    /// A completion's usage frame: `tokens` prompt tokens.
+    pub(super) fn usage(tokens: u32) -> Value {
+        json!({"choices": [], "usage": {"prompt_tokens": tokens, "completion_tokens": 0, "total_tokens": tokens}})
+    }
+
+    /// `completion`, reporting `tokens`.
+    pub(super) fn spending(mut completion: Completion, tokens: u32) -> Completion {
+        completion.push(usage(tokens));
+        completion
+    }
+
+    /// Whether `request` is a helper's: its system message says so.
+    pub(super) fn is_helper(request: &Value) -> bool {
+        system_of(request).contains("# You are a helper")
+    }
+
+    fn system_of(request: &Value) -> &str {
+        request["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+    }
+
+    fn offered(request: &Value) -> Vec<&str> {
+        request["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| tool["function"]["name"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The `tool_call` line of call `id`.
+    pub(super) fn call_line<'l>(lines: &'l [LogLine], id: &str) -> &'l LogLine {
+        lines
+            .iter()
+            .find(|line| matches!(&line.body, LineBody::ToolCall(call) if call.call_id == id))
+            .unwrap_or_else(|| panic!("a tool_call line for {id}"))
+    }
+
+    /// The lines whose parent is the `tool_call` line `call`, but its own
+    /// result: a helper's steps.
+    pub(super) fn steps<'l>(lines: &'l [LogLine], call: &LogLine) -> Vec<&'l LogLine> {
+        let LineBody::ToolCall(own) = &call.body else {
+            panic!("a tool_call line")
+        };
+        lines
+            .iter()
+            .filter(|line| line.parent == Some(call.id))
+            .filter(|line| {
+                !matches!(&line.body, LineBody::ToolResult(result) if result.call_id == own.call_id)
+            })
+            .collect()
+    }
+
+    /// Every file under `root`, with its bytes, but what every turn writes:
+    /// the session's `log/` and the sessions zone's index.
+    fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(root: &Path, dir: &Path, skip: &[PathBuf], out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                let rel = path.strip_prefix(root).expect("inside").to_owned();
+                if skip.iter().any(|skipped| rel.starts_with(skipped)) {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(root, &path, skip, out);
+                } else {
+                    out.insert(rel, std::fs::read(&path).expect("read"));
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        let skip = [
+            PathBuf::from(format!("60-sessions/{SESSION}/log")),
+            PathBuf::from("60-sessions/.keeper"),
+        ];
+        walk(root, root, &skip, &mut out);
+        out
+    }
+
+    /// 94.4 acceptance 1: whatever a helper's model calls but a read is
+    /// answered "a helper cannot write, send, delegate or start another
+    /// helper" — the agent's own tools included — and the drive and the
+    /// session folder are byte for byte as they were. R203: each refused
+    /// step has exactly one audit row, refused and carrying the helper's
+    /// call, classified where its tool has a row of the tier table; a read
+    /// it made has its own one row and nothing more.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_helper_cannot_write_send_or_delegate() {
+        let forbidden = [
+            (
+                "w",
+                "drive_write",
+                json!({"profile": "tgdrive", "path": "notes/new.md", "content": "x"}),
+            ),
+            (
+                "e",
+                "drive_edit",
+                json!({"profile": "tgdrive", "path": "notes/hello.md", "old_text": "first", "new_text": "last"}),
+            ),
+            (
+                "s",
+                "session_write",
+                json!({"path": "artifacts/x.md", "content": "x"}),
+            ),
+            (
+                "d",
+                "delegate",
+                json!({"agent": "tgdrive/tola", "brief": "x"}),
+            ),
+            ("r", "reply", json!({"text": "x"})),
+            ("a", "ask_human", json!({"question": "Go on?"})),
+            (
+                "c",
+                "card_update",
+                json!({"card": "card.md", "fields": {"status": "done"}}),
+            ),
+            ("h", "helper", json!({"brief": "Go deeper."})),
+            ("j", "journal_append", json!({"text": "x"})),
+            ("m", "memory_propose", json!({"text": "x"})),
+            ("u", "run", json!({"command": "rm -rf notes"})),
+        ];
+        let read = (
+            "ok",
+            "drive_read",
+            json!({"profile": "tgdrive", "path": "notes/hello.md"}),
+        );
+        let mut last = forbidden[8..].to_vec();
+        last.push(read);
+        let mut world = world(
+            ProviderKind::Ollama,
+            &[
+                "drive_read",
+                "drive_write",
+                "drive_edit",
+                "session_write",
+                "card_update",
+                "delegate",
+                "helper",
+                "journal_append",
+                "memory_propose",
+                "run",
+            ],
+            vec![
+                calls(&[("h1", "helper", json!({"brief": "Try every tool."}))]),
+                calls(&forbidden[..8]),
+                calls(&last),
+                prose("Nothing would run."),
+                prose("The helper could change nothing."),
+            ],
+        );
+        write(&world.dir(SESSION), "card.md", CARD);
+        let mut served = world.open(SESSION);
+        let before = files(&world.tgdrive);
+        let turn = report(world.ask(&mut served, "try it").await);
+        assert_eq!(turn.ending, TurnEnding::Complete);
+
+        let lines = world.lines(SESSION);
+        let helper = call_line(&lines, "h1");
+        let made: Vec<(String, String)> = steps(&lines, helper)
+            .into_iter()
+            .filter_map(|line| match &line.body {
+                LineBody::ToolCall(call) if call.call_id != "ok" => Some(call.call_id.clone()),
+                _ => None,
+            })
+            .map(|id| {
+                let result = result_of(&tool_results(&lines), &id).clone();
+                assert_eq!(result.outcome, ToolOutcomeWord::Refused, "{id}");
+                (id, result.content)
+            })
+            .collect();
+        let tools: Vec<&str> = forbidden.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(
+            made.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            tools
+        );
+        for (id, content) in &made {
+            assert!(content.ends_with(REFUSAL), "{id}: {content}");
+        }
+        assert_eq!(
+            result_of(&tool_results(&lines), "h1").outcome,
+            ToolOutcomeWord::Ok
+        );
+        assert_eq!(
+            result_of(&tool_results(&lines), "ok").outcome,
+            ToolOutcomeWord::Ok
+        );
+        let rows = audit_list(&world, &served);
+        let mut refused: Vec<(String, bool)> = rows
+            .iter()
+            .filter(|row| row.message_id.as_deref() == Some("h1"))
+            .map(|row| {
+                assert_eq!(
+                    row.outcome,
+                    keeper_core::bots::audit::AuditOutcome::Refused,
+                    "{row:?}"
+                );
+                (row.tool.clone(), row.tier.is_some())
+            })
+            .collect();
+        refused.sort();
+        let mut expected: Vec<(String, bool)> = forbidden
+            .iter()
+            .map(|(_, tool, _)| {
+                let classified = keeper_core::agents::tier::AgentTool::from_wire(tool).is_some();
+                ((*tool).to_owned(), classified)
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(refused, expected);
+        let reads = rows.iter().filter(|row| row.tool == "drive_read").count();
+        assert_eq!(reads, 1, "{rows:?}");
+        assert_eq!(rows.len(), forbidden.len() + 2, "{rows:?}");
+        let after = files(&world.tgdrive);
+        let changed: Vec<&PathBuf> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|path| before.get(*path) != after.get(*path))
+            .collect();
+        assert!(changed.is_empty(), "changed: {changed:?}");
+    }
+
+    /// 94.4 acceptance 2: a helper's request holds the session's frame, its
+    /// brief and its inputs, and is offered only the reads the turn is —
+    /// none of the conversation, the soul or the core memory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_helper_request_is_context_free() {
+        let mut world = world(
+            ProviderKind::Ollama,
+            &["drive_read", "drive_write", "helper"],
+            vec![
+                prose("hi there."),
+                calls(&[(
+                    "h1",
+                    "helper",
+                    json!({"brief": "Say what the note holds.", "inputs": {"note": "notes/hello.md"}}),
+                )]),
+                prose("It holds two lines."),
+                prose("Two lines."),
+            ],
+        );
+        let mut served = world.open(SESSION);
+        report(world.ask(&mut served, "remember the blue door").await);
+        report(world.ask(&mut served, "what is in my note?").await);
+
+        let requests = world.stub.requests();
+        let helpers: Vec<&Value> = requests.iter().filter(|r| is_helper(r)).collect();
+        assert_eq!(helpers.len(), 1);
+        let request = helpers[0];
+        let messages = request["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 2, "{request}");
+        let system = system_of(request);
+        assert!(system.contains("You are nixi@electra."), "{system}");
+        let brief = messages[1]["content"].as_str().expect("the brief");
+        assert!(brief.contains("Say what the note holds."), "{brief}");
+        assert!(brief.contains("note: notes/hello.md"), "{brief}");
+        let whole = request.to_string();
+        for absent in [
+            "A quiet companion",
+            "Nixi answers from the drive",
+            "tgorka likes short answers",
+            "remember the blue door",
+            "hi there.",
+            "what is in my note?",
+        ] {
+            assert!(!whole.contains(absent), "{absent}: {whole}");
+        }
+        assert_eq!(offered(request), ["drive_read"]);
+    }
+
+    /// 94.4 acceptance 3: three helpers of one round, each answered after
+    /// 300 ms, are launched together and all awaited: the next request
+    /// leaves less than 600 ms after the first helper's, carrying all
+    /// three answers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_layers_run_in_parallel_and_are_all_awaited() {
+        let slow = |text: &str| {
+            let mut completion = vec![json!({"pause_ms": 300})];
+            completion.extend(prose(text));
+            completion
+        };
+        let mut world = world(
+            ProviderKind::Ollama,
+            &["helper"],
+            vec![
+                calls(&[
+                    ("h1", "helper", json!({"brief": "Review it blind."})),
+                    ("h2", "helper", json!({"brief": "Walk every branch."})),
+                    ("h3", "helper", json!({"brief": "Check the claims."})),
+                ]),
+                slow("finding A"),
+                slow("finding B"),
+                slow("finding C"),
+                prose("All three read."),
+            ],
+        );
+        let mut served = world.open(SESSION);
+        report(world.ask(&mut served, "review it").await);
+
+        let requests = world.stub.requests();
+        let arrived = world.stub.arrived();
+        let launched: Vec<Instant> = requests
+            .iter()
+            .zip(&arrived)
+            .filter(|(request, _)| is_helper(request))
+            .map(|(_, at)| *at)
+            .collect();
+        assert_eq!(launched.len(), 3);
+        let first = *launched.iter().min().expect("first");
+        let last = *launched.iter().max().expect("last");
+        assert!(
+            last - first < Duration::from_millis(300),
+            "each launched before any answered: {:?}",
+            last - first
+        );
+        let next = requests
+            .iter()
+            .zip(&arrived)
+            .rposition(|(request, _)| !is_helper(request))
+            .expect("the next request");
+        assert!(arrived[next] > last);
+        assert!(
+            arrived[next] - first < Duration::from_millis(600),
+            "{:?}",
+            arrived[next] - first
+        );
+        let after = requests[next].to_string();
+        for id in ["h1", "h2", "h3"] {
+            assert!(
+                after.contains(&format!("\"tool_call_id\":\"{id}\"")),
+                "{id}"
+            );
+        }
+        for finding in ["finding A", "finding B", "finding C"] {
+            assert!(after.contains(finding), "{finding}: {after}");
+        }
+    }
+
+    /// 94.4 acceptance 4 (R111, over two rounds): with `tokens_per_turn =
+    /// 2000`, a helper launched once the turn has spent 2000 — 1500 by the
+    /// first round's helper, 500 by the second round's own completion — is
+    /// stopped with "this turn's token budget is spent", and the turn ends
+    /// at its next round with the same sentence. A helper whose own rounds
+    /// reach the budget stops there too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn helper_tokens_count_against_the_turn() {
+        let budgeted = "\n[limits]\ntokens_per_turn = 2000\n";
+        let mut world = world(
+            ProviderKind::Ollama,
+            &["drive_read", "helper"],
+            vec![
+                calls(&[("h1", "helper", json!({"brief": "First."}))]),
+                spending(prose("finding A"), 1500),
+                spending(calls(&[("h2", "helper", json!({"brief": "Second."}))]), 500),
+                prose("never asked"),
+            ],
+        );
+        world.deps = deps_of(
+            &world,
+            "nixi",
+            &nixi_toml(&["drive_read", "helper"], budgeted),
+        );
+        let mut served = world.open(SESSION);
+        let turn = report(world.ask(&mut served, "two helpers").await);
+        assert_eq!(turn.ending, TurnEnding::Spent);
+        let requests = world.stub.requests();
+        assert_eq!(requests.len(), 3, "the second helper reached no model");
+        assert_eq!(requests.iter().filter(|r| is_helper(r)).count(), 1);
+        let lines = world.lines(SESSION);
+        let results = tool_results(&lines);
+        assert_eq!(result_of(&results, "h1").outcome, ToolOutcomeWord::Ok);
+        let second = result_of(&results, "h2");
+        assert_eq!(second.outcome, ToolOutcomeWord::Refused);
+        assert!(second.content.ends_with(TURN_SPENT), "{}", second.content);
+        let LineBody::Error(error) = &kinds(&lines, LineKind::Error).last().expect("error").body
+        else {
+            panic!("an error line")
+        };
+        assert_eq!(
+            (error.sentence.as_str(), error.code.as_str()),
+            (TURN_SPENT, "turn_tokens")
+        );
+
+        // One helper whose own first round spends the budget: stopped
+        // before its next round, and the turn with it.
+        let mut world = super::world(
+            ProviderKind::Ollama,
+            &["drive_read", "helper"],
+            vec![
+                calls(&[("h1", "helper", json!({"brief": "Read on."}))]),
+                spending(
+                    calls(&[(
+                        "r1",
+                        "drive_read",
+                        json!({"profile": "tgdrive", "path": "notes/hello.md"}),
+                    )]),
+                    2000,
+                ),
+                prose("never asked"),
+                prose("never asked"),
+            ],
+        );
+        world.deps = deps_of(
+            &world,
+            "nixi",
+            &nixi_toml(&["drive_read", "helper"], budgeted),
+        );
+        let mut served = world.open(SESSION);
+        let turn = report(world.ask(&mut served, "one helper").await);
+        assert_eq!(turn.ending, TurnEnding::Spent);
+        assert_eq!(world.stub.requests().len(), 2);
+        let lines = world.lines(SESSION);
+        let results = tool_results(&lines);
+        let only = result_of(&results, "h1");
+        assert_eq!(only.outcome, ToolOutcomeWord::Refused);
+        assert!(only.content.ends_with(TURN_SPENT), "{}", only.content);
+    }
+
+    /// 94.4 acceptance 5, the warm context's half: a helper call is a T0
+    /// `tool_call`/`tool_result` pair; its model's rounds and its calls are
+    /// lines whose parent is that `tool_call`; the turn's next request —
+    /// and the next turn's — carries its answer and none of its steps; the
+    /// served session's context equals a cold replay of the log.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn helper_steps_are_in_the_log_and_out_of_the_replay() {
+        let mut world = world(
+            ProviderKind::Ollama,
+            &["drive_read", "helper"],
+            vec![
+                calls(&[(
+                    "h1",
+                    "helper",
+                    json!({"brief": "Say only the first line of notes/hello.md."}),
+                )]),
+                calls(&[(
+                    "r1",
+                    "drive_read",
+                    json!({"profile": "tgdrive", "path": "notes/hello.md"}),
+                )]),
+                prose("The first line is: first line."),
+                prose("It begins with first line."),
+                prose("Again: first line."),
+            ],
+        );
+        let mut served = world.open(SESSION);
+        report(world.ask(&mut served, "how does hello begin?").await);
+        report(world.ask(&mut served, "say it again").await);
+
+        let lines = world.lines(SESSION);
+        let helper = call_line(&lines, "h1");
+        let LineBody::ToolCall(call) = &helper.body else {
+            unreachable!()
+        };
+        assert_eq!((call.tool.as_str(), call.tier), ("helper", 0));
+        let kinds_under: Vec<LineKind> = steps(&lines, helper).iter().map(|l| l.kind()).collect();
+        assert_eq!(
+            kinds_under,
+            [LineKind::Assistant, LineKind::ToolCall, LineKind::Assistant]
+        );
+        let inner = call_line(&lines, "r1");
+        assert_eq!(inner.parent, Some(helper.id));
+
+        let requests = world.stub.requests();
+        let main: Vec<&Value> = requests.iter().filter(|r| !is_helper(r)).collect();
+        assert_eq!(main.len(), 3);
+        for request in &main[1..] {
+            let text = request.to_string();
+            assert!(text.contains("The first line is: first line."), "{text}");
+            assert!(!text.contains("second line"), "a step's result: {text}");
+            assert!(!text.contains("\"r1\""), "a step's call: {text}");
+        }
+        let dir = world.dir(SESSION);
+        let fresh = replay(&read_session(&dir), &|sha| hydrate_blob(&dir, sha)).expect("replay");
+        assert_eq!(
+            messages_text(&served.context.messages),
+            messages_text(&fresh.messages)
+        );
+    }
+
+    /// 94.4 acceptance 6: what a helper reads joins the session's label —
+    /// a `label` line naming the file — and its answer carries the label.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_helpers_reads_join_the_session_label() {
+        let mut world = world(
+            ProviderKind::Ollama,
+            &["drive_read", "helper"],
+            vec![
+                calls(&[("h1", "helper", json!({"brief": "Summarise the diary."}))]),
+                calls(&[(
+                    "p1",
+                    "drive_read",
+                    json!({"profile": "private", "path": "diary.md"}),
+                )]),
+                prose("It greets the diary."),
+                prose("Done."),
+            ],
+        );
+        let mut served = world.open(SESSION);
+        assert!(!served.context.label.local_only);
+        report(world.ask(&mut served, "summarise my diary").await);
+
+        let lines = world.lines(SESSION);
+        let narrowed = kinds(&lines, LineKind::Label)
+            .into_iter()
+            .find_map(|line| match &line.body {
+                LineBody::Label(body) if body.cause.reference == "private/diary.md" => {
+                    Some(body.label())
+                }
+                _ => None,
+            })
+            .expect("the diary's label line");
+        assert!(narrowed.local_only);
+        assert_eq!(
+            narrowed.readers,
+            Readers::Only([user(TGORKA)].into_iter().collect())
+        );
+        assert_eq!(served.context.label, narrowed);
+        assert_eq!(
+            result_of(&tool_results(&lines), "h1").label,
+            served.context.label
+        );
+    }
+
+    /// A drive's skill `review` whose customization has two review layers:
+    /// `blind-hunter` on the bot at `remote`, `edge` on the agent's.
+    fn review_skill(world: &World, remote: &str) {
+        write(
+            &world.tgdrive,
+            "80-agents/_skills/review/SKILL.md",
+            "---\nname: review\ndescription: Reviews a change.\n---\n\nRun every layer.\n",
+        );
+        write(
+            &world.tgdrive,
+            "80-agents/_skills/review/customize.toml",
+            &format!(
+                "[[workflow.review_layers]]\nid = \"blind-hunter\"\ninstruction = \"Review it blind.\"\nbot = \"bot:openai:{remote}#gpt-x\"\n\n[[workflow.review_layers]]\nid = \"edge\"\ninstruction = \"Walk every branch.\"\n"
+            ),
+        );
+    }
+
+    /// A second provider, kind `openai`, at `stub`: a model that is not
+    /// local.
+    fn remote_row(world: &mut World, stub: &Stub) {
+        let provider = Provider {
+            id: "remote".to_owned(),
+            kind: ProviderKind::OpenAi,
+            name: "remote".to_owned(),
+            base_url: stub.url.clone(),
+            created_ms: 2,
+        };
+        store::insert_provider(&world.deps.data_dir, &provider).expect("provider");
+        let row = store::get_provider(&world.deps.data_dir, "remote")
+            .expect("read")
+            .expect("row");
+        world.deps.rows.push(row);
+    }
+
+    fn layers() -> Completion {
+        calls(&[
+            (
+                "h1",
+                "helper",
+                json!({"brief": "Review the change.", "lens": "blind-hunter", "skill": "review"}),
+            ),
+            (
+                "h2",
+                "helper",
+                json!({"brief": "Review the change.", "lens": "edge", "skill": "review"}),
+            ),
+        ])
+    }
+
+    /// 94.4 acceptance 7: a layer naming a bot runs on it, one naming none
+    /// on the agent's; in a session whose label is `local_only` the layer
+    /// on a bot that is not local is refused with the label's sentence and
+    /// nothing reaches that provider, while the agent's local one runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_layer_bot_honours_local_only() {
+        let remote = Stub::start(vec![prose("blind finding")]);
+        let mut world = world(
+            ProviderKind::Ollama,
+            &["drive_read", "helper"],
+            vec![layers(), prose("edge finding"), prose("Triaged.")],
+        );
+        remote_row(&mut world, &remote);
+        review_skill(&world, &remote.url);
+        let mut served = world.open(SESSION);
+        report(world.ask(&mut served, "review it").await);
+        let sent = remote.requests();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["model"], "gpt-x");
+        assert!(system_of(&sent[0]).contains("Review it blind."));
+        let local: Vec<Value> = world
+            .stub
+            .requests()
+            .into_iter()
+            .filter(is_helper)
+            .collect();
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0]["model"], "model");
+        assert!(system_of(&local[0]).contains("Walk every branch."));
+        let results = tool_results(&world.lines(SESSION));
+        assert!(result_of(&results, "h1").content.contains("blind finding"));
+        assert!(result_of(&results, "h2").content.contains("edge finding"));
+
+        // The diary read first: the session's label is local_only.
+        let remote = Stub::start(vec![prose("never")]);
+        let mut world = super::world(
+            ProviderKind::Ollama,
+            &["drive_read", "helper"],
+            vec![
+                calls(&[(
+                    "p1",
+                    "drive_read",
+                    json!({"profile": "private", "path": "diary.md"}),
+                )]),
+                layers(),
+                prose("edge finding"),
+                prose("Triaged."),
+            ],
+        );
+        remote_row(&mut world, &remote);
+        review_skill(&world, &remote.url);
+        let mut served = world.open(SESSION);
+        report(world.ask(&mut served, "review my diary").await);
+        assert!(served.context.label.local_only);
+        assert_eq!(remote.hits.load(Ordering::SeqCst), 0, "no request");
+        let results = tool_results(&world.lines(SESSION));
+        let blind = result_of(&results, "h1");
+        assert_eq!(blind.outcome, ToolOutcomeWord::Refused);
+        assert!(
+            blind.content.ends_with(LOCAL_ONLY_SINK),
+            "{}",
+            blind.content
+        );
+        assert!(result_of(&results, "h2").content.contains("edge finding"));
+    }
+
+    /// 94.4 acceptance 8: `bmad-build` rendered against the duplicate-free
+    /// fixture configuration renders its three review layers; the model,
+    /// following step 4, launches them as three helpers of one round, each
+    /// on its layer's instruction. Each reads the staged diff with the
+    /// session's own `drive_read` and answers from it alone — its next
+    /// request holds its brief, its read and the diff's lines, nothing of
+    /// the turn or of another helper — and the session triages their
+    /// findings (R203).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bmad_build_review_layers_run_as_helpers() {
+        let diff_at = format!("60-sessions/{SESSION}/artifacts/review.diff");
+        let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-let answer = 41;\n+let answer = 42;\n";
+        let review = |lens: &str| json!({"brief": "Review the change in diff_file.", "lens": lens, "skill": "bmad-build", "inputs": {"diff_file": diff_at}});
+        // Each helper's first answer reads the diff: held 300 ms, so all
+        // three first requests are in before any helper's second.
+        let read = || {
+            let mut completion = vec![json!({"pause_ms": 300})];
+            completion.extend(calls(&[(
+                "d1",
+                "drive_read",
+                json!({"profile": "tgdrive", "path": diff_at}),
+            )]));
+            completion
+        };
+        let mut world = world(
+            ProviderKind::Ollama,
+            &["bmad_render", "drive_read", "helper"],
+            vec![
+                calls(&[("r1", "bmad_render", json!({"skill": "bmad-build"}))]),
+                calls(&[
+                    ("v1", "helper", review("blind-hunter")),
+                    ("v2", "helper", review("edge-case-hunter")),
+                    ("v3", "helper", review("verification-gap")),
+                ]),
+                read(),
+                read(),
+                read(),
+                prose("finding one"),
+                prose("finding two"),
+                prose("finding three"),
+                prose("Triage: one patch, two dismissed."),
+            ],
+        );
+        install_bmad(&world);
+        write(&world.dir(SESSION), "artifacts/review.diff", diff);
+        let mut served = world.open(SESSION);
+        let turn = report(world.ask(&mut served, "build x").await);
+        assert_eq!(turn.ending, TurnEnding::Complete);
+
+        let requests = world.stub.requests();
+        let helpers: Vec<&Value> = requests.iter().filter(|r| is_helper(r)).collect();
+        assert_eq!(helpers.len(), 6);
+        let lens_of = |request: &Value| {
+            system_of(request)
+                .split_once("# Your lens: ")
+                .and_then(|(_, rest)| rest.lines().next())
+                .expect("a lens")
+                .to_owned()
+        };
+        let mut lenses: Vec<String> = Vec::new();
+        for request in helpers
+            .iter()
+            .filter(|r| r["messages"].as_array().map(Vec::len) != Some(2))
+        {
+            let messages = request["messages"].as_array().expect("messages");
+            // Its brief, its read, the read's result: nothing else.
+            assert_eq!(messages.len(), 4, "{request}");
+            assert_eq!(messages[3]["role"], "tool", "{request}");
+            let read = messages[3]["content"].as_str().expect("the read");
+            assert!(read.contains("+let answer = 42;"), "{read}");
+            let whole = request.to_string();
+            for absent in ["build x", "finding one", "finding two", "finding three"] {
+                assert!(!whole.contains(absent), "{absent}: {whole}");
+            }
+            lenses.push(lens_of(request));
+        }
+        lenses.sort();
+        assert_eq!(
+            lenses,
+            ["blind-hunter", "edge-case-hunter", "verification-gap"]
+        );
+
+        let lines = world.lines(SESSION);
+        let results = tool_results(&lines);
+        for id in ["v1", "v2", "v3"] {
+            assert_eq!(result_of(&results, id).outcome, ToolOutcomeWord::Ok, "{id}");
+            let call = steps(&lines, call_line(&lines, id))
+                .into_iter()
+                .find(|line| matches!(&line.body, LineBody::ToolCall(c) if c.tool == "drive_read"))
+                .unwrap_or_else(|| panic!("{id} read the diff"));
+            let read = lines
+                .iter()
+                .find_map(|line| match &line.body {
+                    LineBody::ToolResult(result) if line.parent == Some(call.id) => Some(result),
+                    _ => None,
+                })
+                .expect("the read's result");
+            assert_eq!(read.outcome, ToolOutcomeWord::Ok, "{id}");
+            assert!(read.content.contains("+let answer = 42;"), "{id}");
+        }
+        let triage = requests.last().expect("the triage").to_string();
+        for id in ["v1", "v2", "v3"] {
+            assert!(
+                triage.contains(&format!("\"tool_call_id\":\"{id}\"")),
+                "{id}"
+            );
+        }
+        for finding in ["finding one", "finding two", "finding three"] {
+            assert!(triage.contains(finding), "{finding}");
+        }
+        assert!(!triage.contains("+let answer = 42;"), "no helper's read");
+    }
+
+    /// R203 (R94H-04): two helpers launched together on a 2000-token turn —
+    /// `blind-hunter` on the remote bot answers at once having spent 1900;
+    /// `edge`, 300 ms later, spends 200 on a read. Its next request would
+    /// follow 2100 spent by the turn's helpers: it is never sent, and
+    /// `edge` is refused with the budget's sentence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parallel_helpers_share_the_turns_spend_after_their_launch() {
+        let budgeted = "\n[limits]\ntokens_per_turn = 2000\n";
+        let remote = Stub::start(vec![spending(prose("blind finding"), 1900)]);
+        let mut slow_read = vec![json!({"pause_ms": 300})];
+        slow_read.extend(spending(
+            calls(&[(
+                "r1",
+                "drive_read",
+                json!({"profile": "tgdrive", "path": "notes/hello.md"}),
+            )]),
+            200,
+        ));
+        let mut world = world(
+            ProviderKind::Ollama,
+            &["drive_read", "helper"],
+            vec![
+                layers(),
+                slow_read,
+                prose("never asked"),
+                prose("never asked"),
+            ],
+        );
+        remote_row(&mut world, &remote);
+        review_skill(&world, &remote.url);
+        world.deps = deps_of(
+            &world,
+            "nixi",
+            &nixi_toml(&["drive_read", "helper"], budgeted),
+        );
+        let mut served = world.open(SESSION);
+        let turn = report(world.ask(&mut served, "review it").await);
+        assert_eq!(turn.ending, TurnEnding::Spent);
+        assert_eq!(remote.requests().len(), 1);
+        let local = world.stub.requests();
+        assert_eq!(
+            local.iter().filter(|r| is_helper(r)).count(),
+            1,
+            "edge asked once"
+        );
+        assert_eq!(local.len(), 2);
+        let results = tool_results(&world.lines(SESSION));
+        assert_eq!(result_of(&results, "h1").outcome, ToolOutcomeWord::Ok);
+        let edge = result_of(&results, "h2");
+        assert_eq!(edge.outcome, ToolOutcomeWord::Refused);
+        assert!(edge.content.ends_with(TURN_SPENT), "{}", edge.content);
+    }
+
+    /// R203 (R94H-05): a helper whose stream reports 1500 tokens and then
+    /// fails is refused, its round's line under its call says `failed` with
+    /// those tokens, and they count: the next round's helper, launched at
+    /// 2000 spent, reaches no model.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_helper_round_keeps_its_line_and_its_tokens() {
+        let budgeted = "\n[limits]\ntokens_per_turn = 2000\n";
+        let mut failing = broken("half a find");
+        failing.insert(1, usage(1500));
+        let mut world = world(
+            ProviderKind::Ollama,
+            &["drive_read", "helper"],
+            vec![
+                calls(&[("h1", "helper", json!({"brief": "First."}))]),
+                failing,
+                spending(calls(&[("h2", "helper", json!({"brief": "Second."}))]), 500),
+                prose("never asked"),
+            ],
+        );
+        world.deps = deps_of(
+            &world,
+            "nixi",
+            &nixi_toml(&["drive_read", "helper"], budgeted),
+        );
+        let mut served = world.open(SESSION);
+        let turn = report(world.ask(&mut served, "two helpers").await);
+        assert_eq!(turn.ending, TurnEnding::Spent);
+        let requests = world.stub.requests();
+        assert_eq!(requests.iter().filter(|r| is_helper(r)).count(), 1);
+        let lines = world.lines(SESSION);
+        let results = tool_results(&lines);
+        assert_eq!(result_of(&results, "h1").outcome, ToolOutcomeWord::Refused);
+        let round = steps(&lines, call_line(&lines, "h1"))
+            .into_iter()
+            .find_map(|line| match &line.body {
+                LineBody::Assistant(body) => Some(body.clone()),
+                _ => None,
+            })
+            .expect("its round's line");
+        assert_eq!(
+            (
+                round.finish.as_str(),
+                round.usage.prompt,
+                round.text.as_str()
+            ),
+            ("failed", Some(1500), "half a find")
+        );
+        let second = result_of(&results, "h2");
+        assert_eq!(second.outcome, ToolOutcomeWord::Refused);
+        assert!(second.content.ends_with(TURN_SPENT), "{}", second.content);
+    }
+
+    /// Serve `text` to `served`, Stop pressed `after` it arrived.
+    async fn stopped_after(
+        world: &mut World,
+        served: &mut ServedSession,
+        text: &str,
+        after: Duration,
+    ) -> Outcome {
+        let arrived = world.arrived(TGORKA, text);
+        let (handle, signal) = chat::cancellation();
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            handle.cancel();
+        });
+        served
+            .serve(&world.deps, world.room.clone(), arrived, signal)
+            .await
+            .expect("served")
+    }
+
+    /// R203 (R94H-06): Stop while a helper's answer streams, while its
+    /// provider has not answered yet, and while its request waits to be
+    /// retried. Each time the helper ends at once — refused "this turn was
+    /// stopped before the helper answered", what had arrived of its round
+    /// on that round's line — the round's later call does not run, no
+    /// request leaves after the Stop, and the turn ends stopped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_ends_the_helpers_and_the_turn() {
+        use keeper_core::agents::helper::STOPPED;
+        let streaming = {
+            let mut completion = prose("half");
+            completion.insert(1, json!({"pause_ms": 3000}));
+            completion
+        };
+        let unanswered = {
+            let mut completion = vec![json!({"hold_ms": 3000})];
+            completion.extend(prose("late"));
+            completion
+        };
+        let busy = vec![json!({"status": 503, "retry_after": 3})];
+        for (case, helper, said) in [
+            ("streaming", streaming, "half"),
+            ("before headers", unanswered, ""),
+            ("retry delay", busy, ""),
+        ] {
+            let mut world = world(
+                ProviderKind::Ollama,
+                &["drive_read", "helper"],
+                vec![
+                    calls(&[
+                        ("h1", "helper", json!({"brief": "Look."})),
+                        (
+                            "r2",
+                            "drive_read",
+                            json!({"profile": "tgdrive", "path": "notes/hello.md"}),
+                        ),
+                    ]),
+                    helper,
+                    prose("never asked"),
+                    prose("never asked"),
+                ],
+            );
+            let mut served = world.open(SESSION);
+            let started = Instant::now();
+            let turn = report(
+                stopped_after(&mut world, &mut served, "look", Duration::from_millis(500)).await,
+            );
+            let took = started.elapsed();
+            assert_eq!(turn.ending, TurnEnding::Stopped, "{case}");
+            assert!(took < Duration::from_millis(2000), "{case}: {took:?}");
+            std::thread::sleep(Duration::from_millis(3500));
+            assert_eq!(
+                world.stub.requests().len(),
+                2,
+                "{case}: nothing after the Stop"
+            );
+            let lines = world.lines(SESSION);
+            let results = tool_results(&lines);
+            let helped = result_of(&results, "h1");
+            assert_eq!(helped.outcome, ToolOutcomeWord::Refused, "{case}");
+            assert!(
+                helped.content.ends_with(STOPPED),
+                "{case}: {}",
+                helped.content
+            );
+            let rounds: Vec<AssistantBody> = steps(&lines, call_line(&lines, "h1"))
+                .into_iter()
+                .filter_map(|line| match &line.body {
+                    LineBody::Assistant(body) => Some(body.clone()),
+                    _ => None,
+                })
+                .collect();
+            if said.is_empty() {
+                assert!(rounds.is_empty(), "{case}: {}", rounds.len());
+            } else {
+                assert_eq!(rounds.len(), 1, "{case}");
+                assert_eq!(
+                    (rounds[0].text.as_str(), rounds[0].finish.as_str()),
+                    (said, "cancelled"),
+                    "{case}"
+                );
+            }
+            let later = result_of(&results, "r2");
+            assert_eq!(later.outcome, ToolOutcomeWord::Refused, "{case}");
+            assert!(
+                later.content.ends_with(keeper_core::bots::tools::STOPPED),
+                "{case}: {}",
+                later.content
+            );
+        }
     }
 }

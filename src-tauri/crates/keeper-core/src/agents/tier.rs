@@ -113,12 +113,13 @@ pub enum AgentTool {
     SkillView,
     AskHuman,
     WorkflowStart,
+    Helper,
     Declassify,
 }
 
 impl AgentTool {
     /// Every tool, in the table's order.
-    pub const ALL: [AgentTool; 25] = [
+    pub const ALL: [AgentTool; 26] = [
         AgentTool::DriveList,
         AgentTool::DriveRead,
         AgentTool::DriveGlob,
@@ -143,6 +144,7 @@ impl AgentTool {
         AgentTool::SkillView,
         AgentTool::AskHuman,
         AgentTool::WorkflowStart,
+        AgentTool::Helper,
         AgentTool::Declassify,
     ];
 
@@ -173,6 +175,7 @@ impl AgentTool {
             AgentTool::SkillView => "skill_view",
             AgentTool::AskHuman => "ask_human",
             AgentTool::WorkflowStart => "workflow_start",
+            AgentTool::Helper => "helper",
             AgentTool::Declassify => "declassify",
         }
     }
@@ -354,6 +357,9 @@ fn row(tool: AgentTool, facts: &CallFacts) -> Tier {
         | AgentTool::BmadParty
         | AgentTool::SkillsList
         | AgentTool::SkillView => Tier::T0,
+        // A helper only reads, through its session's own grants, and its
+        // model call is checked as the session's own is (R105).
+        AgentTool::Helper => Tier::T0,
         AgentTool::DriveWrite
         | AgentTool::DriveEdit
         | AgentTool::SessionWrite
@@ -569,7 +575,8 @@ mod tests {
                 | AgentTool::BmadConfig
                 | AgentTool::BmadParty
                 | AgentTool::SkillsList
-                | AgentTool::SkillView => {
+                | AgentTool::SkillView
+                | AgentTool::Helper => {
                     assert_eq!(tier(tool, outside), Tier::T0, "{tool:?}");
                 }
                 AgentTool::DriveWrite | AgentTool::DriveEdit => {

@@ -439,6 +439,7 @@ pub(crate) fn deps_over(
         data_dir: data_dir.to_owned(),
         row,
         bot,
+        rows: rows.to_vec(),
         home: home.clone(),
         host: host.clone(),
         drives: decls,

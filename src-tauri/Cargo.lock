@@ -4273,6 +4273,7 @@ version = "0.9.0"
 dependencies = [
  "chrono",
  "fs4",
+ "futures-util",
  "keeper-core",
  "keeper-ported",
  "keeper-sync",

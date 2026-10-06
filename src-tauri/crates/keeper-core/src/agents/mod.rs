@@ -20,6 +20,7 @@ pub mod doorbell;
 pub mod drive;
 pub mod events;
 pub mod focus;
+pub mod helper;
 pub mod home;
 pub mod host;
 pub mod index;

@@ -58,6 +58,7 @@ pub mod drive;
 pub mod grants;
 #[cfg(unix)]
 pub mod headless;
+pub mod helper;
 pub mod host;
 #[cfg(unix)]
 pub mod hosts;
