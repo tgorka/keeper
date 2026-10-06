@@ -200,7 +200,23 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
                 .map(|_| ())
                 .map_err(|e| failed(format!("copy {from} → {to}: {e}")))
         }
-        PlanStep::WriteFile { path, content } => atomic_write(&rel(zone, path)?, content)
+        PlanStep::CopyChecked { from, to, sha256 } => {
+            let source = rel(zone, from)?;
+            let target = rel(zone, to)?;
+            if hash_file(&target).is_ok_and(|held| held == *sha256) {
+                return sync_parent(&target)
+                    .map_err(|e| failed(format!("copy {from} → {to}: {e}")));
+            }
+            copy_checked(&source, &target, sha256)
+                .map_err(|e| failed(format!("copy {from} → {to}: {e}")))?
+                .then_some(())
+                .ok_or_else(|| {
+                    ExecError::Refused(format!(
+                        "{from} changed after it was checked; nothing was copied — try again"
+                    ))
+                })
+        }
+        PlanStep::WriteFile { path, content } => write_durable(&rel(zone, path)?, content)
             .map_err(|e| failed(format!("write {path}: {e}"))),
         PlanStep::CreateFile { path, content } => {
             let target = rel(zone, path)?;
@@ -217,7 +233,7 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
                 )))
                 }
             }
-            atomic_write(&target, content).map_err(|e| failed(format!("write {path}: {e}")))
+            write_durable(&target, content).map_err(|e| failed(format!("write {path}: {e}")))
         }
         PlanStep::GuardedWrite {
             path,
@@ -242,7 +258,7 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
                     "{path} changed while this was being planned; nothing was written — try again"
                 )));
             }
-            atomic_write(&target, content).map_err(|e| failed(format!("write {path}: {e}")))
+            write_durable(&target, content).map_err(|e| failed(format!("write {path}: {e}")))
         }
         PlanStep::MoveDir { from, to } => {
             let source = rel_link(zone, from)?;
@@ -501,17 +517,46 @@ fn contained(zone: &Path, path: &str, reach: Reach) -> Result<PathBuf, ExecError
     }
 }
 
-/// Write bytes atomically and durably: a temp file beside the target,
-/// synced, renamed over it, then the folder synced, so a crash or a power
-/// cut leaves the old file or the new one whole and the rename on the disk
-/// (`memlog.py`'s `write_atomic`, NFR-117). A folder it has to make is
-/// made as [`make_dirs`] makes it.
-fn atomic_write(target: &Path, content: &str) -> std::io::Result<()> {
+/// Write bytes atomically and durably: a fresh stage beside the target
+/// ([`stage_beside`]), synced, renamed over it, then the folder synced, so
+/// a crash or a power cut leaves the old file or the new one whole and the
+/// rename on the disk (`memlog.py`'s `write_atomic`, NFR-117). A folder it
+/// has to make is made as [`make_dirs`] makes it.
+pub(crate) fn write_durable(target: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     if parent.symlink_metadata().is_err() {
         make_dirs(parent)?;
     }
+    let (tmp, mut file) = stage_beside(target)?;
+    let written = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| publish_stage(&tmp, &file, target));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written?;
+    sync_dir(parent)
+}
+
+/// Remove the file at `path` durably — the removal synced in its folder —
+/// and succeed when it is not there.
+pub(crate) fn remove_durable(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => sync_parent(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// A stage for `target`, beside it, that is this write's own: whatever
+/// is at the staging name already — a crash's leftover, or a link or a
+/// second name of another file planted there — is removed as an entry,
+/// never followed or written through, and the stage is created
+/// exclusively, so its handle is a new regular file nothing else names.
+fn stage_beside(target: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
     let tmp = parent.join(format!(
         ".{}.keeper-tmp",
         target
@@ -519,12 +564,80 @@ fn atomic_write(target: &Path, content: &str) -> std::io::Result<()> {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file".to_owned())
     ));
-    let mut file = std::fs::File::create(&tmp)?;
-    file.write_all(content.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, target)?;
-    sync_dir(parent)
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    Ok((tmp, file))
+}
+
+/// Rename the stage `tmp` over `target` once the name still holds the
+/// file `held` is a handle of: what is published is that regular file,
+/// never an entry put in its place meanwhile.
+fn publish_stage(tmp: &Path, held: &std::fs::File, target: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let named = std::fs::symlink_metadata(tmp)?;
+        let ours = held.metadata()?;
+        if !named.file_type().is_file() || (named.dev(), named.ino()) != (ours.dev(), ours.ino()) {
+            return Err(std::io::Error::other(
+                "the staged file was replaced before it was published",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = held;
+    std::fs::rename(tmp, target)
+}
+
+/// The lowercase hex SHA-256 of the file at `path`, read as one version.
+fn hash_file(path: &Path) -> std::io::Result<String> {
+    keeper_sync::stability::verify_while_reading(path)
+        .map(|(sha256, _)| sha256)
+        .map_err(std::io::Error::other)
+}
+
+/// Copy `source` over `target` as [`write_durable`] writes, once the
+/// staged bytes hash to `sha256`: copied through the stage's own handle
+/// ([`stage_beside`]), synced, read back through that handle and hashed,
+/// and that file renamed into place, the folder synced. `false`, the stage
+/// removed and the target as it was, when they do not: the source changed
+/// after it was checked.
+fn copy_checked(source: &Path, target: &Path, sha256: &str) -> std::io::Result<bool> {
+    use std::io::Seek as _;
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    if parent.symlink_metadata().is_err() {
+        make_dirs(parent)?;
+    }
+    let (tmp, mut staged) = stage_beside(target)?;
+    let copied = std::fs::File::open(source)
+        .and_then(|mut from| std::io::copy(&mut from, &mut staged))
+        .and_then(|_| staged.sync_all())
+        .and_then(|()| staged.rewind())
+        .and_then(|()| keeper_core::sessions::plan::sha256_hex_of(&staged))
+        .and_then(|held| {
+            if held != sha256 {
+                return Ok(false);
+            }
+            publish_stage(&tmp, &staged, target).map(|()| true)
+        });
+    match copied {
+        Ok(true) => {
+            sync_dir(parent)?;
+            Ok(true)
+        }
+        other => {
+            let _ = std::fs::remove_file(&tmp);
+            other
+        }
+    }
 }
 
 /// Make `dir` and every folder above it that is not there, durably: each
@@ -547,8 +660,38 @@ fn make_dirs(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Make `dir`, a folder of the notes vault rooted at `vault` in the drive
+/// rooted at `drive`, and every folder on the way that is not there,
+/// durably: then every entry from the drive's child down to `dir` synced
+/// in its parent, whether this call made it, an earlier one made it and
+/// failed before its sync, or the vault's registration made it — the vault
+/// root and every configured folder above it included. So `Ok` says every
+/// folder a write under `dir` is reached through is on the disk, and a
+/// retry after a partial failure syncs what the failed one did not. A vault
+/// that does not lie in the drive (a link the person made) is synced from
+/// its own root down. For a writer outside the zone that says a write is
+/// durable: the notes vault's (R244, R253). A `dir` under neither is
+/// refused.
+pub fn make_dirs_within(drive: &Path, vault: &Path, dir: &Path) -> std::io::Result<()> {
+    let root = if vault.starts_with(drive) {
+        drive
+    } else {
+        vault
+    };
+    let below = dir.strip_prefix(root).map_err(|_| {
+        std::io::Error::other(format!("{} is not under {}", dir.display(), root.display()))
+    })?;
+    std::fs::create_dir_all(dir)?;
+    let mut at = root.to_path_buf();
+    for part in below.components() {
+        at.push(part);
+        sync_parent(&at)?;
+    }
+    Ok(())
+}
+
 /// [`sync_dir`] of the folder holding `path`.
-fn sync_parent(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent(path: &Path) -> std::io::Result<()> {
     match path.parent() {
         Some(parent) => sync_dir(parent),
         None => Ok(()),
@@ -641,7 +784,7 @@ fn write_journal(journal: &Path, row: &JournalRow) -> Result<(), ExecError> {
         step: row.done,
         reason: format!("could not encode the journal: {e}"),
     })?;
-    atomic_write(journal, &text).map_err(|e| ExecError::Failed {
+    write_durable(journal, &text).map_err(|e| ExecError::Failed {
         verb: row.plan.verb.clone(),
         step: row.done,
         reason: format!("could not write the journal: {e}"),
@@ -1370,5 +1513,44 @@ mod tests {
                 .is_err_and(|error| error.to_string().starts_with("publish ")),
             "{published:?}"
         );
+    }
+
+    /// R244, R253 (R95K4-06, R95K5-04): the folders a durable vault write
+    /// reaches its file through are on the disk before it is said done, from
+    /// the drive's root down — a vault root not there yet, under a nested
+    /// configured folder, included. With the drive's entry list unsyncable,
+    /// the write is an error, and still one on a retry that finds the vault
+    /// made; so too with the configured folder's, the vault root's or a
+    /// folder under it; once every one syncs, done. A vault that lies
+    /// outside the drive is synced from its own root.
+    #[cfg(unix)]
+    #[test]
+    fn folders_a_durable_write_makes_are_synced_from_the_drive_down() {
+        let drive = tempfile::tempdir().expect("drive");
+        let vault = drive.path().join("10-notes/team");
+        let deep = vault.join("knowledge/topic");
+        {
+            let _unsynced = Mode::set(drive.path(), 0o300);
+            let made = make_dirs_within(drive.path(), &vault, &deep);
+            assert!(made.is_err(), "{made:?}");
+            assert!(deep.is_dir());
+            let retried = make_dirs_within(drive.path(), &vault, &deep);
+            assert!(retried.is_err(), "{retried:?}");
+        }
+        for unsyncable in [
+            drive.path().join("10-notes"),
+            vault.clone(),
+            vault.join("knowledge"),
+        ] {
+            let _unsynced = Mode::set(&unsyncable, 0o300);
+            let retried = make_dirs_within(drive.path(), &vault, &deep);
+            assert!(retried.is_err(), "{}: {retried:?}", unsyncable.display());
+        }
+        make_dirs_within(drive.path(), &vault, &deep).expect("synced");
+
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let _unsynced = Mode::set(drive.path(), 0o300);
+        make_dirs_within(drive.path(), elsewhere.path(), &elsewhere.path().join("k"))
+            .expect("synced from its own root");
     }
 }

@@ -23,7 +23,7 @@
 use std::path::Path;
 
 use keeper_sync::bots_fs::{self, FileRead, FsRefusal, Limits, LineRange};
-use keeper_sync::browse::BrowseRefusal;
+use keeper_sync::browse::{self, BrowseRefusal};
 use keeper_sync::files_write::{WriteRoute, WriteScope};
 use keeper_sync::lfs::pointer::Pointer;
 
@@ -761,17 +761,19 @@ fn a_link_put_in_an_offered_entrys_place_is_never_followed() {
     assert!(texts.is_empty(), "{texts:?}");
     assert_eq!(walked.skipped, 1, "the replaced file");
 
-    let landed = bots_fs::search_landing(root, "b/z.md").expect("contained");
-    assert_eq!(landed.as_deref(), Some("b/z.md"));
+    let landed = |rel: &str| {
+        browse::resolve_known(root, rel)
+            .and_then(browse::Known::under_root)
+            .expect("contained")
+            .map(|landing| landing.relative())
+    };
+    assert_eq!(landed("b/z.md").as_deref(), Some("b/z.md"));
     swap("b", "secret");
     assert_eq!(
         budget(100, 1 << 20).read(root, "b/z.md"),
         Err(bots_fs::Unread::Skipped)
     );
-    assert_eq!(
-        bots_fs::search_landing(root, "b/z.md").expect("contained"),
-        Some("secret/z.md".to_owned())
-    );
+    assert_eq!(landed("b/z.md").as_deref(), Some("secret/z.md"));
 
     let fifo = root.join("pipe.md");
     let made = std::process::Command::new("mkfifo")

@@ -14983,7 +14983,7 @@ mod workflows {
 mod helpers {
     use std::time::Instant;
 
-    use keeper_core::agents::helper::{REFUSAL, TURN_SPENT};
+    use keeper_core::agents::helper::TURN_SPENT;
     use keeper_core::agents::label::LOCAL_ONLY_SINK;
 
     use super::*;
@@ -15081,8 +15081,7 @@ mod helpers {
     }
 
     /// 94.4 acceptance 1: whatever a helper's model calls but a read is
-    /// answered "a helper cannot write, send, delegate or start another
-    /// helper" — the agent's own tools included — and the drive and the
+    /// refused — the agent's own tools included — and the drive and the
     /// session folder are byte for byte as they were. R203: each refused
     /// step has exactly one audit row, refused and carrying the helper's
     /// call, classified where its tool has a row of the tier table; a read
@@ -15159,26 +15158,22 @@ mod helpers {
 
         let lines = world.lines(SESSION);
         let helper = call_line(&lines, "h1");
-        let made: Vec<(String, String)> = steps(&lines, helper)
+        let made: Vec<String> = steps(&lines, helper)
             .into_iter()
             .filter_map(|line| match &line.body {
                 LineBody::ToolCall(call) if call.call_id != "ok" => Some(call.call_id.clone()),
                 _ => None,
             })
-            .map(|id| {
-                let result = result_of(&tool_results(&lines), &id).clone();
-                assert_eq!(result.outcome, ToolOutcomeWord::Refused, "{id}");
-                (id, result.content)
+            .inspect(|id| {
+                assert_eq!(
+                    result_of(&tool_results(&lines), id).outcome,
+                    ToolOutcomeWord::Refused,
+                    "{id}"
+                );
             })
             .collect();
         let tools: Vec<&str> = forbidden.iter().map(|(id, _, _)| *id).collect();
-        assert_eq!(
-            made.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-            tools
-        );
-        for (id, content) in &made {
-            assert!(content.ends_with(REFUSAL), "{id}: {content}");
-        }
+        assert_eq!(made, tools);
         assert_eq!(
             result_of(&tool_results(&lines), "h1").outcome,
             ToolOutcomeWord::Ok
@@ -16768,6 +16763,43 @@ async fn the_review_pass_can_only_propose() {
     assert!(!next.contains("Review the conversation above"));
     assert!(!next.contains("notes/review.md"));
     assert_eq!(world.stub.requests().len(), 4, "no second review");
+}
+
+/// A review pass never gains the session writer the harvest writes
+/// knowledge with: in a session whose agent may `session_write`, the pass
+/// is not offered it, and a write it makes anyway is refused and never
+/// lands — what a session keeps is written only by its own turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_review_pass_never_gains_the_session_writer() {
+    const NOTE: &str = "artifacts/tea.md";
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "session_write", "memory_propose"],
+        vec![
+            prose("Tea, noted."),
+            calls(&[(
+                "k1",
+                "session_write",
+                json!({"path": NOTE, "content": "Tea.\n"}),
+            )]),
+            prose("Nothing more."),
+        ],
+    );
+    world.deps.home.config.memory.nudge_user_turns = 1;
+    let mut served = world.open(SESSION);
+    report(world.ask(&mut served, "I drink tea").await);
+    let requests = world.stub.requests();
+    assert_eq!(requests.len(), 3, "the turn, then two rounds of review");
+    assert_eq!(
+        offered_tools(&requests[1]),
+        ["drive_read", "memory_propose"]
+    );
+    let lines = world.lines(SESSION);
+    assert_eq!(
+        result_of(&tool_results(&lines), "k1").outcome,
+        ToolOutcomeWord::Refused
+    );
+    assert!(!world.dir(SESSION).join(NOTE).exists());
 }
 
 /// R126, R204: a review pass spends what is left of the turn's

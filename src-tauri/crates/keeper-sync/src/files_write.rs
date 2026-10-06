@@ -90,7 +90,7 @@
 //! command answers from a registry that has no slot for that vault is a pane
 //! offering an action that will fail.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::browse::{self, BrowseRefusal};
 
@@ -139,7 +139,9 @@ pub enum WriteRefusal {
     /// The entry is a directory, and this surface deletes files.
     IsDirectory { name: String },
     /// The subpath is not a plain descendant: absolute, or holding `..`, `.`,
-    /// an empty component or a platform separator.
+    /// an empty component or a platform separator. Also a configured vault or
+    /// zone subfolder that names no folder inside the profile
+    /// ([`WriteScope::new`]), which refuses every write in that scope.
     Escapes { subpath: String },
     /// A create with no name.
     NameEmpty,
@@ -375,15 +377,24 @@ pub struct CreateTarget {
     pub profile_relative: String,
 }
 
-/// One configured subfolder spelling, `/`-joined with empty parts dropped —
-/// the normalisation [`WriteScope::new`] documents, shared with the sessions
-/// fence so the two cannot disagree about what a subfolder string means.
-fn normalise_subfolder(configured: &str) -> String {
-    configured
-        .split(['/', '\\'])
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("/")
+/// One configured subfolder as the folder its root is registered at: the
+/// trimmed configuration's own native components, `/`-joined — `.` dropped,
+/// every name kept literal — because `SyncProfile::vault_root` and the zones'
+/// roots join that same trimmed string with native `Path` semantics. On Unix
+/// `notes\.` is ONE folder whose name holds a backslash; reading it as
+/// `notes` would check one file and let the writer replace another. `None`
+/// for a parent, root or drive component: no folder inside the profile, and
+/// a fence that guessed which one would be guessing where bytes land.
+fn native_prefix(configured: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in Path::new(configured.trim()).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => parts.push(name.to_str()?),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(parts.join("/"))
 }
 
 /// Where one profile's Files surface may write.
@@ -393,34 +404,42 @@ fn normalise_subfolder(configured: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteScope<'a> {
     profile_name: &'a str,
-    /// The live vault's subfolder inside the profile, normalised, or `None`
-    /// when this profile holds no reachable vault.
+    /// The live vault's subfolder inside the profile, as [`native_prefix`]
+    /// reads it, or `None` when this profile holds no reachable vault.
     subfolder: Option<String>,
-    /// The sessions zone's subfolder inside the profile, normalised, or `None`
-    /// when this profile holds no sessions zone (Phase 7, AD-113). What it
-    /// fences is narrow and absolute: any path under a session's `workspace/`
-    /// refuses every write, because the zone's own contract makes that subtree
-    /// scratch keeper reads and never touches.
+    /// The sessions zone's subfolder inside the profile, read as the vault's
+    /// is, or `None` when this profile holds no sessions zone (Phase 7,
+    /// AD-113). What it fences is narrow and absolute: any path under a
+    /// session's `workspace/` refuses every write, because the zone's own
+    /// contract makes that subtree scratch keeper reads and never touches.
     sessions_subfolder: Option<String>,
-    /// The agents zone's subfolder inside the profile, normalised, or `None`
-    /// when this profile keeps no agents (AD-361). It fences every home file
-    /// from every tool writer (AD-362).
+    /// The agents zone's subfolder inside the profile, read as the vault's
+    /// is, or `None` when this profile keeps no agents (AD-361). It fences
+    /// every home file from every tool writer (AD-362).
     agents_subfolder: Option<String>,
     /// Whether the whole sessions zone is closed to this scope's writes
     /// (R51) — an agent host's scope, never a person's or a ⌘9 bot's.
     sessions_closed: bool,
+    /// The first configured subfolder [`native_prefix`] could not place
+    /// inside the profile: every write in this scope refuses naming it.
+    unplaceable: Option<String>,
 }
 
 impl<'a> WriteScope<'a> {
     /// A scope over the vault at `subfolder`, or over no vault at all.
     ///
-    /// The subfolder is normalised here and only here. It is whatever the user
-    /// typed into the settings form — `Notes/`, `\Notes`, `notes//daily` — and
-    /// `NotesConfig::validate` deliberately refuses rather than corrects, so
-    /// those spellings survive into the stored profile. Comparing them raw
-    /// against a `/`-joined dirent path would answer "outside the vault" for a
-    /// vault the user is looking at, and the surface would refuse to write in
-    /// the one folder it is meant to write in.
+    /// The subfolder is read here and only here, as [`native_prefix`] reads
+    /// it: the folder `SyncProfile::vault_root` registers, whatever the user
+    /// typed into the settings form — `Notes/`, `./Notes`, ` Notes `,
+    /// `notes//daily` all name it, and `NotesConfig::validate` deliberately
+    /// refuses rather than corrects, so those spellings survive into the
+    /// stored profile. Comparing them raw against a `/`-joined dirent path
+    /// would answer "outside the vault" for a vault the user is looking at.
+    /// A backslash is a separator only where the platform's paths say so: on
+    /// Unix `\Notes` is a folder of that name, which is where the registered
+    /// vault writes. A subfolder naming no folder inside the profile — a
+    /// `..`, a root or a drive — refuses every write ([`WriteRefusal::Escapes`]
+    /// naming it) rather than standing for some folder it might mean.
     ///
     /// Case is deliberately NOT folded: unlike the folder-role marker, which
     /// only decides a glyph, this decides where bytes land, and
@@ -428,12 +447,38 @@ impl<'a> WriteScope<'a> {
     /// are the dirent's own. Two folders differing only in case are two folders
     /// on the filesystem this is asserted on.
     pub fn new(profile_name: &'a str, subfolder: Option<&str>) -> Self {
-        Self {
+        let mut scope = Self {
             profile_name,
-            subfolder: subfolder.map(normalise_subfolder),
+            subfolder: None,
             sessions_subfolder: None,
             agents_subfolder: None,
             sessions_closed: false,
+            unplaceable: None,
+        };
+        scope.subfolder = scope.place(subfolder);
+        scope
+    }
+
+    /// `configured` as [`native_prefix`] reads it, or — when it names no
+    /// folder inside the profile — its trimmed spelling, remembered so every
+    /// write in this scope refuses ([`Self::placed`]).
+    fn place(&mut self, configured: Option<&str>) -> Option<String> {
+        let configured = configured?;
+        Some(native_prefix(configured).unwrap_or_else(|| {
+            let spelled = configured.trim().to_owned();
+            self.unplaceable.get_or_insert_with(|| spelled.clone());
+            spelled
+        }))
+    }
+
+    /// Refused when a configured subfolder of this scope names no folder
+    /// inside the profile: which file a write would reach is then unknown.
+    fn placed(&self) -> Result<(), WriteRefusal> {
+        match &self.unplaceable {
+            Some(subfolder) => Err(WriteRefusal::Escapes {
+                subpath: subfolder.clone(),
+            }),
+            None => Ok(()),
         }
     }
 
@@ -444,7 +489,7 @@ impl<'a> WriteScope<'a> {
     /// this refuses nothing new, which is exactly the compatibility a fence
     /// must have: absent knowledge widens nothing.
     pub fn with_sessions(mut self, sessions_subfolder: Option<&str>) -> Self {
-        self.sessions_subfolder = sessions_subfolder.map(normalise_subfolder);
+        self.sessions_subfolder = self.place(sessions_subfolder);
         self
     }
 
@@ -480,7 +525,7 @@ impl<'a> WriteScope<'a> {
     /// Armed wherever a scope is built for a bot or an agent; a scope built
     /// without it refuses nothing new, as [`Self::with_sessions`] does.
     pub fn with_agents(mut self, agents_subfolder: Option<&str>) -> Self {
-        self.agents_subfolder = agents_subfolder.map(normalise_subfolder);
+        self.agents_subfolder = self.place(agents_subfolder);
         self
     }
 
@@ -527,6 +572,7 @@ impl<'a> WriteScope<'a> {
     /// with the vault's name and is not inside it, and a `starts_with` on the
     /// string would have let a write out of the vault into its neighbour.
     fn vault_relative(&self, subpath: &str) -> Result<String, WriteRefusal> {
+        self.placed()?;
         let Some(subfolder) = self.subfolder.as_deref() else {
             return Err(WriteRefusal::NoVault {
                 profile_name: self.profile_name.to_owned(),
@@ -762,9 +808,12 @@ impl<'a> WriteScope<'a> {
         }
     }
 
-    /// The fork itself. Everything above it is arguments; everything below it
-    /// is consequences.
-    fn classify(&self, subpath: &str, is_dir: bool) -> Result<Owned, WriteRefusal> {
+    /// The zones' fences alone, for a path a write may be about to create
+    /// ([`Self::create`] asks only the vault): a session's `workspace/`,
+    /// an agent's home and the agents zone's own `_` folders, and — in an
+    /// agent host's scope — the sessions zone.
+    pub fn fenced(&self, subpath: &str) -> Result<(), WriteRefusal> {
+        self.placed()?;
         // The workspace fence first (AD-113): scratch refuses every write, on
         // the zone's own contract, before any question about vaults is asked.
         if self.in_session_workspace(subpath) {
@@ -786,6 +835,13 @@ impl<'a> WriteScope<'a> {
                 subpath: subpath.to_owned(),
             });
         }
+        Ok(())
+    }
+
+    /// The fork itself. Everything above it is arguments; everything below it
+    /// is consequences.
+    fn classify(&self, subpath: &str, is_dir: bool) -> Result<Owned, WriteRefusal> {
+        self.fenced(subpath)?;
         // With no vault, `vault_relative` tests for one before it tests the
         // path, so an escape must already have been refused by the caller —
         // `route` does it by resolving, `owner`'s caller by having read the
@@ -1747,12 +1803,19 @@ mod tests {
     }
 
     /// The stored subfolder is whatever the user typed, and `NotesConfig`
-    /// refuses rather than corrects — so `Notes/`, `\Notes` and `a//b` all
-    /// reach here verbatim. Normalising at construction is what keeps the
+    /// refuses rather than corrects — so `Notes/`, `./Notes` and `a//b` all
+    /// reach here verbatim. Read as the native path `vault_root` joins, every
+    /// spelling of one folder names that folder, which is what keeps the
     /// surface from refusing to write in the one folder it exists to write in.
     #[test]
-    fn the_configured_subfolder_is_normalised_however_it_was_typed() {
-        for spelling in ["10-notes", "10-notes/", "/10-notes", "\\10-notes"] {
+    fn the_configured_subfolder_is_read_as_the_folder_its_root_is_joined_at() {
+        for spelling in [
+            "10-notes",
+            "10-notes/",
+            "./10-notes",
+            " 10-notes ",
+            "10-notes/.",
+        ] {
             let scope = WriteScope::new("Vault", Some(spelling));
             assert_eq!(
                 scope.directory("10-notes/a.md"),
@@ -1760,7 +1823,7 @@ mod tests {
                 "{spelling}"
             );
         }
-        for spelling in ["a/b", "a//b", "a\\b", "/a/b/"] {
+        for spelling in ["a/b", "a//b", "./a/./b/"] {
             let scope = WriteScope::new("Vault", Some(spelling));
             assert_eq!(
                 scope.directory("a/b/c.md"),
@@ -1781,6 +1844,63 @@ mod tests {
                 subpath: "other/a.md".to_owned(),
             }
         );
+    }
+
+    /// A subfolder that names no folder inside the profile — a root, a parent
+    /// — is not read as whichever folder it might mean: every write in that
+    /// scope refuses, naming it, whether it is the vault or a zone.
+    #[test]
+    fn a_subfolder_naming_no_folder_in_the_profile_refuses_every_write() {
+        for spelling in ["/10-notes", "../10-notes", "10-notes/../x"] {
+            let refused = Err(WriteRefusal::Escapes {
+                subpath: spelling.to_owned(),
+            });
+            let vault = WriteScope::new("Vault", Some(spelling));
+            assert_eq!(
+                vault.directory("10-notes/a.md").map(drop),
+                refused,
+                "{spelling}"
+            );
+            assert_eq!(
+                vault.owner("10-notes/a.md", false).map(drop),
+                refused,
+                "{spelling}"
+            );
+            assert_eq!(
+                vault.owner("other/a.md", false).map(drop),
+                refused,
+                "{spelling}"
+            );
+            let zone = WriteScope::new("Vault", Some("10-notes")).with_agents(Some(spelling));
+            assert_eq!(
+                zone.directory("10-notes/a.md").map(drop),
+                refused,
+                "{spelling}"
+            );
+            assert_eq!(zone.fenced("10-notes/a.md"), refused, "{spelling}");
+        }
+    }
+
+    /// On Unix a backslash is a filename character, so `notes\.` is ONE
+    /// folder — the one `vault_root` registers — and `notes/` beside it is
+    /// not the vault: a create there refuses and an existing file there goes
+    /// to the plain writer at its own path, never to the vault's writer.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_in_a_unix_subfolder_is_part_of_the_folders_name() {
+        let scope = WriteScope::new("Vault", Some("notes\\."));
+        assert!(matches!(
+            scope.directory("notes/keep.md"),
+            Err(WriteRefusal::OutsideVault { .. })
+        ));
+        assert_eq!(
+            scope.owner("notes/keep.md", false),
+            Ok(WriteOwner::Unmanaged)
+        );
+        assert!(matches!(
+            WriteScope::new("Vault", Some("a\\b")).directory("a/b/c.md"),
+            Err(WriteRefusal::OutsideVault { .. })
+        ));
     }
 
     /// An escape is refused before the vault question is asked, so it is

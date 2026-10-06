@@ -795,8 +795,8 @@ fn perform(
 /// is reachable only where the host's vault port names a live vault (AD-102).
 ///
 /// The vault is looked up here, and again by [`VaultWriter::write`] when the
-/// bytes land: a vault unregistered in between fails the write rather than
-/// writing through a stale handle.
+/// bytes land: a vault unregistered or moved in between fails the write
+/// rather than writing through a stale handle.
 fn write_through(
     profile: &SyncProfile,
     vault: Option<&dyn VaultWriter>,
@@ -819,7 +819,7 @@ fn write_through(
         .with_agents(profile.agents.as_ref().map(|a| a.subfolder.as_str()))
         .with_sessions_closed(sessions_closed);
 
-    let live = subfolder.as_ref().and(vault);
+    let live = subfolder.as_deref().zip(vault);
     let route = match bots_fs::plan_write(&scope, live, profile.local_path.as_path(), subpath) {
         Ok(route) => route,
         Err(refusal) => {
@@ -830,7 +830,10 @@ fn write_through(
     };
 
     match route {
-        WriteRoute::Vault { vault, path } => {
+        WriteRoute::Vault {
+            vault: (subfolder, vault),
+            path,
+        } => {
             let bytes = content.len() as u64;
             if bytes > limits.max_write_bytes {
                 return Ok(ToolOutcome::Refused {
@@ -841,7 +844,7 @@ fn write_through(
                 });
             }
             vault
-                .write(&profile.id, path.as_str(), content)
+                .write(&profile.id, subfolder, path.as_str(), content)
                 .map_err(|detail| BotsError::Tool { detail })?;
             Ok(ToolOutcome::Wrote {
                 subpath: subpath.to_owned(),
@@ -934,5 +937,81 @@ mod tests {
         let bot = write_through(&profile, None, &card, "x", &limits(), false).expect("an outcome");
         assert!(matches!(bot, ToolOutcome::Wrote { .. }), "{bot:?}");
         assert_eq!(on_disk(), "x");
+    }
+
+    /// The shell's vault writer as far as a routed write reaches it: the
+    /// live subfolder, joined under the drive natively, as `vault_root` is.
+    #[cfg(unix)]
+    struct NativeVault {
+        root: PathBuf,
+        subfolder: &'static str,
+    }
+
+    #[cfg(unix)]
+    impl VaultWriter for NativeVault {
+        fn subfolder(&self, _: &str) -> Option<String> {
+            Some(self.subfolder.to_owned())
+        }
+
+        fn write(&self, _: &str, subfolder: &str, rel: &str, text: &str) -> Result<(), String> {
+            std::fs::write(self.root.join(subfolder).join(rel), text).map_err(|e| e.to_string())
+        }
+
+        fn amend(
+            &self,
+            _: &str,
+            _: &str,
+            _: &dyn Fn(&str) -> Option<String>,
+        ) -> Result<bool, String> {
+            Err("a routed write never amends".to_owned())
+        }
+    }
+
+    /// A vault configured `notes\.` on Unix is the folder of that name, and
+    /// `notes/` beside it is not the vault: an agent's write to an existing
+    /// `notes/both.md` lands there through the plain writer, one to an
+    /// absent `notes/keep.md` is refused, and the files in `notes\./` the
+    /// route never looked at keep their bytes.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_hosts_write_lands_only_where_it_was_routed() {
+        let drive = tempfile::tempdir().expect("drive");
+        let profile = SyncProfile::new("tgdrive", "tgdrive", drive.path(), "unused");
+        let vault = NativeVault {
+            root: drive.path().to_owned(),
+            subfolder: "notes\\.",
+        };
+        let theirs = drive.path().join("notes\\.");
+        let mine = drive.path().join("notes");
+        std::fs::create_dir_all(&theirs).expect("notes\\.");
+        std::fs::create_dir_all(&mine).expect("notes");
+        for name in ["keep.md", "both.md"] {
+            std::fs::write(theirs.join(name), "theirs\n").expect("theirs");
+        }
+        std::fs::write(mine.join("both.md"), "mine\n").expect("mine");
+        let write = |subpath: &str| {
+            write_through(&profile, Some(&vault), subpath, "x", &limits(), true)
+                .expect("an outcome")
+        };
+
+        let absent = write("notes/keep.md");
+        assert!(matches!(absent, ToolOutcome::Refused { .. }), "{absent:?}");
+        assert!(!mine.join("keep.md").exists());
+        let both = write("notes/both.md");
+        assert!(
+            matches!(both, ToolOutcome::Wrote { managed: false, .. }),
+            "{both:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(mine.join("both.md")).expect("mine"),
+            "x"
+        );
+        for name in ["keep.md", "both.md"] {
+            assert_eq!(
+                std::fs::read_to_string(theirs.join(name)).expect("theirs"),
+                "theirs\n",
+                "{name}"
+            );
+        }
     }
 }
