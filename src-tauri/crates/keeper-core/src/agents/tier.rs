@@ -11,10 +11,10 @@
 //! |---|---|---|
 //! | T0 | reads | runs it |
 //! | T1 | reversible inside the session, the surface, `delegate`, `reply`, `bmad_render`, `bmad_memlog`, `ask_human`, `journal_append`, `memory_propose`, `skill_propose` | runs it |
-//! | T2 | a drive write outside the session, a first write the grant asks for | asks a person |
-//! | T3 | a schedule or workflow set by an agent, a declassification | asks a person, once |
-//! | T4 | (no tool of this build) | the requester decides |
-//! | T5 | a write to the agent's own machine files or to `approvals/` | refuses |
+//! | T2 | a drive write outside the session, a first write the grant asks for, a sandboxed `run` | asks a person |
+//! | T3 | a schedule or workflow set by an agent, a declassification, a `run` with network | asks a person, once |
+//! | T4 | a `run` of code the session holds or given inline, a `git push --force` | the requester decides |
+//! | T5 | a write to the agent's own machine files or to `approvals/`, a `run` of `sudo` and its kin | refuses |
 //!
 //! **The raise** (R171): a call that already needs a person (T2 and up) is
 //! one tier stricter when the session is delegated, unattended or
@@ -124,11 +124,12 @@ pub enum AgentTool {
     MemoryApply,
     /// The same for a skill under `_skills/`.
     SkillApply,
+    Run,
 }
 
 impl AgentTool {
     /// Every tool, in the table's order.
-    pub const ALL: [AgentTool; 32] = [
+    pub const ALL: [AgentTool; 33] = [
         AgentTool::DriveList,
         AgentTool::DriveRead,
         AgentTool::DriveGlob,
@@ -161,6 +162,7 @@ impl AgentTool {
         AgentTool::Declassify,
         AgentTool::MemoryApply,
         AgentTool::SkillApply,
+        AgentTool::Run,
     ];
 
     /// The name the model calls (an action's own word for the actions).
@@ -198,6 +200,7 @@ impl AgentTool {
             AgentTool::Declassify => "declassify",
             AgentTool::MemoryApply => "memory_apply",
             AgentTool::SkillApply => "skill_apply",
+            AgentTool::Run => "run",
         }
     }
 
@@ -222,6 +225,14 @@ pub struct CallFacts {
     /// A write to keeper's own files wherever it lands: an `agent.toml`, a
     /// `_drive.toml`, or anything in a session's `approvals/`.
     pub protected: bool,
+    /// A `run` with network (96.1 #2).
+    pub network: bool,
+    /// A `run` of code the session holds or given inline (S-08).
+    pub held_code: bool,
+    /// A `git push` that overwrites what is there.
+    pub force_push: bool,
+    /// A `run` of `sudo`, `doas`, `su` or `pkexec`.
+    pub privileged: bool,
 }
 
 /// The grant's answer for a drive verb, without its payload.
@@ -419,6 +430,10 @@ fn row(tool: AgentTool, facts: &CallFacts) -> Tier {
         // A person decides by construction: the change waits for them, so
         // nothing raises it (R128).
         AgentTool::MemoryApply | AgentTool::SkillApply => Tier::T2,
+        AgentTool::Run if facts.privileged => Tier::T5,
+        AgentTool::Run if facts.held_code || facts.force_push => Tier::T4,
+        AgentTool::Run if facts.network => Tier::T3,
+        AgentTool::Run => Tier::T2,
     }
 }
 
@@ -531,6 +546,7 @@ pub fn named_facts(tool: AgentTool, args: &Value, landed: CallFacts) -> CallFact
             other_session_card: !landed.in_session,
             sets_schedule: schedules(&args["fields"]),
             protected: landed.protected,
+            ..CallFacts::default()
         },
         // A next round's card is dropped (R49), so it sets nothing.
         AgentTool::Delegate => CallFacts {
@@ -773,9 +789,12 @@ mod tests {
                 AgentTool::MemoryApply | AgentTool::SkillApply => {
                     assert_eq!(tier(tool, CallFacts::default()), Tier::T2);
                 }
+                // Its facts' rows are `run::tests::run_tier_table`'s.
+                AgentTool::Run => {
+                    assert_eq!(tier(tool, CallFacts::default()), Tier::T2);
+                }
             }
         }
-        assert_eq!(AgentTool::from_wire("run"), None);
         // A first write the grant asks for is at least T2; a read the grant
         // allows stays T0, and a T5 stays T5 whatever the grant says.
         let asks = Context {

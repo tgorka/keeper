@@ -1028,9 +1028,10 @@ tier decides whether it runs:
 | --- | --- | --- |
 | T0 | `drive_list`, `drive_read`, `drive_glob`, `drive_grep`, `drive_stat`, `drive_search`; `bmad_config`, `bmad_party`, `skills_list`, `skill_view`; `helper` | runs it |
 | T1 | `session_write`; `card_update` on a card of the session; a `drive_write` or `drive_edit` inside the session's own folder; `delegate` and its later rounds; `reply`; the five `surface_*` tools; `bmad_render` and `bmad_memlog`, which write only inside the session; `journal_append`, `memory_propose` and `skill_propose`, which write only into the agent's own home and change nothing until the consolidator or a person acts | runs it |
-| T2 | `drive_write` or `drive_edit` outside the session; `card_update` on another session's card; any write the agent's grant asks a person about; the consolidator's `memory_apply` and `skill_apply` — host actions, never a model's call — fixed at T2 in every session: nothing raises them | asks a person |
-| T3 | `card_update` that sets `schedule` or `workflow`, and a `delegate` whose card carries either — in every session, the person's own DM included; letting a blocked flow through (a declassification) | asks a person, for that one action |
-| T5 | a write — `drive_write`, `drive_edit`, `session_write` or `card_update` — that lands on any `agent.toml`, any `_drive.toml`, or anything in a session's `approvals/`, on any drive | never: "keeper never lets an agent do this: it would change the agent's own configuration or the approvals that guard its work. A person can do it themselves. Nothing was changed." |
+| T2 | `drive_write` or `drive_edit` outside the session; `card_update` on another session's card; any write the agent's grant asks a person about; the consolidator's `memory_apply` and `skill_apply` — host actions, never a model's call — fixed at T2 in every session: nothing raises them; a `run` without network (§ *Running a command*) | asks a person |
+| T3 | `card_update` that sets `schedule` or `workflow`, and a `delegate` whose card carries either — in every session, the person's own DM included; letting a blocked flow through (a declassification); a `run` with network | asks a person, for that one action |
+| T4 | a `run` of code the session holds or given inline; a `git push --force` | the person who started the work decides |
+| T5 | a write — `drive_write`, `drive_edit`, `session_write` or `card_update` — that lands on any `agent.toml`, any `_drive.toml`, or anything in a session's `approvals/`, on any drive; a `run` of `sudo`, `doas`, `su` or `pkexec` | never: "keeper never lets an agent do this: it would change the agent's own configuration or the approvals that guard its work. A person can do it themselves. Nothing was changed." (a `run` says why in its own words) |
 
 A write's tier is decided by where it lands on the disk, not how the call spelled it: keeper
 follows every folder link on the way and compares names as the Mac's volume does, so
@@ -1039,8 +1040,8 @@ follows every folder link on the way and compares names as the Mac's volume does
 lands outside it (T2). T5 is never an approval's to give: in a session that read outside content
 it is still refused with the sentence above, not with the approval sentence.
 
-No tool of this build is T4 (irreversible: deletes, credentials, running downloaded code). The
-grant still answers every drive call: a write the grant asks about is at least T2, and the higher
+The only T4 calls of this build are `run`'s. The grant still answers every drive call: a write the
+grant asks about is at least T2, and the higher
 of the two wins, so a grant alone never lets a write through. On agentd and on the Mac a call that
 asks a person parks for one (§ *When an action waits*); a host with no decision source — none of
 keeper's hosts is — refuses it with "This needs a person's approval, and there is no one here to
@@ -1082,6 +1083,188 @@ expires 24 hours after it was made. An approval in the morning resumes the run o
 holds the session's claim then, the write done once; with no decision by the expiry the run is
 refused, its card says so, and the log has `approval expired`. Until it ends, the card's later
 windows are not begun.
+
+## Running a command
+
+An agent whose `[tools].allow` names `run` may run a program — on a host that offers `sandbox`
+(its `[host].needs` derives it, so such an agent waits for one). It is never a shell string:
+`run({argv, cwd?, network?, timeout_s?, read?})` takes the program and its arguments as a list,
+and a shell given `-c`/`--command`, reading its script from standard input, or given no script
+file is refused — directly or behind `env`, `nice`, `nohup`, `timeout`, `xargs`, `stdbuf`,
+`command`, `flock` and their kin (D-33). So is a program keeper knows runs a command line given as
+text: `watch`, `script`, `flock -c`, `ssh` with a remote command or a command option
+(`ProxyCommand`, `LocalCommand`, `-F`), `scp -S`, `sftp -b`, `rsync -e`/`--rsh`/`--rsync-path`, and
+git given `-c`, `--config-env` or `--exec-path`, or running `rebase --exec`, `submodule foreach`,
+`bisect run`, `filter-branch`, `difftool --extcmd`, `grep -O` or the upload/receive-pack options.
+That list is not exhaustive: a program missing from it still runs only in the sandbox, at its tier.
+Each is refused however its value is spelled — attached (`env -S'…'`, `git -calias.x=…`, `rebase
+-xmake`, `rsync -e/usr/bin/x`) or apart, a long option whole or abbreviated (`--split=`, `--exe=`)
+— and a wrapper's option keeper does not know is refused too, since keeper could not tell where its
+program begins. `env` may not set `PATH`, `HOME`, `TMPDIR` or any `GIT_*`, `LD_*` or `DYLD_*`
+variable, nor change folder (`-C`; give `cwd`) or where it finds its program (`-P`); `ruby -C`,
+`ruby -X`, `ruby -x<folder>` and `perl -x<folder>`, which change folder before reading their
+script, are refused, however the folder is spelled (`-Xsub`, `-X sub`); and `xargs` may not read
+its arguments from a file. Any text after a wrapper is read as that wrapper reads it — a command
+name that starts with a letter outside ASCII is the program, an option keeper does not know is
+refused. git may not be given its repository
+apart from its folder (`--git-dir`, `--work-tree`, `--bare`): run it in the repository's folder.
+Write the script into `workspace/` and run that file instead.
+
+**The request is bounded:** `argv` holds 1 to 256 elements of at most 32 KiB each, no NUL; `cwd` is
+a folder inside the session's `workspace/`, wherever its links lead (one leading out is refused);
+`timeout_s` is 1 to 1800, 120 when absent; `read` names drives in the session's scope that the
+agent's grants let it read (as `drive_read` would). keeper walks from the drive's checkout to
+`workspace/` folder by folder — the sessions zone and every folder of it, the session's folders,
+`workspace/` itself — and each must be a real folder: a link in any of their places is refused,
+never followed. Each folder is opened from the one opened before it, never by its path again, so a
+folder swapped for a link while keeper walks redirects nothing — no check, no folder made — and
+the run is refused; the folder keeper reached is the one the approval binds.
+
+**What the program sees.** Only an OS sandbox it cannot leave — on Linux, agentd re-executes
+itself, applies landlock (ABI 6 or newer) and a seccomp filter to itself and then becomes the
+program; on the Mac, `/usr/bin/sandbox-exec` with a profile keeper writes:
+
+| place | access |
+| --- | --- |
+| the session's `workspace/` | read, write, run |
+| its own empty `HOME` and `TMPDIR`, made for it outside the workspace and the drives, removed when it ends | read, write |
+| `/usr`, `/bin`, `/sbin`, `/lib*`, `/etc` (on the Mac `/System`, the Command Line Tools and the folder `xcode-select -p` names), and `[sandbox] read_exec` and `env` | read, run |
+| the drives named in `read`, without network only — never their `.git/` and never any `.keeper/` | read |
+| anything else: other drives, `/proc`, `/sys`, `/dev` (but `null`, `zero`, `urandom`), `/run`, the host's home, its secrets | nothing |
+
+Every grant is checked as it resolves when the run starts: one that is or holds `/proc`, `/sys`,
+`/dev`, `/run`, a drive, the host's secrets, or a credential under its home (`.ssh`, `.gnupg`,
+`.aws`, `.config`, `.netrc`, `.docker`, `.kube`, a keyring …) refuses the run — a system folder
+holding a drive, or a `read_exec` link retargeted since start, included. A credential that is a
+link, or holds links, is refused where it leads too, through every folder a link leads to: with
+`~/.ssh` a link to `/opt/keys`, a grant of `/opt` or `/opt/keys` refuses the run, and with
+`~/.ssh/keys` a link to `/opt/key-store` whose `id_ed25519` is a link to
+`/usr/local/share/private-key`, so does a grant of `/usr/local/share`. A credential folder keeper
+cannot read refuses every run (and, at start, the sandbox): where it leads is not known.
+
+Without network it opens no socket at all; with network it may reach any host over TCP and UDP
+but no local Unix socket. The one exception is the Mac's: a networked run may reach the system
+resolver's socket, `/private/var/run/mDNSResponder`, for name resolution only, and nothing else
+local; a Mac run without network has no such exception. In every run it cannot trace,
+read or signal another process (`ptrace`, `process_vm_*`, `kcmp`, `pidfd_getfd`, `perf_event_open`,
+io_uring; on the Mac `process-info*` and the keychain's Mach service), reach the keyrings, System V
+IPC or POSIX message queues, load a `bpf` program, change its personality, make a namespace, or
+leave its process group (`setsid`, `setpgid`). On Linux it cannot change any file's metadata —
+mode, owner, times, extended attributes — because landlock does not guard them: the cost is that
+`chmod +x`, `tar x` and `cp -p` cannot set modes or times even inside `workspace/` (DW-758). Of
+what it would inherit, a run gets only its standard streams: every other descriptor — from agentd
+or from whatever started agentd — is closed before the program starts, and a run where one cannot
+be closed is refused. The one other descriptor a program can hold is keeper's own read-only handle
+of a program a wrapper starts, opened inside the sandbox (below). Its environment is exactly `PATH` (the system's folders, then `read_exec`), `HOME`,
+`TMPDIR`, `LANG=C.UTF-8`, `TERM=dumb`, `NO_COLOR=1`, `GIT_TERMINAL_PROMPT=0`,
+`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` and `[sandbox] env` — no credential of the
+host's. A `git` program gets `-c core.hooksPath=/dev/null` right after it, so no hook runs, and the
+argv cannot override it; the card shows that argv. Builds run against what the workspace vendors: a
+toolchain's caches are read-only, so use `--offline`.
+
+**Tiers.** Without network: T2. With network: T3. Code the session holds — the program, the program
+a wrapper runs (`env ./tool`, and through BusyBox's `env`, `nice` or `nohup`: `busybox env ./tool`),
+or an interpreter's script inside `workspace/`; anything under a
+root entry of `workspace/` whose name starts with `.` (`.npmrc`, `.cargo/config.toml`); a git hook
+(a file in a `.git/hooks/` not ending in `.sample`); a repository's configuration with any key
+beyond the ones that only describe it (a `core.fsmonitor`, `core.sshCommand`, filter or diff
+driver, alias, `include.path`, credential helper …), found where git finds it — every `.git/`,
+every folder whose `HEAD` git reads as one (`ref: refs/…`, a link to `refs/…`, or an object id)
+beside an `objects` and a `refs` git can enter (a bare repository, a separate git folder), and
+the folder a `.git` file (`gitdir: …`) or a worktree's `commondir` names (a file named `commondir`
+anywhere but beside a `HEAD` or in a `.git/` is a project's own, and names nothing; so is a folder
+git cannot take for a repository — a `HEAD` holding other text, an `objects` or `refs` that is an
+ordinary file — which refuses nothing); one that names a folder outside `workspace/` refuses the
+run, and so does a repository keeper cannot read as git does — a `.git`, a `commondir` or a
+configuration that is a link, or an `objects` or `refs` that is a link beside a `HEAD` git reads,
+which git follows — before anything runs and again right before the program starts, as
+does a configuration that ran nothing when the run was prepared and runs a program now; a setting
+given inline to `env`
+(`RUSTC_WRAPPER=…`) — or code given inline in any spelling its interpreter reads (`python -c` and
+`-cprint(1)`, `node -e`/`--eval`, `bun -e`, `perl -e`/`-e1`, `ruby -e`, `php -r`, `lua -e`,
+`osascript -e`, `deno eval`), and `git push --force` (or `-f`, `--force-with-lease`, a
+`+refspec`): T4. `sudo`, `doas`, `su`, `pkexec`: refused. keeper reads `env` as `env` reads itself
+— its options, then an optional `-`, then every element holding a `=` as a setting (after `--`
+too, and `./NAME=value` as much as `NAME=value`), then the program — and keeper's own variables
+are refused wherever they are set. A name `-u` (`--unset`, `-uNAME`) removes that holds a `=`
+(`env -u LD_PRELOAD=./x.so tool`) is refused: BusyBox's `env` sets that variable instead, GNU's
+rejects it. Of BusyBox's applets that start a program, keeper reads `env`, `nice` and `nohup`;
+its others (`timeout`, `xargs`, `time`, `setsid`, `ionice`, `flock`) read their options unlike
+the tools keeper knows, so a run through them is refused. BusyBox's `nice` reads one adjustment
+(`-n 3`, `-n3` or `-3`) and runs the next element whatever it looks like, so a second option there
+(`busybox nice -n 3 -n./tool true` runs the file `-n./tool`, not `true`) is refused rather than
+read as GNU's `nice` reads it. The approval binds the host that resolved
+it, the argv as it runs, the folder `cwd` resolved to, that folder and `workspace/` themselves (by
+device and inode), the environment, the resolved program — and the one a wrapper runs, and any
+wrapper a wrapper runs (`env nice tool`) — with their SHA-256 and every held file's SHA-256
+(`exec_binding`). Before it is used keeper resolves and hashes all of it again: another host,
+another folder behind the same `cwd` or put at the same name, or any other difference refuses it.
+The run it lets go is prepared once more and runs only on those same facts, and the trampoline
+checks the folders, programs, held files and a networked run's workspace again, inside the
+sandbox, right before the program starts. On Linux it reads each program's bytes through one open
+handle and starts the program by that handle, so a program put at its path after that check is not
+what runs. That holds behind a wrapper too: the wrapper is given a link to the handle of the
+program it starts in that program's place in its argv (which is the name that program sees as its
+own), and still does all it does — `env` sets, `nice` lowers the priority — before it starts the
+program keeper checked. That handle is opened only once the sandbox holds, as the run's own grants
+allow: a program outside every grant — on a drive the run did not ask for, under the host's home —
+refuses the run and is never handed on, so the program inherits a read-only descriptor of each
+such program only when it is a file the run may read anyway. What keeper cannot close (DW-759): a script (`#!`) is started by its path, as
+its interpreter opens it by name — wherever the script is, in `workspace/` or in a `read_exec`
+folder (R245); a held file or a workspace file changed by another writer — sync, another process of
+the host — after that last check is read as it is then; and on the Mac the program, and any program
+a wrapper starts, is checked before `sandbox-exec` starts it by its path. The card's sentence is
+keeper's: *Run `<program>` in `workspace/<cwd>`*, *with network*, *with code the session holds*;
+below it the card draws the argv one element per line, the program and its hash, each wrapper a
+wrapper starts and the program the last one runs with theirs, the folder, the drives the run
+reads (read-only), the seconds after which it is stopped, each held file, and with network the
+*Network* chip — "This command may reach any host. It sees only this session's workspace: <n>
+files, <size>." — with the file list one tap away. The card does not draw the environment (the
+fixed one above) nor the folders' device and inode, which the approval binds too. An argument, a
+drive or a name that could be misread — empty, holding a newline, a tab, a quote, a backslash or a
+bidirectional override, or with a space at an end — is shown in quotes with each such character
+escaped (`"a\nb"`, `"\u{202e}…"`), so one argument never looks like two and nothing is reordered;
+what runs is the raw value. A run's card draws only that view, never its arguments as raw JSON.
+A run whose binding is too large for the card travels as the request's
+attachment, whole: opened on the card, keeper checks it against the digest and draws it as it draws
+an inline run — the argv, the programs, the folder, the drives, the time limit, the held code and
+the *Network* chip — and it
+is approved only once it was shown.
+
+**Approve for this session.** A T2 run outside `main` offers it: later runs of the same program
+(and wrapped program, and any wrapper between), byte for byte, in the same folder — the folder itself, not another put at
+its name — on the same host, with any arguments, go without asking for at most 24 hours — until the session closes or this host lets it go. A run
+that needs network, runs code the session holds, or is raised a tier is outside it.
+
+**Network is a send to anyone.** A networked run sees only `workspace/`, so what it can send is its
+argv and the workspace. Its T3 approval releases exactly the workspace its card listed — every
+file's path and SHA-256 (at most 512 files) — and keeper lists it again before the run: one file
+more, or other bytes, refuses it and the agent asks again. A file whose name is not UTF-8, a pipe,
+a socket or a device in `workspace/` refuses every run: keeper could not bind it.
+
+**What it may write.** `workspace/` is on the session's home drive, so a run is a write there: one
+that would read a drive fewer people read than the home drive's — or that runs in a session already
+narrowed below them — is refused before anything runs.
+
+**The result.** Its exit status (or *timed out after N s*, its process group stopped), then
+stdout and stderr, each kept to 64 KiB and saying `truncated: {shown, total}` in the stream's own
+bytes when not all of it is shown — invalid UTF-8 replaced, two full streams sharing the tool
+result's 80 KiB, never cut again after — read as data, not instructions. Its pipes are drained for
+at most two seconds after the group is killed. Its label: the readers of the drives it read
+(anyone when none), and `untrusted` when it had network or read any drive, else `agent`.
+Secret-shaped text in it is redacted in the log like every other line. `keeper-agentd status`
+prints `sandbox: landlock ABI <n>, seccomp ok` or `sandbox: unavailable — <reason>`; the Mac logs
+`sandbox-exec ok; no [sandbox] table is configurable on this Mac yet` — its own `read_exec`/`env`
+table arrives with its MCP servers' store, checked as agentd's is. On Linux nothing of a run can
+leave its process group, so the whole group ending is every process of it. On the Mac a process
+can leave the group, and the Mac gives keeper no way to tell a run's descendant from any other
+process without privileges keeper does not hold: after the group is killed, keeper kills each
+process still naming the run's `TMPDIR`, and the result says how many it found — never that every
+process ended. One that also cleared its environment can outlive the run, still inside the same
+profile and keeping every grant the run had: the workspace, read and write; the drives the run
+asked to read, read-only, for a run without network (a networked run reads no drive); no secret,
+no other drive, and no network the run did not have (DW-757). Without a sandbox `run` is not
+offered and nothing runs unsandboxed. ⌘9 bots and scheduled tasks never have `run`.
 
 ## When an action waits
 
@@ -1779,10 +1962,22 @@ the bots' URL rules; an `[[agents]] drive` must be a `[[drives]] id`. Two `[[dri
 one `remote`. `[[trust]]` needs `user`;
 `master_key` (`ed25519:<unpadded base64>`) is written by a person after comparing the fingerprint
 with the person's own device, never by keeper, and without it the person is not pinned and no
-decision of theirs is accepted (*Deciding*). `[[mcp]]`, `[[kvm]]` and `[sandbox]` are read and checked now and
-used by later epics; an `[[mcp]] role = "kvm:<id>"` must name a `[[kvm]] id`. `[sandbox]
-read_exec` must be absolute; that it names nothing inside a drive's checkout and nothing holding
-this host's secrets is checked by the sandbox that mounts it, in a later release.
+decision of theirs is accepted (*Deciding*). `[[mcp]]` and `[[kvm]]` are read and checked now and
+used by later epics; an `[[mcp]] role = "kvm:<id>"` must name a `[[kvm]] id`. `[sandbox]` is
+`run`'s (§ *Running a command*):
+
+```toml
+[sandbox]
+read_exec = ["/opt/toolchains/bin"]
+env       = { RUSTUP_HOME = "/usr/local/rustup", CARGO_HOME = "/usr/local/cargo" }
+```
+
+`read_exec` folders and `env` values are absolute paths a run may read and execute (the `read_exec`
+folders also go on its `PATH`); an `env` name is upper-case and never one keeper sets itself
+(`PATH`, `HOME`, `TMPDIR`, `LANG`, `TERM`, `NO_COLOR`, `GIT_*` of the run's list), `KEEPER_*`,
+`LD_*` or `DYLD_*`. At start agentd refuses to offer `sandbox` when one of them is `/`, is or holds
+a drive's checkout, agentd's own configuration, data or state folder or `$CREDENTIALS_DIRECTORY`,
+or holds its user's home; `keeper-agentd status` names which.
 
 `[[providers]]` become `keeper.db` rows, one per entry and kept in step with the file at every
 start: a changed `base_url` updates its row, a removed entry deletes it. No token enters the
@@ -2606,10 +2801,11 @@ offered as `[tools].allow` says, but never in a proxy's `main` or `conversation`
 is refused, "a workflow is started by delegation or a card, never inside the DM". Before anything
 is made, the workflow must let `workflow_start` start it, every tool it names must be one a turn of
 the run would be offered — what its agent is offered in a session of kind `workflow`, `reply` and
-`ask_human` included, a name `allow` gives that no tool answers yet not ("`bmad-build` needs `run`,
-which `amelia` is not allowed") — every drive it works in must be in scope, and every input is
-checked: a required one given, a `path` inside a drive the run works in (`<drive>:<path>`, or a
-path of the home drive), a `drive` in scope, a `session` the id of a session of the drive. The
+`ask_human` included, `run` only on a host whose sandbox passed its probe, a name `allow` gives
+that no tool answers here not ("`bmad-build` needs `run`, which `amelia` is not allowed") — every
+drive it works in must be in scope, and every input is checked: a required one given, a `path`
+inside a drive the run works in (`<drive>:<path>`, or a path of the home drive), a `drive` in
+scope, a `session` the id of a session of the drive. The
 brief and its inputs land in the run's folder in the home drive, which every reader of that drive
 reads, whatever the run's label says: a session whose label keeps them from those readers parks
 on a declassification of exactly those bytes, as a write would, or is refused where nobody can

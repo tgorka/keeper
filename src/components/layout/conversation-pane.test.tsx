@@ -312,6 +312,7 @@ describe("ConversationPane", () => {
       verify: false,
       only: null,
       declassify: null,
+      run: null,
     };
 
     await waitFor(() => expect(captured.onBatch).not.toBeNull());
@@ -396,6 +397,7 @@ describe("ConversationPane", () => {
       verify: false,
       only: null,
       declassify: null,
+      run: null,
     });
 
     await waitFor(() => expect(captured.onBatch).not.toBeNull());

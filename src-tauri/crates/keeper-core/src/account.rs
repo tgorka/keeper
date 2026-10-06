@@ -4074,7 +4074,7 @@ impl AccountManager {
         account_id: &str,
         room_id: &str,
         id: &str,
-    ) -> Result<String, CoreError> {
+    ) -> Result<crate::agents::approval_card::ApprovalPayloadVm, CoreError> {
         let room = self.session_room(account_id, room_id).await?;
         let (shown, digest) = approval_payload(&room, id).await?;
         self.agent_shown
@@ -5392,12 +5392,16 @@ where
     .collect()
 }
 
-/// The attached action of the approval `id` in the session room `room`, as
-/// pretty-printed JSON, and the binding digest it was checked against
+/// The attached action of the approval `id` in the session room `room` —
+/// as pretty-printed JSON and, for a `run`, the typed run view an inline
+/// card draws (R231) — and the binding digest it was checked against
 /// (R186): its encrypted file fetched and decrypted through the media
 /// cache, and refused with a sentence unless its bytes are the file the
 /// request names and the action its digest and summary bind.
-pub async fn approval_payload(room: &Room, id: &str) -> Result<(String, String), CoreError> {
+pub async fn approval_payload(
+    room: &Room,
+    id: &str,
+) -> Result<(approval_card::ApprovalPayloadVm, String), CoreError> {
     use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
     use matrix_sdk::ruma::events::room::{EncryptedFile, MediaSource};
     let refused = |sentence: &str| CoreError::Unsupported(sentence.to_owned());
@@ -5425,9 +5429,7 @@ pub async fn approval_payload(room: &Room, id: &str) -> Result<(String, String),
     )
     .await
     .map_err(|_| refused(approval_card::PAYLOAD_UNAVAILABLE))?;
-    let args = approval_card::verify_attached(record, &bytes).map_err(CoreError::Unsupported)?;
-    let shown = serde_json::to_string_pretty(&args)
-        .map_err(|error| CoreError::Internal(error.to_string()))?;
+    let shown = approval_card::attached_payload(record, &bytes).map_err(CoreError::Unsupported)?;
     Ok((shown, record.binding_digest.clone()))
 }
 
@@ -5456,22 +5458,14 @@ pub async fn decide_approval(
         hosted: hosted.rooms(),
     };
     let fold = agent_room::approvals_of(room).await;
-    let record = fold
-        .check(
-            &viewer,
-            &req.id,
-            &req.binding_digest,
-            req.scope,
-            chrono::Utc::now(),
-            &|user| user.to_string(),
-        )
-        .map_err(CoreError::Unsupported)?;
-    if req.decision == crate::agents::approval::Decision::Approve
-        && approval_card::binding(record) == approval_card::Binding::Attached
-        && !shown(&record.binding_digest)
-    {
-        return Err(CoreError::Unsupported(approval_card::UNSEEN.to_owned()));
-    }
+    fold.decide(
+        &viewer,
+        &req,
+        chrono::Utc::now(),
+        &|user| user.to_string(),
+        shown,
+    )
+    .map_err(CoreError::Unsupported)?;
     let content = ApprovalDecisionContent {
         id: req.id,
         binding_digest: req.binding_digest,

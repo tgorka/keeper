@@ -21,7 +21,7 @@
 //!   (AD-62).
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -778,6 +778,9 @@ impl DesktopHost {
         let mut copies = Vec::new();
         let mut syncs = Vec::new();
         let doors = Arc::new(ClientDoors::default());
+        let sandbox =
+            crate::agent::off_the_runtime(|| desktop_sandbox(&views, &self.data_dir, &host))
+                .map(Arc::new);
         for home in &signed {
             let user = home.config.matrix_user.clone();
             let Some(homeserver) = homeserver_for(&user, &facts.homeservers) else {
@@ -806,6 +809,7 @@ impl DesktopHost {
                         client: client.clone(),
                         anchor: Anchor::Desktop(key.trust.clone()),
                     })),
+                    sandbox: sandbox.clone(),
                     ..deps
                 }),
                 Err(sentence) => {
@@ -831,7 +835,14 @@ impl DesktopHost {
             .into_iter()
             .map(|drive| (drive.view, drive.materialized))
             .collect();
-        let runtime = HostRuntime::desktop(host, login, &self.version, &manifest, copies.clone());
+        let runtime = HostRuntime::desktop(
+            host,
+            login,
+            &self.version,
+            &manifest,
+            copies.clone(),
+            sandbox.is_some(),
+        );
         self.doorbell
             .set_principal_agents(runtime.principal_agents());
         let (stop, signal) = chat::cancellation();
@@ -895,6 +906,65 @@ impl DesktopHost {
         }
         for sync in built.syncs {
             sync.abort();
+        }
+    }
+}
+
+/// This Mac's sandbox (96.1 #11): `/usr/bin/sandbox-exec`, with the
+/// developer folder `xcode-select -p` names read-and-execute (R148, where
+/// `/usr/bin/git`'s tools live), probed; `None` off macOS or when the
+/// probe fails — `run` is then not offered here. Its `[sandbox]` table is
+/// the default one, through the check agentd's goes through: the Mac's
+/// device-local table lands with its MCP store (R213, rung
+/// `agents-96-mcp-mac`), and its status line says so.
+fn desktop_sandbox(
+    views: &[DriveView],
+    data_dir: &Path,
+    host: &HostSlug,
+) -> Option<crate::run::SandboxHost> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let developer: Vec<PathBuf> = std::process::Command::new("/usr/bin/xcode-select")
+        .arg("-p")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|text| PathBuf::from(text.trim()))
+        .filter(|path| path.is_absolute())
+        .into_iter()
+        .collect();
+    let mut table = match keeper_core::agents::run::SandboxTable::check(Vec::new(), BTreeMap::new())
+    {
+        Ok(table) => table,
+        Err((at, reason)) => {
+            tracing::warn!(%at, %reason, "agents: this Mac's [sandbox] table does not read");
+            return None;
+        }
+    };
+    table.read_exec.extend(developer);
+    let forbidden = crate::run::Forbidden {
+        drives: views
+            .iter()
+            .map(|view| (view.id.clone(), view.profile.local_path.clone()))
+            .collect(),
+        secrets: vec![data_dir.to_path_buf()],
+        home: std::env::var_os("HOME").map(PathBuf::from),
+    };
+    match crate::run::SandboxHost::probe(
+        crate::run::Kind::SandboxExec,
+        host.as_str(),
+        &table,
+        &forbidden,
+    ) {
+        Ok(sandbox) => {
+            tracing::info!(sandbox = %sandbox.status, "agents: this Mac's sandbox");
+            Some(sandbox)
+        }
+        Err(reason) => {
+            tracing::warn!(%reason, "agents: no sandbox on this Mac; agents that need `sandbox` wait for another host");
+            None
         }
     }
 }
@@ -1259,7 +1329,7 @@ mod tests {
             copies: Vec::new(),
             syncs: Vec::new(),
             known: Arc::default(),
-            runtime: HostRuntime::desktop(host, "tgorka", "test", &[], Vec::new()),
+            runtime: HostRuntime::desktop(host, "tgorka", "test", &[], Vec::new(), false),
             stop,
             signal,
         }

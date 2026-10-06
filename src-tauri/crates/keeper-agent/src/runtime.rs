@@ -453,6 +453,7 @@ pub(crate) fn deps_over(
             .unwrap_or_default(),
         lfs_threshold_bytes: home_drive.profile.lfs_threshold_bytes,
         decisions: None,
+        sandbox: None,
     })
 }
 
@@ -740,6 +741,42 @@ pub(crate) fn start_copy(
     (copy, sync)
 }
 
+/// This host's sandbox (96.1 #11, R141): agentd's own binary as the
+/// trampoline, `[sandbox] read_exec` and `env` checked against its drives,
+/// its own folders and secrets and its user's home, then probed.
+fn agentd_sandbox(
+    config: &AgentdConfig,
+    dirs: &XdgDirs,
+    drives: &[DriveView],
+) -> Result<crate::run::SandboxHost, String> {
+    let program = std::env::current_exe()
+        .map_err(|error| format!("agentd could not find its own binary: {error}"))?;
+    let forbidden = crate::run::Forbidden {
+        drives: drives
+            .iter()
+            .map(|drive| (drive.id.clone(), drive.profile.local_path.clone()))
+            .collect(),
+        secrets: [&dirs.config, &dirs.data, &dirs.state]
+            .into_iter()
+            .cloned()
+            .chain(std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from))
+            .collect(),
+        home: std::env::var_os("HOME").map(PathBuf::from),
+    };
+    crate::run::SandboxHost::probe(
+        crate::run::Kind::Trampoline {
+            program,
+            args: vec![crate::run::TRAMPOLINE_ARG.into()],
+        },
+        &config.host,
+        &keeper_core::agents::run::SandboxTable {
+            read_exec: config.read_exec.clone(),
+            env: config.sandbox_env.clone(),
+        },
+        &forbidden,
+    )
+}
+
 /// Run the host until `shutdown` turns `true`.
 pub async fn run(
     config: AgentdConfig,
@@ -790,6 +827,17 @@ pub async fn run(
             tracing::warn!(drive = %drive.id, %sentence, "agentd: this drive's zone hosts nothing");
         }
     }
+    // A `run` only where the sandbox holds (96.1 #11): agentd's own binary
+    // is the trampoline, probed once now.
+    let sandbox = agentd_sandbox(&config, &dirs, &drives);
+    let sandbox_status = match &sandbox {
+        Ok(sandbox) => sandbox.status.clone(),
+        Err(reason) => {
+            tracing::warn!(%reason, "agentd: no sandbox on this host; agents that need `sandbox` wait for another host");
+            format!("unavailable — {reason}")
+        }
+    };
+    let sandbox = sandbox.ok().map(Arc::new);
 
     let sessions_zones: Vec<PathBuf> = drives
         .iter()
@@ -852,6 +900,7 @@ pub async fn run(
                     client: client.clone(),
                     anchor: Anchor::Pinned(config.trust.clone()),
                 })),
+                sandbox: sandbox.clone(),
                 ..deps
             }),
             Err(sentence) => {
@@ -876,6 +925,7 @@ pub async fn run(
         env!("CARGO_PKG_VERSION"),
         &drives,
         copies.clone(),
+        sandbox.is_some(),
     );
     doorbell.set_principal_agents(hosts.principal_agents());
     // Each steward's triage and harvest sessions are made from the first
@@ -901,7 +951,7 @@ pub async fn run(
     let engine = Arc::clone(&agentd.engine);
     let mut supervisor = tokio::spawn(async move { engine.run(engine_shutdown).await });
 
-    let mut status = StatusFile::new(dirs.state.join(STATUS_FILE));
+    let mut status = StatusFile::new(dirs.state.join(STATUS_FILE), sandbox_status);
     let trust = Arc::new(Mutex::new(Vec::<Value>::new()));
     let trust_reader = tokio::spawn(read_trust(
         config.trust.clone(),
@@ -2499,13 +2549,20 @@ fn trust_line(entry: &TrustEntry, published: Result<Option<String>, String>) -> 
 /// when it changes and every [`STATUS_HEARTBEAT`] while it does not.
 struct StatusFile {
     path: PathBuf,
+    /// What the start's probe found: `landlock ABI 7, seccomp ok`, or
+    /// `unavailable — <reason>` (96.1 #11).
+    sandbox: String,
     /// The last body written, without its time, and when.
     last: Option<(String, Instant)>,
 }
 
 impl StatusFile {
-    fn new(path: PathBuf) -> StatusFile {
-        StatusFile { path, last: None }
+    fn new(path: PathBuf, sandbox: String) -> StatusFile {
+        StatusFile {
+            path,
+            sandbox,
+            last: None,
+        }
     }
 
     /// Each drive's engine state, each copy, the sessions it serves and the
@@ -2565,6 +2622,7 @@ impl StatusFile {
             "copies": copies,
             "claims": hosts.held(),
             "trust": trust,
+            "sandbox": self.sandbox,
         });
         let body = status.to_string();
         let fresh = self

@@ -193,6 +193,33 @@ fn the_widest_live_mode_picks_the_vocabulary() {
     assert_eq!(offer.specs().len(), 5);
 }
 
+/// 96.1 #10: `run` is an agent's tool alone (D-33): no provider kind, at any
+/// grant's widest mode and whatever the model states, is offered it.
+#[test]
+fn bots_never_offer_run() {
+    for kind in [
+        ProviderKind::Hermes,
+        ProviderKind::Ollama,
+        ProviderKind::OpenAi,
+    ] {
+        for supported in [Some(true), None, Some(false)] {
+            for mode in [GrantMode::Write, GrantMode::Read] {
+                let offer = offer_tools(kind, supported, &[profile("drive-1", mode)]);
+                assert!(
+                    !names(&offer).iter().any(|name| name == "run"),
+                    "{kind:?} {supported:?} {mode:?}"
+                );
+            }
+        }
+    }
+    assert!(names(&offer_tools(
+        ProviderKind::Ollama,
+        Some(true),
+        &[profile("drive-1", GrantMode::Write)]
+    ))
+    .contains(&"drive_write".to_owned()));
+}
+
 // ---------------------------------------------------------------------------
 // context_targets
 // ---------------------------------------------------------------------------

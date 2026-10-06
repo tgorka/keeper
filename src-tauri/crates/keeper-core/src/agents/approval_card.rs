@@ -195,7 +195,8 @@ pub struct ApprovalCardVm {
     pub summary: String,
     /// The tool, as the model called it.
     pub tool: String,
-    /// The exact arguments, pretty-printed JSON; `None` when attached.
+    /// The exact arguments, pretty-printed JSON; `None` when attached, and
+    /// for a `run`, which `run` draws whole.
     pub payload: Option<String>,
     /// [`ATTACHED`] and the arguments' SHA-256, when they travel as a file:
     /// `agent_approval_payload` fetches and checks them.
@@ -221,6 +222,169 @@ pub struct ApprovalCardVm {
     /// At T4: who alone decides, and that it cannot be undone.
     pub only: Option<String>,
     pub declassify: Option<DeclassifyVm>,
+    /// A `run`'s execution as keeper bound it (UX-DR139); `None` for any
+    /// other tool, or when the action is attached — [`attached_payload`]
+    /// then draws the same view once its file is checked (R231).
+    pub run: Option<RunCardVm>,
+}
+
+/// What a `run` card draws (UX-DR139, R155, R213, R260): the argv as it
+/// runs, one element per line — git's inserted `-c core.hooksPath=/dev/null`
+/// with it; the program started, each wrapper a wrapper starts, and the
+/// program the last one runs, with the first 12 hex digits of their
+/// SHA-256; where it runs; the drives it asked to read and when it is
+/// stopped; each piece of code the session holds; and, with network, the
+/// workspace it releases. Not drawn: the environment, which is the host's
+/// fixed one, and the folders' device and inode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RunCardVm {
+    pub argv: Vec<String>,
+    /// `/usr/bin/cargo · 0123456789ab`.
+    pub program: String,
+    /// Each wrapper a wrapper starts before the program (`env nice tool`
+    /// starts `nice`), the same way, in order.
+    pub wrappers: Vec<String>,
+    /// The program a wrapper runs, the same way.
+    pub wrapped: Option<String>,
+    /// `workspace/<folder>`, as it resolved.
+    pub cwd: String,
+    /// Each drive id the run asked to read, read-only.
+    pub reads: Vec<String>,
+    /// The seconds after which it is stopped: the one it asked for, or the
+    /// default.
+    #[ts(type = "number")]
+    pub timeout_s: u64,
+    /// Each file of the code the session holds, or the inline code's flag,
+    /// with its hash: `tool.py · 0123456789ab`.
+    pub held: Vec<String>,
+    pub network: Option<RunNetworkVm>,
+}
+
+/// The *Network* chip and the workspace a networked run releases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RunNetworkVm {
+    /// "This command may reach any host. It sees only this session's
+    /// workspace: <n> files, <size>."
+    pub sentence: String,
+    /// Every file it releases, by path.
+    pub files: Vec<String>,
+}
+
+/// `text` as a run card shows one argument or one file's name (R231):
+/// itself when nothing in it could be misread — not empty, no control or
+/// bidirectional character, no quote or backslash, no space at either end
+/// — else in double quotes with `\\`, `\"`, `\n`, `\t` and `\u{…}` escapes.
+/// So an empty argument, one holding a newline and two arguments, a name
+/// that a bidi override would reorder, each shows as what it is; the raw
+/// values are what runs and what the digest binds.
+fn card_text(text: &str) -> String {
+    let bidi = |c: char| matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let plain = !text.is_empty()
+        && text.trim() == text
+        && !text
+            .chars()
+            .any(|c| c.is_control() || bidi(c) || c == '"' || c == '\\');
+    if plain {
+        return text.to_owned();
+    }
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() || bidi(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `bytes` as a person reads a size.
+fn size_words(bytes: u64) -> String {
+    match bytes {
+        0..=999 => format!("{bytes} bytes"),
+        1_000..=999_999 => format!("{:.1} kB", bytes as f64 / 1e3),
+        1_000_000..=999_999_999 => format!("{:.1} MB", bytes as f64 / 1e6),
+        _ => format!("{:.1} GB", bytes as f64 / 1e9),
+    }
+}
+
+/// What `request`, a `run` as its digest is over it — inline, or its
+/// attachment read back — shows, each argument and name as [`card_text`].
+fn run_card(request: &ApprovalRequestContent) -> RunCardVm {
+    let binding = &request.action.exec_binding;
+    let args = &request.action.args;
+    let raw = |value: &Value| value.as_str().unwrap_or("").to_owned();
+    let text = |value: &Value| card_text(value.as_str().unwrap_or(""));
+    let hashed = |what: String, sha: &Value| {
+        let sha = raw(sha);
+        format!("{what} · {}", sha.get(..12).unwrap_or(&sha))
+    };
+    let network = request.preconditions.workspace.as_ref().map(|set| {
+        let files: Vec<String> = set["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|file| text(&file["path"]))
+            .collect();
+        RunNetworkVm {
+            sentence: format!(
+                "This command may reach any host. It sees only this session's workspace: {} {}, {}.",
+                files.len(),
+                if files.len() == 1 { "file" } else { "files" },
+                size_words(set["bytes"].as_u64().unwrap_or(0)),
+            ),
+            files,
+        }
+    });
+    RunCardVm {
+        argv: binding["argv"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(text)
+            .collect(),
+        program: hashed(text(&binding["exe"]), &binding["exe_sha256"]),
+        wrappers: binding["wrappers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|wrapper| hashed(text(&wrapper["path"]), &wrapper["sha256"]))
+            .collect(),
+        wrapped: binding
+            .get("program")
+            .map(|program| hashed(text(&program["path"]), &program["sha256"])),
+        cwd: card_text(&format!("workspace/{}", raw(&binding["cwd"]))),
+        reads: args["read"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(text)
+            .collect(),
+        timeout_s: args["timeout_s"]
+            .as_u64()
+            .unwrap_or(crate::agents::run::TIMEOUT_DEFAULT_S),
+        held: binding["operands"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|operand| {
+                let what = operand["path"]
+                    .as_str()
+                    .or_else(|| operand["inline"].as_str())
+                    .unwrap_or("");
+                hashed(card_text(what), &operand["sha256"])
+            })
+            .collect(),
+        network,
+    }
 }
 
 /// One request event's cards: one, or a coalesced card's rows. `id` is the
@@ -267,10 +431,11 @@ pub enum Binding {
     Unbound,
 }
 
-/// Whether `summary` is keeper's own sentence for `tool` with `args`.
+/// Whether `summary` is keeper's own sentence for `tool` with `args` and
+/// the request's `exec_binding`.
 fn summary_holds(request: &ApprovalRequestContent, args: &Value) -> bool {
     AgentTool::from_wire(&request.action.tool)
-        .is_some_and(|tool| summary_of(tool, args) == request.summary)
+        .is_some_and(|tool| summary_of(tool, args, &request.action.exec_binding) == request.summary)
 }
 
 /// How `request`'s digest stands against what its card shows (R185).
@@ -292,9 +457,11 @@ pub fn binding(request: &ApprovalRequestContent) -> Binding {
     }
 }
 
-/// The arguments in an attached action's decrypted `bytes`, when they are
-/// the file the request names and the action its digest and summary bind
-/// (R186); else [`PAYLOAD_REFUSED`].
+/// What an attached action's decrypted `bytes` hold, when they are the
+/// file the request names and the action its digest and summary bind
+/// (R186); else [`PAYLOAD_REFUSED`]. A `run`'s file holds its arguments,
+/// its `exec_binding` and the workspace set it releases, all of which the
+/// digest is over and the person sees (R213); any other's, the arguments.
 pub fn verify_attached(request: &ApprovalRequestContent, bytes: &[u8]) -> Result<Value, String> {
     let refused = || PAYLOAD_REFUSED.to_owned();
     if binding(request) != Binding::Attached {
@@ -303,11 +470,59 @@ pub fn verify_attached(request: &ApprovalRequestContent, bytes: &[u8]) -> Result
     if request.file_sha256.as_deref() != Some(crate::agents::approval::sha256_hex(bytes).as_str()) {
         return Err(refused());
     }
-    let args: Value = serde_json::from_slice(bytes).map_err(|_| refused())?;
-    if !request.binds(&args) || !summary_holds(request, &args) {
+    let payload: Value = serde_json::from_slice(bytes).map_err(|_| refused())?;
+    if request.action.tool == AgentTool::Run.as_wire() {
+        let (args, exec_binding, workspace) =
+            crate::agents::approval::attached_run(payload.clone()).ok_or_else(refused)?;
+        let mut whole = request.clone();
+        whole.action.exec_binding = exec_binding;
+        whole.preconditions.workspace = workspace;
+        if !whole.binds(&args) || !summary_holds(&whole, &args) {
+            return Err(refused());
+        }
+        return Ok(payload);
+    }
+    if !request.binds(&payload) || !summary_holds(request, &payload) {
         return Err(refused());
     }
-    Ok(args)
+    Ok(payload)
+}
+
+/// An attached action as a device shows it once its bytes are checked
+/// (R186, R231): the action as text and, for a `run`, the same typed run
+/// view an inline `run` card draws — its argv, programs, folder, held
+/// code and, with network, the workspace it releases, counted, sized and
+/// listed — built from what the digest binds, never from the card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ApprovalPayloadVm {
+    /// The action, pretty-printed JSON.
+    pub text: String,
+    pub run: Option<RunCardVm>,
+}
+
+/// What an attached action's `bytes` show (R186, R231): refused as
+/// [`verify_attached`] refuses them; else the payload as text and, for a
+/// `run`, its run view from the arguments, binding and workspace set the
+/// digest was just checked over.
+pub fn attached_payload(
+    request: &ApprovalRequestContent,
+    bytes: &[u8],
+) -> Result<ApprovalPayloadVm, String> {
+    let payload = verify_attached(request, bytes)?;
+    let text = serde_json::to_string_pretty(&payload).map_err(|_| PAYLOAD_REFUSED.to_owned())?;
+    let run = (request.action.tool == AgentTool::Run.as_wire())
+        .then(|| crate::agents::approval::attached_run(payload))
+        .flatten()
+        .map(|(args, exec_binding, workspace)| {
+            let mut whole = request.clone();
+            whole.action.args = args;
+            whole.action.exec_binding = exec_binding;
+            whole.preconditions.workspace = workspace;
+            run_card(&whole)
+        });
+    Ok(ApprovalPayloadVm { text, run })
 }
 
 /// The scopes the card offers: the request's, never `session` above T2.
@@ -418,7 +633,10 @@ impl ApprovalCardVm {
         name: &dyn Fn(&UserId) -> String,
     ) -> ApprovalCardVm {
         let attached = request.file.is_some();
-        let payload = (!attached)
+        let run = request.action.tool == AgentTool::Run.as_wire();
+        // A run is drawn as its typed view alone (R247): its arguments as
+        // raw JSON would show a bidi override as the character it is.
+        let payload = (!attached && !run)
             .then(|| serde_json::to_string_pretty(&request.action.args).ok())
             .flatten();
         let attachment = attached.then(|| match &request.file_sha256 {
@@ -443,10 +661,12 @@ impl ApprovalCardVm {
                 Scope::Session => ScopeOfferVm {
                     scope,
                     label: "Approve for this session".to_owned(),
-                    detail: if attached {
-                        ATTACHED_REACH.to_owned()
-                    } else {
-                        session_reach(&request.action.tool, &request.action.args)
+                    detail: match (attached, request.action.tool == AgentTool::Run.as_wire()) {
+                        // A run's allowance is its programs and folder,
+                        // whatever its size (R146, R231).
+                        (true, true) => crate::agents::run::ATTACHED_SESSION_REACH.to_owned(),
+                        (true, false) => ATTACHED_REACH.to_owned(),
+                        (false, _) => session_reach(&request.action.tool, &request.action.args),
                     },
                 },
             })
@@ -489,6 +709,7 @@ impl ApprovalCardVm {
             only,
             declassify: (request.action.tool == "declassify")
                 .then(|| declassify(&request.action.args, name)),
+            run: (run && !attached).then(|| run_card(request)),
         }
     }
 }
@@ -818,6 +1039,29 @@ impl ApprovalFold {
             None => Ok(record),
         }
     }
+
+    /// Whether `viewer` may send the decision `req` at `now`, `shown`
+    /// saying whether this app has shown an attached action with a
+    /// binding digest: [`Self::check`], and an approve of an attached
+    /// action not shown refused ([`UNSEEN`], R186) — so nothing is approved
+    /// that [`attached_payload`] did not check and show first.
+    pub fn decide(
+        &self,
+        viewer: &Viewer,
+        req: &ApprovalDecideReq,
+        now: DateTime<Utc>,
+        name: &dyn Fn(&UserId) -> String,
+        shown: &dyn Fn(&str) -> bool,
+    ) -> Result<&ApprovalRequestContent, String> {
+        let record = self.check(viewer, &req.id, &req.binding_digest, req.scope, now, name)?;
+        if req.decision == Decision::Approve
+            && binding(record) == Binding::Attached
+            && !shown(&record.binding_digest)
+        {
+            return Err(UNSEEN.to_owned());
+        }
+        Ok(record)
+    }
 }
 
 /// The session rooms whose agent this app hosts now: the desktop's agents
@@ -927,7 +1171,8 @@ mod tests {
         let tool = request["action"]["tool"].as_str().expect("tool").to_owned();
         request["summary"] = json!(summary_of(
             AgentTool::from_wire(&tool).expect("a tool"),
-            args
+            args,
+            &request["action"]["exec_binding"]
         ));
         request["binding_digest"] = json!(binding_digest(
             request["id"].as_str().expect("id"),
@@ -1102,6 +1347,151 @@ mod tests {
             declassify.sentence,
             "Approving lets Marta read the brief: exactly these bytes (SHA-256 0123456789ab), once. Nothing else of this session reaches them."
         );
+    }
+
+    /// R96R-17, UX-DR139: a `run` card draws its execution as keeper bound
+    /// it, not as the model asked — the argv as it runs, the folder `cwd`
+    /// resolved to, the programs and held files with their SHA-256 — and,
+    /// with network, the workspace it releases.
+    #[test]
+    fn a_run_card_draws_what_keeper_bound() {
+        let args = json!({"argv": ["env", "./tool", "fetch"], "cwd": "sel", "network": true});
+        let binding = json!({
+            "host": "electra",
+            "argv": ["env", "./tool", "-c", "core.hooksPath=/dev/null", "fetch"],
+            "cwd": "repo-a",
+            "env": [],
+            "exe": "/usr/bin/env",
+            "exe_sha256": "0123456789abcdef".repeat(4),
+            "program": {"path": "/w/repo-a/tool", "sha256": "fedcba9876543210".repeat(4)},
+            "operands": [{"path": "tool", "inline": null, "sha256": "aa".repeat(32)}],
+        });
+        let mut value = request("01R", 3, &["once"]);
+        value["action"] = json!({"tool": "run", "args": args, "exec_binding": binding});
+        value["preconditions"]["files"] = json!([]);
+        value["preconditions"]["workspace"] = json!({"sha256": "s", "bytes": 41_300,
+            "files": [{"path": "a.txt", "sha256": "b"}, {"path": "tool", "sha256": "c"}]});
+        let run = card(sealed(value, &args), &viewer(TGORKA))
+            .run
+            .expect("a run card");
+        assert_eq!(
+            run.argv,
+            ["env", "./tool", "-c", "core.hooksPath=/dev/null", "fetch"]
+        );
+        assert_eq!(run.program, "/usr/bin/env · 0123456789ab");
+        assert_eq!(
+            run.wrapped.as_deref(),
+            Some("/w/repo-a/tool · fedcba987654")
+        );
+        assert_eq!(run.cwd, "workspace/repo-a");
+        assert_eq!(run.held, ["tool · aaaaaaaaaaaa"]);
+        assert!(run.network.is_some());
+        // Another tool draws no run.
+        assert_eq!(
+            card(request("01A", 2, &["once"]), &viewer(TGORKA)).run,
+            None
+        );
+    }
+
+    /// R96R2-11, R96R3-06, R247: each argument and name on a run card shows
+    /// as what it is — empty, holding a newline, a tab, a quote, a
+    /// backslash, a bidi override or a trailing space — never raw, and each
+    /// distinct from the plain argument it could be taken for; a plain one
+    /// shows as it is. Nothing the whole inline card carries to the webview
+    /// holds the raw override, while its digest still binds the raw bytes.
+    #[test]
+    fn a_run_card_shows_each_argument_as_what_it_is() {
+        let hostile = [
+            "printf",
+            "",
+            "a\nb",
+            "a",
+            "b",
+            "t\tx",
+            "say \"hi\"",
+            "back\\slash",
+            "\u{202e}gnp.exe",
+            "x ",
+            "\"\"",
+        ];
+        let args = json!({"argv": hostile});
+        let binding = json!({
+            "argv": hostile,
+            "cwd": "a\nb",
+            "exe": "/w/\u{202e}tool",
+            "exe_sha256": "e".repeat(64),
+            "operands": [{"path": "dir/\u{2066}x", "sha256": "f".repeat(64)}],
+        });
+        let mut value = request("01R", 2, &["once"]);
+        value["action"] = json!({"tool": "run", "args": args, "exec_binding": binding});
+        value["preconditions"]["files"] = json!([]);
+        let whole = card(sealed(value, &args), &viewer(TGORKA));
+        assert!(whole.can_decide, "the digest binds the raw argv");
+        let bidi = |c: char| matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+        let sent = serde_json::to_string(&whole).expect("json");
+        assert!(!sent.chars().any(bidi), "{sent}");
+        let run = whole.run.expect("a run card");
+        let raw = |c: char| c.is_control() || bidi(c);
+        for shown in run
+            .argv
+            .iter()
+            .chain([&run.program, &run.cwd])
+            .chain(&run.held)
+        {
+            assert!(!shown.chars().any(raw), "{shown:?}");
+        }
+        let distinct: BTreeSet<&String> = run.argv.iter().collect();
+        assert_eq!(distinct.len(), hostile.len(), "{:?}", run.argv);
+        assert_eq!(run.argv[0], "printf");
+        assert_eq!(run.argv[3], "a");
+        assert_ne!(run.argv[1], "");
+        assert_ne!(run.argv[9], "x");
+    }
+
+    /// R96R4-05, R260: two inline runs alike but for the drives they ask
+    /// to read, how long they may take and the wrapper between, draw
+    /// differently — each drive (a hostile name escaped like every other
+    /// name), the time it is stopped at (the default when it asked for
+    /// none), each wrapper with its hash — and nothing the whole card
+    /// carries holds a raw override.
+    #[test]
+    fn a_run_card_draws_the_drives_it_reads_when_it_stops_and_each_wrapper() {
+        let sha = |c: &str| c.repeat(64);
+        let run_of = |args: Value, wrappers: Value| {
+            let mut binding = json!({
+                "host": "electra",
+                "argv": args["argv"],
+                "cwd": "",
+                "env": [],
+                "exe": "/usr/bin/env",
+                "exe_sha256": sha("e"),
+                "program": {"path": "/usr/bin/cargo", "sha256": sha("c")},
+                "operands": [],
+            });
+            if !wrappers.is_null() {
+                binding["wrappers"] = wrappers;
+            }
+            let mut value = request("01R", 2, &["once"]);
+            value["action"] = json!({"tool": "run", "args": args, "exec_binding": binding});
+            value["preconditions"]["files"] = json!([]);
+            let whole = card(sealed(value, &args), &viewer(TGORKA));
+            assert!(whole.can_decide, "the digest binds the request");
+            let sent = serde_json::to_string(&whole).expect("json");
+            assert!(!sent.contains('\u{202e}'), "{sent}");
+            whole.run.expect("a run card")
+        };
+        let argv = json!(["env", "nice", "cargo", "test"]);
+        let plain = run_of(json!({"argv": argv}), Value::Null);
+        assert_eq!(plain.reads, Vec::<String>::new());
+        assert_eq!(plain.timeout_s, crate::agents::run::TIMEOUT_DEFAULT_S);
+        assert_eq!(plain.wrappers, Vec::<String>::new());
+        let wider = run_of(
+            json!({"argv": argv, "read": ["tgdrive", "\u{202e}evird"], "timeout_s": 1800}),
+            json!([{"path": "/usr/bin/nice", "sha256": sha("a")}]),
+        );
+        assert_eq!(wider.reads, ["tgdrive", "\"\\u{202e}evird\""]);
+        assert_eq!(wider.timeout_s, 1800);
+        assert_eq!(wider.wrappers, ["/usr/bin/nice · aaaaaaaaaaaa"]);
     }
 
     /// R78 (R4-08): approving for the session names the tool, the drive,

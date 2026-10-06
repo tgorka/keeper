@@ -42,6 +42,7 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   type ApprovalCardVm,
   type ApprovalDecision,
+  type ApprovalPayloadVm,
   type ApprovalPersonVm,
   type ApprovalScope,
   type ApprovalVm,
@@ -145,6 +146,109 @@ function Payload({ tool, text }: { tool: string; text: string }) {
   );
 }
 
+export const RUN_SHOW_FILES = "Show the files it sees";
+export const RUN_HIDE_FILES = "Hide the files";
+
+/**
+ * A `run`'s execution as keeper bound it (UX-DR139): the argv one element
+ * per line, the program, each wrapper between and the one the last wrapper
+ * runs with their hashes, the folder, the drives it reads, when it is
+ * stopped, the code the session holds, and with network what it may send.
+ * Every name arrives escaped by Rust where it could be misread.
+ */
+function RunPayload({ run }: { run: NonNullable<ApprovalCardVm["run"]> }) {
+  const captionId = useId();
+  const filesId = useId();
+  const [files, setFiles] = useState(false);
+  return (
+    <figure aria-labelledby={captionId} className="flex min-w-0 flex-col gap-1">
+      <figcaption id={captionId} className="text-muted-foreground text-xs">
+        What will run
+      </figcaption>
+      <pre className="max-h-60 overflow-y-auto whitespace-pre-wrap rounded-md border border-border bg-background p-2 font-mono text-xs [overflow-wrap:anywhere]">
+        {run.argv.join("\n")}
+      </pre>
+      <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-xs">
+        <dt className="text-muted-foreground">Program</dt>
+        <dd className="font-mono">{run.program}</dd>
+        {run.wrappers.length > 0 && (
+          <>
+            <dt className="text-muted-foreground">Then starts</dt>
+            <dd>
+              <ul className="font-mono">
+                {run.wrappers.map((wrapper, n) => (
+                  // biome-ignore lint/suspicious/noArrayIndexKey: the same wrapper may start twice.
+                  <li key={n}>{wrapper}</li>
+                ))}
+              </ul>
+            </dd>
+          </>
+        )}
+        {run.wrapped !== null && (
+          <>
+            <dt className="text-muted-foreground">Runs</dt>
+            <dd className="font-mono">{run.wrapped}</dd>
+          </>
+        )}
+        <dt className="text-muted-foreground">In</dt>
+        <dd className="font-mono">{run.cwd}</dd>
+        {run.reads.length > 0 && (
+          <>
+            <dt className="text-muted-foreground">Reads, read-only</dt>
+            <dd>
+              <ul className="font-mono">
+                {run.reads.map((drive) => (
+                  <li key={drive}>{drive}</li>
+                ))}
+              </ul>
+            </dd>
+          </>
+        )}
+        <dt className="text-muted-foreground">Stopped after</dt>
+        <dd>{run.timeoutS} s</dd>
+        {run.held.length > 0 && (
+          <>
+            <dt className="text-muted-foreground">Code the session holds</dt>
+            <dd>
+              <ul className="font-mono">
+                {run.held.map((held) => (
+                  <li key={held}>{held}</li>
+                ))}
+              </ul>
+            </dd>
+          </>
+        )}
+      </dl>
+      {run.network !== null && (
+        <div className="flex flex-col gap-1 rounded-md border border-border p-2 text-xs">
+          <p>
+            <span className="mr-1 rounded-sm bg-muted px-1 font-medium">Network</span>
+            {run.network.sentence}
+          </p>
+          {run.network.files.length > 0 && (
+            <>
+              <button
+                type="button"
+                aria-expanded={files}
+                aria-controls={filesId}
+                onClick={() => setFiles((was) => !was)}
+                className="w-fit rounded-sm text-muted-foreground underline-offset-2 outline-none hover:text-foreground hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {files ? RUN_HIDE_FILES : RUN_SHOW_FILES}
+              </button>
+              <ul id={filesId} hidden={!files} className="max-h-60 overflow-y-auto font-mono">
+                {run.network.files.map((file) => (
+                  <li key={file}>{file}</li>
+                ))}
+              </ul>
+            </>
+          )}
+        </div>
+      )}
+    </figure>
+  );
+}
+
 export const APPROVAL_SHOW_FULL = "Show the full action";
 export const APPROVAL_HIDE_FULL = "Hide the full action";
 export const APPROVAL_PAYLOAD_FAILED =
@@ -152,32 +256,38 @@ export const APPROVAL_PAYLOAD_FAILED =
 
 /**
  * An attached action, fetched whole on request: Rust checks the file against
- * the card's digest before answering, and says why when it cannot.
+ * the card's digest before answering, and says why when it cannot. A `run`
+ * is drawn as an inline one is, from the typed view Rust built over what the
+ * digest binds.
  */
 function AttachedAction({
   card,
   accountId,
   roomId,
+  onShown,
 }: {
   card: ApprovalCardVm;
   accountId: string;
   roomId: string;
+  /** Called once the file, checked against the card's digest, is shown. */
+  onShown: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [text, setText] = useState<string | null>(null);
+  const [shown, setShown] = useState<ApprovalPayloadVm | null>(null);
   const [refusal, setRefusal] = useState<string | null>(null);
 
   const toggle = async () => {
-    if (open || text !== null) {
+    if (open || shown !== null) {
       setOpen((was) => !was);
       return;
     }
     setRefusal(null);
     setLoading(true);
     try {
-      setText(await agentApprovalPayload(accountId, roomId, card.id));
+      setShown(await agentApprovalPayload(accountId, roomId, card.id));
       setOpen(true);
+      onShown();
     } catch (error) {
       setRefusal(syncErrorMessage(error, APPROVAL_PAYLOAD_FAILED));
     } finally {
@@ -203,7 +313,13 @@ function AttachedAction({
       >
         {open ? APPROVAL_HIDE_FULL : APPROVAL_SHOW_FULL}
       </Button>
-      {open && text !== null && <Payload tool={card.tool} text={text} />}
+      {open &&
+        shown !== null &&
+        (shown.run !== null ? (
+          <RunPayload run={shown.run} />
+        ) : (
+          <Payload tool={card.tool} text={shown.text} />
+        ))}
       {refusal !== null && (
         <p role="status" className="text-destructive text-xs">
           {refusal}
@@ -294,15 +410,21 @@ function Outcome({ card }: { card: ApprovalCardVm }) {
   }
 }
 
+export const APPROVAL_SEE_RUN_FIRST =
+  "Show the full action before approving: it holds what this run is bound to and what it releases.";
+
 /** Approve (in each offered scope) or deny with an optional note. */
 function Decide({
   card,
   accountId,
   roomId,
+  unseen,
 }: {
   card: ApprovalCardVm;
   accountId: string;
   roomId: string;
+  /** An attached `run` not yet shown: it cannot be approved unseen (UX-DR139). */
+  unseen: boolean;
 }) {
   const noteId = useId();
   const [sending, setSending] = useState(false);
@@ -383,7 +505,7 @@ function Decide({
               type="button"
               size="sm"
               variant={i === 0 ? "default" : "outline"}
-              disabled={sending}
+              disabled={sending || unseen}
               aria-describedby={`${noteId}-${offer.scope}`}
               onClick={() => void decide("approve", offer.scope)}
             >
@@ -400,6 +522,9 @@ function Decide({
             {APPROVAL_DENY}
           </Button>
         </div>
+      )}
+      {!denying && unseen && (
+        <p className="text-muted-foreground text-xs">{APPROVAL_SEE_RUN_FIRST}</p>
       )}
       {!denying &&
         card.scopes.map((offer) => (
@@ -436,6 +561,8 @@ function ApprovalCard({
   const weight = TIER_WEIGHT[card.tier] ?? HEAVIEST;
   const TierIcon = weight.icon;
   const waiting = card.state.state === "pending" || card.state.state === "decided";
+  const [shown, setShown] = useState(false);
+  const unseen = card.tool === "run" && card.attachment !== null && !shown;
   const head =
     card.declassify !== null ? declassifyQuestion(card.declassify.readers) : card.summary;
   // At T4 Rust's `only` already says who decides; its `cannotDecide` for anyone
@@ -466,9 +593,15 @@ function ApprovalCard({
         <Summary text={head} />
       </p>
       {card.declassify !== null && <p className="text-sm">{card.declassify.sentence}</p>}
+      {card.run !== null && <RunPayload run={card.run} />}
       {card.payload !== null && <Payload tool={card.tool} text={card.payload} />}
       {card.attachment !== null && (
-        <AttachedAction card={card} accountId={accountId} roomId={roomId} />
+        <AttachedAction
+          card={card}
+          accountId={accountId}
+          roomId={roomId}
+          onShown={() => setShown(true)}
+        />
       )}
       <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-xs">
         <dt className="text-muted-foreground">Asked by</dt>
@@ -490,7 +623,13 @@ function ApprovalCard({
       </dl>
       {waiting && card.only !== null && <p className={cn("text-sm", weight.tone)}>{card.only}</p>}
       {waiting && card.canDecide && (
-        <Decide key={card.state.state} card={card} accountId={accountId} roomId={roomId} />
+        <Decide
+          key={card.state.state}
+          card={card}
+          accountId={accountId}
+          roomId={roomId}
+          unseen={unseen}
+        />
       )}
       {waiting && !card.canDecide && (reason !== null || card.verify) && (
         <div className="flex flex-col items-start gap-2">

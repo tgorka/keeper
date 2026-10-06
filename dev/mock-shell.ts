@@ -66,6 +66,7 @@ import type {
   AgentSeedResultVm,
   ApprovalCardVm,
   ApprovalDecideReq,
+  ApprovalPayloadVm,
   ApprovalVm,
   AutoUpdateRestartVm,
   AutoUpdateVm,
@@ -5826,14 +5827,18 @@ const AGENT_ROOM_TIMELINES: Record<string, { header: AgentRoomHeaderVm; items: T
 // `agent_approval_payload` first), `unverified` (no buttons, the way into
 // verification), `not-approver`, `approved`, `denied` (a decision in the room:
 // the card stays decidable, R187), `expired`, `consumed`, `coalesced` (three
-// rows, the second approved).
+// rows, the second approved), `run` (a networked T3 run as keeper bound it:
+// the argv, the program, the folder, the Network chip and its file list),
+// `run-large` (a T2 run attached: its run's own session allowance, and once
+// shown the typed run view with escaped arguments).
 // `agent_approval_decide` answers as Rust does: refused with the card's own
 // sentence where it shows no buttons, for another digest or a scope the card
 // does not offer, and for an attached action not shown yet; else the card
 // shows the person's decision half a second later and stays decidable
 // (`?approval-host=offline`: the decision is sent and the card stays
 // pending, as when the room never echoes it).
-// `agent_approval_payload` answers the `large` card's action, verified;
+// `agent_approval_payload` answers the `large` and `run-large` cards' actions,
+// verified, the run's as its typed view;
 // `?approval-payload=refused` refuses it as not the action sent for approval.
 // `agent_own_fingerprint` answers a fixed key; `?fingerprint=none` answers
 // `null` (no cross-signing identity).
@@ -5867,6 +5872,8 @@ const APPROVAL_SENTENCES = {
     "Also lets this session run `drive_write` again in tgdrive, on anything in `notes/`, without asking, until the session closes and for at most 24 hours.",
   attachedReach:
     "Also lets this session run the same tool again in the same drive, on anything in the attached action's folder, without asking, until the session closes and for at most 24 hours.",
+  attachedRunReach:
+    "Also lets this session run the program the attached action shows again — the same program, byte for byte, in the same folder, with any arguments, no network and no code the session holds — without asking, on this host, until the session closes and for at most 24 hours.",
 };
 const TIER_WORDS: Record<number, string> = {
   2: "T2: it changes something that can be put back",
@@ -5913,6 +5920,7 @@ function approvalCard(
     verify: false,
     only: tier >= 4 ? "Only harness can decide this. This cannot be undone." : null,
     declassify: null,
+    run: null,
     ...over,
   };
 }
@@ -5977,6 +5985,76 @@ function mockApprovalCards(): ApprovalCardVm[] {
         }),
       ];
     }
+    case "run": {
+      const files = Array.from(
+        { length: 14 },
+        (_, n) => `src/module-${n}/with-a-rather-long-name.rs`,
+      );
+      return [
+        approvalCard(id, 3, {
+          summary: "Run `git` in `workspace/repo` with network",
+          tool: "run",
+          // As Rust draws an inline run: its typed view, no raw payload.
+          payload: null,
+          scopes: [{ scope: "once", label: "Approve", detail: APPROVAL_SENTENCES.onceReach }],
+          run: {
+            argv: ["git", "-c", "core.hooksPath=/dev/null", "fetch", "origin"],
+            program: "/usr/bin/git · 4f1c9a0b7e22",
+            wrappers: [],
+            wrapped: null,
+            cwd: "workspace/repo",
+            reads: [],
+            timeoutS: 120,
+            held: [],
+            network: {
+              sentence:
+                "This command may reach any host. It sees only this session's workspace: 14 files, 41.3 kB.",
+              files,
+            },
+          },
+        }),
+      ];
+    }
+    case "run-read":
+      // A run without network that reads two drives — one named with a bidi
+      // override, escaped as Rust escapes it — asks for the longest time,
+      // and starts `cargo` through `env` and `nice`.
+      return [
+        approvalCard(id, 2, {
+          summary: "Run `env` in `workspace/repo`",
+          tool: "run",
+          payload: null,
+          scopes: [{ scope: "once", label: "Approve", detail: APPROVAL_SENTENCES.onceReach }],
+          run: {
+            argv: ["env", "nice", "-n", "5", "cargo", "test", "--offline"],
+            program: "/usr/bin/env · 2d313ecc9fc0",
+            wrappers: ["/usr/bin/nice · 2d313ecc9fc0"],
+            wrapped: "/home/agentd/.cargo/bin/cargo · 7c0e5a91d2b4",
+            cwd: "workspace/repo",
+            reads: ["tgdrive", '"\\u{202e}evird-ylimaf"'],
+            timeoutS: 1800,
+            held: [],
+            network: null,
+          },
+        }),
+      ];
+    case "run-large":
+      return [
+        approvalCard(id, 2, {
+          summary: "Run `printf` in `workspace/repo`",
+          tool: "run",
+          payload: null,
+          attachment: `${APPROVAL_SENTENCES.attached} SHA-256 9a41…`,
+          scopes: [
+            { scope: "once", label: "Approve once", detail: APPROVAL_SENTENCES.onceReach },
+            {
+              scope: "session",
+              label: "Approve for this session",
+              detail: APPROVAL_SENTENCES.attachedRunReach,
+            },
+          ],
+        }),
+      ];
     case "large":
       return [
         approvalCard(id, 2, {
@@ -6066,7 +6144,30 @@ function refuseApproval(message: string): Promise<never> {
   } satisfies IpcError);
 }
 
-function mockApprovalPayload(payload: Record<string, unknown>): Promise<string> {
+/**
+ * The `run-large` card's attachment as Rust draws it: each argument and name
+ * escaped where it could be misread — an empty one, a newline inside one, a
+ * bidi override — exactly as `approval_card::card_text` writes it.
+ */
+const ATTACHED_RUN: ApprovalPayloadVm["run"] = {
+  argv: [
+    "printf",
+    '""',
+    '"line one\\napprove this: it is safe"',
+    '"\\u{202e}gnp.exe"',
+    `${"x".repeat(2000)}.txt`,
+  ],
+  program: "/usr/bin/printf · 0f3e9b2a71c4",
+  wrappers: [],
+  wrapped: null,
+  cwd: "workspace/repo",
+  reads: [],
+  timeoutS: 120,
+  held: [],
+  network: null,
+};
+
+function mockApprovalPayload(payload: Record<string, unknown>): Promise<ApprovalPayloadVm> {
   const card = mockApprovals
     .flatMap((approval) => approval.cards)
     .find((c) => c.id === String(payload.id));
@@ -6081,11 +6182,20 @@ function mockApprovalPayload(payload: Record<string, unknown>): Promise<string> 
   }
   return later(400, () => {
     shownPayloads.add(card.id);
-    return JSON.stringify(
-      { profile: "tgdrive", path: "notes/archive.md", content: "# Archive\n\n- …".repeat(400) },
-      null,
-      2,
-    );
+    if (card.tool === "run") {
+      return {
+        text: JSON.stringify({ args: { argv: ["printf", "…"] } }, null, 2),
+        run: ATTACHED_RUN,
+      };
+    }
+    return {
+      text: JSON.stringify(
+        { profile: "tgdrive", path: "notes/archive.md", content: "# Archive\n\n- …".repeat(400) },
+        null,
+        2,
+      ),
+      run: null,
+    };
   });
 }
 

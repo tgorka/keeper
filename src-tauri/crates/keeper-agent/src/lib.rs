@@ -74,6 +74,7 @@ pub mod memory;
 pub mod ports;
 pub mod promote;
 pub mod rooms;
+pub mod run;
 #[cfg(unix)]
 pub mod runtime;
 pub mod search;
