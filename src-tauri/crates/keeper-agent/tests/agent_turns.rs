@@ -7854,6 +7854,108 @@ mod parks {
         assert_eq!(tool_results(&world.lines(SESSION)).len(), 1);
     }
 
+    /// DW-567, R206: a consolidator's `memory_apply` record in a session's
+    /// store goes through the worker as every approval does — adopted with
+    /// no parked call, asked of exactly the approvers its arguments bind
+    /// (the owner, not every reader of the drive), a decision by another
+    /// reader ignored, the approver's consumed once in the room and logged
+    /// `consumed` — the line the consolidator applies on — and nothing of
+    /// the model's runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_consolidator_record_is_consumed_once_through_the_worker() {
+        use keeper_core::agents::approval::FilePin;
+        use keeper_core::agents::consolidate::{review_record, After, ApplyArgs, FileChange};
+        let (mut world, approvals) = deciding(Vec::new());
+        let before = "tgorka likes short answers.\n";
+        let args = ApplyArgs {
+            v: ApplyArgs::VERSION,
+            agent: "nixi".to_owned(),
+            home: "nixi".to_owned(),
+            change: FileChange {
+                path: "nixi/MEMORY.md".to_owned(),
+                before: Some(before.to_owned()),
+                after: After::Text(format!("{before}§\nreviews on Fridays\n")),
+            },
+            proposals: vec![ulid::Ulid::new().to_string()],
+            sessions: Vec::new(),
+            approvers: vec![TGORKA.to_owned()],
+            label: Label {
+                readers: Readers::Only(BTreeSet::from([user(TGORKA), user(MARTA)])),
+                integrity: Integrity::Agent,
+                local_only: false,
+            },
+            preview: "artifacts/memory-review-x.md".to_owned(),
+            preview_sha256: sha256_hex(b"preview"),
+        };
+        let pinned = "80-agents/nixi/MEMORY.md".to_owned();
+        let mut record = review_record(
+            &ulid::Ulid::new(),
+            chrono::Utc::now(),
+            &format!("60-sessions/{SESSION}"),
+            "tgdrive",
+            "electra",
+            &args,
+            FilePin {
+                drive: "tgdrive".to_owned(),
+                path: pinned.clone(),
+                landing: Some(pinned),
+                sha256: Some(sha256_hex(before.as_bytes())),
+            },
+        )
+        .expect("a record");
+        std::fs::create_dir_all(world.approvals().join("blobs")).expect("store");
+        if let Some((sha, bytes)) = record.externalise_args() {
+            std::fs::write(world.approvals().join(format!("blobs/{sha}.json")), bytes)
+                .expect("blob");
+        }
+        std::fs::write(
+            world.approvals().join(format!("{}.json", record.id)),
+            serde_json::to_string_pretty(&record).expect("json"),
+        )
+        .expect("record");
+
+        let mut served = open(&world, &approvals);
+        let (_handle, signal) = chat::cancellation();
+        served
+            .resume_approvals(&world.deps, world.room.clone(), signal)
+            .await;
+        let requests = world.sent_of(APPROVAL_REQUEST);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["approvers"], json!([TGORKA]));
+        assert!(served.waiting());
+
+        let martas = world.decision_from(
+            MARTA,
+            "PHONE",
+            decision_content(&record, Decision::Approve, None),
+        );
+        world.serve(&mut served, martas).await;
+        assert!(approvals.events().is_empty(), "not an approver");
+
+        let decided = world.decision(&record, Decision::Approve);
+        assert!(matches!(
+            world.serve(&mut served, decided).await,
+            Outcome::Decided
+        ));
+        assert_eq!(approvals.events().len(), 1, "consumed once");
+        let states: Vec<ApprovalState> = world
+            .approval_lines()
+            .iter()
+            .map(|body| body.state)
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ApprovalState::Requested,
+                ApprovalState::Decided,
+                ApprovalState::Decided,
+                ApprovalState::Consumed
+            ]
+        );
+        assert!(results(&world).is_empty(), "no model call ran");
+        assert!(!served.waiting());
+    }
+
     /// A `drive_write` to a note that is not there classifies by where it
     /// would land (T2 outside the session) and parks, its record pinning
     /// the file as absent; the call's one audit row waits pending, marked

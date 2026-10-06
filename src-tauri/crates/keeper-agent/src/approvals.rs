@@ -416,6 +416,68 @@ fn read_text_in(dir: &Path, name: &str) -> std::io::Result<String> {
     String::from_utf8(read_in(dir, name)?).map_err(std::io::Error::other)
 }
 
+/// The record `id` in the approvals store of the session at `session_dir`,
+/// read strictly with its arguments: a store, record or blob that is a link
+/// is refused, never followed, and a record naming another id than its file
+/// is refused. The one reader of every store — the worker's and the
+/// consolidator's.
+pub(crate) fn read_stored_record(
+    session_dir: &Path,
+    id: &str,
+) -> Result<(ApprovalRecord, Value), String> {
+    let unread = |error: std::io::Error| format!("the approval record could not be read: {error}");
+    let dir = contained(&session_dir.join(APPROVALS_DIR), false).map_err(unread)?;
+    let text = read_text_in(&dir, &format!("{id}.json")).map_err(unread)?;
+    let record = parse_record(&text).map_err(|refusal| refusal.to_string())?;
+    if record.id != id {
+        return Err("the approval record names another id than its file".to_owned());
+    }
+    let blob = match &record.action.args_blob {
+        Some(sha) => Some(
+            contained(&dir.join("blobs"), false)
+                .and_then(|blobs| read_text_in(&blobs, &format!("{sha}.json")))
+                .map_err(|error| format!("the approval's arguments could not be read: {error}"))?,
+        ),
+        None => None,
+    };
+    let args = record
+        .args(blob.as_deref())
+        .ok_or_else(|| "the approval's arguments do not match their digest".to_owned())?;
+    Ok((record, args))
+}
+
+/// The decision written beside `id`'s record in the store of the session at
+/// `session_dir`, when one reads — through no link.
+pub(crate) fn read_stored_decision(session_dir: &Path, id: &str) -> Option<DecisionRecord> {
+    let dir = contained(&session_dir.join(APPROVALS_DIR), false).ok()?;
+    let text = read_text_in(&dir, &format!("{id}.decision.json")).ok()?;
+    parse_decision(&text)
+        .ok()
+        .filter(|decision| decision.id == id)
+}
+
+/// The ids of the records in the store of the session at `session_dir`:
+/// regular files only, a linked store none.
+pub(crate) fn stored_ids(session_dir: &Path) -> Vec<String> {
+    let Ok(dir) = contained(&session_dir.join(APPROVALS_DIR), false) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let id = name.strip_suffix(".json")?;
+            Ulid::from_string(id).ok().map(|_| id.to_owned())
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
 /// Write `bytes` as `dir/name` (a folder [`contained`] made), once and
 /// whole: into a create-new file beside it, `fsync`ed, then hard-linked to
 /// `name` — which fails when anything, a link included, is there already
@@ -546,25 +608,7 @@ impl ServedSession {
 
     /// The record `id`, read strictly, with its arguments.
     fn read_record(&self, deps: &AgentDeps, id: &str) -> Result<(ApprovalRecord, Value), String> {
-        let unread =
-            |error: std::io::Error| format!("the approval record could not be read: {error}");
-        let dir = self.approvals(deps, false).map_err(unread)?;
-        let text = read_text_in(&dir, &format!("{id}.json")).map_err(unread)?;
-        let record = parse_record(&text).map_err(|refusal| refusal.to_string())?;
-        let blob = match &record.action.args_blob {
-            Some(sha) => Some(
-                contained(&dir.join("blobs"), false)
-                    .and_then(|blobs| read_text_in(&blobs, &format!("{sha}.json")))
-                    .map_err(|error| {
-                        format!("the approval's arguments could not be read: {error}")
-                    })?,
-            ),
-            None => None,
-        };
-        let args = record
-            .args(blob.as_deref())
-            .ok_or_else(|| "the approval's arguments do not match their digest".to_owned())?;
-        Ok((record, args))
+        read_stored_record(&deps.sessions_zone.join(&self.context.session.path), id)
     }
 
     /// The round file of `id`: the parked round's later calls as the model
@@ -579,9 +623,7 @@ impl ServedSession {
 
     /// The decision written beside `id`'s record, when one reads.
     fn read_decision(&self, deps: &AgentDeps, id: &str) -> Option<DecisionRecord> {
-        let dir = self.approvals(deps, false).ok()?;
-        let text = read_text_in(&dir, &format!("{id}.decision.json")).ok()?;
-        parse_decision(&text).ok()
+        read_stored_decision(&deps.sessions_zone.join(&self.context.session.path), id)
     }
 
     /// The proxy DMs the request of `id` reached, by approver; none when its
@@ -885,7 +927,18 @@ impl ServedSession {
             }
             None => None,
         };
-        let approvers = match &self.context.label.readers {
+        // The consolidator's record is decided by the approvers its digest
+        // binds, while they are still who they should be (R206); a parked
+        // call asks the session's readers.
+        let bound;
+        let readers = if keeper_core::agents::consolidate::is_host_action(record) {
+            let (_, args) = self.read_record(deps, &record.id)?;
+            bound = Readers::Only(self.host_action_approvers(deps, record, &args)?);
+            &bound
+        } else {
+            &self.context.label.readers
+        };
+        let approvers = match readers {
             Readers::Only(set) => set.iter().map(|user| user.to_string()).collect(),
             Readers::Anyone => Vec::new(),
         };
@@ -1010,12 +1063,16 @@ impl ServedSession {
             .filter(|id| !self.context.parked.contains_key(id))
             .collect();
         for id in ids {
-            let Ok((record, _)) = self.read_record(deps, &id) else {
+            let Ok((record, args)) = self.read_record(deps, &id) else {
                 continue;
             };
             let Ok(call_line) = Ulid::from_string(&record.call.line) else {
                 continue;
             };
+            if keeper_core::agents::consolidate::is_host_action(&record) {
+                self.adopt_host_action(deps, id, &record, &args, call_line);
+                continue;
+            }
             let round = self.context.calls_from(call_line);
             if round.first().map(|(_, wire)| &wire.id) != Some(&record.call.call_id) {
                 continue;
@@ -1034,6 +1091,87 @@ impl ServedSession {
                 },
             );
         }
+    }
+
+    /// Who may decide `record`, one of the consolidator's host actions
+    /// bound to `args`: the approvers its digest binds, while they are
+    /// exactly who the drive's owner and readers and the source sessions'
+    /// requesters make them now ([`ApplyArgs::approvers_now`]) — checked
+    /// when it is adopted, announced and decided (R206). Never its label:
+    /// that is the data's.
+    pub(crate) fn host_action_approvers(
+        &self,
+        deps: &AgentDeps,
+        record: &ApprovalRecord,
+        args: &Value,
+    ) -> Result<std::collections::BTreeSet<OwnedUserId>, String> {
+        use keeper_core::agents::consolidate::{ApplyArgs, APPROVERS_MOVED};
+        let args: ApplyArgs =
+            serde_json::from_value(args.clone()).map_err(|_| APPROVERS_MOVED.to_owned())?;
+        let decl = deps
+            .drives
+            .get(&record.drive)
+            .ok_or_else(|| APPROVERS_MOVED.to_owned())?;
+        let facts = |path: &str| {
+            crate::zone::session_facts(&deps.drive_root, &deps.sessions_subfolder, path)
+        };
+        args.approvers_now(&decl.owner, &decl.readers, &facts)
+    }
+
+    /// A record the consolidator wrote into this review session (R128): its
+    /// action parks no model call, so the log holds no `tool_call` for it.
+    /// It waits from serve start on — announced already when the log says
+    /// so, carried by its own lines after a restart — until it ends; the
+    /// worker asks its approvers and writes their decision, consumes it once
+    /// as every approval is consumed, and the consolidator carries out only
+    /// a consumed one. One whose approvers are no longer who they should be
+    /// is refused here, for good.
+    fn adopt_host_action(
+        &mut self,
+        deps: &AgentDeps,
+        id: String,
+        record: &ApprovalRecord,
+        args: &Value,
+        call_line: Ulid,
+    ) {
+        let session_dir = deps.sessions_zone.join(&self.context.session.path);
+        let mut request_event = None;
+        let mut announced = false;
+        for line in keeper_core::agents::log::reader::read_session(&session_dir).lines {
+            let LineBody::Approval(body) = &line.body else {
+                continue;
+            };
+            if body.id != id {
+                continue;
+            }
+            if body.is_terminal() {
+                return;
+            }
+            if body.state == ApprovalState::Requested {
+                announced = true;
+                request_event = line.matrix_event.clone();
+            }
+        }
+        let mut pending = Pending {
+            id: id.clone(),
+            call_id: record.call.call_id.clone(),
+            call_line,
+            request_event,
+            ended: None,
+            round: vec![record.call.call_id.clone()],
+            announced,
+            ran: false,
+        };
+        if let Err(reason) = self.host_action_approvers(deps, record, args) {
+            tracing::warn!(approval = %id, %reason, "agents: a memory review's approvers no longer hold; it is refused");
+            let mut body = line(&id, ApprovalState::Refused);
+            body.reason = Some(reason);
+            if !self.end(&pending, body) {
+                return;
+            }
+            pending.ended = Some(ApprovalState::Refused);
+        }
+        self.context.parked.insert(id, pending);
     }
 
     /// The earliest moment one of this session's pending approvals expires.
@@ -1089,7 +1227,10 @@ impl ServedSession {
                     if let Err(error) = self.announce(deps, &port, record, pending.call_line).await
                     {
                         tracing::error!(approval = %pending.id, %error, "agents: a parked call's request could not be announced again");
-                        if error == UNATTACHED || error == NOBODY_TO_ASK {
+                        if error == UNATTACHED
+                            || error == NOBODY_TO_ASK
+                            || error == keeper_core::agents::consolidate::APPROVERS_MOVED
+                        {
                             // Nobody can be asked — without what it asks, or
                             // with no approver's proxy here: refused, and
                             // its turn goes on (R180, R194).
@@ -1598,7 +1739,10 @@ impl ServedSession {
             return drift(CHANGED.to_owned());
         }
         let session_dir = deps.sessions_zone.join(&self.context.session.path);
-        if !checkpoint_holds(&session_dir, &record.checkpoint) {
+        // The consolidator's action parked no model call: no log to check.
+        if !keeper_core::agents::consolidate::is_host_action(record)
+            && !checkpoint_holds(&session_dir, &record.checkpoint)
+        {
             return drift("the session's log changed after it was approved".to_owned());
         }
         if record.stale(now) {

@@ -13,3 +13,4 @@
 pub mod agentskills;
 pub mod bmad;
 pub mod hermes;
+pub mod openclaw;

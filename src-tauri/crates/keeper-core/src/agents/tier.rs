@@ -84,9 +84,9 @@ impl Tier {
     }
 }
 
-/// Every tool an agent's call can name in this build, and the action
-/// `declassify`. Matched exhaustively, so a new tool has no tier until it
-/// has a row.
+/// Every tool an agent's call can name in this build, and the actions
+/// `declassify`, `memory_apply` and `skill_apply`. Matched exhaustively, so
+/// a new tool has no tier until it has a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentTool {
     DriveList,
@@ -118,11 +118,16 @@ pub enum AgentTool {
     MemoryPropose,
     SkillPropose,
     Declassify,
+    /// The consolidator's change to an agent's `USER.md`/`MEMORY.md` that
+    /// waits for a person (R128): never a model's call.
+    MemoryApply,
+    /// The same for a skill under `_skills/`.
+    SkillApply,
 }
 
 impl AgentTool {
     /// Every tool, in the table's order.
-    pub const ALL: [AgentTool; 29] = [
+    pub const ALL: [AgentTool; 31] = [
         AgentTool::DriveList,
         AgentTool::DriveRead,
         AgentTool::DriveGlob,
@@ -152,9 +157,11 @@ impl AgentTool {
         AgentTool::MemoryPropose,
         AgentTool::SkillPropose,
         AgentTool::Declassify,
+        AgentTool::MemoryApply,
+        AgentTool::SkillApply,
     ];
 
-    /// The name the model calls (the action's own word for `declassify`).
+    /// The name the model calls (an action's own word for the actions).
     pub fn as_wire(self) -> &'static str {
         match self {
             AgentTool::DriveList => "drive_list",
@@ -186,6 +193,8 @@ impl AgentTool {
             AgentTool::MemoryPropose => "memory_propose",
             AgentTool::SkillPropose => "skill_propose",
             AgentTool::Declassify => "declassify",
+            AgentTool::MemoryApply => "memory_apply",
+            AgentTool::SkillApply => "skill_apply",
         }
     }
 
@@ -403,12 +412,17 @@ fn row(tool: AgentTool, facts: &CallFacts) -> Tier {
         // consolidator or a person acts on them (AD-400).
         AgentTool::JournalAppend | AgentTool::MemoryPropose | AgentTool::SkillPropose => Tier::T1,
         AgentTool::Declassify => Tier::T3,
+        // A person decides by construction: the change waits for them, so
+        // nothing raises it (R128).
+        AgentTool::MemoryApply | AgentTool::SkillApply => Tier::T2,
     }
 }
 
 /// Classify one call (AD-392, R171): its row, at least T2 when the grant
 /// asks (the higher wins), then raised once when it needs a person already
-/// and any reason holds.
+/// and any reason holds — except the consolidator's host actions, whose
+/// person decides by construction: fixed T2 in every context (R128), their
+/// reasons still listed.
 pub fn classify(tool: AgentTool, facts: &CallFacts, context: &Context) -> Classification {
     let grant_floor = match context.grant {
         Some(GrantWord::Ask) => Tier::T2,
@@ -424,7 +438,8 @@ pub fn classify(tool: AgentTool, facts: &CallFacts, context: &Context) -> Classi
     .into_iter()
     .filter_map(|(holds, raise)| holds.then_some(raise))
     .collect();
-    let tier = if base_tier >= Tier::T2 && !raised_by.is_empty() {
+    let fixed = matches!(tool, AgentTool::MemoryApply | AgentTool::SkillApply);
+    let tier = if !fixed && base_tier >= Tier::T2 && !raised_by.is_empty() {
         base_tier.raised()
     } else {
         base_tier
@@ -750,6 +765,9 @@ mod tests {
                 AgentTool::Declassify => {
                     assert_eq!(tier(tool, CallFacts::default()), Tier::T3);
                 }
+                AgentTool::MemoryApply | AgentTool::SkillApply => {
+                    assert_eq!(tier(tool, CallFacts::default()), Tier::T2);
+                }
             }
         }
         assert_eq!(AgentTool::from_wire("run"), None);
@@ -879,6 +897,38 @@ mod tests {
         let read = classify(AgentTool::DriveRead, &write, &watched_by_nobody);
         assert_eq!(read.tier, Tier::T0);
         assert_eq!(once.gate(), Gate::Person);
+    }
+
+    /// R128 in the central table: the consolidator's host actions are T2 in
+    /// their scheduled session and in every other context that raises a
+    /// call — one answer, never a hand-built one beside it.
+    #[test]
+    fn host_actions_are_fixed_t2_in_every_context() {
+        let mut contexts = vec![attended()];
+        for raise in 0..4 {
+            let mut context = attended();
+            match raise {
+                0 => context.unattended = true,
+                1 => context.delegated = true,
+                2 => context.integrity = Integrity::Untrusted,
+                _ => context.via_kvm = true,
+            }
+            contexts.push(context);
+        }
+        contexts.push(Context {
+            delegated: true,
+            unattended: true,
+            integrity: Integrity::Untrusted,
+            via_kvm: true,
+            grant: None,
+        });
+        for tool in [AgentTool::MemoryApply, AgentTool::SkillApply] {
+            for context in &contexts {
+                let classified = classify(tool, &CallFacts::default(), context);
+                assert_eq!(classified.tier, Tier::T2, "{tool:?} in {context:?}");
+                assert_eq!(classified.gate(), Gate::Person);
+            }
+        }
     }
 
     /// R83 as R103 extends it: unattended is the session kind, or a

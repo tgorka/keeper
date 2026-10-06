@@ -171,7 +171,18 @@ impl ServedSession {
                         .any(|agent| agent.matrix_user == *sender)
                 }),
             sender_in_label: reads(&self.context.label.readers, sender),
-            sender_in_approvers: reads(&record.label.readers, sender),
+            // The consolidator's record: the approvers its digest binds,
+            // checked again now; never its label, which is the data's.
+            sender_in_approvers: if keeper_core::agents::consolidate::is_host_action(record) {
+                crate::approvals::read_stored_record(
+                    &deps.sessions_zone.join(&self.context.session.path),
+                    &record.id,
+                )
+                .and_then(|(_, args)| self.host_action_approvers(deps, record, &args))
+                .is_ok_and(|approvers| approvers.contains(sender))
+            } else {
+                reads(&record.label.readers, sender)
+            },
             requester: record.dispatch_chain.first().cloned(),
         };
         judge(source, arrived, seat, record.risk.tier).await

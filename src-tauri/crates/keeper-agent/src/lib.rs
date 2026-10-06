@@ -48,6 +48,8 @@ pub mod ask;
 pub mod bmad;
 pub mod cards;
 pub mod claims;
+#[cfg(unix)]
+pub mod consolidate;
 pub mod deciding;
 pub mod delegate;
 #[cfg(unix)]
@@ -62,6 +64,7 @@ pub mod helper;
 pub mod host;
 #[cfg(unix)]
 pub mod hosts;
+pub mod maintain;
 pub mod matrix_sink;
 pub mod memory;
 pub mod ports;

@@ -223,6 +223,66 @@ pub fn holds_commit(repo_path: &Path, id: &str) -> Result<bool> {
     Ok(held)
 }
 
+/// Walk every commit `HEAD` reaches — whatever its time says: a commit's
+/// time is its committer's clock, and an ancestor may be dated after its
+/// child — calling `seen` on each until it says stop. An object the walk
+/// cannot read is an error, never the end of the history.
+fn each_reached(
+    repo: &gix::Repository,
+    mut seen: impl FnMut(&gix::revision::walk::Info<'_>) -> Result<bool>,
+) -> Result<()> {
+    let Some(tip) = head(repo)? else {
+        return Ok(());
+    };
+    let walk = repo.rev_walk([tip]).all().map_err(|err| walk_error(&err))?;
+    for info in walk {
+        if !seen(&info.map_err(|err| walk_error(&err))?)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the commit `id` (full hex) is `HEAD` or one of its ancestors,
+/// by the commit graph alone. An error when it cannot be known: `id` is
+/// not a commit this copy can read, or the history is not readable.
+pub fn reaches(repo_path: &Path, id: &str) -> Result<bool> {
+    let repo = open(repo_path)?;
+    let target = gix::ObjectId::from_hex(id.as_bytes())
+        .map_err(|err| SyncError::Git(format!("{id} is not a commit id: {err}")))?;
+    repo.find_object(target)
+        .map_err(|err| walk_error(&err))?
+        .try_into_commit()
+        .map_err(|err| walk_error(&err))?;
+    let mut found = false;
+    each_reached(&repo, |info| {
+        found = info.id == target;
+        Ok(!found)
+    })?;
+    Ok(found)
+}
+
+/// Which of `lines` the messages of `HEAD`'s whole history hold as one of
+/// their own lines: one walk for all of them, stopped once each is found.
+pub fn lines_in_history(repo_path: &Path, lines: &HashSet<String>) -> Result<HashSet<String>> {
+    let repo = open(repo_path)?;
+    let mut found = HashSet::new();
+    if lines.is_empty() {
+        return Ok(found);
+    }
+    each_reached(&repo, |info| {
+        let commit = info.object().map_err(|err| walk_error(&err))?;
+        let message = commit.message_raw().map_err(|err| walk_error(&err))?;
+        for held in message.to_str_lossy().lines() {
+            if lines.contains(held) {
+                found.insert(held.to_owned());
+            }
+        }
+        Ok(found.len() < lines.len())
+    })?;
+    Ok(found)
+}
+
 /// The files that differ between the trees of commits `from` and `to`,
 /// repository-relative and `/`-separated, each once. `from` = `None` is the
 /// empty tree: everything `to` holds. A rename is both paths, as on

@@ -470,7 +470,7 @@ impl MemoryTools {
             if pending.target != Target::Memory(target) {
                 continue;
             }
-            if let Some(op) = hermes_op(&pending) {
+            if let Some(op) = pending.hermes_op() {
                 let _ = store.apply_batch(&[op]);
             }
         }
@@ -688,27 +688,6 @@ impl MemoryTools {
             ),
         })
     }
-}
-
-/// A pending memory proposal as the op Hermes' store applies.
-fn hermes_op(staged: &Proposal) -> Option<hermes::Op> {
-    let matched = staged.matched.clone();
-    let pin = matched.clone().unwrap_or_default();
-    Some(match staged.op {
-        Op::Add => hermes::Op::Add {
-            content: staged.body.clone(),
-        },
-        Op::Replace => hermes::Op::Replace {
-            old_text: pin,
-            content: staged.body.clone(),
-            matched_entry: matched,
-        },
-        Op::Remove => hermes::Op::Remove {
-            old_text: pin,
-            matched_entry: matched,
-        },
-        Op::Create | Op::Patch | Op::Archive => return None,
-    })
 }
 
 #[cfg(test)]

@@ -892,6 +892,9 @@ pub async fn run(
 
     // Tapped before the supervisor runs, so its first push is seen.
     let mut ringer = Ringer::new(Arc::clone(&agentd.engine) as Arc<dyn DriveEngine>);
+    // The nights of the drives this host's principal owns, when it is always
+    // on (AD-401): their runs never hold up the tick.
+    let mut nights = crate::consolidate::Consolidator::new(Arc::clone(&agentd.engine));
     let (engine_stop, engine_shutdown) = watch::channel(false);
     let engine = Arc::clone(&agentd.engine);
     let mut supervisor = tokio::spawn(async move { engine.run(engine_shutdown).await });
@@ -972,6 +975,7 @@ pub async fn run(
         }
         hosts.tick(&stop_signal).await;
         ringer.tick(&hosts.round(&drives), &doorbell);
+        nights.tick(hosts.night(&drives));
         // Once a copy has synced, a control room made before presence or
         // the doorbell existed is brought up to date (R37, R59).
         if !control_checked && copies.iter().any(|copy| *copy.syncs.borrow() > 0) {

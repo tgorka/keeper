@@ -102,6 +102,21 @@ pub fn read_content(content: &Value) -> Result<ClaimContent, ClaimRefusal> {
     Ok(claim)
 }
 
+/// The state key of `drive`'s one maintenance claim in the principal's
+/// control room: every drive-wide maintenance job — the nightly
+/// consolidation, the weekly curator — runs only under it, so no two of them
+/// run on one drive at once (AD-378, R207).
+pub fn maintenance_key(drive: &str) -> String {
+    format!("maintain:{drive}")
+}
+
+/// The state key under which maintenance `job` records, as a released
+/// claim, the last window it completed on `drive`: each job's own, so one
+/// job's night never stands for another's.
+pub fn completion_key(job: &str, drive: &str) -> String {
+    format!("{job}:{drive}")
+}
+
 /// Whether a host may write a new claim over `current` at `server_now` (ms):
 /// there is none, it is released, or its event is [`TTL`] old.
 pub fn may_acquire(current: Option<&ServerClaim>, server_now: u64) -> bool {

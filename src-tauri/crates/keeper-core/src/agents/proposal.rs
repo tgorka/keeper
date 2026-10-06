@@ -204,6 +204,29 @@ impl Proposal {
         format!("{}.md", self.id)
     }
 
+    /// The memory change as Hermes' batch op, pinned to its `match`;
+    /// `None` for a skill's.
+    pub fn hermes_op(&self) -> Option<keeper_ported::hermes::memory::Op> {
+        use keeper_ported::hermes::memory::Op as HermesOp;
+        let matched = self.matched.clone();
+        let pin = matched.clone().unwrap_or_default();
+        Some(match self.op {
+            Op::Add => HermesOp::Add {
+                content: self.body.clone(),
+            },
+            Op::Replace => HermesOp::Replace {
+                old_text: pin,
+                content: self.body.clone(),
+                matched_entry: matched,
+            },
+            Op::Remove => HermesOp::Remove {
+                old_text: pin,
+                matched_entry: matched,
+            },
+            Op::Create | Op::Patch | Op::Archive => return None,
+        })
+    }
+
     /// The file's bytes: frontmatter in [`KEYS`]' order, then the body.
     pub fn render(&self) -> String {
         let text = |value: &str| FieldValue::Str(value.to_owned());

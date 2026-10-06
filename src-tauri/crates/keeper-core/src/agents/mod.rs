@@ -13,6 +13,7 @@ pub mod approval_card;
 pub mod ask;
 pub mod card;
 pub mod claim;
+pub mod consolidate;
 pub mod copy;
 pub mod delegation;
 pub mod device;

@@ -247,7 +247,7 @@ fn init_profile_repo(work: &Path) {
 /// `git add && git commit`: the index-before-reference ordering this file
 /// asserts (`commit.rs:267-272`) is keeper's own, and a fixture that used the
 /// `git` binary would prove a property of git instead.
-fn commit_paths(
+fn stage_and_commit_paths(
     repo: &gix::Repository,
     work: &Path,
     added: &[&str],
@@ -508,7 +508,7 @@ fn assert_recovered_after_kill(work: &Path, reported: &[(usize, String)], contex
     let resumed_name = "after-the-kill.txt";
     let resumed_bytes = b"work committed after the kill\n";
     std::fs::write(work.join(resumed_name), resumed_bytes).expect("write the resuming change");
-    let resumed = commit_paths(&repo, work, &[resumed_name])
+    let resumed = stage_and_commit_paths(&repo, work, &[resumed_name])
         .unwrap_or_else(|err| panic!("{context}: the next run must be able to commit: {err}"))
         .unwrap_or_else(|| panic!("{context}: the resuming change must produce a commit"));
     assert_blob_bytes(
@@ -544,7 +544,7 @@ fn durability_child_stages_until_killed() {
     loop {
         let name = staged_name(i);
         std::fs::write(work.join(&name), payload(i)).expect("child: write the staged file");
-        let committed = commit_paths(&repo, &work, &[name.as_str()])
+        let committed = stage_and_commit_paths(&repo, &work, &[name.as_str()])
             .expect("child: stage and commit")
             .expect("child: a new file must produce a commit");
         // Printed only after the call returned, so the parent's list contains
@@ -682,7 +682,7 @@ fn a_commit_interrupted_between_the_index_and_the_reference_resumes_cleanly() {
     let repo = git::repo::open(&work, false).expect("open the profile repository");
     let first_bytes = payload(0);
     std::fs::write(work.join("first.txt"), &first_bytes).expect("write the first file");
-    let first = commit_paths(&repo, &work, &["first.txt"])
+    let first = stage_and_commit_paths(&repo, &work, &["first.txt"])
         .expect("the first commit must succeed")
         .expect("a new file must produce a commit");
 
@@ -693,7 +693,7 @@ fn a_commit_interrupted_between_the_index_and_the_reference_resumes_cleanly() {
     // locally and has not been published.
     std::fs::write(&lock, format!("{first}\n")).expect("plant the reference lock");
 
-    let interrupted = commit_paths(&repo, &work, &["second.txt"]);
+    let interrupted = stage_and_commit_paths(&repo, &work, &["second.txt"]);
     assert!(
         interrupted.is_err(),
         "an abandoned HEAD lock must stop the commit, or the fault was never injected"
@@ -724,7 +724,7 @@ fn a_commit_interrupted_between_the_index_and_the_reference_resumes_cleanly() {
         !lock.exists(),
         "{context}: the abandoned lock must be gone, not merely worked around"
     );
-    let resumed = commit_paths(&repo, &work, &["second.txt"])
+    let resumed = stage_and_commit_paths(&repo, &work, &["second.txt"])
         .expect("the retry must commit")
         .expect("the re-driven change must produce a commit");
     assert_ne!(resumed, first, "{context}: the retry must advance HEAD");
@@ -780,7 +780,7 @@ fn a_push_cut_off_by_network_loss_keeps_its_journal_unit_and_publishes_on_the_re
     let published = payload(7);
     std::fs::write(work.join("note.txt"), &published).expect("write the file to publish");
     let repo = git::repo::open(&work, false).expect("open the profile repository");
-    commit_paths(&repo, &work, &["note.txt"])
+    stage_and_commit_paths(&repo, &work, &["note.txt"])
         .expect("the commit must succeed")
         .expect("a new file must produce a commit");
     let head_before = git_text(&work, &["rev-parse", "HEAD"]).trim().to_owned();

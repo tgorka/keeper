@@ -830,6 +830,432 @@ pub fn landing(root: &Path, subpath: &str) -> Result<Vec<String>, BrowseRefusal>
     Ok(names)
 }
 
+/// A folder's root held open for every effect of one request: opened once,
+/// so a root replaced by a link afterwards redirects none of them (AD-65's
+/// boundary carried to the effect, not only checked before it). Its `.git`
+/// folder is held open with it, so a `.git` replaced inside the root is
+/// not the one held either.
+#[cfg(unix)]
+pub(crate) struct Root {
+    fd: std::os::fd::OwnedFd,
+    /// The root's `.git` as it was when the root was opened; `None` when
+    /// it had none.
+    git: Option<std::os::fd::OwnedFd>,
+}
+
+#[cfg(unix)]
+impl Root {
+    pub(crate) fn open(root: &Path) -> std::io::Result<Root> {
+        use rustix::fs::{openat, Mode, OFlags};
+        let fd = openat(
+            rustix::fs::CWD,
+            root,
+            OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::RDONLY,
+            Mode::empty(),
+        )?;
+        let git = Self::git_in(&fd).ok();
+        Ok(Root { fd, git })
+    }
+
+    /// `.git` in the folder `fd`, opened through no link.
+    fn git_in(fd: &std::os::fd::OwnedFd) -> rustix::io::Result<std::os::fd::OwnedFd> {
+        use rustix::fs::{openat, Mode, OFlags};
+        openat(
+            fd,
+            ".git",
+            OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::RDONLY,
+            Mode::empty(),
+        )
+    }
+
+    /// Whether `root` still names the folder held: what [`landing`] checks
+    /// by its name is then this folder.
+    pub(crate) fn is_at(&self, root: &Path) -> bool {
+        match (rustix::fs::fstat(&self.fd), rustix::fs::stat(root)) {
+            (Ok(held), Ok(named)) => held.st_dev == named.st_dev && held.st_ino == named.st_ino,
+            _ => false,
+        }
+    }
+
+    /// Whether `git_dir` names the `.git` folder held since the root was
+    /// opened, and the root still holds it under that name — read through
+    /// no link — so a repository opened by its path is this folder's, not
+    /// one swapped in under its name, nor a `.git` put in place of its own.
+    pub(crate) fn holds_git_dir(&self, git_dir: &Path) -> bool {
+        let Some(git) = &self.git else {
+            return false;
+        };
+        let there = Self::git_in(&self.fd).and_then(|fd| rustix::fs::fstat(&fd));
+        match (rustix::fs::fstat(git), there, rustix::fs::stat(git_dir)) {
+            (Ok(held), Ok(there), Ok(named)) => [there, named]
+                .iter()
+                .all(|one| one.st_dev == held.st_dev && one.st_ino == held.st_ino),
+            _ => false,
+        }
+    }
+}
+
+/// The steps of [`Contained::create`]'s staging a test stops at, as a
+/// killed process would.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Staging {
+    /// The staging file exists, empty.
+    Created,
+    /// Its bytes are written and synced; it is not placed.
+    Synced,
+    /// It is linked under the path's name and still under its own.
+    Linked,
+}
+
+/// What a stop at a [`Staging`] step returns: an interruption, which no
+/// write or link of the staging returns itself.
+#[cfg(unix)]
+fn stopped() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "stopped while a file was staged",
+    )
+}
+
+/// A path under a held [`Root`]: its parent folder opened from the root one
+/// plain name at a time, never through a link, and its last name. Every
+/// effect is taken relative to that open folder, so an ancestor replaced by
+/// a link after [`landing`] checked it cannot redirect a write outside the
+/// root — the open refuses the link instead.
+#[cfg(unix)]
+pub(crate) struct Contained {
+    parent: std::os::fd::OwnedFd,
+    name: std::ffi::OsString,
+}
+
+/// What refusing a link on the way to an effect says.
+#[cfg(unix)]
+fn refused_link(subpath: &str) -> std::io::Error {
+    std::io::Error::other(format!(
+        "{subpath}: a folder on the way is a link or not a folder, so keeper does not write there"
+    ))
+}
+
+/// The git blob id of the file `name` in `parent`, read through no link:
+/// `None` when nothing is there, an empty id for anything not a file.
+#[cfg(unix)]
+fn blob_in(parent: &std::os::fd::OwnedFd, name: &OsStr) -> std::io::Result<Option<String>> {
+    use rustix::fs::{openat, Mode, OFlags};
+    match openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            let mut file = std::fs::File::from(fd);
+            if !file.metadata()?.is_file() {
+                return Ok(Some(String::new()));
+            }
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut bytes)?;
+            Ok(Some(crate::engine::blob_id(&bytes)))
+        }
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(rustix::io::Errno::LOOP) => Ok(Some(String::new())),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether `a` and `b` in `parent` are one file under two names, read
+/// through no link: `false` when either is missing.
+#[cfg(unix)]
+fn one_file(parent: &std::os::fd::OwnedFd, a: &OsStr, b: &OsStr) -> std::io::Result<bool> {
+    use rustix::fs::{statat, AtFlags};
+    let identity = |name: &OsStr| match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(Some((stat.st_dev, stat.st_ino))),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(error) => Err(std::io::Error::from(error)),
+    };
+    Ok(matches!((identity(a)?, identity(b)?), (Some(a), Some(b)) if a == b))
+}
+
+/// Whether `name` in `parent` is executable by its owner, read through no
+/// link.
+#[cfg(unix)]
+fn executable_in(parent: &std::os::fd::OwnedFd, name: &OsStr) -> std::io::Result<bool> {
+    use rustix::fs::{statat, AtFlags, Mode};
+    let stat = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    Ok(Mode::from_raw_mode(stat.st_mode).contains(Mode::XUSR))
+}
+
+/// Give `from` (in `parent`) the name `to` only where nothing is called
+/// that: `Ok(false)`, and `from` left as it was, when something is.
+/// `linked` is asked once both names hold it; `false` stops there.
+#[cfg(unix)]
+fn place(
+    parent: &std::os::fd::OwnedFd,
+    from: &str,
+    to: &OsStr,
+    linked: &dyn Fn() -> bool,
+) -> std::io::Result<bool> {
+    use rustix::fs::{linkat, unlinkat, AtFlags};
+    match linkat(parent, from, parent, to, AtFlags::empty()) {
+        Ok(()) => {
+            if !linked() {
+                return Err(stopped());
+            }
+            unlinkat(parent, from, AtFlags::empty())?;
+            Ok(true)
+        }
+        Err(rustix::io::Errno::EXIST) => Ok(false),
+        // A volume that has no hard links: the no-replace rename instead.
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        Err(_) => match rustix::fs::renameat_with(
+            parent,
+            from,
+            parent,
+            to,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => Ok(true),
+            Err(rustix::io::Errno::EXIST) => Ok(false),
+            Err(error) => Err(error.into()),
+        },
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+impl Contained {
+    /// `subpath` of `root`, its missing folders made when `make`.
+    pub(crate) fn open(root: &Root, subpath: &str, make: bool) -> std::io::Result<Contained> {
+        use rustix::fs::{mkdirat, openat, Mode, OFlags};
+        let segments = plain_segments(subpath)
+            .map_err(|refusal| std::io::Error::other(refusal.to_string()))?;
+        let (name, folders) = segments
+            .split_last()
+            .ok_or_else(|| std::io::Error::other("the root itself is not a file"))?;
+        let folder = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::RDONLY;
+        let mut parent = rustix::io::fcntl_dupfd_cloexec(&root.fd, 0)?;
+        for segment in folders {
+            parent = match openat(&parent, *segment, folder, Mode::empty()) {
+                Ok(next) => next,
+                Err(rustix::io::Errno::NOENT) if make => {
+                    match mkdirat(&parent, *segment, Mode::from_raw_mode(0o755)) {
+                        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    openat(&parent, *segment, folder, Mode::empty())
+                        .map_err(|_| refused_link(subpath))?
+                }
+                Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+                    return Err(refused_link(subpath))
+                }
+                Err(error) => return Err(error.into()),
+            };
+        }
+        Ok(Contained {
+            parent,
+            name: name.to_os_string(),
+        })
+    }
+
+    /// The git blob id of the file there, read through no link: `None` when
+    /// nothing is there, an empty id for anything that is not a file.
+    pub(crate) fn blob(&self) -> std::io::Result<Option<String>> {
+        blob_in(&self.parent, &self.name)
+    }
+
+    /// Whether the file there is the one named `other` beside it: a
+    /// [`Self::create`] stopped once its staging was linked under both.
+    pub(crate) fn is_linked_as(&self, other: &str) -> std::io::Result<bool> {
+        one_file(&self.parent, &self.name, OsStr::new(other))
+    }
+
+    /// Whether the file there is executable by its owner — the bit Git
+    /// records — read through no link.
+    pub(crate) fn executable(&self) -> std::io::Result<bool> {
+        executable_in(&self.parent, &self.name)
+    }
+
+    /// Put `bytes` there only where nothing is — a create-new file beside
+    /// it named `staging`, executable when `executable`, synced, given the
+    /// name without replacing anything, the folder synced: `Ok(false)`,
+    /// nothing written, when something is there by then. `staging` is the
+    /// caller's to name and to clear after a kill ([`Self::clear`]); a
+    /// leftover of an earlier attempt under it is cleared first. `at` is
+    /// told each [`Staging`] step; `false` stops there as a killed process
+    /// would, leaving what is staged.
+    pub(crate) fn create(
+        &self,
+        bytes: &[u8],
+        staging: &str,
+        executable: bool,
+        at: &dyn Fn(Staging) -> bool,
+    ) -> std::io::Result<bool> {
+        use rustix::fs::{fsync, openat, unlinkat, AtFlags, Mode, OFlags};
+        use std::io::Write as _;
+        self.clear(staging)?;
+        let fd = openat(
+            &self.parent,
+            staging,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(if executable { 0o755 } else { 0o644 }),
+        )?;
+        if !at(Staging::Created) {
+            return Err(stopped());
+        }
+        let mut file = std::fs::File::from(fd);
+        let written = file.write_all(bytes).and_then(|()| file.sync_all());
+        if written.is_ok() && !at(Staging::Synced) {
+            return Err(stopped());
+        }
+        let placed = written
+            .and_then(|()| place(&self.parent, staging, &self.name, &|| at(Staging::Linked)));
+        match &placed {
+            // As a kill would leave it: nothing is cleared.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return placed,
+            Ok(true) => {}
+            _ => {
+                let _ = unlinkat(&self.parent, staging, AtFlags::empty());
+            }
+        }
+        let placed = placed?;
+        fsync(&self.parent)?;
+        Ok(placed)
+    }
+
+    /// Remove `name` beside the path, when anything is called that: what a
+    /// [`Self::create`] killed on the way left under its staging name.
+    pub(crate) fn clear(&self, name: &str) -> std::io::Result<()> {
+        use rustix::fs::{unlinkat, AtFlags};
+        match unlinkat(&self.parent, name, AtFlags::empty()) {
+            Ok(()) => rustix::fs::fsync(&self.parent).map_err(std::io::Error::from),
+            Err(rustix::io::Errno::NOENT) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Move what is there aside, as `aside` in the same folder, so that
+    /// nothing saved there meanwhile is ever replaced: `None` when nothing is
+    /// there.
+    pub(crate) fn displace<'a>(&'a self, aside: &str) -> std::io::Result<Option<Displaced<'a>>> {
+        match rustix::fs::renameat(&self.parent, &self.name, &self.parent, aside) {
+            Ok(()) => Ok(Some(Displaced {
+                from: self,
+                name: aside.to_owned(),
+            })),
+            Err(rustix::io::Errno::NOENT) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// What an earlier [`Self::displace`] left as `aside`, when anything is
+    /// there: a process killed between moving it aside and settling it.
+    pub(crate) fn displaced<'a>(&'a self, aside: &str) -> std::io::Result<Option<Displaced<'a>>> {
+        Ok(
+            blob_in(&self.parent, OsStr::new(aside))?.map(|_| Displaced {
+                from: self,
+                name: aside.to_owned(),
+            }),
+        )
+    }
+
+    /// Remove the folder there when it is empty; one that is not, or is
+    /// gone, is no error.
+    pub(crate) fn remove_if_empty(&self) -> std::io::Result<()> {
+        use rustix::fs::{unlinkat, AtFlags};
+        match unlinkat(&self.parent, &self.name, AtFlags::REMOVEDIR) {
+            Ok(())
+            | Err(
+                rustix::io::Errno::NOTEMPTY
+                | rustix::io::Errno::EXIST
+                | rustix::io::Errno::NOENT
+                | rustix::io::Errno::NOTDIR,
+            ) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// What [`Contained::displace`] moved aside: put back where nothing took its
+/// place, or dropped.
+#[cfg(unix)]
+pub(crate) struct Displaced<'a> {
+    from: &'a Contained,
+    name: String,
+}
+
+#[cfg(unix)]
+impl Displaced<'_> {
+    pub(crate) fn blob(&self) -> std::io::Result<Option<String>> {
+        blob_in(&self.from.parent, OsStr::new(&self.name))
+    }
+
+    /// Whether it is the file named `other` beside its path.
+    pub(crate) fn is_linked_as(&self, other: &str) -> std::io::Result<bool> {
+        one_file(&self.from.parent, OsStr::new(&self.name), OsStr::new(other))
+    }
+
+    /// Whether it is executable by its owner — the bit Git records —
+    /// read through no link.
+    pub(crate) fn executable(&self) -> std::io::Result<bool> {
+        executable_in(&self.from.parent, OsStr::new(&self.name))
+    }
+
+    /// Whether it is the file whose blob id is `blob` with the executable
+    /// bit `executable`: its bytes read through no link, then its name
+    /// seen to name that same file, unchanged since it was opened — no
+    /// write, mode change or replacement in between — with that bit. The
+    /// last read before [`Self::discard`]; anything missing, not a file or
+    /// changed meanwhile is `false`.
+    pub(crate) fn holds(&self, blob: &str, executable: bool) -> std::io::Result<bool> {
+        use rustix::fs::{fstat, openat, statat, AtFlags, FileType, Mode, OFlags};
+        let parent = &self.from.parent;
+        let fd = match openat(
+            parent,
+            self.name.as_str(),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let opened = fstat(&fd)?;
+        if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile {
+            return Ok(false);
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::fs::File::from(fd), &mut bytes)?;
+        if crate::engine::blob_id(&bytes) != blob {
+            return Ok(false);
+        }
+        let now = match statat(parent, self.name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(now) => now,
+            Err(rustix::io::Errno::NOENT) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let unchanged =
+            |stat: &rustix::fs::Stat| (stat.st_dev, stat.st_ino, stat.st_ctime, stat.st_ctime_nsec);
+        Ok(unchanged(&now) == unchanged(&opened)
+            && Mode::from_raw_mode(now.st_mode).contains(Mode::XUSR) == executable)
+    }
+
+    /// Drop it, the folder synced.
+    pub(crate) fn discard(self) -> std::io::Result<()> {
+        use rustix::fs::{fsync, unlinkat, AtFlags};
+        unlinkat(&self.from.parent, self.name.as_str(), AtFlags::empty())?;
+        fsync(&self.from.parent).map_err(std::io::Error::from)
+    }
+
+    /// Put it back under its name unless something took that name meanwhile;
+    /// then it stays beside it under its own, and that name is the answer.
+    pub(crate) fn restore(self) -> std::io::Result<Option<String>> {
+        let back = place(&self.from.parent, &self.name, &self.from.name, &|| true)?;
+        rustix::fs::fsync(&self.from.parent)?;
+        Ok((!back).then_some(self.name))
+    }
+}
+
 /// Split a profile-relative subpath into its components, refusing any that is
 /// not a plain name.
 ///

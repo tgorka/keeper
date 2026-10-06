@@ -1050,6 +1050,81 @@ pub enum PullNow {
     NotPulled,
 }
 
+/// What [`Engine::commit_paths`] commits and checks. Every path is
+/// repository-relative and `/`-separated, and no written or moved path is
+/// another's, or lies under another's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitRequest {
+    /// Each file's new bytes; `None` deletes it. Every written path is
+    /// guarded too: a write over what the request did not read is refused.
+    pub writes: Vec<(String, Option<Vec<u8>>)>,
+    /// Files or folders moved whole as `HEAD` holds them, `(from, to)`:
+    /// each file under `from` must be on the disk as `HEAD` holds it, and
+    /// nothing may be at `to`.
+    pub moves: Vec<(String, String)>,
+    /// Each path's git blob id the request was planned over, `None` for a
+    /// path that was absent: at `HEAD` and on the disk, checked once the
+    /// lane is held and again on the disk right before the commit is
+    /// published. A path only guarded — a declaration the plan read — is
+    /// never written.
+    pub guards: Vec<(String, Option<String>)>,
+    pub subject: String,
+    pub trailers: Vec<crate::provenance::MemoryTrailer>,
+}
+
+/// What [`Engine::commit_paths`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitPaths {
+    /// One commit holds the request, and a push is queued.
+    Committed { commit: String },
+    /// A guarded path is not what the request was planned over — at `HEAD`
+    /// or on the disk — or the branch moved before the publication, so
+    /// nothing changed: no commit, no file, no index entry.
+    Guarded { path: String },
+    /// Everything already was as the request asks: no commit.
+    Unchanged,
+    /// The caller's fence said no right before the publication — its lease
+    /// is gone — so nothing changed.
+    Fenced,
+}
+
+/// The git blob id of `bytes`, lowercase hex: what [`CommitRequest::guards`]
+/// names a file's contents by.
+pub fn blob_id(bytes: &[u8]) -> String {
+    gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, bytes)
+        .map(|id| id.to_hex().to_string())
+        .unwrap_or_default()
+}
+
+/// What [`Engine::commit_paths`] asks right before it publishes: whether
+/// its caller may still write — a lease's holder, say.
+pub type CommitFence = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+#[cfg(unix)]
+mod authored;
+#[cfg(all(unix, test))]
+use authored::{Cut, COMMIT_LANE_POLL};
+
+/// An authored commit's effects are taken inside folders held open with no
+/// link followed; a build without that keeps no promise it cannot keep.
+#[cfg(not(unix))]
+impl Engine {
+    pub async fn commit_paths(
+        self: &Arc<Self>,
+        _profile_id: &str,
+        _request: &CommitRequest,
+        _fence: CommitFence,
+    ) -> Result<CommitPaths> {
+        Err(SyncError::Config(
+            "an authored commit is made only on a Unix host".to_owned(),
+        ))
+    }
+
+    fn settle_commit_paths(&self, _profile: &SyncProfile) -> Result<bool> {
+        Ok(false)
+    }
+}
+
 /// How many unapplied "this path is finished" assertions
 /// [`Engine::finished_tap`] holds before it starts dropping them.
 ///
@@ -2076,6 +2151,16 @@ impl Engine {
         };
         engine.seed_folder_tasks()?;
         engine.seed_status()?;
+        // A commit a kill cut off is finished as the engine opens, where its
+        // folder is there; one that cannot be says so on the card and holds
+        // the folder's passes until it is.
+        for profile in engine.list_profiles()? {
+            if engine.volume_ready(&profile).unwrap_or(false) {
+                if let Err(error) = engine.settle_commit_paths(&profile) {
+                    tracing::warn!(profile = profile.name, %error, "a cut-off commit could not be finished as the engine opened");
+                }
+            }
+        }
         Ok(engine)
     }
 
@@ -5536,6 +5621,9 @@ impl Engine {
             // Still working from a previous tick. Not an error.
             None => return Ok(()),
         };
+        // A commit a kill cut off is finished before anything walks, pulls
+        // or commits the folder; one that cannot be holds it.
+        self.settle_commit_paths(profile)?;
 
         // Arming happens after the volume gate — the root has to exist — and
         // inside the reservation, so nothing drains a wake on a tick that is
@@ -11081,6 +11169,12 @@ impl Engine {
         source: SyncSource,
         push_unit: Option<i64>,
     ) -> Result<()> {
+        // A request of `commit_paths` a kill cut off is rolled forward first,
+        // and this pass's walk — taken before it — commits nothing: the next
+        // walk reads the folder as it is then.
+        if self.settle_commit_paths(profile)? {
+            return Ok(());
+        }
         let repo = self.open_repo(profile)?;
         let device = self.device();
         let (name, email) = git::commit::author_for(profile, &device);
@@ -12876,6 +12970,7 @@ impl Engine {
         let _reservation = self
             .reserve(&profile.id)
             .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+        self.settle_commit_paths(&profile)?;
 
         tracing::info!(
             profile = profile.name,
@@ -18362,6 +18457,9 @@ mod after_walk {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    mod commit_paths;
+
     fn history_commit(
         repo: &gix::Repository,
         message: &str,
@@ -27109,9 +27207,15 @@ mod tests {
     async fn pending_lists_what_is_still_coming_in_not_only_what_is_going_out() {
         let dir = tempfile::tempdir().expect("tempdir");
         let platform = Arc::new(TestPlatform::new(dir.path()));
-        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+        let Ok(mut engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
             return;
         };
+        // The folder's clean filter would be this test binary, which git
+        // runs on the routed clip and which answers with its own argument
+        // error (DW-720). The question here is the queue, not the filter: no
+        // filter is registered, as on a phone.
+        engine.filter_program = None;
+        engine.filter_serves_process = false;
         let mut p = adoptable(dir.path());
         p.lfs_threshold_bytes = 1024;
         std::fs::write(p.local_path.join("clip.mp4"), vec![42u8; 200_000]).expect("write");

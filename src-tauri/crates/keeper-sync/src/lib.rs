@@ -76,8 +76,9 @@ pub use copy::{
 pub use credential::AccessToken;
 pub use db::{ActivityEntry, ActivityKind, ActivityRow, DeliveryState};
 pub use engine::{
-    Engine, FinishedTap, ParkedUnit, PathDurability, PendingFile, PendingReason, ProblemReport,
-    SyncOutcome, VerifyReport, TASK_QUIT_SETTLE,
+    blob_id, CommitFence, CommitPaths, CommitRequest, Engine, FinishedTap, ParkedUnit,
+    PathDurability, PendingFile, PendingReason, ProblemReport, SyncOutcome, VerifyReport,
+    TASK_QUIT_SETTLE,
 };
 pub use error::{Result, SyncError};
 pub use git::resolve::{GitChoice, GitOrigin, GitReject, GitRejection, GitRequest, GitResolution};
@@ -88,7 +89,7 @@ pub use platform::{
 };
 pub use profile::{ProfileState, SyncDirection, SyncLane, SyncProfile};
 pub use progress::{SyncPhase, SyncProgress, SyncStatus};
-pub use provenance::{Provenance, SyncSource};
+pub use provenance::{MemoryTrailer, Provenance, SyncSource};
 pub use sparse::SparseCone;
 
 /// Version string stamped into provenance trailers and the LFS user agent.

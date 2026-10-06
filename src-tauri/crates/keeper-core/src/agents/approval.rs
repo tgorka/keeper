@@ -384,6 +384,14 @@ pub fn summary_of(tool: AgentTool, args: &Value) -> String {
                 sha.get(..12).unwrap_or(sha)
             )
         }
+        AgentTool::MemoryApply | AgentTool::SkillApply => {
+            let proposals = args["proposals"].as_array().map_or(0, Vec::len);
+            format!(
+                "Change {}'s {} as {proposals} proposal(s) ask",
+                arg(args, "agent"),
+                args["change"]["path"].as_str().unwrap_or("")
+            )
+        }
     }
 }
 

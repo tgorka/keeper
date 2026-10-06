@@ -297,7 +297,7 @@ const MAX_LOOKBACK_MS: i64 = (366 * 8 + 2) * 24 * 60 * 60_000;
 /// spans doubling from the dialect's one minute until one holds a fire,
 /// then walks forward only across that span, so a host away for a year
 /// asks the schedule a few dozen times, not once per missed window.
-fn latest_fire(schedule: &TaskSchedule, first: i64, now_ms: i64, offset: i32) -> i64 {
+pub(crate) fn latest_fire(schedule: &TaskSchedule, first: i64, now_ms: i64, offset: i32) -> i64 {
     let mut span = keeper_sync::tasks::MIN_SCHEDULE_INTERVAL_MS;
     loop {
         let from = now_ms.saturating_sub(span).max(first);

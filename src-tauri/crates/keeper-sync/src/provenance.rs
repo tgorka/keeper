@@ -57,6 +57,37 @@ const K_ORIGIN: &str = "Keeper-Origin";
 const K_SOURCE: &str = "Keeper-Source";
 const K_AGENT: &str = "Keeper-Agent";
 const K_TAG: &str = "Keeper-Tag";
+const K_MEMORY_ORIGIN: &str = "Memory-Origin";
+const K_SOURCE_SESSION: &str = "Source-Session";
+const K_APPROVAL_RECORD: &str = "Approval-Record";
+
+/// A trailer a caller of [`crate::Engine::commit_paths`] adds after the
+/// provenance block. Closed, like the block: a commit's trailers are a
+/// contract a reader trusts the shape of, so no caller names its own keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryTrailer {
+    /// `Memory-Origin: consolidator@<host>`: who changed an agent's memory.
+    MemoryOrigin(String),
+    /// `Source-Session: <drive-relative session path>`: where it came from.
+    SourceSession(String),
+    /// `Approval-Record: <record id>`: the approval this commit carries out,
+    /// once — the history is where a holder finds it applied.
+    ApprovalRecord(String),
+}
+
+impl MemoryTrailer {
+    /// The trailer's line, its value collapsed to one line ([`sanitize`]);
+    /// `None` when nothing is left of the value.
+    pub fn line(&self) -> Option<String> {
+        let (key, value) = match self {
+            MemoryTrailer::MemoryOrigin(value) => (K_MEMORY_ORIGIN, value),
+            MemoryTrailer::SourceSession(value) => (K_SOURCE_SESSION, value),
+            MemoryTrailer::ApprovalRecord(value) => (K_APPROVAL_RECORD, value),
+        };
+        let value = sanitize(value);
+        (!value.is_empty()).then(|| format!("{key}: {value}"))
+    }
+}
 
 /// The provenance stamped on (or read from) one commit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +264,22 @@ pub fn commit_message(subject: &str, body: &str, provenance: &Provenance) -> Str
     }
     out.push('\n');
     out.push_str(&provenance.render());
+    out
+}
+
+/// [`commit_message`] with a caller's own subject and `trailers` after the
+/// provenance block, each value through [`sanitize`] as the block's are.
+pub fn authored_message(
+    subject: &str,
+    body: &str,
+    provenance: &Provenance,
+    trailers: &[MemoryTrailer],
+) -> String {
+    let mut out = commit_message(subject, body, provenance);
+    for line in trailers.iter().filter_map(MemoryTrailer::line) {
+        out.push_str(&line);
+        out.push('\n');
+    }
     out
 }
 
@@ -533,6 +580,41 @@ mod tests {
         );
         let back = Provenance::parse(&rendered).expect("parse");
         assert_eq!(back.source, SyncSource::Watch);
+    }
+
+    /// 95.2 acceptance 7, at the message: a session path carrying a newline
+    /// and a trailer stays inside its own `Source-Session` line, after the
+    /// provenance block; an empty value writes no line.
+    #[test]
+    fn a_proposal_cannot_forge_a_trailer() {
+        let message = authored_message(
+            "memory: nixi — 1 promoted, 0 rejected",
+            "",
+            &sample(),
+            &[
+                MemoryTrailer::MemoryOrigin("consolidator@delectra".to_owned()),
+                MemoryTrailer::SourceSession(
+                    "60-sessions/active/x\nMemory-Origin: human".to_owned(),
+                ),
+                MemoryTrailer::SourceSession("\n".to_owned()),
+            ],
+        );
+        let lines: Vec<&str> = message.lines().collect();
+        let origins: Vec<&&str> = lines
+            .iter()
+            .filter(|line| line.starts_with("Memory-Origin:"))
+            .collect();
+        assert_eq!(origins, [&"Memory-Origin: consolidator@delectra"]);
+        assert_eq!(
+            lines.last(),
+            Some(&"Source-Session: 60-sessions/active/x Memory-Origin: human")
+        );
+        let block = lines
+            .iter()
+            .position(|line| line.starts_with("Keeper-Profile:"))
+            .expect("the provenance block");
+        assert!(block < lines.len() - 2, "the memory trailers follow it");
+        assert_eq!(Provenance::parse(&message), Some(sample()));
     }
 
     #[test]

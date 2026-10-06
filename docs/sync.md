@@ -1395,6 +1395,98 @@ you want a real one.
 Provenance rides git's own metadata rather than a sidecar file precisely so it
 cannot drift the first time someone uses plain `git`.
 
+### A commit a caller writes: `Engine::commit_paths`
+
+The nightly memory consolidation commits through `Engine::commit_paths`: one
+commit of exactly the paths it asks for, under its own subject and, after the
+block above, closed trailers (`Memory-Origin`, `Source-Session`,
+`Approval-Record`). It never undoes a file:
+
+- Under the folder's lane and off the async executor, every path must land on
+  itself under the folder's root — which is then held open, its `.git` held
+  open with it, so a root or a folder on the way swapped for a link, the whole
+  folder swapped for another checkout, or another `.git` put in its place
+  inside it, redirects nothing and publishes nothing — and no written or
+  moved path, nor the `.gitattributes` a large
+  file's rule needs, may be another or inside another. The branch `HEAD`
+  names and its commit are read once: every written path, every moved file
+  and every declaration the caller read must be, in that commit and on the
+  disk, what the caller read. Anything else refuses the request with nothing
+  changed.
+- The commit is built from that commit's tree and the requested bytes alone —
+  not the disk, not the index, whose other staged entries stay staged — with
+  a large file's LFS object stored and its rule added to `.gitattributes` in
+  the same commit. A record of it, and of the uploads it will owe, goes to
+  `.git/keeper-commit-paths.json`, synced.
+- Every byte the disk will get is read, the guarded files are read again, and
+  then the caller's fence is asked, right before the branch moves from exactly
+  that commit to the new one in one compare-and-swap: the only publication.
+  The re-read is right before the publication, not one step with it: a guarded
+  file that changes in the instant between them (one hash pass) does not stop
+  it. Nothing on the disk or in the index changed before it, and a request
+  refused there owes the remote no upload: uploads are queued only once it
+  published. A refused request drops its record only from the `.git` it
+  began with: one put in its place keeps its own.
+- Then the disk and the index follow the commit, path by path, each only where
+  `HEAD` still holds the commit's version — read once, right before the files
+  follow: a commit you made before that read, taking it back, stays yours; one
+  landing in the instant after it can have the commit's files written over its
+  own, and stays in the history under them — and the path still holds what was
+  there before. A file is moved aside, checked and replaced, executable if the
+  commit says so — or as you set it, when you changed only its executable bit
+  — only where nothing took its place, so a save made meanwhile stays,
+  uncommitted, yours; a file a move or a deletion takes away whose executable
+  bit you changed stays where it is. The index is changed under its own
+  `index.lock` from its read to its write: a `git add` at that instant is
+  refused, never lost.
+
+A process killed on the way leaves the record. When the engine opens, and
+before any pass walks, pulls or commits the folder, a record whose commit
+`HEAD`'s history does not reach — by the commit graph, never by commit dates —
+is dropped: nothing of it is anywhere. One whose commit it reaches is finished
+the same way, its uploads queued and any file it was staging (named
+`.keeper.<request>-<n>.tmp`, which no commit takes in) removed. A path `HEAD`
+no longer holds as the commit does is settled against what `HEAD` holds
+there now, mode included, and it completes only where whose everything at
+the path is can be told: the commit's own new file — still linked under its
+staging name, holding the commit's bytes and the executable bit the commit
+gave it — is removed where you took the commit back or committed the path's
+deletion; the old file it had moved aside goes back where you took the
+commit back and nothing took the path, and is removed where you committed
+the path's deletion, so the file is not brought back; where you saved a file
+there, yours stays and the old one is removed. The old file is removed only
+while it holds the bytes and the executable bit it was committed with, read
+right before it goes: one you saved over, or whose bit you set or cleared —
+beside an empty path, your own file or the commit's, before the settling
+began or while it ran — stays. An executable bit is never moved from one
+file to another: modes are held, never transferred. Where whose a file is
+cannot be told — the path holds the commit's bytes with nothing to say the
+commit put them there, or `HEAD` holds a third version while anything of
+the commit's is still there, or you took the commit back with another mode
+than the one it replaced, or took it back after removing the old file it had
+moved aside, or you set or cleared the executable bit of the commit's file or
+of the old file beside it, or saved over that old file — or a file of yours
+cannot go back, nothing is removed: the files stay as they are, each with its
+bit, the old one beside the path as `.keeper-displaced-<request>-<n>`, and
+the record with them, and the folder commits nothing until you settle the
+path: put there what you want — `git checkout -- <path>` for what `HEAD`
+holds, nothing for a deletion; to keep the commit's bytes, commit them; or
+put the bit back as it was — and remove the old file kept beside it unless
+it should go back (with the bit you gave it). A settling run again holds
+again with every file and bit where you left them, one a kill stopped after
+it moved the commit's file off the path to `.keeper-taken-<request>-<n>`
+included: that file goes back first. A kill inside that move back, after the
+file got the path's name and before it lost its own, leaves one file under
+both names, and the folder holds until you remove the `.keeper-taken-…` name
+— only when it is the same file as the path (`ls -i` shows one inode number
+for both); a different file under that name is the commit's own, kept
+because a file of yours took the path. A change to the old file in the
+instant between keeper's last look at it and its removal is not seen. A
+record whose commit or history cannot be read is not known to be either;
+like any record that cannot be settled it stays, the folder's card says so,
+and the folder commits nothing until it is. Authored commits are made on
+Linux and macOS only.
+
 ---
 
 ## 11. Offline behaviour

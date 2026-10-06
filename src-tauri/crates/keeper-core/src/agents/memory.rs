@@ -192,6 +192,8 @@ pub struct MemoryFile {
     pub entries: Vec<String>,
     /// The frontmatter holds something keeper's parser cannot read back.
     unparsed: bool,
+    /// The frontmatter's bytes as found, written back verbatim.
+    frontmatter: String,
 }
 
 impl MemoryFile {
@@ -205,6 +207,7 @@ impl MemoryFile {
                 target,
                 entries: Vec::new(),
                 unparsed: false,
+                frontmatter: String::new(),
             });
         };
         let (frontmatter, body_offset) = Frontmatter::parse(text);
@@ -215,6 +218,7 @@ impl MemoryFile {
                 target,
                 entries: found,
                 unparsed: frontmatter.unparsed().is_some(),
+                frontmatter: text[..body_offset].to_owned(),
             }),
             Some(sentence) => Err(MemoryProblem {
                 file: target.file(),
@@ -242,6 +246,17 @@ impl MemoryFile {
             &self.entries.join(SEPARATOR),
             self.target.cap(),
         )
+    }
+
+    /// The file's text with `entries` as its body: the frontmatter as it
+    /// was found, then the entries joined canonically (R124).
+    pub fn render(&self, entries: &[String]) -> String {
+        let mut out = self.frontmatter.clone();
+        out.push_str(&entries.join(SEPARATOR));
+        if !entries.is_empty() {
+            out.push('\n');
+        }
+        out
     }
 }
 

@@ -8119,12 +8119,47 @@ location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs`
 reason: The memory tools ask the claim right before each effect — a proposal's link, the journal's cut and its append (R95M-07, R204; unit-proved by `memory::tests::a_proposal_is_published_whole_under_the_claim` and `journal::tests::a_lost_claim_cuts_and_writes_nothing`) — but the turns harness cannot lose a `Lease` between a review pass's `tool_call` line and its effect (the same seam DW-553 names). Close with that seam.
 status: open
 
+### DW-565: The night's read is a full `sync_once`, not `Engine::pull_now`.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R-NEW-1, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`run_round`)
+reason: `pull_now` only queues a pull for a commit a doorbell named; the night needs the fetched head before it plans, so it runs the engine's own pass (commit, pull, push) and plans over `HEAD`.
+status: recorded — R205 rules `sync_once` the night's read; the declarations are read again at the fetched `HEAD` (R95C-14)
+
+### DW-566: A review room made before a failed night's commit is orphaned.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R128, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`run_home`), `hosts.rs` (`review_room`)
+reason: the room is made before the commit that writes the session folder naming it; a guarded or failed commit leaves the room with no folder. Close with R165's record-then-folder discipline.
+status: open
+
+### DW-567: No turns-level test drives a consolidator record through a served review session's worker.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R128, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`parks`)
+reason: `adopt_host_action`, the narrowed approvers and the skipped checkpoint are built but proven only by compilation; acceptance 10/13's decision is written by the test as the worker would write it. Close with a `parks` test: a record from `consolidate::review_record` in the session's `approvals/`, `resume_approvals` sends one request naming the record's readers, a decision is written and consumed, and no completion is asked.
+status: closed (review fixes R95C-01…22) — `agent_turns::parks::a_consolidator_record_is_consumed_once_through_the_worker`
+
+### DW-568: The live test `one_consolidator_per_drive_on_synapse` is not written.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, 2026-10-06)
+location: `src-tauri/crates/keeper-agentd/tests/`
+reason: the rung ran out of budget; `consolidation_lease_arithmetic` proves the arithmetic over the fake server only.
+status: closed (review fixes R95C-01…22) — `keeper-agentd/tests/live_consolidate.rs::one_consolidator_per_drive_on_synapse`, run against delectra's Synapse 2026-10-06: one Run (hesperia-sim), the other HeldBy, renewed past the stop deadline, both Done after the release (205 s); a whole agentd night is DW-709
+
+### DW-569: The new behaviour tests of rung `agents-95-consolidate` are not mutation-proved.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, 2026-10-06)
+location: keeper-sync `engine/tests/commit_paths.rs`, keeper-agent `tests/consolidation.rs`, `hosts.rs` tests, keeper-core `consolidate/tests.rs`, keeper-ported `openclaw/gates.rs`
+reason: out of budget; owed before review.
+status: closed (R207) — the rung-wide pass ran: 88 mutants over the rung's behaviour tests of rounds 1–3, every one killed by assertion (`/tmp/agents-salvage/mut-95cons-3.log`, the last three after their tests were added in `mut-95cons-4.log`)
+
 ### DW-575: A proposal's part file a crash leaves behind is never swept.
 
 origin: epic 95, story 95.1 (rung `agents-95-memory`, review R95M-15, R204, 2026-10-06)
 location: `src-tauri/crates/keeper-agent/src/memory/mod.rs` (`write_new`)
 reason: A proposal is written to `proposals/.<id>.md.<ulid>.part`, synced, then linked to its name; every return path removes the part file, but a host that dies between its creation and that removal leaves a dotted file no reader takes for a proposal and nothing deletes. Close with the consolidator (95.2) removing part files older than a run.
-status: open
+status: open (narrowed 2026-10-07, restack of `agents-95-consolidate` onto 1caff43e) — the night reads only `<ulid>.md`: a part file, committed or not, is never a proposal, never settled and never moved (`consolidation::a_proposals_part_file_is_never_a_proposal`); nothing sweeps it yet
 
 ### DW-576: A skill not offered to the session cannot be patched or archived by it.
 
@@ -8138,11 +8173,242 @@ status: open
 origin: epic 95, story 95.1 (rung `agents-95-memory`, review R95M-15, R204, 2026-10-06)
 location: `src-tauri/crates/keeper-agent/src/memory/mod.rs` (`write_new`)
 reason: After the link the folder is synced; when that fails the proposal is removed and the call refused, but a consolidator that listed the folder in between can have read the whole proposal, which then applies without the session's `memory` line. No planted-fault test covers the folder sync failing. Close with the consolidator re-checking a proposal's presence under its lease before it applies it, and a fault seam for the sync.
-status: open
+status: open (narrowed 2026-10-07, restack of `agents-95-consolidate` onto 1caff43e) — the consolidator half holds: a night lists proposals on the disk and its commit is guarded on every settled proposal as the disk holds it right before the publication, under the lease, so a proposal taken back is never applied (`consolidation::a_proposal_taken_back_is_never_applied`); the fault seam for the folder sync remains
 
 ### DW-578: A journal append whose folder sync fails is refused although its entry is in the file.
 
 origin: epic 95, story 95.1 (rung `agents-95-memory`, review R95M-10, R204, 2026-10-06)
 location: `src-tauri/crates/keeper-agent/src/memory/journal.rs` (`append_with`)
 reason: A first append syncs the day file's folder after the entry is written and synced; a failure there is reported as "could not be written" while the entry stays, so a model that retries writes it twice. Close with a refusal that says the entry was written but may not survive a power loss, or a sync before the entry is written.
+status: open
+
+### DW-700: A cut-off `commit_paths` puts back only the paths it can still reach.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-10, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine.rs` (`Engine::put_back`, `recover_commit_paths`)
+reason: a path whose folder was swapped for a link, or moved away, after the request wrote it is logged and left rather than followed; the record is removed so the folder's commits go on, and such a leftover is a person's change to the watcher. A folder swapped under a running request is adversarial; closing it needs the effects staged under `.git` and published by one rename.
+status: closed (R207) — `commit_paths` never puts anything back: it publishes once and rolls forward; a path behind a swapped folder refuses there, keeps the record and holds the folder's commits with its card saying so (`commit_paths::{a_root_or_folder_swapped_for_a_link_redirects_nothing, an_unfinished_commit_holds_the_folder_until_it_is_finished}`)
+
+### DW-701: On Windows the contained effect re-checks the landing instead of holding the folders open.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-12, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/browse.rs` (`Contained`)
+reason: the no-follow walk uses `openat`/`renameat` (rustix, unix only); elsewhere `Contained` re-runs `landing` before each effect, which narrows the window but does not close it. The consolidator itself runs on unix hosts only.
+status: closed (R207, R95CR-08) — `browse::{Root, Contained}` are Unix only and a non-Unix build refuses an authored commit (`Engine::commit_paths` → `SyncError::Config`); DW-725 records the platform consequence
+
+### DW-702: No test drives an LFS-routed path through `commit_paths`.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-11, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/git/commit.rs` (`commit_authored`)
+reason: an LFS pointer that does not name the requested bytes refuses the commit (`SyncError::Integrity` → `CommitPaths::Guarded`), but memory files and skills stay far under the LFS threshold and no fixture routes one; the branch is proven by inspection only.
+status: closed (R207, R95CR-09) — `commit_paths::routed_writes_carry_their_rule_and_nothing_else` routes a write through LFS: pointer committed, rule added to `HEAD`'s attributes, bytes and rule on the disk; an unsaved attributes edit holds it
+
+### DW-703: The consolidator reads every review session's log on every tick of a done night.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-01, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`owed`, `any_decided`)
+reason: whether a consumed or denied review waits is read from the sessions' logs each tick; cheap for a handful of review sessions, linear in their lines. Close by waking on the session worker's `consumed` instead.
+status: open
+
+### DW-704: A drive whose agents are served by different hosts gets no night.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-07, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`HostRuntime::night`)
+reason: the fix takes the review's second option — a host consolidates a drive only when it serves every agent homed there — so a drive split across hosts is consolidated by none (logged at debug). Per-home completion windows would let each host run its own agents.
+status: open
+
+### DW-705: A failed night taken over from a lapsed holder goes back naming no window.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-05, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`run_round`, `Taken::Run::prior`)
+reason: a run that does not finish releases the claim naming the night the claim said done before; when the claim it took was a lapsed holder's (not released), that night is unknown and the release names none. The night is still owed and runs once; only the record of the last done night is lost.
+status: closed (R207) — obsolete: the night's lease no longer names its window; each job records its completed window under its own key (`maintain::maintain`), and a run that does not finish records nothing
+
+### DW-706: A cut-off `commit_paths` is settled by the folder's next commit, not at engine start.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-10, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine.rs` (`Engine::commit`, `commit_paths_held`)
+reason: every commit of the folder — a watcher pass's, a pull's pre-fetch commit, the next request's — settles the record first and commits nothing of a walk taken over the fragments; a status read before that commit lists the fragments as local changes.
+status: closed (R207) — `Engine::settle_commit_paths` runs at `Engine::open` for every mounted folder and at the start of every pass (`tick_profile`, `sync_once`) and commit
+
+### DW-707: An over-cap review offers the leading part that fits, not a person's choice.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-20, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/consolidate.rs` (`batch`)
+reason: the candidates that fit are taken in proposal order and the rest listed, still pending; choosing which entries to drop instead would need one record per alternative.
+status: open
+
+### DW-708: Applying a consumed host action is recorded in the drive, not in the review session's log.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-01, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`decided`)
+reason: the worker logs `consumed`; the lease holder's application is the commit that moves the proposals to `proposals/done/`, which every host reconciles by pulling. The session's log never says the change landed; the card does not either.
+status: open
+
+### DW-709: The live test proves the lease on Synapse, not a whole agentd night.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, DW-568, 2026-10-06)
+location: `src-tauri/crates/keeper-agentd/tests/live_consolidate.rs`
+reason: `one_consolidator_per_drive_on_synapse` races two copies through `take_night`, `holding` and `release` on the real homeserver; two `keeper-agentd run` processes consolidating one drive at 03:00 with a real review room are not driven.
+status: open — the live test now races the drive's one maintenance claim between a consolidation and a curator job (R207); a whole agentd night is still not driven
+
+### DW-720: A keeper-sync unit test printed `error: Unrecognized option: 'repo'`.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine.rs` (`tests::pending_lists_what_is_still_coming_in_not_only_what_is_going_out`)
+reason: `Engine::open` registers the running executable as the folder's LFS clean filter; under `cargo test` that is the test binary, which git ran on the routed clip and which answered with its own argument error. No assertion depended on it.
+status: closed (R207) — the test registers no filter for its folder (`filter_program = None`, as on a phone); its subject is the queue, not the filter
+
+### DW-721: A holder that commits an approval and dies before pushing is followed by an identical guarded commit.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95CR-10, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`decided`, `carried`)
+reason: host A applies a consumed approval locally (`Approval-Record: <id>`) and dies before its push; B takes the claim, pulls, does not find the trailer in its history, and applies the same change — the same bytes over the same guarded blobs, the same moves. When A comes back, its unpushed commit and B's carry the identical tree change; the convergence leg sees the same paths at the same blobs on both sides. Nothing is applied twice in content; the history holds two commits naming the record. Preventing it needs the application recorded on the server (the room) before the commit, which is a second authorization mechanism R207 rules out.
+status: open
+
+### DW-722: A path LFS already tracks can never be guarded.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`commit_paths_held`)
+reason: a guard compares the disk's bytes with `HEAD`'s blob; for an LFS-tracked path `HEAD` holds the pointer and the disk the content, so a write over it, or a move of a folder holding one, is always `Guarded`. Memory files, proposals and skills stay far under the threshold.
+status: open
+
+### DW-723: An unsaved edit of `.gitattributes` holds a night that routes a file through LFS.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95CR-09, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs`, `lfs/stage.rs` (`prepare_authored`)
+reason: the rule is added to `HEAD`'s attributes and the file is guarded like every other path, so a person's uncommitted edit makes the request `Guarded` until the watcher commits it. A routing that needs no new rule leaves the attributes alone, and a managed block's repair waits for the watcher's next commit.
+status: open
+
+### DW-724: Whether a decision was carried out is read by walking the history each tick.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95CR-10, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`carried`), `keeper-sync/src/git/history.rs` (`commit_with_line`)
+reason: every consumed or denied record walks `HEAD`'s history down to the record's creation (a day of skew allowed) looking for its `Approval-Record`; cheap for days-old records, linear in the commits since. A history that cannot be read counts as carried out, so nothing is applied on an unknown.
+status: closed (R217, R95C3-05/06) — the timestamp bound is gone; one walk of the whole reachable history per `waiting` call, and an unreadable history is `Application::Unknown`, which holds; the remaining cost is DW-820
+
+### DW-725: Authored commits are made on Unix hosts only.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95CR-08, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine.rs` (the non-Unix `Engine::commit_paths`)
+reason: the root held open and the no-follow, no-replace effects use `openat`/`linkat`/`renameat` (rustix); Windows refuses rather than keep a weaker promise. The consolidator itself runs on Unix hosts only.
+status: open
+
+### DW-726: The claim's renewal is a sibling of the work, not a task of its own.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95CR-06, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/maintain.rs` (`holding`)
+reason: renewal and work are polled in one `select!`; it keeps running because every blocking part of a night runs off the executor (`commit_paths` and the plan through `spawn_blocking`). A future caller that blocks inside the work would stall it; a spawned renewal needs `'static` ports.
+status: closed (R217, R95C3-02) — `maintain::holding` spawns the renewal with owned ports (`CopyPort::keyed_claims` returns `Arc<dyn ClaimPort>`) and stops it between renewals
+
+### DW-727: A person's save kept beside its path is said in the log only.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95CR-07, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`materialize`)
+reason: when a file moved aside turns out to be a person's save and its path was taken again meanwhile, it stays beside it as `.keeper-displaced-<request>-<n>` and a warning is logged; the folder's card does not name it.
+status: open
+
+### DW-728: The window is recorded after the claim's release.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95C-05, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/maintain.rs` (`maintain`)
+reason: completion is written only once the release was accepted, so a crash between the two leaves the window unrecorded and the job runs again — idempotent for the night (nothing pending is applied twice), at the cost of one more run.
+status: open (R217, R95C3-08: the completion is now written monotonically under the claim taken again after the accepted release; the crash window and its extra run remain, see DW-821)
+
+### DW-729: The runtime's simultaneous start of the two schedulers is proven through the helper, not `runtime::run`.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95U-03, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`one_maintenance_job_per_drive_whichever_starts_first`)
+reason: both jobs take the one claim through `maintain::maintain`; the test starts two at once on two hosts and each interleaving. The curator's scheduler lives on rung 3 and is restacked onto this one; agentd's tick starting both is not driven here.
+status: open
+
+### DW-820: Whether a decision was carried out walks the whole history while it waits.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R217 / R95C3-05, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`waiting`), `keeper-sync/src/git/history.rs` (`lines_in_history`)
+reason: no commit date bounds the search any more, so a consumed or denied record not carried out yet costs one walk of every commit `HEAD` reaches per `waiting` call (each tick of a drive remembered done asks `any_decided`), stopped early only once every marker is found. A commit-graph generation index would bound it.
+status: open
+
+### DW-821: Recording a window takes the drive's claim a second time.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R217 / R95C3-08, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/maintain.rs` (`record_held`)
+reason: the completion is written under the claim taken again after the accepted release, so it is serialized with every other job's; that costs one more acquisition (its settle wait) per run, and a run whose second acquisition is lost to another host records nothing and runs again — idempotent, one more run.
+status: open
+
+### DW-822: The publication's folder checks precede a path-based ref transaction.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R217 / R95C3-09, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`bound`), `git/commit.rs` (`publish`)
+reason: gitoxide edits references by path; the held root and its `.git` are checked before the repository opens, before the record, right before the compare-and-swap and before every roll-forward, but a swap between the last check and the reference lock is not excluded by a descriptor.
+status: open
+
+### DW-823: A person's long-held `index.lock` leaves a published commit for the next pass.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R217 / R95C3-10, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/git/commit.rs` (`index_follow`, `INDEX_LOCK_WAIT`)
+reason: the index follows under its own lock, waited for 2 s; past that the roll-forward fails, the record stays, the card says so and the next pass finishes it.
+status: open
+
+### DW-824: A link a moved skill folder holds is materialized as a file.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R217 / R95C3-13, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`roll_forward`, `materialize`)
+reason: the executable mode is carried to the disk; a `120000` entry moved with its folder is written as a regular file holding the link's target, so the next watcher pass would record that as a change. Skill folders hold no links today.
+status: open
+
+### DW-825: A refused rejection leaving a night unfinished is proven at `consolidate::settled`, not through `run_round`.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R217 / R95C3-07, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`a_night_whose_commit_did_not_finish_is_tried_again`), `tests/consolidation.rs` (`a_refused_rejection_leaves_the_night_unfinished`)
+reason: `run_round` is driven with a real home to `Done`, and with staged proposals whose published commit cannot be finished to `Again` (unrecorded) and then, once the next pull finished it, to `Done`; that proves `night_of` asks `settled`. A consumed approval whose rejection is refused needs a person's decision recorded through the approval store and the agentd harness of `tests/consolidation.rs`, so that branch of `settled` is proven there, at `settled` itself.
+status: open
+
+### DW-900: A person's commit in the instant after the roll-forward's one `HEAD` read can be followed over.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R233 / R95C4-02, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`roll_forward`, `materialize`)
+reason: accepted residual. Which paths follow a published commit is read from `HEAD` once, right before the disk and the index follow; a person's commit landing between that read and the materialization (a window of one hash pass) — a reversal of the commit, say — can still have the night's files written over its paths on the disk and the index entries moved. Keeper is one person's set of devices, the window is bounded, the person's commit stays in the history, and every later night/watch pass sees it with the difference on top. `docs/agents.md` and `docs/sync.md` state the guarantee exactly ("read once, right before the files follow"). Proven only up to that read: `commit_paths::a_persons_commit_right_after_the_publication_is_never_written_over`.
+status: open
+
+### DW-901: A proposal taken back between the night's last re-read and the publication can be settled.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R233 / R95C4-05, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`commit_paths_held`, the re-read before `git::commit::publish`), `keeper-agent/src/consolidate.rs` (`settle_into`; `add_review`, `decided` — the review path)
+reason: accepted residual. Every guarded path and every changed path is read on the disk again right before the compare-and-swap; that re-read and the publication are not one step, so a proposal withdrawal (or any guarded edit) landing between them — a window of one hash pass — is carried by the commit. The review path has no stronger protocol: the commit publishing a review guards every proposal its preview was made from, and the commit carrying a decision out guards the ones it settles, through the same re-read, so a proposal taken back in that instant can still be shown in the published review or settled by the decision's commit (R246 / R95C5-03). No shared serialization of proposal publication/withdrawal with the night exists. Keeper is one person's devices and the window is bounded; the next night or watcher pass sees what landed after. `docs/agents.md` and `docs/sync.md` state "re-read right before publication", never atomic; `docs/agents.md` cites this entry from the proposals and the review paragraphs. The early-removal regression `consolidation::a_proposal_taken_back_is_never_applied` stays.
+status: open
+
+### DW-902: A review room's creation is fenced before it starts, not between its own requests.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R233 / R95C4-06, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`run_home`), `hosts.rs` (`CopyPort::review_room`)
+reason: the live fence is asked again after the awaited authority check, right before `room()` starts; the room implementation makes the room and sends its invitations without the fence, so a claim lost while those requests are in flight still completes them. The room is reused by a night run again (`review_room_of`) only once its session is committed; an unused room is left.
+status: open
+
+### DW-903: The completion's fence is asked right before its send, not inside it.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R233 / R95C4-03, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/maintain.rs` (`record`, `record_held`)
+reason: Matrix state has no compare-and-swap. The completion is read, the claim taken again is asked (`Lease::may_write`) right before the send, and the run is not counted recorded when the claim lapsed before the send or its release was refused after it. That is not unconditional monotonicity: a send held up after the last ask — past the claim's 60 s margin (`claim::STOP_WITHOUT_RENEWAL`), while another host takes the drive and records a later window — can still land after that later completion and replace it with an older window, and that night is then run again. `recorded` is the host's local answer; it says nothing about whether a send already made reached the server. This is the claim protocol's own residual, as for every fenced effect; `docs/agents.md` states these boundaries and cites this entry (R246 / R95C5-03).
+status: open
+
+### DW-970: A settling that cannot tell whose a file is holds the folder until a person settles the path.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R246 / R95C5-02, 2026-10-08; widened by R250 / R95C6-01…03, R264 / R95C7-01…03 and R268 / R95C8-01…03)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`put_back`), `src-tauri/crates/keeper-sync/src/browse.rs` (`Displaced::holds`)
+reason: accepted by design. A transaction's own new file is told apart from a person's only while it is still linked under its staging name, holds the commit's bytes and has the executable bit the commit gave it; the old file it moved aside is the commit's only while it holds the committed before-image bytes with the before-image entry's executable bit, read by one check (`browse::Displaced::holds`) right before it is dropped — beside an empty path once a deletion was committed, beside a person's file saved at a reversed path, after the commit's own file was dropped — and before the commit's file is moved off the path for it (R268). Recovery completes only when every path's occupant, mode, `HEAD` entry and before-image are attributed (R250), and no mode is ever moved from one file to another (R264): modes are held, never transferred. It holds — nothing moved or dropped, the files as they are, the old file beside the path as `.keeper-displaced-<request>-<n>`, the record kept and the folder's commits held with the reason on its card — where the path holds the commit's bytes without that staging link (a kill after the placement unlinked the staging name, before the old file moved aside was dropped — no `Cut` stops there — then the commit taken back or the path's deletion committed), where `HEAD` holds a third version while the commit's own file or its old file is still there (with or without an old file moved aside), where `HEAD` holds the old bytes with another mode than the entry the commit replaced, where `HEAD` holds the replaced entry again but the old file moved aside is gone (the commit's own file stays at the path rather than leave it empty for a watcher to commit as a deletion), where the commit's own file's executable bit is not the one its committed entry gives it (a person set or cleared it, a new file included), and where the old file moved aside has other bytes or another executable bit than its committed entry when it would go (a person saved over it or set or cleared its bit at any point before that check, beside an empty path, a person's file or the commit's) — or any of these cannot be read. Holding leaves no step for a kill to interrupt between a mode and the file that carries it: a settling run again holds again with every file and bit where the person left it, including one a kill stopped after moving the commit's file off the path (it goes back first) and one a kill stopped after dropping the commit's file (the old file is checked again before it goes) — except a kill inside that move back, between its link and its unlink, which holds until a person removes the alias (DW-1061). A change in the instant between the check and the unlink is DW-1060. A person settles the path by putting there what they want (`git checkout -- <path>` for what `HEAD` holds, removing the file for a deletion, committing the commit's bytes to keep them, or putting a bit back as it was) and removing the old file kept beside it unless it should go back (after a reversal, an empty path and the old file left let the next settling put it back, with whatever bit the person gave it — never removed, so never checked), or putting the old file's bit back so the settling drops it. No automatic choice is made, because either choice can lose a person's file or mode. Proof: `commit_paths::{a_settling_that_cannot_tell_whose_a_file_is_keeps_the_record, a_deletion_committed_over_a_file_nothing_attributes_holds_the_folder, a_third_version_over_the_commits_own_file_holds_the_folder, a_mode_a_settling_cannot_attribute_holds_the_folder, a_reversal_whose_old_file_is_gone_keeps_the_commits_file, an_old_file_whose_bit_a_person_changed_is_never_dropped, an_old_file_changed_while_its_settling_runs_stays}` (the staging name removed by hand stands in for that kill, a rename to `.keeper-taken-<request>-<n>` for the kill after the move off the path, `Cut::Dropped` for the kill after the commit's file was dropped and for a person acting while the settling runs).
+status: open
+
+### DW-1060: A change to the old file in the instant between the settling's last look at it and its unlink is not seen.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R268 / R95C8-02, 2026-10-08)
+location: `src-tauri/crates/keeper-sync/src/browse.rs` (`Displaced::holds`, `Displaced::discard`), `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`put_back`'s `drop_old`)
+reason: accepted residual, the same class as DW-900. The old file moved aside is dropped by name: `Displaced::holds` opens it through no link, `fstat`s the descriptor, reads its bytes and compares their blob id with the committed before-image, then `statat`s the name and requires the same device, inode and change time (`st_ctime`, `st_ctime_nsec`: no write, mode change or link change since the open) and the before-image's executable bit; `Displaced::discard` then `unlinkat`s the name. A replacement or a change of bytes or bit made before that `statat` holds (`commit_paths::an_old_file_changed_while_its_settling_runs_stays`); one made after the `statat` returns and before the `unlinkat` — a window of two system calls, `holds` returning and `drop_old` calling `discard` — is not seen, and that file is unlinked. On a file system whose change time is coarser than the interval, a write after the bytes are read and within the same tick is not seen either. Closing it needs the drop to act on the descriptor that was checked (an unlink by identity, which POSIX lacks) or a rename of the name to a private one first and a check of what was moved, with its own recovery. Keeper is one person's set of devices; the old file is a hidden `.keeper-displaced-<request>-<n>` the person has no reason to edit in that instant.
+status: open
+
+### DW-1061: A kill inside the `.keeper-taken` restoration, between its link and its unlink, holds until a person removes the alias.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R268 / R95C8-03, 2026-10-08)
+location: `src-tauri/crates/keeper-sync/src/browse.rs` (`place`, `Displaced::restore`), `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`put_back`, the `.keeper-taken` branch first)
+reason: `put_back` moves a commit's file off the path as `.keeper-taken-<request>-<n>` and, on a later settling, puts it back first through `place`: `linkat` to the path's name, then `unlinkat` of the taken name. A kill between the two leaves one inode under both names. Every settling after it tries the same `linkat`, gets `EEXIST`, takes it for a file a person saved at the path and holds (`saved there … kept beside it as .keeper-taken-…`) before reading any bytes or mode. Nothing is lost — bytes and modes are where they were — but putting the path or the bit back, or removing the old file, does not release the hold while the alias stays. Manual remedy: remove the `.keeper-taken-<request>-<n>` name only when it is the same file as the path (`ls -i` shows one inode number for both); the next settling then proceeds. A different file under that name is the commit's own file, kept because a person's file took the path: that is a genuine conflict, settled as DW-970 says. Eventual fix: recognise and finish its own partial restore — when the taken name and the path are one inode, unlink the taken name, sync the folder and go on — with a regression stopping between `place`'s link and unlink. Not a dead end: the manual remedy releases it.
 status: open

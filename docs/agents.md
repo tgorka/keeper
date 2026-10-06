@@ -513,6 +513,121 @@ it, and a pass whose last answer reaches it ends with "this turn's token budget 
 archive is pinned to; a workflow may need the memory tools, and its run is offered them when the
 agent is allowed them; inside a run they are refused once the run replied, as every call is.
 
+### Memory › Consolidation
+
+Proposals become memory by night, on an always-on host only (agentd with `always_on = true`;
+the Mac never consolidates). At 03:00 at the host's offset, the host that wins the drive's one
+maintenance claim `maintain:<drive>` in the principal's control room — the same claim the weekly
+curator takes, so the two never run on one drive at once — and finds the night's completion
+`consolidate:<drive>` not naming that night yet pulls the drive and, for each agent homed
+there, reads `USER.md`, `MEMORY.md`, `_skills/`, `proposals/`, the agent's `agent.toml` and the
+drive's `_drive.toml` as committed — a `promote = false` pushed before the night counts. Another
+host — or the curator — logs "the maintenance of tgdrive is held by electra" and writes nothing,
+and tries again once the claim could have lapsed. A host consolidates a drive only when it serves
+every agent homed there; each agent's review room is made by that agent. A host that missed
+several nights runs once. The claim is renewed by a task of its own while the night runs, and the
+night's pull, Git work and review writes run off the task that waits for them, so nothing the
+night does holds the renewal up; every room and every commit's publication asks the claim first,
+right before it: a holder that cannot renew stops before its next agent and its next write. Right
+before a review room is made the night reads the two declarations again, as committed and on the
+disk: a change since — a reader added, an owner, a `promote` — makes no room and writes nothing of
+that agent tonight; the claim is asked again once that read is back, right before the room. A
+night counts as done only once every agent of it settled — every commit it published followed by
+its files, every decision a person took carried out — the claim went back, and the night was
+recorded under `consolidate:<drive>` with the claim taken again for that one write. That write is
+three steps, not one: the completion is read, the claim is asked once more, and then the new
+completion is sent. A later night already recorded when it is read stays, and nothing is sent; a
+claim that lapsed by the time it is asked sends nothing. Matrix state has no compare-and-swap, so a
+send held up after that last ask — past the claim's lapse, while another host takes the drive and
+records a later night — can still land after that later completion and replace it; the later
+night is then run again (DW-903). Whether the host counts the night recorded is its own answer
+and nothing more: it does not when its claim lapsed before the send or its release was refused
+after it, and that says nothing about whether a send already made reached the server. One that
+failed or did not finish is run again.
+
+- **Never scored:** a proposal at `untrusted` integrity, or from a `scheduled` or `delegated`
+  session — a workflow's run included, by the origin its proposals carry — is rejected naming the
+  gate. A `gate` session's proposal gets no verdict and waits for the weekly curator, whatever its
+  session. A proposal whose session was archived since still counts as that session's. Only
+  `proposals/<ulid>.md` is a proposal: a part file a publication left behind never is. A proposal
+  taken back from the disk is never applied when it is gone by the night's last re-read, right
+  before its commit is published; that re-read and the publication are not one step, so one
+  taken back in the instant between them (one hash pass) can still be settled by that commit
+  (DW-901).
+- **The gates are OpenClaw's** (`keeper-ported/src/openclaw/UPSTREAM.md`): one fact proposed in
+  three sessions on three days, its newest within 30 days, scores at least 0.75 and promotes;
+  short of that it stays pending; older than 30 days it expires.
+- **Who stands behind it:** on a private drive a promoting fact is applied only when one of its
+  proposals was written at `owner` or `peer` integrity. An agent's own repetition, a shared
+  drive's change (two or more readers), a review pass's replace or remove (any one of the fact's
+  proposals), a person's skill, or `[memory].promote = false` waits for a person instead.
+- **Who may read it:** a fact whose proposals only some of the drive's readers may read is
+  rejected, never written and never shown in a review; approving never widens who may read it.
+- **What waits for a person:** a review session `<date>-memory-review-<agent>` with a card, one
+  before/after preview per change and one approval each. `MEMORY.md` and skills wait for the
+  drive's owner; a shared drive's `USER.md` waits for the people whose sessions it came from —
+  the approval names them, and a decision by anyone else, or after the owner changed, counts for
+  nothing. Approving applies exactly the previewed change once the approval was used, as every
+  approval is (`consumed` in the room, once); declining rejects the proposals in your name; an
+  approval that expired or was refused changes nothing, and its proposals come up again. A
+  preview is made from every proposal it shows, and each commit that would use them reads them
+  again right before it is published: one taken back by the re-read before the review's commit
+  publishes no review, and one taken back after it, by the re-read before the commit that would
+  carry your decision out, leaves the change unapplied whatever you decide — the rest come up
+  again in a new preview, never as a smaller change. Each re-read and its publication are not
+  one step: a proposal taken back in the instant between them (one hash pass) can still be shown
+  in the review that commit publishes, or settled by the commit that carries the decision out
+  (DW-901). The
+  commit that carries a decision out names it (`Approval-Record: <id>`), and a decision the
+  drive's history names — anywhere in it, whatever the commits' dates say — is never carried out
+  again: revert that commit and your revert stands. While the history cannot be read, nothing is
+  carried out and the review keeps its file.
+  One review per file at a time — per skill across the whole drive, whichever agent proposed it:
+  nothing else changes a file while its review is open, and once it is decided and carried out —
+  or declined, refused or expired — the next proposal for that file is reviewed. A night run again
+  adds to its review session and never replaces an earlier preview.
+- **Over the cap:** a batch that would put a file over its cap is not applied; the part that fits
+  goes to review, and the preview lists the proposed entries that do not, with their sessions.
+  When nothing fits, the card lists what was proposed and the file's entries.
+- **Your words win:** a file you edited into a shape keeper would not write back stops that
+  agent's night (the card quotes why); a file that changed since the night read it, here or on
+  another device, by the night's last re-read right before its commit is published, is never
+  written over, and an edit landing after its write stays yours, uncommitted, never inside the
+  night's commit.
+- **One commit per agent:** `memory: <agent> — <n> promoted, <m> rejected`, keeper's provenance
+  block, then `Memory-Origin: consolidator@<host>` and one `Source-Session:` per contributing
+  session. The commit holds exactly the night's paths, never anything else you staged. The settled
+  proposals move to `proposals/done/` beside `<ulid>.verdict.toml` in that commit; the push rings
+  `memory` in the control rooms. Nothing on your disk changes before that commit exists: it is
+  built from the files as committed, the files it guards are read again right before it is
+  published — re-read, then published; not one step — and only then do your files follow it,
+  each one only where it still holds what was committed before, so a save you make meanwhile,
+  even in the instant a file is replaced, stays yours, and so does an executable bit you set or
+  cleared on it. Which paths follow is read from the branch once, right before they do: a commit
+  of yours landing in the instant after that read (one hash pass) can still have the night's
+  files written over its own on the disk; your commit stays in the history, and the next pass
+  sees the difference on top of it as a change. A night refused before the publication left
+  nothing anywhere and drops its record only from the `.git` it began with — another put in its
+  place keeps its own. One stopped after the publication is finished — never undone — before the
+  folder's next commit, against the branch as it is then: if you took the commit back, the old
+  file goes back and the night's own new file goes; if you committed the file's deletion, it
+  stays deleted; a file you saved there stays and the old one goes — only while the old one
+  still holds the bytes and the executable bit it was committed with. Where keeper cannot tell
+  whose the file at the path is — it holds the night's bytes with nothing to say the night put
+  them there, or you committed a third version while anything of the night's is still there, or
+  took it back with another mode, or set or cleared the executable bit of the night's file or
+  of the old one beside it, or saved over that old one — nothing is removed and no bit is moved
+  from one file to another: the files stay as they are, the old one beside the path, until you
+  put the path as you want it (`docs/sync.md` § 10). One that cannot be finished says so on the
+  folder's card and holds
+  the folder's commits until it is. A night routes a large
+  file through LFS as any commit does, adding the rule to `.gitattributes` in the same commit;
+  while you have an unsaved edit of `.gitattributes`, such a night waits. Nights are written on
+  Linux and macOS only.
+- **Skills:** a skill proposal is scanned again as committed; one carrying an attack is rejected.
+  One change per skill a night. An agent's new skill lands stamped `metadata.keeper_proposal` and
+  is not offered (`skills_list` names it waiting) until you delete the key.
+
 ### Skills
 
 `_skills/<name>/SKILL.md` is shared by every agent in the zone. Its frontmatter is checked by the
@@ -741,8 +856,8 @@ tier decides whether it runs:
 | tier | calls | what keeper does |
 | --- | --- | --- |
 | T0 | `drive_list`, `drive_read`, `drive_glob`, `drive_grep`, `drive_stat`; `bmad_config`, `bmad_party`, `skills_list`, `skill_view`; `helper` | runs it |
-| T1 | `session_write`; `card_update` on a card of the session; a `drive_write` or `drive_edit` inside the session's own folder; `delegate` and its later rounds; `reply`; the five `surface_*` tools; `bmad_render` and `bmad_memlog`, which write only inside the session | runs it |
-| T2 | `drive_write` or `drive_edit` outside the session; `card_update` on another session's card; any write the agent's grant asks a person about | asks a person |
+| T1 | `session_write`; `card_update` on a card of the session; a `drive_write` or `drive_edit` inside the session's own folder; `delegate` and its later rounds; `reply`; the five `surface_*` tools; `bmad_render` and `bmad_memlog`, which write only inside the session; `journal_append`, `memory_propose` and `skill_propose`, which write only into the agent's own home and change nothing until the consolidator or a person acts | runs it |
+| T2 | `drive_write` or `drive_edit` outside the session; `card_update` on another session's card; any write the agent's grant asks a person about; the consolidator's `memory_apply` and `skill_apply` — host actions, never a model's call — fixed at T2 in every session: nothing raises them | asks a person |
 | T3 | `card_update` that sets `schedule` or `workflow`, and a `delegate` whose card carries either — in every session, the person's own DM included; letting a blocked flow through (a declassification) | asks a person, for that one action |
 | T5 | a write — `drive_write`, `drive_edit`, `session_write` or `card_update` — that lands on any `agent.toml`, any `_drive.toml`, or anything in a session's `approvals/`, on any drive | never: "keeper never lets an agent do this: it would change the agent's own configuration or the approvals that guard its work. A person can do it themselves. Nothing was changed." |
 

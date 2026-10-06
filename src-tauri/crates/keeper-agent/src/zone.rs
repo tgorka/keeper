@@ -145,6 +145,34 @@ fn read_home(zone_dir: &Path, folder: &str, decl: &DriveDecl) -> Result<AgentHom
     })
 }
 
+/// The session `path` (drive-relative, under the sessions zone `sessions`)
+/// names, where the zone holds it now: there, or — archived or moved since
+/// — the session of the same folder name under `active/` or
+/// `archive/<year>/`, the zone's own location rules. Its `agent.toml` is
+/// read as every zone file is ([`read_text`]).
+pub fn session_facts(
+    root: &Path,
+    sessions: &str,
+    path: &str,
+) -> Option<keeper_core::agents::consolidate::SessionFacts> {
+    let rel = path.strip_prefix(sessions)?.strip_prefix('/')?;
+    keeper_core::sessions::model::classify(rel)?;
+    let name = rel.rsplit('/').next()?;
+    let zone = root.join(sessions);
+    let moved = crate::sessions::scan::session_dirs(&zone)
+        .into_iter()
+        .filter(|candidate| candidate.rsplit('/').next() == Some(name));
+    std::iter::once(rel.to_owned())
+        .chain(moved)
+        .find_map(|rel| {
+            let text = read_text(&zone, &format!("{rel}/{}", session::FILE_NAME)).ok()??;
+            session::parse_session_agent_toml(&text).ok()
+        })
+        .map(|agent| keeper_core::agents::consolidate::SessionFacts {
+            requested_by: agent.requested_by,
+        })
+}
+
 /// The active sessions of `profile`'s sessions zone that hold an
 /// `agent.toml`. Archived sessions are never served.
 pub fn active_sessions(profile: &SyncProfile) -> Vec<FoundSession> {

@@ -109,6 +109,13 @@ pub fn detect_drift(raw: &str, limit: usize) -> bool {
             && parsed.iter().map(|e| e.chars().count()).max().unwrap_or(0) <= limit))
 }
 
+/// What a write to the drifted file `name` is refused with.
+pub fn drift_message(name: &str) -> String {
+    format!(
+        "Refusing to write {name}: file on disk has content that wouldn't round-trip through the memory tool (likely added by the patch tool, a shell append, a manual edit, or a concurrent session). Resolve the drift first — either rewrite the file as a clean §-delimited list of entries, or move the extra content out — then retry. This guard exists to prevent silent data loss (issue #26045)."
+    )
+}
+
 /// What the frozen snapshot holds for `entry` of `file_name`: the entry, or
 /// the `[BLOCKED: …]` placeholder when it matches a threat at `strict`. An
 /// entry that is exactly a placeholder this function renders for
@@ -359,10 +366,7 @@ impl Store {
                 "Integrate the extra content into the memory one entry at a time, then rewrite {} to a clean state.",
                 self.name
             )),
-            ..Failure::new(format!(
-                "Refusing to write {}: file on disk has content that wouldn't round-trip through the memory tool (likely added by the patch tool, a shell append, a manual edit, or a concurrent session). Resolve the drift first — either rewrite the file as a clean §-delimited list of entries, or move the extra content out — then retry. This guard exists to prevent silent data loss (issue #26045).",
-                self.name
-            ))
+            ..Failure::new(drift_message(&self.name))
         }
     }
 

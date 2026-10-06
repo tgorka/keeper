@@ -347,6 +347,8 @@ pub enum Acquired {
         from_host: Option<String>,
         /// The window the claim named before this host took it.
         from_window: Option<String>,
+        /// Whether that claim was released: its window then ran to the end.
+        from_released: bool,
     },
     /// Another host's claim is live.
     HeldElsewhere,
@@ -361,6 +363,7 @@ struct Current {
     epoch: u64,
     host: Option<String>,
     window: Option<String>,
+    released: bool,
     acquirable: bool,
     /// Whether `acquirable` was decided by the server's clock: a claim that
     /// is neither absent, released, nor `me`'s own.
@@ -373,6 +376,7 @@ fn current(state: Option<&ServerState>, me: &Claimant, server_now: u64) -> Curre
             epoch: 0,
             host: None,
             window: None,
+            released: false,
             acquirable: true,
             clocked: false,
         };
@@ -384,6 +388,7 @@ fn current(state: Option<&ServerState>, me: &Claimant, server_now: u64) -> Curre
             clocked: !claim.content.released && !claim.is_held_by(me, claim.content.epoch),
             host: Some(claim.content.host),
             window: claim.content.window,
+            released: claim.content.released,
         },
         Err(refusal) => {
             tracing::warn!(event = %state.event_id, %refusal, "agents: a session's claim does not read");
@@ -391,6 +396,7 @@ fn current(state: Option<&ServerState>, me: &Claimant, server_now: u64) -> Curre
                 epoch: state.content["epoch"].as_u64().unwrap_or(0),
                 host: None,
                 window: None,
+                released: false,
                 acquirable: server_now
                     >= u64::from(state.origin_server_ts.get())
                         .saturating_add(claim::TTL.as_millis() as u64),
@@ -482,6 +488,7 @@ async fn acquire_naming(
         lease: std::sync::Arc::new(Lease::new(epoch, event, server_ts, window, sent_at)),
         from_host: found.host.filter(|host| *host != me.host),
         from_window: found.window,
+        from_released: found.released,
     })
 }
 
@@ -824,6 +831,7 @@ mod tests {
                 lease,
                 from_host,
                 from_window,
+                ..
             } => {
                 assert_eq!(lease.epoch, 3, "epoch + 1");
                 assert_eq!(from_host.as_deref(), Some("electra"));

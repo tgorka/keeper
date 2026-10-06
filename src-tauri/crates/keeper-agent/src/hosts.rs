@@ -254,8 +254,9 @@ pub(crate) trait CopyPort: Send + Sync {
     /// The claim of the session room `room`.
     fn claims<'a>(&'a self, room: &'a OwnedRoomId) -> Box<dyn ClaimPort + 'a>;
     /// The claim under the state key `key` of `room`: a steward duty's
-    /// creation claim in the control room (R165).
-    fn keyed_claims<'a>(&'a self, room: &'a OwnedRoomId, key: &'a str) -> Box<dyn ClaimPort + 'a>;
+    /// creation claim in the control room (R165). Owned, so a renewal can
+    /// run as a task of its own.
+    fn keyed_claims(&self, room: &OwnedRoomId, key: &str) -> Arc<dyn ClaimPort>;
     /// Send a session status into `room`.
     fn send_status<'a>(
         &'a self,
@@ -326,6 +327,9 @@ pub(crate) trait CopyPort: Send + Sync {
     /// Leave every room this copy is in that was made for its steward's
     /// `duty` session, but `keep`, revoking the drive's readers' invites.
     fn steward_orphans<'a>(&'a self, duty: Duty, keep: Option<&'a RoomId>) -> ClaimFuture<'a, ()>;
+    /// A new room for this copy's agent's memory review session, the home
+    /// drive's readers invited (R128).
+    fn review_room(&self) -> ClaimFuture<'_, Result<OwnedRoomId, String>>;
 }
 
 impl CopyPort for Copy {
@@ -406,8 +410,8 @@ impl CopyPort for Copy {
         ))
     }
 
-    fn keyed_claims<'a>(&'a self, room: &'a OwnedRoomId, key: &'a str) -> Box<dyn ClaimPort + 'a> {
-        Box::new(RoomClaims::keyed(
+    fn keyed_claims(&self, room: &OwnedRoomId, key: &str) -> Arc<dyn ClaimPort> {
+        Arc::new(RoomClaims::keyed(
             self.client.clone(),
             room.clone(),
             key,
@@ -633,6 +637,20 @@ impl CopyPort for Copy {
                 tracing::info!(room = %orphan, duty = duty.name(), "agents: a steward's room no folder will name is left");
                 crate::seed::discard(&self.client, &orphan, &invited).await;
             }
+        })
+    }
+
+    fn review_room(&self) -> ClaimFuture<'_, Result<OwnedRoomId, String>> {
+        Box::pin(async move {
+            let readers = self.deps.home.drive.readers.iter().cloned().collect();
+            bounded(self.client.create_room(
+                keeper_core::agents::matrix::RoomKind::Session(SessionKind::Scheduled),
+                &format!("{} — memory review", self.config().name),
+                readers,
+                &[],
+            ))
+            .await
+            .map_err(|error| error.to_string())
         })
     }
 
@@ -973,6 +991,69 @@ impl HostRuntime {
             copies: self.copies.clone(),
             control: self.control_room.clone(),
         }
+    }
+
+    /// What tonight's consolidation needs of this host (AD-401, R129):
+    /// `None` unless it is always on and knows its control room. Its drives
+    /// are the mounted ones whose `_drive.toml` names this host's principal
+    /// and whose every agent this host serves — the one drive-wide window a
+    /// night completes covers them all — each home with the copy serving it,
+    /// and the first copy homed there that is in the control room: the
+    /// lease's sender. A drive whose agents are served by several hosts has
+    /// no complete consolidator here and gets no night from this host.
+    pub(crate) fn night(&self, drives: &[DriveView]) -> Option<crate::consolidate::NightRound> {
+        if !self.always_on {
+            return None;
+        }
+        let control = self.control_room.clone()?;
+        let (now_ms, offset) = (self.calendar)(self.clock.now());
+        let drives = drives
+            .iter()
+            .filter_map(|view| {
+                let decl = view.hosts.as_ref().ok()?;
+                if decl.principal != self.principal {
+                    return None;
+                }
+                let served: Vec<&Arc<dyn CopyPort>> = self
+                    .copies
+                    .iter()
+                    .filter(|copy| copy.config().drive == view.id)
+                    .collect();
+                let copy = served.iter().find(|copy| copy.joined(&control))?;
+                let mut homes = Vec::new();
+                for home in view.zone.homes.iter().filter_map(|(_, home)| home.as_ref().ok()) {
+                    let Some(serving) = served
+                        .iter()
+                        .find(|copy| copy.config().matrix_user == home.config.matrix_user)
+                    else {
+                        tracing::debug!(drive = %view.id, agent = %home.config.id, "agents: this host does not serve every agent of the drive, so it does not consolidate it");
+                        return None;
+                    };
+                    homes.push(crate::consolidate::NightHome {
+                        home: crate::consolidate::Home::of(
+                            &view.profile,
+                            home,
+                            self.host.as_str(),
+                        )?,
+                        copy: Arc::clone(serving),
+                    });
+                }
+                Some(crate::consolidate::NightDrive {
+                    id: view.id.clone(),
+                    homes,
+                    copy: Arc::clone(copy),
+                })
+            })
+            .collect();
+        Some(crate::consolidate::NightRound {
+            me: self.host.clone(),
+            control,
+            clock: Arc::clone(&self.clock),
+            rtt: Arc::clone(&self.rtt),
+            now_ms,
+            offset,
+            drives,
+        })
     }
 
     /// This host's manifest at `server_now`; `live: false` withdraws it.
@@ -1805,6 +1886,7 @@ impl HostRuntime {
                 lease,
                 from_host,
                 from_window,
+                ..
             }) => {
                 tracing::info!(
                     session = %session.path, %room, epoch = lease.epoch,
@@ -2202,7 +2284,7 @@ fn zone_of(session: &FoundSession) -> Option<PathBuf> {
 }
 
 /// Who `copy` claims as on `host`.
-fn claimant(host: &HostSlug, copy: &dyn CopyPort) -> Claimant {
+pub(crate) fn claimant(host: &HostSlug, copy: &dyn CopyPort) -> Claimant {
     Claimant {
         host: host.as_str().to_owned(),
         device: copy.device(),
@@ -2684,14 +2766,14 @@ mod tests {
         }
     }
 
-    struct FakeClaims<'a> {
-        server: &'a Server,
+    struct FakeClaims {
+        server: Arc<Server>,
         room: OwnedRoomId,
         key: String,
         sender: OwnedUserId,
     }
 
-    impl ClaimPort for FakeClaims<'_> {
+    impl ClaimPort for FakeClaims {
         fn send(&self, content: Value) -> ClaimFuture<'_, Result<OwnedEventId, AgentMatrixError>> {
             Box::pin(async move {
                 if self.server.fail_claims.load(Ordering::Relaxed) {
@@ -3028,16 +3110,17 @@ mod tests {
         }
 
         fn claims<'a>(&'a self, room: &'a OwnedRoomId) -> Box<dyn ClaimPort + 'a> {
-            self.keyed_claims(room, "")
+            Box::new(FakeClaims {
+                server: Arc::clone(&self.server),
+                room: room.clone(),
+                key: String::new(),
+                sender: self.config.matrix_user.clone(),
+            })
         }
 
-        fn keyed_claims<'a>(
-            &'a self,
-            room: &'a OwnedRoomId,
-            key: &'a str,
-        ) -> Box<dyn ClaimPort + 'a> {
-            Box::new(FakeClaims {
-                server: &self.server,
+        fn keyed_claims(&self, room: &OwnedRoomId, key: &str) -> Arc<dyn ClaimPort> {
+            Arc::new(FakeClaims {
+                server: Arc::clone(&self.server),
                 room: room.clone(),
                 key: key.to_owned(),
                 sender: self.config.matrix_user.clone(),
@@ -3358,6 +3441,14 @@ mod tests {
                         left.push(room);
                     }
                 }
+            })
+        }
+
+        fn review_room(&self) -> ClaimFuture<'_, Result<OwnedRoomId, String>> {
+            Box::pin(async move {
+                let n = self.server.events.fetch_add(1, Ordering::Relaxed);
+                OwnedRoomId::try_from(format!("!review{n}:example.org"))
+                    .map_err(|error| error.to_string())
             })
         }
     }
@@ -5569,5 +5660,1517 @@ mod tests {
         assert_eq!(claim.content.window, Some(w_9));
         assert!(taker.copy.routed().is_empty(), "{:?}", taker.copy.routed());
         assert!(ran_in(&card_in(zone.path()), "2026-10-05T09:00:00Z"));
+    }
+
+    /// tgdrive's view with no homes read: a drive of `principal`.
+    fn bare_view(principal: &str) -> DriveView {
+        let mut decl = keeper_core::agents::drive::parse(&drive_toml()).expect("decl");
+        decl.principal = principal.to_owned();
+        let mut profile = keeper_sync::SyncProfile::new(
+            "tgdrive".to_owned(),
+            "tgdrive".to_owned(),
+            PathBuf::from("/nowhere"),
+            String::new(),
+        );
+        profile.agents = Some(Default::default());
+        profile.sessions = Some(Default::default());
+        DriveView {
+            id: "tgdrive".to_owned(),
+            profile,
+            hosts: Ok(decl),
+            zone: crate::zone::ZoneRead {
+                drive: "tgdrive".to_owned(),
+                assessment: keeper_core::agents::zone::assess(&[], None),
+                homes: Vec::new(),
+            },
+            sessions: Vec::new(),
+        }
+    }
+
+    /// 95.2 acceptance 9, the first half: a host that is not always on —
+    /// every desktop — has no night to run; an always-on one consolidates
+    /// only its own principal's drives, and only from the control room.
+    #[tokio::test]
+    async fn the_desktop_never_consolidates() {
+        let mut w = world(Duration::ZERO, true);
+        let drives = [bare_view("tgorka")];
+        assert!(w.rt.night(&drives).is_none(), "not always on");
+        w.rt.always_on = true;
+        let night = w.rt.night(&drives).expect("an always-on host's night");
+        assert_eq!(night.drives.len(), 1);
+        assert_eq!(night.drives[0].id, "tgdrive");
+        assert!(w
+            .rt
+            .night(&[bare_view("marta")])
+            .expect("night")
+            .drives
+            .is_empty());
+        w.copy.joined.lock().expect("lock").remove(&control());
+        assert!(
+            w.rt.night(&drives).expect("night").drives.is_empty(),
+            "no copy of the drive in the control room: nobody to hold the lease"
+        );
+    }
+
+    /// The drive's claim and a job's completion, read from the server.
+    fn claim_at(w: &World, key: &str) -> Option<ServerClaim> {
+        w.server()
+            .get(&control(), CLAIM, key)
+            .map(|state| ServerClaim::read(&state).expect("claim"))
+    }
+
+    /// 95.2 acceptance 8 and 9 (pure): at 03:00 one host holds the drive's
+    /// maintenance claim for the night and the other is told who holds it;
+    /// once the night is recorded done, both find it done; a host back after
+    /// missing three nights runs once, for the latest.
+    #[tokio::test(start_paused = true)]
+    async fn consolidation_lease_arithmetic() {
+        use crate::consolidate::night_window;
+        use crate::maintain::{maintain, Maintained};
+        let w = world(Duration::ZERO, true);
+        let room = control();
+        let (lease, done) = (
+            claim::maintenance_key("tgdrive"),
+            claim::completion_key(keeper_core::agents::consolidate::JOB, "tgdrive"),
+        );
+        let lease_port = w.copy.keyed_claims(&room, &lease);
+        let done_port = w.copy.keyed_claims(&room, &done);
+        let me = claimant(&HostSlug::new(ME).expect("slug"), w.copy.as_ref());
+        let other = Claimant {
+            host: OTHER.to_owned(),
+            ..me.clone()
+        };
+        let (clock, rtt) = (Arc::<ServerClock>::default(), Arc::<Rtt>::default());
+        let at = |text: &str| {
+            chrono::DateTime::parse_from_rfc3339(text)
+                .expect("time")
+                .timestamp_millis()
+        };
+        let tuesday = night_window(at("2026-10-06T10:00:00Z"), 0).expect("window");
+        assert_eq!(tuesday, at("2026-10-06T03:00:00Z"));
+        assert_eq!(
+            night_window(at("2026-10-06T02:59:59Z"), 0),
+            Some(at("2026-10-05T03:00:00Z")),
+            "before 03:00 the night is yesterday's"
+        );
+        assert_eq!(
+            night_window(at("2026-10-06T10:00:00Z"), 120),
+            Some(at("2026-10-06T01:00:00Z")),
+            "03:00 at the host's offset"
+        );
+
+        // A night three windows ago ran and was recorded.
+        let saturday = at("2026-10-03T03:00:00Z");
+        let ran = maintain(
+            &lease_port,
+            done_port.as_ref(),
+            &other,
+            &clock,
+            &rtt,
+            Some(saturday),
+            |_| async { ((), true) },
+        )
+        .await
+        .expect("maintain");
+        assert!(
+            matches!(ran, Maintained::Ran { recorded: true, .. }),
+            "{ran:?}"
+        );
+
+        let ran = maintain(
+            &lease_port,
+            done_port.as_ref(),
+            &me,
+            &clock,
+            &rtt,
+            Some(tuesday),
+            |_| async {
+                // While it runs, the other host is told who holds the drive.
+                let held: Maintained<()> = maintain(
+                    &lease_port,
+                    done_port.as_ref(),
+                    &other,
+                    &clock,
+                    &rtt,
+                    Some(tuesday),
+                    |_| async { panic!("one consolidator") },
+                )
+                .await
+                .expect("maintain");
+                (held, true)
+            },
+        )
+        .await
+        .expect("maintain");
+        let Maintained::Ran {
+            out: Maintained::HeldBy(holder),
+            recorded: true,
+        } = ran
+        else {
+            panic!("three missed nights: one run, now: {ran:?}");
+        };
+        assert_eq!(holder, ME);
+        let recorded = claim_at(&w, &done).expect("the completion");
+        assert!(recorded.content.released);
+        assert_eq!(
+            recorded.content.window,
+            Some(claim::rfc3339(tuesday as u64))
+        );
+        assert!(claim_at(&w, &lease).expect("the claim").content.released);
+        for host in [&me, &other] {
+            assert!(matches!(
+                maintain(
+                    &lease_port,
+                    done_port.as_ref(),
+                    host,
+                    &clock,
+                    &rtt,
+                    Some(tuesday),
+                    |_| async { panic!("done") },
+                )
+                .await
+                .expect("maintain"),
+                Maintained::<()>::Done
+            ));
+        }
+    }
+
+    /// R207 (R95U-03): one maintenance job per drive, whichever starts
+    /// first — the night under way holds the curator off and the curator
+    /// under way holds the night off, on another host or at once on two —
+    /// and each job's completion is its own.
+    #[tokio::test(start_paused = true)]
+    async fn one_maintenance_job_per_drive_whichever_starts_first() {
+        use crate::maintain::{maintain, Maintained};
+        let w = world(Duration::ZERO, true);
+        let room = control();
+        let lease = claim::maintenance_key("tgdrive");
+        let (night, week) = (
+            claim::completion_key("consolidate", "tgdrive"),
+            claim::completion_key("curate", "tgdrive"),
+        );
+        let lease_port = w.copy.keyed_claims(&room, &lease);
+        let night_port = w.copy.keyed_claims(&room, &night);
+        let week_port = w.copy.keyed_claims(&room, &week);
+        let me = claimant(&HostSlug::new(ME).expect("slug"), w.copy.as_ref());
+        let other = Claimant {
+            host: OTHER.to_owned(),
+            ..me.clone()
+        };
+        let (clock, rtt) = (Arc::<ServerClock>::default(), Arc::<Rtt>::default());
+        let (tonight, this_week) = (1_791_262_800_000_i64, 1_791_003_600_000_i64);
+        let curate = |window: i64| {
+            maintain(
+                &lease_port,
+                week_port.as_ref(),
+                &other,
+                &clock,
+                &rtt,
+                Some(window),
+                |_| async { ("curated", true) },
+            )
+        };
+        let consolidate = || {
+            maintain(
+                &lease_port,
+                night_port.as_ref(),
+                &me,
+                &clock,
+                &rtt,
+                Some(tonight),
+                |_| async { ("consolidated", true) },
+            )
+        };
+
+        // The night first: the curator is held off.
+        let ran = maintain(
+            &lease_port,
+            night_port.as_ref(),
+            &me,
+            &clock,
+            &rtt,
+            Some(tonight),
+            |_| async { (curate(this_week).await.expect("curate"), false) },
+        )
+        .await
+        .expect("night");
+        let Maintained::Ran { out, recorded } = ran else {
+            panic!("{ran:?}");
+        };
+        assert!(
+            matches!(&out, Maintained::HeldBy(host) if host == ME),
+            "{out:?}"
+        );
+        assert!(!recorded, "unsettled work records nothing");
+        assert!(claim_at(&w, &night).is_none());
+
+        // The curator first: the night is held off.
+        let ran = maintain(
+            &lease_port,
+            week_port.as_ref(),
+            &other,
+            &clock,
+            &rtt,
+            Some(this_week),
+            |_| async { (consolidate().await.expect("night"), true) },
+        )
+        .await
+        .expect("curate");
+        let Maintained::Ran { out, recorded } = ran else {
+            panic!("{ran:?}");
+        };
+        assert!(
+            matches!(&out, Maintained::HeldBy(host) if host == OTHER),
+            "{out:?}"
+        );
+        assert!(recorded);
+        assert_eq!(
+            claim_at(&w, &week).expect("the week").content.window,
+            Some(claim::rfc3339(this_week as u64))
+        );
+        assert!(
+            claim_at(&w, &night).is_none(),
+            "the curator's week is not the night's"
+        );
+
+        // Both at once, on two hosts: one runs, the other is held off.
+        let next_week = this_week + 7 * 24 * 60 * 60 * 1000;
+        let (a, b) = tokio::join!(consolidate(), curate(next_week));
+        let (a, b) = (a.expect("night"), b.expect("week"));
+        let ran = |one: &Maintained<&str>| matches!(one, Maintained::Ran { .. });
+        let held = |one: &Maintained<&str>| matches!(one, Maintained::HeldBy(_));
+        assert!(
+            (ran(&a) && held(&b)) || (held(&a) && ran(&b)),
+            "one at a time: {a:?} {b:?}"
+        );
+    }
+
+    /// A home of `config`'s agent in tgdrive's agents zone.
+    fn home_of(config: AgentConfig) -> Result<crate::zone::AgentHome, String> {
+        Ok(crate::zone::AgentHome {
+            dir: PathBuf::from("/nowhere/80-agents").join(&config.id),
+            zone: PathBuf::from("/nowhere/80-agents"),
+            drive: keeper_core::agents::drive::parse(&drive_toml()).expect("decl"),
+            config,
+        })
+    }
+
+    /// R95C-07 and R95C-08: a host consolidates a drive only when it serves
+    /// every agent homed there — one drive-wide night never stands for an
+    /// agent another host serves — and each agent's review room is made by
+    /// its own copy, the lease sent by the one in the control room.
+    #[tokio::test]
+    async fn a_host_consolidates_only_drives_it_serves_whole() {
+        let mut w = world(Duration::ZERO, true);
+        w.rt.always_on = true;
+        let decl = keeper_core::agents::drive::parse(&drive_toml()).expect("decl");
+        let otto = parse_agent_toml(
+            &format!("version = 1\nid = \"otto\"\nname = \"Otto\"\nkind = \"proxy\"\nmatrix_user = \"@otto:example.org\"\nhuman = \"{PERSON}\"\n\n[model]\nbot = \"bot:openai:http://127.0.0.1:9#model\"\n"),
+            "otto",
+            &decl,
+        )
+        .expect("agent.toml");
+        let mut view = bare_view("tgorka");
+        view.zone.homes = vec![
+            ("nixi".to_owned(), home_of(config())),
+            ("otto".to_owned(), home_of(otto.clone())),
+        ];
+        let drives = [view];
+        assert!(
+            w.rt.night(&drives).expect("night").drives.is_empty(),
+            "otto is served elsewhere: no night here"
+        );
+        let otto_copy: Arc<dyn CopyPort> = Arc::new(FakeCopy {
+            config: otto,
+            ..fake_copy()
+        });
+        w.rt.copies.push(Arc::clone(&otto_copy));
+        let night = w.rt.night(&drives).expect("night");
+        assert_eq!(night.drives.len(), 1);
+        let drive = &night.drives[0];
+        assert_eq!(drive.homes.len(), 2);
+        for one in &drive.homes {
+            assert_eq!(
+                one.copy.config().matrix_user,
+                one.home.config.matrix_user,
+                "{}'s room is made by its own copy",
+                one.home.config.id
+            );
+        }
+        assert_eq!(
+            drive.copy.config().id,
+            "nixi",
+            "the lease's sender is in the control room"
+        );
+    }
+
+    /// A claim port whose first read is from before another host's.
+    struct StaleFirst {
+        inner: Arc<dyn ClaimPort>,
+        read: std::sync::atomic::AtomicBool,
+    }
+
+    impl ClaimPort for StaleFirst {
+        fn send(&self, content: Value) -> ClaimFuture<'_, Result<OwnedEventId, AgentMatrixError>> {
+            self.inner.send(content)
+        }
+
+        fn read(&self) -> ClaimFuture<'_, Result<Option<ServerState>, AgentMatrixError>> {
+            if self.read.swap(true, Ordering::SeqCst) {
+                self.inner.read()
+            } else {
+                Box::pin(async { Ok(None) })
+            }
+        }
+
+        fn next_sync(&self) -> ClaimFuture<'_, Duration> {
+            self.inner.next_sync()
+        }
+    }
+
+    /// R95C-06: a host that read the night as due while another completed
+    /// and recorded it before this host's acquisition finds it done once it
+    /// holds the claim, runs nothing, and hands the claim back.
+    #[tokio::test(start_paused = true)]
+    async fn a_night_completed_during_the_acquisition_is_done() {
+        use crate::maintain::{maintain, Maintained};
+        let w = world(Duration::ZERO, true);
+        let room = control();
+        let (lease, done) = (
+            claim::maintenance_key("tgdrive"),
+            claim::completion_key(keeper_core::agents::consolidate::JOB, "tgdrive"),
+        );
+        let me = claimant(&HostSlug::new(ME).expect("slug"), w.copy.as_ref());
+        let other = Claimant {
+            host: OTHER.to_owned(),
+            ..me.clone()
+        };
+        let (clock, rtt) = (Arc::<ServerClock>::default(), Arc::<Rtt>::default());
+        let tuesday = 1_791_262_800_000;
+        let lease_port = w.copy.keyed_claims(&room, &lease);
+        let done_port = w.copy.keyed_claims(&room, &done);
+        maintain(
+            &lease_port,
+            done_port.as_ref(),
+            &other,
+            &clock,
+            &rtt,
+            Some(tuesday),
+            |_| async { ((), true) },
+        )
+        .await
+        .expect("the other host runs it");
+        let stale = StaleFirst {
+            inner: w.copy.keyed_claims(&room, &done),
+            read: std::sync::atomic::AtomicBool::new(false),
+        };
+        let taken = maintain(
+            &lease_port,
+            &stale,
+            &me,
+            &clock,
+            &rtt,
+            Some(tuesday),
+            |_| async { panic!("nothing runs") },
+        )
+        .await
+        .expect("maintain");
+        assert!(matches!(taken, Maintained::<()>::Done), "{taken:?}");
+        let held = claim_at(&w, &lease).expect("claim");
+        assert!(held.content.released);
+        assert_eq!(held.content.host, ME, "it was taken, then handed back");
+    }
+
+    /// R95C-04, R95CR-06: a holder whose renewal is refused — another host
+    /// took the claim — or cannot reach the server loses it while its work
+    /// runs, so the fence its work asks before every effect says no, and
+    /// nothing is recorded done; one whose renewals are accepted may still
+    /// write long after the stop deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_that_cannot_renew_stops_before_its_next_effect() {
+        use crate::maintain::{maintain, Maintained};
+        let w = world(Duration::ZERO, true);
+        let room = control();
+        let (lease, done) = (
+            claim::maintenance_key("tgdrive"),
+            claim::completion_key(keeper_core::agents::consolidate::JOB, "tgdrive"),
+        );
+        let lease_port = w.copy.keyed_claims(&room, &lease);
+        let done_port = w.copy.keyed_claims(&room, &done);
+        let me = claimant(&HostSlug::new(ME).expect("slug"), w.copy.as_ref());
+        let other = Claimant {
+            host: OTHER.to_owned(),
+            ..me.clone()
+        };
+        let (clock, rtt) = (Arc::<ServerClock>::default(), Arc::<Rtt>::default());
+        let long = claim::STOP_WITHOUT_RENEWAL * 3;
+        let ran = maintain(
+            &lease_port,
+            done_port.as_ref(),
+            &me,
+            &clock,
+            &rtt,
+            Some(1_791_262_800_000),
+            |fence| async move {
+                tokio::time::sleep(long).await;
+                (fence(), true)
+            },
+        )
+        .await
+        .expect("maintain");
+        assert!(
+            matches!(
+                ran,
+                Maintained::Ran {
+                    out: true,
+                    recorded: true
+                }
+            ),
+            "renewed while it ran: {ran:?}"
+        );
+
+        let window = 1_791_349_200_000;
+        let ran = maintain(
+            &lease_port,
+            done_port.as_ref(),
+            &me,
+            &clock,
+            &rtt,
+            Some(window),
+            |fence| {
+                let (w, other, lease) = (&w, &other, &lease);
+                async move {
+                    let claim = claim_at(w, lease).expect("claim");
+                    w.server().put(
+                        &control(),
+                        CLAIM,
+                        lease,
+                        &w.copy.config.matrix_user,
+                        serde_json::to_value(other.content(
+                            claim.content.epoch + 1,
+                            0,
+                            0,
+                            false,
+                            None,
+                        ))
+                        .expect("content"),
+                    );
+                    tokio::time::sleep(claim::RENEW_EVERY + Duration::from_secs(5)).await;
+                    (fence(), true)
+                }
+            },
+        )
+        .await
+        .expect("maintain");
+        assert!(
+            matches!(
+                ran,
+                Maintained::Ran {
+                    out: false,
+                    recorded: false
+                }
+            ),
+            "a refused renewal stops it: {ran:?}"
+        );
+        assert_ne!(
+            claim_at(&w, &done).expect("done").content.window,
+            Some(claim::rfc3339(window as u64)),
+            "nothing recorded done"
+        );
+
+        // A renewal that cannot reach the server loses the claim as surely
+        // as a refused one: the work stops long before its stop deadline.
+        let free = claim_at(&w, &lease).expect("claim");
+        w.server().put(
+            &control(),
+            CLAIM,
+            &lease,
+            &w.copy.config.matrix_user,
+            serde_json::to_value(other.content(free.content.epoch, 0, 0, true, None))
+                .expect("content"),
+        );
+        let window = 1_791_392_400_000;
+        let ran = maintain(
+            &lease_port,
+            done_port.as_ref(),
+            &me,
+            &clock,
+            &rtt,
+            Some(window),
+            |fence| {
+                let w = &w;
+                async move {
+                    w.server().fail_claims.store(true, Ordering::Relaxed);
+                    tokio::time::sleep(claim::RENEW_EVERY + Duration::from_secs(5)).await;
+                    (fence(), true)
+                }
+            },
+        )
+        .await
+        .expect("maintain");
+        w.server().fail_claims.store(false, Ordering::Relaxed);
+        assert!(
+            matches!(
+                ran,
+                Maintained::Ran {
+                    out: false,
+                    recorded: false
+                }
+            ),
+            "an unreachable renewal stops it: {ran:?}"
+        );
+
+        // Taken over at the very end: the work settled with the fence still
+        // open, but the release is refused — another host may be running the
+        // drive — so the window is not recorded.
+        let free = claim_at(&w, &lease).expect("claim");
+        w.server().put(
+            &control(),
+            CLAIM,
+            &lease,
+            &w.copy.config.matrix_user,
+            serde_json::to_value(other.content(free.content.epoch, 0, 0, true, None))
+                .expect("content"),
+        );
+        let window = 1_791_435_600_000;
+        let ran = maintain(
+            &lease_port,
+            done_port.as_ref(),
+            &me,
+            &clock,
+            &rtt,
+            Some(window),
+            |fence| {
+                let (w, other, lease) = (&w, &other, &lease);
+                async move {
+                    let claim = claim_at(w, lease).expect("claim");
+                    w.server().put(
+                        &control(),
+                        CLAIM,
+                        lease,
+                        &w.copy.config.matrix_user,
+                        serde_json::to_value(other.content(
+                            claim.content.epoch + 1,
+                            0,
+                            0,
+                            false,
+                            None,
+                        ))
+                        .expect("content"),
+                    );
+                    (fence(), true)
+                }
+            },
+        )
+        .await
+        .expect("maintain");
+        assert!(
+            matches!(
+                ran,
+                Maintained::Ran {
+                    out: true,
+                    recorded: false
+                }
+            ),
+            "a refused release records nothing: {ran:?}"
+        );
+        assert_ne!(
+            claim_at(&w, &done).expect("done").content.window,
+            Some(claim::rfc3339(window as u64))
+        );
+
+        // Taken over and handed back while the work ran: the release is
+        // refused though the drive is free again by the time the window
+        // would be recorded — the work did not hold the drive throughout,
+        // so its window is not recorded.
+        let free = claim_at(&w, &lease).expect("claim");
+        w.server().put(
+            &control(),
+            CLAIM,
+            &lease,
+            &w.copy.config.matrix_user,
+            serde_json::to_value(other.content(free.content.epoch, 0, 0, true, None))
+                .expect("content"),
+        );
+        let window = 1_791_478_800_000;
+        let ran = maintain(
+            &lease_port,
+            done_port.as_ref(),
+            &me,
+            &clock,
+            &rtt,
+            Some(window),
+            |fence| {
+                let (w, other, lease) = (&w, &other, &lease);
+                async move {
+                    let claim = claim_at(w, lease).expect("claim");
+                    w.server().put(
+                        &control(),
+                        CLAIM,
+                        lease,
+                        &w.copy.config.matrix_user,
+                        serde_json::to_value(other.content(
+                            claim.content.epoch + 1,
+                            0,
+                            0,
+                            true,
+                            None,
+                        ))
+                        .expect("content"),
+                    );
+                    (fence(), true)
+                }
+            },
+        )
+        .await
+        .expect("maintain");
+        assert!(
+            matches!(
+                ran,
+                Maintained::Ran {
+                    out: true,
+                    recorded: false
+                }
+            ),
+            "a release refused, the drive free again, records nothing: {ran:?}"
+        );
+        assert_ne!(
+            claim_at(&w, &done).expect("done").content.window,
+            Some(claim::rfc3339(window as u64))
+        );
+    }
+
+    /// R95C-05, through `run_round`'s own branches: a drive whose claim
+    /// another host holds, or whose agent's night fails, is tried again and
+    /// its night is not recorded; a night that settled is remembered done
+    /// for its window, and recorded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_night_is_remembered_done_only_when_it_was() {
+        use crate::consolidate::{run_round, NightDrive, NightHome, NightRound, Remembered};
+        let w = world(Duration::ZERO, true);
+        let data = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(crate::headless::HeadlessSyncPlatform::new(
+            data.path(),
+            ME,
+            Arc::new(crate::headless::SecretMap::new(
+                keeper_sync::xdg::SecretStore::new(
+                    crate::headless::SECRET_ENV_PREFIX,
+                    data.path().join("secrets"),
+                ),
+            )),
+        ));
+        let engine = Arc::new(keeper_sync::Engine::open(platform).expect("engine"));
+        let (lease, done) = (
+            claim::maintenance_key("tgdrive"),
+            claim::completion_key(keeper_core::agents::consolidate::JOB, "tgdrive"),
+        );
+        let copy = Arc::clone(&w.copy) as Arc<dyn CopyPort>;
+        let round = |homes: Vec<NightHome>| NightRound {
+            me: HostSlug::new(ME).expect("slug"),
+            control: control(),
+            clock: Arc::default(),
+            rtt: Arc::default(),
+            now_ms: 0,
+            offset: 0,
+            drives: vec![NightDrive {
+                id: "tgdrive".to_owned(),
+                homes,
+                copy: Arc::clone(&copy),
+            }],
+        };
+        let decl = keeper_core::agents::drive::parse(&drive_toml()).expect("decl");
+        let failing = NightHome {
+            home: crate::consolidate::Home {
+                drive: "tgdrive".to_owned(),
+                profile_id: "no-such-profile".to_owned(),
+                root: data.path().join("tgdrive"),
+                agents: "80-agents".to_owned(),
+                sessions: "60-sessions".to_owned(),
+                folder: "nixi".to_owned(),
+                config: config(),
+                decl,
+                host: ME.to_owned(),
+            },
+            copy: Arc::clone(&copy),
+        };
+        let window = 1_791_262_800_000;
+        let remembered = |what: &Arc<Mutex<BTreeMap<String, Remembered>>>| {
+            what.lock().expect("lock").get("tgdrive").copied()
+        };
+
+        // Held by another host.
+        let other = Claimant {
+            host: OTHER.to_owned(),
+            ..claimant(&HostSlug::new(ME).expect("slug"), w.copy.as_ref())
+        };
+        let now = wall_ms();
+        w.server().put(
+            &control(),
+            CLAIM,
+            &lease,
+            &w.copy.config.matrix_user,
+            serde_json::to_value(other.content(1, now, now, false, None)).expect("content"),
+        );
+        let state = Arc::default();
+        run_round(
+            Arc::clone(&engine),
+            round(Vec::new()),
+            window,
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(
+            matches!(remembered(&state), Some(Remembered::Again(_))),
+            "held elsewhere"
+        );
+        assert!(claim_at(&w, &done).is_none());
+        w.server().put(
+            &control(),
+            CLAIM,
+            &lease,
+            &w.copy.config.matrix_user,
+            serde_json::to_value(other.content(1, now, now, true, None)).expect("content"),
+        );
+        // Not tried again before its wait is over, though the drive is free.
+        run_round(
+            Arc::clone(&engine),
+            round(Vec::new()),
+            window,
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(matches!(remembered(&state), Some(Remembered::Again(_))));
+        assert!(claim_at(&w, &done).is_none());
+
+        // An agent whose night fails.
+        let state = Arc::default();
+        run_round(
+            Arc::clone(&engine),
+            round(vec![failing]),
+            window,
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(
+            matches!(remembered(&state), Some(Remembered::Again(_))),
+            "failed"
+        );
+        assert!(claim_at(&w, &done).is_none(), "not recorded");
+        assert!(claim_at(&w, &lease).expect("claim").content.released);
+
+        // A night that settles.
+        let state = Arc::default();
+        run_round(
+            Arc::clone(&engine),
+            round(Vec::new()),
+            window,
+            Arc::clone(&state),
+        )
+        .await;
+        assert_eq!(remembered(&state), Some(Remembered::Done(window)));
+        assert_eq!(
+            claim_at(&w, &done).expect("recorded").content.window,
+            Some(claim::rfc3339(window as u64))
+        );
+
+        // R95C3-07: a real home, pulled, its night run to the end — nothing
+        // of it unfinished — is done and recorded for the next window.
+        let checkout = tempfile::tempdir().expect("tempdir");
+        let Some((engine, home)) = real_drive(checkout.path(), &[]).await else {
+            return;
+        };
+        let next = window + 24 * 60 * 60 * 1000;
+        let state = Arc::default();
+        run_round(
+            engine,
+            round(vec![NightHome {
+                home,
+                copy: Arc::clone(&copy),
+            }]),
+            next,
+            Arc::clone(&state),
+        )
+        .await;
+        assert_eq!(remembered(&state), Some(Remembered::Done(next)));
+        assert_eq!(
+            claim_at(&w, &done).expect("recorded").content.window,
+            Some(claim::rfc3339(next as u64))
+        );
+    }
+
+    /// R95C3-07, through `run_round`: a real home whose night publishes its
+    /// commit but cannot write all of its files is not done — tried again,
+    /// its window not recorded — and once the next pull finished that
+    /// commit, the night is done and recorded.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_night_whose_commit_did_not_finish_is_tried_again() {
+        use crate::consolidate::{run_round, NightDrive, NightHome, NightRound, Remembered};
+        use keeper_core::agents::memory::MemoryTarget;
+        use keeper_core::agents::proposal::{Op, Origin, Proposal, Target};
+        use std::os::unix::fs::PermissionsExt as _;
+        let w = world(Duration::ZERO, true);
+        let now = chrono::Utc::now();
+        // One fact proposed in three sessions on three days, a person
+        // standing behind the first: the night commits it by itself.
+        let staged: Vec<(String, String)> = (0..3i64)
+            .map(|n| {
+                let created = now - chrono::Duration::days(n) - chrono::Duration::minutes(1);
+                let id = ulid::Ulid::from_parts(
+                    u64::try_from(created.timestamp_millis()).expect("after 1970"),
+                    n as u128 + 1,
+                );
+                let text = Proposal {
+                    id,
+                    agent: "nixi".to_owned(),
+                    target: Target::Memory(MemoryTarget::Memory),
+                    op: Op::Add,
+                    matched: None,
+                    session: format!("60-sessions/active/s{n}"),
+                    host: ME.to_owned(),
+                    origin: Origin::Foreground,
+                    label: Label {
+                        readers: Readers::Only(std::collections::BTreeSet::from([user(PERSON)])),
+                        integrity: if n == 0 {
+                            Integrity::Peer
+                        } else {
+                            Integrity::Agent
+                        },
+                        local_only: false,
+                    },
+                    created_at: created,
+                    body: "tgorka reviews on Fridays".to_owned(),
+                }
+                .render();
+                (format!("80-agents/nixi/proposals/{id}.md"), text)
+            })
+            .collect();
+        let checkout = tempfile::tempdir().expect("tempdir");
+        let Some((engine, home)) = real_drive(checkout.path(), &staged).await else {
+            return;
+        };
+        let window = now
+            .date_naive()
+            .and_hms_opt(3, 0, 0)
+            .expect("03:00")
+            .and_utc()
+            .timestamp_millis();
+        let done = claim::completion_key(keeper_core::agents::consolidate::JOB, "tgdrive");
+        let copy = Arc::clone(&w.copy) as Arc<dyn CopyPort>;
+        let round = || NightRound {
+            me: HostSlug::new(ME).expect("slug"),
+            control: control(),
+            clock: Arc::default(),
+            rtt: Arc::default(),
+            now_ms: 0,
+            offset: 0,
+            drives: vec![NightDrive {
+                id: "tgdrive".to_owned(),
+                homes: vec![NightHome {
+                    home: home.clone(),
+                    copy: Arc::clone(&copy),
+                }],
+                copy: Arc::clone(&copy),
+            }],
+        };
+        let remembered = |what: &Arc<Mutex<BTreeMap<String, Remembered>>>| {
+            what.lock().expect("lock").get("tgdrive").copied()
+        };
+
+        // The folder the promoted proposals move to cannot be written: the
+        // commit is published, its files do not all follow.
+        let moved_to = home.root.join("80-agents/nixi/proposals/done");
+        std::fs::create_dir_all(&moved_to).expect("done");
+        std::fs::set_permissions(&moved_to, std::fs::Permissions::from_mode(0o555))
+            .expect("read-only");
+        let state = Arc::default();
+        run_round(Arc::clone(&engine), round(), window, Arc::clone(&state)).await;
+        std::fs::set_permissions(&moved_to, std::fs::Permissions::from_mode(0o755))
+            .expect("writable");
+        assert_eq!(
+            engine.unsettled_commit(&home.profile_id).ok(),
+            Some(true),
+            "the night's commit is published and unfinished"
+        );
+        assert!(
+            matches!(remembered(&state), Some(Remembered::Again(_))),
+            "not done: {:?}",
+            remembered(&state)
+        );
+        assert!(claim_at(&w, &done).is_none(), "not recorded");
+
+        // The next run's pull finishes the commit: done, and recorded.
+        let state = Arc::default();
+        run_round(Arc::clone(&engine), round(), window, Arc::clone(&state)).await;
+        assert_eq!(engine.unsettled_commit(&home.profile_id).ok(), Some(false));
+        assert_eq!(remembered(&state), Some(Remembered::Done(window)));
+        assert_eq!(
+            claim_at(&w, &done).expect("recorded").content.window,
+            Some(claim::rfc3339(window as u64))
+        );
+    }
+
+    /// A drive with nixi's home and `files`, checked out from a bare remote
+    /// by an engine of its own: `(engine, nixi's home)`. `None` without
+    /// `git`.
+    async fn real_drive(
+        root: &Path,
+        files: &[(String, String)],
+    ) -> Option<(Arc<keeper_sync::Engine>, crate::consolidate::Home)> {
+        let git = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "seed")
+                .env("GIT_AUTHOR_EMAIL", "seed@example.invalid")
+                .env("GIT_COMMITTER_NAME", "seed")
+                .env("GIT_COMMITTER_EMAIL", "seed@example.invalid")
+                .args(args)
+                .status()
+                .ok()
+                .filter(std::process::ExitStatus::success)
+        };
+        let bare = root.join("tgdrive.git");
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&bare).ok()?;
+        std::fs::create_dir_all(&seed).ok()?;
+        git(&bare, &["init", "-q", "--bare", "-b", "main"])?;
+        git(&seed, &["init", "-q", "-b", "main"])?;
+        let mut seeded = vec![
+            ("80-agents/_drive.toml".to_owned(), drive_toml()),
+            (
+                "80-agents/nixi/agent.toml".to_owned(),
+                format!("version = 1\nid = \"nixi\"\nname = \"Nixi\"\nkind = \"proxy\"\nmatrix_user = \"@nixi:example.org\"\nhuman = \"{PERSON}\"\n\n[model]\nbot = \"bot:openai:http://127.0.0.1:9#model\"\n"),
+            ),
+            ("60-sessions/README.md".to_owned(), "# sessions\n".to_owned()),
+        ];
+        seeded.extend(files.iter().cloned());
+        for (rel, text) in seeded {
+            let path = seed.join(rel);
+            std::fs::create_dir_all(path.parent()?).ok()?;
+            std::fs::write(path, text).ok()?;
+        }
+        git(&seed, &["add", "-A"])?;
+        git(&seed, &["commit", "-q", "-m", "seed"])?;
+        git(&seed, &["push", "-q", &bare.to_string_lossy(), "main"])?;
+        let data = root.join("data");
+        let platform = Arc::new(crate::headless::HeadlessSyncPlatform::new(
+            &data,
+            ME,
+            Arc::new(crate::headless::SecretMap::new(
+                keeper_sync::xdg::SecretStore::new(
+                    crate::headless::SECRET_ENV_PREFIX,
+                    data.join("secrets"),
+                ),
+            )),
+        ));
+        let engine = Arc::new(keeper_sync::Engine::open(platform).expect("engine"));
+        std::fs::create_dir_all(data.join("drives")).expect("drives");
+        let mut profile = keeper_sync::SyncProfile::new(
+            ulid::Ulid::new().to_string(),
+            "tgdrive",
+            data.join("drives/tgdrive"),
+            bare.to_string_lossy().into_owned(),
+        );
+        profile.direction = keeper_sync::SyncDirection::Bidirectional;
+        profile.sessions = Some(Default::default());
+        profile.agents = Some(Default::default());
+        engine.upsert_profile(&profile).expect("profile");
+        engine
+            .sync_once(&profile.id, keeper_sync::SyncSource::Manual)
+            .await
+            .expect("the first checkout");
+        let decl = keeper_core::agents::drive::parse(&drive_toml()).expect("decl");
+        let zone = crate::zone::read_zone("tgdrive", &profile, Some(&decl));
+        let (_, read) = zone
+            .homes
+            .iter()
+            .find(|(name, _)| name == "nixi")
+            .expect("nixi's home");
+        let home = crate::consolidate::Home::of(&profile, read.as_ref().expect("it reads"), ME)
+            .expect("a home");
+        Some((engine, home))
+    }
+
+    /// Whether the claim `key`, this host's at epoch 1 and due a renewal,
+    /// is renewed through its own task while `work` runs stuck on the
+    /// record a kill left in `home`'s drive — a FIFO nothing writes until
+    /// the renewal is seen, or 20 s went by.
+    async fn renewed_while_stuck<F: Future>(
+        w: &World,
+        home: &crate::consolidate::Home,
+        work: impl FnOnce() -> F,
+    ) -> bool {
+        let record = home.root.join(".git/keeper-commit-paths.json");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&record)
+            .status()
+            .expect("mkfifo")
+            .success());
+        let key = claim::maintenance_key("tgdrive");
+        let me = claimant(&HostSlug::new(ME).expect("slug"), w.copy.as_ref());
+        let now = wall_ms();
+        let event = w.server().put(
+            &control(),
+            CLAIM,
+            &key,
+            &w.copy.config.matrix_user,
+            serde_json::to_value(me.content(1, now, now, false, None)).expect("content"),
+        );
+        let due = Moment {
+            at: tokio::time::Instant::now() - claim::RENEW_EVERY,
+            wall_ms: now - claim::RENEW_EVERY.as_millis() as u64,
+        };
+        let lease = Arc::new(Lease::new(1, event.clone(), now, None, due));
+        let server = Arc::clone(&w.copy.server);
+        let watcher = std::thread::spawn(move || {
+            let looked = std::time::Instant::now();
+            let renewed = loop {
+                let current = server
+                    .get(&control(), CLAIM, &key)
+                    .map(|state| state.event_id);
+                if current.is_some_and(|current| current != event) {
+                    break true;
+                }
+                if looked.elapsed() > Duration::from_secs(20) {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            std::thread::spawn(move || {
+                let _ = std::fs::write(&record, "{");
+            });
+            renewed
+        });
+        let port = w
+            .copy
+            .keyed_claims(&control(), &claim::maintenance_key("tgdrive"));
+        let (clock, rtt) = (Arc::<ServerClock>::default(), Arc::<Rtt>::default());
+        crate::maintain::holding(&port, &me, &lease, &clock, &rtt, work()).await;
+        watcher.join().expect("watcher")
+    }
+
+    /// R95C3-02: the claim's renewal is a task of its own — work that blocks
+    /// the task it runs on, the real recovery of a night's pull stuck on the
+    /// record a kill left, does not starve it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_renewal_runs_while_the_work_blocks_its_task() {
+        let w = world(Duration::ZERO, true);
+        let checkout = tempfile::tempdir().expect("tempdir");
+        let Some((engine, home)) = real_drive(checkout.path(), &[]).await else {
+            return;
+        };
+        let id = home.profile_id.clone();
+        let renewed = renewed_while_stuck(&w, &home, || async move {
+            engine.sync_once(&id, keeper_sync::SyncSource::Bot).await
+        })
+        .await;
+        assert!(renewed, "renewed while the pull was stuck");
+    }
+
+    /// R95C3-02: the night's pull leaves the task that polls the night, so
+    /// even on a runtime of one thread the claim is renewed while the pull's
+    /// recovery is stuck.
+    #[tokio::test]
+    async fn the_nights_pull_never_holds_up_the_renewal() {
+        let w = world(Duration::ZERO, true);
+        let checkout = tempfile::tempdir().expect("tempdir");
+        let Some((engine, home)) = real_drive(checkout.path(), &[]).await else {
+            return;
+        };
+        let id = home.profile_id.clone();
+        let renewed = renewed_while_stuck(&w, &home, || async move {
+            crate::consolidate::pull(&engine, &id).await
+        })
+        .await;
+        assert!(renewed, "renewed while the pull was stuck");
+    }
+
+    /// A completion port whose first read once `armed` is answered as it
+    /// was before another host's whole run of `window` — acquisition, work,
+    /// release and record — was let go by.
+    struct Overtaken {
+        inner: Arc<dyn ClaimPort>,
+        lease: Arc<dyn ClaimPort>,
+        other: Claimant,
+        window: i64,
+        armed: AtomicBool,
+        /// Whether that run recorded its window, once it was tried.
+        overtook: Mutex<Option<bool>>,
+    }
+
+    impl ClaimPort for Overtaken {
+        fn send(&self, content: Value) -> ClaimFuture<'_, Result<OwnedEventId, AgentMatrixError>> {
+            self.inner.send(content)
+        }
+
+        fn read(&self) -> ClaimFuture<'_, Result<Option<ServerState>, AgentMatrixError>> {
+            Box::pin(async move {
+                let read = self.inner.read().await;
+                if self.armed.swap(false, Ordering::SeqCst) {
+                    let (clock, rtt) = (Arc::<ServerClock>::default(), Arc::<Rtt>::default());
+                    let ran = crate::maintain::maintain(
+                        &self.lease,
+                        self.inner.as_ref(),
+                        &self.other,
+                        &clock,
+                        &rtt,
+                        Some(self.window),
+                        |_| async { ((), true) },
+                    )
+                    .await;
+                    *self.overtook.lock().expect("lock") = Some(matches!(
+                        ran,
+                        Ok(crate::maintain::Maintained::Ran { recorded: true, .. })
+                    ));
+                }
+                read
+            })
+        }
+
+        fn next_sync(&self) -> ClaimFuture<'_, Duration> {
+            self.inner.next_sync()
+        }
+    }
+
+    /// R95C3-08: a completion never goes back to an earlier window. Another
+    /// host that takes the drive while this one records its window keeps
+    /// the later window it recorded; and a later window recorded already
+    /// stays when this host records an earlier one.
+    #[tokio::test(start_paused = true)]
+    async fn a_completion_never_goes_back_to_an_earlier_window() {
+        use crate::maintain::{maintain, Maintained};
+        let w = world(Duration::ZERO, true);
+        let room = control();
+        let (lease, done) = (
+            claim::maintenance_key("tgdrive"),
+            claim::completion_key(keeper_core::agents::consolidate::JOB, "tgdrive"),
+        );
+        let lease_port = w.copy.keyed_claims(&room, &lease);
+        let done_port = w.copy.keyed_claims(&room, &done);
+        let me = claimant(&HostSlug::new(ME).expect("slug"), w.copy.as_ref());
+        let other = Claimant {
+            host: OTHER.to_owned(),
+            ..me.clone()
+        };
+        let (clock, rtt) = (Arc::<ServerClock>::default(), Arc::<Rtt>::default());
+        let recorded = || claim_at(&w, &done).and_then(|claim| claim.content.window);
+        let day = 24 * 60 * 60 * 1000;
+        let (tonight, tomorrow) = (1_791_262_800_000_i64, 1_791_262_800_000_i64 + day);
+        let overtaken = Overtaken {
+            inner: Arc::clone(&done_port),
+            lease: Arc::clone(&lease_port),
+            other: other.clone(),
+            window: tomorrow,
+            armed: AtomicBool::new(false),
+            overtook: Mutex::new(None),
+        };
+        let ran = maintain(
+            &lease_port,
+            &overtaken,
+            &me,
+            &clock,
+            &rtt,
+            Some(tonight),
+            |_| {
+                overtaken.armed.store(true, Ordering::SeqCst);
+                async { ((), true) }
+            },
+        )
+        .await
+        .expect("tonight");
+        assert!(
+            matches!(ran, Maintained::Ran { recorded: true, .. }),
+            "{ran:?}"
+        );
+        let overtook = overtaken
+            .overtook
+            .lock()
+            .expect("lock")
+            .expect("the other host tried meanwhile");
+        if overtook {
+            assert_eq!(
+                recorded(),
+                Some(claim::rfc3339(tomorrow as u64)),
+                "its later window stays recorded"
+            );
+        }
+        let ran = maintain(
+            &lease_port,
+            done_port.as_ref(),
+            &other,
+            &clock,
+            &rtt,
+            Some(tomorrow),
+            |_| async { ((), true) },
+        )
+        .await
+        .expect("tomorrow");
+        assert!(
+            matches!(
+                ran,
+                Maintained::Ran { recorded: true, .. } | Maintained::Done
+            ),
+            "{ran:?}"
+        );
+        assert_eq!(recorded(), Some(claim::rfc3339(tomorrow as u64)));
+
+        let (earlier, later) = (tomorrow + day, tomorrow + 3 * day);
+        let ran = maintain(
+            &lease_port,
+            done_port.as_ref(),
+            &me,
+            &clock,
+            &rtt,
+            Some(earlier),
+            |_| {
+                let claim = claim_at(&w, &done).expect("completion");
+                w.server().put(
+                    &control(),
+                    CLAIM,
+                    &done,
+                    &w.copy.config.matrix_user,
+                    serde_json::to_value(other.content(
+                        claim.content.epoch + 1,
+                        0,
+                        0,
+                        true,
+                        Some(claim::rfc3339(later as u64)),
+                    ))
+                    .expect("content"),
+                );
+                async { ((), true) }
+            },
+        )
+        .await
+        .expect("earlier");
+        assert!(
+            matches!(ran, Maintained::Ran { recorded: true, .. }),
+            "{ran:?}"
+        );
+        assert_eq!(
+            recorded(),
+            Some(claim::rfc3339(later as u64)),
+            "the later window stays"
+        );
+    }
+
+    /// A completion port whose read, once `armed`, is answered as it was
+    /// and then held while this host's claim lapses — its VM paused past
+    /// the deadline — and another host takes the drive and records
+    /// `later`.
+    struct PausedAfterRead {
+        inner: Arc<dyn ClaimPort>,
+        other: Claimant,
+        later: i64,
+        armed: AtomicBool,
+    }
+
+    impl ClaimPort for PausedAfterRead {
+        fn send(&self, content: Value) -> ClaimFuture<'_, Result<OwnedEventId, AgentMatrixError>> {
+            self.inner.send(content)
+        }
+
+        fn read(&self) -> ClaimFuture<'_, Result<Option<ServerState>, AgentMatrixError>> {
+            Box::pin(async move {
+                let read = self.inner.read().await;
+                if self.armed.swap(false, Ordering::SeqCst) {
+                    tokio::time::advance(claim::STOP_WITHOUT_RENEWAL * 2).await;
+                    let epoch = read
+                        .as_ref()
+                        .ok()
+                        .and_then(Option::as_ref)
+                        .and_then(|state| ServerClaim::read(state).ok())
+                        .map_or(0, |claim| claim.content.epoch);
+                    let now = u64::try_from(self.later).unwrap_or(0);
+                    self.inner
+                        .send(
+                            serde_json::to_value(self.other.content(
+                                epoch + 1,
+                                now,
+                                now,
+                                true,
+                                Some(claim::rfc3339(now)),
+                            ))
+                            .expect("content"),
+                        )
+                        .await
+                        .expect("the other host records");
+                }
+                read
+            })
+        }
+
+        fn next_sync(&self) -> ClaimFuture<'_, Duration> {
+            self.inner.next_sync()
+        }
+    }
+
+    /// R95C4-03: a host whose claim lapses between its completion read and
+    /// its write — paused past the deadline while another host took the
+    /// drive and recorded a later window — writes nothing over that window
+    /// and does not count its own night recorded.
+    #[tokio::test(start_paused = true)]
+    async fn a_completion_read_before_the_claim_lapsed_is_never_written() {
+        use crate::maintain::{maintain, Maintained};
+        let w = world(Duration::ZERO, true);
+        let room = control();
+        let (lease, done) = (
+            claim::maintenance_key("tgdrive"),
+            claim::completion_key(keeper_core::agents::consolidate::JOB, "tgdrive"),
+        );
+        let lease_port = w.copy.keyed_claims(&room, &lease);
+        let done_port = w.copy.keyed_claims(&room, &done);
+        let me = claimant(&HostSlug::new(ME).expect("slug"), w.copy.as_ref());
+        let other = Claimant {
+            host: OTHER.to_owned(),
+            ..me.clone()
+        };
+        let (clock, rtt) = (Arc::<ServerClock>::default(), Arc::<Rtt>::default());
+        let day = 24 * 60 * 60 * 1000;
+        let (tonight, later) = (1_791_262_800_000_i64, 1_791_262_800_000_i64 + day);
+        let paused = PausedAfterRead {
+            inner: Arc::clone(&done_port),
+            other,
+            later,
+            armed: AtomicBool::new(false),
+        };
+        let ran = maintain(
+            &lease_port,
+            &paused,
+            &me,
+            &clock,
+            &rtt,
+            Some(tonight),
+            |_| {
+                paused.armed.store(true, Ordering::SeqCst);
+                async { ((), true) }
+            },
+        )
+        .await
+        .expect("tonight");
+        assert!(
+            matches!(
+                ran,
+                Maintained::Ran {
+                    recorded: false,
+                    ..
+                }
+            ),
+            "{ran:?}"
+        );
+        assert_eq!(
+            claim_at(&w, &done).and_then(|claim| claim.content.window),
+            Some(claim::rfc3339(later as u64)),
+            "the later window stays"
+        );
+    }
+
+    /// A completion port whose write, once `armed`, lands and then has
+    /// another host take the drive's claim from under the recording one.
+    struct TakenAtTheWrite {
+        inner: Arc<dyn ClaimPort>,
+        lease: Arc<dyn ClaimPort>,
+        other: Claimant,
+        armed: AtomicBool,
+    }
+
+    impl ClaimPort for TakenAtTheWrite {
+        fn send(&self, content: Value) -> ClaimFuture<'_, Result<OwnedEventId, AgentMatrixError>> {
+            Box::pin(async move {
+                let sent = self.inner.send(content).await;
+                if self.armed.swap(false, Ordering::SeqCst) {
+                    let epoch = self
+                        .lease
+                        .read()
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|state| ServerClaim::read(&state).ok())
+                        .map_or(0, |claim| claim.content.epoch);
+                    let now = wall_ms();
+                    self.lease
+                        .send(
+                            serde_json::to_value(self.other.content(
+                                epoch + 1,
+                                now,
+                                now,
+                                false,
+                                None,
+                            ))
+                            .expect("content"),
+                        )
+                        .await
+                        .expect("the other host takes the drive");
+                }
+                sent
+            })
+        }
+
+        fn read(&self) -> ClaimFuture<'_, Result<Option<ServerState>, AgentMatrixError>> {
+            self.inner.read()
+        }
+
+        fn next_sync(&self) -> ClaimFuture<'_, Duration> {
+            self.inner.next_sync()
+        }
+    }
+
+    /// R95C4-03: a completion written under a claim another host took
+    /// before it was handed back — its release refused — is not counted
+    /// recorded: the night is run again rather than remembered done.
+    #[tokio::test(start_paused = true)]
+    async fn a_completion_whose_claim_was_taken_before_its_release_is_not_recorded() {
+        use crate::maintain::{maintain, Maintained};
+        let w = world(Duration::ZERO, true);
+        let room = control();
+        let (lease, done) = (
+            claim::maintenance_key("tgdrive"),
+            claim::completion_key(keeper_core::agents::consolidate::JOB, "tgdrive"),
+        );
+        let lease_port = w.copy.keyed_claims(&room, &lease);
+        let done_port = w.copy.keyed_claims(&room, &done);
+        let me = claimant(&HostSlug::new(ME).expect("slug"), w.copy.as_ref());
+        let other = Claimant {
+            host: OTHER.to_owned(),
+            ..me.clone()
+        };
+        let (clock, rtt) = (Arc::<ServerClock>::default(), Arc::<Rtt>::default());
+        let taken = TakenAtTheWrite {
+            inner: Arc::clone(&done_port),
+            lease: Arc::clone(&lease_port),
+            other,
+            armed: AtomicBool::new(false),
+        };
+        let ran = maintain(
+            &lease_port,
+            &taken,
+            &me,
+            &clock,
+            &rtt,
+            Some(1_791_262_800_000),
+            |_| {
+                taken.armed.store(true, Ordering::SeqCst);
+                async { ((), true) }
+            },
+        )
+        .await
+        .expect("tonight");
+        assert!(
+            matches!(
+                ran,
+                Maintained::Ran {
+                    recorded: false,
+                    ..
+                }
+            ),
+            "{ran:?}"
+        );
+        assert_eq!(
+            claim_at(&w, &lease).map(|claim| claim.content.host),
+            Some(OTHER.to_owned()),
+            "the drive is the other host's"
+        );
     }
 }
