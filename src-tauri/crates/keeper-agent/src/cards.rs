@@ -675,10 +675,12 @@ pub fn begin(
         Scheduled::Wait { waiting, .. } => Begun::Said(RunBody {
             state: RunState::Waiting,
             detail: Some(waiting.clone()),
+            step: None,
         }),
         Scheduled::TakenOver { host, .. } => Begun::Said(RunBody {
             state: RunState::Review,
             detail: Some(effect_unknown(host)),
+            step: None,
         }),
     })
 }
@@ -941,6 +943,9 @@ mod tests {
         }
         fn relay(&self, _: &str) -> Option<crate::ask::Relay> {
             None
+        }
+        fn ended(&self) -> bool {
+            false
         }
     }
 
@@ -1743,6 +1748,8 @@ mod tests {
             dispatch_chain: Vec::new(),
             limits: None,
             workflow: None,
+            checkpoints: None,
+            outputs: Vec::new(),
             created_at: chrono::Utc::now(),
         }
     }
@@ -1940,6 +1947,7 @@ mod tests {
         let unknown = Begun::Said(RunBody {
             state: RunState::Review,
             detail: Some("ran on electra, effect unknown".to_owned()),
+            step: None,
         });
         // The window was written, its run never finished: it is settled,
         // `last_run` left as it is (R164).

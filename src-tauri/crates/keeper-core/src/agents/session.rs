@@ -31,7 +31,7 @@ pub const TITLE_MAX: usize = 120;
 /// The deepest delegation hop.
 pub const HOP_MAX: i64 = 3;
 
-const ROOT_KEYS: [&str; 18] = [
+const ROOT_KEYS: [&str; 20] = [
     "version",
     "id",
     "agent",
@@ -49,6 +49,8 @@ const ROOT_KEYS: [&str; 18] = [
     "dispatch_chain",
     "limits",
     "workflow",
+    "checkpoints",
+    "outputs",
     "created_at",
 ];
 const PARENT_KEYS: [&str; 3] = ["drive", "session", "room"];
@@ -115,6 +117,38 @@ impl FromStr for SessionKind {
     }
 }
 
+/// Who a workflow session's checkpoints reach (R103): fixed for its run,
+/// stamped once when it opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Checkpoints {
+    /// BMAD's halts reach the person through their proxy (`ask_human`).
+    Proxy,
+    /// Nobody watches: every halt takes its stated default, and a call that
+    /// needs a person is raised once (R83).
+    Unattended,
+}
+
+impl Checkpoints {
+    /// The word the files use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Proxy => "proxy",
+            Self::Unattended => "unattended",
+        }
+    }
+}
+
+impl FromStr for Checkpoints {
+    type Err = ();
+
+    fn from_str(word: &str) -> Result<Self, ()> {
+        [Self::Proxy, Self::Unattended]
+            .into_iter()
+            .find(|checkpoints| checkpoints.as_str() == word)
+            .ok_or(())
+    }
+}
+
 /// The delegating session (AD-385).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionParent {
@@ -171,6 +205,14 @@ pub struct SessionAgent {
     pub limits: Option<SessionLimits>,
     /// A folder under `_workflows/`.
     pub workflow: Option<String>,
+    /// A workflow session's checkpoints, as its run opened (R103); `None`
+    /// for every other session.
+    pub checkpoints: Option<Checkpoints>,
+    /// A workflow session's declared outputs, session-relative, their
+    /// tokens filled as its run opened (R107): what its reply is checked
+    /// against, whatever its `workflow.toml` says later. Empty for every
+    /// other session.
+    pub outputs: Vec<String>,
     /// When the session was created.
     pub created_at: DateTime<Utc>,
 }
@@ -534,6 +576,17 @@ pub fn parse_session_agent_toml(text_in: &str) -> Result<SessionAgent, SessionRe
         dispatch_chain,
         limits: limits(&table)?,
         workflow: text(&table, "workflow", "workflow")?,
+        checkpoints: match text(&table, "checkpoints", "checkpoints")? {
+            None => None,
+            Some(word) => Some(word.parse().map_err(|()| {
+                invalid(
+                    "checkpoints",
+                    format!("\"{word}\""),
+                    "it is proxy or unattended.",
+                )
+            })?),
+        },
+        outputs: text_list(&table, "outputs")?.unwrap_or_default(),
         created_at,
     })
 }
@@ -584,6 +637,15 @@ pub fn compose_session_agent_toml(session: &SessionAgent) -> String {
     }
     if let Some(workflow) = &session.workflow {
         line("workflow", quoted(workflow));
+    }
+    if let Some(checkpoints) = session.checkpoints {
+        line("checkpoints", quoted(checkpoints.as_str()));
+    }
+    if !session.outputs.is_empty() {
+        line(
+            "outputs",
+            quoted_list(session.outputs.iter().map(String::as_str)),
+        );
     }
     line(
         "created_at",
@@ -640,6 +702,8 @@ pin = ""
 hop = 1
 dispatch_chain = ["@tgorka:h", "@nixi:h", "@tola-grey:h"]
 workflow = "release-notes"
+checkpoints = "unattended"
+outputs = ["artifacts/notes-2026-09-30.md"]
 created_at = "2026-09-30T08:15:03.120Z"
 
 [parent]
@@ -679,6 +743,8 @@ tokens = 200000
         assert_eq!(session.hop, 1);
         assert_eq!(session.label.integrity, Integrity::Peer);
         assert_eq!(session.dispatch_chain.len(), 3);
+        assert_eq!(session.checkpoints, Some(Checkpoints::Unattended));
+        assert_eq!(session.outputs, ["artifacts/notes-2026-09-30.md"]);
         assert_eq!(session.dispatch_chain[0].as_str(), "@tgorka:h");
         let composed = compose_session_agent_toml(&session);
         assert_eq!(
@@ -707,6 +773,7 @@ local_only = true
         assert_eq!(session.hop, 0);
         assert_eq!(session.needs, None);
         assert!(session.dispatch_chain.is_empty(), "a file before R76");
+        assert_eq!(session.checkpoints, None, "only a workflow's run stamps it");
         assert!(session.label.local_only);
         let again = parse_session_agent_toml(&compose_session_agent_toml(&session)).expect("again");
         assert_eq!(again, session);
@@ -777,6 +844,13 @@ local_only = true
             "id"
         );
         assert_eq!(refused_key(&with("version = 1", "version = 2")), "version");
+        assert_eq!(
+            refused_key(&with(
+                "checkpoints = \"unattended\"",
+                "checkpoints = \"watched\""
+            )),
+            "checkpoints"
+        );
         assert_eq!(
             refused_key(&with("\"@nixi:h\", \"@tola", "\"nixi\", \"@tola")),
             "dispatch_chain"

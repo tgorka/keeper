@@ -1287,6 +1287,7 @@ fn the_index_answers_with_the_logs_gone() {
         LineBody::Run(RunBody {
             state: RunState::Review,
             detail: None,
+            step: None,
         }),
     );
     appended.claim = Some("$c2".into());
@@ -1398,6 +1399,7 @@ fn where_a_card_runs_comes_from_its_sessions_log() {
         LineBody::Run(RunBody {
             state: RunState::Waiting,
             detail: Some("hesperia — a live host".to_owned()),
+            step: None,
         }),
     );
     waiting.claim = Some("$c2".into());
@@ -1542,6 +1544,7 @@ fn a_refresh_agrees_with_a_whole_read_whatever_the_order() {
                         state: [RunState::Running, RunState::Waiting, RunState::Review]
                             [next(3) as usize],
                         detail: Some(format!("line {seq}")),
+                        step: None,
                     }),
                 ),
             };
@@ -1612,6 +1615,7 @@ fn a_refresh_fences_a_superseded_epochs_late_line() {
         LineBody::Run(RunBody {
             state: RunState::Running,
             detail: None,
+            step: None,
         }),
     );
     append("electra", &stale);

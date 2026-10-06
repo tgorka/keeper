@@ -20,7 +20,9 @@ use crate::agents::card;
 use crate::agents::events::{CONTENT_VERSION, DELEGATE};
 use crate::agents::home;
 use crate::agents::label::{Integrity, Label, Readers};
-use crate::agents::session::{SessionAgent, SessionKind, SessionLimits, SessionParent, HOP_MAX};
+use crate::agents::session::{
+    Checkpoints, SessionAgent, SessionKind, SessionLimits, SessionParent, HOP_MAX,
+};
 use crate::notes::frontmatter::{FieldValue, Frontmatter};
 
 /// The child session's card, at its root.
@@ -329,7 +331,30 @@ pub fn child_session(
             tokens: content.limits.tokens,
         }),
         workflow: None,
+        checkpoints: None,
+        outputs: Vec::new(),
         created_at,
+    })
+}
+
+/// A workflow's run (R104): the session `child_session` makes of `content`
+/// — whose `to` is the starting agent itself — of kind `workflow`, naming
+/// its workflow and its checkpoints, fixed for the run (R103).
+pub fn workflow_session(
+    content: &DelegateContent,
+    agent: &str,
+    drive: &str,
+    room: &OwnedRoomId,
+    created_at: DateTime<Utc>,
+    workflow: &str,
+    checkpoints: Checkpoints,
+) -> Option<SessionAgent> {
+    let child = child_session(content, agent, drive, room, created_at)?;
+    Some(SessionAgent {
+        kind: SessionKind::Workflow,
+        workflow: Some(workflow.to_owned()),
+        checkpoints: Some(checkpoints),
+        ..child
     })
 }
 

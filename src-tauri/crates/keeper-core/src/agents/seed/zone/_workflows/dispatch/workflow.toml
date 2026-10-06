@@ -1,0 +1,10 @@
+# keeper's header for this BMAD-format workflow (AD-398). A person's file:
+# edit it as you like; keeper never writes it again.
+version = 1
+name = "dispatch"
+description = "Hand each card that has an assignee and no run state to that agent, with only the drives its work needs."
+tools = ["drive_read", "delegate"]
+
+[[inputs]]
+name = "session"
+type = "session"

@@ -1247,6 +1247,7 @@ mod tests {
             body: LineBody::Run(RunBody {
                 state,
                 detail: None,
+                step: None,
             }),
         }
     }

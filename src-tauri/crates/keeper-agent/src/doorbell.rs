@@ -1019,6 +1019,8 @@ mod tests {
             dispatch_chain: Vec::new(),
             limits: None,
             workflow: None,
+            checkpoints: None,
+            outputs: Vec::new(),
             created_at: chrono::Utc::now(),
         });
         std::fs::create_dir_all(outside.path().join("elsewhere")).expect("dir");

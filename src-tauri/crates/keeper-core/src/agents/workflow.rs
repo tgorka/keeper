@@ -16,6 +16,7 @@
 
 use serde_json::{json, Map, Value};
 
+use crate::agents::session::Checkpoints;
 use crate::bots::chat::ToolSpec;
 
 /// `resolve_config.py` and `resolve_customization.py`, ported.
@@ -807,6 +808,563 @@ pub fn parse_ask(args: &Value) -> Result<AskCall, String> {
     })
 }
 
+/// Opens a workflow's run in a session of its own (R104).
+pub const WORKFLOW_START: &str = "workflow_start";
+/// The header a `_workflows/<name>/` folder carries.
+pub const WORKFLOW_FILE: &str = "workflow.toml";
+/// The longest `description`, in characters.
+pub const DESCRIPTION_MAX: usize = 280;
+/// A folder of `_workflows/` without its header.
+pub const NOT_A_WORKFLOW: &str = "not a workflow: no workflow.toml";
+/// `workflow_start` in a proxy's own `main` or `conversation` (AD-380).
+pub const IN_THE_DM: &str = "a workflow is started by delegation or a card, never inside the DM";
+/// The continuations one run may take (R106).
+pub const CONTINUATIONS_PER_RUN: u32 = 3;
+/// What the host says when it continues a run whose rounds ran out (R106).
+pub const CONTINUE: &str = "continue";
+
+/// A `[[inputs]]` entry's `type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputKind {
+    /// Free text.
+    Text,
+    /// A path in a drive in scope.
+    Path,
+    /// A drive in scope, by id.
+    Drive,
+    /// An existing session, by id.
+    Session,
+}
+
+impl InputKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Path => "path",
+            Self::Drive => "drive",
+            Self::Session => "session",
+        }
+    }
+}
+
+/// One `[[inputs]]` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowInput {
+    pub name: String,
+    pub kind: InputKind,
+    pub required: bool,
+}
+
+/// One `[[outputs]]` entry: `path` is under the session's `artifacts/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowOutput {
+    pub name: String,
+    pub path: String,
+}
+
+/// `[trigger]` (R108): `schedule` is a card's, never the header's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Trigger {
+    /// `workflow_start` and a menu may start it.
+    pub manual: bool,
+    /// A workflow card may start it.
+    pub card: bool,
+}
+
+/// A read `workflow.toml` (AD-398, the architecture's *Data formats*).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Workflow {
+    pub name: String,
+    pub description: String,
+    /// A file inside the folder.
+    pub entry: String,
+    pub inputs: Vec<WorkflowInput>,
+    pub outputs: Vec<WorkflowOutput>,
+    /// Names of the vocabulary the run needs.
+    pub tools: Vec<String>,
+    /// Drive ids, or `home`.
+    pub drives: Vec<String>,
+    pub trigger: Trigger,
+    pub checkpoints: Checkpoints,
+}
+
+const WORKFLOW_KEYS: [&str; 10] = [
+    "version",
+    "name",
+    "description",
+    "entry",
+    "inputs",
+    "outputs",
+    "tools",
+    "drives",
+    "trigger",
+    "checkpoints",
+];
+
+/// Whether `path` is a plain relative path: no root, no `.` or `..`, no
+/// empty segment, no backslash.
+fn plain(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\\')
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+/// `[a-z0-9][a-z0-9-]{0,31}`: a drive's id.
+fn drive_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 32
+        && bytes[0] != b'-'
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+/// The `{{…}}` tokens of `path`, or `Err` for one never closed.
+fn tokens(path: &str) -> Result<Vec<&str>, ()> {
+    let mut found = Vec::new();
+    let mut rest = path;
+    while let Some(at) = rest.find("{{") {
+        let after = &rest[at + 2..];
+        let end = after.find("}}").ok_or(())?;
+        found.push(&after[..end]);
+        rest = &after[end + 2..];
+    }
+    Ok(found)
+}
+
+/// Read `_workflows/<folder>/workflow.toml`'s `text`; `has_file` says
+/// whether a folder-relative path is a file of the folder. Closed: every
+/// refusal is one sentence naming the key.
+pub fn parse_workflow_toml(
+    folder: &str,
+    text: &str,
+    has_file: &dyn Fn(&str) -> bool,
+) -> Result<Workflow, String> {
+    use toml::Value as T;
+    let say = |why: String| format!("_workflows/{folder}/{WORKFLOW_FILE}: {why}");
+    let table: toml::Table = crate::toml_order::from_str(text).map_err(|error| {
+        say(format!(
+            "it is not valid TOML: {}",
+            error.message().lines().next().unwrap_or("")
+        ))
+    })?;
+    if let Some(key) = table
+        .keys()
+        .find(|key| !WORKFLOW_KEYS.contains(&key.as_str()))
+    {
+        return Err(say(format!("`{key}` is not one of its keys.")));
+    }
+    let string = |key: &str| -> Result<Option<String>, String> {
+        match table.get(key) {
+            None => Ok(None),
+            Some(T::String(value)) => Ok(Some(value.clone())),
+            Some(_) => Err(say(format!("`{key}` is text in quotes."))),
+        }
+    };
+    let strings = |key: &str| -> Result<Option<Vec<String>>, String> {
+        match table.get(key) {
+            None => Ok(None),
+            Some(T::Array(items)) => items
+                .iter()
+                .map(|item| match item {
+                    T::String(value) => Ok(value.clone()),
+                    _ => Err(say(format!("`{key}` is a list of text."))),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some),
+            Some(_) => Err(say(format!("`{key}` is a list of text."))),
+        }
+    };
+    let tables = |key: &str| -> Result<Vec<toml::Table>, String> {
+        match table.get(key) {
+            None => Ok(Vec::new()),
+            Some(T::Array(items)) => items
+                .iter()
+                .map(|item| match item {
+                    T::Table(entry) => Ok(entry.clone()),
+                    _ => Err(say(format!("`{key}` is a list of tables, [[{key}]]."))),
+                })
+                .collect(),
+            Some(_) => Err(say(format!("`{key}` is a list of tables, [[{key}]]."))),
+        }
+    };
+    let closed = |entry: &toml::Table, key: &str, keys: &[&str]| -> Result<(), String> {
+        match entry.keys().find(|k| !keys.contains(&k.as_str())) {
+            Some(other) => Err(say(format!("`{key}.{other}` is not one of its keys."))),
+            None => Ok(()),
+        }
+    };
+    let entry_text = |entry: &toml::Table, key: &str, field: &str| -> Result<String, String> {
+        match entry.get(field) {
+            Some(T::String(value)) if !value.trim().is_empty() => Ok(value.clone()),
+            Some(_) => Err(say(format!("`{key}.{field}` is non-empty text."))),
+            None => Err(say(format!("each of `{key}` needs `{field}`."))),
+        }
+    };
+
+    match table.get("version") {
+        Some(T::Integer(1)) => {}
+        Some(T::Integer(version)) => {
+            return Err(say(format!(
+                "it is version {version}, which this keeper cannot read: it reads version 1."
+            )))
+        }
+        Some(_) => return Err(say("`version` is a whole number.".to_owned())),
+        None => return Err(say("it needs `version`.".to_owned())),
+    }
+    let name = string("name")?.ok_or_else(|| say("it needs `name`.".to_owned()))?;
+    if name != folder {
+        return Err(say(format!(
+            "`name` is {name}, but a workflow is named by its folder, {folder}."
+        )));
+    }
+    let description =
+        string("description")?.ok_or_else(|| say("it needs `description`.".to_owned()))?;
+    let chars = description.chars().count();
+    if chars > DESCRIPTION_MAX {
+        return Err(say(format!(
+            "`description` is {chars} characters long; it is at most {DESCRIPTION_MAX}."
+        )));
+    }
+    let entry = string("entry")?.unwrap_or_else(|| "SKILL.md".to_owned());
+    if !plain(&entry) {
+        return Err(say(format!(
+            "`entry` is {entry}, which is not a path inside the folder."
+        )));
+    }
+    if !has_file(&entry) {
+        return Err(say(format!(
+            "`entry` is {entry}, which is not a file in the folder."
+        )));
+    }
+    let mut inputs = Vec::new();
+    for input in tables("inputs")? {
+        closed(&input, "inputs", &["name", "type", "required"])?;
+        let name = entry_text(&input, "inputs", "name")?;
+        let word = entry_text(&input, "inputs", "type")?;
+        let kind = match word.as_str() {
+            "text" => InputKind::Text,
+            "path" => InputKind::Path,
+            "drive" => InputKind::Drive,
+            "session" => InputKind::Session,
+            _ => {
+                return Err(say(format!(
+                    "the input {name}'s type is {word}; it is one of text, path, drive, session."
+                )))
+            }
+        };
+        let required = match input.get("required") {
+            None => false,
+            Some(T::Boolean(required)) => *required,
+            Some(_) => return Err(say("`inputs.required` is true or false.".to_owned())),
+        };
+        if inputs
+            .iter()
+            .any(|known: &WorkflowInput| known.name == name)
+        {
+            return Err(say(format!("the input {name} is declared twice.")));
+        }
+        inputs.push(WorkflowInput {
+            name,
+            kind,
+            required,
+        });
+    }
+    let mut outputs = Vec::new();
+    for output in tables("outputs")? {
+        closed(&output, "outputs", &["name", "path"])?;
+        let name = entry_text(&output, "outputs", "name")?;
+        let path = entry_text(&output, "outputs", "path")?;
+        let found = tokens(&path).map_err(|()| {
+            say(format!(
+                "the output {name}'s path {path} opens a token it never closes."
+            ))
+        })?;
+        if let Some(other) = found
+            .iter()
+            .find(|token| !matches!(**token, "date" | "slug"))
+        {
+            return Err(say(format!(
+                "the output {name}'s path names {{{{{other}}}}}; only {{{{date}}}} and {{{{slug}}}} are filled in."
+            )));
+        }
+        if !plain(&path) {
+            return Err(say(format!(
+                "the output {name}'s path {path} is not a path under the session's artifacts/."
+            )));
+        }
+        outputs.push(WorkflowOutput { name, path });
+    }
+    let tools = strings("tools")?.unwrap_or_default();
+    if let Some(other) = tools
+        .iter()
+        .find(|tool| !crate::agents::home::TOOL_VOCABULARY.contains(&tool.as_str()))
+    {
+        return Err(say(format!(
+            "`tools` names {other}, which is not a tool of the agents' vocabulary."
+        )));
+    }
+    let drives = strings("drives")?.unwrap_or_else(|| vec!["home".to_owned()]);
+    if let Some(bad) = drives
+        .iter()
+        .find(|drive| *drive != "home" && !drive_id(drive))
+    {
+        return Err(say(format!(
+            "`drives` names {bad}, which is neither a drive id nor home."
+        )));
+    }
+    let trigger = match table.get("trigger") {
+        None => Trigger {
+            manual: true,
+            card: true,
+        },
+        Some(T::Table(trigger)) => {
+            if trigger.contains_key("schedule") {
+                return Err(say("`trigger.schedule` is not read: a schedule is a workflow card's `schedule:`, never the workflow's.".to_owned()));
+            }
+            closed(trigger, "trigger", &["manual", "card"])?;
+            let flag = |key: &str| match trigger.get(key) {
+                None => Ok(true),
+                Some(T::Boolean(on)) => Ok(*on),
+                Some(_) => Err(say(format!("`trigger.{key}` is true or false."))),
+            };
+            Trigger {
+                manual: flag("manual")?,
+                card: flag("card")?,
+            }
+        }
+        Some(_) => return Err(say("`trigger` is a table, [trigger].".to_owned())),
+    };
+    let checkpoints = match string("checkpoints")? {
+        None => Checkpoints::Proxy,
+        Some(word) => word.parse().map_err(|()| {
+            say(format!(
+                "`checkpoints` is {word}; it is proxy or unattended."
+            ))
+        })?,
+    };
+    Ok(Workflow {
+        name,
+        description,
+        entry,
+        inputs,
+        outputs,
+        tools,
+        drives,
+        trigger,
+        checkpoints,
+    })
+}
+
+/// Whether `agent`'s session may run `workflow`, the run offered `offered`
+/// (wire names) and in scope `scope`, its home drive `home`: every tool it
+/// names is offered ([`tools_check`]), and every drive it works in is in
+/// scope ([`run_drives`]). `Ok` holds the run's drives, its home first.
+pub fn start_check(
+    workflow: &Workflow,
+    agent: &str,
+    offered: &[&str],
+    scope: &[String],
+    home: &str,
+) -> Result<Vec<String>, String> {
+    tools_check(workflow, agent, offered)?;
+    run_drives(workflow, scope, home)
+}
+
+/// Whether every tool `workflow` names is among `offered`, the wire names a
+/// turn of its run would be offered; else the sentence naming the first
+/// that is not.
+pub fn tools_check(workflow: &Workflow, agent: &str, offered: &[&str]) -> Result<(), String> {
+    if let Some(tool) = workflow
+        .tools
+        .iter()
+        .find(|tool| !offered.contains(&tool.as_str()))
+    {
+        return Err(format!(
+            "`{}` needs `{tool}`, which `{agent}` is not allowed.",
+            workflow.name
+        ));
+    }
+    Ok(())
+}
+
+/// The drives `workflow`'s run works in, its home `home` first, each in
+/// `scope`; else the sentence naming the first that is not.
+pub fn run_drives(
+    workflow: &Workflow,
+    scope: &[String],
+    home: &str,
+) -> Result<Vec<String>, String> {
+    let mut drives = vec![home.to_owned()];
+    for drive in &workflow.drives {
+        let drive = if drive == "home" { home } else { drive };
+        if !scope.iter().any(|in_scope| in_scope == drive) {
+            return Err(format!(
+                "`{}` works in {drive}, which is not in this session's scope.",
+                workflow.name
+            ));
+        }
+        if !drives.iter().any(|known| known == drive) {
+            drives.push(drive.to_owned());
+        }
+    }
+    Ok(drives)
+}
+
+/// An output's path with its tokens filled: `{{date}}` the run's day
+/// (`YYYY-MM-DD`), `{{slug}}` the workflow's name.
+pub fn expand_output(path: &str, date: &str, slug: &str) -> String {
+    path.replace("{{date}}", date).replace("{{slug}}", slug)
+}
+
+/// The sentence a reply carries for a declared output the run did not
+/// write (R107).
+pub fn missing_output(path: &str) -> String {
+    format!("declared output `{path}` was not written")
+}
+
+fn derived(parts: &[&str]) -> ulid::Ulid {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("keeper.agents.workflow\n{}", parts.join("\n")).as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    ulid::Ulid::from_bytes(bytes)
+}
+
+/// The run a workflow card opens in `window` (RFC 3339): the same on every
+/// host for the card `card` of the session `session` (Q5).
+pub fn run_id(session: &str, card: &str, window: &str) -> ulid::Ulid {
+    derived(&[session, card, window])
+}
+
+/// The run a `workflow_start` call `call` of `session` opens: a call run
+/// again — a replay, a resumed park — opens the same session (AD-368).
+pub fn start_id(session: &str, call: &str) -> ulid::Ulid {
+    derived(&[session, "call", call])
+}
+
+/// The delegation the card `card` of the session `session` (its id) is
+/// handed on as when a run of another session hands it on: the same on
+/// every host and in every run, so a card is handed on once (R202).
+pub fn handoff_id(session: &str, card: &str) -> ulid::Ulid {
+    derived(&[session, "handoff", card])
+}
+
+/// One `workflow_start` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartCall {
+    pub name: String,
+    /// Each input as named, its value as given.
+    pub inputs: Vec<(String, String)>,
+}
+
+/// `workflow_start`'s spec: offered as `[tools].allow` says, never in a
+/// proxy's own conversation.
+pub fn start_spec() -> ToolSpec {
+    ToolSpec {
+        name: WORKFLOW_START.to_owned(),
+        description: "Start a workflow of the drive's _workflows/ in a session of its own, by its folder's name, a menu code or a skill:action of the drive's bmad-help.csv. It runs there and replies to this session when it is done.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "The workflow: its folder under _workflows/, or a BMAD menu code or skill:action naming it."},
+                "inputs": {"type": "object", "additionalProperties": {"type": "string"}, "description": "The workflow's declared inputs, by name: text, a drive path, a drive id, or a session id."}
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// Read a `workflow_start` call's arguments.
+pub fn parse_start(args: &Value) -> Result<StartCall, String> {
+    let keys = object(WORKFLOW_START, args, &["name", "inputs"])?;
+    let name = text(WORKFLOW_START, keys, "name")?
+        .ok_or_else(|| "workflow_start needs the workflow's name.".to_owned())?
+        .trim()
+        .to_owned();
+    let inputs = match keys.get("inputs") {
+        None => Vec::new(),
+        Some(Value::Object(given)) => given
+            .iter()
+            .map(|(name, value)| match value {
+                Value::String(value) => Ok((name.clone(), value.clone())),
+                _ => Err(format!("workflow_start's input {name} is a string.")),
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => {
+            return Err("workflow_start's inputs are an object of strings, by name.".to_owned())
+        }
+    };
+    Ok(StartCall { name, inputs })
+}
+
+/// The inputs `given` checked against `workflow`'s declarations, in
+/// declared order: none undeclared, every required one given, none empty.
+pub fn check_inputs<'w>(
+    workflow: &'w Workflow,
+    given: &[(String, String)],
+) -> Result<Vec<(&'w WorkflowInput, String)>, String> {
+    if let Some((other, _)) = given
+        .iter()
+        .find(|(name, _)| !workflow.inputs.iter().any(|input| input.name == *name))
+    {
+        return Err(format!("`{}` declares no input {other}.", workflow.name));
+    }
+    let mut checked = Vec::new();
+    for input in &workflow.inputs {
+        match given.iter().find(|(name, _)| *name == input.name) {
+            Some((_, value)) if value.trim().is_empty() => {
+                return Err(format!(
+                    "`{}`'s input {} is empty.",
+                    workflow.name, input.name
+                ))
+            }
+            Some((_, value)) => checked.push((input, value.trim().to_owned())),
+            None if input.required => {
+                return Err(format!(
+                    "`{}` needs the input {} ({}).",
+                    workflow.name,
+                    input.name,
+                    input.kind.as_str()
+                ))
+            }
+            None => {}
+        }
+    }
+    Ok(checked)
+}
+
+/// The run's brief — its card's body: the workflow, where its entry is
+/// (`folder`, drive-relative), its inputs, and the outputs it declares.
+pub fn brief(workflow: &Workflow, folder: &str, inputs: &[(&WorkflowInput, String)]) -> String {
+    let mut text = format!(
+        "Run the workflow {}: {}\nRead and follow {folder}/{}.",
+        workflow.name, workflow.description, workflow.entry
+    );
+    if !inputs.is_empty() {
+        text.push_str("\n\nInputs:");
+        for (input, value) in inputs {
+            text.push_str(&format!(
+                "\n- {} ({}): {value}",
+                input.name,
+                input.kind.as_str()
+            ));
+        }
+    }
+    if !workflow.outputs.is_empty() {
+        text.push_str("\n\nIt writes, under artifacts/:");
+        for output in &workflow.outputs {
+            text.push_str(&format!("\n- {}: {}", output.name, output.path));
+        }
+    }
+    text.push_str("\n\nWhen the run is done, reply.");
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,5 +1710,207 @@ mod tests {
         assert!(at(rest + 1, third, third).is_err());
         assert!(at(rest, third + 1, third).is_err());
         assert!(at(rest, third, third + 1).is_err());
+    }
+
+    const HEADER: &str = r#"version = 1
+name = "bmad-build"
+description = "Clarify, plan, implement, review and present."
+entry = "workflow.md"
+tools = ["drive_read", "session_write", "run"]
+checkpoints = "unattended"
+
+[[inputs]]
+name = "intent"
+type = "text"
+required = true
+
+[[inputs]]
+name = "spec"
+type = "path"
+
+[[outputs]]
+name = "spec"
+path = "_bmad-output/implementation-artifacts/spec-{{slug}}-{{date}}.md"
+
+[trigger]
+card = false
+"#;
+
+    fn read(text: &str) -> Result<Workflow, String> {
+        parse_workflow_toml("bmad-build", text, &|path| {
+            ["SKILL.md", "workflow.md"].contains(&path)
+        })
+    }
+
+    /// The refusal `text` gets, without its file prefix.
+    fn why(text: &str) -> String {
+        let refused = read(text).expect_err("refused");
+        refused
+            .strip_prefix("_workflows/bmad-build/workflow.toml: ")
+            .expect("names the file")
+            .to_owned()
+    }
+
+    fn with(line: &str, replacement: &str) -> String {
+        assert!(HEADER.contains(line), "{line}");
+        HEADER.replacen(line, replacement, 1)
+    }
+
+    /// 94.3 acceptance 1 (R108): the header is closed — one row per rule,
+    /// each refused with its sentence — and its defaults are the
+    /// architecture's.
+    #[test]
+    fn workflow_toml_grammar() {
+        let read_whole = read(HEADER).expect("reads");
+        assert_eq!(read_whole.entry, "workflow.md");
+        assert_eq!(read_whole.inputs[0].kind, InputKind::Text);
+        assert!(read_whole.inputs[0].required);
+        assert!(!read_whole.inputs[1].required);
+        assert_eq!(read_whole.checkpoints, Checkpoints::Unattended);
+        assert_eq!(
+            read_whole.trigger,
+            Trigger {
+                manual: true,
+                card: false
+            }
+        );
+
+        let minimal = read("version = 1\nname = \"bmad-build\"\ndescription = \"Build.\"\n")
+            .expect("defaults");
+        assert_eq!(minimal.entry, "SKILL.md");
+        assert_eq!(minimal.drives, ["home"]);
+        assert_eq!(
+            minimal.trigger,
+            Trigger {
+                manual: true,
+                card: true
+            }
+        );
+        assert_eq!(minimal.checkpoints, Checkpoints::Proxy);
+        assert!(
+            minimal.inputs.is_empty() && minimal.outputs.is_empty() && minimal.tools.is_empty()
+        );
+
+        let rows: [(String, &str); 12] = [
+            (with("version = 1\n", "version = 1\nmood = \"x\"\n"), "`mood` is not one of its keys."),
+            (with("version = 1", "version = 2"), "it is version 2, which this keeper cannot read: it reads version 1."),
+            (with("name = \"bmad-build\"", "name = \"build\""), "`name` is build, but a workflow is named by its folder, bmad-build."),
+            (
+                with(
+                    "description = \"Clarify, plan, implement, review and present.\"",
+                    &format!("description = \"{}\"", "d".repeat(DESCRIPTION_MAX + 1)),
+                ),
+                "`description` is 281 characters long; it is at most 280.",
+            ),
+            (with("entry = \"workflow.md\"", "entry = \"../other/SKILL.md\""), "`entry` is ../other/SKILL.md, which is not a path inside the folder."),
+            (with("entry = \"workflow.md\"", "entry = \"steps/missing.md\""), "`entry` is steps/missing.md, which is not a file in the folder."),
+            (with("type = \"path\"", "type = \"url\""), "the input spec's type is url; it is one of text, path, drive, session."),
+            (with("{{slug}}-{{date}}", "{{slug}}-{{user}}"), "the output spec's path names {{user}}; only {{date}} and {{slug}} are filled in."),
+            (with("\"run\"]", "\"shell\"]"), "`tools` names shell, which is not a tool of the agents' vocabulary."),
+            (with("card = false", "schedule = \"@daily\""), "`trigger.schedule` is not read: a schedule is a workflow card's `schedule:`, never the workflow's."),
+            (with("checkpoints = \"unattended\"", "checkpoints = \"never\""), "`checkpoints` is never; it is proxy or unattended."),
+            (with("card = false", "card = false\nevery = 1"), "`trigger.every` is not one of its keys."),
+        ];
+        for (text, sentence) in rows {
+            assert_eq!(why(&text), sentence);
+        }
+        assert!(read(&with(
+            "description = \"Clarify, plan, implement, review and present.\"",
+            &format!("description = \"{}\"", "d".repeat(DESCRIPTION_MAX))
+        ))
+        .is_ok());
+    }
+
+    /// 94.3 acceptance 2: a workflow whose tools the session is not offered,
+    /// or whose drives are not in its scope, is refused for that agent by
+    /// name; offered all, it runs in its drives, home first.
+    #[test]
+    fn a_workflow_is_refused_for_an_agent_lacking_its_tools() {
+        let workflow = read(HEADER).expect("reads");
+        let scope = vec!["tgdrive".to_owned(), "neuradrive".to_owned()];
+        assert_eq!(
+            start_check(
+                &workflow,
+                "amelia",
+                &["drive_read", "session_write"],
+                &scope,
+                "tgdrive"
+            ),
+            Err("`bmad-build` needs `run`, which `amelia` is not allowed.".to_owned())
+        );
+        assert_eq!(
+            start_check(
+                &workflow,
+                "amelia",
+                &["drive_read", "session_write", "run"],
+                &scope,
+                "tgdrive"
+            ),
+            Ok(vec!["tgdrive".to_owned()])
+        );
+        let elsewhere = Workflow {
+            drives: vec!["home".to_owned(), "neuradrive".to_owned()],
+            tools: Vec::new(),
+            ..workflow
+        };
+        assert_eq!(
+            start_check(&elsewhere, "amelia", &[], &scope, "tgdrive"),
+            Ok(vec!["tgdrive".to_owned(), "neuradrive".to_owned()])
+        );
+        assert_eq!(
+            start_check(&elsewhere, "amelia", &[], &scope[..1], "tgdrive"),
+            Err(
+                "`bmad-build` works in neuradrive, which is not in this session's scope."
+                    .to_owned()
+            )
+        );
+    }
+
+    /// 94.3 acceptance 3's pure half: undeclared, missing and empty inputs
+    /// are refused; a run's id is the same for the same call or window.
+    #[test]
+    fn inputs_are_checked_and_runs_are_named_alike_everywhere() {
+        let workflow = read(HEADER).expect("reads");
+        let given = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            check_inputs(&workflow, &given(&[])).map(|_| ()),
+            Err("`bmad-build` needs the input intent (text).".to_owned())
+        );
+        assert_eq!(
+            check_inputs(&workflow, &given(&[("intent", "x"), ("colour", "red")])).map(|_| ()),
+            Err("`bmad-build` declares no input colour.".to_owned())
+        );
+        assert_eq!(
+            check_inputs(&workflow, &given(&[("intent", " ")])).map(|_| ()),
+            Err("`bmad-build`'s input intent is empty.".to_owned())
+        );
+        let checked =
+            check_inputs(&workflow, &given(&[("spec", "a.md"), ("intent", "x")])).expect("ok");
+        assert_eq!(
+            checked
+                .iter()
+                .map(|(input, value)| (input.name.as_str(), value.as_str()))
+                .collect::<Vec<_>>(),
+            [("intent", "x"), ("spec", "a.md")]
+        );
+        assert_eq!(start_id("s", "c1"), start_id("s", "c1"));
+        assert_ne!(start_id("s", "c1"), start_id("s", "c2"));
+        assert_eq!(
+            run_id("s", "card.md", "2026-10-06T00:00:00Z"),
+            run_id("s", "card.md", "2026-10-06T00:00:00Z")
+        );
+        assert_ne!(
+            run_id("s", "card.md", "2026-10-06T00:00:00Z"),
+            run_id("s", "card.md", "2026-10-07T00:00:00Z")
+        );
+        assert_eq!(
+            expand_output(&workflow.outputs[0].path, "2026-10-06", "bmad-build"),
+            "_bmad-output/implementation-artifacts/spec-bmad-build-2026-10-06.md"
+        );
     }
 }

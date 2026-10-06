@@ -135,11 +135,21 @@ fn every_seeded_file_is_valid_under_its_own_grammar() {
         assert!(nixi.menu.is_empty(), "no workflow of her own (AD-380)");
         for steward in &configs[1..] {
             let codes: Vec<&str> = steward.menu.iter().map(|m| m.code.as_str()).collect();
-            assert_eq!(codes, ["TR", "DS", "HV"]);
-            assert!(steward
-                .menu
+            assert_eq!(codes, ["TR", "DS", "HV", "WT", "WD"]);
+            // 92.5 reads the prompts by code; the workflows beside them name
+            // folders the same seed writes (94.3).
+            assert!(steward.menu[..3]
                 .iter()
                 .all(|m| matches!(m.action, home::MenuAction::Prompt(_))));
+            for item in &steward.menu[3..] {
+                let home::MenuAction::Workflow(name) = &item.action else {
+                    panic!("{} runs a workflow", item.code);
+                };
+                assert!(
+                    files.contains_key(format!("_workflows/{name}/workflow.toml").as_str()),
+                    "{name} is seeded"
+                );
+            }
         }
 
         // The template, once `agents new` has expanded it.

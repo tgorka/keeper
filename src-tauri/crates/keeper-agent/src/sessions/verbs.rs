@@ -93,7 +93,7 @@ pub fn find(zone: &Path, session_id: &str) -> Option<SessionRowVm> {
 /// truth and a lineage only an index knew would be invisible to `cat`, to
 /// Obsidian and to the agent.
 pub fn create(zone: &Path, req: CreateReq) -> Result<CreateOutcome, VerbError> {
-    create_with(zone, req, Vec::new())
+    create_with(zone, req, Vec::new(), &|| true)
 }
 
 /// Create the session folder an agent works in (AD-365, AD-368): the flat
@@ -123,6 +123,7 @@ pub fn create_agent_session(
             session::FILE_NAME.to_owned(),
             session::compose_session_agent_toml(agent),
         )],
+        &|| true,
     )
 }
 
@@ -137,6 +138,20 @@ pub fn create_carded_session(
     agent: &keeper_core::agents::session::SessionAgent,
     files: Vec<(String, String)>,
     now: chrono::DateTime<chrono::Local>,
+) -> Result<CreateOutcome, VerbError> {
+    create_claimed_session(zone, agent, files, now, &|| true)
+}
+
+/// [`create_carded_session`] by the holder of another session's claim — a
+/// workflow's run its parent opens (R104): `may_write`, that claim, is
+/// asked under the zone's lock right before the folder is made, so a
+/// parent that lost its claim while it waited makes nothing (R120).
+pub fn create_claimed_session(
+    zone: &Path,
+    agent: &keeper_core::agents::session::SessionAgent,
+    files: Vec<(String, String)>,
+    now: chrono::DateTime<chrono::Local>,
+    may_write: &dyn Fn() -> bool,
 ) -> Result<CreateOutcome, VerbError> {
     use keeper_core::agents::session;
     let mut extra = vec![(
@@ -153,14 +168,38 @@ pub fn create_carded_session(
             now,
         },
         extra,
+        may_write,
     )
 }
 
-/// [`create`], with `extra` files composed into the new session's plan.
+/// The zone-relative folder a session titled `title`, created `now`, would
+/// be made in were it made now: what a check of its bytes names before the
+/// folder exists (R202).
+pub fn new_session_path(zone: &Path, title: &str, now: chrono::DateTime<chrono::Local>) -> String {
+    format!(
+        "{}/{}",
+        keeper_core::sessions::model::ACTIVE_DIR,
+        dir_name_for(zone, title.trim(), now)
+    )
+}
+
+/// The folder name a session titled `title` (trimmed) gets in `zone` on
+/// `now`'s day, past the names already taken.
+fn dir_name_for(zone: &Path, title: &str, now: chrono::DateTime<chrono::Local>) -> String {
+    keeper_core::sessions::model::session_dir_name(
+        title,
+        &now.format("%Y-%m-%d").to_string(),
+        &taken_names(zone),
+    )
+}
+
+/// [`create`], with `extra` files composed into the new session's plan,
+/// made only while `may_write` holds under the zone's lock.
 fn create_with(
     zone: &Path,
     req: CreateReq,
     extra: Vec<(String, String)>,
+    may_write: &dyn Fn() -> bool,
 ) -> Result<CreateOutcome, VerbError> {
     use keeper_core::sessions::pattern::{self, PatternKind};
     use keeper_core::sessions::{model, plan, spaces, template};
@@ -183,7 +222,7 @@ fn create_with(
     let now_local = now.to_rfc3339();
     let date = now.format("%Y-%m-%d").to_string();
     let stamp = format!("{date}-{}", now.format("%H%M"));
-    let dir_name = model::session_dir_name(&title, &date, &taken_names(zone));
+    let dir_name = dir_name_for(zone, &title, now);
 
     // Which pattern, resolved to the one thing the plan needs: a zone-relative
     // directory to copy out of, and the kind that decides what travels. The
@@ -447,6 +486,11 @@ fn create_with(
         "create".to_owned()
     };
     let session_path = compiled.session.clone();
+    if !may_write() {
+        return Err(VerbError::Refused(
+            crate::sessions::write::NO_CLAIM.to_owned(),
+        ));
+    }
     exec::run_held(compiled, &held)?;
     Ok(CreateOutcome::Created {
         path: session_path,

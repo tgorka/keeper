@@ -144,6 +144,9 @@ pub fn cut_off_sentence(host: &str) -> String {
     format!("My answer was cut off when {host} restarted. Ask again if you still need it.")
 }
 
+/// The `error` line's code that closes a turn cut off by a restart.
+const INTERRUPTED: &str = "interrupted";
+
 /// The words a turn stopped by shutdown ends with.
 pub fn shutdown_suffix(host: &str) -> String {
     format!(" … (stopped: {host} is shutting down)")
@@ -254,6 +257,25 @@ pub struct SessionContext {
     /// Every question another agent asked this proxy's person that a `peer`
     /// line took here, relayed or not: one is never taken twice (R199).
     pub asked_of_me: HashSet<String>,
+    /// The continuations a workflow's run took (R106), from its `peer`
+    /// lines' host-made events — a takeover's resume counted among them.
+    pub continuations: u32,
+    /// Every generation this session's `bmad_render` calls published: each
+    /// call's arguments and the answer naming its generation, oldest first
+    /// (94.3 acceptance 8, R202).
+    pub rendered: Vec<(String, String)>,
+    /// `bmad_render` calls with no result yet: call id → arguments.
+    renders: HashMap<String, String>,
+    /// A workflow's run: the host step its last `run` line announced whose
+    /// turn has not begun here (R106, R202).
+    pub pending_step: Option<String>,
+    /// Whether the session's last turn was closed `interrupted` and no turn
+    /// began since: a takeover's resume is owed (R106, R202).
+    pub cut_off: bool,
+    /// The workflow steps this run began, by arrival id: from its log's
+    /// `peer` lines, every host's, and from the anchors another copy left
+    /// in the room ([`Self::started`]). Never a second turn (R202).
+    steps_begun: HashSet<String>,
 }
 
 impl SessionContext {
@@ -316,6 +338,12 @@ impl SessionContext {
             asks: BTreeMap::new(),
             relays: BTreeMap::new(),
             asked_of_me: HashSet::new(),
+            continuations: 0,
+            rendered: Vec::new(),
+            renders: HashMap::new(),
+            pending_step: None,
+            cut_off: false,
+            steps_begun: HashSet::new(),
         };
         for stored in &log.lines {
             match &stored.body {
@@ -360,7 +388,10 @@ impl SessionContext {
                 self.open = Some(body.clone());
                 self.frame_time = line.ts.with_timezone(&chrono::Local).fixed_offset();
             }
-            LineBody::User(_) | LineBody::Peer(_) => self.unanswered = Some(line.id),
+            LineBody::User(_) | LineBody::Peer(_) => {
+                self.unanswered = Some(line.id);
+                self.cut_off = false;
+            }
             // A round that called tools is the middle of a turn (C6): a crash
             // after it still leaves the person's question unanswered.
             LineBody::Assistant(body) if body.finish == ROUND_FINISH => {}
@@ -504,6 +535,20 @@ impl SessionContext {
             LineBody::ToolCall(call) if call.tool == delegate::DELEGATE => {
                 self.delegate_calls.insert(line.id, call.args.clone());
             }
+            LineBody::ToolCall(call) if call.tool == keeper_core::agents::workflow::BMAD_RENDER => {
+                self.renders.insert(call.call_id.clone(), call.args.clone());
+            }
+            LineBody::ToolResult(result) => {
+                if let Some(args) = self.renders.remove(&result.call_id) {
+                    let rendered = (args, result.content.clone());
+                    if result.outcome == ToolOutcomeWord::Ok
+                        && result.content.starts_with(crate::bmad::READ_AND_FOLLOW)
+                        && !self.rendered.contains(&rendered)
+                    {
+                        self.rendered.push(rendered);
+                    }
+                }
+            }
             LineBody::Peer(peer) => {
                 // A relayed answer is the person's, not a round of the
                 // exchange its proxy may have delegated.
@@ -534,8 +579,24 @@ impl SessionContext {
                 {
                     self.harvested.insert(event.to_string());
                 }
+                if let Some(event) = line
+                    .matrix_event
+                    .as_ref()
+                    .filter(|event| event.as_str().starts_with(WORKFLOW_EVENT))
+                {
+                    if is_continuation(event.as_str()) {
+                        self.continuations += 1;
+                    }
+                    if self.pending_step.as_deref() == step_of(event.as_str()) {
+                        self.pending_step = None;
+                    }
+                    self.steps_begun.insert(event.to_string());
+                }
             }
-            LineBody::Run(run) => self.run = Some(run.state),
+            LineBody::Run(run) => {
+                self.run = Some(run.state);
+                self.pending_step = run.step.clone();
+            }
             LineBody::Ask(body) => match body.state {
                 AskState::Asked => {
                     if let Some(open) = OpenAsk::of(body) {
@@ -554,6 +615,7 @@ impl SessionContext {
             },
             LineBody::Told(_) => self.told = true,
             LineBody::Error(error) if error.code == LABEL_CODE => self.withheld = true,
+            LineBody::Error(error) if error.code == INTERRUPTED => self.cut_off = true,
             LineBody::Delegate(body) => match body.state {
                 DelegateState::Opened => {
                     let (Some(room), Ok(to)) =
@@ -574,6 +636,7 @@ impl SessionContext {
                             sent: false,
                             replied: false,
                             rounds: 0,
+                            window: body.window.clone(),
                         },
                     );
                 }
@@ -624,19 +687,36 @@ impl SessionContext {
         }
     }
 
-    /// The harvests among `answered` — the questions another copy of this
-    /// agent already answered in the room — count as begun.
+    /// The harvests and workflow steps among `answered` — the questions
+    /// another copy of this agent already answered in the room — count as
+    /// begun, though their `peer` lines never reached this log (R202).
     pub fn started<'a>(&mut self, answered: impl Iterator<Item = &'a str>) {
-        self.harvested.extend(
-            answered
-                .filter(|event| is_harvest_event(event))
-                .map(str::to_owned),
-        );
+        for event in answered {
+            if is_harvest_event(event) {
+                self.harvested.insert(event.to_owned());
+            } else if event.starts_with(WORKFLOW_EVENT) {
+                self.steps_begun.insert(event.to_owned());
+            }
+        }
     }
 
     /// Whether the harvest `event` began in this session, here or elsewhere.
     pub fn harvest_began(&self, event: &EventId) -> bool {
         self.harvested.contains(event.as_str())
+    }
+
+    /// Whether the workflow step `event` began in this session, here or —
+    /// its anchor in the room — on another host.
+    pub fn step_began(&self, event: &EventId) -> bool {
+        self.steps_begun.contains(event.as_str())
+    }
+
+    /// Whether this session is a workflow's run that has ended: replied
+    /// (`review`) or refused (`failed`). It takes no more turns or effects.
+    pub fn run_ended(&self) -> bool {
+        use keeper_core::agents::log::RunState as LogRun;
+        self.agent.kind == SessionKind::Workflow
+            && matches!(self.run, Some(LogRun::Review | LogRun::Failed))
     }
 
     /// The delegation this session handed its card `source` to.
@@ -675,11 +755,15 @@ impl SessionContext {
     }
 
     /// The agents this session's room sends pass between, left out of its
-    /// audience (R94): its own agent `me`, and a delegated session's
-    /// requester, whose session joins the label a reply carries.
+    /// audience (R94): its own agent `me`, and the requester of a session
+    /// that answers one — a delegated session, a workflow's run (R104) —
+    /// whose session joins the label a reply carries.
     pub fn room_own(&self, me: &UserId) -> Vec<OwnedUserId> {
         let mut own = vec![me.to_owned()];
-        if self.agent.kind == SessionKind::Delegated {
+        if matches!(
+            self.agent.kind,
+            SessionKind::Delegated | SessionKind::Workflow
+        ) {
             own.push(self.agent.requested_by.clone());
         }
         own
@@ -903,6 +987,8 @@ struct AllowedTools<'t> {
     grants: Arc<dyn GrantSource>,
     /// `ask_human`, by the session's kind (R102).
     asks: AskTools<'t>,
+    /// `workflow_start` (R104).
+    workflows: crate::workflow::WorkflowTools<'t>,
     view: &'t dyn TurnView,
     sinks: &'t Sinks,
     /// The declarations of the drives this host mounts: a write's audience.
@@ -928,6 +1014,9 @@ struct AllowedTools<'t> {
     bound: Mutex<Option<Bound>>,
     /// The call this turn parked on.
     parked: Mutex<Option<Parking>>,
+    /// The session asks a person (R102) and nobody can be asked now: its
+    /// calls are classified unattended (R83 as R103 extends it, R202).
+    nobody_to_ask: bool,
 }
 
 /// A consumed approval as the one execution of its call holds it: the
@@ -961,6 +1050,13 @@ fn landed_names(profile: Option<&SyncProfile>, subpath: &str) -> Vec<String> {
 }
 
 impl AllowedTools<'_> {
+    /// The context of a call in this session now: its `agent.toml`, its
+    /// label, and whether anyone can be asked in it.
+    fn context(&self) -> Context {
+        Context::of_session(&self.agent, self.view.label().integrity)
+            .nobody_to_ask(self.nobody_to_ask)
+    }
+
     /// Classify call `id` in this session now, and keep its tier for the
     /// call's line.
     fn classify(
@@ -972,7 +1068,7 @@ impl AllowedTools<'_> {
     ) -> Classification {
         let context = Context {
             grant,
-            ..Context::of_session(&self.agent, self.view.label().integrity)
+            ..self.context()
         };
         let classification = tier::classify(tool, facts, &context);
         self.tiers
@@ -1115,7 +1211,7 @@ impl AllowedTools<'_> {
             }
             Err(_) => tier::named_facts(tool, args, CallFacts::default()),
         };
-        let context = Context::of_session(&self.agent, self.view.label().integrity);
+        let context = self.context();
         tier::classify(tool, &facts, &context).tier.as_u8()
     }
 }
@@ -1169,7 +1265,7 @@ impl crate::sinks::Lift for AllowedTools<'_> {
         if let Some(delegation) = delegation {
             args["delegation"] = Value::from(delegation);
         }
-        let context = Context::of_session(&self.agent, self.view.label().integrity);
+        let context = self.context();
         let classification = tier::classify(AgentTool::Declassify, &CallFacts::default(), &context);
         let pins = match &flow.destination {
             Destination::Drive { drive, path } => vec![(drive.clone(), path.clone())],
@@ -1213,6 +1309,11 @@ fn write_effect(call: &ToolCall) -> String {
     })
     .to_string()
 }
+
+/// What a call of a workflow's run that replied, or failed, is told: the
+/// round's calls each get their result, none its effect (R202).
+pub const RUN_ENDED: &str =
+    "This workflow's run has replied: it ends here, and this call had no effect.";
 
 impl ToolHost for AllowedTools<'_> {
     fn run(&self, call: &ToolCall) -> Result<ToolOutcome, BotsError> {
@@ -1290,6 +1391,11 @@ impl ToolHost for AllowedTools<'_> {
     }
 
     fn run_named(&self, wire: &chat::ToolCall) -> Option<ToolOutcome> {
+        // Asked ahead of every call, a drive verb's too: an ended run's
+        // calls never reach `run` (R202).
+        if self.view.ended() {
+            return Some(refusal(RUN_ENDED.to_owned()));
+        }
         let args = wire.arguments.as_ref().unwrap_or(&Value::Null);
         if delegate::is_delegation(&wire.name) {
             let tool = AgentTool::from_wire(&wire.name)?;
@@ -1376,6 +1482,27 @@ impl ToolHost for AllowedTools<'_> {
                     Err(withheld) => Some(withheld.into()),
                 }
             };
+            if let Some(outcome) = &outcome {
+                audit.finish(outcome);
+            }
+            return outcome;
+        }
+        if wire.name == keeper_core::agents::workflow::WORKFLOW_START {
+            let tool = AgentTool::WorkflowStart;
+            let classification = self.classify(&wire.id, tool, &CallFacts::default(), None);
+            let gated = self.gated(&wire.id, &wire.name, &classification, &[], Vec::new());
+            // A brief the label keeps from the home drive parks on a
+            // declassification of its bytes, as a write would (R202).
+            let audit = CallAudit::new(
+                self.sinks,
+                &wire.name,
+                Effect::Write,
+                &classification,
+                gated,
+                (&self.home.id, self.session_dir.as_str()),
+            )
+            .lifting(self, &wire.id);
+            let outcome = self.workflows.run(wire, &audit);
             if let Some(outcome) = &outcome {
                 audit.finish(outcome);
             }
@@ -1901,6 +2028,93 @@ pub fn harvest_arrival(agent: &UserId, closed: &crate::stewards::Closed) -> Opti
     })
 }
 
+/// What a workflow's run takes next from its host (R104, R106).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowStep {
+    /// Its first turn, from its card.
+    Start,
+    /// Its `n`th continuation (1-based): the last turn's rounds ran out.
+    Continue(u32),
+    /// After a takeover cut a turn of it short: its `n`th continuation too,
+    /// counted against the three (R106).
+    Resume(u32),
+}
+
+impl WorkflowStep {
+    /// What the arrival's id and its `run` line's `step` name it by.
+    pub fn key(self) -> String {
+        match self {
+            WorkflowStep::Start => "start".to_owned(),
+            WorkflowStep::Continue(n) => format!("continue-{n}"),
+            WorkflowStep::Resume(n) => format!("resume-{n}"),
+        }
+    }
+
+    /// The step `key` names.
+    pub fn of_key(key: &str) -> Option<WorkflowStep> {
+        if key == "start" {
+            return Some(WorkflowStep::Start);
+        }
+        let (word, n) = key.split_once('-')?;
+        let n = n.parse().ok()?;
+        match word {
+            "continue" => Some(WorkflowStep::Continue(n)),
+            "resume" => Some(WorkflowStep::Resume(n)),
+            _ => None,
+        }
+    }
+}
+
+/// The opaque part every workflow arrival's id starts with.
+const WORKFLOW_EVENT: &str = "$workflow-";
+
+/// The step a workflow arrival's id `event` names.
+fn step_of(event: &str) -> Option<&str> {
+    let (key, _) = event.strip_prefix(WORKFLOW_EVENT)?.split_once(':')?;
+    key.split_once('-').map(|(_, step)| step)
+}
+
+/// Whether `event` is a workflow run's continuation or resume: a turn the
+/// host made, counted against its run's three (R106).
+fn is_continuation(event: &str) -> bool {
+    matches!(
+        step_of(event).and_then(WorkflowStep::of_key),
+        Some(WorkflowStep::Continue(_) | WorkflowStep::Resume(_))
+    )
+}
+
+/// A workflow arrival whose content is not one this build reads.
+pub const NOT_A_WORKFLOW_STEP: &str = "the host sent no workflow step this host reads";
+/// A workflow step for a run that began already, or has ended.
+pub const RUN_MOVED_ON: &str = "the workflow's run began already, or has ended";
+/// A continuation past a run's three, or a resume while it waits for a
+/// person or another holder's turn (R106, R202).
+pub const NOT_NOW: &str = "the workflow's run has no continuation left, or waits for a person";
+/// A run whose turn began on another host, its lines not here yet: it is
+/// not begun again (R202).
+pub const BEGUN_ELSEWHERE: &str =
+    "a turn of this workflow's run began on another host whose lines have not arrived here; it is not run again";
+
+/// The arrival a workflow's run takes next, in the agent's own name. Its id
+/// names the run and the step, so however often it is routed — by another
+/// host after a takeover too — the session's dedupe keeps it to one turn.
+pub fn workflow_arrival(agent: &UserId, run: &Ulid, step: WorkflowStep) -> Option<Arrived> {
+    let key = step.key();
+    let run = run.to_string().to_ascii_lowercase();
+    Some(Arrived {
+        event_id: OwnedEventId::try_from(format!("{WORKFLOW_EVENT}{run}-{key}:keeper.invalid"))
+            .ok()?,
+        sender: agent.to_owned(),
+        arrival: Arrival::Workflow,
+        text: String::new(),
+        content: json!({"do": key}),
+        received_at: Instant::now(),
+        replay: false,
+        via: None,
+        device: None,
+    })
+}
+
 /// What became of an arrival.
 #[derive(Debug)]
 pub enum Outcome {
@@ -2143,7 +2357,7 @@ impl ServedSession {
             None,
             LineBody::Error(ErrorBody {
                 sentence: sentence.clone(),
-                code: "interrupted".to_owned(),
+                code: INTERRUPTED.to_owned(),
             }),
         )?;
         off_the_runtime(|| self.writer.sync())?;
@@ -2359,6 +2573,11 @@ impl ServedSession {
                 tracing::info!(session = %self.context.session.path, sender = %arrived.sender, note, "agents: an observer's event is not a turn");
                 Ok(Outcome::Ignored(note))
             }
+            // A workflow's run that replied, or failed, takes no more turns
+            // (R202): what would start one is left as it is.
+            Disposition::Turn | Disposition::Unasked if self.run_ended() => {
+                Ok(Outcome::Ignored(RUN_MOVED_ON))
+            }
             // A decision on a request another session sent into this DM
             // goes home to that session (R89).
             Disposition::Decision if self.forward(&arrived) => Ok(Outcome::Forwarded),
@@ -2433,6 +2652,7 @@ impl ServedSession {
             Disposition::Delegation => self.delegation_moved(deps, port, arrived, stop).await,
             Disposition::Scheduled => self.scheduled(deps, port, arrived, stop).await,
             Disposition::Harvest => self.harvest(deps, port, arrived, stop).await,
+            Disposition::Workflow => self.workflow_step(deps, port, arrived, stop).await,
         }
     }
 
@@ -2586,6 +2806,7 @@ impl ServedSession {
             LineBody::Run(RunBody {
                 state: LogRun::Running,
                 detail: None,
+                step: None,
             }),
         )?;
         // The card is read as the drive read of it would be (S-02): one
@@ -2612,13 +2833,114 @@ impl ServedSession {
                 )),
             )?;
         }
-        arrived.text = brief;
         let card = scheduled.card().to_owned();
+        // A card naming a workflow runs it in a fresh session of its own
+        // instead of a turn here (the epic's Q5): one per window.
+        if let Scheduled::Run { window, .. } = &scheduled {
+            let dir = deps.sessions_zone.join(&session);
+            let named = off_the_runtime(|| cards::read_scheduled(&dir, &card))
+                .ok()
+                .flatten()
+                .and_then(|keys| match keys.workflow? {
+                    keeper_core::agents::card::Field::Read(name) => Some(name),
+                    keeper_core::agents::card::Field::Unreadable(raw) => Some(raw),
+                });
+            if let Some(name) = named {
+                return self
+                    .run_workflow_card(deps, &card, window, &name, &brief)
+                    .await;
+            }
+        }
+        arrived.text = brief;
         self.scheduled_card = Some(card.clone());
         let ran = self.turn(deps, port, arrived, stop).await;
         self.scheduled_card = None;
         self.finish_scheduled(deps, &card, ran.as_ref().ok().map(|report| report.ending))?;
         ran.map(Outcome::Answered)
+    }
+
+    /// The window of the scheduled card `card` naming the workflow `name`
+    /// (the epic's Q5): its run opens — its id from the card and `window`,
+    /// unattended (R103), its tools checked against what its run would be
+    /// offered and its brief against the home drive's readers (R202) — and
+    /// this session logs `delegate opened`, naming the card and the window,
+    /// and `sent` for it; its reply sets the card to `review` while the
+    /// card still names that window. A workflow that does not read, whose
+    /// trigger keeps cards out (R108), that this agent may not run or whose
+    /// brief the label keeps from the drive, ends the card `run: failed`
+    /// with the sentence.
+    async fn run_workflow_card(
+        &mut self,
+        deps: &AgentDeps,
+        card: &str,
+        window: &str,
+        name: &str,
+        body: &str,
+    ) -> Result<Outcome, ServeError> {
+        use keeper_core::agents::log::RunState as LogRun;
+        let config = &deps.home.config;
+        let from = self.delegator(deps);
+        // What its model would be offered, armed as a turn of it would be.
+        let (_, model_tools) = arm_session(&self.context, deps, Vec::new(), Probe::Ask).await;
+        let run_offer = |drives: &[String]| workflow_offer(deps, &model_tools, drives);
+        let sinks = self.sinks(deps);
+        let zone = drive_relative(&deps.drive_root, &deps.home.zone);
+        let scope = self.context.scope.clone();
+        let run = crate::workflow::CardRun {
+            from: &from,
+            agent: &config.id,
+            root: &deps.drive_root,
+            zone: &zone,
+            run_offer: &run_offer,
+            scope: &scope,
+            label: self.context.label.clone(),
+            sinks: &sinks,
+            drive_readers: Readers::Only(deps.home.drive.readers.clone()),
+        };
+        let opened = match self.delegations.clone() {
+            Some(port) => {
+                let parent = OwnLog(Mutex::new((&mut self.context, &mut self.writer)));
+                off_the_runtime(|| {
+                    crate::workflow::for_card(
+                        port.as_ref(),
+                        &parent,
+                        &run,
+                        name,
+                        card,
+                        window,
+                        body,
+                    )
+                })
+            }
+            None => Err(delegate::NO_ROOMS.to_owned()),
+        };
+        let Err(sentence) = opened else {
+            return Ok(Outcome::Scheduled(LogRun::Running));
+        };
+        tracing::warn!(session = %self.context.session.path, card, %sentence, "agents: a workflow card's run was refused");
+        let (zone, session) = (
+            deps.sessions_zone.clone(),
+            self.context.session.path.clone(),
+        );
+        let lease = self.writer.lease();
+        let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
+        if let Err(error) = off_the_runtime(|| {
+            cards::write_run(&zone, &session, card, Run::Failed, None, &may_write)
+        }) {
+            tracing::warn!(%session, card, %error, "agents: a workflow card could not be set failed");
+        }
+        self.writer.write(
+            &mut self.context,
+            None,
+            None,
+            LineBody::Run(RunBody {
+                state: LogRun::Failed,
+                detail: Some(sentence),
+                step: None,
+            }),
+        )?;
+        off_the_runtime(|| self.writer.sync())?;
+        Ok(Outcome::Scheduled(LogRun::Failed))
     }
 
     /// End the run of the scheduled card `card` as its turn — the run's own
@@ -2664,6 +2986,7 @@ impl ServedSession {
                     LineBody::Run(RunBody {
                         state,
                         detail: None,
+                        step: None,
                     }),
                 )?;
                 off_the_runtime(|| self.writer.sync())?;
@@ -2676,7 +2999,7 @@ impl ServedSession {
     }
 
     /// The session as its `delegate` and `reply` tools and its briefs name it.
-    fn delegator(&self, deps: &AgentDeps) -> Delegator {
+    pub fn delegator(&self, deps: &AgentDeps) -> Delegator {
         let config = &deps.home.config;
         Delegator {
             user: config.matrix_user.clone(),
@@ -2773,6 +3096,10 @@ impl ServedSession {
             tracing::info!(session = %self.context.session.path, sender = %arrived.sender, note = NOT_ASKED, "agents: an answer is not taken");
             return Ok(Outcome::Ignored(NOT_ASKED));
         };
+        // A workflow's run refused on this host takes no answer either.
+        if self.run_ended() {
+            return Ok(Outcome::Ignored(RUN_MOVED_ON));
+        }
         self.go_on(deps, port, arrived, stop, open.card).await
     }
 
@@ -2817,6 +3144,7 @@ impl ServedSession {
             LineBody::Run(RunBody {
                 state: keeper_core::agents::log::RunState::Running,
                 detail: None,
+                step: None,
             }),
         )?;
         let (zone, path) = (
@@ -2839,6 +3167,283 @@ impl ServedSession {
             self.finish_scheduled(deps, &card, ran.as_ref().ok().map(|report| report.ending))?;
         }
         ran.map(Outcome::Answered)
+    }
+
+    /// Whether this session is a workflow's run that has ended: replied
+    /// (`review`) or refused (`failed`). It takes no more turns.
+    fn run_ended(&self) -> bool {
+        self.context.run_ended()
+    }
+
+    /// Whether a workflow's run may take a host-made turn now (R106, R202):
+    /// it began and has not ended, no ask of it waits for its answer, it is
+    /// not blocked on a person and no call of it waits for a decision.
+    fn may_go_on(&self) -> bool {
+        self.context.accepted
+            && !self.run_ended()
+            && self.context.asks.is_empty()
+            && self.context.run != Some(keeper_core::agents::log::RunState::Blocked)
+            && !self.waiting()
+    }
+
+    /// What a workflow's run takes next as its worker starts (R104, R106,
+    /// R202): its first turn, from its card, while its log holds none; the
+    /// host step its last `run` line announced and no turn took — a
+    /// continuation, a resume — however the queue it went into was lost;
+    /// after a takeover closed an `interrupted` turn of it, a resume, its
+    /// `run` line written first, counted against the three and never while
+    /// an ask, a block or a park waits. A step whose anchor another host
+    /// left in the room is not begun again: the run says it waits for that
+    /// host's lines. Nothing for any other session, or a run that ended.
+    pub fn workflow_arrivals(&mut self, deps: &AgentDeps) -> Result<Vec<Arrived>, ServeError> {
+        use keeper_core::agents::log::RunState as LogRun;
+        use keeper_core::agents::workflow::CONTINUATIONS_PER_RUN;
+        if self.context.agent.kind != SessionKind::Workflow || self.run_ended() {
+            return Ok(Vec::new());
+        }
+        let step = if !self.context.accepted {
+            Some(WorkflowStep::Start)
+        } else if let Some(step) = self
+            .context
+            .pending_step
+            .as_deref()
+            .and_then(WorkflowStep::of_key)
+        {
+            Some(step)
+        } else if self.context.cut_off && self.may_go_on() {
+            let n = self.context.continuations + 1;
+            if n > CONTINUATIONS_PER_RUN {
+                tracing::info!(session = %self.context.session.path, "agents: a workflow's run cut short has no continuation left to resume with");
+                None
+            } else {
+                let step = WorkflowStep::Resume(n);
+                self.writer.write(
+                    &mut self.context,
+                    None,
+                    None,
+                    LineBody::Run(RunBody {
+                        state: LogRun::Running,
+                        detail: Some(format!(
+                            "resumed on {} after a takeover",
+                            deps.host.as_str()
+                        )),
+                        step: Some(step.key()),
+                    }),
+                )?;
+                off_the_runtime(|| self.writer.sync())?;
+                Some(step)
+            }
+        } else {
+            None
+        };
+        let Some(arrived) = step.and_then(|step| {
+            workflow_arrival(&deps.home.config.matrix_user, &self.context.agent.id, step)
+        }) else {
+            return Ok(Vec::new());
+        };
+        if self.context.step_began(&arrived.event_id) {
+            tracing::warn!(session = %self.context.session.path, step = %arrived.event_id, "agents: {BEGUN_ELSEWHERE}");
+            self.writer.write(
+                &mut self.context,
+                None,
+                None,
+                LineBody::Run(RunBody {
+                    state: LogRun::Waiting,
+                    detail: Some(BEGUN_ELSEWHERE.to_owned()),
+                    step: None,
+                }),
+            )?;
+            off_the_runtime(|| self.writer.sync())?;
+            return Ok(Vec::new());
+        }
+        Ok(vec![arrived])
+    }
+
+    /// The continuation a workflow's turn that just `ran` asks for (R106):
+    /// one whose rounds ran out — not one that asked, replied, hit a bound
+    /// or failed — while its run has continuations left and its budget is
+    /// not spent. Its `run` line, naming the step, is on the disk before the
+    /// step is queued, so a holder that starts later takes it (R202).
+    fn continue_run(&mut self, ran: &Ran) -> Result<Option<WorkflowStep>, ServeError> {
+        use keeper_core::agents::log::RunState as LogRun;
+        use keeper_core::agents::workflow::CONTINUATIONS_PER_RUN;
+        let goes_on = self.context.agent.kind == SessionKind::Workflow
+            && ran.ending == TurnEnding::Complete
+            && ran.exhausted
+            && self.may_go_on()
+            && self.context.continuations < CONTINUATIONS_PER_RUN
+            && self.context.token_bound().is_none();
+        if !goes_on {
+            return Ok(None);
+        }
+        let n = self.context.continuations + 1;
+        let step = WorkflowStep::Continue(n);
+        self.writer.write(
+            &mut self.context,
+            None,
+            None,
+            LineBody::Run(RunBody {
+                state: LogRun::Running,
+                detail: Some(format!("continuing, {n} of {CONTINUATIONS_PER_RUN}")),
+                step: Some(step.key()),
+            }),
+        )?;
+        off_the_runtime(|| self.writer.sync())?;
+        Ok(Some(step))
+    }
+
+    /// A step of this workflow's run (R104, R106): its first turn, its
+    /// brief the card's body, opened by `delegate accepted`, `run:
+    /// running` and a `peer` line in the agent's own name; or the host's
+    /// `continue`, its `run` line written as the step was made. A start for
+    /// a run that began, a step for one that ended, is nothing; so is a
+    /// continuation or a resume past the run's three, out of turn, or while
+    /// an ask, a block or a park waits (R202).
+    async fn workflow_step(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        mut arrived: Arrived,
+        stop: CancelSignal,
+    ) -> Result<Outcome, ServeError> {
+        use keeper_core::agents::log::RunState as LogRun;
+        use keeper_core::agents::workflow::{CONTINUATIONS_PER_RUN, CONTINUE};
+        if self.context.agent.kind != SessionKind::Workflow {
+            return Ok(Outcome::Ignored(NOT_A_WORKFLOW_STEP));
+        }
+        let Some(step) = arrived.content["do"]
+            .as_str()
+            .and_then(WorkflowStep::of_key)
+        else {
+            return Ok(Outcome::Ignored(NOT_A_WORKFLOW_STEP));
+        };
+        if self.run_ended() {
+            return Ok(Outcome::Ignored(RUN_MOVED_ON));
+        }
+        let text = match step {
+            WorkflowStep::Start if !self.context.accepted => {
+                let card = deps
+                    .sessions_zone
+                    .join(&self.context.session.path)
+                    .join(keeper_core::agents::delegation::CARD_FILE);
+                let Ok(text) = off_the_runtime(|| std::fs::read_to_string(&card)) else {
+                    tracing::warn!(session = %self.context.session.path, "agents: a workflow's run has no card to start from");
+                    return Ok(Outcome::Ignored(NOT_A_WORKFLOW_STEP));
+                };
+                let (_, body_at) = keeper_core::notes::frontmatter::Frontmatter::parse(&text);
+                self.writer.write(
+                    &mut self.context,
+                    None,
+                    None,
+                    LineBody::Run(RunBody {
+                        state: LogRun::Running,
+                        detail: None,
+                        step: None,
+                    }),
+                )?;
+                let (zone, path) = (
+                    deps.sessions_zone.clone(),
+                    self.context.session.path.clone(),
+                );
+                let lease = self.writer.lease();
+                let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
+                if let Err(error) = off_the_runtime(|| {
+                    delegate::set_card_run(&zone, &path, Run::Running, &may_write)
+                }) {
+                    tracing::warn!(session = %path, %error, "agents: a workflow's card could not be set running");
+                }
+                text.get(body_at..).unwrap_or_default().trim().to_owned()
+            }
+            WorkflowStep::Start => return Ok(Outcome::Ignored(RUN_MOVED_ON)),
+            WorkflowStep::Continue(n) | WorkflowStep::Resume(n) => {
+                let in_turn = n == self.context.continuations + 1 && n <= CONTINUATIONS_PER_RUN;
+                if !in_turn || !self.may_go_on() {
+                    return Ok(Outcome::Ignored(NOT_NOW));
+                }
+                CONTINUE.to_owned()
+            }
+        };
+        arrived.text = text;
+        self.turn(deps, port, arrived, stop)
+            .await
+            .map(Outcome::Answered)
+    }
+
+    /// A format-B run another host rendered (94.3 acceptance 8): its
+    /// generation's folder is under `workspace/`, which is not synced, so
+    /// a worker that does not find it renders it again before the run goes
+    /// on. The same answer — the same generation — and the run goes on; any
+    /// other, and the run ends `failed` with [`crate::workflow::SOURCES_CHANGED`]
+    /// on its `run` line and its card.
+    pub fn rerender(&mut self, deps: &AgentDeps) -> Result<(), ServeError> {
+        use keeper_core::agents::log::RunState as LogRun;
+        if self.context.agent.kind != SessionKind::Workflow || self.run_ended() {
+            return Ok(());
+        }
+        let session_dir = format!("{}/{}", deps.sessions_subfolder, self.context.session.path);
+        let bmad = crate::bmad::BmadTools::new(
+            deps.home.drive.id.clone(),
+            deps.drive_root.clone(),
+            drive_relative(&deps.drive_root, &deps.home.zone),
+            crate::bmad::SessionFolder {
+                zone: deps.sessions_zone.clone(),
+                path: self.context.session.path.clone(),
+                dir: session_dir,
+            },
+            self.context.agent.workflow.clone(),
+            self.context.skills.clone(),
+        );
+        // Every generation the run read, not only the last: each must read
+        // here as it did where it was rendered (R202).
+        let mut changed = false;
+        for (args, said) in self.context.rendered.clone() {
+            let entry = said
+                .strip_prefix(crate::bmad::READ_AND_FOLLOW)
+                .unwrap_or_default();
+            if deps.drive_root.join(entry).is_file() {
+                continue;
+            }
+            let wire = chat::ToolCall {
+                id: "rerender".to_owned(),
+                name: keeper_core::agents::workflow::BMAD_RENDER.to_owned(),
+                arguments: serde_json::from_str(&args).ok(),
+                arguments_raw: args,
+            };
+            let lease = self.writer.lease();
+            let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
+            let again = off_the_runtime(|| bmad.write(bmad.prepare(&wire), &may_write));
+            if !matches!(&again, ToolOutcome::Answered { text } if *text == said) {
+                changed = true;
+                break;
+            }
+            tracing::info!(session = %self.context.session.path, entry, "agents: a workflow's generation was rendered again on this host");
+        }
+        if !changed {
+            return Ok(());
+        }
+        let (zone, path) = (
+            deps.sessions_zone.clone(),
+            self.context.session.path.clone(),
+        );
+        let lease = self.writer.lease();
+        let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
+        if let Err(error) =
+            off_the_runtime(|| delegate::set_card_run(&zone, &path, Run::Failed, &may_write))
+        {
+            tracing::warn!(session = %path, %error, "agents: a workflow's card could not be set failed");
+        }
+        self.writer.write(
+            &mut self.context,
+            None,
+            None,
+            LineBody::Run(RunBody {
+                state: LogRun::Failed,
+                detail: Some(crate::workflow::SOURCES_CHANGED.to_owned()),
+                step: None,
+            }),
+        )?;
+        off_the_runtime(|| self.writer.sync())?;
+        Ok(())
     }
 
     /// Another agent's question for this proxy's person (R99, R101), routed
@@ -3067,10 +3672,29 @@ impl ServedSession {
                             artifacts: handed_over(&arrived.content),
                             label,
                         }),
+                        window: None,
                     }),
                 )?;
-                // The card it was handed on for goes to review with it.
-                if let Some(source) = delegate::source_of(open.args.as_deref()) {
+                // A workflow's run that replied takes a late child's reply
+                // as a record, never as a turn that reopens it (R202).
+                if self.run_ended() {
+                    off_the_runtime(|| self.writer.sync())?;
+                    return Ok(Outcome::Ignored(RUN_MOVED_ON));
+                }
+                // The card it was handed on for goes to review with it; so
+                // does a scheduled card whose window opened this workflow's
+                // run, while the card still names that window: a slower
+                // run of an older one keeps to its own (R202).
+                let source = match (&open.window, delegate::source_of(open.args.as_deref())) {
+                    (Some(window), _) => {
+                        self.names_window(deps, window).then(|| window.card.clone())
+                    }
+                    (None, Some(source)) if delegate::handed_from(&source).is_none() => {
+                        Some(source)
+                    }
+                    _ => None,
+                };
+                if let Some(source) = source {
                     let lease = self.writer.lease();
                     let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
                     let (zone, session) = (&deps.sessions_zone, &self.context.session.path);
@@ -3088,11 +3712,37 @@ impl ServedSession {
         }
     }
 
+    /// Whether this session's card `window.card` still names the window
+    /// `window.window` as its `last_run`: the run that window opened is the
+    /// card's latest.
+    fn names_window(
+        &self,
+        deps: &AgentDeps,
+        window: &keeper_core::agents::log::CardWindow,
+    ) -> bool {
+        let dir = deps.sessions_zone.join(&self.context.session.path);
+        let Ok(at) = DateTime::parse_from_rfc3339(&window.window) else {
+            return false;
+        };
+        off_the_runtime(|| cards::read_scheduled(&dir, &window.card))
+            .ok()
+            .flatten()
+            .is_some_and(|keys| {
+                matches!(&keys.last_run, Some(keeper_core::agents::card::Field::Read(last))
+                    if last.timestamp_millis() == at.timestamp_millis())
+            })
+    }
+
     /// The `peer` line of a reply whose receipt is logged and whose line is
     /// not, written now: the reply's label joined into the session's —
     /// readers narrowed, `local_only` and a lower integrity kept, another
     /// agent's words at most `agent` (R94) — then its words and its files.
+    /// A workflow's run that ended keeps a late reply as its receipt alone:
+    /// nothing it says opens a turn there (R202).
     fn peer_the_reply(&mut self) -> Result<Option<LogLine>, ServeError> {
+        if self.run_ended() {
+            return Ok(None);
+        }
         let Some((receipt, event, body)) = self.context.reply_unpeered.clone() else {
             return Ok(None);
         };
@@ -3234,6 +3884,7 @@ impl ServedSession {
                     state: DelegateState::Refused,
                     reason: Some(reason),
                     reply: None,
+                    window: None,
                 }),
             )?;
             off_the_runtime(|| self.writer.sync())?;
@@ -3267,6 +3918,7 @@ impl ServedSession {
                 state: DelegateState::Sent,
                 reason: None,
                 reply: None,
+                window: None,
             }),
         )?;
         off_the_runtime(|| self.writer.sync())?;
@@ -3537,6 +4189,8 @@ impl ServedSession {
             dispatch_chain: vec![person.clone(), config.matrix_user.clone()],
             limits: None,
             workflow: None,
+            checkpoints: None,
+            outputs: Vec::new(),
             created_at: chrono::Utc::now(),
         };
         let path = match off_the_runtime(|| {
@@ -3623,9 +4277,11 @@ impl ServedSession {
         port: &Arc<dyn EditPort>,
         bound: Option<BoundReached>,
     ) -> Result<(), ServeError> {
-        if self.context.agent.kind != SessionKind::Delegated
-            || self.context.run == Some(keeper_core::agents::log::RunState::Blocked)
-        {
+        let answers = matches!(
+            self.context.agent.kind,
+            SessionKind::Delegated | SessionKind::Workflow
+        );
+        if !answers || self.context.run == Some(keeper_core::agents::log::RunState::Blocked) {
             return Ok(());
         }
         let detail = match (bound, &self.context.agent.limits) {
@@ -3638,7 +4294,12 @@ impl ServedSession {
                 self.reply_bound(deps, port, &bound).await;
                 bound.word()
             }
-            (None, Some(limits)) if self.context.exchange_rounds >= limits.rounds_per_exchange => {
+            // A workflow's run takes no rounds from its requester: one
+            // brief, one reply (R104); only its budget blocks it.
+            (None, Some(limits))
+                if self.context.agent.kind == SessionKind::Delegated
+                    && self.context.exchange_rounds >= limits.rounds_per_exchange =>
+            {
                 "rounds"
             }
             _ => return Ok(()),
@@ -3661,6 +4322,7 @@ impl ServedSession {
             LineBody::Run(RunBody {
                 state: keeper_core::agents::log::RunState::Blocked,
                 detail: Some(detail.to_owned()),
+                step: None,
             }),
         )?;
         off_the_runtime(|| self.writer.sync())?;
@@ -3773,6 +4435,7 @@ impl ServedSession {
                         state: DelegateState::Accepted,
                         reason: None,
                         reply: None,
+                        window: None,
                     });
                     self.writer.write(&mut self.context, None, None, accepted)?;
                 }
@@ -3787,6 +4450,38 @@ impl ServedSession {
                     LineBody::Peer(PeerBody {
                         sender: arrived.sender.clone(),
                         text,
+                        ask: None,
+                        answers: None,
+                        artifacts: None,
+                    }),
+                )
+            }
+            // A workflow's run takes its brief from its card, in the agent's
+            // own name, accepted once as a delegated session takes its
+            // first brief (R104).
+            Arrival::Workflow => {
+                if !self.context.accepted {
+                    let accepted = LineBody::Delegate(DelegateBody {
+                        id: self.context.agent.id.to_string(),
+                        to: deps.home.config.matrix_user.to_string(),
+                        room: Some(self.context.agent.room.clone()),
+                        child: Some(ChildSession {
+                            drive: deps.home.config.drive.clone(),
+                            session: self.context.session.path.clone(),
+                        }),
+                        state: DelegateState::Accepted,
+                        reason: None,
+                        reply: None,
+                        window: None,
+                    });
+                    self.writer.write(&mut self.context, None, None, accepted)?;
+                }
+                (
+                    self.context.label.clone(),
+                    LabelCauseKind::AgentMessage,
+                    LineBody::Peer(PeerBody {
+                        sender: arrived.sender.clone(),
+                        text: arrived.text.clone(),
                         ask: None,
                         answers: None,
                         artifacts: None,
@@ -4219,6 +4914,10 @@ impl ServedSession {
                     LineBody::Assistant(AssistantBody {
                         text: if ran.ending == TurnEnding::Stopped {
                             format!("{}{}", ran.round_text, shutdown_suffix(deps.host.as_str()))
+                        } else if outcome.is_none() && ran.round_logged {
+                            // A run that replied, stopped at the gate: its
+                            // last round's prose is on that round's line.
+                            String::new()
                         } else {
                             ran.round_text.clone()
                         },
@@ -4309,6 +5008,13 @@ impl ServedSession {
         // it crossed parks the session as one the gate stopped would.
         let bound = ran.bound.or_else(|| self.context.token_bound());
         self.after_delegated_turn(deps, &port, bound).await?;
+        if let Some(step) = self.continue_run(&ran)? {
+            let me = &deps.home.config.matrix_user;
+            let next = workflow_arrival(me, &self.context.agent.id, step);
+            if let (Some(next), Some(inbox)) = (next, &self.inbox) {
+                inbox(next);
+            }
+        }
         self.say_waiting(&port, deps).await;
         // An ask whose proxy has not joined yet goes in on the clock.
         if self.context.asks.values().any(|open| !open.sent) {
@@ -4577,6 +5283,9 @@ struct Ran {
     bound: Option<BoundReached>,
     /// The call the turn parked on, when it did.
     parked: Option<crate::approvals::ParkedTurn>,
+    /// The tool loop's rounds ran out: its last completion was offered no
+    /// tools (R106).
+    exhausted: bool,
 }
 
 /// How a turn opens: on an arrival, or at a call that waited for a person.
@@ -4606,6 +5315,9 @@ struct TurnLog<'a> {
     broken: Option<String>,
     /// The parked call's `tool_call` line and wire call (R73).
     parked: Option<(Option<Ulid>, chat::ToolCall)>,
+    /// Why the round gate stopped a workflow's run before its next round:
+    /// it replied, or an ask read back from its log still waits (R202).
+    stopped: Option<TurnEnding>,
 }
 
 impl TurnView for Mutex<TurnLog<'_>> {
@@ -4648,6 +5360,60 @@ impl TurnView for Mutex<TurnLog<'_>> {
             .relays
             .get(id)
             .cloned()
+    }
+
+    fn ended(&self) -> bool {
+        self.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .context
+            .run_ended()
+    }
+}
+
+/// A session's own log, written by its worker outside a turn: what a
+/// scheduled card's window opens a workflow's run from (R202).
+struct OwnLog<'s>(Mutex<(&'s mut SessionContext, &'s mut SessionWriter)>);
+
+impl crate::workflow::Parent for OwnLog<'_> {
+    fn delegation(&self, id: &str) -> Option<Delegation> {
+        let log = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        log.0.delegations.get(id).cloned()
+    }
+
+    fn record(&self, line: LineBody) -> Result<(), String> {
+        let mut log = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let (context, writer) = &mut *log;
+        writer
+            .write(context, None, None, line)
+            .and_then(|_| writer.sync())
+            .map_err(|error| error.to_string())
+    }
+
+    fn may_write(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .1
+            .may_write()
+    }
+}
+
+impl crate::workflow::Parent for Mutex<TurnLog<'_>> {
+    fn delegation(&self, id: &str) -> Option<Delegation> {
+        TurnView::delegation(self, id)
+    }
+
+    fn record(&self, line: LineBody) -> Result<(), String> {
+        let mut log = self.lock().unwrap_or_else(|p| p.into_inner());
+        let log = &mut *log;
+        log.writer
+            .write(log.context, None, None, line)
+            .and_then(|_| log.writer.sync())
+            .map_err(|error| error.to_string())
+    }
+
+    fn may_write(&self) -> bool {
+        TurnView::may_write(self)
     }
 }
 
@@ -4704,36 +5470,126 @@ fn grant_read(grants: &dyn GrantSource, drive: &str, at: &str) -> Result<(), Str
     }
 }
 
-/// The `reply` a turn of `context` is offered: a delegated session's answer
-/// (R48), or — in the `main` or `conversation` of an agent of `kind`
-/// `proxy`, while a question another agent asked its person waits — the
-/// relay of that answer (R100).
-fn reply_offer(context: &SessionContext, kind: AgentKind) -> ReplyOffer {
-    let own = matches!(
-        context.agent.kind,
-        SessionKind::Main | SessionKind::Conversation
-    );
-    if context.agent.kind == SessionKind::Delegated {
+/// The `reply` a turn of a session of kind `session` is offered: the answer
+/// of a session that answers a requester — delegated, or a workflow's run
+/// (R48, R104) — or — in the `main` or `conversation` of an agent of
+/// `kind` `proxy`, while a question another agent asked its person waits
+/// (`relays_waiting`) — the relay of that answer (R100).
+fn reply_offer(session: SessionKind, relays_waiting: bool, kind: AgentKind) -> ReplyOffer {
+    let own = matches!(session, SessionKind::Main | SessionKind::Conversation);
+    if matches!(session, SessionKind::Delegated | SessionKind::Workflow) {
         ReplyOffer::Delegated
-    } else if kind == AgentKind::Proxy && own && !context.relays.is_empty() {
+    } else if kind == AgentKind::Proxy && own && relays_waiting {
         ReplyOffer::Relay
     } else {
         ReplyOffer::None
     }
 }
+
+/// What a turn of a session of kind `session` of the agent `config` is
+/// offered, its model offered `model_tools` (none: a model that calls no
+/// tools) under `grants`: the drive verbs `[tools].allow` names, then the
+/// agent's own tools — the surface, `delegate` and the card tools as
+/// `allow` says, `reply` by the session (R48, R100), the BMAD and skill
+/// tools where the home drive `home` reads (R195), `ask_human` by the
+/// session's kind (R102) and `workflow_start` outside a proxy's own
+/// conversation (AD-380). Arming and a workflow's start check both ask it
+/// (R202).
+fn agent_offer(
+    config: &keeper_core::agents::home::AgentConfig,
+    session: SessionKind,
+    relays_waiting: bool,
+    grants: &dyn GrantSource,
+    home: &str,
+    mut tools: Vec<chat::ToolSpec>,
+) -> Vec<chat::ToolSpec> {
+    // Whether this model is offered tools at all: the surface tools ride on
+    // the same offer, and a model that cannot call tools is told of none.
+    if tools.is_empty() {
+        return tools;
+    }
+    tools.retain(|spec| config.allow.contains(&spec.name));
+    tools.extend(crate::surface::specs(&crate::surface::offered(config)));
+    tools.extend(delegate::specs(
+        config.allow.iter().any(|name| name == delegate::DELEGATE),
+        reply_offer(session, relays_waiting, config.kind),
+    ));
+    tools.extend(crate::cards::specs(&config.allow));
+    // The BMAD and skill tools read the home drive: they are offered only
+    // where its grant would let a `drive_read` of it run (R195).
+    if grant_read(grants, home, "").is_ok() {
+        tools.extend(keeper_core::agents::workflow::specs(&config.allow));
+    }
+    if keeper_core::agents::ask::offered(config.kind, session) {
+        tools.push(keeper_core::agents::workflow::ask_spec());
+    }
+    let in_the_dm = config.kind == AgentKind::Proxy
+        && matches!(session, SessionKind::Main | SessionKind::Conversation);
+    if !in_the_dm
+        && config
+            .allow
+            .iter()
+            .any(|name| name == keeper_core::agents::workflow::WORKFLOW_START)
+    {
+        tools.push(keeper_core::agents::workflow::start_spec());
+    }
+    tools
+}
+
+/// The wire names a turn of a workflow's run of this agent, working in
+/// `drives`, would be offered: [`agent_offer`] for a session of kind
+/// `workflow` under its own grants, its model offered `model_tools` —
+/// what its start is checked against (R202).
+fn workflow_offer(
+    deps: &AgentDeps,
+    model_tools: &[chat::ToolSpec],
+    drives: &[String],
+) -> Vec<String> {
+    let config = &deps.home.config;
+    let grants = AgentGrants::new(
+        &deps.row.provider.id,
+        &deps.bot.id,
+        &config.drives,
+        drives,
+        &config.allow,
+    );
+    agent_offer(
+        config,
+        SessionKind::Workflow,
+        false,
+        &grants,
+        &deps.home.drive.id,
+        model_tools.to_vec(),
+    )
+    .into_iter()
+    .map(|spec| spec.name)
+    .collect()
+}
+
 /// Arm one turn of `context`'s agent: its own grants, its history, and only
-/// the tools in `[tools].allow`. The system message is not in it yet: it is
-/// [`SessionContext::compose`] over the returned context bundle.
+/// the tools [`agent_offer`] offers. The system message is not in it yet:
+/// it is [`SessionContext::compose`] over the returned context bundle.
 pub async fn arm_agent(
     context: &SessionContext,
     deps: &AgentDeps,
     probe: Probe,
 ) -> crate::turn::Armed {
+    arm_session(context, deps, context.messages.clone(), probe)
+        .await
+        .0
+}
+
+/// [`arm_agent`] over `messages`, and the tools its model was offered
+/// before the agent's own offer: what a workflow's run of it would be
+/// offered too.
+async fn arm_session(
+    context: &SessionContext,
+    deps: &AgentDeps,
+    messages: Vec<ChatMessage>,
+    probe: Probe,
+) -> (crate::turn::Armed, Vec<chat::ToolSpec>) {
     let config = &deps.home.config;
     let grants = agent_grants(context, deps);
-    // The BMAD and skill tools read the home drive: they are offered only
-    // where its grant would let a `drive_read` of it run (R195).
-    let reads_home = grant_read(grants.as_ref(), &deps.home.drive.id, "").is_ok();
     let origin = TurnOrigin::Agent {
         session: context.session.clone(),
     };
@@ -4743,50 +5599,22 @@ pub async fn arm_agent(
         &deps.row,
         &deps.bot,
         &deps.bot.target,
-        context.messages.clone(),
-        grants,
+        messages,
+        Arc::clone(&grants),
         &move |_| origin.clone(),
         probe == Probe::Ask,
     )
     .await;
-    // Whether this model is offered tools at all: the surface tools ride on
-    // the same offer, and a model that cannot call tools is told of none.
-    let tools_offered = !armed.request.tools.is_empty();
-    armed
-        .request
-        .tools
-        .retain(|spec| config.allow.contains(&spec.name));
-    // The surface, `delegate`, `reply` and `ask_human` tools are the agent's
-    // own, never a drive verb's spec: `delegate` as `[tools].allow` says,
-    // `reply` by the session (R48, R100) and `ask_human` by the session's
-    // kind (R102), whatever it says.
-    if tools_offered {
-        armed
-            .request
-            .tools
-            .extend(crate::surface::specs(&crate::surface::offered(config)));
-        armed.request.tools.extend(delegate::specs(
-            config.allow.iter().any(|name| name == delegate::DELEGATE),
-            reply_offer(context, config.kind),
-        ));
-        armed
-            .request
-            .tools
-            .extend(crate::cards::specs(&config.allow));
-        if reads_home {
-            armed
-                .request
-                .tools
-                .extend(keeper_core::agents::workflow::specs(&config.allow));
-        }
-        if keeper_core::agents::ask::offered(config.kind, context.agent.kind) {
-            armed
-                .request
-                .tools
-                .push(keeper_core::agents::workflow::ask_spec());
-        }
-    }
-    armed
+    let model_tools = std::mem::take(&mut armed.request.tools);
+    armed.request.tools = agent_offer(
+        config,
+        context.agent.kind,
+        !context.relays.is_empty(),
+        grants.as_ref(),
+        &deps.home.drive.id,
+        model_tools.clone(),
+    );
+    (armed, model_tools)
 }
 
 /// The `open` line for `composed`.
@@ -4826,7 +5654,8 @@ async fn run_agent_turn(
 ) -> Ran {
     let config = &deps.home.config;
     let local = deps.model_is_local();
-    let mut armed = arm_agent(context, deps, Probe::Ask).await;
+    let (mut armed, model_tools) =
+        arm_session(context, deps, context.messages.clone(), Probe::Ask).await;
     let failed = |error: String| Ran {
         ending: TurnEnding::Failed,
         outcome: None,
@@ -4837,6 +5666,7 @@ async fn run_agent_turn(
         error: Some(error),
         bound: None,
         parked: None,
+        exhausted: false,
     };
 
     // What the prompt carries beyond the conversation — the home's frozen
@@ -4931,8 +5761,33 @@ async fn run_agent_turn(
         context.agent.workflow.clone(),
         context.skills.clone(),
     );
-    let reply = reply_offer(context, config.kind);
+    let reply = reply_offer(context.agent.kind, !context.relays.is_empty(), config.kind);
     let asks_offered = keeper_core::agents::ask::offered(config.kind, context.agent.kind);
+    let unattended =
+        context.agent.checkpoints == Some(keeper_core::agents::session::Checkpoints::Unattended);
+    // A session that asks a person and finds nobody to ask is one nobody
+    // watches, whatever its kind (R102, R103, R202): R83's raise holds.
+    let known = tools
+        .delegations
+        .as_ref()
+        .map_or_else(|| Arc::new(rooms::Known::default()), |port| port.known());
+    let nobody_to_ask =
+        asks_offered && !crate::ask::can_ask(&tools.from.chain, &tools.from.user, &known);
+    let agents_zone = drive_relative(&deps.drive_root, &deps.home.zone);
+    // A workflow's run checks at its reply the outputs it declared as it
+    // opened, whatever its header says now (R107, R202).
+    let outputs = context.agent.outputs.clone();
+    let workflow_roots: Vec<(String, PathBuf)> = profiles
+        .iter()
+        .map(|profile| (profile.id.clone(), profile.local_path.clone()))
+        .collect();
+    let offered_names: Vec<String> = armed
+        .request
+        .tools
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect();
+    let scope = context.scope.clone();
     let log = Mutex::new(TurnLog {
         context,
         writer,
@@ -4947,6 +5802,7 @@ async fn run_agent_turn(
         round_usage: Usage::default(),
         broken: None,
         parked: None,
+        stopped: None,
     });
     let host = AllowedTools {
         inner: drive_host,
@@ -4966,9 +5822,28 @@ async fn run_agent_turn(
             Arc::clone(&tools.gate),
             &log,
             asks_offered,
+            unattended,
             &tools.sinks,
             tools.scheduled.clone(),
         ),
+        workflows: crate::workflow::WorkflowTools {
+            from: tools.from.clone(),
+            port: tools.delegations.clone(),
+            view: &log,
+            parent: &log,
+            agent: config.id.clone(),
+            kind: config.kind,
+            root: deps.drive_root.clone(),
+            zone: agents_zone,
+            roots: workflow_roots,
+            offered: offered_names,
+            run_offer: Box::new(move |drives: &[String]| {
+                workflow_offer(deps, &model_tools, drives)
+            }),
+            scope,
+            sinks: &tools.sinks,
+            drive_readers: Readers::Only(deps.home.drive.readers.clone()),
+        },
         delegation: DelegateTools::new(
             tools.from,
             tools.delegations,
@@ -4977,7 +5852,8 @@ async fn run_agent_turn(
             config.allow.iter().any(|name| name == delegate::DELEGATE),
             reply,
             &tools.sinks,
-        ),
+        )
+        .with_outputs(outputs),
         view: &log,
         sinks: &tools.sinks,
         drives: &deps.drives,
@@ -4990,6 +5866,7 @@ async fn run_agent_turn(
         parks: deps.decisions.is_some(),
         bound: Mutex::new(None),
         parked: Mutex::new(None),
+        nobody_to_ask,
     };
     let tool_loop = ToolLoop {
         client: &client,
@@ -5244,6 +6121,21 @@ async fn run_agent_turn(
                 detail: crate::ask::ASKED.to_owned(),
             });
         }
+        // A workflow's run that replied ends at its reply, and one whose ask
+        // read back from its log still waits goes no further before the
+        // answer: no model round runs on (R202).
+        if log.context.run_ended() {
+            log.stopped = Some(TurnEnding::Complete);
+            return Err(BotsError::Tool {
+                detail: RUN_ENDED.to_owned(),
+            });
+        }
+        if log.context.agent.kind == SessionKind::Workflow && !log.context.asks.is_empty() {
+            log.stopped = Some(TurnEnding::Asked);
+            return Err(BotsError::Tool {
+                detail: crate::ask::ASKED.to_owned(),
+            });
+        }
         if let Some(bound) = log.context.token_bound() {
             log.bound = Some(bound);
             return Err(BotsError::Tool {
@@ -5341,7 +6233,9 @@ async fn run_agent_turn(
     let round_text = log.round_text;
     let prompt_sha256 = Some(composed.prompt_sha256);
     let bound = log.bound;
+    let stopped = log.stopped;
     let waits = parked.is_some();
+    let exhausted = matches!(&result, Some(Ok(done)) if done.exhausted);
     let ran =
         move |ending: TurnEnding, outcome: Option<chat::ChatOutcome>, error: Option<String>| Ran {
             ending,
@@ -5353,6 +6247,7 @@ async fn run_agent_turn(
             error,
             bound,
             parked,
+            exhausted,
         };
     if let Some(error) = log.failure {
         return ran(TurnEnding::Failed, None, Some(error.to_string()));
@@ -5380,8 +6275,11 @@ async fn run_agent_turn(
         }
         Some(Err(_)) if log.local_only => ran(TurnEnding::LocalOnly, None, None),
         Some(Err(_)) if asked => ran(TurnEnding::Asked, None, None),
-        Some(Err(_)) if bound.is_some() => ran(TurnEnding::Bounded, None, None),
-        Some(Err(error)) => ran(TurnEnding::Failed, None, Some(error.to_string())),
+        Some(Err(error)) => match stopped {
+            Some(ending) => ran(ending, None, None),
+            None if bound.is_some() => ran(TurnEnding::Bounded, None, None),
+            None => ran(TurnEnding::Failed, None, Some(error.to_string())),
+        },
     }
 }
 

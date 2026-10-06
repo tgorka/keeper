@@ -178,6 +178,8 @@ fn session_agent(room: &OwnedRoomId, person: &OwnedUserId, mac: bool) -> Session
         dispatch_chain: Vec::new(),
         limits: None,
         workflow: None,
+        checkpoints: None,
+        outputs: Vec::new(),
         created_at: chrono::Utc::now(),
     }
 }

@@ -292,6 +292,10 @@ pub fn summary_of(tool: AgentTool, args: &Value) -> String {
         AgentTool::AskHuman => {
             "Ask the person this work is for a question, through their proxy".to_owned()
         }
+        AgentTool::WorkflowStart => format!(
+            "Start the workflow {} in a session of its own",
+            arg(args, "name")
+        ),
         AgentTool::SurfaceOpen => format!("Open `{path}` in {} on your screen", arg(args, "drive")),
         AgentTool::SurfaceHighlight => {
             format!(

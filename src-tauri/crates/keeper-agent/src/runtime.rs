@@ -1135,8 +1135,9 @@ async fn serve_session(
     // copy of this agent already answered is not asked again.
     let answered = answered_by(&events, me);
     backlog.retain(|arrived| !answered.contains(arrived.event_id.as_str()));
-    // A harvest another copy started — its anchor is in the room — is not
-    // started again, though its `peer` line never reached this log.
+    // A harvest or a workflow step another copy started — its anchor is in
+    // the room — is not started again, though its `peer` line never reached
+    // this log (R202).
     served.context.started(answered.iter().map(String::as_str));
     let trail = trail_of(&events, me, served.context.unanswered);
     match served.recover(deps, Arc::clone(&port), &trail).await {
@@ -1146,6 +1147,18 @@ async fn serve_session(
         Ok(false) => {}
         Err(error) => {
             tracing::error!(session = %session.path, %error, "agentd: the interrupted turn could not be closed")
+        }
+    }
+    // A workflow's run another host rendered renders here before it goes
+    // on; then its first turn, the host step its log announced, or its
+    // resume after a takeover (R106, R202).
+    if let Err(error) = served.rerender(deps) {
+        tracing::error!(session = %session.path, %error, "agentd: a workflow's run could not be checked against its generation");
+    }
+    match served.workflow_arrivals(deps) {
+        Ok(steps) => backlog.extend(steps),
+        Err(error) => {
+            tracing::error!(session = %session.path, %error, "agentd: a workflow's next step could not be logged")
         }
     }
     // What this session's delegations did while no worker served it.
@@ -1346,18 +1359,14 @@ impl DelegationPort for ClientRooms {
 
     fn create<'a>(
         &'a self,
+        kind: SessionKind,
         name: &'a str,
         invite: Vec<OwnedUserId>,
         agents: Vec<OwnedUserId>,
     ) -> RoomFuture<'a> {
         Box::pin(async move {
             self.client
-                .create_room(
-                    RoomKind::Session(SessionKind::Delegated),
-                    name,
-                    invite,
-                    &agents,
-                )
+                .create_room(RoomKind::Session(kind), name, invite, &agents)
                 .await
         })
     }
@@ -1711,14 +1720,19 @@ fn register_handlers(copy: &Arc<Copy>) {
                 }
                 // A room one of this agent's sessions delegated into: its
                 // target's join and reply go to that session, and nothing
-                // else of it to anyone (R55).
+                // else of it to anyone (R55). A workflow's run this agent
+                // started is served here too (R104): only its own reply
+                // goes to the session that started it, and everyone else's
+                // event — a proxy's answer — to the run's own worker.
                 let parent = copy
                     .children
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .get(room.room_id())
                     .map(|(parent, _)| parent.clone());
-                if let Some(parent) = parent {
+                let own_run = copy.router.serves(room.room_id())
+                    && value["sender"].as_str() != Some(copy.deps.home.config.matrix_user.as_str());
+                if let Some(parent) = parent.filter(|_| !own_run) {
                     if let Some(arrived) =
                         child_arrival(&value, encryption.as_ref(), room.room_id(), received_at)
                     {

@@ -669,7 +669,8 @@ keep them empty.
 A call that already needs a person (T2 or more) is held one tier stricter when:
 
 - the session was handed on: `kind = "delegated"`, or any hop of 1 or more (`delegated`);
-- nobody watches it run: `kind = "scheduled"` or `"gate"` (`unattended`);
+- nobody watches it run: `kind = "scheduled"` or `"gate"`, or a workflow's run stamped
+  `checkpoints = "unattended"` (`unattended`);
 - the session read outside content: its label's integrity is `untrusted` (`untrusted`);
 - its target is reached through a KVM (`kvm`; no tool of this build is).
 
@@ -980,6 +981,7 @@ tokens = 200000
 | `needs`, `pin` | the agent's | placement, as in the home's `[host]` |
 | `hop` | `0` | 0 to 3 |
 | `workflow` | none | a folder under `_workflows/` |
+| `checkpoints` | none | a `workflow` session's only: `proxy` or `unattended`, stamped once as its run opens (*Workflows*, below) |
 | `created_at` | required | RFC 3339 |
 | `[parent]` | none | `drive`, `session` (its folder, zone-relative) and `room` of the delegating session |
 | `[label]` | required | `readers` (`"*"` or Matrix ids), `integrity`, optional `local_only` |
@@ -1227,6 +1229,8 @@ February). The window it runs is the *latest* one at or before now, so a host aw
 runs an `@hourly` card once on return, not five times, and that window becomes `last_run`. An
 unreadable `schedule:` or `last_run:` never runs (the board shows the key unreadable). A card
 carrying `scheduled_by` never runs until a person's *Allow*; then its next due window runs once.
+A card naming a `workflow:` runs that workflow in a session of its own instead of a turn
+(*Workflows*, below).
 
 **Who.** The host holding the session's claim runs it, on its tick, and only while placement picks
 that host: a holder kept for the session's messages while placement waits — a need it no longer
@@ -2147,6 +2151,134 @@ only while this host holds the session's claim.
   and the cut is said; a character the cut falls inside is left out. A file with a byte that is
   not UTF-8 is refused as not text, wherever the byte is.
 
+### `workflow.toml`
+
+A folder `_workflows/<name>/` is a workflow when it holds a BMAD skill as written and a
+`workflow.toml` header beside it; a folder without one is listed as "not a workflow: no
+workflow.toml". The header is closed — an unknown key is refused by name, as is any rule below —
+and only a person writes it (`_workflows/` is a person's, like the rest of the zone).
+
+```toml
+version = 1
+name = "bmad-create-epics-and-stories"
+description = "Break the PRD and architecture into epics and user stories."
+entry = "SKILL.md"
+tools = ["drive_read", "drive_glob", "session_write", "bmad_config", "ask_human"]
+drives = ["home"]
+checkpoints = "proxy"
+
+[[inputs]]
+name = "prd"
+type = "path"
+required = false
+
+[[outputs]]
+name = "epics"
+path = "_bmad-output/planning-artifacts/epics.md"
+
+[trigger]
+manual = true
+card = true
+```
+
+| key | default | rule |
+| --- | --- | --- |
+| `version` | required | `1`; any other is unreadable by this keeper |
+| `name` | required | the folder's name |
+| `description` | required | at most 280 characters |
+| `entry` | `SKILL.md` | a file inside the folder |
+| `[[inputs]]` | none | `name`, `type` (`text`, `path`, `drive` or `session`), `required` (`false`) |
+| `[[outputs]]` | none | `name`, `path` under the run's `artifacts/`; `{{date}}` (the day the run opened) and `{{slug}}` (the workflow's name) are the only tokens |
+| `tools` | none | names of the agents' vocabulary the run needs |
+| `drives` | `["home"]` | drive ids, or `home` |
+| `[trigger]` | `manual = true`, `card = true` | `manual = false` keeps `workflow_start` and the menus out, `card = false` keeps cards out; a `schedule` is refused — "a schedule is a workflow card's `schedule:`, never the workflow's" |
+| `checkpoints` | `proxy` | `proxy` or `unattended` |
+
+### A run
+
+A workflow runs in a session of its own, never as a brief to the agent that started it and never
+inside a proxy's DM. Its session is the starting agent's, `kind = "workflow"`, its `agent.toml`
+naming the workflow, the starting session as its `[parent]`, one hop deeper, the parent's dispatch
+chain and its `checkpoints`; its room holds the agent and the label's readers as observers; its
+card's body is the brief — the workflow, the entry to read and follow, the inputs and the declared
+outputs. The starting session logs `delegate opened` and `sent` and watches the room, so the run's
+`reply` comes home as a delegation's does. The host that holds the run's claim starts its first
+turn from its card, in the agent's own name.
+
+**`workflow_start({name, inputs?})`** (T1) starts one by its folder's name, or by a BMAD menu code
+or `skill:action` of the drive's `_bmad/_config/bmad-help.csv` when exactly one of the rows it
+names is a `_workflows/` folder; a name matching more than one is refused, naming them. It is
+offered as `[tools].allow` says, but never in a proxy's `main` or `conversation`: called there it
+is refused, "a workflow is started by delegation or a card, never inside the DM". Before anything
+is made, the workflow must let `workflow_start` start it, every tool it names must be one a turn of
+the run would be offered — what its agent is offered in a session of kind `workflow`, `reply` and
+`ask_human` included, a name `allow` gives that no tool answers yet not ("`bmad-build` needs `run`,
+which `amelia` is not allowed") — every drive it works in must be in scope, and every input is
+checked: a required one given, a `path` inside a drive the run works in (`<drive>:<path>`, or a
+path of the home drive), a `drive` in scope, a `session` the id of a session of the drive. The
+brief and its inputs land in the run's folder in the home drive, which every reader of that drive
+reads, whatever the run's label says: a session whose label keeps them from those readers parks
+on a declassification of exactly those bytes, as a write would, or is refused where nobody can
+decide. The run's id is derived from the calling session and the call's id, so the same call
+again — a replay, a resumed approval — names the session it opened and opens nothing.
+
+**Opening.** A run is opened under the starting session's claim, asked again under the zone's lock
+as its folder is made: a host that lost the claim while it waited makes no session. The room is
+named in the starting session's `delegate opened` before the folder exists, so an opening cut
+short goes on in that room, never a second one, and a run whose folder exists has the starting
+session's `opened` and `sent` written again from its own `agent.toml` where that log lacks them.
+
+**Cards.** A card of a scheduled session naming `workflow:` runs on its schedule as any scheduled
+card does (*Cards that run on a schedule*), but its window opens the workflow's run instead of a
+turn: no model is asked in the scheduled session, the card reads `run: running` with its
+`last_run`, and the run's id is derived from the session, the card and the window, so two hosts
+due in the same window open one session between them. The run's tools are checked as
+`workflow_start`'s are, and its brief against the home drive's readers. A workflow whose trigger
+says `card = false` ends the card `run: failed` with "`<name>` may not be started by a card". A
+card whose `workflow:` or `schedule:` an agent wrote carries `scheduled_by` and opens nothing until
+a person's *Allow*. When the run replies, the card goes to `review` while it still names the window
+that run opened: a slower run of an older window leaves the card to the newer one.
+
+**Checkpoints.** A BMAD halt or menu is an `ask_human` in the run (*Asking a person*). With
+`checkpoints = "proxy"` it reaches the person the work is for through their proxy, and the run goes
+on with the choice they picked. A run is stamped `checkpoints = "unattended"` when its workflow
+says so, when a scheduled card started it, or when nobody could be asked as it opened; the stamp is
+written once and holds for the run. An unattended run asks nobody — each question takes its
+default at once — and is unattended for *Work nobody is watching*.
+
+**Continuing.** A turn of a run that ends because its rounds ran out — not one that asked,
+replied, hit a bound or failed — is followed by one the host makes: `run: running` ("continuing,
+1 of 3") and a `peer` line `continue` in the agent's own name, at most three per run and within
+its token budget. The step's `run` line is on the disk before the step is queued, so a holder that
+starts later takes it, once, whatever became of the queue. After a takeover cut a turn of a run
+short, the new holder resumes it ("resumed on <host> after a takeover") as one of the three, and
+never while an ask of it, a block or a parked call waits. A step another host began — its anchor
+in the room — whose lines have not reached this host is not begun again: the run says `waiting`
+for them.
+
+**Closing.** A run closes at its `reply`, and takes no more effects: a later call of the same round
+is refused ("This workflow's run has replied: it ends here, and this call had no effect."), no
+model round follows, and a late reply of a delegation it made is kept as a receipt, never a turn.
+Each declared output — those stamped into the run's `agent.toml` (`outputs`) as it opened, whatever
+its `workflow.toml` says later — must then be a file under the run's `artifacts/`; each missing one
+is named in the reply and on the `run: review` line — "declared output
+`artifacts/_bmad-output/planning-artifacts/epics.md` was not written".
+
+**Another host.** A run moves with its session (*Which host answers*): the new holder replays the
+log and goes on from the run's own files. A format-B run's generations are under `workspace/`,
+which is not synced, so the new holder renders each one the run read again before it goes on; when
+one differs — the workflow's sources or the drive's `_bmad/` configuration changed — the run ends
+`failed` with "this workflow's sources or BMAD configuration changed since this run rendered them;
+start it again".
+
+**Seeded.** Seeding a steward (`keeper-agentd agents init`, *Set up agents*) writes
+`_workflows/triage/` and `_workflows/dispatch/`, each a BMAD-format `SKILL.md`, `steps/` and a
+`workflow.toml`, never over a file that is there, and the stewards' menus name them (`WT`, `WD`)
+beside their prompts. `WD` hands a card of the session it is given on as `source =
+"<session id>:<card>"`: the host binds that card to one delegation, so a second `WD` — or the
+session handing the card on itself — is told the first one's. `bmad-build` needs `run`, so it runs
+nowhere until `run` exists.
+
 ## Asking a person
 
 `ask_human({question, choices?, default?})` is how an agent asks the person its work is for — a
@@ -2160,7 +2292,9 @@ agent of a mounted drive with `kind = "proxy"` and that `human`), else through t
 pinned `[[trust]]` entry. With nobody to ask, the stated default is the answer at once —
 `{"answer": "Stop", "choice": "Stop", "by": "default"}` and an `ask defaulted` line — and with no
 default the call is refused: "No person can answer this run and the question names no default."
-A default is one of the choices when both are given.
+A default is one of the choices when both are given. A session in which nobody can be asked is
+unattended for *Work nobody is watching*, whatever its kind: a call that needs a person is raised
+for it, once.
 
 **The ask ends the turn.** The call checks the ask as a send into the person's DM with their proxy
 — a session the person does not read asks nobody — and into the session's room as it is now,

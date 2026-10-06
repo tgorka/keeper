@@ -131,7 +131,7 @@ pub fn specs(delegate: bool, reply: ReplyOffer) -> Vec<ToolSpec> {
                         "additionalProperties": false
                     },
                     "session": {"type": "string", "description": "An open delegation's id, to say more in its exchange."},
-                    "source": {"type": "string", "description": "The card in this session whose work this hands on, e.g. answer-x.md: it shows the delegation's progress, and handing it on again names the delegation it went to."}
+                    "source": {"type": "string", "description": "The card whose work this hands on: one of this session's, e.g. answer-x.md, whose run shows the delegation's progress, or another session's of this drive as <session id>:<card>. Handing a card on again names the delegation it went to."}
                 },
                 "required": ["agent", "brief"],
                 "additionalProperties": false
@@ -187,10 +187,12 @@ pub type BriefRoomFuture<'a> = Pin<Box<dyn Future<Output = Option<BriefRoom>> + 
 pub trait DelegationPort: Send + Sync {
     /// Every agent of a drive this host mounts.
     fn known(&self) -> Arc<Known>;
-    /// A delegated session room named `name`, made by the agent, `invite`
-    /// invited and `agents` at power 50.
+    /// A session room of `kind` — a delegation's, or a workflow's run
+    /// (R104) — named `name`, made by the agent, `invite` invited and
+    /// `agents` at power 50.
     fn create<'a>(
         &'a self,
+        kind: SessionKind,
         name: &'a str,
         invite: Vec<OwnedUserId>,
         agents: Vec<OwnedUserId>,
@@ -249,6 +251,8 @@ pub struct Delegation {
     pub replied: bool,
     /// Rounds sent since the last reply.
     pub rounds: u32,
+    /// A workflow's run a scheduled card started: that card and its window.
+    pub window: Option<keeper_core::agents::log::CardWindow>,
 }
 
 /// The session a turn runs in, as its `delegate` and `reply` read it.
@@ -287,6 +291,9 @@ pub trait TurnView: Sync {
     /// The question another agent asked this proxy's person, `id`, while it
     /// waits for its answer to be relayed (R100).
     fn relay(&self, id: &str) -> Option<crate::ask::Relay>;
+    /// Whether this session is a workflow's run that has ended — replied,
+    /// or failed: it takes no more effects (R202).
+    fn ended(&self) -> bool;
 }
 
 #[derive(Debug, Deserialize)]
@@ -322,13 +329,85 @@ fn parse_args(raw: &str) -> Result<DelegateArgs, String> {
 }
 
 /// The card a delegation's `delegate` call `args` handed on: its path in
-/// the delegating session, as the call named it.
+/// the delegating session, as the call named it, or `<session>:<card>`
+/// for a card of another session ([`handed_from`]).
 pub fn source_of(args: Option<&str>) -> Option<String> {
     parse_args(args?)
         .ok()?
         .source
         .map(|source| source.trim().to_owned())
         .filter(|source| !source.is_empty())
+}
+
+/// A `source` naming a card of another session of this drive — the session
+/// a dispatch run was given — as `<session id>:<card>`: that session's id
+/// and the card (R202). `None` for a card of the calling session.
+pub fn handed_from(source: &str) -> Option<(&str, &str)> {
+    let (session, card) = source.split_once(':')?;
+    session.parse::<Ulid>().ok()?;
+    Some((session, card))
+}
+
+/// What a card handed on already answers: its delegation, and how to say
+/// more in that exchange.
+fn handed_already(source: &str, id: &str) -> Option<ToolOutcome> {
+    Some(ToolOutcome::Answered {
+        text: format!(
+            "{source} was handed on already, as delegation {id}. To say more in that exchange, call delegate with session = {id}."
+        ),
+    })
+}
+
+/// The delegation the card `card` of the session at `session` (zone
+/// relative, its id `session_id`) was handed on as, read from the disk:
+/// by that session itself — a `delegate` call naming the card as its
+/// `source` — or, as [`keeper_core::agents::workflow::handoff_id`] names
+/// it, by any workflow run `me` opened in `zone` (R202). The host's
+/// binding: whichever run asks, a card is handed on once.
+fn handed_on(
+    zone: &Path,
+    me: &UserId,
+    session: &str,
+    session_id: &str,
+    card: &str,
+) -> Option<String> {
+    use keeper_core::agents::log::reader::read_session;
+    let handoff = keeper_core::agents::workflow::handoff_id(session_id, card).to_string();
+    let mut calls: std::collections::HashMap<Ulid, String> = std::collections::HashMap::new();
+    for line in read_session(&zone.join(session)).lines {
+        match &line.body {
+            LineBody::ToolCall(call) if call.tool == DELEGATE => {
+                calls.insert(line.id, call.args.clone());
+            }
+            LineBody::Delegate(body) if body.state == DelegateState::Opened => {
+                let named = line
+                    .parent
+                    .and_then(|parent| calls.get(&parent))
+                    .and_then(|args| source_of(Some(args)));
+                if named.as_deref() == Some(card) {
+                    return Some(body.id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    for rel in crate::sessions::scan::session_dirs(zone) {
+        let dir = zone.join(&rel);
+        let run = std::fs::read_to_string(dir.join(keeper_core::agents::session::FILE_NAME))
+            .ok()
+            .and_then(|text| keeper_core::agents::session::parse_session_agent_toml(&text).ok());
+        if !run.is_some_and(|run| run.kind == SessionKind::Workflow && run.requested_by == me) {
+            continue;
+        }
+        let opened = read_session(&dir).lines.into_iter().any(|line| {
+            matches!(&line.body, LineBody::Delegate(body)
+                if body.state == DelegateState::Opened && body.id == handoff)
+        });
+        if opened {
+            return Some(handoff);
+        }
+    }
+    None
 }
 
 /// The agent `name` names (R67): `<drive>/<id>`, or a bare id only when
@@ -644,6 +723,9 @@ pub struct DelegateTools<'t> {
     pub offer_reply: ReplyOffer,
     /// Where a send the label refuses is audited (R65).
     pub sinks: &'t Sinks,
+    /// A workflow's run: the outputs it declared, session-relative, each
+    /// checked when it replies (R107).
+    pub outputs: Vec<String>,
     lines: Mutex<Vec<LineBody>>,
 }
 
@@ -671,8 +753,14 @@ impl<'t> DelegateTools<'t> {
             view,
             offer_delegate,
             sinks,
+            outputs: Vec::new(),
             lines: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The outputs a workflow's run declared, checked at its reply.
+    pub fn with_outputs(self, outputs: Vec<String>) -> DelegateTools<'t> {
+        DelegateTools { outputs, ..self }
     }
 
     /// The `delegate` and `run` lines written since the last take: the
@@ -703,6 +791,7 @@ impl<'t> DelegateTools<'t> {
             state: DelegateState::Refused,
             reason: Some(reason.clone()),
             reply: None,
+            window: None,
         }));
         refused(reason)
     }
@@ -848,23 +937,40 @@ impl<'t> DelegateTools<'t> {
             .as_deref()
             .map(str::trim)
             .filter(|source| !source.is_empty());
+        // A card of another session — a dispatch run's input — is handed on
+        // as the one delegation its binding names, however many runs ask.
+        let mut handoff = None;
         if let Some(source) = source {
             // A card handed on already names its delegation, whichever day
             // asks again: its exchange goes on there.
             if let Some(open) = self.view.handed(source) {
-                return Some(ToolOutcome::Answered {
-                    text: format!(
-                        "{source} was handed on already, as delegation {}. To say more in that exchange, call delegate with session = {}.",
-                        open.id, open.id
-                    ),
-                });
+                return handed_already(source, &open.id);
             }
-            if let Err(sentence) = card_in(&self.from.zone, &self.from.session, source) {
-                return refused(sentence);
+            match handed_from(source) {
+                Some((session, card)) => {
+                    let Some(row) = crate::sessions::verbs::find(&self.from.zone, session) else {
+                        return refused(format!("{session} is no session of this drive."));
+                    };
+                    if let Err(sentence) = card_in(&self.from.zone, &row.path, card) {
+                        return refused(sentence.replace("this session", "that session"));
+                    }
+                    if let Some(id) =
+                        handed_on(&self.from.zone, &self.from.user, &row.path, session, card)
+                    {
+                        return handed_already(source, &id);
+                    }
+                    handoff =
+                        Some(keeper_core::agents::workflow::handoff_id(session, card).to_string());
+                }
+                None => {
+                    if let Err(sentence) = card_in(&self.from.zone, &self.from.session, source) {
+                        return refused(sentence);
+                    }
+                }
             }
         }
         // A resumed call approved for these bytes sends under the same id.
-        let id = audit.delegation_id(Ulid::new().to_string());
+        let id = audit.delegation_id(handoff.unwrap_or_else(|| Ulid::new().to_string()));
         let known = port.known();
         let target = match resolve(&known, &args.agent) {
             Ok(target) => target,
@@ -933,7 +1039,12 @@ impl<'t> DelegateTools<'t> {
             return self.withheld(&id, &to, None, withheld);
         }
         let name = session_title(&target.id, chrono::Utc::now());
-        let room = match block_on(port.create(&name, invites, vec![target.matrix_user.clone()])) {
+        let room = match block_on(port.create(
+            SessionKind::Delegated,
+            &name,
+            invites,
+            vec![target.matrix_user.clone()],
+        )) {
             Ok(room) => room,
             Err(error) => {
                 return self.refuse(
@@ -953,9 +1064,11 @@ impl<'t> DelegateTools<'t> {
             state: DelegateState::Opened,
             reason: None,
             reply: None,
+            window: None,
         }));
-        // The card it hands on says so, and is not handed on again.
-        if let Some(source) = source {
+        // The card it hands on says so, and is not handed on again; another
+        // session's card is that session's to write.
+        if let Some(source) = source.filter(|source| handed_from(source).is_none()) {
             let (zone, session) = (&self.from.zone, &self.from.session);
             if let Err(error) =
                 crate::cards::write_run(zone, session, source, Run::Running, None, &|| {
@@ -1089,6 +1202,7 @@ impl<'t> DelegateTools<'t> {
             state: DelegateState::Sent,
             reason: None,
             reply: None,
+            window: None,
         }));
         Some(ToolOutcome::Answered {
             text: format!("Sent to {to}."),
@@ -1119,9 +1233,22 @@ impl<'t> DelegateTools<'t> {
         let Some(port) = self.port.clone() else {
             return refused(NO_ROOMS);
         };
+        // A workflow's run closes at its reply: each output it declared and
+        // did not write is named in the reply and on its `run` line (R107).
+        let missing: Vec<String> = self
+            .outputs
+            .iter()
+            .filter(|path| artifact_in(&self.from.zone, &self.from.session, path).is_err())
+            .map(|path| keeper_core::agents::workflow::missing_output(path))
+            .collect();
+        let text = if missing.is_empty() {
+            text.to_owned()
+        } else {
+            format!("{text}\n\n{}.", missing.join(".\n"))
+        };
         let (me, requester) = (&self.from.user, &self.from.requester);
         let label = self.view.label();
-        let content = reply_content(text, handed, &label);
+        let content = reply_content(&text, handed, &label);
         let admitted = block_on(reply_verdict(
             port.as_ref(),
             self.sinks,
@@ -1157,16 +1284,21 @@ impl<'t> DelegateTools<'t> {
             state: DelegateState::Replied,
             reason: None,
             reply: None,
+            window: None,
         }));
+        // A workflow's run ends here, whatever becomes of its card: the line
+        // is the log's own word (R202).
         let (zone, session) = (self.from.zone.clone(), self.from.session.clone());
-        match set_card_run(&zone, &session, Run::Review, &|| self.view.may_write()) {
-            Ok(_) => self.line(LineBody::Run(RunBody {
+        let carded = set_card_run(&zone, &session, Run::Review, &|| self.view.may_write());
+        if let Err(error) = &carded {
+            tracing::warn!(%session, %error, "agents: a reply's card could not be set to review");
+        }
+        if carded.is_ok() || self.from.kind == SessionKind::Workflow {
+            self.line(LineBody::Run(RunBody {
                 state: RunState::Review,
-                detail: None,
-            })),
-            Err(error) => {
-                tracing::warn!(%session, %error, "agents: a reply's card could not be set to review");
-            }
+                detail: (!missing.is_empty()).then(|| missing.join("; ")),
+                step: None,
+            }));
         }
         Some(ToolOutcome::Answered {
             text: "Replied.".to_owned(),

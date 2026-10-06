@@ -151,6 +151,8 @@ pub fn session(
         dispatch_chain: vec![decl.owner.clone(), config.matrix_user.clone()],
         limits: None,
         workflow: None,
+        checkpoints: None,
+        outputs: Vec::new(),
         created_at: now.with_timezone(&chrono::Utc),
     }
 }

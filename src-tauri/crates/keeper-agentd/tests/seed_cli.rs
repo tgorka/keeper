@@ -188,6 +188,44 @@ fn the_catalogue_is_a_choice() {
     assert!(listing(&drive).is_empty());
 }
 
+/// 94.3 acceptance 10: seeding a steward writes `_workflows/triage/` and
+/// `_workflows/dispatch/`, each a valid `workflow.toml` (acceptance 1's
+/// grammar) beside its skill; run again it writes nothing, and a person's
+/// edited `SKILL.md` stays as they left it. Without a steward, none.
+#[test]
+fn agents_init_seeds_the_steward_workflows_without_overwriting() {
+    use keeper_core::agents::workflow::parse_workflow_toml;
+    let env = Env::new();
+    let drive = env.checkout();
+    let zone = drive.join("80-agents");
+    let out = init_into(&env, &drive, &["--bot", BOT, "--with", "tola-grey"]);
+    assert!(out.status.success(), "{}", text(&out));
+    for name in ["triage", "dispatch"] {
+        let folder = zone.join("_workflows").join(name);
+        let header = std::fs::read_to_string(folder.join("workflow.toml")).expect("workflow.toml");
+        let workflow = parse_workflow_toml(name, &header, &|rel| folder.join(rel).is_file())
+            .unwrap_or_else(|why| panic!("{name}: {why}"));
+        assert_eq!(workflow.entry, "SKILL.md");
+        assert!(folder.join("steps").is_dir(), "{name} has its steps");
+    }
+    let skill = zone.join("_workflows/triage/SKILL.md");
+    std::fs::write(&skill, "my own triage\n").expect("a person's edit");
+    let before = listing(&drive);
+    let again = init_into(&env, &drive, &["--bot", BOT, "--with", "tola-grey"]);
+    assert!(again.status.success(), "{}", text(&again));
+    assert_eq!(listing(&drive), before, "nothing new");
+    assert_eq!(
+        std::fs::read_to_string(&skill).expect("skill"),
+        "my own triage\n"
+    );
+
+    let env = Env::new();
+    let drive = env.checkout();
+    let out = init_into(&env, &drive, &["--bot", BOT, "--with", "nixi"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!drive.join("80-agents/_workflows").exists());
+}
+
 /// No `--bot` is Rust's refusal, the one *Set up agents* gives, and nothing
 /// is written (S-20).
 #[test]

@@ -1,0 +1,10 @@
+# keeper's header for this BMAD-format workflow (AD-398). A person's file:
+# edit it as you like; keeper never writes it again.
+version = 1
+name = "triage"
+description = "Sort what came into the drive into one card per piece of work, each with its assignee and who asked."
+tools = ["drive_list", "drive_read", "drive_grep", "session_write"]
+
+[[outputs]]
+name = "triage"
+path = "triage-{{date}}.md"

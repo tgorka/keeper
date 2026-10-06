@@ -399,6 +399,20 @@ fn world_read_by(
 ) -> World {
     let root = tempfile::tempdir().expect("tempdir");
     let tgdrive = root.path().join("tgdrive");
+    world_in(root, tgdrive, readers, kind, allow, script)
+}
+
+/// The world with tgdrive at `tgdrive` — a checkout, say — read by
+/// `readers`; its other drive and its data under `root`. A conversation
+/// already in the checkout is kept as it is.
+fn world_in(
+    root: tempfile::TempDir,
+    tgdrive: PathBuf,
+    readers: &[&str],
+    kind: ProviderKind,
+    allow: &[&str],
+    script: Vec<Completion>,
+) -> World {
     let private = root.path().join("private");
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).expect("data");
@@ -430,7 +444,14 @@ fn world_read_by(
     write(&tgdrive, "10-notes/a.md", "needle here\n");
     write(&tgdrive, "00-inbox/x.md", "from outside\n");
     write(&private, "diary.md", "dear diary\n");
-    session(&tgdrive, SESSION, &tg_decl);
+    if !tgdrive
+        .join("60-sessions")
+        .join(SESSION)
+        .join("agent.toml")
+        .exists()
+    {
+        session(&tgdrive, SESSION, &tg_decl);
+    }
 
     let tg_profile = profile("tgdrive", &tgdrive);
     let zone = read_zone("tgdrive", &tg_profile, Some(&tg_decl));
@@ -541,6 +562,8 @@ fn session_of(
         dispatch_chain: Vec::new(),
         limits: None,
         workflow: None,
+        checkpoints: None,
+        outputs: Vec::new(),
         created_at: chrono::Utc::now(),
     };
     write(
@@ -3150,6 +3173,8 @@ struct Delegations {
     /// Every invite, and every room a relay was sent into, to be left.
     invited: Mutex<Vec<(OwnedRoomId, OwnedUserId)>>,
     left: Mutex<Vec<OwnedRoomId>>,
+    /// The kind of each room made, in order.
+    kinds: Mutex<Vec<SessionKind>>,
 }
 
 impl Delegations {
@@ -3224,6 +3249,7 @@ impl DelegationPort for Delegations {
 
     fn create<'a>(
         &'a self,
+        kind: SessionKind,
         name: &'a str,
         invite: Vec<OwnedUserId>,
         agents: Vec<OwnedUserId>,
@@ -3233,6 +3259,7 @@ impl DelegationPort for Delegations {
             let room = OwnedRoomId::try_from(format!("!child{}:example.org", made.len() + 1))
                 .expect("room");
             made.push((name.to_owned(), invite, agents, room.clone()));
+            self.kinds.lock().expect("lock").push(kind);
             Ok(room)
         })
     }
@@ -4619,6 +4646,7 @@ async fn a_reply_whose_peer_line_was_lost_is_restored_from_its_receipt() {
                         artifacts: vec!["tgdrive/60-sessions/x/artifacts/report.md".to_owned()],
                         label: read.clone(),
                     }),
+                    window: None,
                 }),
             )
             .expect("the receipt");
@@ -7978,8 +8006,9 @@ mod parks {
 
     /// 93.4 AC4, inside the child, with a decision source: the twin of
     /// `an_action_needing_a_person_in_a_delegated_session_is_refused`.
-    /// Tola's write outside her session is T2 raised to T3 `[delegated]`;
-    /// it parks in her session — its record there, its request into her
+    /// Tola's write outside her session is T2 raised to T3 `[delegated]` —
+    /// tgorka's proxy can be asked, so the session is attended (R202); it
+    /// parks in her session — its record there, its request into her
     /// room — and the file is never written while it waits.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_action_needing_a_person_in_a_delegated_session_parks_with_a_source() {
@@ -7999,7 +8028,7 @@ mod parks {
         );
         let mut tola = tolas(&world, &["drive_read", "drive_write"]);
         tola.decisions = Some(Admit::pinned());
-        let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+        let rooms = Delegations::over(known_with_proxy());
         let (_nixi, child, brief) = handed_over(&mut world, &rooms).await;
         let path = world.create_child(&tola, &child, &read_brief(&brief).expect("a brief"));
         let mut tolas_session = world.child(&tola, &path, &rooms);
@@ -10867,6 +10896,70 @@ mod parks {
             );
         }
     }
+
+    /// R202 (R94W-13): a session that asks a person and finds nobody to
+    /// ask is unattended whatever its kind (R83 as R103 extends it). Tola's
+    /// delegated session, nobody to relay tgorka's answers: her write is
+    /// raised once, T2 to T3, for both reasons (R171); with Nixi to relay
+    /// them, for the hop alone. Her read stays T0 either way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_nobody_can_be_asked_in_is_raised_once() {
+        for relayed in [true, false] {
+            let mut world = super::world(
+                ProviderKind::OpenAi,
+                &["drive_read", "delegate"],
+                vec![
+                    hand_inbox(),
+                    prose("Handed on."),
+                    calls(&[
+                        (
+                            "r1",
+                            "drive_read",
+                            json!({"profile": "tgdrive", "path": "notes/hello.md"}),
+                        ),
+                        (
+                            "w1",
+                            "drive_write",
+                            json!({"profile": "tgdrive", "path": "notes/sorted.md", "content": "later"}),
+                        ),
+                    ]),
+                    prose("That needs tgorka."),
+                ],
+            );
+            let mut tola = tolas(&world, &["drive_read", "drive_write"]);
+            tola.decisions = Some(Admit::pinned());
+            let rooms = Delegations::over(if relayed {
+                known_with_proxy()
+            } else {
+                known(&[TGORKA, MARTA])
+            });
+            let (_nixi, child, brief) = handed_over(&mut world, &rooms).await;
+            let path = world.create_child(&tola, &child, &read_brief(&brief).expect("a brief"));
+            let mut session = world.child(&tola, &path, &rooms);
+            let arrived = world.brief(&brief);
+            report(serve_as(&tola, &mut session, &Arc::new(Room::default()), arrived).await);
+            let record = world.record_in(&path);
+            let raised: Vec<&str> = if relayed {
+                vec!["delegated"]
+            } else {
+                vec!["delegated", "unattended"]
+            };
+            assert_eq!(
+                (
+                    record.risk.tier,
+                    record.risk.base_tier,
+                    record.risk.raised_by.clone()
+                ),
+                (3, 2, raised.iter().map(|r| (*r).to_owned()).collect()),
+                "relayed: {relayed}"
+            );
+            assert_eq!(
+                line_tier(&world.lines(&path), "r1"),
+                0,
+                "relayed: {relayed}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -11652,4 +11745,2406 @@ async fn an_ask_waits_out_a_rate_limit_and_stops_at_a_permanent_refusal() {
     let closed = ask_lines(&world.lines(TOLAS_RUN)).pop().expect("a line");
     assert_eq!(closed.state, AskState::Refused);
     assert!(!tolas.holds_windows());
+}
+
+// ---------------------------------------------------------------------------
+// Story 94.3: workflow.toml, workflow cards, checkpoints through the proxy
+// ---------------------------------------------------------------------------
+
+mod workflows {
+    use super::*;
+    use keeper_agent::agent::{scheduled_arrival, TurnEnding};
+    use keeper_agent::cards::Scheduled;
+    use keeper_core::agents::ask::answer_content;
+    use keeper_core::agents::log::{AskState, RunState as LogRun};
+    use keeper_core::agents::session::Checkpoints;
+    use keeper_core::agents::workflow::{run_id, start_id, IN_THE_DM, NOT_A_WORKFLOW};
+
+    /// The format-C fixture: BMAD's `bmad-create-epics-and-stories`.
+    const EPICS: &str = "bmad-create-epics-and-stories";
+    /// The format-B fixture: BMAD's `bmad-build`.
+    const BUILD: &str = "bmad-build";
+    /// What the format-C fixture's step 2 halts at (G4 §3).
+    const STEP_2_MENU: &str =
+        "**Select an Option:** [A] Advanced Elicitation [P] Party Mode [C] Continue";
+    const STEP_2: &str =
+        "80-agents/_workflows/bmad-create-epics-and-stories/steps/step-02-design-epics.md";
+    const STEP_3: &str =
+        "80-agents/_workflows/bmad-create-epics-and-stories/steps/step-03-create-stories.md";
+    /// The format-C fixture's one declared output, session-relative.
+    const EPICS_MD: &str = "artifacts/_bmad-output/planning-artifacts/epics.md";
+    /// Dr Tola Grey's scheduled session, whose card tgorka wrote.
+    const DESK: &str = "active/2026-10-06-desk";
+    const DESK_ROOM: &str = "!desk:example.org";
+    const DESK_ID: &str = "01JA00000000000000000DESK0";
+    /// Every tool a fixture's run names, and `workflow_start`.
+    const RUNS: [&str; 8] = [
+        "drive_read",
+        "drive_glob",
+        "drive_write",
+        "session_write",
+        "bmad_config",
+        "bmad_render",
+        "bmad_memlog",
+        "workflow_start",
+    ];
+    /// Tola's desk card: hourly, last run at eight.
+    const HOURLY: &str = "schedule: \"@hourly\"\nlast_run: \"2026-10-05T08:00:00Z\"\n";
+
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("mkdir");
+        for entry in std::fs::read_dir(from).expect("a fixture") {
+            let entry = entry.expect("entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy");
+            }
+        }
+    }
+
+    /// The fixture `name` as tgdrive's workflow, its header as `header`
+    /// makes it of the fixture's.
+    fn install(world: &World, name: &str, header: &dyn Fn(&str) -> String) {
+        let dir = world.tgdrive.join("80-agents/_workflows").join(name);
+        copy_tree(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/workflows")
+                .join(name),
+            &dir,
+        );
+        let file = dir.join("workflow.toml");
+        let text = std::fs::read_to_string(&file).expect("the header");
+        std::fs::write(&file, header(&text)).expect("the header");
+    }
+
+    fn as_is(text: &str) -> String {
+        text.to_owned()
+    }
+
+    /// `text` with the root keys `keys` before its first table.
+    fn with_keys(text: &str, keys: &str) -> String {
+        let at = text.find("\n[").expect("a table") + 1;
+        format!("{}{keys}\n{}", &text[..at], &text[at..])
+    }
+
+    /// A workflow of tgdrive written here: `header` and a `SKILL.md`.
+    fn put(world: &World, name: &str, header: &str) {
+        write(
+            &world.tgdrive,
+            &format!("80-agents/_workflows/{name}/workflow.toml"),
+            header,
+        );
+        write(
+            &world.tgdrive,
+            &format!("80-agents/_workflows/{name}/SKILL.md"),
+            "---\nname: x\n---\n\nDo it.\n",
+        );
+    }
+
+    /// Tola, her scheduled session at [`DESK`] — tgorka's card, `keys` in
+    /// its frontmatter — and the rooms her host has.
+    struct Desk {
+        tola: AgentDeps,
+        rooms: Arc<Delegations>,
+        room: Arc<Room>,
+        served: ServedSession,
+    }
+
+    fn desk(world: &World, keys: &str) -> Desk {
+        desk_of(world, keys, tolas(world, &RUNS))
+    }
+
+    fn desk_of(world: &World, keys: &str, tola: AgentDeps) -> Desk {
+        let tg_decl = world.deps.drives["tgdrive"].clone();
+        let mut agent = session_of(
+            &world.tgdrive,
+            DESK,
+            &tg_decl,
+            "tola",
+            SessionKind::Scheduled,
+            DESK_ROOM,
+        );
+        agent.id = DESK_ID.parse().expect("a ULID");
+        // tgorka's card: whoever answers for him answers its checkpoints.
+        agent.dispatch_chain = vec![user(TGORKA)];
+        write(
+            &world.tgdrive,
+            &format!("60-sessions/{DESK}/agent.toml"),
+            &compose_session_agent_toml(&agent),
+        );
+        write(
+            &world.tgdrive,
+            &format!("60-sessions/{DESK}/README.md"),
+            &format!("---\nid: {DESK_ID}\n---\n\n# Epics\n"),
+        );
+        write(
+            &world.tgdrive,
+            &format!("60-sessions/{DESK}/card.md"),
+            &format!("---\ntags: [task]\ntitle: Epics\nstatus: todo\nassignee: tola\n{keys}---\n\nPlan the epics.\n"),
+        );
+        let rooms = Delegations::over(known_with_proxy());
+        rooms.rooms.lock().expect("lock").push((
+            OwnedRoomId::try_from(DESK_ROOM).expect("room"),
+            [TOLA, TGORKA, MARTA].iter().map(|u| user(u)).collect(),
+        ));
+        let mut served = world.open_as(&tola, DESK);
+        served.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+        Desk {
+            tola,
+            rooms,
+            room: Arc::new(Room::of(&[TOLA, TGORKA, MARTA])),
+            served,
+        }
+    }
+
+    fn ms(text: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .expect("an instant")
+            .timestamp_millis()
+    }
+
+    /// The desk card's window `window`, routed half an hour into it.
+    fn window(window: &str) -> Arrived {
+        scheduled_arrival(
+            &user(TOLA),
+            &Scheduled::Run {
+                card: "card.md".to_owned(),
+                window: window.to_owned(),
+                now_ms: ms(window) + 30 * 60_000,
+                utc_offset_minutes: 0,
+            },
+        )
+        .expect("an arrival")
+    }
+
+    /// The window at `hour` o'clock on 2026-10-05.
+    fn hour(hour: u32) -> Arrived {
+        window(&format!("2026-10-05T{hour:02}:00:00.000Z"))
+    }
+
+    fn start(call: &str, name: &str, inputs: Value) -> Completion {
+        calls(&[(
+            call,
+            "workflow_start",
+            json!({"name": name, "inputs": inputs}),
+        )])
+    }
+
+    impl Desk {
+        async fn serve(&mut self, arrived: Arrived) -> Outcome {
+            serve_as(&self.tola, &mut self.served, &self.room, arrived).await
+        }
+
+        fn id(&self) -> String {
+            self.served.context.agent.id.to_string()
+        }
+
+        /// The run the desk's call `call` opened, zone-relative.
+        fn run_of(&self, world: &World, call: &str) -> String {
+            let id = start_id(&self.id(), call).to_string();
+            keeper_agent::sessions::verbs::find(&world.deps.sessions_zone, &id)
+                .unwrap_or_else(|| panic!("the run: {:?}", tool_results(&world.lines(DESK))))
+                .path
+        }
+
+        /// The run at `path`, served by Tola's host with this desk's rooms;
+        /// its room holds Tola and the label's readers.
+        fn open_run(&self, world: &World, path: &str) -> (ServedSession, Arc<Room>) {
+            let served = world.open_as(&self.tola, path);
+            self.serving(served)
+        }
+
+        fn serving(&self, mut served: ServedSession) -> (ServedSession, Arc<Room>) {
+            let room = served.context.agent.room.clone();
+            let mut known = self.rooms.rooms.lock().expect("lock");
+            if !known.iter().any(|(r, _)| *r == room) {
+                known.push((
+                    room,
+                    [TOLA, TGORKA, MARTA].iter().map(|u| user(u)).collect(),
+                ));
+            }
+            served.delegations = Some(self.rooms.clone() as Arc<dyn DelegationPort>);
+            (served, Arc::new(Room::of(&[TOLA, TGORKA, MARTA])))
+        }
+    }
+
+    fn agent_toml(world: &World, path: &str) -> SessionAgent {
+        let text = std::fs::read_to_string(world.dir(path).join("agent.toml")).expect("agent.toml");
+        keeper_core::agents::session::parse_session_agent_toml(&text).expect("parse")
+    }
+
+    fn brief_of(world: &World, path: &str) -> String {
+        let text = std::fs::read_to_string(
+            world
+                .dir(path)
+                .join(keeper_core::agents::delegation::CARD_FILE),
+        )
+        .expect("the card");
+        let (_, body) = keeper_core::notes::frontmatter::Frontmatter::parse(&text);
+        text[body..].trim().to_owned()
+    }
+
+    fn desk_card(world: &World, key: &str) -> Option<String> {
+        let text = std::fs::read_to_string(world.dir(DESK).join("card.md")).expect("card");
+        keeper_core::notes::frontmatter::Frontmatter::parse(&text)
+            .0
+            .as_string(key)
+            .map(str::to_owned)
+    }
+
+    /// The first turn of `run`: from its card.
+    async fn begin(tola: &AgentDeps, run: &mut ServedSession, room: &Arc<Room>) -> Outcome {
+        let mut first = run.workflow_arrivals(tola).expect("steps");
+        assert_eq!(first.len(), 1, "one first turn");
+        serve_as(tola, run, room, first.remove(0)).await
+    }
+
+    fn results_of(lines: &[LogLine], call: &str) -> Vec<ToolResultBody> {
+        tool_results(lines)
+            .into_iter()
+            .filter(|result| result.call_id == call)
+            .collect()
+    }
+
+    /// 94.3 acceptance 3 (R104, AD-368): Tola's `workflow_start` of the
+    /// format-C fixture opens one session of kind `workflow` — its
+    /// `agent.toml` naming the workflow, the desk as its parent, one hop
+    /// deeper, tgorka's chain and `checkpoints = "proxy"` (Nixi answers for
+    /// him); its room the label's readers, watched by the desk; its card
+    /// the brief with the inputs; `delegate opened` and `sent` in the desk.
+    /// The same call id again opens nothing; another call id another run.
+    /// The run's first turn is its card's body, in Tola's own name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workflow_start_opens_one_session_per_call_id() {
+        let inputs = json!({"prd": "notes/hello.md"});
+        let world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                start("w1", EPICS, inputs.clone()),
+                prose("Started."),
+                start("w1", EPICS, inputs.clone()),
+                prose("Started already."),
+                start("w2", EPICS, inputs),
+                prose("Started again."),
+                prose("Reading the workflow."),
+            ],
+        );
+        install(&world, EPICS, &as_is);
+        let mut desk = desk(&world, HOURLY);
+        for at in [9, 10, 11] {
+            report(desk.serve(hour(at)).await);
+        }
+
+        let made = desk.rooms.made();
+        assert_eq!(made.len(), 2, "{made:?}");
+        assert_eq!(
+            *desk.rooms.kinds.lock().expect("lock"),
+            [SessionKind::Workflow, SessionKind::Workflow]
+        );
+        let (_, invites, agents, room) = made[0].clone();
+        assert_eq!(invites, vec![user(MARTA), user(TGORKA)]);
+        assert!(agents.is_empty());
+        assert!(desk.rooms.watched.lock().expect("lock").contains(&(
+            room.clone(),
+            OwnedRoomId::try_from(DESK_ROOM).expect("room")
+        )));
+
+        let path = desk.run_of(&world, "w1");
+        assert_ne!(path, desk.run_of(&world, "w2"));
+        let run = agent_toml(&world, &path);
+        assert_eq!(run.id, start_id(&desk.id(), "w1"));
+        assert_eq!(run.kind, SessionKind::Workflow);
+        assert_eq!(run.agent, "tola");
+        assert_eq!(run.workflow.as_deref(), Some(EPICS));
+        assert_eq!(run.checkpoints, Some(Checkpoints::Proxy));
+        assert_eq!(run.requested_by, user(TOLA));
+        assert_eq!(run.parent.as_ref().map(|p| p.session.as_str()), Some(DESK));
+        assert_eq!(run.hop, 1);
+        assert_eq!(run.dispatch_chain, vec![user(TGORKA)]);
+        assert_eq!(run.room, room);
+        let brief = brief_of(&world, &path);
+        assert!(
+            brief.contains(&format!(
+                "Read and follow 80-agents/_workflows/{EPICS}/SKILL.md."
+            )) && brief.contains("- prd (path): notes/hello.md"),
+            "{brief}"
+        );
+
+        let lines = world.lines(DESK);
+        assert_eq!(
+            delegate_lines(&lines)
+                .iter()
+                .map(|line| line.state)
+                .collect::<Vec<_>>(),
+            [
+                DelegateState::Opened,
+                DelegateState::Sent,
+                DelegateState::Opened,
+                DelegateState::Sent
+            ]
+        );
+        let again = results_of(&lines, "w1");
+        assert_eq!(again.len(), 2);
+        assert!(
+            again[1]
+                .content
+                .contains("was started by this call already"),
+            "{}",
+            again[1].content
+        );
+
+        // The run's first turn is its card, in Tola's own name.
+        let (mut run, room) = desk.open_run(&world, &path);
+        report(begin(&desk.tola, &mut run, &room).await);
+        let lines = world.lines(&path);
+        assert_eq!(delegate_lines(&lines)[0].state, DelegateState::Accepted);
+        let peer = peer_lines(&lines).remove(0);
+        assert_eq!((peer.sender, peer.text), (user(TOLA), brief));
+        assert_eq!(run_states(&lines)[0].0, LogRun::Running);
+        assert_eq!(card_field(&world, &path, "run").as_deref(), Some("running"));
+        assert!(
+            run.workflow_arrivals(&desk.tola).expect("steps").is_empty(),
+            "begun once"
+        );
+    }
+
+    /// 94.3 acceptance 2 and 3: every input is checked before anything is
+    /// made — a required one missing, a `path` not in the drive or leading
+    /// out of it or into a drive the run does not work in, a `drive` out of
+    /// scope, a `session` that is none — and so is the workflow: a folder
+    /// without its header, one whose trigger keeps `workflow_start` out
+    /// (R108), one needing a tool Tola is not allowed, a name nothing
+    /// answers to. Each is refused with its sentence; the one valid call
+    /// opens the one room, its brief carrying all four inputs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workflow_start_validates_its_inputs() {
+        let topic = |more: Value| {
+            let mut inputs = json!({"topic": "the inbox"});
+            for (key, value) in more.as_object().expect("object") {
+                inputs[key] = value.clone();
+            }
+            inputs
+        };
+        let unknown = ulid::Ulid::new().to_string();
+        let rows: Vec<(&str, &str, Value, String)> = vec![
+            ("v1", "intake", json!({}), "`intake` needs the input topic (text).".to_owned()),
+            (
+                "v2",
+                "intake",
+                topic(json!({"source": "notes/missing.md"})),
+                "`intake`'s input source: notes/missing.md is not in tgdrive.".to_owned(),
+            ),
+            (
+                "v3",
+                "intake",
+                topic(json!({"source": "private:diary.md"})),
+                "`intake`'s input source: private:diary.md is in private, which this run does not work in.".to_owned(),
+            ),
+            (
+                "v4",
+                "intake",
+                topic(json!({"drive": "neuradrive"})),
+                "`intake`'s input drive: neuradrive is not a drive in this session's scope.".to_owned(),
+            ),
+            (
+                "v5",
+                "intake",
+                topic(json!({"session": unknown})),
+                format!("`intake`'s input session: {unknown} is no session of this drive."),
+            ),
+            ("v6", "intake", topic(json!({"colour": "red"})), "`intake` declares no input colour.".to_owned()),
+            (
+                "v7",
+                "manual",
+                json!({}),
+                keeper_agent::workflow::not_by_hand("manual"),
+            ),
+            ("v8", "bare", json!({}), format!("_workflows/bare: {NOT_A_WORKFLOW}")),
+            (
+                "v9",
+                "builder",
+                json!({}),
+                "`builder` needs `run`, which `tola` is not allowed.".to_owned(),
+            ),
+            ("v10", "nowhere", json!({}), keeper_agent::workflow::not_found("nowhere")),
+        ];
+        let mut round: Vec<(&str, &str, Value)> = rows
+            .iter()
+            .map(|(id, name, inputs, _)| {
+                (
+                    *id,
+                    "workflow_start",
+                    json!({"name": name, "inputs": inputs}),
+                )
+            })
+            .collect();
+        round.push((
+            "out",
+            "workflow_start",
+            json!({"name": "intake", "inputs": {"topic": "the inbox", "source": "../escape.md"}}),
+        ));
+        round.push((
+            "ok",
+            "workflow_start",
+            json!({"name": "intake", "inputs": {"topic": "the inbox", "source": "notes/hello.md", "drive": "tgdrive", "session": DESK_ID}}),
+        ));
+        let world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                calls(&round[..6]),
+                calls(&round[6..]),
+                prose("One started."),
+            ],
+        );
+        put(
+            &world,
+            "intake",
+            "version = 1\nname = \"intake\"\ndescription = \"Take one thing in.\"\n\n[[inputs]]\nname = \"topic\"\ntype = \"text\"\nrequired = true\n\n[[inputs]]\nname = \"source\"\ntype = \"path\"\n\n[[inputs]]\nname = \"drive\"\ntype = \"drive\"\n\n[[inputs]]\nname = \"session\"\ntype = \"session\"\n",
+        );
+        put(
+            &world,
+            "manual",
+            "version = 1\nname = \"manual\"\ndescription = \"Cards only.\"\n\n[trigger]\nmanual = false\n",
+        );
+        put(
+            &world,
+            "builder",
+            "version = 1\nname = \"builder\"\ndescription = \"Builds.\"\ntools = [\"run\"]\n",
+        );
+        write(&world.tgdrive, "80-agents/_workflows/bare/SKILL.md", "x\n");
+        write(world.tgdrive.parent().expect("root"), "escape.md", "out\n");
+        let mut desk = desk(&world, HOURLY);
+        report(desk.serve(hour(9)).await);
+
+        let lines = world.lines(DESK);
+        let results = tool_results(&lines);
+        for (id, _, _, sentence) in &rows {
+            let result = result_of(&results, id);
+            assert_eq!(result.outcome, ToolOutcomeWord::Refused, "{id}");
+            assert_eq!(result.content, format!("Refused: {sentence}"), "{id}");
+        }
+        let out = result_of(&results, "out");
+        assert!(
+            out.content
+                .starts_with("Refused: `intake`'s input source: ../escape.md is refused: "),
+            "{}",
+            out.content
+        );
+        let ok = result_of(&results, "ok");
+        assert_eq!(ok.outcome, ToolOutcomeWord::Ok, "{}", ok.content);
+        assert_eq!(
+            desk.rooms.made().len(),
+            1,
+            "only the valid call made a room"
+        );
+        let brief = brief_of(&world, &desk.run_of(&world, "ok"));
+        for input in [
+            "- topic (text): the inbox".to_owned(),
+            "- source (path): notes/hello.md".to_owned(),
+            "- drive (drive): tgdrive".to_owned(),
+            format!("- session (session): {DESK_ID}"),
+        ] {
+            assert!(brief.contains(&input), "{brief}");
+        }
+    }
+
+    async fn offers_start(served: &ServedSession, deps: &AgentDeps) -> bool {
+        arm_agent(&served.context, deps, Probe::Skip)
+            .await
+            .request
+            .tools
+            .iter()
+            .any(|spec| spec.name == "workflow_start")
+    }
+
+    /// 94.3 acceptance 4 (AD-380): with `workflow_start` in Nixi's `allow`,
+    /// her DM is not offered it — Tola's desk is — and a call made anyway
+    /// is refused with the sentence; no room is made.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workflow_start_is_refused_in_a_proxy_dm() {
+        let mut world = world(
+            ProviderKind::OpenAi,
+            &["drive_read", "workflow_start"],
+            vec![start("w1", EPICS, json!({})), prose("Not here.")],
+        );
+        install(&world, EPICS, &as_is);
+        nixis_dm(&world);
+        let desk = desk(&world, HOURLY);
+        assert!(
+            offers_start(&desk.served, &desk.tola).await,
+            "a steward's desk is"
+        );
+        let rooms = Delegations::over(known_with_proxy());
+        let mut nixi = world.open(DM);
+        nixi.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+        assert!(!offers_start(&nixi, &world.deps).await, "the DM is not");
+        report(world.ask(&mut nixi, "run the epics workflow").await);
+        let result = result_of(&tool_results(&world.lines(DM)), "w1").clone();
+        assert_eq!(result.outcome, ToolOutcomeWord::Refused);
+        assert_eq!(result.content, format!("Refused: {IN_THE_DM}."));
+        assert!(rooms.made().is_empty());
+    }
+
+    /// The desk card naming the format-C fixture, `@daily`.
+    const DAILY: &str = "schedule: \"@daily\"\nlast_run: \"2026-10-05T00:00:00Z\"\nworkflow: bmad-create-epics-and-stories\n";
+    const OCT_6: &str = "2026-10-06T00:00:00.000Z";
+
+    /// 94.3 acceptance 5 (the epic's Q5): the desk's `@daily` card naming
+    /// the format-C fixture, when due, opens one workflow session instead
+    /// of a turn — no model is asked — its id from the card and the window,
+    /// unattended (R103), the card `running` with `last_run` set. A second
+    /// host whose copy of the card had not seen the window yet opens
+    /// nothing more: the run's id names the session already. The next
+    /// window opens a fresh session. A late reply of the older window's run
+    /// leaves the card to the newer one, still `running` (R202); the newer
+    /// run's reply sets it to `review`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workflow_card_runs_once_per_window_in_a_fresh_session() {
+        let mut world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                calls(&[("r1", "reply", json!({"text": "Epics planned."}))]),
+                prose("Noted."),
+                calls(&[("r2", "reply", json!({"text": "Epics planned again."}))]),
+                prose("Noted again."),
+            ],
+        );
+        install(&world, EPICS, &as_is);
+        let mut desk = desk(&world, DAILY);
+        let card_before = std::fs::read_to_string(world.dir(DESK).join("card.md")).expect("card");
+        let outcome = desk.serve(window(OCT_6)).await;
+        assert!(
+            matches!(outcome, Outcome::Scheduled(LogRun::Running)),
+            "{outcome:?} {:?}",
+            run_states(&world.lines(DESK))
+        );
+        assert_eq!(world.stub.hits.load(Ordering::SeqCst), 0, "no turn");
+        assert_eq!(desk.rooms.made().len(), 1);
+        assert_eq!(
+            *desk.rooms.kinds.lock().expect("lock"),
+            [SessionKind::Workflow]
+        );
+        let id = run_id(&desk.id(), "card.md", OCT_6).to_string();
+        let path = keeper_agent::sessions::verbs::find(&world.deps.sessions_zone, &id)
+            .expect("the run")
+            .path;
+        let run = agent_toml(&world, &path);
+        assert_eq!(
+            (run.kind, run.workflow.as_deref(), run.checkpoints),
+            (
+                SessionKind::Workflow,
+                Some(EPICS),
+                Some(Checkpoints::Unattended)
+            )
+        );
+        assert_eq!(run.parent.as_ref().map(|p| p.session.as_str()), Some(DESK));
+        assert!(brief_of(&world, &path).ends_with("The card card.md says:\nPlan the epics."));
+        assert_eq!(desk_card(&world, "run").as_deref(), Some("running"));
+        assert_eq!(
+            desk_card(&world, "last_run").map(|at| ms(&at)),
+            Some(ms(OCT_6))
+        );
+        assert_eq!(delegate_lines(&world.lines(DESK)).len(), 2);
+
+        // Another host, its copy of the card from before the window.
+        std::fs::write(world.dir(DESK).join("card.md"), &card_before).expect("card");
+        let mut there = world.open_as(&desk.tola, DESK);
+        there.delegations = Some(desk.rooms.clone() as Arc<dyn DelegationPort>);
+        let (_stop, signal) = chat::cancellation();
+        let outcome = there
+            .serve(&desk.tola, desk.room.clone(), window(OCT_6), signal)
+            .await
+            .expect("served");
+        assert!(matches!(outcome, Outcome::Scheduled(LogRun::Running)));
+        assert_eq!(desk.rooms.made().len(), 1, "one session between them");
+        assert_eq!(delegate_lines(&world.lines(DESK)).len(), 2);
+
+        // The next window: a fresh session.
+        assert!(matches!(
+            desk.serve(window("2026-10-07T00:00:00.000Z")).await,
+            Outcome::Scheduled(LogRun::Running)
+        ));
+        assert_eq!(desk.rooms.made().len(), 2);
+        let next = run_id(&desk.id(), "card.md", "2026-10-07T00:00:00.000Z").to_string();
+        assert_ne!(next, id);
+        assert!(keeper_agent::sessions::verbs::find(&world.deps.sessions_zone, &next).is_some());
+
+        // The first window's run replies late: the card is the second
+        // window's now, and stays as that run left it.
+        let reply_of = |room: &Arc<Room>, text: &str| {
+            room.sent()
+                .into_iter()
+                .find(|(_, content)| {
+                    content["body"]
+                        .as_str()
+                        .is_some_and(|b| b.starts_with(text))
+                })
+                .expect("the run's reply")
+                .1
+        };
+        let (mut run, room) = desk.open_run(&world, &path);
+        report(begin(&desk.tola, &mut run, &room).await);
+        let replied = world.reply(&run.context.agent.room, &reply_of(&room, "Epics planned."));
+        report(desk.serve(replied).await);
+        assert_eq!(desk_card(&world, "run").as_deref(), Some("running"));
+        assert_eq!(
+            desk_card(&world, "last_run").map(|at| ms(&at)),
+            Some(ms("2026-10-07T00:00:00.000Z"))
+        );
+
+        // The second window's run replies: its card is reviewed.
+        let newer = keeper_agent::sessions::verbs::find(&world.deps.sessions_zone, &next)
+            .expect("the run")
+            .path;
+        let (mut run, room) = desk.open_run(&world, &newer);
+        report(begin(&desk.tola, &mut run, &room).await);
+        let replied = world.reply(
+            &run.context.agent.room,
+            &reply_of(&room, "Epics planned again."),
+        );
+        report(desk.serve(replied).await);
+        assert_eq!(desk_card(&world, "run").as_deref(), Some("review"));
+    }
+
+    /// 94.3 acceptance 5 (R108): a card naming a workflow whose trigger says
+    /// `card = false` ends `run: failed` with the sentence, on its line and
+    /// its card; nothing is opened.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_card_naming_a_manual_only_workflow_fails_with_a_sentence() {
+        let world = world(ProviderKind::OpenAi, &["drive_read"], Vec::new());
+        install(&world, EPICS, &|text| {
+            format!("{text}\n[trigger]\ncard = false\n")
+        });
+        let mut desk = desk(&world, DAILY);
+        assert!(matches!(
+            desk.serve(window(OCT_6)).await,
+            Outcome::Scheduled(LogRun::Failed)
+        ));
+        assert_eq!(
+            run_states(&world.lines(DESK)).last().cloned(),
+            Some((
+                LogRun::Failed,
+                Some(format!("`{EPICS}` may not be started by a card"))
+            ))
+        );
+        assert_eq!(desk_card(&world, "run").as_deref(), Some("failed"));
+        assert!(desk.rooms.made().is_empty());
+        assert_eq!(world.stub.hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// 94.3 acceptance 5 (92.2, 92.3, S-21): Tola's write naming the
+    /// workflow on her desk card is stored with `scheduled_by` — the card
+    /// is not due, and its window opens nothing; once tgorka's *Allow*
+    /// removes the mark, the window opens the run once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agent_written_workflow_card_waits_for_a_persons_tick() {
+        let world = world(ProviderKind::OpenAi, &["drive_read"], Vec::new());
+        install(&world, EPICS, &as_is);
+        let plain = "schedule: \"@daily\"\nlast_run: \"2026-10-05T00:00:00Z\"\n";
+        let mut desk = desk(&world, plain);
+        let file = world.dir(DESK).join("card.md");
+        let old = std::fs::read_to_string(&file).expect("card");
+        let new = old.replace(
+            "assignee: tola\n",
+            "assignee: tola\nworkflow: bmad-create-epics-and-stories\n",
+        );
+        let stored = keeper_core::agents::card::stamp_agent_write(
+            Some(&old),
+            &new,
+            &user(TOLA),
+            Integrity::Agent,
+        );
+        std::fs::write(&file, &stored).expect("Tola's write");
+        assert_eq!(desk_card(&world, "scheduled_by").as_deref(), Some(TOLA));
+        let keys = keeper_core::agents::card::CardAgent::of_text(&stored).expect("keys");
+        assert_eq!(
+            keeper_agent::cards::due(&keys, ms(OCT_6) + 30 * 60_000, 0),
+            keeper_agent::cards::Due::Unticked
+        );
+        assert!(matches!(
+            desk.serve(window(OCT_6)).await,
+            Outcome::Ignored(_)
+        ));
+        assert!(desk.rooms.made().is_empty(), "no session before the tick");
+
+        let plan =
+            keeper_core::sessions::tasks::compile_allow_schedule(DESK, "card.md", &stored, TGORKA)
+                .expect("tgorka's Allow");
+        keeper_agent::sessions::exec::run(&world.deps.sessions_zone, plan).expect("allowed");
+        assert_eq!(desk_card(&world, "scheduled_by"), None);
+        assert!(matches!(
+            desk.serve(window(OCT_6)).await,
+            Outcome::Scheduled(LogRun::Running)
+        ));
+        assert_eq!(desk.rooms.made().len(), 1);
+        assert!(matches!(
+            desk.serve(window(OCT_6)).await,
+            Outcome::Ignored(_) | Outcome::Duplicate
+        ));
+        assert_eq!(desk.rooms.made().len(), 1, "once");
+    }
+
+    /// The run of the format-C fixture the desk's call `w1` opened, begun:
+    /// its first turn reads step 2 and asks its menu.
+    async fn asked_at_step_2(world: &mut World, desk: &Desk) -> (String, ServedSession, Arc<Room>) {
+        let path = desk.run_of(world, "w1");
+        let (mut run, room) = desk.open_run(world, &path);
+        let turn = report(begin(&desk.tola, &mut run, &room).await);
+        assert_eq!(turn.ending, TurnEnding::Asked);
+        (path, run, room)
+    }
+
+    /// The script up to the run's ask at step 2: the desk's start, then a
+    /// first turn that reads step 2 and asks its menu.
+    fn to_step_2() -> Vec<Completion> {
+        vec![
+            start("w1", EPICS, json!({})),
+            prose("Started."),
+            calls(&[(
+                "r2",
+                "drive_read",
+                json!({"profile": "tgdrive", "path": STEP_2}),
+            )]),
+            calls(&[(
+                "a1",
+                "ask_human",
+                json!({"question": STEP_2_MENU, "choices": ["A", "P", "C"], "default": "C"}),
+            )]),
+        ]
+    }
+
+    /// 94.3 acceptance 6 (`checkpoints = "proxy"`): the format-C run halts at
+    /// step 2's menu through `ask_human`; the question is tgorka's, through
+    /// Nixi, who is invited into the run's room and sent it once she
+    /// joined. Her relayed `C` resumes the run: the model is told the
+    /// choice and reads step 3.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_classic_checkpoint_reaches_the_requesters_proxy() {
+        let mut script = to_step_2();
+        script.extend([
+            calls(&[(
+                "r3",
+                "drive_read",
+                json!({"profile": "tgdrive", "path": STEP_3}),
+            )]),
+            prose("On to step 3."),
+        ]);
+        let mut world = world(ProviderKind::OpenAi, &["drive_read"], script);
+        install(&world, EPICS, &as_is);
+        let mut desk = desk(&world, HOURLY);
+        report(desk.serve(hour(9)).await);
+        let (path, mut run, room) = asked_at_step_2(&mut world, &desk).await;
+        let run_room = run.context.agent.room.clone();
+        let asks = ask_lines(&world.lines(&path));
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].state, AskState::Asked);
+        assert_eq!(asks[0].question.as_deref(), Some(STEP_2_MENU));
+        assert_eq!(
+            (asks[0].to.as_ref(), asks[0].via.as_ref()),
+            (Some(&user(TGORKA)), Some(&user(NIXI)))
+        );
+        assert!(run_states(&world.lines(&path)).contains(&(
+            LogRun::Blocked,
+            Some("waiting for tgorka, through Nixi".to_owned())
+        )));
+
+        // Tola's worker invites Nixi; the question waits for her join.
+        let port: Arc<dyn EditPort> = room.clone();
+        assert!(run.send_asks(&desk.tola, &port).await.is_empty());
+        assert!(
+            room.sent()
+                .iter()
+                .all(|(_, content)| keeper_core::agents::ask::read_ask(content).is_none()),
+            "nothing before the join"
+        );
+        assert!(desk
+            .rooms
+            .invited
+            .lock()
+            .expect("lock")
+            .contains(&(run_room.clone(), user(NIXI))));
+        desk.rooms
+            .joined
+            .lock()
+            .expect("lock")
+            .push((run_room.clone(), user(NIXI)));
+        run.send_asks(&desk.tola, &port).await;
+        let question = ask_content_of(&room);
+        assert_eq!(
+            question["body"]
+                .as_str()
+                .map(|b| b.contains("[C] Continue")),
+            Some(true)
+        );
+
+        let mut answer = world.event(NIXI, Arrival::Answer, answer_content("C", &asks[0].id));
+        answer.text = "C".to_owned();
+        let turn = report(serve_as(&desk.tola, &mut run, &room, answer).await);
+        assert_eq!(turn.ending, TurnEnding::Complete);
+        let lines = world.lines(&path);
+        let closed = ask_lines(&lines).pop().expect("the ask's close");
+        assert_eq!(
+            (closed.state, closed.choice.as_deref()),
+            (AskState::Answered, Some("C"))
+        );
+        let requests = world.stub.requests();
+        assert!(
+            requests[requests.len() - 2]
+                .to_string()
+                .contains("It picks the choice C."),
+            "{}",
+            requests[requests.len() - 2]
+        );
+        let step_3 = result_of(&tool_results(&lines), "r3").clone();
+        assert_eq!(step_3.outcome, ToolOutcomeWord::Ok, "{}", step_3.content);
+        assert!(
+            step_3
+                .content
+                .contains("Step 3: Generate Epics and Stories"),
+            "{}",
+            step_3.content
+        );
+    }
+
+    /// 94.3 acceptance 7 (R103, R171): the same run, its workflow saying
+    /// `checkpoints = "unattended"`, is stamped so once, at open, though
+    /// Nixi could be asked. Step 2's menu returns its default `C` at once,
+    /// with nobody invited or asked; a write that needs a person is held
+    /// one tier stricter — once: the run is a hop deep already, so the
+    /// tier stays T3 and the raise names both reasons.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unattended_workflow_takes_defaults_and_is_raised_once() {
+        let write_out = (
+            "w9",
+            "drive_write",
+            json!({"profile": "tgdrive", "path": "notes/out.md", "content": "epics"}),
+        );
+        for unattended in [false, true] {
+            let mut first = vec![write_out.clone()];
+            if unattended {
+                first.insert(
+                    0,
+                    (
+                        "a1",
+                        "ask_human",
+                        json!({"question": STEP_2_MENU, "choices": ["A", "P", "C"], "default": "C"}),
+                    ),
+                );
+            }
+            let world = world(
+                ProviderKind::OpenAi,
+                &["drive_read"],
+                vec![
+                    start("w1", EPICS, json!({})),
+                    prose("Started."),
+                    calls(&first),
+                    prose("It needs a person."),
+                ],
+            );
+            install(&world, EPICS, &|text| {
+                if unattended {
+                    with_keys(text, "checkpoints = \"unattended\"")
+                } else {
+                    text.to_owned()
+                }
+            });
+            let mut desk = desk(&world, HOURLY);
+            report(desk.serve(hour(9)).await);
+            let path = desk.run_of(&world, "w1");
+            let stamped = if unattended {
+                Checkpoints::Unattended
+            } else {
+                Checkpoints::Proxy
+            };
+            assert_eq!(agent_toml(&world, &path).checkpoints, Some(stamped));
+            let (mut run, room) = desk.open_run(&world, &path);
+            let turn = report(begin(&desk.tola, &mut run, &room).await);
+            assert_eq!(
+                turn.ending,
+                TurnEnding::Complete,
+                "unattended: {unattended}"
+            );
+            let lines = world.lines(&path);
+            assert_eq!(line_tier(&lines, "w9"), 3, "unattended: {unattended}");
+            let row = &audit_rows(&world, &run)["drive_write"];
+            let raised = if unattended {
+                "delegated,unattended"
+            } else {
+                "delegated"
+            };
+            assert_eq!(
+                (row.tier, row.base_tier, row.raised_by.as_deref()),
+                (Some(3), Some(2), Some(raised))
+            );
+            assert!(!world.tgdrive.join("notes/out.md").exists());
+            if unattended {
+                let defaulted: Value =
+                    serde_json::from_str(&result_of(&tool_results(&lines), "a1").content)
+                        .expect("json");
+                assert_eq!(
+                    defaulted,
+                    json!({"answer": "C", "choice": "C", "by": "default"})
+                );
+                assert_eq!(
+                    ask_lines(&lines)
+                        .iter()
+                        .map(|a| a.state)
+                        .collect::<Vec<_>>(),
+                    [AskState::Defaulted]
+                );
+                assert!(desk.rooms.invited.lock().expect("lock").is_empty());
+            }
+        }
+    }
+
+    /// `deps` on the host `host`.
+    fn on_host(deps: &AgentDeps, host: &str) -> AgentDeps {
+        AgentDeps {
+            env: deps.env.clone(),
+            data_dir: deps.data_dir.clone(),
+            row: deps.row.clone(),
+            bot: deps.bot.clone(),
+            home: deps.home.clone(),
+            host: HostSlug::new(host).expect("slug"),
+            drives: deps.drives.clone(),
+            drive_root: deps.drive_root.clone(),
+            sessions_zone: deps.sessions_zone.clone(),
+            sessions_subfolder: deps.sessions_subfolder.clone(),
+            lfs_threshold_bytes: deps.lfs_threshold_bytes,
+            decisions: None,
+        }
+    }
+
+    /// The run at `path` served under `deps`, holding `lease` — its
+    /// `claim acquired` line written, taken over from `from` when given.
+    fn held(
+        world: &World,
+        deps: &AgentDeps,
+        path: &str,
+        lease: &Arc<Lease>,
+        from: Option<&str>,
+    ) -> ServedSession {
+        let mut served = ServedSession::open(
+            deps,
+            &world.dir(path),
+            SessionRef {
+                drive: "tgdrive".to_owned(),
+                path: path.to_owned(),
+            },
+            agent_toml(world, path),
+            Some(Arc::clone(lease)),
+        )
+        .expect("served");
+        served
+            .writer
+            .write_claim(
+                &mut served.context,
+                lease.line(ClaimAction::Acquired, from.map(str::to_owned)),
+            )
+            .expect("claim line");
+        served
+    }
+
+    fn epics_md(steps: &str) -> String {
+        format!("---\nstepsCompleted: [{steps}]\ninputDocuments: []\n---\n\n# Epics\n")
+    }
+
+    /// 94.3 acceptance 8, format C (AD-398, §10.3): electra runs the
+    /// fixture to `stepsCompleted: [1, 2]` in the run's `epics.md` and halts
+    /// at step 2's menu; its claim lapses and hesperia takes the session
+    /// over at epoch 2. tgorka's `C` reaches hesperia, which replays the
+    /// log — the model is told of step 2's menu and the choice — and
+    /// continues at step 3: the file reads `[1, 2, 3]`, hesperia's lines
+    /// carry epoch 2, and nothing electra wrote is rewritten. One folder
+    /// both hosts see: the two-checkout git sync is DW-539's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_classic_workflow_resumes_on_the_other_host_from_its_own_files() {
+        let mut world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                start("w1", EPICS, json!({})),
+                prose("Started."),
+                calls(&[(
+                    "s2",
+                    "session_write",
+                    json!({"path": EPICS_MD, "content": epics_md("1, 2")}),
+                )]),
+                calls(&[(
+                    "a1",
+                    "ask_human",
+                    json!({"question": STEP_2_MENU, "choices": ["A", "P", "C"], "default": "C"}),
+                )]),
+                calls(&[(
+                    "s3",
+                    "session_write",
+                    json!({"path": EPICS_MD, "content": epics_md("1, 2, 3")}),
+                )]),
+                prose("Step 3 written."),
+            ],
+        );
+        install(&world, EPICS, &as_is);
+        let mut desk = desk(&world, HOURLY);
+        report(desk.serve(hour(9)).await);
+        let path = desk.run_of(&world, "w1");
+        let file = world.dir(&path).join(EPICS_MD);
+
+        let electra = lease(1, "$e1:example.org");
+        let (mut run, room) = desk.serving(held(&world, &desk.tola, &path, &electra, None));
+        let turn = report(begin(&desk.tola, &mut run, &room).await);
+        assert_eq!(turn.ending, TurnEnding::Asked);
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("epics"),
+            epics_md("1, 2")
+        );
+        let run_room = run.context.agent.room.clone();
+        desk.rooms
+            .joined
+            .lock()
+            .expect("lock")
+            .push((run_room, user(NIXI)));
+        let port: Arc<dyn EditPort> = room.clone();
+        run.send_asks(&desk.tola, &port).await;
+        let ask = ask_lines(&world.lines(&path)).remove(0).id;
+        let electras = world.lines(&path);
+        drop(run);
+
+        let on_hesperia = on_host(&desk.tola, "hesperia");
+        let taker = lease(2, "$h2:example.org");
+        let (mut run, room) =
+            desk.serving(held(&world, &on_hesperia, &path, &taker, Some("electra")));
+        let mut answer = world.event(NIXI, Arrival::Answer, answer_content("C", &ask));
+        answer.text = "C".to_owned();
+        let turn = report(serve_as(&on_hesperia, &mut run, &room, answer).await);
+        assert_eq!(turn.ending, TurnEnding::Complete);
+
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("epics"),
+            epics_md("1, 2, 3")
+        );
+        let lines = world.lines(&path);
+        assert_eq!(
+            &lines[..electras.len()],
+            &electras[..],
+            "nothing of electra's is rewritten"
+        );
+        let hesperias = &lines[electras.len()..];
+        assert!(!hesperias.is_empty());
+        for line in hesperias {
+            assert_eq!(
+                (line.epoch, line.host.as_str()),
+                (2, "hesperia"),
+                "{line:?}"
+            );
+        }
+        let told = world.stub.requests().last().expect("a request").to_string();
+        assert!(
+            told.contains("[C] Continue") && told.contains("It picks the choice C."),
+            "{told}"
+        );
+    }
+
+    /// 94.3 acceptance 8, format B (Q2): a `bmad-build` run renders its
+    /// generation on electra, and the offered `_skills/bmad-build` inline.
+    /// `workspace/` is not synced, so hesperia finds neither: it renders
+    /// both again before the run goes on, each the same generation at the
+    /// same path (R202). Once the drive's `_bmad/config.toml` changed, the
+    /// generation differs and the run ends `failed` with the sentence, on
+    /// its line and its card; it takes no more turns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rendered_workflow_is_rendered_again_after_takeover() {
+        let world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                start("w1", BUILD, json!({"intent": "fix the inbox"})),
+                prose("Started."),
+                calls(&[
+                    ("g1", "bmad_render", json!({})),
+                    ("g2", "bmad_render", json!({"skill": "bmad-build"})),
+                ]),
+                prose("Rendered."),
+            ],
+        );
+        // `run` arrives with 96.1; the render does not need it.
+        install(&world, BUILD, &|text| text.replace(", \"run\"]", "]"));
+        super::install_bmad(&world);
+        // The inline skill is the drive's own variant: its own generation.
+        let skill = world
+            .tgdrive
+            .join("80-agents/_skills/bmad-build/workflow.md");
+        let text = std::fs::read_to_string(&skill).expect("the skill");
+        std::fs::write(&skill, format!("{text}\nThis drive's variant.\n")).expect("the skill");
+        let mut desk = desk(&world, HOURLY);
+        report(desk.serve(hour(9)).await);
+        let path = desk.run_of(&world, "w1");
+        let (mut run, room) = desk.open_run(&world, &path);
+        report(begin(&desk.tola, &mut run, &room).await);
+        let entry_of = |call: &str| {
+            result_of(&tool_results(&world.lines(&path)), call)
+                .content
+                .strip_prefix("read and follow ")
+                .unwrap_or_else(|| panic!("{call} rendered"))
+                .to_owned()
+        };
+        let entries = [entry_of("g1"), entry_of("g2")];
+        assert_ne!(entries[0], entries[1], "two generations");
+        let workspace = world.dir(&path).join("workspace");
+        for entry in &entries {
+            assert!(world.tgdrive.join(entry).is_file(), "{entry}");
+        }
+        drop(run);
+
+        let on_hesperia = on_host(&desk.tola, "hesperia");
+        std::fs::remove_dir_all(&workspace).expect("not synced");
+        let (mut run, _) = desk.serving(world.open_as(&on_hesperia, &path));
+        run.rerender(&on_hesperia).expect("rerendered");
+        for entry in &entries {
+            assert!(
+                world.tgdrive.join(entry).is_file(),
+                "the same generation again: {entry}"
+            );
+        }
+        assert!(run_states(&world.lines(&path))
+            .iter()
+            .all(|(state, _)| *state != LogRun::Failed));
+        drop(run);
+
+        std::fs::remove_dir_all(&workspace).expect("not synced");
+        let config = world.tgdrive.join("_bmad/config.toml");
+        let text = std::fs::read_to_string(&config).expect("config");
+        std::fs::write(
+            &config,
+            text.replace(
+                "{project-root}/_bmad-output/implementation-artifacts",
+                "{project-root}/_bmad-output/impl",
+            ),
+        )
+        .expect("changed");
+        let (mut run, _) = desk.serving(world.open_as(&on_hesperia, &path));
+        run.rerender(&on_hesperia).expect("checked");
+        assert_eq!(
+            run_states(&world.lines(&path)).last().cloned(),
+            Some((
+                LogRun::Failed,
+                Some(keeper_agent::workflow::SOURCES_CHANGED.to_owned())
+            ))
+        );
+        assert_eq!(card_field(&world, &path, "run").as_deref(), Some("failed"));
+        assert!(run
+            .workflow_arrivals(&on_hesperia)
+            .expect("steps")
+            .is_empty());
+    }
+
+    /// 94.3 acceptance 9 (R107): a format-C run that replies without its
+    /// declared `epics.md` names it in the reply and on its `run: review`
+    /// line; one that wrote it replies as it said, its line naming nothing.
+    /// Either way its card reads `review`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn declared_outputs_are_checked_at_close() {
+        let world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                start("w1", EPICS, json!({})),
+                start("w2", EPICS, json!({})),
+                prose("Started both."),
+                calls(&[("r1", "reply", json!({"text": "Epics planned."}))]),
+                calls(&[
+                    (
+                        "s1",
+                        "session_write",
+                        json!({"path": EPICS_MD, "content": epics_md("1, 2, 3, 4")}),
+                    ),
+                    ("r2", "reply", json!({"text": "Epics planned."})),
+                ]),
+            ],
+        );
+        install(&world, EPICS, &as_is);
+        let mut desk = desk(&world, HOURLY);
+        report(desk.serve(hour(9)).await);
+        let missing = format!("declared output `{EPICS_MD}` was not written");
+        for (call, sentence) in [("w1", Some(missing.clone())), ("w2", None)] {
+            let path = desk.run_of(&world, call);
+            let (mut run, room) = desk.open_run(&world, &path);
+            report(begin(&desk.tola, &mut run, &room).await);
+            let reply = room
+                .sent()
+                .into_iter()
+                .find(|(kind, content)| {
+                    kind == "m.room.message"
+                        && content["body"]
+                            .as_str()
+                            .is_some_and(|b| b.starts_with("Epics planned."))
+                })
+                .expect("a reply")
+                .1;
+            let body = match &sentence {
+                Some(sentence) => format!("Epics planned.\n\n{sentence}."),
+                None => "Epics planned.".to_owned(),
+            };
+            assert_eq!(reply["body"], body.as_str(), "{call}");
+            assert_eq!(
+                run_states(&world.lines(&path)).last().cloned(),
+                Some((LogRun::Review, sentence)),
+                "{call}"
+            );
+            assert_eq!(card_field(&world, &path, "run").as_deref(), Some("review"));
+        }
+    }
+
+    /// R106: a run whose turns end with their rounds spent continues
+    /// itself — `run: running` saying which, then the host's `continue` —
+    /// three times and no more; the count survives a reload. After a
+    /// takeover cut a turn short, the run is resumed once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_workflow_run_continues_itself_at_most_three_times() {
+        let read = |id: &str| {
+            calls(&[(
+                id,
+                "drive_read",
+                json!({"profile": "tgdrive", "path": STEP_2}),
+            )])
+        };
+        let mut script = vec![start("w1", EPICS, json!({})), prose("Started.")];
+        // Each turn: a round that reads, one past the budget, and the
+        // answer the spent budget leaves.
+        for n in 0..5 {
+            script.push(read(&format!("r{n}")));
+            script.push(read(&format!("x{n}")));
+            script.push(prose("More to do."));
+        }
+        let world = world(ProviderKind::OpenAi, &["drive_read"], script);
+        install(&world, EPICS, &as_is);
+        let tola = deps_of(
+            &world,
+            "tola",
+            &format!(
+                "{}\n[limits]\nrounds_per_turn = 2\n",
+                steward_toml("tola", "Dr Tola Grey", &RUNS)
+            ),
+        );
+        let mut desk = desk_of(&world, HOURLY, tola);
+        report(desk.serve(hour(9)).await);
+        let path = desk.run_of(&world, "w1");
+        let (mut run, room) = desk.open_run(&world, &path);
+        let queued: Arc<Mutex<Vec<Arrived>>> = Arc::default();
+        let into = Arc::clone(&queued);
+        run.inbox = Some(Arc::new(move |arrived| {
+            into.lock().expect("lock").push(arrived)
+        }));
+        report(begin(&desk.tola, &mut run, &room).await);
+        for _ in 0..4 {
+            let next = queued.lock().expect("lock").pop();
+            let Some(next) = next else { break };
+            report(serve_as(&desk.tola, &mut run, &room, next).await);
+        }
+        assert!(queued.lock().expect("lock").is_empty());
+        let details: Vec<Option<String>> = run_states(&world.lines(&path))
+            .into_iter()
+            .filter(|(state, _)| *state == LogRun::Running)
+            .map(|(_, detail)| detail)
+            .collect();
+        assert_eq!(
+            details,
+            [
+                None,
+                Some("continuing, 1 of 3".to_owned()),
+                Some("continuing, 2 of 3".to_owned()),
+                Some("continuing, 3 of 3".to_owned()),
+            ]
+        );
+        let continued = peer_lines(&world.lines(&path))
+            .iter()
+            .filter(|peer| peer.text == keeper_core::agents::workflow::CONTINUE)
+            .count();
+        assert_eq!(continued, 3);
+        drop(run);
+
+        let (mut again, room) = desk.open_run(&world, &path);
+        assert_eq!(again.context.continuations, 3);
+        assert!(again
+            .workflow_arrivals(&desk.tola)
+            .expect("steps")
+            .is_empty());
+        // A takeover cut its last turn short: the resume would be a fourth
+        // continuation, so none is made, and one routed anyway is refused.
+        again.context.cut_off = true;
+        assert!(again
+            .workflow_arrivals(&desk.tola)
+            .expect("steps")
+            .is_empty());
+        let id = again.context.agent.id;
+        let fourth = keeper_agent::agent::workflow_arrival(
+            &user(TOLA),
+            &id,
+            keeper_agent::agent::WorkflowStep::Resume(4),
+        )
+        .expect("an arrival");
+        assert!(matches!(
+            serve_as(&desk.tola, &mut again, &room, fourth).await,
+            Outcome::Ignored(keeper_agent::agent::NOT_NOW)
+        ));
+        assert_eq!(again.context.continuations, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // R202: the review fixes of story 94.3 (R94W-01…14)
+    // -----------------------------------------------------------------------
+
+    /// The session a run is opened from, as `workflow::open` reads and
+    /// writes it: its log's `delegate` lines, a claim that answers yes to
+    /// `claims` more asks, and a log that refuses a `sent` line while `cut`.
+    #[derive(Default)]
+    struct Opener {
+        lines: Mutex<Vec<keeper_core::agents::log::DelegateBody>>,
+        claims: Mutex<usize>,
+        cut: Mutex<bool>,
+    }
+
+    impl Opener {
+        fn holding(claims: usize) -> Opener {
+            Opener {
+                claims: Mutex::new(claims),
+                ..Opener::default()
+            }
+        }
+
+        fn states(&self) -> Vec<DelegateState> {
+            self.lines
+                .lock()
+                .expect("lock")
+                .iter()
+                .map(|line| line.state)
+                .collect()
+        }
+    }
+
+    impl keeper_agent::workflow::Parent for Opener {
+        fn delegation(&self, id: &str) -> Option<keeper_agent::delegate::Delegation> {
+            let lines = self.lines.lock().expect("lock");
+            let opened = lines
+                .iter()
+                .find(|line| line.id == id && line.state == DelegateState::Opened)?;
+            Some(keeper_agent::delegate::Delegation {
+                id: id.to_owned(),
+                to: user(&opened.to),
+                room: opened.room.clone()?,
+                args: None,
+                sent: lines
+                    .iter()
+                    .any(|line| line.id == id && line.state == DelegateState::Sent),
+                replied: false,
+                rounds: 0,
+                window: opened.window.clone(),
+            })
+        }
+
+        fn record(&self, line: LineBody) -> Result<(), String> {
+            let LineBody::Delegate(body) = line else {
+                return Err("not a delegate line".to_owned());
+            };
+            if body.state == DelegateState::Sent && *self.cut.lock().expect("lock") {
+                return Err("the host stopped".to_owned());
+            }
+            self.lines.lock().expect("lock").push(body);
+            Ok(())
+        }
+
+        fn may_write(&self) -> bool {
+            let mut claims = self.claims.lock().expect("lock");
+            match claims.checked_sub(1) {
+                Some(left) => {
+                    *claims = left;
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
+    /// R202 (R94W-02, R94W-04): opening a run is fenced by its parent's
+    /// claim and goes on from what the parent logged. A claim lost while
+    /// the room is made leaves the room in the parent's `opened` line and
+    /// no folder — the claim is asked again under the zone's lock. Opened
+    /// again, the logged room is the run's (no second room); cut before
+    /// its `sent`, the run exists and its parent says it opened it. Opened
+    /// again, nothing is made and the `sent` is written; a parent whose log
+    /// lacks both lines gets both from the run's own `agent.toml`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_opening_cut_short_goes_on_from_what_its_parent_logged() {
+        let world = world(ProviderKind::OpenAi, &["drive_read"], Vec::new());
+        install(&world, EPICS, &as_is);
+        let desk = desk(&world, HOURLY);
+        let from = desk.served.delegator(&desk.tola);
+        let workflow = keeper_agent::workflow::read_workflow(&world.tgdrive, "80-agents", EPICS)
+            .expect("the workflow");
+        let id = start_id(&desk.id(), "w1");
+        let opening = keeper_agent::workflow::Opening {
+            from: &from,
+            agent: "tola",
+            id,
+            workflow: &workflow,
+            drives: vec!["tgdrive".to_owned()],
+            brief: "Plan the epics.".to_owned(),
+            label: desk.served.context.label.clone(),
+            checkpoints: Checkpoints::Proxy,
+            window: None,
+            at: chrono::Utc::now(),
+        };
+        let open =
+            |parent: &Opener| keeper_agent::workflow::open(desk.rooms.as_ref(), parent, &opening);
+        let run =
+            || keeper_agent::sessions::verbs::find(&world.deps.sessions_zone, &id.to_string());
+
+        let parent = Opener::holding(3);
+        assert_eq!(
+            open(&parent),
+            Err(format!(
+                "The workflow's session could not be made: {}",
+                keeper_agent::sessions::write::NO_CLAIM
+            ))
+        );
+        assert_eq!(desk.rooms.made().len(), 1);
+        let room = desk.rooms.made()[0].3.clone();
+        assert_eq!(parent.states(), [DelegateState::Opened]);
+        assert!(run().is_none(), "no session without the claim");
+
+        *parent.claims.lock().expect("lock") = usize::MAX;
+        *parent.cut.lock().expect("lock") = true;
+        assert!(open(&parent).is_err());
+        assert_eq!(desk.rooms.made().len(), 1, "no second room");
+        let path = run().expect("the run").path;
+        assert_eq!(agent_toml(&world, &path).room, room);
+        assert_eq!(parent.states(), [DelegateState::Opened]);
+
+        *parent.cut.lock().expect("lock") = false;
+        assert_eq!(
+            open(&parent),
+            Ok(keeper_agent::workflow::Opened::Existed { path: path.clone() })
+        );
+        assert_eq!(
+            parent.states(),
+            [DelegateState::Opened, DelegateState::Sent]
+        );
+
+        let elsewhere = Opener::holding(usize::MAX);
+        assert_eq!(
+            open(&elsewhere),
+            Ok(keeper_agent::workflow::Opened::Existed { path })
+        );
+        assert_eq!(
+            elsewhere.states(),
+            [DelegateState::Opened, DelegateState::Sent]
+        );
+        assert_eq!(
+            elsewhere.lines.lock().expect("lock")[0].room,
+            Some(room.clone())
+        );
+        assert_eq!(desk.rooms.made().len(), 1);
+        assert!(desk
+            .rooms
+            .watched
+            .lock()
+            .expect("lock")
+            .contains(&(room, OwnedRoomId::try_from(DESK_ROOM).expect("room"))));
+    }
+
+    /// R202 (R94W-01): a run's brief lands in its home drive, which tgorka
+    /// and Marta read whatever the run's label says. Tola's desk read
+    /// something only tgorka may read: her `workflow_start` is refused at
+    /// the label, and so is her card's window; no room, no session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_narrowed_session_opens_no_run_in_a_broader_drive() {
+        let world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![start("w1", EPICS, json!({})), prose("Not started.")],
+        );
+        install(&world, EPICS, &as_is);
+        let mut desk = desk(&world, HOURLY);
+        narrow(&mut desk.served, &[TGORKA]);
+        report(desk.serve(hour(9)).await);
+        let result = result_of(&tool_results(&world.lines(DESK)), "w1").clone();
+        assert_eq!(
+            result.outcome,
+            ToolOutcomeWord::Refused,
+            "{}",
+            result.content
+        );
+        assert!(desk.rooms.made().is_empty());
+        let id = start_id(&desk.id(), "w1").to_string();
+        assert!(keeper_agent::sessions::verbs::find(&world.deps.sessions_zone, &id).is_none());
+
+        let world = super::world(ProviderKind::OpenAi, &["drive_read"], Vec::new());
+        install(&world, EPICS, &as_is);
+        let mut desk = self::desk(&world, DAILY);
+        narrow(&mut desk.served, &[TGORKA]);
+        assert!(matches!(
+            desk.serve(window(OCT_6)).await,
+            Outcome::Scheduled(LogRun::Failed)
+        ));
+        assert!(desk.rooms.made().is_empty());
+        let id = run_id(&desk.id(), "card.md", OCT_6).to_string();
+        assert!(keeper_agent::sessions::verbs::find(&world.deps.sessions_zone, &id).is_none());
+        assert_eq!(desk_card(&world, "run").as_deref(), Some("failed"));
+    }
+
+    /// R202 (R94W-03): a run is admitted by what its turns would be
+    /// offered, not by `allow`. `helper` is in Tola's `allow` but no turn
+    /// is offered it on this rung: a workflow naming it is refused. `reply`
+    /// is not in her `allow`, but every run is offered it by its kind: a
+    /// workflow naming it starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_is_admitted_by_what_its_turns_are_offered() {
+        let world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                calls(&[
+                    ("h1", "workflow_start", json!({"name": "helping"})),
+                    ("y1", "workflow_start", json!({"name": "replying"})),
+                ]),
+                prose("One started."),
+            ],
+        );
+        put(
+            &world,
+            "helping",
+            "version = 1\nname = \"helping\"\ndescription = \"Helps.\"\ntools = [\"helper\"]\n",
+        );
+        put(
+            &world,
+            "replying",
+            "version = 1\nname = \"replying\"\ndescription = \"Replies.\"\ntools = [\"reply\"]\n",
+        );
+        let mut allow = RUNS.to_vec();
+        allow.push("helper");
+        let mut desk = desk_of(&world, HOURLY, tolas(&world, &allow));
+        report(desk.serve(hour(9)).await);
+        let results = tool_results(&world.lines(DESK));
+        let helping = result_of(&results, "h1");
+        assert_eq!(
+            helping.content,
+            "Refused: `helping` needs `helper`, which `tola` is not allowed."
+        );
+        let replying = result_of(&results, "y1");
+        assert_eq!(
+            replying.outcome,
+            ToolOutcomeWord::Ok,
+            "{}",
+            replying.content
+        );
+        assert_eq!(desk.rooms.made().len(), 1);
+        // The started run's audit row names the folder its brief landed in.
+        let folder = format!("60-sessions/{}", desk.run_of(&world, "y1"));
+        assert!(
+            audit_list(&world, &desk.served)
+                .iter()
+                .any(|row| row.tool == "workflow_start" && row.subpath == folder),
+            "{folder}: {:?}",
+            audit_list(&world, &desk.served)
+        );
+    }
+
+    /// R202 (R94W-05): another host began the run's first turn — its
+    /// anchor names the start in the room — and its lines have not reached
+    /// this checkout. The run is not begun again here: it says it waits
+    /// for that host's lines, and no model is asked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_turn_begun_on_another_host_is_not_begun_again() {
+        let world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![start("w1", EPICS, json!({})), prose("Started.")],
+        );
+        install(&world, EPICS, &as_is);
+        let mut desk = desk(&world, HOURLY);
+        report(desk.serve(hour(9)).await);
+        let path = desk.run_of(&world, "w1");
+        let (mut run, _) = desk.open_run(&world, &path);
+        let begun = keeper_agent::agent::workflow_arrival(
+            &user(TOLA),
+            &run.context.agent.id,
+            keeper_agent::agent::WorkflowStep::Start,
+        )
+        .expect("an arrival")
+        .event_id;
+        run.context.started([begun.as_str()].into_iter());
+        assert!(run.workflow_arrivals(&desk.tola).expect("steps").is_empty());
+        let lines = world.lines(&path);
+        assert_eq!(
+            run_states(&lines).last().cloned(),
+            Some((
+                LogRun::Waiting,
+                Some(keeper_agent::agent::BEGUN_ELSEWHERE.to_owned())
+            ))
+        );
+        assert!(peer_lines(&lines).is_empty());
+        assert_eq!(world.stub.hits.load(Ordering::SeqCst), 2, "the desk's only");
+    }
+
+    /// `ServedSession` `run` with an `interrupted` line, as a restart that
+    /// cut its turn short closes it.
+    fn cut(run: &mut ServedSession) {
+        let ServedSession {
+            context, writer, ..
+        } = run;
+        writer
+            .write(
+                context,
+                None,
+                None,
+                LineBody::Error(keeper_core::agents::log::ErrorBody {
+                    sentence: "My answer was cut off when electra restarted.".to_owned(),
+                    code: "interrupted".to_owned(),
+                }),
+            )
+            .expect("the line");
+    }
+
+    /// R202 (R94W-06): a run's next host step is on its log before it is
+    /// queued. Its first turn spends its rounds and the queue the
+    /// continuation went into is lost: the next holder takes continuation
+    /// 1 from the log, once. A restart then cuts a turn short: the resume
+    /// is logged as continuation 2, and when its queue is lost too the
+    /// next holder takes that same resume — not a third.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_runs_next_step_survives_a_lost_queue() {
+        let world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                start("w1", EPICS, json!({})),
+                prose("Started."),
+                calls(&[(
+                    "r0",
+                    "drive_read",
+                    json!({"profile": "tgdrive", "path": STEP_2}),
+                )]),
+                calls(&[(
+                    "x0",
+                    "drive_read",
+                    json!({"profile": "tgdrive", "path": STEP_2}),
+                )]),
+                prose("More to do."),
+                prose("Paused."),
+                prose("Resumed."),
+            ],
+        );
+        install(&world, EPICS, &as_is);
+        let tola = deps_of(
+            &world,
+            "tola",
+            &format!(
+                "{}\n[limits]\nrounds_per_turn = 2\n",
+                steward_toml("tola", "Dr Tola Grey", &RUNS)
+            ),
+        );
+        let mut desk = desk_of(&world, HOURLY, tola);
+        report(desk.serve(hour(9)).await);
+        let path = desk.run_of(&world, "w1");
+        let (mut run, room) = desk.open_run(&world, &path);
+        let id = run.context.agent.id;
+        let step = |step| {
+            keeper_agent::agent::workflow_arrival(&user(TOLA), &id, step)
+                .expect("an arrival")
+                .event_id
+        };
+        report(begin(&desk.tola, &mut run, &room).await);
+        drop(run);
+
+        let (mut run, room) = desk.open_run(&world, &path);
+        let mut next = run.workflow_arrivals(&desk.tola).expect("steps");
+        assert_eq!(
+            next.iter().map(|a| a.event_id.clone()).collect::<Vec<_>>(),
+            [step(keeper_agent::agent::WorkflowStep::Continue(1))]
+        );
+        report(serve_as(&desk.tola, &mut run, &room, next.remove(0)).await);
+        assert_eq!(run.context.continuations, 1);
+        assert!(
+            run.workflow_arrivals(&desk.tola).expect("steps").is_empty(),
+            "taken once"
+        );
+        cut(&mut run);
+        drop(run);
+
+        let (mut run, _) = desk.open_run(&world, &path);
+        let resume = step(keeper_agent::agent::WorkflowStep::Resume(2));
+        let first = run.workflow_arrivals(&desk.tola).expect("steps");
+        assert_eq!(
+            first.iter().map(|a| a.event_id.clone()).collect::<Vec<_>>(),
+            std::slice::from_ref(&resume)
+        );
+        drop(run);
+        let (mut run, room) = desk.open_run(&world, &path);
+        let mut again = run.workflow_arrivals(&desk.tola).expect("steps");
+        assert_eq!(
+            again.iter().map(|a| a.event_id.clone()).collect::<Vec<_>>(),
+            [resume]
+        );
+        let resumed = run_states(&world.lines(&path))
+            .iter()
+            .filter(|(_, detail)| {
+                detail
+                    .as_deref()
+                    .is_some_and(|d| d.starts_with("resumed on"))
+            })
+            .count();
+        assert_eq!(resumed, 1);
+        report(serve_as(&desk.tola, &mut run, &room, again.remove(0)).await);
+        assert_eq!(run.context.continuations, 2);
+    }
+
+    /// R202 (R94W-08): a turn cut short after its ask was logged is not
+    /// resumed while the ask waits: no resume is made, one routed anyway
+    /// is refused, and no model is asked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cut_turn_waiting_for_an_answer_is_not_resumed() {
+        let mut script = to_step_2();
+        script.push(prose("Never asked."));
+        let mut world = world(ProviderKind::OpenAi, &["drive_read"], script);
+        install(&world, EPICS, &as_is);
+        let mut desk = desk(&world, HOURLY);
+        report(desk.serve(hour(9)).await);
+        let (path, mut run, _) = asked_at_step_2(&mut world, &desk).await;
+        cut(&mut run);
+        drop(run);
+        let asked = world.stub.hits.load(Ordering::SeqCst);
+
+        let (mut run, room) = desk.open_run(&world, &path);
+        assert!(run.workflow_arrivals(&desk.tola).expect("steps").is_empty());
+        let resume = keeper_agent::agent::workflow_arrival(
+            &user(TOLA),
+            &run.context.agent.id,
+            keeper_agent::agent::WorkflowStep::Resume(1),
+        )
+        .expect("an arrival");
+        assert!(matches!(
+            serve_as(&desk.tola, &mut run, &room, resume).await,
+            Outcome::Ignored(keeper_agent::agent::NOT_NOW)
+        ));
+        assert_eq!(world.stub.hits.load(Ordering::SeqCst), asked);
+        assert_eq!(run.context.continuations, 0);
+    }
+
+    /// R202 (R94W-08): a run waiting for its person's answer takes no model
+    /// round for anything else. Its turn hands work to Nixi and asks; a
+    /// restart later its ask is read back from the log, and Nixi's reply
+    /// is kept — its receipt logged — with no model asked before the
+    /// answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_waiting_for_its_answer_takes_no_round_for_a_reply() {
+        let mut world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                start("w1", "asking", json!({})),
+                prose("Started."),
+                calls(&[(
+                    "d1",
+                    "delegate",
+                    json!({"agent": "nixi", "brief": "Plan the epics."}),
+                )]),
+                calls(&[(
+                    "a1",
+                    "ask_human",
+                    json!({"question": "Go on?", "choices": ["Yes", "No"], "default": "No"}),
+                )]),
+                prose("Never asked."),
+            ],
+        );
+        put(
+            &world,
+            "asking",
+            "version = 1\nname = \"asking\"\ndescription = \"Asks.\"\ntools = [\"delegate\"]\n",
+        );
+        let mut allow = RUNS.to_vec();
+        allow.push("delegate");
+        let mut desk = desk_of(&world, HOURLY, tolas(&world, &allow));
+        report(desk.serve(hour(9)).await);
+        let path = desk.run_of(&world, "w1");
+        let (mut run, room) = desk.open_run(&world, &path);
+        let turn = report(begin(&desk.tola, &mut run, &room).await);
+        assert_eq!(turn.ending, TurnEnding::Asked);
+        drop(run);
+
+        let (mut run, room) = desk.open_run(&world, &path);
+        assert!(!run.context.asks.is_empty(), "the ask, read back");
+        let child = delegate_lines(&world.lines(&path))
+            .into_iter()
+            .find(|line| line.state == DelegateState::Opened)
+            .and_then(|line| line.room)
+            .expect("the delegation's room");
+        let mut joined = world.event(NIXI, Arrival::Joined, json!({"membership": "join"}));
+        joined.via = Some(child.clone());
+        serve_as(&desk.tola, &mut run, &room, joined).await;
+        let asked = world.stub.hits.load(Ordering::SeqCst);
+        let event = json!({
+            "type": "m.room.message",
+            "sender": NIXI,
+            "event_id": "$planned:example.org",
+            "content": keeper_agent::delegate::reply_content(
+                "Planned.",
+                Vec::new(),
+                &run.context.label,
+            ),
+        });
+        let reply =
+            keeper_agent::agent::reply_of(&event, &user(NIXI), &child, tokio::time::Instant::now())
+                .expect("a reply");
+        serve_as(&desk.tola, &mut run, &room, reply).await;
+        assert_eq!(world.stub.hits.load(Ordering::SeqCst), asked, "no round");
+        assert!(delegate_lines(&world.lines(&path))
+            .iter()
+            .any(|line| line.state == DelegateState::Replied));
+        assert!(!run.context.asks.is_empty(), "the ask still waits");
+    }
+
+    /// R202 (R94W-09): a run is checked at its reply against the outputs
+    /// stamped into its `agent.toml` as it opened. Its `workflow.toml`
+    /// unreadable since, the reply still names the output it did not write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_runs_outputs_are_those_it_opened_with() {
+        let world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                start("w1", EPICS, json!({})),
+                prose("Started."),
+                calls(&[("r1", "reply", json!({"text": "Epics planned."}))]),
+            ],
+        );
+        install(&world, EPICS, &as_is);
+        let mut desk = desk(&world, HOURLY);
+        report(desk.serve(hour(9)).await);
+        let path = desk.run_of(&world, "w1");
+        assert_eq!(agent_toml(&world, &path).outputs, [EPICS_MD]);
+        std::fs::write(
+            world
+                .tgdrive
+                .join("80-agents/_workflows")
+                .join(EPICS)
+                .join("workflow.toml"),
+            "version = [\n",
+        )
+        .expect("broken");
+        let (mut run, room) = desk.open_run(&world, &path);
+        report(begin(&desk.tola, &mut run, &room).await);
+        let missing = keeper_core::agents::workflow::missing_output(EPICS_MD);
+        assert_eq!(
+            run_states(&world.lines(&path)).last().cloned(),
+            Some((LogRun::Review, Some(missing)))
+        );
+    }
+
+    /// R202 (R94W-10): a run's reply ends it, whatever becomes of its card.
+    /// Its first turn spends its rounds and its card no longer reads before
+    /// its continuation, which replies, writes and reads in one round: the
+    /// write and the read are refused and the file never lands, no model
+    /// round follows, its run line says `review`, and it takes no next step.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_that_replied_ends_there() {
+        let world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                start("w1", EPICS, json!({})),
+                prose("Started."),
+                calls(&[(
+                    "x1",
+                    "drive_read",
+                    json!({"profile": "tgdrive", "path": STEP_2}),
+                )]),
+                calls(&[(
+                    "x2",
+                    "drive_read",
+                    json!({"profile": "tgdrive", "path": STEP_2}),
+                )]),
+                prose("More to do."),
+                calls(&[
+                    ("r1", "reply", json!({"text": "Done."})),
+                    (
+                        "s1",
+                        "session_write",
+                        json!({"path": EPICS_MD, "content": epics_md("1")}),
+                    ),
+                    (
+                        "x3",
+                        "drive_read",
+                        json!({"profile": "tgdrive", "path": STEP_2}),
+                    ),
+                ]),
+                prose("Never asked."),
+            ],
+        );
+        install(&world, EPICS, &as_is);
+        let tola = deps_of(
+            &world,
+            "tola",
+            &format!(
+                "{}\n[limits]\nrounds_per_turn = 2\n",
+                steward_toml("tola", "Dr Tola Grey", &RUNS)
+            ),
+        );
+        let mut desk = desk_of(&world, HOURLY, tola);
+        report(desk.serve(hour(9)).await);
+        let path = desk.run_of(&world, "w1");
+        let (mut run, room) = desk.open_run(&world, &path);
+        report(begin(&desk.tola, &mut run, &room).await);
+        std::fs::write(
+            world
+                .dir(&path)
+                .join(keeper_core::agents::delegation::CARD_FILE),
+            [0xff, 0xfe, 0xfd],
+        )
+        .expect("the card");
+        let mut next = run.workflow_arrivals(&desk.tola).expect("steps");
+        assert_eq!(next.len(), 1, "the continuation");
+        report(serve_as(&desk.tola, &mut run, &room, next.remove(0)).await);
+        let lines = world.lines(&path);
+        let results = tool_results(&lines);
+        for call in ["s1", "x3"] {
+            assert_eq!(
+                result_of(&results, call).content,
+                format!("Refused: {}", keeper_agent::agent::RUN_ENDED),
+                "{call}"
+            );
+        }
+        assert!(!world.dir(&path).join(EPICS_MD).exists());
+        assert_eq!(world.stub.hits.load(Ordering::SeqCst), 6);
+        assert_eq!(
+            run_states(&lines).last().map(|(state, _)| *state),
+            Some(LogRun::Review)
+        );
+        assert!(run.workflow_arrivals(&desk.tola).expect("steps").is_empty());
+    }
+
+    /// R202 (R94W-14): a run hands on a card of another session as the
+    /// one delegation the host binds to that card. Two runs of Tola's —
+    /// two `WD`s — hand on the desk's card: the second is told the first's
+    /// delegation, and no second room is made. The first run replied
+    /// meanwhile; Nixi's late reply to it is kept as a receipt and opens
+    /// no turn there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_card_is_handed_on_once_however_many_runs_ask() {
+        let source = format!("{DESK_ID}:card.md");
+        let hand_on = |call: &str| {
+            calls(&[(
+                call,
+                "delegate",
+                json!({"agent": "nixi", "brief": "Plan the epics.", "source": source}),
+            )])
+        };
+        let mut world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                calls(&[
+                    ("w1", "workflow_start", json!({"name": "handing"})),
+                    ("w2", "workflow_start", json!({"name": "handing"})),
+                ]),
+                prose("Started both."),
+                hand_on("d1"),
+                calls(&[("y1", "reply", json!({"text": "Handed on."}))]),
+                hand_on("d2"),
+                prose("Handed on before."),
+            ],
+        );
+        put(
+            &world,
+            "handing",
+            "version = 1\nname = \"handing\"\ndescription = \"Hands on.\"\ntools = [\"delegate\"]\n",
+        );
+        let mut allow = RUNS.to_vec();
+        allow.push("delegate");
+        let mut desk = desk_of(&world, HOURLY, tolas(&world, &allow));
+        report(desk.serve(hour(9)).await);
+        let made = |kind| {
+            desk.rooms
+                .kinds
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|k| **k == kind)
+                .count()
+        };
+        let handoff = keeper_core::agents::workflow::handoff_id(DESK_ID, "card.md").to_string();
+
+        let first = desk.run_of(&world, "w1");
+        let (mut run, room) = desk.open_run(&world, &first);
+        report(begin(&desk.tola, &mut run, &room).await);
+        assert_eq!(made(SessionKind::Delegated), 1);
+        let opened = |path: &str| {
+            delegate_lines(&world.lines(path))
+                .into_iter()
+                .filter(|line| line.state == DelegateState::Opened)
+                .collect::<Vec<_>>()
+        };
+        let handed = opened(&first);
+        assert_eq!(
+            handed
+                .iter()
+                .map(|line| line.id.clone())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&handoff)
+        );
+
+        let second = desk.run_of(&world, "w2");
+        let (mut other, other_room) = desk.open_run(&world, &second);
+        report(begin(&desk.tola, &mut other, &other_room).await);
+        let told = result_of(&tool_results(&world.lines(&second)), "d2").clone();
+        assert!(told.content.contains(&handoff), "{}", told.content);
+        assert_eq!(made(SessionKind::Delegated), 1, "no second room");
+        assert!(opened(&second).is_empty());
+
+        // Nixi joins, the brief goes in, and her reply comes after the
+        // run's own.
+        let child = handed[0].room.clone().expect("the room");
+        let mut joined = world.event(NIXI, Arrival::Joined, json!({"membership": "join"}));
+        joined.via = Some(child.clone());
+        serve_as(&desk.tola, &mut run, &room, joined).await;
+        assert!(delegate_lines(&world.lines(&first))
+            .iter()
+            .any(|line| line.state == DelegateState::Sent));
+        let asked = world.stub.hits.load(Ordering::SeqCst);
+        let event = json!({
+            "type": "m.room.message",
+            "sender": NIXI,
+            "event_id": "$late:example.org",
+            "content": keeper_agent::delegate::reply_content(
+                "Planned.",
+                Vec::new(),
+                &run.context.label,
+            ),
+        });
+        let late =
+            keeper_agent::agent::reply_of(&event, &user(NIXI), &child, tokio::time::Instant::now())
+                .expect("a reply");
+        assert!(matches!(
+            serve_as(&desk.tola, &mut run, &room, late).await,
+            Outcome::Ignored(keeper_agent::agent::RUN_MOVED_ON)
+        ));
+        assert_eq!(world.stub.hits.load(Ordering::SeqCst), asked, "no turn");
+        assert!(delegate_lines(&world.lines(&first))
+            .iter()
+            .any(|line| line.state == DelegateState::Replied));
+    }
+
+    // -----------------------------------------------------------------------
+    // R202 (R94W-15): a takeover across two checkouts synced through git
+    // -----------------------------------------------------------------------
+
+    const SYNC_HOST: &str = "KEEPER_TEST_SYNC_HOST";
+    const SYNC_DATA: &str = "KEEPER_TEST_SYNC_DATA";
+    const SYNC_REMOTE: &str = "KEEPER_TEST_SYNC_REMOTE";
+
+    /// tgdrive's bare remote, seeded with its declaration. `git` is needed:
+    /// keeper-sync's engine drives it.
+    fn bare_tgdrive(root: &Path) -> PathBuf {
+        let git = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "seed")
+                .env("GIT_AUTHOR_EMAIL", "seed@example.invalid")
+                .env("GIT_COMMITTER_NAME", "seed")
+                .env("GIT_COMMITTER_EMAIL", "seed@example.invalid")
+                .args(args)
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let bare = root.join("tgdrive.git");
+        std::fs::create_dir_all(&bare).expect("the remote");
+        assert!(git(&bare, &["init", "-q", "--bare", "-b", "main"]), "git");
+        let seed = root.join("seed");
+        write(
+            &seed,
+            "80-agents/_drive.toml",
+            &format!("version = 1\nid = \"tgdrive\"\ntitle = \"tgdrive\"\nprincipal = \"tgorka\"\nowner = \"{TGORKA}\"\nreaders = [\"{TGORKA}\", \"{MARTA}\"]\n"),
+        );
+        assert!(git(&seed, &["init", "-q", "-b", "main"]));
+        assert!(git(&seed, &["add", "-A"]));
+        assert!(git(&seed, &["commit", "-q", "-m", "seed"]));
+        assert!(git(&seed, &["push", "-q", &bare.to_string_lossy(), "main"]));
+        bare
+    }
+
+    /// One sync of tgdrive by agentd's engine on `host`, its data at
+    /// `data`, through `remote`: in a process of its own — this binary,
+    /// running [`sync_one_checkout`] — since the engine's folder tier is
+    /// one per process. The checkout's path.
+    fn sync(host: &str, data: &Path, remote: &Path) -> PathBuf {
+        let out = std::process::Command::new(std::env::current_exe().expect("this binary"))
+            .args([
+                "workflows::sync_one_checkout",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SYNC_HOST, host)
+            .env(SYNC_DATA, data)
+            .env(SYNC_REMOTE, remote)
+            .output()
+            .expect("the sync's process");
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success() && said.contains("1 passed"),
+            "{host}'s sync: {said}"
+        );
+        data.join("drives").join("tgdrive")
+    }
+
+    /// Half of [`a_classic_workflow_is_taken_over_on_another_checkout`],
+    /// run by [`sync`] in a process of its own: agentd's engine opened as
+    /// `$KEEPER_TEST_SYNC_HOST` over `$KEEPER_TEST_SYNC_DATA`, and one
+    /// `sync_once` of tgdrive with `$KEEPER_TEST_SYNC_REMOTE`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "a sync the two-checkout takeover runs in a process of its own"]
+    async fn sync_one_checkout() {
+        let (Ok(host), Ok(data), Ok(remote)) = (
+            std::env::var(SYNC_HOST),
+            std::env::var(SYNC_DATA),
+            std::env::var(SYNC_REMOTE),
+        ) else {
+            return;
+        };
+        let data = PathBuf::from(data);
+        std::fs::create_dir_all(&data).expect("the data");
+        let config = keeper_core::agents::agentd::AgentdConfig::parse(&format!(
+            "version = 1\nprincipal = \"tgorka\"\nhost = \"{host}\"\n\n[homeserver]\nurl = \"https://matrix.example.org\"\n\n[[drives]]\nid = \"tgdrive\"\nremote = \"{remote}\"\nowner = \"{TGORKA}\"\nreaders = [\"{TGORKA}\", \"{MARTA}\"]\n\n[[agents]]\ndrive = \"tgdrive\"\nids = [\"tola\"]\n"
+        ))
+        .expect("the config");
+        let store = keeper_sync::xdg::SecretStore::new(
+            keeper_agent::headless::SECRET_ENV_PREFIX,
+            data.join("secrets"),
+        );
+        let platform = Arc::new(keeper_agent::headless::HeadlessSyncPlatform::new(
+            &data,
+            &host,
+            Arc::new(keeper_agent::headless::SecretMap::new(store)),
+        ));
+        let agentd = keeper_agent::headless::open_engine(&config, platform).expect("the engine");
+        let drive = &agentd.drives[0];
+        // A path is committed once it is quiet for the settle window, a wait
+        // for a person's typing: none here, so no test sleeps through it.
+        let mut profile = agentd
+            .engine
+            .list_profiles()
+            .expect("profiles")
+            .into_iter()
+            .find(|row| row.id == drive.profile_id)
+            .expect("the profile");
+        profile.settle_ms = 0;
+        agentd.engine.upsert_profile(&profile).expect("the profile");
+        agentd
+            .engine
+            .sync_once(
+                &drive.profile_id,
+                keeper_sync::provenance::SyncSource::Manual,
+            )
+            .await
+            .expect("synced");
+    }
+
+    /// 94.3 acceptance 8 on two checkouts (R202, R94W-15, R94W-05): electra
+    /// and hesperia each sync a checkout of tgdrive of their own through
+    /// agentd's engine and one bare remote. Electra opens the format-C run
+    /// and syncs, and hesperia pulls the folder before any turn of it.
+    /// Electra begins the run — its anchor names the start in the room —
+    /// writes `[1, 2]`, asks at step 2 and does not sync yet: hesperia,
+    /// whose checkout has none of that turn, begins nothing. Electra syncs;
+    /// hesperia pulls, takes the session over at epoch 2, takes tgorka's
+    /// `C`, writes `[1, 2, 3]` and syncs; electra pulls it: the file reads
+    /// `[1, 2, 3]` in electra's checkout, electra's lines as they were,
+    /// hesperia's after them at epoch 2.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_classic_workflow_is_taken_over_on_another_checkout() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let remote = bare_tgdrive(root.path());
+        let (data_e, data_h) = (root.path().join("electra"), root.path().join("hesperia"));
+        let checkout_e = sync("electra", &data_e, &remote);
+        let electra = super::world_in(
+            tempfile::tempdir().expect("tempdir"),
+            checkout_e.clone(),
+            &[TGORKA, MARTA],
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                start("w1", EPICS, json!({})),
+                prose("Started."),
+                calls(&[(
+                    "s2",
+                    "session_write",
+                    json!({"path": EPICS_MD, "content": epics_md("1, 2")}),
+                )]),
+                calls(&[(
+                    "a1",
+                    "ask_human",
+                    json!({"question": STEP_2_MENU, "choices": ["A", "P", "C"], "default": "C"}),
+                )]),
+            ],
+        );
+        install(&electra, EPICS, &as_is);
+        let mut desk = desk(&electra, HOURLY);
+        report(desk.serve(hour(9)).await);
+        let path = desk.run_of(&electra, "w1");
+        sync("electra", &data_e, &remote);
+        let checkout_h = sync("hesperia", &data_h, &remote);
+        let run_h = checkout_h.join("60-sessions").join(&path);
+        assert!(
+            run_h.join("agent.toml").is_file(),
+            "the run reached hesperia"
+        );
+
+        let (mut run, room) = desk.serving(held(
+            &electra,
+            &desk.tola,
+            &path,
+            &lease(1, "$e1:example.org"),
+            None,
+        ));
+        let id = run.context.agent.id;
+        let turn = report(begin(&desk.tola, &mut run, &room).await);
+        assert_eq!(turn.ending, TurnEnding::Asked);
+        let run_room = run.context.agent.room.clone();
+        desk.rooms
+            .joined
+            .lock()
+            .expect("lock")
+            .push((run_room.clone(), user(NIXI)));
+        let port: Arc<dyn EditPort> = room.clone();
+        run.send_asks(&desk.tola, &port).await;
+        let ask = ask_lines(&electra.lines(&path)).remove(0).id;
+        drop(run);
+
+        // Hesperia, its checkout without electra's turn, its own rooms.
+        let mut hesperia = super::world_in(
+            tempfile::tempdir().expect("tempdir"),
+            checkout_h.clone(),
+            &[TGORKA, MARTA],
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                calls(&[(
+                    "s3",
+                    "session_write",
+                    json!({"path": EPICS_MD, "content": epics_md("1, 2, 3")}),
+                )]),
+                prose("Step 3 written."),
+            ],
+        );
+        let on_hesperia = on_host(&tolas(&hesperia, &RUNS), "hesperia");
+        let rooms = Delegations::over(known_with_proxy());
+        rooms.rooms.lock().expect("lock").push((
+            run_room.clone(),
+            [TOLA, TGORKA, MARTA].iter().map(|u| user(u)).collect(),
+        ));
+        rooms
+            .joined
+            .lock()
+            .expect("lock")
+            .push((run_room, user(NIXI)));
+        let serving = |mut served: ServedSession| {
+            served.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+            served
+        };
+        assert!(!run_h.join(EPICS_MD).exists(), "electra's turn is not here");
+        let mut early = serving(hesperia.open_as(&on_hesperia, &path));
+        let begun = keeper_agent::agent::workflow_arrival(
+            &user(TOLA),
+            &id,
+            keeper_agent::agent::WorkflowStep::Start,
+        )
+        .expect("an arrival")
+        .event_id;
+        early.context.started([begun.as_str()].into_iter());
+        assert!(early
+            .workflow_arrivals(&on_hesperia)
+            .expect("steps")
+            .is_empty());
+        drop(early);
+        assert_eq!(hesperia.stub.hits.load(Ordering::SeqCst), 0, "begun once");
+
+        sync("electra", &data_e, &remote);
+        sync("hesperia", &data_h, &remote);
+        assert_eq!(
+            std::fs::read_to_string(run_h.join(EPICS_MD)).expect("electra's epics"),
+            epics_md("1, 2")
+        );
+        let room = Arc::new(Room::of(&[TOLA, TGORKA, MARTA]));
+        let mut run = serving(held(
+            &hesperia,
+            &on_hesperia,
+            &path,
+            &lease(2, "$h2:example.org"),
+            Some("electra"),
+        ));
+        let mut answer = hesperia.event(NIXI, Arrival::Answer, answer_content("C", &ask));
+        answer.text = "C".to_owned();
+        let turn = report(serve_as(&on_hesperia, &mut run, &room, answer).await);
+        assert_eq!(turn.ending, TurnEnding::Complete);
+        drop(run);
+        sync("hesperia", &data_h, &remote);
+
+        let electras: Vec<LogLine> = electra
+            .lines(&path)
+            .into_iter()
+            .filter(|line| line.host.as_str() == "electra")
+            .collect();
+        sync("electra", &data_e, &remote);
+        assert_eq!(
+            std::fs::read_to_string(electra.dir(&path).join(EPICS_MD)).expect("the epics"),
+            epics_md("1, 2, 3"),
+            "hesperia's step reached electra's checkout"
+        );
+        let lines = electra.lines(&path);
+        let of = |host: &str| -> Vec<LogLine> {
+            lines
+                .iter()
+                .filter(|line| line.host.as_str() == host)
+                .cloned()
+                .collect()
+        };
+        assert_eq!(of("electra"), electras, "nothing of electra's is rewritten");
+        let taken: Vec<&LogLine> = lines.iter().filter(|line| line.epoch == 2).collect();
+        assert!(!taken.is_empty(), "hesperia's turn");
+        for line in taken {
+            assert_eq!(line.host.as_str(), "hesperia", "{line:?}");
+        }
+        let last_electra = lines
+            .iter()
+            .rposition(|line| line.host.as_str() == "electra")
+            .expect("electra's lines");
+        let first_taken = lines
+            .iter()
+            .position(|line| line.epoch == 2)
+            .expect("hesperia's turn");
+        assert!(
+            first_taken > last_electra,
+            "the takeover follows electra's turn"
+        );
+        let told = hesperia
+            .stub
+            .requests()
+            .last()
+            .expect("a request")
+            .to_string();
+        assert!(
+            told.contains("[C] Continue") && told.contains("It picks the choice C."),
+            "{told}"
+        );
+    }
 }

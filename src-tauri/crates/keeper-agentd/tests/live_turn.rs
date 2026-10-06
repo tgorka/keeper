@@ -194,6 +194,8 @@ async fn host(
         dispatch_chain: Vec::new(),
         limits: None,
         workflow: None,
+        checkpoints: None,
+        outputs: Vec::new(),
         created_at: chrono::Utc::now(),
     };
     let soul = "---\nname: Nixi\ntitle: the smoke proxy\nicon: \"*\"\nrole: Answers the smoke test.\nidentity: \"A test proxy.\"\ncommunication_style: Short.\nprinciples:\n  - Answer from the drive.\n---\n\nNixi answers from the drive.\n";

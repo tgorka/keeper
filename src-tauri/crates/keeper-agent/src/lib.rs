@@ -31,6 +31,8 @@
 //! - [`surface`] names a note the person looks at by its drive.
 //! - [`delegate`] hands work to another agent and answers a delegation;
 //!   [`ask`] asks a person through their proxy and relays the answer.
+//! - [`workflow`] opens a workflow's run in a session of its own: by
+//!   `workflow_start` or a due workflow card.
 //! - [`stewards`] makes a steward's triage and harvest sessions and says
 //!   which closed sessions wake her harvest.
 //! - [`doorbell`] rings the hosts that should fetch a push of agent work,
@@ -72,5 +74,6 @@ pub mod stewards;
 pub mod surface;
 pub mod task;
 pub mod turn;
+pub mod workflow;
 pub mod writer;
 pub mod zone;

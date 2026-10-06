@@ -57,6 +57,10 @@ pub const TOOLS: [&str; 6] = [
     BMAD_PARTY,
 ];
 
+/// What a render answers before its generation's `workflow.md`, as
+/// `render_skill.py` prints it.
+pub const READ_AND_FOLLOW: &str = "read and follow ";
+
 /// Whether `name` is one of [`TOOLS`].
 pub fn serves(name: &str) -> bool {
     TOOLS.contains(&name)
@@ -351,6 +355,7 @@ impl BmadTools {
                 Ok(call) => self.config(&call, &mut files),
                 Err(sentence) => refused(sentence),
             },
+
             BMAD_PARTY => match workflow::parse_party(args) {
                 Ok(call) => self.party(&call, &mut files),
                 Err(sentence) => refused(sentence),
@@ -405,7 +410,7 @@ impl BmadTools {
         let args = prepared.call.arguments.as_ref().unwrap_or(&Json::Null);
         let outcome = match prepared.render {
             Some(Ok(rendered)) => match self.publish(&rendered, may_write) {
-                Ok(entry) => answered(format!("read and follow {entry}")),
+                Ok(entry) => answered(format!("{READ_AND_FOLLOW}{entry}")),
                 Err(sentence) => refused(format!("HALT: {sentence}")),
             },
             Some(Err(sentence)) => refused(sentence),

@@ -304,6 +304,8 @@ async fn a_delegation_round_trip_on_a_real_homeserver() {
         dispatch_chain: Vec::new(),
         limits: None,
         workflow: None,
+        checkpoints: None,
+        outputs: Vec::new(),
         created_at: chrono::Utc::now(),
     };
     let files = vec![
@@ -606,6 +608,8 @@ async fn a_declassification_decided_in_the_proxy_dm_lets_one_flow_through() {
         dispatch_chain: Vec::new(),
         limits: None,
         workflow: None,
+        checkpoints: None,
+        outputs: Vec::new(),
         created_at: chrono::Utc::now(),
     };
     let files = vec![

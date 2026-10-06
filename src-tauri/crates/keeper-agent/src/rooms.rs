@@ -408,6 +408,10 @@ pub enum Arrival {
     /// A closed session of the drive, for a steward's harvest session (R61).
     /// Made only by the session's claim holder, never read from the room.
     Harvest,
+    /// A workflow's run goes on (R104, R106): its first turn from its card,
+    /// or a continuation once its rounds ran out or a takeover cut a turn.
+    /// Made only by the session's claim holder, never read from the room.
+    Workflow,
     /// Any other `dev.keeper.agent.*` event: a status, a turn reference, a
     /// claim.
     AgentEvent,
@@ -437,6 +441,8 @@ pub enum Disposition {
     Scheduled,
     /// The host found a closed session the steward's harvest reads.
     Harvest,
+    /// A workflow's run goes on from its card or where it stopped.
+    Workflow,
     /// Neither: not logged, not a turn. The sentence is the host's own note.
     Ignored(&'static str),
 }
@@ -506,6 +512,11 @@ pub fn classify(served: &Served<'_>, sender: &UserId, arrival: Arrival) -> Dispo
         Arrival::Scheduled => return Disposition::Scheduled,
         Arrival::Harvest => return Disposition::Harvest,
         Arrival::Unasked => return Disposition::Unasked,
+        Arrival::Workflow => return Disposition::Workflow,
+        // Made only by this host, from the room the session delegated into;
+        // the worker checks the sender against the delegation it made — a
+        // workflow's run this agent started replies in its own name (R104).
+        Arrival::Joined | Arrival::Replied => return Disposition::Delegation,
         _ => {}
     }
     if sender == served.agent_user {
@@ -525,8 +536,6 @@ pub fn classify(served: &Served<'_>, sender: &UserId, arrival: Arrival) -> Dispo
                 Disposition::Ignored(NOT_THE_REQUESTER)
             }
         }
-        // Made only by this host, from the room the session delegated into;
-        // the worker checks the sender against the delegation it made.
         Arrival::Joined | Arrival::Replied => Disposition::Delegation,
         // Made only by this host, from the room it was asked in.
         Arrival::Ask if conversation => Disposition::Ask,
@@ -536,6 +545,7 @@ pub fn classify(served: &Served<'_>, sender: &UserId, arrival: Arrival) -> Dispo
         Arrival::Scheduled => Disposition::Scheduled,
         Arrival::Harvest => Disposition::Harvest,
         Arrival::Unasked => Disposition::Unasked,
+        Arrival::Workflow => Disposition::Workflow,
         Arrival::Scope { owner_signed } | Arrival::ConversationRequest { owner_signed } => {
             let asks_conversation = matches!(arrival, Arrival::ConversationRequest { .. });
             if !conversation {

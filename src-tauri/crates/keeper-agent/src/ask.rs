@@ -230,6 +230,16 @@ pub fn proxy_audience(known: &Known, via: &UserId) -> Option<Readers> {
         .map(|agent| agent.home_readers)
 }
 
+/// Whether anyone could answer an ask of a session whose dispatch chain is
+/// `chain`, `me` asking, with `known` (R102): what a workflow's run is
+/// stamped by as it opens (R103).
+pub fn can_ask(chain: &[OwnedUserId], me: &UserId, known: &Known) -> bool {
+    let (proxies, trusted) = relayers(known);
+    let is_agent =
+        |user: &UserId| user == me || known.agents.iter().any(|agent| agent.matrix_user == user);
+    answerer(chain, &proxies, &trusted, is_agent).is_some()
+}
+
 /// One turn's `ask_human`.
 pub struct AskTools<'t> {
     pub from: Delegator,
@@ -239,6 +249,9 @@ pub struct AskTools<'t> {
     pub view: &'t dyn TurnView,
     /// Whether this session is offered `ask_human` (R102).
     pub offered: bool,
+    /// A workflow's run stamped `checkpoints = "unattended"`: nobody is
+    /// asked, and every question takes its default (R103).
+    pub unattended: bool,
     pub sinks: &'t Sinks,
     /// The scheduled card whose run this turn is, if any.
     pub scheduled: Option<String>,
@@ -260,6 +273,7 @@ impl<'t> AskTools<'t> {
         gate: Arc<RoomGate>,
         view: &'t dyn TurnView,
         offered: bool,
+        unattended: bool,
         sinks: &'t Sinks,
         scheduled: Option<String>,
     ) -> AskTools<'t> {
@@ -269,6 +283,7 @@ impl<'t> AskTools<'t> {
             gate,
             view,
             offered,
+            unattended,
             sinks,
             scheduled,
             lines: Mutex::new(Vec::new()),
@@ -335,7 +350,10 @@ impl<'t> AskTools<'t> {
         let is_agent = |user: &UserId| {
             user == self.from.user || known.agents.iter().any(|agent| agent.matrix_user == user)
         };
-        let Some(answerer) = answerer(&self.from.chain, &proxies, &trusted, is_agent) else {
+        let found = (!self.unattended)
+            .then(|| answerer(&self.from.chain, &proxies, &trusted, is_agent))
+            .flatten();
+        let Some(answerer) = found else {
             // Nobody to ask: the stated default answers at once, or the
             // call is refused and the skill's own HALT ends the turn (R103).
             let Some(default) = call.default else {
@@ -431,6 +449,7 @@ impl<'t> AskTools<'t> {
         self.line(LineBody::Run(RunBody {
             state: RunState::Blocked,
             detail: Some(detail),
+            step: None,
         }));
         let (zone, session) = (&self.from.zone, &self.from.session);
         if let Err(error) = set_card_run(zone, session, Run::Blocked, &|| self.view.may_write()) {

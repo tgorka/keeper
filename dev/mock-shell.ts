@@ -4177,9 +4177,22 @@ const seedFiles = (dir: string): string[] =>
   ["agent.toml", "SOUL.md", "USER.md", "MEMORY.md", "journal/.keep", "proposals/.keep"].map(
     (file) => `${dir}/${file}`,
   );
+/** The stewards' workflows, seeded beside a steward (94.3). */
+const STEWARD_WORKFLOW_FILES = [
+  "_workflows/triage/workflow.toml",
+  "_workflows/triage/SKILL.md",
+  "_workflows/triage/steps/step-01-read.md",
+  "_workflows/triage/steps/step-02-cards.md",
+  "_workflows/dispatch/workflow.toml",
+  "_workflows/dispatch/SKILL.md",
+  "_workflows/dispatch/steps/step-01-hand-on.md",
+];
 /** Which files of a seed are already in p1's zone: the zone and Nixi's home. */
 const seedExisting = (profileId: string, path: string): boolean =>
-  profileId === "p1" && !path.startsWith("tola-grey/") && !path.startsWith("lucyna-novak/");
+  profileId === "p1" &&
+  !path.startsWith("tola-grey/") &&
+  !path.startsWith("lucyna-novak/") &&
+  !path.startsWith("_workflows/");
 function seedPlan(req: AgentSeedReq): AgentSeedPlanVm {
   const refuse = (message: string) => {
     throw { code: "internal", message, accountId: null, retriable: false };
@@ -4204,6 +4217,9 @@ function seedPlan(req: AgentSeedReq): AgentSeedPlanVm {
     "_drive.toml",
     ...seedFiles("_template"),
     ...SEED_CATALOGUE.filter((id) => req.with.includes(id)).flatMap(seedFiles),
+    ...(req.with.some((id) => id === "tola-grey" || id === "lucyna-novak")
+      ? STEWARD_WORKFLOW_FILES
+      : []),
   ];
   return {
     write: paths.filter((path) => !seedExisting(req.profileId, path)),

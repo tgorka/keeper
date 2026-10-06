@@ -314,6 +314,8 @@ async fn ask_human_round_trip_on_synapse() {
         dispatch_chain: Vec::new(),
         limits: None,
         workflow: None,
+        checkpoints: None,
+        outputs: Vec::new(),
         created_at: chrono::Utc::now(),
     };
     let files = vec![

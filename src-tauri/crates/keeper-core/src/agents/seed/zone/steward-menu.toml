@@ -22,3 +22,13 @@ prompt      = """
 A session of this drive has closed; its path is in the brief. Read its README, its artifacts and its last log lines with your drive tools.
 Reply with what it learned that the drive should keep, and where in the drive it belongs. Write nothing else.
 """
+
+[[menu]]
+code        = "WT"
+description = "Run the triage workflow"
+workflow    = "triage"
+
+[[menu]]
+code        = "WD"
+description = "Run the dispatch workflow"
+workflow    = "dispatch"

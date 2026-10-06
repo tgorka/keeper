@@ -25,7 +25,7 @@
 use serde_json::Value;
 
 use crate::agents::label::Integrity;
-use crate::agents::session::{SessionAgent, SessionKind};
+use crate::agents::session::{Checkpoints, SessionAgent, SessionKind};
 use crate::bots::grant::GrantVerdict;
 use crate::sessions::model::{ACTIVE_DIR, ARCHIVE_DIR};
 
@@ -112,12 +112,13 @@ pub enum AgentTool {
     SkillsList,
     SkillView,
     AskHuman,
+    WorkflowStart,
     Declassify,
 }
 
 impl AgentTool {
     /// Every tool, in the table's order.
-    pub const ALL: [AgentTool; 24] = [
+    pub const ALL: [AgentTool; 25] = [
         AgentTool::DriveList,
         AgentTool::DriveRead,
         AgentTool::DriveGlob,
@@ -141,6 +142,7 @@ impl AgentTool {
         AgentTool::SkillsList,
         AgentTool::SkillView,
         AgentTool::AskHuman,
+        AgentTool::WorkflowStart,
         AgentTool::Declassify,
     ];
 
@@ -170,6 +172,7 @@ impl AgentTool {
             AgentTool::SkillsList => "skills_list",
             AgentTool::SkillView => "skill_view",
             AgentTool::AskHuman => "ask_human",
+            AgentTool::WorkflowStart => "workflow_start",
             AgentTool::Declassify => "declassify",
         }
     }
@@ -220,7 +223,9 @@ impl From<&GrantVerdict> for GrantWord {
 pub struct Context {
     /// The work was handed on: a delegated session, or any hop ≥ 1.
     pub delegated: bool,
-    /// Nobody watches it run: a scheduled or gate session (R83).
+    /// Nobody watches it run: a scheduled or gate session, a workflow's run
+    /// stamped `checkpoints = "unattended"`, or a session that asks a person
+    /// and finds nobody to ask (R83, R103).
     pub unattended: bool,
     /// The session's label's integrity now.
     pub integrity: Integrity,
@@ -233,15 +238,29 @@ pub struct Context {
 impl Context {
     /// The context of a call in the session `agent` describes, whose label
     /// is at `integrity` now. Unattended ⇔ the session kind is `scheduled`
-    /// or `gate` (R83; a workflow's `checkpoints = "unattended"` joins
-    /// them when 94.3 adds the key).
+    /// or `gate`, or its `checkpoints` are `unattended` (R83 as R103
+    /// extends it): a workflow's run is stamped so when its workflow says
+    /// so, when a scheduled card started it, or when nobody could be asked
+    /// as it opened.
     pub fn of_session(agent: &SessionAgent, integrity: Integrity) -> Context {
         Context {
             delegated: agent.kind == SessionKind::Delegated || agent.hop >= 1,
-            unattended: matches!(agent.kind, SessionKind::Scheduled | SessionKind::Gate),
+            unattended: matches!(agent.kind, SessionKind::Scheduled | SessionKind::Gate)
+                || agent.checkpoints == Some(Checkpoints::Unattended),
             integrity,
             via_kvm: false,
             grant: None,
+        }
+    }
+
+    /// This context in a session that asks a person (R102) and finds
+    /// `nobody` to ask now: unattended too, whatever its kind and its stamp
+    /// (R83 as R103 extends it) — the session its default answers for is
+    /// one nobody watches.
+    pub fn nobody_to_ask(self, nobody: bool) -> Context {
+        Context {
+            unattended: self.unattended || nobody,
+            ..self
         }
     }
 }
@@ -357,7 +376,13 @@ fn row(tool: AgentTool, facts: &CallFacts) -> Tier {
         // artifacts/: both land inside the session by construction (R105).
         // An ask goes into the session's own room, whose observers are the
         // label's readers, and to the person it is for (R105).
-        AgentTool::BmadRender | AgentTool::BmadMemlog | AgentTool::AskHuman => Tier::T1,
+        // A workflow's run is a session of the caller's own, opened as a
+        // delegation's is (R81's reasoning); naming a workflow on a card
+        // stays T3 (S-21).
+        AgentTool::BmadRender
+        | AgentTool::BmadMemlog
+        | AgentTool::AskHuman
+        | AgentTool::WorkflowStart => Tier::T1,
         AgentTool::Declassify => Tier::T3,
     }
 }
@@ -695,7 +720,8 @@ mod tests {
                 | AgentTool::SurfaceProposeEdit
                 | AgentTool::BmadRender
                 | AgentTool::BmadMemlog
-                | AgentTool::AskHuman => {
+                | AgentTool::AskHuman
+                | AgentTool::WorkflowStart => {
                     assert_eq!(tier(tool, CallFacts::default()), Tier::T1, "{tool:?}");
                 }
                 AgentTool::Declassify => {
@@ -832,7 +858,8 @@ mod tests {
         assert_eq!(once.gate(), Gate::Person);
     }
 
-    /// R83: unattended is the session kind; delegated is the kind or a hop.
+    /// R83 as R103 extends it: unattended is the session kind, or a
+    /// workflow run stamped unattended; delegated is the kind or a hop.
     #[test]
     fn the_context_comes_from_the_session() {
         let text = include_str!(
@@ -857,6 +884,15 @@ mod tests {
             assert_eq!(context.grant, None);
             agent.hop = 1;
             assert!(Context::of_session(&agent, Integrity::Agent).delegated);
+            agent.checkpoints = Some(Checkpoints::Proxy);
+            assert_eq!(
+                Context::of_session(&agent, Integrity::Agent).unattended,
+                context.unattended,
+                "{kind:?}"
+            );
+            agent.checkpoints = Some(Checkpoints::Unattended);
+            assert!(Context::of_session(&agent, Integrity::Agent).unattended);
+            agent.checkpoints = None;
         }
     }
 }

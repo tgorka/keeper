@@ -35,6 +35,40 @@ const TEMPLATE_AGENT: &str = include_str!("zone/_template/agent.toml");
 const TEMPLATE_SOUL: &str = include_str!("zone/_template/SOUL.md");
 const STEWARD_MENU: &str = include_str!("zone/steward-menu.toml");
 
+/// The stewards' workflows (AD-398, 94.3): BMAD-format skills with their
+/// `workflow.toml`, seeded beside a steward and never written again. Their
+/// menu codes `WT` and `WD` sit in `steward-menu.toml` beside the prompts.
+pub const STEWARD_WORKFLOWS: [(&str, &str); 7] = [
+    (
+        "_workflows/triage/workflow.toml",
+        include_str!("zone/_workflows/triage/workflow.toml"),
+    ),
+    (
+        "_workflows/triage/SKILL.md",
+        include_str!("zone/_workflows/triage/SKILL.md"),
+    ),
+    (
+        "_workflows/triage/steps/step-01-read.md",
+        include_str!("zone/_workflows/triage/steps/step-01-read.md"),
+    ),
+    (
+        "_workflows/triage/steps/step-02-cards.md",
+        include_str!("zone/_workflows/triage/steps/step-02-cards.md"),
+    ),
+    (
+        "_workflows/dispatch/workflow.toml",
+        include_str!("zone/_workflows/dispatch/workflow.toml"),
+    ),
+    (
+        "_workflows/dispatch/SKILL.md",
+        include_str!("zone/_workflows/dispatch/SKILL.md"),
+    ),
+    (
+        "_workflows/dispatch/steps/step-01-hand-on.md",
+        include_str!("zone/_workflows/dispatch/steps/step-01-hand-on.md"),
+    ),
+];
+
 /// The folder `agents new` copies.
 pub const TEMPLATE_DIR: &str = "_template";
 
@@ -313,6 +347,13 @@ pub fn files(choices: &SeedChoices) -> Vec<SeedFile> {
             render(agent.agent_toml, choices),
             render(agent.soul, choices),
         ));
+    }
+    if choices.with.iter().any(|agent| agent.kind == "steward") {
+        files.extend(
+            STEWARD_WORKFLOWS
+                .iter()
+                .map(|(path, text)| file((*path).to_owned(), (*text).to_owned())),
+        );
     }
     files
 }

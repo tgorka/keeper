@@ -9,7 +9,10 @@
 //!   generation's identity and manifest, and the check of an existing one.
 //! - [`memlog`]: `memlog.py`'s memory log, as functions over the file's text.
 //! - [`party`]: `resolve_party.py`'s party-mode roster and its projections.
+//! - [`help`]: the install's `bmad-help.csv` catalogue — its rows, menu codes
+//!   and phase graph.
 pub mod config;
+pub mod help;
 pub mod memlog;
 pub mod party;
 mod py;

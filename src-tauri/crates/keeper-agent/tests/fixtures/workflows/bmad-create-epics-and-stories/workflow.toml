@@ -1,0 +1,12 @@
+version = 1
+name = "bmad-create-epics-and-stories"
+description = "Break the PRD and architecture into epics and user stories with acceptance criteria."
+tools = ["drive_read", "drive_glob", "session_write", "bmad_config", "ask_human"]
+
+[[inputs]]
+name = "prd"
+type = "path"
+
+[[outputs]]
+name = "epics"
+path = "_bmad-output/planning-artifacts/epics.md"

@@ -489,6 +489,22 @@ pub struct DelegateBody {
     /// that marks its event seen never loses what it said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<DelegateReply>,
+    /// On `opened` of a workflow's run a scheduled card started: that card
+    /// and its window, so the run's reply finishes the card only while it
+    /// still names this window (the epic's Q5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<CardWindow>,
+}
+
+/// The scheduled card, and the window of it, a workflow's run was opened
+/// for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CardWindow {
+    /// The card, session-relative.
+    pub card: String,
+    /// The window, RFC 3339.
+    pub window: String,
 }
 
 /// A reply as the delegating session received it.
@@ -600,6 +616,12 @@ pub struct RunBody {
     pub state: RunState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// A workflow's run: the host step this line announces — `continue-<n>`
+    /// or `resume` — its turn yet to come, written before the step is
+    /// queued, so the next holder finds it whatever became of the queue
+    /// (R106).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
 }
 
 /// `surface`: a surface tool's call on a person's device.
@@ -1101,6 +1123,7 @@ mod tests {
                     artifacts: vec!["tgdrive/60-sessions/active/x/artifacts/a.md".into()],
                     label: label(),
                 }),
+                window: None,
             }),
             LineBody::Ask(AskBody {
                 id: "01J".into(),
@@ -1130,6 +1153,7 @@ mod tests {
             LineBody::Run(RunBody {
                 state: RunState::Blocked,
                 detail: Some("waiting".into()),
+                step: None,
             }),
             LineBody::Surface(SurfaceBody {
                 id: "s1".into(),

@@ -1976,7 +1976,10 @@ impl HostRuntime {
         let copy = Arc::clone(&slot.copy);
         let label = logged_label(&slot.session.dir, &slot.agent.label);
         let mut own = vec![copy.config().matrix_user.clone()];
-        if slot.agent.kind == SessionKind::Delegated {
+        if matches!(
+            slot.agent.kind,
+            SessionKind::Delegated | SessionKind::Workflow
+        ) {
             own.push(slot.agent.requested_by.clone());
         }
         let sinks = copy.sinks(&slot.agent);
@@ -2775,6 +2778,176 @@ mod tests {
         parked_at_start: AtomicBool,
         /// Each served room's worker activity, as its host reads it.
         activities: Mutex<HashMap<OwnedRoomId, Arc<crate::agent::Activity>>>,
+        /// A routed window of a card naming a workflow opens that run, as
+        /// `ServedSession::run_workflow_card` does, from the drive at this
+        /// root through these rooms.
+        workflows: Option<(PathBuf, Arc<RunRooms>)>,
+    }
+
+    /// The homeserver's workflow rooms, made by every host.
+    #[derive(Default)]
+    struct RunRooms {
+        made: Mutex<Vec<OwnedRoomId>>,
+    }
+
+    impl crate::delegate::DelegationPort for RunRooms {
+        fn known(&self) -> Arc<crate::rooms::Known> {
+            Arc::default()
+        }
+
+        fn create<'a>(
+            &'a self,
+            _kind: SessionKind,
+            _name: &'a str,
+            _invite: Vec<OwnedUserId>,
+            _agents: Vec<OwnedUserId>,
+        ) -> crate::agent::RoomFuture<'a> {
+            Box::pin(async move {
+                let mut made = self.made.lock().expect("lock");
+                let room = OwnedRoomId::try_from(format!("!run{}:example.org", made.len() + 1))
+                    .expect("room");
+                made.push(room.clone());
+                Ok(room)
+            })
+        }
+
+        fn send<'a>(
+            &'a self,
+            _room: &'a RoomId,
+            _content: Value,
+            _txn: matrix_sdk::ruma::OwnedTransactionId,
+        ) -> crate::matrix_sink::SendFuture<'a> {
+            unreachable!("opening a run sends nothing")
+        }
+
+        fn joined<'a>(
+            &'a self,
+            _room: &'a RoomId,
+            _user: &'a matrix_sdk::ruma::UserId,
+        ) -> crate::delegate::BoolFuture<'a> {
+            Box::pin(async { false })
+        }
+
+        fn members<'a>(&'a self, _room: &'a RoomId) -> crate::delegate::MembersFuture<'a> {
+            Box::pin(async { Ok(BTreeSet::new()) })
+        }
+
+        fn since_brief<'a>(
+            &'a self,
+            _room: &'a RoomId,
+            _me: &'a matrix_sdk::ruma::UserId,
+        ) -> crate::delegate::EventsFuture<'a> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn brief_room<'a>(&'a self, _room: &'a RoomId) -> crate::delegate::BriefRoomFuture<'a> {
+            Box::pin(async { None })
+        }
+
+        fn watch(&self, _child: &RoomId, _parent: &RoomId, _kind: SessionKind) {}
+
+        fn invite<'a>(
+            &'a self,
+            _room: &'a RoomId,
+            _user: &'a matrix_sdk::ruma::UserId,
+            _label: &'a Label,
+            _audience: Option<Readers>,
+        ) -> crate::delegate::UnitFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn depart(&self, _room: &RoomId) {}
+    }
+
+    /// The scheduled session's log as opening a run writes it, under the
+    /// worker's lease.
+    struct RunParent<'a> {
+        lease: &'a Lease,
+        lines: Mutex<Vec<LineBody>>,
+    }
+
+    impl crate::workflow::Parent for RunParent<'_> {
+        fn delegation(&self, _id: &str) -> Option<crate::delegate::Delegation> {
+            None
+        }
+
+        fn record(&self, line: LineBody) -> Result<(), String> {
+            self.lines.lock().expect("lock").push(line);
+            Ok(())
+        }
+
+        fn may_write(&self) -> bool {
+            self.lease.may_write()
+        }
+    }
+
+    /// The scheduled session's id, the same on every host.
+    const SCHEDULED_ID: &str = "01JA00000000000000000SORT0";
+
+    impl FakeCopy {
+        /// The worker's half of a workflow card's window: its run opened
+        /// through `rooms` from the drive at `root`, on a runtime of its own
+        /// as a worker thread would block on the room.
+        fn open_run(
+            &self,
+            root: &Path,
+            rooms: &RunRooms,
+            zone: &Path,
+            (session, agent, lease): (&str, &SessionAgent, &Lease),
+            card: &str,
+            window: &str,
+        ) -> Result<(), String> {
+            let decl = keeper_core::agents::drive::parse(&drive_toml()).expect("decl");
+            let from = crate::delegate::Delegator {
+                user: self.config.matrix_user.clone(),
+                drive: "tgdrive".to_owned(),
+                id: SCHEDULED_ID.to_owned(),
+                session: session.to_owned(),
+                room: agent.room.clone(),
+                kind: SessionKind::Scheduled,
+                requester: user(PERSON),
+                hop: 0,
+                limits: self.config.limits,
+                zone: zone.to_owned(),
+                subfolder: "60-sessions".to_owned(),
+                chain: vec![user(PERSON)],
+            };
+            let offer = |_: &[String]| vec!["drive_read".to_owned()];
+            let sinks = self.sinks(agent);
+            let scope = ["tgdrive".to_owned()];
+            let run = crate::workflow::CardRun {
+                from: &from,
+                agent: &self.config.id,
+                root,
+                zone: "80-agents",
+                run_offer: &offer,
+                scope: &scope,
+                label: agent.label.clone(),
+                sinks: &sinks,
+                drive_readers: Readers::Only(decl.readers.clone()),
+            };
+            let parent = RunParent {
+                lease,
+                lines: Mutex::default(),
+            };
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        tokio::runtime::Builder::new_multi_thread()
+                            .worker_threads(1)
+                            .build()
+                            .expect("a runtime")
+                            .block_on(async {
+                                crate::workflow::for_card(
+                                    rooms, &parent, &run, "sort", card, window, "",
+                                )
+                            })
+                    })
+                    .join()
+                    .expect("the opening")
+            })
+            .map(|_| ())
+        }
     }
 
     impl CopyPort for FakeCopy {
@@ -3068,10 +3241,20 @@ mod tests {
                                 .is_none_or(|w| lease.window().as_ref() == Some(w))
                     };
                     let holder = cards::Holder { agent, host: &host };
-                    let begun = cards::begin(zone, session, &holder, &scheduled, &may_write)
+                    let mut begun = cards::begin(zone, session, &holder, &scheduled, &may_write)
                         .map_err(|error| error.to_string());
                     if let Ok(cards::Begun::Run { .. }) = &begun {
-                        if self.parks.load(Ordering::SeqCst) {
+                        if let (Some((root, rooms)), Scheduled::Run { window, .. }) =
+                            (&self.workflows, &scheduled)
+                        {
+                            let worker = (session.as_str(), agent, lease.as_ref());
+                            let card = scheduled.card();
+                            if let Err(sentence) =
+                                self.open_run(root, rooms, zone, worker, card, window)
+                            {
+                                begun = Err(sentence);
+                            }
+                        } else if self.parks.load(Ordering::SeqCst) {
                             cards::write_run(
                                 zone,
                                 session,
@@ -3277,6 +3460,8 @@ mod tests {
                 dispatch_chain: Vec::new(),
                 limits: None,
                 workflow: None,
+                checkpoints: None,
+                outputs: Vec::new(),
                 created_at: chrono::Utc::now(),
             };
             let dir = self.dir(room);
@@ -3731,6 +3916,7 @@ mod tests {
             parks: AtomicBool::new(false),
             parked_at_start: AtomicBool::new(false),
             activities: Mutex::default(),
+            workflows: None,
             harvests: Mutex::default(),
             acks: Mutex::default(),
             stall_steward_rooms: false,
@@ -3822,6 +4008,8 @@ mod tests {
             dispatch_chain: Vec::new(),
             limits: None,
             workflow: None,
+            checkpoints: None,
+            outputs: Vec::new(),
             created_at: chrono::Utc::now(),
         })
     }
@@ -4713,6 +4901,8 @@ mod tests {
                 dispatch_chain: Vec::new(),
                 limits: None,
                 workflow: None,
+                checkpoints: None,
+                outputs: Vec::new(),
                 created_at: chrono::Utc::now(),
             };
             let dir = zone.join(SCHEDULED);
@@ -4798,6 +4988,85 @@ mod tests {
         assert_eq!(run_of(&card), Some(keeper_core::agents::card::Run::Review));
     }
 
+    /// 94.3 AC5 (R202, R94W-15): two host runtimes, each over a checkout of
+    /// its own holding the same card naming a workflow, and one homeserver.
+    /// Neither checkout has seen the other's writes, so only the session's
+    /// claim keeps the window to one of them: the holder's worker opens the
+    /// workflow's run as `ServedSession::run_workflow_card` does — one room
+    /// made, one run folder, its id the window's — and the other host opens
+    /// nothing, however often both tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_due_workflow_card_opens_one_run_across_two_hosts() {
+        let server = Arc::new(Server::default());
+        let checkout = || {
+            let root = tempfile::tempdir().expect("checkout");
+            let workflow = root.path().join("80-agents/_workflows/sort");
+            std::fs::create_dir_all(&workflow).expect("the workflow");
+            std::fs::write(
+                workflow.join("workflow.toml"),
+                "version = 1\nname = \"sort\"\ndescription = \"Sorts.\"\ntools = [\"drive_read\"]\n",
+            )
+            .expect("its header");
+            std::fs::write(
+                workflow.join("SKILL.md"),
+                "---\nname: sort\n---\n\nSort it.\n",
+            )
+            .expect("its skill");
+            put_card(
+                &root.path().join("60-sessions"),
+                &hourly("workflow: sort\nlast_run: \"2026-10-05T08:00:00Z\"\n"),
+            );
+            root
+        };
+        let (mine, theirs) = (checkout(), checkout());
+        let rooms = Arc::new(RunRooms::default());
+        let copy = |root: &Path| {
+            Arc::new(FakeCopy {
+                server: Arc::clone(&server),
+                zone: Some(root.join("60-sessions")),
+                workflows: Some((root.to_owned(), Arc::clone(&rooms))),
+                ..fake_copy()
+            })
+        };
+        let mut here = world_over(copy(mine.path()), true);
+        let mut there = world_over(copy(theirs.path()), true);
+        there.rt.host = HostSlug::new(OTHER).expect("slug");
+        let a = room(1);
+        for w in [&mut here, &mut there] {
+            w.at("2026-10-05T09:30:00Z");
+            w.offer_scheduled(&a);
+        }
+        for _ in 0..6 {
+            tokio::join!(here.tick(), there.tick());
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+
+        let routed = (here.copy.routed(), there.copy.routed());
+        assert_eq!(here.copy.runs() + there.copy.runs(), 1, "{routed:?}");
+        assert_eq!(rooms.made.lock().expect("lock").len(), 1, "one room");
+        let window = named("2026-10-05T09:00:00Z");
+        let id = keeper_core::agents::workflow::run_id(SCHEDULED_ID, "card.md", &window);
+        let runs: Vec<String> = [mine.path(), theirs.path()]
+            .into_iter()
+            .flat_map(|root| {
+                let zone = root.join("60-sessions");
+                crate::sessions::scan::session_dirs(&zone)
+                    .into_iter()
+                    .filter_map(move |rel| {
+                        let text = std::fs::read_to_string(zone.join(&rel).join("agent.toml"));
+                        text.ok()
+                            .and_then(|text| {
+                                keeper_core::agents::session::parse_session_agent_toml(&text).ok()
+                            })
+                            .filter(|run| run.kind == SessionKind::Workflow)
+                            .map(|run| format!("{rel} {}", run.id))
+                    })
+            })
+            .collect();
+        assert_eq!(runs.len(), 1, "one run in both checkouts: {runs:?}");
+        assert!(runs[0].ends_with(&id.to_string()), "the window's: {runs:?}");
+    }
+
     /// 92.3 AC3 (Q8, R57): a card pinned to hesperia while hesperia is not
     /// live is said to wait by electra, the announcing host — `run: waiting`
     /// and its line naming what it waits for — which then hands the claim
@@ -4841,7 +5110,8 @@ mod tests {
                 },
                 Ok(cards::Begun::Said(keeper_core::agents::log::RunBody {
                     state: keeper_core::agents::log::RunState::Waiting,
-                    detail: Some(waiting)
+                    detail: Some(waiting),
+                    step: None
                 }))
             )
         );
@@ -4975,7 +5245,8 @@ mod tests {
                 },
                 Ok(cards::Begun::Said(keeper_core::agents::log::RunBody {
                     state: keeper_core::agents::log::RunState::Review,
-                    detail: Some("ran on electra, effect unknown".to_owned())
+                    detail: Some("ran on electra, effect unknown".to_owned()),
+                    step: None
                 }))
             ),
             "{routed:?}"
@@ -5225,7 +5496,8 @@ mod tests {
             routed.first().map(|(_, begun)| begun.clone()),
             Some(Ok(cards::Begun::Said(keeper_core::agents::log::RunBody {
                 state: keeper_core::agents::log::RunState::Review,
-                detail: Some("ran on hesperia, effect unknown".to_owned())
+                detail: Some("ran on hesperia, effect unknown".to_owned()),
+                step: None
             }))),
             "{routed:?}"
         );
