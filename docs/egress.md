@@ -62,6 +62,7 @@ keeps those crates out of its build.
 | **`[homeserver].url`'s host** | While `run` serves, and on `init` and `login` | The agents' Matrix traffic: each copy's sign-in, `/sync`, the rooms it joins, the anchors and edits of its answers, its status anchor. One homeserver per host; agentd listens on nothing. |
 | **Each `[[providers]] base_url`'s host** | Each turn of an agent whose `[model].bot` names that provider, and the model probe while arming it | Chat completions for the agent's own model, the one the person chose for it. Only providers the file names are reached; a session whose label is `local_only` reaches none but a local (`ollama`) one. |
 | **Each `[[drives]] remote`'s host**, and the LFS destinations the daemon rows above describe | Each drive's checkout and every sync while `run` serves | Fetch and push of the drives, through agentd's own engine: the sessions' logs and artifacts reach the drive this way. |
+| **A host an approved `run` with network names** (docs/agents.md § *Running a command*) | Only after a person approves that one run | Whatever its program reaches — keeper cannot list it ahead, so each such run is approved on its own (T3), and that approval is the person configuring that destination (NFR-121). The run sees only its session's `workspace/`, exactly as its card listed it; no drive, no `.keeper/`, no credential of the host's. The same holds on the Mac. |
 
 No other destination: no update check, and no telemetry destination at all.
 

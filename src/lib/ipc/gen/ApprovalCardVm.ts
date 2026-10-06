@@ -2,6 +2,7 @@
 import type { ApprovalPersonVm } from "./ApprovalPersonVm";
 import type { ApprovalStateVm } from "./ApprovalStateVm";
 import type { DeclassifyVm } from "./DeclassifyVm";
+import type { RunCardVm } from "./RunCardVm";
 import type { ScopeOfferVm } from "./ScopeOfferVm";
 
 /**
@@ -29,7 +30,8 @@ summary: string,
  */
 tool: string, 
 /**
- * The exact arguments, pretty-printed JSON; `None` when attached.
+ * The exact arguments, pretty-printed JSON; `None` when attached, and
+ * for a `run`, which `run` draws whole.
  */
 payload: string | null, 
 /**
@@ -69,4 +71,10 @@ verify: boolean,
 /**
  * At T4: who alone decides, and that it cannot be undone.
  */
-only: string | null, declassify: DeclassifyVm | null, };
+only: string | null, declassify: DeclassifyVm | null, 
+/**
+ * A `run`'s execution as keeper bound it (UX-DR139); `None` for any
+ * other tool, or when the action is attached — [`attached_payload`]
+ * then draws the same view once its file is checked (R231).
+ */
+run: RunCardVm | null, };

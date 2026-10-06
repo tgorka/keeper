@@ -14,6 +14,7 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
 });
 
 import {
+  APPROVAL_SEE_RUN_FIRST,
   APPROVAL_SENT,
   ApprovalRequest,
   approvalListName,
@@ -54,6 +55,7 @@ function card(over: Partial<ApprovalCardVm> = {}): ApprovalCardVm {
     verify: false,
     only: null,
     declassify: null,
+    run: null,
     ...over,
   };
 }
@@ -109,6 +111,76 @@ describe("ApprovalRequest — what the card shows (UX-DR136)", () => {
       "true",
     );
     expect(screen.getByRole("figure").querySelector("pre")?.textContent).toBe(long);
+  });
+
+  it("draws a run as keeper bound it: the argv as it runs, the program, the folder, what it releases", () => {
+    draw(
+      card({
+        tier: 3,
+        tool: "run",
+        payload: null,
+        summary: "Run `git` in `workspace/repo` with network",
+        run: {
+          argv: ["git", "-c", "core.hooksPath=/dev/null", "fetch"],
+          program: "/usr/bin/git · 4f1c9a0b7e22",
+          wrappers: [],
+          wrapped: null,
+          cwd: "workspace/repo",
+          reads: [],
+          timeoutS: 120,
+          held: [".npmrc · 0123456789ab"],
+          network: {
+            sentence:
+              "This command may reach any host. It sees only this session's workspace: 2 files, 10 bytes.",
+            files: ["a.txt", "src/lib.rs"],
+          },
+        },
+      }),
+    );
+    const run = screen.getByRole("figure", { name: "What will run" });
+    expect(run.querySelector("pre")?.textContent).toBe("git\n-c\ncore.hooksPath=/dev/null\nfetch");
+    expect(within(run).getByText("/usr/bin/git · 4f1c9a0b7e22")).toBeVisible();
+    expect(within(run).getByText("workspace/repo")).toBeVisible();
+    expect(within(run).getByText(".npmrc · 0123456789ab")).toBeVisible();
+    expect(within(run).getByText(/may reach any host/)).toBeVisible();
+    expect(within(run).getByText("src/lib.rs")).not.toBeVisible();
+    fireEvent.click(within(run).getByRole("button", { name: "Show the files it sees" }));
+    expect(within(run).getByText("src/lib.rs")).toBeVisible();
+  });
+
+  it("tells apart two runs alike but for the drives they read, their time limit and a wrapper between", () => {
+    type Run = NonNullable<ApprovalCardVm["run"]>;
+    const run = (more: Partial<Run>): Run => ({
+      argv: ["env", "nice", "cargo", "test"],
+      program: "/usr/bin/env · 2d313ecc9fc0",
+      wrappers: [],
+      wrapped: "/usr/bin/cargo · 7c0e5a91d2b4",
+      cwd: "workspace",
+      reads: [],
+      timeoutS: 120,
+      held: [],
+      network: null,
+      ...more,
+    });
+    const drawn = (shown: Run) => {
+      const { unmount } = draw(card({ tool: "run", payload: null, run: shown }));
+      const text = screen.getByRole("figure", { name: "What will run" }).textContent ?? "";
+      unmount();
+      return text;
+    };
+    const plain = drawn(run({}));
+    const wider = drawn(
+      run({
+        wrappers: ["/usr/bin/nice · 2d313ecc9fc0"],
+        reads: ["tgdrive", '"\\u{202e}evird"'],
+        timeoutS: 1800,
+      }),
+    );
+    for (const shown of ["/usr/bin/nice · 2d313ecc9fc0", "tgdrive", '"\\u{202e}evird"', "1800 s"]) {
+      expect(wider).toContain(shown);
+      expect(plain).not.toContain(shown);
+    }
+    expect(plain).toContain("120 s");
   });
 
   it("folds one very long line too, saying how many characters", () => {
@@ -448,7 +520,7 @@ describe("ApprovalRequest — an attached action", () => {
 
   it("fetches the whole action on request and shows it", async () => {
     const whole = '{\n  "path": "notes/archive.md"\n}';
-    agentApprovalPayload.mockResolvedValue(whole);
+    agentApprovalPayload.mockResolvedValue({ text: whole, run: null });
     draw(attached());
     expect(screen.queryByRole("figure")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Show the full action" }));
@@ -476,5 +548,46 @@ describe("ApprovalRequest — an attached action", () => {
     ).toBeInTheDocument();
     expect(screen.queryByRole("figure")).toBeNull();
     expect(screen.getByRole("button", { name: "Approve once" })).toBeEnabled();
+  });
+
+  it("an attached run is drawn as a run, and approved only once it was shown", async () => {
+    agentApprovalPayload.mockRejectedValueOnce({
+      code: "unsupported",
+      message: "keeper could not check the attached action against the request's digest.",
+    });
+    agentApprovalPayload.mockResolvedValueOnce({
+      text: '{\n  "args": {"argv": ["git", "fetch"]}\n}',
+      run: {
+        argv: ["git", "-c", "core.hooksPath=/dev/null", "fetch", '"a\\nb"'],
+        program: "/usr/bin/git · 0123456789ab",
+        wrappers: [],
+        wrapped: null,
+        cwd: "workspace/repo",
+        reads: [],
+        timeoutS: 120,
+        held: [],
+        network: {
+          sentence:
+            "This command may reach any host. It sees only this session's workspace: 1 file, 5 bytes.",
+          files: ["a.txt"],
+        },
+      },
+    });
+    draw(card({ ...attached(), tool: "run", tier: 3 }));
+    const approve = screen.getByRole("button", { name: "Approve once" });
+    expect(approve).toBeDisabled();
+    expect(screen.getByText(APPROVAL_SEE_RUN_FIRST)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Deny" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Show the full action" }));
+    await screen.findByText(
+      "keeper could not check the attached action against the request's digest.",
+    );
+    expect(approve).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Show the full action" }));
+    await waitFor(() => expect(approve).toBeEnabled());
+    expect(screen.queryByText(APPROVAL_SEE_RUN_FIRST)).toBeNull();
+    // What runs is drawn as Rust bound it, not the raw JSON.
+    expect(screen.getByRole("figure", { name: "What will run" })).toBeVisible();
+    expect(screen.queryByText(/"args"/)).toBeNull();
   });
 });

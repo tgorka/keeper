@@ -36,9 +36,21 @@ toml = { workspace = true }
 futures-util = { workspace = true }
 
 # The headless host's process layer: no secret variable and no core dump
-# after start (S-07), `prctl` on Linux.
+# after start (S-07), `prctl` on Linux; a `run`'s own process group, killed
+# whole at its timeout.
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
+
+# A `run`'s sandbox on Linux, applied by the trampoline to itself before it
+# execs the program (D-33): landlock for files and TCP, seccomp for sockets
+# and the calls that reach into another process, nix to close what it
+# inherited and to start the checked program by its descriptor
+# (`execveat`, feature `process`).
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { workspace = true }
+seccompiler = { workspace = true }
+libc = { workspace = true }
+nix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

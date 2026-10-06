@@ -877,19 +877,25 @@ async fn make_steward(
     Ok(true)
 }
 
+/// The `sandbox` capability, when the host's probe passed (96.1 #11): a
+/// host offers it only where it can enforce it.
+fn sandbox_tool(sandbox: bool) -> impl Iterator<Item = String> {
+    sandbox.then(|| "sandbox".to_owned()).into_iter()
+}
+
 impl HostRuntime {
-    /// The runtime of an agentd host over its mounted `drives` and `copies`.
+    /// The runtime of an agentd host over its mounted `drives` and `copies`;
+    /// `sandbox` when its probe passed (96.1 #11).
     pub(crate) fn agentd(
         config: &AgentdConfig,
         host: HostSlug,
         version: &str,
         drives: &[DriveView],
         copies: Vec<Arc<Copy>>,
+        sandbox: bool,
     ) -> HostRuntime {
-        let tools = config
-            .mcp
-            .iter()
-            .map(|mcp| format!("mcp:{}", mcp.name))
+        let tools = sandbox_tool(sandbox)
+            .chain(config.mcp.iter().map(|mcp| format!("mcp:{}", mcp.name)))
             .chain(config.kvm.iter().map(|kvm| format!("kvm:{}", kvm.id)))
             .collect();
         let manifest_drives = drives
@@ -926,15 +932,17 @@ impl HostRuntime {
         }
     }
 
-    /// The runtime of a desktop host: never always on, no tool of its own
-    /// yet, its drives as the app syncs them, and no control room until one
-    /// of its copies is found in the principal's ([`Self::set_control_room`]).
+    /// The runtime of a desktop host: never always on, `sandbox` its only
+    /// tool when its probe passed, its drives as the app syncs them, and no
+    /// control room until one of its copies is found in the principal's
+    /// ([`Self::set_control_room`]).
     pub(crate) fn desktop(
         host: HostSlug,
         principal: &str,
         version: &str,
         drives: &[(DriveView, Materialized)],
         copies: Vec<Arc<Copy>>,
+        sandbox: bool,
     ) -> HostRuntime {
         HostRuntime {
             host,
@@ -942,7 +950,7 @@ impl HostRuntime {
             always_on: false,
             version: version.to_owned(),
             control_room: None,
-            tools: Vec::new(),
+            tools: sandbox_tool(sandbox).collect(),
             drives: drives
                 .iter()
                 .map(|(view, materialized)| HostDrive {
@@ -7460,5 +7468,26 @@ mod tests {
             claim_at(&w, &week).expect("recorded").content.window,
             Some(claim::rfc3339(window as u64))
         );
+    }
+
+    /// 96.1 #11: a host's manifest offers `sandbox` exactly when its probe
+    /// passed — agentd's beside its configured servers, the desktop's as
+    /// its only tool — so an agent needing it waits for a host that can.
+    #[test]
+    fn sandbox_capability_follows_the_probe() {
+        let config = AgentdConfig::parse(
+            "version = 1\nprincipal = \"tgorka\"\nhost = \"electra\"\n\n[homeserver]\nurl = \"https://matrix.example.org\"\n\n[[mcp]]\nname = \"forge\"\nurl = \"https://forge.example.org/mcp\"\n",
+        )
+        .expect("parses");
+        let slug = || HostSlug::new("electra").expect("slug");
+        for (probed, agentd, desktop) in [
+            (true, vec!["sandbox", "mcp:forge"], vec!["sandbox"]),
+            (false, vec!["mcp:forge"], vec![]),
+        ] {
+            let server = HostRuntime::agentd(&config, slug(), "t", &[], Vec::new(), probed);
+            assert_eq!(server.manifest(0, true).tools, agentd, "{probed}");
+            let mac = HostRuntime::desktop(slug(), "tgorka", "t", &[], Vec::new(), probed);
+            assert_eq!(mac.manifest(0, true).tools, desktop, "{probed}");
+        }
     }
 }

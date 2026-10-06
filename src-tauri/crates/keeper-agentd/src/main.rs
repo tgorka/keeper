@@ -5,12 +5,16 @@
 //! log into the drive, which its own sync engine commits and pushes.
 //!
 //! **`main`'s order is the security of the process (S-07):**
-//! 1. git's LFS filter invocations are answered first: the engine registers
+//! 1. A run's sandbox trampoline is answered first (D-33, R141): agentd
+//!    re-executes itself with a hidden argv, and that process — one thread,
+//!    nothing else started — applies landlock and seccomp to itself and
+//!    becomes the program.
+//! 2. git's LFS filter invocations are answered next: the engine registers
 //!    this binary as the filter, and git runs it with no configuration.
-//! 2. The command line is parsed.
-//! 3. Every secret is read, the secret variables leave the environment and
+//! 3. The command line is parsed.
+//! 4. Every secret is read, the secret variables leave the environment and
 //!    the process makes itself non-dumpable — while it still has one thread.
-//! 4. Only then is the multi-thread runtime built; `#[tokio::main]` would
+//! 5. Only then is the multi-thread runtime built; `#[tokio::main]` would
 //!    have started its threads before the body ran.
 //!
 //! Logging is `tracing-subscriber`'s fmt layer to stderr, which journald
@@ -33,12 +37,30 @@ use std::process::ExitCode;
 use clap::Parser as _;
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if let Some(code) = served_as_sandbox_trampoline() {
+        return code;
+    }
     if served_as_lfs_filter() {
         return ExitCode::SUCCESS;
     }
     let cli = cli::Cli::parse();
     init_logging(cli.verbose);
     ExitCode::from(cli::run(cli))
+}
+
+/// Become a sandboxed `run` when that is what this process was started as:
+/// `keeper-agentd __keeper-run-sandbox <plan>`. It returns only on failure.
+#[cfg(target_os = "linux")]
+fn served_as_sandbox_trampoline() -> Option<ExitCode> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next()? != keeper_agent::run::TRAMPOLINE_ARG {
+        return None;
+    }
+    let plan = args.next()?;
+    Some(keeper_agent::run::linux::trampoline(std::path::Path::new(
+        &plan,
+    )))
 }
 
 /// Serve git's `lfs clean|smudge|filter-process` invocation when that is what

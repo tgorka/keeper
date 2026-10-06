@@ -292,6 +292,10 @@ pub struct SessionContext {
     /// The nudges' counters, from every line (95.1): when the session's
     /// agent reviews what it learned.
     pub nudges: keeper_core::agents::nudge::Nudges,
+    /// The `session` approvals of T2 runs this host consumed (R146): held
+    /// in memory only, so they end when the session closes or this host
+    /// lets it go — a run then asks again.
+    pub(crate) run_allowances: Vec<keeper_core::agents::run::RunAllowance>,
 }
 
 impl SessionContext {
@@ -364,6 +368,7 @@ impl SessionContext {
             turn_tokens_at: 0,
             last_result: None,
             nudges: Default::default(),
+            run_allowances: Vec::new(),
         };
         for stored in &log.lines {
             match &stored.body {
@@ -1011,6 +1016,9 @@ pub struct AgentDeps {
     /// a test world or agentd's prompt preview has it, refuses it with
     /// [`UNATTENDED_REFUSAL`].
     pub decisions: Option<Arc<dyn crate::approvals::DecisionSource>>,
+    /// This host's sandbox, when its probe passed (96.1 #11): `run` is
+    /// offered only with it, and never runs without it.
+    pub sandbox: Option<Arc<crate::run::SandboxHost>>,
 }
 
 impl AgentDeps {
@@ -1046,6 +1054,9 @@ struct AllowedTools<'t> {
     memory: crate::memory::MemoryTools,
     /// `drive_search` (95.4).
     search: crate::search::SearchTools,
+    /// `run` (96.1): this host's sandbox and where this session's runs
+    /// work; `None` where the host offers no `sandbox`.
+    runs: Option<RunTools>,
     view: &'t dyn TurnView,
     sinks: &'t Sinks,
     /// The declarations of the drives this host mounts: a write's audience.
@@ -1079,13 +1090,14 @@ struct AllowedTools<'t> {
 }
 
 /// A consumed approval as the one execution of its call holds it: the
-/// call's wire id and tool, the record, and the flow a `declassify`
-/// approval releases (R89).
+/// call's wire id and tool, the record, the flow a `declassify` approval
+/// releases (R89), and what a `run` approval was checked against (R213).
 struct Bound {
     call: String,
     tool: String,
     approval: Ulid,
     released: Option<crate::approvals::Released>,
+    run: Option<Box<crate::approvals::ApprovedRun>>,
 }
 
 /// Why a bound call that would now reach someone its approval did not name
@@ -1172,6 +1184,7 @@ impl AllowedTools<'_> {
         call: &chat::ToolCall,
         approval: Ulid,
         released: Option<crate::approvals::Released>,
+        approved_run: Option<Box<crate::approvals::ApprovedRun>>,
         run: impl FnOnce() -> R,
     ) -> R {
         *self.bound.lock().unwrap_or_else(|p| p.into_inner()) = Some(Bound {
@@ -1179,6 +1192,7 @@ impl AllowedTools<'_> {
             tool: call.name.clone(),
             approval,
             released,
+            run: approved_run,
         });
         let ran = run();
         *self.bound.lock().unwrap_or_else(|p| p.into_inner()) = None;
@@ -1194,6 +1208,17 @@ impl AllowedTools<'_> {
             .as_ref()
             .filter(|bound| bound.call == id && bound.tool == tool)
             .map(|bound| bound.approval)
+    }
+
+    /// What the consumed approval call `id`, a `run`, runs on was checked
+    /// against, while it is the bound call's execution.
+    fn bound_run(&self, id: &str) -> Option<Box<crate::approvals::ApprovedRun>> {
+        self.bound
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .filter(|bound| bound.call == id && bound.tool == keeper_core::agents::run::RUN)
+            .and_then(|bound| bound.run.clone())
     }
 
     /// What classified call `id` to `recipients` comes to once its sinks
@@ -1234,6 +1259,8 @@ impl AllowedTools<'_> {
             classification: classification.clone(),
             pins,
             declassify: None,
+            exec_binding: Value::Null,
+            workspace: None,
         });
         Gated::Park(approval)
     }
@@ -1492,6 +1519,211 @@ impl crate::helper::Parent for AllowedTools<'_> {
     }
 }
 
+/// What a turn's `run` calls work with (96.1): this host's sandbox, the
+/// session's place in its sessions zone, the drives in its scope this host
+/// mounts and the agent's grants let it read, the `session` approvals this
+/// host holds for it, and the label of what each run could read, taken by
+/// the call's result.
+struct RunTools {
+    host: Arc<crate::run::SandboxHost>,
+    /// The home drive's checkout and its sessions zone's folder in it.
+    drive: PathBuf,
+    zone: String,
+    session: String,
+    drives: Vec<(String, PathBuf)>,
+    allowances: Vec<keeper_core::agents::run::RunAllowance>,
+    labels: Mutex<Vec<Label>>,
+}
+
+impl RunTools {
+    /// The label of the run the call that just ended made, if it ran.
+    fn take_label(&self) -> Option<Label> {
+        self.labels.lock().unwrap_or_else(|p| p.into_inner()).pop()
+    }
+}
+
+/// The drives a run of `context`'s session may mount on this host: in its
+/// scope, checked out here, and readable under the agent's grants exactly
+/// as a `drive_read` of the drive is (NFR-115, R213).
+pub(crate) fn run_drives(context: &SessionContext, deps: &AgentDeps) -> Vec<(String, PathBuf)> {
+    let grants = agent_grants(context, deps);
+    deps.env
+        .drive
+        .as_ref()
+        .map(|drive| drive.profiles.profiles())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|profile| context.scope.contains(&profile.id))
+        .filter(|profile| grant_read(&*grants, &profile.id, "").is_ok())
+        .map(|profile| (profile.id, profile.local_path))
+        .collect()
+}
+
+impl AllowedTools<'_> {
+    /// A `run` call (96.1, D-33), in the order every call keeps (R82,
+    /// R90): what it relies on read and its tier classified from that;
+    /// T5 refused; a call an approval bound runs only on the facts that
+    /// approval was checked against (R213); its writable workspace checked
+    /// as a write to the session's home drive, against the label joined with
+    /// every drive it would read (R213); a networked run — a send to anyone
+    /// (AD-391) — only on its own T3 approval, which names the workspace set
+    /// it releases (R145, S-03); a T2 run a `session` approval covers goes
+    /// without asking (R146); its one audit row before the program starts;
+    /// then the sandboxed run, its result labelled by what the run could
+    /// read.
+    fn run_command(&self, wire: &chat::ToolCall) -> ToolOutcome {
+        use keeper_core::agents::run as core_run;
+        let tool = AgentTool::Run;
+        let name = wire.name.as_str();
+        let args = wire.arguments.as_ref().unwrap_or(&Value::Null);
+        let at = format!(
+            "{}/{}",
+            self.session_dir,
+            keeper_core::sessions::model::WORKSPACE_DIR
+        );
+        let drive = self.home.id.clone();
+        let ready = self
+            .runs
+            .as_ref()
+            .filter(|_| self.allow.iter().any(|allowed| allowed == core_run::RUN))
+            .ok_or_else(|| format!("{name} is not one of this agent's tools on this host."))
+            .and_then(|runs| {
+                let session = crate::run::Session {
+                    drive: &runs.drive,
+                    zone: &runs.zone,
+                    path: &runs.session,
+                };
+                runs.host
+                    .prepare(args, session, &runs.drives)
+                    .map(|prepared| (prepared, runs))
+            });
+        let facts = ready.as_ref().map_or_else(
+            |_| CallFacts::default(),
+            |(prepared, _)| prepared.call_facts,
+        );
+        let classification = self.classify(&wire.id, tool, &facts, None);
+        let refused = |reason: String| {
+            CallAudit::new(
+                self.sinks,
+                name,
+                Effect::Write,
+                &classification,
+                Gated::Run(self.bound_approval(&wire.id, name).map(Approval::Approved)),
+                (&drive, &at),
+            )
+            .refuse(reason)
+        };
+        let (prepared, runs) = match ready {
+            Ok(ready) => ready,
+            Err(reason) => return refused(reason),
+        };
+        if classification.gate() == Gate::Refuse {
+            return refused(core_run::PRIVILEGED.to_owned());
+        }
+        let bound = self.bound_approval(&wire.id, name);
+        if bound.is_some() {
+            let held = self.bound_run(&wire.id).is_some_and(|approved| {
+                approved.exec_binding == prepared.exec_binding
+                    && approved.workspace == prepared.workspace_set
+            });
+            if !held {
+                tracing::warn!(call = %wire.id, "agents: a run changed between its approval's check and its start");
+                return refused(
+                    "This run was refused: where it runs, its program, the code it runs or its workspace changed after it was approved. Nothing was run.".to_owned(),
+                );
+            }
+        }
+        // Its workspace is written, whatever the program does: a write to
+        // the session's home drive, by the label as it would be once the
+        // run read every drive it mounts.
+        let reading = self.view.label().join(&core_run::result_label(
+            false,
+            &crate::run::mounted_labels(&prepared.mounted, self.drives),
+        ));
+        let home_readers = Sink::DriveWrite {
+            drive_readers: Readers::Only(self.home.readers.clone()),
+        };
+        if let SinkVerdict::Block { reason, .. } = check_sink(&reading, &home_readers) {
+            return refused(format!(
+                "This run was refused: its workspace is on {drive}, and {reason}"
+            ));
+        }
+        let blocked = match check_sink(&self.view.label(), &core_run::network_sink()) {
+            SinkVerdict::Block { reason, .. } if prepared.request.network && bound.is_none() => {
+                Some(reason)
+            }
+            _ => None,
+        };
+        let allowed = runs
+            .allowances
+            .iter()
+            .filter(|_| bound.is_none())
+            .filter(|_| {
+                !matches!(
+                    check_call(&self.view.label(), name, classification.tier, &[]),
+                    CallVerdict::Block { .. }
+                )
+            })
+            .find(|allowance| {
+                allowance.covers(
+                    &prepared.exec_binding,
+                    classification.tier,
+                    self.agent.kind,
+                    chrono::Utc::now(),
+                )
+            })
+            .and_then(|allowance| Ulid::from_string(&allowance.approval).ok());
+        let gated = match allowed {
+            Some(approval) => Gated::Run(Some(Approval::Approved(approval))),
+            None => match self.gated(&wire.id, name, &classification, &[], Vec::new()) {
+                Gated::Park(approval) => {
+                    if let Some(parking) = self
+                        .parked
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .as_mut()
+                    {
+                        parking.exec_binding = prepared.exec_binding.clone();
+                        parking.workspace = prepared.workspace_set.clone();
+                    }
+                    Gated::Park(approval)
+                }
+                // Nobody can be asked: a networked run says what blocks it.
+                Gated::Refuse(reason) => Gated::Refuse(blocked.unwrap_or(reason)),
+                gated => gated,
+            },
+        };
+        let audit = CallAudit::new(
+            self.sinks,
+            name,
+            Effect::Write,
+            &classification,
+            gated,
+            (&drive, &at),
+        );
+        if let Err(withheld) = audit.admit(&drive, &at) {
+            let outcome = withheld.into();
+            audit.finish(&outcome);
+            return outcome;
+        }
+        let outcome = match crate::agent::off_the_runtime(|| runs.host.execute(&prepared)) {
+            Ok(ran) => {
+                runs.labels
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(core_run::result_label(
+                        prepared.request.network,
+                        &crate::run::mounted_labels(&prepared.mounted, self.drives),
+                    ));
+                ToolOutcome::Answered { text: ran.render() }
+            }
+            Err(reason) => ToolOutcome::Refused { reason },
+        };
+        audit.finish(&outcome);
+        outcome
+    }
+}
+
 impl crate::sinks::Lift for AllowedTools<'_> {
     /// A flow of call `call` the label blocks (R89). The call a consumed
     /// approval bound never parks again: its flow goes through when that
@@ -1554,6 +1786,8 @@ impl crate::sinks::Lift for AllowedTools<'_> {
             classification,
             pins,
             declassify: Some(args),
+            exec_binding: Value::Null,
+            workspace: None,
         });
         crate::sinks::Lifted::Parked(approval)
     }
@@ -2025,6 +2259,9 @@ impl AllowedTools<'_> {
             };
             audit.finish(&outcome);
             return Some(outcome);
+        }
+        if wire.name == keeper_core::agents::run::RUN {
+            return Some(self.run_command(wire));
         }
         if !crate::surface::is_surface(&wire.name) {
             return None;
@@ -5231,6 +5468,7 @@ impl ServedSession {
                     keeper_core::agents::approval::summary_of(
                         parked.parking.classification.tool,
                         &parked.args,
+                        &parked.parking.exec_binding,
                     )
                 });
                 let note = format!("{} {summary}", crate::approvals::WAITING_FOR);
@@ -6090,15 +6328,17 @@ fn reply_offer(session: SessionKind, relays_waiting: bool, kind: AgentKind) -> R
 /// tools where the home drive `home` reads (R195), `helper` as `allow`
 /// says (R105), `ask_human` by the session's kind (R102),
 /// `workflow_start` outside a proxy's own conversation (AD-380) and the
-/// memory tools `allow` names, by the session's kind (R127), and
-/// `drive_search` as `allow` says (95.4). Arming and a workflow's start
-/// check both ask it (R202).
+/// memory tools `allow` names, by the session's kind (R127),
+/// `drive_search` as `allow` says (95.4), and `run` as `allow` says where
+/// this host's sandbox passed its probe, `sandboxed` (96.1 #11). Arming and
+/// a workflow's start check both ask it (R202).
 fn agent_offer(
     config: &keeper_core::agents::home::AgentConfig,
     session: SessionKind,
     relays_waiting: bool,
     grants: &dyn GrantSource,
     home: &str,
+    sandboxed: bool,
     mut tools: Vec<chat::ToolSpec>,
 ) -> Vec<chat::ToolSpec> {
     // Whether this model is offered tools at all: the surface tools ride on
@@ -6138,6 +6378,14 @@ fn agent_offer(
     if config.allow.iter().any(|name| crate::search::serves(name)) {
         tools.push(crate::search::spec());
     }
+    if sandboxed
+        && config
+            .allow
+            .iter()
+            .any(|name| name == keeper_core::agents::run::RUN)
+    {
+        tools.push(keeper_core::agents::run::spec());
+    }
     tools
 }
 
@@ -6164,6 +6412,7 @@ fn workflow_offer(
         false,
         &grants,
         &deps.home.drive.id,
+        deps.sandbox.is_some(),
         model_tools.to_vec(),
     )
     .into_iter()
@@ -6217,6 +6466,7 @@ async fn arm_session(
         !context.relays.is_empty(),
         grants.as_ref(),
         &deps.home.drive.id,
+        deps.sandbox.is_some(),
         model_tools.clone(),
     );
     (armed, model_tools)
@@ -6539,6 +6789,18 @@ async fn run_agent_turn(
             review: review.is_some(),
         },
     );
+    // `run`'s place on this host: the session's workspace, the drives the
+    // agent may read in its scope this host mounts, and the `session`
+    // approvals of runs it holds (96.1, R146).
+    let runs = deps.sandbox.as_ref().map(|host| RunTools {
+        host: Arc::clone(host),
+        drive: deps.drive_root.clone(),
+        zone: deps.sessions_subfolder.clone(),
+        session: context.session.path.clone(),
+        drives: run_drives(context, deps),
+        allowances: context.run_allowances.clone(),
+        labels: Mutex::new(Vec::new()),
+    });
     let log = Mutex::new(TurnLog {
         context,
         writer,
@@ -6634,6 +6896,7 @@ async fn run_agent_turn(
             helper_offer,
             stop.clone(),
         ),
+        runs,
     };
     let tool_loop = ToolLoop {
         client: &client,
@@ -6703,7 +6966,9 @@ async fn run_agent_turn(
             .collect();
         // A helper's answer was drawn from its brief, which this session's
         // model wrote, and from what it read: it carries the session's
-        // label joined with its reads.
+        // label joined with its reads. A run's result is labelled by what it
+        // could read (96.1 #14).
+        let ran = host.runs.as_ref().and_then(RunTools::take_label);
         let result_label = if helped.is_some() {
             reads
                 .iter()
@@ -6714,6 +6979,7 @@ async fn run_agent_turn(
             reads
                 .iter()
                 .map(|(label, _)| label.clone())
+                .chain(ran.clone())
                 .reduce(|joined, label| joined.join(&label))
                 .unwrap_or_else(|| log.context.label.clone())
         };
@@ -6773,6 +7039,21 @@ async fn run_agent_turn(
                 );
             }
             log.progress.reads += 1;
+        }
+        if let Some(label) = ran {
+            let joined = log.context.label.join(&label);
+            if joined != log.context.label {
+                log.write(
+                    None,
+                    LineBody::Label(LabelBody::new(
+                        &joined,
+                        LabelCause {
+                            kind: LabelCauseKind::ToolResult,
+                            reference: wire.id.clone(),
+                        },
+                    )),
+                );
+            }
         }
         log.progress.calls += 1;
         // The room's gate checks the label as it is now from the next send.
@@ -6841,12 +7122,14 @@ async fn run_agent_turn(
             let (call, (record, outcome)) = match resume.settled {
                 // What runs is what the record bound, not the log's
                 // redacted copy (R174).
-                crate::approvals::Settled::Run(bound, released) => {
+                crate::approvals::Settled::Run(bound, released, approved_run) => {
                     // The approval — and the flow a `declassify` one lets
-                    // through — is this one execution's alone (R89).
-                    let ran = host.run_bound(&bound, resume.approval, released, || {
-                        tools::run_call(&host, &default_profile, &bound, &mut events)
-                    });
+                    // through, the facts a `run` one was checked on — is
+                    // this one execution's alone (R89, R213).
+                    let ran =
+                        host.run_bound(&bound, resume.approval, released, approved_run, || {
+                            tools::run_call(&host, &default_profile, &bound, &mut events)
+                        });
                     let ran = match ran {
                         // A bound call never parks again (its drift is
                         // refused); were it to, it would not wait either.
@@ -7020,12 +7303,14 @@ async fn run_agent_turn(
                 }
                 None => wire.arguments.unwrap_or(Value::Null),
             };
+            let workspace = parking.workspace.clone();
             Some(crate::approvals::ParkedTurn {
                 parking,
                 call_line,
                 args,
                 preconditions: keeper_core::agents::approval::Preconditions {
                     files,
+                    workspace,
                     ..Default::default()
                 },
                 rest: parked_rest,

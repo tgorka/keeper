@@ -14,7 +14,7 @@
 use std::sync::Mutex;
 
 use keeper_agent::surface::{drive_of, locate, Located};
-use keeper_core::agents::approval_card::ApprovalDecideReq;
+use keeper_core::agents::approval_card::{ApprovalDecideReq, ApprovalPayloadVm};
 use keeper_core::agents::events::{Focus, PresencePlatform, SurfaceOutcome};
 use keeper_core::agents::proxy::{AgentFocusReq, ProxyRoomVm};
 use keeper_core::agents::spoken::{FollowSlot, SpokenStep};
@@ -323,17 +323,18 @@ pub async fn agent_approval_decide(
 }
 
 /// The attached action of the approval `id` in the session room `room_id`,
-/// as pretty-printed JSON, fetched, decrypted and checked against its
-/// digest; refused with a sentence when it is not the action sent for
-/// approval (R186, `keeper_core`'s `agent_approval_payload`). Once shown,
-/// it may be approved from this app.
+/// as pretty-printed JSON and, for a `run`, its typed run view (R231),
+/// fetched, decrypted and checked against its digest; refused with a
+/// sentence when it is not the action sent for approval (R186,
+/// `keeper_core`'s `agent_approval_payload`). Once shown, it may be
+/// approved from this app.
 #[tauri::command]
 pub async fn agent_approval_payload(
     state: State<'_, AppState>,
     account_id: String,
     room_id: String,
     id: String,
-) -> Result<String, IpcError> {
+) -> Result<ApprovalPayloadVm, IpcError> {
     state
         .accounts
         .agent_approval_payload(&account_id, &room_id, &id)

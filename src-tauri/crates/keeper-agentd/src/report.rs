@@ -102,8 +102,9 @@ fn running(host: &Host) -> Option<Value> {
 }
 
 /// The tools an agent's `[tools].allow` names, split into those this host
-/// implements and those it does not.
-fn tools(home: &AgentHome) -> (Vec<&str>, Vec<&str>) {
+/// implements and those it does not; `run` is offered only where the
+/// running host's sandbox passed its probe (96.1 #11).
+fn tools(home: &AgentHome, sandboxed: bool) -> (Vec<&str>, Vec<&str>) {
     home.config
         .allow
         .iter()
@@ -117,8 +118,28 @@ fn tools(home: &AgentHome) -> (Vec<&str>, Vec<&str>) {
                 || *name == keeper_core::agents::workflow::ASK_HUMAN
                 || *name == keeper_core::agents::workflow::WORKFLOW_START
                 || *name == keeper_core::agents::helper::HELPER
+                || (sandboxed && *name == keeper_core::agents::run::RUN)
                 || ToolName::ALL.iter().any(|tool| tool.as_wire() == *name)
         })
+}
+
+/// The running host's sandbox as its start's probe found it: the line
+/// `status` prints, and whether `run` is offered.
+fn sandbox_line(live: Option<&Value>) -> (String, bool) {
+    match live.map(|status| &status["sandbox"]) {
+        None => (
+            "sandbox: not known — the host is not running, and it probes at start".to_owned(),
+            false,
+        ),
+        Some(Value::String(found)) if !found.starts_with("unavailable") => {
+            (format!("sandbox: {found}"), true)
+        }
+        Some(Value::String(found)) => (format!("sandbox: {found}"), false),
+        Some(_) => (
+            "sandbox: unavailable — the running host is older than this command".to_owned(),
+            false,
+        ),
+    }
 }
 
 /// `status`. With `--session`, `probe: false` composes without asking the
@@ -143,6 +164,8 @@ pub fn status(host: &Host, session: Option<&str>, probe: bool) -> Result<(), Cli
             host.dirs.state.display()
         ),
     }
+    let (sandbox, sandboxed) = sandbox_line(live.as_ref());
+    println!("{sandbox}");
     for drive in &inspection.drives {
         let engine = live
             .as_ref()
@@ -225,7 +248,7 @@ pub fn status(host: &Host, session: Option<&str>, probe: bool) -> Result<(), Cli
                 agent.kind.as_str()
             );
         }
-        let (offered, missing) = tools(home);
+        let (offered, missing) = tools(home, sandboxed);
         println!("  tools offered: {}", offered.join(", "));
         if !missing.is_empty() {
             println!("  not offered on this host: {}", missing.join(", "));
@@ -446,5 +469,26 @@ mod tests {
                 "trust @tgorka:h: matches; published {old}, pinned {old}; agentd.toml now pins none, used after a restart"
             )]
         );
+    }
+
+    /// 96.1 #11: `status` names what the running host's probe found, and
+    /// offers `run` only when the sandbox holds.
+    #[test]
+    fn status_names_the_missing_sandbox() {
+        let missing = json!({"sandbox": "unavailable — landlock: kernel ABI 3 is below 6"});
+        assert_eq!(
+            sandbox_line(Some(&missing)),
+            (
+                "sandbox: unavailable — landlock: kernel ABI 3 is below 6".to_owned(),
+                false
+            )
+        );
+        let held = json!({"sandbox": "landlock ABI 7, seccomp ok"});
+        assert_eq!(
+            sandbox_line(Some(&held)),
+            ("sandbox: landlock ABI 7, seccomp ok".to_owned(), true)
+        );
+        assert!(!sandbox_line(None).1);
+        assert!(!sandbox_line(Some(&json!({}))).1);
     }
 }

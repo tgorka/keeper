@@ -1746,6 +1746,21 @@ an irreversible action stand for more than once.
   mounts no drive, so nothing the argv does not show can leave (rulings R24(15), R28 S-03). A
   session tainted by outside content needs a person for anything consequential (D-34). The approval
   binds what was shown to what runs; drift denies it.
+- **The Linux filter, exactly (Q7; rulings R147, R213):** the trampoline refuses to start when any
+  descriptor but standard input, output and error is open; landlock (ABI 6 or newer, a hard
+  requirement) grants only the plan's folders, nothing of `/proc`, `/sys`, `/dev` (but `null`,
+  `zero`, `urandom`), `/run`, a drive's `.git/` or `.keeper/`, the home's credentials or the host's
+  secrets, and scopes abstract Unix sockets and signals to the run; seccomp answers `EPERM` to
+  `socket(2)` for every family without network and for every family but IPv4 and IPv6 with it, and
+  in every run to the calls that reach another process (`ptrace`, `process_vm_*`, `kcmp`,
+  `pidfd_getfd`, `perf_event_open`, io_uring), the keyrings, System V IPC and POSIX message queues,
+  `bpf`, `personality`, a namespace (`unshare`, `setns`, a `clone` with a `CLONE_NEW*` flag),
+  leaving the process group (`setsid`, `setpgid`) and every metadata change (the chmod, chown,
+  xattr and utime families, which landlock does not mediate), with the x32 numbers too; `clone3`
+  gets `ENOSYS` so the C library falls back to `clone`, and a call of another architecture kills
+  the process. Each rule is proved twice: on the generated filter itself, and on the kernel beside
+  a control outside the sandbox that this host does not refuse. The metadata rule costs modes and
+  times inside the workspace too (DW-758).
 - **Why a sandbox and not a policy:** in-process guardrails do not hold against an adversarial
   model — "the only security boundary against an adversarial LLM is the operating system" (the
   operator's own lesson, research §3.9). A rule the model can talk past is not a boundary.

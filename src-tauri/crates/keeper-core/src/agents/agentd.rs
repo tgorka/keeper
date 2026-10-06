@@ -45,9 +45,15 @@ pub struct AgentdConfig {
     pub trust: Vec<TrustEntry>,
     /// `[sandbox].read_exec`: absolute paths only. The architecture's other
     /// two rules — nothing inside a drive's checkout, nothing holding this
-    /// host's secrets — need the host's directories, so the sandbox that
-    /// mounts these (90.5) checks them, not the parser.
+    /// host's secrets — need the host's directories, so the host that
+    /// builds a run's sandbox checks them (`run::grant_refusal`), not the
+    /// parser.
     pub read_exec: Vec<PathBuf>,
+    /// `[sandbox].env` (R148): variables a run gets whose values are
+    /// absolute paths — a toolchain's `RUSTUP_HOME`, `CARGO_HOME` — mounted
+    /// read-and-execute, checked as `read_exec` is. Never a name of the
+    /// run's own environment, `KEEPER_*`, `LD_*` or `DYLD_*`.
+    pub sandbox_env: Vec<(String, PathBuf)>,
     pub mcp: Vec<McpEntry>,
     pub kvm: Vec<KvmEntry>,
 }
@@ -261,6 +267,8 @@ struct RawTrust {
 struct RawSandbox {
     #[serde(default)]
     read_exec: Vec<String>,
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -416,23 +424,15 @@ impl AgentdConfig {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let read_exec = raw
-            .sandbox
-            .map(|sandbox| sandbox.read_exec)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|path| {
-                let path = PathBuf::from(path);
-                if path.is_absolute() {
-                    Ok(path)
-                } else {
-                    Err(invalid(
-                        "[sandbox] `read_exec`",
-                        format!("\"{}\" is not an absolute path", path.display()),
-                    ))
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let sandbox = raw.sandbox.unwrap_or(RawSandbox {
+            read_exec: Vec::new(),
+            env: Default::default(),
+        });
+        let crate::agents::run::SandboxTable {
+            read_exec,
+            env: sandbox_env,
+        } = crate::agents::run::SandboxTable::check(sandbox.read_exec, sandbox.env)
+            .map_err(|(at, reason)| invalid(at, reason))?;
 
         let kvm = raw
             .kvm
@@ -477,6 +477,7 @@ impl AgentdConfig {
             agents,
             trust,
             read_exec,
+            sandbox_env,
             mcp,
             kvm,
         })
@@ -959,5 +960,39 @@ readers     = ["@tgorka:example.org"]
             .replace("credential = \"secret:paseo\"\n", "");
         let config = AgentdConfig::parse(&text).expect("a kvm role naming desk parses");
         assert_eq!(config.mcp[0].role, Some(McpRole::Kvm("desk".to_owned())));
+    }
+
+    /// R148: a toolchain's homes reach a run as `[sandbox] env`, absolute
+    /// paths under a name the run's own environment does not hold.
+    #[test]
+    fn sandbox_env_names_absolute_paths_keeper_does_not_set() {
+        let with = |env: &str| {
+            EXAMPLE.replace(
+                "read_exec = [\"/opt/toolchains/bin\"]",
+                &format!("read_exec = [\"/opt/toolchains/bin\"]\nenv = {{ {env} }}"),
+            )
+        };
+        let config = AgentdConfig::parse(&with(
+            "RUSTUP_HOME = \"/usr/local/rustup\", CARGO_HOME = \"/usr/local/cargo\"",
+        ))
+        .expect("parses");
+        assert_eq!(
+            config.sandbox_env,
+            [
+                ("CARGO_HOME".to_owned(), PathBuf::from("/usr/local/cargo")),
+                ("RUSTUP_HOME".to_owned(), PathBuf::from("/usr/local/rustup")),
+            ]
+        );
+        for env in [
+            "CARGO_HOME = \"cargo\"",
+            "HOME = \"/srv\"",
+            "PATH = \"/opt/bin\"",
+            "GIT_CONFIG_GLOBAL = \"/etc/gitconfig\"",
+            "LD_PRELOAD = \"/tmp/x.so\"",
+            "KEEPER_AGENTD_SECRET_X = \"/x\"",
+            "cargo_home = \"/usr/local/cargo\"",
+        ] {
+            assert!(refused(&with(env)).contains("[sandbox] env"), "{env}");
+        }
     }
 }
