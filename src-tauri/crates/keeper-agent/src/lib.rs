@@ -29,7 +29,8 @@
 //! - [`seed`] writes an agents zone's seed and a new agent, never over a
 //!   file, and makes a proxy's DM with its `main` session.
 //! - [`surface`] names a note the person looks at by its drive.
-//! - [`delegate`] hands work to another agent and answers a delegation.
+//! - [`delegate`] hands work to another agent and answers a delegation;
+//!   [`ask`] asks a person through their proxy and relays the answer.
 //! - [`stewards`] makes a steward's triage and harvest sessions and says
 //!   which closed sessions wake her harvest.
 //! - [`doorbell`] rings the hosts that should fetch a push of agent work,
@@ -41,6 +42,7 @@
 pub mod agent;
 pub mod approval;
 pub mod approvals;
+pub mod ask;
 pub mod bmad;
 pub mod cards;
 pub mod claims;

@@ -4,7 +4,9 @@
 //! Like the surface tools they are an agent's alone, served from the
 //! agent's own host through [`ToolHost::run_named`]; a ⌘9 bot never has them
 //! (R38). `delegate` is offered when `[tools].allow` names it, `reply` in
-//! every delegated session and nowhere else (R48).
+//! every delegated session (R48) and, while a question another agent asked
+//! its person waits for their answer, in a proxy's `main` or
+//! `conversation` as the relay of that answer (R100, [`crate::ask`]).
 //!
 //! # Handing on
 //!
@@ -26,7 +28,9 @@
 //!
 //! `reply` sends the delegated session's answer into its room, carrying
 //! `dev.keeper.agent.artifacts` and the session's label as it is then
-//! (`dev.keeper.agent.label`, R94), and sets its card's `run: review`.
+//! (`dev.keeper.agent.label`, R94), and sets its card's `run: review`. With
+//! `ask`, in a proxy's own session, it relays its person's answer into the
+//! room the question came from instead ([`crate::ask::relay`]).
 //!
 //! Every send — the brief once the target joined, each later round, and the
 //! reply — is checked against the label at that moment and the room's people
@@ -52,6 +56,7 @@ use keeper_core::agents::label::{
     approved_label, check_sink, Destination, Label, Readers, Sink, SinkVerdict,
 };
 use keeper_core::agents::log::{DelegateBody, DelegateState, LineBody, RunBody, RunState};
+use keeper_core::agents::matrix::AgentMatrixError;
 use keeper_core::agents::proxy::ScopeRequest;
 use keeper_core::agents::session::SessionKind;
 use keeper_core::bots::chat::{ToolCall as WireToolCall, ToolSpec};
@@ -79,6 +84,18 @@ pub const REPLY: &str = "reply";
 /// What `reply` says outside a delegated session.
 pub const NOT_DELEGATED: &str =
     "reply answers a delegation, and this session was not delegated to you.";
+
+/// Which `reply` a session is offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyOffer {
+    /// None: neither delegated nor relaying.
+    None,
+    /// A delegated session's answer to its requester (R48).
+    Delegated,
+    /// A proxy's relay of its person's answer to an open ask (R100).
+    Relay,
+}
+
 /// What a call says on a host with no room to make one in.
 pub const NO_ROOMS: &str = "This host cannot open a room for a delegation.";
 
@@ -88,8 +105,8 @@ pub fn is_delegation(name: &str) -> bool {
 }
 
 /// The specs a turn is offered: `delegate` when `[tools].allow` names it,
-/// `reply` in a delegated session (R48).
-pub fn specs(delegate: bool, reply: bool) -> Vec<ToolSpec> {
+/// `reply` as `reply` says (R48, R100).
+pub fn specs(delegate: bool, reply: ReplyOffer) -> Vec<ToolSpec> {
     let mut specs = Vec::new();
     if delegate {
         specs.push(ToolSpec {
@@ -121,8 +138,9 @@ pub fn specs(delegate: bool, reply: bool) -> Vec<ToolSpec> {
             }),
         });
     }
-    if reply {
-        specs.push(ToolSpec {
+    match reply {
+        ReplyOffer::None => {}
+        ReplyOffer::Delegated => specs.push(ToolSpec {
             name: REPLY.to_owned(),
             description: "Reply to the agent that delegated this session: your answer, and the files under artifacts/ it should read. This closes the exchange.".to_owned(),
             parameters: json!({
@@ -134,7 +152,20 @@ pub fn specs(delegate: bool, reply: bool) -> Vec<ToolSpec> {
                 "required": ["text"],
                 "additionalProperties": false
             }),
-        });
+        }),
+        ReplyOffer::Relay => specs.push(ToolSpec {
+            name: REPLY.to_owned(),
+            description: "Relay your person's answer to a question another agent asked them through you, once they have answered it here. What goes to the asking agent is your person's own message, as they wrote it — never your words: name the question's id as ask, and, when they said more than one thing since the question, quote the message that answers it as text.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The message of your person's that answers, exactly as they wrote it; without it, their first message since the question."},
+                    "ask": {"type": "string", "description": "The question's id, as its message names it."}
+                },
+                "required": ["ask"],
+                "additionalProperties": false
+            }),
+        }),
     }
     specs
 }
@@ -144,6 +175,8 @@ pub type BoolFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 /// A boxed future of decrypted timeline events, oldest first, or why they
 /// could not all be read.
 pub type EventsFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<Value>, String>> + Send + 'a>>;
+/// A boxed future of a room change, or the homeserver's answer refusing it.
+pub type UnitFuture<'a> = Pin<Box<dyn Future<Output = Result<(), AgentMatrixError>> + Send + 'a>>;
 /// A boxed future of a room's members, joined or invited.
 pub type MembersFuture<'a> =
     Pin<Box<dyn Future<Output = Result<BTreeSet<OwnedUserId>, String>> + Send + 'a>>;
@@ -179,8 +212,26 @@ pub trait DelegationPort: Send + Sync {
     fn since_brief<'a>(&'a self, room: &'a RoomId, me: &'a UserId) -> EventsFuture<'a>;
     /// What `room` is now, as a brief's admission reads it (R93).
     fn brief_room<'a>(&'a self, room: &'a RoomId) -> BriefRoomFuture<'a>;
-    /// Route `child`'s joins and replies to `parent`'s worker from now on.
-    fn watch(&self, child: &RoomId, parent: &RoomId);
+    /// Route `child`'s joins and replies to `parent`'s worker from now on;
+    /// `kind` is the parent session's: an ask in `child` goes to it only
+    /// when it is the proxy's own conversation (R199).
+    fn watch(&self, child: &RoomId, parent: &RoomId, kind: SessionKind);
+    /// Invite `user` into `room` when what the room holds, labelled
+    /// `label`, may reach them — through `audience` when they are an agent
+    /// this host knows or a pinned proxy (AD-391): the proxy an ask goes
+    /// through (R101, R199).
+    fn invite<'a>(
+        &'a self,
+        room: &'a RoomId,
+        user: &'a UserId,
+        label: &'a Label,
+        audience: Option<Readers>,
+    ) -> UnitFuture<'a>;
+    /// A proxy relayed an answer into `room` (R100, S-27): its host reads
+    /// the room back and leaves it once no ask there waits for a relay of
+    /// this proxy's and none of its sessions delegated into it — tried
+    /// again until it has left.
+    fn depart(&self, room: &RoomId);
 }
 
 /// One delegation a session made, as its log says.
@@ -233,6 +284,9 @@ pub trait TurnView: Sync {
     /// Whether the session's claim lets this host write now (NFR-120):
     /// asked by every file writer right before its effect (R120).
     fn may_write(&self) -> bool;
+    /// The question another agent asked this proxy's person, `id`, while it
+    /// waits for its answer to be relayed (R100).
+    fn relay(&self, id: &str) -> Option<crate::ask::Relay>;
 }
 
 #[derive(Debug, Deserialize)]
@@ -575,7 +629,7 @@ pub(crate) fn approved_brief(
     Some((content, sha))
 }
 
-fn block_on<F: Future>(fut: F) -> F::Output {
+pub(crate) fn block_on<F: Future>(fut: F) -> F::Output {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
 }
 
@@ -587,7 +641,7 @@ pub struct DelegateTools<'t> {
     pub room: Arc<dyn EditPort>,
     pub view: &'t dyn TurnView,
     pub offer_delegate: bool,
-    pub offer_reply: bool,
+    pub offer_reply: ReplyOffer,
     /// Where a send the label refuses is audited (R65).
     pub sinks: &'t Sinks,
     lines: Mutex<Vec<LineBody>>,
@@ -606,10 +660,11 @@ impl<'t> DelegateTools<'t> {
         room: Arc<dyn EditPort>,
         view: &'t dyn TurnView,
         offer_delegate: bool,
+        offer_reply: ReplyOffer,
         sinks: &'t Sinks,
     ) -> DelegateTools<'t> {
         DelegateTools {
-            offer_reply: from.kind == SessionKind::Delegated,
+            offer_reply,
             from,
             port,
             room,
@@ -677,10 +732,50 @@ impl<'t> DelegateTools<'t> {
                 refused(format!("{DELEGATE} is not one of this agent's tools."))
             }
             DELEGATE => self.delegate(&wire.arguments_raw, audit),
-            REPLY if !self.offer_reply => refused(NOT_DELEGATED),
-            REPLY => self.reply(wire.arguments.as_ref(), audit),
+            REPLY => match (self.offer_reply, Self::ask_of(wire)) {
+                (ReplyOffer::Relay, Some(id)) => self.relay(wire, &id, audit),
+                (ReplyOffer::Relay, None) => {
+                    refused("reply relays your person's answer: name the question's id as ask.")
+                }
+                (ReplyOffer::Delegated, None) => self.reply(wire.arguments.as_ref(), audit),
+                (_, Some(_)) => refused(crate::ask::NO_RELAY),
+                (ReplyOffer::None, None) => refused(NOT_DELEGATED),
+            },
             _ => None,
         }
+    }
+
+    /// The question a `reply` call `wire` relays the answer to.
+    fn ask_of(wire: &WireToolCall) -> Option<String> {
+        wire.arguments.as_ref()?["ask"]
+            .as_str()
+            .map(|id| id.trim().to_owned())
+    }
+
+    /// A proxy's `reply(ask, text?)`: its person's own message relayed into
+    /// the room the question came from (R100, R199); `text` only picks which.
+    fn relay(&self, wire: &WireToolCall, id: &str, audit: &CallAudit<'_>) -> Option<ToolOutcome> {
+        let picked = wire
+            .arguments
+            .as_ref()
+            .and_then(|args| args["text"].as_str());
+        let Some(relay) = self.view.relay(id) else {
+            return refused(format!(
+                "No question with the id {id} waits for your person's answer here."
+            ));
+        };
+        let Some(port) = self.port.clone() else {
+            return refused(NO_ROOMS);
+        };
+        crate::ask::relay(
+            port.as_ref(),
+            self.sinks,
+            &self.from.user,
+            &relay,
+            picked,
+            audit,
+            &|line| self.line(line),
+        )
     }
 
     /// Where a call `wire` goes, as its audit row names it before the call
@@ -689,7 +784,11 @@ impl<'t> DelegateTools<'t> {
     /// known).
     pub fn destination(&self, wire: &WireToolCall) -> (String, String) {
         if wire.name == REPLY {
-            return (String::new(), self.from.room.to_string());
+            let relayed = Self::ask_of(wire).and_then(|id| self.view.relay(&id));
+            return match relayed {
+                Some(relay) => (String::new(), relay.room.to_string()),
+                None => (String::new(), self.from.room.to_string()),
+            };
         }
         let Some((name, _)) = self.recipient(wire) else {
             return Default::default();
@@ -845,7 +944,7 @@ impl<'t> DelegateTools<'t> {
                 )
             }
         };
-        port.watch(&room, &self.from.room);
+        port.watch(&room, &self.from.room, self.from.kind);
         self.line(LineBody::Delegate(DelegateBody {
             id: id.clone(),
             to,
@@ -936,7 +1035,7 @@ impl<'t> DelegateTools<'t> {
         // they approve, as the opening brief does (R193).
         let mut approved = None;
         // Its answer comes back here whatever this copy was told before.
-        port.watch(&delegation.room, &self.from.room);
+        port.watch(&delegation.room, &self.from.room, self.from.kind);
         let checked = block_on(room_now(
             port,
             &delegation.room,

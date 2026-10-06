@@ -1021,12 +1021,13 @@ per date and host, compared as a number. Each host writes only its own chunks an
 | `open` | `agent, drive, kind, title, requested_by, label, drives, model, prompt_sha256, memory_sha256` |
 | `claim` | `epoch, action` (`acquired`, `renewed`, `released`, `lost`), `from_host, claim_event, server_ts` |
 | `user` | `sender, text, attachments` |
-| `peer` | `sender, text`, optional `ask {id, question}` and `artifacts` |
+| `peer` | `sender, text`, optional `ask {id, question, room, label}` (another agent's question for the proxy's person, in the proxy's session), `answers {id, choice}` (the person's answer to this session's ask, relayed by their proxy; `choice` is `null` when the answer picks none) and `artifacts` |
 | `assistant` | `text, model, finish, usage {prompt, completion}, ttft_ms, duration_ms, anchor_event`; a round that called tools carries that round's own usage |
 | `tool_call` | `call_id, tool, args, tier`, optional `grant_id`; `args` is the string the model sent, verbatim |
 | `tool_result` | `call_id, outcome` (`ok`, `refused`, `failed`), `content`, optional `truncated {shown, total}`, `label` |
 | `approval` | `id, state` (`requested`, `decided`, `consumed`, `expired`, `refused`), optional `decision, by, result, reason, scope`; terminal: `consumed`, `expired`, `refused`, and `decided` with `decision: "deny"`; a `decided` line without `decision` is a decision ignored, `reason` saying why |
 | `delegate` | `id, to`, optional `room` (absent on a refusal made before the room existed), optional `child {drive, session}`, `state` (`opened`, `sent`, `accepted`, `replied`, `refused`), optional `reason` |
+| `ask` | `id, state` (`asked`, `sent`, `answered`, `defaulted`, `refused`), optional `to, via, room, question, choices, default, card, answer, choice, reason`; in the asking session `asked` → `sent` → `answered`, `asked` → `refused` when the send was refused, or `defaulted`/`refused` at once; `card` names the scheduled card whose run asked; in the proxy's session one `answered` carrying the person's message it relayed |
 | `label` | `readers, integrity`, optional `local_only`, `cause {kind, ref}` |
 | `scope` | `drives, set_by` |
 | `run` | `state` (`queued`, `running`, `waiting`, `blocked`, `review`, `failed`, `idle`), optional `detail` |
@@ -2145,6 +2146,67 @@ only while this host holds the session's claim.
   folder; a path out of the folder, by `..` or by a link, is refused. A file over 64 KiB is cut
   and the cut is said; a character the cut falls inside is left out. A file with a byte that is
   not UTF-8 is refused as not text, wherever the byte is.
+
+## Asking a person
+
+`ask_human({question, choices?, default?})` is how an agent asks the person its work is for — a
+BMAD HALT, a menu, a checkpoint. It is offered in every session but a proxy's own `main` and
+`conversation`, whatever `[tools].allow` says, and is T1: the question goes into the session's
+own room, whose observers are its label's readers, and to the person it is for.
+
+**Who answers.** The head of the session's dispatch chain, when it is a person: through the
+chain's next agent when that is their proxy, else through the proxy keeper knows for them (an
+agent of a mounted drive with `kind = "proxy"` and that `human`), else through the `proxy` of their
+pinned `[[trust]]` entry. With nobody to ask, the stated default is the answer at once —
+`{"answer": "Stop", "choice": "Stop", "by": "default"}` and an `ask defaulted` line — and with no
+default the call is refused: "No person can answer this run and the question names no default."
+A default is one of the choices when both are given.
+
+**The ask ends the turn.** The call checks the ask as a send into the person's DM with their proxy
+— a session the person does not read asks nobody — and into the session's room as it is now,
+refuses a question whose event would pass 40 KiB (its question, choices and default take at most
+12 KiB), writes `ask asked` — the ask's intent, carrying everything needed to send it, and the
+scheduled card whose run asked — and `run: blocked` ("waiting for tgorka, through Nixi"), sets the
+card blocked, and returns at once telling the model to end its turn; the round gate refuses any
+further round of that turn. The call publishes nothing and no thread waits for the person.
+
+**The send.** Once the turn's lines are synced to disk, the session's worker invites the proxy
+unless it is in the room — a proxy keeper knows only by a pinned `[[trust]]` entry is checked as its
+person's, there and in every later check of the room — waits for its join, so its device holds the
+room's key, and only then checks the label and the room as they are at that moment and sends the
+question: an ordinary `m.text` whose body is the question with its choices numbered, carrying
+`dev.keeper.agent.ask`, under the ask's own transaction, so a send tried again after a restart is
+one event (`ask sent`). A refusal there — the room let a reader in beyond the label, the invite's
+label check, or the homeserver refusing the event for good (too large, forbidden) — sends nothing
+and becomes the run's next turn: a `peer` line in the agent's own name saying the question was never
+asked and why, then `ask refused`. A send the homeserver asks to wait is tried after that wait;
+anything else on the worker's clock.
+
+**The proxy's side.** A proxy joins a session room an agent of a mounted drive invites it to when
+that drive's readers include its person. Its host takes an ask there into the proxy's `main` DM, or
+into the session that delegated into the room when that is the proxy's own `main` or
+`conversation` — only a sealed ask whose body says its question, from a known agent at an agent's
+power in a session room, naming this proxy and its person, under a label the person reads — as a
+`peer` line carrying the question and the asking session's label: that turn of the DM runs at the
+asking session's integrity, which the person's next line resets. The host also reads back every
+session room it joined and serves no session of — after a restart, and again after a read, a route
+or a leave that failed — and routes each ask there no answer of its own names; a question is taken
+into the DM once, relayed or not. The proxy asks in its own voice; once the person has answered,
+`reply({ask, text?})` — offered in the proxy's `main` and `conversation` while a question waits —
+sends the person's own message since the question, exactly as they wrote it: the one `text` quotes,
+else their first. The model never writes the answer: a `reply` before the person said anything, or
+whose `text` is none of their messages, is refused and sends nothing. The message goes into the
+asking room as the person's own to that session's readers, checked against the room as it is then.
+The proxy leaves the room once its host's read-back finds every ask there answered by it and none of
+its sessions delegated into it, and tries again until it has left.
+
+**The answer.** It arrives in the asking session as a `peer` line from the proxy naming the ask and
+the choice the person's message picks — by its number or its text in any case; `null` when it picks
+none — then `ask answered` and `run: running`, and a turn; a scheduled run's turn ends its card as
+the run would have. While a call of the asking round waits for a person, the answer is held with the
+session's other arrivals and its turn comes once that call has its result. While a scheduled run's
+ask waits, its card's later windows do not begin. Devices show the ask and the answer as plain text
+(an ask card is DW-534).
 
 ## The stewards
 

@@ -71,6 +71,10 @@ const SESSION: &str = "active/2026-10-02-chat";
 const DELEGATION: &str = "@DELEGATION@";
 /// What a `delegate` result says just before the delegation's id.
 const DELEGATION_SAID: &str = "as delegation ";
+/// In a scripted completion: the id of the question the request carries.
+const ASK: &str = "@ASK@";
+/// What a relayed question says just before its id.
+const ASK_SAID: &str = "Question ";
 
 struct DataDir(PathBuf);
 
@@ -122,6 +126,10 @@ struct Room {
     /// sent: what was on disk before the room heard of it.
     witness: Mutex<Option<PathBuf>>,
     records_at_request: Mutex<Option<usize>>,
+    /// What the homeserver answers the next sends of an ask, in order; and
+    /// every ask send's transaction.
+    ask_errors: Mutex<Vec<keeper_core::agents::matrix::AgentMatrixError>>,
+    ask_txns: Mutex<Vec<String>>,
 }
 
 impl Room {
@@ -145,9 +153,16 @@ impl EditPort for Room {
         &'a self,
         event_type: &'a str,
         content: Value,
-        _: OwnedTransactionId,
+        txn: OwnedTransactionId,
     ) -> SendFuture<'a> {
         Box::pin(async move {
+            if content.get(keeper_core::agents::events::ASK).is_some() {
+                self.ask_txns.lock().expect("lock").push(txn.to_string());
+                let mut errors = self.ask_errors.lock().expect("lock");
+                if !errors.is_empty() {
+                    return Err(errors.remove(0));
+                }
+            }
             if let Some(stop) = self.stop.lock().expect("lock").take() {
                 stop.cancel();
             }
@@ -281,10 +296,13 @@ impl Stub {
                     // the request itself carries — what a model would read
                     // in its `delegate` result — never one the test knows.
                     let request = String::from_utf8_lossy(&body);
-                    let named = request.rfind(DELEGATION_SAID).map(|at| {
-                        let from = at + DELEGATION_SAID.len();
-                        request[from..(from + 26).min(request.len())].to_owned()
-                    });
+                    let said = |what: &str| {
+                        request.rfind(what).map(|at| {
+                            let from = at + what.len();
+                            request[from..(from + 26).min(request.len())].to_owned()
+                        })
+                    };
+                    let (named, asked) = (said(DELEGATION_SAID), said(ASK_SAID));
                     // A `{"pause_ms": n}` entry is no frame: the stream
                     // waits there, so the edits in between are paced.
                     let mut parts: Vec<(String, u64)> = Vec::new();
@@ -295,6 +313,9 @@ impl Stub {
                                 let mut frame = format!("data: {data}\n\n");
                                 if let Some(id) = &named {
                                     frame = frame.replace(DELEGATION, id);
+                                }
+                                if let Some(id) = &asked {
+                                    frame = frame.replace(ASK, id);
                                 }
                                 parts.push((frame, 0))
                             }
@@ -3123,6 +3144,12 @@ struct Delegations {
     /// The room a brief arrives in, when not the one made by Nixi with
     /// Tola at 50.
     facts: Mutex<Option<BriefRoom>>,
+    /// The people of a room this fake did not make, when the test names
+    /// them.
+    rooms: Mutex<Vec<(OwnedRoomId, BTreeSet<OwnedUserId>)>>,
+    /// Every invite, and every room a relay was sent into, to be left.
+    invited: Mutex<Vec<(OwnedRoomId, OwnedUserId)>>,
+    left: Mutex<Vec<OwnedRoomId>>,
 }
 
 impl Delegations {
@@ -3144,12 +3171,22 @@ impl Delegations {
     /// Who is in `room`: Nixi, who made it, everyone it invited, and anyone
     /// added since; Nixi and Tola in a room this fake did not make.
     fn people(&self, room: &RoomId) -> BTreeSet<OwnedUserId> {
-        let mut people = BTreeSet::from([user(NIXI)]);
+        let named = self
+            .rooms
+            .lock()
+            .expect("lock")
+            .iter()
+            .find(|(r, _)| r == room)
+            .map(|(_, people)| people.clone());
+        let mut people = named
+            .clone()
+            .unwrap_or_else(|| BTreeSet::from([user(NIXI)]));
         match self.made().into_iter().find(|made| made.3 == room) {
             Some((_, invites, _, _)) => people.extend(invites),
-            None => {
+            None if named.is_none() => {
                 people.insert(user(TOLA));
             }
+            None => {}
         }
         people.extend(
             self.added
@@ -3268,7 +3305,7 @@ impl DelegationPort for Delegations {
         })
     }
 
-    fn watch(&self, child: &RoomId, parent: &RoomId) {
+    fn watch(&self, child: &RoomId, parent: &RoomId, _kind: SessionKind) {
         self.ops
             .lock()
             .expect("lock")
@@ -3277,6 +3314,38 @@ impl DelegationPort for Delegations {
             .lock()
             .expect("lock")
             .push((child.to_owned(), parent.to_owned()));
+    }
+
+    /// As the client's invite does: refused when the label does not reach
+    /// whom it adds, `audience` standing for an agent.
+    fn invite<'a>(
+        &'a self,
+        room: &'a RoomId,
+        user: &'a UserId,
+        label: &'a Label,
+        audience: Option<Readers>,
+    ) -> keeper_agent::delegate::UnitFuture<'a> {
+        Box::pin(async move {
+            let sink = keeper_core::agents::matrix::invitee_sink(user, audience);
+            if let keeper_core::agents::label::SinkVerdict::Block { reason, .. } =
+                keeper_core::agents::label::check_sink(label, &sink)
+            {
+                return Err(keeper_core::agents::matrix::AgentMatrixError::Label(reason));
+            }
+            self.invited
+                .lock()
+                .expect("lock")
+                .push((room.to_owned(), user.to_owned()));
+            self.added
+                .lock()
+                .expect("lock")
+                .push((room.to_owned(), user.to_owned()));
+            Ok(())
+        })
+    }
+
+    fn depart(&self, room: &RoomId) {
+        self.left.lock().expect("lock").push(room.to_owned());
     }
 }
 
@@ -4167,6 +4236,7 @@ async fn an_unanswered_peer_line_is_closed_after_a_restart() {
                     sender: user(TOLA),
                     text: "The inbox is sorted.".to_owned(),
                     ask: None,
+                    answers: None,
                     artifacts: None,
                 }),
             )
@@ -4571,6 +4641,7 @@ async fn a_reply_whose_peer_line_was_lost_is_restored_from_its_receipt() {
             sender: user(TOLA),
             text: "Sorted.".to_owned(),
             ask: None,
+            answers: None,
             artifacts: Some(vec!["tgdrive/60-sessions/x/artifacts/report.md".to_owned()]),
         }
     );
@@ -5230,6 +5301,7 @@ fn begun_on(dir: &Path, host: &str, event: &OwnedEventId, sender: &OwnedUserId) 
                 sender: sender.clone(),
                 text: "harvest".to_owned(),
                 ask: None,
+                answers: None,
                 artifacts: None,
             }),
         })
@@ -10692,4 +10764,892 @@ mod parks {
             assert!(!served.waiting());
         }
     }
+
+    /// Whether every tool call of every assistant message `request` sends
+    /// has its result in it: a request a provider takes.
+    fn every_call_has_its_result(request: &Value) -> bool {
+        let mut open = std::collections::BTreeSet::new();
+        for message in request["messages"].as_array().into_iter().flatten() {
+            for call in message["tool_calls"].as_array().into_iter().flatten() {
+                open.insert(call["id"].to_string());
+            }
+            if message["role"] == "tool" {
+                open.remove(&message["tool_call_id"].to_string());
+            }
+        }
+        open.is_empty()
+    }
+
+    /// R94A-08: Tola's scheduled run asks tgorka and, in the same round,
+    /// parks a change of its card. Whether his answer arrives while the
+    /// change waits — then it is held — or after it was decided, no request
+    /// goes to the model before every call of that round has its result, and
+    /// the answer's turn comes after the round went on; the card's run ends
+    /// once answered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_waits_for_its_rounds_parked_call() {
+        use keeper_core::agents::ask::answer_content;
+        use keeper_core::agents::card::{CardAgent, Field, Run};
+        for answer_first in [true, false] {
+            let mut world = world(
+                ProviderKind::OpenAi,
+                &["drive_read", "card_update"],
+                vec![
+                    calls(&[
+                        (
+                            "a1",
+                            "ask_human",
+                            json!({"question": "Go on?", "choices": ["Continue", "Stop"]}),
+                        ),
+                        (
+                            "c1",
+                            "card_update",
+                            json!({"card": "card.md", "fields": {"schedule": "@daily"}}),
+                        ),
+                    ]),
+                    prose("Waiting for tgorka."),
+                    prose("Going on."),
+                ],
+            );
+            let mut tola = tolas(&world, &["drive_read", "card_update"]);
+            tola.decisions = Some(Admit::pinned());
+            let approvals = Arc::new(Approvals::default());
+            let room = OwnedRoomId::try_from(TOLAS_ROOM).expect("room");
+            let rooms = Delegations::over(known_with_proxy());
+            rooms.rooms.lock().expect("lock").push((
+                room,
+                [TOLA, TGORKA, MARTA].iter().map(|u| user(u)).collect(),
+            ));
+            let tolas_room = Arc::new(Room::of(&[TOLA, TGORKA, MARTA]));
+            let run = tolas_run(&world);
+            let mut tolas = world.open_as(&tola, TOLAS_RUN);
+            tolas.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+            tolas.approval_room = Some(Arc::clone(&approvals) as Arc<dyn ApprovalRoom>);
+            let parked = report(serve_as(&tola, &mut tolas, &tolas_room, run).await);
+            assert_eq!(parked.ending, TurnEnding::Parked);
+            let id = ask_lines(&world.lines(TOLAS_RUN))[0].id.clone();
+            let mut answer = world.event(NIXI, Arrival::Answer, answer_content("1", &id));
+            answer.text = "1".to_owned();
+            let mut record = world.record_in(TOLAS_RUN);
+            record.dispatch_chain = vec![TGORKA.to_owned()];
+            std::fs::write(
+                world
+                    .dir(TOLAS_RUN)
+                    .join(format!("approvals/{}.json", record.id)),
+                serde_json::to_string(&record).expect("json"),
+            )
+            .expect("rewrite");
+            let decided = world.decision(&record, Decision::Approve);
+            if answer_first {
+                assert!(matches!(
+                    serve_as(&tola, &mut tolas, &tolas_room, answer.clone()).await,
+                    Outcome::Held
+                ));
+                assert_eq!(world.stub.requests().len(), 1, "no request while parked");
+            }
+            assert!(matches!(
+                serve_as(&tola, &mut tolas, &tolas_room, decided).await,
+                Outcome::Decided
+            ));
+            report(serve_as(&tola, &mut tolas, &tolas_room, answer).await);
+            let requests = world.stub.requests();
+            assert_eq!(requests.len(), 3, "answer_first: {answer_first}");
+            assert!(
+                requests.iter().all(every_call_has_its_result),
+                "answer_first: {answer_first}: {requests:?}"
+            );
+            assert!(requests[2].to_string().contains("relaying the answer"));
+            let text = std::fs::read_to_string(world.dir(TOLAS_RUN).join("card.md")).expect("card");
+            assert_eq!(
+                CardAgent::of_text(&text).expect("keys").run,
+                Some(Field::Read(Run::Review)),
+                "{text}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Story 94.2: ask_human
+// ---------------------------------------------------------------------------
+
+/// Dr Tola Grey's scheduled session, which tgorka's card started: its room
+/// holds Tola and the label's readers, not Nixi.
+const TOLAS_RUN: &str = "active/2026-10-06-tola";
+const TOLAS_ROOM: &str = "!tola:example.org";
+
+/// Tola's scheduled session at [`TOLAS_RUN`], its card due, and the arrival
+/// of its window.
+fn tolas_run(world: &World) -> Arrived {
+    use keeper_agent::agent::scheduled_arrival;
+    use keeper_agent::cards::Scheduled;
+    let tg_decl = world.deps.drives["tgdrive"].clone();
+    session_of(
+        &world.tgdrive,
+        TOLAS_RUN,
+        &tg_decl,
+        "tola",
+        SessionKind::Scheduled,
+        TOLAS_ROOM,
+    );
+    write(
+        &world.tgdrive,
+        &format!("60-sessions/{TOLAS_RUN}/card.md"),
+        "---\ntags: [task]\ntitle: Epics\nstatus: todo\nassignee: tola\nschedule: \"@hourly\"\nlast_run: \"2026-10-05T08:00:00Z\"\n---\n\nPlan the epics.\n",
+    );
+    scheduled_arrival(
+        &user(TOLA),
+        &Scheduled::Run {
+            card: "card.md".to_owned(),
+            window: "2026-10-05T09:00:00.000Z".to_owned(),
+            now_ms: chrono::DateTime::parse_from_rfc3339("2026-10-05T09:30:00Z")
+                .expect("an instant")
+                .timestamp_millis(),
+            utc_offset_minutes: 0,
+        },
+    )
+    .expect("an arrival")
+}
+
+fn ask_lines(lines: &[LogLine]) -> Vec<keeper_core::agents::log::AskBody> {
+    kinds(lines, LineKind::Ask)
+        .iter()
+        .map(|line| match &line.body {
+            LineBody::Ask(body) => body.clone(),
+            _ => unreachable!(),
+        })
+        .collect()
+}
+
+fn peer_lines(lines: &[LogLine]) -> Vec<PeerBody> {
+    kinds(lines, LineKind::Peer)
+        .iter()
+        .map(|line| match &line.body {
+            LineBody::Peer(body) => body.clone(),
+            _ => unreachable!(),
+        })
+        .collect()
+}
+
+fn run_states(lines: &[LogLine]) -> Vec<(keeper_core::agents::log::RunState, Option<String>)> {
+    kinds(lines, LineKind::Run)
+        .iter()
+        .map(|line| match &line.body {
+            LineBody::Run(body) => (body.state, body.detail.clone()),
+            _ => unreachable!(),
+        })
+        .collect()
+}
+
+/// 94.2 acceptance 6 (R99–R101, R197, R199): Dr Tola Grey's run, which
+/// tgorka's card started, asks him through Nixi. The call writes `ask
+/// asked` and `run: blocked`, publishes nothing, and returns at once — the
+/// gate ends the turn before another round. Her worker then invites Nixi;
+/// only once Nixi has joined does the question go into the room. Nixi's
+/// host carries it into her DM as a `peer` line under Tola's label; tgorka
+/// answers `1` there; Nixi's `reply(…, ask)` relays his message into Tola's
+/// room and departs it. Tola's session takes it as the answer to its
+/// question — `Continue` — and runs on.
+#[tokio::test(flavor = "multi_thread")]
+async fn ask_human_parks_and_resumes_through_the_proxy() {
+    use keeper_agent::agent::TurnEnding;
+    use keeper_core::agents::ask::{read_answer, read_ask};
+    use keeper_core::agents::log::{AskState, RunState as LogRun};
+    let ask =
+        json!({"question": "Go on to step 3?", "choices": ["Continue", "Stop"], "default": "Stop"});
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![
+            calls(&[("a1", "ask_human", ask)]),
+            prose("tgorka, Dr Tola Grey asks: go on to step 3, or stop?"),
+            calls(&[("r1", "reply", json!({"text": "1", "ask": ASK}))]),
+            prose("Told her."),
+            prose("Going on to step 3."),
+        ],
+    );
+    nixis_dm(&world);
+    let tola = tolas(&world, &["drive_read"]);
+    let room = OwnedRoomId::try_from(TOLAS_ROOM).expect("room");
+    let tolas_rooms = Delegations::over(known_with_proxy());
+    tolas_rooms.rooms.lock().expect("lock").push((
+        room.clone(),
+        [TOLA, TGORKA, MARTA].iter().map(|u| user(u)).collect(),
+    ));
+    let tolas_room = Arc::new(Room::of(&[TOLA, TGORKA, MARTA]));
+    let run = tolas_run(&world);
+    let mut tolas = world.open_as(&tola, TOLAS_RUN);
+    tolas.delegations = Some(tolas_rooms.clone() as Arc<dyn DelegationPort>);
+
+    // The ask: its intent on disk, nothing invited or sent by the call, and
+    // the turn over after its one request.
+    let turn = report(serve_as(&tola, &mut tolas, &tolas_room, run).await);
+    assert_eq!(turn.ending, TurnEnding::Asked);
+    assert_eq!(world.stub.requests().len(), 1, "no round after the ask");
+    assert!(tolas_rooms.invited.lock().expect("lock").is_empty());
+    let asked_in = |sent: &[(String, Value)]| {
+        sent.iter()
+            .filter(|(kind, _)| kind == "m.room.message")
+            .filter_map(|(_, content)| read_ask(content))
+            .collect::<Vec<_>>()
+    };
+    let lines = world.lines(TOLAS_RUN);
+    let asks = ask_lines(&lines);
+    assert_eq!(
+        asks.iter().map(|a| a.state).collect::<Vec<_>>(),
+        [AskState::Asked]
+    );
+    assert_eq!(asks[0].to.as_ref(), Some(&user(TGORKA)));
+    assert_eq!(asks[0].via.as_ref(), Some(&user(NIXI)));
+    assert!(run_states(&lines).contains(&(
+        LogRun::Blocked,
+        Some("waiting for tgorka, through Nixi".to_owned())
+    )));
+    let result = tool_results(&lines).pop().expect("a result");
+    assert!(
+        result.content.contains("End your turn"),
+        "{}",
+        result.content
+    );
+
+    // Her worker: Nixi invited, nothing sent while she is out of the room.
+    let port: Arc<dyn EditPort> = tolas_room.clone();
+    assert!(tolas.send_asks(&tola, &port).await.is_empty());
+    assert_eq!(
+        *tolas_rooms.invited.lock().expect("lock"),
+        vec![(room.clone(), user(NIXI))]
+    );
+    assert!(
+        asked_in(&tolas_room.sent()).is_empty(),
+        "nothing before the join"
+    );
+
+    // Nixi joins: the question goes in on the clock, once.
+    tolas_rooms
+        .joined
+        .lock()
+        .expect("lock")
+        .push((room.clone(), user(NIXI)));
+    tolas.send_asks(&tola, &port).await;
+    tolas.send_asks(&tola, &port).await;
+    let sent = asked_in(&tolas_room.sent());
+    assert_eq!(sent.len(), 1);
+    let question = sent[0].clone();
+    assert_eq!(
+        (question.to.as_str(), question.via.as_str()),
+        (TGORKA, NIXI)
+    );
+    assert_eq!(question.id, asks[0].id);
+    assert_eq!(question.label, tolas.context.label);
+    assert_eq!(
+        ask_lines(&world.lines(TOLAS_RUN))
+            .iter()
+            .map(|a| a.state)
+            .collect::<Vec<_>>(),
+        [AskState::Asked, AskState::Sent]
+    );
+
+    // Nixi's host carries it into her DM, from Tola's room.
+    let nixis_rooms = Delegations::over(known_with_proxy());
+    nixis_rooms.rooms.lock().expect("lock").push((
+        room.clone(),
+        [TOLA, TGORKA, MARTA, NIXI]
+            .iter()
+            .map(|u| user(u))
+            .collect(),
+    ));
+    let mut nixi = world.open(DM);
+    nixi.delegations = Some(nixis_rooms.clone() as Arc<dyn DelegationPort>);
+    let mut carried = world.event(TOLA, Arrival::Ask, ask_content_of(&tolas_room));
+    carried.text = carried.content["body"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    carried.via = Some(room.clone());
+    report(world.serve(&mut nixi, carried.clone()).await);
+    assert!(matches!(
+        world.serve(&mut nixi, carried).await,
+        Outcome::Duplicate
+    ));
+    let peers = peer_lines(&world.lines(DM));
+    let asked_of_nixi = peers[0].ask.as_ref().expect("the ask");
+    assert_eq!(peers[0].sender, user(TOLA));
+    assert_eq!(
+        (asked_of_nixi.id.as_str(), &asked_of_nixi.room),
+        (question.id.as_str(), &room)
+    );
+    assert_eq!(asked_of_nixi.label, question.label);
+
+    // tgorka answers in the DM; Nixi relays it into Tola's room and leaves.
+    report(world.ask(&mut nixi, "1").await);
+    let relayed = nixis_rooms.sent();
+    assert_eq!(relayed.len(), 1);
+    assert_eq!(relayed[0].0, room);
+    assert_eq!(relayed[0].1["body"], "1");
+    assert_eq!(
+        read_answer(&relayed[0].1).map(|a| a.id),
+        Some(question.id.clone())
+    );
+    assert_eq!(*nixis_rooms.left.lock().expect("lock"), vec![room.clone()]);
+    let nixis = world.lines(DM);
+    assert_eq!(
+        ask_lines(&nixis)
+            .iter()
+            .map(|a| a.state)
+            .collect::<Vec<_>>(),
+        [AskState::Answered]
+    );
+    let told = tool_results(&nixis).pop().expect("a result");
+    assert_eq!(told.outcome, ToolOutcomeWord::Ok, "{}", told.content);
+
+    // The answer comes home: a `peer` line naming the ask and its choice,
+    // the run going on, and a turn.
+    // Marta's copy of it is no answer: only the proxy the ask went through
+    // answers it.
+    let forged = world.event(MARTA, Arrival::Answer, relayed[0].1.clone());
+    assert!(matches!(
+        serve_as(&tola, &mut tolas, &tolas_room, forged).await,
+        Outcome::Ignored(keeper_agent::agent::NOT_ASKED)
+    ));
+    let mut answer = world.event(NIXI, Arrival::Answer, relayed[0].1.clone());
+    answer.text = "1".to_owned();
+    let turn = report(serve_as(&tola, &mut tolas, &tolas_room, answer.clone()).await);
+    assert_eq!(turn.ending, TurnEnding::Complete);
+    assert!(matches!(
+        serve_as(&tola, &mut tolas, &tolas_room, answer).await,
+        Outcome::Duplicate
+    ));
+    let lines = world.lines(TOLAS_RUN);
+    let peer = peer_lines(&lines).pop().expect("the answer");
+    assert_eq!(peer.sender, user(NIXI));
+    let answers = peer.answers.expect("an answer");
+    assert_eq!(
+        (answers.id.as_str(), answers.choice.as_deref()),
+        (question.id.as_str(), Some("Continue"))
+    );
+    let closed = ask_lines(&lines).pop().expect("the ask's close");
+    assert_eq!(
+        (closed.state, closed.choice.as_deref()),
+        (AskState::Answered, Some("Continue"))
+    );
+    let runs: Vec<LogRun> = run_states(&lines).into_iter().map(|r| r.0).collect();
+    assert_eq!(runs[runs.len() - 2..], [LogRun::Running, LogRun::Review]);
+    assert!(tolas.context.asks.is_empty());
+    let told = format!(
+        "relaying the answer to your question {}:\\n1\\n\\nIt picks the choice Continue.",
+        question.id
+    );
+    let requests = world.stub.requests();
+    assert!(requests
+        .last()
+        .expect("a request")
+        .to_string()
+        .contains(&told));
+}
+
+/// The ask Tola's room was sent.
+fn ask_content_of(room: &Room) -> Value {
+    room.sent()
+        .into_iter()
+        .find(|(kind, content)| {
+            kind == "m.room.message" && keeper_core::agents::ask::read_ask(content).is_some()
+        })
+        .expect("an ask")
+        .1
+}
+
+/// 94.2 acceptance 7, the host's half (R103): with nobody to ask — no proxy
+/// of tgorka's known here — a question with a default is answered by it at
+/// once, naming its choice, and the turn goes on; one with none is refused
+/// with the epic's sentence. Nothing is sent or invited either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn ask_human_defaults_and_choices() {
+    use keeper_core::agents::ask::NO_ONE_TO_ASK;
+    use keeper_core::agents::log::AskState;
+    let world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![
+            calls(&[
+                (
+                    "d1",
+                    "ask_human",
+                    json!({"question": "Go on?", "choices": ["Continue", "Stop"], "default": "Stop"}),
+                ),
+                ("d2", "ask_human", json!({"question": "Which file?"})),
+            ]),
+            prose("Stopped."),
+        ],
+    );
+    let tola = tolas(&world, &["drive_read"]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let tolas_room = Arc::new(Room::of(&[TOLA, TGORKA, MARTA]));
+    let run = tolas_run(&world);
+    let mut tolas = world.open_as(&tola, TOLAS_RUN);
+    tolas.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+    let turn = report(serve_as(&tola, &mut tolas, &tolas_room, run).await);
+    assert_eq!(turn.ending, keeper_agent::agent::TurnEnding::Complete);
+    let lines = world.lines(TOLAS_RUN);
+    let results = tool_results(&lines);
+    let defaulted: Value = serde_json::from_str(&result_of(&results, "d1").content).expect("json");
+    assert_eq!(
+        defaulted,
+        json!({"answer": "Stop", "choice": "Stop", "by": "default"})
+    );
+    let refused = result_of(&results, "d2");
+    assert_eq!(refused.outcome, ToolOutcomeWord::Refused);
+    assert!(
+        refused.content.contains(NO_ONE_TO_ASK),
+        "{}",
+        refused.content
+    );
+    assert_eq!(
+        ask_lines(&lines)
+            .iter()
+            .map(|a| a.state)
+            .collect::<Vec<_>>(),
+        [AskState::Defaulted, AskState::Refused]
+    );
+    assert!(rooms.invited.lock().expect("lock").is_empty());
+    assert!(rooms.sent().is_empty());
+    assert!(tolas_room
+        .sent()
+        .iter()
+        .all(|(_, content)| keeper_core::agents::ask::read_ask(content).is_none()));
+    assert_eq!(world.stub.requests().len(), 2, "the turn went on");
+}
+
+/// 94.2 acceptance 6, S-09: an ask from a session at `untrusted` makes the
+/// DM's turn that relays it `untrusted`; tgorka's next line returns the DM
+/// to his own word. Its readers only narrow throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relayed_ask_taints_one_turn_of_the_dm() {
+    use keeper_core::agents::ask::{ask_content, AskContent};
+    use keeper_core::agents::events::CONTENT_VERSION;
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![prose("Tola asks whether to go on."), prose("Noted.")],
+    );
+    nixis_dm(&world);
+    let mut nixi = world.open(DM);
+    nixi.delegations = Some(Delegations::over(known_with_proxy()) as Arc<dyn DelegationPort>);
+    let before = nixi.context.label.clone();
+    let asked = AskContent {
+        v: CONTENT_VERSION,
+        id: ulid::Ulid::new().to_string(),
+        question: "Go on?".to_owned(),
+        choices: Vec::new(),
+        default: None,
+        to: user(TGORKA),
+        via: user(NIXI),
+        label: Label {
+            integrity: Integrity::Untrusted,
+            ..before.clone()
+        },
+    };
+    let mut carried = world.event(TOLA, Arrival::Ask, ask_content(&asked));
+    carried.text = "Go on?".to_owned();
+    carried.via = Some(OwnedRoomId::try_from(TOLAS_ROOM).expect("room"));
+    report(world.serve(&mut nixi, carried).await);
+    assert_eq!(nixi.context.label.integrity, Integrity::Untrusted);
+    assert_eq!(nixi.context.label.readers, before.readers);
+    report(world.ask(&mut nixi, "yes").await);
+    assert_eq!(nixi.context.label.integrity, Integrity::Owner);
+    assert_eq!(nixi.context.label.readers, before.readers);
+}
+
+/// Tola's run at [`TOLAS_RUN`] under `known`, its rooms naming `members` in
+/// her room, Nixi joined there when `joined`; the session, her deps, her
+/// room's fake and the run's arrival.
+fn tolas_asking(
+    world: &World,
+    known: Known,
+    members: &[&'static str],
+    joined: bool,
+) -> (
+    ServedSession,
+    AgentDeps,
+    Arc<Delegations>,
+    Arc<Room>,
+    Arrived,
+) {
+    let tola = tolas(world, &["drive_read"]);
+    let room = OwnedRoomId::try_from(TOLAS_ROOM).expect("room");
+    let rooms = Delegations::over(known);
+    rooms
+        .rooms
+        .lock()
+        .expect("lock")
+        .push((room.clone(), members.iter().map(|u| user(u)).collect()));
+    if joined {
+        rooms.joined.lock().expect("lock").push((room, user(NIXI)));
+    }
+    let tolas_room = Arc::new(Room::of(members));
+    let run = tolas_run(world);
+    let mut tolas = world.open_as(&tola, TOLAS_RUN);
+    tolas.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+    (tolas, tola, rooms, tolas_room, run)
+}
+
+/// The scheduled card of Tola's run, its `run:` key.
+fn tolas_card_run(
+    world: &World,
+) -> Option<keeper_core::agents::card::Field<keeper_core::agents::card::Run>> {
+    let text = std::fs::read_to_string(world.dir(TOLAS_RUN).join("card.md")).expect("card");
+    keeper_core::agents::card::CardAgent::of_text(&text)
+        .expect("keys")
+        .run
+}
+
+const ASKING: &str = "{\"question\": \"Go on to step 3?\", \"choices\": [\"Continue\", \"Stop\"]}";
+
+fn asking() -> Completion {
+    calls(&[(
+        "a1",
+        "ask_human",
+        serde_json::from_str(ASKING).expect("json"),
+    )])
+}
+
+/// R94A-01 (R199): what Nixi relays is tgorka's own message since the
+/// question, as her host logged it. A `reply` before he said anything
+/// relays nothing; one naming a choice he did not pick, or carrying
+/// anything else of the DM, is refused; the one that relays sends his `1`
+/// alone. A question taken once is never taken again, relayed or not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_carries_only_the_persons_own_message() {
+    use keeper_agent::ask::{NOT_ANSWERED_YET, NOT_THEIR_WORDS};
+    use keeper_core::agents::ask::{ask_content, read_answer, AskContent};
+    use keeper_core::agents::events::CONTENT_VERSION;
+    const PRIVATE: &str = "the safe's code is 4711";
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![
+            calls(&[("r0", "reply", json!({"ask": ASK}))]),
+            prose("tgorka, Dr Tola Grey asks: go on to step 3, or stop?"),
+            calls(&[("r1", "reply", json!({"ask": ASK, "text": "Stop"}))]),
+            calls(&[(
+                "r2",
+                "reply",
+                json!({"ask": ASK, "text": format!("1, and {PRIVATE}")}),
+            )]),
+            calls(&[("r3", "reply", json!({"ask": ASK}))]),
+            prose("Told her."),
+        ],
+    );
+    nixis_dm(&world);
+    let rooms = Delegations::over(known_with_proxy());
+    rooms.rooms.lock().expect("lock").push((
+        OwnedRoomId::try_from(TOLAS_ROOM).expect("room"),
+        [TOLA, TGORKA, MARTA, NIXI]
+            .iter()
+            .map(|u| user(u))
+            .collect(),
+    ));
+    let mut nixi = world.open(DM);
+    nixi.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+    let id = ulid::Ulid::new().to_string();
+    let content = ask_content(&AskContent {
+        v: CONTENT_VERSION,
+        id: id.clone(),
+        question: "Go on to step 3?".to_owned(),
+        choices: vec!["Continue".to_owned(), "Stop".to_owned()],
+        default: None,
+        to: user(TGORKA),
+        via: user(NIXI),
+        label: Label {
+            readers: Readers::Only([user(TGORKA), user(MARTA)].into()),
+            integrity: Integrity::Agent,
+            local_only: false,
+        },
+    });
+    let mut carried = world.event(TOLA, Arrival::Ask, content.clone());
+    carried.text = content["body"].as_str().unwrap_or_default().to_owned();
+    carried.via = Some(OwnedRoomId::try_from(TOLAS_ROOM).expect("room"));
+    report(world.serve(&mut nixi, carried.clone()).await);
+    assert!(rooms.sent().is_empty(), "nothing before tgorka spoke");
+
+    report(world.ask(&mut nixi, "1").await);
+    let sent = rooms.sent();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].1["body"], "1");
+    assert_eq!(read_answer(&sent[0].1).map(|a| a.id), Some(id.clone()));
+    let results = tool_results(&world.lines(DM));
+    let refused = |call: &str, sentence: &str| {
+        let result = result_of(&results, call);
+        assert_eq!(result.outcome, ToolOutcomeWord::Refused, "{call}");
+        assert!(
+            result.content.contains(sentence),
+            "{call}: {}",
+            result.content
+        );
+    };
+    refused("r0", NOT_ANSWERED_YET);
+    refused("r1", NOT_THEIR_WORDS);
+    refused("r2", NOT_THEIR_WORDS);
+    assert_eq!(result_of(&results, "r3").outcome, ToolOutcomeWord::Ok);
+    assert!(
+        rooms
+            .sent()
+            .iter()
+            .all(|(_, content, _)| !content.to_string().contains(PRIVATE)),
+        "nothing of the DM crosses"
+    );
+
+    // The same question again — re-sent, or read back after a restart —
+    // is no second turn.
+    let mut again = carried.clone();
+    again.event_id = OwnedEventId::try_from("$again:example.org").expect("id");
+    assert!(matches!(
+        world.serve(&mut nixi, again.clone()).await,
+        Outcome::Duplicate
+    ));
+    drop(nixi);
+    let mut restarted = world.open(DM);
+    restarted.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+    assert!(matches!(
+        world.serve(&mut restarted, again).await,
+        Outcome::Duplicate
+    ));
+}
+
+/// R94A-02 (R199): tgorka's proxy known only by his pinned `[[trust]]`
+/// entry, not in Tola's room: the invite reaches her as his proxy, and
+/// once she joined the room's check counts her as his — the question goes
+/// in. No agent of a mounted drive names Nixi here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pinned_proxy_is_asked_from_outside_the_room() {
+    use keeper_core::agents::agentd::TrustEntry;
+    use keeper_core::agents::log::AskState;
+    let world = world(ProviderKind::OpenAi, &["drive_read"], vec![asking()]);
+    let mut known = known(&[TGORKA, MARTA]);
+    known.agents.retain(|agent| agent.matrix_user != NIXI);
+    known.trust = vec![TrustEntry {
+        user: user(TGORKA),
+        proxy: Some(user(NIXI)),
+        master_key: Some("ed25519:pinned".to_owned()),
+    }];
+    let (mut tolas, tola, rooms, tolas_room, run) =
+        tolas_asking(&world, known, &[TOLA, TGORKA, MARTA], false);
+    report(serve_as(&tola, &mut tolas, &tolas_room, run).await);
+    let port: Arc<dyn EditPort> = tolas_room.clone();
+    assert!(tolas.send_asks(&tola, &port).await.is_empty());
+    let room = OwnedRoomId::try_from(TOLAS_ROOM).expect("room");
+    assert_eq!(
+        *rooms.invited.lock().expect("lock"),
+        vec![(room.clone(), user(NIXI))]
+    );
+    rooms.joined.lock().expect("lock").push((room, user(NIXI)));
+    tolas_room.set_members(&[TOLA, TGORKA, MARTA, NIXI]);
+    assert!(tolas.send_asks(&tola, &port).await.is_empty());
+    assert_eq!(tolas_room.ask_txns.lock().expect("lock").len(), 1);
+    assert_eq!(
+        ask_lines(&world.lines(TOLAS_RUN))
+            .iter()
+            .map(|a| a.state)
+            .collect::<Vec<_>>(),
+        [AskState::Asked, AskState::Sent]
+    );
+}
+
+/// R94A-04 (R199): the call publishes nothing — the `ask asked` line is on
+/// disk before the question goes anywhere, even with Nixi in the room. A
+/// host that stopped there sends it after its restart, under the ask's
+/// own transaction, so a send the server took before the stop is one
+/// event; once `ask sent` is logged, no restart sends it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ask_is_on_disk_before_it_is_sent_and_sent_after_a_restart() {
+    use keeper_core::agents::log::AskState;
+    let world = world(ProviderKind::OpenAi, &["drive_read"], vec![asking()]);
+    let (mut tolas, tola, rooms, tolas_room, run) = tolas_asking(
+        &world,
+        known_with_proxy(),
+        &[TOLA, TGORKA, MARTA, NIXI],
+        true,
+    );
+    report(serve_as(&tola, &mut tolas, &tolas_room, run).await);
+    let asks = ask_lines(&world.lines(TOLAS_RUN));
+    assert_eq!(
+        asks.iter().map(|a| a.state).collect::<Vec<_>>(),
+        [AskState::Asked]
+    );
+    assert!(
+        tolas_room.ask_txns.lock().expect("lock").is_empty(),
+        "nothing published by the call"
+    );
+    drop(tolas);
+
+    let port: Arc<dyn EditPort> = tolas_room.clone();
+    let reopen = || {
+        let mut served = world.open_as(&tola, TOLAS_RUN);
+        served.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+        served
+    };
+    let mut restarted = reopen();
+    assert!(restarted.send_asks(&tola, &port).await.is_empty());
+    assert_eq!(
+        *tolas_room.ask_txns.lock().expect("lock"),
+        [format!("ask-{}", asks[0].id)]
+    );
+    drop(restarted);
+    let mut again = reopen();
+    assert!(again.send_asks(&tola, &port).await.is_empty());
+    assert_eq!(tolas_room.ask_txns.lock().expect("lock").len(), 1);
+}
+
+/// R94A-06/07 (R199): a scheduled run that asked holds its card: the host
+/// begins no later window — the clock past the next one finds the run
+/// waiting — and, after a restart, the answer's turn finishes that very
+/// card, `run: review`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scheduled_runs_answer_finishes_its_card() {
+    use keeper_agent::agent::{scheduled_arrival, ASK_WAITS};
+    use keeper_agent::cards::Scheduled;
+    use keeper_core::agents::ask::answer_content;
+    use keeper_core::agents::card::{Field, Run};
+    use keeper_core::agents::log::RunState as LogRun;
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![asking(), prose("Going on to step 3.")],
+    );
+    let (mut tolas, tola, rooms, tolas_room, run) =
+        tolas_asking(&world, known_with_proxy(), &[TOLA, TGORKA, MARTA], false);
+    report(serve_as(&tola, &mut tolas, &tolas_room, run).await);
+    assert_eq!(tolas_card_run(&world), Some(Field::Read(Run::Blocked)));
+    assert!(tolas.holds_windows());
+    let card_before = std::fs::read_to_string(world.dir(TOLAS_RUN).join("card.md")).expect("card");
+    let next = scheduled_arrival(
+        &user(TOLA),
+        &Scheduled::Run {
+            card: "card.md".to_owned(),
+            window: "2026-10-05T10:00:00.000Z".to_owned(),
+            now_ms: chrono::DateTime::parse_from_rfc3339("2026-10-05T10:30:00Z")
+                .expect("an instant")
+                .timestamp_millis(),
+            utc_offset_minutes: 0,
+        },
+    )
+    .expect("an arrival");
+    assert!(matches!(
+        serve_as(&tola, &mut tolas, &tolas_room, next).await,
+        Outcome::Ignored(ASK_WAITS)
+    ));
+    assert_eq!(
+        std::fs::read_to_string(world.dir(TOLAS_RUN).join("card.md")).expect("card"),
+        card_before
+    );
+    assert_eq!(world.stub.requests().len(), 1);
+    let id = ask_lines(&world.lines(TOLAS_RUN))[0].id.clone();
+    drop(tolas);
+
+    let mut restarted = world.open_as(&tola, TOLAS_RUN);
+    restarted.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+    assert!(restarted.holds_windows(), "after a restart too");
+    let mut answer = world.event(NIXI, Arrival::Answer, answer_content("1", &id));
+    answer.text = "1".to_owned();
+    report(serve_as(&tola, &mut restarted, &tolas_room, answer).await);
+    assert_eq!(tolas_card_run(&world), Some(Field::Read(Run::Review)));
+    assert_eq!(
+        run_states(&world.lines(TOLAS_RUN)).last().map(|r| r.0),
+        Some(LogRun::Review)
+    );
+    assert!(!restarted.holds_windows());
+}
+
+/// R94A-11/13 (R199): Nixi is in Tola's room when Tola asks, and a reader
+/// outside her label joins before the send: the one final check at the
+/// send refuses it, nothing is sent, and the refusal is the run's next
+/// turn — `ask refused` naming why, the model told its question was never
+/// asked, the card's run ended rather than left blocked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_the_room_no_longer_lets_in_is_never_asked_and_the_run_hears_it() {
+    use keeper_core::agents::card::{Field, Run};
+    use keeper_core::agents::log::AskState;
+    let world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![asking(), prose("I could not ask tgorka; I stop here.")],
+    );
+    let (mut tolas, tola, _rooms, tolas_room, run) = tolas_asking(
+        &world,
+        known_with_proxy(),
+        &[TOLA, TGORKA, MARTA, NIXI],
+        true,
+    );
+    report(serve_as(&tola, &mut tolas, &tolas_room, run).await);
+    tolas_room.set_members(&[TOLA, TGORKA, MARTA, NIXI, "@eve:example.org"]);
+    let port: Arc<dyn EditPort> = tolas_room.clone();
+    let refused = tolas.send_asks(&tola, &port).await;
+    assert_eq!(refused.len(), 1);
+    assert!(
+        tolas_room.ask_txns.lock().expect("lock").is_empty(),
+        "nothing sent"
+    );
+    let unasked = refused.into_iter().next().expect("a refusal");
+    report(serve_as(&tola, &mut tolas, &tolas_room, unasked).await);
+    let closed = ask_lines(&world.lines(TOLAS_RUN)).pop().expect("a line");
+    assert_eq!(closed.state, AskState::Refused);
+    assert!(closed.reason.is_some());
+    assert!(world
+        .stub
+        .requests()
+        .last()
+        .expect("a request")
+        .to_string()
+        .contains("was never asked"));
+    assert!(tolas.context.asks.is_empty());
+    assert_eq!(tolas_card_run(&world), Some(Field::Read(Run::Review)));
+}
+
+/// R94A-12 (R199): a send the homeserver asks to wait is not tried again
+/// before that wait is over; one it refuses for good is refused, and the
+/// run hears it, instead of being tried for ever.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ask_waits_out_a_rate_limit_and_stops_at_a_permanent_refusal() {
+    use keeper_core::agents::log::AskState;
+    use keeper_core::agents::matrix::AgentMatrixError;
+    let world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![asking(), prose("The question was too long; I stop.")],
+    );
+    let (mut tolas, tola, _rooms, tolas_room, run) = tolas_asking(
+        &world,
+        known_with_proxy(),
+        &[TOLA, TGORKA, MARTA, NIXI],
+        true,
+    );
+    *tolas_room.ask_errors.lock().expect("lock") = vec![
+        AgentMatrixError::RateLimited {
+            retry_after_ms: Some(400),
+        },
+        AgentMatrixError::TooLarge,
+    ];
+    report(serve_as(&tola, &mut tolas, &tolas_room, run).await);
+    let port: Arc<dyn EditPort> = tolas_room.clone();
+    let attempts = || tolas_room.ask_txns.lock().expect("lock").len();
+    assert!(tolas.send_asks(&tola, &port).await.is_empty());
+    assert_eq!(attempts(), 1);
+    assert!(tolas.send_asks(&tola, &port).await.is_empty());
+    assert_eq!(attempts(), 1, "the wait is honoured");
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    let refused = tolas.send_asks(&tola, &port).await;
+    assert_eq!((attempts(), refused.len()), (2, 1));
+    assert!(tolas.send_asks(&tola, &port).await.is_empty());
+    assert_eq!(attempts(), 2, "never sent again");
+    report(
+        serve_as(
+            &tola,
+            &mut tolas,
+            &tolas_room,
+            refused.into_iter().next().expect("a refusal"),
+        )
+        .await,
+    );
+    let closed = ask_lines(&world.lines(TOLAS_RUN)).pop().expect("a line");
+    assert_eq!(closed.state, AskState::Refused);
+    assert!(!tolas.holds_windows());
 }

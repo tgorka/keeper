@@ -112,6 +112,7 @@ fn tools(home: &AgentHome) -> (Vec<&str>, Vec<&str>) {
             keeper_agent::delegate::is_delegation(name)
                 || keeper_agent::cards::is_card_tool(name)
                 || keeper_agent::bmad::serves(name)
+                || *name == keeper_core::agents::workflow::ASK_HUMAN
                 || ToolName::ALL.iter().any(|tool| tool.as_wire() == *name)
         })
 }

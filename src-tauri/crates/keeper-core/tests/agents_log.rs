@@ -1672,13 +1672,14 @@ fn a_refresh_reads_a_bounded_amount_of_log() {
     assert_eq!(row.lines, first.lines + 20, "the rest on the next opens");
 }
 
-/// R-18: a person's attachments and a peer's question are in the message the
-/// turn sends (`message_for` of the line as written) and in the message a
-/// replay rebuilds, the same bytes both ways.
+/// R-18: a person's attachments, a peer's question and a relayed answer are
+/// in the message the turn sends (`message_for` of the line as written) and
+/// in the message a replay rebuilds, the same bytes both ways; an answer
+/// reads as the answer to its ask (R99), never as a question of its own.
 #[test]
 fn attachments_and_a_peer_question_replay_as_they_were_sent() {
     use keeper_core::agents::log::replay::message_for;
-    use keeper_core::agents::log::{Attachment, PeerAsk, PeerBody};
+    use keeper_core::agents::log::{Attachment, PeerAnswer, PeerAsk, PeerBody};
 
     let scratch = Scratch::new();
     let session = &scratch.0;
@@ -1714,13 +1715,36 @@ fn attachments_and_a_peer_question_replay_as_they_were_sent() {
             ask: Some(PeerAsk {
                 id: "q1".to_owned(),
                 question: "Ship on Friday?".to_owned(),
+                room: "!steward:h".try_into().expect("room"),
+                label: Label {
+                    readers: Readers::Only([user("@tgorka:h")].into()),
+                    integrity: Integrity::Owner,
+                    local_only: false,
+                },
             }),
+            answers: None,
             artifacts: Some(vec![
                 "tgdrive/60-sessions/active/x/artifacts/plan.md".to_owned()
             ]),
         }),
     );
-    let sent: Vec<String> = [&asked, &peer]
+    let answered = line(
+        "electra",
+        0,
+        at(2),
+        3,
+        LineBody::Peer(PeerBody {
+            sender: user("@nixi:h"),
+            text: "1".to_owned(),
+            ask: None,
+            answers: Some(PeerAnswer {
+                id: "q0".to_owned(),
+                choice: Some("Continue".to_owned()),
+            }),
+            artifacts: None,
+        }),
+    );
+    let sent: Vec<String> = [&asked, &peer, &answered]
         .into_iter()
         .map(|line| {
             let receipt = writer.append(line).expect("append");
@@ -1745,4 +1769,10 @@ fn attachments_and_a_peer_question_replay_as_they_were_sent() {
         "{}",
         sent[1]
     );
+    assert!(
+        sent[2].contains("From @nixi:h, relaying the answer to your question q0:\\n1\\n\\nIt picks the choice Continue."),
+        "{}",
+        sent[2]
+    );
+    assert!(!sent[2].contains("Question q0"), "{}", sent[2]);
 }

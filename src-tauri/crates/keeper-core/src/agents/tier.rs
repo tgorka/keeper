@@ -10,7 +10,7 @@
 //! | tier | what | the host |
 //! |---|---|---|
 //! | T0 | reads | runs it |
-//! | T1 | reversible inside the session, the surface, `delegate`, `reply`, `bmad_render`, `bmad_memlog` | runs it |
+//! | T1 | reversible inside the session, the surface, `delegate`, `reply`, `bmad_render`, `bmad_memlog`, `ask_human` | runs it |
 //! | T2 | a drive write outside the session, a first write the grant asks for | asks a person |
 //! | T3 | a schedule or workflow set by an agent, a declassification | asks a person, once |
 //! | T4 | (no tool of this build) | the requester decides |
@@ -111,12 +111,13 @@ pub enum AgentTool {
     BmadParty,
     SkillsList,
     SkillView,
+    AskHuman,
     Declassify,
 }
 
 impl AgentTool {
     /// Every tool, in the table's order.
-    pub const ALL: [AgentTool; 23] = [
+    pub const ALL: [AgentTool; 24] = [
         AgentTool::DriveList,
         AgentTool::DriveRead,
         AgentTool::DriveGlob,
@@ -139,6 +140,7 @@ impl AgentTool {
         AgentTool::BmadParty,
         AgentTool::SkillsList,
         AgentTool::SkillView,
+        AgentTool::AskHuman,
         AgentTool::Declassify,
     ];
 
@@ -167,6 +169,7 @@ impl AgentTool {
             AgentTool::BmadParty => "bmad_party",
             AgentTool::SkillsList => "skills_list",
             AgentTool::SkillView => "skill_view",
+            AgentTool::AskHuman => "ask_human",
             AgentTool::Declassify => "declassify",
         }
     }
@@ -352,7 +355,9 @@ fn row(tool: AgentTool, facts: &CallFacts) -> Tier {
         | AgentTool::SurfaceProposeEdit => Tier::T1,
         // A render published into the session's workspace/, a memlog in its
         // artifacts/: both land inside the session by construction (R105).
-        AgentTool::BmadRender | AgentTool::BmadMemlog => Tier::T1,
+        // An ask goes into the session's own room, whose observers are the
+        // label's readers, and to the person it is for (R105).
+        AgentTool::BmadRender | AgentTool::BmadMemlog | AgentTool::AskHuman => Tier::T1,
         AgentTool::Declassify => Tier::T3,
     }
 }
@@ -689,7 +694,8 @@ mod tests {
                 | AgentTool::SurfaceScroll
                 | AgentTool::SurfaceProposeEdit
                 | AgentTool::BmadRender
-                | AgentTool::BmadMemlog => {
+                | AgentTool::BmadMemlog
+                | AgentTool::AskHuman => {
                     assert_eq!(tier(tool, CallFacts::default()), Tier::T1, "{tool:?}");
                 }
                 AgentTool::Declassify => {

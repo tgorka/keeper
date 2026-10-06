@@ -42,9 +42,11 @@ use std::time::Duration;
 use keeper_core::agents::agentd::{AgentdConfig, DrivePin, TrustEntry};
 use keeper_core::agents::drive::{self, DriveDecl};
 use keeper_core::agents::events::{
-    control_levels, ControlLevels, APPROVAL_DECISION, CONTROL_ROOM_TYPE, CONVERSATION_REQUEST,
-    DELEGATE, DOORBELL, PRESENCE, SCOPE, SESSION_ROOM_TYPE, SURFACE_REQUEST, SURFACE_RESULT, TURN,
+    control_levels, ControlLevels, ANSWER, APPROVAL_DECISION, ASK, CONTROL_ROOM_TYPE,
+    CONVERSATION_REQUEST, DELEGATE, DOORBELL, PRESENCE, SCOPE, SESSION_ROOM_TYPE, SURFACE_REQUEST,
+    SURFACE_RESULT, TURN,
 };
+use keeper_core::agents::home::AgentKind;
 use keeper_core::agents::index::Index;
 use keeper_core::agents::label::{Label, Readers};
 use keeper_core::agents::log::{ClaimAction, HostSlug};
@@ -80,7 +82,9 @@ use crate::agent::{
 };
 use crate::claims::Lease;
 use crate::deciding::ClientDecisions;
-use crate::delegate::{BoolFuture, BriefRoomFuture, DelegationPort, EventsFuture, MembersFuture};
+use crate::delegate::{
+    BoolFuture, BriefRoomFuture, DelegationPort, EventsFuture, MembersFuture, UnitFuture,
+};
 use crate::doorbell::{self as bells, Doorbell, DriveEngine, Ringer, RING_FINISH};
 use crate::headless::{
     apply_providers, drive_path, open_engine, zone_verdicts, HeadlessError, HeadlessPlatform,
@@ -572,6 +576,10 @@ impl Drop for Detach {
     }
 }
 
+/// Each room a copy's sessions delegated into, with the room and the kind
+/// of the session that did.
+pub(crate) type Children = Arc<Mutex<HashMap<OwnedRoomId, (OwnedRoomId, SessionKind)>>>;
+
 /// One hosted agent's copy on this host while it runs.
 pub(crate) struct Copy {
     pub(crate) deps: Arc<AgentDeps>,
@@ -581,9 +589,13 @@ pub(crate) struct Copy {
     pub(crate) router: Arc<Router>,
     /// Counts the copy's completed `/sync` rounds: a taker's settle waits one.
     pub(crate) syncs: watch::Receiver<u64>,
-    /// Rooms this copy's sessions delegated into, each with the room of the
-    /// session that did: their joins and replies go to that session (R55).
-    pub(crate) children: Arc<Mutex<HashMap<OwnedRoomId, OwnedRoomId>>>,
+    /// Rooms this copy's sessions delegated into, each with the room and
+    /// the kind of the session that did: their joins and replies go to that
+    /// session (R55), and so does an ask when it is a proxy's own (R199).
+    pub(crate) children: Children,
+    /// The rooms this proxy may have an ask to take from or to leave,
+    /// read back on the host's clock (R199).
+    pub(crate) ask_rooms: Arc<Mutex<AskRooms>>,
     /// The opening brief of each delegated room no session folder names
     /// yet, addressed to this agent: placement decides which host makes the
     /// session (R54). Bounded like the router's rooms.
@@ -704,6 +716,7 @@ pub(crate) fn start_copy(
         router: Arc::new(Router::default()),
         syncs: rounds_seen,
         children: Arc::default(),
+        ask_rooms: Arc::default(),
         pending: Mutex::default(),
         doorbell,
         harvest_acks: Arc::default(),
@@ -1097,6 +1110,7 @@ async fn serve_session(
         client: copy.client.clone(),
         known: Arc::clone(&copy.known),
         children: Arc::clone(&copy.children),
+        ask_rooms: Arc::clone(&copy.ask_rooms),
     });
     served.conversations = Some(Arc::clone(&rooms) as Arc<dyn ConversationPort>);
     served.delegations = Some(rooms);
@@ -1264,7 +1278,9 @@ impl crate::approvals::ApprovalRoom for ClientApprovals {
 struct ClientRooms {
     client: AgentClient,
     known: Arc<RwLock<Arc<Known>>>,
-    children: Arc<Mutex<HashMap<OwnedRoomId, OwnedRoomId>>>,
+    children: Children,
+    /// The rooms of asks this proxy relayed into, read back to be left.
+    ask_rooms: Arc<Mutex<AskRooms>>,
 }
 
 impl ConversationPort for ClientRooms {
@@ -1392,11 +1408,28 @@ impl DelegationPort for ClientRooms {
         })
     }
 
-    fn watch(&self, child: &RoomId, parent: &RoomId) {
+    fn watch(&self, child: &RoomId, parent: &RoomId, kind: SessionKind) {
         self.children
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(child.to_owned(), parent.to_owned());
+            .insert(child.to_owned(), (parent.to_owned(), kind));
+    }
+
+    fn invite<'a>(
+        &'a self,
+        room: &'a RoomId,
+        user: &'a UserId,
+        label: &'a Label,
+        audience: Option<Readers>,
+    ) -> UnitFuture<'a> {
+        Box::pin(self.client.invite(room, user, label, audience))
+    }
+
+    fn depart(&self, room: &RoomId) {
+        self.ask_rooms
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .again(room);
     }
 }
 
@@ -1667,6 +1700,15 @@ fn register_handlers(copy: &Arc<Copy>) {
                     }
                     return;
                 }
+                // Another agent's question for this proxy's person, in a
+                // room no worker of this copy serves: admitted, it is a turn
+                // of the proxy's DM (R99, R101), and nothing else of it.
+                if value["content"][ASK].is_object()
+                    && !copy.router.serves(room.room_id())
+                    && intercept_ask(&copy, &room, &value, encryption.as_ref(), received_at).await
+                {
+                    return;
+                }
                 // A room one of this agent's sessions delegated into: its
                 // target's join and reply go to that session, and nothing
                 // else of it to anyone (R55).
@@ -1675,7 +1717,7 @@ fn register_handlers(copy: &Arc<Copy>) {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .get(room.room_id())
-                    .cloned();
+                    .map(|(parent, _)| parent.clone());
                 if let Some(parent) = parent {
                     if let Some(arrived) =
                         child_arrival(&value, encryption.as_ref(), room.room_id(), received_at)
@@ -1699,6 +1741,316 @@ fn register_handlers(copy: &Arc<Copy>) {
             }
         },
     );
+}
+
+/// Where an ask in a room goes (R199): to the session that delegated into
+/// the room — `parent`, with its kind — when that is the proxy's own `main`
+/// or `conversation`, the sessions an ask is a turn of; else to `main`, the
+/// proxy's DM.
+pub(crate) fn ask_target(
+    parent: Option<(OwnedRoomId, SessionKind)>,
+    main: Option<OwnedRoomId>,
+) -> Option<OwnedRoomId> {
+    match parent {
+        Some((room, SessionKind::Main | SessionKind::Conversation)) => Some(room),
+        _ => main,
+    }
+}
+
+/// An ask `value` (decrypted) in `room`, a room this copy serves no session
+/// of: when this copy's agent is a proxy with a person, the ask
+/// [`rooms::admit_ask`] admits is routed to the session it is a turn of
+/// ([`route_ask`]); anything else of it is dropped. A room whose state, or
+/// whose ask's session, could not be read is read back on a later tick
+/// ([`recover_asks`]). `false` when this copy's agent is no proxy: the
+/// event goes the ordinary way.
+async fn intercept_ask(
+    copy: &Copy,
+    room: &Room,
+    value: &Value,
+    encryption: Option<&EncryptionInfo>,
+    received_at: Instant,
+) -> bool {
+    let config = &copy.deps.home.config;
+    let (AgentKind::Proxy, Some(human)) = (config.kind, config.human.as_ref()) else {
+        return false;
+    };
+    let Some(arrived) = arrival_of(value, encryption, received_at) else {
+        return true;
+    };
+    if arrived.arrival != Arrival::Ask || arrived.sender == config.matrix_user {
+        return true;
+    }
+    let me = &config.matrix_user;
+    let again = || {
+        copy.ask_rooms
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .again(room.room_id());
+    };
+    let Some(facts) = brief_room(room).await else {
+        tracing::warn!(room = %room.room_id(), "agents: an ask's room could not be read; it is read back later");
+        again();
+        return true;
+    };
+    let known = Arc::clone(&copy.known.read().unwrap_or_else(|p| p.into_inner()));
+    let event = BriefEvent {
+        event_type: "m.room.message",
+        sender: &arrived.sender,
+        content: &arrived.content,
+        sealed: true,
+    };
+    if let Err(note) = rooms::admit_ask(&facts, &event, me, human, &known) {
+        tracing::info!(room = %room.room_id(), sender = %arrived.sender, note, "agents: an ask this proxy may not take is ignored");
+        return true;
+    }
+    if !route_ask(copy, room.room_id(), arrived).await {
+        again();
+    }
+    true
+}
+
+/// Route `arrived`, an ask admitted in `room`, to the proxy's session it is
+/// a turn of ([`ask_target`]) as an [`Arrival::Ask`] whose `via` is `room`;
+/// the session dedupes it by its id. `false` when that session could not be
+/// named.
+async fn route_ask(copy: &Copy, room: &RoomId, arrived: Arrived) -> bool {
+    let config = &copy.deps.home.config;
+    let parent = copy
+        .children
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(room)
+        .cloned();
+    let main = match parent {
+        Some((_, SessionKind::Main | SessionKind::Conversation)) => None,
+        _ => {
+            let (zone, drive, id) = (
+                copy.deps.sessions_zone.clone(),
+                config.drive.clone(),
+                config.id.clone(),
+            );
+            tokio::task::spawn_blocking(move || crate::sinks::main_dm(&zone, &drive, &id))
+                .await
+                .ok()
+                .flatten()
+        }
+    };
+    let Some(target) = ask_target(parent, main) else {
+        tracing::warn!(%room, "agents: an ask came for a proxy whose DM this host cannot name; it is read back later");
+        return false;
+    };
+    copy.router.route(
+        &target,
+        Arrived {
+            via: Some(room.to_owned()),
+            ..arrived
+        },
+    );
+    true
+}
+
+/// The session rooms a proxy's copy reads back for asks (R199): each room
+/// once after the copy starts, and again whenever it is asked to — a relay
+/// went into it, or a read, a route or a leave of it failed — until a read
+/// settles it.
+#[derive(Debug, Default)]
+pub(crate) struct AskRooms {
+    read: HashSet<OwnedRoomId>,
+    again: HashSet<OwnedRoomId>,
+}
+
+impl AskRooms {
+    /// Of the rooms `joined` now, those to read back: never read yet, or
+    /// asked again. A room no longer joined is forgotten.
+    pub(crate) fn due(&mut self, joined: &[OwnedRoomId]) -> Vec<OwnedRoomId> {
+        self.again.retain(|room| joined.contains(room));
+        joined
+            .iter()
+            .filter(|room| !self.read.contains(*room) || self.again.contains(*room))
+            .cloned()
+            .collect()
+    }
+
+    /// Read `room` back on the next tick.
+    pub(crate) fn again(&mut self, room: &RoomId) {
+        self.again.insert(room.to_owned());
+    }
+
+    /// `room` was read back: `settled` when everything of it was done —
+    /// every waiting ask routed, the room left when it should be — else it
+    /// is read again on the next tick.
+    pub(crate) fn settled(&mut self, room: &RoomId, settled: bool) {
+        self.read.insert(room.to_owned());
+        if settled {
+            self.again.remove(room);
+        } else {
+            self.again.insert(room.to_owned());
+        }
+    }
+}
+
+/// Whether a proxy leaves an ask room after a read back (S-27, R199): it
+/// answered there, no ask of the room waits for its relay, and no session
+/// of its delegated into the room.
+pub(crate) fn leaves(waiting: usize, answered: usize, delegated: bool) -> bool {
+    waiting == 0 && answered > 0 && !delegated
+}
+
+/// A room's timeline read back for asks (R199): every ask
+/// [`rooms::admit_ask`] admits for `me` and its person `human` in a room
+/// that is `room` now, oldest first, that no answer `me` sent into the room
+/// names — the asks that wait for a relay — and how many it answered.
+pub(crate) async fn asks_waiting<F, Fut>(
+    fetch: F,
+    room: &BriefRoom,
+    me: &UserId,
+    human: &UserId,
+    known: &Known,
+) -> Result<(Vec<Value>, usize), String>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<Page, String>>,
+{
+    let mut asks: Vec<(String, Value)> = Vec::new();
+    let mut answered: HashSet<String> = HashSet::new();
+    walk_back(fetch, |event, sealed| {
+        let Some(sender) = event["sender"]
+            .as_str()
+            .and_then(|sender| UserId::parse(sender).ok())
+        else {
+            return false;
+        };
+        if sender == me {
+            if let Some(answer) = keeper_core::agents::ask::read_answer(&event["content"]) {
+                answered.insert(answer.id);
+            }
+            return false;
+        }
+        let ask = rooms::admit_ask(
+            room,
+            &BriefEvent {
+                event_type: event["type"].as_str().unwrap_or_default(),
+                sender: &sender,
+                content: &event["content"],
+                sealed,
+            },
+            me,
+            human,
+            known,
+        );
+        if let Ok(ask) = ask {
+            asks.push((ask.id, event.clone()));
+        }
+        false
+    })
+    .await?;
+    asks.reverse();
+    let total = asks.len();
+    let waiting: Vec<Value> = asks
+        .into_iter()
+        .filter(|(id, _)| !answered.contains(id))
+        .map(|(_, event)| event)
+        .collect();
+    let done = total - waiting.len();
+    Ok((waiting, done))
+}
+
+/// An ask read back from `room`'s timeline, as its proxy session's arrival.
+fn read_back_ask(event: &Value, room: &RoomId) -> Option<Arrived> {
+    let content = event["content"].clone();
+    Some(Arrived {
+        event_id: OwnedEventId::try_from(event["event_id"].as_str()?).ok()?,
+        sender: OwnedUserId::try_from(event["sender"].as_str()?).ok()?,
+        arrival: Arrival::Ask,
+        text: content["body"].as_str().unwrap_or_default().to_owned(),
+        content,
+        received_at: Instant::now(),
+        replay: false,
+        via: Some(room.to_owned()),
+        device: None,
+    })
+}
+
+/// A proxy copy's read back of the session rooms it joined that no session
+/// of its serves (R199): each ask there that waits for its relay is routed
+/// to its session again — after a restart, a lost interception or a read
+/// that failed; the session takes an ask once — and a room where it
+/// answered and nothing waits any more is left (S-27). A room whose read,
+/// route or leave failed is read again on the next tick.
+pub(crate) async fn recover_asks(copy: &Copy, served: &HashSet<OwnedRoomId>) {
+    let config = &copy.deps.home.config;
+    let (AgentKind::Proxy, Some(human)) = (config.kind, config.human.as_ref()) else {
+        return;
+    };
+    let me = &config.matrix_user;
+    let rooms: Vec<Room> = copy
+        .client
+        .client()
+        .joined_rooms()
+        .into_iter()
+        .filter(|room| {
+            room.room_type()
+                .is_some_and(|kind| kind.to_string() == SESSION_ROOM_TYPE)
+                && !served.contains(room.room_id())
+                && !copy.router.serves(room.room_id())
+                && room
+                    .creators()
+                    .is_some_and(|creators| !creators.contains(me))
+        })
+        .collect();
+    let joined: Vec<OwnedRoomId> = rooms.iter().map(|room| room.room_id().to_owned()).collect();
+    let due = copy
+        .ask_rooms
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .due(&joined);
+    let known = Arc::clone(&copy.known.read().unwrap_or_else(|p| p.into_inner()));
+    for id in due {
+        let Some(room) = rooms.iter().find(|room| *room.room_id() == *id) else {
+            continue;
+        };
+        let settled = match brief_room(room).await {
+            None => false,
+            Some(facts) => {
+                match asks_waiting(|from| page_back(room, from), &facts, me, human, &known).await {
+                    Err(error) => {
+                        tracing::warn!(room = %id, %error, "agents: an ask room could not be read back; it is read again");
+                        false
+                    }
+                    Ok((waiting, answered)) => {
+                        let mut settled = true;
+                        for event in &waiting {
+                            if let Some(arrived) = read_back_ask(event, &id) {
+                                settled &= route_ask(copy, &id, arrived).await;
+                            }
+                        }
+                        let delegated = copy
+                            .children
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .contains_key(&id);
+                        if leaves(waiting.len(), answered, delegated) {
+                            match copy.client.leave(&id).await {
+                                Ok(()) => {
+                                    tracing::info!(room = %id, "agents: a proxy left a room once every ask there was relayed")
+                                }
+                                Err(error) => {
+                                    tracing::warn!(room = %id, %error, "agents: a proxy could not leave a room it relayed into; it tries again");
+                                    settled = false;
+                                }
+                            }
+                        }
+                        settled
+                    }
+                }
+            }
+        };
+        copy.ask_rooms
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .settled(&id, settled);
+    }
 }
 
 /// Who is in `room` or invited to it.
@@ -1843,6 +2195,8 @@ pub(crate) async fn recover_briefs(copy: &Copy, served: HashSet<OwnedRoomId>) {
         }
     })
     .await;
+    // A proxy's asks are read back on the same clock (R199).
+    recover_asks(copy, &served).await;
 }
 
 /// One page of a room's timeline read backward: its events, newest first,
@@ -2026,6 +2380,10 @@ pub fn arrival_of(
             return None;
         } else if content[DELEGATE].is_object() {
             Arrival::Brief
+        } else if content[ASK].is_object() {
+            Arrival::Ask
+        } else if content[ANSWER].is_object() {
+            Arrival::Answer
         } else {
             Arrival::Text
         }
@@ -2598,5 +2956,183 @@ mod tests {
             .expect("an opening");
         assert_eq!((read.event, read.at), (live.event, live.at));
         assert_eq!(read.brief.brief, "Sort the inbox.");
+    }
+
+    /// An asking room as a proxy's host reads it: Tola at 50 in a delegated
+    /// room Amelia made, Tola known; Nixi is the proxy and tgorka her person.
+    fn ask_room() -> (BriefRoom, Known) {
+        use keeper_core::agents::home::AgentKind;
+        use matrix_sdk::ruma::events::room::power_levels::{
+            RoomPowerLevels, RoomPowerLevelsEventContent,
+        };
+        use matrix_sdk::ruma::room_version_rules::AuthorizationRules;
+        let readers = Readers::Only(std::collections::BTreeSet::from([user(TGORKA)]));
+        let known = Known {
+            agents: vec![KnownAgent {
+                id: "tola".to_owned(),
+                drive: "tgdrive".to_owned(),
+                name: "Dr Tola Grey".to_owned(),
+                matrix_user: user(TOLA),
+                kind: AgentKind::Steward,
+                human: None,
+                hosted: false,
+                home_readers: readers.clone(),
+                opening: Label {
+                    readers,
+                    ..Label::top()
+                },
+                drives: vec!["tgdrive".to_owned()],
+            }],
+            trust: Vec::new(),
+        };
+        let levels: RoomPowerLevelsEventContent =
+            serde_json::from_value(keeper_core::agents::events::power_levels(
+                SessionKind::Delegated,
+                &user("@amelia:example.org"),
+                &[user(TOLA)],
+            ))
+            .expect("levels");
+        let room = BriefRoom {
+            room_type: Some(SESSION_ROOM_TYPE.to_owned()),
+            creators: vec![user("@amelia:example.org")],
+            levels: Some(RoomPowerLevels::new(
+                levels.into(),
+                &AuthorizationRules::V1,
+                Vec::<OwnedUserId>::new(),
+            )),
+            members: std::collections::BTreeSet::from([user(NIXI), user(TOLA), user(TGORKA)]),
+        };
+        (room, known)
+    }
+
+    fn ask_event(n: usize, id: &str) -> Value {
+        use keeper_core::agents::ask::{ask_content, AskContent};
+        event(
+            n,
+            TOLA,
+            ask_content(&AskContent {
+                v: keeper_core::agents::events::CONTENT_VERSION,
+                id: id.to_owned(),
+                question: "Go on?".to_owned(),
+                choices: Vec::new(),
+                default: None,
+                to: user(TGORKA),
+                via: user(NIXI),
+                label: Label {
+                    readers: Readers::Only(std::collections::BTreeSet::from([user(TGORKA)])),
+                    ..Label::top()
+                },
+            }),
+        )
+    }
+
+    const TGORKA: &str = "@tgorka:example.org";
+    const FIRST: &str = "01J9AAAAAAAAAAAAAAAAAAAAAA";
+    const SECOND: &str = "01J9BBBBBBBBBBBBBBBBBBBBBB";
+
+    /// R94A-05 and R94A-10: a read back of an asking room finds each ask
+    /// for this proxy's person that no answer of its own in the room names
+    /// — the second of two when only the first was relayed — by the live
+    /// intake's one admission (an unsealed ask is none), and counts the
+    /// relayed ones; an answer someone else sent relays nothing.
+    #[tokio::test]
+    async fn a_read_back_finds_the_asks_still_waiting_for_a_relay() {
+        use keeper_core::agents::ask::answer_content;
+        let (room, known) = ask_room();
+        let (me, human) = (user(NIXI), user(TGORKA));
+        let ids = |waiting: &[Value]| {
+            waiting
+                .iter()
+                .map(|event| event["content"][keeper_core::agents::events::ASK]["id"].clone())
+                .collect::<Vec<_>>()
+        };
+        let timeline = vec![
+            (ask_event(1, FIRST), true),
+            (ask_event(2, SECOND), true),
+            (event(3, TOLA, answer_content("1", SECOND)), true),
+            (event(4, NIXI, answer_content("1", FIRST)), true),
+            (ask_event(5, "01J9CCCCCCCCCCCCCCCCCCCCCC"), false),
+        ];
+        let (waiting, answered) = asks_waiting(pages(&timeline, None), &room, &me, &human, &known)
+            .await
+            .expect("read back");
+        assert_eq!(ids(&waiting), [json!(SECOND)]);
+        assert_eq!(answered, 1);
+        assert!(!leaves(waiting.len(), answered, false), "the second waits");
+        let mut both = timeline.clone();
+        both.push((event(6, NIXI, answer_content("2", SECOND)), true));
+        let (waiting, answered) = asks_waiting(pages(&both, None), &room, &me, &human, &known)
+            .await
+            .expect("read back");
+        assert!(waiting.is_empty());
+        assert_eq!(answered, 2);
+        assert!(leaves(waiting.len(), answered, false));
+        assert!(
+            asks_waiting(pages(&both, Some(0)), &room, &me, &human, &known)
+                .await
+                .is_err(),
+            "an unread room is no empty one"
+        );
+    }
+
+    /// S-27 with R94A-09/10: a proxy leaves an asking room only once it
+    /// relayed there and nothing waits, never a room one of its sessions
+    /// delegated into or one it was invited to and not asked in yet.
+    #[test]
+    fn a_proxy_leaves_only_after_its_last_relay() {
+        assert!(leaves(0, 1, false));
+        assert!(!leaves(1, 1, false));
+        assert!(!leaves(0, 0, false));
+        assert!(!leaves(0, 2, true));
+    }
+
+    /// R94A-05/09: each joined room is read once after a start; one whose
+    /// read, route or leave failed, or that a relay went into, is read
+    /// again until a read settles it; one no longer joined is forgotten.
+    #[test]
+    fn an_ask_room_is_read_again_until_it_settles() {
+        let (a, b) = (
+            OwnedRoomId::try_from("!a:example.org").expect("room"),
+            OwnedRoomId::try_from("!b:example.org").expect("room"),
+        );
+        let mut rooms = AskRooms::default();
+        let joined = vec![a.clone(), b.clone()];
+        assert_eq!(rooms.due(&joined), joined);
+        rooms.settled(&a, true);
+        rooms.settled(&b, false);
+        assert_eq!(rooms.due(&joined), vec![b.clone()], "the leave failed");
+        rooms.settled(&b, true);
+        assert!(rooms.due(&joined).is_empty());
+        rooms.again(&a);
+        assert_eq!(rooms.due(&joined), vec![a.clone()], "a relay went in");
+        assert!(
+            rooms.due(std::slice::from_ref(&b)).is_empty(),
+            "a left room is forgotten"
+        );
+        assert!(rooms.due(&joined).is_empty());
+    }
+
+    /// R94A-03: an ask in a room a proxy's session delegated into goes to
+    /// that session only when it is the proxy's own `main` or
+    /// `conversation`; from any other, to the proxy's DM.
+    #[test]
+    fn an_ask_goes_to_a_parent_only_when_it_takes_asks() {
+        let (parent, main) = (
+            OwnedRoomId::try_from("!parent:example.org").expect("room"),
+            OwnedRoomId::try_from("!dm:example.org").expect("room"),
+        );
+        for kind in SessionKind::ALL {
+            let own = matches!(kind, SessionKind::Main | SessionKind::Conversation);
+            assert_eq!(
+                ask_target(Some((parent.clone(), kind)), Some(main.clone())),
+                Some(if own { parent.clone() } else { main.clone() }),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(ask_target(None, Some(main.clone())), Some(main));
+        assert_eq!(
+            ask_target(Some((parent, SessionKind::Scheduled)), None),
+            None
+        );
     }
 }

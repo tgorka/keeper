@@ -7950,6 +7950,66 @@ location: `src-tauri/crates/keeper-core/src/agents/skills.rs` (`index`)
 reason: The acceptance lists such a skill as refused ("proposed by <agent> on <date>; not offered until a person adopts it") and `skill_view` refusing one still carrying `metadata.keeper_proposal`, but proposals are 95.2's and `skills::index` has no proposal rule; the clause moved to 95.2, which adds it to the index both tools read.
 status: open
 
+
+### DW-534: An ask renders as plain text on devices.
+
+origin: epic 94, story 94.2 (rung `agents-94-ask`, R113, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/room.rs`, `src/components/chat/`
+reason: R113 keeps the ask and the relayed answer plain `m.text` in 94; a person reading the asking room sees the question and its numbered choices as text, with no card naming who asks whom or which choice was taken. Close with an ask VM decided by the design lane, as the brief has.
+status: open
+
+### DW-535: An ask that reached a proxy's room while its host was down is not read back.
+
+origin: epic 94, story 94.2 (rung `agents-94-ask`, R101, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/runtime.rs` (`intercept_ask`)
+reason: The interception acts on live timeline events only; an ask sent while the proxy's host was not syncing is decrypted on the next sync and intercepted then, but one older than the sync window the host resumes from is never taken, and the asking run stays blocked. Close with a read-back of joined, unserved session rooms for asks with no `peer` line in the proxy's DM, as `recover_briefs` does for briefs.
+status: narrowed 2026-10-06
+resolution: Narrowed by R199 (R94A-05) to DW-546. A proxy's copy reads back every session room it joined and serves no session of (`runtime::recover_asks`, on the host's clock after `recover_briefs`): each room once after a start, and again after a read, a route or a leave that failed or a relay that went in (`runtime::AskRooms`); each ask `rooms::admit_ask` admits there that no answer of its own names (`runtime::asks_waiting`) is routed to its session again, which takes an ask once (`SessionContext.asked_of_me`). Proved by `runtime::tests::a_read_back_finds_the_asks_still_waiting_for_a_relay`, `an_ask_room_is_read_again_until_it_settles` and `agent_turns::a_relay_carries_only_the_persons_own_message` (the same ask again, and after a restart, is no second turn).
+
+### DW-536: A scheduled run's card is not finished by the turn its answer starts.
+
+origin: epic 94, story 94.2 (rung `agents-94-ask`, R99, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`ServedSession::answered`, `finish_scheduled`)
+reason: An ask in a scheduled run leaves its card `blocked`; the answer sets the session's card `running` (a delegated session's `brief.md`) and runs a turn, but that turn is not a scheduled window's, so `finish_scheduled` does not write the scheduled card's `review`/`failed`. Close by recording the card an asking run belongs to on its `ask` line and finishing it after the answer's turn.
+status: closed 2026-10-06
+resolution: Fixed by R199 (R94A-06/07): the `ask asked` line names the scheduled card whose run asked (`AskBody.card`, `OpenAsk.card`); while it waits the worker reports the run as holding its card (`ServedSession::holds_windows`, `Activity.parked`) and a later window is ignored (`ASK_WAITS`); the answer's turn — or a refusal's — writes that card `running` and ends it as the run would have (`ServedSession::go_on`, `finish_scheduled`), after a restart too. Proved by `agent_turns::a_scheduled_runs_answer_finishes_its_card`.
+
+### DW-537: A run nobody can be asked about is not yet held one tier stricter.
+
+origin: epic 94, story 94.2 acceptance 7 (rung `agents-94-ask`, R103, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/tier.rs` (`Context::of_session`), `src-tauri/crates/keeper-core/src/agents/session.rs`
+reason: R103 extends R83's `unattended` to "R102 finds no one to ask" and stamps `checkpoints` into the session's `agent.toml`; this rung answers such a run's asks with their defaults but leaves the tier context and the session key to rung `agents-94-workflows`, which owns `checkpoints`.
+status: open
+
+### DW-538: An ask whose deferred send the label refuses leaves its run blocked unannounced.
+
+origin: epic 94, story 94.2 (rung `agents-94-ask`, R168, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`ServedSession::send_asks`)
+reason: A question sent on the clock (its proxy joined after the call) is checked against the room as it is then; a refusal writes `ask refused` and sends nothing, but no turn tells the model and the card stays `blocked` until a person or another arrival moves it. Close by running a turn with the refusal as a `peer` note, as a refused brief's join is said.
+status: closed 2026-10-06
+resolution: Fixed by R199 (R94A-11/12/13): every send of an ask — at once after its turn or on the clock — goes through `ServedSession::send_asks`, whose refusal (the room at the send, the invite's label check, a `TooLarge` or `Forbidden` send) becomes an `Arrival::Unasked`: the run's next turn, opened by a `peer` line in the agent's own name saying why the question was never asked, then `ask refused`; its card's run ends. Proved by `agent_turns::a_question_the_room_no_longer_lets_in_is_never_asked_and_the_run_hears_it` and `an_ask_waits_out_a_rate_limit_and_stops_at_a_permanent_refusal`.
+
+### DW-546: An ask further back than a read-back's pages is not found.
+
+origin: epic 94, story 94.2 (rung `agents-94-ask`, review R94A-05, R199, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/runtime.rs` (`asks_waiting`, `walk_back`)
+reason: The read-back of an asking room walks at most `BACKLOG_PAGES` pages back, as the brief read-back does; an ask behind more of the room's events than that, never taken live, is not found, and its run waits until a person moves it. Close with a read-back that stops at the proxy's join event instead of a page bound.
+status: open
+
+### DW-547: A parked round's continuation that asked still makes another model request.
+
+origin: epic 94, story 94.2 (rung `agents-94-ask`, review R94A-08, R199, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`run_agent_turn`, `ServedSession::resume_turn`)
+reason: When a round calls `ask_human` and then a call that parks, the round gate's `asked` is the first turn's; the continuation that runs once the call is decided starts its own tools and goes on to the model, so the run speaks once more before the answer comes (the answer itself waits for the round, R199). Close by carrying the round's ask into the continuation's gate, so it ends at that round as the asking turn would have.
+status: open
+
+### DW-548: A proxy's failed leave is retried every tick without backing off.
+
+origin: epic 94, story 94.2 (rung `agents-94-ask`, review R94A-09, R199, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/runtime.rs` (`recover_asks`, `AskRooms::settled`)
+reason: A room whose leave the homeserver refuses is read back and left again on every host tick, each failure logged, until it succeeds; nothing grows the wait. Close with a per-room backoff in `AskRooms`.
+status: open
+
 ### DW-552: A render staging folder a refused publication leaves behind is never swept.
 
 origin: epic 94, story 94.2 (rung `agents-94-render`, review R94R-01, R196, 2026-10-06)
@@ -7970,4 +8030,3 @@ origin: epic 94, story 94.2 (rung `agents-94-render`, review R94R-03, R196, 2026
 location: `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`run_from`)
 reason: `run_from` syncs `.keeper/` after removing the journal, but the only fault a test can plant — an unreadable folder — fails the journal's own earlier writes into that same folder first, so no test separates the removal's sync from them. The steps' directory syncs are proved by planting (`exec::tests::a_folder_the_journal_counts_is_synced_where_it_was_made`). Close with an injectable sync seam or a power-cut harness.
 status: open
-

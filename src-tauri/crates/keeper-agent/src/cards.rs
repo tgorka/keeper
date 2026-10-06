@@ -939,6 +939,9 @@ mod tests {
         fn may_write(&self) -> bool {
             self.1.load(std::sync::atomic::Ordering::SeqCst)
         }
+        fn relay(&self, _: &str) -> Option<crate::ask::Relay> {
+            None
+        }
     }
 
     fn view(integrity: Integrity) -> View {

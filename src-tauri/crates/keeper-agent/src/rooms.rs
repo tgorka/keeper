@@ -11,6 +11,7 @@
 use std::collections::BTreeSet;
 
 use keeper_core::agents::agentd::TrustEntry;
+use keeper_core::agents::ask::{enveloped_ask, AskContent};
 use keeper_core::agents::delegation::{enveloped_brief, trusted_brief, DelegateContent};
 use keeper_core::agents::events::{CONTROL_ROOM_TYPE, SESSION_ROOM_TYPE};
 use keeper_core::agents::home::AgentKind;
@@ -91,9 +92,14 @@ pub enum InviteDecision {
 ///   agent's audience — a delegation;
 /// - **(c)** the `proxy` of a `[[trust]]` entry that is pinned (it has a
 ///   `master_key`) and whose person reads the invited agent's home drive,
-///   when `check_sink(Room)` lets the opening label reach that person.
+///   when `check_sink(Room)` lets the opening label reach that person;
+/// - **(d)** for an invited proxy, the user of an agent homed in a drive
+///   this host mounts whose readers include the proxy's `human` — the
+///   session room an ask for that person goes into (R101). Joining reads
+///   nothing on its own: what the proxy takes from the room is an ask
+///   [`admit_ask`] admits, and it leaves once it relayed the answer.
 ///
-/// The desktop has no `[[trust]]`, so there only (a) and (b) join (R63).
+/// The desktop has no `[[trust]]`, so there only (a), (b) and (d) join (R63).
 ///
 /// A control room (`dev.keeper.agent.control`) is joined only as a
 /// visitor: by a steward hosted here, invited by someone who is not an
@@ -133,7 +139,13 @@ pub fn invite_decision(invite: &Invite, known: &Known) -> InviteDecision {
                 agent_audiences: Vec::new(),
             })
     });
-    if proxy_person || mounted_agent || pinned_proxy {
+    let asking_agent = invited.kind == AgentKind::Proxy
+        && invited.human.as_ref().is_some_and(|human| {
+            known.agents.iter().any(|agent| {
+                agent.matrix_user == invite.inviter && reads(&agent.home_readers, human)
+            })
+        });
+    if proxy_person || mounted_agent || pinned_proxy || asking_agent {
         InviteDecision::Join
     } else {
         InviteDecision::Pending
@@ -281,6 +293,66 @@ pub fn admit_brief(
     Ok(brief)
 }
 
+/// An event that is not an `m.text` message carrying a question its body
+/// says, or is an edit of one.
+pub const NOT_AN_ASK: &str =
+    "an ask is an m.text message carrying a question its body says, never an edit";
+/// An ask its sender's device did not seal.
+pub const UNSEALED_ASK: &str = "an ask its sender's device did not seal is not taken";
+/// An ask outside a session's room.
+pub const NOT_A_SESSION_ROOM: &str = "an ask is taken only in a session's room";
+/// An ask from a sender who is no agent this host knows, or below an
+/// agent's power in its room now.
+pub const NOT_AN_ASKING_AGENT: &str =
+    "an ask is taken only from an agent this host knows, at an agent's power in its room";
+/// An ask for another proxy, or for another person.
+pub const NOT_THIS_PROXY: &str = "an ask is taken only by the proxy it names, for its own person";
+/// An ask whose label does not reach the proxy's person.
+pub const BEYOND_THE_PERSON: &str =
+    "an ask whose label does not reach the proxy's person is not taken";
+
+/// The one test an ask passes before the proxy's host takes it into its
+/// DM (R101, R93's shape): the event is an ask's envelope ([`enveloped_ask`]:
+/// an `m.room.message` of `m.text`, not an edit, whose body is the question
+/// it carries) its sender's device sealed, in a session's room; its sender
+/// is an agent this host knows holding an agent's power there now; it names
+/// `me` as the proxy and `human`, `me`'s person, as the one asked; and its
+/// label reaches that person — the DM's audience (AD-391).
+pub fn admit_ask(
+    room: &BriefRoom,
+    event: &BriefEvent<'_>,
+    me: &UserId,
+    human: &UserId,
+    known: &Known,
+) -> Result<AskContent, &'static str> {
+    let ask = enveloped_ask(event.event_type, event.content).ok_or(NOT_AN_ASK)?;
+    if !event.sealed {
+        return Err(UNSEALED_ASK);
+    }
+    if room.room_type.as_deref() != Some(SESSION_ROOM_TYPE) {
+        return Err(NOT_A_SESSION_ROOM);
+    }
+    let sender = event.sender;
+    let agent = known
+        .agents
+        .iter()
+        .any(|agent| agent.matrix_user.as_str() == sender.as_str());
+    if !agent || !holds_agent_power(room.levels.as_ref(), sender) {
+        return Err(NOT_AN_ASKING_AGENT);
+    }
+    if ask.via.as_str() != me.as_str() || ask.to.as_str() != human.as_str() {
+        return Err(NOT_THIS_PROXY);
+    }
+    let person = Sink::Room {
+        humans: BTreeSet::from([human.to_owned()]),
+        agent_audiences: Vec::new(),
+    };
+    if check_sink(&ask.label, &person) != SinkVerdict::Allow {
+        return Err(BEYOND_THE_PERSON);
+    }
+    Ok(ask)
+}
+
 /// What arrived in a served session's room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arrival {
@@ -316,6 +388,19 @@ pub enum Arrival {
     /// The target agent's reply in a room this session delegated into,
     /// routed here the same way.
     Replied,
+    /// Another agent's question for this proxy's person (R99): an
+    /// `m.room.message` carrying `dev.keeper.agent.ask`, routed here by the
+    /// host from the room it was asked in once [`admit_ask`] admitted it.
+    Ask,
+    /// The relay of the person's answer to this session's ask: an
+    /// `m.room.message` carrying `dev.keeper.agent.answer` (R100). The
+    /// worker checks it against the ask it answers.
+    Answer,
+    /// An ask of this session that cannot be put to anyone any more — its
+    /// room refused the question at its send, or the homeserver refused it
+    /// for good (R199): the run goes on with the refusal. Made only by the
+    /// session's worker, never read from the room.
+    Unasked,
     /// The host's clock: its scheduled card's window, a wait, or a takeover
     /// (92.3). Made only by the session's claim holder, never read from the
     /// room.
@@ -342,6 +427,12 @@ pub enum Disposition {
     NewConversation,
     /// A delegation this session made moved: its target joined or replied.
     Delegation,
+    /// Another agent asked the proxy's person a question: a turn of its DM.
+    Ask,
+    /// The answer to this session's ask arrived: a turn.
+    Answer,
+    /// An ask of this session could not be put to anyone: a turn.
+    Unasked,
     /// The host's clock asks about the session's scheduled card.
     Scheduled,
     /// The host found a closed session the steward's harvest reads.
@@ -390,6 +481,8 @@ pub const UNSIGNED_DEVICE: &str =
 /// session.
 pub const NOT_THE_REQUESTER: &str =
     "a brief is a turn only in a delegated session, from the agent that delegated it";
+/// An ask anywhere but a proxy's own rooms.
+pub const NOT_ASKED_HERE: &str = "an ask is taken only into a proxy's own rooms";
 
 /// Whether `sender`'s arrival becomes a turn, a decision, a scope, a new
 /// conversation, or nothing (AD-380, R30). Text becomes a turn only in a
@@ -412,6 +505,7 @@ pub fn classify(served: &Served<'_>, sender: &UserId, arrival: Arrival) -> Dispo
     match arrival {
         Arrival::Scheduled => return Disposition::Scheduled,
         Arrival::Harvest => return Disposition::Harvest,
+        Arrival::Unasked => return Disposition::Unasked,
         _ => {}
     }
     if sender == served.agent_user {
@@ -434,8 +528,14 @@ pub fn classify(served: &Served<'_>, sender: &UserId, arrival: Arrival) -> Dispo
         // Made only by this host, from the room the session delegated into;
         // the worker checks the sender against the delegation it made.
         Arrival::Joined | Arrival::Replied => Disposition::Delegation,
+        // Made only by this host, from the room it was asked in.
+        Arrival::Ask if conversation => Disposition::Ask,
+        Arrival::Ask => Disposition::Ignored(NOT_ASKED_HERE),
+        // The worker checks the sender against the ask it answers.
+        Arrival::Answer => Disposition::Answer,
         Arrival::Scheduled => Disposition::Scheduled,
         Arrival::Harvest => Disposition::Harvest,
+        Arrival::Unasked => Disposition::Unasked,
         Arrival::Scope { owner_signed } | Arrival::ConversationRequest { owner_signed } => {
             let asks_conversation = matches!(arrival, Arrival::ConversationRequest { .. });
             if !conversation {
@@ -642,6 +742,34 @@ mod tests {
             ),
             InviteDecision::Pending
         );
+        // (d) R101: Lena (neuradrive, read by tgorka and Marta)
+        // asks tgorka through Nixi: her room is wider than Nixi's opening
+        // label, so (b) leaves it pending, and arm (d) joins it. An agent
+        // whose drive tgorka does not read invites no proxy of his; and a
+        // specialist is never brought in that way.
+        let mut asking = known.clone();
+        asking.agents.push(agent(
+            "@kai:example.org",
+            AgentKind::Steward,
+            None,
+            &[MARTA],
+            false,
+        ));
+        assert_eq!(
+            invite_decision(&invite(LENA, "@nixi:example.org", true), &asking),
+            InviteDecision::Join
+        );
+        for case in [
+            invite("@kai:example.org", "@nixi:example.org", true),
+            invite(LENA, "@nixi:example.org", false),
+            invite("@kai:example.org", "@amelia:example.org", true),
+        ] {
+            assert_eq!(
+                invite_decision(&case, &asking),
+                InviteDecision::Pending,
+                "{case:?}"
+            );
+        }
 
         // 92.4 acceptance 9: a control room is joined only as a visitor — a
         // steward hosted here, brought in by a person who reads its home.
@@ -1007,6 +1135,49 @@ mod tests {
         }
     }
 
+    /// R99: an ask is a turn only in a proxy's own rooms, as the host routes
+    /// it; anywhere else it is nothing. An answer always goes to the worker,
+    /// which checks it against the ask it answers.
+    #[test]
+    fn an_ask_is_a_turn_only_in_a_proxys_own_rooms() {
+        let tgorka = user(TGORKA);
+        let nixi = user("@nixi:example.org");
+        let tola = user("@tola:example.org");
+        let room = readers(&[TGORKA]);
+        for kind in SessionKind::ALL {
+            let session = served(AgentKind::Proxy, Some(&tgorka), kind, &nixi, &room);
+            let own = matches!(kind, SessionKind::Main | SessionKind::Conversation);
+            assert_eq!(
+                classify(&session, &tola, Arrival::Ask),
+                if own {
+                    Disposition::Ask
+                } else {
+                    Disposition::Ignored(NOT_ASKED_HERE)
+                },
+                "{kind:?}"
+            );
+        }
+        let stewards = served(
+            AgentKind::Steward,
+            None,
+            SessionKind::Delegated,
+            &tola,
+            &room,
+        );
+        assert_eq!(
+            classify(&stewards, &nixi, Arrival::Ask),
+            Disposition::Ignored(NOT_ASKED_HERE)
+        );
+        assert_eq!(
+            classify(&stewards, &nixi, Arrival::Answer),
+            Disposition::Answer
+        );
+        assert_eq!(
+            classify(&stewards, &tola, Arrival::Answer),
+            Disposition::Ignored(OWN_EVENT)
+        );
+    }
+
     /// A room's power levels as `events::power_levels` makes them for
     /// `kind`, `creator` at 100 and `agents` at 50, with `changes` applied.
     fn levels_of(
@@ -1238,5 +1409,117 @@ mod tests {
         assert!(admit(&by_mira, &mira, &from_mira, "m.room.message").is_ok());
     }
 
+    /// R101 with R93's shape: Nixi's host takes into tgorka's DM only a
+    /// sealed `m.text` ask whose body says its question, from a known agent
+    /// at an agent's power in a session room, naming Nixi and tgorka, under
+    /// a label tgorka reads.
+    #[test]
+    fn an_ask_is_admitted_only_for_this_proxys_person() {
+        use keeper_core::agents::ask::{ask_content, AskContent};
+        use keeper_core::agents::events::CONTENT_VERSION;
+
+        let known = known(Vec::new());
+        let (nixi, tgorka) = (user("@nixi:example.org"), user(TGORKA));
+        let lena = user(LENA);
+        let asked = |readers_: &[&str]| AskContent {
+            v: CONTENT_VERSION,
+            id: ulid::Ulid::new().to_string(),
+            question: "Go on to step 3?".to_owned(),
+            choices: vec!["Continue".to_owned(), "Stop".to_owned()],
+            default: None,
+            to: tgorka.clone(),
+            via: nixi.clone(),
+            label: Label {
+                readers: readers(readers_),
+                integrity: Integrity::Agent,
+                local_only: false,
+            },
+        };
+        let room = |levels: RoomPowerLevels| BriefRoom {
+            room_type: Some(SESSION_ROOM_TYPE.to_owned()),
+            creators: vec![user("@amelia:example.org")],
+            levels: Some(levels),
+            members: BTreeSet::from([lena.clone(), nixi.clone(), tgorka.clone()]),
+        };
+        let delegated = || {
+            levels_of(
+                SessionKind::Delegated,
+                &user("@amelia:example.org"),
+                std::slice::from_ref(&lena),
+                |_| {},
+            )
+        };
+        let steward_room = room(delegated());
+        let admit = |room: &BriefRoom, sender: &OwnedUserId, content: &Value, sealed: bool| {
+            admit_ask(
+                room,
+                &BriefEvent {
+                    event_type: "m.room.message",
+                    sender,
+                    content,
+                    sealed,
+                },
+                &nixi,
+                &tgorka,
+                &known,
+            )
+        };
+        let genuine = ask_content(&asked(&[TGORKA, MARTA]));
+        assert!(admit(&steward_room, &lena, &genuine, true).is_ok());
+
+        let mut said_else = genuine.clone();
+        said_else["body"] = serde_json::json!("Delete the archive?");
+        assert_eq!(
+            admit(&steward_room, &lena, &said_else, true).err(),
+            Some(NOT_AN_ASK)
+        );
+        assert_eq!(
+            admit(&steward_room, &lena, &genuine, false).err(),
+            Some(UNSEALED_ASK)
+        );
+        let untyped = BriefRoom {
+            room_type: None,
+            ..steward_room.clone()
+        };
+        assert_eq!(
+            admit(&untyped, &lena, &genuine, true).err(),
+            Some(NOT_A_SESSION_ROOM)
+        );
+        // A person, or an agent below an agent's power in the room now.
+        assert_eq!(
+            admit(&steward_room, &tgorka, &genuine, true).err(),
+            Some(NOT_AN_ASKING_AGENT)
+        );
+        let demoted = room(levels_of(
+            SessionKind::Delegated,
+            &user("@amelia:example.org"),
+            std::slice::from_ref(&lena),
+            |json| json["users"][LENA] = serde_json::json!(0),
+        ));
+        assert_eq!(
+            admit(&demoted, &lena, &genuine, true).err(),
+            Some(NOT_AN_ASKING_AGENT)
+        );
+        // Another proxy's ask, or one for another person.
+        let mut elsewhere = asked(&[TGORKA, MARTA]);
+        elsewhere.via = user("@mira:example.org");
+        assert_eq!(
+            admit(&steward_room, &lena, &ask_content(&elsewhere), true).err(),
+            Some(NOT_THIS_PROXY)
+        );
+        let mut martas = asked(&[TGORKA, MARTA]);
+        martas.to = user(MARTA);
+        assert_eq!(
+            admit(&steward_room, &lena, &ask_content(&martas), true).err(),
+            Some(NOT_THIS_PROXY)
+        );
+        // A session tgorka does not read asks him nothing.
+        assert_eq!(
+            admit(&steward_room, &lena, &ask_content(&asked(&[MARTA])), true).err(),
+            Some(BEYOND_THE_PERSON)
+        );
+    }
+
     const DELEGATE_EVENT: &str = keeper_core::agents::events::DELEGATE;
+    const LENA: &str = "@lena:example.org";
 }

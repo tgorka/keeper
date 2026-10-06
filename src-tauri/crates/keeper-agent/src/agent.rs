@@ -40,7 +40,7 @@ use keeper_core::agents::events::{
     StatusContent, ARTIFACTS, CONTENT_VERSION, SCOPE, STATUS, TURN,
 };
 use keeper_core::agents::focus::FOCUS_TTL;
-use keeper_core::agents::home::{serves_local_models, MenuItem};
+use keeper_core::agents::home::{serves_local_models, AgentKind, MenuItem};
 use keeper_core::agents::label::{
     check_call, check_sink, label_drive_read, label_person_message, okf_label_facts, Author,
     CallVerdict, Destination, Integrity, Label, LabelBody, LabelCause, LabelCauseKind, ReadFacts,
@@ -49,9 +49,10 @@ use keeper_core::agents::label::{
 use keeper_core::agents::log::reader::{hydrate_blob, read_session};
 use keeper_core::agents::log::replay::{message_for, ReplayRefusal};
 use keeper_core::agents::log::{
-    ApprovalBody, ApprovalState, AssistantBody, ChildSession, DelegateBody, DelegateReply,
-    DelegateState, ErrorBody, HostSlug, LineBody, LogLine, OpenBody, PeerBody, RunBody, ScopeBody,
-    ToldBody, ToolCallBody, ToolOutcomeWord, ToolResultBody, Truncated, Usage, UserBody,
+    ApprovalBody, ApprovalState, AskBody, AskState, AssistantBody, ChildSession, DelegateBody,
+    DelegateReply, DelegateState, ErrorBody, HostSlug, LineBody, LogLine, OpenBody, PeerAnswer,
+    PeerAsk, PeerBody, RunBody, ScopeBody, ToldBody, ToolCallBody, ToolOutcomeWord, ToolResultBody,
+    Truncated, Usage, UserBody,
 };
 use keeper_core::agents::matrix::AgentMatrixError;
 use keeper_core::agents::memory::{self, MemorySnapshot};
@@ -83,9 +84,12 @@ use tokio::time::Instant;
 use ulid::Ulid;
 
 use crate::approvals::Parking;
+use crate::ask::{AskTools, OpenAsk, Relay};
 use crate::cards::{self, Begun, Scheduled};
 use crate::claims::Lease;
-use crate::delegate::{self, DelegateTools, Delegation, DelegationPort, Delegator, TurnView};
+use crate::delegate::{
+    self, DelegateTools, Delegation, DelegationPort, Delegator, ReplyOffer, TurnView,
+};
 use crate::drive::finish_word;
 use crate::grants::{AgentGrants, GrantSource};
 use crate::host::{AgentDrive, Approval, Classified, HostIds, UNATTENDED_REFUSAL};
@@ -242,6 +246,14 @@ pub struct SessionContext {
     /// Every `tool_call` line with no result yet, in order: a parked
     /// round's call and the calls after it.
     open_calls: Vec<(Ulid, chat::ToolCall)>,
+    /// This session's asks that wait for their answer, by id (R99).
+    pub asks: BTreeMap<String, OpenAsk>,
+    /// The questions other agents asked this proxy's person whose answer
+    /// it has not relayed yet, by id (R100).
+    pub relays: BTreeMap<String, Relay>,
+    /// Every question another agent asked this proxy's person that a `peer`
+    /// line took here, relayed or not: one is never taken twice (R199).
+    pub asked_of_me: HashSet<String>,
 }
 
 impl SessionContext {
@@ -301,6 +313,9 @@ impl SessionContext {
             parked: BTreeMap::new(),
             consumed: HashSet::new(),
             open_calls: Vec::new(),
+            asks: BTreeMap::new(),
+            relays: BTreeMap::new(),
+            asked_of_me: HashSet::new(),
         };
         for stored in &log.lines {
             match &stored.body {
@@ -479,7 +494,7 @@ impl SessionContext {
     }
 
     /// What a line changes beyond the conversation: the budget, the
-    /// exchange, the delegations, the run.
+    /// exchange, the delegations, the asks, the run.
     fn keep(&mut self, line: &LogLine) {
         match &line.body {
             LineBody::Assistant(body) => {
@@ -490,10 +505,28 @@ impl SessionContext {
                 self.delegate_calls.insert(line.id, call.args.clone());
             }
             LineBody::Peer(peer) => {
-                if peer.sender == self.agent.requested_by {
+                // A relayed answer is the person's, not a round of the
+                // exchange its proxy may have delegated.
+                if peer.sender == self.agent.requested_by && peer.answers.is_none() {
                     self.exchange_rounds += 1;
                 }
                 self.reply_unpeered = None;
+                if let Some(answer) = &peer.answers {
+                    self.asks.remove(&answer.id);
+                }
+                if let Some(ask) = &peer.ask {
+                    self.asked_of_me.insert(ask.id.clone());
+                    self.relays.insert(
+                        ask.id.clone(),
+                        Relay {
+                            id: ask.id.clone(),
+                            room: ask.room.clone(),
+                            asker: peer.sender.clone(),
+                            label: ask.label.clone(),
+                            said: Vec::new(),
+                        },
+                    );
+                }
                 if let Some(event) = line
                     .matrix_event
                     .as_ref()
@@ -503,6 +536,22 @@ impl SessionContext {
                 }
             }
             LineBody::Run(run) => self.run = Some(run.state),
+            LineBody::Ask(body) => match body.state {
+                AskState::Asked => {
+                    if let Some(open) = OpenAsk::of(body) {
+                        self.asks.insert(body.id.clone(), open);
+                    }
+                }
+                AskState::Sent => {
+                    if let Some(open) = self.asks.get_mut(&body.id) {
+                        open.sent = true;
+                    }
+                }
+                AskState::Answered | AskState::Defaulted | AskState::Refused => {
+                    self.asks.remove(&body.id);
+                    self.relays.remove(&body.id);
+                }
+            },
             LineBody::Told(_) => self.told = true,
             LineBody::Error(error) if error.code == LABEL_CODE => self.withheld = true,
             LineBody::Delegate(body) => match body.state {
@@ -562,6 +611,15 @@ impl SessionContext {
                     }
                 }
             },
+            // The person's own words after a question was shown are all a
+            // relay of its answer may carry (R199).
+            LineBody::User(user) if user.sender == self.agent.requested_by => {
+                for relay in self.relays.values_mut() {
+                    if !user.text.trim().is_empty() {
+                        relay.said.push(user.text.clone());
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -843,6 +901,8 @@ struct AllowedTools<'t> {
     /// The turn's grants: a BMAD or skill tool reads the home drive only
     /// where they let a `drive_read` of it run (R195).
     grants: Arc<dyn GrantSource>,
+    /// `ask_human`, by the session's kind (R102).
+    asks: AskTools<'t>,
     view: &'t dyn TurnView,
     sinks: &'t Sinks,
     /// The declarations of the drives this host mounts: a write's audience.
@@ -1321,6 +1381,27 @@ impl ToolHost for AllowedTools<'_> {
             }
             return outcome;
         }
+        if wire.name == keeper_core::agents::workflow::ASK_HUMAN {
+            let tool = AgentTool::AskHuman;
+            let classification = self.classify(&wire.id, tool, &CallFacts::default(), None);
+            let gated = self.gated(&wire.id, &wire.name, &classification, &[], Vec::new());
+            // A block is refused, never parked: each ask mints its own id,
+            // so no approval could name its bytes again (as DW-521's
+            // surface requests).
+            let audit = CallAudit::new(
+                self.sinks,
+                &wire.name,
+                Effect::Write,
+                &classification,
+                gated,
+                ("", self.agent.room.as_str()),
+            );
+            let outcome = self.asks.run(wire, &audit);
+            if let Some(outcome) = &outcome {
+                audit.finish(outcome);
+            }
+            return outcome;
+        }
         if crate::bmad::serves(&wire.name) {
             let tool = AgentTool::from_wire(&wire.name)?;
             let classification = self.classify(&wire.id, tool, &CallFacts::default(), None);
@@ -1460,6 +1541,8 @@ struct TurnTools {
     sinks: Sinks,
     /// The session room's boundary, which the surface's requests pass too.
     gate: Arc<RoomGate>,
+    /// The scheduled card whose run the turn is: an ask names it.
+    scheduled: Option<String>,
 }
 
 /// One served session: its context and its writer.
@@ -1507,6 +1590,9 @@ pub struct ServedSession {
     /// parked run's continuation — so a park records it and the run's end
     /// is written on it (R178).
     pub(crate) scheduled_card: Option<String>,
+    /// Asks whose refusal is on its way to the run as an
+    /// [`Arrival::Unasked`]: never sent meanwhile (R199).
+    refusing: std::collections::BTreeSet<String>,
 }
 
 /// What a session's worker tells its host while it holds the claim.
@@ -1546,11 +1632,17 @@ struct Retry {
     replies: std::collections::BTreeSet<String>,
     /// The session's person was not told yet that its work narrowed.
     tell: bool,
+    /// An ask of the session is not in its room yet: its proxy has not
+    /// joined, or its invite or send failed for now.
+    asks: bool,
+    /// Not before this moment: the homeserver asked the ask's send to wait
+    /// (R199).
+    asks_after: Option<Instant>,
 }
 
 impl Retry {
     fn is_empty(&self) -> bool {
-        self.briefs.is_empty() && self.replies.is_empty() && !self.tell
+        self.briefs.is_empty() && self.replies.is_empty() && !self.tell && !self.asks
     }
 }
 
@@ -1657,6 +1749,40 @@ pub const ROUNDS_SPENT: &str =
 pub const BUDGET_SPENT: &str = "this delegation spent its token budget; a brief is not a turn here";
 /// A brief in a room this host could not read the state of.
 pub const ROOM_UNREAD: &str = "the delegated room could not be read, so the brief is not taken";
+/// An answer no ask of this session waits for, or from anyone but the
+/// proxy it went through.
+pub const NOT_ASKED: &str = "no ask of this session waits for this answer from its sender";
+/// An ask the host did not route here, or for another proxy.
+pub const NOT_A_ROUTED_ASK: &str =
+    "an ask is taken only as the host routes it from the room it was asked in";
+/// A scheduled window while the card's run waits for a person's answer.
+pub const ASK_WAITS: &str =
+    "the card's run asked a person and waits for their answer; no later window begins meanwhile";
+
+/// The arrival an ask of this session that can no longer be put to anyone
+/// becomes (R199), in the agent's own name: one per ask, so however often
+/// it is made the session takes it once. Never a room's event.
+pub fn unasked_arrival(agent: &UserId, open: &OpenAsk, reason: &str) -> Option<Arrived> {
+    Some(Arrived {
+        event_id: OwnedEventId::try_from(format!(
+            "$unasked-{}:keeper.invalid",
+            open.id.to_ascii_lowercase()
+        ))
+        .ok()?,
+        sender: agent.to_owned(),
+        arrival: Arrival::Unasked,
+        text: format!(
+            "Your question {} was never asked, and no one will answer it: {reason}",
+            open.id
+        ),
+        content: json!({"id": open.id, "reason": reason}),
+        received_at: Instant::now(),
+        replay: false,
+        via: None,
+        device: None,
+    })
+}
+
 /// A target's join whose brief could not be sent: sent again on the clock.
 pub const BRIEF_UNSENT: &str = "the brief could not be sent; it is sent again on the host's clock";
 /// A target's join whose brief the label no longer lets into the room.
@@ -1819,6 +1945,9 @@ pub enum TurnEnding {
     LocalOnly,
     /// A delegated session reached its token budget (92.1).
     Bounded,
+    /// The turn asked a person through their proxy and ends: their answer
+    /// is the session's next arrival (R99).
+    Asked,
     /// A call waits for a person's decision: the turn holds nothing and
     /// goes on when it is decided (93.2).
     Parked,
@@ -1858,6 +1987,9 @@ pub enum ServeError {
     /// A harvest's turn opens on the closed session it carries.
     #[error("a harvest arrival carries no closed session")]
     NotAHarvest,
+    /// An ask's turn opens on the ask it carries, routed from its room.
+    #[error("an ask arrival carries no ask from a room this host reads")]
+    NotAnAsk,
     /// A harvest's room's members could not be read: it is handed again.
     #[error("the harvest room's members could not be read")]
     MembersUnread,
@@ -1974,6 +2106,7 @@ impl ServedSession {
             held_said: false,
             settling: BTreeMap::new(),
             scheduled_card: None,
+            refusing: std::collections::BTreeSet::new(),
         })
     }
 
@@ -2085,6 +2218,9 @@ impl ServedSession {
         // first: an approval decided or expired meanwhile (93.2 AC5, R84).
         self.resume_approvals(deps, Arc::clone(&port), stop.clone())
             .await;
+        // An ask whose intent is on disk and whose question is not in the
+        // room goes in now, or comes back as a refusal the run takes.
+        backlog.extend(self.send_asks(deps, &port).await);
         // What still waits, with its request in a proxy's DM, is heard
         // there again (R89).
         self.expect_decisions(deps);
@@ -2125,6 +2261,9 @@ impl ServedSession {
                         continue;
                     }
                     () = tokio::time::sleep(crate::runtime::TICK), if !self.retry.is_empty() => {
+                        if self.retry.asks {
+                            backlog.extend(self.send_asks(deps, &port).await);
+                        }
                         backlog.extend(self.retry_delegations(deps).await);
                         continue;
                     }
@@ -2142,6 +2281,10 @@ impl ServedSession {
             let outcome = self
                 .serve(deps, Arc::clone(&port), arrived, stop.clone())
                 .await;
+            // A turn's ask, its intent on disk now, goes in at once (R199).
+            if self.retry.asks {
+                backlog.extend(self.send_asks(deps, &port).await);
+            }
             self.idle(activity);
             // The host hands a harvest again only when it failed before it
             // began: one that began and then failed is the interrupted
@@ -2169,12 +2312,22 @@ impl ServedSession {
         }
     }
 
-    /// The work is done: say first whether a call waits for a person, then
-    /// clear busy — the host never sees an idle worker it may begin a
-    /// window beside while a run is parked (R177).
+    /// The work is done: say first whether the run waits for a person —
+    /// a call parked on them, or a scheduled card's ask — then clear busy:
+    /// the host never sees an idle worker it may begin a window beside while
+    /// a run waits (R177, R199).
     fn idle(&self, activity: &Activity) {
-        activity.parked.store(self.waiting(), Ordering::SeqCst);
+        activity
+            .parked
+            .store(self.holds_windows(), Ordering::SeqCst);
         activity.busy.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether the session's scheduled card waits for a person: a call of
+    /// its run is parked, or its run asked and the answer has not come
+    /// (R84, R199). Its next windows are not begun meanwhile.
+    pub fn holds_windows(&self) -> bool {
+        self.waiting() || self.context.asks.values().any(|open| open.card.is_some())
     }
 
     /// Serve one arrival: ignore it, log a decision, or run a turn.
@@ -2237,6 +2390,9 @@ impl ServedSession {
             // `main` or `conversation` session their new message denies it
             // and then runs; anywhere else what would start a turn is held
             // until the approval ends, and the status says once what waits.
+            // An ask's answer, or its refusal, is held too: its round has a
+            // call with no result yet, and no request goes out before every
+            // call of it has one (R199).
             _ if self.waiting() => {
                 let persons_word = matches!(
                     self.context.agent.kind,
@@ -2265,6 +2421,9 @@ impl ServedSession {
             Disposition::Turn if arrived.arrival == Arrival::Brief => {
                 self.take_brief(deps, port, arrived, stop).await
             }
+            Disposition::Ask => self.take_ask(deps, port, arrived, stop).await,
+            Disposition::Answer => self.answered(deps, port, arrived, stop).await,
+            Disposition::Unasked => self.unasked(deps, port, arrived, stop).await,
             Disposition::Turn => self
                 .turn(deps, port, arrived, stop)
                 .await
@@ -2367,6 +2526,11 @@ impl ServedSession {
         let Ok(scheduled) = serde_json::from_value::<Scheduled>(arrived.content.clone()) else {
             return Ok(Outcome::Ignored(NOT_SCHEDULED));
         };
+        // A run that asked a person waits for their answer, which finishes
+        // its card: no later window begins meanwhile (R199).
+        if matches!(scheduled, Scheduled::Run { .. }) && self.holds_windows() {
+            return Ok(Outcome::Ignored(ASK_WAITS));
+        }
         let session = self.context.session.path.clone();
         let lease = self.writer.lease();
         // A window begins only while the claim names it (R56): a run routed
@@ -2470,11 +2634,19 @@ impl ServedSession {
     ) -> Result<(), ServeError> {
         use keeper_core::agents::log::RunState as LogRun;
         let (run, state) = match ending {
-            Some(TurnEnding::Complete) => (Run::Review, LogRun::Review),
-            Some(TurnEnding::Parked) if self.waiting() => (Run::Blocked, LogRun::Blocked),
-            Some(TurnEnding::Stopped | TurnEnding::LocalOnly | TurnEnding::Bounded) => {
+            // A run whose ask waits for its answer is blocked on a person
+            // however its turn ended (R99).
+            Some(TurnEnding::Complete | TurnEnding::Asked) if !self.context.asks.is_empty() => {
                 (Run::Blocked, LogRun::Blocked)
             }
+            Some(TurnEnding::Complete) => (Run::Review, LogRun::Review),
+            Some(TurnEnding::Parked) if self.waiting() => (Run::Blocked, LogRun::Blocked),
+            Some(
+                TurnEnding::Stopped
+                | TurnEnding::LocalOnly
+                | TurnEnding::Bounded
+                | TurnEnding::Asked,
+            ) => (Run::Blocked, LogRun::Blocked),
             Some(TurnEnding::Parked | TurnEnding::Failed) | None => (Run::Failed, LogRun::Failed),
         };
         let (zone, session) = (
@@ -2580,6 +2752,273 @@ impl ServedSession {
         self.turn(deps, port, arrived, stop)
             .await
             .map(Outcome::Answered)
+    }
+
+    /// The proxy's relay of its person's answer to this session's ask (R99,
+    /// R100): taken only from the proxy the ask went through, for an ask
+    /// that waits; the run goes on with it ([`Self::go_on`]), opened by a
+    /// `peer` line naming the ask.
+    async fn answered(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        arrived: Arrived,
+        stop: CancelSignal,
+    ) -> Result<Outcome, ServeError> {
+        let open = keeper_core::agents::ask::read_answer(&arrived.content)
+            .and_then(|answer| self.context.asks.get(&answer.id))
+            .filter(|open| open.via == arrived.sender)
+            .cloned();
+        let Some(open) = open else {
+            tracing::info!(session = %self.context.session.path, sender = %arrived.sender, note = NOT_ASKED, "agents: an answer is not taken");
+            return Ok(Outcome::Ignored(NOT_ASKED));
+        };
+        self.go_on(deps, port, arrived, stop, open.card).await
+    }
+
+    /// An ask of this session that can no longer be put to anyone (R199):
+    /// its refusal is the run's next turn — `ask refused` naming why, after
+    /// a `peer` line in the agent's own name saying it — so the model learns
+    /// its question was never asked, and the run goes on ([`Self::go_on`]).
+    async fn unasked(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        arrived: Arrived,
+        stop: CancelSignal,
+    ) -> Result<Outcome, ServeError> {
+        let open = arrived.content["id"]
+            .as_str()
+            .and_then(|id| self.context.asks.get(id))
+            .filter(|open| !open.sent)
+            .cloned();
+        let Some(open) = open else {
+            return Ok(Outcome::Ignored(NOT_ASKED));
+        };
+        self.go_on(deps, port, arrived, stop, open.card).await
+    }
+
+    /// The run that asked goes on (R99, R199): `run: running`, its card
+    /// with it — the scheduled `card` it asked in, else the session's own —
+    /// and the turn `arrived` opens; a scheduled card's run then ends as
+    /// that turn did, as the run that asked would have.
+    async fn go_on(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        arrived: Arrived,
+        stop: CancelSignal,
+        card: Option<String>,
+    ) -> Result<Outcome, ServeError> {
+        self.writer.write(
+            &mut self.context,
+            None,
+            None,
+            LineBody::Run(RunBody {
+                state: keeper_core::agents::log::RunState::Running,
+                detail: None,
+            }),
+        )?;
+        let (zone, path) = (
+            deps.sessions_zone.clone(),
+            self.context.session.path.clone(),
+        );
+        let lease = self.writer.lease();
+        let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
+        let running = off_the_runtime(|| match &card {
+            Some(card) => cards::write_run(&zone, &path, card, Run::Running, None, &may_write),
+            None => delegate::set_card_run(&zone, &path, Run::Running, &may_write),
+        });
+        if let Err(error) = running {
+            tracing::warn!(session = %path, %error, "agents: an answered session's card could not be set running");
+        }
+        self.scheduled_card = card.clone();
+        let ran = self.turn(deps, port, arrived, stop).await;
+        self.scheduled_card = None;
+        if let Some(card) = card {
+            self.finish_scheduled(deps, &card, ran.as_ref().ok().map(|report| report.ending))?;
+        }
+        ran.map(Outcome::Answered)
+    }
+
+    /// Another agent's question for this proxy's person (R99, R101), routed
+    /// here by the host from the room it was asked in once admitted — live,
+    /// or read back from that room (R199): a turn of the DM, opened by a
+    /// `peer` line carrying the ask under the asking session's label (S-09),
+    /// in which the proxy asks its person in its own voice and later relays
+    /// their answer with `reply`. An ask taken here once, relayed or not, is
+    /// never taken again.
+    async fn take_ask(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        arrived: Arrived,
+        stop: CancelSignal,
+    ) -> Result<Outcome, ServeError> {
+        let me = &deps.home.config.matrix_user;
+        let ask = keeper_core::agents::ask::read_ask(&arrived.content)
+            .filter(|ask| ask.via == *me && arrived.via.is_some());
+        let Some(ask) = ask else {
+            return Ok(Outcome::Ignored(NOT_A_ROUTED_ASK));
+        };
+        if self.context.asked_of_me.contains(&ask.id) {
+            return Ok(Outcome::Duplicate);
+        }
+        self.turn(deps, port, arrived, stop)
+            .await
+            .map(Outcome::Answered)
+    }
+
+    /// This session's asks whose question is not in the room yet (R197,
+    /// R199). The log is synced first, so nothing is published before the
+    /// `ask asked` line that recovers it after a crash; then, for each, the
+    /// proxy is invited unless it is in the room, its join awaited — so its
+    /// device holds the room's key (R29 F5) — and, at that one final send,
+    /// the label and the room as they are then are checked (R168) and the
+    /// ask sent under its own transaction, so a send tried again is one
+    /// event. A refusal — by the room, by the invite's label check, or by the
+    /// homeserver for good (`TooLarge`, `Forbidden`) — comes back as an
+    /// [`Arrival::Unasked`] the run takes; a send the homeserver asks to wait
+    /// is tried after that wait, anything else on the clock.
+    pub async fn send_asks(&mut self, deps: &AgentDeps, port: &Arc<dyn EditPort>) -> Vec<Arrived> {
+        use keeper_core::agents::workflow::ASK_HUMAN;
+        self.retry.asks = false;
+        let mut refused = Vec::new();
+        let Some(rooms) = self.delegations.clone() else {
+            return refused;
+        };
+        let unsent: Vec<OpenAsk> = self
+            .context
+            .asks
+            .values()
+            .filter(|open| !open.sent && !self.refusing.contains(&open.id))
+            .cloned()
+            .collect();
+        if unsent.is_empty() {
+            return refused;
+        }
+        if self
+            .retry
+            .asks_after
+            .is_some_and(|after| Instant::now() < after)
+        {
+            self.retry.asks = true;
+            return refused;
+        }
+        self.retry.asks_after = None;
+        if let Err(error) = off_the_runtime(|| self.writer.sync()) {
+            tracing::warn!(session = %self.context.session.path, %error, "agents: the log could not be synced; no ask goes out before it is");
+            self.retry.asks = true;
+            return refused;
+        }
+        let (room, me) = (
+            self.context.agent.room.clone(),
+            deps.home.config.matrix_user.clone(),
+        );
+        let known = rooms.known();
+        for open in unsent {
+            let unasked = |reason: &str| unasked_arrival(&me, &open, reason);
+            let present = match rooms.members(&room).await {
+                Ok(members) => members.contains(&open.via),
+                Err(error) => {
+                    tracing::warn!(ask = %open.id, %error, "agents: an ask's room could not be read; it is tried again on the clock");
+                    self.retry.asks = true;
+                    continue;
+                }
+            };
+            if !present {
+                let audience = crate::ask::proxy_audience(&known, &open.via);
+                match rooms
+                    .invite(&room, &open.via, &self.context.label, audience)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(AgentMatrixError::Label(reason) | AgentMatrixError::Forbidden(reason)) => {
+                        refused.extend(unasked(&format!(
+                            "{} could not be invited to ask {}: {reason}",
+                            open.via, open.to
+                        )));
+                        continue;
+                    }
+                    Err(AgentMatrixError::RateLimited { retry_after_ms }) => {
+                        self.wait_asks(retry_after_ms);
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(ask = %open.id, %error, "agents: an ask's proxy could not be invited; it is tried again on the clock");
+                        self.retry.asks = true;
+                        continue;
+                    }
+                }
+            }
+            if !rooms.joined(&room, &open.via).await {
+                self.retry.asks = true;
+                continue;
+            }
+            let content =
+                keeper_core::agents::ask::ask_content(&open.content(self.context.label.clone()));
+            match self
+                .gate(deps, port)
+                .admit(ASK_HUMAN, content.to_string().as_bytes())
+                .await
+            {
+                Ok(()) => {}
+                Err(reason) if reason == MEMBERS_UNREAD => {
+                    self.retry.asks = true;
+                    continue;
+                }
+                Err(reason) => {
+                    refused.extend(unasked(&reason));
+                    continue;
+                }
+            }
+            match port
+                .send("m.room.message", content, crate::ask::ask_txn(&open.id))
+                .await
+            {
+                Ok(_) => {}
+                Err(error @ (AgentMatrixError::TooLarge | AgentMatrixError::Forbidden(_))) => {
+                    refused.extend(unasked(&error.to_string()));
+                    continue;
+                }
+                Err(AgentMatrixError::RateLimited { retry_after_ms }) => {
+                    self.wait_asks(retry_after_ms);
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(ask = %open.id, %error, "agents: an ask could not be sent; it is sent again on the clock");
+                    self.retry.asks = true;
+                    continue;
+                }
+            }
+            let written = self
+                .writer
+                .write(
+                    &mut self.context,
+                    None,
+                    None,
+                    LineBody::Ask(open.line(AskState::Sent)),
+                )
+                .and_then(|_| off_the_runtime(|| self.writer.sync()));
+            if let Err(error) = written {
+                tracing::warn!(ask = %open.id, %error, "agents: an ask's line could not be written");
+            }
+        }
+        self.refusing.extend(
+            refused
+                .iter()
+                .filter_map(|arrived| arrived.content["id"].as_str().map(str::to_owned)),
+        );
+        refused
+    }
+
+    /// The homeserver asked an ask's send to wait `retry_after_ms` (the
+    /// clock's tick when it named none): nothing of the session's asks is
+    /// tried before then.
+    fn wait_asks(&mut self, retry_after_ms: Option<u64>) {
+        let wait = retry_after_ms.map_or(crate::runtime::TICK, std::time::Duration::from_millis);
+        self.retry.asks = true;
+        self.retry.asks_after = Some(Instant::now() + wait);
     }
 
     /// A delegation this session made moved (R55): its target joined — the
@@ -2689,6 +3128,7 @@ impl ServedSession {
                 sender,
                 text: reply.text,
                 ask: None,
+                answers: None,
                 artifacts: (!reply.artifacts.is_empty()).then_some(reply.artifacts),
             }),
         )?;
@@ -2870,7 +3310,11 @@ impl ServedSession {
         let all: Vec<Delegation> = self.context.delegations.values().cloned().collect();
         let mut replies = Vec::new();
         for open in all {
-            rooms.watch(&open.room, &self.context.agent.room);
+            rooms.watch(
+                &open.room,
+                &self.context.agent.room,
+                self.context.agent.kind,
+            );
             if !open.sent {
                 if rooms.joined(&open.room, &open.to).await {
                     if let Err(error) = self.send_brief(deps, &open, None).await {
@@ -3305,11 +3749,15 @@ impl ServedSession {
     /// person's message, its label join and a `user` line; for a brief, the
     /// session's `delegate accepted` (once), the delegation's label and a
     /// `peer` line; for a delegation's reply, the `peer` line its receipt
-    /// stands for ([`Self::peer_the_reply`]).
+    /// stands for ([`Self::peer_the_reply`]); for another agent's ask in a
+    /// proxy's DM, the asking session's label and a `peer` line carrying
+    /// the ask (S-09); for the answer to this session's ask, a `peer` line
+    /// naming it, then `ask answered`.
     fn open_turn(&mut self, deps: &AgentDeps, arrived: &Arrived) -> Result<LogLine, ServeError> {
         if arrived.arrival == Arrival::Replied {
             return self.peer_the_reply()?.ok_or(ServeError::NoReceipt);
         }
+        let mut after = None;
         let (joined, cause, opening) = match arrived.arrival {
             Arrival::Brief => {
                 let brief = read_brief(&arrived.content);
@@ -3340,6 +3788,7 @@ impl ServedSession {
                         sender: arrived.sender.clone(),
                         text,
                         ask: None,
+                        answers: None,
                         artifacts: None,
                     }),
                 )
@@ -3352,6 +3801,7 @@ impl ServedSession {
                     sender: arrived.sender.clone(),
                     text: arrived.text.clone(),
                     ask: None,
+                    answers: None,
                     artifacts: None,
                 }),
             ),
@@ -3368,6 +3818,89 @@ impl ServedSession {
                         sender: arrived.sender.clone(),
                         text: arrived.text.clone(),
                         ask: None,
+                        answers: None,
+                        artifacts: None,
+                    }),
+                )
+            }
+            // Another agent's words, under its session's label: the DM's
+            // turn that relays them runs at that integrity, until its
+            // person's next line (S-09); its readers only narrow.
+            Arrival::Ask => {
+                let (Some(ask), Some(room)) = (
+                    keeper_core::agents::ask::read_ask(&arrived.content),
+                    arrived.via.clone(),
+                ) else {
+                    return Err(ServeError::NotAnAsk);
+                };
+                let agent = Label {
+                    integrity: Integrity::Agent,
+                    ..Label::top()
+                };
+                (
+                    self.context.label.join(&ask.label).join(&agent),
+                    LabelCauseKind::AgentMessage,
+                    LineBody::Peer(PeerBody {
+                        sender: arrived.sender.clone(),
+                        text: arrived.text.clone(),
+                        ask: Some(PeerAsk {
+                            id: ask.id,
+                            question: ask.question,
+                            room,
+                            label: ask.label,
+                        }),
+                        answers: None,
+                        artifacts: None,
+                    }),
+                )
+            }
+            // The person's own answer to this session's question, relayed by
+            // their proxy (R101): it joins nothing a person of the session
+            // could not say.
+            Arrival::Answer => {
+                let open = keeper_core::agents::ask::read_answer(&arrived.content)
+                    .and_then(|answer| self.context.asks.get(&answer.id).cloned())
+                    .ok_or(ServeError::NotAnAsk)?;
+                let choice = keeper_core::agents::ask::choice_of(&arrived.text, &open.choices);
+                after = Some(LineBody::Ask(AskBody {
+                    answer: Some(arrived.text.clone()),
+                    choice: choice.clone(),
+                    ..open.line(AskState::Answered)
+                }));
+                (
+                    self.context.label.clone(),
+                    LabelCauseKind::PersonMessage,
+                    LineBody::Peer(PeerBody {
+                        sender: arrived.sender.clone(),
+                        text: arrived.text.clone(),
+                        ask: None,
+                        answers: Some(PeerAnswer {
+                            id: open.id,
+                            choice,
+                        }),
+                        artifacts: None,
+                    }),
+                )
+            }
+            // An ask no one will answer, in the agent's own name: no person
+            // spoke, and the run learns why its question was never asked.
+            Arrival::Unasked => {
+                let open = arrived.content["id"]
+                    .as_str()
+                    .and_then(|id| self.context.asks.get(id).cloned())
+                    .ok_or(ServeError::NotAnAsk)?;
+                after = Some(LineBody::Ask(AskBody {
+                    reason: arrived.content["reason"].as_str().map(str::to_owned),
+                    ..open.line(AskState::Refused)
+                }));
+                (
+                    self.context.label.clone(),
+                    LabelCauseKind::AgentMessage,
+                    LineBody::Peer(PeerBody {
+                        sender: arrived.sender.clone(),
+                        text: arrived.text.clone(),
+                        ask: None,
+                        answers: None,
                         artifacts: None,
                     }),
                 )
@@ -3414,12 +3947,17 @@ impl ServedSession {
                 )),
             )?;
         }
-        Ok(self.writer.write(
+        let opened = self.writer.write(
             &mut self.context,
             None,
             Some(arrived.event_id.clone()),
             opening,
-        )?)
+        )?;
+        if let Some(after) = after {
+            self.writer
+                .write(&mut self.context, Some(opened.id), None, after)?;
+        }
+        Ok(opened)
     }
 
     async fn turn(
@@ -3525,6 +4063,7 @@ impl ServedSession {
             from: self.delegator(deps),
             sinks: sinks.clone(),
             gate: Arc::clone(&gate),
+            scheduled: self.scheduled_card.clone(),
         };
         let ran = run_agent_turn(
             &mut self.context,
@@ -3568,6 +4107,7 @@ impl ServedSession {
                 shown.clone(),
             ),
             TurnEnding::Failed => (join_note(&visible, TURN_FAILED), shown.clone()),
+            TurnEnding::Asked => (visible, shown.clone()),
             TurnEnding::Parked => {
                 let summary = ran.parked.as_ref().map_or_else(String::new, |parked| {
                     keeper_core::agents::approval::summary_of(
@@ -3649,6 +4189,26 @@ impl ServedSession {
         let closing = match ran.ending {
             // A parked turn is not over: nothing closes it yet.
             TurnEnding::Parked => None,
+            // A turn that asked ends where the gate stopped it: the prose
+            // of its last round is on that round's line already.
+            TurnEnding::Asked => Some(self.writer.write(
+                &mut self.context,
+                ran.parent,
+                Some(delivered.final_event.clone()),
+                LineBody::Assistant(AssistantBody {
+                    text: if ran.round_logged {
+                        String::new()
+                    } else {
+                        ran.round_text.clone()
+                    },
+                    model: deps.bot.target.clone(),
+                    finish: "stop".to_owned(),
+                    usage: Usage::default(),
+                    ttft_ms: None,
+                    duration_ms: 0,
+                    anchor_event: Some(anchor.to_string()),
+                }),
+            )?),
             TurnEnding::Complete | TurnEnding::Stopped => {
                 let outcome = ran.outcome.as_ref();
                 let usage = outcome.and_then(|o| o.usage.as_ref());
@@ -3750,6 +4310,10 @@ impl ServedSession {
         let bound = ran.bound.or_else(|| self.context.token_bound());
         self.after_delegated_turn(deps, &port, bound).await?;
         self.say_waiting(&port, deps).await;
+        // An ask whose proxy has not joined yet goes in on the clock.
+        if self.context.asks.values().any(|open| !open.sent) {
+            self.retry.asks = true;
+        }
 
         Ok(TurnReport {
             user_line: user_id,
@@ -3766,12 +4330,15 @@ impl ServedSession {
     }
 
     /// This session's room gate over `port` (R168): the room's members at
-    /// each send, the known agents through their audiences, the session's
-    /// own agents left out, under the label now; a suppression audited.
+    /// each send, the known agents and the pinned proxies through their
+    /// audiences (R199), the session's own agents left out, under the label
+    /// now; a suppression audited.
     pub(crate) fn gate(&self, deps: &AgentDeps, port: &Arc<dyn EditPort>) -> Arc<RoomGate> {
         Arc::new(RoomGate::new(
             Arc::clone(port),
-            self.delegations.as_ref().map(|rooms| rooms.known()),
+            self.delegations
+                .as_ref()
+                .map(|rooms| Arc::new(crate::ask::with_pinned_proxies(&rooms.known()))),
             self.context.room_own(&deps.home.config.matrix_user),
             self.context.label.clone(),
             Some((self.sinks(deps), self.context.agent.room.clone())),
@@ -4073,6 +4640,15 @@ impl TurnView for Mutex<TurnLog<'_>> {
             .handed(source)
             .cloned()
     }
+
+    fn relay(&self, id: &str) -> Option<Relay> {
+        self.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .context
+            .relays
+            .get(id)
+            .cloned()
+    }
 }
 
 impl TurnLog<'_> {
@@ -4128,6 +4704,23 @@ fn grant_read(grants: &dyn GrantSource, drive: &str, at: &str) -> Result<(), Str
     }
 }
 
+/// The `reply` a turn of `context` is offered: a delegated session's answer
+/// (R48), or — in the `main` or `conversation` of an agent of `kind`
+/// `proxy`, while a question another agent asked its person waits — the
+/// relay of that answer (R100).
+fn reply_offer(context: &SessionContext, kind: AgentKind) -> ReplyOffer {
+    let own = matches!(
+        context.agent.kind,
+        SessionKind::Main | SessionKind::Conversation
+    );
+    if context.agent.kind == SessionKind::Delegated {
+        ReplyOffer::Delegated
+    } else if kind == AgentKind::Proxy && own && !context.relays.is_empty() {
+        ReplyOffer::Relay
+    } else {
+        ReplyOffer::None
+    }
+}
 /// Arm one turn of `context`'s agent: its own grants, its history, and only
 /// the tools in `[tools].allow`. The system message is not in it yet: it is
 /// [`SessionContext::compose`] over the returned context bundle.
@@ -4163,9 +4756,10 @@ pub async fn arm_agent(
         .request
         .tools
         .retain(|spec| config.allow.contains(&spec.name));
-    // The surface, `delegate` and `reply` tools are the agent's own, never
-    // a drive verb's spec: `delegate` as `[tools].allow` says, `reply` in a
-    // delegated session whatever it says (R48).
+    // The surface, `delegate`, `reply` and `ask_human` tools are the agent's
+    // own, never a drive verb's spec: `delegate` as `[tools].allow` says,
+    // `reply` by the session (R48, R100) and `ask_human` by the session's
+    // kind (R102), whatever it says.
     if tools_offered {
         armed
             .request
@@ -4173,7 +4767,7 @@ pub async fn arm_agent(
             .extend(crate::surface::specs(&crate::surface::offered(config)));
         armed.request.tools.extend(delegate::specs(
             config.allow.iter().any(|name| name == delegate::DELEGATE),
-            context.agent.kind == SessionKind::Delegated,
+            reply_offer(context, config.kind),
         ));
         armed
             .request
@@ -4184,6 +4778,12 @@ pub async fn arm_agent(
                 .request
                 .tools
                 .extend(keeper_core::agents::workflow::specs(&config.allow));
+        }
+        if keeper_core::agents::ask::offered(config.kind, context.agent.kind) {
+            armed
+                .request
+                .tools
+                .push(keeper_core::agents::workflow::ask_spec());
         }
     }
     armed
@@ -4331,6 +4931,8 @@ async fn run_agent_turn(
         context.agent.workflow.clone(),
         context.skills.clone(),
     );
+    let reply = reply_offer(context, config.kind);
+    let asks_offered = keeper_core::agents::ask::offered(config.kind, context.agent.kind);
     let log = Mutex::new(TurnLog {
         context,
         writer,
@@ -4358,12 +4960,22 @@ async fn run_agent_turn(
         },
         bmad,
         grants,
+        asks: AskTools::new(
+            tools.from.clone(),
+            tools.delegations.clone(),
+            Arc::clone(&tools.gate),
+            &log,
+            asks_offered,
+            &tools.sinks,
+            tools.scheduled.clone(),
+        ),
         delegation: DelegateTools::new(
             tools.from,
             tools.delegations,
             tools.room,
             &log,
             config.allow.iter().any(|name| name == delegate::DELEGATE),
+            reply,
             &tools.sinks,
         ),
         view: &log,
@@ -4474,6 +5086,9 @@ async fn run_agent_turn(
             log.write(call_line, LineBody::Surface(line));
         }
         for line in host.delegation.take_lines() {
+            log.write(call_line, line);
+        }
+        for line in host.asks.take_lines() {
             log.write(call_line, line);
         }
         for (label, path) in reads {
@@ -4623,6 +5238,12 @@ async fn run_agent_turn(
                 detail: LOCAL_ONLY_REFUSAL.to_owned(),
             });
         }
+        // A turn that asked a person ends at its ask (R99).
+        if host.asks.asked() {
+            return Err(BotsError::Tool {
+                detail: crate::ask::ASKED.to_owned(),
+            });
+        }
         if let Some(bound) = log.context.token_bound() {
             log.bound = Some(bound);
             return Err(BotsError::Tool {
@@ -4687,6 +5308,7 @@ async fn run_agent_turn(
         }
     }
     let parking = host.parked.lock().unwrap_or_else(|p| p.into_inner()).take();
+    let asked = host.asks.asked();
     drop(host);
     let log = log.into_inner().unwrap_or_else(|p| p.into_inner());
     let parked = match (parking, log.parked) {
@@ -4757,6 +5379,7 @@ async fn run_agent_turn(
             }
         }
         Some(Err(_)) if log.local_only => ran(TurnEnding::LocalOnly, None, None),
+        Some(Err(_)) if asked => ran(TurnEnding::Asked, None, None),
         Some(Err(_)) if bound.is_some() => ran(TurnEnding::Bounded, None, None),
         Some(Err(error)) => ran(TurnEnding::Failed, None, Some(error.to_string())),
     }

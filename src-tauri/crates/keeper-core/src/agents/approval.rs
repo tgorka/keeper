@@ -285,7 +285,13 @@ pub fn summary_of(tool: AgentTool, args: &Value) -> String {
             Some(session) => format!("Send the next round to the session {session}"),
             None => format!("Hand work to {}", arg(args, "agent")),
         },
-        AgentTool::Reply => "Reply to the session that handed this work on".to_owned(),
+        AgentTool::Reply => match args["ask"].as_str() {
+            Some(ask) => format!("Relay your person's answer to the question {ask}"),
+            None => "Reply to the session that handed this work on".to_owned(),
+        },
+        AgentTool::AskHuman => {
+            "Ask the person this work is for a question, through their proxy".to_owned()
+        }
         AgentTool::SurfaceOpen => format!("Open `{path}` in {} on your screen", arg(args, "drive")),
         AgentTool::SurfaceHighlight => {
             format!(

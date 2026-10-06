@@ -242,7 +242,8 @@ pub fn tool_then(name: &'static str, args: Value, answer: &'static str) -> Stub 
 
 /// A model that answers its `n`th chat request (from 1) with one call of
 /// the tool each `(n, name, args)` of `calls` names, and every other one
-/// with `answer`.
+/// with `answer`. `@ASK@` in a call's arguments is the id of the last
+/// question the request carries ("Question <id>: …").
 pub fn calls_at(calls: Vec<(usize, &'static str, Value)>, answer: &'static str) -> Stub {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("addr"));
@@ -285,7 +286,15 @@ pub fn calls_at(calls: Vec<(usize, &'static str, Value)>, answer: &'static str) 
                 let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
                 let frame = match calls.iter().find(|(at, ..)| *at == n) {
                     Some((_, name, args)) => {
-                        json!({"model":"stub","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":format!("call_{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]})
+                        let request = String::from_utf8_lossy(&body);
+                        let asked = request.rfind("Question ").map(|at| {
+                            let from = at + "Question ".len();
+                            request[from..(from + 26).min(request.len())].to_owned()
+                        });
+                        let args = args
+                            .to_string()
+                            .replace("@ASK@", asked.as_deref().unwrap_or(""));
+                        json!({"model":"stub","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":format!("call_{n}"),"type":"function","function":{"name":name,"arguments":args}}]},"finish_reason":"tool_calls"}]})
                     }
                     None => {
                         json!({"model":"stub","choices":[{"index":0,"delta":{"content":answer},"finish_reason":"stop"}]})

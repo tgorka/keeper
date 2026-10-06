@@ -30,6 +30,8 @@ pub const BMAD_PARTY: &str = "bmad_party";
 pub const SKILLS_LIST: &str = "skills_list";
 /// One offered skill's `SKILL.md`, or one file inside it.
 pub const SKILL_VIEW: &str = "skill_view";
+/// A question for the person the work is for, through their proxy (R99).
+pub const ASK_HUMAN: &str = "ask_human";
 
 /// The tools through which a session follows BMAD's skills and
 /// workflows: a session offered any of them is told where BMAD's project
@@ -726,6 +728,85 @@ pub fn parse_view(args: &Value) -> Result<ViewCall, String> {
     })
 }
 
+/// One `ask_human` call: the question, the answers it offers in order, and
+/// the one an unattended run takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskCall {
+    pub question: String,
+    pub choices: Vec<String>,
+    pub default: Option<String>,
+}
+
+/// `ask_human`'s spec: offered by the session's kind, not by `[tools].allow`
+/// (R102).
+pub fn ask_spec() -> ToolSpec {
+    ToolSpec {
+        name: ASK_HUMAN.to_owned(),
+        description: "Ask the person this work is for a question — a HALT, a menu, a checkpoint — through their proxy, who asks them in its own words. This ends your turn: say what you are waiting for and stop; their answer arrives as the next message, naming the choice it picks. Where nobody can be asked, the default is the answer at once.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "The question, whole: the person reads nothing else of this session."},
+                "choices": {"type": "array", "items": {"type": "string"}, "description": "The answers it offers, e.g. [\"Continue\", \"Stop\"]; an answer picks one by its number or its text."},
+                "default": {"type": "string", "description": "The answer when nobody can be asked: one of choices, when there are choices."}
+            },
+            "required": ["question"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// The most bytes an ask's question, choices and default take together: its
+/// event carries them twice — the body a device shows and the ask — and is
+/// encrypted under the homeserver's 64 KiB cap ([`crate::agents::ask::ASK_EVENT_BYTES`]).
+pub const ASK_TEXT_BYTES: usize = 12 * 1024;
+
+/// Read an `ask_human` call's arguments: a question; distinct choices, each
+/// told apart from the others however it is cased; a default among them
+/// when both are given; all of it within [`ASK_TEXT_BYTES`].
+pub fn parse_ask(args: &Value) -> Result<AskCall, String> {
+    let keys = object(ASK_HUMAN, args, &["question", "choices", "default"])?;
+    let question = text(ASK_HUMAN, keys, "question")?
+        .ok_or_else(|| "ask_human needs the question.".to_owned())?;
+    let choices: Vec<String> = match keys.get("choices") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| match item {
+                Value::String(choice) if !choice.trim().is_empty() => Ok(choice.trim().to_owned()),
+                _ => Err("ask_human's choices are non-empty strings.".to_owned()),
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err("ask_human's choices are a list of strings.".to_owned()),
+    };
+    let mut folded: Vec<String> = choices.iter().map(|choice| choice.to_lowercase()).collect();
+    folded.sort();
+    if folded.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("ask_human's choices are each different, however they are cased.".to_owned());
+    }
+    let default = text(ASK_HUMAN, keys, "default")?.map(|default| default.trim().to_owned());
+    if let Some(default) = &default {
+        if !choices.is_empty() && !choices.contains(default) {
+            return Err(format!(
+                "ask_human's default is one of its choices, and {default} is none of them."
+            ));
+        }
+    }
+    let bytes = question.len()
+        + choices.iter().map(String::len).sum::<usize>()
+        + default.as_ref().map_or(0, String::len);
+    if bytes > ASK_TEXT_BYTES {
+        return Err(format!(
+            "ask_human's question, choices and default take {bytes} bytes, and an ask carries at most {ASK_TEXT_BYTES}: ask a shorter question."
+        ));
+    }
+    Ok(AskCall {
+        question,
+        choices,
+        default,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1020,5 +1101,56 @@ mod tests {
         );
         assert!(parse_memlog(&json!({"command": "set", "workspace": "w", "key": "k"})).is_err());
         assert!(parse_memlog(&json!({"command": "drop", "workspace": "w"})).is_err());
+    }
+
+    /// 94.2 acceptance 7's grammar: a default beside choices is one of
+    /// them; choices that differ only in case could not be told apart by an
+    /// answer, so they are refused.
+    #[test]
+    fn ask_humans_default_is_one_of_its_choices() {
+        assert_eq!(
+            parse_ask(
+                &json!({"question": "Go on?", "choices": ["Continue", "Stop"], "default": "Continue"})
+            ),
+            Ok(AskCall {
+                question: "Go on?".to_owned(),
+                choices: vec!["Continue".to_owned(), "Stop".to_owned()],
+                default: Some("Continue".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse_ask(
+                &json!({"question": "Go on?", "choices": ["Continue", "Stop"], "default": "Later"})
+            ),
+            Err("ask_human's default is one of its choices, and Later is none of them.".to_owned())
+        );
+        // A free question takes any default.
+        assert_eq!(
+            parse_ask(&json!({"question": "Which file?", "default": "a.md"}))
+                .map(|call| call.default),
+            Ok(Some("a.md".to_owned()))
+        );
+        assert!(parse_ask(&json!({"question": "Go on?", "choices": ["Stop", "stop"]})).is_err());
+        assert!(parse_ask(&json!({"choices": ["Continue"]})).is_err());
+    }
+
+    /// R94A-12: an ask's question, choices and default together fit in
+    /// [`ASK_TEXT_BYTES`]; one byte more, in any of them, is refused before
+    /// anything is asked.
+    #[test]
+    fn an_ask_is_bounded_before_it_is_asked() {
+        let at = |question: usize, choice: usize, default: usize| {
+            parse_ask(&json!({
+                "question": "q".repeat(question),
+                "choices": ["c".repeat(choice), "d".repeat(default)],
+                "default": "d".repeat(default),
+            }))
+        };
+        let third = ASK_TEXT_BYTES / 4;
+        let rest = ASK_TEXT_BYTES - 3 * third;
+        assert!(at(rest, third, third).is_ok());
+        assert!(at(rest + 1, third, third).is_err());
+        assert!(at(rest, third + 1, third).is_err());
+        assert!(at(rest, third, third + 1).is_err());
     }
 }

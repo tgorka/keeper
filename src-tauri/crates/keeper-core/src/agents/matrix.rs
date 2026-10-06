@@ -120,6 +120,22 @@ pub enum AgentMatrixError {
     Other(String),
 }
 
+/// Whom an invite of `user` reaches (AD-391, R160): an agent through its
+/// own `audience` when the host knows one for it — a known agent's home
+/// readers, a pinned proxy's person —, anyone else as a person.
+pub fn invitee_sink(user: &UserId, audience: Option<Readers>) -> Sink {
+    match audience {
+        Some(audience) => Sink::Room {
+            humans: Default::default(),
+            agent_audiences: vec![audience],
+        },
+        None => Sink::Room {
+            humans: [user.to_owned()].into(),
+            agent_audiences: Vec::new(),
+        },
+    }
+}
+
 /// Classify a homeserver answer: its `errcode` when it had one, else whether
 /// the transport failed. Pure, so every arm is tested without a server.
 pub fn classify(
@@ -387,17 +403,8 @@ impl AgentClient {
         label: &Label,
         audience: Option<Readers>,
     ) -> Result<(), AgentMatrixError> {
-        let sink = match audience {
-            Some(audience) => Sink::Room {
-                humans: Default::default(),
-                agent_audiences: vec![audience],
-            },
-            None => Sink::Room {
-                humans: [user.to_owned()].into(),
-                agent_audiences: Vec::new(),
-            },
-        };
-        if let SinkVerdict::Block { reason, .. } = check_sink(label, &sink) {
+        if let SinkVerdict::Block { reason, .. } = check_sink(label, &invitee_sink(user, audience))
+        {
             return Err(AgentMatrixError::Label(reason));
         }
         self.joined(room)?
@@ -412,6 +419,12 @@ impl AgentClient {
             .await
             .map(|_| ())
             .map_err(from_sdk)
+    }
+
+    /// Leave `room`: a proxy that joined an asking room for one ask stops
+    /// receiving it once it relayed the answer (R100, R28 S-27).
+    pub async fn leave(&self, room: &RoomId) -> Result<(), AgentMatrixError> {
+        self.joined(room)?.leave().await.map_err(from_sdk)
     }
 
     /// Send a timeline event (encrypted in an encrypted room), once. A retry

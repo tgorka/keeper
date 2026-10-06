@@ -2015,6 +2015,7 @@ fn note_of(decision: &DecisionRecord) -> Option<PeerBody> {
         sender: OwnedUserId::try_from(decision.decided_by.user.as_str()).ok()?,
         text: note.to_owned(),
         ask: None,
+        answers: None,
         artifacts: None,
     })
 }

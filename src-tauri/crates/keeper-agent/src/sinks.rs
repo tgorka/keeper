@@ -794,7 +794,7 @@ impl<'s> CallAudit<'s> {
 
 /// The room of the `main` session of agent `id` homed in `drive`, whose
 /// sessions zone is `zone`, under its derived id.
-fn main_dm(zone: &std::path::Path, drive: &str, id: &str) -> Option<OwnedRoomId> {
+pub(crate) fn main_dm(zone: &std::path::Path, drive: &str, id: &str) -> Option<OwnedRoomId> {
     let session = main_session_id(drive, id).to_string();
     let row = verbs::find(zone, &session)?;
     let text = crate::zone::read_text(&zone.join(&row.path), "agent.toml").ok()??;

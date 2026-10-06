@@ -113,9 +113,24 @@ fn user_text(body: &UserBody) -> String {
 }
 
 /// Another agent's message, as data: who sent it, its text, the files it
-/// hands over one per line, then the question it asks under the ask's id.
+/// hands over one per line, then the question it asks under the ask's id;
+/// a person's answer a proxy relays reads as the answer to this session's
+/// question, with the choice it picks (R99).
 fn peer_text(body: &PeerBody) -> String {
-    let mut text = format!("From {}:\n{}", body.sender, body.text);
+    let mut text = match &body.answers {
+        Some(answer) => format!(
+            "From {}, relaying the answer to your question {}:\n{}",
+            body.sender, answer.id, body.text
+        ),
+        None => format!("From {}:\n{}", body.sender, body.text),
+    };
+    if let Some(choice) = body
+        .answers
+        .as_ref()
+        .and_then(|answer| answer.choice.as_ref())
+    {
+        text.push_str(&format!("\n\nIt picks the choice {choice}."));
+    }
     if let Some(files) = body.artifacts.as_ref().filter(|files| !files.is_empty()) {
         text.push_str("\n\nFiles handed over:");
         for file in files {

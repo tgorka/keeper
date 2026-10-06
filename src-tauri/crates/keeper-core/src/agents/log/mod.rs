@@ -175,6 +175,7 @@ pub enum LineKind {
     ToolResult,
     Approval,
     Delegate,
+    Ask,
     Label,
     Scope,
     Run,
@@ -189,7 +190,7 @@ pub enum LineKind {
 
 impl LineKind {
     /// Every kind, in the documented order.
-    pub const ALL: [LineKind; 19] = [
+    pub const ALL: [LineKind; 20] = [
         Self::Open,
         Self::Claim,
         Self::User,
@@ -199,6 +200,7 @@ impl LineKind {
         Self::ToolResult,
         Self::Approval,
         Self::Delegate,
+        Self::Ask,
         Self::Label,
         Self::Scope,
         Self::Run,
@@ -223,6 +225,7 @@ impl LineKind {
             Self::ToolResult => "tool_result",
             Self::Approval => "approval",
             Self::Delegate => "delegate",
+            Self::Ask => "ask",
             Self::Label => "label",
             Self::Scope => "scope",
             Self::Run => "run",
@@ -300,12 +303,25 @@ pub struct UserBody {
     pub attachments: Vec<Attachment>,
 }
 
-/// A question another agent asks through a `peer` line.
+/// A question another agent asks a person through a `peer` line in their
+/// proxy's session (R99): the ask's id and question, the room it was asked
+/// in — where the answer is relayed — and the asking session's label then.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerAsk {
     pub id: String,
     pub question: String,
+    pub room: OwnedRoomId,
+    pub label: Label,
+}
+
+/// The ask a `peer` line answers (R99): its id, and the choice the answer
+/// picks, `null` when it picks none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerAnswer {
+    pub id: String,
+    pub choice: Option<String>,
 }
 
 /// `peer`: a message from another agent.
@@ -316,6 +332,9 @@ pub struct PeerBody {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask: Option<PeerAsk>,
+    /// A person's answer to this session's ask, relayed by their proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<PeerAnswer>,
     /// `<drive>/<path>` of each file it hands over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<Vec<String>>,
@@ -484,6 +503,59 @@ pub struct DelegateReply {
     pub label: Label,
 }
 
+/// Where an ask stands (R99): `asked` when the call made it — its intent,
+/// on disk before anything is published; `sent` when it went into the
+/// session's room, its proxy invited and joined; `answered` in the asking
+/// session when the proxy relayed the answer, and in the proxy's session
+/// when it relayed it; `defaulted` when nobody could be asked and the
+/// default answered; `refused` when the call, or the send it waited for,
+/// was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AskState {
+    Asked,
+    Sent,
+    Answered,
+    Defaulted,
+    Refused,
+}
+
+/// `ask`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskBody {
+    pub id: String,
+    pub state: AskState,
+    /// The person asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<OwnedUserId>,
+    /// Their proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<OwnedUserId>,
+    /// The room the ask went into: the asking session's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<OwnedRoomId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// The scheduled card whose run asked: its next windows wait for the
+    /// answer, whose turn finishes that card (R199).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<String>,
+    /// On `answered` and `defaulted` in the asking session: the answer, and
+    /// the choice it picks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<String>,
+    /// Why it was refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// `scope`: the drives in scope, changed by the person.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -645,6 +717,7 @@ pub enum LineBody {
     ToolResult(ToolResultBody),
     Approval(ApprovalBody),
     Delegate(DelegateBody),
+    Ask(AskBody),
     Label(LabelBody),
     Scope(ScopeBody),
     Run(RunBody),
@@ -672,6 +745,7 @@ impl LineBody {
             Self::ToolResult(_) => LineKind::ToolResult,
             Self::Approval(_) => LineKind::Approval,
             Self::Delegate(_) => LineKind::Delegate,
+            Self::Ask(_) => LineKind::Ask,
             Self::Label(_) => LineKind::Label,
             Self::Scope(_) => LineKind::Scope,
             Self::Run(_) => LineKind::Run,
@@ -699,6 +773,7 @@ impl LineBody {
             LineKind::ToolResult => Self::ToolResult(from(value)?),
             LineKind::Approval => Self::Approval(from(value)?),
             LineKind::Delegate => Self::Delegate(from(value)?),
+            LineKind::Ask => Self::Ask(from(value)?),
             LineKind::Label => Self::Label(from(value)?),
             LineKind::Scope => Self::Scope(from(value)?),
             LineKind::Run => Self::Run(from(value)?),
@@ -725,6 +800,7 @@ impl Serialize for LineBody {
             Self::ToolResult(b) => b.serialize(s),
             Self::Approval(b) => b.serialize(s),
             Self::Delegate(b) => b.serialize(s),
+            Self::Ask(b) => b.serialize(s),
             Self::Label(b) => b.serialize(s),
             Self::Scope(b) => b.serialize(s),
             Self::Run(b) => b.serialize(s),
@@ -963,6 +1039,12 @@ mod tests {
                 ask: Some(PeerAsk {
                     id: "q1".into(),
                     question: "which?".into(),
+                    room: RoomId::parse("!steward:h").expect("room"),
+                    label: label(),
+                }),
+                answers: Some(PeerAnswer {
+                    id: "q0".into(),
+                    choice: None,
                 }),
                 artifacts: Some(vec!["artifacts/x.md".into()]),
             }),
@@ -1019,6 +1101,20 @@ mod tests {
                     artifacts: vec!["tgdrive/60-sessions/active/x/artifacts/a.md".into()],
                     label: label(),
                 }),
+            }),
+            LineBody::Ask(AskBody {
+                id: "01J".into(),
+                state: AskState::Answered,
+                to: Some(user("@tgorka:h")),
+                via: Some(user("@nixi:h")),
+                room: Some(RoomId::parse("!steward:h").expect("room")),
+                question: Some("Go on?".into()),
+                choices: vec!["Continue".into(), "Stop".into()],
+                default: Some("Stop".into()),
+                card: Some("card.md".into()),
+                answer: Some("1".into()),
+                choice: Some("Continue".into()),
+                reason: None,
             }),
             LineBody::Label(LabelBody::new(
                 &label(),

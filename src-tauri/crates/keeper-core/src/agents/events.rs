@@ -65,6 +65,12 @@ pub const ARTIFACTS: &str = "dev.keeper.agent.artifacts";
 /// The key inside a delegated session's reply naming the session's label
 /// as it is when it replies (ruling R94): what the delegating session joins.
 pub const REPLY_LABEL: &str = "dev.keeper.agent.label";
+/// The key inside an agent's `m.room.message` content carrying a question
+/// for a person, through that person's proxy (AD-380, R99): the ask.
+pub const ASK: &str = "dev.keeper.agent.ask";
+/// The key inside a proxy's `m.room.message` content relaying its person's
+/// answer to an ask, into the asking room (R100).
+pub const ANSWER: &str = "dev.keeper.agent.answer";
 
 /// A host pushed a commit of a drive that another host should fetch now
 /// (state, key = the drive id, unencrypted; ruling R59): in a session's room
