@@ -1059,8 +1059,10 @@ pub struct CommitRequest {
     /// guarded too: a write over what the request did not read is refused.
     pub writes: Vec<(String, Option<Vec<u8>>)>,
     /// Files or folders moved whole as `HEAD` holds them, `(from, to)`:
-    /// each file under `from` must be on the disk as `HEAD` holds it, and
-    /// nothing may be at `to`.
+    /// each file under `from` must be guarded — a file the request did not
+    /// read is not moved, and nothing is — and on the disk as `HEAD` holds
+    /// it, the disk must hold nothing else under `from` (checked again
+    /// right before the publication), and nothing may be at `to`.
     pub moves: Vec<(String, String)>,
     /// Each path's git blob id the request was planned over, `None` for a
     /// path that was absent: at `HEAD` and on the disk, checked once the

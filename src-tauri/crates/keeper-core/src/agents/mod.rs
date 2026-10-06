@@ -15,6 +15,7 @@ pub mod card;
 pub mod claim;
 pub mod consolidate;
 pub mod copy;
+pub mod curate;
 pub mod delegation;
 pub mod device;
 pub mod doorbell;

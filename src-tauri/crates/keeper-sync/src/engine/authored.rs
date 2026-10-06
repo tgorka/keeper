@@ -385,7 +385,11 @@ impl Engine {
             }
             for (file, id, mode) in files {
                 let file = file.to_string_lossy().into_owned();
-                if Self::disk_blob(&root, &file)? != Some(hex(*id)) {
+                // A move takes only what the request read: a file it names
+                // no guard for came since — an addition the plan never saw.
+                if !request.guards.iter().any(|(guarded, _)| *guarded == file)
+                    || Self::disk_blob(&root, &file)? != Some(hex(*id))
+                {
                     return Ok(CommitPaths::Guarded { path: file });
                 }
                 let rest = &file[from.len()..];
@@ -402,6 +406,9 @@ impl Engine {
                     after: entry,
                     disk: Some(hex(*id)),
                 });
+            }
+            if let Some(path) = Self::stray(&root, from, files)? {
+                return Ok(CommitPaths::Guarded { path });
             }
         }
 
@@ -579,6 +586,11 @@ impl Engine {
         for (path, planned) in &request.guards {
             if Self::disk_blob(&root, path)? != *planned {
                 return abandon(CommitPaths::Guarded { path: path.clone() });
+            }
+        }
+        for ((from, _), files) in request.moves.iter().zip(&moved_from) {
+            if let Some(path) = Self::stray(&root, from, files)? {
+                return abandon(CommitPaths::Guarded { path });
             }
         }
         for change in &intent.changes {
@@ -1346,6 +1358,25 @@ impl Engine {
             Err(error) => Err(SyncError::io("read a guarded file", path, error)),
             Ok(blob) => Ok(blob),
         }
+    }
+
+    /// The first thing on the disk under the moved `from` that `files` —
+    /// what the commit holds there — does not name: an addition, committed
+    /// or not, the request never read. A folder moves whole or not at all,
+    /// so it holds the move and stays where it is with the folder.
+    fn stray(
+        root: &Root,
+        from: &str,
+        files: &[(PathBuf, gix::hash::ObjectId, Mode)],
+    ) -> Result<Option<String>> {
+        let on_disk = match crate::browse::members(root, from) {
+            Ok(found) => found,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(SyncError::io("list a moved folder", from, error)),
+        };
+        Ok(on_disk
+            .into_iter()
+            .find(|path| !files.iter().any(|(file, _, _)| file == Path::new(path))))
     }
 
     /// Refuse `path` unless it lands on itself under `root`: plain names,

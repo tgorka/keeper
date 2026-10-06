@@ -547,13 +547,13 @@ failed or did not finish is run again.
 
 - **Never scored:** a proposal at `untrusted` integrity, or from a `scheduled` or `delegated`
   session — a workflow's run included, by the origin its proposals carry — is rejected naming the
-  gate. A `gate` session's proposal gets no verdict and waits for the weekly curator, whatever its
-  session. A proposal whose session was archived since still counts as that session's. Only
-  `proposals/<ulid>.md` is a proposal: a part file a publication left behind never is. A proposal
-  taken back from the disk is never applied when it is gone by the night's last re-read, right
-  before its commit is published; that re-read and the publication are not one step, so one
-  taken back in the instant between them (one hash pass) can still be settled by that commit
-  (DW-901).
+  gate. A `gate` session's proposal gets no verdict and waits for the weekly curator (§ *Skills ›
+  The curator*), which expires it at 30 days, whatever its session. A proposal whose session was
+  archived since still counts as that session's. Only `proposals/<ulid>.md` is a proposal: a part
+  file a publication left behind never is. A proposal taken back from the disk is never applied
+  when it is gone by the night's last re-read, right before its commit is published; that re-read
+  and the publication are not one step, so one taken back in the instant between them (one hash
+  pass) can still be settled by that commit (DW-901).
 - **The gates are OpenClaw's** (`keeper-ported/src/openclaw/UPSTREAM.md`): one fact proposed in
   three sessions on three days, its newest within 30 days, scores at least 0.75 and promotes;
   short of that it stays pending; older than 30 days it expires.
@@ -641,10 +641,66 @@ as "web is named in agent.toml, not in _skills/." A dotted folder (`.archive/`) 
 
 A skill whose `metadata` holds `keeper_proposal` is one an agent proposed and no person has
 adopted: it is offered to no session, whatever `[tools].skills` says, and `skills_list` names it
-under "Waiting for a person". A person adopts it by deleting the key; from then on it is theirs.
-A `metadata` keeper cannot read as one block map of distinct keys — a flow map (`{…}`), a nested
-or block value, a key said twice, `metadata` itself said twice — is not taken for adopted: the
-skill is refused with that reason and offered to no session.
+under "Waiting for a person". A person adopts it by deleting the key; from then on it is theirs,
+and the curator never touches it. A `metadata` keeper cannot read as one block map of distinct
+keys — a flow map (`{…}`), a nested or block value, a key said twice, `metadata` itself said
+twice — is not taken for adopted: the skill is refused with that reason and offered to no session.
+
+### Skills › The curator
+
+Once a week the skills agents made and nobody adopted are retired, on an always-on host only. On
+Sundays at 04:00 at the host's offset, the host that wins the drive's one maintenance claim
+`maintain:<drive>` — the night's claim too, so the curator and the consolidation never run on one
+drive at once — and finds the week's completion `curate:<drive>` not naming that Sunday yet pulls
+the drive and reads it at the one commit the pull left. Another host logs "the maintenance of
+tgdrive is held by electra" and tries again once the claim could have lapsed. The time is the
+server's, not the host's own clock. A week counts as done only once its sweep settled — its
+commit, if it made one, followed by its files — it was recorded under `curate:<drive>` and the
+claim went back; a sweep that failed, lost its claim, or was held at its commit because something
+it read changed since is run again once the claim could have lapsed, the same week. A host that
+missed several Sundays sweeps once.
+
+- **What it manages:** a skill whose `metadata` holds `keeper_proposal`, unless it also holds
+  `keeper_pinned: "true"`. A skill you wrote, one you adopted, a pinned one, one any agent's
+  `[tools].skills` names, and one a file under `_workflows/` names as a whole word are never
+  touched. Neither is a skill whose `metadata` is not one block map of distinct keys — a key
+  said twice, `metadata` itself said twice — because whose it is, or whether it is pinned, is
+  then unknown: it stays as it is, as it stays unoffered, and the host's log says why. The
+  names that protect a skill are read as committed. When they cannot all be read — more than 2 000
+  workflow files, one larger than 256 KiB, one that is a link, an `agent.toml` that does not
+  parse, or a workflow or `agent.toml` you changed and did not commit yet — no skill moves that
+  week, and the host's log says why.
+- **Its clock is git's:** such a skill is never offered, so nothing ever uses it; its age is the
+  time since the last commit that changed its folder (its committer's date), the curator's own
+  commits left out — those whose message ends in exactly the block keeper writes: its provenance
+  lines in order, then `Memory-Origin: curator@<host>`, and nothing else. Keeper's lines quoted
+  among your own words, a partial block, or one said twice are yours, so they count. That shape
+  tells keeper's commits from a person's, not who may have typed it: it is no signature. History
+  is read as git simplifies it: a merge that kept one side's version of the folder follows that
+  side only, so a change the merge threw away does not count. An applied patch, or your edit,
+  restarts it. A skill whose last 32 changes are all the curator's has no age it can tell, and
+  stays. No log or index is read.
+- **14 days:** stale — `metadata.keeper_stale: "<date>"` is set, the rest of the file kept. A
+  stale skill changed since is active again and the mark is cleared.
+- **30 days:** archived — the folder moves whole, every file of it with its mode, to
+  `_skills/.archive/<name>/`. Nothing is ever deleted. A skill folder holding a change you have
+  not committed stays, and so does one whose `.archive/<name>/` is taken. An archived skill is
+  not offered and `skill_view` does not find it; to restore one, move its folder back (the move
+  is a change, so its clock restarts).
+- **A gate's proposals:** a `gate` session's proposal, skipped by every night, is given
+  `verdict = "expired"` at the first sweep 30 days or more after it was made and moved to
+  `proposals/done/` unread — unless a file is at either place already: that one is yours and the
+  proposal stays pending.
+- **One commit per sweep:** `skills: <drive> — <n> stale, <m> active again, <k> archived, <g> gate
+  proposals expired`, keeper's provenance block, then `Memory-Origin: curator@<host>`. Every file it
+  touches, every file of a folder it moves, the declarations and every workflow and `agent.toml`
+  it read are guarded by what it read: one changed since — committed or on the disk — or a file
+  added to a folder it moves, committed or only put on the disk, makes the sweep write nothing,
+  and the person's file stays where they put it, with the folder. A host whose claim is lost
+  writes nothing.
+
+To adopt an agent's skill, delete `metadata.keeper_proposal` (and `keeper_stale`, if it is there).
+Until then it is offered to nobody, and the curator archives it 30 days after its last change.
 
 ### No tool edits a home
 

@@ -8182,6 +8182,27 @@ location: `src-tauri/crates/keeper-agent/src/memory/journal.rs` (`append_with`)
 reason: A first append syncs the day file's folder after the entry is written and synced; a failure there is reported as "could not be written" while the entry stays, so a model that retries writes it twice. Close with a refusal that says the entry was written but may not survive a power loss, or a sync before the entry is written.
 status: open
 
+### DW-585: An archived skill's guard covers its `SKILL.md` only.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`change_into`, reused by `curate::plan_sweep`)
+reason: a folder move is guarded on `SKILL.md`'s blob alone; a person's edit to a support file (`scripts/`, `references/`) between the sweep's read and its commit is moved with the folder — kept byte for byte under `.archive/`, not lost, but archived although the skill was just changed. Close by guarding every file of the folder at `HEAD`.
+status: closed (R208, R95U-07) — `consolidate::change_into` guards every file of a moved folder at the planned commit and its destination absent, and `Engine::commit_paths` moves nothing when `HEAD` holds a file under the folder the request did not guard; proof `curation::archiving_guards_the_whole_tree`, `commit_paths::a_move_takes_only_the_files_it_read`
+
+### DW-586: A skill whose `_skills/.archive/<name>/` exists already is left in place with a log line only.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/curate.rs` (`sweep`, `notes`)
+reason: the move cannot land on an existing folder, so the sweep skips it every week and says so only in the host's log; no person is told. Close with a dated archive name or a card.
+status: open
+
+### DW-587: The sweep reads `_workflows/` from the working tree, not from `HEAD`.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/curate.rs` (`texts_under`)
+reason: skills, `agent.toml`s and proposals are read as committed; workflow files were read on the disk after the pull. The earlier text said an uncommitted edit could only protect a skill — wrong: an uncommitted removal of a reference hid a committed one and exposed the skill (R95U-05).
+status: closed (R208, R95U-05/06) — every protection source is read from git's objects at the one pulled commit (`git::history::files_at`, `curate::protection`), guarded through the publication, and an uncommitted change to a workflow or an `agent.toml` makes the read incomplete, so nothing is archived; proof `curation::a_reference_the_sweep_cannot_see_protects`
+
 ### DW-700: A cut-off `commit_paths` puts back only the paths it can still reach.
 
 origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-10, 2026-10-06)
@@ -8322,6 +8343,48 @@ location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`one_maintenance_job_per
 reason: both jobs take the one claim through `maintain::maintain`; the test starts two at once on two hosts and each interleaving. The curator's scheduler lives on rung 3 and is restacked onto this one; agentd's tick starting both is not driven here.
 status: open
 
+### DW-740: A workflow file or agent folder committed after the sweep's plan is not guarded.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R208 / R95U-05, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/curate.rs` (`plan_sweep`, `protection`)
+reason: every workflow and `agent.toml` the plan read is guarded by its blob, so a change to one holds the commit; a new path added between the plan and the publication is no guard's, and `commit_paths` has no "nothing new under this folder" guard outside a move. The window is the plan's few seconds under the claim; the next week reads it.
+status: accepted (R229) — the reading of R208-05: the window is one sweep under the claim and archiving is a reversible move; not fenced
+
+### DW-741: A file put on the disk into a skill folder after the plan stays behind in the old folder.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R208 / R95U-07, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`commit_paths_held`, moves)
+reason: a move takes the files `HEAD` holds, each guarded; an untracked file created between the plan's status read and the publication is not one of them, is never committed and never lost, but the folder it is in is left holding only it.
+status: closed (R230, R95U2-03) — `Engine::commit_paths` lists what a moved folder holds on the disk through the held root (`browse::members`, `authored::stray`) when the guards are checked and again right before the publication; anything the commit does not hold there, committed or not, is `Guarded`, nothing is published and the person's file stays in the whole folder; proof `commit_paths::a_move_holds_for_a_file_on_the_disk_it_never_read`, `curation::archiving_guards_the_whole_tree`
+
+### DW-742: One file of a person's at an expiry's `done/` place holds the whole week's sweep.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R208 / R95U-08, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/curate.rs` (`plan_sweep`); `consolidate::settle_into`
+reason: a committed occupant is seen at the plan and only that proposal stays pending; one only on the disk is caught by the commit's guard, which writes nothing of the week — marks and archives included — until it is committed or removed. Since R230 (R95U2-04) that week stays owed and is planned again every `claim::TTL`, so a removed file frees it the same week.
+status: open
+
+### DW-743: An uncommitted edit to any workflow or `agent.toml` holds every skill transition of the week.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R208 / R95U-04/05, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/curate.rs` (`protection`)
+reason: the read is incomplete, so every skill is protected (R208's reading of 04); keeper commits a drive's changes within its cadence, so the hold lasts until the next sweep after that commit — up to a week.
+status: open
+
+### DW-744: A skill whose 32 newest changes are all the curator's never ages.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R208 / R95U-09, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/curate.rs` (`LOG_DEPTH`, `last_change`)
+reason: a bounded walk that finds no real change answers "unknown", and an unknown age is left alone; 32 curator commits on one folder (16 stale/active rounds) is far past any real skill's life, so it is logged, not lifted.
+status: open
+
+### DW-745: The night's instant is still this machine's clock.
+
+origin: epic 95, story 95.3 review (R95U-10's shape on rung `agents-95-consolidate`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`run_round`: `Utc::now()`)
+reason: the curator now plans at the server-adjusted clock (`curate::sweep_drive`); the consolidator's `now` for proposal ages and verdict dates is still `Utc::now()`. Rung 2's to change, not this rung's.
+status: open
+
 ### DW-820: Whether a decision was carried out walks the whole history while it waits.
 
 origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R217 / R95C3-05, 2026-10-07)
@@ -8362,6 +8425,27 @@ status: open
 origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R217 / R95C3-07, 2026-10-07)
 location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`a_night_whose_commit_did_not_finish_is_tried_again`), `tests/consolidation.rs` (`a_refused_rejection_leaves_the_night_unfinished`)
 reason: `run_round` is driven with a real home to `Done`, and with staged proposals whose published commit cannot be finished to `Again` (unrecorded) and then, once the next pull finished it, to `Done`; that proves `night_of` asks `settled`. A consumed approval whose rejection is refused needs a person's decision recorded through the approval store and the agentd harness of `tests/consolidation.rs`, so that branch of `settled` is proven there, at `settled` itself.
+status: open
+
+### DW-885: A file the drive ignores inside an archivable skill folder holds its archive, retried every claim lapse.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R230 / R95U2-03/04, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`stray`); `src-tauri/crates/keeper-agent/src/curate.rs` (`plan_sweep`, `week`)
+reason: the plan reads uncommitted changes through git's status, which does not list an ignored file (`.DS_Store`, an editor's swap file); the publication's disk listing does, and holds the move. Conservative — nothing is moved or lost — but the week stays owed and the sweep is planned and refused again every `claim::TTL` until the file goes. Telling the plan about ignored files (or ignoring them at the move) is a product decision.
+status: open
+
+### DW-886: A sweep refused at its publication is replanned every claim lapse for as long as the obstruction stays.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R230 / R95U2-04, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/curate.rs` (`week`, `run_round`)
+reason: `Outcome::Skipped` is unsettled, so the week is retried on the existing `AGAIN` cadence — each try a pull, a plan and a log line. A person's file left at an expiry's `done/` place, or DW-885's ignored file, makes that hourly until it goes or the week ends; no backoff.
+status: open
+
+### DW-887: The curator's commits are recognized by the shape of keeper's trailer block, not by a signature.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R230 / R95U2-01, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/provenance.rs` (`MemoryTrailer::of_message`)
+reason: a person can type the exact block, and a person's cherry-pick or rebase of a curator commit keeps it; either makes that change not count toward a skill's age. Only the drive's writers can do it, and the worst effect is an earlier stale mark or archive — a move, reversible. Authenticity would need signed commits.
 status: open
 
 ### DW-900: A person's commit in the instant after the roll-forward's one `HEAD` read can be followed over.
@@ -8411,4 +8495,18 @@ status: open
 origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R268 / R95C8-03, 2026-10-08)
 location: `src-tauri/crates/keeper-sync/src/browse.rs` (`place`, `Displaced::restore`), `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`put_back`, the `.keeper-taken` branch first)
 reason: `put_back` moves a commit's file off the path as `.keeper-taken-<request>-<n>` and, on a later settling, puts it back first through `place`: `linkat` to the path's name, then `unlinkat` of the taken name. A kill between the two leaves one inode under both names. Every settling after it tries the same `linkat`, gets `EEXIST`, takes it for a file a person saved at the path and holds (`saved there … kept beside it as .keeper-taken-…`) before reading any bytes or mode. Nothing is lost — bytes and modes are where they were — but putting the path or the bit back, or removing the old file, does not release the hold while the alias stays. Manual remedy: remove the `.keeper-taken-<request>-<n>` name only when it is the same file as the path (`ls -i` shows one inode number for both); the next settling then proceeds. A different file under that name is the commit's own file, kept because a person's file took the path: that is a genuine conflict, settled as DW-970 says. Eventual fix: recognise and finish its own partial restore — when the taken name and the path are one inode, unlink the taken name, sync the folder and go on — with a regression stopping between `place`'s link and unlink. Not a dead end: the manual remedy releases it.
+status: open
+
+### DW-1062: A settling with `HEAD` unchanged drops an old file moved aside whose executable bit a person changed.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R271 / R95C9-01, 2026-10-08)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`materialize`: `settle(earlier, now.is_none())`); `docs/sync.md` §10
+reason: where `HEAD` still holds the commit's after-image, the settling goes through `materialize`, not `put_back`. With the new file already at the path (`put` false) and the old file moved aside as `.keeper-displaced-<request>-<n>` carrying a bit a person changed while keeper was stopped mid-commit (`theirs` true), `settle` falls through to `old.discard()` and the intent is cleared: the person's chmod of keeper's internal name is lost. Its bytes are the before-image, recoverable from git. Fix: on an occupied destination with a changed aside mode, hold — the aside and the intent stay, no mode transferred; regressions for the bit set and cleared with `HEAD` unchanged, a held watcher commit and the person's resolution. Also: `docs/sync.md` §10 overstates that every saved-over aside holds — bytes restored into an empty path complete (`commit_paths.rs` 2522–2525).
+status: open
+
+### DW-1070: A move taken back after a kill leaves a file the commit had already removed deleted on the disk, and the next watcher pass commits it.
+
+origin: epic 95, story 95.3 (restack of `agents-95-curate` onto 419c9a30, R-NEW-1, 2026-10-08)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`put_back`: `wanted.is_none()` with no old file moved aside returns `Ok(())`; `roll_forward`)
+reason: a move is one deletion at `from/…` and one new file at `to/…` per file. The curator's archive of `_skills/x/{SKILL.md, run.sh}` published, a kill once `_skills/.archive/x/SKILL.md` was linked under its staging name (`Cut::Staged(1, Linked)`), then a person's commit of the index — the commit taken back: the settling drops the archive copy (still the commit's own file) and completes, record gone, but `_skills/x/SKILL.md`, whose deletion the roll-forward had finished (its moved-aside old file already dropped), is not put back — nothing of the commit's is at the path and no old file is aside, so `put_back` returns. `git status` says ` D _skills/x/SKILL.md`, and the next watcher pass commits that deletion over the person's reversal; the bytes stay in history. Seen with a throwaway probe on b9ce3e0f; a kill one change later (`Cut::Displaced(2)`, `Cut::Staged(3, Linked)`) holds instead (DW-970). A consolidation's `proposals/` → `done/` move has the same shape (by reading, not run). Fix (rung 2's `put_back`, final at 419c9a30): where `HEAD` holds the before-image again, the path is empty and this intent's change was the deletion, write the before blob back from the object store with its committed mode, only where nothing is (`Contained::create`); regression: the probe's kill-at-placement case with the skill folder whole afterwards and a watcher pass committing nothing.
 status: open

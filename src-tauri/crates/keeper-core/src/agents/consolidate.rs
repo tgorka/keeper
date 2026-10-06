@@ -925,22 +925,8 @@ fn batch(
 /// `text` with `metadata.keeper_proposal` set to `id`, or removed when
 /// `id` is `None`: the `metadata` block re-rendered, every other byte kept.
 pub fn stamp(text: &str, id: Option<&Ulid>) -> String {
-    let (frontmatter, _) = Frontmatter::parse(text);
-    let mut pairs: Vec<(String, FieldValue)> = match frontmatter.get("metadata") {
-        Some(FieldValue::Map(pairs)) => pairs.clone(),
-        _ => Vec::new(),
-    };
-    pairs.retain(|(key, _)| key != PROPOSAL_KEY);
-    if let Some(id) = id {
-        pairs.push((PROPOSAL_KEY.to_owned(), FieldValue::Str(id.to_string())));
-    }
-    if pairs.is_empty() {
-        if frontmatter.get("metadata").is_some() {
-            return Frontmatter::remove_in(text, "metadata");
-        }
-        return text.to_owned();
-    }
-    Frontmatter::set_in(text, "metadata", FieldValue::Map(pairs))
+    let id = id.map(Ulid::to_string);
+    skills::set_metadata(text, PROPOSAL_KEY, id.as_deref())
 }
 
 /// Whether `text` is an agent's skill no person adopted.

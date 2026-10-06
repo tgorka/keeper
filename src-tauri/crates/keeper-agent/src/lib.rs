@@ -50,6 +50,8 @@ pub mod cards;
 pub mod claims;
 #[cfg(unix)]
 pub mod consolidate;
+#[cfg(unix)]
+pub mod curate;
 pub mod deciding;
 pub mod delegate;
 #[cfg(unix)]

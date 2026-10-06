@@ -101,31 +101,71 @@ enum Adoption {
     Unreadable,
 }
 
-fn adoption(frontmatter: &Frontmatter) -> Adoption {
+/// A `SKILL.md`'s `metadata` pairs — none when it has no `metadata` — or
+/// `None` when keeper cannot read it as one block map of distinct plain
+/// keys: a construct the parser does not model, a key said twice,
+/// `metadata` itself said twice. What such metadata says is unknown, so
+/// no occurrence of a key is taken for its value (R204).
+pub fn metadata_of(frontmatter: &Frontmatter) -> Option<&[(String, FieldValue)]> {
     match frontmatter.count("metadata") {
         // A construct the parser does not model can hide the key itself.
         0 if frontmatter.unparsed().is_some() && frontmatter.raw_block().contains(PROPOSAL_KEY) => {
-            Adoption::Unreadable
+            None
         }
-        0 => Adoption::Adopted,
+        0 => Some(&[]),
         1 => match frontmatter.get("metadata") {
             Some(FieldValue::Map(pairs)) => {
                 let repeated = pairs
                     .iter()
                     .enumerate()
                     .any(|(at, (key, _))| pairs[..at].iter().any(|(earlier, _)| earlier == key));
-                if repeated {
-                    Adoption::Unreadable
-                } else if pairs.iter().any(|(key, _)| key == PROPOSAL_KEY) {
-                    Adoption::Proposed
-                } else {
-                    Adoption::Adopted
-                }
+                (!repeated).then_some(pairs.as_slice())
             }
-            _ => Adoption::Unreadable,
+            _ => None,
         },
-        _ => Adoption::Unreadable,
+        _ => None,
     }
+}
+
+fn adoption(frontmatter: &Frontmatter) -> Adoption {
+    match metadata_of(frontmatter) {
+        None => Adoption::Unreadable,
+        Some(pairs) if pairs.iter().any(|(key, _)| key == PROPOSAL_KEY) => Adoption::Proposed,
+        Some(_) => Adoption::Adopted,
+    }
+}
+
+/// The string `metadata.<key>` of a `SKILL.md`'s text, when it holds one
+/// and its `metadata` is readable ([`metadata_of`]).
+pub fn metadata_value(text: &str, key: &str) -> Option<String> {
+    metadata_of(&Frontmatter::parse(text).0)?
+        .iter()
+        .find_map(|(name, value)| match value {
+            FieldValue::Str(value) if name == key => Some(value.clone()),
+            _ => None,
+        })
+}
+
+/// `text` with `metadata.<key>` set to `value`, or removed when `value` is
+/// `None`: the `metadata` block re-rendered — its other keys in their order,
+/// a set key last — and every other byte kept. A `metadata` left empty goes.
+pub fn set_metadata(text: &str, key: &str, value: Option<&str>) -> String {
+    let (frontmatter, _) = Frontmatter::parse(text);
+    let mut pairs: Vec<(String, FieldValue)> = match frontmatter.get("metadata") {
+        Some(FieldValue::Map(pairs)) => pairs.clone(),
+        _ => Vec::new(),
+    };
+    pairs.retain(|(name, _)| name != key);
+    if let Some(value) = value {
+        pairs.push((key.to_owned(), FieldValue::Str(value.to_owned())));
+    }
+    if pairs.is_empty() {
+        if frontmatter.get("metadata").is_some() {
+            return Frontmatter::remove_in(text, "metadata");
+        }
+        return text.to_owned();
+    }
+    Frontmatter::set_in(text, "metadata", FieldValue::Map(pairs))
 }
 
 /// Validate every found skill and offer the wanted, valid ones.

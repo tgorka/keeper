@@ -1176,6 +1176,44 @@ impl Contained {
     }
 }
 
+/// Every entry under the folder `subpath` of `root` that is not a folder —
+/// a file, a link, anything else — as `/`-joined root-relative paths,
+/// sorted, read through no link: nothing when nothing is there, `subpath`
+/// itself when it is not a folder.
+#[cfg(unix)]
+pub(crate) fn members(root: &Root, subpath: &str) -> std::io::Result<Vec<String>> {
+    use rustix::fs::{openat, Dir, Mode, OFlags};
+    use rustix::io::Errno;
+    let folder = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::RDONLY;
+    let here = Contained::open(root, subpath, false)?;
+    let top = match openat(&here.parent, &here.name, folder, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(Vec::new()),
+        Err(Errno::NOTDIR | Errno::LOOP) => return Ok(vec![subpath.to_owned()]),
+        Err(error) => return Err(error.into()),
+    };
+    let mut out = Vec::new();
+    let mut folders = vec![(top, subpath.to_owned())];
+    while let Some((fd, path)) = folders.pop() {
+        for entry in Dir::read_from(&fd)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if matches!(name.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            let child = format!("{path}/{}", String::from_utf8_lossy(name.to_bytes()));
+            match openat(&fd, name, folder, Mode::empty()) {
+                Ok(inner) => folders.push((inner, child)),
+                Err(Errno::NOTDIR | Errno::LOOP) => out.push(child),
+                Err(Errno::NOENT) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// What [`Contained::displace`] moved aside: put back where nothing took its
 /// place, or dropped.
 #[cfg(unix)]

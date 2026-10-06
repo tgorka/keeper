@@ -17,8 +17,8 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use keeper_core::agents::claim::{self, Claimant, ServerClaim, RENEW_EVERY};
@@ -165,6 +165,9 @@ impl Rtt {
 pub struct ServerClock {
     offset_ms: AtomicI64,
     calibrated: AtomicBool,
+    /// The wall clock it adds the offset to, when not this host's own: a
+    /// value its holder sets, so a test drives both clocks by hand.
+    wall: Option<Arc<AtomicU64>>,
 }
 
 /// This host's wall clock, ms since the Unix epoch.
@@ -175,9 +178,22 @@ pub fn wall_ms() -> u64 {
 }
 
 impl ServerClock {
+    /// A clock whose wall clock reads `wall` (ms since the Unix epoch)
+    /// instead of this host's.
+    pub fn on_wall(wall: Arc<AtomicU64>) -> ServerClock {
+        ServerClock {
+            wall: Some(wall),
+            ..ServerClock::default()
+        }
+    }
+
     /// The server's time now, ms.
     pub fn now(&self) -> u64 {
-        wall_ms().saturating_add_signed(self.offset_ms.load(Ordering::Relaxed))
+        let wall = self
+            .wall
+            .as_ref()
+            .map_or_else(wall_ms, |wall| wall.load(Ordering::Relaxed));
+        wall.saturating_add_signed(self.offset_ms.load(Ordering::Relaxed))
     }
 
     /// The server stamped an event `server_ts` that this host sent between

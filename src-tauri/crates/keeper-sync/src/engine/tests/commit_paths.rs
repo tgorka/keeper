@@ -779,6 +779,135 @@ async fn overlapping_paths_are_refused() {
     assert!(!root.join("_skills/.archive").exists());
 }
 
+/// R208 (R95U-07): a folder moves only whole as the request read it —
+/// a file under it the request names no guard for (one added since the
+/// plan) moves nothing; guarded file by file, it moves, its destination
+/// guarded absent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_takes_only_the_files_it_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let remote_dir = tempfile::tempdir().expect("tempdir");
+    let Some((engine, platform, p)) = with_memory(dir.path(), remote_dir.path(), "a").await else {
+        return;
+    };
+    let root = p.local_path.clone();
+    std::fs::create_dir_all(root.join("_skills/x/scripts")).expect("skill");
+    std::fs::write(root.join("_skills/x/SKILL.md"), "skill").expect("skill");
+    std::fs::write(root.join("_skills/x/scripts/run.sh"), "run").expect("script");
+    commit_after_settling(&engine, &platform, &p);
+    let head = git_out(&root, &["rev-parse", "HEAD"]);
+    let mut ask = CommitRequest {
+        moves: vec![("_skills/x".to_owned(), "_skills/.archive/x".to_owned())],
+        guards: vec![
+            ("_skills/x/SKILL.md".to_owned(), Some(blob_id(b"skill"))),
+            ("_skills/.archive/x".to_owned(), None),
+        ],
+        subject: "skills".to_owned(),
+        ..CommitRequest::default()
+    };
+    assert_eq!(
+        engine.commit_paths(&p.id, &ask, yes()).await.expect("asks"),
+        CommitPaths::Guarded {
+            path: "_skills/x/scripts/run.sh".to_owned()
+        }
+    );
+    assert_eq!(git_out(&root, &["rev-parse", "HEAD"]), head);
+    assert_eq!(read(&root, "_skills/x/scripts/run.sh"), "run");
+    ask.guards
+        .push(("_skills/x/scripts/run.sh".to_owned(), Some(blob_id(b"run"))));
+    assert!(matches!(
+        engine.commit_paths(&p.id, &ask, yes()).await.expect("asks"),
+        CommitPaths::Committed { .. }
+    ));
+    assert_eq!(read(&root, "_skills/.archive/x/scripts/run.sh"), "run");
+    assert!(!root.join("_skills/x").exists());
+}
+
+/// R95U2-03: a moved folder must hold on the disk exactly what the commit
+/// holds under it — a file put there and never committed, before the
+/// guards are read or after, right before the publication, holds the
+/// move: nothing is published, nothing is moved, the new file stays, and
+/// no record is left to settle. One there before is refused with the
+/// guards, so a process killed once a record would be written leaves none
+/// holding the folder's commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_holds_for_a_file_on_the_disk_it_never_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let remote_dir = tempfile::tempdir().expect("tempdir");
+    let Some((engine, platform, p)) = with_memory(dir.path(), remote_dir.path(), "a").await else {
+        return;
+    };
+    let root = p.local_path.clone();
+    std::fs::create_dir_all(root.join("_skills/x")).expect("skill");
+    std::fs::write(root.join("_skills/x/SKILL.md"), "skill").expect("skill");
+    commit_after_settling(&engine, &platform, &p);
+    let head = git_out(&root, &["rev-parse", "HEAD"]);
+    let ask = CommitRequest {
+        moves: vec![("_skills/x".to_owned(), "_skills/.archive/x".to_owned())],
+        guards: vec![
+            ("_skills/x/SKILL.md".to_owned(), Some(blob_id(b"skill"))),
+            ("_skills/.archive/x".to_owned(), None),
+        ],
+        subject: "skills".to_owned(),
+        ..CommitRequest::default()
+    };
+    let new = root.join("_skills/x/references/new.md");
+    let stays = |context: &str| {
+        assert_eq!(git_out(&root, &["rev-parse", "HEAD"]), head, "{context}");
+        assert_eq!(
+            read(&root, "_skills/x/references/new.md"),
+            "mine",
+            "{context}"
+        );
+        assert_eq!(read(&root, "_skills/x/SKILL.md"), "skill", "{context}");
+        assert!(!root.join("_skills/.archive").exists(), "{context}");
+        std::fs::remove_dir_all(root.join("_skills/x/references")).expect("rm");
+    };
+    let guarded = CommitPaths::Guarded {
+        path: "_skills/x/references/new.md".to_owned(),
+    };
+
+    std::fs::create_dir_all(new.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&new, "mine").expect("new");
+    assert_eq!(
+        engine.commit_paths(&p.id, &ask, yes()).await.expect("asks"),
+        guarded
+    );
+    assert!(!record(&root).exists(), "there before: no record");
+    stays("there before");
+
+    std::fs::create_dir_all(new.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&new, "mine").expect("new");
+    let killed = engine.commit_paths_held(&p, &ask, &|| true, &|at| at != Cut::Recorded);
+    assert!(
+        !engine.unsettled_commit(&p.id).expect("unsettled"),
+        "there before, killed at the record: nothing to settle"
+    );
+    assert_eq!(killed.expect("refused with the guards"), guarded);
+    stays("there before, killed at the record");
+
+    let add = |at: Cut| {
+        if at == Cut::Prepared {
+            std::fs::create_dir_all(new.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&new, "mine").expect("new");
+        }
+        true
+    };
+    assert_eq!(
+        engine
+            .commit_paths_held(&p, &ask, &|| true, &add)
+            .expect("asks"),
+        guarded
+    );
+    stays("put there right before the publication");
+
+    assert!(matches!(
+        engine.commit_paths(&p.id, &ask, yes()).await.expect("asks"),
+        CommitPaths::Committed { .. }
+    ));
+    assert_eq!(read(&root, "_skills/.archive/x/SKILL.md"), "skill");
+}
+
 /// R95C-04, R95CR-06 and R95C3-01 at the publication: a fence that says no
 /// once the lane is held changes nothing; nor does a lease lost while the
 /// request's bytes are read and its guards read again — the fence is asked
@@ -1501,9 +1630,16 @@ async fn the_attributes_a_routed_write_needs_are_no_moved_path() {
     std::fs::write(root.join("notes.txt"), "notes").expect("notes");
     git_out(&root, &["add", "notes.txt"]);
     commit_as_person(&root, "notes");
+    // Every moved file guarded, as a move must be: what is refused is the
+    // attributes' place, not an unread file.
     let routed = |moves: Vec<(String, String)>| CommitRequest {
         writes: vec![("clip.bin".to_owned(), Some(vec![b'x'; 4096]))],
-        guards: vec![("clip.bin".to_owned(), None)],
+        guards: std::iter::once(("clip.bin".to_owned(), None))
+            .chain(moves.iter().map(|(from, _)| {
+                let bytes = std::fs::read(root.join(from)).expect("moved file");
+                (from.clone(), Some(blob_id(&bytes)))
+            }))
+            .collect(),
         moves,
         subject: "memory: nixi".to_owned(),
         ..CommitRequest::default()
@@ -1580,7 +1716,11 @@ async fn executable_files_stay_executable_on_the_disk() {
     let ask = CommitRequest {
         writes: vec![("tool.sh".to_owned(), Some(b"echo new".to_vec()))],
         moves: vec![("_skills/x".to_owned(), "_skills/archive/x".to_owned())],
-        guards: vec![("tool.sh".to_owned(), Some(blob_id(b"echo old")))],
+        guards: vec![
+            ("tool.sh".to_owned(), Some(blob_id(b"echo old"))),
+            ("_skills/x/SKILL.md".to_owned(), Some(blob_id(b"skill"))),
+            ("_skills/x/run.sh".to_owned(), Some(blob_id(b"echo run"))),
+        ],
         subject: "memory: nixi".to_owned(),
         ..CommitRequest::default()
     };
@@ -1718,6 +1858,10 @@ async fn a_persons_mode_change_is_never_undone() {
     };
     let ask = CommitRequest {
         moves: vec![("_skills/x".to_owned(), "_skills/archive/x".to_owned())],
+        guards: vec![
+            ("_skills/x/SKILL.md".to_owned(), Some(blob_id(b"skill"))),
+            ("_skills/x/run.sh".to_owned(), Some(blob_id(b"echo run"))),
+        ],
         subject: "memory: nixi".to_owned(),
         ..CommitRequest::default()
     };

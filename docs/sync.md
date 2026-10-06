@@ -1397,10 +1397,10 @@ cannot drift the first time someone uses plain `git`.
 
 ### A commit a caller writes: `Engine::commit_paths`
 
-The nightly memory consolidation commits through `Engine::commit_paths`: one
-commit of exactly the paths it asks for, under its own subject and, after the
-block above, closed trailers (`Memory-Origin`, `Source-Session`,
-`Approval-Record`). It never undoes a file:
+The nightly memory consolidation and the weekly skill curator commit through
+`Engine::commit_paths`: one commit of exactly the paths it asks for, under its
+own subject and, after the block above, closed trailers (`Memory-Origin`,
+`Source-Session`, `Approval-Record`). It never undoes a file:
 
 - Under the folder's lane and off the async executor, every path must land on
   itself under the folder's root — which is then held open, its `.git` held
@@ -1411,16 +1411,20 @@ block above, closed trailers (`Memory-Origin`, `Source-Session`,
   file's rule needs, may be another or inside another. The branch `HEAD`
   names and its commit are read once: every written path, every moved file
   and every declaration the caller read must be, in that commit and on the
-  disk, what the caller read. Anything else refuses the request with nothing
-  changed.
+  disk, what the caller read. A folder moves only with every file that
+  commit holds under it guarded, and only while the disk holds nothing else
+  under it: one the caller did not read — added since, committed or only put
+  on the disk — moves nothing, and stays where it was put with the folder.
+  Anything else refuses the request with nothing changed.
 - The commit is built from that commit's tree and the requested bytes alone —
   not the disk, not the index, whose other staged entries stay staged — with
   a large file's LFS object stored and its rule added to `.gitattributes` in
   the same commit. A record of it, and of the uploads it will owe, goes to
   `.git/keeper-commit-paths.json`, synced.
-- Every byte the disk will get is read, the guarded files are read again, and
-  then the caller's fence is asked, right before the branch moves from exactly
-  that commit to the new one in one compare-and-swap: the only publication.
+- Every byte the disk will get is read, the guarded files and what a moved
+  folder holds on the disk are read again, and then the caller's fence is
+  asked, right before the branch moves from exactly that commit to the new
+  one in one compare-and-swap: the only publication.
   The re-read is right before the publication, not one step with it: a guarded
   file that changes in the instant between them (one hash pass) does not stop
   it. Nothing on the disk or in the index changed before it, and a request

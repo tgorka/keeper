@@ -88,9 +88,18 @@ pub type Fence = CommitFence;
 /// The night window W at `now_ms` read at `offset` minutes: the latest
 /// [`night::SCHEDULE`] instant at or before now, epoch ms.
 pub fn night_window(now_ms: i64, offset: i32) -> Option<i64> {
-    let schedule = TaskSchedule::parse(night::SCHEDULE).ok()?;
+    latest_window(night::SCHEDULE, 2, now_ms, offset)
+}
+
+/// The latest instant of `schedule` at or before `now_ms` at `offset`
+/// minutes, epoch ms, found within the `lookback_days` before now.
+pub fn latest_window(schedule: &str, lookback_days: i64, now_ms: i64, offset: i32) -> Option<i64> {
+    let schedule = TaskSchedule::parse(schedule).ok()?;
     let first = schedule
-        .next_due_after(now_ms.saturating_sub(2 * 24 * 60 * 60_000), offset)
+        .next_due_after(
+            now_ms.saturating_sub(lookback_days * 24 * 60 * 60_000),
+            offset,
+        )
         .filter(|first| *first <= now_ms)?;
     Some(crate::cards::latest_fire(&schedule, first, now_ms, offset))
 }
@@ -134,7 +143,7 @@ impl Home {
     }
 
     /// A path of the agents zone, drive-relative.
-    fn in_agents(&self, rel: &str) -> String {
+    pub(crate) fn in_agents(&self, rel: &str) -> String {
         format!("{}/{rel}", self.agents)
     }
 
@@ -145,15 +154,20 @@ impl Home {
 }
 
 /// `rel`'s text in the commit at `HEAD`; `None` when it is not there.
-fn at_head(root: &Path, rel: &str) -> Result<Option<String>, String> {
-    keeper_sync::git::history::blob_at(root, "HEAD", rel)
-        .map_err(|error| format!("{rel} could not be read at HEAD: {error}"))?
+pub(crate) fn at_head(root: &Path, rel: &str) -> Result<Option<String>, String> {
+    text_at(root, "HEAD", rel)
+}
+
+/// `rel`'s text in the commit `rev` names; `None` when it is not there.
+pub(crate) fn text_at(root: &Path, rev: &str, rel: &str) -> Result<Option<String>, String> {
+    keeper_sync::git::history::blob_at(root, rev, rel)
+        .map_err(|error| format!("{rel} could not be read at {rev}: {error}"))?
         .map(|bytes| String::from_utf8(bytes).map_err(|_| format!("{rel} is not text")))
         .transpose()
 }
 
 /// The commit at `HEAD`, hex.
-fn head(root: &Path) -> Result<String, String> {
+pub(crate) fn head(root: &Path) -> Result<String, String> {
     let repo = keeper_sync::git::repo::open(root, false).map_err(|error| error.to_string())?;
     keeper_sync::git::repo::head_commit_id(&repo)
         .map_err(|error| error.to_string())?
@@ -162,7 +176,7 @@ fn head(root: &Path) -> Result<String, String> {
 }
 
 /// The names of the entries of `dir` on the disk that `keep` admits, sorted.
-fn names(dir: &Path, keep: fn(&std::fs::DirEntry) -> bool) -> Vec<String> {
+pub(crate) fn names(dir: &Path, keep: fn(&std::fs::DirEntry) -> bool) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -175,11 +189,11 @@ fn names(dir: &Path, keep: fn(&std::fs::DirEntry) -> bool) -> Vec<String> {
     out
 }
 
-fn is_dir(entry: &std::fs::DirEntry) -> bool {
+pub(crate) fn is_dir(entry: &std::fs::DirEntry) -> bool {
     entry.file_type().is_ok_and(|kind| kind.is_dir())
 }
 
-fn is_file(entry: &std::fs::DirEntry) -> bool {
+pub(crate) fn is_file(entry: &std::fs::DirEntry) -> bool {
     entry.file_type().is_ok_and(|kind| kind.is_file())
 }
 
@@ -192,15 +206,20 @@ fn is_file(entry: &std::fs::DirEntry) -> bool {
 pub struct Authority {
     pub config: AgentConfig,
     pub decl: DriveDecl,
-    guards: Vec<(String, Option<String>)>,
+    pub(crate) guards: Vec<(String, Option<String>)>,
 }
 
 impl Authority {
     /// Read at `HEAD` of `home`'s drive.
     pub fn at_head(home: &Home) -> Result<Authority, String> {
+        Authority::at(home, "HEAD")
+    }
+
+    /// Read in the commit `rev` of `home`'s drive.
+    pub fn at(home: &Home, rev: &str) -> Result<Authority, String> {
         let decl_path = home.in_agents(drive::FILE_NAME);
         let config_path = home.in_agents(&format!("{}/{}", home.folder, agent_home::FILE_NAME));
-        let decl_text = at_head(&home.root, &decl_path)?
+        let decl_text = text_at(&home.root, rev, &decl_path)?
             .ok_or_else(|| format!("{decl_path} is not in the drive"))?;
         let decl = drive::parse(&decl_text).map_err(|refusal| refusal.to_string())?;
         if decl != home.decl {
@@ -209,7 +228,7 @@ impl Authority {
                  the host's next scan"
             ));
         }
-        let config_text = at_head(&home.root, &config_path)?
+        let config_text = text_at(&home.root, rev, &config_path)?
             .ok_or_else(|| format!("{config_path} is not in the drive"))?;
         let config = agent_home::parse_agent_toml(&config_text, &home.folder, &decl)
             .map_err(|refusal| refusal.to_string())?;
@@ -469,8 +488,11 @@ fn pending(home: &Home, ids: &[Ulid]) -> Result<BTreeMap<Ulid, String>, String> 
     Ok(out)
 }
 
-/// The moves, verdicts and guards that settle `settled` over `commit`.
-fn settle_into(
+/// The moves, verdicts and guards that settle `settled` over `commit`: the
+/// pending proposal at the blob read, its `done/` place and its verdict
+/// where nothing is — a file a person put there stays theirs, and the
+/// commit is not made.
+pub(crate) fn settle_into(
     home: &Home,
     settled: &[Settled],
     blobs: &BTreeMap<Ulid, String>,
@@ -484,6 +506,7 @@ fn settle_into(
         request
             .guards
             .push((pending.clone(), blobs.get(&one.id).cloned()));
+        request.guards.push((done.clone(), None));
         request.moves.push((pending, done));
         let verdict = home.in_agents(&verdict);
         request.guards.push((verdict.clone(), None));
@@ -495,8 +518,16 @@ fn settle_into(
 }
 
 /// `change` (agents-zone-relative) into `request`, guarded on its bytes
-/// before.
-fn change_into(home: &Home, change: &FileChange, request: &mut CommitRequest) {
+/// before. A folder moved whole is guarded file by file as the commit
+/// `rev` holds it — its `SKILL.md` on `change.before` — and its new place
+/// where nothing is: a file of it added, changed or removed since, or one
+/// at its new place, writes nothing (R208).
+pub(crate) fn change_into(
+    home: &Home,
+    change: &FileChange,
+    rev: &str,
+    request: &mut CommitRequest,
+) -> Result<(), String> {
     let path = home.in_agents(&change.path);
     let before = change
         .before
@@ -508,13 +539,25 @@ fn change_into(home: &Home, change: &FileChange, request: &mut CommitRequest) {
             request.writes.push((path, Some(text.clone().into_bytes())));
         }
         After::MovedTo(to) => {
-            request.guards.push((format!("{path}/SKILL.md"), before));
-            request.moves.push((path, home.in_agents(to)));
+            let skill = format!("{path}/SKILL.md");
+            let files = keeper_sync::git::history::files_at(&home.root, rev, &path)
+                .map_err(|error| format!("{path} could not be read at {rev}: {error}"))?;
+            request.guards.extend(
+                files
+                    .into_iter()
+                    .filter(|file| file.path != skill)
+                    .map(|file| (file.path, Some(file.id))),
+            );
+            request.guards.push((skill, before));
+            let to = home.in_agents(to);
+            request.guards.push((to.clone(), None));
+            request.moves.push((path, to));
         }
     }
+    Ok(())
 }
 
-fn request(
+pub(crate) fn request(
     subject: String,
     origin: &str,
     sources: &BTreeSet<String>,
@@ -677,7 +720,7 @@ pub fn decided(home: &Home, now: DateTime<Utc>) -> Result<Vec<CommitRequest>, St
             &authority,
             Some(id),
         );
-        change_into(home, &waiting.args.change, &mut ask);
+        change_into(home, &waiting.args.change, &commit, &mut ask)?;
         settle_into(home, &settled, &blobs, &commit, now, &mut ask);
         out.push(ask);
     }
@@ -836,7 +879,7 @@ pub fn plan_home(home: &Home, drive: &[Home], now: DateTime<Utc>) -> Result<Plan
         None,
     );
     for change in &plan.writes {
-        change_into(home, change, &mut out);
+        change_into(home, change, &commit, &mut out)?;
     }
     settle_into(home, &plan.settled, &blobs, &commit, now, &mut out);
     Ok(Planned {
@@ -1232,7 +1275,7 @@ pub(crate) struct NightDrive {
 }
 
 impl NightDrive {
-    fn homes(&self) -> Vec<Home> {
+    pub(crate) fn homes(&self) -> Vec<Home> {
         self.homes.iter().map(|one| one.home.clone()).collect()
     }
 }
@@ -1262,7 +1305,7 @@ pub(crate) enum Remembered {
 
 /// How long a drive whose night is held elsewhere or did not finish waits
 /// before this host tries again: a lapsed holder's claim is free by then.
-const AGAIN: Duration = claim::TTL;
+pub(crate) const AGAIN: Duration = claim::TTL;
 
 /// A host's nights: one run in flight, started from the tick and never
 /// waited on by it; what each drive's night came to remembered, so a night

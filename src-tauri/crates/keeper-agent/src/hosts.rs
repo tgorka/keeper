@@ -7173,4 +7173,292 @@ mod tests {
             "the drive is the other host's"
         );
     }
+
+    /// R95U-02 and R95U-03, through the curator's own `run_round`: the
+    /// drive's one maintenance claim held by another host — whichever job
+    /// it runs — keeps the week owed, unrecorded, and not asked again
+    /// before its wait; once that holder died (its claim lapsed) the week
+    /// is taken over, settles and is recorded under `curate:<drive>`, never
+    /// as the night's; a week whose pull fails stays owed, its claim handed
+    /// back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_week_is_remembered_done_only_when_it_was() {
+        use crate::consolidate::{NightDrive, NightHome, NightRound, Remembered};
+        use crate::curate::run_round;
+        let w = world(Duration::ZERO, true);
+        let data = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(crate::headless::HeadlessSyncPlatform::new(
+            data.path(),
+            ME,
+            Arc::new(crate::headless::SecretMap::new(
+                keeper_sync::xdg::SecretStore::new(
+                    crate::headless::SECRET_ENV_PREFIX,
+                    data.path().join("secrets"),
+                ),
+            )),
+        ));
+        let engine = Arc::new(keeper_sync::Engine::open(platform).expect("engine"));
+        let (lease, week, night) = (
+            claim::maintenance_key("tgdrive"),
+            claim::completion_key(keeper_core::agents::curate::JOB, "tgdrive"),
+            claim::completion_key(keeper_core::agents::consolidate::JOB, "tgdrive"),
+        );
+        let copy = Arc::clone(&w.copy) as Arc<dyn CopyPort>;
+        // Calibrated, as a host's is once it read back its own event: a
+        // lapsed claim of another host is judged by the server's clock.
+        let clock = Arc::new(ServerClock::default());
+        let calibrated = wall_ms();
+        clock.observe(calibrated, calibrated, calibrated);
+        let round = |homes: Vec<NightHome>| NightRound {
+            me: HostSlug::new(ME).expect("slug"),
+            control: control(),
+            clock: Arc::clone(&clock),
+            rtt: Arc::default(),
+            now_ms: 0,
+            offset: 0,
+            drives: vec![NightDrive {
+                id: "tgdrive".to_owned(),
+                homes,
+                copy: Arc::clone(&copy),
+            }],
+        };
+        let failing = NightHome {
+            home: crate::consolidate::Home {
+                drive: "tgdrive".to_owned(),
+                profile_id: "no-such-profile".to_owned(),
+                root: data.path().join("tgdrive"),
+                agents: "80-agents".to_owned(),
+                sessions: "60-sessions".to_owned(),
+                folder: "nixi".to_owned(),
+                config: config(),
+                decl: keeper_core::agents::drive::parse(&drive_toml()).expect("decl"),
+                host: ME.to_owned(),
+            },
+            copy: Arc::clone(&copy),
+        };
+        let this_week = 1_791_003_600_000_i64;
+        let next_week = this_week + 7 * 24 * 60 * 60 * 1000;
+        let remembered = |what: &Arc<Mutex<BTreeMap<String, Remembered>>>| {
+            what.lock().expect("lock").get("tgdrive").copied()
+        };
+        let other = Claimant {
+            host: OTHER.to_owned(),
+            ..claimant(&HostSlug::new(ME).expect("slug"), w.copy.as_ref())
+        };
+        let hold = |content: serde_json::Value| {
+            w.server().put(
+                &control(),
+                CLAIM,
+                &lease,
+                &w.copy.config.matrix_user,
+                content,
+            );
+        };
+
+        // Held by another host.
+        let now = wall_ms();
+        hold(serde_json::to_value(other.content(1, now, now, false, None)).expect("content"));
+        let state = Arc::default();
+        run_round(
+            Arc::clone(&engine),
+            round(Vec::new()),
+            this_week,
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(
+            matches!(remembered(&state), Some(Remembered::Again(_))),
+            "held"
+        );
+        assert!(claim_at(&w, &week).is_none());
+        // The holder dies; not asked again before the wait is over.
+        hold(serde_json::to_value(other.content(2, now, now, false, None)).expect("content"));
+        let lapsed = now - claim::TTL.as_millis() as u64 - 1_000;
+        w.server()
+            .states
+            .lock()
+            .expect("lock")
+            .get_mut(&(control(), CLAIM.to_owned(), lease.clone()))
+            .expect("the claim")
+            .origin_server_ts = MilliSecondsSinceUnixEpoch(UInt::new(lapsed).expect("ts"));
+        run_round(
+            Arc::clone(&engine),
+            round(Vec::new()),
+            this_week,
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(matches!(remembered(&state), Some(Remembered::Again(_))));
+        assert!(claim_at(&w, &week).is_none());
+        // Asked again: the lapsed claim is taken over and the week settles.
+        let state = Arc::default();
+        run_round(
+            Arc::clone(&engine),
+            round(Vec::new()),
+            this_week,
+            Arc::clone(&state),
+        )
+        .await;
+        assert_eq!(remembered(&state), Some(Remembered::Done(this_week)));
+        assert_eq!(
+            claim_at(&w, &week).expect("recorded").content.window,
+            Some(claim::rfc3339(this_week as u64))
+        );
+        assert!(
+            claim_at(&w, &night).is_none(),
+            "the week is not the night's"
+        );
+
+        // A pull that fails.
+        let state = Arc::default();
+        run_round(
+            Arc::clone(&engine),
+            round(vec![failing]),
+            next_week,
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(
+            matches!(remembered(&state), Some(Remembered::Again(_))),
+            "failed"
+        );
+        assert_eq!(
+            claim_at(&w, &week).expect("recorded").content.window,
+            Some(claim::rfc3339(this_week as u64)),
+            "the failed week is not recorded"
+        );
+        assert!(claim_at(&w, &lease).expect("claim").content.released);
+    }
+
+    /// R95U2-04, through the curator's `run_round` on a real home: a week
+    /// whose pull succeeded but whose publication was held — a person's
+    /// file where a gate proposal's expiry would move it, one the drive
+    /// does not sync — wrote nothing, so it is not done and its window is
+    /// not recorded; nor is a week whose commit was published but whose
+    /// files could not all follow it (R95U-02, rung 2's R95C3-07). Asked
+    /// again the same week once both are gone, it is done, the proposal
+    /// expired.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_week_held_at_its_publication_is_owed_again() {
+        use crate::consolidate::{NightDrive, NightHome, NightRound, Remembered};
+        use crate::curate::run_round;
+        use keeper_core::agents::memory::MemoryTarget;
+        use keeper_core::agents::proposal::{Op, Origin, Proposal, Target};
+        use std::os::unix::fs::PermissionsExt as _;
+        let w = world(Duration::ZERO, true);
+        let created = chrono::Utc::now() - chrono::Duration::days(31);
+        let id = ulid::Ulid::from_parts(
+            u64::try_from(created.timestamp_millis()).expect("after 1970"),
+            1,
+        );
+        let pending = format!("80-agents/nixi/proposals/{id}.md");
+        let done = format!("80-agents/nixi/proposals/done/{id}.md");
+        let text = Proposal {
+            id,
+            agent: "nixi".to_owned(),
+            target: Target::Memory(MemoryTarget::Memory),
+            op: Op::Add,
+            matched: None,
+            session: "60-sessions/active/s0".to_owned(),
+            host: ME.to_owned(),
+            origin: Origin::Gate,
+            label: Label {
+                readers: Readers::Only(std::collections::BTreeSet::from([user(PERSON)])),
+                integrity: Integrity::Agent,
+                local_only: false,
+            },
+            created_at: created,
+            body: "tgorka reviews on Fridays".to_owned(),
+        }
+        .render();
+        let checkout = tempfile::tempdir().expect("tempdir");
+        let Some((engine, home)) = real_drive(
+            checkout.path(),
+            &[
+                (pending.clone(), text),
+                (".gitignore".to_owned(), format!("{done}\n")),
+            ],
+        )
+        .await
+        else {
+            return;
+        };
+        let week = claim::completion_key(keeper_core::agents::curate::JOB, "tgdrive");
+        let copy = Arc::clone(&w.copy) as Arc<dyn CopyPort>;
+        let round = || NightRound {
+            me: HostSlug::new(ME).expect("slug"),
+            control: control(),
+            clock: Arc::default(),
+            rtt: Arc::default(),
+            now_ms: 0,
+            offset: 0,
+            drives: vec![NightDrive {
+                id: "tgdrive".to_owned(),
+                homes: vec![NightHome {
+                    home: home.clone(),
+                    copy: Arc::clone(&copy),
+                }],
+                copy: Arc::clone(&copy),
+            }],
+        };
+        let remembered = |what: &Arc<Mutex<BTreeMap<String, Remembered>>>| {
+            what.lock().expect("lock").get("tgdrive").copied()
+        };
+        let window = 1_791_003_600_000_i64;
+        let head = || {
+            std::process::Command::new("git")
+                .current_dir(&home.root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("git")
+                .stdout
+        };
+
+        std::fs::create_dir_all(home.root.join(&done).parent().expect("done")).expect("mkdir");
+        std::fs::write(home.root.join(&done), "mine\n").expect("mine");
+        let before = head();
+        let state = Arc::default();
+        run_round(Arc::clone(&engine), round(), window, Arc::clone(&state)).await;
+        assert_eq!(head(), before, "nothing published");
+        assert!(home.root.join(&pending).is_file(), "still pending");
+        assert!(
+            matches!(remembered(&state), Some(Remembered::Again(_))),
+            "not done: {:?}",
+            remembered(&state)
+        );
+        assert!(claim_at(&w, &week).is_none(), "not recorded");
+
+        // The person's file is gone, but the place it was cannot be written:
+        // the commit is published and its files do not all follow, so the
+        // week is still not done.
+        std::fs::remove_file(home.root.join(&done)).expect("rm");
+        let place = home.root.join(&done);
+        let place = place.parent().expect("done");
+        std::fs::set_permissions(place, std::fs::Permissions::from_mode(0o555)).expect("read-only");
+        let state = Arc::default();
+        run_round(Arc::clone(&engine), round(), window, Arc::clone(&state)).await;
+        std::fs::set_permissions(place, std::fs::Permissions::from_mode(0o755)).expect("writable");
+        assert_ne!(head(), before, "published");
+        assert_eq!(engine.unsettled_commit(&home.profile_id).ok(), Some(true));
+        assert!(
+            matches!(remembered(&state), Some(Remembered::Again(_))),
+            "not done: {:?}",
+            remembered(&state)
+        );
+        assert!(claim_at(&w, &week).is_none(), "not recorded");
+
+        // Asked again the same week: the pull finishes the commit, and the
+        // week is done.
+        let state = Arc::default();
+        run_round(Arc::clone(&engine), round(), window, Arc::clone(&state)).await;
+        assert_eq!(engine.unsettled_commit(&home.profile_id).ok(), Some(false));
+        assert!(!home.root.join(&pending).exists(), "expired");
+        assert!(home.root.join(&done).is_file());
+        assert_eq!(remembered(&state), Some(Remembered::Done(window)));
+        assert_eq!(
+            claim_at(&w, &week).expect("recorded").content.window,
+            Some(claim::rfc3339(window as u64))
+        );
+    }
 }
