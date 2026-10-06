@@ -536,7 +536,7 @@ or written: a place whose audience is wider than the label's readers is refused.
 | an invite into a room | the invited person, or a known agent's own audience |
 | `delegate` (the hand-off and each later round), `reply` (the model's, or the host's when a budget is spent) | the target agent's audience and every person in the room at that send |
 | `drive_write`, `drive_edit` | the drive's readers (a drive with no declaration counts as anyone) |
-| `session_write`, `card_update`, a long answer's artifact | the home drive's readers |
+| `session_write`, `card_update`, `bmad_render`, `bmad_memlog`, a long answer's artifact | the home drive's readers |
 | a model round | only `local_only` binds a model: a non-local model is refused while it is set |
 
 A room is read when something is sent into it, every time — a retried edit too: its joined and
@@ -633,7 +633,7 @@ tier decides whether it runs:
 | tier | calls | what keeper does |
 | --- | --- | --- |
 | T0 | `drive_list`, `drive_read`, `drive_glob`, `drive_grep`, `drive_stat`; `bmad_config`, `bmad_party`, `skills_list`, `skill_view` | runs it |
-| T1 | `session_write`; `card_update` on a card of the session; a `drive_write` or `drive_edit` inside the session's own folder; `delegate` and its later rounds; `reply`; the five `surface_*` tools | runs it |
+| T1 | `session_write`; `card_update` on a card of the session; a `drive_write` or `drive_edit` inside the session's own folder; `delegate` and its later rounds; `reply`; the five `surface_*` tools; `bmad_render` and `bmad_memlog`, which write only inside the session | runs it |
 | T2 | `drive_write` or `drive_edit` outside the session; `card_update` on another session's card; any write the agent's grant asks a person about | asks a person |
 | T3 | `card_update` that sets `schedule` or `workflow`, and a `delegate` whose card carries either — in every session, the person's own DM included; letting a blocked flow through (a declassification) | asks a person, for that one action |
 | T5 | a write — `drive_write`, `drive_edit`, `session_write` or `card_update` — that lands on any `agent.toml`, any `_drive.toml`, or anything in a session's `approvals/`, on any drive | never: "keeper never lets an agent do this: it would change the agent's own configuration or the approvals that guard its work. A person can do it themselves. Nothing was changed." |
@@ -1155,9 +1155,16 @@ neither tool and keeps its fences as they were.
   Nothing was changed." `run` and `last_run` are refused ("… is written by the host that runs the
   card"), `scheduled_by` and `integrity` too ("… is written by keeper"), and `requested_by`.
 - `session_write(path, content)` writes a file of the session: markdown, csv or json anywhere in
-  it, finished output under `artifacts/`, anything under `workspace/`; never `log/`, `approvals/`,
-  `agent.toml`, `README.md` or `AGENTS.md`. A file that exists is replaced through a write guarded
-  on its exact bytes.
+  it; finished output under `artifacts/`, which also takes BMAD's output kinds — `.yaml`, `.yml`,
+  `.toml`, `.txt` and `.html` (a person's *New file* keeps markdown, csv and json); anything under
+  `workspace/`; never a dotted name, `log/`, `approvals/`, `agent.toml`, `README.md` or `AGENTS.md`.
+  A file that exists is replaced through a write guarded on its exact bytes. `path` is
+  session-relative, or drive-relative through this session's folder as `bmad_config`'s and
+  `bmad_render`'s write locations name it (`60-sessions/active/<session>/artifacts/…`): both name
+  the same file, and its audit row names it once. Every session write is a temp file synced to the
+  disk and renamed over the old one, then the folder synced; a folder a write makes, and a move,
+  are synced into their parent folders before the journal counts the step, and the journal's
+  removal is synced too, so a crash or a power cut leaves the old file or the new one whole.
 
 Both are one fenced door. A path is followed on the disk to where it lands, and the fence is asked
 there: a folder link out of the session (to another session's cards) is refused, and so is one
@@ -2074,13 +2081,16 @@ of the drive; when it is absent, or is a link that leads out of the drive (as tg
 link into makistack is), no team or personal overlay applies and `bmad_config` and `bmad_party`
 say which, under `overlays`. To use overlays under agents, commit `_bmad/custom/` into the drive.
 
-**The tools.** All four are reads (T0), served by the agent's own host and never offered to a ⌘9
-bot. They read the home drive, so they are offered — and run — only where the agent's grant lets a
-`drive_read` of the home drive run: the drive in its `[tools].drives` and in the session's scope.
-Each file is read through keeper-sync's containment and joins the session's label as a read of it,
-labelled where it landed through every link as well as by the path the call named (the stricter
-wins), and by the bytes the tool returned — what the file holds afterwards changes nothing. A
-read whose landing cannot be established is `untrusted`.
+**The tools.** `bmad_config`, `bmad_party`, `skills_list` and `skill_view` are reads (T0);
+`bmad_render` and `bmad_memlog` write only inside the session (T1). All six are served by the
+agent's own host and never offered to a ⌘9 bot. They read the home drive, so they are offered —
+and run — only where the agent's grant lets a `drive_read` of the home drive run: the drive in its
+`[tools].drives` and in the session's scope. Each file is read through keeper-sync's containment
+and joins the session's label as a read of it, labelled where it landed through every link as well
+as by the path the call named (the stricter wins), and by the bytes the tool returned — what the
+file holds afterwards changes nothing. A read whose landing cannot be established is `untrusted`.
+The two writes are checked against the home drive's readers, as `session_write` is, and are made
+only while this host holds the session's claim.
 
 - `bmad_config({scope: "central", keys?})` prints what `resolve_config.py` prints for the four
   layers of `_bmad/` (`config.toml`, `config.user.toml`, `custom/config.toml`,
@@ -2096,6 +2106,39 @@ read whose landing cannot be established is `untrusted`.
   the menu of groups, or one group — under `party`, for the drive's `[agents]` and the party
   skill's customization (the offered skill `bmad-party-mode`, or the running workflow of that
   name).
+- `bmad_render({skill?})` renders a format-B skill as `render_skill.py` does — the offered skill
+  `_skills/<skill>/`, or without `skill` the running workflow's `_workflows/<name>/` — with the
+  central configuration and the skill's customization, every `{project-root}` path bound to its
+  write location in the session. Each render is one generation, named by the hash of everything
+  that went into it, published whole at `<session>/workspace/bmad-render/<skill>/<generation>/`
+  with its `manifest.json`: staged in a folder of its own (a fresh dotted name, made new and real
+  inside the session — whatever already stands at a staging name is never written through) and
+  moved into place in one journaled step only once the staged tree is exactly the rendered files,
+  with no link, no other kind of entry and nothing extra. The answer is `read and follow
+  <session>/workspace/bmad-render/<skill>/<generation>/workflow.md`. A second render of the same
+  inputs names the same generation and writes nothing, once the folder there is checked against
+  its manifest; an edited one is refused, and so is one holding a link, another kind of entry or a
+  file that cannot be read ("HALT: corrupt existing generation …: <file> is a link"). Any refusal
+  is the script's own sentence after `HALT: ` — for example "HALT: ambiguous config value
+  `implementation_artifacts` found at: …" on an install whose modules repeat a key (DW-383) — and
+  nothing is written. A source that links out of the skill's folder halts the render unread, and a
+  folder of the skill that cannot be listed halts it naming that folder: nothing is published from
+  part of the sources. The render is made before it is admitted, so where a declassification is
+  asked for it (a session narrowed below the home drive's readers), the approval binds that
+  generation — its folder and its manifest's SHA-256: a source or customization changed while it
+  waits is another effect, refused on that approval. `workspace/` is not synced, so another host
+  renders again.
+- `bmad_memlog({command, workspace | path, …})` is `memlog.py`'s `init` (`fields`, each
+  `key=value`), `append` (`text`, `type?`, `by?`) and `set` (`key`, `value`) on a run's
+  `.memlog.md` — `workspace` names the run folder, `path` the file, session-relative or
+  drive-relative as `bmad_config`'s write locations give it — and answers its one line,
+  `{"ok": true, "memlog": <path>, "entries": <n>}`. The memlog is the one dotted file keeper
+  writes into a session, and only under `artifacts/`: any other dotted name, or a memlog anywhere
+  else, is refused as every dotted name is. A memlog that is there but cannot be read (bytes that
+  are not UTF-8, a file this host may not read) is refused, never started over, and `init` creates
+  its file only where none has appeared since it looked. Each call is one atomic, durable write
+  through the session runtime, guarded on the bytes it read; the board does not list the memlog,
+  and the model reads it back with `drive_read`.
 - `skills_list()` lists the skills offered to the agent by name and purpose, then every folder of
   `_skills/` that is not offered, with the validator's reason.
 - `skill_view({name, path?})` returns an offered skill's `SKILL.md`, or one file inside its

@@ -1023,14 +1023,17 @@ impl AllowedTools<'_> {
     }
 
     /// Where a card tool's call lands, as it runs it: `card_update`'s card,
-    /// `session_write`'s path, in this session.
+    /// `session_write`'s path, in this session — named session-relative or
+    /// drive-relative, one file ([`crate::sessions::write::in_session`]).
     fn card_at(&self, tool: AgentTool, args: &Value) -> String {
         let key = if tool == AgentTool::CardUpdate {
             "card"
         } else {
             "path"
         };
-        format!("{}/{}", self.session_dir, args[key].as_str().unwrap_or(""))
+        let rel =
+            crate::sessions::write::in_session(&self.session_dir, args[key].as_str().unwrap_or(""));
+        format!("{}/{rel}", self.session_dir)
     }
 
     /// A call later in a parked round, by the table's tier for its line:
@@ -1321,24 +1324,87 @@ impl ToolHost for AllowedTools<'_> {
         if crate::bmad::serves(&wire.name) {
             let tool = AgentTool::from_wire(&wire.name)?;
             let classification = self.classify(&wire.id, tool, &CallFacts::default(), None);
-            let gated = self.gated(&wire.id, &wire.name, &classification, &[], Vec::new());
-            let at = self.bmad.at(wire);
+            if !crate::bmad::writes(&wire.name) {
+                let at = self.bmad.at(wire);
+                let gated = self.gated(&wire.id, &wire.name, &classification, &[], Vec::new());
+                let audit = CallAudit::new(
+                    self.sinks,
+                    &wire.name,
+                    Effect::Read,
+                    &classification,
+                    gated,
+                    (&self.home.id, &at),
+                );
+                let outcome = if !self.allow.contains(&wire.name) {
+                    refusal(format!("{} is not one of this agent's tools.", wire.name))
+                } else if let Err(denied) = grant_read(self.grants.as_ref(), &self.home.id, &at) {
+                    refusal(denied)
+                } else {
+                    match audit.admit(&self.home.id, &at) {
+                        Ok(()) => self.bmad.run(wire, &|| self.view.may_write()),
+                        Err(withheld) => withheld.into(),
+                    }
+                };
+                audit.finish(&outcome);
+                return Some(outcome);
+            }
+            // `bmad_render` and `bmad_memlog` write into the session, as
+            // `session_write` does: checked against the home drive's
+            // readers before any effect, then made under the claim. They
+            // read the home drive too, so its grant is asked before
+            // anything is read. A render is prepared first, so what its
+            // admission binds — a declassification's bytes, the park's pin
+            // — is the generation it publishes (R191).
+            let named = self.bmad.at(wire);
+            let prepared = if !self.allow.contains(&wire.name) {
+                Err(format!("{} is not one of this agent's tools.", wire.name))
+            } else {
+                grant_read(self.grants.as_ref(), &self.home.id, &named)
+                    .map(|()| self.bmad.prepare(wire))
+            };
+            let at = prepared
+                .as_ref()
+                .map_or(named, |prepared| prepared.at.clone());
+            let gated = self.gated(
+                &wire.id,
+                &wire.name,
+                &classification,
+                &[],
+                vec![(self.home.id.clone(), at.clone())],
+            );
             let audit = CallAudit::new(
                 self.sinks,
                 &wire.name,
-                Effect::Read,
+                Effect::Write,
                 &classification,
                 gated,
                 (&self.home.id, &at),
-            );
-            let outcome = if !self.allow.contains(&wire.name) {
-                refusal(format!("{} is not one of this agent's tools.", wire.name))
-            } else if let Err(denied) = grant_read(self.grants.as_ref(), &self.home.id, &at) {
-                refusal(denied)
-            } else {
-                match audit.admit(&self.home.id, &at) {
-                    Ok(()) => self.bmad.run(wire),
-                    Err(withheld) => withheld.into(),
+            )
+            .lifting(self, &wire.id);
+            let outcome = match prepared {
+                Err(sentence) => refusal(sentence),
+                Ok(prepared) => {
+                    let admitted = self
+                        .sinks
+                        .verdict(
+                            &wire.name,
+                            &Destination::Drive {
+                                drive: self.home.id.clone(),
+                                path: at.clone(),
+                            },
+                            &self.view.label(),
+                            &Sink::DriveWrite {
+                                drive_readers: Readers::Only(self.home.readers.clone()),
+                            },
+                            &prepared.effect,
+                            None,
+                        )
+                        .or_else(|blocked| audit.blocked(blocked))
+                        .and_then(|()| audit.admit(&self.home.id, &at));
+                    match admitted {
+                        Ok(()) => self.bmad.write(prepared, &|| self.view.may_write()),
+                        Err(withheld) => withheld.into(),
+                    }
                 }
             };
             audit.finish(&outcome);
@@ -4257,7 +4323,11 @@ async fn run_agent_turn(
         deps.home.drive.id.clone(),
         deps.drive_root.clone(),
         drive_relative(&deps.drive_root, &deps.home.zone),
-        format!("{session_dir}/artifacts"),
+        crate::bmad::SessionFolder {
+            zone: deps.sessions_zone.clone(),
+            path: context.session.path.clone(),
+            dir: session_dir.clone(),
+        },
         context.agent.workflow.clone(),
         context.skills.clone(),
     );

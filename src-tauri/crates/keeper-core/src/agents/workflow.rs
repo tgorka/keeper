@@ -20,6 +20,10 @@ use crate::bots::chat::ToolSpec;
 
 /// `resolve_config.py` and `resolve_customization.py`, ported.
 pub const BMAD_CONFIG: &str = "bmad_config";
+/// `render_skill.py`, ported: a format-B skill rendered into the session.
+pub const BMAD_RENDER: &str = "bmad_render";
+/// `memlog.py`, ported: the run's `.memlog.md` under `artifacts/`.
+pub const BMAD_MEMLOG: &str = "bmad_memlog";
 /// `resolve_party.py`, ported.
 pub const BMAD_PARTY: &str = "bmad_party";
 /// The skills offered to the agent.
@@ -32,8 +36,8 @@ pub const SKILL_VIEW: &str = "skill_view";
 /// root is and what BMAD may assume there.
 const FRAMED: [&str; 7] = [
     BMAD_CONFIG,
-    "bmad_render",
-    "bmad_memlog",
+    BMAD_RENDER,
+    BMAD_MEMLOG,
     BMAD_PARTY,
     SKILLS_LIST,
     SKILL_VIEW,
@@ -104,7 +108,7 @@ pub const CAPABILITIES: [Capability; 19] = [
     },
     Capability {
         assumes: "run commands (`uv run`, Python ≥ 3.11)",
-        tools: &[BMAD_CONFIG, "bmad_render", "bmad_memlog", BMAD_PARTY, "run"],
+        tools: &[BMAD_CONFIG, BMAD_RENDER, BMAD_MEMLOG, BMAD_PARTY, "run"],
         said: &[(
             When::Without(&["run"]),
             "keeper never runs BMAD's Python helpers; a script with no Rust port (DW-382) runs only through `run`, which is not offered.",
@@ -389,6 +393,45 @@ pub struct ViewCall {
     pub path: Option<String>,
 }
 
+/// One `bmad_render` call: the format-B skill to render — the offered
+/// skill `skill` under `_skills/`, or, without one, the workflow the
+/// session runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderCall {
+    pub skill: Option<String>,
+}
+
+/// Which memlog a `bmad_memlog` call writes, as `memlog.py` addresses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemlogTarget {
+    /// `--workspace`: the run folder; the memlog is `<folder>/.memlog.md`.
+    Workspace(String),
+    /// `--path`: the memlog file itself.
+    Path(String),
+}
+
+/// `memlog.py`'s three commands and their flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemlogCommand {
+    /// `init --field key=value …`.
+    Init { fields: Vec<String> },
+    /// `append --text … [--type …] [--by …]`.
+    Append {
+        text: String,
+        entry_type: Option<String>,
+        by: Option<String>,
+    },
+    /// `set --key … --value …`.
+    Set { key: String, value: String },
+}
+
+/// One `bmad_memlog` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemlogCall {
+    pub target: MemlogTarget,
+    pub command: MemlogCommand,
+}
+
 /// The specs of this module's tools that `allow` names, in the
 /// vocabulary's order.
 pub fn specs(allow: &[String]) -> Vec<ToolSpec> {
@@ -428,6 +471,41 @@ pub fn specs(allow: &[String]) -> Vec<ToolSpec> {
                     "keys": {"type": "array", "items": {"type": "string"}, "description": "Dotted keys to print, e.g. [\"agents\"] or [\"workflow\"]; a key not found is left out. Without it, everything."}
                 },
                 "required": ["scope"],
+                "additionalProperties": false
+            }),
+        });
+    }
+    if allowed(BMAD_RENDER) {
+        specs.push(ToolSpec {
+            name: BMAD_RENDER.to_owned(),
+            description: "Render a format-B BMAD skill as its render_skill.py does, with the drive's BMAD configuration and this session's write location for {project-root}: publishes it once under this session's workspace/bmad-render/ and answers \"read and follow <path>/workflow.md\", or \"HALT: <why>\" — then stop as the skill says.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "skill": {"type": "string", "description": "An offered skill under _skills/. Without it, the workflow this session runs."}
+                },
+                "additionalProperties": false
+            }),
+        });
+    }
+    if allowed(BMAD_MEMLOG) {
+        specs.push(ToolSpec {
+            name: BMAD_MEMLOG.to_owned(),
+            description: "BMAD's memlog.py inside this session: init, append to or set a field of a run's .memlog.md under artifacts/, written atomically; answers memlog.py's one-line acknowledgement.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["init", "append", "set"]},
+                    "workspace": {"type": "string", "description": "The run folder under artifacts/; the memlog is its .memlog.md (--workspace). Session-relative, or drive-relative as bmad_config's write locations give it."},
+                    "path": {"type": "string", "description": "The memlog file itself, named .memlog.md, instead of workspace (--path)."},
+                    "fields": {"type": "array", "items": {"type": "string"}, "description": "init: frontmatter fields, each key=value (--field)."},
+                    "text": {"type": "string", "description": "append: the entry; whitespace runs collapse to one line (--text)."},
+                    "type": {"type": "string", "description": "append: the entry's kind, rendered as a tag (--type)."},
+                    "by": {"type": "string", "description": "append: who the entry came from (--by)."},
+                    "key": {"type": "string", "description": "set: the frontmatter field (--key)."},
+                    "value": {"type": "string", "description": "set: its value (--value)."}
+                },
+                "required": ["command"],
                 "additionalProperties": false
             }),
         });
@@ -515,6 +593,100 @@ pub fn parse_config(args: &Value) -> Result<ConfigCall, String> {
         ),
     };
     Ok(ConfigCall { scope, keys })
+}
+
+/// Read a `bmad_render` call's arguments.
+pub fn parse_render(args: &Value) -> Result<RenderCall, String> {
+    let keys = object(BMAD_RENDER, args, &["skill"])?;
+    Ok(RenderCall {
+        skill: text(BMAD_RENDER, keys, "skill")?,
+    })
+}
+
+/// Read a `bmad_memlog` call's arguments as `memlog.py`'s argparse reads
+/// its command line: one of `workspace` and `path`, and the command's own
+/// flags only.
+pub fn parse_memlog(args: &Value) -> Result<MemlogCall, String> {
+    const TARGET: [&str; 3] = ["command", "workspace", "path"];
+    let all = object(
+        BMAD_MEMLOG,
+        args,
+        &[
+            "command",
+            "workspace",
+            "path",
+            "fields",
+            "text",
+            "type",
+            "by",
+            "key",
+            "value",
+        ],
+    )?;
+    let command = all.get("command").and_then(Value::as_str);
+    let flags: &[&str] = match command {
+        Some("init") => &["fields"],
+        Some("append") => &["text", "type", "by"],
+        Some("set") => &["key", "value"],
+        _ => return Err("bmad_memlog needs command: \"init\", \"append\" or \"set\".".to_owned()),
+    };
+    let command = command.unwrap_or_default();
+    if let Some(other) = all
+        .keys()
+        .find(|key| !TARGET.contains(&key.as_str()) && !flags.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "bmad_memlog's {command} takes {}; {other} is none of them.",
+            flags.join(", ")
+        ));
+    }
+    let target =
+        match (
+            text(BMAD_MEMLOG, all, "workspace")?,
+            text(BMAD_MEMLOG, all, "path")?,
+        ) {
+            (Some(folder), None) => MemlogTarget::Workspace(folder),
+            (None, Some(file)) => MemlogTarget::Path(file),
+            _ => return Err(
+                "bmad_memlog needs one of workspace (the run folder) and path (the memlog file)."
+                    .to_owned(),
+            ),
+        };
+    let string = |key: &str| match all.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(format!("bmad_memlog's {key} is a string.")),
+    };
+    let required =
+        |key: &str| string(key)?.ok_or_else(|| format!("bmad_memlog's {command} needs {key}."));
+    let command = match command {
+        "init" => MemlogCommand::Init {
+            fields: match all.get("fields") {
+                None => Vec::new(),
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .map(|item| item.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| {
+                        "bmad_memlog's fields are strings, each key=value.".to_owned()
+                    })?,
+                Some(_) => {
+                    return Err("bmad_memlog's fields is a list of key=value strings.".to_owned())
+                }
+            },
+        },
+        "append" => MemlogCommand::Append {
+            text: required("text")?,
+            entry_type: string("type")?.filter(|kind| !kind.is_empty()),
+            by: string("by")?.filter(|by| !by.is_empty()),
+        },
+        _ => MemlogCommand::Set {
+            key: text(BMAD_MEMLOG, all, "key")?
+                .ok_or_else(|| "bmad_memlog's set needs key.".to_owned())?,
+            value: required("value")?,
+        },
+    };
+    Ok(MemlogCall { target, command })
 }
 
 /// Read a `bmad_party` call's arguments. As `resolve_party.py` reads its
@@ -789,5 +961,64 @@ mod tests {
             })
         );
         assert!(parse_view(&json!({"path": "SKILL.md"})).is_err());
+
+        assert_eq!(parse_render(&Value::Null), Ok(RenderCall { skill: None }));
+        assert_eq!(
+            parse_render(&json!({"skill": "bmad-build"})),
+            Ok(RenderCall {
+                skill: Some("bmad-build".to_owned())
+            })
+        );
+        assert!(parse_render(&json!({"project_root": "/x"})).is_err());
+
+        assert_eq!(
+            parse_memlog(
+                &json!({"command": "init", "workspace": "artifacts/run", "fields": ["topic=T"]})
+            ),
+            Ok(MemlogCall {
+                target: MemlogTarget::Workspace("artifacts/run".to_owned()),
+                command: MemlogCommand::Init {
+                    fields: vec!["topic=T".to_owned()]
+                }
+            })
+        );
+        // `--type` and `--by` given empty are no tag, as `args.type or ""`.
+        assert_eq!(
+            parse_memlog(
+                &json!({"command": "append", "path": "artifacts/run/.memlog.md", "text": "an idea", "type": "", "by": "user"})
+            ),
+            Ok(MemlogCall {
+                target: MemlogTarget::Path("artifacts/run/.memlog.md".to_owned()),
+                command: MemlogCommand::Append {
+                    text: "an idea".to_owned(),
+                    entry_type: None,
+                    by: Some("user".to_owned())
+                }
+            })
+        );
+        assert_eq!(
+            parse_memlog(&json!({"command": "set", "workspace": "w", "key": "phase", "value": ""})),
+            Ok(MemlogCall {
+                target: MemlogTarget::Workspace("w".to_owned()),
+                command: MemlogCommand::Set {
+                    key: "phase".to_owned(),
+                    value: String::new()
+                }
+            })
+        );
+        // argparse's refusals: one target exactly, the command's own flags,
+        // the required ones present.
+        assert!(parse_memlog(&json!({"command": "init"})).is_err());
+        assert!(parse_memlog(&json!({"command": "init", "workspace": "w", "path": "p"})).is_err());
+        assert_eq!(
+            parse_memlog(&json!({"command": "init", "workspace": "w", "text": "x"})),
+            Err("bmad_memlog's init takes fields; text is none of them.".to_owned())
+        );
+        assert_eq!(
+            parse_memlog(&json!({"command": "append", "workspace": "w"})),
+            Err("bmad_memlog's append needs text.".to_owned())
+        );
+        assert!(parse_memlog(&json!({"command": "set", "workspace": "w", "key": "k"})).is_err());
+        assert!(parse_memlog(&json!({"command": "drop", "workspace": "w"})).is_err());
     }
 }

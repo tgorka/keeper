@@ -1423,6 +1423,327 @@ async fn bmad_tools_read_the_home_drive_only_under_its_grant() {
     assert_eq!(served.context.label.integrity, integrity);
 }
 
+/// The session's folder, drive-relative.
+fn session_dir() -> String {
+    format!("60-sessions/{SESSION}")
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("mkdir");
+    for entry in std::fs::read_dir(from).expect("read_dir") {
+        let entry = entry.expect("entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("copy");
+        }
+    }
+}
+
+/// keeper-ported's BMAD fixtures in tgdrive: the install whose
+/// configuration renders (`render/_bmad`) as its `_bmad/`, and the
+/// `bmad-build` skill under the zone's `_skills/`.
+fn install_bmad(world: &World) {
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../keeper-ported/tests/fixtures/bmad");
+    copy_tree(&fixtures.join("render/_bmad"), &world.tgdrive.join("_bmad"));
+    let skill = world.tgdrive.join("80-agents/_skills/bmad-build");
+    copy_tree(&fixtures.join("bmad-build"), &skill);
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: bmad-build\ndescription: The bmad-build fixture.\n---\n\nFollow it.\n",
+    )
+    .expect("SKILL.md");
+}
+
+/// The `tool_call` line's tier of every call of `tool`.
+fn tiers_of(lines: &[LogLine], tool: &str) -> Vec<u8> {
+    kinds(lines, LineKind::ToolCall)
+        .into_iter()
+        .filter_map(|line| match &line.body {
+            LineBody::ToolCall(call) if call.tool == tool => Some(call.tier),
+            _ => None,
+        })
+        .collect()
+}
+
+/// R94R-08 (R105, R96, R119): through the production host, the two BMAD
+/// writes are offered as allowed and run at T1, each with one classified
+/// audit row naming where it wrote; the render publishes its generation
+/// in the session's workspace, and the write locations it names
+/// (`{project-root}`, R96) are exactly where `session_write` puts a
+/// Markdown and a YAML output (R94R-05) — no second session path; and a
+/// source the render read joins the session label before the next round.
+#[tokio::test(flavor = "multi_thread")]
+async fn bmad_render_and_memlog_are_t1_writes_through_the_turn() {
+    use keeper_core::bots::audit::AuditOutcome;
+    use keeper_core::bots::grant::Effect;
+    let out = format!(
+        "{}/artifacts/_bmad-output/implementation-artifacts",
+        session_dir()
+    );
+    let mut world = world(
+        ProviderKind::Ollama,
+        &["bmad_render", "bmad_memlog", "session_write"],
+        vec![
+            calls(&[
+                (
+                    "m1",
+                    "bmad_memlog",
+                    json!({"command": "init", "workspace": "artifacts/run", "fields": ["topic=T"]}),
+                ),
+                (
+                    "s1",
+                    "session_write",
+                    json!({"path": format!("{out}/spec-x.md"), "content": "# Spec\n"}),
+                ),
+                (
+                    "s2",
+                    "session_write",
+                    json!({"path": format!("{out}/sprint-status.yaml"), "content": "development_status: {}\n"}),
+                ),
+                ("r1", "bmad_render", json!({"skill": "bmad-build"})),
+            ]),
+            prose("followed."),
+        ],
+    );
+    install_bmad(&world);
+    write(
+        &world.tgdrive,
+        "80-agents/_skills/bmad-build/references/pasted.md",
+        "---\nintegrity: untrusted\n---\n\nPasted from a web page.\n",
+    );
+    let mut served = world.open(SESSION);
+    let turn = report(world.ask(&mut served, "build x").await);
+    assert_eq!(turn.ending, TurnEnding::Complete);
+
+    let requests = world.stub.requests();
+    let offered: Vec<&str> = requests[0]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    for tool in ["bmad_render", "bmad_memlog"] {
+        assert!(offered.contains(&tool), "{offered:?}");
+    }
+    let lines = world.lines(SESSION);
+    let results = tool_results(&lines);
+    for call in ["m1", "s1", "s2", "r1"] {
+        let result = result_of(&results, call);
+        assert_eq!(
+            result.outcome,
+            ToolOutcomeWord::Ok,
+            "{call}: {}",
+            result.content
+        );
+    }
+    let entry = result_of(&results, "r1")
+        .content
+        .strip_prefix("read and follow ")
+        .expect("the script's line")
+        .to_owned();
+    let generation = entry
+        .strip_suffix("/workflow.md")
+        .expect("its entry")
+        .to_owned();
+    assert!(generation.starts_with(&format!(
+        "{}/workspace/bmad-render/bmad-build/",
+        session_dir()
+    )));
+    let step = std::fs::read_to_string(
+        world
+            .tgdrive
+            .join(&generation)
+            .join("step-01-clarify-and-route.md"),
+    )
+    .expect("published");
+    assert!(step.contains(&format!("`{out}`")), "{step}");
+    let session = world.dir(SESSION);
+    for file in ["spec-x.md", "sprint-status.yaml"] {
+        assert!(
+            session
+                .join("artifacts/_bmad-output/implementation-artifacts")
+                .join(file)
+                .is_file(),
+            "{file}"
+        );
+    }
+    assert!(
+        !session.join("60-sessions").exists(),
+        "no second session path"
+    );
+    assert!(session.join("artifacts/run/.memlog.md").is_file());
+
+    for tool in ["bmad_render", "bmad_memlog"] {
+        assert_eq!(tiers_of(&lines, tool), [1], "{tool}");
+        let rows = rows_of(&world, &served, tool);
+        assert_eq!(rows.len(), 1, "{tool}: {rows:?}");
+        assert_eq!(
+            (rows[0].tier, rows[0].effect, rows[0].outcome),
+            (Some(1), Some(Effect::Write), AuditOutcome::Ok),
+            "{tool}"
+        );
+        assert_eq!(rows[0].profile_id, "tgdrive");
+    }
+    assert_eq!(
+        rows_of(&world, &served, "bmad_render")[0].subpath,
+        generation
+    );
+    assert_eq!(
+        rows_of(&world, &served, "bmad_memlog")[0].subpath,
+        format!("{}/artifacts/run/.memlog.md", session_dir())
+    );
+    let sessions = rows_of(&world, &served, "session_write");
+    assert!(
+        sessions
+            .iter()
+            .all(|row| row.subpath.starts_with(&format!("{out}/"))),
+        "{sessions:?}"
+    );
+
+    // The source joined the label before the round that followed it.
+    let cause = |line: &LogLine| match &line.body {
+        LineBody::Label(body) => Some((body.cause.reference.clone(), body.label().integrity)),
+        _ => None,
+    };
+    let joined = lines
+        .iter()
+        .position(|line| {
+            cause(line)
+                == Some((
+                    "tgdrive/80-agents/_skills/bmad-build/references/pasted.md".to_owned(),
+                    Integrity::Untrusted,
+                ))
+        })
+        .expect("the source's label line");
+    let answered = lines
+        .iter()
+        .rposition(|line| line.kind() == LineKind::Assistant)
+        .expect("the next round's answer");
+    assert!(joined < answered);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(served.context.label.integrity, Integrity::Untrusted);
+}
+
+/// R94R-08: a BMAD write the agent was not given is neither offered nor
+/// run; with the home drive out of the session's scope (R195's grant) the
+/// two writes are not offered and a call to them reads and writes nothing
+/// — no source joins the label; and in a session a read narrowed below the
+/// home drive's readers both writes are refused before any effect (no
+/// decision source here), each on its one classified row.
+#[tokio::test(flavor = "multi_thread")]
+async fn bmad_writes_are_refused_unoffered_or_beyond_the_label() {
+    use keeper_core::bots::audit::{AuditOutcome, AuditVerdict};
+    use keeper_core::bots::grant::Effect;
+    let script = || {
+        vec![
+            calls(&[
+                ("r1", "bmad_render", json!({"skill": "bmad-build"})),
+                (
+                    "m1",
+                    "bmad_memlog",
+                    json!({"command": "init", "workspace": "artifacts/run"}),
+                ),
+            ]),
+            prose("done."),
+        ]
+    };
+    let mut unoffered = world(ProviderKind::Ollama, &["bmad_config"], script());
+    install_bmad(&unoffered);
+    let mut served = unoffered.open(SESSION);
+    report(unoffered.ask(&mut served, "build x").await);
+    let offered = unoffered.stub.requests()[0]["tools"].to_string();
+    assert!(!offered.contains("bmad_render") && !offered.contains("bmad_memlog"));
+    let results = tool_results(&unoffered.lines(SESSION));
+    for (call, tool) in [("r1", "bmad_render"), ("m1", "bmad_memlog")] {
+        assert_eq!(result_of(&results, call).outcome, ToolOutcomeWord::Refused);
+        assert!(
+            result_of(&results, call)
+                .content
+                .contains(&format!("{tool} is not one of this agent's tools.")),
+            "{call}"
+        );
+    }
+    assert!(!unoffered.dir(SESSION).join("workspace").exists());
+    assert!(!unoffered.dir(SESSION).join("artifacts/run").exists());
+
+    let mut world = world(
+        ProviderKind::Ollama,
+        &["bmad_render", "bmad_memlog"],
+        script(),
+    );
+    install_bmad(&world);
+    let mut served = world.open(SESSION);
+    narrow(&mut served, &[TGORKA]);
+    report(world.ask(&mut served, "build x").await);
+    let results = tool_results(&world.lines(SESSION));
+    for call in ["r1", "m1"] {
+        let result = result_of(&results, call);
+        assert_eq!(result.outcome, ToolOutcomeWord::Refused, "{call}");
+        assert!(
+            result.content.contains(MARTA)
+                && result
+                    .content
+                    .contains(keeper_core::agents::label::NEEDS_APPROVAL),
+            "{call}: {}",
+            result.content
+        );
+    }
+    assert!(!world.dir(SESSION).join("workspace").exists());
+    assert!(!world.dir(SESSION).join("artifacts/run").exists());
+    for tool in ["bmad_render", "bmad_memlog"] {
+        let rows = rows_of(&world, &served, tool);
+        assert_eq!(rows.len(), 1, "{tool}: {rows:?}");
+        assert_eq!(
+            (
+                rows[0].tier,
+                rows[0].effect,
+                rows[0].verdict,
+                rows[0].outcome
+            ),
+            (
+                Some(1),
+                Some(Effect::Write),
+                Some(AuditVerdict::Deny),
+                AuditOutcome::Refused
+            ),
+            "{tool}"
+        );
+    }
+
+    let mut scoped = crate::world(
+        ProviderKind::Ollama,
+        &["bmad_render", "bmad_memlog", "drive_read"],
+        script(),
+    );
+    install_bmad(&scoped);
+    write(
+        &scoped.tgdrive,
+        "80-agents/_skills/bmad-build/references/pasted.md",
+        "---\nintegrity: untrusted\n---\n\nPasted from a web page.\n",
+    );
+    let mut served = scoped.open(SESSION);
+    served.context.scope = vec!["private".to_owned()];
+    let integrity = served.context.label.integrity;
+    report(scoped.ask(&mut served, "build x").await);
+    let offered = scoped.stub.requests()[0]["tools"].to_string();
+    assert!(!offered.contains("bmad_render") && !offered.contains("bmad_memlog"));
+    let lines = scoped.lines(SESSION);
+    let results = tool_results(&lines);
+    for call in ["r1", "m1"] {
+        assert_eq!(
+            result_of(&results, call).outcome,
+            ToolOutcomeWord::Refused,
+            "{call}"
+        );
+    }
+    assert!(!scoped.dir(SESSION).join("workspace").exists());
+    assert!(!scoped.dir(SESSION).join("artifacts/run").exists());
+    assert_eq!(served.context.label.integrity, integrity);
+}
+
 /// S-16: the status anchor carries counts, never a path a tool named.
 #[tokio::test(flavor = "multi_thread")]
 async fn tool_progress_carries_counts_not_paths() {
@@ -8596,6 +8917,71 @@ mod parks {
             } else {
                 assert_eq!(w1.outcome, ToolOutcomeWord::Ok, "{}", w1.content);
                 assert_eq!(world.note().as_deref(), Some("for Marta"));
+            }
+            assert!(!served.waiting());
+        }
+    }
+
+    /// R94R-07 (R191, R194): a render a narrowed session parks for a
+    /// declassification binds the generation it would publish. tgorka
+    /// approves letting Marta read it; when a source of the skill changed
+    /// while the approval waited, the render it would now publish is
+    /// another effect — refused on that approval, nothing published, no
+    /// second record. Unchanged, exactly the bound generation is published.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parked_render_publishes_only_the_generation_it_bound() {
+        use keeper_agent::approvals::CHANGED;
+        for changed in [false, true] {
+            let mut world = world(
+                ProviderKind::OpenAi,
+                &["bmad_render"],
+                vec![
+                    calls(&[("r1", "bmad_render", json!({"skill": "bmad-build"}))]),
+                    prose("Rendered."),
+                ],
+            );
+            install_bmad(&world);
+            world.deps.decisions = Some(Admit::pinned());
+            let approvals = Arc::new(Approvals::default());
+            let mut served = open(&world, &approvals);
+            served.doors = Some(Arc::new(Doors::default()));
+            narrow(&mut served, &[TGORKA]);
+            let parked = report(world.ask(&mut served, "build it for Marta").await);
+            assert_eq!(parked.ending, TurnEnding::Parked);
+            let record = world.record();
+            assert_eq!(record.action.tool, "declassify");
+            assert_eq!(record.action.args["readers"], json!([MARTA]));
+            assert_eq!(record.action.args["call"]["tool"], "bmad_render");
+            let renders = world.dir(SESSION).join("workspace/bmad-render/bmad-build");
+            assert!(!renders.exists(), "nothing published while it waits");
+            if changed {
+                write(
+                    &world.tgdrive,
+                    "80-agents/_skills/bmad-build/references/claims-check.md",
+                    "changed while it waited\n",
+                );
+            }
+            let decided = world.decision(&record, Decision::Approve);
+            assert!(matches!(
+                world.serve(&mut served, decided).await,
+                Outcome::Decided
+            ));
+            let r1 = result_of(&results(&world), "r1").clone();
+            if changed {
+                assert_eq!(r1.outcome, ToolOutcomeWord::Refused);
+                assert!(r1.content.contains(CHANGED), "{}", r1.content);
+                assert!(!renders.exists(), "no generation published");
+                assert_eq!(records_in(&world, SESSION).len(), 1, "no second record");
+            } else {
+                assert_eq!(r1.outcome, ToolOutcomeWord::Ok, "{}", r1.content);
+                let published: Vec<_> = std::fs::read_dir(&renders)
+                    .expect("published")
+                    .map(|entry| entry.expect("entry").file_name())
+                    .collect();
+                assert_eq!(published.len(), 1, "{published:?}");
+                assert!(r1
+                    .content
+                    .contains(published[0].to_str().expect("a generation")));
             }
             assert!(!served.waiting());
         }

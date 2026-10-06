@@ -53,7 +53,7 @@ use crate::delegate::{Delegator, TurnView};
 use crate::sessions::exec::{self, ExecError};
 use crate::sessions::lock::ZoneLock;
 use crate::sessions::verbs::VerbError;
-use crate::sessions::write::{landing, session_write_with, NO_CLAIM};
+use crate::sessions::write::{in_session, landing, session_write_with, NO_CLAIM};
 
 /// The tool that edits a card's keys.
 pub const CARD_UPDATE: &str = "card_update";
@@ -104,11 +104,11 @@ pub fn specs(allow: &[String]) -> Vec<ToolSpec> {
     if allowed(SESSION_WRITE) {
         specs.push(ToolSpec {
             name: SESSION_WRITE.to_owned(),
-            description: "Write a file into this session, replacing it if it is there: markdown, csv or json anywhere in the session (a card is markdown tagged task), finished output under artifacts/, anything under workspace/. keeper's own files (log/, approvals/, agent.toml, README.md, AGENTS.md) are not yours to write.".to_owned(),
+            description: "Write a file into this session, replacing it if it is there: markdown, csv or json anywhere in the session (a card is markdown tagged task); finished output under artifacts/, which also takes yaml, yml, toml, txt and html; anything under workspace/. keeper's own files (log/, approvals/, agent.toml, README.md, AGENTS.md) are not yours to write.".to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "The file's path in this session."},
+                    "path": {"type": "string", "description": "The file's path in this session, or from the drive's root as bmad_config's and bmad_render's write locations name it."},
                     "content": {"type": "string"}
                 },
                 "required": ["path", "content"],
@@ -813,15 +813,21 @@ impl CardTools<'_> {
                 ) else {
                     return refused("card_update needs \"card\" and \"fields\" arguments.");
                 };
-                self.update(rel, fields)
+                self.update(in_session(&self.session_dir(), rel), fields)
             }
             _ => {
                 let (Some(rel), Some(content)) = (text("path"), text("content")) else {
                     return refused("session_write needs \"path\" and \"content\" arguments.");
                 };
-                self.write(rel, content)
+                self.write(in_session(&self.session_dir(), rel), content)
             }
         }
+    }
+
+    /// The session's folder, drive-relative: the spelling of a path the
+    /// tools also take a session's file by ([`in_session`]).
+    pub fn session_dir(&self) -> String {
+        format!("{}/{}", self.from.subfolder, self.from.session)
     }
 
     fn update(&self, rel: &str, fields: &Map<String, Value>) -> Option<ToolOutcome> {
@@ -1343,6 +1349,76 @@ mod tests {
             .map(|entry| entry.file_name())
             .collect();
         assert_eq!(entries, [std::ffi::OsString::from(CARD_FILE)]);
+    }
+
+    /// R112: `session_write` puts BMAD's output kinds into `artifacts/` —
+    /// `sprint-status.yaml`, a TOML, a text or an HTML file — and keeps
+    /// the session's own pool to markdown, csv and json; and the memlog's
+    /// dotted name stays `bmad_memlog`'s alone.
+    #[test]
+    fn session_write_takes_bmads_outputs_under_artifacts() {
+        let zone = zone();
+        let view = view(Integrity::Agent);
+        let allow = allow();
+        let tools = tools(zone.path(), &view, &allow);
+        let write = |rel: &str| {
+            tools.run(&call(
+                SESSION_WRITE,
+                json!({"path": rel, "content": "development_status: {}\n"}),
+            ))
+        };
+        let session = zone.path().join(SESSION);
+        for rel in [
+            "artifacts/sprint-status.yaml",
+            "artifacts/_bmad-output/tea-progress.yml",
+            "artifacts/report.toml",
+            "artifacts/notes.txt",
+            "artifacts/site/index.html",
+        ] {
+            assert!(
+                matches!(write(rel), Some(ToolOutcome::Answered { .. })),
+                "{rel}"
+            );
+            assert!(session.join(rel).is_file(), "{rel}");
+        }
+        assert!(refusal(write("artifacts/shot.png")).contains("is none of those"));
+        assert!(refusal(write("sprint-status.yaml")).contains("is none of those"));
+        assert!(refusal(write("artifacts/run/.memlog.md")).contains("not a plain path"));
+        assert!(!session.join("artifacts/shot.png").exists());
+        assert!(!session.join("sprint-status.yaml").exists());
+        assert!(!session.join("artifacts/run").exists());
+    }
+
+    /// R94R-05: a write location as `bmad_config` and `bmad_render` name it
+    /// — from the drive's root, through this session's folder — is the
+    /// session's file, Markdown and YAML alike: written where it names,
+    /// never under a second copy of the session's path.
+    #[test]
+    fn session_write_takes_the_write_locations_bmad_names() {
+        let zone = zone();
+        let view = view(Integrity::Agent);
+        let allow = allow();
+        let tools = tools(zone.path(), &view, &allow);
+        let session = zone.path().join(SESSION);
+        for rel in [
+            "artifacts/_bmad-output/implementation-artifacts/spec-x.md",
+            "artifacts/_bmad-output/implementation-artifacts/sprint-status.yaml",
+        ] {
+            let named = format!("60-sessions/{SESSION}/{rel}");
+            let outcome = tools.run(&call(
+                SESSION_WRITE,
+                json!({"path": named, "content": "status: done\n"}),
+            ));
+            assert!(
+                matches!(outcome, Some(ToolOutcome::Answered { .. })),
+                "{rel}: {outcome:?}"
+            );
+            assert!(session.join(rel).is_file(), "{rel}");
+        }
+        assert!(
+            !session.join("60-sessions").exists(),
+            "no second session path"
+        );
     }
 
     /// R119 (R4-03, R4-04): through the tool, a rewrite cannot change the

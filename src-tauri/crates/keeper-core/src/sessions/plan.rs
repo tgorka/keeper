@@ -33,6 +33,26 @@ pub enum PlanStep {
     CopyFile { from: String, to: String },
     /// Write these exact bytes to a file, atomically, overwriting.
     WriteFile { path: String, content: String },
+    /// Write these exact bytes to a file that is not there, atomically: a
+    /// file there already is refused unless it holds these bytes (a resume
+    /// finding its own write), so a file that appeared since the plan was
+    /// compiled is never replaced.
+    CreateFile { path: String, content: String },
+    /// Create one directory that is not there, inside a parent that is: a
+    /// resume accepts it there only as a real directory, never a link, so
+    /// nothing written into it can be carried somewhere else.
+    MkDirNew { path: String },
+    /// Move the real directory `from` to `to`, which must not be there,
+    /// once its whole tree is exactly `files` — each regular file by
+    /// `/`-joined path below it, with the SHA-256 of its bytes; a link,
+    /// another kind of entry, a missing or an extra file refuses the move.
+    /// Succeeds when `from` is gone and `to` is exactly `files` (the move
+    /// already happened).
+    PublishDir {
+        from: String,
+        to: String,
+        files: std::collections::BTreeMap<String, String>,
+    },
     /// Replace a file's whole content with `content` **only if** its current
     /// content is what the plan was compiled from — the splice-writer's
     /// optimistic guard, so a concurrent agent write turns into a refusal

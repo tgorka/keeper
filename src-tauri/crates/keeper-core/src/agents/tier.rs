@@ -10,7 +10,7 @@
 //! | tier | what | the host |
 //! |---|---|---|
 //! | T0 | reads | runs it |
-//! | T1 | reversible inside the session, the surface, `delegate`, `reply` | runs it |
+//! | T1 | reversible inside the session, the surface, `delegate`, `reply`, `bmad_render`, `bmad_memlog` | runs it |
 //! | T2 | a drive write outside the session, a first write the grant asks for | asks a person |
 //! | T3 | a schedule or workflow set by an agent, a declassification | asks a person, once |
 //! | T4 | (no tool of this build) | the requester decides |
@@ -106,6 +106,8 @@ pub enum AgentTool {
     SurfaceScroll,
     SurfaceProposeEdit,
     BmadConfig,
+    BmadRender,
+    BmadMemlog,
     BmadParty,
     SkillsList,
     SkillView,
@@ -114,7 +116,7 @@ pub enum AgentTool {
 
 impl AgentTool {
     /// Every tool, in the table's order.
-    pub const ALL: [AgentTool; 21] = [
+    pub const ALL: [AgentTool; 23] = [
         AgentTool::DriveList,
         AgentTool::DriveRead,
         AgentTool::DriveGlob,
@@ -132,6 +134,8 @@ impl AgentTool {
         AgentTool::SurfaceScroll,
         AgentTool::SurfaceProposeEdit,
         AgentTool::BmadConfig,
+        AgentTool::BmadRender,
+        AgentTool::BmadMemlog,
         AgentTool::BmadParty,
         AgentTool::SkillsList,
         AgentTool::SkillView,
@@ -158,6 +162,8 @@ impl AgentTool {
             AgentTool::SurfaceScroll => "surface_scroll",
             AgentTool::SurfaceProposeEdit => "surface_propose_edit",
             AgentTool::BmadConfig => "bmad_config",
+            AgentTool::BmadRender => "bmad_render",
+            AgentTool::BmadMemlog => "bmad_memlog",
             AgentTool::BmadParty => "bmad_party",
             AgentTool::SkillsList => "skills_list",
             AgentTool::SkillView => "skill_view",
@@ -344,6 +350,9 @@ fn row(tool: AgentTool, facts: &CallFacts) -> Tier {
         | AgentTool::SurfacePoint
         | AgentTool::SurfaceScroll
         | AgentTool::SurfaceProposeEdit => Tier::T1,
+        // A render published into the session's workspace/, a memlog in its
+        // artifacts/: both land inside the session by construction (R105).
+        AgentTool::BmadRender | AgentTool::BmadMemlog => Tier::T1,
         AgentTool::Declassify => Tier::T3,
     }
 }
@@ -678,7 +687,9 @@ mod tests {
                 | AgentTool::SurfaceHighlight
                 | AgentTool::SurfacePoint
                 | AgentTool::SurfaceScroll
-                | AgentTool::SurfaceProposeEdit => {
+                | AgentTool::SurfaceProposeEdit
+                | AgentTool::BmadRender
+                | AgentTool::BmadMemlog => {
                     assert_eq!(tier(tool, CallFacts::default()), Tier::T1, "{tool:?}");
                 }
                 AgentTool::Declassify => {

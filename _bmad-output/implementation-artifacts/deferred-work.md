@@ -7950,3 +7950,24 @@ location: `src-tauri/crates/keeper-core/src/agents/skills.rs` (`index`)
 reason: The acceptance lists such a skill as refused ("proposed by <agent> on <date>; not offered until a person adopts it") and `skill_view` refusing one still carrying `metadata.keeper_proposal`, but proposals are 95.2's and `skills::index` has no proposal rule; the clause moved to 95.2, which adds it to the index both tools read.
 status: open
 
+### DW-552: A render staging folder a refused publication leaves behind is never swept.
+
+origin: epic 94, story 94.2 (rung `agents-94-render`, review R94R-01, R196, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/sessions/write.rs` (`publish_generation`)
+reason: Each publication stages in its own `.staging-<generation>-<ulid>` folder; a plan the executor refuses (a disk error, a staged tree that is not exactly what was written) clears its journal and leaves that folder under `workspace/bmad-render/<skill>/`. It is inert — nothing reads or publishes a staging folder but the plan that named it — yet it stays in the session. Close with a sweep of staging folders no pending journal names, removing real folders only and never following a link.
+status: open
+
+### DW-553: No turns-level test loses the session's claim between a BMAD write's admission and its effect.
+
+origin: epic 94, story 94.2 (rung `agents-94-render`, review R94R-08, R196, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs`
+reason: The scripted-provider harness has no seam to lose a `Lease` after the `tool_call` line is written and before the tool runs: a lease lost earlier stops the turn at its first line. The claim refusal of `bmad_render` and `bmad_memlog` is proved at the handler (`bmad::tests::bmad_render_halts_on_the_duplicate_keys`, `bmad_memlog_writes_only_the_memlog`, both through the production `may_write` door); turns-level, both tools' refusal beyond the label is. Close with a lease double or a stub hook that fires between the line and the effect.
+status: open
+
+### DW-554: The journal's removal being synced has no planted-fault test.
+
+origin: epic 94, story 94.2 (rung `agents-94-render`, review R94R-03, R196, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`run_from`)
+reason: `run_from` syncs `.keeper/` after removing the journal, but the only fault a test can plant — an unreadable folder — fails the journal's own earlier writes into that same folder first, so no test separates the removal's sync from them. The steps' directory syncs are proved by planting (`exec::tests::a_folder_the_journal_counts_is_synced_where_it_was_made`). Close with an injectable sync seam or a power-cut harness.
+status: open
+

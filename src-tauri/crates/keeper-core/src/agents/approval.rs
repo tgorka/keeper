@@ -315,6 +315,26 @@ pub fn summary_of(tool: AgentTool, args: &Value) -> String {
             }
             None => "Read BMAD's central configuration".to_owned(),
         },
+        AgentTool::BmadRender => match args["skill"].as_str() {
+            Some(skill) => format!("Render the BMAD skill {skill} into this session"),
+            None => "Render this session's workflow into this session".to_owned(),
+        },
+        AgentTool::BmadMemlog => {
+            let memlog = args["path"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| {
+                    args["workspace"]
+                        .as_str()
+                        .map(|run| format!("{run}/.memlog.md"))
+                })
+                .unwrap_or_default();
+            match args["command"].as_str() {
+                Some("init") => format!("Start the memlog `{memlog}`"),
+                Some("set") => format!("Set `{}` in the memlog `{memlog}`", arg(args, "key")),
+                _ => format!("Add an entry to the memlog `{memlog}`"),
+            }
+        }
         AgentTool::BmadParty => "Read BMAD's party roster".to_owned(),
         AgentTool::SkillsList => "List the skills offered to this agent".to_owned(),
         AgentTool::SkillView => match args["path"].as_str() {

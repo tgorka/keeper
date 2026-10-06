@@ -22,6 +22,7 @@
 //! Nothing here decides. A plan arrives compiled; refusals (`GuardedWrite`
 //! mismatch, a missing source) surface as errors the caller sentences.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use keeper_core::sessions::plan::{Plan, PlanStep};
@@ -151,11 +152,15 @@ fn run_from(zone: &Path, journal: &Path, plan: Plan, from: usize) -> Result<(), 
             },
         )?;
     }
-    std::fs::remove_file(journal).map_err(|error| ExecError::Failed {
+    let cleared = |error: std::io::Error| ExecError::Failed {
         verb: plan.verb.clone(),
         step: plan.steps.len(),
         reason: format!("could not clear the journal: {error}"),
-    })
+    };
+    std::fs::remove_file(journal).map_err(cleared)?;
+    // The removal on the disk too, or a power cut brings back a journal
+    // whose remaining steps run over what came after.
+    sync_dir(journal.parent().unwrap_or(zone)).map_err(cleared)
 }
 
 /// One idempotent step. The idempotency table is the resume contract:
@@ -163,8 +168,23 @@ fn run_from(zone: &Path, journal: &Path, plan: Plan, from: usize) -> Result<(), 
 fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
     let failed = |reason: String| ExecError::Refused(reason);
     match step {
-        PlanStep::MkDir { path } => std::fs::create_dir_all(rel(zone, path)?)
-            .map_err(|e| failed(format!("mkdir {path}: {e}"))),
+        PlanStep::MkDir { path } => {
+            make_dirs(&rel(zone, path)?).map_err(|e| failed(format!("mkdir {path}: {e}")))
+        }
+        PlanStep::MkDirNew { path } => {
+            let dir = rel_link(zone, path)?;
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {}
+                // A resume finds the folder its own run made: a real one.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        && dir
+                            .symlink_metadata()
+                            .is_ok_and(|meta| meta.file_type().is_dir()) => {}
+                Err(e) => return Err(failed(format!("mkdir {path}: {e}"))),
+            }
+            sync_parent(&dir).map_err(|e| failed(format!("mkdir {path}: {e}")))
+        }
         PlanStep::CopyFile { from, to } => {
             let source = rel(zone, from)?;
             let target = rel(zone, to)?;
@@ -182,6 +202,23 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
         }
         PlanStep::WriteFile { path, content } => atomic_write(&rel(zone, path)?, content)
             .map_err(|e| failed(format!("write {path}: {e}"))),
+        PlanStep::CreateFile { path, content } => {
+            let target = rel(zone, path)?;
+            match target.symlink_metadata() {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(failed(format!("write {path}: {e}"))),
+                // A resume re-running a completed create sees its own bytes.
+                Ok(_) if std::fs::read(&target).is_ok_and(|bytes| bytes == content.as_bytes()) => {
+                    return sync_parent(&target).map_err(|e| failed(format!("write {path}: {e}")))
+                }
+                Ok(_) => {
+                    return Err(ExecError::Refused(format!(
+                    "{path} appeared while this was being planned; nothing was written — try again"
+                )))
+                }
+            }
+            atomic_write(&target, content).map_err(|e| failed(format!("write {path}: {e}")))
+        }
         PlanStep::GuardedWrite {
             path,
             expect_len,
@@ -224,7 +261,56 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
                 )));
             }
             std::fs::rename(&source, &target)
+                .and_then(|()| sync_moved(&source, &target))
                 .map_err(|e| failed(format!("move {from} → {to}: {e}")))
+        }
+        PlanStep::PublishDir { from, to, files } => {
+            let source = rel_link(zone, from)?;
+            let target = rel_link(zone, to)?;
+            let there = |path: &Path| path.symlink_metadata().is_ok();
+            let exactly = |dir: &Path| {
+                regular_files(dir).map(|found| {
+                    found.len() == files.len()
+                        && found.iter().all(|(name, bytes)| {
+                            files.get(name).map(String::as_str)
+                                == Some(keeper_core::agents::approval::sha256_hex(bytes).as_str())
+                        })
+                })
+            };
+            if !there(&source) && there(&target) {
+                // Already moved — and only its own generation is.
+                return match exactly(&target) {
+                    Ok(true) => sync_moved(&source, &target)
+                        .map_err(|e| failed(format!("publish {from} → {to}: {e}"))),
+                    Ok(false) => Err(ExecError::Refused(format!(
+                        "{to} is not what this plan published; nothing was moved"
+                    ))),
+                    Err(reason) => Err(ExecError::Refused(format!(
+                        "{to}: {reason}; nothing was moved"
+                    ))),
+                };
+            }
+            if there(&target) {
+                return Err(ExecError::Refused(format!(
+                    "{to} already exists; nothing was moved"
+                )));
+            }
+            match exactly(&source) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(ExecError::Refused(format!(
+                        "{from} does not hold exactly what was staged; nothing was published"
+                    )))
+                }
+                Err(reason) => {
+                    return Err(ExecError::Refused(format!(
+                        "{from}: {reason}; nothing was published"
+                    )))
+                }
+            }
+            std::fs::rename(&source, &target)
+                .and_then(|()| sync_moved(&source, &target))
+                .map_err(|e| failed(format!("publish {from} → {to}: {e}")))
         }
         PlanStep::MoveFile { from, to } => {
             let source = rel_link(zone, from)?;
@@ -415,10 +501,17 @@ fn contained(zone: &Path, path: &str, reach: Reach) -> Result<PathBuf, ExecError
     }
 }
 
-/// Write bytes atomically: temp file beside the target, then rename.
+/// Write bytes atomically and durably: a temp file beside the target,
+/// synced, renamed over it, then the folder synced, so a crash or a power
+/// cut leaves the old file or the new one whole and the rename on the disk
+/// (`memlog.py`'s `write_atomic`, NFR-117). A folder it has to make is
+/// made as [`make_dirs`] makes it.
 fn atomic_write(target: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
+    if parent.symlink_metadata().is_err() {
+        make_dirs(parent)?;
+    }
     let tmp = parent.join(format!(
         ".{}.keeper-tmp",
         target
@@ -426,8 +519,120 @@ fn atomic_write(target: &Path, content: &str) -> std::io::Result<()> {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file".to_owned())
     ));
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, target)
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, target)?;
+    sync_dir(parent)
+}
+
+/// Make `dir` and every folder above it that is not there, durably: each
+/// new folder's entry synced in its parent, so a folder the journal says
+/// was made survives a power cut with the journal. A folder already there
+/// has its own entry synced again — a resume after a crash between the
+/// make and the sync.
+fn make_dirs(dir: &Path) -> std::io::Result<()> {
+    let missing: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|ancestor| ancestor.symlink_metadata().is_err())
+        .collect();
+    std::fs::create_dir_all(dir)?;
+    if missing.is_empty() {
+        return sync_parent(dir);
+    }
+    for made in missing.iter().rev() {
+        sync_parent(made)?;
+    }
+    Ok(())
+}
+
+/// [`sync_dir`] of the folder holding `path`.
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) => sync_dir(parent),
+        None => Ok(()),
+    }
+}
+
+/// Make a move from `source` to `target` durable: both folders' entries.
+fn sync_moved(source: &Path, target: &Path) -> std::io::Result<()> {
+    sync_parent(target)?;
+    if source.parent() != target.parent() {
+        sync_parent(source)?;
+    }
+    Ok(())
+}
+
+/// Every file of the real folder `dir`, by `/`-joined path below it, with
+/// its bytes — or the sentence saying why its tree is not only real
+/// folders and regular files that read: a link (never followed), another
+/// kind of entry, a name that is not UTF-8, or a read that failed.
+pub(crate) fn regular_files(dir: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
+    fn walk(dir: &Path, prefix: &str, into: &mut HashMap<String, Vec<u8>>) -> Result<(), String> {
+        let shown = |name: &str| {
+            if name.is_empty() {
+                ".".to_owned()
+            } else {
+                name.to_owned()
+            }
+        };
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            format!(
+                "{} could not be listed: {e}",
+                shown(prefix.trim_end_matches('/'))
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "{} could not be listed: {e}",
+                    shown(prefix.trim_end_matches('/'))
+                )
+            })?;
+            let base = entry.file_name();
+            let base = base
+                .to_str()
+                .ok_or_else(|| format!("{prefix}{} is not a UTF-8 name", base.to_string_lossy()))?;
+            let name = format!("{prefix}{base}");
+            let kind = entry
+                .file_type()
+                .map_err(|e| format!("{name} could not be read: {e}"))?;
+            if kind.is_symlink() {
+                return Err(format!("{name} is a link"));
+            } else if kind.is_dir() {
+                walk(&entry.path(), &format!("{name}/"), into)?;
+            } else if kind.is_file() {
+                let bytes = std::fs::read(entry.path())
+                    .map_err(|e| format!("{name} could not be read: {e}"))?;
+                into.insert(name, bytes);
+            } else {
+                return Err(format!("{name} is neither a file nor a folder"));
+            }
+        }
+        Ok(())
+    }
+    match dir.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(meta) if meta.file_type().is_symlink() => return Err("it is a link".to_owned()),
+        Ok(_) => return Err("it is not a folder".to_owned()),
+        Err(e) => return Err(format!("it could not be read: {e}")),
+    }
+    let mut found = HashMap::new();
+    walk(dir, "", &mut found)?;
+    Ok(found)
+}
+
+/// Make a rename inside `dir` durable: the folder's own entry list synced.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Windows commits a rename with the file; a folder cannot be opened to sync.
+#[cfg(not(unix))]
+fn sync_dir(_: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn write_journal(journal: &Path, row: &JournalRow) -> Result<(), ExecError> {
@@ -943,6 +1148,227 @@ mod tests {
         assert!(
             !zone.path().join(JOURNAL_REL).exists(),
             "the refusal clears the journal, so the next press re-plans"
+        );
+    }
+
+    fn publish_plan(files: &[(&str, &str)]) -> Plan {
+        Plan {
+            verb: "render-publish".to_owned(),
+            session: "active/s".to_owned(),
+            steps: vec![PlanStep::PublishDir {
+                from: "active/s/workspace/.staging-g".to_owned(),
+                to: "active/s/workspace/g".to_owned(),
+                files: files
+                    .iter()
+                    .map(|(name, text)| {
+                        (
+                            (*name).to_owned(),
+                            keeper_core::agents::approval::sha256_hex(text.as_bytes()),
+                        )
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    /// R94R-01: a generation is published only when its staged tree is
+    /// exactly what the plan wrote — a file left there by someone else, a
+    /// link inside it, a staging folder that is itself a link, or a target
+    /// already there refuses the move; a resume recognises a publication
+    /// as its own only when the published tree is exactly its files.
+    #[cfg(unix)]
+    #[test]
+    fn a_generation_is_published_only_as_exactly_what_was_staged() {
+        let zone = zone();
+        let workspace = zone.path().join("active/s/workspace");
+        let staging = workspace.join(".staging-g");
+        let target = workspace.join("g");
+        let stage = || {
+            std::fs::create_dir_all(staging.join("refs")).expect("mkdir");
+            std::fs::write(staging.join("workflow.md"), "w").expect("write");
+            std::fs::write(staging.join("refs/a.md"), "").expect("write");
+        };
+        let plan = || publish_plan(&[("workflow.md", "w"), ("refs/a.md", "")]);
+
+        stage();
+        std::fs::write(staging.join("stale.md"), "not ours").expect("plant");
+        let refused = run(zone.path(), plan()).expect_err("an extra file");
+        assert!(
+            refused.to_string().contains("does not hold exactly"),
+            "{refused}"
+        );
+        assert!(!target.exists());
+        std::fs::remove_file(staging.join("stale.md")).expect("rm");
+
+        // A staged file missing.
+        std::fs::remove_file(staging.join("refs/a.md")).expect("rm");
+        let refused = run(zone.path(), plan()).expect_err("a missing file");
+        assert!(
+            refused.to_string().contains("does not hold exactly"),
+            "{refused}"
+        );
+        assert!(!target.exists());
+        std::fs::write(staging.join("refs/a.md"), "").expect("write");
+
+        // An empty output replaced by a link to bytes elsewhere.
+        let elsewhere = zone.path().join("active/other.md");
+        std::fs::write(&elsewhere, "").expect("write");
+        std::fs::remove_file(staging.join("refs/a.md")).expect("rm");
+        std::os::unix::fs::symlink(&elsewhere, staging.join("refs/a.md")).expect("link");
+        let refused = run(zone.path(), plan()).expect_err("a link");
+        assert!(
+            refused.to_string().contains("refs/a.md is a link"),
+            "{refused}"
+        );
+        assert!(!target.exists());
+        std::fs::remove_dir_all(&staging).expect("rm");
+
+        // A staging folder that is a link to another session's folder.
+        let other = zone.path().join("active/other");
+        std::fs::create_dir_all(other.join("refs")).expect("mkdir");
+        std::fs::write(other.join("workflow.md"), "w").expect("write");
+        std::fs::write(other.join("refs/a.md"), "").expect("write");
+        std::os::unix::fs::symlink(&other, &staging).expect("link");
+        let refused = run(zone.path(), plan()).expect_err("a linked staging");
+        assert!(refused.to_string().contains("it is a link"), "{refused}");
+        assert!(!target.exists());
+        std::fs::remove_file(&staging).expect("rm");
+
+        stage();
+        run(zone.path(), plan()).expect("published");
+        assert_eq!(
+            std::fs::read_to_string(target.join("workflow.md")).expect("w"),
+            "w"
+        );
+        assert!(!staging.exists());
+        // A resume after the move: its own generation, and only that.
+        run(zone.path(), plan()).expect("already published");
+        std::fs::write(target.join("refs/a.md"), "edited").expect("edit");
+        let refused = run(zone.path(), plan()).expect_err("not ours");
+        assert!(
+            refused
+                .to_string()
+                .contains("is not what this plan published"),
+            "{refused}"
+        );
+
+        stage();
+        let refused = run(zone.path(), plan()).expect_err("the target is there");
+        assert!(refused.to_string().contains("already exists"), "{refused}");
+    }
+
+    /// R94R-01: a folder made new is never a link; a resume takes it only
+    /// as the real folder its own run made.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_folder_is_never_a_link() {
+        let zone = zone();
+        std::fs::create_dir_all(zone.path().join("active/s/workspace")).expect("mkdir");
+        std::fs::create_dir_all(zone.path().join("active/other")).expect("mkdir");
+        let step = PlanStep::MkDirNew {
+            path: "active/s/workspace/.staging-g".to_owned(),
+        };
+        std::os::unix::fs::symlink(
+            zone.path().join("active/other"),
+            zone.path().join("active/s/workspace/.staging-g"),
+        )
+        .expect("link");
+        let refused = run_step(zone.path(), &step).expect_err("a link");
+        assert!(refused.to_string().starts_with("mkdir "), "{refused}");
+        std::fs::remove_file(zone.path().join("active/s/workspace/.staging-g")).expect("rm");
+        run_step(zone.path(), &step).expect("made");
+        run_step(zone.path(), &step).expect("a resume takes its own folder");
+    }
+
+    /// R94R-04: a new file is created only where none appeared since the
+    /// plan; a resume finding its own bytes completes.
+    #[test]
+    fn a_created_file_never_replaces_one_that_appeared() {
+        let zone = zone();
+        let dir = zone.path().join("active/s/artifacts/run");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let step = PlanStep::CreateFile {
+            path: "active/s/artifacts/run/.memlog.md".to_owned(),
+            content: "new".to_owned(),
+        };
+        std::fs::write(dir.join(".memlog.md"), "somebody's").expect("plant");
+        let refused = run_step(zone.path(), &step).expect_err("it appeared");
+        assert!(refused.to_string().contains("appeared"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".memlog.md")).expect("kept"),
+            "somebody's"
+        );
+        std::fs::remove_file(dir.join(".memlog.md")).expect("rm");
+        run_step(zone.path(), &step).expect("created");
+        run_step(zone.path(), &step).expect("a resume sees its own bytes");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".memlog.md")).expect("new"),
+            "new"
+        );
+    }
+
+    /// `dir`'s mode set to `mode` until the guard drops.
+    #[cfg(unix)]
+    struct Mode<'p>(&'p Path);
+
+    #[cfg(unix)]
+    impl<'p> Mode<'p> {
+        fn set(dir: &'p Path, mode: u32) -> Mode<'p> {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            Mode(dir)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Mode<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// R94R-03, at the boundary a test can plant: a folder whose entry
+    /// list cannot be synced (writable and searchable, not readable). A
+    /// folder made in it — a new ancestor of the one asked for, or a
+    /// generation moved into it — is a step that did not finish, never
+    /// one the journal moves past: the step's effect is on the disk before
+    /// the cursor advances.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_the_journal_counts_is_synced_where_it_was_made() {
+        let zone = zone();
+        let session = zone.path().join("active/s");
+        std::fs::create_dir_all(session.join("workspace")).expect("mkdir");
+        {
+            let _unsynced = Mode::set(&session, 0o300);
+            let made = run(
+                zone.path(),
+                Plan {
+                    verb: "memlog".to_owned(),
+                    session: "active/s".to_owned(),
+                    steps: vec![PlanStep::MkDir {
+                        path: "active/s/artifacts/run".to_owned(),
+                    }],
+                },
+            );
+            assert!(
+                made.as_ref().is_err_and(|error| error
+                    .to_string()
+                    .starts_with("mkdir active/s/artifacts/run")),
+                "{made:?}"
+            );
+        }
+        let workspace = session.join("workspace");
+        std::fs::create_dir_all(workspace.join(".staging-g")).expect("mkdir");
+        std::fs::write(workspace.join(".staging-g/workflow.md"), "w").expect("write");
+        let _unsynced = Mode::set(&workspace, 0o300);
+        let published = run(zone.path(), publish_plan(&[("workflow.md", "w")]));
+        assert!(
+            published
+                .as_ref()
+                .is_err_and(|error| error.to_string().starts_with("publish ")),
+            "{published:?}"
         );
     }
 }
