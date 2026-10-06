@@ -654,12 +654,19 @@ pub struct HeardBody {
     pub reason: HeardReason,
 }
 
-/// What an agent wrote to its memory.
+/// What an agent wrote to its memory, or the review pass a nudge began.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryOp {
+    /// A `journal_append`; `ref` is the journal file, home-relative.
     Journal,
+    /// A `memory_propose` or `skill_propose`; `ref` is the proposal file,
+    /// home-relative.
     Proposal,
+    /// A nudge's review pass began (story 95.1); `ref` names the nudges
+    /// that fired, `memory`, `skill` or `memory,skill`. Every line of the
+    /// pass descends from this one ([`ReviewLines`]).
+    Review,
 }
 
 /// `memory`.
@@ -669,6 +676,33 @@ pub struct MemoryBody {
     pub op: MemoryOp,
     #[serde(rename = "ref")]
     pub reference: String,
+}
+
+/// The lines of nudges' review passes: each `memory` line of op `review`
+/// and every line descending from it by `parent`. A review reads the
+/// conversation and may propose; it is not part of the conversation, so
+/// replay and the nudges' counters set its lines aside.
+#[derive(Debug, Clone, Default)]
+pub struct ReviewLines {
+    ids: std::collections::HashSet<Ulid>,
+}
+
+impl ReviewLines {
+    /// Whether `line`, taken in log order, belongs to a review pass.
+    pub fn take(&mut self, line: &LogLine) -> bool {
+        let marker = matches!(
+            &line.body,
+            LineBody::Memory(MemoryBody {
+                op: MemoryOp::Review,
+                ..
+            })
+        );
+        let inside = marker || line.parent.is_some_and(|parent| self.ids.contains(&parent));
+        if inside {
+            self.ids.insert(line.id);
+        }
+        inside
+    }
 }
 
 /// `compact`: a summary that replaces every line through `replaces_through`.

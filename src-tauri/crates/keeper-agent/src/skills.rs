@@ -12,7 +12,7 @@
 use std::io::Read as _;
 use std::path::Path;
 
-use keeper_core::agents::skills::SkillsIndex;
+use keeper_core::agents::skills::{self, SkillsIndex};
 use keeper_core::agents::workflow::ViewCall;
 use keeper_core::bots::tools::{ToolOutcome, MAX_READ_BYTES};
 use keeper_sync::browse;
@@ -26,8 +26,12 @@ fn refused(reason: impl Into<String>) -> ToolOutcome {
 }
 
 /// Why `name` is not one of the skills `index` offers: the validator's
-/// reasons for a refused one, else that it is not offered.
+/// reasons for a refused one, that a proposed one waits for a person, else
+/// that it is not offered.
 pub fn not_offered(index: &SkillsIndex, name: &str) -> String {
+    if index.waiting.iter().any(|dir| dir == name) {
+        return format!("{name} is not offered: it {}", skills::WAITING);
+    }
     match index.refused.iter().find(|(dir, _)| dir == name) {
         Some((_, reasons)) => format!("{name} is not offered: {}", reasons.join(" ")),
         None => format!(
@@ -37,7 +41,8 @@ pub fn not_offered(index: &SkillsIndex, name: &str) -> String {
 }
 
 /// `skills_list`: the offered skills by name and purpose, then each
-/// refused folder of `_skills/` with its reasons.
+/// refused folder of `_skills/` with its reasons, then the skills that wait
+/// for a person.
 pub fn list(index: &SkillsIndex) -> ToolOutcome {
     let mut body = String::new();
     if index.offered.is_empty() {
@@ -52,6 +57,12 @@ pub fn list(index: &SkillsIndex) -> ToolOutcome {
         body.push_str("\nIn _skills/ but not offered:\n");
         for (dir, reasons) in &index.refused {
             body.push_str(&format!("- {dir}: {}\n", reasons.join(" ")));
+        }
+    }
+    if !index.waiting.is_empty() {
+        body.push_str("\nWaiting for a person:\n");
+        for dir in &index.waiting {
+            body.push_str(&format!("- {dir}: {}\n", skills::WAITING));
         }
     }
     ToolOutcome::Text {

@@ -6,8 +6,11 @@
 //! reasons and never offered. The prompt carries name and description only;
 //! the body loads through `skill_view` (§9.1).
 //!
-//! Pure: the host walks `_skills/` (skipping `.archive/`) through
-//! `browse::resolve` and hands each directory name with its `SKILL.md` text.
+//! Pure: the host walks `_skills/` through `browse::resolve` and hands each
+//! directory name with its `SKILL.md` text; a dotted folder (`.archive/`)
+//! is never a skill. A skill an agent proposed carries
+//! `metadata.keeper_proposal` and waits for a person: it is never offered
+//! until a person adopts it by deleting the key (R28 S-12, AD-402).
 
 use keeper_ported::agentskills::{validate_metadata, MetaValue};
 
@@ -50,6 +53,9 @@ pub struct SkillsIndex {
     pub offered: Vec<SkillEntry>,
     /// `(directory, reasons)`, by directory.
     pub refused: Vec<(String, Vec<String>)>,
+    /// Valid skills an agent proposed that no person adopted yet, by
+    /// directory: listed, never offered.
+    pub waiting: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -73,13 +79,62 @@ impl SkillDirProblem {
     }
 }
 
+/// The `metadata` key a skill an agent proposed carries until a person
+/// adopts it.
+pub const PROPOSAL_KEY: &str = "keeper_proposal";
+
+/// What a skill that waits for a person is said to be, after its name.
+pub const WAITING: &str = "waits for a person: an agent proposed it, and it is offered once a person adopts it by deleting metadata.keeper_proposal.";
+
+/// Why a skill whose `metadata` keeper cannot read is not offered.
+pub const UNREADABLE_METADATA: &str = "metadata is not one block map of distinct plain keys, so keeper cannot tell whether an agent proposed this skill and a person adopted it; write metadata as a block map of `key: value` lines.";
+
+/// What a skill's `metadata` says of its adoption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Adoption {
+    /// No proposal key: a person's skill, or one a person adopted.
+    Adopted,
+    /// [`PROPOSAL_KEY`] is there: it waits for a person.
+    Proposed,
+    /// Keeper cannot model it, or it says a key twice: whether the
+    /// proposal key is there is unknown, so it is not offered (R204).
+    Unreadable,
+}
+
+fn adoption(frontmatter: &Frontmatter) -> Adoption {
+    match frontmatter.count("metadata") {
+        // A construct the parser does not model can hide the key itself.
+        0 if frontmatter.unparsed().is_some() && frontmatter.raw_block().contains(PROPOSAL_KEY) => {
+            Adoption::Unreadable
+        }
+        0 => Adoption::Adopted,
+        1 => match frontmatter.get("metadata") {
+            Some(FieldValue::Map(pairs)) => {
+                let repeated = pairs
+                    .iter()
+                    .enumerate()
+                    .any(|(at, (key, _))| pairs[..at].iter().any(|(earlier, _)| earlier == key));
+                if repeated {
+                    Adoption::Unreadable
+                } else if pairs.iter().any(|(key, _)| key == PROPOSAL_KEY) {
+                    Adoption::Proposed
+                } else {
+                    Adoption::Adopted
+                }
+            }
+            _ => Adoption::Unreadable,
+        },
+        _ => Adoption::Unreadable,
+    }
+}
+
 /// Validate every found skill and offer the wanted, valid ones.
 pub fn index(found: &[(String, String)], wanted: &SkillFilter) -> SkillsIndex {
     let mut sorted: Vec<&(String, String)> = found.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut out = SkillsIndex::default();
-    for (dir, text) in sorted {
+    for (dir, text) in sorted.into_iter().filter(|(dir, _)| !dir.starts_with('.')) {
         if text.len() > MAX_SKILL_BYTES {
             out.refused.push((
                 dir.clone(),
@@ -112,6 +167,18 @@ pub fn index(found: &[(String, String)], wanted: &SkillFilter) -> SkillsIndex {
                 "_skills/{dir}/SKILL.md's body is {lines} lines; agentskills recommends fewer than \
                  {BODY_WARN_LINES}."
             ));
+        }
+        match adoption(&frontmatter) {
+            Adoption::Adopted => {}
+            Adoption::Proposed => {
+                out.waiting.push(dir.clone());
+                continue;
+            }
+            Adoption::Unreadable => {
+                out.refused
+                    .push((dir.clone(), vec![UNREADABLE_METADATA.to_owned()]));
+                continue;
+            }
         }
         let wanted_here = match wanted {
             SkillFilter::All => true,
@@ -268,5 +335,57 @@ mod tests {
             )),
             ["fits"]
         );
+    }
+
+    /// R28 S-12: a skill carrying `metadata.keeper_proposal` is listed as
+    /// waiting for a person and offered to no one, by name or by `*`; the
+    /// same skill without the key — adopted — is offered; a dotted folder
+    /// is never read as a skill.
+    #[test]
+    fn a_proposed_skill_waits_for_a_person() {
+        let proposed = "---\nname: tidy\ndescription: Tidy the inbox.\nmetadata:\n  keeper_proposal: 01J9ZZ5K8V9Q3W2E1R0T7Y6X5Z\n  author: nixi\n---\nSteps.\n";
+        let adopted = "---\nname: tidy\ndescription: Tidy the inbox.\nmetadata:\n  author: nixi\n---\nSteps.\n";
+        let archived = "---\nname: old\ndescription: d\n---\n";
+        for wanted in [
+            SkillFilter::All,
+            SkillFilter::from_list(&["tidy".to_owned()]),
+        ] {
+            let found = [
+                ("tidy".to_owned(), proposed.to_owned()),
+                (".archive".to_owned(), archived.to_owned()),
+            ];
+            let waiting = index(&found, &wanted);
+            assert!(waiting.offered.is_empty(), "{wanted:?}");
+            assert_eq!(waiting.waiting, ["tidy"]);
+            assert!(waiting.refused.is_empty());
+            let adopted = index(&[("tidy".to_owned(), adopted.to_owned())], &wanted);
+            assert_eq!(names(&adopted), ["tidy"]);
+            assert!(adopted.waiting.is_empty());
+        }
+    }
+
+    /// R204: metadata keeper cannot read as one block map of distinct keys
+    /// — a flow map, a nested value that makes the map opaque, a key said
+    /// twice, `metadata` itself said twice — is not offered: refused with
+    /// the reason, never taken for adopted.
+    #[test]
+    fn unreadable_adoption_metadata_is_not_offered() {
+        let head = "---\nname: tidy\ndescription: Tidy the inbox.\n";
+        for metadata in [
+            "metadata: {keeper_proposal: pending}\n",
+            "metadata:\n  keeper_proposal: pending\n  extra:\n    deep: x\n",
+            "metadata:\n  keeper_proposal: |\n    pending\n",
+            "metadata:\n  author: nixi\n  author: tgorka\n",
+            "metadata:\n  author: nixi\nmetadata:\n  keeper_proposal: pending\n",
+        ] {
+            let text = format!("{head}{metadata}---\nSteps.\n");
+            let index = index(&[("tidy".to_owned(), text)], &SkillFilter::All);
+            assert!(index.offered.is_empty(), "{metadata:?}");
+            assert_eq!(
+                index.refused,
+                [("tidy".to_owned(), vec![UNREADABLE_METADATA.to_owned()])],
+                "{metadata:?}"
+            );
+        }
     }
 }

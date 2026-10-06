@@ -104,6 +104,39 @@ pub fn real_dir(path: &Path) -> Result<(), LogError> {
     Ok(())
 }
 
+/// Open the regular file at `path` for reading and appending, made if
+/// absent: a link or anything else there is refused, one swapped in between
+/// the check and the open too. The discipline of a chunk, and of every
+/// other file one host alone appends to (an agent's journal).
+pub fn open_own_file(path: &Path) -> Result<File, LogError> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if !meta.file_type().is_file() {
+            return Err(LogError::Symlink {
+                path: path.display().to_string(),
+            });
+        }
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(|e| LogError::io(path, e))?;
+    // The file held open must be the regular file at `path`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let held = file.metadata().map_err(|e| LogError::io(path, e))?;
+        let at = fs::symlink_metadata(path).map_err(|e| LogError::io(path, e))?;
+        if !at.file_type().is_file() || (held.dev(), held.ino()) != (at.dev(), at.ino()) {
+            return Err(LogError::Symlink {
+                path: path.display().to_string(),
+            });
+        }
+    }
+    Ok(file)
+}
+
 impl ChunkWriter {
     /// Open `host`'s writer in `session_dir`. The host's newest chunk,
     /// whatever its date, has its torn tail truncated (it is this host's own,
@@ -186,32 +219,7 @@ impl ChunkWriter {
             });
         }
         let path = self.log_dir.join(name.to_string());
-        if let Ok(meta) = fs::symlink_metadata(&path) {
-            if !meta.file_type().is_file() {
-                return Err(LogError::Symlink {
-                    path: path.display().to_string(),
-                });
-            }
-        }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(&path)
-            .map_err(|e| LogError::io(&path, e))?;
-        // The file held open must be the regular file at `path`: a link
-        // swapped in between the check above and the open is refused too.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let held = file.metadata().map_err(|e| LogError::io(&path, e))?;
-            let at = fs::symlink_metadata(&path).map_err(|e| LogError::io(&path, e))?;
-            if !at.file_type().is_file() || (held.dev(), held.ino()) != (at.dev(), at.ino()) {
-                return Err(LogError::Symlink {
-                    path: path.display().to_string(),
-                });
-            }
-        }
+        let mut file = open_own_file(&path)?;
         if !existing {
             // A new chunk's directory entry is made durable with it, so a
             // turn synced into it cannot vanish with the entry on a crash.

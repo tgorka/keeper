@@ -13,7 +13,7 @@ use serde_json::Value;
 use ulid::Ulid;
 
 use super::reader::SessionLog;
-use super::{LineBody, LogError, LogLine, OpenBody, PeerBody, UserBody};
+use super::{LineBody, LogError, LogLine, OpenBody, PeerBody, ReviewLines, UserBody};
 use crate::agents::helper::HELPER;
 use crate::bots::chat::{ChatMessage, ContentPart, Role, ToolCall};
 
@@ -200,6 +200,7 @@ pub fn replay(
     let mut placed: Vec<Placed> = Vec::new();
     let mut last_open = None;
     let mut helpers = HelperSteps::default();
+    let mut review = ReviewLines::default();
     for (position, stored) in log.lines.iter().enumerate() {
         let hydrated;
         let line = match &stored.body {
@@ -223,6 +224,10 @@ pub fn replay(
             _ => stored,
         };
         if helpers.is_step(line) {
+            continue;
+        }
+        // A nudge's review pass read the conversation; it is not part of it.
+        if review.take(line) {
             continue;
         }
 

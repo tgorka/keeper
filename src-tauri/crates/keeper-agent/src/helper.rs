@@ -56,6 +56,9 @@ pub(crate) trait Parent: Sync {
     fn host(&self) -> &dyn ToolHost;
     /// The tier call `id` was classified at, for its line.
     fn tier_of(&self, id: &str) -> u8;
+    /// A helper's `skill_view`, run as the session's own read but never
+    /// what a patch or archive the session proposes is pinned to (R227).
+    fn view_skill(&self, wire: &chat::ToolCall) -> Option<ToolOutcome>;
     /// What the call `record` just read, each with its label and path.
     fn reads(&self, record: &ToolCallRecord, outcome: &ToolOutcome) -> Vec<(Label, String)>;
     /// Step `id` of the helper call `helper`, `tool` at `at` (a drive and
@@ -265,7 +268,7 @@ impl ToolHost for Reads<'_> {
         match ToolName::from_wire(&wire.name) {
             Some(_) => None,
             None if wire.name == keeper_core::agents::workflow::SKILL_VIEW => {
-                self.parent.host().run_named(wire).map(unparked)
+                self.parent.view_skill(wire).map(unparked)
             }
             None => {
                 self.parent.refused(

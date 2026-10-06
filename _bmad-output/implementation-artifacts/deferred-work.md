@@ -8097,3 +8097,52 @@ origin: epic 94, story 94.4 (rung `agents-94-helpers`, 2026-10-06; narrowed by i
 location: `src-tauri/crates/keeper-agent/src/helper.rs` (`Reads`), `keeper_core::bots::audit`
 reason: A helper's refused step's row now carries the helper's call id as its message (R203). A read it made still gets the session's own classified row with no message, so the audit alone does not say which `helper` call read; the log does (a step's `parent` is the helper's `tool_call`). Close by passing the helper's call id into the drive host's row for its reads.
 status: open
+
+### DW-560: An agent can propose a skill's SKILL.md only, never a support file.
+
+origin: epic 95, story 95.1 (rung `agents-95-memory`, R132, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/memory/mod.rs` (`skill_propose`), `src-tauri/crates/keeper-ported/src/hermes/review.rs`
+reason: Hermes' review writes `references/`, `templates/` and `scripts/` files under a skill; keeper's proposal grammar stages one SKILL.md, so the adapted prompts drop that option (UPSTREAM.md lists the change). Close with a proposal body that names a file inside the skill, pinned like a patch, and the consolidator applying it.
+status: open
+
+### DW-561: A journal entry whose text holds a line starting `## ` can be cut short by the torn-tail rule.
+
+origin: epic 95, story 95.1 (rung `agents-95-memory`, R125, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/memory/journal.rs` (`whole`)
+reason: A torn tail is cut back to the last `\n## ` in the file; when the torn entry's own text holds a markdown heading, the cut lands inside that entry and keeps its first part, and a tear that ends exactly on a newline inside an entry is not seen as torn. Each entry is one write, so only a host dying mid-write leaves this. Close with an end marker per entry, or a length the header carries.
+status: done 2026-10-06 — rung `agents-95-memory`, review R95M-09 (R204): each header carries its entry's byte length and `journal::whole` walks the file from its frontmatter, keeping exactly the whole entries (`journal_survives_a_tear_at_every_byte`)
+
+### DW-562: A turn-level test of a review pass that a lost claim stops is missing.
+
+origin: epic 95, story 95.1 (rung `agents-95-memory`, R126, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs`
+reason: The memory tools ask the claim right before each effect — a proposal's link, the journal's cut and its append (R95M-07, R204; unit-proved by `memory::tests::a_proposal_is_published_whole_under_the_claim` and `journal::tests::a_lost_claim_cuts_and_writes_nothing`) — but the turns harness cannot lose a `Lease` between a review pass's `tool_call` line and its effect (the same seam DW-553 names). Close with that seam.
+status: open
+
+### DW-575: A proposal's part file a crash leaves behind is never swept.
+
+origin: epic 95, story 95.1 (rung `agents-95-memory`, review R95M-15, R204, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/memory/mod.rs` (`write_new`)
+reason: A proposal is written to `proposals/.<id>.md.<ulid>.part`, synced, then linked to its name; every return path removes the part file, but a host that dies between its creation and that removal leaves a dotted file no reader takes for a proposal and nothing deletes. Close with the consolidator (95.2) removing part files older than a run.
+status: open
+
+### DW-576: A skill not offered to the session cannot be patched or archived by it.
+
+origin: epic 95, story 95.1 (rung `agents-95-memory`, review R95M-06, R204, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/memory/mod.rs` (`skill`), `src-tauri/crates/keeper-agent/src/skills.rs` (`view`)
+reason: A patch or archive is pinned to the SKILL.md the turn read whole through `skill_view`, and `skill_view` reads only offered skills; a skill outside `[tools].skills`, one waiting for a person, or one longer than `MAX_READ_BYTES` is therefore refused ("Read … whole with skill_view in this turn first"). Fail-closed, as R204 asks. Close with a read of the skill's SKILL.md that records the digest without offering the skill.
+status: open
+
+### DW-577: A proposal whose folder cannot be synced is taken back after a reader may have seen it.
+
+origin: epic 95, story 95.1 (rung `agents-95-memory`, review R95M-15, R204, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/memory/mod.rs` (`write_new`)
+reason: After the link the folder is synced; when that fails the proposal is removed and the call refused, but a consolidator that listed the folder in between can have read the whole proposal, which then applies without the session's `memory` line. No planted-fault test covers the folder sync failing. Close with the consolidator re-checking a proposal's presence under its lease before it applies it, and a fault seam for the sync.
+status: open
+
+### DW-578: A journal append whose folder sync fails is refused although its entry is in the file.
+
+origin: epic 95, story 95.1 (rung `agents-95-memory`, review R95M-10, R204, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/memory/journal.rs` (`append_with`)
+reason: A first append syncs the day file's folder after the entry is written and synced; a failure there is reported as "could not be written" while the entry stays, so a model that retries writes it twice. Close with a refusal that says the entry was written but may not survive a power loss, or a sync before the entry is written.
+status: open

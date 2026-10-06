@@ -10,7 +10,7 @@
 //! | tier | what | the host |
 //! |---|---|---|
 //! | T0 | reads | runs it |
-//! | T1 | reversible inside the session, the surface, `delegate`, `reply`, `bmad_render`, `bmad_memlog`, `ask_human` | runs it |
+//! | T1 | reversible inside the session, the surface, `delegate`, `reply`, `bmad_render`, `bmad_memlog`, `ask_human`, `journal_append`, `memory_propose`, `skill_propose` | runs it |
 //! | T2 | a drive write outside the session, a first write the grant asks for | asks a person |
 //! | T3 | a schedule or workflow set by an agent, a declassification | asks a person, once |
 //! | T4 | (no tool of this build) | the requester decides |
@@ -114,12 +114,15 @@ pub enum AgentTool {
     AskHuman,
     WorkflowStart,
     Helper,
+    JournalAppend,
+    MemoryPropose,
+    SkillPropose,
     Declassify,
 }
 
 impl AgentTool {
     /// Every tool, in the table's order.
-    pub const ALL: [AgentTool; 26] = [
+    pub const ALL: [AgentTool; 29] = [
         AgentTool::DriveList,
         AgentTool::DriveRead,
         AgentTool::DriveGlob,
@@ -145,6 +148,9 @@ impl AgentTool {
         AgentTool::AskHuman,
         AgentTool::WorkflowStart,
         AgentTool::Helper,
+        AgentTool::JournalAppend,
+        AgentTool::MemoryPropose,
+        AgentTool::SkillPropose,
         AgentTool::Declassify,
     ];
 
@@ -176,6 +182,9 @@ impl AgentTool {
             AgentTool::AskHuman => "ask_human",
             AgentTool::WorkflowStart => "workflow_start",
             AgentTool::Helper => "helper",
+            AgentTool::JournalAppend => "journal_append",
+            AgentTool::MemoryPropose => "memory_propose",
+            AgentTool::SkillPropose => "skill_propose",
             AgentTool::Declassify => "declassify",
         }
     }
@@ -389,6 +398,10 @@ fn row(tool: AgentTool, facts: &CallFacts) -> Tier {
         | AgentTool::BmadMemlog
         | AgentTool::AskHuman
         | AgentTool::WorkflowStart => Tier::T1,
+        // A journal entry and a proposal land in the agent's own home,
+        // read with it, and change nothing an agent is told until the
+        // consolidator or a person acts on them (AD-400).
+        AgentTool::JournalAppend | AgentTool::MemoryPropose | AgentTool::SkillPropose => Tier::T1,
         AgentTool::Declassify => Tier::T3,
     }
 }
@@ -728,7 +741,10 @@ mod tests {
                 | AgentTool::BmadRender
                 | AgentTool::BmadMemlog
                 | AgentTool::AskHuman
-                | AgentTool::WorkflowStart => {
+                | AgentTool::WorkflowStart
+                | AgentTool::JournalAppend
+                | AgentTool::MemoryPropose
+                | AgentTool::SkillPropose => {
                     assert_eq!(tier(tool, CallFacts::default()), Tier::T1, "{tool:?}");
                 }
                 AgentTool::Declassify => {

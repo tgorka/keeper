@@ -355,6 +355,22 @@ pub fn summary_of(tool: AgentTool, args: &Value) -> String {
             Some(lens) => format!("Run the review layer {lens} as a read-only helper"),
             None => "Hand one piece of work to a read-only helper".to_owned(),
         },
+        AgentTool::JournalAppend => format!(
+            "Add an entry to this agent's journal ({} bytes)",
+            bytes_of(args, "text")
+        ),
+        AgentTool::MemoryPropose => {
+            let file = match arg(args, "target") {
+                "user" => "USER.md",
+                _ => "MEMORY.md",
+            };
+            format!("Propose to {} an entry of {file}", arg(args, "op"))
+        }
+        AgentTool::SkillPropose => format!(
+            "Propose to {} the skill {}",
+            arg(args, "op"),
+            arg(args, "name")
+        ),
         AgentTool::Declassify => {
             let readers: Vec<&str> = args["readers"]
                 .as_array()

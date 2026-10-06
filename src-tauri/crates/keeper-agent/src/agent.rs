@@ -51,9 +51,9 @@ use keeper_core::agents::log::reader::{hydrate_blob, read_session};
 use keeper_core::agents::log::replay::{message_for, HelperSteps, ReplayRefusal};
 use keeper_core::agents::log::{
     ApprovalBody, ApprovalState, AskBody, AskState, AssistantBody, ChildSession, DelegateBody,
-    DelegateReply, DelegateState, ErrorBody, HostSlug, LineBody, LogLine, OpenBody, PeerAnswer,
-    PeerAsk, PeerBody, RunBody, ScopeBody, ToldBody, ToolCallBody, ToolOutcomeWord, ToolResultBody,
-    Truncated, Usage, UserBody,
+    DelegateReply, DelegateState, ErrorBody, HostSlug, LineBody, LogLine, MemoryBody, MemoryOp,
+    OpenBody, PeerAnswer, PeerAsk, PeerBody, RunBody, ScopeBody, ToldBody, ToolCallBody,
+    ToolOutcomeWord, ToolResultBody, Truncated, Usage, UserBody,
 };
 use keeper_core::agents::matrix::AgentMatrixError;
 use keeper_core::agents::memory::{self, MemorySnapshot};
@@ -138,7 +138,7 @@ const LABEL_CODE: &str = "label";
 
 /// The `finish` of an `assistant` line written for a round that called
 /// tools: the turn goes on after it, so it answers nothing yet.
-pub(crate) const ROUND_FINISH: &str = "tool_calls";
+pub(crate) const ROUND_FINISH: &str = keeper_core::agents::nudge::TOOL_ROUND_FINISH;
 
 /// The message for a turn cut off by a restart (C6): it is not re-run,
 /// because its tool calls may already have had effects.
@@ -289,6 +289,9 @@ pub struct SessionContext {
     pub(crate) turn_tokens_at: u64,
     /// The last `tool_result` line of the session's own calls.
     last_result: Option<Ulid>,
+    /// The nudges' counters, from every line (95.1): when the session's
+    /// agent reviews what it learned.
+    pub nudges: keeper_core::agents::nudge::Nudges,
 }
 
 impl SessionContext {
@@ -360,6 +363,7 @@ impl SessionContext {
             helper_steps: HelperSteps::default(),
             turn_tokens_at: 0,
             last_result: None,
+            nudges: Default::default(),
         };
         for stored in &log.lines {
             match &stored.body {
@@ -398,6 +402,14 @@ impl SessionContext {
         }
         self.keep(line);
         self.track(line);
+        // A nudge's review pass is not the conversation: its tokens and
+        // reads count, its messages are never sent again.
+        if self.nudges.observe(line) {
+            if let LineBody::Label(body) = &line.body {
+                self.label = body.label();
+            }
+            return;
+        }
         match &line.body {
             // A label line holds the label after its join.
             LineBody::Label(body) => self.label = body.label(),
@@ -1030,6 +1042,8 @@ struct AllowedTools<'t> {
     asks: AskTools<'t>,
     /// `workflow_start` (R104).
     workflows: crate::workflow::WorkflowTools<'t>,
+    /// `journal_append`, `memory_propose` and `skill_propose` (95.1).
+    memory: crate::memory::MemoryTools,
     view: &'t dyn TurnView,
     sinks: &'t Sinks,
     /// The declarations of the drives this host mounts: a write's audience.
@@ -1423,6 +1437,10 @@ impl crate::helper::Parent for AllowedTools<'_> {
         AllowedTools::tier_of(self, id)
     }
 
+    fn view_skill(&self, wire: &chat::ToolCall) -> Option<ToolOutcome> {
+        self.named(wire, false)
+    }
+
     fn reads(&self, record: &ToolCallRecord, outcome: &ToolOutcome) -> Vec<(Label, String)> {
         let home = self.home;
         read_label(self.helpers.deps, &self.helpers.profiles, record, outcome)
@@ -1646,6 +1664,15 @@ impl ToolHost for AllowedTools<'_> {
     }
 
     fn run_named(&self, wire: &chat::ToolCall) -> Option<ToolOutcome> {
+        self.named(wire, true)
+    }
+}
+
+impl AllowedTools<'_> {
+    /// A named call: the session model's own when `own`, else a helper's,
+    /// whose `skill_view` pins nothing — the session's patch was written
+    /// against what its own model read (R204, R227).
+    fn named(&self, wire: &chat::ToolCall, own: bool) -> Option<ToolOutcome> {
         // Asked ahead of every call, a drive verb's too: an ended run's
         // calls never reach `run` (R202).
         if self.view.ended() {
@@ -1791,6 +1818,60 @@ impl ToolHost for AllowedTools<'_> {
             }
             return outcome;
         }
+        if crate::memory::serves(&wire.name) {
+            // Into the agent's home, read with it (AD-391's memory sink):
+            // checked against the home's readers before any effect, then
+            // made under the claim (R120).
+            let tool = AgentTool::from_wire(&wire.name)?;
+            let classification = self.classify(&wire.id, tool, &CallFacts::default(), None);
+            let at = self.memory.at(wire);
+            let gated = self.gated(
+                &wire.id,
+                &wire.name,
+                &classification,
+                &[],
+                vec![(self.home.id.clone(), at.clone())],
+            );
+            let audit = CallAudit::new(
+                self.sinks,
+                &wire.name,
+                Effect::Write,
+                &classification,
+                gated,
+                (&self.home.id, &at),
+            )
+            .lifting(self, &wire.id);
+            let outcome = if !self.allow.contains(&wire.name) {
+                refusal(format!("{} is not one of this agent's tools.", wire.name))
+            } else if let Some(reason) = self.memory.refusal(&wire.name) {
+                refusal(reason.to_owned())
+            } else {
+                let label = self.view.label();
+                let admitted = self
+                    .sinks
+                    .verdict(
+                        &wire.name,
+                        &Destination::Drive {
+                            drive: self.home.id.clone(),
+                            path: at.clone(),
+                        },
+                        &label,
+                        &Sink::MemoryWrite {
+                            home_readers: Readers::Only(self.home.readers.clone()),
+                        },
+                        wire.arguments_raw.as_bytes(),
+                        None,
+                    )
+                    .or_else(|blocked| audit.blocked(blocked))
+                    .and_then(|()| audit.admit(&self.home.id, &at));
+                match admitted {
+                    Ok(()) => self.memory.run(wire, &label, &|| self.view.may_write()),
+                    Err(withheld) => withheld.into(),
+                }
+            };
+            audit.finish(&outcome);
+            return Some(outcome);
+        }
         if crate::bmad::serves(&wire.name) {
             let tool = AgentTool::from_wire(&wire.name)?;
             let classification = self.classify(&wire.id, tool, &CallFacts::default(), None);
@@ -1815,6 +1896,26 @@ impl ToolHost for AllowedTools<'_> {
                         Err(withheld) => withheld.into(),
                     }
                 };
+                // A SKILL.md read whole is what a patch or archive of it is
+                // pinned to (R132, R204).
+                if let (
+                    keeper_core::agents::workflow::SKILL_VIEW,
+                    ToolOutcome::Text {
+                        body,
+                        truncated_at: None,
+                        ..
+                    },
+                ) = (wire.name.as_str(), &outcome)
+                {
+                    let viewed = wire
+                        .arguments
+                        .as_ref()
+                        .and_then(|args| keeper_core::agents::workflow::parse_view(args).ok())
+                        .filter(|call| call.path.as_deref().unwrap_or("SKILL.md") == "SKILL.md");
+                    if let Some(call) = viewed.filter(|_| own) {
+                        self.memory.viewed(&call.name, body);
+                    }
+                }
                 audit.finish(&outcome);
                 return Some(outcome);
             }
@@ -5039,11 +5140,12 @@ impl ServedSession {
             &mut self.context,
             &mut self.writer,
             deps,
-            &sink,
-            &board,
-            stop,
+            Some(&sink),
+            Some(&board),
+            stop.clone(),
             tools,
             resume,
+            None,
         )
         .await;
         let stream_end = Instant::now();
@@ -5308,6 +5410,18 @@ impl ServedSession {
         if self.context.asks.values().any(|open| !open.sent) {
             self.retry.asks = true;
         }
+        // A person's own conversation reviews what it learned once its
+        // nudges fire (95.1, R127): after the answer, never in its place.
+        if ran.ending == TurnEnding::Complete
+            && matches!(
+                self.context.agent.kind,
+                SessionKind::Main | SessionKind::Conversation
+            )
+        {
+            if let Some(due) = self.context.nudges.due(&deps.home.config.memory) {
+                self.review(deps, &port, due, stop).await?;
+            }
+        }
 
         Ok(TurnReport {
             user_line: user_id,
@@ -5321,6 +5435,114 @@ impl ServedSession {
             prompt_sha256: ran.prompt_sha256,
             answer,
         })
+    }
+
+    /// Run a nudge's review pass (95.1, R126): a `memory` line names the
+    /// nudges that fired, then the pass runs as its own model run under it
+    /// — the conversation and Hermes' review prompt in, proposals out —
+    /// and its closing line too descends from it. Nothing reaches the room.
+    /// It spends the turn's own `tokens_per_turn`, one account with the
+    /// answer's rounds and its helpers (R111, R126, R226): none once they spent
+    /// it all — then the nudge stays due for the next turn — and no round
+    /// after one that crossed it.
+    async fn review(
+        &mut self,
+        deps: &AgentDeps,
+        port: &Arc<dyn EditPort>,
+        due: keeper_core::agents::nudge::Due,
+        stop: CancelSignal,
+    ) -> Result<(), ServeError> {
+        let turn_spend = self
+            .context
+            .tokens_spent
+            .saturating_sub(self.context.turn_tokens_at);
+        if helper::spent(deps.home.config.limits.tokens_per_turn, turn_spend) {
+            return Ok(());
+        }
+        let marker = self.writer.write(
+            &mut self.context,
+            None,
+            None,
+            LineBody::Memory(MemoryBody {
+                op: MemoryOp::Review,
+                reference: due.as_ref_word().to_owned(),
+            }),
+        )?;
+        let sinks = self.sinks(deps);
+        let tools = TurnTools {
+            surface: None,
+            delegations: None,
+            room: Arc::clone(port),
+            from: self.delegator(deps),
+            sinks,
+            gate: self.gate(deps, port),
+            scheduled: None,
+        };
+        let ran = run_agent_turn(
+            &mut self.context,
+            &mut self.writer,
+            deps,
+            None,
+            None,
+            stop,
+            tools,
+            None,
+            Some(ReviewPass {
+                marker: marker.id,
+                due,
+            }),
+        )
+        .await;
+        let mut parent = ran.parent.or(Some(marker.id));
+        // The pass's last completion, its usage counted once by its line —
+        // before the spent ending when that completion reached the budget.
+        let answered = match ran.ending {
+            TurnEnding::Complete | TurnEnding::Stopped => true,
+            TurnEnding::Spent => ran.outcome.is_some(),
+            _ => false,
+        };
+        if answered {
+            let outcome = ran.outcome.as_ref();
+            let usage = outcome.and_then(|o| o.usage.as_ref());
+            let line = self.writer.write(
+                &mut self.context,
+                parent,
+                None,
+                LineBody::Assistant(AssistantBody {
+                    text: ran.round_text.clone(),
+                    model: outcome
+                        .and_then(|o| o.model.clone())
+                        .unwrap_or_else(|| deps.bot.target.clone()),
+                    finish: outcome
+                        .map_or_else(|| "stop".to_owned(), |o| finish_word(&o.finish_reason)),
+                    usage: Usage {
+                        prompt: usage.and_then(|u| u.prompt_tokens),
+                        completion: usage.and_then(|u| u.completion_tokens),
+                    },
+                    ttft_ms: outcome.and_then(|o| o.first_token_ms),
+                    duration_ms: outcome.map_or(0, |o| o.total_ms),
+                    anchor_event: None,
+                }),
+            )?;
+            parent = Some(line.id);
+        }
+        let closing = match ran.ending {
+            TurnEnding::Complete | TurnEnding::Stopped => None,
+            TurnEnding::Spent => Some(ErrorBody {
+                sentence: helper::TURN_SPENT.to_owned(),
+                code: "turn_tokens".to_owned(),
+            }),
+            _ => Some(ErrorBody {
+                sentence: ran.error.clone().unwrap_or_else(|| TURN_FAILED.to_owned()),
+                code: "review_failed".to_owned(),
+            }),
+        };
+        if let Some(closing) = closing {
+            self.writer
+                .write(&mut self.context, parent, None, LineBody::Error(closing))?;
+        }
+        off_the_runtime(|| self.writer.sync())?;
+        Ok(())
     }
 
     /// This session's room gate over `port` (R168): the room's members at
@@ -5611,6 +5833,9 @@ struct TurnLog<'a> {
     tokens_at_start: u64,
     /// The turn's token budget stopped it before a round.
     spent: bool,
+    /// A review pass's `memory` line: every line it writes descends from
+    /// it.
+    root: Option<Ulid>,
 }
 
 impl TurnView for Mutex<TurnLog<'_>> {
@@ -5725,7 +5950,10 @@ impl TurnLog<'_> {
         if self.failure.is_some() {
             return None;
         }
-        match self.writer.write(self.context, parent, None, body) {
+        match self
+            .writer
+            .write(self.context, parent.or(self.root), None, body)
+        {
             Ok(line) => Some(line.id),
             Err(error) => {
                 self.failure = Some(error);
@@ -5815,9 +6043,10 @@ fn reply_offer(session: SessionKind, relays_waiting: bool, kind: AgentKind) -> R
 /// agent's own tools — the surface, `delegate` and the card tools as
 /// `allow` says, `reply` by the session (R48, R100), the BMAD and skill
 /// tools where the home drive `home` reads (R195), `helper` as `allow`
-/// says (R105), `ask_human` by the session's kind (R102) and
-/// `workflow_start` outside a proxy's own conversation (AD-380). Arming
-/// and a workflow's start check both ask it (R202).
+/// says (R105), `ask_human` by the session's kind (R102),
+/// `workflow_start` outside a proxy's own conversation (AD-380) and the
+/// memory tools `allow` names, by the session's kind (R127). Arming and a
+/// workflow's start check both ask it (R202).
 fn agent_offer(
     config: &keeper_core::agents::home::AgentConfig,
     session: SessionKind,
@@ -5859,6 +6088,7 @@ fn agent_offer(
     {
         tools.push(keeper_core::agents::workflow::start_spec());
     }
+    tools.extend(crate::memory::specs(&config.allow, session, None));
     tools
 }
 
@@ -5965,23 +6195,87 @@ fn open_body(context: &SessionContext, deps: &AgentDeps, composed: &ComposedProm
     }
 }
 
+/// A nudge's review pass (95.1, R126): its own model run after a turn,
+/// handed the conversation and Hermes' review prompt, offered the drive's
+/// reads, the skills and the proposal tool of each nudge that fired —
+/// nothing else that writes, sends or delegates — its lines descending from
+/// the `memory` line that began it, nothing said in the room.
+#[derive(Debug, Clone, Copy)]
+struct ReviewPass {
+    marker: Ulid,
+    due: keeper_core::agents::nudge::Due,
+}
+
+/// What a review pass reads with: the drive's reads and the skills.
+const REVIEW_READS: [&str; 7] = [
+    "drive_list",
+    "drive_read",
+    "drive_glob",
+    "drive_grep",
+    "drive_stat",
+    keeper_core::agents::workflow::SKILLS_LIST,
+    keeper_core::agents::workflow::SKILL_VIEW,
+];
+
+/// The most messages of the conversation a review pass is handed.
+const REVIEW_MESSAGES: usize = 60;
+
+impl ReviewPass {
+    /// Whether the pass is offered `name`.
+    fn offers(self, name: &str) -> bool {
+        REVIEW_READS.contains(&name)
+            || (name == crate::memory::MEMORY_PROPOSE && self.due.memory)
+            || (name == crate::memory::SKILL_PROPOSE && self.due.skills)
+    }
+
+    /// The conversation's last messages from a person's message on, then
+    /// the review prompt.
+    fn messages(self, conversation: &[ChatMessage]) -> Vec<ChatMessage> {
+        let from = conversation.len().saturating_sub(REVIEW_MESSAGES);
+        let mut messages: Vec<ChatMessage> = conversation[from..]
+            .iter()
+            .skip_while(|message| message.role != Role::User)
+            .cloned()
+            .collect();
+        let prompt = keeper_ported::hermes::review::review_prompt(self.due.memory, self.due.skills)
+            .unwrap_or(keeper_ported::hermes::review::MEMORY_REVIEW_PROMPT);
+        messages.push(ChatMessage::text(Role::User, prompt.to_owned()));
+        messages
+    }
+}
+
 /// Run one turn of `context`'s agent: arm, compose, and drive the tool loop
-/// into `sink`, writing every round, call, result and label to the log.
+/// into `sink`, writing every round, call, result and label to the log. A
+/// review pass streams into no room and writes no `open` line.
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_turn(
     context: &mut SessionContext,
     writer: &mut SessionWriter,
     deps: &AgentDeps,
-    sink: &MatrixSink,
-    board: &StatusBoard,
+    sink: Option<&MatrixSink>,
+    board: Option<&StatusBoard>,
     stop: CancelSignal,
     tools: TurnTools,
     resume: Option<crate::approvals::Resume>,
+    review: Option<ReviewPass>,
 ) -> Ran {
     let config = &deps.home.config;
     let local = deps.model_is_local();
     let (mut armed, model_tools) =
         arm_session(context, deps, context.messages.clone(), Probe::Ask).await;
+    let allow: Vec<String> = match review {
+        Some(pass) => {
+            armed.request.tools.retain(|spec| pass.offers(&spec.name));
+            armed.request.messages = pass.messages(&context.messages);
+            config
+                .allow
+                .iter()
+                .filter(|name| pass.offers(name))
+                .cloned()
+                .collect()
+        }
+        None => config.allow.clone(),
+    };
     let failed = |error: String| Ran {
         ending: TurnEnding::Failed,
         outcome: None,
@@ -6001,9 +6295,13 @@ async fn run_agent_turn(
     if let Err(error) = join_prompt_sources(context, writer, deps, &mut armed) {
         return failed(error.to_string());
     }
-    board.relabel(&context.label);
+    if let Some(board) = board {
+        board.relabel(&context.label);
+    }
     let mut composed = context.compose(deps, armed.context.as_ref(), &armed.request.tools);
-    if context.open.as_ref().map(|open| &open.prompt_sha256) != Some(&composed.prompt_sha256) {
+    if review.is_none()
+        && context.open.as_ref().map(|open| &open.prompt_sha256) != Some(&composed.prompt_sha256)
+    {
         // What the model is told changed (or was never recorded): the frame
         // takes the new `open` line's time, and the line records the digest
         // of exactly that composition.
@@ -6042,7 +6340,7 @@ async fn run_agent_turn(
     let offered = crate::surface::offered(config);
     let room_gate = Arc::clone(&tools.gate);
     let surface = crate::surface::person(config)
-        .filter(|_| !offered.is_empty())
+        .filter(|_| !offered.is_empty() && review.is_none())
         .map(|person| crate::surface::SurfaceTools {
             port: tools.surface,
             person: person.clone(),
@@ -6097,8 +6395,12 @@ async fn run_agent_turn(
         context.agent.workflow.clone(),
         context.skills.clone(),
     );
-    let reply = reply_offer(context.agent.kind, !context.relays.is_empty(), config.kind);
-    let asks_offered = keeper_core::agents::ask::offered(config.kind, context.agent.kind);
+    let reply = match review {
+        Some(_) => ReplyOffer::None,
+        None => reply_offer(context.agent.kind, !context.relays.is_empty(), config.kind),
+    };
+    let asks_offered =
+        review.is_none() && keeper_core::agents::ask::offered(config.kind, context.agent.kind);
     let unattended =
         context.agent.checkpoints == Some(keeper_core::agents::session::Checkpoints::Unattended);
     // A session that asks a person and finds nobody to ask is one nobody
@@ -6124,8 +6426,51 @@ async fn run_agent_turn(
         .map(|spec| spec.name.clone())
         .collect();
     let scope = context.scope.clone();
-    // A resumed turn goes on spending the budget it began with (R203).
+    // A resumed turn goes on spending the budget it began with (R203); a
+    // review pass spends the budget of the turn it follows, one account
+    // with the answer's rounds and helpers (R111, R126, R226).
     let tokens_at_start = context.turn_tokens_at;
+    let parent_kind = context
+        .agent
+        .parent
+        .as_ref()
+        .filter(|parent| parent.drive == deps.home.drive.id)
+        .and_then(|parent| {
+            crate::zone::read_text(
+                &deps.sessions_zone,
+                &format!(
+                    "{}/{}",
+                    parent.session,
+                    keeper_core::agents::session::FILE_NAME
+                ),
+            )
+            .ok()
+            .flatten()
+        })
+        .and_then(|text| keeper_core::agents::session::parse_session_agent_toml(&text).ok())
+        .map(|parent| parent.kind);
+    let memory = crate::memory::MemoryTools::new(
+        crate::memory::MemoryHome {
+            agent: config.id.clone(),
+            dir: deps.home.dir.clone(),
+            dir_rel: drive_relative(&deps.drive_root, &deps.home.dir),
+            zone: deps.home.zone.clone(),
+            host: deps.host.clone(),
+        },
+        crate::memory::MemorySession {
+            dir: session_dir.clone(),
+            slug: context
+                .session
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned(),
+            kind: context.agent.kind,
+            parent_kind,
+            review: review.is_some(),
+        },
+    );
     let log = Mutex::new(TurnLog {
         context,
         writer,
@@ -6143,16 +6488,17 @@ async fn run_agent_turn(
         stopped: None,
         tokens_at_start,
         spent: false,
+        root: review.map(|pass| pass.marker),
     });
     let host = AllowedTools {
         inner: drive_host,
-        allow: config.allow.clone(),
+        allow: allow.clone(),
         surface,
         cards: crate::cards::CardTools {
             from: tools.from.clone(),
             drive_readers: Readers::Only(deps.home.drive.readers.clone()),
             view: &log,
-            allow: &config.allow,
+            allow: &allow,
         },
         bmad,
         grants,
@@ -6189,11 +6535,12 @@ async fn run_agent_turn(
             tools.delegations,
             tools.room,
             &log,
-            config.allow.iter().any(|name| name == delegate::DELEGATE),
+            allow.iter().any(|name| name == delegate::DELEGATE),
             reply,
             &tools.sinks,
         )
         .with_outputs(outputs),
+        memory,
         view: &log,
         sinks: &tools.sinks,
         drives: &deps.drives,
@@ -6203,7 +6550,8 @@ async fn run_agent_turn(
         profiles,
         agent,
         tiers: Mutex::new(HashMap::new()),
-        parks: deps.decisions.is_some(),
+        // A review pass never waits for a person: what needs one is refused.
+        parks: deps.decisions.is_some() && review.is_none(),
         bound: Mutex::new(None),
         parked: Mutex::new(None),
         nobody_to_ask,
@@ -6230,9 +6578,11 @@ async fn run_agent_turn(
             log.round_text.clear();
             log.round_line = None;
             log.round_usage = Usage::default();
-            let shown = sink.text();
-            if round > 0 && !shown.is_empty() && !shown.ends_with('\n') {
-                sink.push("\n\n");
+            if let Some(sink) = sink {
+                let shown = sink.text();
+                if round > 0 && !shown.is_empty() && !shown.ends_with('\n') {
+                    sink.push("\n\n");
+                }
             }
         }
         ToolLoopEvent::Chat(ChatEvent::Usage(usage)) => {
@@ -6246,7 +6596,9 @@ async fn run_agent_turn(
             // Each paced edit asks the room's gate first: once the label no
             // longer reaches the room, no more of the answer is streamed
             // into it and its status says only the fixed sentence (S-16).
-            sink.push(&text);
+            if let Some(sink) = sink {
+                sink.push(&text);
+            }
         }
         ToolLoopEvent::Chat(ChatEvent::Failed { error }) => {
             lock().broken = Some(error.to_string());
@@ -6331,6 +6683,9 @@ async fn run_agent_turn(
                 }
             }
         }
+        for line in host.memory.take_lines() {
+            log.write(call_line, line);
+        }
         for (label, path) in reads {
             let joined = log.context.label.join(&label);
             if joined != log.context.label {
@@ -6349,8 +6704,10 @@ async fn run_agent_turn(
         }
         log.progress.calls += 1;
         // The room's gate checks the label as it is now from the next send.
-        board.relabel(&log.context.label);
-        board.update(log.progress);
+        if let Some(board) = board {
+            board.relabel(&log.context.label);
+            board.update(log.progress);
+        }
     };
     let mut report = |record: &ToolCallRecord, wire: &chat::ToolCall, outcome: &ToolOutcome| {
         let mut log = lock();
@@ -6575,6 +6932,10 @@ async fn run_agent_turn(
     let asked = host.asks.asked();
     drop(host);
     let log = log.into_inner().unwrap_or_else(|p| p.into_inner());
+    // A review pass's last completion, the one no gate follows, spends the
+    // turn's one budget too: reaching it ends the pass spent (R226, R227).
+    let review_spent =
+        review.is_some() && helper::spent(config.limits.tokens_per_turn, log.turn_spend());
     let parked = match (parking, log.parked) {
         (Some(mut parking), Some((Some(call_line), wire))) => {
             let files = crate::approvals::pin_files(&read_profiles, &parking.pins);
@@ -6642,6 +7003,8 @@ async fn run_agent_turn(
                 // still failed.
                 let error = log.broken.unwrap_or_else(|| TURN_FAILED.to_owned());
                 ran(TurnEnding::Failed, Some(done.final_outcome), Some(error))
+            } else if review_spent {
+                ran(TurnEnding::Spent, Some(done.final_outcome), None)
             } else {
                 ran(TurnEnding::Complete, Some(done.final_outcome), None)
             }

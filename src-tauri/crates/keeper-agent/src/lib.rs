@@ -63,6 +63,7 @@ pub mod host;
 #[cfg(unix)]
 pub mod hosts;
 pub mod matrix_sink;
+pub mod memory;
 pub mod ports;
 pub mod rooms;
 #[cfg(unix)]

@@ -395,7 +395,7 @@ consolidator (AD-401) and people, nobody else (AD-364).
 | `agent` | string | the agent id |
 | `target` | `user \| memory \| skill:<name>` | required |
 | `op` | `add \| replace \| remove` (memory) or `create \| patch \| archive` (skill) | required |
-| `match` | string | required for `replace`/`remove`: the exact entry text the change is pinned to (digest R6 A1) |
+| `match` | string | required for `replace`/`remove`: the exact entry text the change is pinned to (digest R6 A1); for a skill's `patch`/`archive`: the SHA-256 of the `SKILL.md` it was proposed against (R132) |
 | `session` | string | drive-relative path of the session it came from |
 | `host` | string | host slug |
 | `origin` | `foreground \| review \| scheduled \| delegated \| gate` | how the session was started (AD-401's gates read it) |

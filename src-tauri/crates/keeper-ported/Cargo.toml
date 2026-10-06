@@ -17,6 +17,8 @@ workspace = true
 # BMAD's renderer does; both already in the workspace's lock.
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# `hermes::threats` compiles Hermes' threat patterns; already in the lock.
+regex = { workspace = true }
 # `preserve_order`: a table keeps its document order, as BMAD's Python dicts
 # do, so a merged configuration, a party roster and an ambiguity sentence come
 # out in BMAD's order (R98). Cargo unifies the feature into every crate that
