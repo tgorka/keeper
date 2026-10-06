@@ -42,4 +42,5 @@ pub mod spoken;
 pub mod surface;
 pub mod tier;
 pub mod trust;
+pub mod workflow;
 pub mod zone;

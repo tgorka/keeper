@@ -111,6 +111,7 @@ fn tools(home: &AgentHome) -> (Vec<&str>, Vec<&str>) {
         .partition(|name| {
             keeper_agent::delegate::is_delegation(name)
                 || keeper_agent::cards::is_card_tool(name)
+                || keeper_agent::bmad::serves(name)
                 || ToolName::ALL.iter().any(|tool| tool.as_wire() == *name)
         })
 }
@@ -339,7 +340,7 @@ fn told(
     .map_err(|error| CliError::Failure(error.to_string()))?;
     let probe = if probe { Probe::Ask } else { Probe::Skip };
     let armed = runtime()?.block_on(arm_agent(&context, &deps, probe));
-    let composed = context.compose(&deps, armed.context.as_ref());
+    let composed = context.compose(&deps, armed.context.as_ref(), &armed.request.tools);
     let told = prompt::told(&composed);
     for section in &told.sections {
         println!("## {} {}\n{}", section.slot, section.title, section.text);

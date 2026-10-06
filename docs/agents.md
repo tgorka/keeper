@@ -632,7 +632,7 @@ tier decides whether it runs:
 
 | tier | calls | what keeper does |
 | --- | --- | --- |
-| T0 | `drive_list`, `drive_read`, `drive_glob`, `drive_grep`, `drive_stat` | runs it |
+| T0 | `drive_list`, `drive_read`, `drive_glob`, `drive_grep`, `drive_stat`; `bmad_config`, `bmad_party`, `skills_list`, `skill_view` | runs it |
 | T1 | `session_write`; `card_update` on a card of the session; a `drive_write` or `drive_edit` inside the session's own folder; `delegate` and its later rounds; `reply`; the five `surface_*` tools | runs it |
 | T2 | `drive_write` or `drive_edit` outside the session; `card_update` on another session's card; any write the agent's grant asks a person about | asks a person |
 | T3 | `card_update` that sets `schedule` or `workflow`, and a `delegate` whose card carries either — in every session, the person's own DM included; letting a blocked flow through (a declassification) | asks a person, for that one action |
@@ -2024,6 +2024,84 @@ over. A reply without a label is not taken. A reply sent while the delegating ho
 read back as far as that host's newest brief in the room, however many pages. A `peer` line,
 like a `user` line, is a question a restart closes rather than reruns; a `delegate replied` line
 whose `peer` line a crash lost gets it back from the receipt first.
+
+## Workflows
+
+A BMAD skill assumes capabilities it never names: reading and writing files, running its Python
+helpers, asking the user, spawning subagents. Under keeper each one is answered by the tools of the
+closed vocabulary the turn is offered and by fixed sentences that hold for that offer
+(`keeper_core::agents::workflow::CAPABILITIES`, 19 rows in BMAD's order): a sentence that tells the
+model to use a tool is said only while that tool is offered, and one that says a tool is missing
+only while it is. A skill run here never improvises a missing capability, and is never pointed at a
+tool it cannot call:
+
+| BMAD assumes | keeper answers with | told while it is not offered |
+| --- | --- | --- |
+| read a whole file or a range | `drive_read` | it reads no file |
+| write files; edit frontmatter in place | `session_write` inside the session, `drive_edit` elsewhere | writing outside this session needs `drive_edit` |
+| list / glob | `drive_list`, `drive_glob` | it lists no folder |
+| grep; `git log` | `drive_grep`; `run` | `git log` runs only through `run` |
+| run commands | `bmad_config`, `bmad_render`, `bmad_memlog`, `bmad_party`; `run` | keeper never runs BMAD's Python helpers; a script with no Rust port runs only through `run` |
+| git `rev-parse`, diff, commit | `run` | always: keeper commits the drive itself |
+| run tests / linters | `run` | tests run only through `run` |
+| ask the user and wait | `ask_human` | no person can be asked: a step takes its stated default, or ends the turn |
+| invoke a skill by name | `skill_view` (followed inline), `workflow_start` (the next workflow) | each apart: without `skill_view` the invoked skill is not loaded; handing off needs `workflow_start` |
+| spawn a context-free subagent | `helper` | do the work inline, as the skill's fallback says |
+| re-address a live subagent | `delegate` (a delegated session's next round) | always: a helper keeps no identity |
+| agent teams | `delegate` | always: a party runs in one mind — `subagent`, `agent-team` and `auto` run as `session`; without `delegate`, every persona thinks in this session |
+| per-agent model choice | `delegate` | every step runs on this agent's own model |
+| web search | — | always: keeper has no web search of its own, and an MCP tool is never taken for one |
+| MCP / external systems | the agent's MCP tools | no MCP server is configured |
+| environment variables | — | always: none are visible |
+| open an editor or a report | `surface_open` | only a person's proxy opens a note; name the path |
+| the current date | the frame's `Now:` | always |
+| lifecycle hooks, tmux | — | always: bmad-loop does not run under keeper |
+
+A turn offered any of the `bmad_*` tools, `skills_list`, `skill_view` or `workflow_start` is told
+this map as its offer answers it, at the end of the session frame, after where BMAD's project root
+is.
+
+**The project root.** The home drive's root is BMAD's project root. Its install,
+`{project-root}/_bmad/`, is read there and never written. Every other `{project-root}` path is
+read under the drive's root and written under the session's `artifacts/`:
+`{project-root}/_bmad-output/planning-artifacts` is read at `_bmad-output/planning-artifacts` and
+written at `<session>/artifacts/_bmad-output/planning-artifacts`, so two runs never share one
+output. The skills' own `_bmad/<module>/config.yaml` files are read at the install; `bmad_config`
+answers the TOML configuration only.
+
+**Overlays.** keeper reads only what the drive holds. `_bmad/custom/` is read when it is a folder
+of the drive; when it is absent, or is a link that leads out of the drive (as tgdrive's host-local
+link into makistack is), no team or personal overlay applies and `bmad_config` and `bmad_party`
+say which, under `overlays`. To use overlays under agents, commit `_bmad/custom/` into the drive.
+
+**The tools.** All four are reads (T0), served by the agent's own host and never offered to a ⌘9
+bot. They read the home drive, so they are offered — and run — only where the agent's grant lets a
+`drive_read` of the home drive run: the drive in its `[tools].drives` and in the session's scope.
+Each file is read through keeper-sync's containment and joins the session's label as a read of it,
+labelled where it landed through every link as well as by the path the call named (the stricter
+wins), and by the bytes the tool returned — what the file holds afterwards changes nothing. A
+read whose landing cannot be established is `untrusted`.
+
+- `bmad_config({scope: "central", keys?})` prints what `resolve_config.py` prints for the four
+  layers of `_bmad/` (`config.toml`, `config.user.toml`, `custom/config.toml`,
+  `custom/config.user.toml`), keys in BMAD's order, under `config`, with `roots`: the drive, the
+  install, the session's output folder, and each `{project-root}` path key's `read` and `write`
+  location. `keys` keeps only the dotted keys found, as `--key` does. A missing
+  `_bmad/config.toml` is refused with "required TOML file not found: _bmad/config.toml".
+- `bmad_config({scope: "customization", skill?, keys?})` prints what
+  `resolve_customization.py` prints: the offered skill `_skills/<skill>/customize.toml`, or without
+  `skill` the running workflow's `_workflows/<name>/customize.toml`, merged with
+  `_bmad/custom/<name>.toml` and `<name>.user.toml` — overlays are keyed by the folder's name.
+- `bmad_party({list_groups?, party?})` prints what `resolve_party.py` prints — the room to load,
+  the menu of groups, or one group — under `party`, for the drive's `[agents]` and the party
+  skill's customization (the offered skill `bmad-party-mode`, or the running workflow of that
+  name).
+- `skills_list()` lists the skills offered to the agent by name and purpose, then every folder of
+  `_skills/` that is not offered, with the validator's reason.
+- `skill_view({name, path?})` returns an offered skill's `SKILL.md`, or one file inside its
+  folder; a path out of the folder, by `..` or by a link, is refused. A file over 64 KiB is cut
+  and the cut is said; a character the cut falls inside is left out. A file with a byte that is
+  not UTF-8 is refused as not text, wherever the byte is.
 
 ## The stewards
 

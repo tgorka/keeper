@@ -461,6 +461,7 @@ fn world_read_by(
             ("tgdrive".to_owned(), tg_decl),
             ("private".to_owned(), private_decl),
         ]),
+        drive_root: tgdrive.clone(),
         sessions_zone: tg_profile.sessions_root().expect("sessions"),
         sessions_subfolder: "60-sessions".to_owned(),
         lfs_threshold_bytes: 1_000_000,
@@ -1254,7 +1255,7 @@ async fn every_read_and_message_joins_the_session_label() {
         Readers::Only([user(TGORKA)].into_iter().collect())
     );
     assert_eq!(served.context.label, causes[1].1);
-    let frame = served.context.compose(&world.deps, None).text;
+    let frame = served.context.compose(&world.deps, None, &[]).text;
     assert!(
         frame.contains(&format!("may be shown only to: {TGORKA}.")),
         "{frame}"
@@ -1273,6 +1274,153 @@ async fn every_read_and_message_joins_the_session_label() {
     };
     assert_eq!(why.code, "label");
     assert_eq!(why.sentence, NARROWER_THAN_ROOM);
+}
+
+/// 94.2 acceptance 5: an agent allowed `skill_view` alone is offered it,
+/// its frame says where BMAD's project root is read and written (R96) and
+/// answers every capability BMAD assumes (R195: a skill-only agent follows
+/// BMAD's skills too), its `skill_view` is a `tool_call` line like any
+/// call, and the file it read joins the session label as a read of that
+/// file does (R119).
+#[tokio::test(flavor = "multi_thread")]
+async fn skill_view_is_a_logged_read_that_joins_the_label() {
+    let mut world = world(
+        ProviderKind::Ollama,
+        &["skill_view"],
+        vec![
+            calls(&[(
+                "v1",
+                "skill_view",
+                json!({"name": "x", "path": "references/a.md"}),
+            )]),
+            prose("followed."),
+        ],
+    );
+    write(
+        &world.tgdrive,
+        "80-agents/_skills/x/SKILL.md",
+        "---\nname: x\ndescription: Does x.\n---\n\nRead references/a.md.\n",
+    );
+    write(
+        &world.tgdrive,
+        "80-agents/_skills/x/references/a.md",
+        "---\nintegrity: untrusted\n---\n\nPasted from a web page.\n",
+    );
+    let mut served = world.open(SESSION);
+    report(world.ask(&mut served, "follow x").await);
+
+    let request = &world.stub.requests()[0];
+    let offered: Vec<&str> = request["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    assert_eq!(offered, ["skill_view"]);
+    let system = request["messages"][0]["content"].as_str().expect("system");
+    assert!(
+        system.contains("`60-sessions/active/2026-10-02-chat/artifacts/`"),
+        "{system}"
+    );
+    for capability in &keeper_core::agents::workflow::CAPABILITIES {
+        assert!(system.contains(capability.assumes), "{system}");
+    }
+
+    let lines = world.lines(SESSION);
+    let call = kinds(&lines, LineKind::ToolCall);
+    let LineBody::ToolCall(call) = &call[0].body else {
+        panic!("a tool_call line");
+    };
+    assert_eq!(call.tool, "skill_view");
+    assert_eq!(call.tier, 0);
+    let causes: Vec<(String, Label)> = kinds(&lines, LineKind::Label)
+        .iter()
+        .map(|line| match &line.body {
+            LineBody::Label(body) => (body.cause.reference.clone(), body.label()),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(
+        causes
+            .last()
+            .map(|(cause, label)| (cause.as_str(), label.integrity)),
+        Some((
+            "tgdrive/80-agents/_skills/x/references/a.md",
+            Integrity::Untrusted
+        ))
+    );
+    assert_eq!(served.context.label.integrity, Integrity::Untrusted);
+}
+
+/// R195: the BMAD and skill tools read the home drive only where its grant
+/// lets a `drive_read` of it run. With the home drive out of the session's
+/// scope, `skill_view` is not offered, its frame is not composed, and a
+/// call to it is refused as the `drive_read` of the same file is: nothing
+/// of the file reaches the model or the label.
+#[tokio::test(flavor = "multi_thread")]
+async fn bmad_tools_read_the_home_drive_only_under_its_grant() {
+    let mut world = world(
+        ProviderKind::Ollama,
+        &["skill_view", "drive_read"],
+        vec![
+            calls(&[
+                (
+                    "v1",
+                    "skill_view",
+                    json!({"name": "x", "path": "references/a.md"}),
+                ),
+                (
+                    "r1",
+                    "drive_read",
+                    json!({"profile": "tgdrive", "path": "80-agents/_skills/x/references/a.md"}),
+                ),
+            ]),
+            prose("could not."),
+        ],
+    );
+    write(
+        &world.tgdrive,
+        "80-agents/_skills/x/SKILL.md",
+        "---\nname: x\ndescription: Does x.\n---\n\nRead references/a.md.\n",
+    );
+    write(
+        &world.tgdrive,
+        "80-agents/_skills/x/references/a.md",
+        "---\nintegrity: untrusted\n---\n\nThe secret step.\n",
+    );
+    let mut served = world.open(SESSION);
+    served.context.scope = vec!["private".to_owned()];
+    let integrity = served.context.label.integrity;
+    report(world.ask(&mut served, "follow x").await);
+
+    let requests = world.stub.requests();
+    let offered: Vec<&str> = requests[0]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    assert_eq!(offered, ["drive_read"]);
+    let system = requests[0]["messages"][0]["content"]
+        .as_str()
+        .expect("system");
+    assert!(
+        !system.contains("invoke a skill by name, forwarding intent"),
+        "{system}"
+    );
+
+    let lines = world.lines(SESSION);
+    let results = tool_results(&lines);
+    assert_eq!(result_of(&results, "v1").outcome, ToolOutcomeWord::Refused);
+    assert_eq!(result_of(&results, "r1").outcome, ToolOutcomeWord::Refused);
+    assert!(!requests[1].to_string().contains("The secret step"));
+    for line in kinds(&lines, LineKind::Label) {
+        let LineBody::Label(body) = &line.body else {
+            unreachable!()
+        };
+        assert!(!body.cause.reference.contains("_skills/x"), "{body:?}");
+    }
+    assert_eq!(served.context.label.integrity, integrity);
 }
 
 /// S-16: the status anchor carries counts, never a path a tool named.
@@ -1834,6 +1982,7 @@ fn tolas_deps(world: &World) -> AgentDeps {
         home,
         host: world.deps.host.clone(),
         drives: world.deps.drives.clone(),
+        drive_root: world.deps.drive_root.clone(),
         sessions_zone: world.deps.sessions_zone.clone(),
         sessions_subfolder: world.deps.sessions_subfolder.clone(),
         lfs_threshold_bytes: world.deps.lfs_threshold_bytes,
@@ -1996,7 +2145,7 @@ async fn drives_in_scope_are_the_persons_choice_within_the_agents_allow() {
         outcomes(&world),
         [ToolOutcomeWord::Ok, ToolOutcomeWord::Refused]
     );
-    let frame = served.context.compose(&world.deps, None).text;
+    let frame = served.context.compose(&world.deps, None, &[]).text;
     assert!(frame.contains("- tgdrive: tgdrive"), "{frame}");
     assert!(!frame.contains("- private: private"), "{frame}");
 
@@ -2121,7 +2270,7 @@ async fn the_focus_is_told_to_the_next_turn_and_never_logged() {
         focus: hers,
         heard: tokio::time::Instant::now(),
     });
-    let frame = served.context.compose(&world.deps, None).text;
+    let frame = served.context.compose(&world.deps, None, &[]).text;
     assert!(!frame.contains("hers.md"), "{frame}");
 
     // D3: a focus not heard again within the TTL — the dock's clear was
@@ -2136,7 +2285,7 @@ async fn the_focus_is_told_to_the_next_turn_and_never_logged() {
         focus: mine.clone(),
         heard,
     });
-    let frame = served.context.compose(&world.deps, None).text;
+    let frame = served.context.compose(&world.deps, None, &[]).text;
     assert!(frame.contains("stale.md"), "heard now: {frame}");
     served.context.focus = Some(HeldFocus {
         focus: mine,
@@ -2144,7 +2293,7 @@ async fn the_focus_is_told_to_the_next_turn_and_never_logged() {
             .checked_sub(FOCUS_TTL + Duration::from_secs(1))
             .expect("an instant that long ago"),
     });
-    let frame = served.context.compose(&world.deps, None).text;
+    let frame = served.context.compose(&world.deps, None, &[]).text;
     assert!(!frame.contains("stale.md"), "heard too long ago: {frame}");
 
     // A scope event without a focus clears it.
@@ -2155,7 +2304,7 @@ async fn the_focus_is_told_to_the_next_turn_and_never_logged() {
     );
     world.serve(&mut served, cleared).await;
     assert_eq!(served.context.focus, None);
-    let frame = served.context.compose(&world.deps, None).text;
+    let frame = served.context.compose(&world.deps, None, &[]).text;
     assert!(!frame.contains("The person is looking at"), "{frame}");
 }
 
@@ -2431,6 +2580,7 @@ fn deps_of(world: &World, folder: &str, agent_toml: &str) -> AgentDeps {
         bot: world.deps.bot.clone(),
         host: world.deps.host.clone(),
         drives: world.deps.drives.clone(),
+        drive_root: world.deps.drive_root.clone(),
         sessions_zone: world.deps.sessions_zone.clone(),
         sessions_subfolder: world.deps.sessions_subfolder.clone(),
         lfs_threshold_bytes: world.deps.lfs_threshold_bytes,
@@ -9316,6 +9466,7 @@ mod parks {
             home: world.deps.home.clone(),
             host: world.deps.host.clone(),
             drives: world.deps.drives.clone(),
+            drive_root: world.deps.drive_root.clone(),
             sessions_zone: world.deps.sessions_zone.clone(),
             sessions_subfolder: world.deps.sessions_subfolder.clone(),
             lfs_threshold_bytes: world.deps.lfs_threshold_bytes,

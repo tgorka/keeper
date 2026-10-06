@@ -7934,3 +7934,19 @@ origin: epic 93, story 93.3 review fixes (rung `agents-93-decide`, R194 on revie
 location: `src-tauri/crates/keeper-agent/src/approvals.rs` (`ServedSession::forget`)
 reason: When no approver can be asked from this host, the park's record, round file and asked file are removed so nothing waits or is announced again; a record whose arguments were over 16 KiB also wrote `approvals/blobs/<sha256>.json`, which is content-addressed and may be another record's too, so it is left. It is inert — nothing reads a blob without a record naming it — but it stays in the synced session. Close with a sweep of blobs no record names.
 status: open
+
+### DW-530: `bmad_party` does not say when the drive's `_bmad/custom/` was not read.
+
+origin: epic 94, story 94.2 (rung `agents-94-config`, R97, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/bmad.rs` (`BmadTools::party`)
+reason: R97 has a tool result say when `_bmad/custom/` is absent or leads out of the drive; `bmad_config` adds an `overlays` sentence, but `bmad_party` prints `resolve_party.py`'s bytes exactly (94.2 acceptance 5), so a roster read without the drive's party overlay looks the same as one read with it. Close by deciding where the sentence goes without breaking the script's output (a second line after the JSON, or a frame line).
+status: closed 2026-10-06
+resolution: Fixed by R195 (06): `bmad_party` prints the script's projection under `party`, byte for byte, and beside it the `overlays` sentence `bmad_config` gives when `_bmad/custom/` is absent or leads out of the drive. Proved by `bmad::tests::bmad_party_says_which_overlays_it_did_not_read` (roster, groups and one group; absent and linked out; nothing behind the link read) and the goldens of `bmad_party_is_resolve_party`.
+
+### DW-531: `skills_list` and `skill_view` have no rule for a skill an agent proposed and no person adopted.
+
+origin: epic 94, story 94.2 acceptance 5 (rung `agents-94-config`, codemap §3 row 17, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/skills.rs` (`index`)
+reason: The acceptance lists such a skill as refused ("proposed by <agent> on <date>; not offered until a person adopts it") and `skill_view` refusing one still carrying `metadata.keeper_proposal`, but proposals are 95.2's and `skills::index` has no proposal rule; the clause moved to 95.2, which adds it to the index both tools read.
+status: open
+

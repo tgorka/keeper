@@ -41,6 +41,7 @@
 pub mod agent;
 pub mod approval;
 pub mod approvals;
+pub mod bmad;
 pub mod cards;
 pub mod claims;
 pub mod deciding;
@@ -64,6 +65,7 @@ pub mod runtime;
 pub mod seed;
 pub mod sessions;
 pub mod sinks;
+pub mod skills;
 pub mod stewards;
 pub mod surface;
 pub mod task;

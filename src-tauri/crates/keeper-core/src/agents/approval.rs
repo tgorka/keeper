@@ -308,6 +308,19 @@ pub fn summary_of(tool: AgentTool, args: &Value) -> String {
                 arg(args, "drive")
             )
         }
+        AgentTool::BmadConfig => match args["skill"].as_str() {
+            Some(skill) => format!("Read the BMAD customization of the skill {skill}"),
+            None if arg(args, "scope") == "customization" => {
+                "Read the BMAD customization of this session's workflow".to_owned()
+            }
+            None => "Read BMAD's central configuration".to_owned(),
+        },
+        AgentTool::BmadParty => "Read BMAD's party roster".to_owned(),
+        AgentTool::SkillsList => "List the skills offered to this agent".to_owned(),
+        AgentTool::SkillView => match args["path"].as_str() {
+            Some(file) => format!("Read `{file}` of the skill {}", arg(args, "name")),
+            None => format!("Read the skill {}", arg(args, "name")),
+        },
         AgentTool::Declassify => {
             let readers: Vec<&str> = args["readers"]
                 .as_array()

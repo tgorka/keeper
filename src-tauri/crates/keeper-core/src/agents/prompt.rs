@@ -46,6 +46,10 @@ pub struct SessionFrame {
     /// The note the person's docked notes view shows, when its drive is in
     /// scope (R41): held in memory, never logged.
     pub focus: Option<Focus>,
+    /// What BMAD may assume here, for a turn offered a tool through which
+    /// it follows a BMAD skill or workflow
+    /// ([`super::workflow::frame_lines`]); empty otherwise.
+    pub bmad: Vec<String>,
 }
 
 /// One persistent fact as it enters the prompt: a sentence, or a file from
@@ -295,6 +299,12 @@ fn frame_slot(b: &mut Builder, frame: &SessionFrame, facts: &[RenderedFact]) {
         "Now: {}",
         frame.now.to_rfc3339_opts(SecondsFormat::Secs, false)
     ));
+    if !frame.bmad.is_empty() {
+        b.text.push('\n');
+        for line in &frame.bmad {
+            b.line(line);
+        }
+    }
     b.text.push('\n');
     b.line(FILE_CONTENT_IS_DATA);
     for fact in facts {
@@ -420,6 +430,7 @@ mod tests {
             audience_sentence: label.sentence(&|user| user.localpart().to_owned()),
             now: DateTime::parse_from_rfc3339("2026-10-02T10:15:03+02:00").expect("time"),
             focus: None,
+            bmad: Vec::new(),
         };
         let agents_md = fixture("zone-ok/AGENTS.md");
         let bytes = agents_md.len();

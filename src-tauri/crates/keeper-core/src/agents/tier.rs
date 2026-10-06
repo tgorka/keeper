@@ -105,12 +105,16 @@ pub enum AgentTool {
     SurfacePoint,
     SurfaceScroll,
     SurfaceProposeEdit,
+    BmadConfig,
+    BmadParty,
+    SkillsList,
+    SkillView,
     Declassify,
 }
 
 impl AgentTool {
     /// Every tool, in the table's order.
-    pub const ALL: [AgentTool; 17] = [
+    pub const ALL: [AgentTool; 21] = [
         AgentTool::DriveList,
         AgentTool::DriveRead,
         AgentTool::DriveGlob,
@@ -127,6 +131,10 @@ impl AgentTool {
         AgentTool::SurfacePoint,
         AgentTool::SurfaceScroll,
         AgentTool::SurfaceProposeEdit,
+        AgentTool::BmadConfig,
+        AgentTool::BmadParty,
+        AgentTool::SkillsList,
+        AgentTool::SkillView,
         AgentTool::Declassify,
     ];
 
@@ -149,6 +157,10 @@ impl AgentTool {
             AgentTool::SurfacePoint => "surface_point",
             AgentTool::SurfaceScroll => "surface_scroll",
             AgentTool::SurfaceProposeEdit => "surface_propose_edit",
+            AgentTool::BmadConfig => "bmad_config",
+            AgentTool::BmadParty => "bmad_party",
+            AgentTool::SkillsList => "skills_list",
+            AgentTool::SkillView => "skill_view",
             AgentTool::Declassify => "declassify",
         }
     }
@@ -309,7 +321,11 @@ fn row(tool: AgentTool, facts: &CallFacts) -> Tier {
         | AgentTool::DriveRead
         | AgentTool::DriveGlob
         | AgentTool::DriveGrep
-        | AgentTool::DriveStat => Tier::T0,
+        | AgentTool::DriveStat
+        | AgentTool::BmadConfig
+        | AgentTool::BmadParty
+        | AgentTool::SkillsList
+        | AgentTool::SkillView => Tier::T0,
         AgentTool::DriveWrite
         | AgentTool::DriveEdit
         | AgentTool::SessionWrite
@@ -510,7 +526,11 @@ mod tests {
                 | AgentTool::DriveRead
                 | AgentTool::DriveGlob
                 | AgentTool::DriveGrep
-                | AgentTool::DriveStat => {
+                | AgentTool::DriveStat
+                | AgentTool::BmadConfig
+                | AgentTool::BmadParty
+                | AgentTool::SkillsList
+                | AgentTool::SkillView => {
                     assert_eq!(tier(tool, outside), Tier::T0, "{tool:?}");
                 }
                 AgentTool::DriveWrite | AgentTool::DriveEdit => {

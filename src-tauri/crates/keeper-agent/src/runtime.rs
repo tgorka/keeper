@@ -438,6 +438,7 @@ pub(crate) fn deps_over(
         home: home.clone(),
         host: host.clone(),
         drives: decls,
+        drive_root: home_drive.profile.local_path.clone(),
         sessions_zone,
         sessions_subfolder: home_drive
             .profile

@@ -67,7 +67,7 @@ use keeper_core::agents::tier::{
 use keeper_core::bots::chat::{self, CancelSignal, ChatEvent, ChatMessage, ChatOptions, Role};
 use keeper_core::bots::context_files::ContextBundle;
 use keeper_core::bots::error::BotsError;
-use keeper_core::bots::grant::Effect;
+use keeper_core::bots::grant::{Effect, GrantVerdict, ToolTarget};
 use keeper_core::bots::store::ProviderRow;
 use keeper_core::bots::tools::{
     self, ToolCall, ToolCallRecord, ToolHost, ToolLoop, ToolLoopEvent, ToolLoopOptions, ToolName,
@@ -87,7 +87,7 @@ use crate::cards::{self, Begun, Scheduled};
 use crate::claims::Lease;
 use crate::delegate::{self, DelegateTools, Delegation, DelegationPort, Delegator, TurnView};
 use crate::drive::finish_word;
-use crate::grants::AgentGrants;
+use crate::grants::{AgentGrants, GrantSource};
 use crate::host::{AgentDrive, Approval, Classified, HostIds, UNATTENDED_REFUSAL};
 use crate::matrix_sink::{
     anchor_content, cut, cut_to_log, deliver, deliver_gated, deliver_unless_narrowed,
@@ -662,12 +662,26 @@ impl SessionContext {
 
     /// The system message for one turn: the frozen soul, memory, skills and
     /// menu, the frame over the current label and scope, and the context
-    /// files the turn's arming loaded.
-    pub fn compose(&self, deps: &AgentDeps, context: Option<&ContextBundle>) -> ComposedPrompt {
+    /// files the turn's arming loaded; a turn offered among `tools` one
+    /// through which it follows a BMAD skill or workflow is told where
+    /// BMAD's project root is and what it may assume.
+    pub fn compose(
+        &self,
+        deps: &AgentDeps,
+        context: Option<&ContextBundle>,
+        tools: &[chat::ToolSpec],
+    ) -> ComposedPrompt {
+        let offered: Vec<&str> = tools.iter().map(|spec| spec.name.as_str()).collect();
+        let session_path = format!("{}/{}", deps.sessions_subfolder, self.session.path);
+        let bmad = keeper_core::agents::workflow::frame_lines(
+            &deps.home.drive.id,
+            &format!("{session_path}/artifacts"),
+            &offered,
+        );
         let frame = SessionFrame {
             agent: deps.home.config.id.clone(),
             host: deps.host.as_str().to_owned(),
-            session_path: format!("{}/{}", deps.sessions_subfolder, self.session.path),
+            session_path,
             session_kind: self.agent.kind.as_str().to_owned(),
             drives: self
                 .scope
@@ -690,6 +704,7 @@ impl SessionContext {
                 .filter(|held| held.heard.elapsed() < FOCUS_TTL)
                 .map(|held| held.focus.clone())
                 .filter(|focus| self.scope.contains(&focus.drive)),
+            bmad,
         };
         prompt::compose(&PromptInput {
             soul: &self.soul,
@@ -787,6 +802,9 @@ pub struct AgentDeps {
     pub host: HostSlug,
     /// The declarations of the drives this host mounts, by id.
     pub drives: BTreeMap<String, DriveDecl>,
+    /// The home drive's root on this host: BMAD's project root, where its
+    /// `_bmad/` install is read (R96).
+    pub drive_root: PathBuf,
     /// The home drive's sessions zone.
     pub sessions_zone: PathBuf,
     /// Its folder inside the drive, for the frame's drive-relative path.
@@ -808,8 +826,8 @@ impl AgentDeps {
 }
 
 /// A tool host that refuses any tool outside `[tools].allow`, and serves the
-/// agent's surface, `delegate`, `reply`, `card_update` and `session_write`
-/// tools itself (R38, R50: no ⌘9 host has them). Every call is classified
+/// agent's surface, `delegate`, `reply`, `card_update`, `session_write`,
+/// BMAD and skill tools itself (R38, R50: no ⌘9 host has them). Every call is classified
 /// (AD-392) on where it lands and audited in exactly one row with its tier
 /// (R90), before any effect; one that writes or sends is checked first
 /// against the label at its sink, then against the integrity rule over its
@@ -820,6 +838,11 @@ struct AllowedTools<'t> {
     surface: Option<crate::surface::SurfaceTools>,
     delegation: DelegateTools<'t>,
     cards: crate::cards::CardTools<'t>,
+    /// `bmad_config`, `bmad_party`, `skills_list` and `skill_view`.
+    bmad: crate::bmad::BmadTools,
+    /// The turn's grants: a BMAD or skill tool reads the home drive only
+    /// where they let a `drive_read` of it run (R195).
+    grants: Arc<dyn GrantSource>,
     view: &'t dyn TurnView,
     sinks: &'t Sinks,
     /// The declarations of the drives this host mounts: a write's audience.
@@ -1294,6 +1317,32 @@ impl ToolHost for AllowedTools<'_> {
                 audit.finish(outcome);
             }
             return outcome;
+        }
+        if crate::bmad::serves(&wire.name) {
+            let tool = AgentTool::from_wire(&wire.name)?;
+            let classification = self.classify(&wire.id, tool, &CallFacts::default(), None);
+            let gated = self.gated(&wire.id, &wire.name, &classification, &[], Vec::new());
+            let at = self.bmad.at(wire);
+            let audit = CallAudit::new(
+                self.sinks,
+                &wire.name,
+                Effect::Read,
+                &classification,
+                gated,
+                (&self.home.id, &at),
+            );
+            let outcome = if !self.allow.contains(&wire.name) {
+                refusal(format!("{} is not one of this agent's tools.", wire.name))
+            } else if let Err(denied) = grant_read(self.grants.as_ref(), &self.home.id, &at) {
+                refusal(denied)
+            } else {
+                match audit.admit(&self.home.id, &at) {
+                    Ok(()) => self.bmad.run(wire),
+                    Err(withheld) => withheld.into(),
+                }
+            };
+            audit.finish(&outcome);
+            return Some(outcome);
         }
         if !crate::surface::is_surface(&wire.name) {
             return None;
@@ -3985,6 +4034,34 @@ pub enum Probe {
     Skip,
 }
 
+/// The grants a turn of `context`'s agent runs under: its own
+/// `[tools].drives` within the session's scope (C3).
+fn agent_grants(context: &SessionContext, deps: &AgentDeps) -> Arc<dyn GrantSource> {
+    let config = &deps.home.config;
+    Arc::new(AgentGrants::new(
+        &deps.row.provider.id,
+        &deps.bot.id,
+        &config.drives,
+        &context.scope,
+        &config.allow,
+    ))
+}
+
+/// Whether `grants` let a read of `at` in `drive` run, decided as a
+/// `drive_read` of it is; else the grant layer's sentence.
+fn grant_read(grants: &dyn GrantSource, drive: &str, at: &str) -> Result<(), String> {
+    let target = ToolTarget {
+        profile_id: drive.to_owned(),
+        subpath: at.to_owned(),
+    };
+    match grants.verdict(&target, Effect::Read) {
+        Ok(GrantVerdict::Allow { .. }) => Ok(()),
+        Ok(GrantVerdict::Ask { reason, .. }) => Err(reason.to_owned()),
+        Ok(GrantVerdict::Deny { reason }) => Err(reason),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// Arm one turn of `context`'s agent: its own grants, its history, and only
 /// the tools in `[tools].allow`. The system message is not in it yet: it is
 /// [`SessionContext::compose`] over the returned context bundle.
@@ -3994,13 +4071,10 @@ pub async fn arm_agent(
     probe: Probe,
 ) -> crate::turn::Armed {
     let config = &deps.home.config;
-    let grants = Arc::new(AgentGrants::new(
-        &deps.row.provider.id,
-        &deps.bot.id,
-        &config.drives,
-        &context.scope,
-        &config.allow,
-    ));
+    let grants = agent_grants(context, deps);
+    // The BMAD and skill tools read the home drive: they are offered only
+    // where its grant would let a `drive_read` of it run (R195).
+    let reads_home = grant_read(grants.as_ref(), &deps.home.drive.id, "").is_ok();
     let origin = TurnOrigin::Agent {
         session: context.session.clone(),
     };
@@ -4039,6 +4113,12 @@ pub async fn arm_agent(
             .request
             .tools
             .extend(crate::cards::specs(&config.allow));
+        if reads_home {
+            armed
+                .request
+                .tools
+                .extend(keeper_core::agents::workflow::specs(&config.allow));
+        }
     }
     armed
 }
@@ -4100,14 +4180,14 @@ async fn run_agent_turn(
         return failed(error.to_string());
     }
     board.relabel(&context.label);
-    let mut composed = context.compose(deps, armed.context.as_ref());
+    let mut composed = context.compose(deps, armed.context.as_ref(), &armed.request.tools);
     if context.open.as_ref().map(|open| &open.prompt_sha256) != Some(&composed.prompt_sha256) {
         // What the model is told changed (or was never recorded): the frame
         // takes the new `open` line's time, and the line records the digest
         // of exactly that composition.
         let ts = writer.next_ts();
         context.frame_time = ts.with_timezone(&chrono::Local).fixed_offset();
-        composed = context.compose(deps, armed.context.as_ref());
+        composed = context.compose(deps, armed.context.as_ref(), &armed.request.tools);
         let open = open_body(context, deps, &composed);
         if let Err(error) = writer.write_at(context, ts, None, None, LineBody::Open(open)) {
             return failed(error.to_string());
@@ -4172,6 +4252,15 @@ async fn run_agent_turn(
         &session_dir,
     );
     let agent = context.agent.clone();
+    let grants = agent_grants(context, deps);
+    let bmad = crate::bmad::BmadTools::new(
+        deps.home.drive.id.clone(),
+        deps.drive_root.clone(),
+        drive_relative(&deps.drive_root, &deps.home.zone),
+        format!("{session_dir}/artifacts"),
+        context.agent.workflow.clone(),
+        context.skills.clone(),
+    );
     let log = Mutex::new(TurnLog {
         context,
         writer,
@@ -4197,6 +4286,8 @@ async fn run_agent_turn(
             view: &log,
             allow: &config.allow,
         },
+        bmad,
+        grants,
         delegation: DelegateTools::new(
             tools.from,
             tools.delegations,
@@ -4261,10 +4352,24 @@ async fn run_agent_turn(
                   record: &ToolCallRecord,
                   wire: &chat::ToolCall,
                   outcome: &ToolOutcome| {
-        let read = read_label(deps, &read_profiles, record, outcome);
-        let result_label = read
-            .as_ref()
-            .map_or_else(|| log.context.label.clone(), |(label, _)| label.clone());
+        // What the call read: a drive verb's file, or the home drive's
+        // files a BMAD or skill tool read, each labelled by where it landed
+        // and the bytes it returned, as they were at the read (R195).
+        let home = &deps.home.drive;
+        let reads: Vec<(Label, String)> = read_label(deps, &read_profiles, record, outcome)
+            .into_iter()
+            .chain(
+                host.bmad
+                    .take_reads()
+                    .into_iter()
+                    .map(|read| (read.label(home), format!("{}/{}", home.id, read.path()))),
+            )
+            .collect();
+        let result_label = reads
+            .iter()
+            .map(|(label, _)| label.clone())
+            .reduce(|joined, label| joined.join(&label))
+            .unwrap_or_else(|| log.context.label.clone());
         let (word, truncated) = match outcome {
             ToolOutcome::Refused { .. } => (ToolOutcomeWord::Refused, None),
             ToolOutcome::Text {
@@ -4301,7 +4406,7 @@ async fn run_agent_turn(
         for line in host.delegation.take_lines() {
             log.write(call_line, line);
         }
-        if let Some((label, path)) = read {
+        for (label, path) in reads {
             let joined = log.context.label.join(&label);
             if joined != log.context.label {
                 log.write(
@@ -4613,6 +4718,19 @@ fn read_label(
     let decl = deps.drives.get(drive)?;
     let label = drive_read_label(decl, profiles, drive, path, record.name, outcome);
     Some((label, display.to_owned()))
+}
+
+/// `dir` relative to `root`, `/`-separated: the agents zone's folder in
+/// its drive.
+fn drive_relative(root: &Path, dir: &Path) -> String {
+    dir.strip_prefix(root)
+        .map(|rel| {
+            rel.components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .unwrap_or_default()
 }
 
 /// [`read_label`] once the drive is known: what the call at `path` of

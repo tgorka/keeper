@@ -28,6 +28,10 @@ fs4 = { workspace = true }
 chrono = { workspace = true }
 # An agent's room: the event ids and transaction ids its sends carry.
 matrix-sdk = { workspace = true }
+# BMAD's helpers, ported (AD-396): `bmad_config` and `bmad_party` read the
+# drive's install through them, and print what they print in key order.
+keeper-ported = { path = "../keeper-ported" }
+toml = { workspace = true }
 
 # The headless host's process layer: no secret variable and no core dump
 # after start (S-07), `prctl` on Linux.
